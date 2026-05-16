@@ -1,0 +1,18 @@
+{
+  "name": "cottontail",
+  "version": "0.1.0",
+  "description": "Tiny Zig-based JavaScript runtime scaffold for Electrobun.",
+  "license": "MIT",
+  "author": "Blackboard Technologies Inc.",
+  "type": "module",
+  "packageManager": "bun@1.3.10",
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "check-zig-version": "bun run setup && node scripts/zig.js version",
+    "build": "bun run setup && node scripts/zig.js build",
+    "build:release": "bun run setup && node scripts/zig.js build -Doptimize=ReleaseSmall",
+    "run": "bun run setup && node scripts/run.js",
+    "dev": "bun run run",
+    "test": "bun run setup && node scripts/zig.js build test"
+  }
+}

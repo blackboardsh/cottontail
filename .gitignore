@@ -1,1 +1,7 @@
-# Add files to ignore here
+.DS_Store
+.zig-cache/
+zig-out/
+node_modules/
+vendors/zig/
+vendors/zig.zip
+vendors/zig-temp/
