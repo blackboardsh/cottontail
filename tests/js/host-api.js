@@ -22,8 +22,40 @@ const envMap = cottontail.env();
 assert(envMap.COTTONTAIL_TEST_ENV === 'present', 'env() object mismatch');
 
 const tempFilePath = cottontail.env('COTTONTAIL_TMP_FILE');
+const tempDirPath = cottontail.env('COTTONTAIL_TMP_DIR');
 cottontail.writeFile(tempFilePath, 'host api roundtrip');
 const roundtrip = cottontail.readFile(tempFilePath);
 assert(roundtrip === 'host api roundtrip', 'writeFile/readFile roundtrip mismatch');
+
+assert(typeof cottontail.platform === 'function', 'platform() missing');
+assert(typeof cottontail.arch === 'function', 'arch() missing');
+assert(cottontail.platform().length > 0, 'platform() empty');
+assert(cottontail.arch().length > 0, 'arch() empty');
+
+assert(cottontail.existsSync('tests/js/fixtures/sample.txt'), 'existsSync fixture mismatch');
+assert(!cottontail.existsSync('tests/js/fixtures/missing.txt'), 'existsSync missing mismatch');
+
+cottontail.mkdirSync(tempDirPath, true);
+assert(cottontail.existsSync(tempDirPath), 'mkdirSync failed');
+cottontail.rmSync(tempDirPath, true, true);
+assert(!cottontail.existsSync(tempDirPath), 'rmSync failed');
+
+const cwdPath = cottontail.cwd();
+const childBinary = cottontail.platform() === 'win32'
+  ? `${cwdPath}/zig-out/bin/cottontail.exe`
+  : `${cwdPath}/zig-out/bin/cottontail`;
+const childScript = `${cwdPath}/tests/js/spawn-child.js`;
+const childCwd = `${cwdPath}/tests/js/fixtures`;
+const childResult = cottontail.spawnSync(childBinary, [childScript], {
+  cwd: childCwd,
+  env: {
+    COTTONTAIL_SPAWN_TOKEN: 'spawned',
+  },
+  stdio: 'pipe',
+});
+
+assert(childResult.status === 0, `spawnSync status mismatch: ${childResult.status}`);
+assert(childResult.stdout.includes(`spawn cwd = ${childCwd}`), 'spawnSync cwd mismatch');
+assert(childResult.stdout.includes('spawn token = spawned'), 'spawnSync env mismatch');
 
 console.log('host api passed');

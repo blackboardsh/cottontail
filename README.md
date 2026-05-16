@@ -2,6 +2,8 @@
 
 `cottontail` is a tiny Zig-based JavaScript runtime for Electrobun workloads.
 
+After a fresh clone, Bun is still the bootstrap path until `cottontail` is published or otherwise available on the machine. Once you have built the local binary once, you can use `cottontail` itself to drive the repo workflow.
+
 This repo currently focuses on developer experience:
 
 - Bun drives the local workflow.
@@ -28,6 +30,19 @@ This repo currently focuses on developer experience:
 - `bun run test` runs both the Zig and JavaScript tests.
 - `bun run check-zig-version` prints the vendored Zig version through the local wrapper script.
 
+## Bootstrap
+
+After a fresh clone:
+
+- `bun run build`
+
+After the first local build, you can drive the repo with `cottontail` itself:
+
+- `./zig-out/bin/cottontail scripts/repo.js build`
+- `./zig-out/bin/cottontail scripts/repo.js test`
+- `./zig-out/bin/cottontail scripts/repo.js bench`
+- `./zig-out/bin/cottontail scripts/repo.js run test.js`
+
 ## Current status
 
-The runtime is intentionally minimal right now. It embeds QuickJS-ng, supports relative ESM imports and async jobs, and exposes `cottontail.args`, `cwd()`, `readFile()`, `writeFile()`, `env()`, and `nanotime()`, but it does not yet expose Electrobun-specific APIs or a broader compatibility surface.
+The runtime is intentionally minimal right now. It embeds QuickJS-ng, supports relative ESM imports and async jobs, and exposes `cottontail.args`, `cwd()`, `readFile()`, `writeFile()`, `env()`, `nanotime()`, basic fs mutation, platform/process info, and synchronous child process execution, but it does not yet expose Electrobun-specific APIs or a broader compatibility surface.

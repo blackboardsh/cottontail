@@ -1,5 +1,10 @@
 const std = @import("std");
+const host = @import("host.zig");
 const runtime = @import("runtime.zig");
+
+comptime {
+    host.forceLink();
+}
 
 const version = "0.1.0-dev";
 const help_text_template =

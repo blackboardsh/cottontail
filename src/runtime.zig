@@ -1,4 +1,5 @@
 const std = @import("std");
+const host = @import("host.zig");
 
 const c = @cImport({
     @cInclude("qjs_runner.h");
@@ -12,6 +13,7 @@ pub const Runtime = struct {
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
         const handle = c.ct_qjs_runtime_create() orelse return error.RuntimeInitFailed;
+        host.configure(io);
         return .{
             .io = io,
             .allocator = allocator,

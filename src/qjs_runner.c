@@ -1,6 +1,7 @@
 #include "qjs_runner.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,62 @@ extern char **environ;
 #endif
 
 #include "quickjs.h"
+
+#if defined(_WIN32)
+#define CT_PLATFORM_STRING "win32"
+#elif defined(__APPLE__)
+#define CT_PLATFORM_STRING "darwin"
+#elif defined(__linux__)
+#define CT_PLATFORM_STRING "linux"
+#else
+#define CT_PLATFORM_STRING "unknown"
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define CT_ARCH_STRING "arm64"
+#elif defined(__x86_64__) || defined(_M_X64)
+#define CT_ARCH_STRING "x64"
+#elif defined(__i386__) || defined(_M_IX86)
+#define CT_ARCH_STRING "x86"
+#else
+#define CT_ARCH_STRING "unknown"
+#endif
+
+typedef struct {
+    const char *name;
+    const char *value;
+} CtHostEnvEntry;
+
+typedef struct {
+    const char *cwd;
+    const CtHostEnvEntry *env_entries;
+    size_t env_count;
+    bool capture_output;
+} CtHostSpawnOptions;
+
+typedef struct {
+    int exit_code;
+    char *stdout_ptr;
+    size_t stdout_len;
+    char *stderr_ptr;
+    size_t stderr_len;
+} CtHostSpawnResult;
+
+extern void ct_host_string_free(char *value);
+extern void ct_host_buffer_free(char *value);
+extern bool ct_host_exists(const char *path);
+extern int ct_host_mkdir(const char *path, bool recursive, char **error_out);
+extern int ct_host_rm(const char *path, bool recursive, bool force, char **error_out);
+extern int ct_host_unlink(const char *path, char **error_out);
+extern int ct_host_chmod(const char *path, unsigned int mode, char **error_out);
+extern int ct_host_spawn_sync(
+    const char *file,
+    const char *const *argv,
+    size_t argc,
+    CtHostSpawnOptions options,
+    CtHostSpawnResult *result_out,
+    char **error_out
+);
 
 struct CtQjsRuntime {
     JSRuntime *runtime;
@@ -199,6 +256,203 @@ static void ct_set_error_out(char **error_out, char *message) {
     } else {
         free(message);
     }
+}
+
+static char *ct_copy_js_string(JSContext *ctx, JSValueConst value) {
+    size_t len = 0;
+    const char *string_value = JS_ToCStringLen(ctx, &len, value);
+    char *copy = NULL;
+
+    if (string_value == NULL) {
+        return NULL;
+    }
+
+    copy = ct_duplicate_bytes(string_value, len);
+    JS_FreeCString(ctx, string_value);
+    return copy;
+}
+
+static void ct_free_string_array(char **values, size_t count) {
+    if (values == NULL) {
+        return;
+    }
+
+    for (size_t index = 0; index < count; index += 1) {
+        free(values[index]);
+    }
+
+    free(values);
+}
+
+static void ct_free_env_entries(CtHostEnvEntry *entries, size_t count) {
+    if (entries == NULL) {
+        return;
+    }
+
+    for (size_t index = 0; index < count; index += 1) {
+        free((char *) entries[index].name);
+        free((char *) entries[index].value);
+    }
+
+    free(entries);
+}
+
+static JSValue ct_throw_host_error(JSContext *ctx, char *error_message) {
+    JSValue exception = JS_ThrowInternalError(
+        ctx,
+        "%s",
+        error_message != NULL ? error_message : "Host operation failed"
+    );
+
+    if (error_message != NULL) {
+        ct_host_string_free(error_message);
+    }
+
+    return exception;
+}
+
+static int ct_parse_string_array(
+    JSContext *ctx,
+    JSValueConst value,
+    char ***out_values,
+    size_t *out_count
+) {
+    JSValue length_value = JS_UNDEFINED;
+    uint32_t length = 0;
+    char **values = NULL;
+
+    *out_values = NULL;
+    *out_count = 0;
+
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        return 0;
+    }
+
+    if (!JS_IsArray(value)) {
+        JS_ThrowTypeError(ctx, "spawnSync args must be an array");
+        return -1;
+    }
+
+    length_value = JS_GetPropertyStr(ctx, value, "length");
+    if (JS_IsException(length_value)) {
+        return -1;
+    }
+
+    if (JS_ToUint32(ctx, &length, length_value) < 0) {
+        JS_FreeValue(ctx, length_value);
+        return -1;
+    }
+    JS_FreeValue(ctx, length_value);
+
+    values = (char **) calloc(length > 0 ? length : 1, sizeof(char *));
+    if (values == NULL) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+
+    for (uint32_t index = 0; index < length; index += 1) {
+        JSValue item = JS_GetPropertyUint32(ctx, value, index);
+        if (JS_IsException(item)) {
+            ct_free_string_array(values, index);
+            return -1;
+        }
+
+        values[index] = ct_copy_js_string(ctx, item);
+        JS_FreeValue(ctx, item);
+
+        if (values[index] == NULL) {
+            ct_free_string_array(values, index + 1);
+            return -1;
+        }
+    }
+
+    *out_values = values;
+    *out_count = length;
+    return 0;
+}
+
+static int ct_parse_env_object(
+    JSContext *ctx,
+    JSValueConst value,
+    CtHostEnvEntry **out_entries,
+    size_t *out_count
+) {
+    JSPropertyEnum *properties = NULL;
+    uint32_t property_count = 0;
+    CtHostEnvEntry *entries = NULL;
+
+    *out_entries = NULL;
+    *out_count = 0;
+
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        return 0;
+    }
+
+    if (!JS_IsObject(value)) {
+        JS_ThrowTypeError(ctx, "spawnSync env must be an object");
+        return -1;
+    }
+
+    if (JS_GetOwnPropertyNames(
+            ctx,
+            &properties,
+            &property_count,
+            value,
+            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY
+        ) < 0) {
+        return -1;
+    }
+
+    entries = (CtHostEnvEntry *) calloc(property_count > 0 ? property_count : 1, sizeof(CtHostEnvEntry));
+    if (entries == NULL) {
+        JS_FreePropertyEnum(ctx, properties, property_count);
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+
+    for (uint32_t index = 0; index < property_count; index += 1) {
+        JSValue property_value = JS_GetProperty(ctx, value, properties[index].atom);
+        const char *name = NULL;
+
+        if (JS_IsException(property_value)) {
+            JS_FreePropertyEnum(ctx, properties, property_count);
+            ct_free_env_entries(entries, index);
+            return -1;
+        }
+
+        name = JS_AtomToCString(ctx, properties[index].atom);
+        if (name == NULL) {
+            JS_FreeValue(ctx, property_value);
+            JS_FreePropertyEnum(ctx, properties, property_count);
+            ct_free_env_entries(entries, index);
+            return -1;
+        }
+
+        entries[index].name = ct_duplicate_string(name);
+        JS_FreeCString(ctx, name);
+
+        if (entries[index].name == NULL) {
+            JS_FreeValue(ctx, property_value);
+            JS_FreePropertyEnum(ctx, properties, property_count);
+            ct_free_env_entries(entries, index + 1);
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+
+        entries[index].value = ct_copy_js_string(ctx, property_value);
+        JS_FreeValue(ctx, property_value);
+
+        if (entries[index].value == NULL) {
+            JS_FreePropertyEnum(ctx, properties, property_count);
+            ct_free_env_entries(entries, index + 1);
+            return -1;
+        }
+    }
+
+    JS_FreePropertyEnum(ctx, properties, property_count);
+    *out_entries = entries;
+    *out_count = property_count;
+    return 0;
 }
 
 static void ct_promise_rejection_tracker(
@@ -450,6 +704,362 @@ static JSValue ct_env(JSContext *ctx, JSValueConst this_val, int argc, JSValueCo
     return result;
 }
 
+static JSValue ct_exists_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    bool exists = false;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.existsSync(path) requires a path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    exists = ct_host_exists(path);
+    JS_FreeCString(ctx, path);
+    return JS_NewBool(ctx, exists);
+}
+
+static JSValue ct_mkdir_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    bool recursive = false;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.mkdirSync(path, recursive) requires a path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (argc >= 2) {
+        int recursive_value = JS_ToBool(ctx, argv[1]);
+        if (recursive_value < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        recursive = recursive_value != 0;
+    }
+
+    if (ct_host_mkdir(path, recursive, &error_message) != 0) {
+        JS_FreeCString(ctx, path);
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    JS_FreeCString(ctx, path);
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_rm_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    bool recursive = false;
+    bool force = false;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.rmSync(path, recursive, force) requires a path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (argc >= 2) {
+        int recursive_value = JS_ToBool(ctx, argv[1]);
+        if (recursive_value < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        recursive = recursive_value != 0;
+    }
+
+    if (argc >= 3) {
+        int force_value = JS_ToBool(ctx, argv[2]);
+        if (force_value < 0) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
+        force = force_value != 0;
+    }
+
+    if (ct_host_rm(path, recursive, force, &error_message) != 0) {
+        JS_FreeCString(ctx, path);
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    JS_FreeCString(ctx, path);
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_unlink_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.unlinkSync(path) requires a path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (ct_host_unlink(path, &error_message) != 0) {
+        JS_FreeCString(ctx, path);
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    JS_FreeCString(ctx, path);
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_chmod_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    int32_t mode = 0;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "cottontail.chmodSync(path, mode) requires a path and mode");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (JS_ToInt32(ctx, &mode, argv[1]) < 0) {
+        JS_FreeCString(ctx, path);
+        return JS_EXCEPTION;
+    }
+
+    if (ct_host_chmod(path, (unsigned int) mode, &error_message) != 0) {
+        JS_FreeCString(ctx, path);
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    JS_FreeCString(ctx, path);
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *file = NULL;
+    char **args = NULL;
+    size_t arg_count = 0;
+    char *cwd = NULL;
+    CtHostEnvEntry *env_entries = NULL;
+    size_t env_count = 0;
+    bool capture_output = true;
+    char *error_message = NULL;
+    CtHostSpawnResult result = {0};
+    JSValue response = JS_UNDEFINED;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.spawnSync(file, args, options) requires a file");
+    }
+
+    file = JS_ToCString(ctx, argv[0]);
+    if (file == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (argc >= 2 && ct_parse_string_array(ctx, argv[1], &args, &arg_count) != 0) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
+        JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
+        JSValue stdio_value = JS_GetPropertyStr(ctx, argv[2], "stdio");
+
+        if (JS_IsException(cwd_value) || JS_IsException(env_value) || JS_IsException(stdio_value)) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, stdio_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            return JS_EXCEPTION;
+        }
+
+        if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
+            cwd = ct_copy_js_string(ctx, cwd_value);
+            if (cwd == NULL) {
+                JS_FreeValue(ctx, cwd_value);
+                JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, stdio_value);
+                JS_FreeCString(ctx, file);
+                ct_free_string_array(args, arg_count);
+                return JS_EXCEPTION;
+            }
+        }
+
+        if (ct_parse_env_object(ctx, env_value, &env_entries, &env_count) != 0) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, stdio_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            return JS_EXCEPTION;
+        }
+
+        if (!JS_IsUndefined(stdio_value) && !JS_IsNull(stdio_value)) {
+            char *stdio = ct_copy_js_string(ctx, stdio_value);
+            if (stdio == NULL) {
+                JS_FreeValue(ctx, cwd_value);
+                JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, stdio_value);
+                JS_FreeCString(ctx, file);
+                ct_free_string_array(args, arg_count);
+                ct_free_env_entries(env_entries, env_count);
+                free(cwd);
+                return JS_EXCEPTION;
+            }
+
+            if (strcmp(stdio, "inherit") == 0) {
+                capture_output = false;
+            } else if (strcmp(stdio, "pipe") != 0) {
+                free(stdio);
+                JS_FreeValue(ctx, cwd_value);
+                JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, stdio_value);
+                JS_FreeCString(ctx, file);
+                ct_free_string_array(args, arg_count);
+                ct_free_env_entries(env_entries, env_count);
+                free(cwd);
+                return JS_ThrowTypeError(ctx, "spawnSync options.stdio must be 'pipe' or 'inherit'");
+            }
+
+            free(stdio);
+        }
+
+        JS_FreeValue(ctx, cwd_value);
+        JS_FreeValue(ctx, env_value);
+        JS_FreeValue(ctx, stdio_value);
+    }
+
+    if (ct_host_spawn_sync(
+            file,
+            (const char *const *) args,
+            arg_count,
+            (CtHostSpawnOptions){
+                .cwd = cwd,
+                .env_entries = env_entries,
+                .env_count = env_count,
+                .capture_output = capture_output,
+            },
+            &result,
+            &error_message
+        ) != 0) {
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    response = JS_NewObject(ctx);
+    if (JS_IsException(response)) {
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        if (result.stdout_ptr != NULL) {
+            ct_host_buffer_free(result.stdout_ptr);
+        }
+        if (result.stderr_ptr != NULL) {
+            ct_host_buffer_free(result.stderr_ptr);
+        }
+        return response;
+    }
+
+    if (JS_SetPropertyStr(ctx, response, "status", JS_NewInt32(ctx, result.exit_code)) < 0 ||
+        JS_SetPropertyStr(
+            ctx,
+            response,
+            "stdout",
+            JS_NewStringLen(ctx, result.stdout_ptr != NULL ? result.stdout_ptr : "", result.stdout_len)
+        ) < 0 ||
+        JS_SetPropertyStr(
+            ctx,
+            response,
+            "stderr",
+            JS_NewStringLen(ctx, result.stderr_ptr != NULL ? result.stderr_ptr : "", result.stderr_len)
+        ) < 0) {
+        JS_FreeValue(ctx, response);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        if (result.stdout_ptr != NULL) {
+            ct_host_buffer_free(result.stdout_ptr);
+        }
+        if (result.stderr_ptr != NULL) {
+            ct_host_buffer_free(result.stderr_ptr);
+        }
+        return JS_EXCEPTION;
+    }
+
+    JS_FreeCString(ctx, file);
+    ct_free_string_array(args, arg_count);
+    ct_free_env_entries(env_entries, env_count);
+    free(cwd);
+
+    if (result.stdout_ptr != NULL) {
+        ct_host_buffer_free(result.stdout_ptr);
+    }
+    if (result.stderr_ptr != NULL) {
+        ct_host_buffer_free(result.stderr_ptr);
+    }
+
+    return response;
+}
+
+static JSValue ct_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int32_t code = 0;
+
+    (void) this_val;
+
+    if (argc >= 1 && JS_ToInt32(ctx, &code, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    exit(code);
+}
+
+static JSValue ct_platform(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    return JS_NewString(ctx, CT_PLATFORM_STRING);
+}
+
+static JSValue ct_arch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    return JS_NewString(ctx, CT_ARCH_STRING);
+}
+
 static int ct_set_import_meta(JSContext *ctx, JSValue module_value, const char *module_name, bool is_main) {
     JSModuleDef *module = (JSModuleDef *) JS_VALUE_GET_PTR(module_value);
     JSValue meta = JS_GetImportMeta(ctx, module);
@@ -559,6 +1169,15 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "readFile", JS_NewCFunction(ctx, ct_read_file, "readFile", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "writeFile", JS_NewCFunction(ctx, ct_write_file, "writeFile", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "env", JS_NewCFunction(ctx, ct_env, "env", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "existsSync", JS_NewCFunction(ctx, ct_exists_sync, "existsSync", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "mkdirSync", JS_NewCFunction(ctx, ct_mkdir_sync, "mkdirSync", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "rmSync", JS_NewCFunction(ctx, ct_rm_sync, "rmSync", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "unlinkSync", JS_NewCFunction(ctx, ct_unlink_sync, "unlinkSync", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "chmodSync", JS_NewCFunction(ctx, ct_chmod_sync, "chmodSync", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnSync", JS_NewCFunction(ctx, ct_spawn_sync, "spawnSync", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "exit", JS_NewCFunction(ctx, ct_exit, "exit", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "platform", JS_NewCFunction(ctx, ct_platform, "platform", 0)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "arch", JS_NewCFunction(ctx, ct_arch, "arch", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "args", JS_NewArray(ctx)) < 0) {
         JS_FreeValue(ctx, cottontail);
         JS_FreeValue(ctx, global);
