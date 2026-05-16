@@ -12,7 +12,9 @@
     "build": "bun run setup && node scripts/zig.js build",
     "build:release": "bun run setup && node scripts/zig.js build -Doptimize=ReleaseSmall",
     "run": "bun run setup && node scripts/run.js",
-    "dev": "bun run run",
-    "test": "bun run setup && node scripts/zig.js build test"
+    "dev": "bun run run -- test.js",
+    "test:zig": "bun run setup && node scripts/zig.js build test",
+    "test:js": "bun run run -- test.js",
+    "test": "bun run test:zig && bun run test:js"
   }
 }

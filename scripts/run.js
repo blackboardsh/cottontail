@@ -6,19 +6,36 @@ import { join } from 'path';
 
 const zigBinary = process.platform === 'win32' ? 'zig.exe' : 'zig';
 const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
+const cottontailBinary = join(
+  process.cwd(),
+  'zig-out',
+  'bin',
+  process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'
+);
 
 if (!existsSync(zigPath)) {
   console.error(`Vendored Zig compiler not found at ${zigPath}. Run "bun run setup" first.`);
   process.exit(1);
 }
 
-const args = ['build', 'run'];
+const buildResult = spawnSync(zigPath, ['build'], { stdio: 'inherit' });
 
-if (process.argv.length > 2) {
-  args.push('--', ...process.argv.slice(2));
+if (buildResult.error) {
+  console.error('Failed to build cottontail.');
+  console.error(buildResult.error.message);
+  process.exit(1);
 }
 
-const result = spawnSync(zigPath, args, { stdio: 'inherit' });
+if ((buildResult.status ?? 1) !== 0) {
+  process.exit(buildResult.status ?? 1);
+}
+
+if (!existsSync(cottontailBinary)) {
+  console.error(`Built cottontail binary not found at ${cottontailBinary}.`);
+  process.exit(1);
+}
+
+const result = spawnSync(cottontailBinary, process.argv.slice(2), { stdio: 'inherit' });
 
 if (result.error) {
   console.error('Failed to run cottontail.');

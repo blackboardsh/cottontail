@@ -1,18 +1,20 @@
 const std = @import("std");
 
+extern fn ct_run_file(script_path: [*:0]const u8) c_int;
+
 const version = "0.1.0-dev";
 const help_text_template =
     \\cottontail {s}
-    \\Tiny Zig-based JavaScript runtime scaffold for Electrobun.
+    \\Tiny Zig-based JavaScript runtime for Electrobun.
     \\
     \\Usage:
-    \\  cottontail
+    \\  cottontail <script.js>
     \\  cottontail --help
     \\  cottontail --version
     \\
     \\Status:
-    \\  QuickJS-ng embedding is not wired yet.
-    \\  This scaffold exists to lock in the Bun + vendored Zig workflow.
+    \\  QuickJS-ng is embedded with a minimal console.log / console.error host.
+    \\  Pass a JavaScript file path to evaluate it as a global script.
     \\
 ;
 
@@ -51,15 +53,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try stderr.print(
-        "cottontail: runtime bootstrap is not implemented yet; received argument: {s}\n",
-        .{arg},
-    );
-    try stderr.flush();
-    std.process.exit(2);
+    const exit_code = ct_run_file(arg.ptr);
+    if (exit_code != 0) {
+        try stderr.flush();
+        std.process.exit(@intCast(exit_code));
+    }
 }
 
-test "help text mentions cottontail and QuickJS-ng" {
+test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "QuickJS-ng") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script.js>") != null);
 }

@@ -5,3 +5,5 @@ node_modules/
 vendors/zig/
 vendors/zig.zip
 vendors/zig-temp/
+vendors/quickjs/
+vendors/quickjs.zip
