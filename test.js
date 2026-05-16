@@ -4,6 +4,9 @@ function assert(condition, message) {
   }
 }
 
+assert(typeof cottontail === "object", "cottontail host object missing");
+assert(typeof cottontail.nanotime === "function", "cottontail.nanotime missing");
+
 console.log("running cottontail smoke test");
 console.log("2 + 2 =", 2 + 2);
 assert(2 + 2 === 4, "basic arithmetic failed");

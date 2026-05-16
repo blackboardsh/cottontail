@@ -1,6 +1,5 @@
 const std = @import("std");
-
-extern fn ct_run_file(script_path: [*:0]const u8) c_int;
+const runtime = @import("runtime.zig");
 
 const version = "0.1.0-dev";
 const help_text_template =
@@ -8,13 +7,13 @@ const help_text_template =
     \\Tiny Zig-based JavaScript runtime for Electrobun.
     \\
     \\Usage:
-    \\  cottontail <script.js>
+    \\  cottontail <entrypoint.js> [args...]
     \\  cottontail --help
     \\  cottontail --version
     \\
     \\Status:
-    \\  QuickJS-ng is embedded with a minimal console.log / console.error host.
-    \\  Pass a JavaScript file path to evaluate it as a global script.
+    \\  QuickJS-ng is embedded with ESM imports, async job draining, and a small cottontail host API.
+    \\  Entry points can be classic scripts or ESM modules.
     \\
 ;
 
@@ -53,7 +52,20 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const exit_code = ct_run_file(arg.ptr);
+    var js_runtime = runtime.Runtime.init(init.io, init.arena.allocator()) catch {
+        try stderr.print("cottontail: failed to initialize the embedded QuickJS runtime\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+    defer js_runtime.deinit();
+
+    js_runtime.setArgs(args[2..]) catch {
+        try stderr.print("cottontail: failed to initialize cottontail.args\n", .{});
+        try stderr.flush();
+        std.process.exit(1);
+    };
+
+    const exit_code = js_runtime.runFile(arg);
     if (exit_code != 0) {
         try stderr.flush();
         std.process.exit(@intCast(exit_code));
@@ -63,5 +75,5 @@ pub fn main(init: std.process.Init) !void {
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "QuickJS-ng") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<script.js>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js>") != null);
 }
