@@ -17,6 +17,15 @@
     "bench": "bun run bench:build && node scripts/bench.js",
     "test:zig": "bun run setup && node scripts/zig.js build test",
     "test:js": "bun run build && node scripts/test-js.js",
-    "test": "bun run test:zig && bun run test:js"
+    "test:electrobun": "bun run build && node scripts/test-electrobun.js",
+    "test:electrobun:cli": "bun run build && node scripts/test-electrobun-cli.js",
+    "electrobun:window": "bun run run -- electrobun examples/electrobun-window.js",
+    "test": "bun run test:zig && bun run test:js",
+    "test:blocking": "bun run test && bun run test:electrobun && bun run test:electrobun:cli",
+    "push:beta": "bun run test:blocking && bun scripts/push-version.js beta",
+    "push:patch": "bun run test:blocking && bun scripts/push-version.js patch",
+    "push:minor": "bun run test:blocking && bun scripts/push-version.js minor",
+    "push:major": "bun run test:blocking && bun scripts/push-version.js major",
+    "push:stable": "bun run test:blocking && bun scripts/push-version.js stable"
   }
 }

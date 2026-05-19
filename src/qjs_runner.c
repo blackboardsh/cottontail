@@ -73,6 +73,19 @@ extern int ct_host_spawn_sync(
     CtHostSpawnResult *result_out,
     char **error_out
 );
+extern bool ct_electrobun_enabled(void);
+extern unsigned int ct_electrobun_create_window_host(
+    const char *title,
+    double x,
+    double y,
+    double width,
+    double height,
+    bool hidden,
+    bool activate,
+    bool quit_on_close,
+    char **error_out
+);
+extern int ct_electrobun_quit_host(char **error_out);
 
 struct CtQjsRuntime {
     JSRuntime *runtime;
@@ -452,6 +465,55 @@ static int ct_parse_env_object(
     JS_FreePropertyEnum(ctx, properties, property_count);
     *out_entries = entries;
     *out_count = property_count;
+    return 0;
+}
+
+static int ct_get_optional_float64_property(
+    JSContext *ctx,
+    JSValueConst object,
+    const char *name,
+    double *out_value
+) {
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+
+    if (JS_IsException(value)) {
+        return -1;
+    }
+
+    if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
+        if (JS_ToFloat64(ctx, out_value, value) < 0) {
+            JS_FreeValue(ctx, value);
+            return -1;
+        }
+    }
+
+    JS_FreeValue(ctx, value);
+    return 0;
+}
+
+static int ct_get_optional_bool_property(
+    JSContext *ctx,
+    JSValueConst object,
+    const char *name,
+    bool *out_value
+) {
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+    int bool_value = 0;
+
+    if (JS_IsException(value)) {
+        return -1;
+    }
+
+    if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
+        bool_value = JS_ToBool(ctx, value);
+        if (bool_value < 0) {
+            JS_FreeValue(ctx, value);
+            return -1;
+        }
+        *out_value = bool_value != 0;
+    }
+
+    JS_FreeValue(ctx, value);
     return 0;
 }
 
@@ -1032,6 +1094,89 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     return response;
 }
 
+static JSValue ct_electrobun_create_window(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *title_copy = NULL;
+    const char *title = "Cottontail";
+    double x = 100;
+    double y = 100;
+    double width = 960;
+    double height = 640;
+    bool hidden = false;
+    bool activate = true;
+    bool quit_on_close = true;
+    char *error_message = NULL;
+    unsigned int window_id = 0;
+
+    (void) this_val;
+
+    if (argc >= 1) {
+        JSValue title_value = JS_UNDEFINED;
+
+        if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0]) && !JS_IsObject(argv[0])) {
+            return JS_ThrowTypeError(ctx, "electrobun.createWindow(options) expects an options object");
+        }
+
+        title_value = JS_GetPropertyStr(ctx, argv[0], "title");
+        if (JS_IsException(title_value)) {
+            return JS_EXCEPTION;
+        }
+
+        if (!JS_IsUndefined(title_value) && !JS_IsNull(title_value)) {
+            title_copy = ct_copy_js_string(ctx, title_value);
+            if (title_copy == NULL) {
+                JS_FreeValue(ctx, title_value);
+                return JS_EXCEPTION;
+            }
+            title = title_copy;
+        }
+        JS_FreeValue(ctx, title_value);
+
+        if (ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
+            ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
+            ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
+            ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
+            ct_get_optional_bool_property(ctx, argv[0], "hidden", &hidden) != 0 ||
+            ct_get_optional_bool_property(ctx, argv[0], "activate", &activate) != 0 ||
+            ct_get_optional_bool_property(ctx, argv[0], "quitOnClose", &quit_on_close) != 0) {
+            free(title_copy);
+            return JS_EXCEPTION;
+        }
+    }
+
+    window_id = ct_electrobun_create_window_host(
+        title,
+        x,
+        y,
+        width,
+        height,
+        hidden,
+        activate,
+        quit_on_close,
+        &error_message
+    );
+    free(title_copy);
+
+    if (window_id == 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_NewUint32(ctx, window_id);
+}
+
+static JSValue ct_electrobun_quit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *error_message = NULL;
+
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    if (ct_electrobun_quit_host(&error_message) != 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_UNDEFINED;
+}
+
 static JSValue ct_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int32_t code = 0;
 
@@ -1131,6 +1276,7 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue console = JS_NewObject(ctx);
     JSValue cottontail = JS_NewObject(ctx);
+    JSValue electrobun = JS_UNDEFINED;
 
     if (JS_IsException(console)) {
         JS_FreeValue(ctx, global);
@@ -1141,6 +1287,16 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_FreeValue(ctx, console);
         JS_FreeValue(ctx, global);
         return -1;
+    }
+
+    if (ct_electrobun_enabled()) {
+        electrobun = JS_NewObject(ctx);
+        if (JS_IsException(electrobun)) {
+            JS_FreeValue(ctx, cottontail);
+            JS_FreeValue(ctx, console);
+            JS_FreeValue(ctx, global);
+            return -1;
+        }
     }
 
     if (JS_SetPropertyStr(ctx, console, "log", JS_NewCFunction(ctx, ct_console_log, "log", 1)) < 0) {
@@ -1179,6 +1335,16 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "platform", JS_NewCFunction(ctx, ct_platform, "platform", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "arch", JS_NewCFunction(ctx, ct_arch, "arch", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "args", JS_NewArray(ctx)) < 0) {
+        JS_FreeValue(ctx, electrobun);
+        JS_FreeValue(ctx, cottontail);
+        JS_FreeValue(ctx, global);
+        return -1;
+    }
+
+    if (!JS_IsUndefined(electrobun) &&
+        (JS_SetPropertyStr(ctx, electrobun, "createWindow", JS_NewCFunction(ctx, ct_electrobun_create_window, "createWindow", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "quit", JS_NewCFunction(ctx, ct_electrobun_quit, "quit", 0)) < 0)) {
+        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, cottontail);
         JS_FreeValue(ctx, global);
         return -1;
@@ -1189,7 +1355,16 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     if (JS_SetPropertyStr(ctx, global, "cottontail", cottontail) < 0) {
         JS_FreeValue(ctx, runtime->host_object);
         runtime->host_object = JS_UNDEFINED;
+        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, cottontail);
+        JS_FreeValue(ctx, global);
+        return -1;
+    }
+
+    if (!JS_IsUndefined(electrobun) && JS_SetPropertyStr(ctx, global, "electrobun", electrobun) < 0) {
+        JS_FreeValue(ctx, runtime->host_object);
+        runtime->host_object = JS_UNDEFINED;
+        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, global);
         return -1;
     }
