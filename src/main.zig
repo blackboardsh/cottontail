@@ -10,7 +10,7 @@ comptime {
     host.forceLink();
 }
 
-const version = "0.1.0";
+const version = "0.1.1-beta.0";
 const help_text_template =
     \\cottontail {s}
     \\Tiny Zig-based JavaScript runtime for Electrobun.
