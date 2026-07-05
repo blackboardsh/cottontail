@@ -8,7 +8,7 @@ const zigBinary = process.platform === 'win32' ? 'zig.exe' : 'zig';
 const zigPath = join(process.cwd(), 'vendors', 'zig', zigBinary);
 
 if (!existsSync(zigPath)) {
-  console.error(`Vendored Zig compiler not found at ${zigPath}. Run "bun run setup" first.`);
+  console.error(`Vendored Zig compiler not found at ${zigPath}. Run the cottontail setup first.`);
   process.exit(1);
 }
 

@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 
 const load_config_template = @embedFile("electrobun_cli/load_config_helper.js");
 const run_hook_template = @embedFile("electrobun_cli/run_hook_helper.js");
-const esbuild_driver_template = @embedFile("electrobun_cli/esbuild_driver.cjs");
 
 const esbuild_version = "0.28.0";
 
@@ -97,7 +96,7 @@ pub fn run(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
     const self_exe_path = try std.process.executablePathAlloc(init.io, init.arena.allocator());
     const exe_dir = try std.process.executableDirPathAlloc(init.io, init.arena.allocator());
-    const cottontail_home = try findCottontailHome(init.io, init.arena.allocator(), exe_dir);
+    const cottontail_home = try findCottontailHome(init, init.arena.allocator(), exe_dir);
     const project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
 
     const ctx = Context{
@@ -166,7 +165,7 @@ fn printHelp(writer: anytype) !void {
         \\  cottontail electrobun dev [--env=dev|canary|stable] [--watch]
         \\
         \\Notes:
-        \\  - esbuild is vendored automatically on first use through npm.
+        \\  - esbuild is vendored automatically on first use as a native binary.
         \\  - hook scripts are transpiled and executed by cottontail.
         \\  - init copies templates from the installed electrobun package.
         \\
@@ -197,11 +196,25 @@ fn parseBuildEnvironment(args: []const [:0]const u8) BuildEnvironment {
     return .dev;
 }
 
-fn findCottontailHome(io: std.Io, allocator: std.mem.Allocator, exe_dir: []const u8) ![]const u8 {
+fn findCottontailHome(init: std.process.Init, allocator: std.mem.Allocator, exe_dir: []const u8) ![]const u8 {
+    if (init.environ_map.get("COTTONTAIL_HOME")) |home| {
+        const absolute_home = try resolvePathForCwd(init.io, allocator, home);
+        if (looksLikeCottontailHome(init.io, allocator, absolute_home)) {
+            return absolute_home;
+        }
+    }
+
+    if (init.environ_map.get("DASH_COTTONTAIL_ROOT")) |home| {
+        const absolute_home = try resolvePathForCwd(init.io, allocator, home);
+        if (looksLikeCottontailHome(init.io, allocator, absolute_home)) {
+            return absolute_home;
+        }
+    }
+
     var current = try allocator.dupe(u8, exe_dir);
 
     while (true) {
-        if (looksLikeCottontailHome(io, allocator, current)) {
+        if (looksLikeCottontailHome(init.io, allocator, current)) {
             return current;
         }
 
@@ -211,6 +224,13 @@ fn findCottontailHome(io: std.Io, allocator: std.mem.Allocator, exe_dir: []const
     }
 
     return error.CottontailHomeNotFound;
+}
+
+fn resolvePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try allocator.dupe(u8, path);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
 }
 
 fn looksLikeCottontailHome(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) bool {
@@ -288,14 +308,10 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
     try runHook(ctx, config, "preBuild", null);
 
     const main_process = getMainProcess(config.root);
-    if (main_process == .zig) {
-        return error.ZigMainProcessNotSupportedYet;
-    }
-
     switch (main_process) {
         .bun => try buildBundledElectrobunApp(ctx, config),
         .cottontail => try buildCottontailApp(ctx, config),
-        .zig => unreachable,
+        .zig => try buildBundledElectrobunApp(ctx, config),
     }
 
     try runHook(ctx, config, "postBuild", null);
@@ -308,7 +324,7 @@ fn runBuiltApp(ctx: *const Context, config: CommandContext) !void {
     switch (main_process) {
         .bun => try runBundledElectrobunApp(ctx, config),
         .cottontail => try runCottontailApp(ctx, config),
-        .zig => return error.ZigMainProcessNotSupportedYet,
+        .zig => try runBundledElectrobunApp(ctx, config),
     }
 }
 
@@ -447,9 +463,139 @@ fn runCottontailApp(ctx: *const Context, config: CommandContext) !void {
     }
 }
 
+fn executableFileName(comptime basename: []const u8) []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => basename ++ ".exe",
+        else => basename,
+    };
+}
+
+fn zigTargetName() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "x86_64-windows",
+        .linux => switch (builtin.cpu.arch) {
+            .aarch64 => "aarch64-linux",
+            else => "x86_64-linux",
+        },
+        .macos => switch (builtin.cpu.arch) {
+            .aarch64 => "aarch64-macos",
+            else => "x86_64-macos",
+        },
+        else => "native",
+    };
+}
+
+fn appendZigStringLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    try out.append(allocator, '"');
+    for (value) |char| {
+        switch (char) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, char),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+fn writeZigMainBuildScript(ctx: *const Context, build_script_path: []const u8, relative_sdk_path: []const u8, relative_entrypoint_path: []const u8) !void {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(ctx.allocator);
+
+    try source.appendSlice(ctx.allocator,
+        \\const std = @import("std");
+        \\
+        \\pub fn build(b: *std.Build) void {
+        \\    const target = b.standardTargetOptions(.{});
+        \\    const optimize = b.standardOptimizeOption(.{});
+        \\
+        \\    const electrobun = b.createModule(.{
+        \\        .root_source_file = b.path(
+    );
+    try appendZigStringLiteral(ctx.allocator, &source, relative_sdk_path);
+    try source.appendSlice(ctx.allocator,
+        \\),
+        \\    });
+        \\
+        \\    const exe = b.addExecutable(.{
+        \\        .name = "main",
+        \\        .root_source_file = b.path(
+    );
+    try appendZigStringLiteral(ctx.allocator, &source, relative_entrypoint_path);
+    try source.appendSlice(ctx.allocator,
+        \\),
+        \\        .target = target,
+        \\        .optimize = optimize,
+        \\    });
+        \\
+        \\    exe.root_module.addImport("electrobun", electrobun);
+        \\    exe.linkLibC();
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    );
+
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{
+        .sub_path = build_script_path,
+        .data = source.items,
+    });
+}
+
+fn buildZigMainExecutable(ctx: *const Context, config: CommandContext, platform_paths: PlatformPaths, bundle: AppBundlePaths) ![]const u8 {
+    const zig_binary = try std.fs.path.join(ctx.allocator, &.{ platform_paths.package_root, "vendors", "zig", executableFileName("zig") });
+    if (!pathExists(ctx.io, zig_binary)) return error.ZigCompilerNotFound;
+
+    const zig_sdk_path = try std.fs.path.join(ctx.allocator, &.{ platform_paths.shared_dist_dir, "zig-sdk", "electrobun.zig" });
+    if (!pathExists(ctx.io, zig_sdk_path)) return error.ZigSdkNotFound;
+
+    const entrypoint = try resolveMainEntrypoint(ctx, config.root, .zig);
+    if (!pathExists(ctx.io, entrypoint)) return error.ZigEntrypointNotFound;
+
+    const temp_build_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.build_root, ".electrobun-zig-main", try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ osName(), archName() }) });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, temp_build_dir);
+
+    const relative_sdk_path = try std.fs.path.relative(ctx.allocator, ctx.project_root, ctx.environ_map, temp_build_dir, zig_sdk_path);
+    const relative_entrypoint_path = try std.fs.path.relative(ctx.allocator, ctx.project_root, ctx.environ_map, temp_build_dir, entrypoint);
+    const build_script_path = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "build.zig" });
+    try writeZigMainBuildScript(ctx, build_script_path, relative_sdk_path, relative_entrypoint_path);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(ctx.allocator);
+    try argv.append(ctx.allocator, zig_binary);
+    try argv.append(ctx.allocator, "build");
+    try argv.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "-Dtarget={s}", .{zigTargetName()}));
+    if (builtin.os.tag == .windows) {
+        try argv.append(ctx.allocator, "-Dcpu=baseline");
+    }
+    if (config.build_env != .dev) {
+        try argv.append(ctx.allocator, "-Doptimize=ReleaseSmall");
+    }
+
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = temp_build_dir },
+        .create_no_window = true,
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+
+    if (termExitCode(result.term) != 0) {
+        if (result.stdout.len > 0) ctx.writeStdout("{s}", .{result.stdout});
+        if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
+        return error.ZigBuildFailed;
+    }
+
+    const zig_out_bin = try std.fs.path.join(ctx.allocator, &.{ temp_build_dir, "zig-out", "bin", executableFileName("main") });
+    if (!pathExists(ctx.io, zig_out_bin)) return error.ZigMainBinaryNotFound;
+    return zig_out_bin;
+}
+
 fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
     const platform_paths = try getPlatformPaths(ctx);
     const bundle = try appBundlePaths(ctx, config);
+    const main_process = getMainProcess(config.root);
 
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.exec_dir);
     try std.Io.Dir.cwd().createDirPath(ctx.io, bundle.resources_dir);
@@ -463,7 +609,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     }
 
     try copyPath(ctx, platform_paths.launcher, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() }));
-    try copyPath(ctx, platform_paths.bun_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+    if (main_process == .bun) {
+        try copyPath(ctx, platform_paths.bun_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
+    }
     try copyPath(ctx, platform_paths.core_lib, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.core_lib) }));
     try copyPath(ctx, platform_paths.native_wrapper, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.native_wrapper) }));
     try copyPath(ctx, platform_paths.libasar, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.libasar) }));
@@ -474,7 +622,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
         try copyPath(ctx, platform_paths.zig_zstd, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.zig_zstd) }));
     }
 
-    try copyPath(ctx, platform_paths.main_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "main.js" }));
+    if (main_process == .bun) {
+        try copyPath(ctx, platform_paths.main_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "main.js" }));
+    }
     try copyPath(ctx, platform_paths.preload_full_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "preload-full.js" }));
     try copyPath(ctx, platform_paths.preload_sandboxed_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "preload-sandboxed.js" }));
 
@@ -483,16 +633,25 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     }
 
     if (bundleUsesCef(config.root)) {
-        try copyBundledCef(ctx, bundle, platform_paths);
+        try copyBundledCef(ctx, bundle, platform_paths, main_process);
     }
 
     try writeBundledRuntimeMetadata(ctx, config, bundle);
 
-    const main_source = try resolveMainEntrypoint(ctx, config.root, .bun);
-    const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
-    const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
-    try buildMainEntrypoint(ctx, config.root, .bun, main_source, main_output);
+    switch (main_process) {
+        .bun => {
+            const main_source = try resolveMainEntrypoint(ctx, config.root, .bun);
+            const bun_dir = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "bun" });
+            try std.Io.Dir.cwd().createDirPath(ctx.io, bun_dir);
+            const main_output = try std.fs.path.join(ctx.allocator, &.{ bun_dir, "index.js" });
+            try buildMainEntrypoint(ctx, config.root, .bun, main_source, main_output);
+        },
+        .zig => {
+            const main_binary = try buildZigMainExecutable(ctx, config, platform_paths, bundle);
+            try copyPath(ctx, main_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, executableFileName("main") }));
+        },
+        .cottontail => unreachable,
+    }
 
     try buildViews(ctx, config.root, bundle.app_code_dir);
     try copyStaticAssets(ctx, config.root, bundle.app_code_dir);
@@ -549,7 +708,20 @@ fn spawnBuiltApp(ctx: *const Context, config: CommandContext) !std.process.Child
                 .create_no_window = true,
             });
         },
-        .zig => error.ZigMainProcessNotSupportedYet,
+        .zig => blk: {
+            const bundle = try appBundlePaths(ctx, config);
+            const launcher_path = try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() });
+            if (!pathExists(ctx.io, launcher_path)) return error.BuiltMainNotFound;
+
+            break :blk try std.process.spawn(ctx.io, .{
+                .argv = &[_][]const u8{launcher_path},
+                .cwd = .{ .path = bundle.exec_dir },
+                .stdin = .inherit,
+                .stdout = .inherit,
+                .stderr = .inherit,
+                .create_no_window = true,
+            });
+        },
     };
 }
 
@@ -619,9 +791,9 @@ fn runHook(ctx: *const Context, config: CommandContext, hook_name: []const u8, e
 fn ensureEsbuild(ctx: *const Context) !void {
     const vendor_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "vendors", "esbuild" });
     const version_file = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, ".esbuild-version" });
-    const esbuild_pkg = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "node_modules", "esbuild", "package.json" });
+    const esbuild_bin = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, esbuildBinaryName() });
 
-    if (pathExists(ctx.io, version_file) and pathExists(ctx.io, esbuild_pkg)) {
+    if (pathExists(ctx.io, version_file) and pathExists(ctx.io, esbuild_bin)) {
         const current_version = std.Io.Dir.cwd().readFileAlloc(ctx.io, version_file, ctx.allocator, .limited(64)) catch "";
         if (std.mem.eql(u8, std.mem.trim(u8, current_version, " \r\n\t"), esbuild_version)) {
             return;
@@ -634,35 +806,81 @@ fn ensureEsbuild(ctx: *const Context) !void {
 
     try std.Io.Dir.cwd().createDirPath(ctx.io, vendor_dir);
 
-    const package_json_path = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "package.json" });
+    const package_name = try esbuildPackageName();
+    const tarball_name = try esbuildTarballName();
+    const url = try std.fmt.allocPrint(
+        ctx.allocator,
+        "https://registry.npmjs.org/@esbuild/{s}/-/{s}-{s}.tgz",
+        .{ package_name, tarball_name, esbuild_version },
+    );
+    const tarball_path = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "esbuild.tgz" });
+    const extract_dir = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "extract" });
+
+    ctx.writeStdout("Vendoring esbuild {s} ({s})...\n", .{ esbuild_version, package_name });
+
+    try runInherited(ctx, &[_][]const u8{ "curl", "-L", "--fail", "-o", tarball_path, url }, ctx.cottontail_home);
+    try std.Io.Dir.cwd().createDirPath(ctx.io, extract_dir);
+    try runInherited(ctx, &[_][]const u8{ "tar", "-xzf", tarball_path, "-C", extract_dir }, ctx.cottontail_home);
+
+    const extracted_bin = try std.fs.path.join(ctx.allocator, &.{ extract_dir, "package", "bin", esbuildBinaryName() });
+    try std.Io.Dir.copyFileAbsolute(extracted_bin, esbuild_bin, ctx.io, .{});
+
+    if (builtin.os.tag != .windows) {
+        try runInherited(ctx, &[_][]const u8{ "chmod", "+x", esbuild_bin }, ctx.cottontail_home);
+    }
+
+    std.Io.Dir.cwd().deleteFile(ctx.io, tarball_path) catch {};
+    std.Io.Dir.cwd().deleteTree(ctx.io, extract_dir) catch {};
+
     try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = package_json_path,
-        .data =
-            \\{
-            \\  "name": "cottontail-esbuild-vendor",
-            \\  "private": true
-            \\}
-            \\
-        ,
+        .sub_path = version_file,
+        .data = esbuild_version ++ "\n",
     });
+}
 
-    ctx.writeStdout("Vendoring esbuild {s} with npm...\n", .{esbuild_version});
+fn esbuildBinaryName() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "esbuild.exe",
+        else => "esbuild",
+    };
+}
 
-    const spec = try std.fmt.allocPrint(ctx.allocator, "esbuild@{s}", .{esbuild_version});
-    const npm_bin = if (builtin.os.tag == .windows) "npm.cmd" else "npm";
-
-    var child = try std.process.spawn(ctx.io, .{
-        .argv = &[_][]const u8{
-            npm_bin,
-            "install",
-            "--prefix",
-            vendor_dir,
-            "--no-save",
-            "--no-fund",
-            "--no-audit",
-            spec,
+fn esbuildPackageName() ![]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => switch (builtin.cpu.arch) {
+            .aarch64 => "darwin-arm64",
+            .x86_64 => "darwin-x64",
+            else => error.UnsupportedEsbuildPlatform,
         },
-        .cwd = .{ .path = ctx.cottontail_home },
+        .linux => switch (builtin.cpu.arch) {
+            .aarch64 => "linux-arm64",
+            .x86_64 => "linux-x64",
+            else => error.UnsupportedEsbuildPlatform,
+        },
+        .windows => switch (builtin.cpu.arch) {
+            .aarch64 => "win32-arm64",
+            .x86_64 => "win32-x64",
+            else => error.UnsupportedEsbuildPlatform,
+        },
+        else => error.UnsupportedEsbuildPlatform,
+    };
+}
+
+fn esbuildTarballName() ![]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => switch (builtin.cpu.arch) {
+            .aarch64 => "win32-arm64",
+            .x86_64 => "win32-x64",
+            else => error.UnsupportedEsbuildPlatform,
+        },
+        else => try esbuildPackageName(),
+    };
+}
+
+fn runInherited(ctx: *const Context, argv: []const []const u8, cwd: []const u8) !void {
+    var child = try std.process.spawn(ctx.io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -672,13 +890,8 @@ fn ensureEsbuild(ctx: *const Context) !void {
 
     const term = try child.wait(ctx.io);
     if (termExitCode(term) != 0) {
-        return error.EsbuildVendoringFailed;
+        return error.ProcessFailed;
     }
-
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = version_file,
-        .data = esbuild_version ++ "\n",
-    });
 }
 
 fn transpileHelperModule(ctx: *const Context, source_path: []const u8, output_path: []const u8) !void {
@@ -798,30 +1011,23 @@ fn appendSharedEsbuildOptions(
 }
 
 fn runEsbuild(ctx: *const Context, build_spec: std.json.Value) !void {
-    const tmp_dir = try ensureCliTempDir(ctx);
+    try ensureEsbuild(ctx);
+
+    if (build_spec != .object) {
+        return error.InvalidEsbuildSpec;
+    }
+
     const vendor_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "vendors", "esbuild" });
-    const driver_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "esbuild-driver.cjs" });
-    const spec_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "esbuild-spec.json" });
+    const esbuild_bin = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, esbuildBinaryName() });
 
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = driver_path,
-        .data = esbuild_driver_template,
-    });
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(ctx.allocator);
 
-    var full_spec: std.json.ObjectMap = .empty;
-    try full_spec.put(ctx.allocator, "op", .{ .string = "build" });
-    try full_spec.put(ctx.allocator, "vendorDir", .{ .string = vendor_dir });
-    try full_spec.put(ctx.allocator, "options", build_spec);
+    try argv.append(ctx.allocator, esbuild_bin);
+    try appendEsbuildCliArgs(ctx, &argv, build_spec.object);
 
-    const spec_json = try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .object = full_spec }, .{});
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{
-        .sub_path = spec_path,
-        .data = spec_json,
-    });
-
-    const node_bin = if (builtin.os.tag == .windows) "node.exe" else "node";
     const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = &[_][]const u8{ node_bin, driver_path, spec_path },
+        .argv = argv.items,
         .cwd = .{ .path = ctx.project_root },
         .create_no_window = true,
     });
@@ -833,6 +1039,89 @@ fn runEsbuild(ctx: *const Context, build_spec: std.json.Value) !void {
         if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
         return error.EsbuildFailed;
     }
+}
+
+fn appendEsbuildCliArgs(ctx: *const Context, argv: *std.ArrayList([]const u8), spec: std.json.ObjectMap) !void {
+    if (spec.get("entryPoints")) |value| {
+        if (value == .array) {
+            for (value.array.items) |entry| {
+                if (entry == .string) {
+                    try argv.append(ctx.allocator, entry.string);
+                }
+            }
+        }
+    }
+
+    if (getBoolFieldFromObject(spec, "bundle")) {
+        try argv.append(ctx.allocator, "--bundle");
+    }
+
+    if (getStringFieldFromObject(spec, "platform")) |value| {
+        try appendEsbuildFlagValue(ctx, argv, "platform", value);
+    }
+    if (getStringFieldFromObject(spec, "format")) |value| {
+        try appendEsbuildFlagValue(ctx, argv, "format", value);
+    }
+    if (getStringFieldFromObject(spec, "outfile")) |value| {
+        try appendEsbuildFlagValue(ctx, argv, "outfile", value);
+    }
+    if (getStringFieldFromObject(spec, "outdir")) |value| {
+        try appendEsbuildFlagValue(ctx, argv, "outdir", value);
+    }
+
+    if (getBoolFieldFromObject(spec, "minify")) {
+        try argv.append(ctx.allocator, "--minify");
+    }
+
+    if (getValueFieldFromObject(spec, "sourcemap")) |value| {
+        switch (value) {
+            .bool => if (value.bool) try argv.append(ctx.allocator, "--sourcemap"),
+            .string => try appendEsbuildFlagValue(ctx, argv, "sourcemap", value.string),
+            else => {},
+        }
+    }
+
+    if (getValueFieldFromObject(spec, "target")) |value| {
+        switch (value) {
+            .string => try appendEsbuildFlagValue(ctx, argv, "target", value.string),
+            .array => for (value.array.items) |item| {
+                if (item == .string) try appendEsbuildFlagValue(ctx, argv, "target", item.string);
+            },
+            else => {},
+        }
+    }
+
+    if (getValueFieldFromObject(spec, "external")) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                if (item == .string) {
+                    try appendEsbuildPrefixedValue(ctx, argv, "external", item.string);
+                }
+            }
+        }
+    }
+
+    if (getValueFieldFromObject(spec, "define")) |value| {
+        if (value == .object) {
+            var it = value.object.iterator();
+            while (it.next()) |entry| {
+                const define_value = switch (entry.value_ptr.*) {
+                    .string => entry.value_ptr.*.string,
+                    else => try std.json.Stringify.valueAlloc(ctx.allocator, entry.value_ptr.*, .{}),
+                };
+                const define_arg = try std.fmt.allocPrint(ctx.allocator, "{s}={s}", .{ entry.key_ptr.*, define_value });
+                try appendEsbuildPrefixedValue(ctx, argv, "define", define_arg);
+            }
+        }
+    }
+}
+
+fn appendEsbuildFlagValue(ctx: *const Context, argv: *std.ArrayList([]const u8), name: []const u8, value: []const u8) !void {
+    try argv.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "--{s}={s}", .{ name, value }));
+}
+
+fn appendEsbuildPrefixedValue(ctx: *const Context, argv: *std.ArrayList([]const u8), name: []const u8, value: []const u8) !void {
+    try argv.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "--{s}:{s}", .{ name, value }));
 }
 
 fn copyPath(ctx: *const Context, source_path: []const u8, dest_path: []const u8) !void {
@@ -937,7 +1226,12 @@ fn resolveMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process
             }
             break :blk "src/bun/index.ts";
         },
-        .zig => return error.ZigMainProcessNotSupportedYet,
+        .zig => blk: {
+            if (getObjectFieldFromObject(build, "zig")) |object| {
+                if (getStringFieldFromObject(object, "entrypoint")) |path| break :blk path;
+            }
+            break :blk "src/zig/main.zig";
+        },
     };
 
     return absoluteProjectPath(ctx, relative);
@@ -973,6 +1267,14 @@ fn getMainProcess(root: std.json.Value) MainProcess {
     if (std.mem.eql(u8, value, "cottontail")) return .cottontail;
     if (std.mem.eql(u8, value, "zig")) return .zig;
     return .bun;
+}
+
+fn mainProcessName(main_process: MainProcess) []const u8 {
+    return switch (main_process) {
+        .bun => "bun",
+        .cottontail => "cottontail",
+        .zig => "zig",
+    };
 }
 
 fn getAppName(_: *const Context, root: std.json.Value) ![]const u8 {
@@ -1327,7 +1629,7 @@ fn appBundlePaths(ctx: *const Context, config: CommandContext) !AppBundlePaths {
 fn bundleDisplayName(ctx: *const Context, config: CommandContext) ![]const u8 {
     const app_name = try getAppName(ctx, config.root);
     const suffix = switch (config.build_env) {
-        .dev => if (builtin.os.tag == .macos) ".app" else "",
+        .dev => if (builtin.os.tag == .macos) "-dev.app" else "-dev",
         .canary => if (builtin.os.tag == .macos) "-canary.app" else "-canary",
         .stable => if (builtin.os.tag == .macos) ".app" else "",
     };
@@ -1380,7 +1682,14 @@ fn writeInfoPlist(ctx: *const Context, config: CommandContext, bundle: AppBundle
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = plist_path, .data = contents });
 }
 
-fn copyBundledCef(ctx: *const Context, bundle: AppBundlePaths, platform_paths: PlatformPaths) !void {
+fn cefHelperBaseName(main_process: MainProcess) []const u8 {
+    return switch (main_process) {
+        .bun => "bun",
+        .cottontail, .zig => "main",
+    };
+}
+
+fn copyBundledCef(ctx: *const Context, bundle: AppBundlePaths, platform_paths: PlatformPaths, main_process: MainProcess) !void {
     if (!pathExists(ctx.io, platform_paths.cef_dir)) return;
 
     switch (builtin.os.tag) {
@@ -1390,12 +1699,13 @@ fn copyBundledCef(ctx: *const Context, bundle: AppBundlePaths, platform_paths: P
             const framework_dest = try std.fs.path.join(ctx.allocator, &.{ frameworks_dir, "Chromium Embedded Framework.framework" });
             try copyPath(ctx, framework_source, framework_dest);
 
+            const base_name = cefHelperBaseName(main_process);
             const helper_names = [_][]const u8{
-                "bun Helper",
-                "bun Helper (Alerts)",
-                "bun Helper (GPU)",
-                "bun Helper (Plugin)",
-                "bun Helper (Renderer)",
+                try std.fmt.allocPrint(ctx.allocator, "{s} Helper", .{base_name}),
+                try std.fmt.allocPrint(ctx.allocator, "{s} Helper (Alerts)", .{base_name}),
+                try std.fmt.allocPrint(ctx.allocator, "{s} Helper (GPU)", .{base_name}),
+                try std.fmt.allocPrint(ctx.allocator, "{s} Helper (Plugin)", .{base_name}),
+                try std.fmt.allocPrint(ctx.allocator, "{s} Helper (Renderer)", .{base_name}),
             };
             for (helper_names) |helper_name| {
                 const helper_app_name = try std.fmt.allocPrint(ctx.allocator, "{s}.app", .{helper_name});
@@ -1420,11 +1730,14 @@ fn writeBundledRuntimeMetadata(ctx: *const Context, config: CommandContext, bund
     const runtime_json = try std.json.Stringify.valueAlloc(ctx.allocator, runtime_value, .{});
     const default_renderer = if (platformBuildObject(config.root)) |platform| getStringFieldFromObject(platform, "defaultRenderer") orelse "native" else "native";
     const available_renderers = if (bundleUsesCef(config.root)) "[\"native\",\"cef\"]" else "[\"native\"]";
-    const build_json = try std.fmt.allocPrint(ctx.allocator,
-        "{{\"mainProcess\":\"bun\",\"defaultRenderer\":\"{s}\",\"availableRenderers\":{s},\"runtime\":{s}}}",
-        .{ default_renderer, available_renderers, runtime_json },
+    const main_process = mainProcessName(getMainProcess(config.root));
+    const build_json = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"mainProcess\":\"{s}\",\"defaultRenderer\":\"{s}\",\"availableRenderers\":{s},\"runtime\":{s}}}",
+        .{ main_process, default_renderer, available_renderers, runtime_json },
     );
-    const version_json = try std.fmt.allocPrint(ctx.allocator,
+    const version_json = try std.fmt.allocPrint(
+        ctx.allocator,
         "{{\"version\":\"{s}\",\"hash\":\"\",\"channel\":\"{s}\",\"name\":\"{s}\",\"identifier\":\"{s}\"}}",
         .{ version_name, buildEnvironmentName(config.build_env), app_name, identifier },
     );

@@ -3,6 +3,7 @@ const electrobun_bridge = @import("electrobun.zig");
 const electrobun_cli = @import("electrobun_cli.zig");
 const host = @import("host.zig");
 const runtime = @import("runtime.zig");
+const script_runner = @import("script_runner.zig");
 
 comptime {
     electrobun_bridge.forceLink();
@@ -16,8 +17,8 @@ const help_text_template =
     \\Tiny Zig-based JavaScript runtime for Electrobun.
     \\
     \\Usage:
-    \\  cottontail <entrypoint.js> [args...]
-    \\  cottontail run <entrypoint.js> [args...]
+    \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
+    \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail electrobun <entrypoint.js> [args...]
     \\  cottontail electrobun <init|config|build|run|dev> [args...]
     \\  cottontail --help
@@ -25,7 +26,7 @@ const help_text_template =
     \\
     \\Status:
     \\  QuickJS-ng is embedded with ESM imports, async job draining, and a small cottontail host API.
-    \\  Entry points can be classic scripts or ESM modules.
+    \\  Entry points can be classic scripts, ESM modules, or TypeScript transpiled through esbuild.
     \\  Electrobun bridge mode can open native windows through the local Electrobun core.
     \\
 ;
@@ -168,20 +169,7 @@ pub fn main(init: std.process.Init) !void {
     } else arg;
     const script_args = if (std.mem.eql(u8, arg, "run")) args[3..] else args[2..];
 
-    var js_runtime = runtime.Runtime.init(init.io, init.arena.allocator()) catch {
-        try stderr.print("cottontail: failed to initialize the embedded QuickJS runtime\n", .{});
-        try stderr.flush();
-        std.process.exit(1);
-    };
-    defer js_runtime.deinit();
-
-    js_runtime.setArgs(script_args) catch {
-        try stderr.print("cottontail: failed to initialize cottontail.args\n", .{});
-        try stderr.flush();
-        std.process.exit(1);
-    };
-
-    const exit_code = js_runtime.runFile(script_path);
+    const exit_code = try script_runner.run(init, script_path, script_args);
     if (exit_code != 0) {
         try stderr.flush();
         std.process.exit(@intCast(exit_code));
@@ -191,5 +179,5 @@ pub fn main(init: std.process.Init) !void {
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "QuickJS-ng") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
 }

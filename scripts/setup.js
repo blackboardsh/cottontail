@@ -179,7 +179,7 @@ function vendorZig() {
 function setup() {
   vendorZig();
   vendorQuickjs();
-  console.log('\nSetup complete. You can now run: bun run build');
+  console.log('\nSetup complete. Vendored Zig is ready at vendors/zig/zig');
 }
 
 setup();
