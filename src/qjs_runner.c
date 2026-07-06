@@ -80,11 +80,75 @@ extern unsigned int ct_electrobun_create_window_host(
     double y,
     double width,
     double height,
+    const char *title_bar_style,
+    bool transparent,
     bool hidden,
     bool activate,
+    double traffic_light_x,
+    double traffic_light_y,
     bool quit_on_close,
     char **error_out
 );
+extern unsigned int ct_electrobun_create_webview_host(
+    unsigned int window_id,
+    unsigned int host_webview_id,
+    const char *renderer,
+    const char *url,
+    double x,
+    double y,
+    double width,
+    double height,
+    bool auto_resize,
+    const char *partition,
+    const char *secret_key,
+    const char *preload,
+    const char *views_root,
+    bool sandbox,
+    bool start_transparent,
+    bool start_passthrough,
+    char **error_out
+);
+extern int ct_electrobun_close_window_host(unsigned int window_id, char **error_out);
+extern int ct_electrobun_set_window_always_on_top_host(unsigned int window_id, bool flag, char **error_out);
+extern bool ct_electrobun_send_host_message_host(unsigned int webview_id, const char *message, char **error_out);
+extern char *ct_electrobun_pop_host_message_host(unsigned int *out_webview_id, char **error_out);
+extern char *ct_electrobun_pop_event_host(char **error_out);
+extern int ct_electrobun_call_u32_host(const char *symbol_name, unsigned int value, char **error_out);
+extern int ct_electrobun_call_u32_bool_host(const char *symbol_name, unsigned int value, bool flag, char **error_out);
+extern bool ct_electrobun_call_u32_bool_ret_host(const char *symbol_name, unsigned int value, char **error_out);
+extern int ct_electrobun_call_u32_string_host(const char *symbol_name, unsigned int value, const char *text, char **error_out);
+extern bool ct_electrobun_call_u32_string_bool_ret_host(const char *symbol_name, unsigned int value, const char *text, char **error_out);
+extern int ct_electrobun_call_u32_string_bool_bool_host(const char *symbol_name, unsigned int value, const char *text, bool a, bool b, char **error_out);
+extern int ct_electrobun_call_u32_f64_f64_host(const char *symbol_name, unsigned int value, double x, double y, char **error_out);
+extern int ct_electrobun_call_u32_f64_host(const char *symbol_name, unsigned int value, double number, char **error_out);
+extern double ct_electrobun_call_u32_f64_ret_host(const char *symbol_name, unsigned int value, char **error_out);
+extern int ct_electrobun_call_u32_f64_f64_f64_f64_host(const char *symbol_name, unsigned int value, double x, double y, double width, double height, char **error_out);
+extern char *ct_electrobun_get_window_frame_host(unsigned int window_id, char **error_out);
+extern int ct_electrobun_resize_view_host(const char *symbol_name, unsigned int view_id, double x, double y, double width, double height, const char *masks_json, char **error_out);
+extern int ct_electrobun_call_bool_host(const char *symbol_name, bool flag, char **error_out);
+extern bool ct_electrobun_call_bool_ret_host(const char *symbol_name, char **error_out);
+extern int ct_electrobun_call_void_host(const char *symbol_name, char **error_out);
+extern int ct_electrobun_call_string_host(const char *symbol_name, const char *value, char **error_out);
+extern bool ct_electrobun_call_string_bool_ret_host(const char *symbol_name, const char *value, char **error_out);
+extern char *ct_electrobun_call_string_ret_host(const char *symbol_name, char **error_out);
+extern char *ct_electrobun_call_string_string_ret_host(const char *symbol_name, const char *a, const char *b, char **error_out);
+extern bool ct_electrobun_call_string_string_bool_ret_host(const char *symbol_name, const char *a, const char *b, char **error_out);
+extern bool ct_electrobun_call_string_string_string_bool_ret_host(const char *symbol_name, const char *a, const char *b, const char *c, char **error_out);
+extern int ct_electrobun_call_string_string_host(const char *symbol_name, const char *a, const char *b, char **error_out);
+extern int ct_electrobun_call_int_host(const char *symbol_name, int value, char **error_out);
+extern bool ct_electrobun_call_u32_ptr_exists_host(const char *symbol_name, unsigned int value, char **error_out);
+extern unsigned int ct_electrobun_create_wgpu_view_host(unsigned int window_id, double x, double y, double width, double height, bool start_transparent, bool start_passthrough, bool hidden, char **error_out);
+extern unsigned int ct_electrobun_create_tray_host(const char *title, const char *image, bool is_template, unsigned int width, unsigned int height, bool handler_enabled, char **error_out);
+extern bool ct_electrobun_show_tray_host(unsigned int tray_id, char **error_out);
+extern char *ct_electrobun_get_tray_bounds_host(unsigned int tray_id, char **error_out);
+extern int ct_electrobun_show_notification_host(const char *title, const char *body, const char *subtitle, bool silent, char **error_out);
+extern int ct_electrobun_set_menu_host(const char *symbol_name, const char *menu_json, bool handler_enabled, char **error_out);
+extern char *ct_electrobun_open_file_dialog_host(const char *starting_folder, const char *allowed_file_types, int can_choose_files, int can_choose_directories, int allows_multiple_selection, char **error_out);
+extern int ct_electrobun_show_message_box_host(const char *box_type, const char *title, const char *message, const char *detail, const char *buttons, int default_id, int cancel_id, char **error_out);
+extern int ct_electrobun_set_global_shortcut_callback_host(bool enabled, char **error_out);
+extern int ct_electrobun_set_url_open_handler_host(bool enabled, char **error_out);
+extern int ct_electrobun_set_app_reopen_handler_host(bool enabled, char **error_out);
+extern int ct_electrobun_set_quit_requested_handler_host(bool enabled, char **error_out);
 extern int ct_electrobun_quit_host(char **error_out);
 
 struct CtQjsRuntime {
@@ -517,6 +581,55 @@ static int ct_get_optional_bool_property(
     return 0;
 }
 
+static int ct_get_optional_uint32_property(
+    JSContext *ctx,
+    JSValueConst object,
+    const char *name,
+    uint32_t *out_value
+) {
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+
+    if (JS_IsException(value)) {
+        return -1;
+    }
+
+    if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
+        if (JS_ToUint32(ctx, out_value, value) < 0) {
+            JS_FreeValue(ctx, value);
+            return -1;
+        }
+    }
+
+    JS_FreeValue(ctx, value);
+    return 0;
+}
+
+static int ct_get_optional_string_property(
+    JSContext *ctx,
+    JSValueConst object,
+    const char *name,
+    char **out_value
+) {
+    JSValue value = JS_GetPropertyStr(ctx, object, name);
+
+    if (JS_IsException(value)) {
+        return -1;
+    }
+
+    if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
+        char *copy = ct_copy_js_string(ctx, value);
+        if (copy == NULL) {
+            JS_FreeValue(ctx, value);
+            return -1;
+        }
+        free(*out_value);
+        *out_value = copy;
+    }
+
+    JS_FreeValue(ctx, value);
+    return 0;
+}
+
 static void ct_promise_rejection_tracker(
     JSContext *ctx,
     JSValueConst promise,
@@ -617,6 +730,31 @@ static JSValue ct_nanotime(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     (void) argv;
 
     return JS_NewBigInt64(ctx, ct_monotonic_nanotime());
+}
+
+static JSValue ct_sleep(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    double ms = 0;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_ToFloat64(ctx, &ms, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "cottontail.sleep(ms) requires a duration in milliseconds");
+    }
+
+    if (ms <= 0) {
+        return JS_UNDEFINED;
+    }
+
+#if defined(_WIN32)
+    Sleep((DWORD) ms);
+#else
+    struct timespec duration;
+    duration.tv_sec = (time_t) (ms / 1000);
+    duration.tv_nsec = (long) ((ms - ((double) duration.tv_sec * 1000.0)) * 1000000.0);
+    while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
+#endif
+
+    return JS_UNDEFINED;
 }
 
 static JSValue ct_cwd(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1094,13 +1232,37 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     return response;
 }
 
+static JSValue ct_return_owned_cstring(JSContext *ctx, char *value) {
+    JSValue result;
+
+    if (value == NULL) {
+        return JS_NULL;
+    }
+
+    result = JS_NewString(ctx, value);
+    ct_host_string_free(value);
+    return result;
+}
+
+static JSValue ct_status_to_js(JSContext *ctx, int status, char *error_message) {
+    if (status != 0 || error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return JS_UNDEFINED;
+}
+
 static JSValue ct_electrobun_create_window(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     char *title_copy = NULL;
+    char *title_bar_style_copy = NULL;
     const char *title = "Cottontail";
+    const char *title_bar_style = "default";
     double x = 100;
     double y = 100;
     double width = 960;
     double height = 640;
+    double traffic_light_x = 0;
+    double traffic_light_y = 0;
+    bool transparent = false;
     bool hidden = false;
     bool activate = true;
     bool quit_on_close = true;
@@ -1131,14 +1293,26 @@ static JSValue ct_electrobun_create_window(JSContext *ctx, JSValueConst this_val
         }
         JS_FreeValue(ctx, title_value);
 
+        if (ct_get_optional_string_property(ctx, argv[0], "titleBarStyle", &title_bar_style_copy) != 0) {
+            free(title_copy);
+            return JS_EXCEPTION;
+        }
+        if (title_bar_style_copy != NULL) {
+            title_bar_style = title_bar_style_copy;
+        }
+
         if (ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
             ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
             ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
             ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
+            ct_get_optional_float64_property(ctx, argv[0], "trafficLightX", &traffic_light_x) != 0 ||
+            ct_get_optional_float64_property(ctx, argv[0], "trafficLightY", &traffic_light_y) != 0 ||
+            ct_get_optional_bool_property(ctx, argv[0], "transparent", &transparent) != 0 ||
             ct_get_optional_bool_property(ctx, argv[0], "hidden", &hidden) != 0 ||
             ct_get_optional_bool_property(ctx, argv[0], "activate", &activate) != 0 ||
             ct_get_optional_bool_property(ctx, argv[0], "quitOnClose", &quit_on_close) != 0) {
             free(title_copy);
+            free(title_bar_style_copy);
             return JS_EXCEPTION;
         }
     }
@@ -1149,18 +1323,236 @@ static JSValue ct_electrobun_create_window(JSContext *ctx, JSValueConst this_val
         y,
         width,
         height,
+        title_bar_style,
+        transparent,
         hidden,
         activate,
+        traffic_light_x,
+        traffic_light_y,
         quit_on_close,
         &error_message
     );
     free(title_copy);
+    free(title_bar_style_copy);
 
     if (window_id == 0) {
         return ct_throw_host_error(ctx, error_message);
     }
 
     return JS_NewUint32(ctx, window_id);
+}
+
+static JSValue ct_electrobun_create_webview(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t window_id = 0;
+    uint32_t host_webview_id = 0;
+    double x = 0;
+    double y = 0;
+    double width = 800;
+    double height = 600;
+    bool auto_resize = true;
+    bool sandbox = false;
+    bool start_transparent = false;
+    bool start_passthrough = false;
+    char *renderer = ct_duplicate_string("native");
+    char *url = ct_duplicate_string("");
+    char *partition = ct_duplicate_string("persist:default");
+    char *secret_key = ct_duplicate_string("");
+    char *preload = ct_duplicate_string("");
+    char *views_root = ct_duplicate_string("");
+    char *error_message = NULL;
+    unsigned int webview_id = 0;
+
+    (void) this_val;
+
+    if (renderer == NULL || url == NULL || partition == NULL || secret_key == NULL || preload == NULL || views_root == NULL) {
+        free(renderer);
+        free(url);
+        free(partition);
+        free(secret_key);
+        free(preload);
+        free(views_root);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        free(renderer);
+        free(url);
+        free(partition);
+        free(secret_key);
+        free(preload);
+        free(views_root);
+        return JS_ThrowTypeError(ctx, "electrobun.createWebview(options) expects an options object");
+    }
+
+    if (ct_get_optional_uint32_property(ctx, argv[0], "windowId", &window_id) != 0 ||
+        ct_get_optional_uint32_property(ctx, argv[0], "hostWebviewId", &host_webview_id) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "renderer", &renderer) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "url", &url) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "autoResize", &auto_resize) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "partition", &partition) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "secretKey", &secret_key) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "preload", &preload) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "viewsRoot", &views_root) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "sandbox", &sandbox) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "startTransparent", &start_transparent) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "startPassthrough", &start_passthrough) != 0) {
+        free(renderer);
+        free(url);
+        free(partition);
+        free(secret_key);
+        free(preload);
+        free(views_root);
+        return JS_EXCEPTION;
+    }
+
+    if (window_id == 0) {
+        free(renderer);
+        free(url);
+        free(partition);
+        free(secret_key);
+        free(preload);
+        free(views_root);
+        return JS_ThrowTypeError(ctx, "electrobun.createWebview(options) requires windowId");
+    }
+
+    webview_id = ct_electrobun_create_webview_host(
+        window_id,
+        host_webview_id,
+        renderer,
+        url,
+        x,
+        y,
+        width,
+        height,
+        auto_resize,
+        partition,
+        secret_key,
+        preload,
+        views_root,
+        sandbox,
+        start_transparent,
+        start_passthrough,
+        &error_message
+    );
+
+    free(renderer);
+    free(url);
+    free(partition);
+    free(secret_key);
+    free(preload);
+    free(views_root);
+
+    if (webview_id == 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_NewUint32(ctx, webview_id);
+}
+
+static JSValue ct_electrobun_close_window(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t window_id = 0;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.closeWindow(windowId) requires a window id");
+    }
+
+    if (ct_electrobun_close_window_host(window_id, &error_message) != 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_electrobun_set_window_always_on_top(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t window_id = 0;
+    int flag = 0;
+    char *error_message = NULL;
+
+    (void) this_val;
+
+    if (argc < 2 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.setWindowAlwaysOnTop(windowId, flag) requires a window id and flag");
+    }
+
+    flag = JS_ToBool(ctx, argv[1]);
+    if (flag < 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (ct_electrobun_set_window_always_on_top_host(window_id, flag != 0, &error_message) != 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_electrobun_send_host_message(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t webview_id = 0;
+    char *message = NULL;
+    char *error_message = NULL;
+    bool ok = false;
+
+    (void) this_val;
+
+    if (argc < 2 || JS_ToUint32(ctx, &webview_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.sendHostMessageToWebview(webviewId, message) requires a webview id and message");
+    }
+
+    message = ct_copy_js_string(ctx, argv[1]);
+    if (message == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    ok = ct_electrobun_send_host_message_host(webview_id, message, &error_message);
+    free(message);
+
+    if (!ok) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_TRUE;
+}
+
+static JSValue ct_electrobun_pop_host_message(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    unsigned int webview_id = 0;
+    char *message = NULL;
+    char *error_message = NULL;
+    JSValue result = JS_UNDEFINED;
+
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    message = ct_electrobun_pop_host_message_host(&webview_id, &error_message);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    if (message == NULL) {
+        return JS_NULL;
+    }
+
+    result = JS_NewObject(ctx);
+    if (JS_IsException(result)) {
+        ct_host_string_free(message);
+        return result;
+    }
+
+    if (JS_SetPropertyStr(ctx, result, "webviewId", JS_NewUint32(ctx, webview_id)) < 0 ||
+        JS_SetPropertyStr(ctx, result, "message", JS_NewString(ctx, message)) < 0) {
+        ct_host_string_free(message);
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+
+    ct_host_string_free(message);
+    return result;
 }
 
 static JSValue ct_electrobun_quit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1175,6 +1567,734 @@ static JSValue ct_electrobun_quit(JSContext *ctx, JSValueConst this_val, int arg
     }
 
     return JS_UNDEFINED;
+}
+
+static JSValue ct_electrobun_core_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *signature = NULL;
+    char *symbol = NULL;
+    char *error_message = NULL;
+    JSValue result = JS_UNDEFINED;
+
+    (void) this_val;
+
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "electrobun.coreCall(signature, symbol, ...args) requires a signature and symbol");
+    }
+
+    signature = ct_copy_js_string(ctx, argv[0]);
+    symbol = ct_copy_js_string(ctx, argv[1]);
+    if (signature == NULL || symbol == NULL) {
+        result = JS_EXCEPTION;
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32") == 0) {
+        uint32_t value = 0;
+        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32 requires one uint32 argument");
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_host(symbol, value, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_bool") == 0) {
+        uint32_t value = 0;
+        int flag = 0;
+        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_bool requires uint32 and bool arguments");
+            goto cleanup;
+        }
+        flag = JS_ToBool(ctx, argv[3]);
+        if (flag < 0) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_bool_host(symbol, value, flag != 0, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_bool_ret") == 0) {
+        uint32_t value = 0;
+        bool ok = false;
+        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_bool_ret requires one uint32 argument");
+            goto cleanup;
+        }
+        ok = ct_electrobun_call_u32_bool_ret_host(symbol, value, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_string") == 0) {
+        uint32_t value = 0;
+        char *text = NULL;
+        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_string requires uint32 and string arguments");
+            goto cleanup;
+        }
+        text = ct_copy_js_string(ctx, argv[3]);
+        if (text == NULL) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_string_host(symbol, value, text, &error_message), error_message);
+        free(text);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_string_bool_ret") == 0) {
+        uint32_t value = 0;
+        char *text = NULL;
+        bool ok = false;
+        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_string_bool_ret requires uint32 and string arguments");
+            goto cleanup;
+        }
+        text = ct_copy_js_string(ctx, argv[3]);
+        if (text == NULL) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        ok = ct_electrobun_call_u32_string_bool_ret_host(symbol, value, text, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        free(text);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_string_bool_bool") == 0) {
+        uint32_t value = 0;
+        char *text = NULL;
+        int a = 0;
+        int b = 0;
+        if (argc < 6 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_string_bool_bool requires uint32, string, bool, bool arguments");
+            goto cleanup;
+        }
+        text = ct_copy_js_string(ctx, argv[3]);
+        a = JS_ToBool(ctx, argv[4]);
+        b = JS_ToBool(ctx, argv[5]);
+        if (text == NULL || a < 0 || b < 0) {
+            free(text);
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_string_bool_bool_host(symbol, value, text, a != 0, b != 0, &error_message), error_message);
+        free(text);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_f64_f64") == 0) {
+        uint32_t value = 0;
+        double x = 0;
+        double y = 0;
+        if (argc < 5 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &x, argv[3]) < 0 || JS_ToFloat64(ctx, &y, argv[4]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_f64 requires uint32, number, number arguments");
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_f64_host(symbol, value, x, y, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_f64") == 0) {
+        uint32_t value = 0;
+        double number = 0;
+        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &number, argv[3]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_f64 requires uint32 and number arguments");
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_host(symbol, value, number, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_f64_ret") == 0) {
+        uint32_t value = 0;
+        double number = 0;
+        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_ret requires one uint32 argument");
+            goto cleanup;
+        }
+        number = ct_electrobun_call_u32_f64_ret_host(symbol, value, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewFloat64(ctx, number);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_f64_f64_f64_f64") == 0) {
+        uint32_t value = 0;
+        double x = 0;
+        double y = 0;
+        double width = 0;
+        double height = 0;
+        if (argc < 7 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &x, argv[3]) < 0 || JS_ToFloat64(ctx, &y, argv[4]) < 0 || JS_ToFloat64(ctx, &width, argv[5]) < 0 || JS_ToFloat64(ctx, &height, argv[6]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_f64_f64_f64 requires uint32 and four number arguments");
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_f64_f64_f64_host(symbol, value, x, y, width, height, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "bool") == 0) {
+        int flag = 0;
+        if (argc < 3) {
+            result = JS_ThrowTypeError(ctx, "coreCall bool requires one bool argument");
+            goto cleanup;
+        }
+        flag = JS_ToBool(ctx, argv[2]);
+        if (flag < 0) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_bool_host(symbol, flag != 0, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "bool_ret") == 0) {
+        bool ok = ct_electrobun_call_bool_ret_host(symbol, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "void") == 0) {
+        result = ct_status_to_js(ctx, ct_electrobun_call_void_host(symbol, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "string") == 0) {
+        char *value = NULL;
+        if (argc < 3) {
+            result = JS_ThrowTypeError(ctx, "coreCall string requires one string argument");
+            goto cleanup;
+        }
+        value = ct_copy_js_string(ctx, argv[2]);
+        if (value == NULL) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_string_host(symbol, value, &error_message), error_message);
+        free(value);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "string_bool_ret") == 0) {
+        char *value = NULL;
+        bool ok = false;
+        if (argc < 3) {
+            result = JS_ThrowTypeError(ctx, "coreCall string_bool_ret requires one string argument");
+            goto cleanup;
+        }
+        value = ct_copy_js_string(ctx, argv[2]);
+        if (value == NULL) {
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        ok = ct_electrobun_call_string_bool_ret_host(symbol, value, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        free(value);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "string_ret") == 0) {
+        char *value = ct_electrobun_call_string_ret_host(symbol, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : ct_return_owned_cstring(ctx, value);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "string_string_ret") == 0 || strcmp(signature, "string_string_bool_ret") == 0 || strcmp(signature, "string_string") == 0) {
+        char *a = NULL;
+        char *b = NULL;
+        if (argc < 4) {
+            result = JS_ThrowTypeError(ctx, "coreCall string_string* requires two string arguments");
+            goto cleanup;
+        }
+        a = ct_copy_js_string(ctx, argv[2]);
+        b = ct_copy_js_string(ctx, argv[3]);
+        if (a == NULL || b == NULL) {
+            free(a);
+            free(b);
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        if (strcmp(signature, "string_string_ret") == 0) {
+            char *value = ct_electrobun_call_string_string_ret_host(symbol, a, b, &error_message);
+            result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : ct_return_owned_cstring(ctx, value);
+        } else if (strcmp(signature, "string_string_bool_ret") == 0) {
+            bool ok = ct_electrobun_call_string_string_bool_ret_host(symbol, a, b, &error_message);
+            result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        } else {
+            result = ct_status_to_js(ctx, ct_electrobun_call_string_string_host(symbol, a, b, &error_message), error_message);
+        }
+        free(a);
+        free(b);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "string_string_string_bool_ret") == 0) {
+        char *a = NULL;
+        char *b = NULL;
+        char *c = NULL;
+        bool ok = false;
+        if (argc < 5) {
+            result = JS_ThrowTypeError(ctx, "coreCall string_string_string_bool_ret requires three string arguments");
+            goto cleanup;
+        }
+        a = ct_copy_js_string(ctx, argv[2]);
+        b = ct_copy_js_string(ctx, argv[3]);
+        c = ct_copy_js_string(ctx, argv[4]);
+        if (a == NULL || b == NULL || c == NULL) {
+            free(a);
+            free(b);
+            free(c);
+            result = JS_EXCEPTION;
+            goto cleanup;
+        }
+        ok = ct_electrobun_call_string_string_string_bool_ret_host(symbol, a, b, c, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        free(a);
+        free(b);
+        free(c);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "int") == 0) {
+        int32_t value = 0;
+        if (argc < 3 || JS_ToInt32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall int requires one int argument");
+            goto cleanup;
+        }
+        result = ct_status_to_js(ctx, ct_electrobun_call_int_host(symbol, value, &error_message), error_message);
+        goto cleanup;
+    }
+
+    if (strcmp(signature, "u32_ptr_exists") == 0) {
+        uint32_t value = 0;
+        bool ok = false;
+        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
+            result = JS_ThrowTypeError(ctx, "coreCall u32_ptr_exists requires one uint32 argument");
+            goto cleanup;
+        }
+        ok = ct_electrobun_call_u32_ptr_exists_host(symbol, value, &error_message);
+        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
+        goto cleanup;
+    }
+
+    result = JS_ThrowTypeError(ctx, "unsupported electrobun.coreCall signature: %s", signature);
+
+cleanup:
+    free(signature);
+    free(symbol);
+    return result;
+}
+
+static JSValue ct_electrobun_get_window_frame(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t window_id = 0;
+    char *error_message = NULL;
+    char *frame_json = NULL;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.getWindowFrame(windowId) requires a window id");
+    }
+
+    frame_json = ct_electrobun_get_window_frame_host(window_id, &error_message);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return ct_return_owned_cstring(ctx, frame_json);
+}
+
+static JSValue ct_electrobun_resize_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *symbol = NULL;
+    char *masks_json = NULL;
+    uint32_t view_id = 0;
+    double x = 0;
+    double y = 0;
+    double width = 0;
+    double height = 0;
+    char *error_message = NULL;
+    JSValue result = JS_UNDEFINED;
+
+    (void) this_val;
+
+    if (argc < 7) {
+        return JS_ThrowTypeError(ctx, "electrobun.resizeView(symbol, id, x, y, width, height, masksJSON) requires seven arguments");
+    }
+
+    symbol = ct_copy_js_string(ctx, argv[0]);
+    masks_json = ct_copy_js_string(ctx, argv[6]);
+    if (symbol == NULL || masks_json == NULL ||
+        JS_ToUint32(ctx, &view_id, argv[1]) < 0 ||
+        JS_ToFloat64(ctx, &x, argv[2]) < 0 ||
+        JS_ToFloat64(ctx, &y, argv[3]) < 0 ||
+        JS_ToFloat64(ctx, &width, argv[4]) < 0 ||
+        JS_ToFloat64(ctx, &height, argv[5]) < 0) {
+        free(symbol);
+        free(masks_json);
+        return JS_EXCEPTION;
+    }
+
+    result = ct_status_to_js(ctx, ct_electrobun_resize_view_host(symbol, view_id, x, y, width, height, masks_json, &error_message), error_message);
+    free(symbol);
+    free(masks_json);
+    return result;
+}
+
+static JSValue ct_electrobun_create_wgpu_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t window_id = 0;
+    double x = 0;
+    double y = 0;
+    double width = 320;
+    double height = 240;
+    bool start_transparent = false;
+    bool start_passthrough = false;
+    bool hidden = false;
+    char *error_message = NULL;
+    unsigned int view_id = 0;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        return JS_ThrowTypeError(ctx, "electrobun.createWGPUView(options) expects an options object");
+    }
+
+    if (ct_get_optional_uint32_property(ctx, argv[0], "windowId", &window_id) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
+        ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "startTransparent", &start_transparent) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "startPassthrough", &start_passthrough) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "hidden", &hidden) != 0) {
+        return JS_EXCEPTION;
+    }
+
+    if (window_id == 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.createWGPUView(options) requires windowId");
+    }
+
+    view_id = ct_electrobun_create_wgpu_view_host(window_id, x, y, width, height, start_transparent, start_passthrough, hidden, &error_message);
+    if (view_id == 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_NewUint32(ctx, view_id);
+}
+
+static JSValue ct_electrobun_create_tray(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *title = ct_duplicate_string("");
+    char *image = ct_duplicate_string("");
+    bool is_template = false;
+    bool handler_enabled = false;
+    uint32_t width = 18;
+    uint32_t height = 18;
+    char *error_message = NULL;
+    unsigned int tray_id = 0;
+
+    (void) this_val;
+
+    if (title == NULL || image == NULL) {
+        free(title);
+        free(image);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        free(title);
+        free(image);
+        return JS_ThrowTypeError(ctx, "electrobun.createTray(options) expects an options object");
+    }
+
+    if (ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "image", &image) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "isTemplate", &is_template) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "handler", &handler_enabled) != 0 ||
+        ct_get_optional_uint32_property(ctx, argv[0], "width", &width) != 0 ||
+        ct_get_optional_uint32_property(ctx, argv[0], "height", &height) != 0) {
+        free(title);
+        free(image);
+        return JS_EXCEPTION;
+    }
+
+    tray_id = ct_electrobun_create_tray_host(title, image, is_template, width, height, handler_enabled, &error_message);
+    free(title);
+    free(image);
+    if (tray_id == 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    return JS_NewUint32(ctx, tray_id);
+}
+
+static JSValue ct_electrobun_show_tray(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t tray_id = 0;
+    char *error_message = NULL;
+    bool ok = false;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &tray_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.showTray(trayId) requires a tray id");
+    }
+
+    ok = ct_electrobun_show_tray_host(tray_id, &error_message);
+    if (!ok || error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return JS_TRUE;
+}
+
+static JSValue ct_electrobun_get_tray_bounds(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t tray_id = 0;
+    char *error_message = NULL;
+    char *bounds_json = NULL;
+
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &tray_id, argv[0]) < 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.getTrayBounds(trayId) requires a tray id");
+    }
+
+    bounds_json = ct_electrobun_get_tray_bounds_host(tray_id, &error_message);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return ct_return_owned_cstring(ctx, bounds_json);
+}
+
+static JSValue ct_electrobun_show_notification(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *title = ct_duplicate_string("");
+    char *body = ct_duplicate_string("");
+    char *subtitle = ct_duplicate_string("");
+    bool silent = false;
+    char *error_message = NULL;
+    JSValue result = JS_UNDEFINED;
+
+    (void) this_val;
+
+    if (title == NULL || body == NULL || subtitle == NULL) {
+        free(title);
+        free(body);
+        free(subtitle);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        free(title);
+        free(body);
+        free(subtitle);
+        return JS_ThrowTypeError(ctx, "electrobun.showNotification(options) expects an options object");
+    }
+
+    if (ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "body", &body) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "subtitle", &subtitle) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "silent", &silent) != 0) {
+        free(title);
+        free(body);
+        free(subtitle);
+        return JS_EXCEPTION;
+    }
+
+    result = ct_status_to_js(ctx, ct_electrobun_show_notification_host(title, body, subtitle, silent, &error_message), error_message);
+    free(title);
+    free(body);
+    free(subtitle);
+    return result;
+}
+
+static JSValue ct_electrobun_set_menu(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *symbol = NULL;
+    char *menu_json = NULL;
+    int handler = 0;
+    char *error_message = NULL;
+    JSValue result = JS_UNDEFINED;
+
+    (void) this_val;
+
+    if (argc < 3) {
+        return JS_ThrowTypeError(ctx, "electrobun.setMenu(symbol, menuJSON, handler) requires three arguments");
+    }
+
+    symbol = ct_copy_js_string(ctx, argv[0]);
+    menu_json = ct_copy_js_string(ctx, argv[1]);
+    handler = JS_ToBool(ctx, argv[2]);
+    if (symbol == NULL || menu_json == NULL || handler < 0) {
+        free(symbol);
+        free(menu_json);
+        return JS_EXCEPTION;
+    }
+
+    result = ct_status_to_js(ctx, ct_electrobun_set_menu_host(symbol, menu_json, handler != 0, &error_message), error_message);
+    free(symbol);
+    free(menu_json);
+    return result;
+}
+
+static JSValue ct_electrobun_open_file_dialog(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *starting_folder = ct_duplicate_string("");
+    char *allowed_file_types = ct_duplicate_string("");
+    bool can_choose_files = true;
+    bool can_choose_directories = false;
+    bool allows_multiple_selection = false;
+    char *error_message = NULL;
+    char *value = NULL;
+
+    (void) this_val;
+
+    if (starting_folder == NULL || allowed_file_types == NULL) {
+        free(starting_folder);
+        free(allowed_file_types);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        free(starting_folder);
+        free(allowed_file_types);
+        return JS_ThrowTypeError(ctx, "electrobun.openFileDialog(options) expects an options object");
+    }
+
+    if (ct_get_optional_string_property(ctx, argv[0], "startingFolder", &starting_folder) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "allowedFileTypes", &allowed_file_types) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "canChooseFiles", &can_choose_files) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "canChooseDirectory", &can_choose_directories) != 0 ||
+        ct_get_optional_bool_property(ctx, argv[0], "allowsMultipleSelection", &allows_multiple_selection) != 0) {
+        free(starting_folder);
+        free(allowed_file_types);
+        return JS_EXCEPTION;
+    }
+
+    value = ct_electrobun_open_file_dialog_host(
+        starting_folder,
+        allowed_file_types,
+        can_choose_files ? 1 : 0,
+        can_choose_directories ? 1 : 0,
+        allows_multiple_selection ? 1 : 0,
+        &error_message
+    );
+    free(starting_folder);
+    free(allowed_file_types);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return ct_return_owned_cstring(ctx, value);
+}
+
+static JSValue ct_electrobun_show_message_box(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *box_type = ct_duplicate_string("info");
+    char *title = ct_duplicate_string("");
+    char *message = ct_duplicate_string("");
+    char *detail = ct_duplicate_string("");
+    char *buttons = ct_duplicate_string("OK");
+    int32_t default_id = 0;
+    int32_t cancel_id = -1;
+    char *error_message = NULL;
+    int response = 0;
+
+    (void) this_val;
+
+    if (box_type == NULL || title == NULL || message == NULL || detail == NULL || buttons == NULL) {
+        free(box_type);
+        free(title);
+        free(message);
+        free(detail);
+        free(buttons);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
+        free(box_type);
+        free(title);
+        free(message);
+        free(detail);
+        free(buttons);
+        return JS_ThrowTypeError(ctx, "electrobun.showMessageBox(options) expects an options object");
+    }
+
+    if (ct_get_optional_string_property(ctx, argv[0], "boxType", &box_type) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "message", &message) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "detail", &detail) != 0 ||
+        ct_get_optional_string_property(ctx, argv[0], "buttons", &buttons) != 0) {
+        free(box_type);
+        free(title);
+        free(message);
+        free(detail);
+        free(buttons);
+        return JS_EXCEPTION;
+    }
+
+    if (ct_get_optional_uint32_property(ctx, argv[0], "defaultID", (uint32_t *) &default_id) != 0 ||
+        ct_get_optional_uint32_property(ctx, argv[0], "cancelID", (uint32_t *) &cancel_id) != 0) {
+        free(box_type);
+        free(title);
+        free(message);
+        free(detail);
+        free(buttons);
+        return JS_EXCEPTION;
+    }
+
+    response = ct_electrobun_show_message_box_host(box_type, title, message, detail, buttons, default_id, cancel_id, &error_message);
+    free(box_type);
+    free(title);
+    free(message);
+    free(detail);
+    free(buttons);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return JS_NewInt32(ctx, response);
+}
+
+static JSValue ct_electrobun_set_native_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *name = NULL;
+    int enabled = 0;
+    char *error_message = NULL;
+    int status = -1;
+
+    (void) this_val;
+
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "electrobun.setNativeCallback(name, enabled) requires a name and enabled flag");
+    }
+
+    name = ct_copy_js_string(ctx, argv[0]);
+    enabled = JS_ToBool(ctx, argv[1]);
+    if (name == NULL || enabled < 0) {
+        free(name);
+        return JS_EXCEPTION;
+    }
+
+    if (strcmp(name, "globalShortcut") == 0) {
+        status = ct_electrobun_set_global_shortcut_callback_host(enabled != 0, &error_message);
+    } else if (strcmp(name, "urlOpen") == 0) {
+        status = ct_electrobun_set_url_open_handler_host(enabled != 0, &error_message);
+    } else if (strcmp(name, "appReopen") == 0) {
+        status = ct_electrobun_set_app_reopen_handler_host(enabled != 0, &error_message);
+    } else if (strcmp(name, "quitRequested") == 0) {
+        status = ct_electrobun_set_quit_requested_handler_host(enabled != 0, &error_message);
+    } else {
+        JSValue exception = JS_ThrowTypeError(ctx, "unknown native callback: %s", name);
+        free(name);
+        return exception;
+    }
+
+    free(name);
+    return ct_status_to_js(ctx, status, error_message);
+}
+
+static JSValue ct_electrobun_pop_event(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    char *error_message = NULL;
+    char *event_json = NULL;
+
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    event_json = ct_electrobun_pop_event_host(&error_message);
+    if (error_message != NULL) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+    return ct_return_owned_cstring(ctx, event_json);
 }
 
 static JSValue ct_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1321,6 +2441,7 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     }
 
     if (JS_SetPropertyStr(ctx, cottontail, "nanotime", JS_NewCFunction(ctx, ct_nanotime, "nanotime", 0)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "sleep", JS_NewCFunction(ctx, ct_sleep, "sleep", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "cwd", JS_NewCFunction(ctx, ct_cwd, "cwd", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "readFile", JS_NewCFunction(ctx, ct_read_file, "readFile", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "writeFile", JS_NewCFunction(ctx, ct_write_file, "writeFile", 2)) < 0 ||
@@ -1343,6 +2464,24 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
 
     if (!JS_IsUndefined(electrobun) &&
         (JS_SetPropertyStr(ctx, electrobun, "createWindow", JS_NewCFunction(ctx, ct_electrobun_create_window, "createWindow", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "createWebview", JS_NewCFunction(ctx, ct_electrobun_create_webview, "createWebview", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "closeWindow", JS_NewCFunction(ctx, ct_electrobun_close_window, "closeWindow", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "setWindowAlwaysOnTop", JS_NewCFunction(ctx, ct_electrobun_set_window_always_on_top, "setWindowAlwaysOnTop", 2)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "sendHostMessageToWebview", JS_NewCFunction(ctx, ct_electrobun_send_host_message, "sendHostMessageToWebview", 2)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "popNextQueuedHostMessage", JS_NewCFunction(ctx, ct_electrobun_pop_host_message, "popNextQueuedHostMessage", 0)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "popNextNativeEvent", JS_NewCFunction(ctx, ct_electrobun_pop_event, "popNextNativeEvent", 0)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "coreCall", JS_NewCFunction(ctx, ct_electrobun_core_call, "coreCall", 2)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "getWindowFrame", JS_NewCFunction(ctx, ct_electrobun_get_window_frame, "getWindowFrame", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "resizeView", JS_NewCFunction(ctx, ct_electrobun_resize_view, "resizeView", 7)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "createWGPUView", JS_NewCFunction(ctx, ct_electrobun_create_wgpu_view, "createWGPUView", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "createTray", JS_NewCFunction(ctx, ct_electrobun_create_tray, "createTray", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "showTray", JS_NewCFunction(ctx, ct_electrobun_show_tray, "showTray", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "getTrayBounds", JS_NewCFunction(ctx, ct_electrobun_get_tray_bounds, "getTrayBounds", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "showNotification", JS_NewCFunction(ctx, ct_electrobun_show_notification, "showNotification", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "setMenu", JS_NewCFunction(ctx, ct_electrobun_set_menu, "setMenu", 3)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "openFileDialog", JS_NewCFunction(ctx, ct_electrobun_open_file_dialog, "openFileDialog", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "showMessageBox", JS_NewCFunction(ctx, ct_electrobun_show_message_box, "showMessageBox", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "setNativeCallback", JS_NewCFunction(ctx, ct_electrobun_set_native_callback, "setNativeCallback", 2)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "quit", JS_NewCFunction(ctx, ct_electrobun_quit, "quit", 0)) < 0)) {
         JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, cottontail);
@@ -1409,6 +2548,7 @@ CtQjsRuntime *ct_qjs_runtime_create(void) {
         ct_qjs_runtime_destroy(runtime);
         return NULL;
     }
+    JS_SetMaxStackSize(runtime->runtime, 0);
 
     runtime->context = JS_NewContext(runtime->runtime);
     if (runtime->context == NULL) {

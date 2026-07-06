@@ -926,6 +926,7 @@ fn buildMainEntrypoint(ctx: *const Context, root: std.json.Value, main_process: 
     }
 
     try appendSharedEsbuildOptions(ctx, &spec, options, .main);
+    try addElectrobunImportAliases(ctx, &spec);
     try runEsbuild(ctx, .{ .object = spec });
 }
 
@@ -953,6 +954,7 @@ fn buildViews(ctx: *const Context, root: std.json.Value, app_dir: []const u8) !v
         try spec.put(ctx.allocator, "outfile", .{ .string = output_file });
 
         try appendSharedEsbuildOptions(ctx, &spec, view_value.object, .view);
+        try addElectrobunImportAliases(ctx, &spec);
         try runEsbuild(ctx, .{ .object = spec });
     }
 }
@@ -1008,6 +1010,21 @@ fn appendSharedEsbuildOptions(
     if (getValueFieldFromObject(object, "define")) |value| {
         if (value == .object) try spec.put(ctx.allocator, "define", value);
     }
+
+    if (getValueFieldFromObject(object, "alias")) |value| {
+        if (value == .object) try spec.put(ctx.allocator, "alias", value);
+    }
+}
+
+fn addElectrobunImportAliases(ctx: *const Context, spec: *std.json.ObjectMap) !void {
+    const package_root = (try resolveElectrobunPackageRoot(ctx)) orelse return;
+
+    var alias: std.json.ObjectMap = .empty;
+    try alias.put(ctx.allocator, "electrobun", .{ .string = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "bun", "index.ts" }) });
+    try alias.put(ctx.allocator, "electrobun/bun", .{ .string = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "bun", "index.ts" }) });
+    try alias.put(ctx.allocator, "electrobun/cottontail", .{ .string = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "sdks", "cottontail", "index.ts" }) });
+    try alias.put(ctx.allocator, "electrobun/view", .{ .string = try std.fs.path.join(ctx.allocator, &.{ package_root, "dist", "api", "browser", "index.ts" }) });
+    try spec.put(ctx.allocator, "alias", .{ .object = alias });
 }
 
 fn runEsbuild(ctx: *const Context, build_spec: std.json.Value) !void {
@@ -1111,6 +1128,18 @@ fn appendEsbuildCliArgs(ctx: *const Context, argv: *std.ArrayList([]const u8), s
                 };
                 const define_arg = try std.fmt.allocPrint(ctx.allocator, "{s}={s}", .{ entry.key_ptr.*, define_value });
                 try appendEsbuildPrefixedValue(ctx, argv, "define", define_arg);
+            }
+        }
+    }
+
+    if (getValueFieldFromObject(spec, "alias")) |value| {
+        if (value == .object) {
+            var it = value.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == .string) {
+                    const alias_arg = try std.fmt.allocPrint(ctx.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.*.string });
+                    try appendEsbuildPrefixedValue(ctx, argv, "alias", alias_arg);
+                }
             }
         }
     }
@@ -1498,6 +1527,9 @@ fn resolveElectrobunPackageRoot(ctx: *const Context) !?[]const u8 {
         if (pathExists(ctx.io, package_root)) return package_root;
     }
 
+    const sibling_repo = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "..", "electrobun", "package" });
+    if (pathExists(ctx.io, try std.fs.path.join(ctx.allocator, &.{ sibling_repo, "package.json" }))) return sibling_repo;
+
     var current = ctx.project_root;
 
     while (true) {
@@ -1508,9 +1540,6 @@ fn resolveElectrobunPackageRoot(ctx: *const Context) !?[]const u8 {
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
-
-    const sibling_repo = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "..", "electrobun", "package" });
-    if (pathExists(ctx.io, try std.fs.path.join(ctx.allocator, &.{ sibling_repo, "package.json" }))) return sibling_repo;
 
     return null;
 }
