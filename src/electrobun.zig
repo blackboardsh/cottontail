@@ -109,6 +109,25 @@ const U32F64RetFn = *const fn (u32) callconv(.c) f64;
 const U32F64F64F64F64Fn = *const fn (u32, f64, f64, f64, f64) callconv(.c) void;
 const GetWindowFrameFn = *const fn (u32, *f64, *f64, *f64, *f64) callconv(.c) void;
 const ResizeViewFn = *const fn (u32, f64, f64, f64, f64, [*:0]const u8) callconv(.c) void;
+const NativeRet0Fn = *const fn () callconv(.c) u64;
+const NativeRet1Fn = *const fn (u64) callconv(.c) u64;
+const NativeRet2Fn = *const fn (u64, u64) callconv(.c) u64;
+const NativeRet3Fn = *const fn (u64, u64, u64) callconv(.c) u64;
+const NativeRet4Fn = *const fn (u64, u64, u64, u64) callconv(.c) u64;
+const NativeRet5Fn = *const fn (u64, u64, u64, u64, u64) callconv(.c) u64;
+const NativeRet6Fn = *const fn (u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const NativeRet7Fn = *const fn (u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const NativeRet8Fn = *const fn (u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const NativeVoid0Fn = *const fn () callconv(.c) void;
+const NativeVoid1Fn = *const fn (u64) callconv(.c) void;
+const NativeVoid2Fn = *const fn (u64, u64) callconv(.c) void;
+const NativeVoid3Fn = *const fn (u64, u64, u64) callconv(.c) void;
+const NativeVoid4Fn = *const fn (u64, u64, u64, u64) callconv(.c) void;
+const NativeVoid5Fn = *const fn (u64, u64, u64, u64, u64) callconv(.c) void;
+const NativeVoid6Fn = *const fn (u64, u64, u64, u64, u64, u64) callconv(.c) void;
+const NativeVoid7Fn = *const fn (u64, u64, u64, u64, u64, u64, u64) callconv(.c) void;
+const NativeVoid8Fn = *const fn (u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) void;
+const WgpuRenderPassSetViewportFn = *const fn (u64, f32, f32, f32, f32, f32, f32) callconv(.c) void;
 const StringFn = *const fn ([*:0]const u8) callconv(.c) void;
 const StringBoolRetFn = *const fn ([*:0]const u8) callconv(.c) bool;
 const StringRetFn = *const fn () callconv(.c) ?[*:0]u8;
@@ -209,6 +228,8 @@ const BridgeState = struct {
     app_name: ?[:0]u8 = null,
     app_channel: ?[:0]u8 = null,
     core: ?Core = null,
+    wgpu_lib: ?std.DynLib = null,
+    exe_dir: ?[:0]u8 = null,
     running_in_app_bundle: bool = false,
     quit_on_close_windows: std.AutoHashMapUnmanaged(u32, void) = .empty,
     event_queue: std.ArrayListUnmanaged([:0]u8) = .empty,
@@ -251,6 +272,7 @@ pub fn forceLink() void {
     _ = &ct_electrobun_call_string_string_host;
     _ = &ct_electrobun_call_int_host;
     _ = &ct_electrobun_call_u32_ptr_exists_host;
+    _ = &ct_electrobun_native_call_host;
     _ = &ct_electrobun_create_wgpu_view_host;
     _ = &ct_electrobun_create_tray_host;
     _ = &ct_electrobun_show_tray_host;
@@ -286,6 +308,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator) !void {
     try configureWebviewRuntime(io, allocator, &core, dist_dir);
 
     state.core = core;
+    state.exe_dir = try allocator.dupeZ(u8, exe_dir);
     state.app_identifier = try envOrDefault(allocator, "COTTONTAIL_ELECTROBUN_IDENTIFIER", "dev.electrobun.cottontail");
     state.app_name = try envOrDefault(allocator, "COTTONTAIL_ELECTROBUN_NAME", "Cottontail");
     state.app_channel = try envOrDefault(allocator, "COTTONTAIL_ELECTROBUN_CHANNEL", "dev");
@@ -459,6 +482,10 @@ fn stageIfPresent(
     const dest_path = try std.fs.path.join(allocator, &.{ dest_dir, file_name });
     defer allocator.free(dest_path);
 
+    if (std.mem.eql(u8, source_path, dest_path)) {
+        return;
+    }
+
     try std.Io.Dir.copyFileAbsolute(source_path, dest_path, io, .{
         .replace = true,
         .make_path = true,
@@ -528,6 +555,33 @@ fn lookupCoreSymbol(comptime T: type, core: *Core, symbol_name: [*:0]const u8, e
         setErrorOut(error_out, message);
         return null;
     };
+}
+
+fn ensureWgpuLib(error_out: *?[*:0]u8) ?*std.DynLib {
+    if (!state.enabled) {
+        setErrorOut(error_out, "electrobun bridge is not enabled");
+        return null;
+    }
+
+    if (state.wgpu_lib) |*lib| {
+        return lib;
+    }
+
+    const exe_dir = state.exe_dir orelse {
+        setErrorOut(error_out, "electrobun executable directory is not available");
+        return null;
+    };
+    const path = std.fs.path.join(std.heap.c_allocator, &.{ exe_dir, wgpuLibraryName() }) catch {
+        setErrorOut(error_out, "failed to build WGPU library path");
+        return null;
+    };
+    defer std.heap.c_allocator.free(path);
+
+    state.wgpu_lib = std.DynLib.open(path) catch {
+        setErrorOut(error_out, "failed to load WGPU library");
+        return null;
+    };
+    return &state.wgpu_lib.?;
 }
 
 fn finishCoreVoidCall(core: *Core, error_out: *?[*:0]u8) c_int {
@@ -859,18 +913,30 @@ export fn ct_electrobun_send_host_message_host(
 ) bool {
     error_out.* = null;
 
-    if (!state.enabled) {
-        setErrorOut(error_out, "electrobun bridge is not enabled");
-        return false;
+    const core = requireCore(error_out) orelse return false;
+
+    if (core.symbols.send_host_message_to_webview_via_transport(webview_id, message)) {
+        return true;
     }
 
-    const core = state.core orelse {
-        setErrorOut(error_out, "electrobun core is not loaded");
+    const eval_func = lookupCoreSymbol(U32StringFn, core, "evaluateJavaScriptWithNoCompletion", error_out) orelse return false;
+    const js = std.fmt.allocPrint(
+        std.heap.c_allocator,
+        "window.__electrobun.receiveMessageFromHost({s});",
+        .{std.mem.span(message)},
+    ) catch {
+        setErrorOut(error_out, "failed to allocate host message fallback script");
         return false;
     };
+    defer std.heap.c_allocator.free(js);
+    const js_z = std.heap.c_allocator.dupeZ(u8, js) catch {
+        setErrorOut(error_out, "failed to allocate host message fallback script");
+        return false;
+    };
+    defer std.heap.c_allocator.free(js_z);
 
-    if (!core.symbols.send_host_message_to_webview_via_transport(webview_id, message)) {
-        operationError(error_out, "sendHostMessageToWebview");
+    eval_func(webview_id, js_z.ptr);
+    if (finishCoreVoidCall(core, error_out) != 0) {
         return false;
     }
 
@@ -1171,6 +1237,111 @@ export fn ct_electrobun_call_u32_ptr_exists_host(symbol_name: [*:0]const u8, val
     const core = requireCore(error_out) orelse return false;
     const func = lookupCoreSymbol(U32PtrRetFn, core, symbol_name, error_out) orelse return false;
     return func(value) != null;
+}
+
+fn nativeCallVoid(lib: *std.DynLib, symbol_name: [:0]const u8, args: []const u64, error_out: *?[*:0]u8) bool {
+    if (std.mem.eql(u8, symbol_name, "wgpuRenderPassEncoderSetViewport")) {
+        if (args.len != 7) {
+            setErrorOut(error_out, "wgpuRenderPassEncoderSetViewport requires 7 arguments");
+            return false;
+        }
+        const func = lib.lookup(WgpuRenderPassSetViewportFn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out);
+        func(
+            args[0],
+            @floatFromInt(args[1]),
+            @floatFromInt(args[2]),
+            @floatFromInt(args[3]),
+            @floatFromInt(args[4]),
+            @floatFromInt(args[5]),
+            @floatFromInt(args[6]),
+        );
+        return true;
+    }
+
+    switch (args.len) {
+        0 => (lib.lookup(NativeVoid0Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(),
+        1 => (lib.lookup(NativeVoid1Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0]),
+        2 => (lib.lookup(NativeVoid2Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1]),
+        3 => (lib.lookup(NativeVoid3Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2]),
+        4 => (lib.lookup(NativeVoid4Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2], args[3]),
+        5 => (lib.lookup(NativeVoid5Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4]),
+        6 => (lib.lookup(NativeVoid6Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5]),
+        7 => (lib.lookup(NativeVoid7Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5], args[6]),
+        8 => (lib.lookup(NativeVoid8Fn, symbol_name) orelse return missingNativeSymbol(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]),
+        else => {
+            setErrorOut(error_out, "native calls support at most 8 arguments");
+            return false;
+        },
+    }
+    return true;
+}
+
+fn nativeCallRet(lib: *std.DynLib, symbol_name: [:0]const u8, args: []const u64, error_out: *?[*:0]u8) ?u64 {
+    return switch (args.len) {
+        0 => (lib.lookup(NativeRet0Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(),
+        1 => (lib.lookup(NativeRet1Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0]),
+        2 => (lib.lookup(NativeRet2Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1]),
+        3 => (lib.lookup(NativeRet3Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2]),
+        4 => (lib.lookup(NativeRet4Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2], args[3]),
+        5 => (lib.lookup(NativeRet5Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4]),
+        6 => (lib.lookup(NativeRet6Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5]),
+        7 => (lib.lookup(NativeRet7Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5], args[6]),
+        8 => (lib.lookup(NativeRet8Fn, symbol_name) orelse return missingNativeSymbolRet(symbol_name, error_out))(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]),
+        else => {
+            setErrorOut(error_out, "native calls support at most 8 arguments");
+            return null;
+        },
+    };
+}
+
+fn missingNativeSymbol(symbol_name: []const u8, error_out: *?[*:0]u8) bool {
+    const message = std.fmt.allocPrint(std.heap.c_allocator, "missing native symbol: {s}", .{symbol_name}) catch {
+        setErrorOut(error_out, "missing native symbol");
+        return false;
+    };
+    defer std.heap.c_allocator.free(message);
+    setErrorOut(error_out, message);
+    return false;
+}
+
+fn missingNativeSymbolRet(symbol_name: []const u8, error_out: *?[*:0]u8) ?u64 {
+    _ = missingNativeSymbol(symbol_name, error_out);
+    return null;
+}
+
+export fn ct_electrobun_native_call_host(
+    library_name: [*:0]const u8,
+    symbol_name: [*:0]const u8,
+    return_type: [*:0]const u8,
+    argc: usize,
+    args_ptr: [*]const u64,
+    result_out: *u64,
+    error_out: *?[*:0]u8,
+) bool {
+    error_out.* = null;
+    result_out.* = 0;
+
+    const library = std.mem.span(library_name);
+    const symbol: [:0]const u8 = std.mem.span(symbol_name);
+    const returns = std.mem.span(return_type);
+    const args = args_ptr[0..argc];
+
+    const lib = if (std.mem.eql(u8, library, "core"))
+        &(requireCore(error_out) orelse return false).lib
+    else if (std.mem.eql(u8, library, "wgpu"))
+        ensureWgpuLib(error_out) orelse return false
+    else {
+        setErrorOut(error_out, "unknown native library");
+        return false;
+    };
+
+    if (std.mem.eql(u8, returns, "void")) {
+        return nativeCallVoid(lib, symbol, args, error_out);
+    }
+
+    const result = nativeCallRet(lib, symbol, args, error_out) orelse return false;
+    result_out.* = result;
+    return true;
 }
 
 export fn ct_electrobun_create_wgpu_view_host(

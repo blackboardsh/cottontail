@@ -137,6 +137,7 @@ extern bool ct_electrobun_call_string_string_string_bool_ret_host(const char *sy
 extern int ct_electrobun_call_string_string_host(const char *symbol_name, const char *a, const char *b, char **error_out);
 extern int ct_electrobun_call_int_host(const char *symbol_name, int value, char **error_out);
 extern bool ct_electrobun_call_u32_ptr_exists_host(const char *symbol_name, unsigned int value, char **error_out);
+extern bool ct_electrobun_native_call_host(const char *library_name, const char *symbol_name, const char *return_type, size_t argc, const uint64_t *args, uint64_t *result_out, char **error_out);
 extern unsigned int ct_electrobun_create_wgpu_view_host(unsigned int window_id, double x, double y, double width, double height, bool start_transparent, bool start_passthrough, bool hidden, char **error_out);
 extern unsigned int ct_electrobun_create_tray_host(const char *title, const char *image, bool is_template, unsigned int width, unsigned int height, bool handler_enabled, char **error_out);
 extern bool ct_electrobun_show_tray_host(unsigned int tray_id, char **error_out);
@@ -158,6 +159,9 @@ struct CtQjsRuntime {
     int pending_unhandled_rejections;
     char *last_unhandled_rejection;
 };
+
+static JSValue ct_throw_host_error(JSContext *ctx, char *error_message);
+static int ct_drain_jobs(CtQjsRuntime *runtime, char **error_out);
 
 static char *ct_duplicate_bytes(const char *value, size_t len) {
     char *copy = (char *) malloc(len + 1);
@@ -347,6 +351,201 @@ static char *ct_copy_js_string(JSContext *ctx, JSValueConst value) {
     copy = ct_duplicate_bytes(string_value, len);
     JS_FreeCString(ctx, string_value);
     return copy;
+}
+
+static int ct_js_value_to_native_u64(JSContext *ctx, JSValueConst value, uint64_t *out) {
+    if (JS_IsArrayBuffer(value)) {
+        size_t size = 0;
+        uint8_t *data = JS_GetArrayBuffer(ctx, &size, value);
+        (void) size;
+        if (data == NULL) {
+            return -1;
+        }
+        *out = (uint64_t) (uintptr_t) data;
+        return 0;
+    }
+
+    if (JS_GetTypedArrayType(value) >= 0) {
+        size_t byte_offset = 0;
+        size_t byte_length = 0;
+        size_t bytes_per_element = 0;
+        size_t buffer_size = 0;
+        uint8_t *data = NULL;
+        JSValue buffer = JS_GetTypedArrayBuffer(ctx, value, &byte_offset, &byte_length, &bytes_per_element);
+
+        (void) byte_length;
+        (void) bytes_per_element;
+
+        if (JS_IsException(buffer)) {
+            return -1;
+        }
+
+        data = JS_GetArrayBuffer(ctx, &buffer_size, buffer);
+        JS_FreeValue(ctx, buffer);
+        if (data == NULL || byte_offset > buffer_size) {
+            return -1;
+        }
+
+        *out = (uint64_t) (uintptr_t) (data + byte_offset);
+        return 0;
+    }
+
+    if (JS_IsObject(value)) {
+        JSValue buffer = JS_GetPropertyStr(ctx, value, "buffer");
+        if (JS_IsException(buffer)) {
+            return -1;
+        }
+        if (JS_IsArrayBuffer(buffer)) {
+            JSValue byte_offset_value = JS_GetPropertyStr(ctx, value, "byteOffset");
+            uint64_t byte_offset = 0;
+            size_t size = 0;
+            uint8_t *data = NULL;
+
+            if (JS_IsException(byte_offset_value)) {
+                JS_FreeValue(ctx, buffer);
+                return -1;
+            }
+            if (JS_IsBigInt(byte_offset_value)) {
+                if (JS_ToBigUint64(ctx, &byte_offset, byte_offset_value) < 0) {
+                    JS_FreeValue(ctx, byte_offset_value);
+                    JS_FreeValue(ctx, buffer);
+                    return -1;
+                }
+            } else {
+                double byte_offset_number = 0;
+                if (JS_ToFloat64(ctx, &byte_offset_number, byte_offset_value) < 0 || byte_offset_number < 0) {
+                    JS_FreeValue(ctx, byte_offset_value);
+                    JS_FreeValue(ctx, buffer);
+                    return -1;
+                }
+                byte_offset = (uint64_t) byte_offset_number;
+            }
+            JS_FreeValue(ctx, byte_offset_value);
+
+            data = JS_GetArrayBuffer(ctx, &size, buffer);
+            JS_FreeValue(ctx, buffer);
+            if (data == NULL || byte_offset > size) {
+                return -1;
+            }
+            *out = (uint64_t) (uintptr_t) (data + byte_offset);
+            return 0;
+        }
+        JS_FreeValue(ctx, buffer);
+    }
+
+    if (JS_IsBigInt(value) && JS_ToBigUint64(ctx, out, value) == 0) {
+        return 0;
+    }
+
+    if (JS_IsNumber(value)) {
+        double number = 0;
+        if (JS_ToFloat64(ctx, &number, value) < 0) {
+            return -1;
+        }
+        *out = (uint64_t) number;
+        return 0;
+    }
+
+    return -1;
+}
+
+static JSValue ct_electrobun_memory_address(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint64_t address = 0;
+
+    (void) this_val;
+
+    if (argc < 1 || ct_js_value_to_native_u64(ctx, argv[0], &address) != 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.memoryAddress(value) requires an ArrayBuffer, typed array, number, or bigint");
+    }
+
+    return JS_NewFloat64(ctx, (double) address);
+}
+
+static void ct_external_array_buffer_noop(JSRuntime *rt, void *opaque, void *ptr) {
+    (void) rt;
+    (void) opaque;
+    (void) ptr;
+}
+
+static JSValue ct_electrobun_memory_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint64_t address = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+
+    (void) this_val;
+
+    if (argc < 3 ||
+        ct_js_value_to_native_u64(ctx, argv[0], &address) != 0 ||
+        ct_js_value_to_native_u64(ctx, argv[1], &offset) != 0 ||
+        ct_js_value_to_native_u64(ctx, argv[2], &length) != 0) {
+        return JS_ThrowTypeError(ctx, "electrobun.memoryView(ptr, offset, length) requires pointer, offset, and length");
+    }
+
+    if (address == 0 || length == 0) {
+        return JS_NewArrayBufferCopy(ctx, NULL, 0);
+    }
+
+    return JS_NewArrayBuffer(
+        ctx,
+        (uint8_t *) (uintptr_t) (address + offset),
+        (size_t) length,
+        ct_external_array_buffer_noop,
+        NULL,
+        false
+    );
+}
+
+static JSValue ct_electrobun_native_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *library_name = NULL;
+    const char *symbol_name = NULL;
+    const char *return_type = NULL;
+    char *error_message = NULL;
+    uint64_t args[8] = {0};
+    uint64_t result = 0;
+    int native_argc = argc - 3;
+    bool ok = false;
+
+    (void) this_val;
+
+    if (argc < 3 || native_argc > 8) {
+        return JS_ThrowTypeError(ctx, "electrobun.nativeCall(library, symbol, returnType, ...args) supports up to 8 native args");
+    }
+
+    library_name = JS_ToCString(ctx, argv[0]);
+    symbol_name = JS_ToCString(ctx, argv[1]);
+    return_type = JS_ToCString(ctx, argv[2]);
+    if (library_name == NULL || symbol_name == NULL || return_type == NULL) {
+        JS_FreeCString(ctx, library_name);
+        JS_FreeCString(ctx, symbol_name);
+        JS_FreeCString(ctx, return_type);
+        return JS_EXCEPTION;
+    }
+
+    for (int index = 0; index < native_argc; index += 1) {
+        if (ct_js_value_to_native_u64(ctx, argv[index + 3], &args[index]) != 0) {
+            JS_FreeCString(ctx, library_name);
+            JS_FreeCString(ctx, symbol_name);
+            JS_FreeCString(ctx, return_type);
+            return JS_ThrowTypeError(ctx, "native call args must be ArrayBuffers, typed arrays, numbers, or bigints");
+        }
+    }
+
+    ok = ct_electrobun_native_call_host(library_name, symbol_name, return_type, (size_t) native_argc, args, &result, &error_message);
+    JS_FreeCString(ctx, library_name);
+    JS_FreeCString(ctx, symbol_name);
+    JS_FreeCString(ctx, return_type);
+
+    if (!ok) {
+        return ct_throw_host_error(ctx, error_message);
+    }
+
+    if (strcmp(return_type, "void") == 0) {
+        return JS_UNDEFINED;
+    }
+    if (strcmp(return_type, "u64") == 0) {
+        return JS_NewBigUint64(ctx, result);
+    }
+    return JS_NewFloat64(ctx, (double) result);
 }
 
 static void ct_free_string_array(char **values, size_t count) {
@@ -753,6 +952,25 @@ static JSValue ct_sleep(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     duration.tv_nsec = (long) ((ms - ((double) duration.tv_sec * 1000.0)) * 1000000.0);
     while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
 #endif
+
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_drain_jobs_host(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    char *error_message = NULL;
+
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+
+    if (runtime == NULL) {
+        return JS_ThrowInternalError(ctx, "Cottontail runtime is not available");
+    }
+
+    if (ct_drain_jobs(runtime, &error_message) != 0) {
+        return ct_throw_host_error(ctx, error_message);
+    }
 
     return JS_UNDEFINED;
 }
@@ -2442,6 +2660,7 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
 
     if (JS_SetPropertyStr(ctx, cottontail, "nanotime", JS_NewCFunction(ctx, ct_nanotime, "nanotime", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "sleep", JS_NewCFunction(ctx, ct_sleep, "sleep", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "drainJobs", JS_NewCFunction(ctx, ct_drain_jobs_host, "drainJobs", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "cwd", JS_NewCFunction(ctx, ct_cwd, "cwd", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "readFile", JS_NewCFunction(ctx, ct_read_file, "readFile", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "writeFile", JS_NewCFunction(ctx, ct_write_file, "writeFile", 2)) < 0 ||
@@ -2471,6 +2690,9 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
          JS_SetPropertyStr(ctx, electrobun, "popNextQueuedHostMessage", JS_NewCFunction(ctx, ct_electrobun_pop_host_message, "popNextQueuedHostMessage", 0)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "popNextNativeEvent", JS_NewCFunction(ctx, ct_electrobun_pop_event, "popNextNativeEvent", 0)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "coreCall", JS_NewCFunction(ctx, ct_electrobun_core_call, "coreCall", 2)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "nativeCall", JS_NewCFunction(ctx, ct_electrobun_native_call, "nativeCall", 3)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "memoryAddress", JS_NewCFunction(ctx, ct_electrobun_memory_address, "memoryAddress", 1)) < 0 ||
+         JS_SetPropertyStr(ctx, electrobun, "memoryView", JS_NewCFunction(ctx, ct_electrobun_memory_view, "memoryView", 3)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "getWindowFrame", JS_NewCFunction(ctx, ct_electrobun_get_window_frame, "getWindowFrame", 1)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "resizeView", JS_NewCFunction(ctx, ct_electrobun_resize_view, "resizeView", 7)) < 0 ||
          JS_SetPropertyStr(ctx, electrobun, "createWGPUView", JS_NewCFunction(ctx, ct_electrobun_create_wgpu_view, "createWGPUView", 1)) < 0 ||
@@ -2555,6 +2777,7 @@ CtQjsRuntime *ct_qjs_runtime_create(void) {
         ct_qjs_runtime_destroy(runtime);
         return NULL;
     }
+    JS_SetContextOpaque(runtime->context, runtime);
 
     JS_SetModuleLoaderFunc2(runtime->runtime, NULL, ct_module_loader, ct_module_check_attributes, runtime);
     JS_SetHostPromiseRejectionTracker(runtime->runtime, ct_promise_rejection_tracker, runtime);

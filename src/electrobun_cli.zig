@@ -310,7 +310,7 @@ fn runBuild(ctx: *const Context, config: CommandContext) !void {
     const main_process = getMainProcess(config.root);
     switch (main_process) {
         .bun => try buildBundledElectrobunApp(ctx, config),
-        .cottontail => try buildCottontailApp(ctx, config),
+        .cottontail => try buildBundledElectrobunApp(ctx, config),
         .zig => try buildBundledElectrobunApp(ctx, config),
     }
 
@@ -323,7 +323,7 @@ fn runBuiltApp(ctx: *const Context, config: CommandContext) !void {
     const main_process = getMainProcess(config.root);
     switch (main_process) {
         .bun => try runBundledElectrobunApp(ctx, config),
-        .cottontail => try runCottontailApp(ctx, config),
+        .cottontail => try runBundledElectrobunApp(ctx, config),
         .zig => try runBundledElectrobunApp(ctx, config),
     }
 }
@@ -612,6 +612,9 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     if (main_process == .bun) {
         try copyPath(ctx, platform_paths.bun_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, bunBinaryFileName() }));
     }
+    if (main_process == .cottontail) {
+        try copyPath(ctx, ctx.self_exe_path, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, cottontailBinaryFileName() }));
+    }
     try copyPath(ctx, platform_paths.core_lib, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.core_lib) }));
     try copyPath(ctx, platform_paths.native_wrapper, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.native_wrapper) }));
     try copyPath(ctx, platform_paths.libasar, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.libasar) }));
@@ -627,6 +630,10 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
     }
     try copyPath(ctx, platform_paths.preload_full_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "preload-full.js" }));
     try copyPath(ctx, platform_paths.preload_sandboxed_js, try std.fs.path.join(ctx.allocator, &.{ bundle.resources_dir, "preload-sandboxed.js" }));
+    if (main_process == .cottontail) {
+        try copyPath(ctx, platform_paths.preload_full_js, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "preload-full.js" }));
+        try copyPath(ctx, platform_paths.preload_sandboxed_js, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, "preload-sandboxed.js" }));
+    }
 
     if (bundleUsesWgpu(config.root) and pathExists(ctx.io, platform_paths.wgpu_lib)) {
         try copyPath(ctx, platform_paths.wgpu_lib, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, std.fs.path.basename(platform_paths.wgpu_lib) }));
@@ -650,7 +657,11 @@ fn buildBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void 
             const main_binary = try buildZigMainExecutable(ctx, config, platform_paths, bundle);
             try copyPath(ctx, main_binary, try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, executableFileName("main") }));
         },
-        .cottontail => unreachable,
+        .cottontail => {
+            const main_source = try resolveMainEntrypoint(ctx, config.root, .cottontail);
+            const main_output = try std.fs.path.join(ctx.allocator, &.{ bundle.app_code_dir, "main.js" });
+            try buildMainEntrypoint(ctx, config.root, .cottontail, main_source, main_output);
+        },
     }
 
     try buildViews(ctx, config.root, bundle.app_code_dir);
@@ -669,46 +680,7 @@ fn runBundledElectrobunApp(ctx: *const Context, config: CommandContext) !void {
 
 fn spawnBuiltApp(ctx: *const Context, config: CommandContext) !std.process.Child {
     return switch (getMainProcess(config.root)) {
-        .bun => blk: {
-            const bundle = try appBundlePaths(ctx, config);
-            const launcher_path = try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() });
-            if (!pathExists(ctx.io, launcher_path)) return error.BuiltMainNotFound;
-
-            break :blk try std.process.spawn(ctx.io, .{
-                .argv = &[_][]const u8{launcher_path},
-                .cwd = .{ .path = bundle.exec_dir },
-                .stdin = .inherit,
-                .stdout = .inherit,
-                .stderr = .inherit,
-                .create_no_window = true,
-            });
-        },
-        .cottontail => blk: {
-            const build_root = try buildOutputRoot(ctx, config);
-            const app_dir = try std.fs.path.join(ctx.allocator, &.{ build_root, "app" });
-            const main_script = try std.fs.path.join(ctx.allocator, &.{ app_dir, "main.js" });
-            if (!pathExists(ctx.io, main_script)) return error.BuiltMainNotFound;
-
-            var env_map = std.process.Environ.Map.init(ctx.allocator);
-            try inheritCurrentEnvironmentFromContext(ctx, &env_map);
-            try env_map.put("COTTONTAIL_ELECTROBUN_NAME", try getAppName(ctx, config.root));
-            try env_map.put("COTTONTAIL_ELECTROBUN_IDENTIFIER", try getAppIdentifier(ctx, config.root));
-            try env_map.put("COTTONTAIL_ELECTROBUN_CHANNEL", buildEnvironmentName(config.build_env));
-            if (try resolveElectrobunDist(ctx)) |dist_dir| {
-                try env_map.put("COTTONTAIL_ELECTROBUN_DIST", dist_dir);
-            }
-
-            break :blk try std.process.spawn(ctx.io, .{
-                .argv = &[_][]const u8{ ctx.self_exe_path, "electrobun", main_script },
-                .cwd = .{ .path = app_dir },
-                .environ_map = &env_map,
-                .stdin = .inherit,
-                .stdout = .inherit,
-                .stderr = .inherit,
-                .create_no_window = true,
-            });
-        },
-        .zig => blk: {
+        .bun, .cottontail, .zig => blk: {
             const bundle = try appBundlePaths(ctx, config);
             const launcher_path = try std.fs.path.join(ctx.allocator, &.{ bundle.exec_dir, launcherFileName() });
             if (!pathExists(ctx.io, launcher_path)) return error.BuiltMainNotFound;
@@ -1522,6 +1494,13 @@ fn bunBinaryFileName() []const u8 {
     };
 }
 
+fn cottontailBinaryFileName() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "cottontail.exe",
+        else => "cottontail",
+    };
+}
+
 fn resolveElectrobunPackageRoot(ctx: *const Context) !?[]const u8 {
     if (ctx.environ_map.get("COTTONTAIL_ELECTROBUN_PACKAGE")) |package_root| {
         if (pathExists(ctx.io, package_root)) return package_root;
@@ -1714,7 +1693,8 @@ fn writeInfoPlist(ctx: *const Context, config: CommandContext, bundle: AppBundle
 fn cefHelperBaseName(main_process: MainProcess) []const u8 {
     return switch (main_process) {
         .bun => "bun",
-        .cottontail, .zig => "main",
+        .cottontail => "cottontail",
+        .zig => "main",
     };
 }
 

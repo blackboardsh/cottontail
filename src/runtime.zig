@@ -9,7 +9,7 @@ pub const Runtime = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     handle: *c.CtQjsRuntime,
-    max_script_size: usize = 10 * 1024 * 1024,
+    max_script_size: usize = 64 * 1024 * 1024,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
         const handle = c.ct_qjs_runtime_create() orelse return error.RuntimeInitFailed;
