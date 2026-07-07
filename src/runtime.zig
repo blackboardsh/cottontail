@@ -89,6 +89,23 @@ pub const Runtime = struct {
         return 0;
     }
 
+    pub fn tick(self: *Runtime) !void {
+        var eval_error: [*c]u8 = null;
+        if (c.ct_qjs_runtime_tick(self.handle, &eval_error) != 0) {
+            defer if (eval_error != null) {
+                c.ct_qjs_string_free(eval_error);
+            };
+
+            if (eval_error != null) {
+                self.writeStderrLine(std.mem.span(eval_error));
+            } else {
+                self.writeStderrLine("Unknown JavaScript exception during Cottontail tick");
+            }
+
+            return error.TickFailed;
+        }
+    }
+
     fn writeLoadError(self: *Runtime, script_path: []const u8, err: anyerror) void {
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);

@@ -10,13 +10,21 @@
 #include <direct.h>
 #include <windows.h>
 #else
+#include <dlfcn.h>
+#include <ffi/ffi.h>
 #include <limits.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 extern char **environ;
 #endif
 
 #include "quickjs.h"
+
+#define CT_FFI_MAX_ARGS 64
+#define CT_JS_STACK_SIZE (8u * 1024u * 1024u)
+#define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
 
 #if defined(_WIN32)
 #define CT_PLATFORM_STRING "win32"
@@ -73,84 +81,55 @@ extern int ct_host_spawn_sync(
     CtHostSpawnResult *result_out,
     char **error_out
 );
-extern bool ct_electrobun_enabled(void);
-extern unsigned int ct_electrobun_create_window_host(
-    const char *title,
-    double x,
-    double y,
-    double width,
-    double height,
-    const char *title_bar_style,
-    bool transparent,
-    bool hidden,
-    bool activate,
-    double traffic_light_x,
-    double traffic_light_y,
-    bool quit_on_close,
-    char **error_out
-);
-extern unsigned int ct_electrobun_create_webview_host(
-    unsigned int window_id,
-    unsigned int host_webview_id,
-    const char *renderer,
-    const char *url,
-    double x,
-    double y,
-    double width,
-    double height,
-    bool auto_resize,
-    const char *partition,
-    const char *secret_key,
-    const char *preload,
-    const char *views_root,
-    bool sandbox,
-    bool start_transparent,
-    bool start_passthrough,
-    char **error_out
-);
-extern int ct_electrobun_close_window_host(unsigned int window_id, char **error_out);
-extern int ct_electrobun_set_window_always_on_top_host(unsigned int window_id, bool flag, char **error_out);
-extern bool ct_electrobun_send_host_message_host(unsigned int webview_id, const char *message, char **error_out);
-extern char *ct_electrobun_pop_host_message_host(unsigned int *out_webview_id, char **error_out);
-extern char *ct_electrobun_pop_event_host(char **error_out);
-extern int ct_electrobun_call_u32_host(const char *symbol_name, unsigned int value, char **error_out);
-extern int ct_electrobun_call_u32_bool_host(const char *symbol_name, unsigned int value, bool flag, char **error_out);
-extern bool ct_electrobun_call_u32_bool_ret_host(const char *symbol_name, unsigned int value, char **error_out);
-extern int ct_electrobun_call_u32_string_host(const char *symbol_name, unsigned int value, const char *text, char **error_out);
-extern bool ct_electrobun_call_u32_string_bool_ret_host(const char *symbol_name, unsigned int value, const char *text, char **error_out);
-extern int ct_electrobun_call_u32_string_bool_bool_host(const char *symbol_name, unsigned int value, const char *text, bool a, bool b, char **error_out);
-extern int ct_electrobun_call_u32_f64_f64_host(const char *symbol_name, unsigned int value, double x, double y, char **error_out);
-extern int ct_electrobun_call_u32_f64_host(const char *symbol_name, unsigned int value, double number, char **error_out);
-extern double ct_electrobun_call_u32_f64_ret_host(const char *symbol_name, unsigned int value, char **error_out);
-extern int ct_electrobun_call_u32_f64_f64_f64_f64_host(const char *symbol_name, unsigned int value, double x, double y, double width, double height, char **error_out);
-extern char *ct_electrobun_get_window_frame_host(unsigned int window_id, char **error_out);
-extern int ct_electrobun_resize_view_host(const char *symbol_name, unsigned int view_id, double x, double y, double width, double height, const char *masks_json, char **error_out);
-extern int ct_electrobun_call_bool_host(const char *symbol_name, bool flag, char **error_out);
-extern bool ct_electrobun_call_bool_ret_host(const char *symbol_name, char **error_out);
-extern int ct_electrobun_call_void_host(const char *symbol_name, char **error_out);
-extern int ct_electrobun_call_string_host(const char *symbol_name, const char *value, char **error_out);
-extern bool ct_electrobun_call_string_bool_ret_host(const char *symbol_name, const char *value, char **error_out);
-extern char *ct_electrobun_call_string_ret_host(const char *symbol_name, char **error_out);
-extern char *ct_electrobun_call_string_string_ret_host(const char *symbol_name, const char *a, const char *b, char **error_out);
-extern bool ct_electrobun_call_string_string_bool_ret_host(const char *symbol_name, const char *a, const char *b, char **error_out);
-extern bool ct_electrobun_call_string_string_string_bool_ret_host(const char *symbol_name, const char *a, const char *b, const char *c, char **error_out);
-extern int ct_electrobun_call_string_string_host(const char *symbol_name, const char *a, const char *b, char **error_out);
-extern int ct_electrobun_call_int_host(const char *symbol_name, int value, char **error_out);
-extern bool ct_electrobun_call_u32_ptr_exists_host(const char *symbol_name, unsigned int value, char **error_out);
-extern bool ct_electrobun_native_call_host(const char *library_name, const char *symbol_name, const char *return_type, size_t argc, const uint64_t *args, uint64_t *result_out, char **error_out);
-extern unsigned int ct_electrobun_create_wgpu_view_host(unsigned int window_id, double x, double y, double width, double height, bool start_transparent, bool start_passthrough, bool hidden, char **error_out);
-extern unsigned int ct_electrobun_create_tray_host(const char *title, const char *image, bool is_template, unsigned int width, unsigned int height, bool handler_enabled, char **error_out);
-extern bool ct_electrobun_show_tray_host(unsigned int tray_id, char **error_out);
-extern char *ct_electrobun_get_tray_bounds_host(unsigned int tray_id, char **error_out);
-extern int ct_electrobun_show_notification_host(const char *title, const char *body, const char *subtitle, bool silent, char **error_out);
-extern int ct_electrobun_set_menu_host(const char *symbol_name, const char *menu_json, bool handler_enabled, char **error_out);
-extern char *ct_electrobun_open_file_dialog_host(const char *starting_folder, const char *allowed_file_types, int can_choose_files, int can_choose_directories, int allows_multiple_selection, char **error_out);
-extern int ct_electrobun_show_message_box_host(const char *box_type, const char *title, const char *message, const char *detail, const char *buttons, int default_id, int cancel_id, char **error_out);
-extern int ct_electrobun_set_global_shortcut_callback_host(bool enabled, char **error_out);
-extern int ct_electrobun_set_url_open_handler_host(bool enabled, char **error_out);
-extern int ct_electrobun_set_app_reopen_handler_host(bool enabled, char **error_out);
-extern int ct_electrobun_set_quit_requested_handler_host(bool enabled, char **error_out);
-extern int ct_electrobun_quit_host(char **error_out);
+
+typedef enum {
+    CT_FFI_TYPE_VOID,
+    CT_FFI_TYPE_BOOL,
+    CT_FFI_TYPE_U8,
+    CT_FFI_TYPE_I8,
+    CT_FFI_TYPE_U16,
+    CT_FFI_TYPE_I16,
+    CT_FFI_TYPE_U32,
+    CT_FFI_TYPE_I32,
+    CT_FFI_TYPE_U64,
+    CT_FFI_TYPE_I64,
+    CT_FFI_TYPE_F32,
+    CT_FFI_TYPE_F64,
+    CT_FFI_TYPE_PTR,
+    CT_FFI_TYPE_CSTRING,
+    CT_FFI_TYPE_FUNCTION,
+} CtFfiType;
+
+typedef union {
+    uint8_t u8;
+    int8_t i8;
+    uint16_t u16;
+    int16_t i16;
+    uint32_t u32;
+    int32_t i32;
+    uint64_t u64;
+    int64_t i64;
+    float f32;
+    double f64;
+    void *ptr;
+} CtFfiValue;
+
+typedef struct CtFfiCallback CtFfiCallback;
+static int ct_get_array_buffer_bytes(JSContext *ctx, JSValueConst value, uint8_t **out_data, size_t *out_len);
+
+typedef struct CtFfiCallbackJob {
+    CtFfiCallback *callback;
+    size_t argc;
+    CtFfiValue args[CT_FFI_MAX_ARGS];
+    CtFfiValue result;
+    bool completed;
+    bool wait_for_result;
+    struct CtFfiCallbackJob *next;
+#if !defined(_WIN32)
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+#endif
+} CtFfiCallbackJob;
 
 struct CtQjsRuntime {
     JSRuntime *runtime;
@@ -158,6 +137,12 @@ struct CtQjsRuntime {
     JSValue host_object;
     int pending_unhandled_rejections;
     char *last_unhandled_rejection;
+#if !defined(_WIN32)
+    pthread_t owner_thread;
+    pthread_mutex_t callback_mutex;
+#endif
+    CtFfiCallbackJob *callback_jobs_head;
+    CtFfiCallbackJob *callback_jobs_tail;
 };
 
 static JSValue ct_throw_host_error(JSContext *ctx, char *error_message);
@@ -354,6 +339,11 @@ static char *ct_copy_js_string(JSContext *ctx, JSValueConst value) {
 }
 
 static int ct_js_value_to_native_u64(JSContext *ctx, JSValueConst value, uint64_t *out) {
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        *out = 0;
+        return 0;
+    }
+
     if (JS_IsArrayBuffer(value)) {
         size_t size = 0;
         uint8_t *data = JS_GetArrayBuffer(ctx, &size, value);
@@ -449,103 +439,10 @@ static int ct_js_value_to_native_u64(JSContext *ctx, JSValueConst value, uint64_
     return -1;
 }
 
-static JSValue ct_electrobun_memory_address(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint64_t address = 0;
-
-    (void) this_val;
-
-    if (argc < 1 || ct_js_value_to_native_u64(ctx, argv[0], &address) != 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.memoryAddress(value) requires an ArrayBuffer, typed array, number, or bigint");
-    }
-
-    return JS_NewFloat64(ctx, (double) address);
-}
-
 static void ct_external_array_buffer_noop(JSRuntime *rt, void *opaque, void *ptr) {
     (void) rt;
     (void) opaque;
     (void) ptr;
-}
-
-static JSValue ct_electrobun_memory_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint64_t address = 0;
-    uint64_t offset = 0;
-    uint64_t length = 0;
-
-    (void) this_val;
-
-    if (argc < 3 ||
-        ct_js_value_to_native_u64(ctx, argv[0], &address) != 0 ||
-        ct_js_value_to_native_u64(ctx, argv[1], &offset) != 0 ||
-        ct_js_value_to_native_u64(ctx, argv[2], &length) != 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.memoryView(ptr, offset, length) requires pointer, offset, and length");
-    }
-
-    if (address == 0 || length == 0) {
-        return JS_NewArrayBufferCopy(ctx, NULL, 0);
-    }
-
-    return JS_NewArrayBuffer(
-        ctx,
-        (uint8_t *) (uintptr_t) (address + offset),
-        (size_t) length,
-        ct_external_array_buffer_noop,
-        NULL,
-        false
-    );
-}
-
-static JSValue ct_electrobun_native_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    const char *library_name = NULL;
-    const char *symbol_name = NULL;
-    const char *return_type = NULL;
-    char *error_message = NULL;
-    uint64_t args[8] = {0};
-    uint64_t result = 0;
-    int native_argc = argc - 3;
-    bool ok = false;
-
-    (void) this_val;
-
-    if (argc < 3 || native_argc > 8) {
-        return JS_ThrowTypeError(ctx, "electrobun.nativeCall(library, symbol, returnType, ...args) supports up to 8 native args");
-    }
-
-    library_name = JS_ToCString(ctx, argv[0]);
-    symbol_name = JS_ToCString(ctx, argv[1]);
-    return_type = JS_ToCString(ctx, argv[2]);
-    if (library_name == NULL || symbol_name == NULL || return_type == NULL) {
-        JS_FreeCString(ctx, library_name);
-        JS_FreeCString(ctx, symbol_name);
-        JS_FreeCString(ctx, return_type);
-        return JS_EXCEPTION;
-    }
-
-    for (int index = 0; index < native_argc; index += 1) {
-        if (ct_js_value_to_native_u64(ctx, argv[index + 3], &args[index]) != 0) {
-            JS_FreeCString(ctx, library_name);
-            JS_FreeCString(ctx, symbol_name);
-            JS_FreeCString(ctx, return_type);
-            return JS_ThrowTypeError(ctx, "native call args must be ArrayBuffers, typed arrays, numbers, or bigints");
-        }
-    }
-
-    ok = ct_electrobun_native_call_host(library_name, symbol_name, return_type, (size_t) native_argc, args, &result, &error_message);
-    JS_FreeCString(ctx, library_name);
-    JS_FreeCString(ctx, symbol_name);
-    JS_FreeCString(ctx, return_type);
-
-    if (!ok) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    if (strcmp(return_type, "void") == 0) {
-        return JS_UNDEFINED;
-    }
-    if (strcmp(return_type, "u64") == 0) {
-        return JS_NewBigUint64(ctx, result);
-    }
-    return JS_NewFloat64(ctx, (double) result);
 }
 
 static void ct_free_string_array(char **values, size_t count) {
@@ -1022,10 +919,42 @@ static JSValue ct_read_file(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return result;
 }
 
+static JSValue ct_read_file_buffer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *path = NULL;
+    char *buffer = NULL;
+    size_t buffer_len = 0;
+    JSValue result;
+
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.readFileBuffer(path) requires a path");
+    }
+
+    path = JS_ToCString(ctx, argv[0]);
+    if (path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    if (ct_read_file_bytes(path, &buffer, &buffer_len) != 0) {
+        JSValue exception = JS_ThrowReferenceError(ctx, "failed to read file '%s'", path);
+        JS_FreeCString(ctx, path);
+        return exception;
+    }
+
+    result = JS_NewArrayBufferCopy(ctx, (const uint8_t *) buffer, buffer_len);
+    free(buffer);
+    JS_FreeCString(ctx, path);
+    return result;
+}
+
 static JSValue ct_write_file(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     const char *path = NULL;
     const char *data = NULL;
     size_t data_len = 0;
+    uint8_t *buffer_data = NULL;
+    size_t buffer_len = 0;
+    int data_is_buffer = 0;
 
     (void) this_val;
 
@@ -1038,20 +967,30 @@ static JSValue ct_write_file(JSContext *ctx, JSValueConst this_val, int argc, JS
         return JS_EXCEPTION;
     }
 
-    data = JS_ToCStringLen(ctx, &data_len, argv[1]);
-    if (data == NULL) {
-        JS_FreeCString(ctx, path);
-        return JS_EXCEPTION;
+    if (ct_get_array_buffer_bytes(ctx, argv[1], &buffer_data, &buffer_len) == 0) {
+        data_is_buffer = 1;
+        data = (const char *) buffer_data;
+        data_len = buffer_len;
+    } else {
+        data = JS_ToCStringLen(ctx, &data_len, argv[1]);
+        if (data == NULL) {
+            JS_FreeCString(ctx, path);
+            return JS_EXCEPTION;
+        }
     }
 
     if (ct_write_file_bytes(path, data, data_len) != 0) {
         JSValue exception = JS_ThrowReferenceError(ctx, "failed to write file '%s'", path);
-        JS_FreeCString(ctx, data);
+        if (!data_is_buffer) {
+            JS_FreeCString(ctx, data);
+        }
         JS_FreeCString(ctx, path);
         return exception;
     }
 
-    JS_FreeCString(ctx, data);
+    if (!data_is_buffer) {
+        JS_FreeCString(ctx, data);
+    }
     JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
@@ -1450,1071 +1389,6 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     return response;
 }
 
-static JSValue ct_return_owned_cstring(JSContext *ctx, char *value) {
-    JSValue result;
-
-    if (value == NULL) {
-        return JS_NULL;
-    }
-
-    result = JS_NewString(ctx, value);
-    ct_host_string_free(value);
-    return result;
-}
-
-static JSValue ct_status_to_js(JSContext *ctx, int status, char *error_message) {
-    if (status != 0 || error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return JS_UNDEFINED;
-}
-
-static JSValue ct_electrobun_create_window(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *title_copy = NULL;
-    char *title_bar_style_copy = NULL;
-    const char *title = "Cottontail";
-    const char *title_bar_style = "default";
-    double x = 100;
-    double y = 100;
-    double width = 960;
-    double height = 640;
-    double traffic_light_x = 0;
-    double traffic_light_y = 0;
-    bool transparent = false;
-    bool hidden = false;
-    bool activate = true;
-    bool quit_on_close = true;
-    char *error_message = NULL;
-    unsigned int window_id = 0;
-
-    (void) this_val;
-
-    if (argc >= 1) {
-        JSValue title_value = JS_UNDEFINED;
-
-        if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0]) && !JS_IsObject(argv[0])) {
-            return JS_ThrowTypeError(ctx, "electrobun.createWindow(options) expects an options object");
-        }
-
-        title_value = JS_GetPropertyStr(ctx, argv[0], "title");
-        if (JS_IsException(title_value)) {
-            return JS_EXCEPTION;
-        }
-
-        if (!JS_IsUndefined(title_value) && !JS_IsNull(title_value)) {
-            title_copy = ct_copy_js_string(ctx, title_value);
-            if (title_copy == NULL) {
-                JS_FreeValue(ctx, title_value);
-                return JS_EXCEPTION;
-            }
-            title = title_copy;
-        }
-        JS_FreeValue(ctx, title_value);
-
-        if (ct_get_optional_string_property(ctx, argv[0], "titleBarStyle", &title_bar_style_copy) != 0) {
-            free(title_copy);
-            return JS_EXCEPTION;
-        }
-        if (title_bar_style_copy != NULL) {
-            title_bar_style = title_bar_style_copy;
-        }
-
-        if (ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
-            ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
-            ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
-            ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
-            ct_get_optional_float64_property(ctx, argv[0], "trafficLightX", &traffic_light_x) != 0 ||
-            ct_get_optional_float64_property(ctx, argv[0], "trafficLightY", &traffic_light_y) != 0 ||
-            ct_get_optional_bool_property(ctx, argv[0], "transparent", &transparent) != 0 ||
-            ct_get_optional_bool_property(ctx, argv[0], "hidden", &hidden) != 0 ||
-            ct_get_optional_bool_property(ctx, argv[0], "activate", &activate) != 0 ||
-            ct_get_optional_bool_property(ctx, argv[0], "quitOnClose", &quit_on_close) != 0) {
-            free(title_copy);
-            free(title_bar_style_copy);
-            return JS_EXCEPTION;
-        }
-    }
-
-    window_id = ct_electrobun_create_window_host(
-        title,
-        x,
-        y,
-        width,
-        height,
-        title_bar_style,
-        transparent,
-        hidden,
-        activate,
-        traffic_light_x,
-        traffic_light_y,
-        quit_on_close,
-        &error_message
-    );
-    free(title_copy);
-    free(title_bar_style_copy);
-
-    if (window_id == 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_NewUint32(ctx, window_id);
-}
-
-static JSValue ct_electrobun_create_webview(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t window_id = 0;
-    uint32_t host_webview_id = 0;
-    double x = 0;
-    double y = 0;
-    double width = 800;
-    double height = 600;
-    bool auto_resize = true;
-    bool sandbox = false;
-    bool start_transparent = false;
-    bool start_passthrough = false;
-    char *renderer = ct_duplicate_string("native");
-    char *url = ct_duplicate_string("");
-    char *partition = ct_duplicate_string("persist:default");
-    char *secret_key = ct_duplicate_string("");
-    char *preload = ct_duplicate_string("");
-    char *views_root = ct_duplicate_string("");
-    char *error_message = NULL;
-    unsigned int webview_id = 0;
-
-    (void) this_val;
-
-    if (renderer == NULL || url == NULL || partition == NULL || secret_key == NULL || preload == NULL || views_root == NULL) {
-        free(renderer);
-        free(url);
-        free(partition);
-        free(secret_key);
-        free(preload);
-        free(views_root);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        free(renderer);
-        free(url);
-        free(partition);
-        free(secret_key);
-        free(preload);
-        free(views_root);
-        return JS_ThrowTypeError(ctx, "electrobun.createWebview(options) expects an options object");
-    }
-
-    if (ct_get_optional_uint32_property(ctx, argv[0], "windowId", &window_id) != 0 ||
-        ct_get_optional_uint32_property(ctx, argv[0], "hostWebviewId", &host_webview_id) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "renderer", &renderer) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "url", &url) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "autoResize", &auto_resize) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "partition", &partition) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "secretKey", &secret_key) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "preload", &preload) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "viewsRoot", &views_root) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "sandbox", &sandbox) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "startTransparent", &start_transparent) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "startPassthrough", &start_passthrough) != 0) {
-        free(renderer);
-        free(url);
-        free(partition);
-        free(secret_key);
-        free(preload);
-        free(views_root);
-        return JS_EXCEPTION;
-    }
-
-    if (window_id == 0) {
-        free(renderer);
-        free(url);
-        free(partition);
-        free(secret_key);
-        free(preload);
-        free(views_root);
-        return JS_ThrowTypeError(ctx, "electrobun.createWebview(options) requires windowId");
-    }
-
-    webview_id = ct_electrobun_create_webview_host(
-        window_id,
-        host_webview_id,
-        renderer,
-        url,
-        x,
-        y,
-        width,
-        height,
-        auto_resize,
-        partition,
-        secret_key,
-        preload,
-        views_root,
-        sandbox,
-        start_transparent,
-        start_passthrough,
-        &error_message
-    );
-
-    free(renderer);
-    free(url);
-    free(partition);
-    free(secret_key);
-    free(preload);
-    free(views_root);
-
-    if (webview_id == 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_NewUint32(ctx, webview_id);
-}
-
-static JSValue ct_electrobun_close_window(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t window_id = 0;
-    char *error_message = NULL;
-
-    (void) this_val;
-
-    if (argc < 1 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.closeWindow(windowId) requires a window id");
-    }
-
-    if (ct_electrobun_close_window_host(window_id, &error_message) != 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_UNDEFINED;
-}
-
-static JSValue ct_electrobun_set_window_always_on_top(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t window_id = 0;
-    int flag = 0;
-    char *error_message = NULL;
-
-    (void) this_val;
-
-    if (argc < 2 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.setWindowAlwaysOnTop(windowId, flag) requires a window id and flag");
-    }
-
-    flag = JS_ToBool(ctx, argv[1]);
-    if (flag < 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (ct_electrobun_set_window_always_on_top_host(window_id, flag != 0, &error_message) != 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_UNDEFINED;
-}
-
-static JSValue ct_electrobun_send_host_message(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t webview_id = 0;
-    char *message = NULL;
-    char *error_message = NULL;
-    bool ok = false;
-
-    (void) this_val;
-
-    if (argc < 2 || JS_ToUint32(ctx, &webview_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.sendHostMessageToWebview(webviewId, message) requires a webview id and message");
-    }
-
-    message = ct_copy_js_string(ctx, argv[1]);
-    if (message == NULL) {
-        return JS_EXCEPTION;
-    }
-
-    ok = ct_electrobun_send_host_message_host(webview_id, message, &error_message);
-    free(message);
-
-    if (!ok) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_TRUE;
-}
-
-static JSValue ct_electrobun_pop_host_message(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    unsigned int webview_id = 0;
-    char *message = NULL;
-    char *error_message = NULL;
-    JSValue result = JS_UNDEFINED;
-
-    (void) this_val;
-    (void) argc;
-    (void) argv;
-
-    message = ct_electrobun_pop_host_message_host(&webview_id, &error_message);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    if (message == NULL) {
-        return JS_NULL;
-    }
-
-    result = JS_NewObject(ctx);
-    if (JS_IsException(result)) {
-        ct_host_string_free(message);
-        return result;
-    }
-
-    if (JS_SetPropertyStr(ctx, result, "webviewId", JS_NewUint32(ctx, webview_id)) < 0 ||
-        JS_SetPropertyStr(ctx, result, "message", JS_NewString(ctx, message)) < 0) {
-        ct_host_string_free(message);
-        JS_FreeValue(ctx, result);
-        return JS_EXCEPTION;
-    }
-
-    ct_host_string_free(message);
-    return result;
-}
-
-static JSValue ct_electrobun_quit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *error_message = NULL;
-
-    (void) this_val;
-    (void) argc;
-    (void) argv;
-
-    if (ct_electrobun_quit_host(&error_message) != 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_UNDEFINED;
-}
-
-static JSValue ct_electrobun_core_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *signature = NULL;
-    char *symbol = NULL;
-    char *error_message = NULL;
-    JSValue result = JS_UNDEFINED;
-
-    (void) this_val;
-
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "electrobun.coreCall(signature, symbol, ...args) requires a signature and symbol");
-    }
-
-    signature = ct_copy_js_string(ctx, argv[0]);
-    symbol = ct_copy_js_string(ctx, argv[1]);
-    if (signature == NULL || symbol == NULL) {
-        result = JS_EXCEPTION;
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32") == 0) {
-        uint32_t value = 0;
-        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32 requires one uint32 argument");
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_host(symbol, value, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_bool") == 0) {
-        uint32_t value = 0;
-        int flag = 0;
-        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_bool requires uint32 and bool arguments");
-            goto cleanup;
-        }
-        flag = JS_ToBool(ctx, argv[3]);
-        if (flag < 0) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_bool_host(symbol, value, flag != 0, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_bool_ret") == 0) {
-        uint32_t value = 0;
-        bool ok = false;
-        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_bool_ret requires one uint32 argument");
-            goto cleanup;
-        }
-        ok = ct_electrobun_call_u32_bool_ret_host(symbol, value, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_string") == 0) {
-        uint32_t value = 0;
-        char *text = NULL;
-        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_string requires uint32 and string arguments");
-            goto cleanup;
-        }
-        text = ct_copy_js_string(ctx, argv[3]);
-        if (text == NULL) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_string_host(symbol, value, text, &error_message), error_message);
-        free(text);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_string_bool_ret") == 0) {
-        uint32_t value = 0;
-        char *text = NULL;
-        bool ok = false;
-        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_string_bool_ret requires uint32 and string arguments");
-            goto cleanup;
-        }
-        text = ct_copy_js_string(ctx, argv[3]);
-        if (text == NULL) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        ok = ct_electrobun_call_u32_string_bool_ret_host(symbol, value, text, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        free(text);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_string_bool_bool") == 0) {
-        uint32_t value = 0;
-        char *text = NULL;
-        int a = 0;
-        int b = 0;
-        if (argc < 6 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_string_bool_bool requires uint32, string, bool, bool arguments");
-            goto cleanup;
-        }
-        text = ct_copy_js_string(ctx, argv[3]);
-        a = JS_ToBool(ctx, argv[4]);
-        b = JS_ToBool(ctx, argv[5]);
-        if (text == NULL || a < 0 || b < 0) {
-            free(text);
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_string_bool_bool_host(symbol, value, text, a != 0, b != 0, &error_message), error_message);
-        free(text);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_f64_f64") == 0) {
-        uint32_t value = 0;
-        double x = 0;
-        double y = 0;
-        if (argc < 5 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &x, argv[3]) < 0 || JS_ToFloat64(ctx, &y, argv[4]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_f64 requires uint32, number, number arguments");
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_f64_host(symbol, value, x, y, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_f64") == 0) {
-        uint32_t value = 0;
-        double number = 0;
-        if (argc < 4 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &number, argv[3]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_f64 requires uint32 and number arguments");
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_host(symbol, value, number, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_f64_ret") == 0) {
-        uint32_t value = 0;
-        double number = 0;
-        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_ret requires one uint32 argument");
-            goto cleanup;
-        }
-        number = ct_electrobun_call_u32_f64_ret_host(symbol, value, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewFloat64(ctx, number);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_f64_f64_f64_f64") == 0) {
-        uint32_t value = 0;
-        double x = 0;
-        double y = 0;
-        double width = 0;
-        double height = 0;
-        if (argc < 7 || JS_ToUint32(ctx, &value, argv[2]) < 0 || JS_ToFloat64(ctx, &x, argv[3]) < 0 || JS_ToFloat64(ctx, &y, argv[4]) < 0 || JS_ToFloat64(ctx, &width, argv[5]) < 0 || JS_ToFloat64(ctx, &height, argv[6]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_f64_f64_f64_f64 requires uint32 and four number arguments");
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_u32_f64_f64_f64_f64_host(symbol, value, x, y, width, height, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "bool") == 0) {
-        int flag = 0;
-        if (argc < 3) {
-            result = JS_ThrowTypeError(ctx, "coreCall bool requires one bool argument");
-            goto cleanup;
-        }
-        flag = JS_ToBool(ctx, argv[2]);
-        if (flag < 0) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_bool_host(symbol, flag != 0, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "bool_ret") == 0) {
-        bool ok = ct_electrobun_call_bool_ret_host(symbol, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "void") == 0) {
-        result = ct_status_to_js(ctx, ct_electrobun_call_void_host(symbol, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "string") == 0) {
-        char *value = NULL;
-        if (argc < 3) {
-            result = JS_ThrowTypeError(ctx, "coreCall string requires one string argument");
-            goto cleanup;
-        }
-        value = ct_copy_js_string(ctx, argv[2]);
-        if (value == NULL) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_string_host(symbol, value, &error_message), error_message);
-        free(value);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "string_bool_ret") == 0) {
-        char *value = NULL;
-        bool ok = false;
-        if (argc < 3) {
-            result = JS_ThrowTypeError(ctx, "coreCall string_bool_ret requires one string argument");
-            goto cleanup;
-        }
-        value = ct_copy_js_string(ctx, argv[2]);
-        if (value == NULL) {
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        ok = ct_electrobun_call_string_bool_ret_host(symbol, value, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        free(value);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "string_ret") == 0) {
-        char *value = ct_electrobun_call_string_ret_host(symbol, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : ct_return_owned_cstring(ctx, value);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "string_string_ret") == 0 || strcmp(signature, "string_string_bool_ret") == 0 || strcmp(signature, "string_string") == 0) {
-        char *a = NULL;
-        char *b = NULL;
-        if (argc < 4) {
-            result = JS_ThrowTypeError(ctx, "coreCall string_string* requires two string arguments");
-            goto cleanup;
-        }
-        a = ct_copy_js_string(ctx, argv[2]);
-        b = ct_copy_js_string(ctx, argv[3]);
-        if (a == NULL || b == NULL) {
-            free(a);
-            free(b);
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        if (strcmp(signature, "string_string_ret") == 0) {
-            char *value = ct_electrobun_call_string_string_ret_host(symbol, a, b, &error_message);
-            result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : ct_return_owned_cstring(ctx, value);
-        } else if (strcmp(signature, "string_string_bool_ret") == 0) {
-            bool ok = ct_electrobun_call_string_string_bool_ret_host(symbol, a, b, &error_message);
-            result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        } else {
-            result = ct_status_to_js(ctx, ct_electrobun_call_string_string_host(symbol, a, b, &error_message), error_message);
-        }
-        free(a);
-        free(b);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "string_string_string_bool_ret") == 0) {
-        char *a = NULL;
-        char *b = NULL;
-        char *c = NULL;
-        bool ok = false;
-        if (argc < 5) {
-            result = JS_ThrowTypeError(ctx, "coreCall string_string_string_bool_ret requires three string arguments");
-            goto cleanup;
-        }
-        a = ct_copy_js_string(ctx, argv[2]);
-        b = ct_copy_js_string(ctx, argv[3]);
-        c = ct_copy_js_string(ctx, argv[4]);
-        if (a == NULL || b == NULL || c == NULL) {
-            free(a);
-            free(b);
-            free(c);
-            result = JS_EXCEPTION;
-            goto cleanup;
-        }
-        ok = ct_electrobun_call_string_string_string_bool_ret_host(symbol, a, b, c, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        free(a);
-        free(b);
-        free(c);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "int") == 0) {
-        int32_t value = 0;
-        if (argc < 3 || JS_ToInt32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall int requires one int argument");
-            goto cleanup;
-        }
-        result = ct_status_to_js(ctx, ct_electrobun_call_int_host(symbol, value, &error_message), error_message);
-        goto cleanup;
-    }
-
-    if (strcmp(signature, "u32_ptr_exists") == 0) {
-        uint32_t value = 0;
-        bool ok = false;
-        if (argc < 3 || JS_ToUint32(ctx, &value, argv[2]) < 0) {
-            result = JS_ThrowTypeError(ctx, "coreCall u32_ptr_exists requires one uint32 argument");
-            goto cleanup;
-        }
-        ok = ct_electrobun_call_u32_ptr_exists_host(symbol, value, &error_message);
-        result = error_message != NULL ? ct_throw_host_error(ctx, error_message) : JS_NewBool(ctx, ok);
-        goto cleanup;
-    }
-
-    result = JS_ThrowTypeError(ctx, "unsupported electrobun.coreCall signature: %s", signature);
-
-cleanup:
-    free(signature);
-    free(symbol);
-    return result;
-}
-
-static JSValue ct_electrobun_get_window_frame(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t window_id = 0;
-    char *error_message = NULL;
-    char *frame_json = NULL;
-
-    (void) this_val;
-
-    if (argc < 1 || JS_ToUint32(ctx, &window_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.getWindowFrame(windowId) requires a window id");
-    }
-
-    frame_json = ct_electrobun_get_window_frame_host(window_id, &error_message);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return ct_return_owned_cstring(ctx, frame_json);
-}
-
-static JSValue ct_electrobun_resize_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *symbol = NULL;
-    char *masks_json = NULL;
-    uint32_t view_id = 0;
-    double x = 0;
-    double y = 0;
-    double width = 0;
-    double height = 0;
-    char *error_message = NULL;
-    JSValue result = JS_UNDEFINED;
-
-    (void) this_val;
-
-    if (argc < 7) {
-        return JS_ThrowTypeError(ctx, "electrobun.resizeView(symbol, id, x, y, width, height, masksJSON) requires seven arguments");
-    }
-
-    symbol = ct_copy_js_string(ctx, argv[0]);
-    masks_json = ct_copy_js_string(ctx, argv[6]);
-    if (symbol == NULL || masks_json == NULL ||
-        JS_ToUint32(ctx, &view_id, argv[1]) < 0 ||
-        JS_ToFloat64(ctx, &x, argv[2]) < 0 ||
-        JS_ToFloat64(ctx, &y, argv[3]) < 0 ||
-        JS_ToFloat64(ctx, &width, argv[4]) < 0 ||
-        JS_ToFloat64(ctx, &height, argv[5]) < 0) {
-        free(symbol);
-        free(masks_json);
-        return JS_EXCEPTION;
-    }
-
-    result = ct_status_to_js(ctx, ct_electrobun_resize_view_host(symbol, view_id, x, y, width, height, masks_json, &error_message), error_message);
-    free(symbol);
-    free(masks_json);
-    return result;
-}
-
-static JSValue ct_electrobun_create_wgpu_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t window_id = 0;
-    double x = 0;
-    double y = 0;
-    double width = 320;
-    double height = 240;
-    bool start_transparent = false;
-    bool start_passthrough = false;
-    bool hidden = false;
-    char *error_message = NULL;
-    unsigned int view_id = 0;
-
-    (void) this_val;
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        return JS_ThrowTypeError(ctx, "electrobun.createWGPUView(options) expects an options object");
-    }
-
-    if (ct_get_optional_uint32_property(ctx, argv[0], "windowId", &window_id) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "x", &x) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "y", &y) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "width", &width) != 0 ||
-        ct_get_optional_float64_property(ctx, argv[0], "height", &height) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "startTransparent", &start_transparent) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "startPassthrough", &start_passthrough) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "hidden", &hidden) != 0) {
-        return JS_EXCEPTION;
-    }
-
-    if (window_id == 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.createWGPUView(options) requires windowId");
-    }
-
-    view_id = ct_electrobun_create_wgpu_view_host(window_id, x, y, width, height, start_transparent, start_passthrough, hidden, &error_message);
-    if (view_id == 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_NewUint32(ctx, view_id);
-}
-
-static JSValue ct_electrobun_create_tray(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *title = ct_duplicate_string("");
-    char *image = ct_duplicate_string("");
-    bool is_template = false;
-    bool handler_enabled = false;
-    uint32_t width = 18;
-    uint32_t height = 18;
-    char *error_message = NULL;
-    unsigned int tray_id = 0;
-
-    (void) this_val;
-
-    if (title == NULL || image == NULL) {
-        free(title);
-        free(image);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        free(title);
-        free(image);
-        return JS_ThrowTypeError(ctx, "electrobun.createTray(options) expects an options object");
-    }
-
-    if (ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "image", &image) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "isTemplate", &is_template) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "handler", &handler_enabled) != 0 ||
-        ct_get_optional_uint32_property(ctx, argv[0], "width", &width) != 0 ||
-        ct_get_optional_uint32_property(ctx, argv[0], "height", &height) != 0) {
-        free(title);
-        free(image);
-        return JS_EXCEPTION;
-    }
-
-    tray_id = ct_electrobun_create_tray_host(title, image, is_template, width, height, handler_enabled, &error_message);
-    free(title);
-    free(image);
-    if (tray_id == 0) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-
-    return JS_NewUint32(ctx, tray_id);
-}
-
-static JSValue ct_electrobun_show_tray(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t tray_id = 0;
-    char *error_message = NULL;
-    bool ok = false;
-
-    (void) this_val;
-
-    if (argc < 1 || JS_ToUint32(ctx, &tray_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.showTray(trayId) requires a tray id");
-    }
-
-    ok = ct_electrobun_show_tray_host(tray_id, &error_message);
-    if (!ok || error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return JS_TRUE;
-}
-
-static JSValue ct_electrobun_get_tray_bounds(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    uint32_t tray_id = 0;
-    char *error_message = NULL;
-    char *bounds_json = NULL;
-
-    (void) this_val;
-
-    if (argc < 1 || JS_ToUint32(ctx, &tray_id, argv[0]) < 0) {
-        return JS_ThrowTypeError(ctx, "electrobun.getTrayBounds(trayId) requires a tray id");
-    }
-
-    bounds_json = ct_electrobun_get_tray_bounds_host(tray_id, &error_message);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return ct_return_owned_cstring(ctx, bounds_json);
-}
-
-static JSValue ct_electrobun_show_notification(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *title = ct_duplicate_string("");
-    char *body = ct_duplicate_string("");
-    char *subtitle = ct_duplicate_string("");
-    bool silent = false;
-    char *error_message = NULL;
-    JSValue result = JS_UNDEFINED;
-
-    (void) this_val;
-
-    if (title == NULL || body == NULL || subtitle == NULL) {
-        free(title);
-        free(body);
-        free(subtitle);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        free(title);
-        free(body);
-        free(subtitle);
-        return JS_ThrowTypeError(ctx, "electrobun.showNotification(options) expects an options object");
-    }
-
-    if (ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "body", &body) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "subtitle", &subtitle) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "silent", &silent) != 0) {
-        free(title);
-        free(body);
-        free(subtitle);
-        return JS_EXCEPTION;
-    }
-
-    result = ct_status_to_js(ctx, ct_electrobun_show_notification_host(title, body, subtitle, silent, &error_message), error_message);
-    free(title);
-    free(body);
-    free(subtitle);
-    return result;
-}
-
-static JSValue ct_electrobun_set_menu(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *symbol = NULL;
-    char *menu_json = NULL;
-    int handler = 0;
-    char *error_message = NULL;
-    JSValue result = JS_UNDEFINED;
-
-    (void) this_val;
-
-    if (argc < 3) {
-        return JS_ThrowTypeError(ctx, "electrobun.setMenu(symbol, menuJSON, handler) requires three arguments");
-    }
-
-    symbol = ct_copy_js_string(ctx, argv[0]);
-    menu_json = ct_copy_js_string(ctx, argv[1]);
-    handler = JS_ToBool(ctx, argv[2]);
-    if (symbol == NULL || menu_json == NULL || handler < 0) {
-        free(symbol);
-        free(menu_json);
-        return JS_EXCEPTION;
-    }
-
-    result = ct_status_to_js(ctx, ct_electrobun_set_menu_host(symbol, menu_json, handler != 0, &error_message), error_message);
-    free(symbol);
-    free(menu_json);
-    return result;
-}
-
-static JSValue ct_electrobun_open_file_dialog(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *starting_folder = ct_duplicate_string("");
-    char *allowed_file_types = ct_duplicate_string("");
-    bool can_choose_files = true;
-    bool can_choose_directories = false;
-    bool allows_multiple_selection = false;
-    char *error_message = NULL;
-    char *value = NULL;
-
-    (void) this_val;
-
-    if (starting_folder == NULL || allowed_file_types == NULL) {
-        free(starting_folder);
-        free(allowed_file_types);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        free(starting_folder);
-        free(allowed_file_types);
-        return JS_ThrowTypeError(ctx, "electrobun.openFileDialog(options) expects an options object");
-    }
-
-    if (ct_get_optional_string_property(ctx, argv[0], "startingFolder", &starting_folder) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "allowedFileTypes", &allowed_file_types) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "canChooseFiles", &can_choose_files) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "canChooseDirectory", &can_choose_directories) != 0 ||
-        ct_get_optional_bool_property(ctx, argv[0], "allowsMultipleSelection", &allows_multiple_selection) != 0) {
-        free(starting_folder);
-        free(allowed_file_types);
-        return JS_EXCEPTION;
-    }
-
-    value = ct_electrobun_open_file_dialog_host(
-        starting_folder,
-        allowed_file_types,
-        can_choose_files ? 1 : 0,
-        can_choose_directories ? 1 : 0,
-        allows_multiple_selection ? 1 : 0,
-        &error_message
-    );
-    free(starting_folder);
-    free(allowed_file_types);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return ct_return_owned_cstring(ctx, value);
-}
-
-static JSValue ct_electrobun_show_message_box(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *box_type = ct_duplicate_string("info");
-    char *title = ct_duplicate_string("");
-    char *message = ct_duplicate_string("");
-    char *detail = ct_duplicate_string("");
-    char *buttons = ct_duplicate_string("OK");
-    int32_t default_id = 0;
-    int32_t cancel_id = -1;
-    char *error_message = NULL;
-    int response = 0;
-
-    (void) this_val;
-
-    if (box_type == NULL || title == NULL || message == NULL || detail == NULL || buttons == NULL) {
-        free(box_type);
-        free(title);
-        free(message);
-        free(detail);
-        free(buttons);
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0]) || !JS_IsObject(argv[0])) {
-        free(box_type);
-        free(title);
-        free(message);
-        free(detail);
-        free(buttons);
-        return JS_ThrowTypeError(ctx, "electrobun.showMessageBox(options) expects an options object");
-    }
-
-    if (ct_get_optional_string_property(ctx, argv[0], "boxType", &box_type) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "title", &title) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "message", &message) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "detail", &detail) != 0 ||
-        ct_get_optional_string_property(ctx, argv[0], "buttons", &buttons) != 0) {
-        free(box_type);
-        free(title);
-        free(message);
-        free(detail);
-        free(buttons);
-        return JS_EXCEPTION;
-    }
-
-    if (ct_get_optional_uint32_property(ctx, argv[0], "defaultID", (uint32_t *) &default_id) != 0 ||
-        ct_get_optional_uint32_property(ctx, argv[0], "cancelID", (uint32_t *) &cancel_id) != 0) {
-        free(box_type);
-        free(title);
-        free(message);
-        free(detail);
-        free(buttons);
-        return JS_EXCEPTION;
-    }
-
-    response = ct_electrobun_show_message_box_host(box_type, title, message, detail, buttons, default_id, cancel_id, &error_message);
-    free(box_type);
-    free(title);
-    free(message);
-    free(detail);
-    free(buttons);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return JS_NewInt32(ctx, response);
-}
-
-static JSValue ct_electrobun_set_native_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *name = NULL;
-    int enabled = 0;
-    char *error_message = NULL;
-    int status = -1;
-
-    (void) this_val;
-
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "electrobun.setNativeCallback(name, enabled) requires a name and enabled flag");
-    }
-
-    name = ct_copy_js_string(ctx, argv[0]);
-    enabled = JS_ToBool(ctx, argv[1]);
-    if (name == NULL || enabled < 0) {
-        free(name);
-        return JS_EXCEPTION;
-    }
-
-    if (strcmp(name, "globalShortcut") == 0) {
-        status = ct_electrobun_set_global_shortcut_callback_host(enabled != 0, &error_message);
-    } else if (strcmp(name, "urlOpen") == 0) {
-        status = ct_electrobun_set_url_open_handler_host(enabled != 0, &error_message);
-    } else if (strcmp(name, "appReopen") == 0) {
-        status = ct_electrobun_set_app_reopen_handler_host(enabled != 0, &error_message);
-    } else if (strcmp(name, "quitRequested") == 0) {
-        status = ct_electrobun_set_quit_requested_handler_host(enabled != 0, &error_message);
-    } else {
-        JSValue exception = JS_ThrowTypeError(ctx, "unknown native callback: %s", name);
-        free(name);
-        return exception;
-    }
-
-    free(name);
-    return ct_status_to_js(ctx, status, error_message);
-}
-
-static JSValue ct_electrobun_pop_event(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    char *error_message = NULL;
-    char *event_json = NULL;
-
-    (void) this_val;
-    (void) argc;
-    (void) argv;
-
-    event_json = ct_electrobun_pop_event_host(&error_message);
-    if (error_message != NULL) {
-        return ct_throw_host_error(ctx, error_message);
-    }
-    return ct_return_owned_cstring(ctx, event_json);
-}
-
 static JSValue ct_exit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int32_t code = 0;
 
@@ -2542,6 +1416,989 @@ static JSValue ct_arch(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
 
     return JS_NewString(ctx, CT_ARCH_STRING);
 }
+
+#if !defined(_WIN32)
+
+struct CtFfiCallback {
+    CtQjsRuntime *runtime;
+    JSContext *ctx;
+    JSValue function;
+    CtFfiType returns;
+    CtFfiType arg_types[CT_FFI_MAX_ARGS];
+    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
+    size_t argc;
+    bool threadsafe;
+    pthread_t owner_thread;
+    ffi_cif cif;
+    ffi_closure *closure;
+    void *code;
+};
+
+typedef struct {
+    char *script_path;
+} CtWorkerStart;
+
+typedef struct CtNativeLibrary {
+    char *path;
+    void *handle;
+    struct CtNativeLibrary *next;
+} CtNativeLibrary;
+
+static pthread_mutex_t ct_native_libraries_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtNativeLibrary *ct_native_libraries = NULL;
+
+static void *ct_get_native_library_handle(const char *path, char **error_out) {
+    void *handle = NULL;
+
+    pthread_mutex_lock(&ct_native_libraries_mutex);
+    for (CtNativeLibrary *entry = ct_native_libraries; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->path, path) == 0) {
+            handle = entry->handle;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_native_libraries_mutex);
+
+    if (handle != NULL) {
+        return handle;
+    }
+
+    handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    if (handle == NULL) {
+        const char *message = dlerror();
+        *error_out = message != NULL ? ct_duplicate_string(message) : ct_duplicate_string("dlopen failed");
+        return NULL;
+    }
+
+    CtNativeLibrary *entry = (CtNativeLibrary *) calloc(1, sizeof(CtNativeLibrary));
+    if (entry == NULL) {
+        *error_out = ct_duplicate_string("out of memory");
+        return handle;
+    }
+    entry->path = ct_duplicate_string(path);
+    entry->handle = handle;
+
+    pthread_mutex_lock(&ct_native_libraries_mutex);
+    entry->next = ct_native_libraries;
+    ct_native_libraries = entry;
+    pthread_mutex_unlock(&ct_native_libraries_mutex);
+
+    return handle;
+}
+
+static ffi_type *ct_ffi_libffi_type(CtFfiType type) {
+    switch (type) {
+        case CT_FFI_TYPE_VOID:
+            return &ffi_type_void;
+        case CT_FFI_TYPE_BOOL:
+        case CT_FFI_TYPE_U8:
+            return &ffi_type_uint8;
+        case CT_FFI_TYPE_I8:
+            return &ffi_type_sint8;
+        case CT_FFI_TYPE_U16:
+            return &ffi_type_uint16;
+        case CT_FFI_TYPE_I16:
+            return &ffi_type_sint16;
+        case CT_FFI_TYPE_U32:
+            return &ffi_type_uint32;
+        case CT_FFI_TYPE_I32:
+            return &ffi_type_sint32;
+        case CT_FFI_TYPE_U64:
+            return &ffi_type_uint64;
+        case CT_FFI_TYPE_I64:
+            return &ffi_type_sint64;
+        case CT_FFI_TYPE_F32:
+            return &ffi_type_float;
+        case CT_FFI_TYPE_F64:
+            return &ffi_type_double;
+        case CT_FFI_TYPE_PTR:
+        case CT_FFI_TYPE_CSTRING:
+        case CT_FFI_TYPE_FUNCTION:
+            return &ffi_type_pointer;
+    }
+
+    return &ffi_type_pointer;
+}
+
+static bool ct_ffi_type_from_name(const char *name, CtFfiType *out) {
+    if (strcmp(name, "void") == 0) *out = CT_FFI_TYPE_VOID;
+    else if (strcmp(name, "bool") == 0) *out = CT_FFI_TYPE_BOOL;
+    else if (strcmp(name, "u8") == 0) *out = CT_FFI_TYPE_U8;
+    else if (strcmp(name, "i8") == 0) *out = CT_FFI_TYPE_I8;
+    else if (strcmp(name, "u16") == 0) *out = CT_FFI_TYPE_U16;
+    else if (strcmp(name, "i16") == 0) *out = CT_FFI_TYPE_I16;
+    else if (strcmp(name, "u32") == 0) *out = CT_FFI_TYPE_U32;
+    else if (strcmp(name, "i32") == 0) *out = CT_FFI_TYPE_I32;
+    else if (strcmp(name, "u64") == 0) *out = CT_FFI_TYPE_U64;
+    else if (strcmp(name, "i64") == 0) *out = CT_FFI_TYPE_I64;
+    else if (strcmp(name, "f32") == 0) *out = CT_FFI_TYPE_F32;
+    else if (strcmp(name, "f64") == 0) *out = CT_FFI_TYPE_F64;
+    else if (strcmp(name, "ptr") == 0 || strcmp(name, "pointer") == 0) *out = CT_FFI_TYPE_PTR;
+    else if (strcmp(name, "cstring") == 0) *out = CT_FFI_TYPE_CSTRING;
+    else if (strcmp(name, "function") == 0 || strcmp(name, "callback") == 0) *out = CT_FFI_TYPE_FUNCTION;
+    else return false;
+    return true;
+}
+
+static int ct_parse_ffi_type(JSContext *ctx, JSValueConst value, CtFfiType *out) {
+    const char *name = JS_ToCString(ctx, value);
+    bool ok = false;
+
+    if (name == NULL) {
+        return -1;
+    }
+
+    ok = ct_ffi_type_from_name(name, out);
+    JS_FreeCString(ctx, name);
+
+    if (!ok) {
+        JS_ThrowTypeError(ctx, "unsupported FFI type");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ct_parse_ffi_type_array(
+    JSContext *ctx,
+    JSValueConst value,
+    CtFfiType *out_types,
+    ffi_type **out_ffi_types,
+    size_t *out_count
+) {
+    JSValue length_value = JS_UNDEFINED;
+    uint32_t length = 0;
+
+    *out_count = 0;
+
+    if (!JS_IsArray(value)) {
+        JS_ThrowTypeError(ctx, "FFI args must be an array of type names");
+        return -1;
+    }
+
+    length_value = JS_GetPropertyStr(ctx, value, "length");
+    if (JS_IsException(length_value)) {
+        return -1;
+    }
+    if (JS_ToUint32(ctx, &length, length_value) < 0) {
+        JS_FreeValue(ctx, length_value);
+        return -1;
+    }
+    JS_FreeValue(ctx, length_value);
+
+    if (length > CT_FFI_MAX_ARGS) {
+        JS_ThrowTypeError(ctx, "Cottontail FFI currently supports up to %d arguments", CT_FFI_MAX_ARGS);
+        return -1;
+    }
+
+    for (uint32_t index = 0; index < length; index += 1) {
+        JSValue item = JS_GetPropertyUint32(ctx, value, index);
+        if (JS_IsException(item)) {
+            return -1;
+        }
+        if (ct_parse_ffi_type(ctx, item, &out_types[index]) != 0) {
+            JS_FreeValue(ctx, item);
+            return -1;
+        }
+        JS_FreeValue(ctx, item);
+        out_ffi_types[index] = ct_ffi_libffi_type(out_types[index]);
+    }
+
+    *out_count = length;
+    return 0;
+}
+
+static int ct_ffi_value_from_js(JSContext *ctx, JSValueConst value, CtFfiType type, CtFfiValue *out) {
+    uint64_t native_value = 0;
+    double number_value = 0;
+
+    memset(out, 0, sizeof(*out));
+
+    switch (type) {
+        case CT_FFI_TYPE_VOID:
+            return 0;
+        case CT_FFI_TYPE_BOOL:
+            out->u8 = JS_ToBool(ctx, value) != 0;
+            return 0;
+        case CT_FFI_TYPE_F32:
+            if (JS_ToFloat64(ctx, &number_value, value) < 0) return -1;
+            out->f32 = (float) number_value;
+            return 0;
+        case CT_FFI_TYPE_F64:
+            if (JS_ToFloat64(ctx, &number_value, value) < 0) return -1;
+            out->f64 = number_value;
+            return 0;
+        case CT_FFI_TYPE_U8:
+        case CT_FFI_TYPE_I8:
+        case CT_FFI_TYPE_U16:
+        case CT_FFI_TYPE_I16:
+        case CT_FFI_TYPE_U32:
+        case CT_FFI_TYPE_I32:
+        case CT_FFI_TYPE_U64:
+        case CT_FFI_TYPE_I64:
+        case CT_FFI_TYPE_PTR:
+        case CT_FFI_TYPE_CSTRING:
+        case CT_FFI_TYPE_FUNCTION:
+            if (JS_IsUndefined(value) || JS_IsNull(value)) {
+                native_value = 0;
+            } else if (ct_js_value_to_native_u64(ctx, value, &native_value) != 0) {
+                JS_ThrowTypeError(ctx, "FFI argument must be a number, bigint, ArrayBuffer, typed array, null, or undefined");
+                return -1;
+            }
+            out->u64 = native_value;
+            return 0;
+    }
+
+    return -1;
+}
+
+static void *ct_ffi_value_ptr(CtFfiValue *value, CtFfiType type) {
+    switch (type) {
+        case CT_FFI_TYPE_BOOL:
+        case CT_FFI_TYPE_U8:
+            return &value->u8;
+        case CT_FFI_TYPE_I8:
+            return &value->i8;
+        case CT_FFI_TYPE_U16:
+            return &value->u16;
+        case CT_FFI_TYPE_I16:
+            return &value->i16;
+        case CT_FFI_TYPE_U32:
+            return &value->u32;
+        case CT_FFI_TYPE_I32:
+            return &value->i32;
+        case CT_FFI_TYPE_U64:
+            return &value->u64;
+        case CT_FFI_TYPE_I64:
+            return &value->i64;
+        case CT_FFI_TYPE_F32:
+            return &value->f32;
+        case CT_FFI_TYPE_F64:
+            return &value->f64;
+        case CT_FFI_TYPE_PTR:
+        case CT_FFI_TYPE_CSTRING:
+        case CT_FFI_TYPE_FUNCTION:
+            value->ptr = (void *) (uintptr_t) value->u64;
+            return &value->ptr;
+        case CT_FFI_TYPE_VOID:
+            return NULL;
+    }
+
+    return NULL;
+}
+
+static JSValue ct_ffi_value_to_js(JSContext *ctx, CtFfiType type, CtFfiValue value) {
+    switch (type) {
+        case CT_FFI_TYPE_VOID:
+            return JS_UNDEFINED;
+        case CT_FFI_TYPE_BOOL:
+            return JS_NewBool(ctx, value.u8 != 0);
+        case CT_FFI_TYPE_U8:
+            return JS_NewUint32(ctx, value.u8);
+        case CT_FFI_TYPE_I8:
+            return JS_NewInt32(ctx, value.i8);
+        case CT_FFI_TYPE_U16:
+            return JS_NewUint32(ctx, value.u16);
+        case CT_FFI_TYPE_I16:
+            return JS_NewInt32(ctx, value.i16);
+        case CT_FFI_TYPE_U32:
+            return JS_NewUint32(ctx, value.u32);
+        case CT_FFI_TYPE_I32:
+            return JS_NewInt32(ctx, value.i32);
+        case CT_FFI_TYPE_U64:
+            return JS_NewBigUint64(ctx, value.u64);
+        case CT_FFI_TYPE_I64:
+            return JS_NewBigInt64(ctx, value.i64);
+        case CT_FFI_TYPE_F32:
+            return JS_NewFloat64(ctx, value.f32);
+        case CT_FFI_TYPE_F64:
+            return JS_NewFloat64(ctx, value.f64);
+        case CT_FFI_TYPE_PTR:
+        case CT_FFI_TYPE_CSTRING:
+        case CT_FFI_TYPE_FUNCTION:
+            return JS_NewFloat64(ctx, (double) (uintptr_t) value.ptr);
+    }
+
+    return JS_UNDEFINED;
+}
+
+static int ct_ffi_result_from_js(JSContext *ctx, JSValueConst value, CtFfiType type, CtFfiValue *out) {
+    return ct_ffi_value_from_js(ctx, value, type, out);
+}
+
+static int ct_call_js_callback(CtFfiCallback *callback, CtFfiValue *args, size_t argc, CtFfiValue *result) {
+    JSContext *ctx = callback->ctx;
+    JSValue js_args[CT_FFI_MAX_ARGS];
+    JSValue js_result = JS_UNDEFINED;
+    int status = 0;
+
+    for (size_t index = 0; index < argc; index += 1) {
+        js_args[index] = ct_ffi_value_to_js(ctx, callback->arg_types[index], args[index]);
+        if (JS_IsException(js_args[index])) {
+            for (size_t cleanup = 0; cleanup < index; cleanup += 1) {
+                JS_FreeValue(ctx, js_args[cleanup]);
+            }
+            return -1;
+        }
+    }
+
+    js_result = JS_Call(ctx, callback->function, JS_UNDEFINED, (int) argc, js_args);
+    for (size_t index = 0; index < argc; index += 1) {
+        JS_FreeValue(ctx, js_args[index]);
+    }
+
+    if (JS_IsException(js_result)) {
+        char *message = ct_copy_exception(ctx);
+        fprintf(stderr, "Cottontail FFI callback failed: %s\n", message != NULL ? message : "unknown error");
+        free(message);
+        return -1;
+    }
+
+    if (callback->returns != CT_FFI_TYPE_VOID) {
+        status = ct_ffi_result_from_js(ctx, js_result, callback->returns, result);
+    }
+    JS_FreeValue(ctx, js_result);
+    return status;
+}
+
+static void ct_write_ffi_return(void *ret, CtFfiType type, CtFfiValue value) {
+    if (ret == NULL) return;
+
+    switch (type) {
+        case CT_FFI_TYPE_VOID:
+            return;
+        case CT_FFI_TYPE_BOOL:
+        case CT_FFI_TYPE_U8:
+            *((uint8_t *) ret) = value.u8;
+            return;
+        case CT_FFI_TYPE_I8:
+            *((int8_t *) ret) = value.i8;
+            return;
+        case CT_FFI_TYPE_U16:
+            *((uint16_t *) ret) = value.u16;
+            return;
+        case CT_FFI_TYPE_I16:
+            *((int16_t *) ret) = value.i16;
+            return;
+        case CT_FFI_TYPE_U32:
+            *((uint32_t *) ret) = value.u32;
+            return;
+        case CT_FFI_TYPE_I32:
+            *((int32_t *) ret) = value.i32;
+            return;
+        case CT_FFI_TYPE_U64:
+            *((uint64_t *) ret) = value.u64;
+            return;
+        case CT_FFI_TYPE_I64:
+            *((int64_t *) ret) = value.i64;
+            return;
+        case CT_FFI_TYPE_F32:
+            *((float *) ret) = value.f32;
+            return;
+        case CT_FFI_TYPE_F64:
+            *((double *) ret) = value.f64;
+            return;
+        case CT_FFI_TYPE_PTR:
+        case CT_FFI_TYPE_CSTRING:
+        case CT_FFI_TYPE_FUNCTION:
+            *((void **) ret) = (void *) (uintptr_t) value.u64;
+            return;
+    }
+}
+
+static void ct_enqueue_callback_job(CtQjsRuntime *runtime, CtFfiCallbackJob *job) {
+    pthread_mutex_lock(&runtime->callback_mutex);
+    if (runtime->callback_jobs_tail != NULL) {
+        runtime->callback_jobs_tail->next = job;
+    } else {
+        runtime->callback_jobs_head = job;
+    }
+    runtime->callback_jobs_tail = job;
+    pthread_mutex_unlock(&runtime->callback_mutex);
+}
+
+static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void *userdata) {
+    CtFfiCallback *callback = (CtFfiCallback *) userdata;
+    CtFfiValue values[CT_FFI_MAX_ARGS];
+    CtFfiValue result;
+    bool same_thread = false;
+    bool wait_for_result = false;
+    (void) cif;
+
+    memset(&result, 0, sizeof(result));
+    memset(values, 0, sizeof(values));
+
+    for (size_t index = 0; index < callback->argc; index += 1) {
+        switch (callback->arg_types[index]) {
+            case CT_FFI_TYPE_BOOL:
+            case CT_FFI_TYPE_U8:
+                values[index].u8 = *((uint8_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_I8:
+                values[index].i8 = *((int8_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_U16:
+                values[index].u16 = *((uint16_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_I16:
+                values[index].i16 = *((int16_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_U32:
+                values[index].u32 = *((uint32_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_I32:
+                values[index].i32 = *((int32_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_U64:
+                values[index].u64 = *((uint64_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_I64:
+                values[index].i64 = *((int64_t *) args[index]);
+                break;
+            case CT_FFI_TYPE_F32:
+                values[index].f32 = *((float *) args[index]);
+                break;
+            case CT_FFI_TYPE_F64:
+                values[index].f64 = *((double *) args[index]);
+                break;
+            case CT_FFI_TYPE_PTR:
+            case CT_FFI_TYPE_CSTRING:
+            case CT_FFI_TYPE_FUNCTION:
+                values[index].u64 = (uint64_t) (uintptr_t) *((void **) args[index]);
+                break;
+            case CT_FFI_TYPE_VOID:
+                break;
+        }
+    }
+
+    same_thread = pthread_equal(pthread_self(), callback->owner_thread) != 0;
+    wait_for_result = !callback->threadsafe || callback->returns != CT_FFI_TYPE_VOID;
+
+    if (same_thread) {
+        if (ct_call_js_callback(callback, values, callback->argc, &result) != 0) {
+            memset(&result, 0, sizeof(result));
+        }
+        ct_write_ffi_return(ret, callback->returns, result);
+        return;
+    }
+
+    CtFfiCallbackJob *job = (CtFfiCallbackJob *) calloc(1, sizeof(CtFfiCallbackJob));
+    if (job == NULL) {
+        ct_write_ffi_return(ret, callback->returns, result);
+        return;
+    }
+
+    job->callback = callback;
+    job->argc = callback->argc;
+    job->wait_for_result = wait_for_result;
+    memcpy(job->args, values, sizeof(CtFfiValue) * callback->argc);
+
+    if (wait_for_result) {
+        pthread_mutex_init(&job->mutex, NULL);
+        pthread_cond_init(&job->cond, NULL);
+        pthread_mutex_lock(&job->mutex);
+    }
+
+    ct_enqueue_callback_job(callback->runtime, job);
+
+    if (wait_for_result) {
+        while (!job->completed) {
+            pthread_cond_wait(&job->cond, &job->mutex);
+        }
+        result = job->result;
+        pthread_mutex_unlock(&job->mutex);
+        pthread_cond_destroy(&job->cond);
+        pthread_mutex_destroy(&job->mutex);
+        free(job);
+    }
+
+    ct_write_ffi_return(ret, callback->returns, result);
+}
+
+static int ct_drain_ffi_callbacks(CtQjsRuntime *runtime, char **error_out) {
+    (void) error_out;
+
+    while (true) {
+        pthread_mutex_lock(&runtime->callback_mutex);
+        CtFfiCallbackJob *job = runtime->callback_jobs_head;
+        if (job != NULL) {
+            runtime->callback_jobs_head = job->next;
+            if (runtime->callback_jobs_head == NULL) {
+                runtime->callback_jobs_tail = NULL;
+            }
+        }
+        pthread_mutex_unlock(&runtime->callback_mutex);
+
+        if (job == NULL) {
+            break;
+        }
+
+        if (ct_call_js_callback(job->callback, job->args, job->argc, &job->result) != 0) {
+            memset(&job->result, 0, sizeof(job->result));
+        }
+
+        if (job->wait_for_result) {
+            pthread_mutex_lock(&job->mutex);
+            job->completed = true;
+            pthread_cond_signal(&job->cond);
+            pthread_mutex_unlock(&job->mutex);
+        } else {
+            free(job);
+        }
+    }
+
+    return 0;
+}
+
+static JSValue ct_memory_address(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint64_t address = 0;
+    (void) this_val;
+
+    if (argc < 1 || ct_js_value_to_native_u64(ctx, argv[0], &address) != 0) {
+        return JS_ThrowTypeError(ctx, "cottontail.memoryAddress(value) requires an ArrayBuffer, typed array, number, or bigint");
+    }
+
+    return JS_NewFloat64(ctx, (double) address);
+}
+
+static JSValue ct_memory_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint64_t address = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    (void) this_val;
+
+    if (argc < 3 ||
+        ct_js_value_to_native_u64(ctx, argv[0], &address) != 0 ||
+        ct_js_value_to_native_u64(ctx, argv[1], &offset) != 0 ||
+        ct_js_value_to_native_u64(ctx, argv[2], &length) != 0) {
+        return JS_ThrowTypeError(ctx, "cottontail.memoryView(ptr, offset, length) requires pointer, offset, and length");
+    }
+
+    if (address == 0 || length == 0) {
+        return JS_NewArrayBufferCopy(ctx, NULL, 0);
+    }
+
+    return JS_NewArrayBuffer(
+        ctx,
+        (uint8_t *) (uintptr_t) (address + offset),
+        (size_t) length,
+        ct_external_array_buffer_noop,
+        NULL,
+        false
+    );
+}
+
+static JSValue ct_native_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *library_path = NULL;
+    const char *symbol_name = NULL;
+    void *handle = NULL;
+    void *symbol = NULL;
+    char *open_error = NULL;
+    CtFfiType return_type = CT_FFI_TYPE_VOID;
+    CtFfiType arg_types[CT_FFI_MAX_ARGS];
+    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
+    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
+    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
+    CtFfiValue result;
+    ffi_cif cif;
+    size_t arg_count = 0;
+    JSValue js_result = JS_UNDEFINED;
+    (void) this_val;
+
+    memset(&result, 0, sizeof(result));
+
+    if (argc < 5) {
+        return JS_ThrowTypeError(ctx, "cottontail.nativeCall(library, symbol, returnType, argTypes, args) requires five arguments");
+    }
+
+    library_path = JS_ToCString(ctx, argv[0]);
+    symbol_name = JS_ToCString(ctx, argv[1]);
+    if (library_path == NULL || symbol_name == NULL) {
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return JS_EXCEPTION;
+    }
+
+    if (ct_parse_ffi_type(ctx, argv[2], &return_type) != 0 ||
+        ct_parse_ffi_type_array(ctx, argv[3], arg_types, ffi_arg_types, &arg_count) != 0) {
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return JS_EXCEPTION;
+    }
+
+    if (!JS_IsArray(argv[4])) {
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return JS_ThrowTypeError(ctx, "cottontail.nativeCall args must be an array");
+    }
+
+    for (size_t index = 0; index < arg_count; index += 1) {
+        JSValue item = JS_GetPropertyUint32(ctx, argv[4], (uint32_t) index);
+        if (JS_IsException(item)) {
+            JS_FreeCString(ctx, library_path);
+            JS_FreeCString(ctx, symbol_name);
+            return JS_EXCEPTION;
+        }
+        if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index]) != 0) {
+            JS_FreeValue(ctx, item);
+            JS_FreeCString(ctx, library_path);
+            JS_FreeCString(ctx, symbol_name);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, item);
+        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+    }
+
+    handle = ct_get_native_library_handle(library_path, &open_error);
+    if (handle == NULL) {
+        JSValue error = JS_ThrowInternalError(ctx, "dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
+        free(open_error);
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return error;
+    }
+
+    symbol = dlsym(handle, symbol_name);
+    if (symbol == NULL) {
+        JSValue error = JS_ThrowInternalError(ctx, "dlsym(%s) failed: %s", symbol_name, dlerror());
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return error;
+    }
+
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int) arg_count, ct_ffi_libffi_type(return_type), ffi_arg_types) != FFI_OK) {
+        JS_FreeCString(ctx, library_path);
+        JS_FreeCString(ctx, symbol_name);
+        return JS_ThrowInternalError(ctx, "ffi_prep_cif failed for %s", symbol_name);
+    }
+
+    ffi_call(&cif, FFI_FN(symbol), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
+    js_result = ct_ffi_value_to_js(ctx, return_type, result);
+
+    JS_FreeCString(ctx, library_path);
+    JS_FreeCString(ctx, symbol_name);
+    return js_result;
+}
+
+static JSValue ct_create_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    CtFfiCallback *callback = NULL;
+    (void) this_val;
+
+    if (argc < 4 || !JS_IsFunction(ctx, argv[0])) {
+        return JS_ThrowTypeError(ctx, "cottontail.createCallback(fn, argTypes, returnType, threadsafe) requires a function");
+    }
+
+    callback = (CtFfiCallback *) calloc(1, sizeof(CtFfiCallback));
+    if (callback == NULL) {
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    callback->runtime = runtime;
+    callback->ctx = ctx;
+    callback->function = JS_DupValue(ctx, argv[0]);
+    callback->threadsafe = JS_ToBool(ctx, argv[3]) != 0;
+    callback->owner_thread = pthread_self();
+
+    if (ct_parse_ffi_type_array(ctx, argv[1], callback->arg_types, callback->ffi_arg_types, &callback->argc) != 0 ||
+        ct_parse_ffi_type(ctx, argv[2], &callback->returns) != 0) {
+        JS_FreeValue(ctx, callback->function);
+        free(callback);
+        return JS_EXCEPTION;
+    }
+
+    callback->closure = ffi_closure_alloc(sizeof(ffi_closure), &callback->code);
+    if (callback->closure == NULL) {
+        JS_FreeValue(ctx, callback->function);
+        free(callback);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    if (ffi_prep_cif(
+            &callback->cif,
+            FFI_DEFAULT_ABI,
+            (unsigned int) callback->argc,
+            ct_ffi_libffi_type(callback->returns),
+            callback->ffi_arg_types
+        ) != FFI_OK ||
+        ffi_prep_closure_loc(
+            callback->closure,
+            &callback->cif,
+            ct_ffi_callback_dispatch,
+            callback,
+            callback->code
+        ) != FFI_OK) {
+        ffi_closure_free(callback->closure);
+        JS_FreeValue(ctx, callback->function);
+        free(callback);
+        return JS_ThrowInternalError(ctx, "failed to create FFI callback");
+    }
+
+    return JS_NewFloat64(ctx, (double) (uintptr_t) callback->code);
+}
+
+static int ct_get_array_buffer_bytes(JSContext *ctx, JSValueConst value, uint8_t **out_data, size_t *out_len) {
+    uint8_t *data = NULL;
+    size_t len = 0;
+
+    data = JS_GetArrayBuffer(ctx, &len, value);
+    if (data != NULL) {
+        *out_data = data;
+        *out_len = len;
+        return 0;
+    }
+
+    JSValue buffer = JS_GetPropertyStr(ctx, value, "buffer");
+    if (JS_IsException(buffer)) {
+        return -1;
+    }
+    if (!JS_IsUndefined(buffer) && !JS_IsNull(buffer)) {
+        JSValue byte_offset_value = JS_GetPropertyStr(ctx, value, "byteOffset");
+        JSValue byte_length_value = JS_GetPropertyStr(ctx, value, "byteLength");
+        uint32_t byte_offset = 0;
+        uint32_t byte_length = 0;
+
+        if (JS_IsException(byte_offset_value) || JS_IsException(byte_length_value) ||
+            JS_ToUint32(ctx, &byte_offset, byte_offset_value) < 0 ||
+            JS_ToUint32(ctx, &byte_length, byte_length_value) < 0) {
+            JS_FreeValue(ctx, byte_offset_value);
+            JS_FreeValue(ctx, byte_length_value);
+            JS_FreeValue(ctx, buffer);
+            return -1;
+        }
+        JS_FreeValue(ctx, byte_offset_value);
+        JS_FreeValue(ctx, byte_length_value);
+
+        data = JS_GetArrayBuffer(ctx, &len, buffer);
+        JS_FreeValue(ctx, buffer);
+        if (data == NULL || byte_offset > len || byte_length > len - byte_offset) {
+            return -1;
+        }
+        *out_data = data + byte_offset;
+        *out_len = byte_length;
+        return 0;
+    }
+
+    JS_FreeValue(ctx, buffer);
+    return -1;
+}
+
+static JSValue ct_inflate_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    z_stream stream;
+    uint8_t *output = NULL;
+    size_t output_capacity = 0;
+    size_t output_len = 0;
+    int status = Z_OK;
+    JSValue result = JS_UNDEFINED;
+    (void) this_val;
+
+    if (argc < 1 || ct_get_array_buffer_bytes(ctx, argv[0], &input, &input_len) != 0) {
+        return JS_ThrowTypeError(ctx, "cottontail.inflateSync(data) requires an ArrayBuffer or typed array");
+    }
+
+    memset(&stream, 0, sizeof(stream));
+    status = inflateInit(&stream);
+    if (status != Z_OK) {
+        return JS_ThrowInternalError(ctx, "inflateInit failed");
+    }
+
+    output_capacity = input_len * 3 + 1024;
+    if (output_capacity < 4096) output_capacity = 4096;
+    output = (uint8_t *) malloc(output_capacity);
+    if (output == NULL) {
+        inflateEnd(&stream);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    stream.next_in = input;
+    stream.avail_in = (uInt) input_len;
+
+    while (true) {
+        if (output_len == output_capacity) {
+            size_t next_capacity = output_capacity * 2;
+            uint8_t *next_output = (uint8_t *) realloc(output, next_capacity);
+            if (next_output == NULL) {
+                free(output);
+                inflateEnd(&stream);
+                return JS_ThrowOutOfMemory(ctx);
+            }
+            output = next_output;
+            output_capacity = next_capacity;
+        }
+
+        stream.next_out = output + output_len;
+        stream.avail_out = (uInt) (output_capacity - output_len);
+        status = inflate(&stream, Z_NO_FLUSH);
+        output_len = stream.total_out;
+
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK) {
+            JSValue error = JS_ThrowInternalError(ctx, "inflate failed: %d", status);
+            free(output);
+            inflateEnd(&stream);
+            return error;
+        }
+    }
+
+    result = JS_NewArrayBufferCopy(ctx, output, output_len);
+    free(output);
+    inflateEnd(&stream);
+    return result;
+}
+
+static void *ct_worker_entry(void *opaque) {
+    CtWorkerStart *start = (CtWorkerStart *) opaque;
+    CtQjsRuntime *runtime = ct_qjs_runtime_create();
+    char *source = NULL;
+    size_t source_len = 0;
+    char *error = NULL;
+
+    if (runtime == NULL) {
+        fprintf(stderr, "cottontail: worker runtime initialization failed\n");
+        free(start->script_path);
+        free(start);
+        return NULL;
+    }
+
+    if (ct_read_file_bytes(start->script_path, &source, &source_len) != 0) {
+        fprintf(stderr, "cottontail: failed to load worker script %s\n", start->script_path);
+        ct_qjs_runtime_destroy(runtime);
+        free(start->script_path);
+        free(start);
+        return NULL;
+    }
+
+    if (ct_qjs_runtime_eval(runtime, source, source_len, start->script_path, &error) != 0) {
+        fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
+        ct_qjs_string_free(error);
+        free(source);
+        ct_qjs_runtime_destroy(runtime);
+        free(start->script_path);
+        free(start);
+        return NULL;
+    }
+    free(source);
+
+    while (true) {
+        if (ct_qjs_runtime_tick(runtime, &error) != 0) {
+            fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker tick failed");
+            ct_qjs_string_free(error);
+            break;
+        }
+        usleep(1000);
+    }
+
+    ct_qjs_runtime_destroy(runtime);
+    free(start->script_path);
+    free(start);
+    return NULL;
+}
+
+static JSValue ct_spawn_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *script_path = NULL;
+    CtWorkerStart *start = NULL;
+    pthread_t thread;
+    pthread_attr_t attr;
+    int attr_status = 0;
+    int create_status = 0;
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.spawnWorker(scriptPath) requires a script path");
+    }
+
+    script_path = JS_ToCString(ctx, argv[0]);
+    if (script_path == NULL) {
+        return JS_EXCEPTION;
+    }
+
+    start = (CtWorkerStart *) calloc(1, sizeof(CtWorkerStart));
+    if (start == NULL) {
+        JS_FreeCString(ctx, script_path);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    start->script_path = ct_duplicate_string(script_path);
+    JS_FreeCString(ctx, script_path);
+    if (start->script_path == NULL) {
+        free(start);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    attr_status = pthread_attr_init(&attr);
+    if (attr_status != 0) {
+        free(start->script_path);
+        free(start);
+        return JS_ThrowInternalError(ctx, "failed to initialize worker thread attributes");
+    }
+
+    attr_status = pthread_attr_setstacksize(&attr, CT_WORKER_STACK_SIZE);
+    if (attr_status != 0) {
+        pthread_attr_destroy(&attr);
+        free(start->script_path);
+        free(start);
+        return JS_ThrowInternalError(ctx, "failed to set worker thread stack size");
+    }
+
+    create_status = pthread_create(&thread, &attr, ct_worker_entry, start);
+    pthread_attr_destroy(&attr);
+
+    if (create_status != 0) {
+        free(start->script_path);
+        free(start);
+        return JS_ThrowInternalError(ctx, "failed to create worker thread");
+    }
+    pthread_detach(thread);
+
+    return JS_NewObject(ctx);
+}
+
+#else
+
+static JSValue ct_memory_address(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail FFI is not implemented on Windows yet");
+}
+
+static JSValue ct_memory_view(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail FFI is not implemented on Windows yet");
+}
+
+static JSValue ct_native_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail FFI is not implemented on Windows yet");
+}
+
+static JSValue ct_create_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail FFI callbacks are not implemented on Windows yet");
+}
+
+static JSValue ct_inflate_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail zlib is not implemented on Windows yet");
+}
+
+static JSValue ct_spawn_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail workers are not implemented on Windows yet");
+}
+
+#endif
 
 static int ct_set_import_meta(JSContext *ctx, JSValue module_value, const char *module_name, bool is_main) {
     JSModuleDef *module = (JSModuleDef *) JS_VALUE_GET_PTR(module_value);
@@ -2598,7 +2455,6 @@ static JSModuleDef *ct_module_loader(JSContext *ctx, const char *module_name, vo
     }
 
     module = (JSModuleDef *) JS_VALUE_GET_PTR(compiled);
-    JS_FreeValue(ctx, compiled);
     return module;
 }
 
@@ -2614,7 +2470,6 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue console = JS_NewObject(ctx);
     JSValue cottontail = JS_NewObject(ctx);
-    JSValue electrobun = JS_UNDEFINED;
 
     if (JS_IsException(console)) {
         JS_FreeValue(ctx, global);
@@ -2625,16 +2480,6 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_FreeValue(ctx, console);
         JS_FreeValue(ctx, global);
         return -1;
-    }
-
-    if (ct_electrobun_enabled()) {
-        electrobun = JS_NewObject(ctx);
-        if (JS_IsException(electrobun)) {
-            JS_FreeValue(ctx, cottontail);
-            JS_FreeValue(ctx, console);
-            JS_FreeValue(ctx, global);
-            return -1;
-        }
     }
 
     if (JS_SetPropertyStr(ctx, console, "log", JS_NewCFunction(ctx, ct_console_log, "log", 1)) < 0) {
@@ -2663,6 +2508,7 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "drainJobs", JS_NewCFunction(ctx, ct_drain_jobs_host, "drainJobs", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "cwd", JS_NewCFunction(ctx, ct_cwd, "cwd", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "readFile", JS_NewCFunction(ctx, ct_read_file, "readFile", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "readFileBuffer", JS_NewCFunction(ctx, ct_read_file_buffer, "readFileBuffer", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "writeFile", JS_NewCFunction(ctx, ct_write_file, "writeFile", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "env", JS_NewCFunction(ctx, ct_env, "env", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "existsSync", JS_NewCFunction(ctx, ct_exists_sync, "existsSync", 1)) < 0 ||
@@ -2671,41 +2517,16 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "unlinkSync", JS_NewCFunction(ctx, ct_unlink_sync, "unlinkSync", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "chmodSync", JS_NewCFunction(ctx, ct_chmod_sync, "chmodSync", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "spawnSync", JS_NewCFunction(ctx, ct_spawn_sync, "spawnSync", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "memoryAddress", JS_NewCFunction(ctx, ct_memory_address, "memoryAddress", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "memoryView", JS_NewCFunction(ctx, ct_memory_view, "memoryView", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "nativeCall", JS_NewCFunction(ctx, ct_native_call, "nativeCall", 5)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "createCallback", JS_NewCFunction(ctx, ct_create_callback, "createCallback", 4)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "inflateSync", JS_NewCFunction(ctx, ct_inflate_sync, "inflateSync", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnWorker", JS_NewCFunction(ctx, ct_spawn_worker, "spawnWorker", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "exit", JS_NewCFunction(ctx, ct_exit, "exit", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "platform", JS_NewCFunction(ctx, ct_platform, "platform", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "arch", JS_NewCFunction(ctx, ct_arch, "arch", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "args", JS_NewArray(ctx)) < 0) {
-        JS_FreeValue(ctx, electrobun);
-        JS_FreeValue(ctx, cottontail);
-        JS_FreeValue(ctx, global);
-        return -1;
-    }
-
-    if (!JS_IsUndefined(electrobun) &&
-        (JS_SetPropertyStr(ctx, electrobun, "createWindow", JS_NewCFunction(ctx, ct_electrobun_create_window, "createWindow", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "createWebview", JS_NewCFunction(ctx, ct_electrobun_create_webview, "createWebview", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "closeWindow", JS_NewCFunction(ctx, ct_electrobun_close_window, "closeWindow", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "setWindowAlwaysOnTop", JS_NewCFunction(ctx, ct_electrobun_set_window_always_on_top, "setWindowAlwaysOnTop", 2)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "sendHostMessageToWebview", JS_NewCFunction(ctx, ct_electrobun_send_host_message, "sendHostMessageToWebview", 2)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "popNextQueuedHostMessage", JS_NewCFunction(ctx, ct_electrobun_pop_host_message, "popNextQueuedHostMessage", 0)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "popNextNativeEvent", JS_NewCFunction(ctx, ct_electrobun_pop_event, "popNextNativeEvent", 0)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "coreCall", JS_NewCFunction(ctx, ct_electrobun_core_call, "coreCall", 2)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "nativeCall", JS_NewCFunction(ctx, ct_electrobun_native_call, "nativeCall", 3)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "memoryAddress", JS_NewCFunction(ctx, ct_electrobun_memory_address, "memoryAddress", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "memoryView", JS_NewCFunction(ctx, ct_electrobun_memory_view, "memoryView", 3)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "getWindowFrame", JS_NewCFunction(ctx, ct_electrobun_get_window_frame, "getWindowFrame", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "resizeView", JS_NewCFunction(ctx, ct_electrobun_resize_view, "resizeView", 7)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "createWGPUView", JS_NewCFunction(ctx, ct_electrobun_create_wgpu_view, "createWGPUView", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "createTray", JS_NewCFunction(ctx, ct_electrobun_create_tray, "createTray", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "showTray", JS_NewCFunction(ctx, ct_electrobun_show_tray, "showTray", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "getTrayBounds", JS_NewCFunction(ctx, ct_electrobun_get_tray_bounds, "getTrayBounds", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "showNotification", JS_NewCFunction(ctx, ct_electrobun_show_notification, "showNotification", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "setMenu", JS_NewCFunction(ctx, ct_electrobun_set_menu, "setMenu", 3)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "openFileDialog", JS_NewCFunction(ctx, ct_electrobun_open_file_dialog, "openFileDialog", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "showMessageBox", JS_NewCFunction(ctx, ct_electrobun_show_message_box, "showMessageBox", 1)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "setNativeCallback", JS_NewCFunction(ctx, ct_electrobun_set_native_callback, "setNativeCallback", 2)) < 0 ||
-         JS_SetPropertyStr(ctx, electrobun, "quit", JS_NewCFunction(ctx, ct_electrobun_quit, "quit", 0)) < 0)) {
-        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, cottontail);
         JS_FreeValue(ctx, global);
         return -1;
@@ -2716,16 +2537,7 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     if (JS_SetPropertyStr(ctx, global, "cottontail", cottontail) < 0) {
         JS_FreeValue(ctx, runtime->host_object);
         runtime->host_object = JS_UNDEFINED;
-        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, cottontail);
-        JS_FreeValue(ctx, global);
-        return -1;
-    }
-
-    if (!JS_IsUndefined(electrobun) && JS_SetPropertyStr(ctx, global, "electrobun", electrobun) < 0) {
-        JS_FreeValue(ctx, runtime->host_object);
-        runtime->host_object = JS_UNDEFINED;
-        JS_FreeValue(ctx, electrobun);
         JS_FreeValue(ctx, global);
         return -1;
     }
@@ -2735,6 +2547,12 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
 }
 
 static int ct_drain_jobs(CtQjsRuntime *runtime, char **error_out) {
+#if !defined(_WIN32)
+    if (ct_drain_ffi_callbacks(runtime, error_out) != 0) {
+        return -1;
+    }
+#endif
+
     while (JS_IsJobPending(runtime->runtime)) {
         JSContext *job_context = NULL;
         int status = JS_ExecutePendingJob(runtime->runtime, &job_context);
@@ -2765,12 +2583,16 @@ CtQjsRuntime *ct_qjs_runtime_create(void) {
     }
 
     runtime->host_object = JS_UNDEFINED;
+#if !defined(_WIN32)
+    runtime->owner_thread = pthread_self();
+    pthread_mutex_init(&runtime->callback_mutex, NULL);
+#endif
     runtime->runtime = JS_NewRuntime();
     if (runtime->runtime == NULL) {
         ct_qjs_runtime_destroy(runtime);
         return NULL;
     }
-    JS_SetMaxStackSize(runtime->runtime, 0);
+    JS_SetMaxStackSize(runtime->runtime, CT_JS_STACK_SIZE);
 
     runtime->context = JS_NewContext(runtime->runtime);
     if (runtime->context == NULL) {
@@ -2804,6 +2626,27 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
         }
         JS_FreeContext(runtime->context);
     }
+
+#if !defined(_WIN32)
+    pthread_mutex_lock(&runtime->callback_mutex);
+    CtFfiCallbackJob *job = runtime->callback_jobs_head;
+    runtime->callback_jobs_head = NULL;
+    runtime->callback_jobs_tail = NULL;
+    pthread_mutex_unlock(&runtime->callback_mutex);
+    while (job != NULL) {
+        CtFfiCallbackJob *next = job->next;
+        if (job->wait_for_result) {
+            pthread_mutex_lock(&job->mutex);
+            job->completed = true;
+            pthread_cond_signal(&job->cond);
+            pthread_mutex_unlock(&job->mutex);
+        } else {
+            free(job);
+        }
+        job = next;
+    }
+    pthread_mutex_destroy(&runtime->callback_mutex);
+#endif
 
     if (runtime->runtime != NULL) {
         JS_FreeRuntime(runtime->runtime);
@@ -2928,6 +2771,33 @@ int ct_qjs_runtime_eval(
 
     JS_FreeValue(runtime->context, result);
     return 0;
+}
+
+int ct_qjs_runtime_tick(CtQjsRuntime *runtime, char **error_out) {
+    static const char tick_source[] =
+        "if (globalThis.__cottontailRunLoopTick) globalThis.__cottontailRunLoopTick();";
+    JSValue result = JS_UNDEFINED;
+
+    if (error_out != NULL) {
+        *error_out = NULL;
+    }
+
+    result = JS_Eval(
+        runtime->context,
+        tick_source,
+        sizeof(tick_source) - 1,
+        "<cottontail-run-loop-tick>",
+        JS_EVAL_TYPE_GLOBAL
+    );
+
+    if (JS_IsException(result)) {
+        JS_FreeValue(runtime->context, result);
+        ct_set_error_out(error_out, ct_copy_exception(runtime->context));
+        return -1;
+    }
+
+    JS_FreeValue(runtime->context, result);
+    return ct_drain_jobs(runtime, error_out);
 }
 
 void ct_qjs_string_free(char *value) {

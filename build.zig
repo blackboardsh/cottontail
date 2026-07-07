@@ -15,6 +15,9 @@ fn configureQuickjs(step: *std.Build.Step.Compile, b: *std.Build) void {
 
     if (step.root_module.resolved_target.?.result.os.tag != .windows) {
         step.root_module.linkSystemLibrary("m", .{});
+        step.root_module.linkSystemLibrary("ffi", .{});
+        step.root_module.linkSystemLibrary("z", .{});
+        step.root_module.linkSystemLibrary("pthread", .{});
     }
 }
 

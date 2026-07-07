@@ -21,6 +21,7 @@ int ct_qjs_runtime_eval(
     const char *filename,
     char **error_out
 );
+int ct_qjs_runtime_tick(CtQjsRuntime *runtime, char **error_out);
 void ct_qjs_string_free(char *value);
 
 #endif
