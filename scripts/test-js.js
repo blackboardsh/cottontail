@@ -100,6 +100,27 @@ try {
       stdoutIncludes: ['host api passed'],
     },
     {
+      name: 'bun-apis',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-apis.js'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun apis passed'],
+    },
+    {
+      name: 'bun-global',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-global.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun global passed'],
+    },
+    {
+      name: 'bun-serve-spawn-ts',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-spawn.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun serve spawn ts passed'],
+    },
+    {
       name: 'sync-error',
       scriptPath: join(rootDir, 'tests', 'js', 'sync-error.js'),
       expectExitCode: 1,

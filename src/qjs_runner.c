@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #if defined(_WIN32)
 #include <direct.h>
@@ -12,8 +13,15 @@
 #else
 #include <dlfcn.h>
 #include <ffi/ffi.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -144,6 +152,76 @@ struct CtQjsRuntime {
     CtFfiCallbackJob *callback_jobs_head;
     CtFfiCallbackJob *callback_jobs_tail;
 };
+
+#if !defined(_WIN32)
+typedef struct CtHttpRequest {
+    uint32_t id;
+    int client_fd;
+    char *method;
+    char *url;
+    char *headers_text;
+    char *body;
+    size_t body_len;
+    bool claimed;
+    bool completed;
+    int status;
+    char *response_headers_text;
+    char *response_body;
+    size_t response_body_len;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    struct CtHttpRequest *next;
+} CtHttpRequest;
+
+typedef struct CtHttpServer {
+    uint32_t id;
+    int listen_fd;
+    uint16_t port;
+    char *hostname;
+    bool stopped;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    CtHttpRequest *requests;
+    struct CtHttpServer *next;
+} CtHttpServer;
+
+static pthread_mutex_t ct_http_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtHttpServer *ct_http_servers = NULL;
+static uint32_t ct_next_http_server_id = 1;
+static uint32_t ct_next_http_request_id = 1;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} CtByteBuffer;
+
+typedef enum {
+    CT_PROCESS_STDIO_PIPE,
+    CT_PROCESS_STDIO_INHERIT,
+    CT_PROCESS_STDIO_IGNORE,
+} CtProcessStdioMode;
+
+typedef struct CtProcess {
+    uint32_t id;
+    pid_t pid;
+    int stdout_fd;
+    int stderr_fd;
+    CtByteBuffer stdout_buffer;
+    CtByteBuffer stderr_buffer;
+    int exit_code;
+    int signal_code;
+    bool completed;
+    bool killed;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    struct CtProcess *next;
+} CtProcess;
+
+static pthread_mutex_t ct_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtProcess *ct_processes = NULL;
+static uint32_t ct_next_process_id = 1;
+#endif
 
 static JSValue ct_throw_host_error(JSContext *ctx, char *error_message);
 static int ct_drain_jobs(CtQjsRuntime *runtime, char **error_out);
@@ -1212,6 +1290,1355 @@ static JSValue ct_chmod_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     JS_FreeCString(ctx, path);
     return JS_UNDEFINED;
 }
+
+#if !defined(_WIN32)
+static bool ct_http_server_is_stopped(CtHttpServer *server) {
+    bool stopped = false;
+    pthread_mutex_lock(&server->mutex);
+    stopped = server->stopped;
+    pthread_mutex_unlock(&server->mutex);
+    return stopped;
+}
+
+static const char *ct_http_reason_phrase(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 304: return "Not Modified";
+        case 400: return "Bad Request";
+        case 404: return "Not Found";
+        case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
+        default: return "OK";
+    }
+}
+
+static ssize_t ct_http_send_all(int fd, const char *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t result = send(fd, data + sent, len - sent, 0);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (result == 0) return -1;
+        sent += (size_t) result;
+    }
+    return (ssize_t) sent;
+}
+
+static void ct_http_free_request(CtHttpRequest *request) {
+    if (request == NULL) return;
+    if (request->client_fd >= 0) close(request->client_fd);
+    free(request->method);
+    free(request->url);
+    free(request->headers_text);
+    free(request->body);
+    free(request->response_headers_text);
+    free(request->response_body);
+    pthread_cond_destroy(&request->cond);
+    pthread_mutex_destroy(&request->mutex);
+    free(request);
+}
+
+static char *ct_http_copy_range(const char *start, size_t len) {
+    char *copy = (char *) malloc(len + 1);
+    if (copy == NULL) return NULL;
+    memcpy(copy, start, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static const char *ct_http_find_header_end(const char *buffer, size_t len) {
+    for (size_t index = 3; index < len; index += 1) {
+        if (buffer[index - 3] == '\r' &&
+            buffer[index - 2] == '\n' &&
+            buffer[index - 1] == '\r' &&
+            buffer[index] == '\n') {
+            return buffer + index + 1;
+        }
+    }
+    return NULL;
+}
+
+static size_t ct_http_content_length(const char *headers, size_t headers_len) {
+    const char *cursor = headers;
+    const char *end = headers + headers_len;
+    while (cursor < end) {
+        const char *line_end = memchr(cursor, '\n', (size_t) (end - cursor));
+        const char *line_stop = line_end != NULL ? line_end : end;
+        size_t line_len = (size_t) (line_stop - cursor);
+        if (line_len > 0 && cursor[line_len - 1] == '\r') line_len -= 1;
+        if (line_len >= 15 && strncasecmp(cursor, "content-length:", 15) == 0) {
+            const char *value = cursor + 15;
+            while (value < cursor + line_len && (*value == ' ' || *value == '\t')) value += 1;
+            return (size_t) strtoull(value, NULL, 10);
+        }
+        if (line_end == NULL) break;
+        cursor = line_end + 1;
+    }
+    return 0;
+}
+
+static int ct_http_read_request(int fd, CtHttpRequest *request) {
+    size_t capacity = 8192;
+    size_t len = 0;
+    char *buffer = (char *) malloc(capacity + 1);
+    const char *header_end = NULL;
+    size_t header_len = 0;
+    size_t content_len = 0;
+
+    if (buffer == NULL) return -1;
+
+    while (true) {
+        if (len == capacity) {
+            size_t next_capacity = capacity * 2;
+            char *next = NULL;
+            if (next_capacity > 1024 * 1024) {
+                free(buffer);
+                return -1;
+            }
+            next = (char *) realloc(buffer, next_capacity + 1);
+            if (next == NULL) {
+                free(buffer);
+                return -1;
+            }
+            buffer = next;
+            capacity = next_capacity;
+        }
+
+        ssize_t read_count = recv(fd, buffer + len, capacity - len, 0);
+        if (read_count < 0) {
+            if (errno == EINTR) continue;
+            free(buffer);
+            return -1;
+        }
+        if (read_count == 0) {
+            free(buffer);
+            return -1;
+        }
+
+        len += (size_t) read_count;
+        buffer[len] = '\0';
+
+        header_end = ct_http_find_header_end(buffer, len);
+        if (header_end != NULL) {
+            header_len = (size_t) (header_end - buffer);
+            content_len = ct_http_content_length(buffer, header_len);
+            if (len >= header_len + content_len) break;
+        }
+    }
+
+    const char *request_line_end = strstr(buffer, "\r\n");
+    const char *first_space = NULL;
+    const char *second_space = NULL;
+    if (request_line_end == NULL || request_line_end > header_end) {
+        free(buffer);
+        return -1;
+    }
+
+    first_space = memchr(buffer, ' ', (size_t) (request_line_end - buffer));
+    if (first_space == NULL) {
+        free(buffer);
+        return -1;
+    }
+    second_space = memchr(first_space + 1, ' ', (size_t) (request_line_end - first_space - 1));
+    if (second_space == NULL) {
+        free(buffer);
+        return -1;
+    }
+
+    request->method = ct_http_copy_range(buffer, (size_t) (first_space - buffer));
+    request->url = ct_http_copy_range(first_space + 1, (size_t) (second_space - first_space - 1));
+    request->headers_text = ct_http_copy_range(request_line_end + 2, (size_t) (header_end - request_line_end - 4));
+    request->body_len = content_len;
+    request->body = (char *) malloc(content_len > 0 ? content_len : 1);
+    if (request->method == NULL || request->url == NULL || request->headers_text == NULL || request->body == NULL) {
+        free(buffer);
+        return -1;
+    }
+    if (content_len > 0) {
+        memcpy(request->body, buffer + header_len, content_len);
+    }
+
+    free(buffer);
+    return 0;
+}
+
+static void ct_http_send_response(CtHttpRequest *request) {
+    int status = request->status > 0 ? request->status : 200;
+    const char *reason = ct_http_reason_phrase(status);
+    const char *headers = request->response_headers_text != NULL ? request->response_headers_text : "";
+    char head[512];
+    int head_len = snprintf(
+        head,
+        sizeof(head),
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\n%s\r\n",
+        status,
+        reason,
+        request->response_body_len,
+        headers
+    );
+    if (head_len < 0) return;
+    if ((size_t) head_len >= sizeof(head)) head_len = (int) sizeof(head) - 1;
+    ct_http_send_all(request->client_fd, head, (size_t) head_len);
+    if (request->response_body_len > 0 && request->response_body != NULL) {
+        ct_http_send_all(request->client_fd, request->response_body, request->response_body_len);
+    }
+}
+
+static void ct_http_server_add_request(CtHttpServer *server, CtHttpRequest *request) {
+    pthread_mutex_lock(&server->mutex);
+    request->next = server->requests;
+    server->requests = request;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static void ct_http_server_remove_request(CtHttpServer *server, CtHttpRequest *request) {
+    pthread_mutex_lock(&server->mutex);
+    CtHttpRequest **cursor = &server->requests;
+    while (*cursor != NULL) {
+        if (*cursor == request) {
+            *cursor = request->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static void *ct_http_server_thread(void *opaque) {
+    CtHttpServer *server = (CtHttpServer *) opaque;
+    while (!ct_http_server_is_stopped(server)) {
+        int client_fd = accept(server->listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            if (ct_http_server_is_stopped(server)) break;
+            continue;
+        }
+
+        CtHttpRequest *request = (CtHttpRequest *) calloc(1, sizeof(CtHttpRequest));
+        if (request == NULL) {
+            close(client_fd);
+            continue;
+        }
+        request->client_fd = client_fd;
+        request->status = 200;
+        pthread_mutex_init(&request->mutex, NULL);
+        pthread_cond_init(&request->cond, NULL);
+
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        request->id = ct_next_http_request_id++;
+        if (ct_next_http_request_id == 0) ct_next_http_request_id = 1;
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+
+        if (ct_http_read_request(client_fd, request) != 0) {
+            static const char bad_request[] =
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+            ct_http_send_all(client_fd, bad_request, sizeof(bad_request) - 1);
+            ct_http_free_request(request);
+            continue;
+        }
+
+        ct_http_server_add_request(server, request);
+
+        pthread_mutex_lock(&request->mutex);
+        while (!request->completed && !ct_http_server_is_stopped(server)) {
+            pthread_cond_wait(&request->cond, &request->mutex);
+        }
+        pthread_mutex_unlock(&request->mutex);
+
+        if (!ct_http_server_is_stopped(server)) {
+            ct_http_send_response(request);
+        }
+
+        ct_http_server_remove_request(server, request);
+        ct_http_free_request(request);
+    }
+    return NULL;
+}
+
+static CtHttpServer *ct_http_find_server(uint32_t id) {
+    CtHttpServer *server = ct_http_servers;
+    while (server != NULL) {
+        if (server->id == id) return server;
+        server = server->next;
+    }
+    return NULL;
+}
+
+static JSValue ct_http_server_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *hostname = "127.0.0.1";
+    const char *hostname_arg = NULL;
+    int32_t port_value = 0;
+    int listen_fd = -1;
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    CtHttpServer *server = NULL;
+    int yes = 1;
+    JSValue result = JS_UNDEFINED;
+    (void) this_val;
+
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        hostname_arg = JS_ToCString(ctx, argv[0]);
+        if (hostname_arg == NULL) return JS_EXCEPTION;
+        hostname = hostname_arg;
+    }
+    if (argc >= 2 && JS_ToInt32(ctx, &port_value, argv[1]) < 0) {
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_EXCEPTION;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_ThrowInternalError(ctx, "socket failed: %s", strerror(errno));
+    }
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t) port_value);
+    if (strcmp(hostname, "0.0.0.0") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, hostname, &addr.sin_addr) != 1) {
+        close(listen_fd);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_ThrowTypeError(ctx, "Bun.serve currently requires an IPv4 hostname");
+    }
+
+    if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "bind failed: %s", strerror(errno));
+        close(listen_fd);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return error;
+    }
+
+    if (getsockname(listen_fd, (struct sockaddr *) &addr, &addr_len) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "getsockname failed: %s", strerror(errno));
+        close(listen_fd);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return error;
+    }
+
+    if (listen(listen_fd, 128) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "listen failed: %s", strerror(errno));
+        close(listen_fd);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return error;
+    }
+
+    server = (CtHttpServer *) calloc(1, sizeof(CtHttpServer));
+    if (server == NULL) {
+        close(listen_fd);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    server->listen_fd = listen_fd;
+    server->port = ntohs(addr.sin_port);
+    server->hostname = ct_duplicate_string(hostname);
+    pthread_mutex_init(&server->mutex, NULL);
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    server->id = ct_next_http_server_id++;
+    if (ct_next_http_server_id == 0) ct_next_http_server_id = 1;
+    server->next = ct_http_servers;
+    ct_http_servers = server;
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+
+    if (pthread_create(&server->thread, NULL, ct_http_server_thread, server) != 0) {
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        if (ct_http_servers == server) {
+            ct_http_servers = server->next;
+        } else {
+            CtHttpServer *cursor = ct_http_servers;
+            while (cursor != NULL && cursor->next != server) cursor = cursor->next;
+            if (cursor != NULL) cursor->next = server->next;
+        }
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+        close(listen_fd);
+        free(server->hostname);
+        pthread_mutex_destroy(&server->mutex);
+        free(server);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_ThrowInternalError(ctx, "pthread_create failed");
+    }
+
+    result = JS_NewObject(ctx);
+    if (JS_IsException(result) ||
+        JS_SetPropertyStr(ctx, result, "id", JS_NewUint32(ctx, server->id)) < 0 ||
+        JS_SetPropertyStr(ctx, result, "port", JS_NewInt32(ctx, (int32_t) server->port)) < 0 ||
+        JS_SetPropertyStr(ctx, result, "hostname", JS_NewString(ctx, server->hostname)) < 0) {
+        if (!JS_IsException(result)) JS_FreeValue(ctx, result);
+        if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+        return JS_EXCEPTION;
+    }
+
+    if (hostname_arg != NULL) JS_FreeCString(ctx, hostname_arg);
+    return result;
+}
+
+static JSValue ct_http_server_poll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t server_id = 0;
+    JSValue result = JS_NULL;
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &server_id, argv[0]) < 0) return JS_EXCEPTION;
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) return JS_NULL;
+
+    pthread_mutex_lock(&server->mutex);
+    CtHttpRequest *request = server->requests;
+    while (request != NULL && request->claimed) request = request->next;
+    if (request != NULL) {
+        request->claimed = true;
+        result = JS_NewObject(ctx);
+        if (!JS_IsException(result)) {
+            JS_SetPropertyStr(ctx, result, "id", JS_NewUint32(ctx, request->id));
+            JS_SetPropertyStr(ctx, result, "method", JS_NewString(ctx, request->method != NULL ? request->method : "GET"));
+            JS_SetPropertyStr(ctx, result, "url", JS_NewString(ctx, request->url != NULL ? request->url : "/"));
+            JS_SetPropertyStr(ctx, result, "headersText", JS_NewString(ctx, request->headers_text != NULL ? request->headers_text : ""));
+            JS_SetPropertyStr(ctx, result, "body", JS_NewArrayBufferCopy(ctx, (const uint8_t *) request->body, request->body_len));
+        }
+    }
+    pthread_mutex_unlock(&server->mutex);
+
+    return result;
+}
+
+static JSValue ct_http_server_respond(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t server_id = 0;
+    uint32_t request_id = 0;
+    int32_t status = 200;
+    char *headers_text = NULL;
+    uint8_t *body_data = NULL;
+    size_t body_len = 0;
+    char *body_copy = NULL;
+    CtHttpRequest *request = NULL;
+    (void) this_val;
+
+    if (argc < 5 ||
+        JS_ToUint32(ctx, &server_id, argv[0]) < 0 ||
+        JS_ToUint32(ctx, &request_id, argv[1]) < 0 ||
+        JS_ToInt32(ctx, &status, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    headers_text = ct_copy_js_string(ctx, argv[3]);
+    if (headers_text == NULL) return JS_EXCEPTION;
+    if (ct_get_array_buffer_bytes(ctx, argv[4], &body_data, &body_len) != 0) {
+        free(headers_text);
+        return JS_EXCEPTION;
+    }
+    body_copy = (char *) malloc(body_len > 0 ? body_len : 1);
+    if (body_copy == NULL) {
+        free(headers_text);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    if (body_len > 0) memcpy(body_copy, body_data, body_len);
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) {
+        free(headers_text);
+        free(body_copy);
+        return JS_ThrowInternalError(ctx, "HTTP server not found");
+    }
+
+    pthread_mutex_lock(&server->mutex);
+    request = server->requests;
+    while (request != NULL && request->id != request_id) request = request->next;
+    pthread_mutex_unlock(&server->mutex);
+
+    if (request == NULL) {
+        free(headers_text);
+        free(body_copy);
+        return JS_ThrowInternalError(ctx, "HTTP request not found");
+    }
+
+    pthread_mutex_lock(&request->mutex);
+    request->status = status;
+    request->response_headers_text = headers_text;
+    request->response_body = body_copy;
+    request->response_body_len = body_len;
+    request->completed = true;
+    pthread_cond_signal(&request->cond);
+    pthread_mutex_unlock(&request->mutex);
+
+    return JS_UNDEFINED;
+}
+
+static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_list) {
+    if (server == NULL) return;
+
+    pthread_mutex_lock(&server->mutex);
+    if (!server->stopped) {
+        server->stopped = true;
+        shutdown(server->listen_fd, SHUT_RDWR);
+        close(server->listen_fd);
+        CtHttpRequest *request = server->requests;
+        while (request != NULL) {
+            pthread_mutex_lock(&request->mutex);
+            request->completed = true;
+            pthread_cond_signal(&request->cond);
+            pthread_mutex_unlock(&request->mutex);
+            request = request->next;
+        }
+    }
+    pthread_mutex_unlock(&server->mutex);
+
+    pthread_join(server->thread, NULL);
+
+    if (remove_from_global_list) {
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        if (ct_http_servers == server) {
+            ct_http_servers = server->next;
+        } else {
+            CtHttpServer *cursor = ct_http_servers;
+            while (cursor != NULL && cursor->next != server) cursor = cursor->next;
+            if (cursor != NULL) cursor->next = server->next;
+        }
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+    }
+
+    CtHttpRequest *request = server->requests;
+    while (request != NULL) {
+        CtHttpRequest *next = request->next;
+        ct_http_free_request(request);
+        request = next;
+    }
+    free(server->hostname);
+    pthread_mutex_destroy(&server->mutex);
+    free(server);
+}
+
+static JSValue ct_http_server_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t server_id = 0;
+    (void) this_val;
+    if (argc < 1 || JS_ToUint32(ctx, &server_id, argv[0]) < 0) return JS_EXCEPTION;
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server != NULL) ct_http_stop_server(server, true);
+    return JS_UNDEFINED;
+}
+
+static void ct_http_stop_all(void) {
+    while (true) {
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        CtHttpServer *server = ct_http_servers;
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+        if (server == NULL) break;
+        ct_http_stop_server(server, true);
+    }
+}
+
+static void ct_byte_buffer_free(CtByteBuffer *buffer) {
+    if (buffer == NULL) return;
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->len = 0;
+    buffer->cap = 0;
+}
+
+static bool ct_byte_buffer_append(CtByteBuffer *buffer, const char *data, size_t len) {
+    if (len == 0) return true;
+    if (buffer->len > SIZE_MAX - len) return false;
+    size_t needed = buffer->len + len;
+    if (needed > buffer->cap) {
+        size_t next_cap = buffer->cap == 0 ? 4096 : buffer->cap;
+        while (next_cap < needed) {
+            if (next_cap > SIZE_MAX / 2) {
+                next_cap = needed;
+                break;
+            }
+            next_cap *= 2;
+        }
+        char *next = (char *) realloc(buffer->data, next_cap);
+        if (next == NULL) return false;
+        buffer->data = next;
+        buffer->cap = next_cap;
+    }
+    memcpy(buffer->data + buffer->len, data, len);
+    buffer->len += len;
+    return true;
+}
+
+static CtProcess *ct_process_find(uint32_t id) {
+    CtProcess *process = ct_processes;
+    while (process != NULL) {
+        if (process->id == id) return process;
+        process = process->next;
+    }
+    return NULL;
+}
+
+static int ct_process_parse_stdio_mode(
+    JSContext *ctx,
+    JSValueConst options,
+    const char *name,
+    CtProcessStdioMode default_mode,
+    CtProcessStdioMode *out
+) {
+    JSValue value = JS_GetPropertyStr(ctx, options, name);
+    if (JS_IsException(value)) return -1;
+
+    if (JS_IsUndefined(value)) {
+        JS_FreeValue(ctx, value);
+        *out = default_mode;
+        return 0;
+    }
+
+    if (JS_IsNull(value)) {
+        JS_FreeValue(ctx, value);
+        *out = CT_PROCESS_STDIO_IGNORE;
+        return 0;
+    }
+
+    char *mode = ct_copy_js_string(ctx, value);
+    JS_FreeValue(ctx, value);
+    if (mode == NULL) return -1;
+
+    if (strcmp(mode, "pipe") == 0) {
+        *out = CT_PROCESS_STDIO_PIPE;
+    } else if (strcmp(mode, "inherit") == 0) {
+        *out = CT_PROCESS_STDIO_INHERIT;
+    } else if (strcmp(mode, "ignore") == 0) {
+        *out = CT_PROCESS_STDIO_IGNORE;
+    } else {
+        free(mode);
+        JS_ThrowTypeError(ctx, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
+        return -1;
+    }
+
+    free(mode);
+    return 0;
+}
+
+static int ct_process_parse_input(JSContext *ctx, JSValueConst options, char **out_data, size_t *out_len) {
+    JSValue value = JS_GetPropertyStr(ctx, options, "input");
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char *copy = NULL;
+
+    *out_data = NULL;
+    *out_len = 0;
+
+    if (JS_IsException(value)) return -1;
+    if (JS_IsUndefined(value) || JS_IsNull(value)) {
+        JS_FreeValue(ctx, value);
+        return 0;
+    }
+
+    if (ct_get_array_buffer_bytes(ctx, value, &bytes, &len) == 0) {
+        copy = (char *) malloc(len > 0 ? len : 1);
+        if (copy == NULL) {
+            JS_FreeValue(ctx, value);
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+        if (len > 0) memcpy(copy, bytes, len);
+        JS_FreeValue(ctx, value);
+        *out_data = copy;
+        *out_len = len;
+        return 0;
+    }
+
+    size_t string_len = 0;
+    const char *string_value = JS_ToCStringLen(ctx, &string_len, value);
+    if (string_value == NULL) {
+        JS_FreeValue(ctx, value);
+        return -1;
+    }
+    copy = (char *) malloc(string_len > 0 ? string_len : 1);
+    if (copy == NULL) {
+        JS_FreeCString(ctx, string_value);
+        JS_FreeValue(ctx, value);
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    if (string_len > 0) memcpy(copy, string_value, string_len);
+    JS_FreeCString(ctx, string_value);
+    JS_FreeValue(ctx, value);
+
+    *out_data = copy;
+    *out_len = string_len;
+    return 0;
+}
+
+static int ct_open_dev_null(int flags) {
+    return open("/dev/null", flags);
+}
+
+static void ct_child_apply_input_stdio(CtProcessStdioMode mode, int pipe_read_fd) {
+    if (mode == CT_PROCESS_STDIO_INHERIT) return;
+
+    if (mode == CT_PROCESS_STDIO_PIPE && pipe_read_fd >= 0) {
+        dup2(pipe_read_fd, STDIN_FILENO);
+        return;
+    }
+
+    int devnull = ct_open_dev_null(O_RDONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        if (devnull > STDERR_FILENO) close(devnull);
+    }
+}
+
+static void ct_child_apply_output_stdio(CtProcessStdioMode mode, int pipe_write_fd, int fd) {
+    if (mode == CT_PROCESS_STDIO_INHERIT) return;
+
+    if (mode == CT_PROCESS_STDIO_PIPE && pipe_write_fd >= 0) {
+        dup2(pipe_write_fd, fd);
+        return;
+    }
+
+    int devnull = ct_open_dev_null(O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, fd);
+        if (devnull > STDERR_FILENO) close(devnull);
+    }
+}
+
+static void ct_process_close_fd(int *fd) {
+    if (fd != NULL && *fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+static void *ct_process_reader_thread(void *opaque) {
+    CtProcess *process = (CtProcess *) opaque;
+    int stdout_fd = process->stdout_fd;
+    int stderr_fd = process->stderr_fd;
+
+    while (stdout_fd >= 0 || stderr_fd >= 0) {
+        fd_set read_fds;
+        int max_fd = -1;
+        FD_ZERO(&read_fds);
+        if (stdout_fd >= 0) {
+            FD_SET(stdout_fd, &read_fds);
+            if (stdout_fd > max_fd) max_fd = stdout_fd;
+        }
+        if (stderr_fd >= 0) {
+            FD_SET(stderr_fd, &read_fds);
+            if (stderr_fd > max_fd) max_fd = stderr_fd;
+        }
+
+        int ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (stdout_fd >= 0 && FD_ISSET(stdout_fd, &read_fds)) {
+            char buffer[8192];
+            ssize_t count = read(stdout_fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                pthread_mutex_lock(&process->mutex);
+                (void) ct_byte_buffer_append(&process->stdout_buffer, buffer, (size_t) count);
+                pthread_mutex_unlock(&process->mutex);
+            } else {
+                close(stdout_fd);
+                stdout_fd = -1;
+                pthread_mutex_lock(&process->mutex);
+                process->stdout_fd = -1;
+                pthread_mutex_unlock(&process->mutex);
+            }
+        }
+
+        if (stderr_fd >= 0 && FD_ISSET(stderr_fd, &read_fds)) {
+            char buffer[8192];
+            ssize_t count = read(stderr_fd, buffer, sizeof(buffer));
+            if (count > 0) {
+                pthread_mutex_lock(&process->mutex);
+                (void) ct_byte_buffer_append(&process->stderr_buffer, buffer, (size_t) count);
+                pthread_mutex_unlock(&process->mutex);
+            } else {
+                close(stderr_fd);
+                stderr_fd = -1;
+                pthread_mutex_lock(&process->mutex);
+                process->stderr_fd = -1;
+                pthread_mutex_unlock(&process->mutex);
+            }
+        }
+    }
+
+    int status = 0;
+    while (waitpid(process->pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        status = 127 << 8;
+        break;
+    }
+
+    pthread_mutex_lock(&process->mutex);
+    if (WIFEXITED(status)) {
+        process->exit_code = WEXITSTATUS(status);
+        process->signal_code = 0;
+    } else if (WIFSIGNALED(status)) {
+        process->exit_code = 128 + WTERMSIG(status);
+        process->signal_code = WTERMSIG(status);
+    } else {
+        process->exit_code = 127;
+        process->signal_code = 0;
+    }
+    process->completed = true;
+    pthread_mutex_unlock(&process->mutex);
+
+    return NULL;
+}
+
+static void ct_process_free(CtProcess *process) {
+    if (process == NULL) return;
+    ct_process_close_fd(&process->stdout_fd);
+    ct_process_close_fd(&process->stderr_fd);
+    ct_byte_buffer_free(&process->stdout_buffer);
+    ct_byte_buffer_free(&process->stderr_buffer);
+    pthread_mutex_destroy(&process->mutex);
+    free(process);
+}
+
+static void ct_process_remove(CtProcess *process) {
+    if (process == NULL) return;
+
+    pthread_mutex_lock(&ct_processes_mutex);
+    if (ct_processes == process) {
+        ct_processes = process->next;
+    } else {
+        CtProcess *cursor = ct_processes;
+        while (cursor != NULL && cursor->next != process) cursor = cursor->next;
+        if (cursor != NULL) cursor->next = process->next;
+    }
+    pthread_mutex_unlock(&ct_processes_mutex);
+    process->next = NULL;
+}
+
+static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *file = NULL;
+    char **args = NULL;
+    size_t arg_count = 0;
+    char *cwd = NULL;
+    CtHostEnvEntry *env_entries = NULL;
+    size_t env_count = 0;
+    char *input_data = NULL;
+    size_t input_len = 0;
+    CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
+    CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
+    CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
+    int stdin_pipe[2] = { -1, -1 };
+    int stdout_pipe[2] = { -1, -1 };
+    int stderr_pipe[2] = { -1, -1 };
+    CtProcess *process = NULL;
+    pid_t pid = -1;
+    (void) this_val;
+
+    if (argc < 1) return JS_ThrowTypeError(ctx, "cottontail.spawnStart(file, args, options) requires a file");
+    file = JS_ToCString(ctx, argv[0]);
+    if (file == NULL) return JS_EXCEPTION;
+
+    if (argc >= 2 && ct_parse_string_array(ctx, argv[1], &args, &arg_count) != 0) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
+        JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
+        if (JS_IsException(cwd_value) || JS_IsException(env_value)) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            return JS_EXCEPTION;
+        }
+
+        if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
+            cwd = ct_copy_js_string(ctx, cwd_value);
+            if (cwd == NULL) {
+                JS_FreeValue(ctx, cwd_value);
+                JS_FreeValue(ctx, env_value);
+                JS_FreeCString(ctx, file);
+                ct_free_string_array(args, arg_count);
+                return JS_EXCEPTION;
+            }
+        }
+
+        if (ct_parse_env_object(ctx, env_value, &env_entries, &env_count) != 0 ||
+            ct_process_parse_stdio_mode(ctx, argv[2], "stdin", CT_PROCESS_STDIO_IGNORE, &stdin_mode) != 0 ||
+            ct_process_parse_stdio_mode(ctx, argv[2], "stdout", CT_PROCESS_STDIO_PIPE, &stdout_mode) != 0 ||
+            ct_process_parse_stdio_mode(ctx, argv[2], "stderr", CT_PROCESS_STDIO_INHERIT, &stderr_mode) != 0 ||
+            ct_process_parse_input(ctx, argv[2], &input_data, &input_len) != 0) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            ct_free_env_entries(env_entries, env_count);
+            free(cwd);
+            free(input_data);
+            return JS_EXCEPTION;
+        }
+
+        JS_FreeValue(ctx, cwd_value);
+        JS_FreeValue(ctx, env_value);
+    }
+
+    if ((stdin_mode == CT_PROCESS_STDIO_PIPE || input_len > 0) && pipe(stdin_pipe) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "pipe failed: %s", strerror(errno));
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return error;
+    }
+    if (stdout_mode == CT_PROCESS_STDIO_PIPE && pipe(stdout_pipe) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "pipe failed: %s", strerror(errno));
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return error;
+    }
+    if (stderr_mode == CT_PROCESS_STDIO_PIPE && pipe(stderr_pipe) != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "pipe failed: %s", strerror(errno));
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return error;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "fork failed: %s", strerror(errno));
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return error;
+    }
+
+    if (pid == 0) {
+        char **exec_argv = (char **) calloc(arg_count + 2, sizeof(char *));
+        if (exec_argv == NULL) _exit(127);
+        exec_argv[0] = (char *) file;
+        for (size_t index = 0; index < arg_count; index += 1) exec_argv[index + 1] = args[index];
+        exec_argv[arg_count + 1] = NULL;
+
+        if (cwd != NULL) chdir(cwd);
+        for (size_t index = 0; index < env_count; index += 1) {
+            setenv(env_entries[index].name, env_entries[index].value, 1);
+        }
+
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_child_apply_input_stdio(stdin_mode, stdin_pipe[0]);
+        ct_child_apply_output_stdio(stdout_mode, stdout_pipe[1], STDOUT_FILENO);
+        ct_child_apply_output_stdio(stderr_mode, stderr_pipe[1], STDERR_FILENO);
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[1]);
+
+        execvp(file, exec_argv);
+        _exit(127);
+    }
+
+    ct_process_close_fd(&stdin_pipe[0]);
+    ct_process_close_fd(&stdout_pipe[1]);
+    ct_process_close_fd(&stderr_pipe[1]);
+
+    if (stdin_pipe[1] >= 0) {
+        size_t written_total = 0;
+        while (written_total < input_len) {
+            ssize_t written = write(stdin_pipe[1], input_data + written_total, input_len - written_total);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            written_total += (size_t) written;
+        }
+        ct_process_close_fd(&stdin_pipe[1]);
+    }
+
+    process = (CtProcess *) calloc(1, sizeof(CtProcess));
+    if (process == NULL) {
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    process->pid = pid;
+    process->stdout_fd = stdout_pipe[0];
+    process->stderr_fd = stderr_pipe[0];
+    process->exit_code = 0;
+    process->signal_code = 0;
+    pthread_mutex_init(&process->mutex, NULL);
+
+    pthread_mutex_lock(&ct_processes_mutex);
+    process->id = ct_next_process_id++;
+    if (ct_next_process_id == 0) ct_next_process_id = 1;
+    process->next = ct_processes;
+    ct_processes = process;
+    pthread_mutex_unlock(&ct_processes_mutex);
+
+    if (pthread_create(&process->thread, NULL, ct_process_reader_thread, process) != 0) {
+        ct_process_remove(process);
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        ct_process_free(process);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return JS_ThrowInternalError(ctx, "failed to create process watcher thread");
+    }
+
+    JSValue response = JS_NewObject(ctx);
+    if (JS_IsException(response)) {
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return response;
+    }
+
+    if (JS_SetPropertyStr(ctx, response, "id", JS_NewUint32(ctx, process->id)) < 0 ||
+        JS_SetPropertyStr(ctx, response, "pid", JS_NewInt32(ctx, (int32_t) pid)) < 0) {
+        JS_FreeValue(ctx, response);
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        free(input_data);
+        return JS_EXCEPTION;
+    }
+
+    JS_FreeCString(ctx, file);
+    ct_free_string_array(args, arg_count);
+    ct_free_env_entries(env_entries, env_count);
+    free(cwd);
+    free(input_data);
+    return response;
+}
+
+static JSValue ct_spawn_poll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t process_id = 0;
+    CtProcess *process = NULL;
+    JSValue response = JS_UNDEFINED;
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &process_id, argv[0]) < 0) return JS_EXCEPTION;
+
+    pthread_mutex_lock(&ct_processes_mutex);
+    process = ct_process_find(process_id);
+    pthread_mutex_unlock(&ct_processes_mutex);
+    if (process == NULL) return JS_NULL;
+
+    response = JS_NewObject(ctx);
+    if (JS_IsException(response)) return response;
+
+    pthread_mutex_lock(&process->mutex);
+    JSValue stdout_value = JS_NewArrayBufferCopy(
+        ctx,
+        (const uint8_t *) process->stdout_buffer.data,
+        process->stdout_buffer.len
+    );
+    JSValue stderr_value = JS_NewArrayBufferCopy(
+        ctx,
+        (const uint8_t *) process->stderr_buffer.data,
+        process->stderr_buffer.len
+    );
+    bool failed =
+        JS_IsException(stdout_value) ||
+        JS_IsException(stderr_value) ||
+        JS_SetPropertyStr(ctx, response, "id", JS_NewUint32(ctx, process->id)) < 0 ||
+        JS_SetPropertyStr(ctx, response, "pid", JS_NewInt32(ctx, (int32_t) process->pid)) < 0 ||
+        JS_SetPropertyStr(ctx, response, "completed", JS_NewBool(ctx, process->completed)) < 0 ||
+        JS_SetPropertyStr(ctx, response, "killed", JS_NewBool(ctx, process->killed)) < 0 ||
+        JS_SetPropertyStr(ctx, response, "stdout", stdout_value) < 0 ||
+        JS_SetPropertyStr(ctx, response, "stderr", stderr_value) < 0;
+
+    if (!failed) {
+        JSValue exit_code_value = process->completed ? JS_NewInt32(ctx, process->exit_code) : JS_NULL;
+        JSValue signal_code_value = process->signal_code != 0 ? JS_NewInt32(ctx, process->signal_code) : JS_NULL;
+        failed =
+            JS_SetPropertyStr(ctx, response, "exitCode", exit_code_value) < 0 ||
+            JS_SetPropertyStr(ctx, response, "signalCode", signal_code_value) < 0;
+    }
+    pthread_mutex_unlock(&process->mutex);
+
+    if (failed) {
+        JS_FreeValue(ctx, response);
+        return JS_EXCEPTION;
+    }
+
+    return response;
+}
+
+static JSValue ct_spawn_kill(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t process_id = 0;
+    int32_t signal_number = SIGTERM;
+    CtProcess *process = NULL;
+    bool ok = false;
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &process_id, argv[0]) < 0) return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]) && JS_ToInt32(ctx, &signal_number, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+
+    pthread_mutex_lock(&ct_processes_mutex);
+    process = ct_process_find(process_id);
+    pthread_mutex_unlock(&ct_processes_mutex);
+    if (process == NULL) return JS_NewBool(ctx, false);
+
+    pthread_mutex_lock(&process->mutex);
+    if (!process->completed && kill(process->pid, signal_number) == 0) {
+        process->killed = true;
+        ok = true;
+    }
+    pthread_mutex_unlock(&process->mutex);
+
+    return JS_NewBool(ctx, ok);
+}
+
+static JSValue ct_spawn_dispose(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    uint32_t process_id = 0;
+    CtProcess *process = NULL;
+    bool completed = false;
+    (void) this_val;
+
+    if (argc < 1 || JS_ToUint32(ctx, &process_id, argv[0]) < 0) return JS_EXCEPTION;
+
+    pthread_mutex_lock(&ct_processes_mutex);
+    process = ct_process_find(process_id);
+    pthread_mutex_unlock(&ct_processes_mutex);
+    if (process == NULL) return JS_UNDEFINED;
+
+    pthread_mutex_lock(&process->mutex);
+    completed = process->completed;
+    pthread_mutex_unlock(&process->mutex);
+    if (!completed) return JS_UNDEFINED;
+
+    pthread_join(process->thread, NULL);
+    ct_process_remove(process);
+    ct_process_free(process);
+    return JS_UNDEFINED;
+}
+
+static void ct_process_stop_all(void) {
+    while (true) {
+        pthread_mutex_lock(&ct_processes_mutex);
+        CtProcess *process = ct_processes;
+        pthread_mutex_unlock(&ct_processes_mutex);
+        if (process == NULL) break;
+
+        pthread_mutex_lock(&process->mutex);
+        if (!process->completed) {
+            process->killed = true;
+            kill(process->pid, SIGTERM);
+        }
+        pthread_mutex_unlock(&process->mutex);
+
+        pthread_join(process->thread, NULL);
+        ct_process_remove(process);
+        ct_process_free(process);
+    }
+}
+
+static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    const char *file = NULL;
+    char **args = NULL;
+    size_t arg_count = 0;
+    char *cwd = NULL;
+    CtHostEnvEntry *env_entries = NULL;
+    size_t env_count = 0;
+    pid_t pid = -1;
+    (void) this_val;
+
+    if (argc < 1) return JS_ThrowTypeError(ctx, "cottontail.spawnDetached(file, args, options) requires a file");
+    file = JS_ToCString(ctx, argv[0]);
+    if (file == NULL) return JS_EXCEPTION;
+    if (argc >= 2 && ct_parse_string_array(ctx, argv[1], &args, &arg_count) != 0) {
+        JS_FreeCString(ctx, file);
+        return JS_EXCEPTION;
+    }
+    if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
+        JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
+        if (JS_IsException(cwd_value) || JS_IsException(env_value)) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            return JS_EXCEPTION;
+        }
+        if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
+            cwd = ct_copy_js_string(ctx, cwd_value);
+            if (cwd == NULL) {
+                JS_FreeValue(ctx, cwd_value);
+                JS_FreeCString(ctx, file);
+                ct_free_string_array(args, arg_count);
+                return JS_EXCEPTION;
+            }
+        }
+        if (ct_parse_env_object(ctx, env_value, &env_entries, &env_count) != 0) {
+            JS_FreeValue(ctx, cwd_value);
+            JS_FreeValue(ctx, env_value);
+            JS_FreeCString(ctx, file);
+            ct_free_string_array(args, arg_count);
+            free(cwd);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, cwd_value);
+        JS_FreeValue(ctx, env_value);
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "fork failed: %s", strerror(errno));
+        JS_FreeCString(ctx, file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        free(cwd);
+        return error;
+    }
+
+    if (pid == 0) {
+        char **exec_argv = (char **) calloc(arg_count + 2, sizeof(char *));
+        if (exec_argv == NULL) _exit(127);
+        exec_argv[0] = (char *) file;
+        for (size_t index = 0; index < arg_count; index += 1) {
+            exec_argv[index + 1] = args[index];
+        }
+        exec_argv[arg_count + 1] = NULL;
+        setsid();
+        if (cwd != NULL) chdir(cwd);
+        for (size_t index = 0; index < env_count; index += 1) {
+            setenv(env_entries[index].name, env_entries[index].value, 1);
+        }
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        execvp(file, exec_argv);
+        _exit(127);
+    }
+
+    JS_FreeCString(ctx, file);
+    ct_free_string_array(args, arg_count);
+    ct_free_env_entries(env_entries, env_count);
+    free(cwd);
+    return JS_NewInt32(ctx, (int32_t) pid);
+}
+#else
+static JSValue ct_http_server_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail Bun.serve is not implemented on Windows yet");
+}
+
+static JSValue ct_http_server_poll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_NULL;
+}
+
+static JSValue ct_http_server_respond(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail Bun.serve is not implemented on Windows yet");
+}
+
+static JSValue ct_http_server_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) ctx;
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_UNDEFINED;
+}
+
+static void ct_http_stop_all(void) {}
+
+static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail Bun.spawn is not implemented on Windows yet");
+}
+
+static JSValue ct_spawn_poll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_NULL;
+}
+
+static JSValue ct_spawn_kill(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_NewBool(ctx, false);
+}
+
+static JSValue ct_spawn_dispose(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) ctx;
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_UNDEFINED;
+}
+
+static void ct_process_stop_all(void) {}
+
+static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void) this_val;
+    (void) argc;
+    (void) argv;
+    return JS_ThrowInternalError(ctx, "Cottontail Bun.spawn detached mode is not implemented on Windows yet");
+}
+#endif
 
 static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     const char *file = NULL;
@@ -2517,6 +3944,15 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "unlinkSync", JS_NewCFunction(ctx, ct_unlink_sync, "unlinkSync", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "chmodSync", JS_NewCFunction(ctx, ct_chmod_sync, "chmodSync", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "spawnSync", JS_NewCFunction(ctx, ct_spawn_sync, "spawnSync", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnStart", JS_NewCFunction(ctx, ct_spawn_start, "spawnStart", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnPoll", JS_NewCFunction(ctx, ct_spawn_poll, "spawnPoll", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnKill", JS_NewCFunction(ctx, ct_spawn_kill, "spawnKill", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnDispose", JS_NewCFunction(ctx, ct_spawn_dispose, "spawnDispose", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "spawnDetached", JS_NewCFunction(ctx, ct_spawn_detached, "spawnDetached", 3)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "httpServerStart", JS_NewCFunction(ctx, ct_http_server_start, "httpServerStart", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "httpServerPoll", JS_NewCFunction(ctx, ct_http_server_poll, "httpServerPoll", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "httpServerRespond", JS_NewCFunction(ctx, ct_http_server_respond, "httpServerRespond", 5)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "httpServerStop", JS_NewCFunction(ctx, ct_http_server_stop, "httpServerStop", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "memoryAddress", JS_NewCFunction(ctx, ct_memory_address, "memoryAddress", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "memoryView", JS_NewCFunction(ctx, ct_memory_view, "memoryView", 3)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "nativeCall", JS_NewCFunction(ctx, ct_native_call, "nativeCall", 5)) < 0 ||
@@ -2616,6 +4052,9 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
     if (runtime == NULL) {
         return;
     }
+
+    ct_http_stop_all();
+    ct_process_stop_all();
 
     ct_free_string(&runtime->last_unhandled_rejection);
 
@@ -2751,17 +4190,20 @@ int ct_qjs_runtime_eval(
     if (JS_IsPromise(result)) {
         JSPromiseStateEnum state = JS_PromiseState(runtime->context, result);
 
+        while (state == JS_PROMISE_PENDING) {
+            if (ct_qjs_runtime_tick(runtime, error_out) != 0) {
+                JS_FreeValue(runtime->context, result);
+                return -1;
+            }
+            usleep(1000);
+            state = JS_PromiseState(runtime->context, result);
+        }
+
         if (state == JS_PROMISE_REJECTED) {
             JSValue promise_result = JS_PromiseResult(runtime->context, result);
             ct_set_error_out(error_out, ct_copy_value_string(runtime->context, promise_result));
             JS_FreeValue(runtime->context, promise_result);
             JS_FreeValue(runtime->context, result);
-            return -1;
-        }
-
-        if (state == JS_PROMISE_PENDING) {
-            JS_FreeValue(runtime->context, result);
-            ct_set_error_out(error_out, ct_duplicate_string("Top-level promise is still pending"));
             return -1;
         }
 

@@ -41,8 +41,12 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
 
     const runnable_path = if (isTypescriptPath(script_path))
         try bundleTypescript(&ctx, script_path)
-    else
-        try allocator.dupe(u8, script_path);
+    else blk: {
+        const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+        if (!runtimeModulesAvailable(&ctx)) break :blk script_abs;
+        const tmp_dir = try ensureTempDir(&ctx);
+        break :blk try writeCottontailEntryWrapper(&ctx, tmp_dir, script_abs);
+    };
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
 
@@ -73,6 +77,7 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
     const tmp_dir = try ensureTempDir(ctx);
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+    const wrapped_entry = try writeCottontailEntryWrapper(ctx, tmp_dir, script_abs);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
     const esbuild_bin = try esbuildBinaryPath(ctx);
 
@@ -91,7 +96,7 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
 
     const args = [_][]const u8{
         esbuild_bin,
-        script_abs,
+        wrapped_entry,
         "--bundle",
         "--platform=neutral",
         "--format=esm",
@@ -138,6 +143,29 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
     return bundle_path;
 }
 
+fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {
+    const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const bun_literal = try jsonStringLiteral(ctx, bun_module);
+    const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const source = try std.fmt.allocPrint(
+        ctx.allocator,
+        "import {s};\nimport {s};\n",
+        .{ bun_literal, script_literal },
+    );
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
+fn jsonStringLiteral(ctx: *const Context, value: []const u8) ![]const u8 {
+    return try std.json.Stringify.valueAlloc(ctx.allocator, std.json.Value{ .string = value }, .{});
+}
+
 fn runtimeModulePath(ctx: *const Context, parts: []const []const u8) ![]const u8 {
     const all_parts = try ctx.allocator.alloc([]const u8, parts.len + 2);
     all_parts[0] = ctx.cottontail_home;
@@ -146,6 +174,11 @@ fn runtimeModulePath(ctx: *const Context, parts: []const []const u8) ![]const u8
         all_parts[index + 2] = part;
     }
     return try std.fs.path.join(ctx.allocator, all_parts);
+}
+
+fn runtimeModulesAvailable(ctx: *const Context) bool {
+    const bun_module = runtimeModulePath(ctx, &.{ "bun", "index.js" }) catch return false;
+    return pathExists(ctx.io, bun_module);
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
