@@ -1107,7 +1107,7 @@ export async function write(path, data) {
 }
 
 const BunObject = globalThis.Bun ?? {};
-BunObject.argv = ["cottontail", ...(cottontail.args || [])];
+BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
 BunObject.env = globalThis.process?.env ?? cottontail.env();
 BunObject.build = build;
 BunObject.file = file;

@@ -5267,19 +5267,40 @@ int ct_qjs_runtime_set_args(
     char **error_out
 ) {
     JSValue args = JS_NewArray(runtime->context);
+    JSValue process_argv = JS_NewArray(runtime->context);
+    size_t user_argc = argc > 0 ? argc - 1 : 0;
 
     if (error_out != NULL) {
         *error_out = NULL;
     }
 
-    if (JS_IsException(args)) {
+    if (JS_IsException(args) || JS_IsException(process_argv)) {
+        JS_FreeValue(runtime->context, args);
+        JS_FreeValue(runtime->context, process_argv);
+        ct_set_error_out(error_out, ct_copy_exception(runtime->context));
+        return -1;
+    }
+
+    if (JS_SetPropertyUint32(runtime->context, process_argv, 0, JS_NewString(runtime->context, "cottontail")) < 0) {
+        JS_FreeValue(runtime->context, args);
+        JS_FreeValue(runtime->context, process_argv);
         ct_set_error_out(error_out, ct_copy_exception(runtime->context));
         return -1;
     }
 
     for (size_t i = 0; i < argc; i += 1) {
-        if (JS_SetPropertyUint32(runtime->context, args, (uint32_t) i, JS_NewString(runtime->context, argv[i])) < 0) {
+        if (JS_SetPropertyUint32(runtime->context, process_argv, (uint32_t) i + 1, JS_NewString(runtime->context, argv[i])) < 0) {
             JS_FreeValue(runtime->context, args);
+            JS_FreeValue(runtime->context, process_argv);
+            ct_set_error_out(error_out, ct_copy_exception(runtime->context));
+            return -1;
+        }
+    }
+
+    for (size_t i = 0; i < user_argc; i += 1) {
+        if (JS_SetPropertyUint32(runtime->context, args, (uint32_t) i, JS_NewString(runtime->context, argv[i + 1])) < 0) {
+            JS_FreeValue(runtime->context, args);
+            JS_FreeValue(runtime->context, process_argv);
             ct_set_error_out(error_out, ct_copy_exception(runtime->context));
             return -1;
         }
@@ -5287,6 +5308,13 @@ int ct_qjs_runtime_set_args(
 
     if (JS_SetPropertyStr(runtime->context, runtime->host_object, "args", args) < 0) {
         JS_FreeValue(runtime->context, args);
+        JS_FreeValue(runtime->context, process_argv);
+        ct_set_error_out(error_out, ct_copy_exception(runtime->context));
+        return -1;
+    }
+
+    if (JS_SetPropertyStr(runtime->context, runtime->host_object, "argv", process_argv) < 0) {
+        JS_FreeValue(runtime->context, process_argv);
         ct_set_error_out(error_out, ct_copy_exception(runtime->context));
         return -1;
     }

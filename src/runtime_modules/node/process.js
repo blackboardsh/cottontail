@@ -89,7 +89,7 @@ function installProcessApi(processObject) {
 }
 
 const process = globalThis.process ?? {
-  argv: ["cottontail", ...(cottontail.args || [])],
+  argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
   argv0: "cottontail",
   execPath: cottontail.execPath?.() ?? "cottontail",
   env: cottontail.env(),

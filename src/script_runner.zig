@@ -57,9 +57,7 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
         .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
     };
 
-    const runnable_path = if (runtimeModulesAvailable(&ctx))
-        try bundleScriptWithEsbuild(&ctx, script_path)
-    else if (isTypescriptPath(script_path))
+    const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(script_path))
         try bundleScriptWithEsbuild(&ctx, script_path)
     else blk: {
         const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
@@ -71,9 +69,10 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
     };
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
-    const process_args = try allocator.alloc([:0]const u8, script_args.len);
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = script_path;
     for (script_args, 0..) |arg, index| {
-        process_args[index] = arg;
+        process_args[index + 1] = arg;
     }
 
     var execution = ScriptExecution{
@@ -206,7 +205,10 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const tmp_dir = try ensureTempDir(ctx);
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
-    const wrapped_entry = try writeCottontailEntryWrapper(ctx, tmp_dir, script_abs);
+    const wrapped_entry = if (try shouldBundleCommonJsEntrypoint(ctx, script_abs))
+        try writeCommonJsEntryWrapper(ctx, tmp_dir, script_abs)
+    else
+        try writeCottontailEntryWrapper(ctx, tmp_dir, script_abs);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
     const esbuild_bin = try esbuildBinaryPath(ctx);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;

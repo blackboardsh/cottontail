@@ -94,7 +94,7 @@ function installProcessApi(processObject) {
 }
 
 const processObject = g.process ?? {
-  argv: ["cottontail", ...(cottontail.args || [])],
+  argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
   argv0: "cottontail",
   execPath: cottontail.execPath?.() ?? "cottontail",
   env: cottontail.env(),
@@ -469,7 +469,7 @@ async function bunWrite(path, data) {
 }
 
 g.Bun ??= {};
-g.Bun.argv ??= ["cottontail", ...(cottontail.args || [])];
+g.Bun.argv ??= cottontail.argv || ["cottontail", ...(cottontail.args || [])];
 g.Bun.env ??= processObject.env;
 g.Bun.file ??= bunFile;
 g.Bun.write ??= bunWrite;

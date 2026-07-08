@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -1189,34 +1190,6 @@ static void ct_queue_spawn_text(CtQjsRuntime *runtime, uint32_t id, const char *
     ct_queue_spawn_event(runtime, event);
 }
 
-static char *ct_read_all_fd(int fd, size_t *out_len) {
-    size_t len = 0;
-    size_t cap = 4096;
-    char *buffer = (char *)malloc(cap);
-    if (buffer == NULL) {
-        *out_len = 0;
-        return NULL;
-    }
-    for (;;) {
-        if (len == cap) {
-            size_t next_cap = cap * 2;
-            char *next = (char *)realloc(buffer, next_cap);
-            if (next == NULL) break;
-            buffer = next;
-            cap = next_cap;
-        }
-        ssize_t n = read(fd, buffer + len, cap - len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        len += (size_t)n;
-    }
-    *out_len = len;
-    return buffer;
-}
-
 static void ct_async_process_remove(CtAsyncProcess *process) {
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess **cursor = &ct_async_processes;
@@ -1286,15 +1259,80 @@ static void ct_async_processes_wait_for_runtime(CtQjsRuntime *runtime) {
 
 static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
-    size_t stdout_len = 0;
-    size_t stderr_len = 0;
-    char *stdout_data = process->stdout_fd >= 0 ? ct_read_all_fd(process->stdout_fd, &stdout_len) : NULL;
-    char *stderr_data = process->stderr_fd >= 0 ? ct_read_all_fd(process->stderr_fd, &stderr_len) : NULL;
-    if (process->stdout_fd >= 0) close(process->stdout_fd);
-    if (process->stderr_fd >= 0) close(process->stderr_fd);
-
     int status = 0;
-    while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
+    bool exited = false;
+    if (process->stdout_fd >= 0) fcntl(process->stdout_fd, F_SETFL, fcntl(process->stdout_fd, F_GETFL, 0) | O_NONBLOCK);
+    if (process->stderr_fd >= 0) fcntl(process->stderr_fd, F_SETFL, fcntl(process->stderr_fd, F_GETFL, 0) | O_NONBLOCK);
+
+    while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
+        struct pollfd fds[2];
+        const char *types[2];
+        int count = 0;
+        if (process->stdout_fd >= 0) {
+            fds[count].fd = process->stdout_fd;
+            fds[count].events = POLLIN | POLLHUP | POLLERR;
+            fds[count].revents = 0;
+            types[count] = "stdout";
+            count += 1;
+        }
+        if (process->stderr_fd >= 0) {
+            fds[count].fd = process->stderr_fd;
+            fds[count].events = POLLIN | POLLHUP | POLLERR;
+            fds[count].revents = 0;
+            types[count] = "stderr";
+            count += 1;
+        }
+
+        int ready = count > 0 ? poll(fds, (nfds_t)count, 50) : 0;
+        if (ready > 0) {
+            for (int index = 0; index < count; index += 1) {
+                if ((fds[index].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+                char buffer[16384];
+                for (;;) {
+                    ssize_t n = read(fds[index].fd, buffer, sizeof(buffer));
+                    if (n > 0) {
+                        ct_queue_spawn_text(process->runtime, process->id, types[index], buffer, (size_t)n);
+                        continue;
+                    }
+                    if (n == 0) {
+                        if (fds[index].fd == process->stdout_fd) {
+                            close(process->stdout_fd);
+                            process->stdout_fd = -1;
+                        } else if (fds[index].fd == process->stderr_fd) {
+                            close(process->stderr_fd);
+                            process->stderr_fd = -1;
+                        }
+                        break;
+                    }
+                    if (errno == EINTR) continue;
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    if (fds[index].fd == process->stdout_fd) {
+                        close(process->stdout_fd);
+                        process->stdout_fd = -1;
+                    } else if (fds[index].fd == process->stderr_fd) {
+                        close(process->stderr_fd);
+                        process->stderr_fd = -1;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (!exited) {
+            pid_t wait_result = waitpid(process->pid, &status, WNOHANG);
+            if (wait_result == process->pid) {
+                exited = true;
+            } else if (wait_result < 0 && errno != EINTR) {
+                exited = true;
+            }
+        }
+
+        if (count == 0 && !exited) usleep(1000);
+    }
+
+    if (!exited) {
+        while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
+    }
     int exit_code = 1;
     int signal_code = 0;
     if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
@@ -1303,8 +1341,6 @@ static void *ct_async_process_thread(void *opaque) {
         exit_code = 128 + signal_code;
     }
 
-    ct_queue_spawn_text(process->runtime, process->id, "stdout", stdout_data, stdout_len);
-    ct_queue_spawn_text(process->runtime, process->id, "stderr", stderr_data, stderr_len);
     CtSpawnEvent *exit_event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
     if (exit_event != NULL) {
         exit_event->process_id = process->id;
@@ -1313,8 +1349,6 @@ static void *ct_async_process_thread(void *opaque) {
         exit_event->signal_code = signal_code;
         ct_queue_spawn_event(process->runtime, exit_event);
     }
-    free(stdout_data);
-    free(stderr_data);
     if (process->stdin_fd >= 0) close(process->stdin_fd);
     ct_async_process_remove(process);
     free(process);
@@ -2130,21 +2164,32 @@ int ct_qjs_runtime_set_args(CtQjsRuntime *runtime, size_t argc, const char *cons
     if (error_out != NULL) *error_out = NULL;
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
-    JSValueRef *values = argc > 0 ? (JSValueRef *)calloc(argc, sizeof(JSValueRef)) : NULL;
-    if (argc > 0 && values == NULL) {
+    size_t user_argc = argc > 0 ? argc - 1 : 0;
+    JSValueRef *arg_values = user_argc > 0 ? (JSValueRef *)calloc(user_argc, sizeof(JSValueRef)) : NULL;
+    JSValueRef *argv_values = (JSValueRef *)calloc(argc + 1, sizeof(JSValueRef));
+    if ((user_argc > 0 && arg_values == NULL) || argv_values == NULL) {
+        free(arg_values);
+        free(argv_values);
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
     }
+    argv_values[0] = ct_make_string(ctx, "cottontail");
     for (size_t index = 0; index < argc; index += 1) {
-        values[index] = ct_make_string(ctx, argv[index]);
+        argv_values[index + 1] = ct_make_string(ctx, argv[index]);
     }
-    JSObjectRef args = ct_make_array(ctx, argc, values, &exception);
-    free(values);
+    for (size_t index = 0; index < user_argc; index += 1) {
+        arg_values[index] = ct_make_string(ctx, argv[index + 1]);
+    }
+    JSObjectRef args = ct_make_array(ctx, user_argc, arg_values, &exception);
+    JSObjectRef process_argv = exception == NULL ? ct_make_array(ctx, argc + 1, argv_values, &exception) : NULL;
+    free(arg_values);
+    free(argv_values);
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
     ct_set_property(ctx, runtime->host_object, "args", args, &exception);
+    if (exception == NULL) ct_set_property(ctx, runtime->host_object, "argv", process_argv, &exception);
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
@@ -2203,6 +2248,23 @@ static JSValueRef ct_global_value(JSContextRef ctx, const char *name) {
     return ct_get_property(ctx, JSContextGetGlobalObject(ctx), name, &exception);
 }
 
+static int ct_jsc_runtime_has_active_handles(CtQjsRuntime *runtime, bool *has_active_handles_out, char **error_out) {
+    *has_active_handles_out = false;
+    JSContextRef ctx = runtime->context;
+    JSStringRef source = ct_js_string(
+        "globalThis.__cottontailHasActiveHandles ? globalThis.__cottontailHasActiveHandles() : false"
+    );
+    JSValueRef exception = NULL;
+    JSValueRef value = JSEvaluateScript(ctx, source, NULL, NULL, 1, &exception);
+    JSStringRelease(source);
+    if (exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+        return -1;
+    }
+    *has_active_handles_out = value != NULL && JSValueToBoolean(ctx, value);
+    return 0;
+}
+
 int ct_qjs_runtime_eval(CtQjsRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
     JSContextRef ctx = runtime->context;
@@ -2235,6 +2297,20 @@ int ct_qjs_runtime_eval(CtQjsRuntime *runtime, const uint8_t *source, size_t sou
         return -1;
     }
     JSValueRef unhandled = ct_global_value(ctx, "__ctUnhandledRejection");
+    if (unhandled != NULL && !JSValueIsUndefined(ctx, unhandled) && !JSValueIsNull(ctx, unhandled)) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, unhandled));
+        return -1;
+    }
+
+    for (;;) {
+        bool has_active_handles = false;
+        if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
+        if (!has_active_handles) break;
+        if (ct_qjs_runtime_tick(runtime, error_out) != 0) return -1;
+        usleep(1000);
+    }
+
+    unhandled = ct_global_value(ctx, "__ctUnhandledRejection");
     if (unhandled != NULL && !JSValueIsUndefined(ctx, unhandled) && !JSValueIsNull(ctx, unhandled)) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, unhandled));
         return -1;
