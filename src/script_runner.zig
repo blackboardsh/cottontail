@@ -57,25 +57,23 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
         .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
     };
 
-    const runnable_path = if (isTypescriptPath(script_path))
+    const runnable_path = if (runtimeModulesAvailable(&ctx))
+        try bundleScriptWithEsbuild(&ctx, script_path)
+    else if (isTypescriptPath(script_path))
         try bundleScriptWithEsbuild(&ctx, script_path)
     else blk: {
         const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
         if (try shouldBundleCommonJsEntrypoint(&ctx, script_abs)) {
-            if (!runtimeModulesAvailable(&ctx)) break :blk script_abs;
             const tmp_dir = try ensureTempDir(&ctx);
             break :blk try writeCommonJsEntryWrapper(&ctx, tmp_dir, script_abs);
         }
-        if (!runtimeModulesAvailable(&ctx)) break :blk script_abs;
-        const tmp_dir = try ensureTempDir(&ctx);
-        break :blk try writeCottontailEntryWrapper(&ctx, tmp_dir, script_abs);
+        break :blk script_abs;
     };
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
-    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    process_args[0] = script_path;
+    const process_args = try allocator.alloc([:0]const u8, script_args.len);
     for (script_args, 0..) |arg, index| {
-        process_args[index + 1] = arg;
+        process_args[index] = arg;
     }
 
     var execution = ScriptExecution{
@@ -451,7 +449,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\}});
         \\moduleModule.__runMain({s});
         \\
-        ,
+    ,
         .{
             try jsonStringLiteral(ctx, bun_module),
             try jsonStringLiteral(ctx, fs_module),

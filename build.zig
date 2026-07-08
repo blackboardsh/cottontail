@@ -1,5 +1,10 @@
 const std = @import("std");
 
+const JsEngine = enum {
+    quickjs,
+    jsc,
+};
+
 fn configureQuickjs(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
@@ -21,9 +26,37 @@ fn configureQuickjs(step: *std.Build.Step.Compile, b: *std.Build) void {
     }
 }
 
+fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
+    step.root_module.link_libc = true;
+    step.root_module.addIncludePath(b.path("src"));
+    step.root_module.addCSourceFile(.{
+        .file = b.path("src/jsc_runner.c"),
+        .flags = &[_][]const u8{"-std=c11"},
+    });
+
+    if (step.root_module.resolved_target.?.result.os.tag == .macos) {
+        step.root_module.linkFramework("JavaScriptCore", .{});
+    } else {
+        @panic("JavaScriptCore backend is currently wired for macOS only");
+    }
+}
+
+fn configureJsEngine(step: *std.Build.Step.Compile, b: *std.Build, engine: JsEngine) void {
+    switch (engine) {
+        .quickjs => configureQuickjs(step, b),
+        .jsc => configureJsc(step, b),
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const default_engine: JsEngine = if ((target.result.os.tag == .macos) or
+        (target.query.os_tag == null and @import("builtin").os.tag == .macos))
+        .jsc
+    else
+        .quickjs;
+    const engine = b.option(JsEngine, "engine", "JavaScript engine backend") orelse default_engine;
 
     const exe = b.addExecutable(.{
         .name = "cottontail",
@@ -34,7 +67,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    configureQuickjs(exe, b);
+    configureJsEngine(exe, b, engine);
 
     b.installArtifact(exe);
 
@@ -55,7 +88,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    configureQuickjs(unit_tests, b);
+    configureJsEngine(unit_tests, b, engine);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
