@@ -15,6 +15,7 @@
     "dev": "bun run run -- test.js",
     "bench:build": "bun run build:release",
     "bench": "bun run bench:build && node scripts/bench.js",
+    "bench:engines": "node scripts/bench-engines.js",
     "test:zig": "bun run setup && node scripts/zig.js build test",
     "test:js": "bun run build && node scripts/test-js.js",
     "test:electrobun": "bun run build && node scripts/test-electrobun.js",
