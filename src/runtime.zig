@@ -12,7 +12,11 @@ pub const Runtime = struct {
     max_script_size: usize = 64 * 1024 * 1024,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
-        const handle = c.ct_qjs_runtime_create() orelse return error.RuntimeInitFailed;
+        return initWithStackSize(io, allocator, 0);
+    }
+
+    pub fn initWithStackSize(io: std.Io, allocator: std.mem.Allocator, stack_size: usize) !Runtime {
+        const handle = c.ct_qjs_runtime_create_with_stack_size(stack_size) orelse return error.RuntimeInitFailed;
         host.configure(io);
         return .{
             .io = io,

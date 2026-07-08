@@ -7,6 +7,7 @@
 typedef struct CtQjsRuntime CtQjsRuntime;
 
 CtQjsRuntime *ct_qjs_runtime_create(void);
+CtQjsRuntime *ct_qjs_runtime_create_with_stack_size(size_t stack_size);
 void ct_qjs_runtime_destroy(CtQjsRuntime *runtime);
 int ct_qjs_runtime_set_args(
     CtQjsRuntime *runtime,

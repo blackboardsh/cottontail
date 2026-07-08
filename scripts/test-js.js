@@ -121,6 +121,78 @@ try {
       stdoutIncludes: ['bun serve spawn ts passed'],
     },
     {
+      name: 'bun-serve-detached',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-detached.ts'),
+      env: {
+        COTTONTAIL_SERVE_DETACHED_OUTPUT: join(tempDir, 'serve-detached.txt'),
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun serve detached passed'],
+    },
+    {
+      name: 'await-then-serve',
+      scriptPath: join(rootDir, 'tests', 'js', 'await-then-serve.ts'),
+      env: {
+        COTTONTAIL_SERVE_DETACHED_OUTPUT: join(tempDir, 'await-serve.txt'),
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['await then serve passed'],
+    },
+    {
+      name: 'node-fs',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-fs.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node fs passed'],
+    },
+    {
+      name: 'node-child-process',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process spawn passed'],
+    },
+    {
+      name: 'node-os',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-os.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node os passed'],
+    },
+    {
+      name: 'proxy-function',
+      scriptPath: join(rootDir, 'tests', 'js', 'proxy-function.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['proxy function passed'],
+    },
+    {
+      name: 'spawn-detached',
+      scriptPath: join(rootDir, 'tests', 'js', 'spawn-detached.ts'),
+      env: {
+        COTTONTAIL_DETACHED_OUTPUT: join(tempDir, 'spawn-detached.txt'),
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['spawn detached passed'],
+    },
+    {
+      name: 'timer-clock',
+      scriptPath: join(rootDir, 'tests', 'js', 'timer-clock.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['timer clock passed'],
+    },
+    {
+      name: 'worker-request-response',
+      scriptPath: join(rootDir, 'tests', 'js', 'worker-request-response.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['worker request response passed'],
+    },
+    {
+      name: 'worker-delayed-request',
+      scriptPath: join(rootDir, 'tests', 'js', 'worker-delayed-request.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['worker delayed request passed'],
+    },
+    {
       name: 'sync-error',
       scriptPath: join(rootDir, 'tests', 'js', 'sync-error.js'),
       expectExitCode: 1,

@@ -1,4 +1,5 @@
 import "./ffi.js";
+import { randomBytes, randomUUID } from "../node/crypto.js";
 
 function shellEscape(value) {
   const text = String(value);
@@ -34,6 +35,18 @@ function runShell(command, capture) {
   return output;
 }
 
+function getRandomValues(view) {
+  if (!ArrayBuffer.isView(view) || view instanceof DataView) {
+    throw new TypeError("crypto.getRandomValues requires an integer typed array");
+  }
+  if (view.byteLength > 65536) {
+    throw new Error("crypto.getRandomValues quota exceeded");
+  }
+
+  new Uint8Array(view.buffer, view.byteOffset, view.byteLength).set(randomBytes(view.byteLength));
+  return view;
+}
+
 class ShellCommand {
   constructor(command) {
     this.command = command;
@@ -67,6 +80,29 @@ export function $(strings, ...values) {
 
 function pathJoin(...parts) {
   return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
+}
+
+function which(command) {
+  const value = String(command || "");
+  if (!value) return null;
+  if (value.includes("/") || value.includes("\\")) {
+    return cottontail.existsSync(value) ? value : null;
+  }
+
+  const env = BunObject.env ?? cottontail.env();
+  const pathValue = String(env.PATH ?? env.Path ?? env.path ?? "");
+  const extensions = cottontail.platform() === "win32"
+    ? String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+
+  for (const dir of pathValue.split(cottontail.platform() === "win32" ? ";" : ":")) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      const candidate = pathJoin(dir, `${value}${ext}`);
+      if (cottontail.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
 }
 
 function bunBinary() {
@@ -169,6 +205,16 @@ function asBuffer(value) {
   return new TextEncoder().encode(String(value ?? ""));
 }
 
+function concatBuffers(left, right) {
+  const lhs = asBuffer(left);
+  const rhs = asBuffer(right);
+  if (globalThis.Buffer?.concat) return globalThis.Buffer.concat([lhs, rhs]);
+  const out = new Uint8Array(lhs.length + rhs.length);
+  out.set(lhs, 0);
+  out.set(rhs, lhs.length);
+  return out;
+}
+
 function signalName(signalNumber) {
   const signals = {
     1: "SIGHUP",
@@ -220,6 +266,35 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
 class ProcessReadable {
   constructor(read) {
     this._read = read;
+    this._listeners = new Map();
+  }
+  on(name, handler) {
+    if (typeof handler !== "function") return this;
+    const key = String(name);
+    const handlers = this._listeners.get(key) ?? [];
+    handlers.push(handler);
+    this._listeners.set(key, handlers);
+    return this;
+  }
+  once(name, handler) {
+    const wrapped = (...args) => {
+      this.off(name, wrapped);
+      handler(...args);
+    };
+    wrapped.listener = handler;
+    return this.on(name, wrapped);
+  }
+  off(name, handler) {
+    const key = String(name);
+    const handlers = this._listeners.get(key) ?? [];
+    this._listeners.set(key, handlers.filter((item) => item !== handler && item.listener !== handler));
+    return this;
+  }
+  removeListener(name, handler) {
+    return this.off(name, handler);
+  }
+  emit(name, ...args) {
+    for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
   }
   async arrayBuffer() {
     const bytes = asBuffer(await this._read());
@@ -254,16 +329,72 @@ class ProcessReadable {
   }
 }
 
+class ProcessWritable {
+  constructor(processId) {
+    this._processId = processId;
+    this._listeners = new Map();
+  }
+  on(name, handler) {
+    if (typeof handler !== "function") return this;
+    const key = String(name);
+    const handlers = this._listeners.get(key) ?? [];
+    handlers.push(handler);
+    this._listeners.set(key, handlers);
+    return this;
+  }
+  once(name, handler) {
+    const wrapped = (...args) => {
+      this.off(name, wrapped);
+      handler(...args);
+    };
+    wrapped.listener = handler;
+    return this.on(name, wrapped);
+  }
+  off(name, handler) {
+    const key = String(name);
+    const handlers = this._listeners.get(key) ?? [];
+    this._listeners.set(key, handlers.filter((item) => item !== handler && item.listener !== handler));
+    return this;
+  }
+  removeListener(name, handler) {
+    return this.off(name, handler);
+  }
+  emit(name, ...args) {
+    for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
+  }
+  write(chunk, callback) {
+    const ok = cottontail.spawnWrite?.(this._processId, chunk) === true;
+    if (typeof callback === "function") callback(ok ? null : new Error("write failed"));
+    return ok;
+  }
+  end(chunk) {
+    if (chunk != null) this.write(chunk);
+    cottontail.spawnCloseStdin?.(this._processId);
+    this.emit("finish");
+    this.emit("close");
+  }
+  destroy() {
+    cottontail.spawnCloseStdin?.(this._processId);
+    this.emit("close");
+  }
+  ref() {
+    return this;
+  }
+  unref() {
+    return this;
+  }
+}
+
 export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
   const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
-  const nativeOptions = normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "inherit" });
+  const nativeOptions = normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const listeners = new Map();
   let killed = false;
   let exitCode = null;
   let signalCode = null;
   let stdoutBuffer = asBuffer("");
   let stderrBuffer = asBuffer("");
-  let pollTimer = null;
+  let unregisterSpawnListener = null;
 
   const child = {
     pid: 0,
@@ -306,9 +437,11 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       killed = cottontail.spawnKill?.(child._id, signalNumber(signal)) === true;
     },
     ref() {
+      unregisterSpawnListener?.ref?.();
       return child;
     },
     unref() {
+      unregisterSpawnListener?.unref?.();
       return child;
     },
     send() {
@@ -338,17 +471,26 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   const native = cottontail.spawnStart(file, args, nativeOptions);
   child._id = native.id;
   child.pid = native.pid;
+  child.stdin = nativeOptions.stdin === "pipe" && nativeOptions.input === undefined ? new ProcessWritable(native.id) : null;
 
   child.exited = new Promise((resolve, reject) => {
     const complete = async (result) => {
-      if (pollTimer != null) clearInterval(pollTimer);
-      pollTimer = null;
-      stdoutBuffer = asBuffer(result.stdout ?? "");
-      stderrBuffer = asBuffer(result.stderr ?? "");
+      if (unregisterSpawnListener != null) {
+        unregisterSpawnListener();
+        unregisterSpawnListener = null;
+      }
       exitCode = result.exitCode == null ? null : Number(result.exitCode);
       signalCode = result.signalCode == null ? null : signalName(result.signalCode) ?? String(result.signalCode);
       killed = killed || result.killed === true;
       try {
+        if (child.stdout) {
+          child.stdout.emit("end");
+          child.stdout.emit("close");
+        }
+        if (child.stderr) {
+          child.stderr.emit("end");
+          child.stderr.emit("close");
+        }
         if (typeof options.onExit === "function") {
           await options.onExit(child, exitCode, signalCode, undefined);
         }
@@ -361,14 +503,28 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       }
     };
 
-    const poll = () => {
-      const result = cottontail.spawnPoll(native.id);
-      if (!result) return;
-      if (result.completed) complete(result);
-    };
-
-    pollTimer = setInterval(poll, 1);
-    poll();
+    unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
+      if (!event) return;
+      if (event.type === "stdout") {
+        const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
+        if (chunk.length > 0) {
+          stdoutBuffer = concatBuffers(stdoutBuffer, chunk);
+          child.stdout?.emit("data", chunk);
+        }
+        return;
+      }
+      if (event.type === "stderr") {
+        const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
+        if (chunk.length > 0) {
+          stderrBuffer = concatBuffers(stderrBuffer, chunk);
+          child.stderr?.emit("data", chunk);
+        }
+        return;
+      }
+      if (event.type === "exit") {
+        complete(event);
+      }
+    });
   });
 
   return child;
@@ -519,6 +675,35 @@ export class Response {
   async json() {
     return JSON.parse(await this.text());
   }
+  get ok() {
+    return this.status >= 200 && this.status < 300;
+  }
+}
+
+export async function fetch(input, init = {}) {
+  const request = input instanceof Request ? input : new Request(input, init);
+  const args = ["-L", "-sS", "-X", request.method];
+  request.headers.forEach((value, key) => {
+    args.push("-H", `${key}: ${value}`);
+  });
+  const body = await request.text();
+  if (body.length > 0 && request.method !== "GET" && request.method !== "HEAD") {
+    args.push("--data-binary", body);
+  }
+  args.push("-w", "\n__COTTONTAIL_HTTP_STATUS__:%{http_code}", request.url);
+
+  const result = cottontail.spawnSync("curl", args, { stdio: "pipe" });
+  const stdout = String(result.stdout ?? "");
+  const marker = "\n__COTTONTAIL_HTTP_STATUS__:";
+  const markerIndex = stdout.lastIndexOf(marker);
+  const responseBody = markerIndex >= 0 ? stdout.slice(0, markerIndex) : stdout;
+  const status = markerIndex >= 0 ? Number(stdout.slice(markerIndex + marker.length).trim()) || 0 : Number(result.status) || 0;
+
+  if (result.status !== 0 && status === 0) {
+    throw new Error(String(result.stderr || result.stdout || "fetch failed"));
+  }
+
+  return new Response(responseBody, { status: status || 200 });
 }
 
 function parseHeadersText(text) {
@@ -543,9 +728,17 @@ function headersToText(headers) {
   return out;
 }
 
-async function normalizeResponse(value) {
+function isPromiseLike(value) {
+  return value != null && typeof value.then === "function";
+}
+
+function normalizeResponse(value) {
   if (value instanceof Response) return value;
   return new Response(value);
+}
+
+function normalizeResponseResult(value) {
+  return isPromiseLike(value) ? value.then(normalizeResponse) : normalizeResponse(value);
 }
 
 function defaultServePort(options) {
@@ -608,13 +801,13 @@ function selectRoute(routes, request) {
   return null;
 }
 
-async function runServeHandler(options, request, server) {
+function runServeHandler(options, request, server) {
   const route = selectRoute(options.routes, request);
   if (route != null) {
-    if (typeof route === "function") return normalizeResponse(await route(request, server));
+    if (typeof route === "function") return normalizeResponseResult(route(request, server));
     return normalizeResponse(route);
   }
-  if (typeof options.fetch === "function") return normalizeResponse(await options.fetch(request, server));
+  if (typeof options.fetch === "function") return normalizeResponseResult(options.fetch(request, server));
   return new Response("Not Found", { status: 404 });
 }
 
@@ -638,9 +831,8 @@ export function serve(options = {}) {
     pendingRequests: 0,
     pendingWebSockets: 0,
     get url() {
-      const url = new URL(`http://${native.hostname}:${native.port}/`);
+      const url = new globalThis.URL(`http://${native.hostname}:${native.port}/`);
       url.pathname = "";
-      url.href = url.origin;
       return url;
     },
     stop() {
@@ -678,57 +870,99 @@ export function serve(options = {}) {
     },
   };
 
-  const handle = async (item) => {
+  const respond = (item, status, headersText, body) => {
+    if (stopped) return;
+    try {
+      cottontail.httpServerRespond(native.id, item.id, status, headersText, body);
+    } catch (error) {
+      if (stopped && String(error).includes("HTTP server not found")) return;
+      throw error;
+    }
+  };
+
+  const responseBody = (response) => {
+    if (response instanceof Response) return arrayBufferFromBytes(response._body);
+    return response.arrayBuffer();
+  };
+
+  const sendResponse = (item, response, statusOverride = undefined) => {
+    const body = responseBody(response);
+    const status = statusOverride ?? response.status;
+    const headers = headersToText(response.headers);
+    if (isPromiseLike(body)) {
+      return body.then((resolvedBody) => respond(item, status, headers, resolvedBody));
+    }
+    respond(item, status, headers, body);
+    return undefined;
+  };
+
+  const handleError = (item, error) => {
+    const message = error instanceof Error ? error.stack || error.message : String(error);
+    let response;
+    if (typeof activeOptions.error === "function") {
+      try {
+        response = normalizeResponseResult(activeOptions.error(error));
+      } catch (nextError) {
+        response = new Response(nextError instanceof Error ? nextError.stack || nextError.message : String(nextError), {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+    } else {
+      response = new Response(message, {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    if (isPromiseLike(response)) {
+      return response.then((resolvedResponse) => sendResponse(item, resolvedResponse, 500));
+    }
+    return sendResponse(item, response, 500);
+  };
+
+  const handle = (item) => {
     const request = new Request(`http://${native.hostname}:${native.port}${item.url}`, {
       method: item.method,
       headers: parseHeadersText(item.headersText),
       body: item.body,
     });
     try {
-      const response = await runServeHandler(activeOptions, request, server);
-      const body = await response.arrayBuffer();
-      cottontail.httpServerRespond(
-        native.id,
-        item.id,
-        response.status,
-        headersToText(response.headers),
-        body,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.stack || error.message : String(error);
-      let response;
-      if (typeof activeOptions.error === "function") {
-        response = await normalizeResponse(await activeOptions.error(error));
-      } else {
-        response = new Response(message, {
-          status: 500,
-          headers: { "content-type": "text/plain; charset=utf-8" },
-        });
+      const response = runServeHandler(activeOptions, request, server);
+      if (isPromiseLike(response)) {
+        return response
+          .then((resolvedResponse) => sendResponse(item, resolvedResponse))
+          .catch((error) => handleError(item, error));
       }
-      cottontail.httpServerRespond(
-        native.id,
-        item.id,
-        500,
-        headersToText(response.headers),
-        await response.arrayBuffer(),
-      );
+      return sendResponse(item, response);
+    } catch (error) {
+      return handleError(item, error);
     }
   };
 
-  const pump = async () => {
+  const pump = () => {
     if (stopped || pumping) return;
     pumping = true;
-    try {
-      while (!stopped) {
-        const item = cottontail.httpServerPoll(native.id);
-        if (!item) break;
-        server.pendingRequests += 1;
-        await handle(item);
+    while (!stopped) {
+      const item = cottontail.httpServerPoll(native.id);
+      if (!item) break;
+      server.pendingRequests += 1;
+      const handled = handle(item);
+      if (isPromiseLike(handled)) {
+        handled.then(
+          () => {},
+          (error) => console.error(error instanceof Error ? error.stack || error.message : error),
+        ).then(() => {
+          server.pendingRequests -= 1;
+          pumping = false;
+          pump();
+        });
+        return;
+      } else {
         server.pendingRequests -= 1;
       }
-    } finally {
-      pumping = false;
     }
+    pumping = false;
   };
 
   interval = setInterval(pump, 1);
@@ -878,10 +1112,17 @@ BunObject.env = globalThis.process?.env ?? cottontail.env();
 BunObject.build = build;
 BunObject.file = file;
 BunObject.write = write;
+BunObject.which = which;
 BunObject.spawn = spawn;
 BunObject.spawnSync = spawnSync;
 BunObject.serve = serve;
+BunObject.fetch = fetch;
 BunObject.Archive = Archive;
+const CryptoObject = globalThis.crypto ?? {};
+CryptoObject.randomUUID ??= randomUUID;
+CryptoObject.getRandomValues ??= getRandomValues;
+globalThis.crypto = CryptoObject;
+globalThis.fetch ??= fetch;
 globalThis.Bun = BunObject;
 globalThis.Headers ??= Headers;
 globalThis.Request ??= Request;

@@ -18,6 +18,10 @@ export function join(...parts) {
   return normalize(parts.filter((part) => part !== "").join("/"));
 }
 
+export function isAbsolute(path) {
+  return String(path || "").startsWith("/") || /^[A-Za-z]:[\\/]/.test(String(path || ""));
+}
+
 export function resolve(...parts) {
   let path = "";
   for (const part of parts) {
@@ -40,6 +44,22 @@ export function basename(path) {
   return index >= 0 ? normalized.slice(index + 1) : normalized;
 }
 
+export function extname(path) {
+  const base = basename(path);
+  const index = base.lastIndexOf(".");
+  if (index <= 0) return "";
+  return base.slice(index);
+}
+
+export function parse(path) {
+  const dir = dirname(path);
+  const base = basename(path);
+  const ext = extname(base);
+  const name = ext ? base.slice(0, -ext.length) : base;
+  const root = String(path || "").startsWith("/") ? "/" : "";
+  return { root, dir, base, ext, name };
+}
+
 export function relative(from, to) {
   const fromParts = resolve(from).split("/").filter(Boolean);
   const toParts = resolve(to).split("/").filter(Boolean);
@@ -50,4 +70,7 @@ export function relative(from, to) {
   return [...fromParts.map(() => ".."), ...toParts].join("/") || ".";
 }
 
-export default { basename, dirname, join, relative, resolve };
+export const sep = cottontail.platform() === "win32" ? "\\" : "/";
+export const posix = { basename, dirname, extname, isAbsolute, join, parse, relative, resolve, sep: "/" };
+
+export default { basename, dirname, extname, isAbsolute, join, parse, posix, relative, resolve, sep };

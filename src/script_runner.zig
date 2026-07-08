@@ -3,6 +3,24 @@ const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
 
 const esbuild_version = "0.28.0";
+const script_thread_stack_size = 128 * 1024 * 1024;
+const script_js_stack_size = 96 * 1024 * 1024;
+
+const RunElectrobunMainThreadFn = *const fn (
+    [*:0]const u8,
+    [*:0]const u8,
+    [*:0]const u8,
+    c_int,
+) callconv(.c) c_int;
+const ElectrobunLastErrorFn = *const fn () callconv(.c) ?[*:0]const u8;
+
+const ScriptExecution = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    runnable_path: [:0]const u8,
+    script_args: []const [:0]const u8,
+    exit_code: u8 = 1,
+};
 
 const Context = struct {
     io: std.Io,
@@ -40,28 +58,141 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
     };
 
     const runnable_path = if (isTypescriptPath(script_path))
-        try bundleTypescript(&ctx, script_path)
+        try bundleScriptWithEsbuild(&ctx, script_path)
     else blk: {
         const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+        if (try shouldBundleCommonJsEntrypoint(&ctx, script_abs)) {
+            if (!runtimeModulesAvailable(&ctx)) break :blk script_abs;
+            const tmp_dir = try ensureTempDir(&ctx);
+            break :blk try writeCommonJsEntryWrapper(&ctx, tmp_dir, script_abs);
+        }
         if (!runtimeModulesAvailable(&ctx)) break :blk script_abs;
         const tmp_dir = try ensureTempDir(&ctx);
         break :blk try writeCottontailEntryWrapper(&ctx, tmp_dir, script_abs);
     };
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = script_path;
+    for (script_args, 0..) |arg, index| {
+        process_args[index + 1] = arg;
+    }
 
-    var js_runtime = runtime.Runtime.init(init.io, allocator) catch {
-        ctx.writeStderr("cottontail: failed to initialize the embedded QuickJS runtime\n", .{});
-        return 1;
+    var execution = ScriptExecution{
+        .io = init.io,
+        .allocator = allocator,
+        .runnable_path = runnable_path_z,
+        .script_args = process_args,
+    };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = script_thread_stack_size },
+        runScriptExecution,
+        .{&execution},
+    );
+
+    if (shouldRunElectrobunMainThread(&ctx)) {
+        const main_thread_status = runElectrobunMainThread(&ctx) catch |err| blk: {
+            ctx.writeStderr("cottontail: failed to run Electrobun main thread: {s}\n", .{@errorName(err)});
+            break :blk @as(u8, 1);
+        };
+        thread.join();
+        if (main_thread_status != 0) {
+            return main_thread_status;
+        }
+    } else {
+        thread.join();
+    }
+
+    return execution.exit_code;
+}
+
+fn shouldRunElectrobunMainThread(ctx: *const Context) bool {
+    return ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") != null;
+}
+
+fn electrobunCoreFileName() []const u8 {
+    return switch (builtin.os.tag) {
+        .windows => "ElectrobunCore.dll",
+        .macos => "libElectrobunCore.dylib",
+        else => "libElectrobunCore.so",
+    };
+}
+
+fn electrobunEnv(ctx: *const Context, name: []const u8, fallback: []const u8) []const u8 {
+    const value = ctx.environ_map.get(name) orelse return fallback;
+    return if (value.len == 0) fallback else value;
+}
+
+fn runElectrobunMainThread(ctx: *const Context) !u8 {
+    const dist_dir = ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") orelse return 0;
+    const core_path = try std.fs.path.join(ctx.allocator, &.{ dist_dir, electrobunCoreFileName() });
+
+    var core = try std.DynLib.open(core_path);
+    defer core.close();
+
+    const run_main_thread = core.lookup(
+        RunElectrobunMainThreadFn,
+        "electrobun_core_run_main_thread",
+    ) orelse return error.MissingElectrobunRunMainThread;
+    const last_error = core.lookup(
+        ElectrobunLastErrorFn,
+        "electrobun_core_last_error",
+    ) orelse return error.MissingElectrobunLastError;
+
+    const identifier = try ctx.allocator.dupeZ(
+        u8,
+        electrobunEnv(ctx, "COTTONTAIL_ELECTROBUN_IDENTIFIER", "app.cottontail.electrobun"),
+    );
+    const name = try ctx.allocator.dupeZ(
+        u8,
+        electrobunEnv(ctx, "COTTONTAIL_ELECTROBUN_NAME", "Electrobun"),
+    );
+    const channel = try ctx.allocator.dupeZ(
+        u8,
+        electrobunEnv(ctx, "COTTONTAIL_ELECTROBUN_CHANNEL", "dev"),
+    );
+
+    const status = run_main_thread(identifier.ptr, name.ptr, channel.ptr, 0);
+    if (status != 0) {
+        if (last_error()) |message| {
+            const message_slice = std.mem.span(message);
+            if (message_slice.len > 0) {
+                ctx.writeStderr("cottontail: ElectrobunCore failed: {s}\n", .{message_slice});
+            }
+        }
+        return @intCast(@min(status, 255));
+    }
+
+    return 0;
+}
+
+fn runScriptExecution(execution: *ScriptExecution) void {
+    var js_runtime = runtime.Runtime.initWithStackSize(
+        execution.io,
+        execution.allocator,
+        script_js_stack_size,
+    ) catch {
+        writeStderr(execution.io, "cottontail: failed to initialize the embedded QuickJS runtime\n", .{});
+        execution.exit_code = 1;
+        return;
     };
     defer js_runtime.deinit();
 
-    js_runtime.setArgs(script_args) catch {
-        ctx.writeStderr("cottontail: failed to initialize cottontail.args\n", .{});
-        return 1;
+    js_runtime.setArgs(execution.script_args) catch {
+        writeStderr(execution.io, "cottontail: failed to initialize cottontail.args\n", .{});
+        execution.exit_code = 1;
+        return;
     };
 
-    return js_runtime.runFile(runnable_path_z);
+    execution.exit_code = js_runtime.runFile(execution.runnable_path);
+}
+
+fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buffer);
+    const stderr = &writer.interface;
+    stderr.print(fmt, args) catch {};
+    stderr.flush() catch {};
 }
 
 fn isTypescriptPath(path: []const u8) bool {
@@ -71,7 +202,7 @@ fn isTypescriptPath(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".cts");
 }
 
-fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
+fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]const u8 {
     try ensureEsbuild(ctx);
 
     const tmp_dir = try ensureTempDir(ctx);
@@ -80,6 +211,12 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
     const wrapped_entry = try writeCottontailEntryWrapper(ctx, tmp_dir, script_abs);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
     const esbuild_bin = try esbuildBinaryPath(ctx);
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    const script_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{script_abs});
+    const script_dir_literal = try jsonStringLiteral(ctx, script_dir);
+    const script_basename_literal = try jsonStringLiteral(ctx, std.fs.path.basename(script_abs));
+    const script_path_literal = try jsonStringLiteral(ctx, script_abs);
+    const script_url_literal = try jsonStringLiteral(ctx, script_url);
 
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const bun_ffi_module = try runtimeModulePath(ctx, &.{ "bun", "ffi.js" });
@@ -90,7 +227,16 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
+    const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
+    const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
+    const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
+    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
+    const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
+    const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
+    const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
+    const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
+    const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
     const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
 
@@ -100,8 +246,16 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
         "--bundle",
         "--platform=neutral",
         "--format=esm",
+        "--main-fields=module,main",
         "--target=es2022",
         try std.fmt.allocPrint(ctx.allocator, "--outfile={s}", .{bundle_path}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dirname={s}", .{script_dir_literal}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dir={s}", .{script_dir_literal}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.filename={s}", .{script_path_literal}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.file={s}", .{script_basename_literal}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.path={s}", .{script_path_literal}),
+        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.url={s}", .{script_url_literal}),
+        "--define:import.meta.main=true",
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun={s}", .{bun_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:ffi={s}", .{bun_ffi_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs={s}", .{fs_module}),
@@ -118,8 +272,26 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:events={s}", .{events_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:events={s}", .{events_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:assert={s}", .{assert_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert={s}", .{assert_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:tty={s}", .{tty_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:tty={s}", .{tty_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:v8={s}", .{v8_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:v8={s}", .{v8_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:stream={s}", .{stream_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream={s}", .{stream_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:perf_hooks={s}", .{perf_hooks_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:perf_hooks={s}", .{perf_hooks_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:vm={s}", .{vm_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:vm={s}", .{vm_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:module={s}", .{module_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:module={s}", .{module_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:url={s}", .{url_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:url={s}", .{url_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:crypto={s}", .{crypto_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:crypto={s}", .{crypto_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:buffer={s}", .{buffer_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:buffer={s}", .{buffer_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:child_process={s}", .{child_process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:child_process={s}", .{child_process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:zlib={s}", .{zlib_module}),
@@ -143,6 +315,49 @@ fn bundleTypescript(ctx: *const Context, script_path: []const u8) ![]const u8 {
     return bundle_path;
 }
 
+fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
+    if (std.mem.endsWith(u8, script_abs, ".cjs")) return true;
+    if (std.mem.endsWith(u8, script_abs, ".mjs")) return false;
+    if (!std.mem.endsWith(u8, script_abs, ".js")) return false;
+
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    return !(try nearestPackageTypeIsModule(ctx, script_dir));
+}
+
+fn nearestPackageTypeIsModule(ctx: *const Context, start_dir: []const u8) !bool {
+    var current: []const u8 = try ctx.allocator.dupe(u8, start_dir);
+    while (true) {
+        const package_json = try std.fs.path.join(ctx.allocator, &.{ current, "package.json" });
+        if (pathExists(ctx.io, package_json)) {
+            const source = std.Io.Dir.cwd().readFileAlloc(
+                ctx.io,
+                package_json,
+                ctx.allocator,
+                .limited(1024 * 1024),
+            ) catch return false;
+            return packageJsonDeclaresModuleType(source);
+        }
+
+        const parent = std.fs.path.dirname(current) orelse return false;
+        if (std.mem.eql(u8, parent, current)) return false;
+        current = parent;
+    }
+}
+
+fn packageJsonDeclaresModuleType(source: []const u8) bool {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, source, offset, "\"type\"")) |index| {
+        const after_key = source[index + "\"type\"".len ..];
+        const colon_index = std.mem.indexOfScalar(u8, after_key, ':') orelse {
+            offset = index + "\"type\"".len;
+            continue;
+        };
+        const value = std.mem.trim(u8, after_key[colon_index + 1 ..], " \t\r\n");
+        return std.mem.startsWith(u8, value, "\"module\"");
+    }
+    return false;
+}
+
 fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const wrapper_name = try std.fmt.allocPrint(
@@ -157,6 +372,109 @@ fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_
         ctx.allocator,
         "import {s};\nimport {s};\n",
         .{ bun_literal, script_literal },
+    );
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
+    return wrapper_path;
+}
+
+fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "script-entry-cjs-{x}.mjs",
+        .{std.hash.Wyhash.hash(0, script_abs)},
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+
+    const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
+    const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
+    const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
+    const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
+    const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
+    const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
+    const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
+    const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
+    const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.js" });
+    const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
+    const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
+    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
+    const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
+    const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
+    const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
+    const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
+    const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
+    const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
+    const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
+    const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
+
+    const source = try std.fmt.allocPrint(
+        ctx.allocator,
+        \\import {s};
+        \\import * as fs from {s};
+        \\import * as fsPromises from {s};
+        \\import * as os from {s};
+        \\import * as path from {s};
+        \\import * as processModule from {s};
+        \\import * as util from {s};
+        \\import * as events from {s};
+        \\import * as assert from {s};
+        \\import * as tty from {s};
+        \\import * as v8 from {s};
+        \\import * as stream from {s};
+        \\import * as perfHooks from {s};
+        \\import * as vm from {s};
+        \\import * as moduleModule from {s};
+        \\import * as url from {s};
+        \\import * as crypto from {s};
+        \\import * as buffer from {s};
+        \\import * as childProcess from {s};
+        \\import * as zlib from {s};
+        \\moduleModule.__setBuiltinModules({{
+        \\  fs, "node:fs": fs,
+        \\  "fs/promises": fsPromises, "node:fs/promises": fsPromises,
+        \\  os, "node:os": os,
+        \\  path, "node:path": path,
+        \\  process: processModule, "node:process": processModule,
+        \\  util, "node:util": util,
+        \\  events, "node:events": events,
+        \\  assert, "node:assert": assert,
+        \\  tty, "node:tty": tty,
+        \\  v8, "node:v8": v8,
+        \\  stream, "node:stream": stream,
+        \\  perf_hooks: perfHooks, "node:perf_hooks": perfHooks,
+        \\  vm, "node:vm": vm,
+        \\  module: moduleModule, "node:module": moduleModule,
+        \\  url, "node:url": url,
+        \\  crypto, "node:crypto": crypto,
+        \\  buffer, "node:buffer": buffer,
+        \\  child_process: childProcess, "node:child_process": childProcess,
+        \\  zlib, "node:zlib": zlib
+        \\}});
+        \\moduleModule.__runMain({s});
+        \\
+        ,
+        .{
+            try jsonStringLiteral(ctx, bun_module),
+            try jsonStringLiteral(ctx, fs_module),
+            try jsonStringLiteral(ctx, fs_promises_module),
+            try jsonStringLiteral(ctx, os_module),
+            try jsonStringLiteral(ctx, path_module),
+            try jsonStringLiteral(ctx, process_module),
+            try jsonStringLiteral(ctx, util_module),
+            try jsonStringLiteral(ctx, events_module),
+            try jsonStringLiteral(ctx, assert_module),
+            try jsonStringLiteral(ctx, tty_module),
+            try jsonStringLiteral(ctx, v8_module),
+            try jsonStringLiteral(ctx, stream_module),
+            try jsonStringLiteral(ctx, perf_hooks_module),
+            try jsonStringLiteral(ctx, vm_module),
+            try jsonStringLiteral(ctx, module_module),
+            try jsonStringLiteral(ctx, url_module),
+            try jsonStringLiteral(ctx, crypto_module),
+            try jsonStringLiteral(ctx, buffer_module),
+            try jsonStringLiteral(ctx, child_process_module),
+            try jsonStringLiteral(ctx, zlib_module),
+            try jsonStringLiteral(ctx, script_abs),
+        },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
@@ -182,9 +500,43 @@ fn runtimeModulesAvailable(ctx: *const Context) bool {
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
-    const tmp_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "run" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, tmp_dir);
-    return tmp_dir;
+    const run_root = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "run" });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, run_root);
+
+    var random_bytes: [16]u8 = undefined;
+    for (0..8) |_| {
+        ctx.io.random(&random_bytes);
+        const dirname = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}",
+            .{
+                random_bytes[0],
+                random_bytes[1],
+                random_bytes[2],
+                random_bytes[3],
+                random_bytes[4],
+                random_bytes[5],
+                random_bytes[6],
+                random_bytes[7],
+                random_bytes[8],
+                random_bytes[9],
+                random_bytes[10],
+                random_bytes[11],
+                random_bytes[12],
+                random_bytes[13],
+                random_bytes[14],
+                random_bytes[15],
+            },
+        );
+        const tmp_dir = try std.fs.path.join(ctx.allocator, &.{ run_root, dirname });
+        std.Io.Dir.cwd().createDir(ctx.io, tmp_dir, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return tmp_dir;
+    }
+
+    return error.TempDirCollision;
 }
 
 fn findCottontailHome(init: std.process.Init, allocator: std.mem.Allocator, exe_dir: []const u8) ![]const u8 {
