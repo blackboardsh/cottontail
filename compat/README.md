@@ -32,3 +32,15 @@ test result. It records:
 Unsupported APIs should stay visible in this manifest until they are implemented
 and covered by tests. Runtime stubs should throw clear errors when added; they
 should not print to stdout because that would affect CLI/app behavior.
+
+## Inline Caveats
+
+Use this grep-friendly comment format for places where an implementation is
+intentionally incomplete or conservative:
+
+```js
+// COTTONTAIL-COMPAT: <module-or-api> - <short reason>; <next step>.
+```
+
+Keep the comment close to the behavior it qualifies. These comments are for
+real compatibility gaps, not generic todos.

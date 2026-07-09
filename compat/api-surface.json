@@ -7631,33 +7631,115 @@
         ],
         "hasDefaultExport": true
       },
-      "assert": {
-        "file": "src/runtime_modules/node/assert.js",
+      "assert/strict": {
+        "file": "src/runtime_modules/node/assert/strict.js",
         "exports": [
+          "Assert",
           "AssertionError",
+          "CallTracker",
+          "deepEqual",
           "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
           "equal",
           "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
           "notDeepStrictEqual",
           "notEqual",
           "notStrictEqual",
           "ok",
-          "strictEqual"
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:assert/strict": {
+        "file": "src/runtime_modules/node/assert/strict.js",
+        "exports": [
+          "Assert",
+          "AssertionError",
+          "CallTracker",
+          "deepEqual",
+          "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
+          "equal",
+          "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
+          "notDeepStrictEqual",
+          "notEqual",
+          "notStrictEqual",
+          "ok",
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
+        ],
+        "hasDefaultExport": true
+      },
+      "assert": {
+        "file": "src/runtime_modules/node/assert.js",
+        "exports": [
+          "Assert",
+          "AssertionError",
+          "CallTracker",
+          "deepEqual",
+          "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
+          "equal",
+          "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
+          "notDeepStrictEqual",
+          "notEqual",
+          "notStrictEqual",
+          "ok",
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
         ],
         "hasDefaultExport": true
       },
       "node:assert": {
         "file": "src/runtime_modules/node/assert.js",
         "exports": [
+          "Assert",
           "AssertionError",
+          "CallTracker",
+          "deepEqual",
           "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
           "equal",
           "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
           "notDeepStrictEqual",
           "notEqual",
           "notStrictEqual",
           "ok",
-          "strictEqual"
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
         ],
         "hasDefaultExport": true
       },
@@ -7702,6 +7784,80 @@
           "fork",
           "spawn",
           "spawnSync"
+        ],
+        "hasDefaultExport": true
+      },
+      "console": {
+        "file": "src/runtime_modules/node/console.js",
+        "exports": [
+          "_ignoreErrors",
+          "_stderr",
+          "_stderrErrorHandler",
+          "_stdout",
+          "_stdoutErrorHandler",
+          "_times",
+          "assert",
+          "clear",
+          "Console",
+          "context",
+          "count",
+          "countReset",
+          "createTask",
+          "debug",
+          "dir",
+          "dirxml",
+          "error",
+          "group",
+          "groupCollapsed",
+          "groupEnd",
+          "info",
+          "log",
+          "profile",
+          "profileEnd",
+          "table",
+          "time",
+          "timeEnd",
+          "timeLog",
+          "timeStamp",
+          "trace",
+          "warn"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:console": {
+        "file": "src/runtime_modules/node/console.js",
+        "exports": [
+          "_ignoreErrors",
+          "_stderr",
+          "_stderrErrorHandler",
+          "_stdout",
+          "_stdoutErrorHandler",
+          "_times",
+          "assert",
+          "clear",
+          "Console",
+          "context",
+          "count",
+          "countReset",
+          "createTask",
+          "debug",
+          "dir",
+          "dirxml",
+          "error",
+          "group",
+          "groupCollapsed",
+          "groupEnd",
+          "info",
+          "log",
+          "profile",
+          "profileEnd",
+          "table",
+          "time",
+          "timeEnd",
+          "timeLog",
+          "timeStamp",
+          "trace",
+          "warn"
         ],
         "hasDefaultExport": true
       },
@@ -7921,35 +8077,141 @@
         ],
         "hasDefaultExport": true
       },
-      "path": {
-        "file": "src/runtime_modules/node/path.js",
+      "path/posix": {
+        "file": "src/runtime_modules/node/path/posix.js",
         "exports": [
+          "_makeLong",
           "basename",
+          "delimiter",
           "dirname",
           "extname",
+          "format",
           "isAbsolute",
           "join",
+          "matchesGlob",
+          "normalize",
           "parse",
           "posix",
           "relative",
           "resolve",
-          "sep"
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:path/posix": {
+        "file": "src/runtime_modules/node/path/posix.js",
+        "exports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "hasDefaultExport": true
+      },
+      "path/win32": {
+        "file": "src/runtime_modules/node/path/win32.js",
+        "exports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:path/win32": {
+        "file": "src/runtime_modules/node/path/win32.js",
+        "exports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "hasDefaultExport": true
+      },
+      "path": {
+        "file": "src/runtime_modules/node/path.js",
+        "exports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
         ],
         "hasDefaultExport": true
       },
       "node:path": {
         "file": "src/runtime_modules/node/path.js",
         "exports": [
+          "_makeLong",
           "basename",
+          "delimiter",
           "dirname",
           "extname",
+          "format",
           "isAbsolute",
           "join",
+          "matchesGlob",
+          "normalize",
           "parse",
           "posix",
           "relative",
           "resolve",
-          "sep"
+          "sep",
+          "toNamespacedPath",
+          "win32"
         ],
         "hasDefaultExport": true
       },
@@ -8079,6 +8341,34 @@
         ],
         "hasDefaultExport": true
       },
+      "sys": {
+        "file": "src/runtime_modules/node/sys.js",
+        "exports": [
+          "deprecate",
+          "format",
+          "formatWithOptions",
+          "inspect",
+          "isDeepStrictEqual",
+          "parseArgs",
+          "promisify",
+          "types"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:sys": {
+        "file": "src/runtime_modules/node/sys.js",
+        "exports": [
+          "deprecate",
+          "format",
+          "formatWithOptions",
+          "inspect",
+          "isDeepStrictEqual",
+          "parseArgs",
+          "promisify",
+          "types"
+        ],
+        "hasDefaultExport": true
+      },
       "tty": {
         "file": "src/runtime_modules/node/tty.js",
         "exports": [
@@ -8117,6 +8407,104 @@
         ],
         "hasDefaultExport": true
       },
+      "util/types": {
+        "file": "src/runtime_modules/node/util/types.js",
+        "exports": [
+          "isAnyArrayBuffer",
+          "isArgumentsObject",
+          "isArrayBuffer",
+          "isArrayBufferView",
+          "isAsyncFunction",
+          "isBigInt64Array",
+          "isBigIntObject",
+          "isBigUint64Array",
+          "isBooleanObject",
+          "isBoxedPrimitive",
+          "isCryptoKey",
+          "isDataView",
+          "isDate",
+          "isExternal",
+          "isFloat16Array",
+          "isFloat32Array",
+          "isFloat64Array",
+          "isGeneratorFunction",
+          "isGeneratorObject",
+          "isInt16Array",
+          "isInt32Array",
+          "isInt8Array",
+          "isKeyObject",
+          "isMap",
+          "isMapIterator",
+          "isModuleNamespaceObject",
+          "isNativeError",
+          "isNumberObject",
+          "isPromise",
+          "isProxy",
+          "isRegExp",
+          "isSet",
+          "isSetIterator",
+          "isSharedArrayBuffer",
+          "isStringObject",
+          "isSymbolObject",
+          "isTypedArray",
+          "isUint16Array",
+          "isUint32Array",
+          "isUint8Array",
+          "isUint8ClampedArray",
+          "isWeakMap",
+          "isWeakSet"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:util/types": {
+        "file": "src/runtime_modules/node/util/types.js",
+        "exports": [
+          "isAnyArrayBuffer",
+          "isArgumentsObject",
+          "isArrayBuffer",
+          "isArrayBufferView",
+          "isAsyncFunction",
+          "isBigInt64Array",
+          "isBigIntObject",
+          "isBigUint64Array",
+          "isBooleanObject",
+          "isBoxedPrimitive",
+          "isCryptoKey",
+          "isDataView",
+          "isDate",
+          "isExternal",
+          "isFloat16Array",
+          "isFloat32Array",
+          "isFloat64Array",
+          "isGeneratorFunction",
+          "isGeneratorObject",
+          "isInt16Array",
+          "isInt32Array",
+          "isInt8Array",
+          "isKeyObject",
+          "isMap",
+          "isMapIterator",
+          "isModuleNamespaceObject",
+          "isNativeError",
+          "isNumberObject",
+          "isPromise",
+          "isProxy",
+          "isRegExp",
+          "isSet",
+          "isSetIterator",
+          "isSharedArrayBuffer",
+          "isStringObject",
+          "isSymbolObject",
+          "isTypedArray",
+          "isUint16Array",
+          "isUint32Array",
+          "isUint8Array",
+          "isUint8ClampedArray",
+          "isWeakMap",
+          "isWeakSet"
+        ],
+        "hasDefaultExport": true
+      },
       "util": {
         "file": "src/runtime_modules/node/util.js",
         "exports": [
@@ -8124,8 +8512,10 @@
           "format",
           "formatWithOptions",
           "inspect",
+          "isDeepStrictEqual",
           "parseArgs",
-          "promisify"
+          "promisify",
+          "types"
         ],
         "hasDefaultExport": true
       },
@@ -8136,8 +8526,10 @@
           "format",
           "formatWithOptions",
           "inspect",
+          "isDeepStrictEqual",
           "parseArgs",
-          "promisify"
+          "promisify",
+          "types"
         ],
         "hasDefaultExport": true
       },
@@ -8250,6 +8642,36 @@
           "URL"
         ]
       },
+      "src/runtime_modules/node/assert/strict.js": {
+        "file": "src/runtime_modules/node/assert/strict.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "Assert",
+          "AssertionError",
+          "CallTracker",
+          "deepEqual",
+          "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
+          "equal",
+          "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
+          "notDeepStrictEqual",
+          "notEqual",
+          "notStrictEqual",
+          "ok",
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/assert.cjs": {
         "file": "src/runtime_modules/node/assert.cjs",
         "hasDefaultExport": true,
@@ -8261,15 +8683,28 @@
         "file": "src/runtime_modules/node/assert.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "Assert",
           "AssertionError",
+          "CallTracker",
+          "deepEqual",
           "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
           "equal",
           "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
           "notDeepStrictEqual",
           "notEqual",
           "notStrictEqual",
           "ok",
-          "strictEqual"
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -8296,6 +8731,45 @@
           "fork",
           "spawn",
           "spawnSync"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/console.js": {
+        "file": "src/runtime_modules/node/console.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_ignoreErrors",
+          "_stderr",
+          "_stderrErrorHandler",
+          "_stdout",
+          "_stdoutErrorHandler",
+          "_times",
+          "assert",
+          "clear",
+          "Console",
+          "context",
+          "count",
+          "countReset",
+          "createTask",
+          "debug",
+          "dir",
+          "dirxml",
+          "error",
+          "group",
+          "groupCollapsed",
+          "groupEnd",
+          "info",
+          "log",
+          "profile",
+          "profileEnd",
+          "table",
+          "time",
+          "timeEnd",
+          "timeLog",
+          "timeStamp",
+          "trace",
+          "warn"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -8426,20 +8900,77 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
-      "src/runtime_modules/node/path.js": {
-        "file": "src/runtime_modules/node/path.js",
+      "src/runtime_modules/node/path/posix.js": {
+        "file": "src/runtime_modules/node/path/posix.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_makeLong",
           "basename",
+          "delimiter",
           "dirname",
           "extname",
+          "format",
           "isAbsolute",
           "join",
+          "matchesGlob",
+          "normalize",
           "parse",
           "posix",
           "relative",
           "resolve",
-          "sep"
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/path/win32.js": {
+        "file": "src/runtime_modules/node/path/win32.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/path.js": {
+        "file": "src/runtime_modules/node/path.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_makeLong",
+          "basename",
+          "delimiter",
+          "dirname",
+          "extname",
+          "format",
+          "isAbsolute",
+          "join",
+          "matchesGlob",
+          "normalize",
+          "parse",
+          "posix",
+          "relative",
+          "resolve",
+          "sep",
+          "toNamespacedPath",
+          "win32"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -8522,6 +9053,22 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/sys.js": {
+        "file": "src/runtime_modules/node/sys.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "deprecate",
+          "format",
+          "formatWithOptions",
+          "inspect",
+          "isDeepStrictEqual",
+          "parseArgs",
+          "promisify",
+          "types"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/tty.js": {
         "file": "src/runtime_modules/node/tty.js",
         "hasDefaultExport": true,
@@ -8545,6 +9092,57 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/util/types.js": {
+        "file": "src/runtime_modules/node/util/types.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "isAnyArrayBuffer",
+          "isArgumentsObject",
+          "isArrayBuffer",
+          "isArrayBufferView",
+          "isAsyncFunction",
+          "isBigInt64Array",
+          "isBigIntObject",
+          "isBigUint64Array",
+          "isBooleanObject",
+          "isBoxedPrimitive",
+          "isCryptoKey",
+          "isDataView",
+          "isDate",
+          "isExternal",
+          "isFloat16Array",
+          "isFloat32Array",
+          "isFloat64Array",
+          "isGeneratorFunction",
+          "isGeneratorObject",
+          "isInt16Array",
+          "isInt32Array",
+          "isInt8Array",
+          "isKeyObject",
+          "isMap",
+          "isMapIterator",
+          "isModuleNamespaceObject",
+          "isNativeError",
+          "isNumberObject",
+          "isPromise",
+          "isProxy",
+          "isRegExp",
+          "isSet",
+          "isSetIterator",
+          "isSharedArrayBuffer",
+          "isStringObject",
+          "isSymbolObject",
+          "isTypedArray",
+          "isUint16Array",
+          "isUint32Array",
+          "isUint8Array",
+          "isUint8ClampedArray",
+          "isWeakMap",
+          "isWeakSet"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/util.js": {
         "file": "src/runtime_modules/node/util.js",
         "hasDefaultExport": true,
@@ -8553,8 +9151,10 @@
           "format",
           "formatWithOptions",
           "inspect",
+          "isDeepStrictEqual",
           "parseArgs",
-          "promisify"
+          "promisify",
+          "types"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -8623,37 +9223,6 @@
       "assert": {
         "module": "present",
         "implemented": [
-          "AssertionError",
-          "deepStrictEqual",
-          "equal",
-          "fail",
-          "notDeepStrictEqual",
-          "notEqual",
-          "notStrictEqual",
-          "ok",
-          "strictEqual"
-        ],
-        "missing": [
-          "Assert",
-          "CallTracker",
-          "deepEqual",
-          "doesNotMatch",
-          "doesNotReject",
-          "doesNotThrow",
-          "ifError",
-          "match",
-          "notDeepEqual",
-          "partialDeepStrictEqual",
-          "rejects",
-          "strict",
-          "throws"
-        ],
-        "extra": []
-      },
-      "assert/strict": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
           "Assert",
           "AssertionError",
           "CallTracker",
@@ -8677,6 +9246,36 @@
           "strictEqual",
           "throws"
         ],
+        "missing": [],
+        "extra": []
+      },
+      "assert/strict": {
+        "module": "present",
+        "implemented": [
+          "Assert",
+          "AssertionError",
+          "CallTracker",
+          "deepEqual",
+          "deepStrictEqual",
+          "doesNotMatch",
+          "doesNotReject",
+          "doesNotThrow",
+          "equal",
+          "fail",
+          "ifError",
+          "match",
+          "notDeepEqual",
+          "notDeepStrictEqual",
+          "notEqual",
+          "notStrictEqual",
+          "ok",
+          "partialDeepStrictEqual",
+          "rejects",
+          "strict",
+          "strictEqual",
+          "throws"
+        ],
+        "missing": [],
         "extra": []
       },
       "async_hooks": {
@@ -8756,9 +9355,8 @@
         "extra": []
       },
       "console": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Console",
           "_ignoreErrors",
           "_stderr",
@@ -8791,6 +9389,7 @@
           "trace",
           "warn"
         ],
+        "missing": [],
         "extra": []
       },
       "constants": {
@@ -9688,32 +10287,30 @@
       "path": {
         "module": "present",
         "implemented": [
+          "_makeLong",
           "basename",
+          "delimiter",
           "dirname",
           "extname",
+          "format",
           "isAbsolute",
           "join",
+          "matchesGlob",
+          "normalize",
           "parse",
           "posix",
           "relative",
           "resolve",
-          "sep"
-        ],
-        "missing": [
-          "_makeLong",
-          "delimiter",
-          "format",
-          "matchesGlob",
-          "normalize",
+          "sep",
           "toNamespacedPath",
           "win32"
         ],
+        "missing": [],
         "extra": []
       },
       "path/posix": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "_makeLong",
           "basename",
           "delimiter",
@@ -9732,12 +10329,12 @@
           "toNamespacedPath",
           "win32"
         ],
+        "missing": [],
         "extra": []
       },
       "path/win32": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "_makeLong",
           "basename",
           "delimiter",
@@ -9756,6 +10353,7 @@
           "toNamespacedPath",
           "win32"
         ],
+        "missing": [],
         "extra": []
       },
       "perf_hooks": {
@@ -10026,8 +10624,17 @@
         "extra": []
       },
       "sys": {
-        "module": "missing",
-        "implemented": [],
+        "module": "present",
+        "implemented": [
+          "deprecate",
+          "format",
+          "formatWithOptions",
+          "inspect",
+          "isDeepStrictEqual",
+          "parseArgs",
+          "promisify",
+          "types"
+        ],
         "missing": [
           "MIMEParams",
           "MIMEType",
@@ -10040,28 +10647,20 @@
           "callbackify",
           "debug",
           "debuglog",
-          "deprecate",
           "diff",
-          "format",
-          "formatWithOptions",
           "getCallSites",
           "getSystemErrorMap",
           "getSystemErrorMessage",
           "getSystemErrorName",
           "inherits",
-          "inspect",
           "isArray",
-          "isDeepStrictEqual",
-          "parseArgs",
           "parseEnv",
-          "promisify",
           "setTraceSigInt",
           "stripVTControlCharacters",
           "styleText",
           "toUSVString",
           "transferableAbortController",
-          "transferableAbortSignal",
-          "types"
+          "transferableAbortSignal"
         ],
         "extra": []
       },
@@ -10163,8 +10762,10 @@
           "format",
           "formatWithOptions",
           "inspect",
+          "isDeepStrictEqual",
           "parseArgs",
-          "promisify"
+          "promisify",
+          "types"
         ],
         "missing": [
           "MIMEParams",
@@ -10185,22 +10786,19 @@
           "getSystemErrorName",
           "inherits",
           "isArray",
-          "isDeepStrictEqual",
           "parseEnv",
           "setTraceSigInt",
           "stripVTControlCharacters",
           "styleText",
           "toUSVString",
           "transferableAbortController",
-          "transferableAbortSignal",
-          "types"
+          "transferableAbortSignal"
         ],
         "extra": []
       },
       "util/types": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "isAnyArrayBuffer",
           "isArgumentsObject",
           "isArrayBuffer",
@@ -10245,6 +10843,7 @@
           "isWeakMap",
           "isWeakSet"
         ],
+        "missing": [],
         "extra": []
       },
       "v8": {

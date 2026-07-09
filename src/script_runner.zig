@@ -227,8 +227,11 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
+    const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
+    const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
+    const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
     const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
     const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
     const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
@@ -240,6 +243,9 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
+    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
+    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
     const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
 
     const args = [_][]const u8{
@@ -268,16 +274,28 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:os={s}", .{os_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:path={s}", .{path_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:path={s}", .{path_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:path/posix={s}", .{path_posix_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:path/posix={s}", .{path_posix_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:path/win32={s}", .{path_win32_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:path/win32={s}", .{path_win32_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:process={s}", .{process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:process={s}", .{process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:readline={s}", .{readline_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline={s}", .{readline_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:util={s}", .{util_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:util/types={s}", .{util_types_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:util/types={s}", .{util_types_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:events={s}", .{events_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:events={s}", .{events_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:assert={s}", .{assert_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert={s}", .{assert_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:assert/strict={s}", .{assert_strict_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert/strict={s}", .{assert_strict_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:console={s}", .{console_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:console={s}", .{console_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:sys={s}", .{sys_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sys={s}", .{sys_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:tty={s}", .{tty_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:tty={s}", .{tty_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:v8={s}", .{v8_module}),
@@ -427,8 +445,11 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
+    const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.js" });
+    const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
+    const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
     const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
     const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
     const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
@@ -440,6 +461,9 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
+    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
+    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
     const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
 
     const source = try std.fmt.allocPrint(
@@ -452,8 +476,11 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as processModule from {s};
         \\import * as readline from {s};
         \\import * as util from {s};
+        \\import * as utilTypes from {s};
         \\import * as events from {s};
         \\import * as assert from {s};
+        \\import * as assertStrict from {s};
+        \\import * as consoleModule from {s};
         \\import * as tty from {s};
         \\import * as v8 from {s};
         \\import * as stream from {s};
@@ -465,6 +492,9 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as crypto from {s};
         \\import * as buffer from {s};
         \\import * as childProcess from {s};
+        \\import * as pathPosix from {s};
+        \\import * as pathWin32 from {s};
+        \\import * as sys from {s};
         \\import * as zlib from {s};
         \\moduleModule.__setBuiltinModules({{
         \\  fs, "node:fs": fs,
@@ -474,8 +504,11 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  process: processModule, "node:process": processModule,
         \\  readline, "node:readline": readline,
         \\  util, "node:util": util,
+        \\  "util/types": utilTypes, "node:util/types": utilTypes,
         \\  events, "node:events": events,
         \\  assert, "node:assert": assert,
+        \\  "assert/strict": assertStrict, "node:assert/strict": assertStrict,
+        \\  console: consoleModule, "node:console": consoleModule,
         \\  tty, "node:tty": tty,
         \\  v8, "node:v8": v8,
         \\  stream, "node:stream": stream,
@@ -487,6 +520,9 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  crypto, "node:crypto": crypto,
         \\  buffer, "node:buffer": buffer,
         \\  child_process: childProcess, "node:child_process": childProcess,
+        \\  "path/posix": pathPosix, "node:path/posix": pathPosix,
+        \\  "path/win32": pathWin32, "node:path/win32": pathWin32,
+        \\  sys, "node:sys": sys,
         \\  zlib, "node:zlib": zlib
         \\}});
         \\moduleModule.__runMain({s});
@@ -501,8 +537,11 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, process_module),
             try jsonStringLiteral(ctx, readline_module),
             try jsonStringLiteral(ctx, util_module),
+            try jsonStringLiteral(ctx, util_types_module),
             try jsonStringLiteral(ctx, events_module),
             try jsonStringLiteral(ctx, assert_module),
+            try jsonStringLiteral(ctx, assert_strict_module),
+            try jsonStringLiteral(ctx, console_module),
             try jsonStringLiteral(ctx, tty_module),
             try jsonStringLiteral(ctx, v8_module),
             try jsonStringLiteral(ctx, stream_module),
@@ -514,6 +553,9 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, crypto_module),
             try jsonStringLiteral(ctx, buffer_module),
             try jsonStringLiteral(ctx, child_process_module),
+            try jsonStringLiteral(ctx, path_posix_module),
+            try jsonStringLiteral(ctx, path_win32_module),
+            try jsonStringLiteral(ctx, sys_module),
             try jsonStringLiteral(ctx, zlib_module),
             try jsonStringLiteral(ctx, script_abs),
         },

@@ -221,6 +221,12 @@ try {
       stdoutIncludes: ['node readline passed'],
     },
     {
+      name: 'node-compat-aliases',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-compat-aliases.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node compat aliases passed'],
+    },
+    {
       name: 'proxy-function',
       scriptPath: join(rootDir, 'tests', 'js', 'proxy-function.ts'),
       expectExitCode: 0,

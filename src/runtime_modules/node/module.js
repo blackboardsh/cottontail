@@ -1,42 +1,54 @@
 import { dirname, join, resolve } from "./path.js";
 import { fileURLToPath } from "./url.js";
 import * as assert from "./assert.js";
+import * as assertStrict from "./assert/strict.js";
 import * as buffer from "./buffer.js";
 import * as childProcess from "./child_process.js";
+import * as consoleModule from "./console.js";
 import * as crypto from "./crypto.js";
 import * as events from "./events.js";
 import * as fs from "./fs.js";
 import * as fsPromises from "./fs/promises.js";
 import * as os from "./os.js";
 import * as path from "./path.js";
+import * as pathPosix from "./path/posix.js";
+import * as pathWin32 from "./path/win32.js";
 import * as perfHooks from "./perf_hooks.js";
 import * as processModule from "./process.js";
 import * as readline from "./readline.js";
 import * as stream from "./stream.js";
+import * as sys from "./sys.js";
 import * as tty from "./tty.js";
 import * as url from "./url.js";
 import * as util from "./util.js";
+import * as utilTypes from "./util/types.js";
 import * as v8 from "./v8.js";
 import * as vm from "./vm.js";
 import * as zlib from "./zlib.js";
 
 export const builtinModules = [
   "assert",
+  "assert/strict",
   "buffer",
   "child_process",
+  "console",
   "crypto",
   "events",
   "fs",
   "module",
   "os",
   "path",
+  "path/posix",
+  "path/win32",
   "process",
   "perf_hooks",
   "readline",
   "stream",
+  "sys",
   "tty",
   "url",
   "util",
+  "util/types",
   "v8",
   "vm",
   "zlib",
@@ -206,16 +218,23 @@ export function __runMain(filename) {
 
 const moduleBuiltin = { __runMain, __setBuiltinModules, builtinModules, createRequire };
 const assertBuiltin = assert.default ?? assert;
+const assertStrictBuiltin = assertStrict.default ?? assertStrict;
+const consoleBuiltin = consoleModule.default ?? consoleModule;
 const eventsBuiltin = events.default ?? events;
 const processBuiltin = processModule.default ?? processModule;
+const sysBuiltin = sys.default ?? sys;
 
 __setBuiltinModules({
   assert: assertBuiltin,
   "node:assert": assertBuiltin,
+  "assert/strict": assertStrictBuiltin,
+  "node:assert/strict": assertStrictBuiltin,
   buffer,
   "node:buffer": buffer,
   child_process: childProcess,
   "node:child_process": childProcess,
+  console: consoleBuiltin,
+  "node:console": consoleBuiltin,
   crypto,
   "node:crypto": crypto,
   events: eventsBuiltin,
@@ -230,6 +249,10 @@ __setBuiltinModules({
   "node:os": os,
   path,
   "node:path": path,
+  "path/posix": pathPosix,
+  "node:path/posix": pathPosix,
+  "path/win32": pathWin32,
+  "node:path/win32": pathWin32,
   perf_hooks: perfHooks,
   "node:perf_hooks": perfHooks,
   process: processBuiltin,
@@ -238,12 +261,16 @@ __setBuiltinModules({
   "node:readline": readline,
   stream,
   "node:stream": stream,
+  sys: sysBuiltin,
+  "node:sys": sysBuiltin,
   tty,
   "node:tty": tty,
   url,
   "node:url": url,
   util,
   "node:util": util,
+  "util/types": utilTypes,
+  "node:util/types": utilTypes,
   v8,
   "node:v8": v8,
   vm,

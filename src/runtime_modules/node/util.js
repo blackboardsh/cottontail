@@ -1,3 +1,5 @@
+import * as types from "./util/types.js";
+
 export function parseArgs(options = {}) {
   const input = options.args || [];
   const values = {};
@@ -102,4 +104,14 @@ export function promisify(fn) {
 
 promisify.custom = Symbol.for("nodejs.util.promisify.custom");
 
-export default { deprecate, format, formatWithOptions, inspect, parseArgs, promisify };
+export function isDeepStrictEqual(left, right) {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return Object.is(left, right);
+  }
+}
+
+export { types };
+
+export default { deprecate, format, formatWithOptions, inspect, isDeepStrictEqual, parseArgs, promisify, types };
