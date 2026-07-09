@@ -43,6 +43,9 @@ const stats = statSync(filePath);
 assert(stats.isFile(), "statSync file isFile mismatch");
 assert(!stats.isDirectory(), "statSync file isDirectory mismatch");
 assert(stats.size === "hello fs".length, `statSync size mismatch: ${stats.size}`);
+assert(stats.mtime instanceof Date, "statSync mtime should be a Date");
+assert(Number.isFinite(stats.mtimeMs), "statSync mtimeMs should be finite");
+assert(stats.mtime.toISOString().length > 0, "statSync mtime should format as ISO");
 
 const streamed = await new Promise<string>((resolve, reject) => {
   let text = "";

@@ -175,13 +175,21 @@ export const readFile = withCallback(readFileSync);
 export const writeFile = withCallback(writeFileSync);
 
 function makeStats(result) {
+  const atimeMs = Number(result.atimeMs) || 0;
+  const mtimeMs = Number(result.mtimeMs) || 0;
+  const ctimeMs = Number(result.ctimeMs) || 0;
+  const birthtimeMs = Number(result.birthtimeMs) || 0;
   return {
     size: Number(result.size) || 0,
     mode: Number(result.mode) || 0,
-    mtimeMs: Number(result.mtimeMs) || 0,
-    ctimeMs: Number(result.ctimeMs) || 0,
-    birthtimeMs: Number(result.birthtimeMs) || 0,
-    atimeMs: Number(result.atimeMs) || 0,
+    atimeMs,
+    mtimeMs,
+    ctimeMs,
+    birthtimeMs,
+    atime: new Date(atimeMs),
+    mtime: new Date(mtimeMs),
+    ctime: new Date(ctimeMs),
+    birthtime: new Date(birthtimeMs),
     isFile: () => Boolean(result.isFile),
     isDirectory: () => Boolean(result.isDirectory),
     isSymbolicLink: () => Boolean(result.isSymbolicLink),
