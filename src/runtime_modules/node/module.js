@@ -5,6 +5,7 @@ import * as assertStrict from "./assert/strict.js";
 import * as buffer from "./buffer.js";
 import * as childProcess from "./child_process.js";
 import * as consoleModule from "./console.js";
+import * as constants from "./constants.js";
 import * as crypto from "./crypto.js";
 import * as events from "./events.js";
 import * as fs from "./fs.js";
@@ -32,6 +33,7 @@ export const builtinModules = [
   "buffer",
   "child_process",
   "console",
+  "constants",
   "crypto",
   "events",
   "fs",
@@ -235,6 +237,8 @@ __setBuiltinModules({
   "node:child_process": childProcess,
   console: consoleBuiltin,
   "node:console": consoleBuiltin,
+  constants,
+  "node:constants": constants,
   crypto,
   "node:crypto": crypto,
   events: eventsBuiltin,

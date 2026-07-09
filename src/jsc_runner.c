@@ -28,6 +28,8 @@
 extern char **environ;
 
 #if defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#include <CommonCrypto/CommonHMAC.h>
 #include <mach-o/dyld.h>
 #endif
 
@@ -51,6 +53,17 @@ extern char **environ;
 
 #define CT_FFI_MAX_ARGS 64
 #define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
+
+static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len);
+
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static unsigned char *ct_cc_md5(const void *data, CC_LONG len, unsigned char *md) {
+    return CC_MD5(data, len, md);
+}
+#pragma clang diagnostic pop
+#endif
 
 static void ct_clear_environment(void) {
     while (environ != NULL && environ[0] != NULL) {
@@ -920,6 +933,284 @@ static JSValueRef ct_random_bytes(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeUndefined(ctx);
     }
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, len, ct_array_buffer_free, NULL, exception);
+}
+
+typedef enum {
+    CT_ZLIB_DEFLATE,
+    CT_ZLIB_DEFLATE_RAW,
+    CT_ZLIB_GZIP,
+    CT_ZLIB_INFLATE,
+    CT_ZLIB_INFLATE_RAW,
+    CT_ZLIB_GUNZIP,
+    CT_ZLIB_UNZIP,
+} CtZlibMode;
+
+static bool ct_zlib_mode_from_name(const char *name, CtZlibMode *mode) {
+    if (strcmp(name, "deflate") == 0) {
+        *mode = CT_ZLIB_DEFLATE;
+        return true;
+    }
+    if (strcmp(name, "deflateRaw") == 0) {
+        *mode = CT_ZLIB_DEFLATE_RAW;
+        return true;
+    }
+    if (strcmp(name, "gzip") == 0) {
+        *mode = CT_ZLIB_GZIP;
+        return true;
+    }
+    if (strcmp(name, "inflate") == 0) {
+        *mode = CT_ZLIB_INFLATE;
+        return true;
+    }
+    if (strcmp(name, "inflateRaw") == 0) {
+        *mode = CT_ZLIB_INFLATE_RAW;
+        return true;
+    }
+    if (strcmp(name, "gunzip") == 0) {
+        *mode = CT_ZLIB_GUNZIP;
+        return true;
+    }
+    if (strcmp(name, "unzip") == 0) {
+        *mode = CT_ZLIB_UNZIP;
+        return true;
+    }
+    return false;
+}
+
+static bool ct_zlib_mode_compresses(CtZlibMode mode) {
+    return mode == CT_ZLIB_DEFLATE || mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_GZIP;
+}
+
+static int ct_zlib_window_bits(CtZlibMode mode) {
+    switch (mode) {
+        case CT_ZLIB_DEFLATE:
+        case CT_ZLIB_INFLATE:
+            return MAX_WBITS;
+        case CT_ZLIB_DEFLATE_RAW:
+        case CT_ZLIB_INFLATE_RAW:
+            return -MAX_WBITS;
+        case CT_ZLIB_GZIP:
+        case CT_ZLIB_GUNZIP:
+            return MAX_WBITS + 16;
+        case CT_ZLIB_UNZIP:
+            return MAX_WBITS + 32;
+    }
+    return MAX_WBITS;
+}
+
+static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.zlibTransformSync(mode, data[, level]) requires mode and data");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *mode_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (mode_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtZlibMode mode;
+    if (!ct_zlib_mode_from_name(mode_name, &mode)) {
+        ct_throw_message(ctx, exception, "Unsupported zlib mode");
+        free(mode_name);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(mode_name);
+
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "zlib input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int level = Z_DEFAULT_COMPRESSION;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        level = (int)ct_value_to_number(ctx, argv[2]);
+        if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
+    }
+
+    const bool compressing = ct_zlib_mode_compresses(mode);
+    size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
+    if (capacity < 65536) capacity = 65536;
+    uint8_t *output = (uint8_t *)malloc(capacity);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.next_in = input;
+    stream.avail_in = (uInt)input_len;
+
+    int status = compressing
+        ? deflateInit2(&stream, level, Z_DEFLATED, ct_zlib_window_bits(mode), MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY)
+        : inflateInit2(&stream, ct_zlib_window_bits(mode));
+    if (status != Z_OK) {
+        free(output);
+        ct_throw_message(ctx, exception, "Failed to initialize zlib stream");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    while (true) {
+        if (stream.total_out >= capacity) {
+            if (capacity > (size_t)512 * 1024 * 1024) {
+                status = Z_MEM_ERROR;
+                break;
+            }
+            size_t next_capacity = capacity * 2;
+            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
+            if (next_output == NULL) {
+                status = Z_MEM_ERROR;
+                break;
+            }
+            output = next_output;
+            capacity = next_capacity;
+        }
+
+        stream.next_out = output + stream.total_out;
+        stream.avail_out = (uInt)(capacity - stream.total_out);
+        status = compressing ? deflate(&stream, Z_FINISH) : inflate(&stream, Z_FINISH);
+        if (status == Z_STREAM_END) break;
+        if (status == Z_OK || status == Z_BUF_ERROR) {
+            if (stream.avail_out == 0 || !compressing) continue;
+        }
+        break;
+    }
+
+    const size_t output_len = stream.total_out;
+    if (compressing) {
+        deflateEnd(&stream);
+    } else {
+        inflateEnd(&stream);
+    }
+
+    if (status != Z_STREAM_END) {
+        const char *message = stream.msg != NULL ? stream.msg : zError(status);
+        free(output);
+        ct_throw_message(ctx, exception, message != NULL ? message : "zlib transform failed");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+}
+
+typedef struct {
+    const char *name;
+    size_t output_len;
+#if defined(__APPLE__)
+    unsigned int hmac_algorithm;
+    unsigned char *(*digest_fn)(const void *, CC_LONG, unsigned char *);
+#endif
+} CtDigestAlgorithm;
+
+static const CtDigestAlgorithm *ct_digest_algorithm(const char *name) {
+#if defined(__APPLE__)
+    static const CtDigestAlgorithm algorithms[] = {
+        {"md5", CC_MD5_DIGEST_LENGTH, kCCHmacAlgMD5, ct_cc_md5},
+        {"sha1", CC_SHA1_DIGEST_LENGTH, kCCHmacAlgSHA1, CC_SHA1},
+        {"sha224", CC_SHA224_DIGEST_LENGTH, kCCHmacAlgSHA224, CC_SHA224},
+        {"sha256", CC_SHA256_DIGEST_LENGTH, kCCHmacAlgSHA256, CC_SHA256},
+        {"sha384", CC_SHA384_DIGEST_LENGTH, kCCHmacAlgSHA384, CC_SHA384},
+        {"sha512", CC_SHA512_DIGEST_LENGTH, kCCHmacAlgSHA512, CC_SHA512},
+    };
+    for (size_t index = 0; index < sizeof(algorithms) / sizeof(algorithms[0]); index += 1) {
+        if (strcasecmp(name, algorithms[index].name) == 0) return &algorithms[index];
+    }
+#else
+    (void)name;
+#endif
+    return NULL;
+}
+
+static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoHashSync(algorithm, data) requires algorithm and data");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
+    free(algorithm_name);
+    if (algorithm == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported digest algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "hash input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *output = (uint8_t *)malloc(algorithm->output_len);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+#if defined(__APPLE__)
+    algorithm->digest_fn(input, (CC_LONG)input_len, output);
+#else
+    free(output);
+    ct_throw_message(ctx, exception, "Native digest algorithms are not available on this platform yet");
+    return JSValueMakeUndefined(ctx);
+#endif
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, algorithm->output_len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoHmacSync(algorithm, key, data) requires algorithm, key, and data");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
+    free(algorithm_name);
+    if (algorithm == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported HMAC algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *key = NULL;
+    size_t key_len = 0;
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &key, &key_len) != 0 || ct_get_bytes(ctx, argv[2], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "HMAC key and input must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *output = (uint8_t *)malloc(algorithm->output_len);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+#if defined(__APPLE__)
+    CCHmac((CCHmacAlgorithm)algorithm->hmac_algorithm, key, key_len, input, input_len, output);
+#else
+    free(output);
+    ct_throw_message(ctx, exception, "Native HMAC algorithms are not available on this platform yet");
+    return JSValueMakeUndefined(ctx);
+#endif
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, algorithm->output_len, ct_array_buffer_free, NULL, exception);
 }
 
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len) {
@@ -4273,6 +4564,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "pid", ct_pid, runtime);
     ct_install_function(ctx, host, "kill", ct_kill_process, runtime);
     ct_install_function(ctx, host, "randomBytes", ct_random_bytes, runtime);
+    ct_install_function(ctx, host, "zlibTransformSync", ct_zlib_transform_sync, runtime);
+    ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
+    ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
     ct_install_function(ctx, host, "platform", ct_platform, runtime);
     ct_install_function(ctx, host, "arch", ct_arch, runtime);
     ct_install_function(ctx, host, "hostname", ct_hostname, runtime);

@@ -12,6 +12,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         step.root_module.linkFramework("JavaScriptCore", .{});
         step.root_module.linkSystemLibrary("ffi", .{});
         step.root_module.linkSystemLibrary("pthread", .{});
+        step.root_module.linkSystemLibrary("z", .{});
     } else {
         @panic("Cottontail currently wires JavaScriptCore through the macOS system framework only");
     }

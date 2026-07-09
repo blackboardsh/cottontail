@@ -240,6 +240,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
     const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
     const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
+    const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
@@ -312,6 +313,8 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:net={s}", .{net_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:url={s}", .{url_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:url={s}", .{url_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:constants={s}", .{constants_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:constants={s}", .{constants_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:crypto={s}", .{crypto_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:crypto={s}", .{crypto_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:buffer={s}", .{buffer_module}),
@@ -458,6 +461,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
     const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
     const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
+    const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
@@ -489,6 +493,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as moduleModule from {s};
         \\import * as net from {s};
         \\import * as url from {s};
+        \\import * as constants from {s};
         \\import * as crypto from {s};
         \\import * as buffer from {s};
         \\import * as childProcess from {s};
@@ -517,6 +522,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  module: moduleModule, "node:module": moduleModule,
         \\  net, "node:net": net,
         \\  url, "node:url": url,
+        \\  constants, "node:constants": constants,
         \\  crypto, "node:crypto": crypto,
         \\  buffer, "node:buffer": buffer,
         \\  child_process: childProcess, "node:child_process": childProcess,
@@ -550,6 +556,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, module_module),
             try jsonStringLiteral(ctx, net_module),
             try jsonStringLiteral(ctx, url_module),
+            try jsonStringLiteral(ctx, constants_module),
             try jsonStringLiteral(ctx, crypto_module),
             try jsonStringLiteral(ctx, buffer_module),
             try jsonStringLiteral(ctx, child_process_module),

@@ -227,6 +227,12 @@ try {
       stdoutIncludes: ['node compat aliases passed'],
     },
     {
+      name: 'node-constants-zlib-crypto',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-constants-zlib-crypto.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node constants zlib crypto passed'],
+    },
+    {
       name: 'proxy-function',
       scriptPath: join(rootDir, 'tests', 'js', 'proxy-function.ts'),
       expectExitCode: 0,
