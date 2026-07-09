@@ -1,3 +1,5 @@
+import { KeyObject } from "../crypto.js";
+
 const typedArrayConstructors = new Set([
   Int8Array,
   Uint8Array,
@@ -110,9 +112,8 @@ export function isInt8Array(value) {
   return value instanceof Int8Array;
 }
 
-export function isKeyObject() {
-  // COTTONTAIL-COMPAT: util.types.isKeyObject - requires native crypto KeyObject support; connect this once node:crypto grows KeyObject.
-  return false;
+export function isKeyObject(value) {
+  return value instanceof KeyObject;
 }
 
 export function isMap(value) {

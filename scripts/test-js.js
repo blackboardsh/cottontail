@@ -209,6 +209,15 @@ try {
       stdoutIncludes: ['node process passed'],
     },
     {
+      name: 'node-process-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-process-surface.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node process surface passed'],
+    },
+    {
       name: 'node-module-direct-package-root',
       scriptPath: join(rootDir, 'tests', 'js', 'node-module-direct-package-root.ts'),
       env: {
@@ -216,6 +225,15 @@ try {
       },
       expectExitCode: 0,
       stdoutIncludes: ['node module direct package root passed'],
+    },
+    {
+      name: 'node-module-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-module-surface.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node module surface passed'],
     },
     {
       name: 'node-net',
@@ -236,10 +254,124 @@ try {
       stdoutIncludes: ['node compat aliases passed'],
     },
     {
+      name: 'node-util-sys-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-util-sys-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node util sys surface passed'],
+    },
+    {
+      name: 'node-stream-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-stream-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node stream surface passed'],
+    },
+    {
+      name: 'node-small-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-small-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node small surface passed'],
+    },
+    {
+      name: 'node-instrumentation-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-instrumentation-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node instrumentation surface passed'],
+    },
+    {
+      name: 'node-v8-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-v8-surface.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node v8 surface passed'],
+    },
+    {
+      name: 'node-test-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-test-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node test surface passed'],
+    },
+    {
+      name: 'node-cluster-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-cluster-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node cluster surface passed'],
+    },
+    {
+      name: 'node-worker-threads-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-worker-threads-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node worker_threads surface passed'],
+    },
+    {
+      name: 'node-zlib-streams-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-zlib-streams-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node zlib streams surface passed'],
+    },
+    {
+      name: 'node-misc-modules-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-misc-modules-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node misc modules surface passed'],
+    },
+    {
       name: 'node-constants-zlib-crypto',
       scriptPath: join(rootDir, 'tests', 'js', 'node-constants-zlib-crypto.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node constants zlib crypto passed'],
+    },
+    {
+      name: 'node-crypto-kdf-dh-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-crypto-kdf-dh-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node crypto kdf dh surface passed'],
+    },
+    {
+      name: 'node-crypto-webcrypto-conformance',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-crypto-webcrypto-conformance.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node crypto webcrypto conformance passed'],
+    },
+    {
+      name: 'node-http-https-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-http-https-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node http https surface passed'],
+    },
+    {
+      name: 'node-dns-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-dns-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node dns surface passed'],
+    },
+    {
+      name: 'node-dgram-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-dgram-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node dgram surface passed'],
+    },
+    {
+      name: 'node-tls-http2-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-tls-http2-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node tls http2 surface passed'],
+    },
+    {
+      name: 'node-sqlite-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-sqlite-surface.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node sqlite surface passed'],
+    },
+    {
+      name: 'node-inspector-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-inspector-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node inspector surface passed'],
     },
     {
       name: 'proxy-function',

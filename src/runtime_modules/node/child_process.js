@@ -1,3 +1,19 @@
+import { EventEmitter } from "./events.js";
+import { Buffer } from "./buffer.js";
+
+export class ChildProcess extends EventEmitter {
+  constructor() {
+    super();
+    this.stdin = null;
+    this.stdout = null;
+    this.stderr = null;
+    this.pid = 0;
+    this.killed = false;
+    this.exitCode = null;
+    this.signalCode = null;
+  }
+}
+
 export function execSync(command, options = {}) {
   const nativeOptions = prepareNativeOptions(cottontail.platform() === "win32" ? "cmd" : "sh", options);
   const result = cottontail.spawnSync(cottontail.platform() === "win32" ? "cmd" : "sh", cottontail.platform() === "win32" ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)], {
@@ -163,7 +179,7 @@ export function spawn(file, args = [], options = {}) {
     unref() { return this; },
   });
 
-  const child = {
+  const child = Object.assign(new ChildProcess(), {
     pid: native.pid ?? 0,
     stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => cottontail.spawnWrite(native.id, chunk)) : null,
     stdout: stdoutMode === "pipe" ? makeStream(stdoutListeners, 1) : null,
@@ -193,7 +209,9 @@ export function spawn(file, args = [], options = {}) {
     kill(signal = "SIGTERM") {
       const signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGALRM: 14, SIGTERM: 15 };
       const signalNumber = typeof signal === "number" ? signal : signals[String(signal).toUpperCase()] ?? 15;
-      return cottontail.spawnKill?.(native.id, signalNumber) === true;
+      const killed = cottontail.spawnKill?.(native.id, signalNumber) === true;
+      child.killed = child.killed || killed;
+      return killed;
     },
     ref() {
       unregisterSpawnListener?.ref?.();
@@ -203,7 +221,7 @@ export function spawn(file, args = [], options = {}) {
       unregisterSpawnListener?.unref?.();
       return child;
     },
-  };
+  });
 
   const emitChild = (name, ...values) => {
     for (const handler of listeners.get(name) ?? []) handler(...values);
@@ -229,6 +247,8 @@ export function spawn(file, args = [], options = {}) {
       }
       const exitCode = event.exitCode ?? 0;
       const signalCode = event.signalCode == null ? null : event.signalCode;
+      child.exitCode = exitCode;
+      child.signalCode = signalCode;
       if (child.stdout) {
         emitFrom(stdoutListeners, "end");
         emitFrom(stdoutListeners, "close");
@@ -244,6 +264,67 @@ export function spawn(file, args = [], options = {}) {
   });
 
   return child;
+}
+
+function normalizeExecFileArgs(args, options, callback) {
+  if (typeof args === "function") {
+    callback = args;
+    args = [];
+    options = {};
+  } else if (!Array.isArray(args)) {
+    callback = typeof options === "function" ? options : callback;
+    options = args ?? {};
+    args = [];
+  } else if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  return { args, options: options ?? {}, callback };
+}
+
+function collectChild(child, options, callback, commandText) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+  child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+  child.on("close", (code, signal) => {
+    const stdoutValue = options.encoding === "buffer" || options.encoding === null ? Buffer.from(stdout) : stdout;
+    const stderrValue = options.encoding === "buffer" || options.encoding === null ? Buffer.from(stderr) : stderr;
+    if (code === 0) {
+      callback?.(null, stdoutValue, stderrValue);
+      return;
+    }
+    const error = new Error(`Command failed: ${commandText}`);
+    error.code = code;
+    error.signal = signal;
+    error.stdout = stdoutValue;
+    error.stderr = stderrValue;
+    callback?.(error, stdoutValue, stderrValue);
+  });
+  return child;
+}
+
+export function execFile(file, args = [], options = {}, callback = undefined) {
+  const normalized = normalizeExecFileArgs(args, options, callback);
+  const child = spawn(file, normalized.args, {
+    ...normalized.options,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return collectChild(child, normalized.options, normalized.callback, String(file));
+}
+
+export function exec(command, options = {}, callback = undefined) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  const shell = cottontail.platform() === "win32" ? "cmd" : "sh";
+  const args = cottontail.platform() === "win32" ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)];
+  const child = spawn(shell, args, {
+    ...options,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return collectChild(child, options, callback, String(command));
 }
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
@@ -320,4 +401,10 @@ function emitChildMessage(child, message, eventName = "message") {
   for (const listener of listeners) listener(message);
 }
 
-export default { execFileSync, execSync, fork, spawn, spawnSync };
+export function _forkChild() {
+  throw new Error("child_process._forkChild is an internal Node bootstrap hook and is not available in Cottontail");
+}
+
+// COTTONTAIL-COMPAT: node:child_process internals - public spawn/exec/fork paths are implemented; _forkChild remains an internal bootstrap hook.
+
+export default { ChildProcess, _forkChild, exec, execFile, execFileSync, execSync, fork, spawn, spawnSync };

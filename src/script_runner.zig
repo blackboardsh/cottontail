@@ -226,15 +226,22 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
+    const readline_promises_module = try runtimeModulePath(ctx, &.{ "node", "readline", "promises.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
+    const async_hooks_module = try runtimeModulePath(ctx, &.{ "node", "async_hooks.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
     const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
     const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
+    const diagnostics_channel_module = try runtimeModulePath(ctx, &.{ "node", "diagnostics_channel.js" });
+    const domain_module = try runtimeModulePath(ctx, &.{ "node", "domain.js" });
     const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
     const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
     const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
+    const stream_consumers_module = try runtimeModulePath(ctx, &.{ "node", "stream", "consumers.js" });
+    const stream_promises_module = try runtimeModulePath(ctx, &.{ "node", "stream", "promises.js" });
+    const stream_web_module = try runtimeModulePath(ctx, &.{ "node", "stream", "web.js" });
     const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
     const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
@@ -243,11 +250,34 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
+    const cluster_module = try runtimeModulePath(ctx, &.{ "node", "cluster.js" });
+    const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
+    const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
     const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
     const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
     const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
+    const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
+    const sea_module = try runtimeModulePath(ctx, &.{ "node", "sea.js" });
+    const sqlite_module = try runtimeModulePath(ctx, &.{ "node", "sqlite.js" });
+    const node_test_module = try runtimeModulePath(ctx, &.{ "node", "test.js" });
+    const test_reporters_module = try runtimeModulePath(ctx, &.{ "node", "test", "reporters.js" });
+    const timers_module = try runtimeModulePath(ctx, &.{ "node", "timers.js" });
+    const timers_promises_module = try runtimeModulePath(ctx, &.{ "node", "timers", "promises.js" });
+    const trace_events_module = try runtimeModulePath(ctx, &.{ "node", "trace_events.js" });
+    const wasi_module = try runtimeModulePath(ctx, &.{ "node", "wasi.js" });
+    const worker_threads_module = try runtimeModulePath(ctx, &.{ "node", "worker_threads.js" });
     const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
+    const http_module = try runtimeModulePath(ctx, &.{ "node", "http.js" });
+    const https_module = try runtimeModulePath(ctx, &.{ "node", "https.js" });
+    const http2_module = try runtimeModulePath(ctx, &.{ "node", "http2.js" });
+    const inspector_module = try runtimeModulePath(ctx, &.{ "node", "inspector.js" });
+    const inspector_promises_module = try runtimeModulePath(ctx, &.{ "node", "inspector", "promises.js" });
+    const dgram_module = try runtimeModulePath(ctx, &.{ "node", "dgram.js" });
+    const dns_module = try runtimeModulePath(ctx, &.{ "node", "dns.js" });
+    const dns_promises_module = try runtimeModulePath(ctx, &.{ "node", "dns", "promises.js" });
+    const tls_module = try runtimeModulePath(ctx, &.{ "node", "tls.js" });
 
     const args = [_][]const u8{
         esbuild_bin,
@@ -283,26 +313,47 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:process={s}", .{process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:readline={s}", .{readline_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline={s}", .{readline_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:readline/promises={s}", .{readline_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline/promises={s}", .{readline_promises_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:util/types={s}", .{util_types_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:util/types={s}", .{util_types_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:events={s}", .{events_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:events={s}", .{events_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:async_hooks={s}", .{async_hooks_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:async_hooks={s}", .{async_hooks_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:assert={s}", .{assert_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert={s}", .{assert_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:assert/strict={s}", .{assert_strict_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert/strict={s}", .{assert_strict_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:console={s}", .{console_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:console={s}", .{console_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:diagnostics_channel={s}", .{diagnostics_channel_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:diagnostics_channel={s}", .{diagnostics_channel_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:domain={s}", .{domain_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:domain={s}", .{domain_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:sys={s}", .{sys_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:sys={s}", .{sys_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:repl={s}", .{repl_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:repl={s}", .{repl_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sea={s}", .{sea_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sqlite={s}", .{sqlite_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:test={s}", .{node_test_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:test/reporters={s}", .{test_reporters_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:test/reporters={s}", .{test_reporters_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:tty={s}", .{tty_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:tty={s}", .{tty_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:v8={s}", .{v8_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:v8={s}", .{v8_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:stream={s}", .{stream_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream={s}", .{stream_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/consumers={s}", .{stream_consumers_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/consumers={s}", .{stream_consumers_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/promises={s}", .{stream_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/promises={s}", .{stream_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/web={s}", .{stream_web_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/web={s}", .{stream_web_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:perf_hooks={s}", .{perf_hooks_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:perf_hooks={s}", .{perf_hooks_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:vm={s}", .{vm_module}),
@@ -319,10 +370,46 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:crypto={s}", .{crypto_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:buffer={s}", .{buffer_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:buffer={s}", .{buffer_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:cluster={s}", .{cluster_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:cluster={s}", .{cluster_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:punycode={s}", .{punycode_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:punycode={s}", .{punycode_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:querystring={s}", .{querystring_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:querystring={s}", .{querystring_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:child_process={s}", .{child_process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:child_process={s}", .{child_process_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:string_decoder={s}", .{string_decoder_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:string_decoder={s}", .{string_decoder_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:timers={s}", .{timers_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:timers={s}", .{timers_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:timers/promises={s}", .{timers_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:timers/promises={s}", .{timers_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:trace_events={s}", .{trace_events_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:trace_events={s}", .{trace_events_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:wasi={s}", .{wasi_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:wasi={s}", .{wasi_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:worker_threads={s}", .{worker_threads_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:worker_threads={s}", .{worker_threads_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:zlib={s}", .{zlib_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:zlib={s}", .{zlib_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:http={s}", .{http_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:http={s}", .{http_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:https={s}", .{https_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:https={s}", .{https_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:http2={s}", .{http2_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:http2={s}", .{http2_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:inspector={s}", .{inspector_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:inspector={s}", .{inspector_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:inspector/promises={s}", .{inspector_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:inspector/promises={s}", .{inspector_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:dgram={s}", .{dgram_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dgram={s}", .{dgram_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:dns={s}", .{dns_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dns={s}", .{dns_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:dns/promises={s}", .{dns_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dns/promises={s}", .{dns_promises_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:tls={s}", .{tls_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:tls={s}", .{tls_module}),
     };
 
     const result = try std.process.run(ctx.allocator, ctx.io, .{
@@ -447,15 +534,22 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
     const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
+    const readline_promises_module = try runtimeModulePath(ctx, &.{ "node", "readline", "promises.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
+    const async_hooks_module = try runtimeModulePath(ctx, &.{ "node", "async_hooks.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.js" });
     const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
     const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
+    const diagnostics_channel_module = try runtimeModulePath(ctx, &.{ "node", "diagnostics_channel.js" });
+    const domain_module = try runtimeModulePath(ctx, &.{ "node", "domain.js" });
     const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
     const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
     const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
+    const stream_consumers_module = try runtimeModulePath(ctx, &.{ "node", "stream", "consumers.js" });
+    const stream_promises_module = try runtimeModulePath(ctx, &.{ "node", "stream", "promises.js" });
+    const stream_web_module = try runtimeModulePath(ctx, &.{ "node", "stream", "web.js" });
     const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
     const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
@@ -464,13 +558,36 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
+    const cluster_module = try runtimeModulePath(ctx, &.{ "node", "cluster.js" });
+    const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
+    const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
     const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
     const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
     const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
+    const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
+    const sea_module = try runtimeModulePath(ctx, &.{ "node", "sea.js" });
+    const sqlite_module = try runtimeModulePath(ctx, &.{ "node", "sqlite.js" });
+    const node_test_module = try runtimeModulePath(ctx, &.{ "node", "test.js" });
+    const test_reporters_module = try runtimeModulePath(ctx, &.{ "node", "test", "reporters.js" });
+    const timers_module = try runtimeModulePath(ctx, &.{ "node", "timers.js" });
+    const timers_promises_module = try runtimeModulePath(ctx, &.{ "node", "timers", "promises.js" });
+    const trace_events_module = try runtimeModulePath(ctx, &.{ "node", "trace_events.js" });
+    const wasi_module = try runtimeModulePath(ctx, &.{ "node", "wasi.js" });
+    const worker_threads_module = try runtimeModulePath(ctx, &.{ "node", "worker_threads.js" });
     const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
+    const http_module = try runtimeModulePath(ctx, &.{ "node", "http.js" });
+    const https_module = try runtimeModulePath(ctx, &.{ "node", "https.js" });
+    const http2_module = try runtimeModulePath(ctx, &.{ "node", "http2.js" });
+    const inspector_module = try runtimeModulePath(ctx, &.{ "node", "inspector.js" });
+    const inspector_promises_module = try runtimeModulePath(ctx, &.{ "node", "inspector", "promises.js" });
+    const dgram_module = try runtimeModulePath(ctx, &.{ "node", "dgram.js" });
+    const dns_module = try runtimeModulePath(ctx, &.{ "node", "dns.js" });
+    const dns_promises_module = try runtimeModulePath(ctx, &.{ "node", "dns", "promises.js" });
+    const tls_module = try runtimeModulePath(ctx, &.{ "node", "tls.js" });
 
-    const source = try std.fmt.allocPrint(
+    const imports_a = try std.fmt.allocPrint(
         ctx.allocator,
         \\import {s};
         \\import * as fs from {s};
@@ -479,59 +596,16 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as path from {s};
         \\import * as processModule from {s};
         \\import * as readline from {s};
+        \\import * as readlinePromises from {s};
         \\import * as util from {s};
         \\import * as utilTypes from {s};
         \\import * as events from {s};
+        \\import * as asyncHooks from {s};
         \\import * as assert from {s};
         \\import * as assertStrict from {s};
         \\import * as consoleModule from {s};
-        \\import * as tty from {s};
-        \\import * as v8 from {s};
-        \\import * as stream from {s};
-        \\import * as perfHooks from {s};
-        \\import * as vm from {s};
-        \\import * as moduleModule from {s};
-        \\import * as net from {s};
-        \\import * as url from {s};
-        \\import * as constants from {s};
-        \\import * as crypto from {s};
-        \\import * as buffer from {s};
-        \\import * as childProcess from {s};
-        \\import * as pathPosix from {s};
-        \\import * as pathWin32 from {s};
-        \\import * as sys from {s};
-        \\import * as zlib from {s};
-        \\moduleModule.__setBuiltinModules({{
-        \\  fs, "node:fs": fs,
-        \\  "fs/promises": fsPromises, "node:fs/promises": fsPromises,
-        \\  os, "node:os": os,
-        \\  path, "node:path": path,
-        \\  process: processModule, "node:process": processModule,
-        \\  readline, "node:readline": readline,
-        \\  util, "node:util": util,
-        \\  "util/types": utilTypes, "node:util/types": utilTypes,
-        \\  events, "node:events": events,
-        \\  assert, "node:assert": assert,
-        \\  "assert/strict": assertStrict, "node:assert/strict": assertStrict,
-        \\  console: consoleModule, "node:console": consoleModule,
-        \\  tty, "node:tty": tty,
-        \\  v8, "node:v8": v8,
-        \\  stream, "node:stream": stream,
-        \\  perf_hooks: perfHooks, "node:perf_hooks": perfHooks,
-        \\  vm, "node:vm": vm,
-        \\  module: moduleModule, "node:module": moduleModule,
-        \\  net, "node:net": net,
-        \\  url, "node:url": url,
-        \\  constants, "node:constants": constants,
-        \\  crypto, "node:crypto": crypto,
-        \\  buffer, "node:buffer": buffer,
-        \\  child_process: childProcess, "node:child_process": childProcess,
-        \\  "path/posix": pathPosix, "node:path/posix": pathPosix,
-        \\  "path/win32": pathWin32, "node:path/win32": pathWin32,
-        \\  sys, "node:sys": sys,
-        \\  zlib, "node:zlib": zlib
-        \\}});
-        \\moduleModule.__runMain({s});
+        \\import * as diagnosticsChannel from {s};
+        \\import * as domain from {s};
         \\
     ,
         .{
@@ -542,15 +616,61 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, path_module),
             try jsonStringLiteral(ctx, process_module),
             try jsonStringLiteral(ctx, readline_module),
+            try jsonStringLiteral(ctx, readline_promises_module),
             try jsonStringLiteral(ctx, util_module),
             try jsonStringLiteral(ctx, util_types_module),
             try jsonStringLiteral(ctx, events_module),
+            try jsonStringLiteral(ctx, async_hooks_module),
             try jsonStringLiteral(ctx, assert_module),
             try jsonStringLiteral(ctx, assert_strict_module),
             try jsonStringLiteral(ctx, console_module),
+            try jsonStringLiteral(ctx, diagnostics_channel_module),
+            try jsonStringLiteral(ctx, domain_module),
+        },
+    );
+    const imports_b = try std.fmt.allocPrint(
+        ctx.allocator,
+        \\import * as tty from {s};
+        \\import * as v8 from {s};
+        \\import * as stream from {s};
+        \\import * as streamConsumers from {s};
+        \\import * as streamPromises from {s};
+        \\import * as streamWeb from {s};
+        \\import * as perfHooks from {s};
+        \\import * as vm from {s};
+        \\import * as moduleModule from {s};
+        \\import * as net from {s};
+        \\import * as url from {s};
+        \\import * as constants from {s};
+        \\import * as crypto from {s};
+        \\import * as buffer from {s};
+        \\import * as cluster from {s};
+        \\import * as punycode from {s};
+        \\import * as querystring from {s};
+        \\import * as childProcess from {s};
+        \\import * as pathPosix from {s};
+        \\import * as pathWin32 from {s};
+        \\import * as stringDecoder from {s};
+        \\import * as sys from {s};
+        \\import * as repl from {s};
+        \\import * as sea from {s};
+        \\import * as nodeTest from {s};
+        \\import * as testReporters from {s};
+        \\import * as timers from {s};
+        \\import * as timersPromises from {s};
+        \\import * as traceEvents from {s};
+        \\import * as wasi from {s};
+        \\import * as workerThreads from {s};
+        \\import * as zlib from {s};
+        \\
+    ,
+        .{
             try jsonStringLiteral(ctx, tty_module),
             try jsonStringLiteral(ctx, v8_module),
             try jsonStringLiteral(ctx, stream_module),
+            try jsonStringLiteral(ctx, stream_consumers_module),
+            try jsonStringLiteral(ctx, stream_promises_module),
+            try jsonStringLiteral(ctx, stream_web_module),
             try jsonStringLiteral(ctx, perf_hooks_module),
             try jsonStringLiteral(ctx, vm_module),
             try jsonStringLiteral(ctx, module_module),
@@ -559,14 +679,126 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, constants_module),
             try jsonStringLiteral(ctx, crypto_module),
             try jsonStringLiteral(ctx, buffer_module),
+            try jsonStringLiteral(ctx, cluster_module),
+            try jsonStringLiteral(ctx, punycode_module),
+            try jsonStringLiteral(ctx, querystring_module),
             try jsonStringLiteral(ctx, child_process_module),
             try jsonStringLiteral(ctx, path_posix_module),
             try jsonStringLiteral(ctx, path_win32_module),
+            try jsonStringLiteral(ctx, string_decoder_module),
             try jsonStringLiteral(ctx, sys_module),
+            try jsonStringLiteral(ctx, repl_module),
+            try jsonStringLiteral(ctx, sea_module),
+            try jsonStringLiteral(ctx, node_test_module),
+            try jsonStringLiteral(ctx, test_reporters_module),
+            try jsonStringLiteral(ctx, timers_module),
+            try jsonStringLiteral(ctx, timers_promises_module),
+            try jsonStringLiteral(ctx, trace_events_module),
+            try jsonStringLiteral(ctx, wasi_module),
+            try jsonStringLiteral(ctx, worker_threads_module),
             try jsonStringLiteral(ctx, zlib_module),
+        },
+    );
+    const imports_c = try std.fmt.allocPrint(
+        ctx.allocator,
+        \\import * as http from {s};
+        \\import * as https from {s};
+        \\import * as http2 from {s};
+        \\import * as inspector from {s};
+        \\import * as inspectorPromises from {s};
+        \\import * as dgram from {s};
+        \\import * as dns from {s};
+        \\import * as dnsPromises from {s};
+        \\import * as tls from {s};
+        \\import * as sqlite from {s};
+        \\
+    ,
+        .{
+            try jsonStringLiteral(ctx, http_module),
+            try jsonStringLiteral(ctx, https_module),
+            try jsonStringLiteral(ctx, http2_module),
+            try jsonStringLiteral(ctx, inspector_module),
+            try jsonStringLiteral(ctx, inspector_promises_module),
+            try jsonStringLiteral(ctx, dgram_module),
+            try jsonStringLiteral(ctx, dns_module),
+            try jsonStringLiteral(ctx, dns_promises_module),
+            try jsonStringLiteral(ctx, tls_module),
+            try jsonStringLiteral(ctx, sqlite_module),
+        },
+    );
+    const bootstrap = try std.fmt.allocPrint(
+        ctx.allocator,
+        \\const eventsBuiltin = events.default ?? events;
+        \\const nodeTestBuiltin = nodeTest.default ?? nodeTest;
+        \\const streamBuiltin = stream.default ?? stream;
+        \\moduleModule.__setBuiltinModules({{
+        \\  fs, "node:fs": fs,
+        \\  "fs/promises": fsPromises, "node:fs/promises": fsPromises,
+        \\  os, "node:os": os,
+        \\  path, "node:path": path,
+        \\  process: processModule, "node:process": processModule,
+        \\  readline, "node:readline": readline,
+        \\  "readline/promises": readlinePromises, "node:readline/promises": readlinePromises,
+        \\  util, "node:util": util,
+        \\  "util/types": utilTypes, "node:util/types": utilTypes,
+        \\  events: eventsBuiltin, "node:events": eventsBuiltin,
+        \\  async_hooks: asyncHooks, "node:async_hooks": asyncHooks,
+        \\  assert, "node:assert": assert,
+        \\  "assert/strict": assertStrict, "node:assert/strict": assertStrict,
+        \\  console: consoleModule, "node:console": consoleModule,
+        \\  diagnostics_channel: diagnosticsChannel, "node:diagnostics_channel": diagnosticsChannel,
+        \\  domain, "node:domain": domain,
+        \\  tty, "node:tty": tty,
+        \\  v8, "node:v8": v8,
+        \\  stream: streamBuiltin, "node:stream": streamBuiltin,
+        \\  "stream/consumers": streamConsumers, "node:stream/consumers": streamConsumers,
+        \\  "stream/promises": streamPromises, "node:stream/promises": streamPromises,
+        \\  "stream/web": streamWeb, "node:stream/web": streamWeb,
+        \\  perf_hooks: perfHooks, "node:perf_hooks": perfHooks,
+        \\  vm, "node:vm": vm,
+        \\  module: moduleModule, "node:module": moduleModule,
+        \\  net, "node:net": net,
+        \\  url, "node:url": url,
+        \\  constants, "node:constants": constants,
+        \\  crypto, "node:crypto": crypto,
+        \\  buffer, "node:buffer": buffer,
+        \\  cluster, "node:cluster": cluster,
+        \\  punycode, "node:punycode": punycode,
+        \\  querystring, "node:querystring": querystring,
+        \\  child_process: childProcess, "node:child_process": childProcess,
+        \\  "path/posix": pathPosix, "node:path/posix": pathPosix,
+        \\  "path/win32": pathWin32, "node:path/win32": pathWin32,
+        \\  string_decoder: stringDecoder, "node:string_decoder": stringDecoder,
+        \\  sys, "node:sys": sys,
+        \\  repl, "node:repl": repl,
+        \\  "node:sea": sea,
+        \\  "node:sqlite": sqlite,
+        \\  "node:test": nodeTestBuiltin,
+        \\  "test/reporters": testReporters, "node:test/reporters": testReporters,
+        \\  timers, "node:timers": timers,
+        \\  "timers/promises": timersPromises, "node:timers/promises": timersPromises,
+        \\  trace_events: traceEvents, "node:trace_events": traceEvents,
+        \\  wasi, "node:wasi": wasi,
+        \\  worker_threads: workerThreads, "node:worker_threads": workerThreads,
+        \\  zlib, "node:zlib": zlib,
+        \\  http, "node:http": http,
+        \\  https, "node:https": https,
+        \\  http2, "node:http2": http2,
+        \\  inspector, "node:inspector": inspector,
+        \\  "inspector/promises": inspectorPromises, "node:inspector/promises": inspectorPromises,
+        \\  dgram, "node:dgram": dgram,
+        \\  dns, "node:dns": dns,
+        \\  "dns/promises": dnsPromises, "node:dns/promises": dnsPromises,
+        \\  tls, "node:tls": tls
+        \\}});
+        \\moduleModule.__runMain({s});
+        \\
+    ,
+        .{
             try jsonStringLiteral(ctx, script_abs),
         },
     );
+    const source = try std.mem.concat(ctx.allocator, u8, &.{ imports_a, imports_b, imports_c, bootstrap });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
 }

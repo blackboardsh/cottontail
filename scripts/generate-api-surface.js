@@ -318,6 +318,132 @@ function buildCoverage(nodeSurface, bunSurface, cottontailSurface) {
   };
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function nodeModuleNameForFile(filePath) {
+  return relative(join(rootDir, 'src', 'runtime_modules', 'node'), filePath)
+    .split(sep)
+    .join('/')
+    .replace(/\.(?:cjs|js)$/, '');
+}
+
+function collectNodeTestFiles() {
+  const testsDir = join(rootDir, 'tests', 'js');
+  if (!existsSync(testsDir)) return [];
+  return readdirSync(testsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.startsWith('node-') && /\.(?:js|ts)$/.test(entry.name))
+    .map((entry) => `tests/js/${entry.name}`)
+    .sort();
+}
+
+function testFilesForModule(testFiles, moduleName) {
+  const normalized = moduleName.replace(/^node:/, '').replace(/[_/]/g, '-');
+  const root = normalized.split('-')[0];
+  return testFiles.filter((file) => {
+    const name = file.slice('tests/js/'.length).replace(/\.(?:js|ts)$/, '');
+    return name === `node-${normalized}` ||
+      name.startsWith(`node-${normalized}-`) ||
+      name === `node-${root}` ||
+      name.startsWith(`node-${root}-`) ||
+      name.includes(`-${normalized}`) ||
+      name.includes(`-${root}-`);
+  });
+}
+
+function collectNodeBehavioralSignals(nodeSurface) {
+  const runtimeNodeRoot = join(rootDir, 'src', 'runtime_modules', 'node');
+  const files = existsSync(runtimeNodeRoot) ? collectFiles(runtimeNodeRoot) : [];
+  const testFiles = collectNodeTestFiles();
+  const modules = {};
+  let compatMarkerCount = 0;
+  let explicitUnsupportedCount = 0;
+
+  for (const filePath of files) {
+    const source = readFileSync(filePath, 'utf8');
+    const moduleName = nodeModuleNameForFile(filePath);
+    const compatMarkers = [];
+    const unsupportedMarkers = [];
+
+    for (const match of source.matchAll(/\/\/\s*COTTONTAIL-COMPAT:\s*([^\n]+)/g)) {
+      compatMarkers.push(match[1].trim());
+    }
+
+    const lines = source.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      const lower = line.toLowerCase();
+      const unsupportedHelperCall =
+        /\bunsupported(?:crypto|tls|http2)?\s*\(/i.test(line) &&
+        !/\bfunction\s+unsupported/i.test(line);
+      const throwingUnsupported =
+        /\bthrow\b/.test(line) &&
+        /(not implemented|requires native|not available in cottontail|requires .*bindings|unsupported|fail loudly|throw until)/i.test(lower);
+      if (unsupportedHelperCall || throwingUnsupported) {
+        unsupportedMarkers.push({
+          line: index + 1,
+          text: line.trim(),
+        });
+      }
+    }
+
+    if (compatMarkers.length > 0 || unsupportedMarkers.length > 0) {
+      modules[moduleName] = {
+        file: relative(rootDir, filePath).split(sep).join('/'),
+        compatMarkers,
+        unsupportedMarkers,
+        tests: testFilesForModule(testFiles, moduleName),
+      };
+      compatMarkerCount += compatMarkers.length;
+      explicitUnsupportedCount += unsupportedMarkers.length;
+    }
+  }
+
+  const publicModuleCount = nodeSurface.publicBuiltinModules.length;
+  const modulesWithCompatMarkers = Object.values(modules).filter((entry) => entry.compatMarkers.length > 0).length;
+  const modulesWithUnsupportedMarkers = Object.values(modules).filter((entry) => entry.unsupportedMarkers.length > 0).length;
+  const caveatModuleShare = publicModuleCount > 0 ? modulesWithCompatMarkers / publicModuleCount : 0;
+  const penalty =
+    caveatModuleShare * 40 +
+    Math.min(30, explicitUnsupportedCount * 0.25) +
+    Math.min(10, compatMarkerCount * 0.1);
+  const midpoint = Math.round(clamp(100 - penalty, 0, 100));
+  const lower = clamp(midpoint - 5, 0, 100);
+  const upper = clamp(midpoint + 5, 0, 100);
+
+  const largestGaps = Object.entries(modules)
+    .map(([name, entry]) => ({
+      name,
+      file: entry.file,
+      compatMarkers: entry.compatMarkers.length,
+      unsupportedMarkers: entry.unsupportedMarkers.length,
+      tests: entry.tests.length,
+      gapScore: entry.compatMarkers.length * 3 + entry.unsupportedMarkers.length * 2 + (entry.tests.length === 0 ? 1 : 0),
+    }))
+    .sort((left, right) => right.gapScore - left.gapScore || left.name.localeCompare(right.name));
+
+  return {
+    note: 'Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.',
+    estimate: {
+      implementedPercentLower: lower,
+      implementedPercentUpper: upper,
+      gapPercentLower: 100 - upper,
+      gapPercentUpper: 100 - lower,
+    },
+    signals: {
+      publicNodeModules: publicModuleCount,
+      nodeTestFiles: testFiles.length,
+      compatMarkers: compatMarkerCount,
+      modulesWithCompatMarkers,
+      explicitUnsupportedMarkers: explicitUnsupportedCount,
+      modulesWithUnsupportedMarkers,
+    },
+    largestGaps,
+    modules,
+  };
+}
+
 const nodeSurface = collectNodeSurface();
 const bunSurface = runBunCollector();
 const cottontailSurface = collectCottontailSurface();
@@ -331,6 +457,9 @@ const manifest = {
   },
   cottontail: cottontailSurface,
   coverage: buildCoverage(nodeSurface, bunSurface, cottontailSurface),
+  behavioral: {
+    node: collectNodeBehavioralSignals(nodeSurface),
+  },
 };
 
 mkdirSync(dirname(outPath), { recursive: true });

@@ -2,15 +2,23 @@
 
 #include <JavaScriptCore/JavaScript.h>
 #include <arpa/inet.h>
+#include <compression.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <ffi/ffi.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <ifaddrs.h>
 #include <limits.h>
+#include <math.h>
+#include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pwd.h>
 #include <pthread.h>
+#include <resolv.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,10 +26,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sqlite3.h>
+#include <arpa/nameser.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #if defined(__APPLE__) || defined(__MACH__)
+#include <mach/mach.h>
+#include <net/if_dl.h>
 #include <sys/mount.h>
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <netpacket/packet.h>
+#include <sys/statvfs.h>
 #else
 #include <sys/statvfs.h>
 #endif
@@ -35,8 +52,27 @@ extern char **environ;
 
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
+#include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonHMAC.h>
 #include <mach-o/dyld.h>
+#endif
+
+#if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>)
+#define CT_HAS_OPENSSL 1
+#include <openssl/core_names.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+#if __has_include(<openssl/thread.h>)
+#include <openssl/thread.h>
+#endif
+#else
+#define CT_HAS_OPENSSL 0
 #endif
 
 #if defined(__APPLE__)
@@ -286,10 +322,69 @@ typedef struct CtHttpServer {
     struct CtHttpServer *next;
 } CtHttpServer;
 
+typedef struct CtSqliteStmt CtSqliteStmt;
+typedef struct CtCryptoCipher CtCryptoCipher;
+typedef struct CtSqliteFunction CtSqliteFunction;
+
+typedef struct CtSqliteDb {
+    uint32_t id;
+    sqlite3 *db;
+    CtSqliteStmt *statements;
+    CtSqliteFunction *authorizer;
+    struct CtSqliteDb *next;
+} CtSqliteDb;
+
+struct CtSqliteStmt {
+    uint32_t id;
+    sqlite3_stmt *stmt;
+    CtSqliteDb *owner;
+    CtSqliteStmt *owner_next;
+    CtSqliteStmt *next;
+};
+
+struct CtCryptoCipher {
+    uint32_t id;
+#if defined(__APPLE__)
+    CCCryptorRef cryptor;
+#else
+    void *cryptor;
+#endif
+#if CT_HAS_OPENSSL
+    EVP_CIPHER_CTX *evp_cipher;
+    bool evp_aead;
+    bool evp_encrypt;
+    bool evp_finalized;
+    uint8_t evp_auth_tag[16];
+    size_t evp_auth_tag_len;
+#endif
+    struct CtCryptoCipher *next;
+};
+
+struct CtSqliteFunction {
+    JSContextRef ctx;
+    JSObjectRef callback;
+    JSObjectRef result_callback;
+    JSObjectRef start_callback;
+    JSValueRef start_value;
+    bool has_start_value;
+};
+
+typedef struct CtSqliteAggregateState {
+    bool initialized;
+    JSValueRef accumulator;
+    char *error_message;
+} CtSqliteAggregateState;
+
 static pthread_mutex_t ct_http_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtHttpServer *ct_http_servers = NULL;
 static uint32_t ct_next_http_server_id = 1;
 static uint32_t ct_next_http_request_id = 1;
+static CtSqliteDb *ct_sqlite_dbs = NULL;
+static CtSqliteStmt *ct_sqlite_stmts = NULL;
+static uint32_t ct_next_sqlite_db_id = 1;
+static uint32_t ct_next_sqlite_stmt_id = 1;
+static CtCryptoCipher *ct_crypto_ciphers = NULL;
+static uint32_t ct_next_crypto_cipher_id = 1;
 
 struct CtJscRuntime {
     JSGlobalContextRef context;
@@ -949,6 +1044,10 @@ typedef enum {
     CT_ZLIB_INFLATE_RAW,
     CT_ZLIB_GUNZIP,
     CT_ZLIB_UNZIP,
+    CT_ZLIB_BROTLI_COMPRESS,
+    CT_ZLIB_BROTLI_DECOMPRESS,
+    CT_ZLIB_ZSTD_COMPRESS,
+    CT_ZLIB_ZSTD_DECOMPRESS,
 } CtZlibMode;
 
 static bool ct_zlib_mode_from_name(const char *name, CtZlibMode *mode) {
@@ -980,11 +1079,27 @@ static bool ct_zlib_mode_from_name(const char *name, CtZlibMode *mode) {
         *mode = CT_ZLIB_UNZIP;
         return true;
     }
+    if (strcmp(name, "brotliCompress") == 0) {
+        *mode = CT_ZLIB_BROTLI_COMPRESS;
+        return true;
+    }
+    if (strcmp(name, "brotliDecompress") == 0) {
+        *mode = CT_ZLIB_BROTLI_DECOMPRESS;
+        return true;
+    }
+    if (strcmp(name, "zstdCompress") == 0) {
+        *mode = CT_ZLIB_ZSTD_COMPRESS;
+        return true;
+    }
+    if (strcmp(name, "zstdDecompress") == 0) {
+        *mode = CT_ZLIB_ZSTD_DECOMPRESS;
+        return true;
+    }
     return false;
 }
 
 static bool ct_zlib_mode_compresses(CtZlibMode mode) {
-    return mode == CT_ZLIB_DEFLATE || mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_GZIP;
+    return mode == CT_ZLIB_DEFLATE || mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_GZIP || mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_ZSTD_COMPRESS;
 }
 
 static int ct_zlib_window_bits(CtZlibMode mode) {
@@ -1000,8 +1115,154 @@ static int ct_zlib_window_bits(CtZlibMode mode) {
             return MAX_WBITS + 16;
         case CT_ZLIB_UNZIP:
             return MAX_WBITS + 32;
+        case CT_ZLIB_BROTLI_COMPRESS:
+        case CT_ZLIB_BROTLI_DECOMPRESS:
+        case CT_ZLIB_ZSTD_COMPRESS:
+        case CT_ZLIB_ZSTD_DECOMPRESS:
+            return MAX_WBITS;
     }
     return MAX_WBITS;
+}
+
+static JSValueRef ct_brotli_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, JSValueRef *exception) {
+    size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
+        ? input_len + (input_len / 4) + 1024
+        : input_len * 4 + 1024;
+    if (output_capacity < 1024) output_capacity = 1024;
+
+    for (int attempt = 0; attempt < 12; attempt += 1) {
+        uint8_t *output = (uint8_t *)malloc(output_capacity);
+        if (output == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        size_t output_len = mode == CT_ZLIB_BROTLI_COMPRESS
+            ? compression_encode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI)
+            : compression_decode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI);
+        if (output_len > 0 || input_len == 0) {
+            return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+        }
+        free(output);
+        output_capacity *= 2;
+    }
+    ct_throw_message(ctx, exception, mode == CT_ZLIB_BROTLI_COMPRESS ? "Brotli compression failed" : "Brotli decompression failed");
+    return JSValueMakeUndefined(ctx);
+}
+
+typedef size_t (*CtZstdCompressBoundFn)(size_t src_size);
+typedef size_t (*CtZstdCompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size, int compression_level);
+typedef unsigned long long (*CtZstdGetFrameContentSizeFn)(const void *src, size_t src_size);
+typedef size_t (*CtZstdDecompressFn)(void *dst, size_t dst_capacity, const void *src, size_t src_size);
+typedef unsigned int (*CtZstdIsErrorFn)(size_t code);
+typedef const char *(*CtZstdGetErrorNameFn)(size_t code);
+
+typedef struct {
+    bool attempted;
+    void *handle;
+    CtZstdCompressBoundFn compress_bound;
+    CtZstdCompressFn compress;
+    CtZstdGetFrameContentSizeFn get_frame_content_size;
+    CtZstdDecompressFn decompress;
+    CtZstdIsErrorFn is_error;
+    CtZstdGetErrorNameFn get_error_name;
+} CtZstdApi;
+
+static CtZstdApi ct_zstd_api = {0};
+
+#define CT_ZSTD_CONTENTSIZE_UNKNOWN ((unsigned long long)-1)
+#define CT_ZSTD_CONTENTSIZE_ERROR ((unsigned long long)-2)
+
+static bool ct_zstd_load(void) {
+    if (ct_zstd_api.attempted) return ct_zstd_api.handle != NULL;
+    ct_zstd_api.attempted = true;
+
+    const char *candidates[] = {
+        "libzstd.1.dylib",
+        "libzstd.dylib",
+        "/opt/homebrew/lib/libzstd.dylib",
+        "/usr/local/lib/libzstd.dylib",
+        "libzstd.so.1",
+        "libzstd.so",
+    };
+    for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index += 1) {
+        void *handle = dlopen(candidates[index], RTLD_LAZY | RTLD_LOCAL);
+        if (handle == NULL) continue;
+        ct_zstd_api.compress_bound = (CtZstdCompressBoundFn)dlsym(handle, "ZSTD_compressBound");
+        ct_zstd_api.compress = (CtZstdCompressFn)dlsym(handle, "ZSTD_compress");
+        ct_zstd_api.get_frame_content_size = (CtZstdGetFrameContentSizeFn)dlsym(handle, "ZSTD_getFrameContentSize");
+        ct_zstd_api.decompress = (CtZstdDecompressFn)dlsym(handle, "ZSTD_decompress");
+        ct_zstd_api.is_error = (CtZstdIsErrorFn)dlsym(handle, "ZSTD_isError");
+        ct_zstd_api.get_error_name = (CtZstdGetErrorNameFn)dlsym(handle, "ZSTD_getErrorName");
+        if (ct_zstd_api.compress_bound != NULL && ct_zstd_api.compress != NULL && ct_zstd_api.get_frame_content_size != NULL &&
+            ct_zstd_api.decompress != NULL && ct_zstd_api.is_error != NULL && ct_zstd_api.get_error_name != NULL) {
+            ct_zstd_api.handle = handle;
+            return true;
+        }
+        dlclose(handle);
+        memset(&ct_zstd_api, 0, sizeof(ct_zstd_api));
+        ct_zstd_api.attempted = true;
+    }
+    return false;
+}
+
+static JSValueRef ct_zstd_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, int level, JSValueRef *exception) {
+    if (!ct_zstd_load()) {
+        ct_throw_message(ctx, exception, "native Zstd support is unavailable");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (mode == CT_ZLIB_ZSTD_COMPRESS) {
+        size_t output_capacity = ct_zstd_api.compress_bound(input_len);
+        uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
+        if (output == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        size_t output_len = ct_zstd_api.compress(output, output_capacity, input, input_len, level);
+        if (ct_zstd_api.is_error(output_len)) {
+            const char *message = ct_zstd_api.get_error_name(output_len);
+            free(output);
+            ct_throw_message(ctx, exception, message != NULL ? message : "Zstd compression failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+    }
+
+    unsigned long long content_size = ct_zstd_api.get_frame_content_size(input, input_len);
+    if (content_size == CT_ZSTD_CONTENTSIZE_ERROR) {
+        ct_throw_message(ctx, exception, "Zstd decompression failed");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_capacity = 0;
+    if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
+        output_capacity = (size_t)content_size;
+    } else {
+        output_capacity = input_len * 4 + 65536;
+        if (output_capacity < 65536) output_capacity = 65536;
+    }
+
+    for (int attempt = 0; attempt < 12; attempt += 1) {
+        uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
+        if (output == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        size_t output_len = ct_zstd_api.decompress(output, output_capacity, input, input_len);
+        if (!ct_zstd_api.is_error(output_len)) {
+            return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+        }
+        const char *message = ct_zstd_api.get_error_name(output_len);
+        free(output);
+        if (content_size != CT_ZSTD_CONTENTSIZE_UNKNOWN) {
+            ct_throw_message(ctx, exception, message != NULL ? message : "Zstd decompression failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        output_capacity *= 2;
+    }
+
+    ct_throw_message(ctx, exception, "Zstd decompression failed");
+    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -1036,8 +1297,17 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     int level = Z_DEFAULT_COMPRESSION;
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
         level = (int)ct_value_to_number(ctx, argv[2]);
-        if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
     }
+
+    if (mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_BROTLI_DECOMPRESS) {
+        return ct_brotli_transform_sync(ctx, mode, input, input_len, exception);
+    }
+
+    if (mode == CT_ZLIB_ZSTD_COMPRESS || mode == CT_ZLIB_ZSTD_DECOMPRESS) {
+        return ct_zstd_transform_sync(ctx, mode, input, input_len, level == Z_DEFAULT_COMPRESSION ? 3 : level, exception);
+    }
+
+    if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
 
     const bool compressing = ct_zlib_mode_compresses(mode);
     size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
@@ -1146,17 +1416,63 @@ static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JS
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        free(algorithm_name);
+        ct_throw_message(ctx, exception, "hash input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t requested_output_len = 0;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        double number = ct_value_to_number(ctx, argv[2]);
+        if (number > 0) requested_output_len = (size_t)number;
+    }
+
+#if CT_HAS_OPENSSL
+    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    if (md != NULL) {
+        EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+        if (md_ctx == NULL) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Failed to allocate digest context");
+            return JSValueMakeUndefined(ctx);
+        }
+        const int md_size = EVP_MD_get_size(md);
+        const bool is_xof = (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0;
+        size_t output_len = requested_output_len > 0 ? requested_output_len : (md_size > 0 ? (size_t)md_size : 0);
+        if (output_len == 0) output_len = is_xof ? 32 : 1;
+        uint8_t *output = (uint8_t *)malloc(output_len);
+        if (output == NULL) {
+            EVP_MD_CTX_free(md_ctx);
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        int ok = EVP_DigestInit_ex(md_ctx, md, NULL) == 1 &&
+            EVP_DigestUpdate(md_ctx, input, input_len) == 1;
+        if (ok && is_xof) {
+            ok = EVP_DigestFinalXOF(md_ctx, output, output_len) == 1;
+        } else if (ok) {
+            unsigned int final_len = 0;
+            ok = EVP_DigestFinal_ex(md_ctx, output, &final_len) == 1;
+            output_len = final_len;
+        }
+        EVP_MD_CTX_free(md_ctx);
+        free(algorithm_name);
+        if (!ok) {
+            free(output);
+            ct_throw_message(ctx, exception, "Digest operation failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+    }
+#endif
+
     const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
     free(algorithm_name);
     if (algorithm == NULL) {
         ct_throw_message(ctx, exception, "Unsupported digest algorithm");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    uint8_t *input = NULL;
-    size_t input_len = 0;
-    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
-        ct_throw_message(ctx, exception, "hash input must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
 
@@ -1188,19 +1504,47 @@ static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JS
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
-    const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
-    free(algorithm_name);
-    if (algorithm == NULL) {
-        ct_throw_message(ctx, exception, "Unsupported HMAC algorithm");
-        return JSValueMakeUndefined(ctx);
-    }
-
     uint8_t *key = NULL;
     size_t key_len = 0;
     uint8_t *input = NULL;
     size_t input_len = 0;
     if (ct_get_bytes(ctx, argv[1], &key, &key_len) != 0 || ct_get_bytes(ctx, argv[2], &input, &input_len) != 0) {
+        free(algorithm_name);
         ct_throw_message(ctx, exception, "HMAC key and input must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if CT_HAS_OPENSSL
+    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    if (md != NULL) {
+        const int md_size = EVP_MD_get_size(md);
+        if (md_size <= 0 || (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "HMAC algorithm is not available");
+            return JSValueMakeUndefined(ctx);
+        }
+        uint8_t *output = (uint8_t *)malloc((size_t)md_size);
+        if (output == NULL) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        unsigned int output_len = 0;
+        unsigned char *result = HMAC(md, key, (int)key_len, input, input_len, output, &output_len);
+        free(algorithm_name);
+        if (result == NULL) {
+            free(output);
+            ct_throw_message(ctx, exception, "HMAC operation failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+    }
+#endif
+
+    const CtDigestAlgorithm *algorithm = ct_digest_algorithm(algorithm_name);
+    free(algorithm_name);
+    if (algorithm == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported HMAC algorithm");
         return JSValueMakeUndefined(ctx);
     }
 
@@ -1217,6 +1561,1580 @@ static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeUndefined(ctx);
 #endif
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, algorithm->output_len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 7) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoArgon2Sync(algorithm, message, nonce, parallelism, tagLength, memory, passes, secret, associatedData) requires seven arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const char *kdf_name = NULL;
+    if (strcasecmp(algorithm_name, "argon2d") == 0) kdf_name = "ARGON2D";
+    else if (strcasecmp(algorithm_name, "argon2i") == 0) kdf_name = "ARGON2I";
+    else if (strcasecmp(algorithm_name, "argon2id") == 0) kdf_name = "ARGON2ID";
+    free(algorithm_name);
+    if (kdf_name == NULL) {
+        ct_throw_message(ctx, exception, "Invalid Argon2 algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *message = NULL;
+    size_t message_len = 0;
+    uint8_t *nonce = NULL;
+    size_t nonce_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &message, &message_len) != 0 || ct_get_bytes(ctx, argv[2], &nonce, &nonce_len) != 0) {
+        ct_throw_message(ctx, exception, "Argon2 message and nonce must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint32_t parallelism = (uint32_t)ct_value_to_number(ctx, argv[3]);
+    size_t tag_len = (size_t)ct_value_to_number(ctx, argv[4]);
+    uint32_t memory = (uint32_t)ct_value_to_number(ctx, argv[5]);
+    uint32_t passes = (uint32_t)ct_value_to_number(ctx, argv[6]);
+    if (parallelism == 0 || tag_len == 0 || memory == 0 || passes == 0) {
+        ct_throw_message(ctx, exception, "Argon2 numeric parameters must be positive");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *secret = NULL;
+    size_t secret_len = 0;
+    bool has_secret = argc >= 8 && !JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7]);
+    if (has_secret && ct_get_bytes(ctx, argv[7], &secret, &secret_len) != 0) {
+        ct_throw_message(ctx, exception, "Argon2 secret must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *associated_data = NULL;
+    size_t associated_data_len = 0;
+    bool has_associated_data = argc >= 9 && !JSValueIsUndefined(ctx, argv[8]) && !JSValueIsNull(ctx, argv[8]);
+    if (has_associated_data && ct_get_bytes(ctx, argv[8], &associated_data, &associated_data_len) != 0) {
+        ct_throw_message(ctx, exception, "Argon2 associatedData must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if CT_HAS_OPENSSL
+    uint8_t *output = (uint8_t *)malloc(tag_len);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if __has_include(<openssl/thread.h>)
+    if (parallelism > 1) {
+        (void)OSSL_set_max_threads(NULL, parallelism);
+    }
+#endif
+
+    EVP_KDF *kdf = EVP_KDF_fetch(NULL, kdf_name, NULL);
+    if (kdf == NULL) {
+        free(output);
+        ct_throw_message(ctx, exception, "Argon2 KDF is unavailable in libcrypto");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_KDF_CTX *kdf_ctx = EVP_KDF_CTX_new(kdf);
+    EVP_KDF_free(kdf);
+    if (kdf_ctx == NULL) {
+        free(output);
+        ct_throw_message(ctx, exception, "Failed to create Argon2 KDF context");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    OSSL_PARAM params[9];
+    size_t param_count = 0;
+    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &parallelism);
+    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &parallelism);
+    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memory);
+    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &passes);
+    params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD, message, message_len);
+    params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, nonce, nonce_len);
+    if (has_secret) params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SECRET, secret, secret_len);
+    if (has_associated_data) params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_ARGON2_AD, associated_data, associated_data_len);
+    params[param_count++] = OSSL_PARAM_construct_end();
+
+    int status = EVP_KDF_derive(kdf_ctx, output, tag_len, params);
+    EVP_KDF_CTX_free(kdf_ctx);
+    if (status != 1) {
+        free(output);
+        ct_throw_message(ctx, exception, "Argon2 derivation failed");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, tag_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Argon2 KDF is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ed25519_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+#if CT_HAS_OPENSSL
+    EVP_PKEY_CTX *keygen_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (keygen_ctx == NULL) {
+        ct_throw_message(ctx, exception, "Failed to create Ed25519 keygen context");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *key = NULL;
+    if (EVP_PKEY_keygen_init(keygen_ctx) != 1 || EVP_PKEY_keygen(keygen_ctx, &key) != 1 || key == NULL) {
+        EVP_PKEY_CTX_free(keygen_ctx);
+        ct_throw_message(ctx, exception, "Failed to generate Ed25519 key pair");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY_CTX_free(keygen_ctx);
+
+    unsigned char public_key[32];
+    unsigned char private_key[32];
+    size_t public_len = sizeof(public_key);
+    size_t private_len = sizeof(private_key);
+    int ok = EVP_PKEY_get_raw_public_key(key, public_key, &public_len) == 1 &&
+        EVP_PKEY_get_raw_private_key(key, private_key, &private_len) == 1 &&
+        public_len == sizeof(public_key) &&
+        private_len == sizeof(private_key);
+    EVP_PKEY_free(key);
+    if (!ok) {
+        ct_throw_message(ctx, exception, "Failed to export Ed25519 key pair");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "publicKey", ct_array_buffer_from_copy(ctx, (const char *)public_key, sizeof(public_key), exception), exception);
+    ct_set_property(ctx, result, "privateKey", ct_array_buffer_from_copy(ctx, (const char *)private_key, sizeof(private_key), exception), exception);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "Ed25519 is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ed25519_public_from_private(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEd25519PublicFromPrivate(privateKey) requires a private key");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &private_key, &private_len) != 0 || private_len != 32) {
+        ct_throw_message(ctx, exception, "Ed25519 private key must be 32 bytes");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    EVP_PKEY *key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, private_key, private_len);
+    if (key == NULL) {
+        ct_throw_message(ctx, exception, "Invalid Ed25519 private key");
+        return JSValueMakeUndefined(ctx);
+    }
+    unsigned char public_key[32];
+    size_t public_len = sizeof(public_key);
+    int ok = EVP_PKEY_get_raw_public_key(key, public_key, &public_len) == 1 && public_len == sizeof(public_key);
+    EVP_PKEY_free(key);
+    if (!ok) {
+        ct_throw_message(ctx, exception, "Failed to derive Ed25519 public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_array_buffer_from_copy(ctx, (const char *)public_key, sizeof(public_key), exception);
+#else
+    ct_throw_message(ctx, exception, "Ed25519 is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ed25519_sign(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEd25519Sign(privateKey, data) requires key and data");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &private_key, &private_len) != 0 || private_len != 32 || ct_get_bytes(ctx, argv[1], &data, &data_len) != 0) {
+        ct_throw_message(ctx, exception, "Ed25519 sign requires a 32-byte private key and byte data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    EVP_PKEY *key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, private_key, private_len);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (key == NULL || md_ctx == NULL) {
+        if (key != NULL) EVP_PKEY_free(key);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize Ed25519 signer");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t signature_len = 0;
+    int ok = EVP_DigestSignInit(md_ctx, NULL, NULL, NULL, key) == 1 &&
+        EVP_DigestSign(md_ctx, NULL, &signature_len, data, data_len) == 1;
+    uint8_t *signature = ok ? (uint8_t *)malloc(signature_len) : NULL;
+    if (signature == NULL) ok = 0;
+    if (ok) ok = EVP_DigestSign(md_ctx, signature, &signature_len, data, data_len) == 1;
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(key);
+    if (!ok) {
+        free(signature);
+        ct_throw_message(ctx, exception, "Ed25519 signing failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, signature, signature_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Ed25519 is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ed25519_verify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEd25519Verify(publicKey, data, signature) requires key, data, and signature");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *public_key = NULL;
+    size_t public_len = 0;
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    uint8_t *signature = NULL;
+    size_t signature_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &public_key, &public_len) != 0 || public_len != 32 ||
+        ct_get_bytes(ctx, argv[1], &data, &data_len) != 0 ||
+        ct_get_bytes(ctx, argv[2], &signature, &signature_len) != 0) {
+        ct_throw_message(ctx, exception, "Ed25519 verify requires a 32-byte public key, byte data, and signature");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    EVP_PKEY *key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, public_key, public_len);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (key == NULL || md_ctx == NULL) {
+        if (key != NULL) EVP_PKEY_free(key);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize Ed25519 verifier");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = 0;
+    if (EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, key) == 1) {
+        status = EVP_DigestVerify(md_ctx, signature, signature_len, data, data_len);
+    }
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(key);
+    return JSValueMakeBoolean(ctx, status == 1);
+#else
+    ct_throw_message(ctx, exception, "Ed25519 is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static int ct_raw_key_type_id(const char *type_name) {
+#if CT_HAS_OPENSSL
+    if (type_name == NULL) return 0;
+    if (strcasecmp(type_name, "ed25519") == 0) return EVP_PKEY_ED25519;
+    if (strcasecmp(type_name, "x25519") == 0) return EVP_PKEY_X25519;
+    if (strcasecmp(type_name, "x448") == 0) return EVP_PKEY_X448;
+    if (strcasecmp(type_name, "ed448") == 0) return EVP_PKEY_ED448;
+#else
+    (void)type_name;
+#endif
+    return 0;
+}
+
+static JSValueRef ct_crypto_raw_key_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawKeyGenerateKeyPair(type) requires a key type");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *type_name = ct_value_to_string_copy(ctx, argv[0]);
+    int key_type = ct_raw_key_type_id(type_name);
+    free(type_name);
+    if (key_type == 0) {
+        ct_throw_message(ctx, exception, "Unknown raw key type");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY_CTX *keygen_ctx = EVP_PKEY_CTX_new_id(key_type, NULL);
+    EVP_PKEY *key = NULL;
+    if (keygen_ctx == NULL || EVP_PKEY_keygen_init(keygen_ctx) != 1 || EVP_PKEY_keygen(keygen_ctx, &key) != 1 || key == NULL) {
+        if (keygen_ctx != NULL) EVP_PKEY_CTX_free(keygen_ctx);
+        ct_throw_message(ctx, exception, "Failed to generate raw key pair");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY_CTX_free(keygen_ctx);
+
+    size_t public_len = 0;
+    size_t private_len = 0;
+    int ok = EVP_PKEY_get_raw_public_key(key, NULL, &public_len) == 1 &&
+        EVP_PKEY_get_raw_private_key(key, NULL, &private_len) == 1;
+    uint8_t *public_key = ok ? (uint8_t *)malloc(public_len) : NULL;
+    uint8_t *private_key = ok ? (uint8_t *)malloc(private_len) : NULL;
+    if (public_key == NULL || private_key == NULL) ok = 0;
+    if (ok) ok = EVP_PKEY_get_raw_public_key(key, public_key, &public_len) == 1 &&
+        EVP_PKEY_get_raw_private_key(key, private_key, &private_len) == 1;
+    EVP_PKEY_free(key);
+    if (!ok) {
+        free(public_key);
+        free(private_key);
+        ct_throw_message(ctx, exception, "Failed to export raw key pair");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "publicKey", JSObjectMakeArrayBufferWithBytesNoCopy(ctx, public_key, public_len, ct_array_buffer_free, NULL, exception), exception);
+    ct_set_property(ctx, result, "privateKey", JSObjectMakeArrayBufferWithBytesNoCopy(ctx, private_key, private_len, ct_array_buffer_free, NULL, exception), exception);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "Raw key generation is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_raw_public_from_private(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawPublicFromPrivate(type, privateKey) requires a key type and private key");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *type_name = ct_value_to_string_copy(ctx, argv[0]);
+    int key_type = ct_raw_key_type_id(type_name);
+    free(type_name);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    if (key_type == 0 || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0) {
+        ct_throw_message(ctx, exception, "Invalid raw private key input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *key = EVP_PKEY_new_raw_private_key(key_type, NULL, private_key, private_len);
+    if (key == NULL) {
+        ct_throw_message(ctx, exception, "Invalid raw private key");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t public_len = 0;
+    int ok = EVP_PKEY_get_raw_public_key(key, NULL, &public_len) == 1;
+    uint8_t *public_key = ok ? (uint8_t *)malloc(public_len) : NULL;
+    if (public_key == NULL) ok = 0;
+    if (ok) ok = EVP_PKEY_get_raw_public_key(key, public_key, &public_len) == 1;
+    EVP_PKEY_free(key);
+    if (!ok) {
+        free(public_key);
+        ct_throw_message(ctx, exception, "Failed to derive raw public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, public_key, public_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Raw public key derivation is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_raw_sign(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawSign(type, privateKey, data) requires a key type, private key, and data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *type_name = ct_value_to_string_copy(ctx, argv[0]);
+    int key_type = ct_raw_key_type_id(type_name);
+    free(type_name);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (key_type == 0 || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0 || ct_get_bytes(ctx, argv[2], &data, &data_len) != 0) {
+        ct_throw_message(ctx, exception, "Invalid raw signing input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *key = EVP_PKEY_new_raw_private_key(key_type, NULL, private_key, private_len);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (key == NULL || md_ctx == NULL) {
+        if (key != NULL) EVP_PKEY_free(key);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize raw signer");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t signature_len = 0;
+    int ok = EVP_DigestSignInit(md_ctx, NULL, NULL, NULL, key) == 1 &&
+        EVP_DigestSign(md_ctx, NULL, &signature_len, data, data_len) == 1;
+    uint8_t *signature = ok ? (uint8_t *)malloc(signature_len) : NULL;
+    if (signature == NULL) ok = 0;
+    if (ok) ok = EVP_DigestSign(md_ctx, signature, &signature_len, data, data_len) == 1;
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(key);
+    if (!ok) {
+        free(signature);
+        ct_throw_message(ctx, exception, "Raw signing failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, signature, signature_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Raw signing is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_raw_verify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawVerify(type, publicKey, data, signature) requires a key type, public key, data, and signature");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *type_name = ct_value_to_string_copy(ctx, argv[0]);
+    int key_type = ct_raw_key_type_id(type_name);
+    free(type_name);
+    uint8_t *public_key = NULL;
+    size_t public_len = 0;
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    uint8_t *signature = NULL;
+    size_t signature_len = 0;
+    if (key_type == 0 || ct_get_bytes(ctx, argv[1], &public_key, &public_len) != 0 ||
+        ct_get_bytes(ctx, argv[2], &data, &data_len) != 0 ||
+        ct_get_bytes(ctx, argv[3], &signature, &signature_len) != 0) {
+        ct_throw_message(ctx, exception, "Invalid raw verification input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *key = EVP_PKEY_new_raw_public_key(key_type, NULL, public_key, public_len);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (key == NULL || md_ctx == NULL) {
+        if (key != NULL) EVP_PKEY_free(key);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize raw verifier");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = 0;
+    if (EVP_DigestVerifyInit(md_ctx, NULL, NULL, NULL, key) == 1) {
+        status = EVP_DigestVerify(md_ctx, signature, signature_len, data, data_len);
+    }
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(key);
+    return JSValueMakeBoolean(ctx, status == 1);
+#else
+    ct_throw_message(ctx, exception, "Raw verification is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_raw_diffie_hellman(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawDiffieHellman(type, privateKey, publicKey) requires a key type, private key, and public key");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *type_name = ct_value_to_string_copy(ctx, argv[0]);
+    int key_type = ct_raw_key_type_id(type_name);
+    free(type_name);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    uint8_t *public_key = NULL;
+    size_t public_len = 0;
+    if (key_type == 0 || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0 || ct_get_bytes(ctx, argv[2], &public_key, &public_len) != 0) {
+        ct_throw_message(ctx, exception, "Invalid raw Diffie-Hellman input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *private_pkey = EVP_PKEY_new_raw_private_key(key_type, NULL, private_key, private_len);
+    EVP_PKEY *public_pkey = EVP_PKEY_new_raw_public_key(key_type, NULL, public_key, public_len);
+    EVP_PKEY_CTX *derive_ctx = private_pkey != NULL ? EVP_PKEY_CTX_new(private_pkey, NULL) : NULL;
+    if (private_pkey == NULL || public_pkey == NULL || derive_ctx == NULL ||
+        EVP_PKEY_derive_init(derive_ctx) != 1 ||
+        EVP_PKEY_derive_set_peer(derive_ctx, public_pkey) != 1) {
+        if (derive_ctx != NULL) EVP_PKEY_CTX_free(derive_ctx);
+        if (private_pkey != NULL) EVP_PKEY_free(private_pkey);
+        if (public_pkey != NULL) EVP_PKEY_free(public_pkey);
+        ct_throw_message(ctx, exception, "Failed to initialize raw Diffie-Hellman");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t secret_len = 0;
+    int ok = EVP_PKEY_derive(derive_ctx, NULL, &secret_len) == 1;
+    uint8_t *secret = ok ? (uint8_t *)malloc(secret_len) : NULL;
+    if (secret == NULL) ok = 0;
+    if (ok) ok = EVP_PKEY_derive(derive_ctx, secret, &secret_len) == 1;
+    EVP_PKEY_CTX_free(derive_ctx);
+    EVP_PKEY_free(private_pkey);
+    EVP_PKEY_free(public_pkey);
+    if (!ok) {
+        free(secret);
+        ct_throw_message(ctx, exception, "Raw Diffie-Hellman failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, secret, secret_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Raw Diffie-Hellman is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static BIGNUM *ct_bn_from_js_bytes(JSContextRef ctx, JSValueRef value) {
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    if (ct_get_bytes(ctx, value, &bytes, &len) != 0 || len == 0) return NULL;
+    return BN_bin2bn(bytes, (int)len, NULL);
+}
+
+#if CT_HAS_OPENSSL
+static JSValueRef ct_js_from_bn(JSContextRef ctx, const BIGNUM *bn, JSValueRef *exception) {
+    if (bn == NULL) return JSValueMakeUndefined(ctx);
+    int len = BN_num_bytes(bn);
+    if (len <= 0) {
+        uint8_t zero = 0;
+        return ct_array_buffer_from_copy(ctx, (const char *)&zero, 1, exception);
+    }
+    uint8_t *buffer = (uint8_t *)malloc((size_t)len);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    BN_bn2bin(bn, buffer);
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)len, ct_array_buffer_free, NULL, exception);
+}
+
+static EVP_PKEY *ct_rsa_pkey_from_js(JSContextRef ctx, const JSValueRef argv[], size_t offset, bool private_key) {
+    BIGNUM *n = ct_bn_from_js_bytes(ctx, argv[offset + 0]);
+    BIGNUM *e = ct_bn_from_js_bytes(ctx, argv[offset + 1]);
+    BIGNUM *d = private_key ? ct_bn_from_js_bytes(ctx, argv[offset + 2]) : NULL;
+    if (n == NULL || e == NULL || (private_key && d == NULL)) {
+        if (n != NULL) BN_free(n);
+        if (e != NULL) BN_free(e);
+        if (d != NULL) BN_free(d);
+        return NULL;
+    }
+
+    RSA *rsa = RSA_new();
+    if (rsa == NULL) {
+        BN_free(n);
+        BN_free(e);
+        if (d != NULL) BN_free(d);
+        return NULL;
+    }
+    if (RSA_set0_key(rsa, n, e, d) != 1) {
+        RSA_free(rsa);
+        return NULL;
+    }
+
+    if (private_key) {
+        BIGNUM *p = ct_bn_from_js_bytes(ctx, argv[offset + 3]);
+        BIGNUM *q = ct_bn_from_js_bytes(ctx, argv[offset + 4]);
+        if (p != NULL && q != NULL) {
+            if (RSA_set0_factors(rsa, p, q) != 1) {
+                BN_free(p);
+                BN_free(q);
+                RSA_free(rsa);
+                return NULL;
+            }
+        } else {
+            if (p != NULL) BN_free(p);
+            if (q != NULL) BN_free(q);
+        }
+
+        BIGNUM *dp = ct_bn_from_js_bytes(ctx, argv[offset + 5]);
+        BIGNUM *dq = ct_bn_from_js_bytes(ctx, argv[offset + 6]);
+        BIGNUM *qi = ct_bn_from_js_bytes(ctx, argv[offset + 7]);
+        if (dp != NULL && dq != NULL && qi != NULL) {
+            if (RSA_set0_crt_params(rsa, dp, dq, qi) != 1) {
+                BN_free(dp);
+                BN_free(dq);
+                BN_free(qi);
+                RSA_free(rsa);
+                return NULL;
+            }
+        } else {
+            if (dp != NULL) BN_free(dp);
+            if (dq != NULL) BN_free(dq);
+            if (qi != NULL) BN_free(qi);
+        }
+    }
+
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        return NULL;
+    }
+    return pkey;
+}
+
+static JSObjectRef ct_js_from_rsa_pkey(JSContextRef ctx, EVP_PKEY *pkey, const char *key_type, JSValueRef *exception) {
+    RSA *rsa = EVP_PKEY_get1_RSA(pkey);
+    if (rsa == NULL) {
+        ct_throw_message(ctx, exception, "Imported key is not an RSA key");
+        return NULL;
+    }
+    const BIGNUM *n = NULL;
+    const BIGNUM *e = NULL;
+    const BIGNUM *d = NULL;
+    const BIGNUM *p = NULL;
+    const BIGNUM *q = NULL;
+    const BIGNUM *dp = NULL;
+    const BIGNUM *dq = NULL;
+    const BIGNUM *qi = NULL;
+    RSA_get0_key(rsa, &n, &e, &d);
+    RSA_get0_factors(rsa, &p, &q);
+    RSA_get0_crt_params(rsa, &dp, &dq, &qi);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "asymmetricKeyType", ct_make_string(ctx, "rsa"), exception);
+    ct_set_property(ctx, result, "type", ct_make_string(ctx, key_type), exception);
+    ct_set_property(ctx, result, "n", ct_js_from_bn(ctx, n, exception), exception);
+    ct_set_property(ctx, result, "e", ct_js_from_bn(ctx, e, exception), exception);
+    if (strcasecmp(key_type, "private") == 0) {
+        if (d != NULL) ct_set_property(ctx, result, "d", ct_js_from_bn(ctx, d, exception), exception);
+        if (p != NULL) ct_set_property(ctx, result, "p", ct_js_from_bn(ctx, p, exception), exception);
+        if (q != NULL) ct_set_property(ctx, result, "q", ct_js_from_bn(ctx, q, exception), exception);
+        if (dp != NULL) ct_set_property(ctx, result, "dp", ct_js_from_bn(ctx, dp, exception), exception);
+        if (dq != NULL) ct_set_property(ctx, result, "dq", ct_js_from_bn(ctx, dq, exception), exception);
+        if (qi != NULL) ct_set_property(ctx, result, "qi", ct_js_from_bn(ctx, qi, exception), exception);
+    }
+    RSA_free(rsa);
+    return result;
+}
+
+static JSValueRef ct_bio_to_js(JSContextRef ctx, BIO *bio, bool pem, JSValueRef *exception) {
+    BUF_MEM *mem = NULL;
+    BIO_get_mem_ptr(bio, &mem);
+    if (mem == NULL || mem->data == NULL) {
+        ct_throw_message(ctx, exception, "Failed to read encoded key");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (pem) return ct_make_string_len(ctx, mem->data, mem->length);
+    return ct_array_buffer_from_copy(ctx, mem->data, mem->length, exception);
+}
+
+static int ct_ec_curve_nid(const char *name) {
+    if (name == NULL) return NID_undef;
+    if (strcasecmp(name, "p-256") == 0 || strcasecmp(name, "p256") == 0 || strcasecmp(name, "secp256r1") == 0) return NID_X9_62_prime256v1;
+    if (strcasecmp(name, "p-384") == 0 || strcasecmp(name, "p384") == 0) return NID_secp384r1;
+    if (strcasecmp(name, "p-521") == 0 || strcasecmp(name, "p521") == 0) return NID_secp521r1;
+    int nid = OBJ_sn2nid(name);
+    if (nid == NID_undef) nid = OBJ_ln2nid(name);
+    if (nid == NID_undef) nid = OBJ_txt2nid(name);
+    return nid;
+}
+
+static EC_KEY *ct_ec_key_from_private(const char *curve_name, const uint8_t *private_key, size_t private_len) {
+    int nid = ct_ec_curve_nid(curve_name);
+    if (nid == NID_undef) return NULL;
+    EC_KEY *key = EC_KEY_new_by_curve_name(nid);
+    if (key == NULL) return NULL;
+    BIGNUM *private_bn = BN_bin2bn(private_key, (int)private_len, NULL);
+    if (private_bn == NULL || EC_KEY_set_private_key(key, private_bn) != 1) {
+        if (private_bn != NULL) BN_free(private_bn);
+        EC_KEY_free(key);
+        return NULL;
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(key);
+    EC_POINT *public_point = EC_POINT_new(group);
+    if (public_point == NULL || EC_POINT_mul(group, public_point, private_bn, NULL, NULL, NULL) != 1 ||
+        EC_KEY_set_public_key(key, public_point) != 1) {
+        if (public_point != NULL) EC_POINT_free(public_point);
+        BN_free(private_bn);
+        EC_KEY_free(key);
+        return NULL;
+    }
+    EC_POINT_free(public_point);
+    BN_free(private_bn);
+    return key;
+}
+
+static EC_KEY *ct_ec_key_from_public(const char *curve_name, const uint8_t *public_key, size_t public_len) {
+    int nid = ct_ec_curve_nid(curve_name);
+    if (nid == NID_undef) return NULL;
+    EC_KEY *key = EC_KEY_new_by_curve_name(nid);
+    if (key == NULL) return NULL;
+    const EC_GROUP *group = EC_KEY_get0_group(key);
+    EC_POINT *point = EC_POINT_new(group);
+    if (point == NULL || EC_POINT_oct2point(group, point, public_key, public_len, NULL) != 1 ||
+        EC_KEY_set_public_key(key, point) != 1) {
+        if (point != NULL) EC_POINT_free(point);
+        EC_KEY_free(key);
+        return NULL;
+    }
+    EC_POINT_free(point);
+    return key;
+}
+
+static JSValueRef ct_ec_private_to_js(JSContextRef ctx, EC_KEY *key, JSValueRef *exception) {
+    const BIGNUM *private_bn = EC_KEY_get0_private_key(key);
+    return ct_js_from_bn(ctx, private_bn, exception);
+}
+
+static JSValueRef ct_ec_public_to_js(JSContextRef ctx, EC_KEY *key, JSValueRef *exception) {
+    const EC_GROUP *group = EC_KEY_get0_group(key);
+    const EC_POINT *point = EC_KEY_get0_public_key(key);
+    size_t len = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
+    if (len == 0) {
+        ct_throw_message(ctx, exception, "Failed to encode EC public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *buffer = (uint8_t *)malloc(len);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, buffer, len, NULL) != len) {
+        free(buffer);
+        ct_throw_message(ctx, exception, "Failed to encode EC public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, len, ct_array_buffer_free, NULL, exception);
+}
+
+static int ct_ec_key_ensure_public(EC_KEY *key) {
+    if (key == NULL || EC_KEY_get0_public_key(key) != NULL) return key != NULL;
+    const BIGNUM *private_bn = EC_KEY_get0_private_key(key);
+    const EC_GROUP *group = EC_KEY_get0_group(key);
+    if (private_bn == NULL || group == NULL) return 0;
+    EC_POINT *public_point = EC_POINT_new(group);
+    if (public_point == NULL) return 0;
+    int ok = EC_POINT_mul(group, public_point, private_bn, NULL, NULL, NULL) == 1 &&
+        EC_KEY_set_public_key(key, public_point) == 1;
+    EC_POINT_free(public_point);
+    return ok;
+}
+
+static const char *ct_ec_curve_name_from_nid(int nid) {
+    if (nid == NID_X9_62_prime256v1) return "prime256v1";
+    if (nid == NID_secp384r1) return "secp384r1";
+    if (nid == NID_secp521r1) return "secp521r1";
+#ifdef NID_secp256k1
+    if (nid == NID_secp256k1) return "secp256k1";
+#endif
+    const char *name = OBJ_nid2sn(nid);
+    return name != NULL ? name : OBJ_nid2ln(nid);
+}
+
+static const char *ct_raw_key_name_from_id(int key_id) {
+    if (key_id == EVP_PKEY_ED25519) return "ed25519";
+    if (key_id == EVP_PKEY_X25519) return "x25519";
+    if (key_id == EVP_PKEY_X448) return "x448";
+    if (key_id == EVP_PKEY_ED448) return "ed448";
+    return NULL;
+}
+
+static JSValueRef ct_raw_pkey_part_to_js(JSContextRef ctx, EVP_PKEY *pkey, bool private_part, JSValueRef *exception) {
+    size_t len = 0;
+    int ok = private_part
+        ? EVP_PKEY_get_raw_private_key(pkey, NULL, &len)
+        : EVP_PKEY_get_raw_public_key(pkey, NULL, &len);
+    if (ok != 1 || len == 0) {
+        ct_throw_message(ctx, exception, private_part ? "Failed to read raw private key" : "Failed to read raw public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *buffer = (uint8_t *)malloc(len);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    ok = private_part
+        ? EVP_PKEY_get_raw_private_key(pkey, buffer, &len)
+        : EVP_PKEY_get_raw_public_key(pkey, buffer, &len);
+    if (ok != 1) {
+        free(buffer);
+        ct_throw_message(ctx, exception, private_part ? "Failed to read raw private key" : "Failed to read raw public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSObjectRef ct_js_from_ec_pkey(JSContextRef ctx, EVP_PKEY *pkey, const char *key_type, JSValueRef *exception) {
+    EC_KEY *ec = EVP_PKEY_get1_EC_KEY(pkey);
+    if (ec == NULL) {
+        ct_throw_message(ctx, exception, "Imported key is not an EC key");
+        return NULL;
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(ec);
+    int nid = group != NULL ? EC_GROUP_get_curve_name(group) : NID_undef;
+    const char *curve_name = ct_ec_curve_name_from_nid(nid);
+    if (curve_name == NULL || !ct_ec_key_ensure_public(ec)) {
+        EC_KEY_free(ec);
+        ct_throw_message(ctx, exception, "Unsupported EC key curve");
+        return NULL;
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "asymmetricKeyType", ct_make_string(ctx, "ec"), exception);
+    ct_set_property(ctx, result, "type", ct_make_string(ctx, key_type), exception);
+    ct_set_property(ctx, result, "namedCurve", ct_make_string(ctx, curve_name), exception);
+    ct_set_property(ctx, result, "publicKey", ct_ec_public_to_js(ctx, ec, exception), exception);
+    if (strcasecmp(key_type, "private") == 0) {
+        const BIGNUM *private_bn = EC_KEY_get0_private_key(ec);
+        if (private_bn == NULL) {
+            EC_KEY_free(ec);
+            ct_throw_message(ctx, exception, "Imported EC private key is missing private key material");
+            return NULL;
+        }
+        ct_set_property(ctx, result, "privateKey", ct_js_from_bn(ctx, private_bn, exception), exception);
+    }
+    EC_KEY_free(ec);
+    return result;
+}
+
+static JSObjectRef ct_js_from_raw_pkey(JSContextRef ctx, EVP_PKEY *pkey, const char *key_type, JSValueRef *exception) {
+    const char *type_name = ct_raw_key_name_from_id(EVP_PKEY_base_id(pkey));
+    if (type_name == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported raw key type");
+        return NULL;
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "asymmetricKeyType", ct_make_string(ctx, type_name), exception);
+    ct_set_property(ctx, result, "type", ct_make_string(ctx, key_type), exception);
+    ct_set_property(ctx, result, "publicKey", ct_raw_pkey_part_to_js(ctx, pkey, false, exception), exception);
+    if (strcasecmp(key_type, "private") == 0) {
+        ct_set_property(ctx, result, "privateKey", ct_raw_pkey_part_to_js(ctx, pkey, true, exception), exception);
+    }
+    return result;
+}
+
+static JSObjectRef ct_js_from_evp_pkey(JSContextRef ctx, EVP_PKEY *pkey, const char *key_type, JSValueRef *exception) {
+    int key_id = EVP_PKEY_base_id(pkey);
+    if (key_id == EVP_PKEY_RSA || key_id == EVP_PKEY_RSA_PSS) return ct_js_from_rsa_pkey(ctx, pkey, key_type, exception);
+    if (key_id == EVP_PKEY_EC) return ct_js_from_ec_pkey(ctx, pkey, key_type, exception);
+    if (ct_raw_key_name_from_id(key_id) != NULL) return ct_js_from_raw_pkey(ctx, pkey, key_type, exception);
+    ct_throw_message(ctx, exception, "Invalid encoded key type");
+    return NULL;
+}
+
+static EVP_PKEY *ct_ec_pkey_from_js(JSContextRef ctx, const char *curve_name, JSValueRef key_value, bool private_key) {
+    uint8_t *key_bytes = NULL;
+    size_t key_len = 0;
+    if (ct_get_bytes(ctx, key_value, &key_bytes, &key_len) != 0 || key_len == 0) return NULL;
+    EC_KEY *ec = private_key
+        ? ct_ec_key_from_private(curve_name, key_bytes, key_len)
+        : ct_ec_key_from_public(curve_name, key_bytes, key_len);
+    if (ec == NULL) return NULL;
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (pkey == NULL || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        EC_KEY_free(ec);
+        return NULL;
+    }
+    return pkey;
+}
+
+static int ct_write_generic_pkey(BIO *bio, EVP_PKEY *pkey, bool private_key, bool pem) {
+    if (pem) {
+        return private_key
+            ? PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL)
+            : PEM_write_bio_PUBKEY(bio, pkey);
+    }
+    return private_key
+        ? i2d_PKCS8PrivateKey_bio(bio, pkey, NULL, NULL, 0, NULL, NULL)
+        : i2d_PUBKEY_bio(bio, pkey);
+}
+
+static int ct_rsa_padding_from_node(int node_padding) {
+    if (node_padding == 6) return RSA_PKCS1_PSS_PADDING;
+    return RSA_PKCS1_PADDING;
+}
+
+static int ct_rsa_configure_pkey_ctx(EVP_PKEY_CTX *pkey_ctx, int node_padding, int salt_len, const EVP_MD *md, bool signing) {
+    if (pkey_ctx == NULL) return 0;
+    int padding = ct_rsa_padding_from_node(node_padding);
+    if (EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, padding) != 1) return 0;
+    if (padding == RSA_PKCS1_PSS_PADDING) {
+        int effective_salt_len = salt_len;
+        if (effective_salt_len == 0) effective_salt_len = signing ? RSA_PSS_SALTLEN_MAX_SIGN : RSA_PSS_SALTLEN_AUTO;
+        if (EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, md) != 1) return 0;
+        if (EVP_PKEY_CTX_set_rsa_pss_saltlen(pkey_ctx, effective_salt_len) != 1) return 0;
+    }
+    return 1;
+}
+#endif
+
+static JSValueRef ct_crypto_rsa_export_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 11) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRsaExportKey requires key type, format, encoding type, and RSA parts");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *key_type = ct_value_to_string_copy(ctx, argv[0]);
+    char *format = ct_value_to_string_copy(ctx, argv[1]);
+    char *encoding_type = ct_value_to_string_copy(ctx, argv[2]);
+    if (key_type == NULL || format == NULL || encoding_type == NULL) {
+        free(key_type);
+        free(format);
+        free(encoding_type);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool private_key = strcasecmp(key_type, "private") == 0;
+    bool pem = strcasecmp(format, "pem") == 0;
+    bool pkcs1 = strcasecmp(encoding_type, "pkcs1") == 0;
+    EVP_PKEY *pkey = ct_rsa_pkey_from_js(ctx, argv, 3, private_key);
+    BIO *bio = BIO_new(BIO_s_mem());
+    if (pkey == NULL || bio == NULL) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        if (bio != NULL) BIO_free(bio);
+        free(key_type);
+        free(format);
+        free(encoding_type);
+        ct_throw_message(ctx, exception, "Failed to initialize RSA key export");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int ok = 0;
+    RSA *rsa = pkcs1 ? EVP_PKEY_get1_RSA(pkey) : NULL;
+    if (pem) {
+        if (private_key && pkcs1) ok = PEM_write_bio_RSAPrivateKey(bio, rsa, NULL, NULL, 0, NULL, NULL);
+        else if (private_key) ok = PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL);
+        else if (pkcs1) ok = PEM_write_bio_RSAPublicKey(bio, rsa);
+        else ok = PEM_write_bio_PUBKEY(bio, pkey);
+    } else {
+        if (private_key && pkcs1) ok = i2d_RSAPrivateKey_bio(bio, rsa);
+        else if (private_key) ok = i2d_PKCS8PrivateKey_bio(bio, pkey, NULL, NULL, 0, NULL, NULL);
+        else if (pkcs1) ok = i2d_RSAPublicKey_bio(bio, rsa);
+        else ok = i2d_PUBKEY_bio(bio, pkey);
+    }
+    if (rsa != NULL) RSA_free(rsa);
+    EVP_PKEY_free(pkey);
+    free(key_type);
+    free(format);
+    free(encoding_type);
+    if (!ok) {
+        BIO_free(bio);
+        ct_throw_message(ctx, exception, "RSA key export failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_bio_to_js(ctx, bio, pem, exception);
+    BIO_free(bio);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "RSA key export is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_export_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcExportKey requires key type, format, encoding type, curve, and key bytes");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *key_type = ct_value_to_string_copy(ctx, argv[0]);
+    char *format = ct_value_to_string_copy(ctx, argv[1]);
+    char *encoding_type = ct_value_to_string_copy(ctx, argv[2]);
+    char *curve_name = ct_value_to_string_copy(ctx, argv[3]);
+    if (key_type == NULL || format == NULL || encoding_type == NULL || curve_name == NULL) {
+        free(key_type);
+        free(format);
+        free(encoding_type);
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool private_key = strcasecmp(key_type, "private") == 0;
+    bool pem = strcasecmp(format, "pem") == 0;
+    bool sec1 = strcasecmp(encoding_type, "sec1") == 0;
+    EVP_PKEY *pkey = ct_ec_pkey_from_js(ctx, curve_name, argv[4], private_key);
+    BIO *bio = BIO_new(BIO_s_mem());
+    free(key_type);
+    free(format);
+    free(curve_name);
+    if (pkey == NULL || bio == NULL) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        if (bio != NULL) BIO_free(bio);
+        free(encoding_type);
+        ct_throw_message(ctx, exception, "Failed to initialize EC key export");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int ok = 0;
+    if (sec1) {
+        EC_KEY *ec = EVP_PKEY_get1_EC_KEY(pkey);
+        if (private_key && ec != NULL) {
+            ok = pem
+                ? PEM_write_bio_ECPrivateKey(bio, ec, NULL, NULL, 0, NULL, NULL)
+                : i2d_ECPrivateKey_bio(bio, ec);
+        }
+        if (ec != NULL) EC_KEY_free(ec);
+    } else {
+        ok = ct_write_generic_pkey(bio, pkey, private_key, pem);
+    }
+    EVP_PKEY_free(pkey);
+    free(encoding_type);
+    if (!ok) {
+        BIO_free(bio);
+        ct_throw_message(ctx, exception, "EC key export failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_bio_to_js(ctx, bio, pem, exception);
+    BIO_free(bio);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "EC key export is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_raw_export_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRawExportKey requires key type, format, encoding type, raw key type, and key bytes");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *key_type = ct_value_to_string_copy(ctx, argv[0]);
+    char *format = ct_value_to_string_copy(ctx, argv[1]);
+    char *raw_type = ct_value_to_string_copy(ctx, argv[3]);
+    if (key_type == NULL || format == NULL || raw_type == NULL) {
+        free(key_type);
+        free(format);
+        free(raw_type);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool private_key = strcasecmp(key_type, "private") == 0;
+    bool pem = strcasecmp(format, "pem") == 0;
+    int pkey_id = ct_raw_key_type_id(raw_type);
+    uint8_t *key_bytes = NULL;
+    size_t key_len = 0;
+    if (pkey_id == 0 || ct_get_bytes(ctx, argv[4], &key_bytes, &key_len) != 0 || key_len == 0) {
+        free(key_type);
+        free(format);
+        free(raw_type);
+        ct_throw_message(ctx, exception, "Invalid raw key export input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *pkey = private_key
+        ? EVP_PKEY_new_raw_private_key(pkey_id, NULL, key_bytes, key_len)
+        : EVP_PKEY_new_raw_public_key(pkey_id, NULL, key_bytes, key_len);
+    BIO *bio = BIO_new(BIO_s_mem());
+    free(key_type);
+    free(raw_type);
+    if (pkey == NULL || bio == NULL) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        if (bio != NULL) BIO_free(bio);
+        free(format);
+        ct_throw_message(ctx, exception, "Failed to initialize raw key export");
+        return JSValueMakeUndefined(ctx);
+    }
+    int ok = ct_write_generic_pkey(bio, pkey, private_key, pem);
+    EVP_PKEY_free(pkey);
+    free(format);
+    if (!ok) {
+        BIO_free(bio);
+        ct_throw_message(ctx, exception, "Raw key export failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_bio_to_js(ctx, bio, pem, exception);
+    BIO_free(bio);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "Raw key export is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static NETSCAPE_SPKI *ct_spkac_from_js(JSContextRef ctx, JSValueRef value) {
+#if CT_HAS_OPENSSL
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, value, &data, &data_len) != 0 || data_len == 0 || data_len > INT_MAX) return NULL;
+    return NETSCAPE_SPKI_b64_decode((const char *)data, (int)data_len);
+#else
+    (void)ctx;
+    (void)value;
+    return NULL;
+#endif
+}
+
+static JSValueRef ct_crypto_spkac_verify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoSpkacVerify(spkac) requires SPKAC data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    NETSCAPE_SPKI *spki = ct_spkac_from_js(ctx, argv[0]);
+    if (spki == NULL) return JSValueMakeBoolean(ctx, false);
+    EVP_PKEY *pkey = NETSCAPE_SPKI_get_pubkey(spki);
+    int ok = pkey != NULL ? NETSCAPE_SPKI_verify(spki, pkey) : 0;
+    if (pkey != NULL) EVP_PKEY_free(pkey);
+    NETSCAPE_SPKI_free(spki);
+    return JSValueMakeBoolean(ctx, ok == 1);
+#else
+    ct_throw_message(ctx, exception, "SPKAC verification is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_spkac_export_public_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoSpkacExportPublicKey(spkac) requires SPKAC data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    NETSCAPE_SPKI *spki = ct_spkac_from_js(ctx, argv[0]);
+    if (spki == NULL) return ct_array_buffer_from_copy(ctx, "", 0, exception);
+    EVP_PKEY *pkey = NETSCAPE_SPKI_get_pubkey(spki);
+    BIO *bio = pkey != NULL ? BIO_new(BIO_s_mem()) : NULL;
+    int ok = bio != NULL && PEM_write_bio_PUBKEY(bio, pkey) == 1;
+    if (pkey != NULL) EVP_PKEY_free(pkey);
+    NETSCAPE_SPKI_free(spki);
+    if (!ok) {
+        if (bio != NULL) BIO_free(bio);
+        return ct_array_buffer_from_copy(ctx, "", 0, exception);
+    }
+    JSValueRef result = ct_bio_to_js(ctx, bio, false, exception);
+    BIO_free(bio);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "SPKAC public key export is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static EVP_PKEY *ct_read_pem_key_from_bytes(const uint8_t *data, size_t data_len, bool private_key) {
+#if CT_HAS_OPENSSL
+    BIO *bio = BIO_new_mem_buf(data, (int)data_len);
+    if (bio == NULL) return NULL;
+    EVP_PKEY *pkey = private_key ? PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL) : PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (pkey != NULL || private_key) return pkey;
+
+    bio = BIO_new_mem_buf(data, (int)data_len);
+    if (bio == NULL) return NULL;
+    RSA *rsa = PEM_read_bio_RSAPublicKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (rsa == NULL) return NULL;
+    pkey = EVP_PKEY_new();
+    if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        return NULL;
+    }
+    return pkey;
+#else
+    (void)data;
+    (void)data_len;
+    (void)private_key;
+    return NULL;
+#endif
+}
+
+static EVP_PKEY *ct_read_der_key_from_bytes(const uint8_t *data, size_t data_len, bool private_key) {
+#if CT_HAS_OPENSSL
+    BIO *bio = BIO_new_mem_buf(data, (int)data_len);
+    if (bio == NULL) return NULL;
+    EVP_PKEY *pkey = private_key ? d2i_PrivateKey_bio(bio, NULL) : d2i_PUBKEY_bio(bio, NULL);
+    BIO_free(bio);
+    if (pkey != NULL || private_key) return pkey;
+
+    bio = BIO_new_mem_buf(data, (int)data_len);
+    if (bio == NULL) return NULL;
+    RSA *rsa = d2i_RSAPublicKey_bio(bio, NULL);
+    BIO_free(bio);
+    if (rsa == NULL) return NULL;
+    pkey = EVP_PKEY_new();
+    if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        return NULL;
+    }
+    return pkey;
+#else
+    (void)data;
+    (void)data_len;
+    (void)private_key;
+    return NULL;
+#endif
+}
+
+static JSValueRef ct_crypto_import_key(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoImportKey(type, format, keyType, data) requires four arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *requested_type = ct_value_to_string_copy(ctx, argv[0]);
+    char *format = ct_value_to_string_copy(ctx, argv[1]);
+    if (requested_type == NULL || format == NULL) {
+        free(requested_type);
+        free(format);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, argv[3], &data, &data_len) != 0 || data_len == 0) {
+        free(requested_type);
+        free(format);
+        ct_throw_message(ctx, exception, "Encoded key data must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool private_key = strcasecmp(requested_type, "public") != 0;
+    EVP_PKEY *pkey = NULL;
+    if (strcasecmp(format, "der") == 0) {
+        pkey = ct_read_der_key_from_bytes(data, data_len, private_key);
+    } else {
+        pkey = ct_read_pem_key_from_bytes(data, data_len, private_key);
+    }
+    bool output_private = private_key;
+    if (pkey == NULL && private_key) {
+        pkey = strcasecmp(format, "der") == 0
+            ? ct_read_der_key_from_bytes(data, data_len, false)
+            : ct_read_pem_key_from_bytes(data, data_len, false);
+        output_private = false;
+    } else if (pkey == NULL && !private_key) {
+        pkey = strcasecmp(format, "der") == 0
+            ? ct_read_der_key_from_bytes(data, data_len, true)
+            : ct_read_pem_key_from_bytes(data, data_len, true);
+        output_private = false;
+    }
+    free(format);
+    if (pkey == NULL) {
+        free(requested_type);
+        ct_throw_message(ctx, exception, "Failed to parse encoded key");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_js_from_evp_pkey(ctx, pkey, output_private ? "private" : "public", exception);
+    EVP_PKEY_free(pkey);
+    free(requested_type);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+#else
+    ct_throw_message(ctx, exception, "Encoded key import is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_rsa_sign(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 12) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRsaSign requires algorithm, padding, saltLength, RSA private parts, and data");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    free(algorithm_name);
+    if (md == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported RSA digest algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, argv[11], &data, &data_len) != 0) {
+        ct_throw_message(ctx, exception, "RSA sign data must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *pkey = ct_rsa_pkey_from_js(ctx, argv, 3, true);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (pkey == NULL || md_ctx == NULL) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize RSA signer");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY_CTX *pkey_ctx = NULL;
+    int node_padding = (int)ct_value_to_number(ctx, argv[1]);
+    int salt_len = (int)ct_value_to_number(ctx, argv[2]);
+    int ok = EVP_DigestSignInit(md_ctx, &pkey_ctx, md, NULL, pkey) == 1 &&
+        ct_rsa_configure_pkey_ctx(pkey_ctx, node_padding, salt_len, md, true) &&
+        EVP_DigestSignUpdate(md_ctx, data, data_len) == 1;
+    size_t signature_len = 0;
+    if (ok) ok = EVP_DigestSignFinal(md_ctx, NULL, &signature_len) == 1;
+    uint8_t *signature = ok ? (uint8_t *)malloc(signature_len) : NULL;
+    if (signature == NULL) ok = 0;
+    if (ok) ok = EVP_DigestSignFinal(md_ctx, signature, &signature_len) == 1;
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        free(signature);
+        ct_throw_message(ctx, exception, "RSA signing failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, signature, signature_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "RSA signing is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_rsa_verify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 7) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoRsaVerify requires algorithm, padding, saltLength, RSA public parts, data, and signature");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    free(algorithm_name);
+    if (md == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported RSA digest algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    uint8_t *signature = NULL;
+    size_t signature_len = 0;
+    if (ct_get_bytes(ctx, argv[5], &data, &data_len) != 0 || ct_get_bytes(ctx, argv[6], &signature, &signature_len) != 0) {
+        ct_throw_message(ctx, exception, "RSA verify data and signature must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY *pkey = ct_rsa_pkey_from_js(ctx, argv, 3, false);
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (pkey == NULL || md_ctx == NULL) {
+        if (pkey != NULL) EVP_PKEY_free(pkey);
+        if (md_ctx != NULL) EVP_MD_CTX_free(md_ctx);
+        ct_throw_message(ctx, exception, "Failed to initialize RSA verifier");
+        return JSValueMakeUndefined(ctx);
+    }
+    EVP_PKEY_CTX *pkey_ctx = NULL;
+    int node_padding = (int)ct_value_to_number(ctx, argv[1]);
+    int salt_len = (int)ct_value_to_number(ctx, argv[2]);
+    int ok = EVP_DigestVerifyInit(md_ctx, &pkey_ctx, md, NULL, pkey) == 1 &&
+        ct_rsa_configure_pkey_ctx(pkey_ctx, node_padding, salt_len, md, false) &&
+        EVP_DigestVerifyUpdate(md_ctx, data, data_len) == 1;
+    int status = ok ? EVP_DigestVerifyFinal(md_ctx, signature, signature_len) : 0;
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(pkey);
+    return JSValueMakeBoolean(ctx, status == 1);
+#else
+    ct_throw_message(ctx, exception, "RSA verification is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcGenerateKeyPair(curve) requires a curve name");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *curve_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (curve_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int nid = ct_ec_curve_nid(curve_name);
+    if (nid == NID_undef) {
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Unknown EC curve");
+        return JSValueMakeUndefined(ctx);
+    }
+    EC_KEY *key = EC_KEY_new_by_curve_name(nid);
+    if (key == NULL || EC_KEY_generate_key(key) != 1) {
+        if (key != NULL) EC_KEY_free(key);
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Failed to generate EC key pair");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "privateKey", ct_ec_private_to_js(ctx, key, exception), exception);
+    ct_set_property(ctx, result, "publicKey", ct_ec_public_to_js(ctx, key, exception), exception);
+    EC_KEY_free(key);
+    free(curve_name);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "EC key generation is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_public_from_private(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcPublicFromPrivate(curve, privateKey) requires a curve and private key");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *curve_name = ct_value_to_string_copy(ctx, argv[0]);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    if (curve_name == NULL || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0) {
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Invalid EC private key input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EC_KEY *key = ct_ec_key_from_private(curve_name, private_key, private_len);
+    free(curve_name);
+    if (key == NULL) {
+        ct_throw_message(ctx, exception, "Invalid EC private key");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_ec_public_to_js(ctx, key, exception);
+    EC_KEY_free(key);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "EC public key derivation is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_sign(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcSign(curve, privateKey, digest) requires a curve, private key, and digest");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *curve_name = ct_value_to_string_copy(ctx, argv[0]);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    uint8_t *digest = NULL;
+    size_t digest_len = 0;
+    if (curve_name == NULL || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0 || ct_get_bytes(ctx, argv[2], &digest, &digest_len) != 0) {
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Invalid EC signing input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EC_KEY *key = ct_ec_key_from_private(curve_name, private_key, private_len);
+    free(curve_name);
+    if (key == NULL) {
+        ct_throw_message(ctx, exception, "Invalid EC private key");
+        return JSValueMakeUndefined(ctx);
+    }
+    unsigned int signature_len = ECDSA_size(key);
+    uint8_t *signature = (uint8_t *)malloc(signature_len);
+    if (signature == NULL) {
+        EC_KEY_free(key);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int ok = ECDSA_sign(0, digest, (int)digest_len, signature, &signature_len, key) == 1;
+    EC_KEY_free(key);
+    if (!ok) {
+        free(signature);
+        ct_throw_message(ctx, exception, "EC signing failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, signature, signature_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "EC signing is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_verify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcVerify(curve, publicKey, digest, signature) requires a curve, public key, digest, and signature");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *curve_name = ct_value_to_string_copy(ctx, argv[0]);
+    uint8_t *public_key = NULL;
+    size_t public_len = 0;
+    uint8_t *digest = NULL;
+    size_t digest_len = 0;
+    uint8_t *signature = NULL;
+    size_t signature_len = 0;
+    if (curve_name == NULL || ct_get_bytes(ctx, argv[1], &public_key, &public_len) != 0 ||
+        ct_get_bytes(ctx, argv[2], &digest, &digest_len) != 0 ||
+        ct_get_bytes(ctx, argv[3], &signature, &signature_len) != 0) {
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Invalid EC verification input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EC_KEY *key = ct_ec_key_from_public(curve_name, public_key, public_len);
+    free(curve_name);
+    if (key == NULL) {
+        ct_throw_message(ctx, exception, "Invalid EC public key");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ECDSA_verify(0, digest, (int)digest_len, signature, (int)signature_len, key);
+    EC_KEY_free(key);
+    return JSValueMakeBoolean(ctx, status == 1);
+#else
+    ct_throw_message(ctx, exception, "EC verification is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_ec_diffie_hellman(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoEcDiffieHellman(curve, privateKey, publicKey) requires a curve, private key, and public key");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *curve_name = ct_value_to_string_copy(ctx, argv[0]);
+    uint8_t *private_key = NULL;
+    size_t private_len = 0;
+    uint8_t *public_key = NULL;
+    size_t public_len = 0;
+    if (curve_name == NULL || ct_get_bytes(ctx, argv[1], &private_key, &private_len) != 0 || ct_get_bytes(ctx, argv[2], &public_key, &public_len) != 0) {
+        free(curve_name);
+        ct_throw_message(ctx, exception, "Invalid EC Diffie-Hellman input");
+        return JSValueMakeUndefined(ctx);
+    }
+    EC_KEY *private_ec = ct_ec_key_from_private(curve_name, private_key, private_len);
+    EC_KEY *public_ec = ct_ec_key_from_public(curve_name, public_key, public_len);
+    free(curve_name);
+    if (private_ec == NULL || public_ec == NULL) {
+        if (private_ec != NULL) EC_KEY_free(private_ec);
+        if (public_ec != NULL) EC_KEY_free(public_ec);
+        ct_throw_message(ctx, exception, "Invalid EC Diffie-Hellman key");
+        return JSValueMakeUndefined(ctx);
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(private_ec);
+    int field_size = EC_GROUP_get_degree(group);
+    size_t secret_len = (size_t)((field_size + 7) / 8);
+    uint8_t *secret = (uint8_t *)malloc(secret_len);
+    if (secret == NULL) {
+        EC_KEY_free(private_ec);
+        EC_KEY_free(public_ec);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int actual_len = ECDH_compute_key(secret, secret_len, EC_KEY_get0_public_key(public_ec), private_ec, NULL);
+    EC_KEY_free(private_ec);
+    EC_KEY_free(public_ec);
+    if (actual_len <= 0) {
+        free(secret);
+        ct_throw_message(ctx, exception, "EC Diffie-Hellman failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, secret, (size_t)actual_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "EC Diffie-Hellman is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
 }
 
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len) {
@@ -1248,6 +3166,1437 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
     }
 
     return -1;
+}
+
+#if defined(__APPLE__)
+typedef struct {
+    const char *name;
+    size_t key_len;
+    size_t iv_len;
+    CCMode mode;
+} CtCipherAlgorithm;
+
+static const CtCipherAlgorithm *ct_cipher_algorithm(const char *name) {
+    static const CtCipherAlgorithm algorithms[] = {
+        {"aes-128-cbc", 16, 16, kCCModeCBC},
+        {"aes-192-cbc", 24, 16, kCCModeCBC},
+        {"aes-256-cbc", 32, 16, kCCModeCBC},
+        {"aes-128-ctr", 16, 16, kCCModeCTR},
+        {"aes-192-ctr", 24, 16, kCCModeCTR},
+        {"aes-256-ctr", 32, 16, kCCModeCTR},
+        {"aes-128-cfb", 16, 16, kCCModeCFB},
+        {"aes-192-cfb", 24, 16, kCCModeCFB},
+        {"aes-256-cfb", 32, 16, kCCModeCFB},
+        {"aes-128-cfb8", 16, 16, kCCModeCFB8},
+        {"aes-192-cfb8", 24, 16, kCCModeCFB8},
+        {"aes-256-cfb8", 32, 16, kCCModeCFB8},
+        {"aes-128-ofb", 16, 16, kCCModeOFB},
+        {"aes-192-ofb", 24, 16, kCCModeOFB},
+        {"aes-256-ofb", 32, 16, kCCModeOFB},
+        {"aes-128-ecb", 16, 0, kCCModeECB},
+        {"aes-192-ecb", 24, 0, kCCModeECB},
+        {"aes-256-ecb", 32, 0, kCCModeECB},
+    };
+    for (size_t index = 0; index < sizeof(algorithms) / sizeof(algorithms[0]); index += 1) {
+        if (strcasecmp(name, algorithms[index].name) == 0) return &algorithms[index];
+    }
+    return NULL;
+}
+#endif
+
+static CtCryptoCipher *ct_crypto_cipher_find(uint32_t id) {
+    CtCryptoCipher *cursor = ct_crypto_ciphers;
+    while (cursor != NULL) {
+        if (cursor->id == id) return cursor;
+        cursor = cursor->next;
+    }
+    return NULL;
+}
+
+static void ct_crypto_cipher_remove(CtCryptoCipher *cipher) {
+    if (cipher == NULL) return;
+    CtCryptoCipher **cursor = &ct_crypto_ciphers;
+    while (*cursor != NULL) {
+        if (*cursor == cipher) {
+            *cursor = cipher->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+#if defined(__APPLE__)
+    if (cipher->cryptor != NULL) CCCryptorRelease(cipher->cryptor);
+#endif
+#if CT_HAS_OPENSSL
+    if (cipher->evp_cipher != NULL) EVP_CIPHER_CTX_free(cipher->evp_cipher);
+#endif
+    free(cipher);
+}
+
+#if CT_HAS_OPENSSL
+static const char *ct_evp_cipher_mode_name(const EVP_CIPHER *cipher) {
+    switch (EVP_CIPHER_get_mode(cipher)) {
+        case EVP_CIPH_ECB_MODE: return "ecb";
+        case EVP_CIPH_CBC_MODE: return "cbc";
+        case EVP_CIPH_CFB_MODE: return "cfb";
+        case EVP_CIPH_OFB_MODE: return "ofb";
+        case EVP_CIPH_CTR_MODE: return "ctr";
+        case EVP_CIPH_GCM_MODE: return "gcm";
+        case EVP_CIPH_CCM_MODE: return "ccm";
+        case EVP_CIPH_XTS_MODE: return "xts";
+        case EVP_CIPH_WRAP_MODE: return "wrap";
+        case EVP_CIPH_OCB_MODE: return "ocb";
+        case EVP_CIPH_SIV_MODE: return "siv";
+        case EVP_CIPH_GCM_SIV_MODE: return "gcm-siv";
+        case EVP_CIPH_STREAM_CIPHER: return "stream";
+        default: return "unknown";
+    }
+}
+
+static JSObjectRef ct_evp_cipher_info_object(JSContextRef ctx, const EVP_CIPHER *cipher, JSValueRef *exception) {
+    JSObjectRef result = ct_make_object(ctx);
+    const char *name = EVP_CIPHER_get0_name(cipher);
+    ct_set_property(ctx, result, "name", ct_make_string(ctx, name != NULL ? name : ""), exception);
+    ct_set_property(ctx, result, "nid", JSValueMakeNumber(ctx, EVP_CIPHER_get_nid(cipher)), exception);
+    ct_set_property(ctx, result, "mode", ct_make_string(ctx, ct_evp_cipher_mode_name(cipher)), exception);
+    ct_set_property(ctx, result, "blockSize", JSValueMakeNumber(ctx, EVP_CIPHER_get_block_size(cipher)), exception);
+    ct_set_property(ctx, result, "keyLength", JSValueMakeNumber(ctx, EVP_CIPHER_get_key_length(cipher)), exception);
+    int iv_len = EVP_CIPHER_get_iv_length(cipher);
+    if (iv_len > 0) ct_set_property(ctx, result, "ivLength", JSValueMakeNumber(ctx, iv_len), exception);
+    if ((EVP_CIPHER_get_flags(cipher) & EVP_CIPH_FLAG_AEAD_CIPHER) != 0) {
+        ct_set_property(ctx, result, "authTagLength", JSValueMakeNumber(ctx, 16), exception);
+    }
+    return result;
+}
+#endif
+
+static JSValueRef ct_crypto_cipher_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherInfo(name) requires a cipher name");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    char *name = ct_value_to_string_copy(ctx, argv[0]);
+    if (name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const EVP_CIPHER *cipher = EVP_get_cipherbyname(name);
+    free(name);
+    if (cipher == NULL) return JSValueMakeUndefined(ctx);
+    return ct_evp_cipher_info_object(ctx, cipher, exception);
+#else
+    ct_throw_message(ctx, exception, "Cipher metadata is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+#if CT_HAS_OPENSSL
+typedef struct {
+    JSContextRef ctx;
+    JSObjectRef array;
+    unsigned index;
+    JSValueRef *exception;
+} CtCipherListContext;
+
+static void ct_cipher_list_callback(const EVP_CIPHER *cipher, const char *from, const char *to, void *arg) {
+    (void)to;
+    CtCipherListContext *list = (CtCipherListContext *)arg;
+    const char *name = from != NULL ? from : (cipher != NULL ? EVP_CIPHER_get0_name(cipher) : NULL);
+    if (name == NULL || name[0] == '\0') return;
+    JSObjectSetPropertyAtIndex(list->ctx, list->array, list->index++, ct_make_string(list->ctx, name), list->exception);
+}
+#endif
+
+static JSValueRef ct_crypto_get_ciphers(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+#if CT_HAS_OPENSSL
+    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
+    CtCipherListContext list = { ctx, array, 0, exception };
+    EVP_CIPHER_do_all_sorted(ct_cipher_list_callback, &list);
+    return array;
+#else
+    ct_throw_message(ctx, exception, "Cipher listing is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherCreate(algorithm, key, iv, encrypt, autoPadding) requires five arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    if (algorithm_name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *key = NULL;
+    size_t key_len = 0;
+    uint8_t *iv = NULL;
+    size_t iv_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &key, &key_len) != 0 || ct_get_bytes(ctx, argv[2], &iv, &iv_len) != 0) {
+        free(algorithm_name);
+        ct_throw_message(ctx, exception, "cipher key and iv must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool encrypt = ct_value_to_bool(ctx, argv[3]);
+    bool auto_padding = ct_value_to_bool(ctx, argv[4]);
+
+#if CT_HAS_OPENSSL
+    const EVP_CIPHER *evp_cipher = EVP_get_cipherbyname(algorithm_name);
+    if (evp_cipher != NULL) {
+        int expected_key_len = EVP_CIPHER_get_key_length(evp_cipher);
+        int default_iv_len = EVP_CIPHER_get_iv_length(evp_cipher);
+        bool is_aead = (EVP_CIPHER_get_flags(evp_cipher) & EVP_CIPH_FLAG_AEAD_CIPHER) != 0;
+        if (expected_key_len > 0 && key_len != (size_t)expected_key_len) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Invalid cipher key length");
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!is_aead && default_iv_len >= 0 && iv_len != (size_t)default_iv_len) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Invalid cipher iv length");
+            return JSValueMakeUndefined(ctx);
+        }
+        if (is_aead && iv_len == 0) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Invalid cipher iv length");
+            return JSValueMakeUndefined(ctx);
+        }
+
+        EVP_CIPHER_CTX *evp_ctx = EVP_CIPHER_CTX_new();
+        if (evp_ctx == NULL) {
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Failed to allocate cipher context");
+            return JSValueMakeUndefined(ctx);
+        }
+        int ok = EVP_CipherInit_ex(evp_ctx, evp_cipher, NULL, NULL, NULL, encrypt ? 1 : 0) == 1;
+        if (ok && is_aead && default_iv_len >= 0 && iv_len != (size_t)default_iv_len) {
+            ok = EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)iv_len, NULL) == 1;
+        }
+        if (ok && !is_aead) EVP_CIPHER_CTX_set_padding(evp_ctx, auto_padding ? 1 : 0);
+        if (ok) ok = EVP_CipherInit_ex(evp_ctx, NULL, NULL, key, iv_len > 0 ? iv : NULL, encrypt ? 1 : 0) == 1;
+        if (!ok) {
+            EVP_CIPHER_CTX_free(evp_ctx);
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Failed to initialize cipher");
+            return JSValueMakeUndefined(ctx);
+        }
+
+        CtCryptoCipher *entry = (CtCryptoCipher *)calloc(1, sizeof(CtCryptoCipher));
+        if (entry == NULL) {
+            EVP_CIPHER_CTX_free(evp_ctx);
+            free(algorithm_name);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        entry->id = ct_next_crypto_cipher_id++;
+        if (ct_next_crypto_cipher_id == 0) ct_next_crypto_cipher_id = 1;
+        entry->evp_cipher = evp_ctx;
+        entry->evp_aead = is_aead;
+        entry->evp_encrypt = encrypt;
+        entry->next = ct_crypto_ciphers;
+        ct_crypto_ciphers = entry;
+        free(algorithm_name);
+        return JSValueMakeNumber(ctx, entry->id);
+    }
+#endif
+
+#if defined(__APPLE__)
+    const CtCipherAlgorithm *algorithm = ct_cipher_algorithm(algorithm_name);
+    free(algorithm_name);
+    if (algorithm == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported cipher algorithm");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (key_len != algorithm->key_len) {
+        ct_throw_message(ctx, exception, "Invalid cipher key length");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (iv_len != algorithm->iv_len) {
+        ct_throw_message(ctx, exception, "Invalid cipher iv length");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CCPadding padding = (auto_padding && (algorithm->mode == kCCModeCBC || algorithm->mode == kCCModeECB)) ? ccPKCS7Padding : ccNoPadding;
+    CCModeOptions options = algorithm->mode == kCCModeCTR ? kCCModeOptionCTR_BE : 0;
+    CCCryptorRef cryptor = NULL;
+    CCCryptorStatus status = CCCryptorCreateWithMode(
+        encrypt ? kCCEncrypt : kCCDecrypt,
+        algorithm->mode,
+        kCCAlgorithmAES,
+        padding,
+        algorithm->iv_len > 0 ? iv : NULL,
+        key,
+        key_len,
+        NULL,
+        0,
+        0,
+        options,
+        &cryptor
+    );
+    if (status != kCCSuccess || cryptor == NULL) {
+        ct_throw_message(ctx, exception, "Failed to initialize cipher");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtCryptoCipher *entry = (CtCryptoCipher *)calloc(1, sizeof(CtCryptoCipher));
+    if (entry == NULL) {
+        CCCryptorRelease(cryptor);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    entry->id = ct_next_crypto_cipher_id++;
+    if (ct_next_crypto_cipher_id == 0) ct_next_crypto_cipher_id = 1;
+    entry->cryptor = cryptor;
+    entry->next = ct_crypto_ciphers;
+    ct_crypto_ciphers = entry;
+    return JSValueMakeNumber(ctx, entry->id);
+#else
+    free(algorithm_name);
+    ct_throw_message(ctx, exception, "Native cipher algorithms are not available on this platform yet");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_update(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherUpdate(id, data) requires a cipher id and data");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtCryptoCipher *entry = ct_crypto_cipher_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Cipher not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "cipher input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if CT_HAS_OPENSSL
+    if (entry->evp_cipher != NULL) {
+        if (entry->evp_finalized) {
+            ct_throw_message(ctx, exception, "Cipher already finalized");
+            return JSValueMakeUndefined(ctx);
+        }
+        size_t output_capacity = input_len + 32;
+        uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
+        if (output == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        int output_len = 0;
+        if (EVP_CipherUpdate(entry->evp_cipher, output, &output_len, input, (int)input_len) != 1) {
+            free(output);
+            ct_throw_message(ctx, exception, "Cipher update failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, (size_t)output_len, ct_array_buffer_free, NULL, exception);
+    }
+#endif
+
+#if defined(__APPLE__)
+    size_t output_capacity = CCCryptorGetOutputLength(entry->cryptor, input_len, false);
+    uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t output_len = 0;
+    CCCryptorStatus status = CCCryptorUpdate(entry->cryptor, input, input_len, output, output_capacity, &output_len);
+    if (status != kCCSuccess) {
+        free(output);
+        ct_throw_message(ctx, exception, "Cipher update failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Native cipher algorithms are not available on this platform yet");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_final(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherFinal(id) requires a cipher id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtCryptoCipher *entry = ct_crypto_cipher_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Cipher not found");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if CT_HAS_OPENSSL
+    if (entry->evp_cipher != NULL) {
+        if (entry->evp_finalized) {
+            ct_throw_message(ctx, exception, "Cipher already finalized");
+            return JSValueMakeUndefined(ctx);
+        }
+        uint8_t *output = (uint8_t *)malloc(32);
+        if (output == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        int output_len = 0;
+        int ok = EVP_CipherFinal_ex(entry->evp_cipher, output, &output_len) == 1;
+        if (ok && entry->evp_aead && entry->evp_encrypt) {
+            entry->evp_auth_tag_len = sizeof(entry->evp_auth_tag);
+            ok = EVP_CIPHER_CTX_ctrl(entry->evp_cipher, EVP_CTRL_AEAD_GET_TAG, (int)entry->evp_auth_tag_len, entry->evp_auth_tag) == 1;
+        }
+        if (!ok) {
+            free(output);
+            ct_crypto_cipher_remove(entry);
+            ct_throw_message(ctx, exception, "Cipher final failed");
+            return JSValueMakeUndefined(ctx);
+        }
+        entry->evp_finalized = true;
+        if (!entry->evp_aead || !entry->evp_encrypt) {
+            ct_crypto_cipher_remove(entry);
+        }
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, (size_t)output_len, ct_array_buffer_free, NULL, exception);
+    }
+#endif
+
+#if defined(__APPLE__)
+    size_t output_capacity = CCCryptorGetOutputLength(entry->cryptor, 0, true);
+    uint8_t *output = (uint8_t *)malloc(output_capacity > 0 ? output_capacity : 1);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t output_len = 0;
+    CCCryptorStatus status = CCCryptorFinal(entry->cryptor, output, output_capacity, &output_len);
+    ct_crypto_cipher_remove(entry);
+    if (status != kCCSuccess) {
+        free(output);
+        ct_throw_message(ctx, exception, "Cipher final failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_crypto_cipher_remove(entry);
+    ct_throw_message(ctx, exception, "Native cipher algorithms are not available on this platform yet");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_set_aad(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherSetAAD(id, aad) requires a cipher id and AAD");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtCryptoCipher *entry = ct_crypto_cipher_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Cipher not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *aad = NULL;
+    size_t aad_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &aad, &aad_len) != 0) {
+        ct_throw_message(ctx, exception, "cipher AAD must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    if (entry->evp_cipher == NULL || !entry->evp_aead || entry->evp_finalized) {
+        ct_throw_message(ctx, exception, "Cipher AAD is only valid for active AEAD ciphers");
+        return JSValueMakeUndefined(ctx);
+    }
+    int output_len = 0;
+    if (EVP_CipherUpdate(entry->evp_cipher, NULL, &output_len, aad, (int)aad_len) != 1) {
+        ct_throw_message(ctx, exception, "Cipher AAD update failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+#else
+    ct_throw_message(ctx, exception, "AEAD cipher support is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_set_auth_tag(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherSetAuthTag(id, tag) requires a cipher id and tag");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtCryptoCipher *entry = ct_crypto_cipher_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Cipher not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *tag = NULL;
+    size_t tag_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &tag, &tag_len) != 0) {
+        ct_throw_message(ctx, exception, "cipher auth tag must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    if (entry->evp_cipher == NULL || !entry->evp_aead || entry->evp_encrypt || entry->evp_finalized) {
+        ct_throw_message(ctx, exception, "Cipher auth tag is only valid for active AEAD deciphers");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (tag_len == 0 || tag_len > 16 || EVP_CIPHER_CTX_ctrl(entry->evp_cipher, EVP_CTRL_AEAD_SET_TAG, (int)tag_len, tag) != 1) {
+        ct_throw_message(ctx, exception, "Cipher auth tag update failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+#else
+    ct_throw_message(ctx, exception, "AEAD cipher support is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static JSValueRef ct_crypto_cipher_get_auth_tag(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoCipherGetAuthTag(id) requires a cipher id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtCryptoCipher *entry = ct_crypto_cipher_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "Cipher not found");
+        return JSValueMakeUndefined(ctx);
+    }
+#if CT_HAS_OPENSSL
+    if (entry->evp_cipher == NULL || !entry->evp_aead || !entry->evp_encrypt || !entry->evp_finalized || entry->evp_auth_tag_len == 0) {
+        ct_throw_message(ctx, exception, "Cipher auth tag is not available");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_array_buffer_from_copy(ctx, (const char *)entry->evp_auth_tag, entry->evp_auth_tag_len, exception);
+    ct_crypto_cipher_remove(entry);
+    return result;
+#else
+    ct_throw_message(ctx, exception, "AEAD cipher support is unavailable in this build");
+    return JSValueMakeUndefined(ctx);
+#endif
+}
+
+static CtSqliteDb *ct_sqlite_find_db(uint32_t id) {
+    CtSqliteDb *cursor = ct_sqlite_dbs;
+    while (cursor != NULL) {
+        if (cursor->id == id) return cursor;
+        cursor = cursor->next;
+    }
+    return NULL;
+}
+
+static CtSqliteStmt *ct_sqlite_find_stmt(uint32_t id) {
+    CtSqliteStmt *cursor = ct_sqlite_stmts;
+    while (cursor != NULL) {
+        if (cursor->id == id) return cursor;
+        cursor = cursor->next;
+    }
+    return NULL;
+}
+
+static void ct_sqlite_throw(JSContextRef ctx, JSValueRef *exception, sqlite3 *db) {
+    ct_throw_message(ctx, exception, db != NULL ? sqlite3_errmsg(db) : "SQLite error");
+}
+
+static void ct_sqlite_unlink_stmt(CtSqliteStmt *stmt) {
+    if (stmt == NULL) return;
+    CtSqliteStmt **global_cursor = &ct_sqlite_stmts;
+    while (*global_cursor != NULL) {
+        if (*global_cursor == stmt) {
+            *global_cursor = stmt->next;
+            break;
+        }
+        global_cursor = &(*global_cursor)->next;
+    }
+    if (stmt->owner != NULL) {
+        CtSqliteStmt **owner_cursor = &stmt->owner->statements;
+        while (*owner_cursor != NULL) {
+            if (*owner_cursor == stmt) {
+                *owner_cursor = stmt->owner_next;
+                break;
+            }
+            owner_cursor = &(*owner_cursor)->owner_next;
+        }
+    }
+}
+
+static void ct_sqlite_finalize_stmt(CtSqliteStmt *stmt) {
+    if (stmt == NULL) return;
+    ct_sqlite_unlink_stmt(stmt);
+    if (stmt->stmt != NULL) sqlite3_finalize(stmt->stmt);
+    free(stmt);
+}
+
+static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, int column, JSValueRef *exception) {
+    int type = sqlite3_column_type(stmt, column);
+    switch (type) {
+        case SQLITE_INTEGER:
+            return JSValueMakeNumber(ctx, (double)sqlite3_column_int64(stmt, column));
+        case SQLITE_FLOAT:
+            return JSValueMakeNumber(ctx, sqlite3_column_double(stmt, column));
+        case SQLITE_TEXT:
+            return ct_make_string_len(ctx, (const char *)sqlite3_column_text(stmt, column), (size_t)sqlite3_column_bytes(stmt, column));
+        case SQLITE_BLOB:
+            return ct_array_buffer_from_copy(ctx, (const char *)sqlite3_column_blob(stmt, column), (size_t)sqlite3_column_bytes(stmt, column), exception);
+        case SQLITE_NULL:
+        default:
+            return JSValueMakeNull(ctx);
+    }
+}
+
+static JSObjectRef ct_sqlite_row_object(JSContextRef ctx, sqlite3_stmt *stmt, JSValueRef *exception) {
+    int count = sqlite3_column_count(stmt);
+    JSObjectRef row = ct_make_object(ctx);
+    for (int index = 0; index < count; index += 1) {
+        const char *name = sqlite3_column_name(stmt, index);
+        ct_set_property(ctx, row, name != NULL ? name : "", ct_sqlite_column_value(ctx, stmt, index, exception), exception);
+    }
+    return row;
+}
+
+static int ct_sqlite_bind_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
+    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return sqlite3_bind_null(stmt, index);
+    if (JSValueIsBoolean(ctx, value)) return sqlite3_bind_int(stmt, index, ct_value_to_bool(ctx, value) ? 1 : 0);
+    if (JSValueIsNumber(ctx, value)) return sqlite3_bind_double(stmt, index, ct_value_to_number(ctx, value));
+    if (JSValueIsString(ctx, value)) {
+        char *text = ct_value_to_string_copy(ctx, value);
+        if (text == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return SQLITE_NOMEM;
+        }
+        int status = sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
+        free(text);
+        return status;
+    }
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
+        return sqlite3_bind_blob(stmt, index, bytes, (int)bytes_len, SQLITE_TRANSIENT);
+    }
+    char *text = ct_value_to_string_copy(ctx, value);
+    if (text == NULL) {
+        ct_throw_message(ctx, exception, "Unsupported SQLite bind parameter");
+        return SQLITE_MISUSE;
+    }
+    int status = sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
+    free(text);
+    return status;
+}
+
+static int ct_sqlite_bind_params(JSContextRef ctx, sqlite3_stmt *stmt, JSValueRef params, JSValueRef *exception) {
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    if (params == NULL || JSValueIsUndefined(ctx, params) || JSValueIsNull(ctx, params)) return SQLITE_OK;
+    if (!JSValueIsObject(ctx, params)) return SQLITE_OK;
+
+    JSObjectRef object = (JSObjectRef)params;
+    JSValueRef length_value = ct_get_property(ctx, object, "length", exception);
+    if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
+    size_t count = JSValueIsUndefined(ctx, length_value) ? 0 : (size_t)ct_value_to_number(ctx, length_value);
+    if (count > 0) {
+        for (size_t index = 0; index < count; index += 1) {
+            JSValueRef value = JSObjectGetPropertyAtIndex(ctx, object, (unsigned)index, exception);
+            if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
+            int status = ct_sqlite_bind_value(ctx, stmt, (int)index + 1, value, exception);
+            if (status != SQLITE_OK) return status;
+        }
+        return SQLITE_OK;
+    }
+
+    int bind_count = sqlite3_bind_parameter_count(stmt);
+    for (int index = 1; index <= bind_count; index += 1) {
+        const char *name = sqlite3_bind_parameter_name(stmt, index);
+        if (name == NULL || name[0] == '\0') continue;
+        JSValueRef value = ct_get_property(ctx, object, name, exception);
+        if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
+        if (JSValueIsUndefined(ctx, value) && (name[0] == ':' || name[0] == '$' || name[0] == '@')) {
+            value = ct_get_property(ctx, object, name + 1, exception);
+            if (exception != NULL && *exception != NULL) return SQLITE_MISUSE;
+        }
+        int status = ct_sqlite_bind_value(ctx, stmt, index, value, exception);
+        if (status != SQLITE_OK) return status;
+    }
+    return SQLITE_OK;
+}
+
+static JSValueRef ct_sqlite_value_to_js(JSContextRef ctx, sqlite3_value *value, JSValueRef *exception) {
+    switch (sqlite3_value_type(value)) {
+        case SQLITE_INTEGER:
+            return JSValueMakeNumber(ctx, (double)sqlite3_value_int64(value));
+        case SQLITE_FLOAT:
+            return JSValueMakeNumber(ctx, sqlite3_value_double(value));
+        case SQLITE_TEXT:
+            return ct_make_string_len(ctx, (const char *)sqlite3_value_text(value), (size_t)sqlite3_value_bytes(value));
+        case SQLITE_BLOB:
+            return ct_array_buffer_from_copy(ctx, (const char *)sqlite3_value_blob(value), (size_t)sqlite3_value_bytes(value), exception);
+        case SQLITE_NULL:
+        default:
+            return JSValueMakeNull(ctx);
+    }
+}
+
+static void ct_sqlite_result_from_js(sqlite3_context *sqlite_ctx, JSContextRef ctx, JSValueRef value) {
+    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) {
+        sqlite3_result_null(sqlite_ctx);
+        return;
+    }
+    if (JSValueIsBoolean(ctx, value)) {
+        sqlite3_result_int(sqlite_ctx, ct_value_to_bool(ctx, value) ? 1 : 0);
+        return;
+    }
+    if (JSValueIsNumber(ctx, value)) {
+        double number = ct_value_to_number(ctx, value);
+        sqlite3_result_double(sqlite_ctx, number);
+        return;
+    }
+    if (JSValueIsString(ctx, value)) {
+        char *text = ct_value_to_string_copy(ctx, value);
+        if (text == NULL) {
+            sqlite3_result_error_nomem(sqlite_ctx);
+            return;
+        }
+        sqlite3_result_text(sqlite_ctx, text, -1, SQLITE_TRANSIENT);
+        free(text);
+        return;
+    }
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
+        sqlite3_result_blob(sqlite_ctx, bytes, (int)bytes_len, SQLITE_TRANSIENT);
+        return;
+    }
+    sqlite3_result_error(sqlite_ctx, "Unsupported SQLite function return value", -1);
+}
+
+static void ct_sqlite_function_destroy(void *opaque) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)opaque;
+    if (entry == NULL) return;
+    if (entry->ctx != NULL && entry->callback != NULL) {
+        JSValueUnprotect(entry->ctx, entry->callback);
+    }
+    if (entry->ctx != NULL && entry->result_callback != NULL) {
+        JSValueUnprotect(entry->ctx, entry->result_callback);
+    }
+    if (entry->ctx != NULL && entry->start_callback != NULL) {
+        JSValueUnprotect(entry->ctx, entry->start_callback);
+    }
+    if (entry->ctx != NULL && entry->has_start_value && entry->start_value != NULL) {
+        JSValueUnprotect(entry->ctx, entry->start_value);
+    }
+    free(entry);
+}
+
+static JSValueRef ct_sqlite_authorizer_string(JSContextRef ctx, const char *value) {
+    return value != NULL ? ct_make_string(ctx, value) : JSValueMakeNull(ctx);
+}
+
+static int ct_sqlite_authorizer_call(void *opaque, int action_code, const char *arg1, const char *arg2, const char *database_name, const char *trigger_or_view) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)opaque;
+    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) return SQLITE_DENY;
+
+    JSValueRef args[] = {
+        JSValueMakeNumber(entry->ctx, action_code),
+        ct_sqlite_authorizer_string(entry->ctx, arg1),
+        ct_sqlite_authorizer_string(entry->ctx, arg2),
+        ct_sqlite_authorizer_string(entry->ctx, database_name),
+        ct_sqlite_authorizer_string(entry->ctx, trigger_or_view),
+    };
+    JSValueRef exception = NULL;
+    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, 5, args, &exception);
+    if (exception != NULL) return SQLITE_DENY;
+    double number = JSValueToNumber(entry->ctx, result, &exception);
+    if (exception != NULL || !isfinite(number)) return SQLITE_DENY;
+    int code = (int)number;
+    if ((double)code != number) return SQLITE_DENY;
+    if (code == SQLITE_OK || code == SQLITE_DENY || code == SQLITE_IGNORE) return code;
+    return SQLITE_DENY;
+}
+
+static void ct_sqlite_function_call(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
+    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) {
+        sqlite3_result_error(sqlite_ctx, "SQLite function callback is unavailable", -1);
+        return;
+    }
+
+    JSValueRef *args = (JSValueRef *)calloc((size_t)(argc > 0 ? argc : 1), sizeof(JSValueRef));
+    if (args == NULL) {
+        sqlite3_result_error_nomem(sqlite_ctx);
+        return;
+    }
+    JSValueRef exception = NULL;
+    for (int index = 0; index < argc; index += 1) {
+        args[index] = ct_sqlite_value_to_js(entry->ctx, argv[index], &exception);
+        if (exception != NULL) {
+            char *message = ct_copy_exception(entry->ctx, exception);
+            sqlite3_result_error(sqlite_ctx, message != NULL ? message : "SQLite function argument conversion failed", -1);
+            free(message);
+            free(args);
+            return;
+        }
+    }
+
+    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, (size_t)argc, args, &exception);
+    free(args);
+    if (exception != NULL) {
+        char *message = ct_copy_exception(entry->ctx, exception);
+        sqlite3_result_error(sqlite_ctx, message != NULL ? message : "SQLite function callback failed", -1);
+        free(message);
+        return;
+    }
+    ct_sqlite_result_from_js(sqlite_ctx, entry->ctx, result);
+}
+
+static void ct_sqlite_aggregate_state_set_error(sqlite3_context *sqlite_ctx, CtSqliteAggregateState *state, char *message, const char *fallback) {
+    const char *text = fallback;
+    if (state != NULL) {
+        if (state->error_message == NULL) {
+            state->error_message = message != NULL ? message : ct_duplicate_bytes(fallback, strlen(fallback));
+        } else {
+            free(message);
+        }
+        text = state->error_message != NULL ? state->error_message : fallback;
+    } else if (message != NULL) {
+        text = message;
+    }
+    sqlite3_result_error(sqlite_ctx, text != NULL ? text : "SQLite aggregate callback failed", -1);
+    if (state == NULL) {
+        free(message);
+    }
+}
+
+static void ct_sqlite_aggregate_state_clear(CtSqliteFunction *entry, CtSqliteAggregateState *state) {
+    if (entry == NULL || state == NULL) return;
+    if (entry->ctx != NULL && state->initialized && state->accumulator != NULL) {
+        JSValueUnprotect(entry->ctx, state->accumulator);
+    }
+    free(state->error_message);
+    state->initialized = false;
+    state->accumulator = NULL;
+    state->error_message = NULL;
+}
+
+static bool ct_sqlite_aggregate_initialize(sqlite3_context *sqlite_ctx, CtSqliteFunction *entry, CtSqliteAggregateState *state) {
+    if (entry == NULL || entry->ctx == NULL || state == NULL) return false;
+    if (state->initialized) return state->error_message == NULL;
+
+    JSValueRef accumulator = NULL;
+    if (entry->start_callback != NULL) {
+        JSValueRef exception = NULL;
+        accumulator = JSObjectCallAsFunction(entry->ctx, entry->start_callback, NULL, 0, NULL, &exception);
+        if (exception != NULL) {
+            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate start callback failed");
+            return false;
+        }
+    } else if (entry->has_start_value) {
+        accumulator = entry->start_value;
+    } else {
+        accumulator = JSValueMakeUndefined(entry->ctx);
+    }
+
+    JSValueProtect(entry->ctx, accumulator);
+    state->accumulator = accumulator;
+    state->initialized = true;
+    return true;
+}
+
+static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
+    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) {
+        sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
+        return;
+    }
+
+    CtSqliteAggregateState *state = (CtSqliteAggregateState *)sqlite3_aggregate_context(sqlite_ctx, sizeof(CtSqliteAggregateState));
+    if (state == NULL) {
+        sqlite3_result_error_nomem(sqlite_ctx);
+        return;
+    }
+    if (state->error_message != NULL) {
+        sqlite3_result_error(sqlite_ctx, state->error_message, -1);
+        return;
+    }
+    if (!ct_sqlite_aggregate_initialize(sqlite_ctx, entry, state)) return;
+
+    size_t js_argc = (size_t)argc + 1;
+    JSValueRef *args = (JSValueRef *)calloc(js_argc > 0 ? js_argc : 1, sizeof(JSValueRef));
+    if (args == NULL) {
+        sqlite3_result_error_nomem(sqlite_ctx);
+        return;
+    }
+    args[0] = state->accumulator;
+
+    JSValueRef exception = NULL;
+    for (int index = 0; index < argc; index += 1) {
+        args[(size_t)index + 1] = ct_sqlite_value_to_js(entry->ctx, argv[index], &exception);
+        if (exception != NULL) {
+            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate argument conversion failed");
+            free(args);
+            return;
+        }
+    }
+
+    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, js_argc, args, &exception);
+    free(args);
+    if (exception != NULL) {
+        ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate step callback failed");
+        return;
+    }
+
+    JSValueProtect(entry->ctx, result);
+    if (state->accumulator != NULL) JSValueUnprotect(entry->ctx, state->accumulator);
+    state->accumulator = result;
+}
+
+static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
+    if (entry == NULL || entry->ctx == NULL) {
+        sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
+        return;
+    }
+
+    CtSqliteAggregateState *state = (CtSqliteAggregateState *)sqlite3_aggregate_context(sqlite_ctx, sizeof(CtSqliteAggregateState));
+    if (state == NULL) {
+        sqlite3_result_error_nomem(sqlite_ctx);
+        return;
+    }
+    if (state->error_message != NULL) {
+        sqlite3_result_error(sqlite_ctx, state->error_message, -1);
+        ct_sqlite_aggregate_state_clear(entry, state);
+        return;
+    }
+    if (!ct_sqlite_aggregate_initialize(sqlite_ctx, entry, state)) {
+        ct_sqlite_aggregate_state_clear(entry, state);
+        return;
+    }
+
+    JSValueRef result = state->accumulator;
+    if (entry->result_callback != NULL) {
+        JSValueRef exception = NULL;
+        JSValueRef arg = state->accumulator;
+        result = JSObjectCallAsFunction(entry->ctx, entry->result_callback, NULL, 1, &arg, &exception);
+        if (exception != NULL) {
+            ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate result callback failed");
+            ct_sqlite_aggregate_state_clear(entry, state);
+            return;
+        }
+    }
+
+    ct_sqlite_result_from_js(sqlite_ctx, entry->ctx, result);
+    ct_sqlite_aggregate_state_clear(entry, state);
+}
+
+static JSValueRef ct_sqlite_open(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteOpen(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3 *db = NULL;
+    int status = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    free(path);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, db);
+        if (db != NULL) sqlite3_close(db);
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = (CtSqliteDb *)calloc(1, sizeof(CtSqliteDb));
+    if (entry == NULL) {
+        sqlite3_close(db);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    entry->id = ct_next_sqlite_db_id++;
+    if (ct_next_sqlite_db_id == 0) ct_next_sqlite_db_id = 1;
+    entry->db = db;
+    entry->next = ct_sqlite_dbs;
+    ct_sqlite_dbs = entry;
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, entry->id), exception);
+    return result;
+}
+
+static JSValueRef ct_sqlite_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteClose(id) requires a database id");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    CtSqliteDb **cursor = &ct_sqlite_dbs;
+    while (*cursor != NULL && (*cursor)->id != id) cursor = &(*cursor)->next;
+    if (*cursor == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = *cursor;
+    while (entry->statements != NULL) ct_sqlite_finalize_stmt(entry->statements);
+    sqlite3_set_authorizer(entry->db, NULL, NULL);
+    if (entry->authorizer != NULL) {
+        ct_sqlite_function_destroy(entry->authorizer);
+        entry->authorizer = NULL;
+    }
+    int status = sqlite3_close(entry->db);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    *cursor = entry->next;
+    free(entry);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_exec(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteExec(id, sql) requires database id and SQL");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *sql = ct_value_to_string_copy(ctx, argv[1]);
+    if (sql == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *error_message = NULL;
+    int status = sqlite3_exec(entry->db, sql, NULL, NULL, &error_message);
+    free(sql);
+    if (status != SQLITE_OK) {
+        ct_throw_message(ctx, exception, error_message != NULL ? error_message : sqlite3_errmsg(entry->db));
+        sqlite3_free(error_message);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_prepare(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqlitePrepare(id, sql) requires database id and SQL");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *sql = ct_value_to_string_copy(ctx, argv[1]);
+    if (sql == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3_stmt *stmt = NULL;
+    int status = sqlite3_prepare_v2(entry->db, sql, -1, &stmt, NULL);
+    free(sql);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *stmt_entry = (CtSqliteStmt *)calloc(1, sizeof(CtSqliteStmt));
+    if (stmt_entry == NULL) {
+        sqlite3_finalize(stmt);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    stmt_entry->id = ct_next_sqlite_stmt_id++;
+    if (ct_next_sqlite_stmt_id == 0) ct_next_sqlite_stmt_id = 1;
+    stmt_entry->stmt = stmt;
+    stmt_entry->owner = entry;
+    stmt_entry->next = ct_sqlite_stmts;
+    ct_sqlite_stmts = stmt_entry;
+    stmt_entry->owner_next = entry->statements;
+    entry->statements = stmt_entry;
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, stmt_entry->id), exception);
+    ct_set_property(ctx, result, "sourceSQL", ct_make_string(ctx, sqlite3_sql(stmt) != NULL ? sqlite3_sql(stmt) : ""), exception);
+    return result;
+}
+
+static JSValueRef ct_sqlite_statement_finalize(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementFinalize(id) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *stmt = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (stmt != NULL) ct_sqlite_finalize_stmt(stmt);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_statement_all(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementAll(id[, params]) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef rows = ct_make_array(ctx, 0, NULL, exception);
+    unsigned row_index = 0;
+    while ((status = sqlite3_step(entry->stmt)) == SQLITE_ROW) {
+        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_object(ctx, entry->stmt, exception), exception);
+    }
+    if (status != SQLITE_DONE) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        sqlite3_reset(entry->stmt);
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3_reset(entry->stmt);
+    return rows;
+}
+
+static JSValueRef ct_sqlite_statement_get(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementGet(id[, params]) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    status = sqlite3_step(entry->stmt);
+    if (status == SQLITE_ROW) {
+        JSObjectRef row = ct_sqlite_row_object(ctx, entry->stmt, exception);
+        sqlite3_reset(entry->stmt);
+        return row;
+    }
+    if (status != SQLITE_DONE) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        sqlite3_reset(entry->stmt);
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3_reset(entry->stmt);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_statement_run(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementRun(id[, params]) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    status = sqlite3_step(entry->stmt);
+    if (status != SQLITE_DONE && status != SQLITE_ROW) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        sqlite3_reset(entry->stmt);
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3_reset(entry->stmt);
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "lastInsertRowid", JSValueMakeNumber(ctx, (double)sqlite3_last_insert_rowid(entry->owner->db)), exception);
+    ct_set_property(ctx, result, "changes", JSValueMakeNumber(ctx, sqlite3_changes(entry->owner->db)), exception);
+    return result;
+}
+
+static JSValueRef ct_sqlite_statement_columns(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementColumns(id) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int count = sqlite3_column_count(entry->stmt);
+    JSObjectRef columns = ct_make_array(ctx, 0, NULL, exception);
+    for (int index = 0; index < count; index += 1) {
+        JSObjectRef column = ct_make_object(ctx);
+        const char *name = sqlite3_column_name(entry->stmt, index);
+        const char *table = sqlite3_column_table_name(entry->stmt, index);
+        const char *database = sqlite3_column_database_name(entry->stmt, index);
+        const char *origin = sqlite3_column_origin_name(entry->stmt, index);
+        ct_set_property(ctx, column, "name", ct_make_string(ctx, name != NULL ? name : ""), exception);
+        ct_set_property(ctx, column, "column", ct_make_string(ctx, origin != NULL ? origin : ""), exception);
+        ct_set_property(ctx, column, "table", ct_make_string(ctx, table != NULL ? table : ""), exception);
+        ct_set_property(ctx, column, "database", ct_make_string(ctx, database != NULL ? database : ""), exception);
+        JSObjectSetPropertyAtIndex(ctx, columns, (unsigned)index, column, exception);
+    }
+    return columns;
+}
+
+static JSValueRef ct_sqlite_create_function(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "sqliteCreateFunction(id, name, argc, flags, callback) requires five arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *name = ct_value_to_string_copy(ctx, argv[1]);
+    if (name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!JSValueIsObject(ctx, argv[4]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[4])) {
+        free(name);
+        ct_throw_message(ctx, exception, "SQLite function callback must be a function");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
+    if (callback == NULL) {
+        free(name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    callback->ctx = ctx;
+    callback->callback = (JSObjectRef)argv[4];
+    JSValueProtect(ctx, callback->callback);
+
+    int function_argc = (int)ct_value_to_number(ctx, argv[2]);
+    int flags = SQLITE_UTF8 | (int)ct_value_to_number(ctx, argv[3]);
+    int status = sqlite3_create_function_v2(
+        entry->db,
+        name,
+        function_argc,
+        flags,
+        callback,
+        ct_sqlite_function_call,
+        NULL,
+        NULL,
+        ct_sqlite_function_destroy
+    );
+    free(name);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_create_aggregate(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 7) {
+        ct_throw_message(ctx, exception, "sqliteCreateAggregate(id, name, argc, flags, start, step, result) requires seven arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *name = ct_value_to_string_copy(ctx, argv[1]);
+    if (name == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!JSValueIsObject(ctx, argv[5]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[5])) {
+        free(name);
+        ct_throw_message(ctx, exception, "SQLite aggregate step callback must be a function");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6]) && (!JSValueIsObject(ctx, argv[6]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[6]))) {
+        free(name);
+        ct_throw_message(ctx, exception, "SQLite aggregate result callback must be a function");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
+    if (callback == NULL) {
+        free(name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    callback->ctx = ctx;
+    callback->callback = (JSObjectRef)argv[5];
+    JSValueProtect(ctx, callback->callback);
+    if (JSValueIsObject(ctx, argv[4]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[4])) {
+        callback->start_callback = (JSObjectRef)argv[4];
+        JSValueProtect(ctx, callback->start_callback);
+    } else {
+        callback->start_value = argv[4];
+        callback->has_start_value = true;
+        JSValueProtect(ctx, callback->start_value);
+    }
+    if (!JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6])) {
+        callback->result_callback = (JSObjectRef)argv[6];
+        JSValueProtect(ctx, callback->result_callback);
+    }
+
+    int function_argc = (int)ct_value_to_number(ctx, argv[2]);
+    int flags = SQLITE_UTF8 | (int)ct_value_to_number(ctx, argv[3]);
+    int status = sqlite3_create_function_v2(
+        entry->db,
+        name,
+        function_argc,
+        flags,
+        callback,
+        NULL,
+        ct_sqlite_aggregate_step,
+        ct_sqlite_aggregate_final,
+        ct_sqlite_function_destroy
+    );
+    free(name);
+    if (status != SQLITE_OK) {
+        ct_sqlite_function_destroy(callback);
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_set_authorizer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteSetAuthorizer(id, callback) requires database id and callback");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    sqlite3_set_authorizer(entry->db, NULL, NULL);
+    if (entry->authorizer != NULL) {
+        ct_sqlite_function_destroy(entry->authorizer);
+        entry->authorizer = NULL;
+    }
+
+    if (JSValueIsNull(ctx, argv[1]) || JSValueIsUndefined(ctx, argv[1])) {
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!JSValueIsObject(ctx, argv[1]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[1])) {
+        ct_throw_message(ctx, exception, "SQLite authorizer callback must be a function or null");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtSqliteFunction *callback = (CtSqliteFunction *)calloc(1, sizeof(CtSqliteFunction));
+    if (callback == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    callback->ctx = ctx;
+    callback->callback = (JSObjectRef)argv[1];
+    JSValueProtect(ctx, callback->callback);
+
+    int status = sqlite3_set_authorizer(entry->db, ct_sqlite_authorizer_call, callback);
+    if (status != SQLITE_OK) {
+        ct_sqlite_function_destroy(callback);
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    entry->authorizer = callback;
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_backup(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteBackup(id, path) requires database id and destination path");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *source = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (source == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[1]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    sqlite3 *destination = NULL;
+    int status = sqlite3_open_v2(path, &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    free(path);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, destination);
+        if (destination != NULL) sqlite3_close(destination);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    sqlite3_backup *backup = sqlite3_backup_init(destination, "main", source->db, "main");
+    if (backup == NULL) {
+        ct_sqlite_throw(ctx, exception, destination);
+        sqlite3_close(destination);
+        return JSValueMakeUndefined(ctx);
+    }
+    int pages = 0;
+    do {
+        status = sqlite3_backup_step(backup, 100);
+        pages += 100;
+    } while (status == SQLITE_OK || status == SQLITE_BUSY || status == SQLITE_LOCKED);
+    int finish_status = sqlite3_backup_finish(backup);
+    if (finish_status != SQLITE_OK) status = finish_status;
+    if (status != SQLITE_DONE) {
+        ct_sqlite_throw(ctx, exception, destination);
+        sqlite3_close(destination);
+        return JSValueMakeUndefined(ctx);
+    }
+    sqlite3_close(destination);
+    return JSValueMakeNumber(ctx, (double)pages);
 }
 
 static void ct_free_string_array(char **values, size_t count) {
@@ -1511,6 +4860,1150 @@ static JSValueRef ct_hostname(JSContextRef ctx, JSObjectRef function, JSObjectRe
     }
     buffer[sizeof(buffer) - 1] = 0;
     return ct_make_string(ctx, buffer);
+}
+
+static JSValueRef ct_dns_lookup(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "dnsLookup(hostname[, family]) requires a hostname");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *hostname = ct_value_to_string_copy(ctx, argv[0]);
+    if (hostname == NULL) {
+        ct_throw_message(ctx, exception, "Failed to read hostname");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int family = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : 0;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    if (family == 4) hints.ai_family = AF_INET;
+    else if (family == 6) hints.ai_family = AF_INET6;
+    else hints.ai_family = AF_UNSPEC;
+
+    struct addrinfo *results = NULL;
+    int status = getaddrinfo(hostname, NULL, &hints, &results);
+    free(hostname);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, gai_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
+    unsigned index = 0;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        if (entry->ai_family != AF_INET && entry->ai_family != AF_INET6) continue;
+        char address[NI_MAXHOST];
+        int name_status = getnameinfo(entry->ai_addr, (socklen_t)entry->ai_addrlen, address, sizeof(address), NULL, 0, NI_NUMERICHOST);
+        if (name_status != 0) continue;
+        JSObjectRef item = ct_make_object(ctx);
+        ct_set_property(ctx, item, "address", ct_make_string(ctx, address), exception);
+        ct_set_property(ctx, item, "family", JSValueMakeNumber(ctx, entry->ai_family == AF_INET6 ? 6 : 4), exception);
+        JSObjectSetPropertyAtIndex(ctx, array, index++, item, exception);
+    }
+    freeaddrinfo(results);
+    return array;
+}
+
+static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "dnsLookupService(address, port) requires address and port");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *address = ct_value_to_string_copy(ctx, argv[0]);
+    int port = (int)ct_value_to_number(ctx, argv[1]);
+    if (address == NULL) {
+        ct_throw_message(ctx, exception, "Failed to read address");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    struct sockaddr_storage storage;
+    memset(&storage, 0, sizeof(storage));
+    socklen_t storage_len = 0;
+    struct sockaddr_in *addr4 = (struct sockaddr_in *)&storage;
+    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&storage;
+    if (inet_pton(AF_INET, address, &addr4->sin_addr) == 1) {
+        addr4->sin_family = AF_INET;
+        addr4->sin_port = htons((uint16_t)port);
+        storage_len = sizeof(struct sockaddr_in);
+    } else if (inet_pton(AF_INET6, address, &addr6->sin6_addr) == 1) {
+        addr6->sin6_family = AF_INET6;
+        addr6->sin6_port = htons((uint16_t)port);
+        storage_len = sizeof(struct sockaddr_in6);
+    } else {
+        free(address);
+        ct_throw_message(ctx, exception, "lookupService requires an IPv4 or IPv6 address");
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+
+    char hostname[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int status = getnameinfo((struct sockaddr *)&storage, storage_len, hostname, sizeof(hostname), service, sizeof(service), 0);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, gai_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "hostname", ct_make_string(ctx, hostname), exception);
+    ct_set_property(ctx, result, "service", ct_make_string(ctx, service), exception);
+    return result;
+}
+
+static int ct_dns_type_from_name(const char *type) {
+    if (strcasecmp(type, "CNAME") == 0) return ns_t_cname;
+    if (strcasecmp(type, "MX") == 0) return ns_t_mx;
+    if (strcasecmp(type, "NS") == 0) return ns_t_ns;
+    if (strcasecmp(type, "PTR") == 0) return ns_t_ptr;
+    if (strcasecmp(type, "SOA") == 0) return ns_t_soa;
+    if (strcasecmp(type, "SRV") == 0) return ns_t_srv;
+    if (strcasecmp(type, "TXT") == 0) return ns_t_txt;
+    if (strcasecmp(type, "NAPTR") == 0) return ns_t_naptr;
+    if (strcasecmp(type, "TLSA") == 0) return 52;
+    if (strcasecmp(type, "CAA") == 0) return 257;
+    return -1;
+}
+
+static JSValueRef ct_dns_uncompress_name_value(JSContextRef ctx, ns_msg *message, const unsigned char *ptr, JSValueRef *exception) {
+    char name[NS_MAXDNAME];
+    if (ns_name_uncompress(ns_msg_base(*message), ns_msg_end(*message), ptr, name, sizeof(name)) < 0) {
+        ct_throw_message(ctx, exception, "Failed to parse DNS name");
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_make_string(ctx, name);
+}
+
+static const unsigned char *ct_dns_read_character_string(JSContextRef ctx, const unsigned char *cursor, const unsigned char *end, JSObjectRef out, unsigned *index, JSValueRef *exception) {
+    if (cursor >= end) {
+        ct_throw_message(ctx, exception, "Invalid DNS character string");
+        return NULL;
+    }
+    unsigned length = *cursor++;
+    if (cursor + length > end) {
+        ct_throw_message(ctx, exception, "Invalid DNS character string length");
+        return NULL;
+    }
+    JSObjectSetPropertyAtIndex(ctx, out, (*index)++, ct_make_string_len(ctx, (const char *)cursor, length), exception);
+    return cursor + length;
+}
+
+static JSValueRef ct_dns_parse_record(JSContextRef ctx, ns_msg *message, ns_rr *record, int requested_type, JSValueRef *exception) {
+    const unsigned char *rdata = ns_rr_rdata(*record);
+    const unsigned char *end = rdata + ns_rr_rdlen(*record);
+    int type = ns_rr_type(*record);
+    if (type != requested_type) return JSValueMakeUndefined(ctx);
+
+    if (type == ns_t_cname || type == ns_t_ns || type == ns_t_ptr) {
+        return ct_dns_uncompress_name_value(ctx, message, rdata, exception);
+    }
+
+    if (type == ns_t_mx) {
+        if (rdata + 2 > end) {
+            ct_throw_message(ctx, exception, "Invalid MX record");
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "exchange", ct_dns_uncompress_name_value(ctx, message, rdata + 2, exception), exception);
+        ct_set_property(ctx, result, "priority", JSValueMakeNumber(ctx, ns_get16(rdata)), exception);
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "MX"), exception);
+        return result;
+    }
+
+    if (type == ns_t_txt) {
+        JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+        unsigned index = 0;
+        const unsigned char *cursor = rdata;
+        while (cursor < end) {
+            cursor = ct_dns_read_character_string(ctx, cursor, end, result, &index, exception);
+            if (cursor == NULL) return JSValueMakeUndefined(ctx);
+        }
+        return result;
+    }
+
+    if (type == ns_t_soa) {
+        JSObjectRef result = ct_make_object(ctx);
+        char name[NS_MAXDNAME];
+        int consumed = ns_name_uncompress(ns_msg_base(*message), ns_msg_end(*message), rdata, name, sizeof(name));
+        if (consumed < 0) {
+            ct_throw_message(ctx, exception, "Invalid SOA nsname");
+            return JSValueMakeUndefined(ctx);
+        }
+        ct_set_property(ctx, result, "nsname", ct_make_string(ctx, name), exception);
+        const unsigned char *cursor = rdata + consumed;
+        consumed = ns_name_uncompress(ns_msg_base(*message), ns_msg_end(*message), cursor, name, sizeof(name));
+        if (consumed < 0 || cursor + consumed + 20 > end) {
+            ct_throw_message(ctx, exception, "Invalid SOA record");
+            return JSValueMakeUndefined(ctx);
+        }
+        ct_set_property(ctx, result, "hostmaster", ct_make_string(ctx, name), exception);
+        cursor += consumed;
+        ct_set_property(ctx, result, "serial", JSValueMakeNumber(ctx, ns_get32(cursor)), exception); cursor += 4;
+        ct_set_property(ctx, result, "refresh", JSValueMakeNumber(ctx, ns_get32(cursor)), exception); cursor += 4;
+        ct_set_property(ctx, result, "retry", JSValueMakeNumber(ctx, ns_get32(cursor)), exception); cursor += 4;
+        ct_set_property(ctx, result, "expire", JSValueMakeNumber(ctx, ns_get32(cursor)), exception); cursor += 4;
+        ct_set_property(ctx, result, "minttl", JSValueMakeNumber(ctx, ns_get32(cursor)), exception);
+        return result;
+    }
+
+    if (type == ns_t_srv) {
+        if (rdata + 6 > end) {
+            ct_throw_message(ctx, exception, "Invalid SRV record");
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "priority", JSValueMakeNumber(ctx, ns_get16(rdata)), exception);
+        ct_set_property(ctx, result, "weight", JSValueMakeNumber(ctx, ns_get16(rdata + 2)), exception);
+        ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, ns_get16(rdata + 4)), exception);
+        ct_set_property(ctx, result, "name", ct_dns_uncompress_name_value(ctx, message, rdata + 6, exception), exception);
+        return result;
+    }
+
+    if (type == ns_t_naptr) {
+        if (rdata + 4 > end) {
+            ct_throw_message(ctx, exception, "Invalid NAPTR record");
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "order", JSValueMakeNumber(ctx, ns_get16(rdata)), exception);
+        ct_set_property(ctx, result, "preference", JSValueMakeNumber(ctx, ns_get16(rdata + 2)), exception);
+        const unsigned char *cursor = rdata + 4;
+        JSObjectRef holder = ct_make_array(ctx, 0, NULL, exception);
+        unsigned index = 0;
+        cursor = ct_dns_read_character_string(ctx, cursor, end, holder, &index, exception);
+        if (cursor == NULL) return JSValueMakeUndefined(ctx);
+        ct_set_property(ctx, result, "flags", JSObjectGetPropertyAtIndex(ctx, holder, 0, exception), exception);
+        cursor = ct_dns_read_character_string(ctx, cursor, end, holder, &index, exception);
+        if (cursor == NULL) return JSValueMakeUndefined(ctx);
+        ct_set_property(ctx, result, "service", JSObjectGetPropertyAtIndex(ctx, holder, 1, exception), exception);
+        cursor = ct_dns_read_character_string(ctx, cursor, end, holder, &index, exception);
+        if (cursor == NULL) return JSValueMakeUndefined(ctx);
+        ct_set_property(ctx, result, "regexp", JSObjectGetPropertyAtIndex(ctx, holder, 2, exception), exception);
+        ct_set_property(ctx, result, "replacement", ct_dns_uncompress_name_value(ctx, message, cursor, exception), exception);
+        return result;
+    }
+
+    if (type == 257) {
+        if (rdata + 2 > end || rdata + 2 + rdata[1] > end) {
+            ct_throw_message(ctx, exception, "Invalid CAA record");
+            return JSValueMakeUndefined(ctx);
+        }
+        unsigned char flags = rdata[0];
+        unsigned tag_len = rdata[1];
+        char tag[256];
+        memcpy(tag, rdata + 2, tag_len);
+        tag[tag_len] = '\0';
+        const unsigned char *value = rdata + 2 + tag_len;
+        size_t value_len = (size_t)(end - value);
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "critical", JSValueMakeNumber(ctx, (flags & 0x80) ? 1 : 0), exception);
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "CAA"), exception);
+        ct_set_property(ctx, result, tag, ct_make_string_len(ctx, (const char *)value, value_len), exception);
+        return result;
+    }
+
+    if (type == 52) {
+        if (rdata + 3 > end) {
+            ct_throw_message(ctx, exception, "Invalid TLSA record");
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "usage", JSValueMakeNumber(ctx, rdata[0]), exception);
+        ct_set_property(ctx, result, "selector", JSValueMakeNumber(ctx, rdata[1]), exception);
+        ct_set_property(ctx, result, "matchingType", JSValueMakeNumber(ctx, rdata[2]), exception);
+        ct_set_property(ctx, result, "cert", ct_array_buffer_from_copy(ctx, (const char *)(rdata + 3), (size_t)(end - (rdata + 3)), exception), exception);
+        return result;
+    }
+
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_dns_resolve_records(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "dnsResolveRecords(hostname, type) requires hostname and type");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *hostname = ct_value_to_string_copy(ctx, argv[0]);
+    char *type_name = ct_value_to_string_copy(ctx, argv[1]);
+    if (hostname == NULL || type_name == NULL) {
+        free(hostname);
+        free(type_name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int record_type = ct_dns_type_from_name(type_name);
+    free(type_name);
+    if (record_type < 0) {
+        free(hostname);
+        ct_throw_message(ctx, exception, "Unsupported DNS record type");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    unsigned char answer[65536];
+    int length = res_query(hostname, ns_c_in, record_type, answer, sizeof(answer));
+    free(hostname);
+    if (length < 0) {
+        ct_throw_message(ctx, exception, hstrerror(h_errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    ns_msg message;
+    if (ns_initparse(answer, length, &message) != 0) {
+        ct_throw_message(ctx, exception, "Failed to parse DNS response");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef results = ct_make_array(ctx, 0, NULL, exception);
+    unsigned result_index = 0;
+    int count = ns_msg_count(message, ns_s_an);
+    for (int index = 0; index < count; index += 1) {
+        ns_rr record;
+        if (ns_parserr(&message, ns_s_an, index, &record) != 0) continue;
+        JSValueRef parsed = ct_dns_parse_record(ctx, &message, &record, record_type, exception);
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        if (!JSValueIsUndefined(ctx, parsed)) {
+            JSObjectSetPropertyAtIndex(ctx, results, result_index++, parsed, exception);
+        }
+    }
+    return results;
+}
+
+static JSObjectRef ct_udp_make_address(JSContextRef ctx, const struct sockaddr *addr, socklen_t addr_len, JSValueRef *exception) {
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int status = getnameinfo(addr, addr_len, host, sizeof(host), service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, gai_strerror(status));
+        return NULL;
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "address", ct_make_string(ctx, host), exception);
+    ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, atoi(service)), exception);
+    ct_set_property(ctx, result, "family", ct_make_string(ctx, addr->sa_family == AF_INET6 ? "IPv6" : "IPv4"), exception);
+    return result;
+}
+
+static int ct_udp_family_from_arg(JSContextRef ctx, JSValueRef value) {
+    int family = (int)ct_value_to_number(ctx, value);
+    return family == 6 ? AF_INET6 : AF_INET;
+}
+
+static int ct_udp_resolve_address(JSContextRef ctx, const char *address, int port, int family, struct sockaddr_storage *storage, socklen_t *storage_len, JSValueRef *exception) {
+    char port_text[32];
+    snprintf(port_text, sizeof(port_text), "%d", port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = address == NULL || address[0] == 0 ? AI_PASSIVE : 0;
+
+    struct addrinfo *results = NULL;
+    int status = getaddrinfo(address != NULL && address[0] != 0 ? address : NULL, port_text, &hints, &results);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, gai_strerror(status));
+        return -1;
+    }
+    if (results == NULL || results->ai_addrlen > sizeof(struct sockaddr_storage)) {
+        freeaddrinfo(results);
+        ct_throw_message(ctx, exception, "Failed to resolve UDP address");
+        return -1;
+    }
+    memcpy(storage, results->ai_addr, results->ai_addrlen);
+    *storage_len = (socklen_t)results->ai_addrlen;
+    freeaddrinfo(results);
+    return 0;
+}
+
+static JSValueRef ct_udp_socket_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    int family = argc >= 1 ? ct_udp_family_from_arg(ctx, argv[0]) : AF_INET;
+    int fd = socket(family, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    ct_set_property(ctx, result, "family", JSValueMakeNumber(ctx, family == AF_INET6 ? 6 : 4), exception);
+    return result;
+}
+
+static JSValueRef ct_udp_socket_bind(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "udpSocketBind(fd, port, address, family) requires fd, port, and address");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int port = (int)ct_value_to_number(ctx, argv[1]);
+    char *address = ct_value_to_optional_string(ctx, argv[2]);
+    int family = argc >= 4 ? ct_udp_family_from_arg(ctx, argv[3]) : AF_INET;
+    struct sockaddr_storage storage;
+    socklen_t storage_len = 0;
+    if (ct_udp_resolve_address(ctx, address, port, family, &storage, &storage_len, exception) != 0) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+    if (bind(fd, (struct sockaddr *)&storage, storage_len) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    struct sockaddr_storage bound;
+    socklen_t bound_len = sizeof(bound);
+    if (getsockname(fd, (struct sockaddr *)&bound, &bound_len) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_udp_make_address(ctx, (struct sockaddr *)&bound, bound_len, exception);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_udp_socket_address(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "udpSocketAddress(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    struct sockaddr_storage address;
+    socklen_t address_len = sizeof(address);
+    if (getsockname(fd, (struct sockaddr *)&address, &address_len) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_udp_make_address(ctx, (struct sockaddr *)&address, address_len, exception);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_udp_socket_send(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "udpSocketSend(fd, data, port, address, family) requires fd, data, port, address, and family");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &data, &data_len) != 0) {
+        ct_throw_message(ctx, exception, "UDP data must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    int port = (int)ct_value_to_number(ctx, argv[2]);
+    char *address = ct_value_to_optional_string(ctx, argv[3]);
+    int family = ct_udp_family_from_arg(ctx, argv[4]);
+    struct sockaddr_storage storage;
+    socklen_t storage_len = 0;
+    if (ct_udp_resolve_address(ctx, address, port, family, &storage, &storage_len, exception) != 0) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+    ssize_t sent = sendto(fd, data, data_len, 0, (struct sockaddr *)&storage, storage_len);
+    if (sent < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)sent);
+}
+
+static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "udpSocketReceive(fd[, maxBytes]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    size_t max_bytes = argc >= 2 ? (size_t)ct_value_to_number(ctx, argv[1]) : 65536;
+    if (max_bytes == 0) max_bytes = 65536;
+    if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
+
+    struct pollfd poll_fd;
+    poll_fd.fd = fd;
+    poll_fd.events = POLLIN | POLLERR | POLLHUP;
+    poll_fd.revents = 0;
+    int ready = poll(&poll_fd, 1, 0);
+    if (ready == 0) return JSValueMakeNull(ctx);
+    if (ready < 0) {
+        if (errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    if ((poll_fd.revents & POLLNVAL) != 0) {
+        ct_throw_message(ctx, exception, "invalid UDP socket");
+        return JSValueMakeUndefined(ctx);
+    }
+    if ((poll_fd.revents & POLLIN) == 0) return JSValueMakeNull(ctx);
+
+    char *buffer = (char *)malloc(max_bytes > 0 ? max_bytes : 1);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    struct sockaddr_storage source;
+    socklen_t source_len = sizeof(source);
+    ssize_t received = recvfrom(fd, buffer, max_bytes, 0, (struct sockaddr *)&source, &source_len);
+    if (received < 0) {
+        free(buffer);
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    JSObjectRef rinfo = ct_udp_make_address(ctx, (struct sockaddr *)&source, source_len, exception);
+    if (rinfo == NULL) {
+        free(buffer);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_property(ctx, rinfo, "size", JSValueMakeNumber(ctx, (double)received), exception);
+    ct_set_property(ctx, result, "rinfo", rinfo, exception);
+    ct_set_property(ctx, result, "data", JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)received, ct_array_buffer_free, NULL, exception), exception);
+    return result;
+}
+
+static JSValueRef ct_udp_socket_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "udpSocketClose(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    if (fd >= 0 && close(fd) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static int ct_tcp_family_from_arg(JSContextRef ctx, JSValueRef value) {
+    int family = (int)ct_value_to_number(ctx, value);
+    return family == 6 ? AF_INET6 : AF_INET;
+}
+
+static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int port, int family, bool passive, struct addrinfo **out_results, JSValueRef *exception) {
+    char port_text[32];
+    snprintf(port_text, sizeof(port_text), "%d", port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = passive ? AI_PASSIVE : 0;
+
+    int status = getaddrinfo(address != NULL && address[0] != 0 ? address : NULL, port_text, &hints, out_results);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, gai_strerror(status));
+        return -1;
+    }
+    return 0;
+}
+
+static void ct_set_nonblocking_fd(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static JSObjectRef ct_tcp_address_object(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
+    struct sockaddr_storage address;
+    socklen_t address_len = sizeof(address);
+    int status = peer
+        ? getpeername(fd, (struct sockaddr *)&address, &address_len)
+        : getsockname(fd, (struct sockaddr *)&address, &address_len);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return NULL;
+    }
+    return ct_udp_make_address(ctx, (struct sockaddr *)&address, address_len, exception);
+}
+
+static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tcpServerListen(port, address[, family]) requires a port and address");
+        return JSValueMakeUndefined(ctx);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    int port = (int)ct_value_to_number(ctx, argv[0]);
+    char *address = ct_value_to_optional_string(ctx, argv[1]);
+    int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_INET;
+
+    struct addrinfo *results = NULL;
+    if (ct_tcp_resolve_address(ctx, address, port, family, true, &results, exception) != 0) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+
+    int listen_fd = -1;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        listen_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (listen_fd < 0) continue;
+        int yes = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        if (bind(listen_fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0 && listen(listen_fd, 128) == 0) {
+            ct_set_nonblocking_fd(listen_fd);
+            break;
+        }
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    freeaddrinfo(results);
+    if (listen_fd < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, listen_fd), exception);
+    JSObjectRef local = ct_tcp_address_object(ctx, listen_fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "address", local, exception);
+    return result;
+}
+
+static JSValueRef ct_tcp_server_accept(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpServerAccept(fd) requires a server file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int listen_fd = (int)ct_value_to_number(ctx, argv[0]);
+    struct sockaddr_storage remote_addr;
+    socklen_t remote_len = sizeof(remote_addr);
+    int fd = accept(listen_fd, (struct sockaddr *)&remote_addr, &remote_len);
+    if (fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef remote = ct_udp_make_address(ctx, (struct sockaddr *)&remote_addr, remote_len, exception);
+    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    JSObjectRef local = ct_tcp_address_object(ctx, fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    return result;
+}
+
+static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tcpSocketConnect(port, address[, family]) requires a port and address");
+        return JSValueMakeUndefined(ctx);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    int port = (int)ct_value_to_number(ctx, argv[0]);
+    char *address = ct_value_to_optional_string(ctx, argv[1]);
+    int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_INET;
+
+    struct addrinfo *results = NULL;
+    if (ct_tcp_resolve_address(ctx, address != NULL ? address : "127.0.0.1", port, family, false, &results, exception) != 0) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+
+    int fd = -1;
+    int last_errno = ECONNREFUSED;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        if (connect(fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0) {
+            break;
+        }
+        last_errno = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(results);
+    if (fd < 0) {
+        ct_throw_message(ctx, exception, strerror(last_errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef local = ct_tcp_address_object(ctx, fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_tcp_address_object(ctx, fd, true, exception);
+    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    return result;
+}
+
+static JSValueRef ct_tcp_socket_address(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpSocketAddress(fd[, peer]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    bool peer = argc >= 2 ? ct_value_to_bool(ctx, argv[1]) : false;
+    JSObjectRef result = ct_tcp_address_object(ctx, fd, peer, exception);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpSocketShutdown(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    if (shutdown(fd, SHUT_WR) != 0 && errno != ENOTCONN) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static double ct_rusage_maxrss_bytes(const struct rusage *usage) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return (double)usage->ru_maxrss;
+#else
+    return (double)usage->ru_maxrss * 1024.0;
+#endif
+}
+
+static double ct_current_rss_bytes(void) {
+#if defined(__APPLE__) || defined(__MACH__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        return (double)info.resident_size;
+    }
+#elif defined(__linux__)
+    FILE *file = fopen("/proc/self/statm", "r");
+    if (file != NULL) {
+        unsigned long size_pages = 0;
+        unsigned long resident_pages = 0;
+        if (fscanf(file, "%lu %lu", &size_pages, &resident_pages) == 2) {
+            fclose(file);
+            long page_size = sysconf(_SC_PAGESIZE);
+            return (double)resident_pages * (double)(page_size > 0 ? page_size : 4096);
+        }
+        fclose(file);
+    }
+#endif
+    struct rusage usage;
+    return getrusage(RUSAGE_SELF, &usage) == 0 ? ct_rusage_maxrss_bytes(&usage) : 0;
+}
+
+static double ct_total_memory_bytes(void) {
+#if defined(__APPLE__) || defined(__MACH__)
+    uint64_t value = 0;
+    size_t len = sizeof(value);
+    if (sysctlbyname("hw.memsize", &value, &len, NULL, 0) == 0) return (double)value;
+#endif
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) return (double)pages * (double)page_size;
+#endif
+    return 0;
+}
+
+static double ct_available_memory_bytes(void) {
+#if defined(__linux__) && defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0) return (double)pages * (double)page_size;
+#elif defined(__APPLE__) || defined(__MACH__)
+    vm_statistics64_data_t stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&stats, &count) == KERN_SUCCESS) {
+        vm_size_t page_size = 0;
+        host_page_size(mach_host_self(), &page_size);
+        uint64_t pages = (uint64_t)stats.free_count + (uint64_t)stats.inactive_count;
+        return (double)pages * (double)(page_size > 0 ? page_size : 4096);
+    }
+#endif
+    return ct_total_memory_bytes();
+}
+
+static JSObjectRef ct_rusage_object(JSContextRef ctx, const struct rusage *usage, JSValueRef *exception) {
+    JSObjectRef result = ct_make_object(ctx);
+    double user_us = (double)usage->ru_utime.tv_sec * 1000000.0 + (double)usage->ru_utime.tv_usec;
+    double system_us = (double)usage->ru_stime.tv_sec * 1000000.0 + (double)usage->ru_stime.tv_usec;
+    ct_set_property(ctx, result, "userCPUTime", JSValueMakeNumber(ctx, user_us), exception);
+    ct_set_property(ctx, result, "systemCPUTime", JSValueMakeNumber(ctx, system_us), exception);
+    ct_set_property(ctx, result, "maxRSS", JSValueMakeNumber(ctx, ct_rusage_maxrss_bytes(usage)), exception);
+    ct_set_property(ctx, result, "sharedMemorySize", JSValueMakeNumber(ctx, (double)usage->ru_ixrss), exception);
+    ct_set_property(ctx, result, "unsharedDataSize", JSValueMakeNumber(ctx, (double)usage->ru_idrss), exception);
+    ct_set_property(ctx, result, "unsharedStackSize", JSValueMakeNumber(ctx, (double)usage->ru_isrss), exception);
+    ct_set_property(ctx, result, "minorPageFault", JSValueMakeNumber(ctx, (double)usage->ru_minflt), exception);
+    ct_set_property(ctx, result, "majorPageFault", JSValueMakeNumber(ctx, (double)usage->ru_majflt), exception);
+    ct_set_property(ctx, result, "swappedOut", JSValueMakeNumber(ctx, (double)usage->ru_nswap), exception);
+    ct_set_property(ctx, result, "fsRead", JSValueMakeNumber(ctx, (double)usage->ru_inblock), exception);
+    ct_set_property(ctx, result, "fsWrite", JSValueMakeNumber(ctx, (double)usage->ru_oublock), exception);
+    ct_set_property(ctx, result, "ipcSent", JSValueMakeNumber(ctx, (double)usage->ru_msgsnd), exception);
+    ct_set_property(ctx, result, "ipcReceived", JSValueMakeNumber(ctx, (double)usage->ru_msgrcv), exception);
+    ct_set_property(ctx, result, "signalsCount", JSValueMakeNumber(ctx, (double)usage->ru_nsignals), exception);
+    ct_set_property(ctx, result, "voluntaryContextSwitches", JSValueMakeNumber(ctx, (double)usage->ru_nvcsw), exception);
+    ct_set_property(ctx, result, "involuntaryContextSwitches", JSValueMakeNumber(ctx, (double)usage->ru_nivcsw), exception);
+    return result;
+}
+
+static int ct_process_setgroups(JSContextRef ctx, JSValueRef value, JSValueRef *exception) {
+    if (!JSValueIsObject(ctx, value)) return -1;
+    JSObjectRef array = (JSObjectRef)value;
+    JSStringRef length_name = ct_js_string("length");
+    JSValueRef length_value = JSObjectGetProperty(ctx, array, length_name, exception);
+    JSStringRelease(length_name);
+    if (exception != NULL && *exception != NULL) return -1;
+    size_t length = (size_t)ct_value_to_number(ctx, length_value);
+    gid_t *groups = (gid_t *)malloc(sizeof(gid_t) * (length > 0 ? length : 1));
+    if (groups == NULL) return -1;
+    for (size_t index = 0; index < length; index += 1) {
+        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, array, (unsigned)index, exception);
+        if (exception != NULL && *exception != NULL) {
+            free(groups);
+            return -1;
+        }
+        groups[index] = (gid_t)ct_value_to_number(ctx, item);
+    }
+    int status = setgroups((int)length, groups);
+    free(groups);
+    return status;
+}
+
+static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "processInfo(kind, ...) requires a kind");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *kind = ct_value_to_string_copy(ctx, argv[0]);
+    if (kind == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (strcmp(kind, "chdir") == 0) {
+        char *path = argc >= 2 ? ct_value_to_string_copy(ctx, argv[1]) : NULL;
+        if (path == NULL || chdir(path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "ppid") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)getppid());
+    }
+    if (strcmp(kind, "getuid") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)getuid());
+    }
+    if (strcmp(kind, "geteuid") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)geteuid());
+    }
+    if (strcmp(kind, "getgid") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)getgid());
+    }
+    if (strcmp(kind, "getegid") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)getegid());
+    }
+    if (strcmp(kind, "setuid") == 0) {
+        int status = argc >= 2 ? setuid((uid_t)ct_value_to_number(ctx, argv[1])) : -1;
+        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "seteuid") == 0) {
+        int status = argc >= 2 ? seteuid((uid_t)ct_value_to_number(ctx, argv[1])) : -1;
+        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "setgid") == 0) {
+        int status = argc >= 2 ? setgid((gid_t)ct_value_to_number(ctx, argv[1])) : -1;
+        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "setegid") == 0) {
+        int status = argc >= 2 ? setegid((gid_t)ct_value_to_number(ctx, argv[1])) : -1;
+        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "getgroups") == 0) {
+        int count = getgroups(0, NULL);
+        if (count < 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            free(kind);
+            return JSValueMakeUndefined(ctx);
+        }
+        gid_t *groups = (gid_t *)malloc(sizeof(gid_t) * (count > 0 ? count : 1));
+        if (groups == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            free(kind);
+            return JSValueMakeUndefined(ctx);
+        }
+        int actual = getgroups(count, groups);
+        JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+        for (int index = 0; index < actual; index += 1) {
+            JSObjectSetPropertyAtIndex(ctx, result, (unsigned)index, JSValueMakeNumber(ctx, (double)groups[index]), exception);
+        }
+        free(groups);
+        free(kind);
+        return result;
+    }
+    if (strcmp(kind, "setgroups") == 0) {
+        int status = argc >= 2 ? ct_process_setgroups(ctx, argv[1], exception) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "initgroups") == 0) {
+        char *user = argc >= 2 ? ct_value_to_string_copy(ctx, argv[1]) : NULL;
+        gid_t gid = argc >= 3 ? (gid_t)ct_value_to_number(ctx, argv[2]) : 0;
+        int status = user != NULL ? initgroups(user, gid) : -1;
+        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        free(user);
+        free(kind);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (strcmp(kind, "umask") == 0) {
+        if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
+            mode_t old = umask((mode_t)ct_value_to_number(ctx, argv[1]));
+            free(kind);
+            return JSValueMakeNumber(ctx, (double)old);
+        }
+        mode_t old = umask(0);
+        umask(old);
+        free(kind);
+        return JSValueMakeNumber(ctx, (double)old);
+    }
+    if (strcmp(kind, "memoryUsage") == 0) {
+        JSObjectRef result = ct_make_object(ctx);
+        double rss = ct_current_rss_bytes();
+        ct_set_property(ctx, result, "rss", JSValueMakeNumber(ctx, rss), exception);
+        ct_set_property(ctx, result, "heapTotal", JSValueMakeNumber(ctx, 0), exception);
+        ct_set_property(ctx, result, "heapUsed", JSValueMakeNumber(ctx, 0), exception);
+        ct_set_property(ctx, result, "external", JSValueMakeNumber(ctx, 0), exception);
+        ct_set_property(ctx, result, "arrayBuffers", JSValueMakeNumber(ctx, 0), exception);
+        free(kind);
+        return result;
+    }
+    if (strcmp(kind, "resourceUsage") == 0 || strcmp(kind, "threadResourceUsage") == 0) {
+        struct rusage usage;
+#if defined(RUSAGE_THREAD)
+        int who = strcmp(kind, "threadResourceUsage") == 0 ? RUSAGE_THREAD : RUSAGE_SELF;
+#else
+        int who = RUSAGE_SELF;
+#endif
+        if (getrusage(who, &usage) != 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            free(kind);
+            return JSValueMakeUndefined(ctx);
+        }
+        JSObjectRef result = ct_rusage_object(ctx, &usage, exception);
+        free(kind);
+        return result;
+    }
+    if (strcmp(kind, "availableMemory") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, ct_available_memory_bytes());
+    }
+    if (strcmp(kind, "constrainedMemory") == 0) {
+        free(kind);
+        return JSValueMakeNumber(ctx, ct_total_memory_bytes());
+    }
+
+    free(kind);
+    ct_throw_message(ctx, exception, "Unknown processInfo kind");
+    return JSValueMakeUndefined(ctx);
+}
+
+static int ct_prefix_bits_from_sockaddr(const struct sockaddr *address) {
+    if (address == NULL) return -1;
+    const unsigned char *bytes = NULL;
+    size_t len = 0;
+    if (address->sa_family == AF_INET) {
+        bytes = (const unsigned char *)&((const struct sockaddr_in *)address)->sin_addr;
+        len = 4;
+    } else if (address->sa_family == AF_INET6) {
+        bytes = (const unsigned char *)&((const struct sockaddr_in6 *)address)->sin6_addr;
+        len = 16;
+    } else {
+        return -1;
+    }
+
+    int bits = 0;
+    bool saw_zero = false;
+    for (size_t index = 0; index < len; index += 1) {
+        unsigned char byte = bytes[index];
+        for (int bit = 7; bit >= 0; bit -= 1) {
+            bool set = ((byte >> bit) & 1u) != 0;
+            if (set && saw_zero) return bits;
+            if (set) bits += 1;
+            else saw_zero = true;
+        }
+    }
+    return bits;
+}
+
+static bool ct_sockaddr_to_ip(const struct sockaddr *address, char *buffer, size_t buffer_len, unsigned *scope_id) {
+    if (address == NULL || buffer == NULL) return false;
+    if (scope_id != NULL) *scope_id = 0;
+    if (address->sa_family == AF_INET) {
+        const struct sockaddr_in *addr4 = (const struct sockaddr_in *)address;
+        return inet_ntop(AF_INET, &addr4->sin_addr, buffer, (socklen_t)buffer_len) != NULL;
+    }
+    if (address->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6 *)address;
+        if (scope_id != NULL) *scope_id = addr6->sin6_scope_id;
+        return inet_ntop(AF_INET6, &addr6->sin6_addr, buffer, (socklen_t)buffer_len) != NULL;
+    }
+    return false;
+}
+
+static void ct_mac_for_interface(struct ifaddrs *interfaces, const char *name, char out[18]) {
+    snprintf(out, 18, "00:00:00:00:00:00");
+    if (interfaces == NULL || name == NULL) return;
+    for (struct ifaddrs *entry = interfaces; entry != NULL; entry = entry->ifa_next) {
+        if (entry->ifa_name == NULL || strcmp(entry->ifa_name, name) != 0 || entry->ifa_addr == NULL) continue;
+        const unsigned char *mac = NULL;
+        size_t len = 0;
+#if defined(__APPLE__) || defined(__MACH__)
+        if (entry->ifa_addr->sa_family == AF_LINK) {
+            const struct sockaddr_dl *link = (const struct sockaddr_dl *)entry->ifa_addr;
+            if (link->sdl_alen > 0) {
+                mac = (const unsigned char *)LLADDR(link);
+                len = (size_t)link->sdl_alen;
+            }
+        }
+#elif defined(__linux__)
+        if (entry->ifa_addr->sa_family == AF_PACKET) {
+            const struct sockaddr_ll *link = (const struct sockaddr_ll *)entry->ifa_addr;
+            if (link->sll_halen > 0) {
+                mac = (const unsigned char *)link->sll_addr;
+                len = (size_t)link->sll_halen;
+            }
+        }
+#endif
+        if (mac != NULL && len >= 6) {
+            snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            return;
+        }
+    }
+}
+
+static JSValueRef ct_os_network_interfaces(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    unsigned index = 0;
+    for (struct ifaddrs *entry = interfaces; entry != NULL; entry = entry->ifa_next) {
+        if (entry->ifa_name == NULL || entry->ifa_addr == NULL) continue;
+        int family = entry->ifa_addr->sa_family;
+        if (family != AF_INET && family != AF_INET6) continue;
+
+        char address[INET6_ADDRSTRLEN];
+        char netmask[INET6_ADDRSTRLEN];
+        unsigned scope_id = 0;
+        if (!ct_sockaddr_to_ip(entry->ifa_addr, address, sizeof(address), &scope_id)) continue;
+        bool has_netmask = ct_sockaddr_to_ip(entry->ifa_netmask, netmask, sizeof(netmask), NULL);
+        int prefix = ct_prefix_bits_from_sockaddr(entry->ifa_netmask);
+        char mac[18];
+        ct_mac_for_interface(interfaces, entry->ifa_name, mac);
+
+        JSObjectRef item = ct_make_object(ctx);
+        ct_set_property(ctx, item, "name", ct_make_string(ctx, entry->ifa_name), exception);
+        ct_set_property(ctx, item, "address", ct_make_string(ctx, address), exception);
+        ct_set_property(ctx, item, "netmask", ct_make_string(ctx, has_netmask ? netmask : ""), exception);
+        ct_set_property(ctx, item, "family", ct_make_string(ctx, family == AF_INET6 ? "IPv6" : "IPv4"), exception);
+        ct_set_property(ctx, item, "mac", ct_make_string(ctx, mac), exception);
+        ct_set_property(ctx, item, "internal", JSValueMakeBoolean(ctx, (entry->ifa_flags & IFF_LOOPBACK) != 0), exception);
+        if (prefix >= 0) {
+            char cidr[INET6_ADDRSTRLEN + 8];
+            snprintf(cidr, sizeof(cidr), "%s/%d", address, prefix);
+            ct_set_property(ctx, item, "cidr", ct_make_string(ctx, cidr), exception);
+        } else {
+            ct_set_property(ctx, item, "cidr", JSValueMakeNull(ctx), exception);
+        }
+        if (family == AF_INET6) {
+            ct_set_property(ctx, item, "scopeid", JSValueMakeNumber(ctx, (double)scope_id), exception);
+        }
+        JSObjectSetPropertyAtIndex(ctx, result, index++, item, exception);
+    }
+
+    freeifaddrs(interfaces);
+    return result;
+}
+
+static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    id_t pid = argc >= 1 ? (id_t)ct_value_to_number(ctx, argv[0]) : 0;
+    errno = 0;
+    int priority = getpriority(PRIO_PROCESS, pid);
+    if (priority == -1 && errno != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)priority);
+}
+
+static JSValueRef ct_os_set_priority(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
+        return JSValueMakeUndefined(ctx);
+    }
+    id_t pid = (id_t)ct_value_to_number(ctx, argv[0]);
+    int priority = (int)ct_value_to_number(ctx, argv[1]);
+    if (setpriority(PRIO_PROCESS, pid, priority) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
 }
 
 struct CtFfiCallback {
@@ -5031,10 +9524,72 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "execPath", ct_exec_path, runtime);
     ct_install_function(ctx, host, "pid", ct_pid, runtime);
     ct_install_function(ctx, host, "kill", ct_kill_process, runtime);
+    ct_install_function(ctx, host, "processInfo", ct_process_info, runtime);
+    ct_install_function(ctx, host, "osNetworkInterfaces", ct_os_network_interfaces, runtime);
+    ct_install_function(ctx, host, "osGetPriority", ct_os_get_priority, runtime);
+    ct_install_function(ctx, host, "osSetPriority", ct_os_set_priority, runtime);
     ct_install_function(ctx, host, "randomBytes", ct_random_bytes, runtime);
     ct_install_function(ctx, host, "zlibTransformSync", ct_zlib_transform_sync, runtime);
     ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
     ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
+    ct_install_function(ctx, host, "cryptoArgon2Sync", ct_crypto_argon2_sync, runtime);
+    ct_install_function(ctx, host, "cryptoEd25519GenerateKeyPair", ct_crypto_ed25519_generate_key_pair, runtime);
+    ct_install_function(ctx, host, "cryptoEd25519PublicFromPrivate", ct_crypto_ed25519_public_from_private, runtime);
+    ct_install_function(ctx, host, "cryptoEd25519Sign", ct_crypto_ed25519_sign, runtime);
+    ct_install_function(ctx, host, "cryptoEd25519Verify", ct_crypto_ed25519_verify, runtime);
+    ct_install_function(ctx, host, "cryptoRawKeyGenerateKeyPair", ct_crypto_raw_key_generate_key_pair, runtime);
+    ct_install_function(ctx, host, "cryptoRawPublicFromPrivate", ct_crypto_raw_public_from_private, runtime);
+    ct_install_function(ctx, host, "cryptoRawSign", ct_crypto_raw_sign, runtime);
+    ct_install_function(ctx, host, "cryptoRawVerify", ct_crypto_raw_verify, runtime);
+    ct_install_function(ctx, host, "cryptoRawDiffieHellman", ct_crypto_raw_diffie_hellman, runtime);
+    ct_install_function(ctx, host, "cryptoEcGenerateKeyPair", ct_crypto_ec_generate_key_pair, runtime);
+    ct_install_function(ctx, host, "cryptoEcPublicFromPrivate", ct_crypto_ec_public_from_private, runtime);
+    ct_install_function(ctx, host, "cryptoEcSign", ct_crypto_ec_sign, runtime);
+    ct_install_function(ctx, host, "cryptoEcVerify", ct_crypto_ec_verify, runtime);
+    ct_install_function(ctx, host, "cryptoEcDiffieHellman", ct_crypto_ec_diffie_hellman, runtime);
+    ct_install_function(ctx, host, "cryptoImportKey", ct_crypto_import_key, runtime);
+    ct_install_function(ctx, host, "cryptoRsaExportKey", ct_crypto_rsa_export_key, runtime);
+    ct_install_function(ctx, host, "cryptoEcExportKey", ct_crypto_ec_export_key, runtime);
+    ct_install_function(ctx, host, "cryptoRawExportKey", ct_crypto_raw_export_key, runtime);
+    ct_install_function(ctx, host, "cryptoSpkacVerify", ct_crypto_spkac_verify, runtime);
+    ct_install_function(ctx, host, "cryptoSpkacExportPublicKey", ct_crypto_spkac_export_public_key, runtime);
+    ct_install_function(ctx, host, "cryptoRsaSign", ct_crypto_rsa_sign, runtime);
+    ct_install_function(ctx, host, "cryptoRsaVerify", ct_crypto_rsa_verify, runtime);
+    ct_install_function(ctx, host, "cryptoCipherInfo", ct_crypto_cipher_info, runtime);
+    ct_install_function(ctx, host, "cryptoGetCiphers", ct_crypto_get_ciphers, runtime);
+    ct_install_function(ctx, host, "cryptoCipherCreate", ct_crypto_cipher_create, runtime);
+    ct_install_function(ctx, host, "cryptoCipherUpdate", ct_crypto_cipher_update, runtime);
+    ct_install_function(ctx, host, "cryptoCipherFinal", ct_crypto_cipher_final, runtime);
+    ct_install_function(ctx, host, "cryptoCipherSetAAD", ct_crypto_cipher_set_aad, runtime);
+    ct_install_function(ctx, host, "cryptoCipherSetAuthTag", ct_crypto_cipher_set_auth_tag, runtime);
+    ct_install_function(ctx, host, "cryptoCipherGetAuthTag", ct_crypto_cipher_get_auth_tag, runtime);
+    ct_install_function(ctx, host, "dnsLookup", ct_dns_lookup, runtime);
+    ct_install_function(ctx, host, "dnsLookupService", ct_dns_lookup_service, runtime);
+    ct_install_function(ctx, host, "dnsResolveRecords", ct_dns_resolve_records, runtime);
+    ct_install_function(ctx, host, "udpSocketCreate", ct_udp_socket_create, runtime);
+    ct_install_function(ctx, host, "udpSocketBind", ct_udp_socket_bind, runtime);
+    ct_install_function(ctx, host, "udpSocketAddress", ct_udp_socket_address, runtime);
+    ct_install_function(ctx, host, "udpSocketSend", ct_udp_socket_send, runtime);
+    ct_install_function(ctx, host, "udpSocketReceive", ct_udp_socket_receive, runtime);
+    ct_install_function(ctx, host, "udpSocketClose", ct_udp_socket_close, runtime);
+    ct_install_function(ctx, host, "tcpServerListen", ct_tcp_server_listen, runtime);
+    ct_install_function(ctx, host, "tcpServerAccept", ct_tcp_server_accept, runtime);
+    ct_install_function(ctx, host, "tcpSocketConnect", ct_tcp_socket_connect, runtime);
+    ct_install_function(ctx, host, "tcpSocketAddress", ct_tcp_socket_address, runtime);
+    ct_install_function(ctx, host, "tcpSocketShutdown", ct_tcp_socket_shutdown, runtime);
+    ct_install_function(ctx, host, "sqliteOpen", ct_sqlite_open, runtime);
+    ct_install_function(ctx, host, "sqliteClose", ct_sqlite_close, runtime);
+    ct_install_function(ctx, host, "sqliteExec", ct_sqlite_exec, runtime);
+    ct_install_function(ctx, host, "sqlitePrepare", ct_sqlite_prepare, runtime);
+    ct_install_function(ctx, host, "sqliteStatementFinalize", ct_sqlite_statement_finalize, runtime);
+    ct_install_function(ctx, host, "sqliteStatementAll", ct_sqlite_statement_all, runtime);
+    ct_install_function(ctx, host, "sqliteStatementGet", ct_sqlite_statement_get, runtime);
+    ct_install_function(ctx, host, "sqliteStatementRun", ct_sqlite_statement_run, runtime);
+    ct_install_function(ctx, host, "sqliteStatementColumns", ct_sqlite_statement_columns, runtime);
+    ct_install_function(ctx, host, "sqliteCreateFunction", ct_sqlite_create_function, runtime);
+    ct_install_function(ctx, host, "sqliteCreateAggregate", ct_sqlite_create_aggregate, runtime);
+    ct_install_function(ctx, host, "sqliteSetAuthorizer", ct_sqlite_set_authorizer, runtime);
+    ct_install_function(ctx, host, "sqliteBackup", ct_sqlite_backup, runtime);
     ct_install_function(ctx, host, "platform", ct_platform, runtime);
     ct_install_function(ctx, host, "arch", ct_arch, runtime);
     ct_install_function(ctx, host, "hostname", ct_hostname, runtime);

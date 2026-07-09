@@ -11,8 +11,16 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     if (step.root_module.resolved_target.?.result.os.tag == .macos) {
         step.root_module.linkFramework("JavaScriptCore", .{});
         step.root_module.linkSystemLibrary("ffi", .{});
+        step.root_module.linkSystemLibrary("compression", .{});
         step.root_module.linkSystemLibrary("pthread", .{});
+        step.root_module.linkSystemLibrary("resolv", .{});
+        step.root_module.linkSystemLibrary("sqlite3", .{});
         step.root_module.linkSystemLibrary("z", .{});
+        step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        step.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
+        step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+        step.root_module.linkSystemLibrary("crypto", .{});
     } else {
         @panic("Cottontail currently wires JavaScriptCore through the macOS system framework only");
     }

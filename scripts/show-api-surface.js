@@ -109,6 +109,13 @@ function printMetric(label, implemented, total, detail = '') {
   console.log(`${pad(label, nameWidth)} ${bar(implemented, total)}  ${pad(ratioLabel(implemented, total), 12)} ${paint(detail, 'dim')}`);
 }
 
+function printRangeMetric(label, lower, upper, detail = '') {
+  const nameWidth = 22;
+  const midpoint = Math.round((Number(lower) + Number(upper)) / 2);
+  const range = `${lower}-${upper}%`;
+  console.log(`${pad(label, nameWidth)} ${bar(midpoint, 100)}  ${pad(range, 12)} ${paint(detail, 'dim')}`);
+}
+
 function printRows(rows, options = {}) {
   const columns = [
     { name: 'surface', width: options.nameWidth || 24, value: (row) => row.name },
@@ -126,6 +133,21 @@ function printRows(rows, options = {}) {
       const value = column.name === 'status' ? paint(raw, statusStyle) : raw;
       return pad(truncate(value, column.width), column.width);
     }).join('  '));
+  }
+}
+
+function printBehaviorRows(rows, options = {}) {
+  const columns = [
+    { name: 'module', width: options.nameWidth || 24, value: (row) => row.name },
+    { name: 'caveats', width: 8, value: (row) => String(row.compatMarkers) },
+    { name: 'unsupported', width: 11, value: (row) => String(row.unsupportedMarkers) },
+    { name: 'tests', width: 6, value: (row) => String(row.tests) },
+    { name: 'score', width: 6, value: (row) => String(row.gapScore) },
+  ];
+
+  console.log(columns.map((column) => paint(pad(column.name, column.width), 'gray')).join('  '));
+  for (const row of rows) {
+    console.log(columns.map((column) => pad(truncate(column.value(row), column.width), column.width)).join('  '));
   }
 }
 
@@ -166,6 +188,7 @@ const bunModuleExportsImplemented = sum(bunModuleRows, (row) => row.implemented)
 const bunModuleExportsTotal = sum(bunModuleRows, (row) => row.total);
 const bunObjectImplemented = manifest.coverage.bun.Bun.implemented.length;
 const bunObjectTotal = bunObjectImplemented + manifest.coverage.bun.Bun.missing.length;
+const nodeBehavior = manifest.behavioral?.node;
 
 console.log(paint('Cottontail API Surface', 'bold'));
 console.log(paint(`Node ${manifest.targets.node.version}  ·  Bun ${manifest.targets.bun.version}  ·  ${manifest.note}`, 'dim'));
@@ -173,6 +196,14 @@ console.log(paint(`Node ${manifest.targets.node.version}  ·  Bun ${manifest.tar
 section('Overview');
 printMetric('Node modules', nodePresent.length, nodeRows.length, `${nodeMissing.length} missing modules`);
 printMetric('Node exports', nodeExportsImplemented, nodeExportsTotal, `${nodeExportsTotal - nodeExportsImplemented} missing names`);
+if (nodeBehavior) {
+  printRangeMetric(
+    'Node behavior',
+    nodeBehavior.estimate.implementedPercentLower,
+    nodeBehavior.estimate.implementedPercentUpper,
+    `heuristic; ~${nodeBehavior.estimate.gapPercentLower}-${nodeBehavior.estimate.gapPercentUpper}% gap`,
+  );
+}
 printMetric('Bun object', bunObjectImplemented, bunObjectTotal, `${bunObjectTotal - bunObjectImplemented} missing properties`);
 printMetric('Bun modules', bunModulePresent.length, bunModuleRows.length, `${bunModuleRows.length - bunModulePresent.length} missing modules`);
 printMetric('Bun module exports', bunModuleExportsImplemented, bunModuleExportsTotal, `${bunModuleExportsTotal - bunModuleExportsImplemented} missing names`);
@@ -185,6 +216,18 @@ printRows(
   { nameWidth: 26 },
 );
 printList('Missing Node modules', nodeMissing.map((row) => row.name), topCount);
+
+if (nodeBehavior) {
+  section(`Node Behavioral Gap Heuristic (top ${topCount})`);
+  console.log(paint(nodeBehavior.note, 'dim'));
+  console.log('');
+  console.log(`${pad('compat markers', 24)} ${nodeBehavior.signals.compatMarkers}`);
+  console.log(`${pad('modules with caveats', 24)} ${nodeBehavior.signals.modulesWithCompatMarkers}/${nodeBehavior.signals.publicNodeModules}`);
+  console.log(`${pad('unsupported markers', 24)} ${nodeBehavior.signals.explicitUnsupportedMarkers}`);
+  console.log(`${pad('node test files', 24)} ${nodeBehavior.signals.nodeTestFiles}`);
+  console.log('');
+  printBehaviorRows(nodeBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });
+}
 
 section('Bun Surface');
 printRows(

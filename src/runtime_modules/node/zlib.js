@@ -1,4 +1,5 @@
 import * as zlibConstants from "./zlib/constants.js";
+import { Transform } from "./stream.js";
 
 export {
   DEFLATE,
@@ -161,6 +162,117 @@ function transformSync(mode, data, options = undefined) {
   return asBuffer(result);
 }
 
+const crc32Table = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+export function crc32(data, value = 0) {
+  let crc = (Number(value) ^ -1) >>> 0;
+  for (const byte of bytesFromData(data)) {
+    crc = (crc >>> 8) ^ crc32Table[(crc ^ byte) & 0xff];
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+class ZlibTransform extends Transform {
+  constructor(mode, options = {}) {
+    super();
+    this._mode = mode;
+    this._options = options ?? {};
+    this._chunks = [];
+    this.bytesRead = 0;
+    this.bytesWritten = 0;
+  }
+
+  write(chunk, encoding = undefined, callback = undefined) {
+    if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    const bytes = bytesFromData(typeof chunk === "string" && encoding ? globalThis.Buffer?.from(chunk, encoding) ?? chunk : chunk);
+    this._chunks.push(bytes);
+    this.bytesRead += bytes.byteLength;
+    callback?.();
+    return true;
+  }
+
+  end(chunk = undefined, encoding = undefined, callback = undefined) {
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (chunk != null) this.write(chunk, encoding);
+    try {
+      const inputLength = this._chunks.reduce((sum, item) => sum + item.byteLength, 0);
+      const input = new Uint8Array(inputLength);
+      let offset = 0;
+      for (const chunkBytes of this._chunks) {
+        input.set(chunkBytes, offset);
+        offset += chunkBytes.byteLength;
+      }
+      const output = transformSync(this._mode, input, this._options);
+      this.bytesWritten += output.byteLength ?? output.length ?? 0;
+      this.push(output);
+      this.push(null);
+      this.emit("finish");
+      callback?.();
+    } catch (error) {
+      this.emit("error", error);
+      callback?.(error);
+    }
+  }
+
+  flush(callback = undefined) {
+    callback?.();
+  }
+
+  close(callback = undefined) {
+    callback?.();
+    this.emit("close");
+  }
+
+  reset() {
+    this._chunks = [];
+    this.bytesRead = 0;
+    this.bytesWritten = 0;
+  }
+}
+
+export class Deflate extends ZlibTransform { constructor(options = {}) { super("deflate", options); } }
+export class DeflateRaw extends ZlibTransform { constructor(options = {}) { super("deflateRaw", options); } }
+export class Gzip extends ZlibTransform { constructor(options = {}) { super("gzip", options); } }
+export class Gunzip extends ZlibTransform { constructor(options = {}) { super("gunzip", options); } }
+export class Inflate extends ZlibTransform { constructor(options = {}) { super("inflate", options); } }
+export class InflateRaw extends ZlibTransform { constructor(options = {}) { super("inflateRaw", options); } }
+export class Unzip extends ZlibTransform { constructor(options = {}) { super("unzip", options); } }
+export class BrotliCompress extends ZlibTransform { constructor(options = {}) { super("brotliCompress", options); } }
+export class BrotliDecompress extends ZlibTransform { constructor(options = {}) { super("brotliDecompress", options); } }
+export class ZstdCompress extends ZlibTransform { constructor(options = {}) { super("zstdCompress", options); } }
+export class ZstdDecompress extends ZlibTransform { constructor(options = {}) { super("zstdDecompress", options); } }
+
+export function createDeflate(options = {}) { return new Deflate(options); }
+export function createDeflateRaw(options = {}) { return new DeflateRaw(options); }
+export function createGzip(options = {}) { return new Gzip(options); }
+export function createGunzip(options = {}) { return new Gunzip(options); }
+export function createInflate(options = {}) { return new Inflate(options); }
+export function createInflateRaw(options = {}) { return new InflateRaw(options); }
+export function createUnzip(options = {}) { return new Unzip(options); }
+export function createBrotliCompress(options = {}) { return new BrotliCompress(options); }
+export function createBrotliDecompress(options = {}) { return new BrotliDecompress(options); }
+export function createZstdCompress(options = {}) { return new ZstdCompress(options); }
+export function createZstdDecompress(options = {}) { return new ZstdDecompress(options); }
+
 function callbackifySync(fn) {
   return (data, options, callback) => {
     if (typeof options === "function") {
@@ -185,6 +297,10 @@ export function inflateSync(data, options = undefined) { return transformSync("i
 export function inflateRawSync(data, options = undefined) { return transformSync("inflateRaw", data, options); }
 export function gunzipSync(data, options = undefined) { return transformSync("gunzip", data, options); }
 export function unzipSync(data, options = undefined) { return transformSync("unzip", data, options); }
+export function brotliCompressSync(data, options = undefined) { return transformSync("brotliCompress", data, options); }
+export function brotliDecompressSync(data, options = undefined) { return transformSync("brotliDecompress", data, options); }
+export function zstdCompressSync(data, options = undefined) { return transformSync("zstdCompress", data, options); }
+export function zstdDecompressSync(data, options = undefined) { return transformSync("zstdDecompress", data, options); }
 
 export const deflate = callbackifySync(deflateSync);
 export const deflateRaw = callbackifySync(deflateRawSync);
@@ -193,12 +309,43 @@ export const inflate = callbackifySync(inflateSync);
 export const inflateRaw = callbackifySync(inflateRawSync);
 export const gunzip = callbackifySync(gunzipSync);
 export const unzip = callbackifySync(unzipSync);
+export const brotliCompress = callbackifySync(brotliCompressSync);
+export const brotliDecompress = callbackifySync(brotliDecompressSync);
+export const zstdCompress = callbackifySync(zstdCompressSync);
+export const zstdDecompress = callbackifySync(zstdDecompressSync);
 
-// COTTONTAIL-COMPAT: node:zlib streams/Brotli/Zstd/crc32 - require stream classes plus native Brotli/Zstd/crc32 bindings; add after core sync/callback zlib transforms.
+// COTTONTAIL-COMPAT: node:zlib streaming/options - zlib/gzip/deflate/Brotli/Zstd streams and crc32 are implemented with whole-buffer transforms; advanced flush/window/dictionary streaming semantics need deeper native stream state.
 
 export default {
+  BrotliCompress,
+  BrotliDecompress,
+  Deflate,
+  DeflateRaw,
+  Gunzip,
+  Gzip,
+  Inflate,
+  InflateRaw,
+  Unzip,
+  ZstdCompress,
+  ZstdDecompress,
   codes,
   constants,
+  crc32,
+  brotliCompress,
+  brotliCompressSync,
+  brotliDecompress,
+  brotliDecompressSync,
+  createBrotliCompress,
+  createBrotliDecompress,
+  createDeflate,
+  createDeflateRaw,
+  createGunzip,
+  createGzip,
+  createInflate,
+  createInflateRaw,
+  createUnzip,
+  createZstdCompress,
+  createZstdDecompress,
   deflate,
   deflateRaw,
   deflateRawSync,
@@ -213,4 +360,8 @@ export default {
   inflateSync,
   unzip,
   unzipSync,
+  zstdCompress,
+  zstdCompressSync,
+  zstdDecompress,
+  zstdDecompressSync,
 };

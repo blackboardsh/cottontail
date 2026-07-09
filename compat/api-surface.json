@@ -7743,6 +7743,34 @@
         ],
         "hasDefaultExport": true
       },
+      "async_hooks": {
+        "file": "src/runtime_modules/node/async_hooks.js",
+        "exports": [
+          "_wrapAsyncCallback",
+          "AsyncLocalStorage",
+          "AsyncResource",
+          "asyncWrapProviders",
+          "createHook",
+          "executionAsyncId",
+          "executionAsyncResource",
+          "triggerAsyncId"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:async_hooks": {
+        "file": "src/runtime_modules/node/async_hooks.js",
+        "exports": [
+          "_wrapAsyncCallback",
+          "AsyncLocalStorage",
+          "AsyncResource",
+          "asyncWrapProviders",
+          "createHook",
+          "executionAsyncId",
+          "executionAsyncResource",
+          "triggerAsyncId"
+        ],
+        "hasDefaultExport": true
+      },
       "buffer": {
         "file": "src/runtime_modules/node/buffer.js",
         "exports": [
@@ -7750,7 +7778,16 @@
           "Blob",
           "btoa",
           "Buffer",
-          "File"
+          "constants",
+          "File",
+          "INSPECT_MAX_BYTES",
+          "isAscii",
+          "isUtf8",
+          "kMaxLength",
+          "kStringMaxLength",
+          "resolveObjectURL",
+          "SlowBuffer",
+          "transcode"
         ],
         "hasDefaultExport": true
       },
@@ -7761,13 +7798,26 @@
           "Blob",
           "btoa",
           "Buffer",
-          "File"
+          "constants",
+          "File",
+          "INSPECT_MAX_BYTES",
+          "isAscii",
+          "isUtf8",
+          "kMaxLength",
+          "kStringMaxLength",
+          "resolveObjectURL",
+          "SlowBuffer",
+          "transcode"
         ],
         "hasDefaultExport": true
       },
       "child_process": {
         "file": "src/runtime_modules/node/child_process.js",
         "exports": [
+          "_forkChild",
+          "ChildProcess",
+          "exec",
+          "execFile",
           "execFileSync",
           "execSync",
           "fork",
@@ -7779,11 +7829,59 @@
       "node:child_process": {
         "file": "src/runtime_modules/node/child_process.js",
         "exports": [
+          "_forkChild",
+          "ChildProcess",
+          "exec",
+          "execFile",
           "execFileSync",
           "execSync",
           "fork",
           "spawn",
           "spawnSync"
+        ],
+        "hasDefaultExport": true
+      },
+      "cluster": {
+        "file": "src/runtime_modules/node/cluster.js",
+        "exports": [
+          "_events",
+          "_eventsCount",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "isMaster",
+          "isPrimary",
+          "isWorker",
+          "SCHED_NONE",
+          "SCHED_RR",
+          "schedulingPolicy",
+          "settings",
+          "setupMaster",
+          "setupPrimary",
+          "Worker",
+          "workers"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:cluster": {
+        "file": "src/runtime_modules/node/cluster.js",
+        "exports": [
+          "_events",
+          "_eventsCount",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "isMaster",
+          "isPrimary",
+          "isWorker",
+          "SCHED_NONE",
+          "SCHED_RR",
+          "schedulingPolicy",
+          "settings",
+          "setupMaster",
+          "setupPrimary",
+          "Worker",
+          "workers"
         ],
         "hasDefaultExport": true
       },
@@ -8336,70 +8434,486 @@
       "crypto": {
         "file": "src/runtime_modules/node/crypto.js",
         "exports": [
+          "argon2",
+          "argon2Sync",
+          "Certificate",
+          "checkPrime",
+          "checkPrimeSync",
+          "Cipheriv",
           "constants",
+          "createCipheriv",
+          "createDecipheriv",
+          "createDiffieHellman",
+          "createDiffieHellmanGroup",
+          "createECDH",
           "createHash",
           "createHmac",
+          "createPrivateKey",
+          "createPublicKey",
+          "createSecretKey",
+          "createSign",
+          "createVerify",
+          "decapsulate",
+          "Decipheriv",
+          "diffieHellman",
+          "DiffieHellman",
+          "DiffieHellmanGroup",
+          "ECDH",
+          "encapsulate",
           "fips",
+          "generateKey",
+          "generateKeyPair",
+          "generateKeyPairSync",
+          "generateKeySync",
+          "generatePrime",
+          "generatePrimeSync",
+          "getCipherInfo",
+          "getCiphers",
+          "getCurves",
+          "getDiffieHellman",
           "getFips",
           "getHashes",
           "getRandomValues",
           "hash",
           "Hash",
+          "hkdf",
+          "hkdfSync",
           "Hmac",
+          "KeyObject",
+          "pbkdf2",
+          "pbkdf2Sync",
+          "privateDecrypt",
+          "privateEncrypt",
           "prng",
           "pseudoRandomBytes",
+          "publicDecrypt",
+          "publicEncrypt",
           "randomBytes",
           "randomFill",
           "randomFillSync",
           "randomInt",
           "randomUUID",
           "rng",
+          "scrypt",
+          "scryptSync",
+          "secureHeapUsed",
+          "setEngine",
           "setFips",
+          "sign",
+          "Sign",
           "subtle",
           "timingSafeEqual",
-          "webcrypto"
+          "verify",
+          "Verify",
+          "webcrypto",
+          "X509Certificate"
         ],
         "hasDefaultExport": true
       },
       "node:crypto": {
         "file": "src/runtime_modules/node/crypto.js",
         "exports": [
+          "argon2",
+          "argon2Sync",
+          "Certificate",
+          "checkPrime",
+          "checkPrimeSync",
+          "Cipheriv",
           "constants",
+          "createCipheriv",
+          "createDecipheriv",
+          "createDiffieHellman",
+          "createDiffieHellmanGroup",
+          "createECDH",
           "createHash",
           "createHmac",
+          "createPrivateKey",
+          "createPublicKey",
+          "createSecretKey",
+          "createSign",
+          "createVerify",
+          "decapsulate",
+          "Decipheriv",
+          "diffieHellman",
+          "DiffieHellman",
+          "DiffieHellmanGroup",
+          "ECDH",
+          "encapsulate",
           "fips",
+          "generateKey",
+          "generateKeyPair",
+          "generateKeyPairSync",
+          "generateKeySync",
+          "generatePrime",
+          "generatePrimeSync",
+          "getCipherInfo",
+          "getCiphers",
+          "getCurves",
+          "getDiffieHellman",
           "getFips",
           "getHashes",
           "getRandomValues",
           "hash",
           "Hash",
+          "hkdf",
+          "hkdfSync",
           "Hmac",
+          "KeyObject",
+          "pbkdf2",
+          "pbkdf2Sync",
+          "privateDecrypt",
+          "privateEncrypt",
           "prng",
           "pseudoRandomBytes",
+          "publicDecrypt",
+          "publicEncrypt",
           "randomBytes",
           "randomFill",
           "randomFillSync",
           "randomInt",
           "randomUUID",
           "rng",
+          "scrypt",
+          "scryptSync",
+          "secureHeapUsed",
+          "setEngine",
           "setFips",
+          "sign",
+          "Sign",
           "subtle",
           "timingSafeEqual",
-          "webcrypto"
+          "verify",
+          "Verify",
+          "webcrypto",
+          "X509Certificate"
+        ],
+        "hasDefaultExport": true
+      },
+      "dgram": {
+        "file": "src/runtime_modules/node/dgram.js",
+        "exports": [
+          "_createSocketHandle",
+          "createSocket",
+          "Socket"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:dgram": {
+        "file": "src/runtime_modules/node/dgram.js",
+        "exports": [
+          "_createSocketHandle",
+          "createSocket",
+          "Socket"
+        ],
+        "hasDefaultExport": true
+      },
+      "diagnostics_channel": {
+        "file": "src/runtime_modules/node/diagnostics_channel.js",
+        "exports": [
+          "channel",
+          "Channel",
+          "hasSubscribers",
+          "subscribe",
+          "tracingChannel",
+          "unsubscribe"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:diagnostics_channel": {
+        "file": "src/runtime_modules/node/diagnostics_channel.js",
+        "exports": [
+          "channel",
+          "Channel",
+          "hasSubscribers",
+          "subscribe",
+          "tracingChannel",
+          "unsubscribe"
+        ],
+        "hasDefaultExport": true
+      },
+      "dns/promises": {
+        "file": "src/runtime_modules/node/dns/promises.js",
+        "exports": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:dns/promises": {
+        "file": "src/runtime_modules/node/dns/promises.js",
+        "exports": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT"
+        ],
+        "hasDefaultExport": true
+      },
+      "dns": {
+        "file": "src/runtime_modules/node/dns.js",
+        "exports": [
+          "ADDRCONFIG",
+          "ADDRGETNETWORKPARAMS",
+          "ALL",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "promises",
+          "PromisesResolver",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT",
+          "V4MAPPED"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:dns": {
+        "file": "src/runtime_modules/node/dns.js",
+        "exports": [
+          "ADDRCONFIG",
+          "ADDRGETNETWORKPARAMS",
+          "ALL",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "promises",
+          "PromisesResolver",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT",
+          "V4MAPPED"
+        ],
+        "hasDefaultExport": true
+      },
+      "domain": {
+        "file": "src/runtime_modules/node/domain.js",
+        "exports": [
+          "_stack",
+          "active",
+          "create",
+          "createDomain",
+          "Domain"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:domain": {
+        "file": "src/runtime_modules/node/domain.js",
+        "exports": [
+          "_stack",
+          "active",
+          "create",
+          "createDomain",
+          "Domain"
         ],
         "hasDefaultExport": true
       },
       "events": {
         "file": "src/runtime_modules/node/events.js",
         "exports": [
-          "EventEmitter"
+          "addAbortListener",
+          "captureRejections",
+          "captureRejectionSymbol",
+          "defaultMaxListeners",
+          "errorMonitor",
+          "EventEmitter",
+          "EventEmitterAsyncResource",
+          "getEventListeners",
+          "getMaxListeners",
+          "init",
+          "kMaxEventTargetListeners",
+          "kMaxEventTargetListenersWarned",
+          "listenerCount",
+          "on",
+          "once",
+          "setMaxListeners",
+          "usingDomains"
         ],
         "hasDefaultExport": true
       },
       "node:events": {
         "file": "src/runtime_modules/node/events.js",
         "exports": [
-          "EventEmitter"
+          "addAbortListener",
+          "captureRejections",
+          "captureRejectionSymbol",
+          "defaultMaxListeners",
+          "errorMonitor",
+          "EventEmitter",
+          "EventEmitterAsyncResource",
+          "getEventListeners",
+          "getMaxListeners",
+          "init",
+          "kMaxEventTargetListeners",
+          "kMaxEventTargetListenersWarned",
+          "listenerCount",
+          "on",
+          "once",
+          "setMaxListeners",
+          "usingDomains"
         ],
         "hasDefaultExport": true
       },
@@ -8709,13 +9223,211 @@
         ],
         "hasDefaultExport": true
       },
+      "http": {
+        "file": "src/runtime_modules/node/http.js",
+        "exports": [
+          "_connectionListener",
+          "Agent",
+          "ClientRequest",
+          "CloseEvent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "IncomingMessage",
+          "maxHeaderSize",
+          "MessageEvent",
+          "METHODS",
+          "OutgoingMessage",
+          "request",
+          "Server",
+          "ServerResponse",
+          "setMaxIdleHTTPParsers",
+          "STATUS_CODES",
+          "validateHeaderName",
+          "validateHeaderValue",
+          "WebSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:http": {
+        "file": "src/runtime_modules/node/http.js",
+        "exports": [
+          "_connectionListener",
+          "Agent",
+          "ClientRequest",
+          "CloseEvent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "IncomingMessage",
+          "maxHeaderSize",
+          "MessageEvent",
+          "METHODS",
+          "OutgoingMessage",
+          "request",
+          "Server",
+          "ServerResponse",
+          "setMaxIdleHTTPParsers",
+          "STATUS_CODES",
+          "validateHeaderName",
+          "validateHeaderValue",
+          "WebSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "http2": {
+        "file": "src/runtime_modules/node/http2.js",
+        "exports": [
+          "connect",
+          "constants",
+          "createSecureServer",
+          "createServer",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "performServerHandshake",
+          "sensitiveHeaders"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:http2": {
+        "file": "src/runtime_modules/node/http2.js",
+        "exports": [
+          "connect",
+          "constants",
+          "createSecureServer",
+          "createServer",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "performServerHandshake",
+          "sensitiveHeaders"
+        ],
+        "hasDefaultExport": true
+      },
+      "https": {
+        "file": "src/runtime_modules/node/https.js",
+        "exports": [
+          "Agent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "request",
+          "Server"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:https": {
+        "file": "src/runtime_modules/node/https.js",
+        "exports": [
+          "Agent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "request",
+          "Server"
+        ],
+        "hasDefaultExport": true
+      },
+      "inspector/promises": {
+        "file": "src/runtime_modules/node/inspector/promises.js",
+        "exports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:inspector/promises": {
+        "file": "src/runtime_modules/node/inspector/promises.js",
+        "exports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "hasDefaultExport": true
+      },
+      "inspector": {
+        "file": "src/runtime_modules/node/inspector.js",
+        "exports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:inspector": {
+        "file": "src/runtime_modules/node/inspector.js",
+        "exports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "hasDefaultExport": true
+      },
       "module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
           "__runMain",
           "__setBuiltinModules",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_readPackage",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "_stat",
           "builtinModules",
-          "createRequire"
+          "constants",
+          "createRequire",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "isBuiltin",
+          "Module",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "SourceMap",
+          "stripTypeScriptTypes",
+          "syncBuiltinESMExports",
+          "wrap",
+          "wrapper"
         ],
         "hasDefaultExport": true
       },
@@ -8724,34 +9436,86 @@
         "exports": [
           "__runMain",
           "__setBuiltinModules",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_readPackage",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "_stat",
           "builtinModules",
-          "createRequire"
+          "constants",
+          "createRequire",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "isBuiltin",
+          "Module",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "SourceMap",
+          "stripTypeScriptTypes",
+          "syncBuiltinESMExports",
+          "wrap",
+          "wrapper"
         ],
         "hasDefaultExport": true
       },
       "net": {
         "file": "src/runtime_modules/node/net.js",
         "exports": [
+          "_createServerHandle",
+          "_normalizeArgs",
+          "BlockList",
           "connect",
           "createConnection",
           "createServer",
+          "getDefaultAutoSelectFamily",
+          "getDefaultAutoSelectFamilyAttemptTimeout",
           "isIP",
           "isIPv4",
           "isIPv6",
-          "Socket"
+          "Server",
+          "setDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamilyAttemptTimeout",
+          "Socket",
+          "SocketAddress",
+          "Stream"
         ],
         "hasDefaultExport": true
       },
       "node:net": {
         "file": "src/runtime_modules/node/net.js",
         "exports": [
+          "_createServerHandle",
+          "_normalizeArgs",
+          "BlockList",
           "connect",
           "createConnection",
           "createServer",
+          "getDefaultAutoSelectFamily",
+          "getDefaultAutoSelectFamilyAttemptTimeout",
           "isIP",
           "isIPv4",
           "isIPv6",
-          "Socket"
+          "Server",
+          "setDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamilyAttemptTimeout",
+          "Socket",
+          "SocketAddress",
+          "Stream"
         ],
         "hasDefaultExport": true
       },
@@ -8759,15 +9523,28 @@
         "file": "src/runtime_modules/node/os.js",
         "exports": [
           "arch",
+          "availableParallelism",
+          "constants",
           "cpus",
+          "devNull",
           "endianness",
           "EOL",
+          "freemem",
+          "getPriority",
           "homedir",
           "hostname",
+          "loadavg",
+          "machine",
+          "networkInterfaces",
           "platform",
           "release",
+          "setPriority",
           "tmpdir",
-          "type"
+          "totalmem",
+          "type",
+          "uptime",
+          "userInfo",
+          "version"
         ],
         "hasDefaultExport": true
       },
@@ -8775,15 +9552,28 @@
         "file": "src/runtime_modules/node/os.js",
         "exports": [
           "arch",
+          "availableParallelism",
+          "constants",
           "cpus",
+          "devNull",
           "endianness",
           "EOL",
+          "freemem",
+          "getPriority",
           "homedir",
           "hostname",
+          "loadavg",
+          "machine",
+          "networkInterfaces",
           "platform",
           "release",
+          "setPriority",
           "tmpdir",
-          "type"
+          "totalmem",
+          "type",
+          "uptime",
+          "userInfo",
+          "version"
         ],
         "hasDefaultExport": true
       },
@@ -8928,41 +9718,126 @@
       "perf_hooks": {
         "file": "src/runtime_modules/node/perf_hooks.js",
         "exports": [
-          "performance"
+          "constants",
+          "createHistogram",
+          "monitorEventLoopDelay",
+          "performance",
+          "Performance",
+          "PerformanceEntry",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceObserver",
+          "PerformanceObserverEntryList",
+          "PerformanceResourceTiming"
         ],
         "hasDefaultExport": true
       },
       "node:perf_hooks": {
         "file": "src/runtime_modules/node/perf_hooks.js",
         "exports": [
-          "performance"
+          "constants",
+          "createHistogram",
+          "monitorEventLoopDelay",
+          "performance",
+          "Performance",
+          "PerformanceEntry",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceObserver",
+          "PerformanceObserverEntryList",
+          "PerformanceResourceTiming"
         ],
         "hasDefaultExport": true
       },
       "process": {
         "file": "src/runtime_modules/node/process.js",
         "exports": [
+          "_debugEnd",
+          "_debugProcess",
+          "_events",
+          "_eventsCount",
+          "_exiting",
+          "_fatalException",
+          "_getActiveHandles",
+          "_getActiveRequests",
+          "_kill",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_rawDebug",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "abort",
+          "allowedNodeEnvironmentFlags",
           "arch",
           "argv",
           "argv0",
+          "availableMemory",
+          "binding",
+          "browser",
+          "chdir",
+          "config",
+          "constrainedMemory",
+          "cpuUsage",
           "cwd",
+          "debugPort",
+          "dlopen",
+          "domain",
           "emit",
+          "emitWarning",
           "env",
+          "execArgv",
           "execPath",
+          "execve",
           "exit",
+          "exitCode",
+          "features",
+          "finalization",
+          "getActiveResourcesInfo",
+          "getBuiltinModule",
+          "getegid",
+          "geteuid",
+          "getgid",
+          "getgroups",
+          "getuid",
+          "hasUncaughtExceptionCaptureCallback",
           "hrtime",
+          "initgroups",
           "kill",
+          "loadEnvFile",
+          "memoryUsage",
+          "moduleLoadList",
           "nextTick",
           "off",
           "on",
           "once",
+          "openStdin",
           "pid",
           "platform",
+          "ppid",
+          "reallyExit",
+          "ref",
           "release",
+          "report",
+          "resourceUsage",
+          "setegid",
+          "seteuid",
+          "setgid",
+          "setgroups",
+          "setSourceMapsEnabled",
+          "setuid",
+          "setUncaughtExceptionCaptureCallback",
+          "sourceMapsEnabled",
           "stderr",
           "stdin",
           "stdout",
+          "threadCpuUsage",
+          "title",
+          "umask",
+          "unref",
           "uptime",
+          "version",
           "versions"
         ],
         "hasDefaultExport": true
@@ -8970,44 +9845,263 @@
       "node:process": {
         "file": "src/runtime_modules/node/process.js",
         "exports": [
+          "_debugEnd",
+          "_debugProcess",
+          "_events",
+          "_eventsCount",
+          "_exiting",
+          "_fatalException",
+          "_getActiveHandles",
+          "_getActiveRequests",
+          "_kill",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_rawDebug",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "abort",
+          "allowedNodeEnvironmentFlags",
           "arch",
           "argv",
           "argv0",
+          "availableMemory",
+          "binding",
+          "browser",
+          "chdir",
+          "config",
+          "constrainedMemory",
+          "cpuUsage",
           "cwd",
+          "debugPort",
+          "dlopen",
+          "domain",
           "emit",
+          "emitWarning",
           "env",
+          "execArgv",
           "execPath",
+          "execve",
           "exit",
+          "exitCode",
+          "features",
+          "finalization",
+          "getActiveResourcesInfo",
+          "getBuiltinModule",
+          "getegid",
+          "geteuid",
+          "getgid",
+          "getgroups",
+          "getuid",
+          "hasUncaughtExceptionCaptureCallback",
           "hrtime",
+          "initgroups",
           "kill",
+          "loadEnvFile",
+          "memoryUsage",
+          "moduleLoadList",
           "nextTick",
           "off",
           "on",
           "once",
+          "openStdin",
           "pid",
           "platform",
+          "ppid",
+          "reallyExit",
+          "ref",
           "release",
+          "report",
+          "resourceUsage",
+          "setegid",
+          "seteuid",
+          "setgid",
+          "setgroups",
+          "setSourceMapsEnabled",
+          "setuid",
+          "setUncaughtExceptionCaptureCallback",
+          "sourceMapsEnabled",
           "stderr",
           "stdin",
           "stdout",
+          "threadCpuUsage",
+          "title",
+          "umask",
+          "unref",
           "uptime",
+          "version",
           "versions"
+        ],
+        "hasDefaultExport": true
+      },
+      "punycode": {
+        "file": "src/runtime_modules/node/punycode.js",
+        "exports": [
+          "decode",
+          "encode",
+          "toASCII",
+          "toUnicode",
+          "ucs2",
+          "version"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:punycode": {
+        "file": "src/runtime_modules/node/punycode.js",
+        "exports": [
+          "decode",
+          "encode",
+          "toASCII",
+          "toUnicode",
+          "ucs2",
+          "version"
+        ],
+        "hasDefaultExport": true
+      },
+      "querystring": {
+        "file": "src/runtime_modules/node/querystring.js",
+        "exports": [
+          "decode",
+          "encode",
+          "escape",
+          "parse",
+          "stringify",
+          "unescape",
+          "unescapeBuffer"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:querystring": {
+        "file": "src/runtime_modules/node/querystring.js",
+        "exports": [
+          "decode",
+          "encode",
+          "escape",
+          "parse",
+          "stringify",
+          "unescape",
+          "unescapeBuffer"
+        ],
+        "hasDefaultExport": true
+      },
+      "readline/promises": {
+        "file": "src/runtime_modules/node/readline/promises.js",
+        "exports": [
+          "createInterface",
+          "Interface",
+          "Readline"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:readline/promises": {
+        "file": "src/runtime_modules/node/readline/promises.js",
+        "exports": [
+          "createInterface",
+          "Interface",
+          "Readline"
         ],
         "hasDefaultExport": true
       },
       "readline": {
         "file": "src/runtime_modules/node/readline.js",
         "exports": [
+          "clearLine",
+          "clearScreenDown",
           "createInterface",
-          "Interface"
+          "cursorTo",
+          "emitKeypressEvents",
+          "Interface",
+          "moveCursor",
+          "promises"
         ],
         "hasDefaultExport": true
       },
       "node:readline": {
         "file": "src/runtime_modules/node/readline.js",
         "exports": [
+          "clearLine",
+          "clearScreenDown",
           "createInterface",
-          "Interface"
+          "cursorTo",
+          "emitKeypressEvents",
+          "Interface",
+          "moveCursor",
+          "promises"
+        ],
+        "hasDefaultExport": true
+      },
+      "repl": {
+        "file": "src/runtime_modules/node/repl.js",
+        "exports": [
+          "_builtinLibs",
+          "builtinModules",
+          "isValidSyntax",
+          "Recoverable",
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "REPLServer",
+          "start",
+          "writer"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:repl": {
+        "file": "src/runtime_modules/node/repl.js",
+        "exports": [
+          "_builtinLibs",
+          "builtinModules",
+          "isValidSyntax",
+          "Recoverable",
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "REPLServer",
+          "start",
+          "writer"
+        ],
+        "hasDefaultExport": true
+      },
+      "sea": {
+        "file": "src/runtime_modules/node/sea.js",
+        "exports": [
+          "getAsset",
+          "getAssetAsBlob",
+          "getAssetKeys",
+          "getRawAsset",
+          "isSea"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:sea": {
+        "file": "src/runtime_modules/node/sea.js",
+        "exports": [
+          "getAsset",
+          "getAssetAsBlob",
+          "getAssetKeys",
+          "getRawAsset",
+          "isSea"
+        ],
+        "hasDefaultExport": true
+      },
+      "sqlite": {
+        "file": "src/runtime_modules/node/sqlite.js",
+        "exports": [
+          "backup",
+          "constants",
+          "DatabaseSync",
+          "Session",
+          "StatementSync"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:sqlite": {
+        "file": "src/runtime_modules/node/sqlite.js",
+        "exports": [
+          "backup",
+          "constants",
+          "DatabaseSync",
+          "Session",
+          "StatementSync"
         ],
         "hasDefaultExport": true
       },
@@ -9027,12 +10121,113 @@
         ],
         "hasDefaultExport": false
       },
+      "stream/consumers": {
+        "file": "src/runtime_modules/node/stream/consumers.js",
+        "exports": [
+          "arrayBuffer",
+          "blob",
+          "buffer",
+          "json",
+          "text"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:stream/consumers": {
+        "file": "src/runtime_modules/node/stream/consumers.js",
+        "exports": [
+          "arrayBuffer",
+          "blob",
+          "buffer",
+          "json",
+          "text"
+        ],
+        "hasDefaultExport": true
+      },
+      "stream/promises": {
+        "file": "src/runtime_modules/node/stream/promises.js",
+        "exports": [
+          "finished",
+          "pipeline"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:stream/promises": {
+        "file": "src/runtime_modules/node/stream/promises.js",
+        "exports": [
+          "finished",
+          "pipeline"
+        ],
+        "hasDefaultExport": true
+      },
+      "stream/web": {
+        "file": "src/runtime_modules/node/stream/web.js",
+        "exports": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TextDecoderStream",
+          "TextEncoderStream",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:stream/web": {
+        "file": "src/runtime_modules/node/stream/web.js",
+        "exports": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TextDecoderStream",
+          "TextEncoderStream",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "hasDefaultExport": true
+      },
       "stream": {
         "file": "src/runtime_modules/node/stream.js",
         "exports": [
+          "_isArrayBufferView",
+          "_isUint8Array",
+          "_uint8ArrayToBuffer",
+          "addAbortSignal",
+          "compose",
+          "destroy",
           "Duplex",
+          "duplexPair",
+          "finished",
+          "getDefaultHighWaterMark",
+          "isDestroyed",
+          "isDisturbed",
+          "isErrored",
+          "isReadable",
+          "isWritable",
           "PassThrough",
+          "pipeline",
+          "promises",
           "Readable",
+          "setDefaultHighWaterMark",
           "Stream",
           "Transform",
           "Writable"
@@ -9042,25 +10237,81 @@
       "node:stream": {
         "file": "src/runtime_modules/node/stream.js",
         "exports": [
+          "_isArrayBufferView",
+          "_isUint8Array",
+          "_uint8ArrayToBuffer",
+          "addAbortSignal",
+          "compose",
+          "destroy",
           "Duplex",
+          "duplexPair",
+          "finished",
+          "getDefaultHighWaterMark",
+          "isDestroyed",
+          "isDisturbed",
+          "isErrored",
+          "isReadable",
+          "isWritable",
           "PassThrough",
+          "pipeline",
+          "promises",
           "Readable",
+          "setDefaultHighWaterMark",
           "Stream",
           "Transform",
           "Writable"
         ],
         "hasDefaultExport": true
       },
+      "string_decoder": {
+        "file": "src/runtime_modules/node/string_decoder.js",
+        "exports": [
+          "StringDecoder"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:string_decoder": {
+        "file": "src/runtime_modules/node/string_decoder.js",
+        "exports": [
+          "StringDecoder"
+        ],
+        "hasDefaultExport": true
+      },
       "sys": {
         "file": "src/runtime_modules/node/sys.js",
         "exports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
         ],
         "hasDefaultExport": true
@@ -9068,14 +10319,213 @@
       "node:sys": {
         "file": "src/runtime_modules/node/sys.js",
         "exports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
+        ],
+        "hasDefaultExport": true
+      },
+      "test/reporters": {
+        "file": "src/runtime_modules/node/test/reporters.js",
+        "exports": [
+          "dot",
+          "junit",
+          "lcov",
+          "spec",
+          "tap"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:test/reporters": {
+        "file": "src/runtime_modules/node/test/reporters.js",
+        "exports": [
+          "dot",
+          "junit",
+          "lcov",
+          "spec",
+          "tap"
+        ],
+        "hasDefaultExport": true
+      },
+      "test": {
+        "file": "src/runtime_modules/node/test.js",
+        "exports": [
+          "after",
+          "afterEach",
+          "assert",
+          "before",
+          "beforeEach",
+          "describe",
+          "it",
+          "mock",
+          "only",
+          "run",
+          "skip",
+          "snapshot",
+          "suite",
+          "test",
+          "todo"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:test": {
+        "file": "src/runtime_modules/node/test.js",
+        "exports": [
+          "after",
+          "afterEach",
+          "assert",
+          "before",
+          "beforeEach",
+          "describe",
+          "it",
+          "mock",
+          "only",
+          "run",
+          "skip",
+          "snapshot",
+          "suite",
+          "test",
+          "todo"
+        ],
+        "hasDefaultExport": true
+      },
+      "timers/promises": {
+        "file": "src/runtime_modules/node/timers/promises.js",
+        "exports": [
+          "scheduler",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:timers/promises": {
+        "file": "src/runtime_modules/node/timers/promises.js",
+        "exports": [
+          "scheduler",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "hasDefaultExport": true
+      },
+      "timers": {
+        "file": "src/runtime_modules/node/timers.js",
+        "exports": [
+          "clearImmediate",
+          "clearInterval",
+          "clearTimeout",
+          "promises",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:timers": {
+        "file": "src/runtime_modules/node/timers.js",
+        "exports": [
+          "clearImmediate",
+          "clearInterval",
+          "clearTimeout",
+          "promises",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "hasDefaultExport": true
+      },
+      "tls": {
+        "file": "src/runtime_modules/node/tls.js",
+        "exports": [
+          "checkServerIdentity",
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "connect",
+          "convertALPNProtocols",
+          "createSecureContext",
+          "createServer",
+          "DEFAULT_CIPHERS",
+          "DEFAULT_ECDH_CURVE",
+          "DEFAULT_MAX_VERSION",
+          "DEFAULT_MIN_VERSION",
+          "getCACertificates",
+          "getCiphers",
+          "rootCertificates",
+          "SecureContext",
+          "Server",
+          "setDefaultCACertificates",
+          "TLSSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:tls": {
+        "file": "src/runtime_modules/node/tls.js",
+        "exports": [
+          "checkServerIdentity",
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "connect",
+          "convertALPNProtocols",
+          "createSecureContext",
+          "createServer",
+          "DEFAULT_CIPHERS",
+          "DEFAULT_ECDH_CURVE",
+          "DEFAULT_MAX_VERSION",
+          "DEFAULT_MIN_VERSION",
+          "getCACertificates",
+          "getCiphers",
+          "rootCertificates",
+          "SecureContext",
+          "Server",
+          "setDefaultCACertificates",
+          "TLSSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "trace_events": {
+        "file": "src/runtime_modules/node/trace_events.js",
+        "exports": [
+          "createTracing",
+          "getEnabledCategories"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:trace_events": {
+        "file": "src/runtime_modules/node/trace_events.js",
+        "exports": [
+          "createTracing",
+          "getEnabledCategories"
         ],
         "hasDefaultExport": true
       },
@@ -9100,20 +10550,42 @@
       "url": {
         "file": "src/runtime_modules/node/url.js",
         "exports": [
+          "domainToASCII",
+          "domainToUnicode",
           "fileURLToPath",
+          "fileURLToPathBuffer",
+          "format",
+          "parse",
           "pathToFileURL",
+          "resolve",
+          "resolveObject",
+          "resolveUrl",
+          "Url",
           "URL",
-          "URLSearchParams"
+          "URLPattern",
+          "URLSearchParams",
+          "urlToHttpOptions"
         ],
         "hasDefaultExport": true
       },
       "node:url": {
         "file": "src/runtime_modules/node/url.js",
         "exports": [
+          "domainToASCII",
+          "domainToUnicode",
           "fileURLToPath",
+          "fileURLToPathBuffer",
+          "format",
+          "parse",
           "pathToFileURL",
+          "resolve",
+          "resolveObject",
+          "resolveUrl",
+          "Url",
           "URL",
-          "URLSearchParams"
+          "URLPattern",
+          "URLSearchParams",
+          "urlToHttpOptions"
         ],
         "hasDefaultExport": true
       },
@@ -9218,13 +10690,38 @@
       "util": {
         "file": "src/runtime_modules/node/util.js",
         "exports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
         ],
         "hasDefaultExport": true
@@ -9232,13 +10729,38 @@
       "node:util": {
         "file": "src/runtime_modules/node/util.js",
         "exports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
         ],
         "hasDefaultExport": true
@@ -9246,23 +10768,70 @@
       "v8": {
         "file": "src/runtime_modules/node/v8.js",
         "exports": [
-          "startupSnapshot"
+          "cachedDataVersionTag",
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "deserialize",
+          "Deserializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapCodeStatistics",
+          "getHeapSnapshot",
+          "getHeapSpaceStatistics",
+          "getHeapStatistics",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "serialize",
+          "Serializer",
+          "setFlagsFromString",
+          "setHeapSnapshotNearHeapLimit",
+          "startupSnapshot",
+          "stopCoverage",
+          "takeCoverage",
+          "writeHeapSnapshot"
         ],
         "hasDefaultExport": true
       },
       "node:v8": {
         "file": "src/runtime_modules/node/v8.js",
         "exports": [
-          "startupSnapshot"
+          "cachedDataVersionTag",
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "deserialize",
+          "Deserializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapCodeStatistics",
+          "getHeapSnapshot",
+          "getHeapSpaceStatistics",
+          "getHeapStatistics",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "serialize",
+          "Serializer",
+          "setFlagsFromString",
+          "setHeapSnapshotNearHeapLimit",
+          "startupSnapshot",
+          "stopCoverage",
+          "takeCoverage",
+          "writeHeapSnapshot"
         ],
         "hasDefaultExport": true
       },
       "vm": {
         "file": "src/runtime_modules/node/vm.js",
         "exports": [
+          "compileFunction",
+          "constants",
           "createContext",
+          "createScript",
           "isContext",
+          "measureMemory",
           "runInContext",
+          "runInNewContext",
           "runInThisContext",
           "Script"
         ],
@@ -9271,11 +10840,84 @@
       "node:vm": {
         "file": "src/runtime_modules/node/vm.js",
         "exports": [
+          "compileFunction",
+          "constants",
           "createContext",
+          "createScript",
           "isContext",
+          "measureMemory",
           "runInContext",
+          "runInNewContext",
           "runInThisContext",
           "Script"
+        ],
+        "hasDefaultExport": true
+      },
+      "wasi": {
+        "file": "src/runtime_modules/node/wasi.js",
+        "exports": [
+          "WASI"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:wasi": {
+        "file": "src/runtime_modules/node/wasi.js",
+        "exports": [
+          "WASI"
+        ],
+        "hasDefaultExport": true
+      },
+      "worker_threads": {
+        "file": "src/runtime_modules/node/worker_threads.js",
+        "exports": [
+          "BroadcastChannel",
+          "getEnvironmentData",
+          "isInternalThread",
+          "isMainThread",
+          "isMarkedAsUntransferable",
+          "locks",
+          "markAsUncloneable",
+          "markAsUntransferable",
+          "MessageChannel",
+          "MessagePort",
+          "moveMessagePortToContext",
+          "parentPort",
+          "postMessageToThread",
+          "receiveMessageOnPort",
+          "resourceLimits",
+          "setEnvironmentData",
+          "SHARE_ENV",
+          "threadId",
+          "threadName",
+          "Worker",
+          "workerData"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:worker_threads": {
+        "file": "src/runtime_modules/node/worker_threads.js",
+        "exports": [
+          "BroadcastChannel",
+          "getEnvironmentData",
+          "isInternalThread",
+          "isMainThread",
+          "isMarkedAsUntransferable",
+          "locks",
+          "markAsUncloneable",
+          "markAsUntransferable",
+          "MessageChannel",
+          "MessagePort",
+          "moveMessagePortToContext",
+          "parentPort",
+          "postMessageToThread",
+          "receiveMessageOnPort",
+          "resourceLimits",
+          "setEnvironmentData",
+          "SHARE_ENV",
+          "threadId",
+          "threadName",
+          "Worker",
+          "workerData"
         ],
         "hasDefaultExport": true
       },
@@ -9508,27 +11150,52 @@
       "zlib": {
         "file": "src/runtime_modules/node/zlib.js",
         "exports": [
+          "brotliCompress",
+          "BrotliCompress",
+          "brotliCompressSync",
+          "brotliDecompress",
+          "BrotliDecompress",
+          "brotliDecompressSync",
           "codes",
           "constants",
+          "crc32",
+          "createBrotliCompress",
+          "createBrotliDecompress",
+          "createDeflate",
+          "createDeflateRaw",
+          "createGunzip",
+          "createGzip",
+          "createInflate",
+          "createInflateRaw",
+          "createUnzip",
+          "createZstdCompress",
+          "createZstdDecompress",
           "deflate",
+          "Deflate",
           "DEFLATE",
           "deflateRaw",
+          "DeflateRaw",
           "DEFLATERAW",
           "deflateRawSync",
           "deflateSync",
           "gunzip",
+          "Gunzip",
           "GUNZIP",
           "gunzipSync",
           "gzip",
+          "Gzip",
           "GZIP",
           "gzipSync",
           "inflate",
+          "Inflate",
           "INFLATE",
           "inflateRaw",
+          "InflateRaw",
           "INFLATERAW",
           "inflateRawSync",
           "inflateSync",
           "unzip",
+          "Unzip",
           "UNZIP",
           "unzipSync",
           "Z_BEST_COMPRESSION",
@@ -9630,34 +11297,65 @@
           "ZSTD_fast",
           "ZSTD_greedy",
           "ZSTD_lazy",
-          "ZSTD_lazy2"
+          "ZSTD_lazy2",
+          "zstdCompress",
+          "ZstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "ZstdDecompress",
+          "zstdDecompressSync"
         ],
         "hasDefaultExport": true
       },
       "node:zlib": {
         "file": "src/runtime_modules/node/zlib.js",
         "exports": [
+          "brotliCompress",
+          "BrotliCompress",
+          "brotliCompressSync",
+          "brotliDecompress",
+          "BrotliDecompress",
+          "brotliDecompressSync",
           "codes",
           "constants",
+          "crc32",
+          "createBrotliCompress",
+          "createBrotliDecompress",
+          "createDeflate",
+          "createDeflateRaw",
+          "createGunzip",
+          "createGzip",
+          "createInflate",
+          "createInflateRaw",
+          "createUnzip",
+          "createZstdCompress",
+          "createZstdDecompress",
           "deflate",
+          "Deflate",
           "DEFLATE",
           "deflateRaw",
+          "DeflateRaw",
           "DEFLATERAW",
           "deflateRawSync",
           "deflateSync",
           "gunzip",
+          "Gunzip",
           "GUNZIP",
           "gunzipSync",
           "gzip",
+          "Gzip",
           "GZIP",
           "gzipSync",
           "inflate",
+          "Inflate",
           "INFLATE",
           "inflateRaw",
+          "InflateRaw",
           "INFLATERAW",
           "inflateRawSync",
           "inflateSync",
           "unzip",
+          "Unzip",
           "UNZIP",
           "unzipSync",
           "Z_BEST_COMPRESSION",
@@ -9759,7 +11457,13 @@
           "ZSTD_fast",
           "ZSTD_greedy",
           "ZSTD_lazy",
-          "ZSTD_lazy2"
+          "ZSTD_lazy2",
+          "zstdCompress",
+          "ZstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "ZstdDecompress",
+          "zstdDecompressSync"
         ],
         "hasDefaultExport": true
       }
@@ -9889,6 +11593,22 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/async_hooks.js": {
+        "file": "src/runtime_modules/node/async_hooks.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_wrapAsyncCallback",
+          "AsyncLocalStorage",
+          "AsyncResource",
+          "asyncWrapProviders",
+          "createHook",
+          "executionAsyncId",
+          "executionAsyncResource",
+          "triggerAsyncId"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/buffer.js": {
         "file": "src/runtime_modules/node/buffer.js",
         "hasDefaultExport": true,
@@ -9897,20 +11617,59 @@
           "Blob",
           "btoa",
           "Buffer",
-          "File"
+          "constants",
+          "File",
+          "INSPECT_MAX_BYTES",
+          "isAscii",
+          "isUtf8",
+          "kMaxLength",
+          "kStringMaxLength",
+          "resolveObjectURL",
+          "SlowBuffer",
+          "transcode"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "resolveObjectURL"
+        ]
       },
       "src/runtime_modules/node/child_process.js": {
         "file": "src/runtime_modules/node/child_process.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_forkChild",
+          "ChildProcess",
+          "exec",
+          "execFile",
           "execFileSync",
           "execSync",
           "fork",
           "spawn",
           "spawnSync"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/cluster.js": {
+        "file": "src/runtime_modules/node/cluster.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_events",
+          "_eventsCount",
+          "_maxListeners",
+          "disconnect",
+          "fork",
+          "isMaster",
+          "isPrimary",
+          "isWorker",
+          "SCHED_NONE",
+          "SCHED_RR",
+          "schedulingPolicy",
+          "settings",
+          "setupMaster",
+          "setupPrimary",
+          "Worker",
+          "workers"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10196,28 +11955,232 @@
         "file": "src/runtime_modules/node/crypto.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "argon2",
+          "argon2Sync",
+          "Certificate",
+          "checkPrime",
+          "checkPrimeSync",
+          "Cipheriv",
           "constants",
+          "createCipheriv",
+          "createDecipheriv",
+          "createDiffieHellman",
+          "createDiffieHellmanGroup",
+          "createECDH",
           "createHash",
           "createHmac",
+          "createPrivateKey",
+          "createPublicKey",
+          "createSecretKey",
+          "createSign",
+          "createVerify",
+          "decapsulate",
+          "Decipheriv",
+          "diffieHellman",
+          "DiffieHellman",
+          "DiffieHellmanGroup",
+          "ECDH",
+          "encapsulate",
           "fips",
+          "generateKey",
+          "generateKeyPair",
+          "generateKeyPairSync",
+          "generateKeySync",
+          "generatePrime",
+          "generatePrimeSync",
+          "getCipherInfo",
+          "getCiphers",
+          "getCurves",
+          "getDiffieHellman",
           "getFips",
           "getHashes",
           "getRandomValues",
           "hash",
           "Hash",
+          "hkdf",
+          "hkdfSync",
           "Hmac",
+          "KeyObject",
+          "pbkdf2",
+          "pbkdf2Sync",
+          "privateDecrypt",
+          "privateEncrypt",
           "prng",
           "pseudoRandomBytes",
+          "publicDecrypt",
+          "publicEncrypt",
           "randomBytes",
           "randomFill",
           "randomFillSync",
           "randomInt",
           "randomUUID",
           "rng",
+          "scrypt",
+          "scryptSync",
+          "secureHeapUsed",
+          "setEngine",
           "setFips",
+          "sign",
+          "Sign",
           "subtle",
           "timingSafeEqual",
-          "webcrypto"
+          "verify",
+          "Verify",
+          "webcrypto",
+          "X509Certificate"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/dgram.js": {
+        "file": "src/runtime_modules/node/dgram.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_createSocketHandle",
+          "createSocket",
+          "Socket"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/diagnostics_channel.js": {
+        "file": "src/runtime_modules/node/diagnostics_channel.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "channel",
+          "Channel",
+          "hasSubscribers",
+          "subscribe",
+          "tracingChannel",
+          "unsubscribe"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "__cottontailDiagnosticsChannels"
+        ]
+      },
+      "src/runtime_modules/node/dns/promises.js": {
+        "file": "src/runtime_modules/node/dns/promises.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "ADDRGETNETWORKPARAMS",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/dns.js": {
+        "file": "src/runtime_modules/node/dns.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "ADDRCONFIG",
+          "ADDRGETNETWORKPARAMS",
+          "ALL",
+          "BADFAMILY",
+          "BADFLAGS",
+          "BADHINTS",
+          "BADNAME",
+          "BADQUERY",
+          "BADRESP",
+          "BADSTR",
+          "CANCELLED",
+          "CONNREFUSED",
+          "DESTRUCTION",
+          "EOF",
+          "FILE",
+          "FORMERR",
+          "getDefaultResultOrder",
+          "getServers",
+          "LOADIPHLPAPI",
+          "lookup",
+          "lookupService",
+          "NODATA",
+          "NOMEM",
+          "NONAME",
+          "NOTFOUND",
+          "NOTIMP",
+          "NOTINITIALIZED",
+          "promises",
+          "PromisesResolver",
+          "REFUSED",
+          "resolve",
+          "resolve4",
+          "resolve6",
+          "resolveAny",
+          "resolveCaa",
+          "resolveCname",
+          "resolveMx",
+          "resolveNaptr",
+          "resolveNs",
+          "resolvePtr",
+          "Resolver",
+          "resolveSoa",
+          "resolveSrv",
+          "resolveTlsa",
+          "resolveTxt",
+          "reverse",
+          "SERVFAIL",
+          "setDefaultResultOrder",
+          "setServers",
+          "TIMEOUT",
+          "V4MAPPED"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/domain.js": {
+        "file": "src/runtime_modules/node/domain.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_stack",
+          "active",
+          "create",
+          "createDomain",
+          "Domain"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10226,7 +12189,23 @@
         "file": "src/runtime_modules/node/events.js",
         "hasDefaultExport": true,
         "namedExports": [
-          "EventEmitter"
+          "addAbortListener",
+          "captureRejections",
+          "captureRejectionSymbol",
+          "defaultMaxListeners",
+          "errorMonitor",
+          "EventEmitter",
+          "EventEmitterAsyncResource",
+          "getEventListeners",
+          "getMaxListeners",
+          "init",
+          "kMaxEventTargetListeners",
+          "kMaxEventTargetListenersWarned",
+          "listenerCount",
+          "on",
+          "once",
+          "setMaxListeners",
+          "usingDomains"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10390,47 +12369,200 @@
           "__cottontailFileWatchers"
         ]
       },
+      "src/runtime_modules/node/http.js": {
+        "file": "src/runtime_modules/node/http.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_connectionListener",
+          "Agent",
+          "ClientRequest",
+          "CloseEvent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "IncomingMessage",
+          "maxHeaderSize",
+          "MessageEvent",
+          "METHODS",
+          "OutgoingMessage",
+          "request",
+          "Server",
+          "ServerResponse",
+          "setMaxIdleHTTPParsers",
+          "STATUS_CODES",
+          "validateHeaderName",
+          "validateHeaderValue",
+          "WebSocket"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/http2.js": {
+        "file": "src/runtime_modules/node/http2.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "connect",
+          "constants",
+          "createSecureServer",
+          "createServer",
+          "getDefaultSettings",
+          "getPackedSettings",
+          "getUnpackedSettings",
+          "Http2ServerRequest",
+          "Http2ServerResponse",
+          "performServerHandshake",
+          "sensitiveHeaders"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/https.js": {
+        "file": "src/runtime_modules/node/https.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "Agent",
+          "createServer",
+          "get",
+          "globalAgent",
+          "request",
+          "Server"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/inspector/promises.js": {
+        "file": "src/runtime_modules/node/inspector/promises.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/inspector.js": {
+        "file": "src/runtime_modules/node/inspector.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "close",
+          "console",
+          "Network",
+          "NetworkResources",
+          "open",
+          "Session",
+          "url",
+          "waitForDebugger"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/module.js": {
         "file": "src/runtime_modules/node/module.js",
         "hasDefaultExport": true,
         "namedExports": [
           "__runMain",
           "__setBuiltinModules",
+          "_cache",
+          "_debug",
+          "_extensions",
+          "_findPath",
+          "_initPaths",
+          "_load",
+          "_nodeModulePaths",
+          "_pathCache",
+          "_preloadModules",
+          "_readPackage",
+          "_resolveFilename",
+          "_resolveLookupPaths",
+          "_stat",
           "builtinModules",
-          "createRequire"
+          "constants",
+          "createRequire",
+          "enableCompileCache",
+          "findPackageJSON",
+          "findSourceMap",
+          "flushCompileCache",
+          "getCompileCacheDir",
+          "getSourceMapsSupport",
+          "globalPaths",
+          "isBuiltin",
+          "Module",
+          "register",
+          "registerHooks",
+          "runMain",
+          "setSourceMapsSupport",
+          "SourceMap",
+          "stripTypeScriptTypes",
+          "syncBuiltinESMExports",
+          "wrap",
+          "wrapper"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailBuiltinModules"
+        ]
       },
       "src/runtime_modules/node/net.js": {
         "file": "src/runtime_modules/node/net.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_createServerHandle",
+          "_normalizeArgs",
+          "BlockList",
           "connect",
           "createConnection",
           "createServer",
+          "getDefaultAutoSelectFamily",
+          "getDefaultAutoSelectFamilyAttemptTimeout",
           "isIP",
           "isIPv4",
           "isIPv6",
-          "Socket"
+          "Server",
+          "setDefaultAutoSelectFamily",
+          "setDefaultAutoSelectFamilyAttemptTimeout",
+          "Socket",
+          "SocketAddress",
+          "Stream"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailFdWatchHandlerInstalled",
+          "__cottontailFdWatchListeners"
+        ]
       },
       "src/runtime_modules/node/os.js": {
         "file": "src/runtime_modules/node/os.js",
         "hasDefaultExport": true,
         "namedExports": [
           "arch",
+          "availableParallelism",
+          "constants",
           "cpus",
+          "devNull",
           "endianness",
           "EOL",
+          "freemem",
+          "getPriority",
           "homedir",
           "hostname",
+          "loadavg",
+          "machine",
+          "networkInterfaces",
           "platform",
           "release",
+          "setPriority",
           "tmpdir",
-          "type"
+          "totalmem",
+          "type",
+          "uptime",
+          "userInfo",
+          "version"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10514,7 +12646,17 @@
         "file": "src/runtime_modules/node/perf_hooks.js",
         "hasDefaultExport": true,
         "namedExports": [
-          "performance"
+          "constants",
+          "createHistogram",
+          "monitorEventLoopDelay",
+          "performance",
+          "Performance",
+          "PerformanceEntry",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceObserver",
+          "PerformanceObserverEntryList",
+          "PerformanceResourceTiming"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10523,27 +12665,92 @@
         "file": "src/runtime_modules/node/process.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_debugEnd",
+          "_debugProcess",
+          "_events",
+          "_eventsCount",
+          "_exiting",
+          "_fatalException",
+          "_getActiveHandles",
+          "_getActiveRequests",
+          "_kill",
+          "_linkedBinding",
+          "_maxListeners",
+          "_preload_modules",
+          "_rawDebug",
+          "_startProfilerIdleNotifier",
+          "_stopProfilerIdleNotifier",
+          "_tickCallback",
+          "abort",
+          "allowedNodeEnvironmentFlags",
           "arch",
           "argv",
           "argv0",
+          "availableMemory",
+          "binding",
+          "browser",
+          "chdir",
+          "config",
+          "constrainedMemory",
+          "cpuUsage",
           "cwd",
+          "debugPort",
+          "dlopen",
+          "domain",
           "emit",
+          "emitWarning",
           "env",
+          "execArgv",
           "execPath",
+          "execve",
           "exit",
+          "exitCode",
+          "features",
+          "finalization",
+          "getActiveResourcesInfo",
+          "getBuiltinModule",
+          "getegid",
+          "geteuid",
+          "getgid",
+          "getgroups",
+          "getuid",
+          "hasUncaughtExceptionCaptureCallback",
           "hrtime",
+          "initgroups",
           "kill",
+          "loadEnvFile",
+          "memoryUsage",
+          "moduleLoadList",
           "nextTick",
           "off",
           "on",
           "once",
+          "openStdin",
           "pid",
           "platform",
+          "ppid",
+          "reallyExit",
+          "ref",
           "release",
+          "report",
+          "resourceUsage",
+          "setegid",
+          "seteuid",
+          "setgid",
+          "setgroups",
+          "setSourceMapsEnabled",
+          "setuid",
+          "setUncaughtExceptionCaptureCallback",
+          "sourceMapsEnabled",
           "stderr",
           "stdin",
           "stdout",
+          "threadCpuUsage",
+          "title",
+          "umask",
+          "unref",
           "uptime",
+          "version",
           "versions"
         ],
         "bunObjectProperties": [],
@@ -10551,12 +12758,101 @@
           "process"
         ]
       },
+      "src/runtime_modules/node/punycode.js": {
+        "file": "src/runtime_modules/node/punycode.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "decode",
+          "encode",
+          "toASCII",
+          "toUnicode",
+          "ucs2",
+          "version"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/querystring.js": {
+        "file": "src/runtime_modules/node/querystring.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "decode",
+          "encode",
+          "escape",
+          "parse",
+          "stringify",
+          "unescape",
+          "unescapeBuffer"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/readline/promises.js": {
+        "file": "src/runtime_modules/node/readline/promises.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "createInterface",
+          "Interface",
+          "Readline"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/readline.js": {
         "file": "src/runtime_modules/node/readline.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "clearLine",
+          "clearScreenDown",
           "createInterface",
-          "Interface"
+          "cursorTo",
+          "emitKeypressEvents",
+          "Interface",
+          "moveCursor",
+          "promises"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/repl.js": {
+        "file": "src/runtime_modules/node/repl.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "_builtinLibs",
+          "builtinModules",
+          "isValidSyntax",
+          "Recoverable",
+          "REPL_MODE_SLOPPY",
+          "REPL_MODE_STRICT",
+          "REPLServer",
+          "start",
+          "writer"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/sea.js": {
+        "file": "src/runtime_modules/node/sea.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "getAsset",
+          "getAssetAsBlob",
+          "getAssetKeys",
+          "getRawAsset",
+          "isSea"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/sqlite.js": {
+        "file": "src/runtime_modules/node/sqlite.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "backup",
+          "constants",
+          "DatabaseSync",
+          "Session",
+          "StatementSync"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10574,16 +12870,90 @@
           "__cottontailFdWatchListeners"
         ]
       },
+      "src/runtime_modules/node/stream/consumers.js": {
+        "file": "src/runtime_modules/node/stream/consumers.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "arrayBuffer",
+          "blob",
+          "buffer",
+          "json",
+          "text"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/stream/promises.js": {
+        "file": "src/runtime_modules/node/stream/promises.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "finished",
+          "pipeline"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/stream/web.js": {
+        "file": "src/runtime_modules/node/stream/web.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "ByteLengthQueuingStrategy",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "DecompressionStream",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TextDecoderStream",
+          "TextEncoderStream",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/stream.js": {
         "file": "src/runtime_modules/node/stream.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_isArrayBufferView",
+          "_isUint8Array",
+          "_uint8ArrayToBuffer",
+          "addAbortSignal",
+          "compose",
+          "destroy",
           "Duplex",
+          "duplexPair",
+          "finished",
+          "getDefaultHighWaterMark",
+          "isDestroyed",
+          "isDisturbed",
+          "isErrored",
+          "isReadable",
+          "isWritable",
           "PassThrough",
+          "pipeline",
+          "promises",
           "Readable",
+          "setDefaultHighWaterMark",
           "Stream",
           "Transform",
           "Writable"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/string_decoder.js": {
+        "file": "src/runtime_modules/node/string_decoder.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "StringDecoder"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10592,14 +12962,138 @@
         "file": "src/runtime_modules/node/sys.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/test/reporters.js": {
+        "file": "src/runtime_modules/node/test/reporters.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "dot",
+          "junit",
+          "lcov",
+          "spec",
+          "tap"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/test.js": {
+        "file": "src/runtime_modules/node/test.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "after",
+          "afterEach",
+          "assert",
+          "before",
+          "beforeEach",
+          "describe",
+          "it",
+          "mock",
+          "only",
+          "run",
+          "skip",
+          "snapshot",
+          "suite",
+          "test",
+          "todo"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/timers/promises.js": {
+        "file": "src/runtime_modules/node/timers/promises.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "scheduler",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/timers.js": {
+        "file": "src/runtime_modules/node/timers.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "clearImmediate",
+          "clearInterval",
+          "clearTimeout",
+          "promises",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/tls.js": {
+        "file": "src/runtime_modules/node/tls.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "checkServerIdentity",
+          "CLIENT_RENEG_LIMIT",
+          "CLIENT_RENEG_WINDOW",
+          "connect",
+          "convertALPNProtocols",
+          "createSecureContext",
+          "createServer",
+          "DEFAULT_CIPHERS",
+          "DEFAULT_ECDH_CURVE",
+          "DEFAULT_MAX_VERSION",
+          "DEFAULT_MIN_VERSION",
+          "getCACertificates",
+          "getCiphers",
+          "rootCertificates",
+          "SecureContext",
+          "Server",
+          "setDefaultCACertificates",
+          "TLSSocket"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/trace_events.js": {
+        "file": "src/runtime_modules/node/trace_events.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "createTracing",
+          "getEnabledCategories"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10619,10 +13113,21 @@
         "file": "src/runtime_modules/node/url.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "domainToASCII",
+          "domainToUnicode",
           "fileURLToPath",
+          "fileURLToPathBuffer",
+          "format",
+          "parse",
           "pathToFileURL",
+          "resolve",
+          "resolveObject",
+          "resolveUrl",
+          "Url",
           "URL",
-          "URLSearchParams"
+          "URLPattern",
+          "URLSearchParams",
+          "urlToHttpOptions"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10682,13 +13187,38 @@
         "file": "src/runtime_modules/node/util.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_errnoException",
+          "_exceptionWithHostPort",
+          "_extend",
+          "aborted",
+          "callbackify",
+          "debug",
+          "debuglog",
           "deprecate",
+          "diff",
           "format",
           "formatWithOptions",
+          "getCallSites",
+          "getSystemErrorMap",
+          "getSystemErrorMessage",
+          "getSystemErrorName",
+          "inherits",
           "inspect",
+          "isArray",
           "isDeepStrictEqual",
+          "MIMEParams",
+          "MIMEType",
           "parseArgs",
+          "parseEnv",
           "promisify",
+          "setTraceSigInt",
+          "stripVTControlCharacters",
+          "styleText",
+          "TextDecoder",
+          "TextEncoder",
+          "toUSVString",
+          "transferableAbortController",
+          "transferableAbortSignal",
           "types"
         ],
         "bunObjectProperties": [],
@@ -10698,7 +13228,28 @@
         "file": "src/runtime_modules/node/v8.js",
         "hasDefaultExport": true,
         "namedExports": [
-          "startupSnapshot"
+          "cachedDataVersionTag",
+          "DefaultDeserializer",
+          "DefaultSerializer",
+          "deserialize",
+          "Deserializer",
+          "GCProfiler",
+          "getCppHeapStatistics",
+          "getHeapCodeStatistics",
+          "getHeapSnapshot",
+          "getHeapSpaceStatistics",
+          "getHeapStatistics",
+          "isStringOneByteRepresentation",
+          "promiseHooks",
+          "queryObjects",
+          "serialize",
+          "Serializer",
+          "setFlagsFromString",
+          "setHeapSnapshotNearHeapLimit",
+          "startupSnapshot",
+          "stopCoverage",
+          "takeCoverage",
+          "writeHeapSnapshot"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10707,14 +13258,62 @@
         "file": "src/runtime_modules/node/vm.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "compileFunction",
+          "constants",
           "createContext",
+          "createScript",
           "isContext",
+          "measureMemory",
           "runInContext",
+          "runInNewContext",
           "runInThisContext",
           "Script"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
+      },
+      "src/runtime_modules/node/wasi.js": {
+        "file": "src/runtime_modules/node/wasi.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "WASI"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/worker_threads.js": {
+        "file": "src/runtime_modules/node/worker_threads.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "BroadcastChannel",
+          "getEnvironmentData",
+          "isInternalThread",
+          "isMainThread",
+          "isMarkedAsUntransferable",
+          "locks",
+          "markAsUncloneable",
+          "markAsUntransferable",
+          "MessageChannel",
+          "MessagePort",
+          "moveMessagePortToContext",
+          "parentPort",
+          "postMessageToThread",
+          "receiveMessageOnPort",
+          "resourceLimits",
+          "setEnvironmentData",
+          "SHARE_ENV",
+          "threadId",
+          "threadName",
+          "Worker",
+          "workerData"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "__cottontailWorkerData",
+          "__cottontailWorkerThreadName",
+          "parentPort",
+          "workerData"
+        ]
       },
       "src/runtime_modules/node/zlib/constants.js": {
         "file": "src/runtime_modules/node/zlib/constants.js",
@@ -10835,27 +13434,52 @@
         "file": "src/runtime_modules/node/zlib.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "brotliCompress",
+          "BrotliCompress",
+          "brotliCompressSync",
+          "brotliDecompress",
+          "BrotliDecompress",
+          "brotliDecompressSync",
           "codes",
           "constants",
+          "crc32",
+          "createBrotliCompress",
+          "createBrotliDecompress",
+          "createDeflate",
+          "createDeflateRaw",
+          "createGunzip",
+          "createGzip",
+          "createInflate",
+          "createInflateRaw",
+          "createUnzip",
+          "createZstdCompress",
+          "createZstdDecompress",
           "deflate",
+          "Deflate",
           "DEFLATE",
           "deflateRaw",
+          "DeflateRaw",
           "DEFLATERAW",
           "deflateRawSync",
           "deflateSync",
           "gunzip",
+          "Gunzip",
           "GUNZIP",
           "gunzipSync",
           "gzip",
+          "Gzip",
           "GZIP",
           "gzipSync",
           "inflate",
+          "Inflate",
           "INFLATE",
           "inflateRaw",
+          "InflateRaw",
           "INFLATERAW",
           "inflateRawSync",
           "inflateSync",
           "unzip",
+          "Unzip",
           "UNZIP",
           "unzipSync",
           "Z_BEST_COMPRESSION",
@@ -10957,7 +13581,13 @@
           "ZSTD_fast",
           "ZSTD_greedy",
           "ZSTD_lazy",
-          "ZSTD_lazy2"
+          "ZSTD_lazy2",
+          "zstdCompress",
+          "ZstdCompress",
+          "zstdCompressSync",
+          "zstdDecompress",
+          "ZstdDecompress",
+          "zstdDecompressSync"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -10977,17 +13607,24 @@
       "write"
     ],
     "globalProperties": [
+      "__cottontailBuiltinModules",
+      "__cottontailDiagnosticsChannels",
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
+      "__cottontailWorkerData",
+      "__cottontailWorkerThreadName",
       "Bun",
       "crypto",
       "fetch",
       "Headers",
+      "parentPort",
       "process",
       "Request",
+      "resolveObjectURL",
       "Response",
-      "URL"
+      "URL",
+      "workerData"
     ]
   },
   "coverage": {
@@ -11051,9 +13688,8 @@
         "extra": []
       },
       "async_hooks": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "AsyncLocalStorage",
           "AsyncResource",
           "asyncWrapProviders",
@@ -11062,7 +13698,10 @@
           "executionAsyncResource",
           "triggerAsyncId"
         ],
-        "extra": []
+        "missing": [],
+        "extra": [
+          "_wrapAsyncCallback"
+        ]
       },
       "buffer": {
         "module": "present",
@@ -11070,12 +13709,10 @@
           "Blob",
           "Buffer",
           "File",
-          "atob",
-          "btoa"
-        ],
-        "missing": [
           "INSPECT_MAX_BYTES",
           "SlowBuffer",
+          "atob",
+          "btoa",
           "constants",
           "isAscii",
           "isUtf8",
@@ -11084,29 +13721,28 @@
           "resolveObjectURL",
           "transcode"
         ],
+        "missing": [],
         "extra": []
       },
       "child_process": {
         "module": "present",
         "implemented": [
+          "ChildProcess",
+          "_forkChild",
+          "exec",
+          "execFile",
           "execFileSync",
           "execSync",
           "fork",
           "spawn",
           "spawnSync"
         ],
-        "missing": [
-          "ChildProcess",
-          "_forkChild",
-          "exec",
-          "execFile"
-        ],
+        "missing": [],
         "extra": []
       },
       "cluster": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "SCHED_NONE",
           "SCHED_RR",
           "Worker",
@@ -11124,6 +13760,7 @@
           "setupPrimary",
           "workers"
         ],
+        "missing": [],
         "extra": []
       },
       "console": {
@@ -11404,36 +14041,14 @@
       "crypto": {
         "module": "present",
         "implemented": [
-          "Hash",
-          "Hmac",
-          "constants",
-          "createHash",
-          "createHmac",
-          "fips",
-          "getFips",
-          "getHashes",
-          "getRandomValues",
-          "hash",
-          "prng",
-          "pseudoRandomBytes",
-          "randomBytes",
-          "randomFill",
-          "randomFillSync",
-          "randomInt",
-          "randomUUID",
-          "rng",
-          "setFips",
-          "subtle",
-          "timingSafeEqual",
-          "webcrypto"
-        ],
-        "missing": [
           "Certificate",
           "Cipheriv",
           "Decipheriv",
           "DiffieHellman",
           "DiffieHellmanGroup",
           "ECDH",
+          "Hash",
+          "Hmac",
           "KeyObject",
           "Sign",
           "Verify",
@@ -11442,11 +14057,14 @@
           "argon2Sync",
           "checkPrime",
           "checkPrimeSync",
+          "constants",
           "createCipheriv",
           "createDecipheriv",
           "createDiffieHellman",
           "createDiffieHellmanGroup",
           "createECDH",
+          "createHash",
+          "createHmac",
           "createPrivateKey",
           "createPublicKey",
           "createSecretKey",
@@ -11455,6 +14073,7 @@
           "decapsulate",
           "diffieHellman",
           "encapsulate",
+          "fips",
           "generateKey",
           "generateKeyPair",
           "generateKeyPairSync",
@@ -11465,37 +14084,53 @@
           "getCiphers",
           "getCurves",
           "getDiffieHellman",
+          "getFips",
+          "getHashes",
+          "getRandomValues",
+          "hash",
           "hkdf",
           "hkdfSync",
           "pbkdf2",
           "pbkdf2Sync",
           "privateDecrypt",
           "privateEncrypt",
+          "prng",
+          "pseudoRandomBytes",
           "publicDecrypt",
           "publicEncrypt",
+          "randomBytes",
+          "randomFill",
+          "randomFillSync",
+          "randomInt",
+          "randomUUID",
+          "rng",
           "scrypt",
           "scryptSync",
           "secureHeapUsed",
           "setEngine",
+          "setFips",
           "sign",
-          "verify"
+          "subtle",
+          "timingSafeEqual",
+          "verify",
+          "webcrypto"
         ],
+        "missing": [],
         "extra": []
       },
       "dgram": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Socket",
           "_createSocketHandle",
           "createSocket"
         ],
+        "missing": [],
         "extra": []
       },
       "diagnostics_channel": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Channel",
           "channel",
           "hasSubscribers",
@@ -11503,12 +14138,12 @@
           "tracingChannel",
           "unsubscribe"
         ],
+        "missing": [],
         "extra": []
       },
       "dns": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "ADDRCONFIG",
           "ADDRGETNETWORKPARAMS",
           "ALL",
@@ -11560,12 +14195,14 @@
           "setDefaultResultOrder",
           "setServers"
         ],
-        "extra": []
+        "missing": [],
+        "extra": [
+          "PromisesResolver"
+        ]
       },
       "dns/promises": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "ADDRGETNETWORKPARAMS",
           "BADFAMILY",
           "BADFLAGS",
@@ -11613,26 +14250,25 @@
           "setDefaultResultOrder",
           "setServers"
         ],
+        "missing": [],
         "extra": []
       },
       "domain": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Domain",
           "_stack",
           "active",
           "create",
           "createDomain"
         ],
+        "missing": [],
         "extra": []
       },
       "events": {
         "module": "present",
         "implemented": [
-          "EventEmitter"
-        ],
-        "missing": [
+          "EventEmitter",
           "EventEmitterAsyncResource",
           "addAbortListener",
           "captureRejectionSymbol",
@@ -11650,6 +14286,7 @@
           "setMaxListeners",
           "usingDomains"
         ],
+        "missing": [],
         "extra": []
       },
       "fs": {
@@ -11808,9 +14445,8 @@
         "extra": []
       },
       "http": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Agent",
           "ClientRequest",
           "CloseEvent",
@@ -11832,12 +14468,12 @@
           "validateHeaderName",
           "validateHeaderValue"
         ],
+        "missing": [],
         "extra": []
       },
       "http2": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Http2ServerRequest",
           "Http2ServerResponse",
           "connect",
@@ -11850,12 +14486,12 @@
           "performServerHandshake",
           "sensitiveHeaders"
         ],
+        "missing": [],
         "extra": []
       },
       "https": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Agent",
           "Server",
           "createServer",
@@ -11863,12 +14499,12 @@
           "globalAgent",
           "request"
         ],
+        "missing": [],
         "extra": []
       },
       "inspector": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Network",
           "NetworkResources",
           "Session",
@@ -11878,12 +14514,12 @@
           "url",
           "waitForDebugger"
         ],
+        "missing": [],
         "extra": []
       },
       "inspector/promises": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Network",
           "NetworkResources",
           "Session",
@@ -11893,15 +14529,12 @@
           "url",
           "waitForDebugger"
         ],
+        "missing": [],
         "extra": []
       },
       "module": {
         "module": "present",
         "implemented": [
-          "builtinModules",
-          "createRequire"
-        ],
-        "missing": [
           "Module",
           "SourceMap",
           "_cache",
@@ -11917,7 +14550,9 @@
           "_resolveFilename",
           "_resolveLookupPaths",
           "_stat",
+          "builtinModules",
           "constants",
+          "createRequire",
           "enableCompileCache",
           "findPackageJSON",
           "findSourceMap",
@@ -11935,6 +14570,7 @@
           "wrap",
           "wrapper"
         ],
+        "missing": [],
         "extra": [
           "__runMain",
           "__setBuiltinModules"
@@ -11943,56 +14579,54 @@
       "net": {
         "module": "present",
         "implemented": [
-          "Socket",
-          "connect",
-          "createConnection",
-          "createServer",
-          "isIP",
-          "isIPv4",
-          "isIPv6"
-        ],
-        "missing": [
           "BlockList",
           "Server",
+          "Socket",
           "SocketAddress",
           "Stream",
           "_createServerHandle",
           "_normalizeArgs",
+          "connect",
+          "createConnection",
+          "createServer",
           "getDefaultAutoSelectFamily",
           "getDefaultAutoSelectFamilyAttemptTimeout",
+          "isIP",
+          "isIPv4",
+          "isIPv6",
           "setDefaultAutoSelectFamily",
           "setDefaultAutoSelectFamilyAttemptTimeout"
         ],
+        "missing": [],
         "extra": []
       },
       "node:sea": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "getAsset",
           "getAssetAsBlob",
           "getAssetKeys",
           "getRawAsset",
           "isSea"
         ],
+        "missing": [],
         "extra": []
       },
       "node:sqlite": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "DatabaseSync",
           "Session",
           "StatementSync",
           "backup",
           "constants"
         ],
+        "missing": [],
         "extra": []
       },
       "node:test": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "after",
           "afterEach",
           "assert",
@@ -12009,18 +14643,19 @@
           "test",
           "todo"
         ],
+        "missing": [],
         "extra": []
       },
       "node:test/reporters": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "dot",
           "junit",
           "lcov",
           "spec",
           "tap"
         ],
+        "missing": [],
         "extra": []
       },
       "os": {
@@ -12028,30 +14663,29 @@
         "implemented": [
           "EOL",
           "arch",
-          "cpus",
-          "endianness",
-          "homedir",
-          "hostname",
-          "platform",
-          "release",
-          "tmpdir",
-          "type"
-        ],
-        "missing": [
           "availableParallelism",
           "constants",
+          "cpus",
           "devNull",
+          "endianness",
           "freemem",
           "getPriority",
+          "homedir",
+          "hostname",
           "loadavg",
           "machine",
           "networkInterfaces",
+          "platform",
+          "release",
           "setPriority",
+          "tmpdir",
           "totalmem",
+          "type",
           "uptime",
           "userInfo",
           "version"
         ],
+        "missing": [],
         "extra": []
       },
       "path": {
@@ -12129,9 +14763,6 @@
       "perf_hooks": {
         "module": "present",
         "implemented": [
-          "performance"
-        ],
-        "missing": [
           "Performance",
           "PerformanceEntry",
           "PerformanceMark",
@@ -12141,33 +14772,15 @@
           "PerformanceResourceTiming",
           "constants",
           "createHistogram",
-          "monitorEventLoopDelay"
+          "monitorEventLoopDelay",
+          "performance"
         ],
+        "missing": [],
         "extra": []
       },
       "process": {
         "module": "present",
         "implemented": [
-          "arch",
-          "argv",
-          "argv0",
-          "cwd",
-          "env",
-          "execPath",
-          "exit",
-          "hrtime",
-          "kill",
-          "nextTick",
-          "pid",
-          "platform",
-          "release",
-          "stderr",
-          "stdin",
-          "stdout",
-          "uptime",
-          "versions"
-        ],
-        "missing": [
           "_debugEnd",
           "_debugProcess",
           "_events",
@@ -12186,18 +14799,25 @@
           "_tickCallback",
           "abort",
           "allowedNodeEnvironmentFlags",
+          "arch",
+          "argv",
+          "argv0",
           "availableMemory",
           "binding",
           "chdir",
           "config",
           "constrainedMemory",
           "cpuUsage",
+          "cwd",
           "debugPort",
           "dlopen",
           "domain",
           "emitWarning",
+          "env",
           "execArgv",
+          "execPath",
           "execve",
+          "exit",
           "exitCode",
           "features",
           "finalization",
@@ -12209,14 +14829,20 @@
           "getgroups",
           "getuid",
           "hasUncaughtExceptionCaptureCallback",
+          "hrtime",
           "initgroups",
+          "kill",
           "loadEnvFile",
           "memoryUsage",
           "moduleLoadList",
+          "nextTick",
           "openStdin",
+          "pid",
+          "platform",
           "ppid",
           "reallyExit",
           "ref",
+          "release",
           "report",
           "resourceUsage",
           "setSourceMapsEnabled",
@@ -12227,13 +14853,20 @@
           "setgroups",
           "setuid",
           "sourceMapsEnabled",
+          "stderr",
+          "stdin",
+          "stdout",
           "threadCpuUsage",
           "title",
           "umask",
           "unref",
-          "version"
+          "uptime",
+          "version",
+          "versions"
         ],
+        "missing": [],
         "extra": [
+          "browser",
           "emit",
           "off",
           "on",
@@ -12241,9 +14874,8 @@
         ]
       },
       "punycode": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "decode",
           "encode",
           "toASCII",
@@ -12251,12 +14883,12 @@
           "ucs2",
           "version"
         ],
+        "missing": [],
         "extra": []
       },
       "querystring": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "decode",
           "encode",
           "escape",
@@ -12265,38 +14897,37 @@
           "unescape",
           "unescapeBuffer"
         ],
+        "missing": [],
         "extra": []
       },
       "readline": {
         "module": "present",
         "implemented": [
           "Interface",
-          "createInterface"
-        ],
-        "missing": [
           "clearLine",
           "clearScreenDown",
+          "createInterface",
           "cursorTo",
           "emitKeypressEvents",
           "moveCursor",
           "promises"
         ],
+        "missing": [],
         "extra": []
       },
       "readline/promises": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "Interface",
           "Readline",
           "createInterface"
         ],
+        "missing": [],
         "extra": []
       },
       "repl": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "REPLServer",
           "REPL_MODE_SLOPPY",
           "REPL_MODE_STRICT",
@@ -12307,6 +14938,7 @@
           "start",
           "writer"
         ],
+        "missing": [],
         "extra": []
       },
       "stream": {
@@ -12317,9 +14949,7 @@
           "Readable",
           "Stream",
           "Transform",
-          "Writable"
-        ],
-        "missing": [
+          "Writable",
           "_isArrayBufferView",
           "_isUint8Array",
           "_uint8ArrayToBuffer",
@@ -12338,33 +14968,33 @@
           "promises",
           "setDefaultHighWaterMark"
         ],
+        "missing": [],
         "extra": []
       },
       "stream/consumers": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "arrayBuffer",
           "blob",
           "buffer",
           "json",
           "text"
         ],
+        "missing": [],
         "extra": []
       },
       "stream/promises": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "finished",
           "pipeline"
         ],
+        "missing": [],
         "extra": []
       },
       "stream/web": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "ByteLengthQueuingStrategy",
           "CompressionStream",
           "CountQueuingStrategy",
@@ -12383,29 +15013,20 @@
           "WritableStreamDefaultController",
           "WritableStreamDefaultWriter"
         ],
+        "missing": [],
         "extra": []
       },
       "string_decoder": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "StringDecoder"
         ],
+        "missing": [],
         "extra": []
       },
       "sys": {
         "module": "present",
         "implemented": [
-          "deprecate",
-          "format",
-          "formatWithOptions",
-          "inspect",
-          "isDeepStrictEqual",
-          "parseArgs",
-          "promisify",
-          "types"
-        ],
-        "missing": [
           "MIMEParams",
           "MIMEType",
           "TextDecoder",
@@ -12417,27 +15038,35 @@
           "callbackify",
           "debug",
           "debuglog",
+          "deprecate",
           "diff",
+          "format",
+          "formatWithOptions",
           "getCallSites",
           "getSystemErrorMap",
           "getSystemErrorMessage",
           "getSystemErrorName",
           "inherits",
+          "inspect",
           "isArray",
+          "isDeepStrictEqual",
+          "parseArgs",
           "parseEnv",
+          "promisify",
           "setTraceSigInt",
           "stripVTControlCharacters",
           "styleText",
           "toUSVString",
           "transferableAbortController",
-          "transferableAbortSignal"
+          "transferableAbortSignal",
+          "types"
         ],
+        "missing": [],
         "extra": []
       },
       "timers": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "clearImmediate",
           "clearInterval",
           "clearTimeout",
@@ -12446,23 +15075,23 @@
           "setInterval",
           "setTimeout"
         ],
+        "missing": [],
         "extra": []
       },
       "timers/promises": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "scheduler",
           "setImmediate",
           "setInterval",
           "setTimeout"
         ],
+        "missing": [],
         "extra": []
       },
       "tls": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
@@ -12482,15 +15111,16 @@
           "rootCertificates",
           "setDefaultCACertificates"
         ],
+        "missing": [],
         "extra": []
       },
       "trace_events": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "createTracing",
           "getEnabledCategories"
         ],
+        "missing": [],
         "extra": []
       },
       "tty": {
@@ -12507,37 +15137,28 @@
         "module": "present",
         "implemented": [
           "URL",
-          "URLSearchParams",
-          "fileURLToPath",
-          "pathToFileURL"
-        ],
-        "missing": [
           "URLPattern",
+          "URLSearchParams",
           "Url",
           "domainToASCII",
           "domainToUnicode",
+          "fileURLToPath",
           "fileURLToPathBuffer",
           "format",
           "parse",
+          "pathToFileURL",
           "resolve",
           "resolveObject",
           "urlToHttpOptions"
         ],
-        "extra": []
+        "missing": [],
+        "extra": [
+          "resolveUrl"
+        ]
       },
       "util": {
         "module": "present",
         "implemented": [
-          "deprecate",
-          "format",
-          "formatWithOptions",
-          "inspect",
-          "isDeepStrictEqual",
-          "parseArgs",
-          "promisify",
-          "types"
-        ],
-        "missing": [
           "MIMEParams",
           "MIMEType",
           "TextDecoder",
@@ -12549,21 +15170,30 @@
           "callbackify",
           "debug",
           "debuglog",
+          "deprecate",
           "diff",
+          "format",
+          "formatWithOptions",
           "getCallSites",
           "getSystemErrorMap",
           "getSystemErrorMessage",
           "getSystemErrorName",
           "inherits",
+          "inspect",
           "isArray",
+          "isDeepStrictEqual",
+          "parseArgs",
           "parseEnv",
+          "promisify",
           "setTraceSigInt",
           "stripVTControlCharacters",
           "styleText",
           "toUSVString",
           "transferableAbortController",
-          "transferableAbortSignal"
+          "transferableAbortSignal",
+          "types"
         ],
+        "missing": [],
         "extra": []
       },
       "util/types": {
@@ -12619,9 +15249,6 @@
       "v8": {
         "module": "present",
         "implemented": [
-          "startupSnapshot"
-        ],
-        "missing": [
           "DefaultDeserializer",
           "DefaultSerializer",
           "Deserializer",
@@ -12640,42 +15267,42 @@
           "serialize",
           "setFlagsFromString",
           "setHeapSnapshotNearHeapLimit",
+          "startupSnapshot",
           "stopCoverage",
           "takeCoverage",
           "writeHeapSnapshot"
         ],
+        "missing": [],
         "extra": []
       },
       "vm": {
         "module": "present",
         "implemented": [
           "Script",
-          "createContext",
-          "isContext",
-          "runInContext",
-          "runInThisContext"
-        ],
-        "missing": [
           "compileFunction",
           "constants",
+          "createContext",
           "createScript",
+          "isContext",
           "measureMemory",
-          "runInNewContext"
+          "runInContext",
+          "runInNewContext",
+          "runInThisContext"
         ],
+        "missing": [],
         "extra": []
       },
       "wasi": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "WASI"
         ],
+        "missing": [],
         "extra": []
       },
       "worker_threads": {
-        "module": "missing",
-        "implemented": [],
-        "missing": [
+        "module": "present",
+        "implemented": [
           "BroadcastChannel",
           "MessageChannel",
           "MessagePort",
@@ -12698,18 +15325,28 @@
           "threadName",
           "workerData"
         ],
+        "missing": [],
         "extra": []
       },
       "zlib": {
         "module": "present",
         "implemented": [
+          "BrotliCompress",
+          "BrotliDecompress",
           "DEFLATE",
           "DEFLATERAW",
+          "Deflate",
+          "DeflateRaw",
           "GUNZIP",
           "GZIP",
+          "Gunzip",
+          "Gzip",
           "INFLATE",
           "INFLATERAW",
+          "Inflate",
+          "InflateRaw",
           "UNZIP",
+          "Unzip",
           "ZLIB_VERNUM",
           "ZSTD_CLEVEL_DEFAULT",
           "ZSTD_COMPRESS",
@@ -12810,8 +15447,26 @@
           "Z_STREAM_ERROR",
           "Z_SYNC_FLUSH",
           "Z_VERSION_ERROR",
+          "ZstdCompress",
+          "ZstdDecompress",
+          "brotliCompress",
+          "brotliCompressSync",
+          "brotliDecompress",
+          "brotliDecompressSync",
           "codes",
           "constants",
+          "crc32",
+          "createBrotliCompress",
+          "createBrotliDecompress",
+          "createDeflate",
+          "createDeflateRaw",
+          "createGunzip",
+          "createGzip",
+          "createInflate",
+          "createInflateRaw",
+          "createUnzip",
+          "createZstdCompress",
+          "createZstdDecompress",
           "deflate",
           "deflateRaw",
           "deflateRawSync",
@@ -12825,41 +15480,13 @@
           "inflateRawSync",
           "inflateSync",
           "unzip",
-          "unzipSync"
-        ],
-        "missing": [
-          "BrotliCompress",
-          "BrotliDecompress",
-          "Deflate",
-          "DeflateRaw",
-          "Gunzip",
-          "Gzip",
-          "Inflate",
-          "InflateRaw",
-          "Unzip",
-          "ZstdCompress",
-          "ZstdDecompress",
-          "brotliCompress",
-          "brotliCompressSync",
-          "brotliDecompress",
-          "brotliDecompressSync",
-          "crc32",
-          "createBrotliCompress",
-          "createBrotliDecompress",
-          "createDeflate",
-          "createDeflateRaw",
-          "createGunzip",
-          "createGzip",
-          "createInflate",
-          "createInflateRaw",
-          "createUnzip",
-          "createZstdCompress",
-          "createZstdDecompress",
+          "unzipSync",
           "zstdCompress",
           "zstdCompressSync",
           "zstdDecompress",
           "zstdDecompressSync"
         ],
+        "missing": [],
         "extra": []
       }
     },
@@ -13206,6 +15833,648 @@
             "xtest"
           ],
           "extra": []
+        }
+      }
+    }
+  },
+  "behavioral": {
+    "node": {
+      "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
+      "estimate": {
+        "implementedPercentLower": 66,
+        "implementedPercentUpper": 76,
+        "gapPercentLower": 24,
+        "gapPercentUpper": 34
+      },
+      "signals": {
+        "publicNodeModules": 58,
+        "nodeTestFiles": 31,
+        "compatMarkers": 29,
+        "modulesWithCompatMarkers": 28,
+        "explicitUnsupportedMarkers": 27,
+        "modulesWithUnsupportedMarkers": 11
+      },
+      "largestGaps": [
+        {
+          "name": "process",
+          "file": "src/runtime_modules/node/process.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 6,
+          "tests": 4,
+          "gapScore": 15
+        },
+        {
+          "name": "http2",
+          "file": "src/runtime_modules/node/http2.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 4,
+          "tests": 1,
+          "gapScore": 11
+        },
+        {
+          "name": "net",
+          "file": "src/runtime_modules/node/net.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 3,
+          "tests": 1,
+          "gapScore": 9
+        },
+        {
+          "name": "tls",
+          "file": "src/runtime_modules/node/tls.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 3,
+          "tests": 1,
+          "gapScore": 9
+        },
+        {
+          "name": "wasi",
+          "file": "src/runtime_modules/node/wasi.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 2,
+          "tests": 0,
+          "gapScore": 8
+        },
+        {
+          "name": "http",
+          "file": "src/runtime_modules/node/http.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 2,
+          "tests": 2,
+          "gapScore": 7
+        },
+        {
+          "name": "https",
+          "file": "src/runtime_modules/node/https.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 2,
+          "tests": 1,
+          "gapScore": 7
+        },
+        {
+          "name": "module",
+          "file": "src/runtime_modules/node/module.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 2,
+          "tests": 3,
+          "gapScore": 7
+        },
+        {
+          "name": "util/types",
+          "file": "src/runtime_modules/node/util/types.js",
+          "compatMarkers": 2,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 6
+        },
+        {
+          "name": "child_process",
+          "file": "src/runtime_modules/node/child_process.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 1,
+          "tests": 2,
+          "gapScore": 5
+        },
+        {
+          "name": "sqlite",
+          "file": "src/runtime_modules/node/sqlite.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 1,
+          "tests": 1,
+          "gapScore": 5
+        },
+        {
+          "name": "v8",
+          "file": "src/runtime_modules/node/v8.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 1,
+          "tests": 1,
+          "gapScore": 5
+        },
+        {
+          "name": "async_hooks",
+          "file": "src/runtime_modules/node/async_hooks.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "buffer",
+          "file": "src/runtime_modules/node/buffer.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "perf_hooks",
+          "file": "src/runtime_modules/node/perf_hooks.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "repl",
+          "file": "src/runtime_modules/node/repl.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "url",
+          "file": "src/runtime_modules/node/url.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "vm",
+          "file": "src/runtime_modules/node/vm.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 0,
+          "gapScore": 4
+        },
+        {
+          "name": "cluster",
+          "file": "src/runtime_modules/node/cluster.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "dgram",
+          "file": "src/runtime_modules/node/dgram.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "dns",
+          "file": "src/runtime_modules/node/dns.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "fs",
+          "file": "src/runtime_modules/node/fs.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 2,
+          "gapScore": 3
+        },
+        {
+          "name": "inspector",
+          "file": "src/runtime_modules/node/inspector.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "os",
+          "file": "src/runtime_modules/node/os.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "stream/web",
+          "file": "src/runtime_modules/node/stream/web.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "util",
+          "file": "src/runtime_modules/node/util.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "worker_threads",
+          "file": "src/runtime_modules/node/worker_threads.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "zlib",
+          "file": "src/runtime_modules/node/zlib.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "tests": 2,
+          "gapScore": 3
+        }
+      ],
+      "modules": {
+        "async_hooks": {
+          "file": "src/runtime_modules/node/async_hooks.js",
+          "compatMarkers": [
+            "node:async_hooks async propagation - synchronous scopes plus timer and microtask AsyncLocalStorage snapshots are tracked; full promise-chain propagation needs native scheduler hooks."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "buffer": {
+          "file": "src/runtime_modules/node/buffer.js",
+          "compatMarkers": [
+            "node:buffer object URL registry - resolveObjectURL delegates to a host registry when one exists; Blob URL creation is not installed globally yet."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "child_process": {
+          "file": "src/runtime_modules/node/child_process.js",
+          "compatMarkers": [
+            "node:child_process internals - public spawn/exec/fork paths are implemented; _forkChild remains an internal bootstrap hook."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 405,
+              "text": "throw new Error(\"child_process._forkChild is an internal Node bootstrap hook and is not available in Cottontail\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-child-process-fork.ts",
+            "tests/js/node-child-process.ts"
+          ]
+        },
+        "cluster": {
+          "file": "src/runtime_modules/node/cluster.js",
+          "compatMarkers": [
+            "node:cluster scheduling - process fork/message lifecycle is implemented; native shared server handles and round-robin socket distribution need net/server bindings."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-cluster-surface.ts"
+          ]
+        },
+        "dgram": {
+          "file": "src/runtime_modules/node/dgram.js",
+          "compatMarkers": [
+            "node:dgram multicast/options - UDP bind/send/receive/close are backed by native datagram sockets; multicast membership, broadcast/TTL tuning, and platform-specific socket options need additional native setsockopt bindings."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-dgram-surface.ts"
+          ]
+        },
+        "dns": {
+          "file": "src/runtime_modules/node/dns.js",
+          "compatMarkers": [
+            "node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; setServers stores requested servers for API compatibility, but record queries still use the platform resolver configuration until per-query resolver state is wired."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-dns-surface.ts"
+          ]
+        },
+        "fs": {
+          "file": "src/runtime_modules/node/fs.js",
+          "compatMarkers": [
+            "node:fs glob/watch/streams - simplified JS implementations cover common behavior; harden against Node's full option/error edge cases."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-fs-surface.ts",
+            "tests/js/node-fs.ts"
+          ]
+        },
+        "http": {
+          "file": "src/runtime_modules/node/http.js",
+          "compatMarkers": [
+            "node:http sockets - HTTP server/client behavior is backed by Cottontail's native HTTP server and fetch; the fetch-backed client is synchronous today, and raw socket upgrades, CONNECT tunneling, same-process loopback, and WebSocket transport need native socket/client bindings."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 342,
+              "text": "throw new Error(\"http.Agent.createConnection requires node:net socket bindings\");"
+            },
+            {
+              "line": 545,
+              "text": "throw new Error(\"WebSocket is not available in Cottontail node:http yet\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-http-https-surface.ts",
+            "tests/js/node-tls-http2-surface.ts"
+          ]
+        },
+        "http2": {
+          "file": "src/runtime_modules/node/http2.js",
+          "compatMarkers": [
+            "node:http2 sessions - constants, settings packing, and HTTP/1-compatible request/response classes are implemented; exported HTTP/2 client/server/session entry points fail loudly until native nghttp2-style bindings land."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 134,
+              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedHttp2(name)));"
+            },
+            {
+              "line": 150,
+              "text": "throw unsupportedHttp2(\"http2.ClientHttp2Session.request\");"
+            },
+            {
+              "line": 169,
+              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedHttp2(`${this._name}.listen`)));"
+            },
+            {
+              "line": 214,
+              "text": "throw unsupportedHttp2(\"http2.performServerHandshake\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-tls-http2-surface.ts"
+          ]
+        },
+        "https": {
+          "file": "src/runtime_modules/node/https.js",
+          "compatMarkers": [
+            "node:https TLS server - HTTPS client requests use fetch; TLS server creation needs native TLS bindings."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 13,
+              "text": "throw new Error(\"https.Server requires native TLS bindings in Cottontail\");"
+            },
+            {
+              "line": 36,
+              "text": "throw new Error(\"https.createServer requires native TLS bindings in Cottontail\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-http-https-surface.ts"
+          ]
+        },
+        "inspector": {
+          "file": "src/runtime_modules/node/inspector.js",
+          "compatMarkers": [
+            "node:inspector server - local Session protocol supports Runtime.evaluate and event delivery; DevTools WebSocket server/open(), debugger breakpoints, heap snapshots, and full domain coverage need JavaScriptCore inspector/runtime hooks."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-inspector-surface.ts"
+          ]
+        },
+        "module": {
+          "file": "src/runtime_modules/node/module.js",
+          "compatMarkers": [
+            "node:module loader hooks/source maps/compile cache - exported with real resolver/cache state where available; loader-hook and TS-strip APIs require dedicated parser/loader support."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 531,
+              "text": "throw new Error(\"module.register loader hooks are not available in Cottontail yet\");"
+            },
+            {
+              "line": 536,
+              "text": "throw new Error(\"module.registerHooks loader hooks are not available in Cottontail yet\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-misc-modules-surface.ts",
+            "tests/js/node-module-direct-package-root.ts",
+            "tests/js/node-module-surface.ts"
+          ]
+        },
+        "net": {
+          "file": "src/runtime_modules/node/net.js",
+          "compatMarkers": [
+            "node:net sockets - address helpers, BlockList, and basic TCP connect/listen/read/write/end are implemented; advanced socket options, backpressure, IPC pipes, and handle sharing need deeper native socket bindings."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 147,
+              "text": "if (typeof cottontail.tcpSocketConnect !== \"function\") throw unsupported(\"net.Socket.connect\");"
+            },
+            {
+              "line": 247,
+              "text": "if (typeof cottontail.tcpServerListen !== \"function\") throw unsupported(\"net.Server.listen\");"
+            },
+            {
+              "line": 387,
+              "text": "throw unsupported(\"net._createServerHandle\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-net.ts"
+          ]
+        },
+        "os": {
+          "file": "src/runtime_modules/node/os.js",
+          "compatMarkers": [
+            "node:os platform details - memory values, network interfaces, and priority use native host APIs; CPU model/timing and some release/version/loadavg details still need deeper platform-specific data."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-os.ts"
+          ]
+        },
+        "perf_hooks": {
+          "file": "src/runtime_modules/node/perf_hooks.js",
+          "compatMarkers": [
+            "node:perf_hooks GC/resource timing - user marks/measures, observers, timerify, and histograms are implemented; native GC/resource entries need JSC instrumentation."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "process": {
+          "file": "src/runtime_modules/node/process.js",
+          "compatMarkers": [
+            "node:process internals/addon hooks - unsupported Node internals throw instead of pretending to expose V8/libuv/N-API state."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 142,
+              "text": "throw new Error(`${name} is not available in Cottontail's embedded Node compatibility layer`);"
+            },
+            {
+              "line": 431,
+              "text": "unsupported(`process.binding(${String(name)})`);"
+            },
+            {
+              "line": 435,
+              "text": "unsupported(`process._linkedBinding(${String(name)})`);"
+            },
+            {
+              "line": 439,
+              "text": "unsupported(\"process.dlopen\");"
+            },
+            {
+              "line": 443,
+              "text": "unsupported(\"process.execve\");"
+            },
+            {
+              "line": 489,
+              "text": "// COTTONTAIL-COMPAT: node:process internals/addon hooks - unsupported Node internals throw instead of pretending to expose V8/libuv/N-API state."
+            }
+          ],
+          "tests": [
+            "tests/js/node-child-process-fork.ts",
+            "tests/js/node-child-process.ts",
+            "tests/js/node-process-surface.ts",
+            "tests/js/node-process.ts"
+          ]
+        },
+        "repl": {
+          "file": "src/runtime_modules/node/repl.js",
+          "compatMarkers": [
+            "node:repl editor/history - basic REPL evaluation is implemented; terminal editing and persistent history need readline TTY integration."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "sqlite": {
+          "file": "src/runtime_modules/node/sqlite.js",
+          "compatMarkers": [
+            "node:sqlite session/window extensions - DatabaseSync, StatementSync, SQLTagStore, scalar and aggregate user functions, authorizers, backup, constants, and synchronous query execution use native sqlite3; Session/changesets, window inverse callbacks, and extension loading need additional sqlite3 extension/callback bindings."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 242,
+              "text": "throw new Error(\"DatabaseSync.aggregate window inverse requires native SQLite window callback support\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-sqlite-surface.ts"
+          ]
+        },
+        "stream/web": {
+          "file": "src/runtime_modules/node/stream/web.js",
+          "compatMarkers": [
+            "node:stream/web - implements common reader/writer/enqueue semantics; BYOB and compression byte transforms need deeper Web Streams parity."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-stream-surface.ts"
+          ]
+        },
+        "tls": {
+          "file": "src/runtime_modules/node/tls.js",
+          "compatMarkers": [
+            "node:tls sockets - certificate identity checks, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, and default cipher inventory are implemented; exported TLS socket/server entry points fail loudly until native TLS bindings land."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 151,
+              "text": "const error = unsupportedTls(\"tls.TLSSocket.renegotiate\");"
+            },
+            {
+              "line": 168,
+              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedTls(\"tls.Server.listen\")));"
+            },
+            {
+              "line": 178,
+              "text": "queueMicrotask(() => socket.destroy(unsupportedTls(\"tls.connect\")));"
+            }
+          ],
+          "tests": [
+            "tests/js/node-tls-http2-surface.ts"
+          ]
+        },
+        "url": {
+          "file": "src/runtime_modules/node/url.js",
+          "compatMarkers": [
+            "node:url URLPattern - supports common component matching, named groups, and wildcards; full URLPattern grammar modifiers and custom regex edge cases need a dedicated parser."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "util/types": {
+          "file": "src/runtime_modules/node/util/types.js",
+          "compatMarkers": [
+            "util.types.isExternal - requires native VM object introspection; add a JSC-backed predicate.",
+            "util.types.isProxy - requires native proxy introspection; add a JSC-backed predicate."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-util-sys-surface.ts"
+          ]
+        },
+        "util": {
+          "file": "src/runtime_modules/node/util.js",
+          "compatMarkers": [
+            "node:util diagnostics - diff/getCallSites/debug output is simplified; replace with richer inspector-backed data later."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-util-sys-surface.ts"
+          ]
+        },
+        "v8": {
+          "file": "src/runtime_modules/node/v8.js",
+          "compatMarkers": [
+            "node:v8 engine internals - serialization and heap snapshots use Cottontail/JSC data; V8 heap object queries, coverage, and promise hooks need engine instrumentation for full parity."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 93,
+              "text": "if (payload.cottontailV8 !== formatVersion) throw new Error(\"Unsupported Cottontail v8 serialization format\");"
+            }
+          ],
+          "tests": [
+            "tests/js/node-v8-surface.ts"
+          ]
+        },
+        "vm": {
+          "file": "src/runtime_modules/node/vm.js",
+          "compatMarkers": [
+            "node:vm context isolation - code executes through JSC eval/Function with object scopes; full V8 contextification and heap measurement require native VM support."
+          ],
+          "unsupportedMarkers": [],
+          "tests": []
+        },
+        "wasi": {
+          "file": "src/runtime_modules/node/wasi.js",
+          "compatMarkers": [
+            "node:wasi syscalls - WASI object lifecycle is implemented; syscall imports throw until a native WASI layer is added."
+          ],
+          "unsupportedMarkers": [
+            {
+              "line": 3,
+              "text": "throw new Error(`WASI import ${name} is not implemented in Cottontail yet`);"
+            },
+            {
+              "line": 38,
+              "text": "// COTTONTAIL-COMPAT: node:wasi syscalls - WASI object lifecycle is implemented; syscall imports throw until a native WASI layer is added."
+            }
+          ],
+          "tests": []
+        },
+        "worker_threads": {
+          "file": "src/runtime_modules/node/worker_threads.js",
+          "compatMarkers": [
+            "node:worker_threads - Worker/message transport uses Cottontail native workers; transferable objects, shared memory, and per-thread inspector/resource accounting need deeper runtime support."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-worker-threads-surface.ts"
+          ]
+        },
+        "zlib": {
+          "file": "src/runtime_modules/node/zlib.js",
+          "compatMarkers": [
+            "node:zlib streaming/options - zlib/gzip/deflate/Brotli/Zstd streams and crc32 are implemented with whole-buffer transforms; advanced flush/window/dictionary streaming semantics need deeper native stream state."
+          ],
+          "unsupportedMarkers": [],
+          "tests": [
+            "tests/js/node-constants-zlib-crypto.ts",
+            "tests/js/node-zlib-streams-surface.ts"
+          ]
         }
       }
     }

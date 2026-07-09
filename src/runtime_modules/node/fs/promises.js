@@ -7,6 +7,8 @@ import {
   constants as fsConstants,
   copyFileSync,
   cpSync,
+  createReadStream,
+  createWriteStream,
   fchmodSync,
   fchownSync,
   fdatasyncSync,
@@ -29,6 +31,7 @@ import {
   readSync,
   readdirSync,
   readlinkSync,
+  readvSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -42,7 +45,9 @@ import {
   watch as watchSync,
   writeFileSync,
   writeSync,
+  writevSync,
 } from "../fs.js";
+import { ReadableStream as WebReadableStream } from "../stream/web.js";
 
 export const constants = fsConstants;
 
@@ -106,21 +111,89 @@ export async function mkdtempDisposable(prefix) {
   return mkdtempDisposableSync(prefix);
 }
 
+let nextFileHandleAsyncId = 1;
+
+function createReadLinesInterface(stream) {
+  let closed = false;
+  const lines = {
+    close() {
+      closed = true;
+      stream.close?.();
+    },
+    async *[Symbol.asyncIterator]() {
+      let buffered = "";
+      try {
+        for await (const chunk of stream) {
+          if (closed) break;
+          buffered += String(chunk);
+          for (;;) {
+            const match = buffered.match(/\r?\n/);
+            if (!match) break;
+            const line = buffered.slice(0, match.index);
+            buffered = buffered.slice(match.index + match[0].length);
+            yield line;
+          }
+        }
+        if (!closed && buffered.length > 0) yield buffered.replace(/\r$/, "");
+      } finally {
+        if (!closed) lines.close();
+      }
+    },
+  };
+  return lines;
+}
+
 class FileHandle {
   constructor(fd, path) {
     this.fd = fd;
     this.path = path;
+    this._asyncId = nextFileHandleAsyncId++;
   }
 
   appendFile(data, options = undefined) { return appendFile(this.fd, data, options); }
   chmod(mode) { return Promise.resolve(fchmodSync(this.fd, mode)); }
   chown(uid, gid) { return Promise.resolve(fchownSync(this.fd, uid, gid)); }
   close() { const fd = this.fd; this.fd = -1; return Promise.resolve(closeSync(fd)); }
+  createReadStream(options = {}) {
+    const stream = createReadStream(this.path, { ...options, fd: this.fd });
+    if (options?.autoClose !== false) stream.once("close", () => { this.fd = -1; });
+    return stream;
+  }
+  createWriteStream(options = {}) {
+    const stream = createWriteStream(this.path, { ...options, fd: this.fd });
+    if (options?.autoClose !== false) stream.once("close", () => { this.fd = -1; });
+    return stream;
+  }
   datasync() { return Promise.resolve(fdatasyncSync(this.fd)); }
+  getAsyncId() { return this._asyncId; }
   read(buffer, offset = 0, length = buffer.byteLength - offset, position = null) {
     return Promise.resolve({ bytesRead: readSync(this.fd, buffer, offset, length, position), buffer });
   }
-  readFile(options = undefined) { return readFile(this.path, options); }
+  readFile(options = undefined) { return Promise.resolve(readFileSync(this.fd, options)); }
+  readLines(options = {}) {
+    return createReadLinesInterface(this.createReadStream({ ...options, encoding: options?.encoding ?? "utf8" }));
+  }
+  readableWebStream(options = {}) {
+    const highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 64 * 1024), 1024 * 1024));
+    return new WebReadableStream({
+      pull: (controller) => {
+        try {
+          const chunk = new Uint8Array(highWaterMark);
+          const bytesRead = readSync(this.fd, chunk, 0, chunk.byteLength, null);
+          if (bytesRead <= 0) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(chunk.subarray(0, bytesRead));
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    });
+  }
+  readv(buffers, position = null) {
+    return Promise.resolve({ bytesRead: readvSync(this.fd, buffers, position), buffers });
+  }
   stat(options = undefined) { return Promise.resolve(fstatSync(this.fd, options)); }
   sync() { return Promise.resolve(fsyncSync(this.fd)); }
   truncate(len = 0) { return Promise.resolve(ftruncateSync(this.fd, len)); }
@@ -128,7 +201,10 @@ class FileHandle {
   write(data, offset = 0, length = undefined, position = null) {
     return Promise.resolve({ bytesWritten: writeSync(this.fd, data, offset, length, position), buffer: data });
   }
-  writeFile(data, options = undefined) { return writeFile(this.path, data, options); }
+  writeFile(data, options = undefined) { writeFileSync(this.fd, data, options); return Promise.resolve(); }
+  writev(buffers, position = null) {
+    return Promise.resolve({ bytesWritten: writevSync(this.fd, buffers, position), buffers });
+  }
 }
 
 export async function open(path, flags = "r", mode = 0o666) {

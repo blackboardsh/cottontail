@@ -28,10 +28,16 @@ test result. It records:
 - the local Bun `Bun` object, selected `bun:*` module exports, and globals
 - the Cottontail runtime-module exports found under `src/runtime_modules`
 - a first-pass name-level coverage comparison
+- a heuristic Node behavioral-readiness signal based on inline caveats,
+  explicit unsupported/native markers, and Node-focused test files
 
 Unsupported APIs should stay visible in this manifest until they are implemented
 and covered by tests. Runtime stubs should throw clear errors when added; they
 should not print to stdout because that would affect CLI/app behavior.
+
+The behavioral-readiness percentage is intentionally rough. It is not a Node
+conformance score; it is a dashboard signal that should move as compatibility
+caveats are added, removed, and covered by tests.
 
 ## Inline Caveats
 
