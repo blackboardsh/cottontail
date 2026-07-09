@@ -82,6 +82,12 @@ function pathJoin(...parts) {
   return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
 }
 
+function tmpRoot(kind) {
+  const env = BunObject.env ?? cottontail.env();
+  const base = String(env.COTTONTAIL_TMP_DIR || env.TMPDIR || env.TEMP || env.TMP || "/tmp");
+  return pathJoin(base, "cottontail", kind);
+}
+
 function which(command) {
   const value = String(command || "");
   if (!value) return null;
@@ -122,7 +128,7 @@ console.log(JSON.stringify({ success: result.success !== false, logs: result.log
 `;
 
 export async function build(options) {
-  const tmp = pathJoin(cottontail.cwd(), ".cottontail-tmp", "bun-build");
+  const tmp = tmpRoot("bun-build");
   cottontail.mkdirSync(tmp, true);
   const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
   const specPath = pathJoin(tmp, `build-${id}.json`);
@@ -191,11 +197,46 @@ function normalizeSpawnOptions(options = {}, defaults = {}) {
   return {
     cwd: options.cwd,
     env: options.env,
+    clearEnv: options.env !== undefined,
     stdin,
     stdout,
     stderr,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
   };
+}
+
+function currentProcessEnv() {
+  return { ...(globalThis.process?.env ?? BunObject.env ?? cottontail.env()) };
+}
+
+function withoutElectrobunHostEnv(env) {
+  const next = { ...(env ?? {}) };
+  for (const key of Object.keys(next)) {
+    if (key.startsWith("COTTONTAIL_ELECTROBUN_")) delete next[key];
+  }
+  return next;
+}
+
+function isCurrentCottontailExecutable(file) {
+  const execPath = String(globalThis.process?.execPath ?? cottontail.execPath?.() ?? "");
+  return execPath.length > 0 && String(file) === execPath;
+}
+
+function prepareNativeSpawnOptions(file, nativeOptions) {
+  if (isCurrentCottontailExecutable(file) && nativeOptions.env === undefined) {
+    return {
+      ...nativeOptions,
+      env: withoutElectrobunHostEnv(currentProcessEnv()),
+      clearEnv: true,
+    };
+  }
+  if (nativeOptions.env !== undefined) {
+    return {
+      ...nativeOptions,
+      clearEnv: true,
+    };
+  }
+  return nativeOptions;
 }
 
 function asBuffer(value) {
@@ -212,6 +253,20 @@ function concatBuffers(left, right) {
   const out = new Uint8Array(lhs.length + rhs.length);
   out.set(lhs, 0);
   out.set(rhs, lhs.length);
+  return out;
+}
+
+function concatManyBuffers(chunks) {
+  if (globalThis.Buffer?.concat) return globalThis.Buffer.concat(chunks.map(asBuffer));
+  let length = 0;
+  for (const chunk of chunks) length += asBuffer(chunk).length;
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const bytes = asBuffer(chunk);
+    out.set(bytes, offset);
+    offset += bytes.length;
+  }
   return out;
 }
 
@@ -245,11 +300,12 @@ function signalNumber(signal = "SIGTERM") {
 
 export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
   const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
-  const nativeOptions = normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const nativeOptions = prepareNativeSpawnOptions(file, normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
   const inherited = nativeOptions.stdin === "inherit" || nativeOptions.stdout === "inherit" || nativeOptions.stderr === "inherit";
   const result = cottontail.spawnSync(file, args, {
     cwd: nativeOptions.cwd,
     env: nativeOptions.env,
+    clearEnv: nativeOptions.clearEnv,
     stdio: inherited ? "inherit" : "pipe",
   });
   const exitCode = Number(result.status ?? result.exitCode ?? 0);
@@ -267,6 +323,9 @@ class ProcessReadable {
   constructor(read) {
     this._read = read;
     this._listeners = new Map();
+    this._chunks = [];
+    this._readRequests = [];
+    this._ended = false;
   }
   on(name, handler) {
     if (typeof handler !== "function") return this;
@@ -294,7 +353,26 @@ class ProcessReadable {
     return this.off(name, handler);
   }
   emit(name, ...args) {
+    if (name === "data") this._push(args[0]);
+    if (name === "end" || name === "close") this._finish();
     for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
+  }
+  _push(chunk) {
+    if (this._ended) return;
+    if (this._readRequests.length > 0) {
+      const resolve = this._readRequests.shift();
+      resolve({ done: false, value: chunk });
+      return;
+    }
+    this._chunks.push(chunk);
+  }
+  _finish() {
+    if (this._ended) return;
+    this._ended = true;
+    while (this._readRequests.length > 0) {
+      const resolve = this._readRequests.shift();
+      resolve({ done: true, value: undefined });
+    }
   }
   async arrayBuffer() {
     const bytes = asBuffer(await this._read());
@@ -310,22 +388,28 @@ class ProcessReadable {
     return JSON.parse(await this.text());
   }
   getReader() {
-    let used = false;
+    let cancelled = false;
     return {
       read: async () => {
-        if (used) return { done: true, value: undefined };
-        used = true;
-        return { done: false, value: await this.bytes() };
+        if (cancelled) return { done: true, value: undefined };
+        if (this._chunks.length > 0) return { done: false, value: this._chunks.shift() };
+        if (this._ended) return { done: true, value: undefined };
+        return new Promise((resolve) => this._readRequests.push(resolve));
       },
       releaseLock() {},
       cancel() {
-        used = true;
+        cancelled = true;
         return Promise.resolve();
       },
     };
   }
   async *[Symbol.asyncIterator]() {
-    yield await this.bytes();
+    const reader = this.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      yield value;
+    }
   }
 }
 
@@ -387,7 +471,7 @@ class ProcessWritable {
 
 export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
   const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
-  const nativeOptions = normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const nativeOptions = prepareNativeSpawnOptions(file, normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
   const listeners = new Map();
   let killed = false;
   let exitCode = null;
@@ -537,6 +621,32 @@ function bytesFromData(data) {
   return new TextEncoder().encode(String(data));
 }
 
+async function bytesFromBody(body) {
+  if (body == null) return new Uint8Array(0);
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  if (typeof body.bytes === "function") return asBuffer(await body.bytes());
+  if (typeof body.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer());
+  if (typeof body.getReader === "function") {
+    const reader = body.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(asBuffer(value));
+    }
+    return concatManyBuffers(chunks);
+  }
+  if (typeof body[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    for await (const chunk of body) chunks.push(asBuffer(chunk));
+    return concatManyBuffers(chunks);
+  }
+  if (typeof body.text === "function") return new TextEncoder().encode(await body.text());
+  return bytesFromData(body);
+}
+
 function arrayBufferFromBytes(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
@@ -637,14 +747,14 @@ export class Request {
     this.url = typeof input === "string" ? input : String(input?.url ?? "");
     this.method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     this.headers = new Headers(init.headers ?? input?.headers);
-    this._body = bytesFromData(init.body ?? input?._body);
+    this._body = init.body ?? input?._body ?? null;
     this.params = init.params ?? input?.params ?? {};
   }
   async arrayBuffer() {
-    return arrayBufferFromBytes(this._body);
+    return arrayBufferFromBytes(await bytesFromBody(this._body));
   }
   async text() {
-    return new TextDecoder().decode(this._body);
+    return new TextDecoder().decode(await bytesFromBody(this._body));
   }
   async json() {
     return JSON.parse(await this.text());
@@ -656,7 +766,7 @@ export class Response {
     this.status = Number(init.status ?? 200);
     this.statusText = String(init.statusText ?? "");
     this.headers = new Headers(init.headers);
-    this._body = bytesFromData(body);
+    this._body = body;
   }
   static json(value, init = {}) {
     const headers = new Headers(init.headers);
@@ -667,10 +777,10 @@ export class Response {
     return new Response(null, { status, headers: { location: String(url) } });
   }
   async arrayBuffer() {
-    return arrayBufferFromBytes(this._body);
+    return arrayBufferFromBytes(await bytesFromBody(this._body));
   }
   async text() {
-    return new TextDecoder().decode(this._body);
+    return new TextDecoder().decode(await bytesFromBody(this._body));
   }
   async json() {
     return JSON.parse(await this.text());
@@ -881,7 +991,13 @@ export function serve(options = {}) {
   };
 
   const responseBody = (response) => {
-    if (response instanceof Response) return arrayBufferFromBytes(response._body);
+    if (response instanceof Response) {
+      const body = response._body;
+      if (body == null || typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+        return arrayBufferFromBytes(bytesFromData(body));
+      }
+      return response.arrayBuffer();
+    }
     return response.arrayBuffer();
   };
 
@@ -1039,9 +1155,9 @@ export class Archive {
   async extract(destination) {
     const dest = String(destination);
     cottontail.mkdirSync(dest, true);
-    const tmpRoot = pathJoin(cottontail.cwd(), ".cottontail-tmp", "archive");
-    cottontail.mkdirSync(tmpRoot, true);
-    const tarPath = pathJoin(tmpRoot, `archive-${Date.now()}-${Math.floor(Math.random() * 1000000)}.tar`);
+    const archiveTmpRoot = tmpRoot("archive");
+    cottontail.mkdirSync(archiveTmpRoot, true);
+    const tarPath = pathJoin(archiveTmpRoot, `archive-${Date.now()}-${Math.floor(Math.random() * 1000000)}.tar`);
     cottontail.writeFile(tarPath, this._bytes);
     const result = cottontail.spawnSync("tar", ["-xf", tarPath, "-C", dest], { stdio: "pipe" });
     cottontail.unlinkSync(tarPath);

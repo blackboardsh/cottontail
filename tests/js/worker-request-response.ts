@@ -29,6 +29,8 @@ if (JSON.stringify(result) !== JSON.stringify({
   payload: {
     method: "ping",
     params: { ok: true },
+    scriptRan: true,
+    imported: 1,
   },
 })) {
   throw new Error(`worker response mismatch: ${JSON.stringify(result)}`);

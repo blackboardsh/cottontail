@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+
+const resolved = require.resolve("./require-resolve-target");
+const value = require(resolved);
+
+if (value !== "ok") {
+  throw new Error("require target mismatch");
+}
+
+console.log("extensionless require resolve passed");

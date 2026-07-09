@@ -106,7 +106,7 @@ try {
         COTTONTAIL_TMP_DIR: tempDir,
       },
       expectExitCode: 0,
-      stdoutIncludes: ['bun apis passed'],
+      stdoutIncludes: ['"cottontailConsoleObject": true', 'bun apis passed'],
     },
     {
       name: 'bun-global',
@@ -119,6 +119,33 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-spawn.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun serve spawn ts passed'],
+    },
+    {
+      name: 'bun-spawn-streaming',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-spawn-streaming.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun spawn streaming passed'],
+    },
+    {
+      name: 'bun-spawn-execpath-env',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-spawn-execpath-env.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun spawn execpath env passed'],
+    },
+    {
+      name: 'extensionless-require-resolve',
+      scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'extensionless-require-resolve'),
+      expectExitCode: 0,
+      stdoutIncludes: ['extensionless require resolve passed'],
+    },
+    {
+      name: 'extensionless-require-resolve-invalid-cottontail-home',
+      scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'extensionless-require-resolve'),
+      env: {
+        COTTONTAIL_HOME: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['extensionless require resolve passed'],
     },
     {
       name: 'bun-serve-detached',
@@ -151,13 +178,47 @@ try {
       name: 'node-child-process',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process.ts'),
       expectExitCode: 0,
-      stdoutIncludes: ['node child_process spawn passed'],
+      stdoutIncludes: ['inherited-stdout', 'node child_process spawn passed'],
+      stderrIncludes: ['inherited-stderr'],
+    },
+    {
+      name: 'node-child-process-fork',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-fork.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process fork passed'],
     },
     {
       name: 'node-os',
       scriptPath: join(rootDir, 'tests', 'js', 'node-os.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node os passed'],
+    },
+    {
+      name: 'node-process',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-process.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node process passed'],
+    },
+    {
+      name: 'node-module-direct-package-root',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-module-direct-package-root.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node module direct package root passed'],
+    },
+    {
+      name: 'node-net',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-net.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node net passed'],
+    },
+    {
+      name: 'node-readline',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-readline.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node readline passed'],
     },
     {
       name: 'proxy-function',

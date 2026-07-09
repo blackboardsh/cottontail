@@ -36,6 +36,8 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
 
     if (step.root_module.resolved_target.?.result.os.tag == .macos) {
         step.root_module.linkFramework("JavaScriptCore", .{});
+        step.root_module.linkSystemLibrary("ffi", .{});
+        step.root_module.linkSystemLibrary("pthread", .{});
     } else {
         @panic("JavaScriptCore backend is currently wired for macOS only");
     }

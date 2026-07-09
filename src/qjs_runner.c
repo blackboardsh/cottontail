@@ -43,8 +43,27 @@ extern char **environ;
 #define CT_MAX_IDLE_TICK_MS 50u
 
 #if !defined(_WIN32)
+static void ct_clear_environment(void) {
+    while (environ != NULL && environ[0] != NULL) {
+        const char *entry = environ[0];
+        const char *equals = strchr(entry, '=');
+        if (equals == NULL) break;
+        size_t name_len = (size_t)(equals - entry);
+        char *name = (char *)malloc(name_len + 1);
+        if (name == NULL) return;
+        memcpy(name, entry, name_len);
+        name[name_len] = '\0';
+        unsetenv(name);
+        free(name);
+    }
+}
+#endif
+
+#if !defined(_WIN32)
 typedef struct CtWorker CtWorker;
 typedef struct CtProcessEvent CtProcessEvent;
+typedef struct CtFdEvent CtFdEvent;
+typedef struct CtFdWatcher CtFdWatcher;
 #endif
 
 #if defined(_WIN32)
@@ -76,6 +95,7 @@ typedef struct {
     const char *cwd;
     const CtHostEnvEntry *env_entries;
     size_t env_count;
+    bool clear_env;
     bool capture_output;
 } CtHostSpawnOptions;
 
@@ -157,6 +177,8 @@ struct CtQjsRuntime {
     JSContext *context;
     JSValue host_object;
     JSValue process_event_callback;
+    JSValue fd_event_callback;
+    JSValue worker_event_callback;
     uint32_t next_tick_delay_ms;
     int pending_unhandled_rejections;
     char *last_unhandled_rejection;
@@ -167,6 +189,13 @@ struct CtQjsRuntime {
     pthread_mutex_t process_event_mutex;
     CtProcessEvent *process_events_head;
     CtProcessEvent *process_events_tail;
+    pthread_mutex_t fd_event_mutex;
+    CtFdEvent *fd_events_head;
+    CtFdEvent *fd_events_tail;
+    pthread_mutex_t worker_event_mutex;
+    struct CtWorkerEvent *worker_events_head;
+    struct CtWorkerEvent *worker_events_tail;
+    uint32_t next_fd_watch_id;
     CtWorker *worker;
 #endif
     CtFfiCallbackJob *callback_jobs_head;
@@ -261,16 +290,45 @@ static pthread_mutex_t ct_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtProcess *ct_processes = NULL;
 static uint32_t ct_next_process_id = 1;
 
+struct CtFdEvent {
+    uint32_t watch_id;
+    char *type;
+    char *data;
+    size_t data_len;
+    char *message;
+    struct CtFdEvent *next;
+};
+
+struct CtFdWatcher {
+    uint32_t id;
+    int fd;
+    size_t max_bytes;
+    CtQjsRuntime *runtime;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool active;
+    struct CtFdWatcher *next;
+};
+
+static pthread_mutex_t ct_fd_watchers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtFdWatcher *ct_fd_watchers = NULL;
+
 typedef struct CtWorkerMessage {
     char *json;
     struct CtWorkerMessage *next;
 } CtWorkerMessage;
+
+typedef struct CtWorkerEvent {
+    uint32_t worker_id;
+    struct CtWorkerEvent *next;
+} CtWorkerEvent;
 
 struct CtWorker {
     uint32_t id;
     pthread_t thread;
     bool terminated;
     pthread_mutex_t mutex;
+    CtQjsRuntime *parent_runtime;
     CtWorkerMessage *parent_to_worker_head;
     CtWorkerMessage *parent_to_worker_tail;
     CtWorkerMessage *worker_to_parent_head;
@@ -285,6 +343,12 @@ static uint32_t ct_next_worker_id = 1;
 
 static JSValue ct_throw_host_error(JSContext *ctx, char *error_message);
 static int ct_drain_jobs(CtQjsRuntime *runtime, char **error_out);
+#if !defined(_WIN32)
+static void *ct_fd_watcher_thread(void *opaque);
+static void ct_fd_watcher_set_active(CtFdWatcher *watcher, bool active);
+static void ct_fd_watchers_remove(CtFdWatcher *watcher);
+static bool ct_fd_watcher_stop_id(uint32_t id);
+#endif
 
 static char *ct_duplicate_bytes(const char *value, size_t len) {
     char *copy = (char *) malloc(len + 1);
@@ -300,6 +364,11 @@ static char *ct_duplicate_bytes(const char *value, size_t len) {
 
 static char *ct_duplicate_string(const char *value) {
     return ct_duplicate_bytes(value, strlen(value));
+}
+
+static bool ct_debug_flag(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL && value[0] != 0 && strcmp(value, "0") != 0;
 }
 
 static void ct_free_string(char **value_ptr) {
@@ -1040,6 +1109,27 @@ static JSValue ct_pid(JSContext *ctx, JSValueConst this_val, int argc, JSValueCo
 #endif
 }
 
+static JSValue ct_kill_process(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int32_t pid = 0;
+    int32_t signal_number = SIGTERM;
+    (void) this_val;
+
+    if (argc < 1) return JS_ThrowTypeError(ctx, "cottontail.kill(pid[, signal]) requires a process id");
+    if (JS_ToInt32(ctx, &pid, argv[0]) != 0) return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]) && JS_ToInt32(ctx, &signal_number, argv[1]) != 0) {
+        return JS_EXCEPTION;
+    }
+
+#if defined(_WIN32)
+    return JS_ThrowInternalError(ctx, "cottontail.kill is not implemented on Windows yet");
+#else
+    if (kill((pid_t) pid, signal_number) != 0) {
+        return JS_ThrowInternalError(ctx, "%s", strerror(errno));
+    }
+    return JS_NewBool(ctx, true);
+#endif
+}
+
 static JSValue ct_read_file(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     const char *path = NULL;
     char *buffer = NULL;
@@ -1095,6 +1185,60 @@ static JSValue ct_read_file_buffer(JSContext *ctx, JSValueConst this_val, int ar
     result = JS_NewArrayBufferCopy(ctx, (const uint8_t *) buffer, buffer_len);
     free(buffer);
     JS_FreeCString(ctx, path);
+    return result;
+}
+
+static int ct_fill_random_bytes(uint8_t *buffer, size_t len) {
+    if (len == 0) return 0;
+#if defined(_WIN32)
+    (void) buffer;
+    errno = ENOSYS;
+    return -1;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(buffer, len);
+    return 0;
+#else
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t count = read(fd, buffer + offset, len - offset);
+        if (count > 0) {
+            offset += (size_t) count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+#endif
+}
+
+static JSValue ct_random_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int64_t len_value = 0;
+    uint8_t *buffer = NULL;
+    JSValue result;
+    (void) this_val;
+
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.randomBytes(size) requires a byte length");
+    }
+    if (JS_ToInt64(ctx, &len_value, argv[0]) != 0) return JS_EXCEPTION;
+    if (len_value < 0 || len_value > INT32_MAX) {
+        return JS_ThrowRangeError(ctx, "Invalid random byte length");
+    }
+
+    buffer = (uint8_t *) malloc((size_t) len_value > 0 ? (size_t) len_value : 1);
+    if (buffer == NULL) return JS_ThrowOutOfMemory(ctx);
+    if (ct_fill_random_bytes(buffer, (size_t) len_value) != 0) {
+        JSValue exception = JS_ThrowInternalError(ctx, "%s", strerror(errno));
+        free(buffer);
+        return exception;
+    }
+    result = JS_NewArrayBufferCopy(ctx, buffer, (size_t) len_value);
+    free(buffer);
     return result;
 }
 
@@ -1355,6 +1499,166 @@ static JSValue ct_close_fd(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return JS_UNDEFINED;
 }
 
+static JSValue ct_fd_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int32_t fd = -1;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    const char *string_value = NULL;
+    size_t string_len = 0;
+    bool ok = true;
+    (void) this_val;
+
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "cottontail.fdWrite(fd, data) requires a file descriptor and data");
+    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) != 0) return JS_EXCEPTION;
+    if (fd < 0) return JS_NewBool(ctx, false);
+
+    if (ct_get_array_buffer_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        string_value = JS_ToCStringLen(ctx, &string_len, argv[1]);
+        if (string_value == NULL) return JS_EXCEPTION;
+        bytes = (uint8_t *) string_value;
+        len = string_len;
+    }
+
+    {
+        size_t written_total = 0;
+        while (written_total < len) {
+            ssize_t written = write(fd, bytes + written_total, len - written_total);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                ok = false;
+                break;
+            }
+            written_total += (size_t) written;
+        }
+    }
+
+    if (string_value != NULL) JS_FreeCString(ctx, string_value);
+    return JS_NewBool(ctx, ok);
+}
+
+static JSValue ct_fd_watch_start(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    int32_t fd = -1;
+    int32_t max_bytes_value = 65536;
+    size_t max_bytes = 65536;
+    (void) this_val;
+
+    if (runtime == NULL || argc < 1) {
+        return JS_ThrowTypeError(ctx, "cottontail.fdWatchStart(fd[, maxBytes]) requires a file descriptor");
+    }
+    if (JS_ToInt32(ctx, &fd, argv[0]) != 0) return JS_EXCEPTION;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]) && JS_ToInt32(ctx, &max_bytes_value, argv[1]) != 0) {
+        return JS_EXCEPTION;
+    }
+    if (fd < 0) return JS_ThrowRangeError(ctx, "invalid file descriptor: %d", fd);
+    if (max_bytes_value > 0) max_bytes = (size_t) max_bytes_value;
+    if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
+
+#if defined(_WIN32)
+    return JS_ThrowInternalError(ctx, "fdWatchStart is not implemented on Windows yet");
+#else
+    CtFdWatcher *watcher = (CtFdWatcher *) calloc(1, sizeof(CtFdWatcher));
+    if (watcher == NULL) return JS_ThrowOutOfMemory(ctx);
+
+    watcher->id = ++runtime->next_fd_watch_id;
+    if (watcher->id == 0) watcher->id = ++runtime->next_fd_watch_id;
+    watcher->fd = fd;
+    watcher->max_bytes = max_bytes;
+    watcher->runtime = runtime;
+    watcher->active = true;
+    pthread_mutex_init(&watcher->mutex, NULL);
+    if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+        fprintf(stderr, "[cottontail:fd] start id=%u fd=%d max=%zu\n", watcher->id, watcher->fd, watcher->max_bytes);
+        fflush(stderr);
+    }
+
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    watcher->next = ct_fd_watchers;
+    ct_fd_watchers = watcher;
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+
+    if (pthread_create(&watcher->thread, NULL, ct_fd_watcher_thread, watcher) != 0) {
+        ct_fd_watcher_set_active(watcher, false);
+        ct_fd_watchers_remove(watcher);
+        pthread_mutex_destroy(&watcher->mutex);
+        free(watcher);
+        return JS_ThrowInternalError(ctx, "failed to create fd watcher thread");
+    }
+    pthread_detach(watcher->thread);
+
+    JSValue result = JS_NewObject(ctx);
+    if (JS_IsException(result)) return result;
+    if (JS_SetPropertyStr(ctx, result, "id", JS_NewUint32(ctx, watcher->id)) < 0) {
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+    return result;
+#endif
+}
+
+static JSValue ct_fd_watch_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    int32_t id = 0;
+    (void) this_val;
+
+    if (argc < 1) return JS_NewBool(ctx, false);
+    if (JS_ToInt32(ctx, &id, argv[0]) != 0) return JS_EXCEPTION;
+#if defined(_WIN32)
+    return JS_NewBool(ctx, false);
+#else
+    return JS_NewBool(ctx, id > 0 && ct_fd_watcher_stop_id((uint32_t) id));
+#endif
+}
+
+static JSValue ct_fd_set_event_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    (void) this_val;
+
+    if (runtime == NULL) {
+        return JS_ThrowInternalError(ctx, "Cottontail runtime is not available");
+    }
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+        if (!JS_IsUndefined(runtime->fd_event_callback)) {
+            JS_FreeValue(ctx, runtime->fd_event_callback);
+        }
+        runtime->fd_event_callback = JS_UNDEFINED;
+        return JS_UNDEFINED;
+    }
+    if (!JS_IsFunction(ctx, argv[0])) {
+        return JS_ThrowTypeError(ctx, "fdSetEventHandler requires a function, null, or undefined");
+    }
+    if (!JS_IsUndefined(runtime->fd_event_callback)) {
+        JS_FreeValue(ctx, runtime->fd_event_callback);
+    }
+    runtime->fd_event_callback = JS_DupValue(ctx, argv[0]);
+    return JS_UNDEFINED;
+}
+
+static JSValue ct_worker_set_event_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    (void) this_val;
+
+    if (runtime == NULL) {
+        return JS_ThrowInternalError(ctx, "Cottontail runtime is not available");
+    }
+    if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+        if (!JS_IsUndefined(runtime->worker_event_callback)) {
+            JS_FreeValue(ctx, runtime->worker_event_callback);
+        }
+        runtime->worker_event_callback = JS_UNDEFINED;
+        return JS_UNDEFINED;
+    }
+    if (!JS_IsFunction(ctx, argv[0])) {
+        return JS_ThrowTypeError(ctx, "workerSetEventHandler requires a function, null, or undefined");
+    }
+    if (!JS_IsUndefined(runtime->worker_event_callback)) {
+        JS_FreeValue(ctx, runtime->worker_event_callback);
+    }
+    runtime->worker_event_callback = JS_DupValue(ctx, argv[0]);
+    return JS_UNDEFINED;
+}
+
 static JSValue ct_env(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void) this_val;
 
@@ -1441,9 +1745,55 @@ static JSValue ct_exists_sync(JSContext *ctx, JSValueConst this_val, int argc, J
     return JS_NewBool(ctx, exists);
 }
 
+static double ct_stat_time_ms(time_t seconds, long nanoseconds) {
+    return ((double) seconds * 1000.0) + ((double) nanoseconds / 1000000.0);
+}
+
+static double ct_stat_atime_ms(const struct stat *stat_value) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return ct_stat_time_ms(stat_value->st_atimespec.tv_sec, stat_value->st_atimespec.tv_nsec);
+#elif defined(__linux__)
+    return ct_stat_time_ms(stat_value->st_atim.tv_sec, stat_value->st_atim.tv_nsec);
+#else
+    return ct_stat_time_ms(stat_value->st_atime, 0);
+#endif
+}
+
+static double ct_stat_mtime_ms(const struct stat *stat_value) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return ct_stat_time_ms(stat_value->st_mtimespec.tv_sec, stat_value->st_mtimespec.tv_nsec);
+#elif defined(__linux__)
+    return ct_stat_time_ms(stat_value->st_mtim.tv_sec, stat_value->st_mtim.tv_nsec);
+#else
+    return ct_stat_time_ms(stat_value->st_mtime, 0);
+#endif
+}
+
+static double ct_stat_ctime_ms(const struct stat *stat_value) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return ct_stat_time_ms(stat_value->st_ctimespec.tv_sec, stat_value->st_ctimespec.tv_nsec);
+#elif defined(__linux__)
+    return ct_stat_time_ms(stat_value->st_ctim.tv_sec, stat_value->st_ctim.tv_nsec);
+#else
+    return ct_stat_time_ms(stat_value->st_ctime, 0);
+#endif
+}
+
+static double ct_stat_birthtime_ms(const struct stat *stat_value) {
+#if defined(__APPLE__) || defined(__MACH__)
+    return ct_stat_time_ms(stat_value->st_birthtimespec.tv_sec, stat_value->st_birthtimespec.tv_nsec);
+#else
+    return ct_stat_ctime_ms(stat_value);
+#endif
+}
+
 static int ct_define_stat_fields(JSContext *ctx, JSValueConst result, const struct stat *stat_value) {
     if (JS_SetPropertyStr(ctx, result, "size", JS_NewFloat64(ctx, (double) stat_value->st_size)) < 0 ||
         JS_SetPropertyStr(ctx, result, "mode", JS_NewInt32(ctx, (int32_t) stat_value->st_mode)) < 0 ||
+        JS_SetPropertyStr(ctx, result, "atimeMs", JS_NewFloat64(ctx, ct_stat_atime_ms(stat_value))) < 0 ||
+        JS_SetPropertyStr(ctx, result, "mtimeMs", JS_NewFloat64(ctx, ct_stat_mtime_ms(stat_value))) < 0 ||
+        JS_SetPropertyStr(ctx, result, "ctimeMs", JS_NewFloat64(ctx, ct_stat_ctime_ms(stat_value))) < 0 ||
+        JS_SetPropertyStr(ctx, result, "birthtimeMs", JS_NewFloat64(ctx, ct_stat_birthtime_ms(stat_value))) < 0 ||
         JS_SetPropertyStr(ctx, result, "isFile", JS_NewBool(ctx, S_ISREG(stat_value->st_mode))) < 0 ||
         JS_SetPropertyStr(ctx, result, "isDirectory", JS_NewBool(ctx, S_ISDIR(stat_value->st_mode))) < 0 ||
         JS_SetPropertyStr(ctx, result, "isSymbolicLink", JS_NewBool(ctx, S_ISLNK(stat_value->st_mode))) < 0) {
@@ -2447,6 +2797,388 @@ static int ct_drain_process_events(CtQjsRuntime *runtime, char **error_out) {
     return 0;
 }
 
+static void ct_fd_event_free(CtFdEvent *event) {
+    if (event == NULL) return;
+    free(event->type);
+    free(event->data);
+    free(event->message);
+    free(event);
+}
+
+static void ct_fd_event_queue_clear(CtQjsRuntime *runtime) {
+    if (runtime == NULL) return;
+
+    pthread_mutex_lock(&runtime->fd_event_mutex);
+    CtFdEvent *event = runtime->fd_events_head;
+    runtime->fd_events_head = NULL;
+    runtime->fd_events_tail = NULL;
+    pthread_mutex_unlock(&runtime->fd_event_mutex);
+
+    while (event != NULL) {
+        CtFdEvent *next = event->next;
+        ct_fd_event_free(event);
+        event = next;
+    }
+}
+
+static void ct_fd_enqueue_event(CtQjsRuntime *runtime, CtFdEvent *event) {
+    if (runtime == NULL || event == NULL) return;
+
+    pthread_mutex_lock(&runtime->fd_event_mutex);
+    if (runtime->fd_events_tail != NULL) {
+        runtime->fd_events_tail->next = event;
+    } else {
+        runtime->fd_events_head = event;
+    }
+    runtime->fd_events_tail = event;
+    pthread_mutex_unlock(&runtime->fd_event_mutex);
+}
+
+static void ct_worker_event_free(CtWorkerEvent *event) {
+    free(event);
+}
+
+static void ct_worker_event_queue_clear(CtQjsRuntime *runtime) {
+    if (runtime == NULL) return;
+
+    pthread_mutex_lock(&runtime->worker_event_mutex);
+    CtWorkerEvent *event = runtime->worker_events_head;
+    runtime->worker_events_head = NULL;
+    runtime->worker_events_tail = NULL;
+    pthread_mutex_unlock(&runtime->worker_event_mutex);
+
+    while (event != NULL) {
+        CtWorkerEvent *next = event->next;
+        ct_worker_event_free(event);
+        event = next;
+    }
+}
+
+static void ct_worker_enqueue_event(CtQjsRuntime *runtime, uint32_t worker_id) {
+    if (runtime == NULL) return;
+
+    CtWorkerEvent *event = (CtWorkerEvent *) calloc(1, sizeof(CtWorkerEvent));
+    if (event == NULL) return;
+    event->worker_id = worker_id;
+
+    pthread_mutex_lock(&runtime->worker_event_mutex);
+    if (runtime->worker_events_tail != NULL) {
+        runtime->worker_events_tail->next = event;
+    } else {
+        runtime->worker_events_head = event;
+    }
+    runtime->worker_events_tail = event;
+    pthread_mutex_unlock(&runtime->worker_event_mutex);
+}
+
+static void ct_fd_enqueue_data(CtQjsRuntime *runtime, uint32_t id, const char *data, size_t data_len) {
+    if (data == NULL || data_len == 0) return;
+    if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+        fprintf(stderr, "[cottontail:fd] data id=%u bytes=%zu\n", id, data_len);
+        fflush(stderr);
+    }
+
+    CtFdEvent *event = (CtFdEvent *) calloc(1, sizeof(CtFdEvent));
+    if (event == NULL) return;
+    event->watch_id = id;
+    event->type = ct_duplicate_bytes("data", 4);
+    event->data = ct_duplicate_bytes(data, data_len);
+    event->data_len = data_len;
+    if (event->type == NULL || event->data == NULL) {
+        ct_fd_event_free(event);
+        return;
+    }
+    ct_fd_enqueue_event(runtime, event);
+}
+
+static void ct_fd_enqueue_simple(CtQjsRuntime *runtime, uint32_t id, const char *type, const char *message) {
+    if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+        fprintf(stderr, "[cottontail:fd] %s id=%u%s%s\n", type, id, message != NULL ? " message=" : "", message != NULL ? message : "");
+        fflush(stderr);
+    }
+
+    CtFdEvent *event = (CtFdEvent *) calloc(1, sizeof(CtFdEvent));
+    if (event == NULL) return;
+    event->watch_id = id;
+    event->type = ct_duplicate_string(type);
+    if (message != NULL) event->message = ct_duplicate_string(message);
+    if (event->type == NULL || (message != NULL && event->message == NULL)) {
+        ct_fd_event_free(event);
+        return;
+    }
+    ct_fd_enqueue_event(runtime, event);
+}
+
+static bool ct_fd_watcher_is_active(CtFdWatcher *watcher) {
+    bool active = false;
+    pthread_mutex_lock(&watcher->mutex);
+    active = watcher->active;
+    pthread_mutex_unlock(&watcher->mutex);
+    return active;
+}
+
+static void ct_fd_watcher_set_active(CtFdWatcher *watcher, bool active) {
+    pthread_mutex_lock(&watcher->mutex);
+    watcher->active = active;
+    pthread_mutex_unlock(&watcher->mutex);
+}
+
+static void ct_fd_watchers_remove(CtFdWatcher *watcher) {
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    CtFdWatcher **cursor = &ct_fd_watchers;
+    while (*cursor != NULL) {
+        if (*cursor == watcher) {
+            *cursor = watcher->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+}
+
+static bool ct_fd_watcher_stop_id(uint32_t id) {
+    bool found = false;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->id == id) {
+            ct_fd_watcher_set_active(watcher, false);
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return found;
+}
+
+static bool ct_fd_watchers_has_runtime(CtQjsRuntime *runtime) {
+    bool found = false;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->runtime == runtime && ct_fd_watcher_is_active(watcher)) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return found;
+}
+
+static void ct_fd_watchers_stop_runtime(CtQjsRuntime *runtime) {
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->runtime == runtime) {
+            ct_fd_watcher_set_active(watcher, false);
+        }
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+}
+
+static void ct_fd_watchers_wait_for_runtime(CtQjsRuntime *runtime) {
+    ct_fd_watchers_stop_runtime(runtime);
+    for (int attempt = 0; attempt < 500 && ct_fd_watchers_has_runtime(runtime); attempt += 1) {
+        usleep(1000);
+    }
+}
+
+static void *ct_fd_watcher_thread(void *opaque) {
+    CtFdWatcher *watcher = (CtFdWatcher *) opaque;
+    if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+        fprintf(stderr, "[cottontail:fd] thread start id=%u fd=%d max=%zu\n", watcher->id, watcher->fd, watcher->max_bytes);
+        fflush(stderr);
+    }
+
+    int flags = fcntl(watcher->fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void) fcntl(watcher->fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    while (ct_fd_watcher_is_active(watcher)) {
+        struct pollfd poll_fd;
+        poll_fd.fd = watcher->fd;
+        poll_fd.events = POLLIN | POLLHUP | POLLERR;
+        poll_fd.revents = 0;
+
+        int ready = poll(&poll_fd, 1, 50);
+        if (!ct_fd_watcher_is_active(watcher)) break;
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            ct_fd_enqueue_simple(watcher->runtime, watcher->id, "error", strerror(errno));
+            break;
+        }
+        if ((poll_fd.revents & POLLNVAL) != 0) {
+            ct_fd_enqueue_simple(watcher->runtime, watcher->id, "error", "invalid file descriptor");
+            break;
+        }
+        if ((poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+            continue;
+        }
+
+        bool terminal = false;
+        for (;;) {
+            size_t max_bytes = watcher->max_bytes > 0 ? watcher->max_bytes : 65536;
+            if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
+            char *buffer = (char *) malloc(max_bytes);
+            if (buffer == NULL) {
+                ct_fd_enqueue_simple(watcher->runtime, watcher->id, "error", "Out of memory");
+                terminal = true;
+                break;
+            }
+
+            ssize_t n = read(watcher->fd, buffer, max_bytes);
+            if (n > 0) {
+                ct_fd_enqueue_data(watcher->runtime, watcher->id, buffer, (size_t) n);
+                free(buffer);
+                continue;
+            }
+            free(buffer);
+
+            if (n == 0) {
+                ct_fd_enqueue_simple(watcher->runtime, watcher->id, "end", NULL);
+                terminal = true;
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if ((poll_fd.revents & POLLHUP) != 0) {
+                    ct_fd_enqueue_simple(watcher->runtime, watcher->id, "end", NULL);
+                    terminal = true;
+                }
+                break;
+            }
+
+            ct_fd_enqueue_simple(watcher->runtime, watcher->id, "error", strerror(errno));
+            terminal = true;
+            break;
+        }
+
+        if (terminal) break;
+    }
+
+    ct_fd_watchers_remove(watcher);
+    ct_fd_watcher_set_active(watcher, false);
+    if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+        fprintf(stderr, "[cottontail:fd] thread stop id=%u fd=%d\n", watcher->id, watcher->fd);
+        fflush(stderr);
+    }
+    pthread_mutex_destroy(&watcher->mutex);
+    free(watcher);
+    return NULL;
+}
+
+static int ct_drain_fd_events(CtQjsRuntime *runtime, char **error_out) {
+    JSContext *ctx = runtime->context;
+
+    while (true) {
+        pthread_mutex_lock(&runtime->fd_event_mutex);
+        CtFdEvent *event = runtime->fd_events_head;
+        if (event != NULL) {
+            runtime->fd_events_head = event->next;
+            if (runtime->fd_events_head == NULL) {
+                runtime->fd_events_tail = NULL;
+            }
+        }
+        pthread_mutex_unlock(&runtime->fd_event_mutex);
+
+        if (event == NULL) break;
+
+        if (!JS_IsUndefined(runtime->fd_event_callback) &&
+            !JS_IsNull(runtime->fd_event_callback)) {
+            JSValue payload = JS_NewObject(ctx);
+            JSValue callback_result = JS_UNDEFINED;
+            bool failed = JS_IsException(payload);
+
+            if (!failed) {
+                failed =
+                    JS_SetPropertyStr(ctx, payload, "id", JS_NewUint32(ctx, event->watch_id)) < 0 ||
+                    JS_SetPropertyStr(ctx, payload, "type", JS_NewString(ctx, event->type != NULL ? event->type : "")) < 0;
+            }
+            if (!failed && event->data != NULL) {
+                failed = JS_SetPropertyStr(
+                    ctx,
+                    payload,
+                    "data",
+                    JS_NewArrayBufferCopy(ctx, (const uint8_t *) event->data, event->data_len)
+                ) < 0;
+            }
+            if (!failed && event->message != NULL) {
+                failed = JS_SetPropertyStr(ctx, payload, "message", JS_NewString(ctx, event->message)) < 0;
+            }
+            if (!failed) {
+                callback_result = JS_Call(ctx, runtime->fd_event_callback, JS_UNDEFINED, 1, &payload);
+                if (JS_IsException(callback_result)) {
+                    failed = true;
+                }
+            }
+
+            JS_FreeValue(ctx, callback_result);
+            JS_FreeValue(ctx, payload);
+
+            if (failed) {
+                ct_fd_event_free(event);
+                ct_set_error_out(error_out, ct_copy_exception(ctx));
+                return -1;
+            }
+        }
+
+        ct_fd_event_free(event);
+    }
+
+    return 0;
+}
+
+static int ct_drain_worker_events(CtQjsRuntime *runtime, char **error_out) {
+    JSContext *ctx = runtime->context;
+
+    if (JS_IsUndefined(runtime->worker_event_callback) ||
+        JS_IsNull(runtime->worker_event_callback)) {
+        return 0;
+    }
+
+    while (true) {
+        pthread_mutex_lock(&runtime->worker_event_mutex);
+        CtWorkerEvent *event = runtime->worker_events_head;
+        if (event != NULL) {
+            runtime->worker_events_head = event->next;
+            if (runtime->worker_events_head == NULL) {
+                runtime->worker_events_tail = NULL;
+            }
+        }
+        pthread_mutex_unlock(&runtime->worker_event_mutex);
+
+        if (event == NULL) break;
+
+        JSValue payload = JS_NewObject(ctx);
+        JSValue callback_result = JS_UNDEFINED;
+        bool failed = JS_IsException(payload);
+
+        if (!failed) {
+            failed = JS_SetPropertyStr(ctx, payload, "id", JS_NewUint32(ctx, event->worker_id)) < 0;
+        }
+        if (!failed) {
+            callback_result = JS_Call(ctx, runtime->worker_event_callback, JS_UNDEFINED, 1, &payload);
+            if (JS_IsException(callback_result)) {
+                failed = true;
+            }
+        }
+
+        JS_FreeValue(ctx, callback_result);
+        JS_FreeValue(ctx, payload);
+
+        if (failed) {
+            ct_worker_event_free(event);
+            ct_set_error_out(error_out, ct_copy_exception(ctx));
+            return -1;
+        }
+
+        ct_worker_event_free(event);
+    }
+
+    return 0;
+}
+
 static CtProcess *ct_process_find(uint32_t id) {
     CtProcess *process = ct_processes;
     while (process != NULL) {
@@ -2735,6 +3467,7 @@ static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, J
     char *cwd = NULL;
     CtHostEnvEntry *env_entries = NULL;
     size_t env_count = 0;
+    bool clear_env = false;
     char *input_data = NULL;
     size_t input_len = 0;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
@@ -2759,19 +3492,23 @@ static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, J
     if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
         JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
         JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
-        if (JS_IsException(cwd_value) || JS_IsException(env_value)) {
+        JSValue clear_env_value = JS_GetPropertyStr(ctx, argv[2], "clearEnv");
+        if (JS_IsException(cwd_value) || JS_IsException(env_value) || JS_IsException(clear_env_value)) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
             return JS_EXCEPTION;
         }
+        clear_env = JS_ToBool(ctx, clear_env_value) != 0;
 
         if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
             cwd = ct_copy_js_string(ctx, cwd_value);
             if (cwd == NULL) {
                 JS_FreeValue(ctx, cwd_value);
                 JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, clear_env_value);
                 JS_FreeCString(ctx, file);
                 ct_free_string_array(args, arg_count);
                 return JS_EXCEPTION;
@@ -2785,6 +3522,7 @@ static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, J
             ct_process_parse_input(ctx, argv[2], &input_data, &input_len) != 0) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
             ct_free_env_entries(env_entries, env_count);
@@ -2795,6 +3533,7 @@ static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, J
 
         JS_FreeValue(ctx, cwd_value);
         JS_FreeValue(ctx, env_value);
+        JS_FreeValue(ctx, clear_env_value);
     }
 
     if ((stdin_mode == CT_PROCESS_STDIO_PIPE || input_len > 0) && pipe(stdin_pipe) != 0) {
@@ -2856,6 +3595,7 @@ static JSValue ct_spawn_start(JSContext *ctx, JSValueConst this_val, int argc, J
         exec_argv[arg_count + 1] = NULL;
 
         if (cwd != NULL) chdir(cwd);
+        if (clear_env) ct_clear_environment();
         for (size_t index = 0; index < env_count; index += 1) {
             setenv(env_entries[index].name, env_entries[index].value, 1);
         }
@@ -3200,6 +3940,7 @@ static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc
     char *cwd = NULL;
     CtHostEnvEntry *env_entries = NULL;
     size_t env_count = 0;
+    bool clear_env = false;
     pid_t pid = -1;
     (void) this_val;
 
@@ -3213,17 +3954,22 @@ static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc
     if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
         JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
         JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
-        if (JS_IsException(cwd_value) || JS_IsException(env_value)) {
+        JSValue clear_env_value = JS_GetPropertyStr(ctx, argv[2], "clearEnv");
+        if (JS_IsException(cwd_value) || JS_IsException(env_value) || JS_IsException(clear_env_value)) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
             return JS_EXCEPTION;
         }
+        clear_env = JS_ToBool(ctx, clear_env_value) != 0;
         if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
             cwd = ct_copy_js_string(ctx, cwd_value);
             if (cwd == NULL) {
                 JS_FreeValue(ctx, cwd_value);
+                JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, clear_env_value);
                 JS_FreeCString(ctx, file);
                 ct_free_string_array(args, arg_count);
                 return JS_EXCEPTION;
@@ -3232,6 +3978,7 @@ static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc
         if (ct_parse_env_object(ctx, env_value, &env_entries, &env_count) != 0) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
             free(cwd);
@@ -3239,6 +3986,7 @@ static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc
         }
         JS_FreeValue(ctx, cwd_value);
         JS_FreeValue(ctx, env_value);
+        JS_FreeValue(ctx, clear_env_value);
     }
 
     pid = fork();
@@ -3261,6 +4009,7 @@ static JSValue ct_spawn_detached(JSContext *ctx, JSValueConst this_val, int argc
         exec_argv[arg_count + 1] = NULL;
         setsid();
         if (cwd != NULL) chdir(cwd);
+        if (clear_env) ct_clear_environment();
         for (size_t index = 0; index < env_count; index += 1) {
             setenv(env_entries[index].name, env_entries[index].value, 1);
         }
@@ -3381,6 +4130,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     char *cwd = NULL;
     CtHostEnvEntry *env_entries = NULL;
     size_t env_count = 0;
+    bool clear_env = false;
     bool capture_output = true;
     char *error_message = NULL;
     CtHostSpawnResult result = {0};
@@ -3405,22 +4155,26 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (argc >= 3 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
         JSValue cwd_value = JS_GetPropertyStr(ctx, argv[2], "cwd");
         JSValue env_value = JS_GetPropertyStr(ctx, argv[2], "env");
+        JSValue clear_env_value = JS_GetPropertyStr(ctx, argv[2], "clearEnv");
         JSValue stdio_value = JS_GetPropertyStr(ctx, argv[2], "stdio");
 
-        if (JS_IsException(cwd_value) || JS_IsException(env_value) || JS_IsException(stdio_value)) {
+        if (JS_IsException(cwd_value) || JS_IsException(env_value) || JS_IsException(clear_env_value) || JS_IsException(stdio_value)) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeValue(ctx, stdio_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
             return JS_EXCEPTION;
         }
+        clear_env = JS_ToBool(ctx, clear_env_value) != 0;
 
         if (!JS_IsUndefined(cwd_value) && !JS_IsNull(cwd_value)) {
             cwd = ct_copy_js_string(ctx, cwd_value);
             if (cwd == NULL) {
                 JS_FreeValue(ctx, cwd_value);
                 JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, clear_env_value);
                 JS_FreeValue(ctx, stdio_value);
                 JS_FreeCString(ctx, file);
                 ct_free_string_array(args, arg_count);
@@ -3431,6 +4185,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
         if (ct_parse_env_object(ctx, env_value, &env_entries, &env_count) != 0) {
             JS_FreeValue(ctx, cwd_value);
             JS_FreeValue(ctx, env_value);
+            JS_FreeValue(ctx, clear_env_value);
             JS_FreeValue(ctx, stdio_value);
             JS_FreeCString(ctx, file);
             ct_free_string_array(args, arg_count);
@@ -3443,6 +4198,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
             if (stdio == NULL) {
                 JS_FreeValue(ctx, cwd_value);
                 JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, clear_env_value);
                 JS_FreeValue(ctx, stdio_value);
                 JS_FreeCString(ctx, file);
                 ct_free_string_array(args, arg_count);
@@ -3457,6 +4213,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
                 free(stdio);
                 JS_FreeValue(ctx, cwd_value);
                 JS_FreeValue(ctx, env_value);
+                JS_FreeValue(ctx, clear_env_value);
                 JS_FreeValue(ctx, stdio_value);
                 JS_FreeCString(ctx, file);
                 ct_free_string_array(args, arg_count);
@@ -3470,6 +4227,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
 
         JS_FreeValue(ctx, cwd_value);
         JS_FreeValue(ctx, env_value);
+        JS_FreeValue(ctx, clear_env_value);
         JS_FreeValue(ctx, stdio_value);
     }
 
@@ -3481,6 +4239,7 @@ static JSValue ct_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
                 .cwd = cwd,
                 .env_entries = env_entries,
                 .env_count = env_count,
+                .clear_env = clear_env,
                 .capture_output = capture_output,
             },
             &result,
@@ -3745,6 +4504,7 @@ static bool ct_ffi_type_from_name(const char *name, CtFfiType *out) {
     else if (strcmp(name, "i8") == 0) *out = CT_FFI_TYPE_I8;
     else if (strcmp(name, "u16") == 0) *out = CT_FFI_TYPE_U16;
     else if (strcmp(name, "i16") == 0) *out = CT_FFI_TYPE_I16;
+    else if (strcmp(name, "int") == 0) *out = CT_FFI_TYPE_I32;
     else if (strcmp(name, "u32") == 0) *out = CT_FFI_TYPE_U32;
     else if (strcmp(name, "i32") == 0) *out = CT_FFI_TYPE_I32;
     else if (strcmp(name, "u64") == 0) *out = CT_FFI_TYPE_U64;
@@ -4546,6 +5306,8 @@ static JSValue ct_is_worker(JSContext *ctx, JSValueConst this_val, int argc, JSV
 
 static JSValue ct_worker_post_message(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
+    CtQjsRuntime *parent_runtime = NULL;
+    uint32_t worker_id = 0;
     const char *json = NULL;
     int status = 0;
     (void) this_val;
@@ -4566,10 +5328,13 @@ static JSValue ct_worker_post_message(JSContext *ctx, JSValueConst this_val, int
         &runtime->worker->worker_to_parent_tail,
         json
     );
+    parent_runtime = runtime->worker->parent_runtime;
+    worker_id = runtime->worker->id;
     pthread_mutex_unlock(&runtime->worker->mutex);
     JS_FreeCString(ctx, json);
 
     if (status != 0) return JS_ThrowOutOfMemory(ctx);
+    ct_worker_enqueue_event(parent_runtime, worker_id);
     return JS_TRUE;
 }
 
@@ -4739,7 +5504,7 @@ static void *ct_worker_entry(void *opaque) {
         return NULL;
     }
 
-    if (ct_qjs_runtime_eval(runtime, source, source_len, start->script_path, &error) != 0) {
+    if (ct_qjs_runtime_eval(runtime, (const uint8_t *) source, source_len, start->script_path, &error) != 0) {
         fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
         ct_qjs_string_free(error);
         free(source);
@@ -4775,6 +5540,7 @@ static void *ct_worker_entry(void *opaque) {
 }
 
 static JSValue ct_spawn_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    CtQjsRuntime *runtime = (CtQjsRuntime *) JS_GetContextOpaque(ctx);
     const char *script_path = NULL;
     CtWorkerStart *start = NULL;
     CtWorker *worker = NULL;
@@ -4802,6 +5568,7 @@ static JSValue ct_spawn_worker(JSContext *ctx, JSValueConst this_val, int argc, 
         return JS_ThrowOutOfMemory(ctx);
     }
     pthread_mutex_init(&worker->mutex, NULL);
+    worker->parent_runtime = runtime;
     pthread_mutex_lock(&ct_workers_mutex);
     worker->id = ct_next_worker_id++;
     worker->next = ct_workers;
@@ -5060,6 +5827,10 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "openFd", JS_NewCFunction(ctx, ct_open_fd, "openFd", 3)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "readFd", JS_NewCFunction(ctx, ct_read_fd, "readFd", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "closeFd", JS_NewCFunction(ctx, ct_close_fd, "closeFd", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "fdWrite", JS_NewCFunction(ctx, ct_fd_write, "fdWrite", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "fdWatchStart", JS_NewCFunction(ctx, ct_fd_watch_start, "fdWatchStart", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "fdWatchStop", JS_NewCFunction(ctx, ct_fd_watch_stop, "fdWatchStop", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "fdSetEventHandler", JS_NewCFunction(ctx, ct_fd_set_event_handler, "fdSetEventHandler", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "env", JS_NewCFunction(ctx, ct_env, "env", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "existsSync", JS_NewCFunction(ctx, ct_exists_sync, "existsSync", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "statSync", JS_NewCFunction(ctx, ct_stat_sync, "statSync", 1)) < 0 ||
@@ -5092,10 +5863,13 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
         JS_SetPropertyStr(ctx, cottontail, "workerPollIncomingMessages", JS_NewCFunction(ctx, ct_worker_poll_incoming_messages, "workerPollIncomingMessages", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "workerPostMessageTo", JS_NewCFunction(ctx, ct_worker_post_message_to, "workerPostMessageTo", 2)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "workerPollMessages", JS_NewCFunction(ctx, ct_worker_poll_messages, "workerPollMessages", 1)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "workerSetEventHandler", JS_NewCFunction(ctx, ct_worker_set_event_handler, "workerSetEventHandler", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "workerTerminate", JS_NewCFunction(ctx, ct_worker_terminate, "workerTerminate", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "exit", JS_NewCFunction(ctx, ct_exit, "exit", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "execPath", JS_NewCFunction(ctx, ct_exec_path, "execPath", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "pid", JS_NewCFunction(ctx, ct_pid, "pid", 0)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "kill", JS_NewCFunction(ctx, ct_kill_process, "kill", 2)) < 0 ||
+        JS_SetPropertyStr(ctx, cottontail, "randomBytes", JS_NewCFunction(ctx, ct_random_bytes, "randomBytes", 1)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "platform", JS_NewCFunction(ctx, ct_platform, "platform", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "arch", JS_NewCFunction(ctx, ct_arch, "arch", 0)) < 0 ||
         JS_SetPropertyStr(ctx, cottontail, "hostname", JS_NewCFunction(ctx, ct_hostname, "hostname", 0)) < 0 ||
@@ -5127,6 +5901,16 @@ static int ct_drain_jobs(CtQjsRuntime *runtime, char **error_out) {
 
 #if !defined(_WIN32)
     if (ct_drain_process_events(runtime, error_out) != 0) {
+        runtime->draining_jobs = false;
+        return -1;
+    }
+
+    if (ct_drain_fd_events(runtime, error_out) != 0) {
+        runtime->draining_jobs = false;
+        return -1;
+    }
+
+    if (ct_drain_worker_events(runtime, error_out) != 0) {
         runtime->draining_jobs = false;
         return -1;
     }
@@ -5175,11 +5959,15 @@ CtQjsRuntime *ct_qjs_runtime_create_with_stack_size(size_t stack_size) {
 
     runtime->host_object = JS_UNDEFINED;
     runtime->process_event_callback = JS_UNDEFINED;
+    runtime->fd_event_callback = JS_UNDEFINED;
+    runtime->worker_event_callback = JS_UNDEFINED;
     runtime->next_tick_delay_ms = CT_DEFAULT_IDLE_TICK_MS;
 #if !defined(_WIN32)
     runtime->owner_thread = pthread_self();
     pthread_mutex_init(&runtime->callback_mutex, NULL);
     pthread_mutex_init(&runtime->process_event_mutex, NULL);
+    pthread_mutex_init(&runtime->fd_event_mutex, NULL);
+    pthread_mutex_init(&runtime->worker_event_mutex, NULL);
 #endif
     runtime->runtime = JS_NewRuntime();
     if (runtime->runtime == NULL) {
@@ -5214,7 +6002,10 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
     ct_http_stop_all();
     ct_process_stop_all();
 #if !defined(_WIN32)
+    ct_fd_watchers_wait_for_runtime(runtime);
     ct_process_event_queue_clear(runtime);
+    ct_fd_event_queue_clear(runtime);
+    ct_worker_event_queue_clear(runtime);
 #endif
 
     ct_free_string(&runtime->last_unhandled_rejection);
@@ -5223,6 +6014,14 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
         if (!JS_IsUndefined(runtime->process_event_callback)) {
             JS_FreeValue(runtime->context, runtime->process_event_callback);
             runtime->process_event_callback = JS_UNDEFINED;
+        }
+        if (!JS_IsUndefined(runtime->fd_event_callback)) {
+            JS_FreeValue(runtime->context, runtime->fd_event_callback);
+            runtime->fd_event_callback = JS_UNDEFINED;
+        }
+        if (!JS_IsUndefined(runtime->worker_event_callback)) {
+            JS_FreeValue(runtime->context, runtime->worker_event_callback);
+            runtime->worker_event_callback = JS_UNDEFINED;
         }
         if (!JS_IsUndefined(runtime->host_object)) {
             JS_FreeValue(runtime->context, runtime->host_object);
@@ -5251,6 +6050,8 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
     }
     pthread_mutex_destroy(&runtime->callback_mutex);
     pthread_mutex_destroy(&runtime->process_event_mutex);
+    pthread_mutex_destroy(&runtime->fd_event_mutex);
+    pthread_mutex_destroy(&runtime->worker_event_mutex);
 #endif
 
     if (runtime->runtime != NULL) {
@@ -5333,6 +6134,19 @@ static int ct_qjs_runtime_has_active_handles(
     int bool_result = 0;
 
     *has_active_handles_out = false;
+
+#if !defined(_WIN32)
+    pthread_mutex_lock(&runtime->fd_event_mutex);
+    bool has_fd_events = runtime->fd_events_head != NULL;
+    pthread_mutex_unlock(&runtime->fd_event_mutex);
+    pthread_mutex_lock(&runtime->worker_event_mutex);
+    bool has_worker_events = runtime->worker_events_head != NULL;
+    pthread_mutex_unlock(&runtime->worker_event_mutex);
+    if (has_fd_events || has_worker_events || ct_fd_watchers_has_runtime(runtime)) {
+        *has_active_handles_out = true;
+        return 0;
+    }
+#endif
 
     result = JS_Eval(
         runtime->context,

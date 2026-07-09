@@ -1,8 +1,10 @@
 export function execSync(command, options = {}) {
+  const nativeOptions = prepareNativeOptions(cottontail.platform() === "win32" ? "cmd" : "sh", options);
   const result = cottontail.spawnSync(cottontail.platform() === "win32" ? "cmd" : "sh", cottontail.platform() === "win32" ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)], {
     stdio: options.stdio === "inherit" ? "inherit" : "pipe",
     cwd: options.cwd,
-    env: options.env,
+    env: nativeOptions.env,
+    clearEnv: nativeOptions.clearEnv,
   });
   if (result.status !== 0) {
     const error = new Error(result.stderr || result.stdout || `Command failed: ${command}`);
@@ -15,10 +17,12 @@ export function execSync(command, options = {}) {
 }
 
 export function execFileSync(file, args = [], options = {}) {
+  const nativeOptions = prepareNativeOptions(file, options);
   const result = cottontail.spawnSync(String(file), Array.from(args ?? [], String), {
     stdio: options.stdio === "inherit" ? "inherit" : "pipe",
     cwd: options.cwd,
-    env: options.env,
+    env: nativeOptions.env,
+    clearEnv: nativeOptions.clearEnv,
     input: options.input,
   });
   if (result.status !== 0) {
@@ -33,11 +37,38 @@ export function execFileSync(file, args = [], options = {}) {
 }
 
 export function spawnSync(file, args = [], options = {}) {
+  const nativeOptions = prepareNativeOptions(file, options);
   return cottontail.spawnSync(String(file), Array.from(args, String), {
     stdio: options.stdio === "inherit" ? "inherit" : "pipe",
     cwd: options.cwd,
-    env: options.env,
+    env: nativeOptions.env,
+    clearEnv: nativeOptions.clearEnv,
   });
+}
+
+function withoutElectrobunHostEnv(env) {
+  const next = { ...(env ?? {}) };
+  for (const key of Object.keys(next)) {
+    if (key.startsWith("COTTONTAIL_ELECTROBUN_")) delete next[key];
+  }
+  return next;
+}
+
+function prepareNativeOptions(file, options = {}) {
+  if (String(file) === String(process.execPath) && options.env === undefined) {
+    return {
+      ...options,
+      env: withoutElectrobunHostEnv(process.env),
+      clearEnv: true,
+    };
+  }
+  if (options.env !== undefined) {
+    return {
+      ...options,
+      clearEnv: true,
+    };
+  }
+  return options;
 }
 
 function normalizeStdio(value, fallback) {
@@ -70,9 +101,11 @@ export function spawn(file, args = [], options = {}) {
   stdoutMode = normalizeStdio(options.stdout, stdoutMode);
   stderrMode = normalizeStdio(options.stderr, stderrMode);
 
+  const nativeOptions = prepareNativeOptions(file, options);
   const native = cottontail.spawnStart(String(file), Array.from(args ?? [], String), {
     cwd: options.cwd,
-    env: options.env,
+    env: nativeOptions.env,
+    clearEnv: nativeOptions.clearEnv,
     stdin: stdinMode,
     stdout: stdoutMode,
     stderr: stderrMode,
@@ -153,6 +186,10 @@ export function spawn(file, args = [], options = {}) {
       listeners.set(name, handlers.filter((item) => item !== handler));
       return child;
     },
+    emit(name, ...values) {
+      emitChild(name, ...values);
+      return (listeners.get(name) ?? []).length > 0;
+    },
     kill(signal = "SIGTERM") {
       const signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGALRM: 14, SIGTERM: 15 };
       const signalNumber = typeof signal === "number" ? signal : signals[String(signal).toUpperCase()] ?? 15;
@@ -209,4 +246,78 @@ export function spawn(file, args = [], options = {}) {
   return child;
 }
 
-export default { execFileSync, execSync, spawn, spawnSync };
+const ipcPrefix = "__COTTONTAIL_IPC__";
+
+export function fork(modulePath, args = [], options = {}) {
+  if (!Array.isArray(args)) {
+    options = args ?? {};
+    args = [];
+  }
+
+  const env = withoutElectrobunHostEnv({
+    ...process.env,
+    ...(options.env ?? {}),
+    COTTONTAIL_IPC_STDIO: "1",
+  });
+  const execArgv = Array.from(options.execArgv ?? process.execArgv ?? [], String);
+  const child = spawn(process.execPath, [...execArgv, String(modulePath), ...Array.from(args ?? [], String)], {
+    ...options,
+    env,
+    stdio: ["pipe", "pipe", options.silent ? "pipe" : "inherit"],
+  });
+
+  child.connected = true;
+  let stdoutBuffer = "";
+
+  child.stdout?.on("data", (chunk) => {
+    stdoutBuffer += String(chunk);
+    for (;;) {
+      const newlineIndex = stdoutBuffer.indexOf("\n");
+      if (newlineIndex < 0) break;
+      const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line.startsWith(ipcPrefix)) {
+        try {
+          emitChildMessage(child, JSON.parse(line.slice(ipcPrefix.length)));
+        } catch (error) {
+          child.emit?.("error", error);
+        }
+      } else if (!options.silent) {
+        process.stdout.write(`${line}\n`);
+      }
+    }
+  });
+
+  child.send = (message, callback = undefined) => {
+    if (!child.connected || !child.stdin) {
+      if (typeof callback === "function") callback(new Error("IPC channel is closed"));
+      return false;
+    }
+    const ok = child.stdin.write(`${ipcPrefix}${JSON.stringify(message)}\n`);
+    if (typeof callback === "function") callback(ok ? null : new Error("write failed"));
+    return ok;
+  };
+  child.disconnect = () => {
+    if (!child.connected) return;
+    child.connected = false;
+    child.stdin?.end();
+    emitChildMessage(child, undefined, "disconnect");
+  };
+
+  child.on("close", () => {
+    child.connected = false;
+  });
+
+  return child;
+}
+
+function emitChildMessage(child, message, eventName = "message") {
+  if (typeof child.emit === "function") {
+    child.emit(eventName, message);
+    return;
+  }
+  const listeners = child.__cottontailForkListeners?.get(eventName) ?? [];
+  for (const listener of listeners) listener(message);
+}
+
+export default { execFileSync, execSync, fork, spawn, spawnSync };

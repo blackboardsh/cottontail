@@ -36,4 +36,20 @@ if (!Buffer.isBuffer(buffer) || !(buffer instanceof Buffer) || buffer.toString()
   throw new Error("Buffer compatibility APIs failed");
 }
 
+const protocolBuffer = Buffer.from('Content-Length: 11\r\n\r\n{"ok":true}');
+const separator = Buffer.from("\r\n\r\n");
+if (protocolBuffer.indexOf("\r\n\r\n") !== 18 || protocolBuffer.indexOf(separator) !== 18) {
+  throw new Error("Buffer.indexOf failed to find protocol separator");
+}
+const protocolBody = protocolBuffer.slice(protocolBuffer.indexOf(separator) + separator.length);
+if (!Buffer.isBuffer(protocolBody) || protocolBody.toString("utf8") !== '{"ok":true}') {
+  throw new Error(`Buffer.slice/toString compatibility failed: ${protocolBody.toString("utf8")}`);
+}
+if (!protocolBuffer.includes(separator)) {
+  throw new Error("Buffer.includes failed to find protocol separator");
+}
+if (Buffer.from("ff", "hex").toString("base64") !== "/w==") {
+  throw new Error("Buffer hex/base64 encoding compatibility failed");
+}
+
 console.log("bun global passed");

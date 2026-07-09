@@ -12,6 +12,7 @@ pub const CtHostSpawnOptions = extern struct {
     cwd: ?[*:0]const u8,
     env_entries: ?[*]const CtHostEnvEntry,
     env_count: usize,
+    clear_env: bool,
     capture_output: bool,
 };
 
@@ -217,16 +218,17 @@ export fn ct_host_spawn_sync(
     var env_map: ?std.process.Environ.Map = null;
     defer if (env_map) |*map| map.deinit();
 
-    if (options.env_entries != null and options.env_count > 0) {
+    if (options.clear_env or (options.env_entries != null and options.env_count > 0)) {
         var map = std.process.Environ.Map.init(gpa);
         errdefer map.deinit();
 
-        const env_entries = options.env_entries.?;
-        for (0..options.env_count) |index| {
-            map.put(std.mem.span(env_entries[index].name), std.mem.span(env_entries[index].value)) catch {
-                setErrorOut(error_out, "OutOfMemory");
-                return -1;
-            };
+        if (options.env_entries) |env_entries| {
+            for (0..options.env_count) |index| {
+                map.put(std.mem.span(env_entries[index].name), std.mem.span(env_entries[index].value)) catch {
+                    setErrorOut(error_out, "OutOfMemory");
+                    return -1;
+                };
+            }
         }
 
         env_map = map;

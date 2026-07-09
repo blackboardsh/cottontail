@@ -1,4 +1,23 @@
+import { createReadableStdio, createWritableStdio } from "./stdio.js";
+
 const processStartMs = Date.now();
+
+function signalNumber(signal = "SIGTERM") {
+  if (typeof signal === "number") return signal;
+  const name = String(signal).toUpperCase();
+  if (name === "0") return 0;
+  const signals = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGQUIT: 3,
+    SIGABRT: 6,
+    SIGKILL: 9,
+    SIGALRM: 14,
+    SIGTERM: 15,
+  };
+  if (signals[name] == null) throw new TypeError(`Unknown signal: ${signal}`);
+  return signals[name];
+}
 
 function installProcessApi(processObject) {
   const listeners = processObject.__cottontailListeners ?? new Map();
@@ -79,24 +98,26 @@ function installProcessApi(processObject) {
   };
 
   processObject.kill ??= (pid = processObject.pid, signal = "SIGTERM") => {
-    if (pid === processObject.pid || pid === 0) {
-      if (signal === 0 || signal === "0") return true;
-      processObject.emit(String(signal));
+    const targetPid = Number(pid);
+    const nativeSignal = signalNumber(signal);
+    if (targetPid === processObject.pid && nativeSignal !== 0 && processObject.emit(String(signal))) {
       return true;
     }
-    throw new Error("process.kill for other processes is not implemented");
+    return cottontail.kill(targetPid, nativeSignal);
   };
 }
 
+const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
 const process = globalThis.process ?? {
   argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
-  argv0: "cottontail",
-  execPath: cottontail.execPath?.() ?? "cottontail",
+  argv0: cottontailExecPath,
+  execPath: cottontailExecPath,
   env: cottontail.env(),
   platform: cottontail.platform(),
   arch: cottontail.arch(),
   pid: cottontail.pid?.() ?? 0,
   versions: { node: "22.0.0", cottontail: "0.0.0-dev" },
+  release: { name: "cottontail" },
   cwd: () => cottontail.cwd(),
   exit: (code = 0) => cottontail.exit(code),
   emitWarning: (message, type = "Warning") => console.warn(`${type}: ${message}`),
@@ -104,12 +125,16 @@ const process = globalThis.process ?? {
 
 globalThis.process = process;
 installProcessApi(process);
+process.execPath ??= cottontailExecPath;
+process.argv0 ??= process.execPath;
+process.execArgv ??= [];
 process.versions ??= { node: "22.0.0", cottontail: "0.0.0-dev" };
 process.versions.node ??= "22.0.0";
+process.release ??= { name: "cottontail" };
 process.emitWarning ??= (message, type = "Warning") => console.warn(`${type}: ${message}`);
-process.stdin ??= { fd: 0, isTTY: false, on: () => process.stdin, resume: () => process.stdin, setEncoding: () => process.stdin };
-process.stdout ??= { fd: 1, isTTY: false, write: (value) => { console.log(String(value).replace(/\n$/, "")); return true; } };
-process.stderr ??= { fd: 2, isTTY: false, write: (value) => { console.error(String(value).replace(/\n$/, "")); return true; } };
+process.stdin ??= createReadableStdio(0);
+process.stdout ??= createWritableStdio(1);
+process.stderr ??= createWritableStdio(2);
 
 export const argv = process.argv;
 export const argv0 = process.argv0;
@@ -118,6 +143,7 @@ export const env = process.env;
 export const platform = process.platform;
 export const arch = process.arch;
 export const versions = process.versions;
+export const release = process.release;
 export const pid = process.pid;
 export const stdin = process.stdin;
 export const stdout = process.stdout;

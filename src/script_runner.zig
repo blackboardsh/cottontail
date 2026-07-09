@@ -225,6 +225,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
     const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
+    const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
@@ -234,6 +235,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
     const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
+    const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
     const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
@@ -268,6 +270,8 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:path={s}", .{path_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:process={s}", .{process_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:process={s}", .{process_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:readline={s}", .{readline_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline={s}", .{readline_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:util={s}", .{util_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:events={s}", .{events_module}),
@@ -286,6 +290,8 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:vm={s}", .{vm_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:module={s}", .{module_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:module={s}", .{module_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:net={s}", .{net_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:node:net={s}", .{net_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:url={s}", .{url_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:url={s}", .{url_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:crypto={s}", .{crypto_module}),
@@ -318,10 +324,38 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
 fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
     if (std.mem.endsWith(u8, script_abs, ".cjs")) return true;
     if (std.mem.endsWith(u8, script_abs, ".mjs")) return false;
-    if (!std.mem.endsWith(u8, script_abs, ".js")) return false;
+    if (!std.mem.endsWith(u8, script_abs, ".js")) {
+        if (std.fs.path.extension(script_abs).len == 0) {
+            return try extensionlessEntrypointLooksCommonJs(ctx, script_abs);
+        }
+        return false;
+    }
 
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     return !(try nearestPackageTypeIsModule(ctx, script_dir));
+}
+
+fn extensionlessEntrypointLooksCommonJs(ctx: *const Context, script_abs: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(256 * 1024),
+    ) catch return false;
+    if (!std.mem.startsWith(u8, source, "#!")) return false;
+
+    const line_end = std.mem.indexOfScalar(u8, source, '\n') orelse @min(source.len, 256);
+    const shebang = source[0..@min(line_end, 256)];
+    const looks_node_cli =
+        std.mem.indexOf(u8, shebang, "node") != null or
+        std.mem.indexOf(u8, shebang, "bun") != null or
+        std.mem.indexOf(u8, shebang, "env") != null;
+    if (!looks_node_cli) return false;
+
+    return std.mem.indexOf(u8, source, "require(") != null or
+        std.mem.indexOf(u8, source, "require.resolve") != null or
+        std.mem.indexOf(u8, source, "module.exports") != null or
+        std.mem.indexOf(u8, source, "exports.") != null;
 }
 
 fn nearestPackageTypeIsModule(ctx: *const Context, start_dir: []const u8) !bool {
@@ -391,6 +425,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
     const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
     const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
+    const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.js" });
@@ -400,6 +435,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
     const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
     const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
+    const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
     const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
     const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
     const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
@@ -414,6 +450,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as os from {s};
         \\import * as path from {s};
         \\import * as processModule from {s};
+        \\import * as readline from {s};
         \\import * as util from {s};
         \\import * as events from {s};
         \\import * as assert from {s};
@@ -423,6 +460,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as perfHooks from {s};
         \\import * as vm from {s};
         \\import * as moduleModule from {s};
+        \\import * as net from {s};
         \\import * as url from {s};
         \\import * as crypto from {s};
         \\import * as buffer from {s};
@@ -434,6 +472,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  os, "node:os": os,
         \\  path, "node:path": path,
         \\  process: processModule, "node:process": processModule,
+        \\  readline, "node:readline": readline,
         \\  util, "node:util": util,
         \\  events, "node:events": events,
         \\  assert, "node:assert": assert,
@@ -443,6 +482,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  perf_hooks: perfHooks, "node:perf_hooks": perfHooks,
         \\  vm, "node:vm": vm,
         \\  module: moduleModule, "node:module": moduleModule,
+        \\  net, "node:net": net,
         \\  url, "node:url": url,
         \\  crypto, "node:crypto": crypto,
         \\  buffer, "node:buffer": buffer,
@@ -459,6 +499,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, os_module),
             try jsonStringLiteral(ctx, path_module),
             try jsonStringLiteral(ctx, process_module),
+            try jsonStringLiteral(ctx, readline_module),
             try jsonStringLiteral(ctx, util_module),
             try jsonStringLiteral(ctx, events_module),
             try jsonStringLiteral(ctx, assert_module),
@@ -468,6 +509,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, perf_hooks_module),
             try jsonStringLiteral(ctx, vm_module),
             try jsonStringLiteral(ctx, module_module),
+            try jsonStringLiteral(ctx, net_module),
             try jsonStringLiteral(ctx, url_module),
             try jsonStringLiteral(ctx, crypto_module),
             try jsonStringLiteral(ctx, buffer_module),
@@ -500,8 +542,7 @@ fn runtimeModulesAvailable(ctx: *const Context) bool {
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
-    const run_root = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "run" });
-    try std.Io.Dir.cwd().createDirPath(ctx.io, run_root);
+    const run_root = try ensureTempRunRoot(ctx);
 
     var random_bytes: [16]u8 = undefined;
     for (0..8) |_| {
@@ -539,14 +580,68 @@ fn ensureTempDir(ctx: *const Context) ![]const u8 {
     return error.TempDirCollision;
 }
 
+fn ensureTempRunRoot(ctx: *const Context) ![]const u8 {
+    if (ctx.environ_map.get("COTTONTAIL_TMP_DIR")) |tmp_dir| {
+        if (tmp_dir.len > 0) {
+            const run_root = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "cottontail", "run" });
+            try std.Io.Dir.cwd().createDirPath(ctx.io, run_root);
+            return run_root;
+        }
+    }
+
+    const project_run_root = try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, ".cottontail-tmp", "run" });
+    if (try createDirPathIfWritable(ctx, project_run_root)) {
+        return project_run_root;
+    }
+
+    const os_tmp_root = try std.fs.path.join(ctx.allocator, &.{ osTempBase(ctx), "cottontail", "run" });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, os_tmp_root);
+    return os_tmp_root;
+}
+
+fn createDirPathIfWritable(ctx: *const Context, path: []const u8) !bool {
+    std.Io.Dir.cwd().createDirPath(ctx.io, path) catch |err| switch (err) {
+        error.AccessDenied,
+        error.FileNotFound,
+        error.NotDir,
+        error.ReadOnlyFileSystem,
+        => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn osTempBase(ctx: *const Context) []const u8 {
+    if (ctx.environ_map.get("TMPDIR")) |value| {
+        if (value.len > 0) return value;
+    }
+    if (ctx.environ_map.get("TEMP")) |value| {
+        if (value.len > 0) return value;
+    }
+    if (ctx.environ_map.get("TMP")) |value| {
+        if (value.len > 0) return value;
+    }
+    return if (builtin.os.tag == .windows) "C:\\Temp" else "/tmp";
+}
+
 fn findCottontailHome(init: std.process.Init, allocator: std.mem.Allocator, exe_dir: []const u8) ![]const u8 {
     if (init.environ_map.get("COTTONTAIL_HOME")) |home| {
-        return try resolvePathForCwd(init.io, allocator, home);
+        const absolute = try resolvePathForCwd(init.io, allocator, home);
+        if (looksLikeCottontailRuntimeHome(init.io, allocator, absolute)) {
+            return absolute;
+        }
     }
 
     if (init.environ_map.get("DASH_COTTONTAIL_ROOT")) |home| {
-        return try resolvePathForCwd(init.io, allocator, home);
+        const absolute = try resolvePathForCwd(init.io, allocator, home);
+        if (looksLikeCottontailRuntimeHome(init.io, allocator, absolute)) {
+            return absolute;
+        }
     }
+
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    if (try findCottontailHomeNear(init.io, allocator, cwd)) |home| return home;
+    if (try findCottontailHomeNear(init.io, allocator, exe_dir)) |home| return home;
 
     const sibling_candidates = [_][]const u8{
         try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "..", "cottontail" }),
@@ -569,12 +664,39 @@ fn findCottontailHome(init: std.process.Init, allocator: std.mem.Allocator, exe_
     return try allocator.dupe(u8, exe_dir);
 }
 
+fn findCottontailHomeNear(io: std.Io, allocator: std.mem.Allocator, start_dir: []const u8) !?[]const u8 {
+    var current: []const u8 = try allocator.dupe(u8, start_dir);
+    while (true) {
+        if (looksLikeCottontailHome(io, allocator, current)) {
+            return current;
+        }
+
+        const sibling = try std.fs.path.join(allocator, &.{ current, "cottontail" });
+        const sibling_absolute = std.Io.Dir.cwd().realPathFileAlloc(io, sibling, allocator) catch sibling;
+        if (looksLikeCottontailHome(io, allocator, sibling_absolute)) {
+            return sibling_absolute;
+        }
+
+        const parent = std.fs.path.dirname(current) orelse return null;
+        if (std.mem.eql(u8, parent, current)) return null;
+        current = parent;
+    }
+}
+
 fn looksLikeCottontailHome(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) bool {
     const package_json = std.fs.path.join(allocator, &.{ candidate, "package.json" }) catch return false;
     defer allocator.free(package_json);
     const src_main = std.fs.path.join(allocator, &.{ candidate, "src", "main.zig" }) catch return false;
     defer allocator.free(src_main);
     return pathExists(io, package_json) and pathExists(io, src_main);
+}
+
+fn looksLikeCottontailRuntimeHome(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) bool {
+    if (looksLikeCottontailHome(io, allocator, candidate)) return true;
+
+    const runtime_module = std.fs.path.join(allocator, &.{ candidate, "src", "runtime_modules", "bun", "index.js" }) catch return false;
+    defer allocator.free(runtime_module);
+    return pathExists(io, runtime_module);
 }
 
 fn resolvePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {

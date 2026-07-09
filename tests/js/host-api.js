@@ -31,6 +31,8 @@ assert(typeof cottontail.platform === 'function', 'platform() missing');
 assert(typeof cottontail.arch === 'function', 'arch() missing');
 assert(cottontail.platform().length > 0, 'platform() empty');
 assert(cottontail.arch().length > 0, 'arch() empty');
+assert(process.argv0 === process.execPath, 'process.argv0 should default to process.execPath');
+assert(process.argv0.endsWith(cottontail.platform() === 'win32' ? 'cottontail.exe' : 'cottontail'), 'process.argv0 should point at cottontail');
 
 assert(cottontail.existsSync('tests/js/fixtures/sample.txt'), 'existsSync fixture mismatch');
 assert(!cottontail.existsSync('tests/js/fixtures/missing.txt'), 'existsSync missing mismatch');

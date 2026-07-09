@@ -8,6 +8,8 @@ import {
   readdirSync,
   statSync,
   symlinkSync,
+  unwatchFile,
+  watchFile,
   writeFileSync,
 } from "node:fs";
 
@@ -65,6 +67,29 @@ const streamedFromFd = await new Promise<string>((resolve, reject) => {
 });
 assert(streamedFromFd === "hello fs", `createReadStream fd data mismatch: ${streamedFromFd}`);
 closeSync(fd);
+
+let watchFileCount = 0;
+await new Promise<void>((resolve, reject) => {
+  const timeout = setTimeout(() => reject(new Error("watchFile timeout")), 3000);
+  const listener = (current: any, previous: any) => {
+    watchFileCount += 1;
+    try {
+      assert(previous.size === "hello fs".length, `watchFile previous size mismatch: ${previous.size}`);
+      assert(current.size === "HELLO FS".length, `watchFile current size mismatch: ${current.size}`);
+      assert(current.size === previous.size, "watchFile should detect same-size edits");
+      clearTimeout(timeout);
+      unwatchFile(filePath, listener);
+      resolve();
+    } catch (error) {
+      clearTimeout(timeout);
+      unwatchFile(filePath, listener);
+      reject(error);
+    }
+  };
+  watchFile(filePath, { interval: 50 }, listener);
+  setTimeout(() => writeFileSync(filePath, "HELLO FS"), 200);
+});
+assert(watchFileCount === 1, `watchFile fired unexpected count: ${watchFileCount}`);
 
 if (cottontail.platform() !== "win32") {
   symlinkSync(filePath, linkPath);

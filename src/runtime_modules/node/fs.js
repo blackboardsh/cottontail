@@ -129,6 +129,25 @@ export function realpathSync(path) {
   return resolve(String(path));
 }
 
+const fdWatchListeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+  globalThis.__cottontailFdWatchHandlerInstalled = true;
+  cottontail.fdSetEventHandler((event) => {
+    const listener = fdWatchListeners.get(Number(event?.id));
+    if (typeof listener === "function") listener(event);
+  });
+}
+
+function registerFdWatchListener(id, listener) {
+  const key = Number(id);
+  fdWatchListeners.set(key, listener);
+  return () => {
+    if (fdWatchListeners.get(key) === listener) {
+      fdWatchListeners.delete(key);
+    }
+  };
+}
+
 function withCallback(action) {
   return (...args) => {
     const callback = args[args.length - 1];
@@ -159,6 +178,10 @@ function makeStats(result) {
   return {
     size: Number(result.size) || 0,
     mode: Number(result.mode) || 0,
+    mtimeMs: Number(result.mtimeMs) || 0,
+    ctimeMs: Number(result.ctimeMs) || 0,
+    birthtimeMs: Number(result.birthtimeMs) || 0,
+    atimeMs: Number(result.atimeMs) || 0,
     isFile: () => Boolean(result.isFile),
     isDirectory: () => Boolean(result.isDirectory),
     isSymbolicLink: () => Boolean(result.isSymbolicLink),
@@ -179,7 +202,8 @@ export function createReadStream(path, options = {}) {
   const autoClose = options?.autoClose !== false;
   let ownsFd = false;
   let closed = false;
-  let timer = null;
+  let watchId = 0;
+  let unregisterWatch = null;
 
   if (stream.fd == null || Number.isNaN(stream.fd)) {
     stream.fd = openSync(path, options?.flags || "r", options?.mode ?? 0o666);
@@ -194,11 +218,22 @@ export function createReadStream(path, options = {}) {
     }
   };
 
+  const stopWatch = () => {
+    if (unregisterWatch) {
+      unregisterWatch();
+      unregisterWatch = null;
+    }
+    if (watchId) {
+      cottontail.fdWatchStop?.(watchId);
+      watchId = 0;
+    }
+  };
+
   const finish = () => {
     if (stream.destroyed) return;
     stream.readableEnded = true;
     stream.destroyed = true;
-    if (timer) clearInterval(timer);
+    stopWatch();
     try {
       closeFd();
     } catch (error) {
@@ -211,7 +246,7 @@ export function createReadStream(path, options = {}) {
   stream.destroy = function destroy(error = undefined) {
     if (stream.destroyed) return stream;
     stream.destroyed = true;
-    if (timer) clearInterval(timer);
+    stopWatch();
     try {
       closeFd();
     } catch (closeError) {
@@ -222,28 +257,34 @@ export function createReadStream(path, options = {}) {
     return stream;
   };
 
-  const pump = () => {
-    if (stream.destroyed) return;
-    try {
-      stream.pending = false;
-      const chunk = cottontail.readFd(stream.fd, highWaterMark);
-      if (chunk === null) {
-        return;
-      }
-      if (chunk.byteLength === 0) {
-        finish();
-        return;
-      }
-      stream.bytesRead += chunk.byteLength;
-      const value = encoding ? makeBuffer(chunk).toString(encoding) : makeBuffer(chunk);
-      stream.push(value);
-    } catch (error) {
-      stream.destroy(error);
-    }
-  };
+  if (typeof cottontail.fdWatchStart !== "function") {
+    throw new Error("cottontail fd watcher is unavailable");
+  }
 
-  setTimeout(pump, 0);
-  timer = setInterval(pump, 16);
+  const watch = cottontail.fdWatchStart(stream.fd, highWaterMark);
+  watchId = Number(watch?.id || 0);
+  if (!watchId) {
+    throw new Error("failed to start fd watcher");
+  }
+  unregisterWatch = registerFdWatchListener(watchId, (event) => {
+    if (stream.destroyed) return;
+    stream.pending = false;
+    if (event.type === "data") {
+      const bytes = event.data ?? new ArrayBuffer(0);
+      if (bytes.byteLength === 0) return;
+      stream.bytesRead += bytes.byteLength;
+      const value = encoding ? makeBuffer(bytes).toString(encoding) : makeBuffer(bytes);
+      stream.push(value);
+      return;
+    }
+    if (event.type === "end") {
+      finish();
+      return;
+    }
+    if (event.type === "error") {
+      stream.destroy(new Error(event.message || "fd read failed"));
+    }
+  });
 
   return stream;
 }
@@ -305,6 +346,100 @@ export function watch(path, options = {}, listener = undefined) {
     }
   }, 500);
   return watcher;
+}
+
+function zeroStats() {
+  return makeStats({});
+}
+
+function statSnapshot(path) {
+  try {
+    return statSync(path);
+  } catch {
+    return zeroStats();
+  }
+}
+
+function statsEqual(a, b) {
+  return a.size === b.size &&
+    a.mode === b.mode &&
+    a.mtimeMs === b.mtimeMs &&
+    a.ctimeMs === b.ctimeMs &&
+    a.birthtimeMs === b.birthtimeMs &&
+    a.atimeMs === b.atimeMs &&
+    a.isFile() === b.isFile() &&
+    a.isDirectory() === b.isDirectory() &&
+    a.isSymbolicLink() === b.isSymbolicLink();
+}
+
+const fileWatchers = globalThis.__cottontailFileWatchers ??= new Map();
+
+function normalizeWatchFileArgs(options, listener) {
+  if (typeof options === "function") {
+    return { options: {}, listener: options };
+  }
+  return { options: options ?? {}, listener };
+}
+
+function closeFileWatcher(path, entry) {
+  clearInterval(entry.timer);
+  fileWatchers.delete(path);
+}
+
+export function watchFile(path, options = {}, listener = undefined) {
+  const normalized = normalizeWatchFileArgs(options, listener);
+  if (typeof normalized.listener !== "function") {
+    throw new TypeError("The \"listener\" argument must be of type function");
+  }
+
+  const filename = String(path);
+  const interval = Math.max(1, Number(normalized.options?.interval || 5007));
+  let entry = fileWatchers.get(filename);
+  if (!entry) {
+    entry = {
+      previous: statSnapshot(filename),
+      listeners: new Set(),
+      timer: null,
+    };
+    entry.timer = setInterval(() => {
+      const current = statSnapshot(filename);
+      if (statsEqual(current, entry.previous)) return;
+      const previous = entry.previous;
+      entry.previous = current;
+      for (const handler of [...entry.listeners]) handler(current, previous);
+    }, interval);
+    fileWatchers.set(filename, entry);
+  }
+
+  entry.listeners.add(normalized.listener);
+
+  const watcher = {
+    close() {
+      unwatchFile(filename, normalized.listener);
+      return watcher;
+    },
+    ref() {
+      return watcher;
+    },
+    unref() {
+      return watcher;
+    },
+  };
+  return watcher;
+}
+
+export function unwatchFile(path, listener = undefined) {
+  const filename = String(path);
+  const entry = fileWatchers.get(filename);
+  if (!entry) return;
+
+  if (typeof listener === "function") {
+    entry.listeners.delete(listener);
+  } else {
+    entry.listeners.clear();
+  }
+
+  if (entry.listeners.size === 0) closeFileWatcher(filename, entry);
 }
 
 export const promises = {
@@ -375,6 +510,8 @@ export default {
   statSync,
   unlinkSync,
   watch,
+  watchFile,
+  unwatchFile,
   close,
   writeFileSync,
   writeFile,

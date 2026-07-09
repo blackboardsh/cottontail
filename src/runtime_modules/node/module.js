@@ -11,6 +11,7 @@ import * as os from "./os.js";
 import * as path from "./path.js";
 import * as perfHooks from "./perf_hooks.js";
 import * as processModule from "./process.js";
+import * as readline from "./readline.js";
 import * as stream from "./stream.js";
 import * as tty from "./tty.js";
 import * as url from "./url.js";
@@ -31,6 +32,7 @@ export const builtinModules = [
   "path",
   "process",
   "perf_hooks",
+  "readline",
   "stream",
   "tty",
   "url",
@@ -78,8 +80,12 @@ function packageRootFor(request, startDir) {
   const packageName = parts.join("/");
   let dir = startDir;
   while (true) {
-    const candidate = join(dir, "node_modules", packageName);
-    if (cottontail.existsSync(join(candidate, "package.json"))) return candidate;
+    const nodeModulesCandidate = join(dir, "node_modules", packageName);
+    if (cottontail.existsSync(join(nodeModulesCandidate, "package.json"))) return nodeModulesCandidate;
+
+    const directCandidate = join(dir, packageName);
+    if (cottontail.existsSync(join(directCandidate, "package.json"))) return directCandidate;
+
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -228,6 +234,8 @@ __setBuiltinModules({
   "node:perf_hooks": perfHooks,
   process: processBuiltin,
   "node:process": processBuiltin,
+  readline,
+  "node:readline": readline,
   stream,
   "node:stream": stream,
   tty,

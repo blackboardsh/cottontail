@@ -29,4 +29,17 @@ assert(result.signal === null, `child_process.spawn signal mismatch: ${result.si
 assert(stdout === "stdout-ok", `child_process.spawn stdout mismatch: ${JSON.stringify(stdout)}`);
 assert(stderr === "stderr-ok", `child_process.spawn stderr mismatch: ${JSON.stringify(stderr)}`);
 
+const inherited = spawn("sh", ["-c", "printf inherited-stdout; printf inherited-stderr >&2"], {
+  stdio: "inherit",
+});
+
+const inheritedResult = await new Promise<{ code: number | null; signal: number | null }>((resolve) => {
+  inherited.on("close", (code, signal) => resolve({ code, signal }));
+});
+
+assert(inherited.stdout === null, "inherited child stdout should be null");
+assert(inherited.stderr === null, "inherited child stderr should be null");
+assert(inheritedResult.code === 0, `inherited child exit mismatch: ${inheritedResult.code}`);
+assert(inheritedResult.signal === null, `inherited child signal mismatch: ${inheritedResult.signal}`);
+
 console.log("node child_process spawn passed");

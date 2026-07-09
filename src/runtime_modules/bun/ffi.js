@@ -1,8 +1,27 @@
+import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
+
 const g = globalThis;
 const processStartMs = Date.now();
 
 function platform() {
   return cottontail.platform();
+}
+
+function signalNumber(signal = "SIGTERM") {
+  if (typeof signal === "number") return signal;
+  const name = String(signal).toUpperCase();
+  if (name === "0") return 0;
+  const signals = {
+    SIGHUP: 1,
+    SIGINT: 2,
+    SIGQUIT: 3,
+    SIGABRT: 6,
+    SIGKILL: 9,
+    SIGALRM: 14,
+    SIGTERM: 15,
+  };
+  if (signals[name] == null) throw new TypeError(`Unknown signal: ${signal}`);
+  return signals[name];
 }
 
 function installProcessApi(processObject) {
@@ -84,40 +103,101 @@ function installProcessApi(processObject) {
   };
 
   processObject.kill ??= (pid = processObject.pid, signal = "SIGTERM") => {
-    if (pid === processObject.pid || pid === 0) {
-      if (signal === 0 || signal === "0") return true;
-      processObject.emit(String(signal));
+    const targetPid = Number(pid);
+    const nativeSignal = signalNumber(signal);
+    if (targetPid === processObject.pid && nativeSignal !== 0 && processObject.emit(String(signal))) {
       return true;
     }
-    throw new Error("process.kill for other processes is not implemented");
+    return cottontail.kill(targetPid, nativeSignal);
   };
 }
 
+const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
 const processObject = g.process ?? {
   argv: cottontail.argv || ["cottontail", ...(cottontail.args || [])],
-  argv0: "cottontail",
-  execPath: cottontail.execPath?.() ?? "cottontail",
+  argv0: cottontailExecPath,
+  execPath: cottontailExecPath,
   env: cottontail.env(),
   platform: platform(),
   arch: cottontail.arch(),
   pid: cottontail.pid?.() ?? 0,
   versions: { node: "22.0.0", cottontail: "0.0.0-dev" },
+  release: { name: "cottontail" },
   cwd: () => cottontail.cwd(),
   exit: (code = 0) => cottontail.exit(code),
   emitWarning: (message, type = "Warning") => console.warn(`${type}: ${message}`),
 };
 g.process = processObject;
 installProcessApi(g.process);
-g.process.execPath ??= cottontail.execPath?.() ?? "cottontail";
+g.process.execPath ??= cottontailExecPath;
+g.process.argv0 ??= g.process.execPath;
+g.process.execArgv ??= [];
 g.process.versions ??= { node: "22.0.0", cottontail: "0.0.0-dev" };
 g.process.versions.node ??= "22.0.0";
+g.process.release ??= { name: "cottontail" };
 g.process.emitWarning ??= (message, type = "Warning") => console.warn(`${type}: ${message}`);
-g.process.stdin ??= { fd: 0, isTTY: false, on: () => g.process.stdin, resume: () => g.process.stdin, setEncoding: () => g.process.stdin };
-g.process.stdout ??= { fd: 1, isTTY: false, write: (value) => { console.log(String(value).replace(/\n$/, "")); return true; } };
-g.process.stderr ??= { fd: 2, isTTY: false, write: (value) => { console.error(String(value).replace(/\n$/, "")); return true; } };
+g.process.stdin ??= createReadableStdio(0);
+g.process.stdout ??= createWritableStdio(1);
+g.process.stderr ??= createWritableStdio(2);
 
-const formatConsoleArg = (value) =>
-  value instanceof Error && value.stack ? value.stack : value;
+const ipcPrefix = "__COTTONTAIL_IPC__";
+if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" && typeof g.process.send !== "function") {
+  g.process.connected = true;
+  g.process.send = (message) => {
+    if (!g.process.connected) return false;
+    return g.process.stdout.write(`${ipcPrefix}${JSON.stringify(message)}\n`);
+  };
+  g.process.disconnect = () => {
+    g.process.connected = false;
+    g.process.emit("disconnect");
+  };
+
+  let ipcBuffer = "";
+  g.process.stdin.setEncoding("utf8");
+  g.process.stdin.on("data", (chunk) => {
+    ipcBuffer += String(chunk);
+    for (;;) {
+      const newlineIndex = ipcBuffer.indexOf("\n");
+      if (newlineIndex < 0) break;
+      const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
+      if (!line.startsWith(ipcPrefix)) continue;
+      try {
+        g.process.emit("message", JSON.parse(line.slice(ipcPrefix.length)));
+      } catch (error) {
+        g.process.emit("error", error);
+      }
+    }
+  });
+  g.process.stdin.on("end", () => {
+    if (g.process.connected) g.process.disconnect();
+  });
+  g.process.stdin.resume();
+}
+
+const formatConsoleArg = (value) => {
+  if (value instanceof Error && value.stack) return value.stack;
+  if (typeof value === "bigint") return `${value}n`;
+  if (typeof value !== "object" || value === null) return value;
+
+  const seen = new Set();
+  try {
+    return JSON.stringify(
+      value,
+      (_key, item) => {
+        if (typeof item === "bigint") return `${item}n`;
+        if (typeof item === "object" && item !== null) {
+          if (seen.has(item)) return "[Circular]";
+          seen.add(item);
+        }
+        return item;
+      },
+      2,
+    );
+  } catch {
+    return String(value);
+  }
+};
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 if (nativeConsoleLog) {
@@ -133,6 +213,8 @@ g.global ??= g;
 g.self ??= g;
 g.performance ??= { now: () => Date.now() };
 g.performance.now ??= () => Date.now();
+g.setImmediate ??= (callback, ...args) => setTimeout(callback, 0, ...args);
+g.clearImmediate ??= (handle) => clearTimeout(handle);
 
 if (typeof g.URLSearchParams !== "function") {
   g.URLSearchParams = class URLSearchParams {
@@ -290,6 +372,32 @@ function stringFromBytes(bytes) {
   return textDecoder.decode(bytes);
 }
 
+function normalizeBufferEncoding(encoding = "utf8") {
+  const normalized = String(encoding || "utf8").toLowerCase().replace(/[-_]/g, "");
+  if (normalized === "utf8" || normalized === "utf") return "utf8";
+  if (normalized === "utf16le" || normalized === "ucs2") return "utf16le";
+  if (normalized === "latin1" || normalized === "binary") return "latin1";
+  if (normalized === "base64") return "base64";
+  if (normalized === "hex") return "hex";
+  return "utf8";
+}
+
+function hexDecode(input) {
+  const clean = String(input).replace(/[^0-9a-fA-F]/g, "");
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let index = 0; index < out.length; index += 1) {
+    out[index] = parseInt(clean.slice(index * 2, index * 2 + 2), 16) || 0;
+  }
+  return out;
+}
+
+function hexEncode(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let output = "";
+  for (const byte of bytes) output += byte.toString(16).padStart(2, "0");
+  return output;
+}
+
 function base64Decode(input) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const clean = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
@@ -327,6 +435,48 @@ function base64Encode(input) {
   return output;
 }
 
+function bytesFromStringWithEncoding(input, encoding = "utf8") {
+  const normalized = normalizeBufferEncoding(encoding);
+  const text = String(input);
+  if (normalized === "base64") return base64Decode(text);
+  if (normalized === "hex") return hexDecode(text);
+  if (normalized === "latin1") {
+    const bytes = new Uint8Array(text.length);
+    for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index) & 0xff;
+    return bytes;
+  }
+  if (normalized === "utf16le") {
+    const bytes = new Uint8Array(text.length * 2);
+    for (let index = 0; index < text.length; index += 1) {
+      const value = text.charCodeAt(index);
+      bytes[index * 2] = value & 0xff;
+      bytes[index * 2 + 1] = (value >> 8) & 0xff;
+    }
+    return bytes;
+  }
+  return bytesFromString(text);
+}
+
+function stringFromBytesWithEncoding(bytes, encoding = "utf8", start = 0, end = bytes.length) {
+  const normalized = normalizeBufferEncoding(encoding);
+  const view = bytes.subarray(Math.max(0, Number(start) || 0), Math.min(bytes.length, end == null ? bytes.length : Number(end)));
+  if (normalized === "base64") return base64Encode(view);
+  if (normalized === "hex") return hexEncode(view);
+  if (normalized === "latin1") {
+    let output = "";
+    for (const byte of view) output += String.fromCharCode(byte);
+    return output;
+  }
+  if (normalized === "utf16le") {
+    let output = "";
+    for (let index = 0; index + 1 < view.length; index += 2) {
+      output += String.fromCharCode(view[index] | (view[index + 1] << 8));
+    }
+    return output;
+  }
+  return stringFromBytes(view);
+}
+
 g.btoa ??= (input) => {
   const text = String(input);
   const bytes = new Uint8Array(text.length);
@@ -347,11 +497,44 @@ function CottontailBuffer(value, encoding = "utf8") {
 CottontailBuffer.prototype = Object.create(Uint8Array.prototype);
 CottontailBuffer.prototype.constructor = CottontailBuffer;
 
-function makeBuffer(bytes) {
-  Object.setPrototypeOf(bytes, CottontailBuffer.prototype);
-  bytes.toString = function toString(encoding = "utf8") {
-    if (encoding === "base64") return base64Encode(this);
-    return stringFromBytes(this);
+function normalizeSearchOffset(byteOffset, length) {
+  let offset = Number(byteOffset ?? 0);
+  if (!Number.isFinite(offset)) offset = 0;
+  offset = Math.trunc(offset);
+  if (offset < 0) offset = Math.max(length + offset, 0);
+  if (offset > length) offset = length;
+  return offset;
+}
+
+function bufferSearchBytes(value, encoding = "utf8") {
+  if (typeof value === "number") return new Uint8Array([value & 0xff]);
+  return CottontailBuffer.from(value, encoding);
+}
+
+function bufferIndexOf(buffer, value, byteOffset = 0, encoding = "utf8") {
+  const needle = bufferSearchBytes(value, encoding);
+  if (needle.length === 0) return normalizeSearchOffset(byteOffset, buffer.length);
+  const start = normalizeSearchOffset(byteOffset, buffer.length);
+  if (needle.length > buffer.length - start) return -1;
+  outer: for (let index = start; index <= buffer.length - needle.length; index += 1) {
+    for (let needleIndex = 0; needleIndex < needle.length; needleIndex += 1) {
+      if (buffer[index + needleIndex] !== needle[needleIndex]) continue outer;
+    }
+    return index;
+  }
+  return -1;
+}
+
+function makeBufferView(bytes, start = 0, end = bytes.length) {
+  const view = Uint8Array.prototype.subarray.call(bytes, start, end);
+  Object.setPrototypeOf(view, CottontailBuffer.prototype);
+  installBufferMethods(view);
+  return view;
+}
+
+function installBufferMethods(bytes) {
+  bytes.toString = function toString(encoding = "utf8", start = 0, end = this.length) {
+    return stringFromBytesWithEncoding(this, encoding, start, end);
   };
   bytes.equals = function equals(other) {
     const rhs = CottontailBuffer.from(other);
@@ -361,15 +544,31 @@ function makeBuffer(bytes) {
     }
     return true;
   };
+  bytes.indexOf = function indexOf(value, byteOffset = 0, encoding = "utf8") {
+    return bufferIndexOf(this, value, byteOffset, encoding);
+  };
+  bytes.includes = function includes(value, byteOffset = 0, encoding = "utf8") {
+    return this.indexOf(value, byteOffset, encoding) !== -1;
+  };
+  bytes.slice = function slice(start = 0, end = this.length) {
+    return makeBufferView(this, start, end);
+  };
+  bytes.subarray = function subarray(start = 0, end = this.length) {
+    return makeBufferView(this, start, end);
+  };
   return bytes;
+}
+
+function makeBuffer(bytes) {
+  Object.setPrototypeOf(bytes, CottontailBuffer.prototype);
+  return installBufferMethods(bytes);
 }
 
 CottontailBuffer.from = function from(value = "", encoding = "utf8") {
   if (value instanceof ArrayBuffer) return makeBuffer(new Uint8Array(value));
   if (ArrayBuffer.isView(value)) return makeBuffer(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
   if (Array.isArray(value)) return makeBuffer(new Uint8Array(value));
-  if (encoding === "base64") return makeBuffer(base64Decode(value));
-  return makeBuffer(bytesFromString(value));
+  return makeBuffer(bytesFromStringWithEncoding(value, encoding));
 };
 CottontailBuffer.alloc = function alloc(size, fill = 0, encoding = "utf8") {
   const bytes = makeBuffer(new Uint8Array(Number(size) || 0));
@@ -566,6 +765,11 @@ function emitWorkerEvent(target, name, event) {
   }
 }
 
+function hasWorkerMessageListener() {
+  if (typeof g.onmessage === "function") return true;
+  return (workerMessageListeners.get("message") ?? []).length > 0;
+}
+
 function serializeWorkerMessage(message) {
   const seen = new WeakSet();
   return JSON.stringify(message, (_key, value) => {
@@ -595,6 +799,7 @@ function installWorkerGlobal() {
 
 function pollWorkerGlobalMessages() {
   if (!cottontail.isWorker?.()) return;
+  if (!hasWorkerMessageListener()) return;
   for (const item of cottontail.workerPollIncomingMessages()) {
     let data = item;
     try {
@@ -605,6 +810,21 @@ function pollWorkerGlobalMessages() {
 }
 
 installWorkerGlobal();
+
+const workerInstances = new Map();
+let workerNativeEventHandlerInstalled = false;
+
+function installWorkerNativeEventHandler() {
+  if (typeof cottontail.workerSetEventHandler !== "function") return false;
+  if (workerNativeEventHandlerInstalled) return true;
+  workerNativeEventHandlerInstalled = true;
+  cottontail.workerSetEventHandler((event) => {
+    const worker = workerInstances.get(Number(event?.id));
+    if (!worker) return;
+    worker._poll();
+  });
+  return true;
+}
 
 function nextRunLoopDelay(now = timerNow()) {
   let nextDelay = 16;
@@ -618,9 +838,9 @@ function nextRunLoopDelay(now = timerNow()) {
 
 g.__cottontailHasActiveHandles = () => {
   if (cottontail.isWorker?.()) {
-    if (typeof g.onmessage === "function") return true;
-    if ((workerMessageListeners.get("message") ?? []).length > 0) return true;
+    if (hasWorkerMessageListener()) return true;
   }
+  if (workerInstances.size > 0) return true;
   if (timers.size > 0) return true;
   for (const entry of spawnEventListeners.values()) {
     if (entry.ref !== false) return true;
@@ -657,7 +877,8 @@ g.Worker ??= class Worker {
     this.onmessage = null;
     this.onerror = null;
     this._listeners = new Map();
-    this._pollTimer = setInterval(() => this._poll(), 16);
+    workerInstances.set(this.id, this);
+    this._pollTimer = installWorkerNativeEventHandler() ? null : setInterval(() => this._poll(), 16);
   }
   _add(name, handler) {
     if (typeof handler !== "function") return this;
@@ -684,7 +905,8 @@ g.Worker ??= class Worker {
     cottontail.workerPostMessageTo(this.id, serializeWorkerMessage(message));
   }
   terminate() {
-    clearInterval(this._pollTimer);
+    if (this._pollTimer != null) clearInterval(this._pollTimer);
+    workerInstances.delete(this.id);
     cottontail.workerTerminate(this.id);
   }
   addEventListener(name, handler) {
@@ -707,6 +929,7 @@ export const FFIType = {
   i8: "i8",
   u16: "u16",
   i16: "i16",
+  int: "int",
   u32: "u32",
   i32: "i32",
   u64: "u64",
@@ -804,7 +1027,12 @@ export class JSCallback {
     this.threadsafe = Boolean(options.threadsafe);
     this.ptr = cottontail.createCallback(fn, this.args, this.returns, this.threadsafe);
   }
-  close() {}
+  close() {
+    if (this.ptr) {
+      cottontail.closeCallback?.(this.ptr);
+      this.ptr = 0;
+    }
+  }
 }
 
 function nativeArg(value, type) {

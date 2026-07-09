@@ -1,9 +1,14 @@
 export function randomBytes(size) {
-  const bytes = new Uint8Array(Number(size) || 0);
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Math.floor(Math.random() * 256);
+  const length = Number(size) || 0;
+  if (length < 0 || !Number.isFinite(length)) {
+    throw new RangeError("randomBytes size must be a non-negative finite number");
   }
-  return bytes;
+  if (typeof cottontail.randomBytes !== "function") {
+    throw new Error("native randomBytes is unavailable");
+  }
+  return globalThis.Buffer?.from
+    ? globalThis.Buffer.from(cottontail.randomBytes(length))
+    : new Uint8Array(cottontail.randomBytes(length));
 }
 
 export function randomUUID() {
@@ -37,8 +42,18 @@ function concatBytes(chunks) {
   return out;
 }
 
+function pathJoin(...parts) {
+  return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
+}
+
+function tmpRoot(kind) {
+  const explicit = cottontail.env("COTTONTAIL_TMP_DIR");
+  const base = explicit || cottontail.env("TMPDIR") || cottontail.env("TEMP") || cottontail.env("TMP") || "/tmp";
+  return pathJoin(base, "cottontail", kind);
+}
+
 function runSha256(bytes) {
-  const tmpDir = `${cottontail.cwd()}/.cottontail-tmp/hash`;
+  const tmpDir = tmpRoot("hash");
   cottontail.mkdirSync(tmpDir, true);
   const tmpPath = `${tmpDir}/${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
   cottontail.writeFile(tmpPath, bytes);

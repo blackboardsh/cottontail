@@ -31,6 +31,8 @@ if (JSON.stringify(result) !== JSON.stringify({
   payload: {
     method: "delayed-ping",
     params: { delayed: true },
+    scriptRan: true,
+    imported: 1,
   },
 })) {
   throw new Error(`delayed worker response mismatch: ${JSON.stringify(result)}`);

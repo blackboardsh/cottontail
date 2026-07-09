@@ -1,3 +1,6 @@
+self.__requestWorkerScriptRan = true;
+await import("./request-worker-import-target.js");
+
 self.onmessage = async (event) => {
   const message = event.data;
   if (message?.type !== "request") return;
@@ -9,6 +12,8 @@ self.onmessage = async (event) => {
     payload: {
       method: message.method,
       params: message.params,
+      scriptRan: self.__requestWorkerScriptRan,
+      imported: self.__requestWorkerImported,
     },
   });
 };

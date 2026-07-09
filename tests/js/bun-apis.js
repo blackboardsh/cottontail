@@ -1,4 +1,5 @@
 import { Bun, Archive } from "../../src/runtime_modules/bun/index.js";
+import { dlopen, FFIType } from "../../src/runtime_modules/bun/ffi.js";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -8,10 +9,34 @@ const tmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
 cottontail.mkdirSync(tmpDir, true);
 
+assert(FFIType.int === "int", "FFIType.int should match Bun's int type name");
+
+if (cottontail.platform() !== "win32") {
+  const libcPath = cottontail.platform() === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6";
+  const libc = dlopen(libcPath, {
+    getpid: { args: [], returns: FFIType.int },
+  });
+  const libcString = dlopen(libcPath, {
+    getpid: { args: [], returns: "int" },
+  });
+  assert(libc.symbols.getpid() === cottontail.pid(), "FFIType.int return mismatch");
+  assert(libcString.symbols.getpid() === cottontail.pid(), "literal int FFI return mismatch");
+}
+
 const spawnResult = Bun.spawnSync(["sh", "-c", "printf spawn-ok"]);
 assert(spawnResult.success, "Bun.spawnSync success mismatch");
 assert(spawnResult.exitCode === 0, "Bun.spawnSync exitCode mismatch");
 assert(spawnResult.stdout.toString() === "spawn-ok", "Bun.spawnSync stdout mismatch");
+
+const streamProcess = Bun.spawn(["sh", "-c", "printf response-stream-ok"], {
+  stdout: "pipe",
+  stderr: "pipe",
+});
+const streamText = await new Response(streamProcess.stdout).text();
+await streamProcess.exited;
+assert(streamText === "response-stream-ok", `Response subprocess stream mismatch: ${JSON.stringify(streamText)}`);
+
+console.log({ cottontailConsoleObject: true, nested: { ok: true } });
 
 const archiveSource = `${tmpDir}/archive-source`;
 const archiveOut = `${tmpDir}/archive-out`;
