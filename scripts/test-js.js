@@ -175,6 +175,15 @@ try {
       stdoutIncludes: ['node fs passed'],
     },
     {
+      name: 'node-fs-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-fs-surface.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node fs surface passed'],
+    },
+    {
       name: 'node-child-process',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process.ts'),
       expectExitCode: 0,

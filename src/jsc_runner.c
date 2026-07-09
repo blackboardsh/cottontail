@@ -20,6 +20,12 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#if defined(__APPLE__) || defined(__MACH__)
+#include <sys/mount.h>
+#else
+#include <sys/statvfs.h>
+#endif
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2460,8 +2466,21 @@ static double ct_stat_birthtime_ms(const struct stat *stat_value) {
 }
 
 static void ct_define_stat_fields(JSContextRef ctx, JSObjectRef object, const struct stat *stat_value, JSValueRef *exception) {
+    ct_set_property(ctx, object, "dev", JSValueMakeNumber(ctx, (double)stat_value->st_dev), exception);
+    ct_set_property(ctx, object, "ino", JSValueMakeNumber(ctx, (double)stat_value->st_ino), exception);
     ct_set_property(ctx, object, "size", JSValueMakeNumber(ctx, (double)stat_value->st_size), exception);
     ct_set_property(ctx, object, "mode", JSValueMakeNumber(ctx, (double)stat_value->st_mode), exception);
+    ct_set_property(ctx, object, "nlink", JSValueMakeNumber(ctx, (double)stat_value->st_nlink), exception);
+    ct_set_property(ctx, object, "uid", JSValueMakeNumber(ctx, (double)stat_value->st_uid), exception);
+    ct_set_property(ctx, object, "gid", JSValueMakeNumber(ctx, (double)stat_value->st_gid), exception);
+    ct_set_property(ctx, object, "rdev", JSValueMakeNumber(ctx, (double)stat_value->st_rdev), exception);
+#if defined(__APPLE__) || defined(__linux__)
+    ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, (double)stat_value->st_blksize), exception);
+    ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, (double)stat_value->st_blocks), exception);
+#else
+    ct_set_property(ctx, object, "blksize", JSValueMakeNumber(ctx, 0), exception);
+    ct_set_property(ctx, object, "blocks", JSValueMakeNumber(ctx, 0), exception);
+#endif
     ct_set_property(ctx, object, "atimeMs", JSValueMakeNumber(ctx, ct_stat_atime_ms(stat_value)), exception);
     ct_set_property(ctx, object, "mtimeMs", JSValueMakeNumber(ctx, ct_stat_mtime_ms(stat_value)), exception);
     ct_set_property(ctx, object, "ctimeMs", JSValueMakeNumber(ctx, ct_stat_ctime_ms(stat_value)), exception);
@@ -4064,10 +4083,28 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
         return JSValueMakeNumber(ctx, -1);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
-    char *flags = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
+    char *flags = argc >= 2 && !JSValueIsNumber(ctx, argv[1]) ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
     int open_flags = O_RDONLY;
-    if (flags != NULL && (strchr(flags, 'w') != NULL)) open_flags = O_WRONLY | O_CREAT | O_TRUNC;
-    int fd = open(path, open_flags, 0666);
+    if (argc >= 2 && JSValueIsNumber(ctx, argv[1])) {
+        open_flags = (int)ct_value_to_number(ctx, argv[1]);
+    } else if (flags != NULL) {
+        if (strcmp(flags, "r") == 0) open_flags = O_RDONLY;
+        else if (strcmp(flags, "r+") == 0) open_flags = O_RDWR;
+        else if (strcmp(flags, "rs") == 0 || strcmp(flags, "sr") == 0) open_flags = O_RDONLY | O_SYNC;
+        else if (strcmp(flags, "rs+") == 0 || strcmp(flags, "sr+") == 0) open_flags = O_RDWR | O_SYNC;
+        else if (strcmp(flags, "w") == 0) open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+        else if (strcmp(flags, "wx") == 0 || strcmp(flags, "xw") == 0) open_flags = O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
+        else if (strcmp(flags, "w+") == 0) open_flags = O_RDWR | O_CREAT | O_TRUNC;
+        else if (strcmp(flags, "wx+") == 0 || strcmp(flags, "xw+") == 0) open_flags = O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
+        else if (strcmp(flags, "a") == 0) open_flags = O_WRONLY | O_CREAT | O_APPEND;
+        else if (strcmp(flags, "ax") == 0 || strcmp(flags, "xa") == 0) open_flags = O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
+        else if (strcmp(flags, "a+") == 0) open_flags = O_RDWR | O_CREAT | O_APPEND;
+        else if (strcmp(flags, "ax+") == 0 || strcmp(flags, "xa+") == 0) open_flags = O_RDWR | O_CREAT | O_APPEND | O_EXCL;
+        else if (strcmp(flags, "as") == 0 || strcmp(flags, "sa") == 0) open_flags = O_WRONLY | O_CREAT | O_APPEND | O_SYNC;
+        else if (strcmp(flags, "as+") == 0 || strcmp(flags, "sa+") == 0) open_flags = O_RDWR | O_CREAT | O_APPEND | O_SYNC;
+    }
+    int mode = argc >= 3 ? (int)ct_value_to_number(ctx, argv[2]) : 0666;
+    int fd = open(path, open_flags, (mode_t)mode);
     if (fd < 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
     free(flags);
@@ -4172,6 +4209,417 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
 
     free(text);
     return JSValueMakeBoolean(ctx, ok);
+}
+
+static JSValueRef ct_access_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "accessSync(path[, mode]) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    int mode = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : F_OK;
+    if (path == NULL || access(path, mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_fd_read_at(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "cottontail.fdReadAt(fd, buffer, offset, length[, position]) requires fd, buffer, offset, and length");
+        return JSValueMakeNumber(ctx, 0);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (fd < 0 || ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0) {
+        ct_throw_message(ctx, exception, "invalid fd or read buffer");
+        return JSValueMakeNumber(ctx, 0);
+    }
+    size_t offset = (size_t)ct_value_to_number(ctx, argv[2]);
+    size_t length = (size_t)ct_value_to_number(ctx, argv[3]);
+    if (offset > bytes_len) offset = bytes_len;
+    if (length > bytes_len - offset) length = bytes_len - offset;
+    bool has_position = argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]);
+    ssize_t count;
+    do {
+        count = has_position
+            ? pread(fd, bytes + offset, length, (off_t)ct_value_to_number(ctx, argv[4]))
+            : read(fd, bytes + offset, length);
+    } while (count < 0 && errno == EINTR);
+    if (count < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeNumber(ctx, 0);
+    }
+    return JSValueMakeNumber(ctx, (double)count);
+}
+
+static JSValueRef ct_fd_write_at(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "cottontail.fdWriteAt(fd, data, offset, length[, position]) requires fd, data, offset, and length");
+        return JSValueMakeNumber(ctx, 0);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    char *text = NULL;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0) {
+        text = ct_value_to_string_copy(ctx, argv[1]);
+        bytes = (uint8_t *)text;
+        bytes_len = text != NULL ? strlen(text) : 0;
+    }
+    if (fd < 0 || bytes == NULL) {
+        free(text);
+        ct_throw_message(ctx, exception, "invalid fd or write data");
+        return JSValueMakeNumber(ctx, 0);
+    }
+    size_t offset = (size_t)ct_value_to_number(ctx, argv[2]);
+    size_t length = (size_t)ct_value_to_number(ctx, argv[3]);
+    if (offset > bytes_len) offset = bytes_len;
+    if (length > bytes_len - offset) length = bytes_len - offset;
+    bool has_position = argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]);
+    size_t written_total = 0;
+    while (written_total < length) {
+        ssize_t count = has_position
+            ? pwrite(fd, bytes + offset + written_total, length - written_total, (off_t)ct_value_to_number(ctx, argv[4]) + (off_t)written_total)
+            : write(fd, bytes + offset + written_total, length - written_total);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            free(text);
+            ct_throw_message(ctx, exception, strerror(errno));
+            return JSValueMakeNumber(ctx, (double)written_total);
+        }
+        if (count == 0) break;
+        written_total += (size_t)count;
+    }
+    free(text);
+    return JSValueMakeNumber(ctx, (double)written_total);
+}
+
+static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "fstatSync(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    struct stat stat_value;
+    if (fstat((int)ct_value_to_number(ctx, argv[0]), &stat_value) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    ct_define_stat_fields(ctx, result, &stat_value, exception);
+    return result;
+}
+
+static JSValueRef ct_fsync_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || fsync((int)ct_value_to_number(ctx, argv[0])) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_fdatasync_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "fdatasyncSync(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+#if defined(__APPLE__) || defined(__MACH__)
+    int status = fsync((int)ct_value_to_number(ctx, argv[0]));
+#else
+    int status = fdatasync((int)ct_value_to_number(ctx, argv[0]));
+#endif
+    if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_ftruncate_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "ftruncateSync(fd[, len]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    off_t len = argc >= 2 ? (off_t)ct_value_to_number(ctx, argv[1]) : 0;
+    if (ftruncate((int)ct_value_to_number(ctx, argv[0]), len) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_fchmod_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2 || fchmod((int)ct_value_to_number(ctx, argv[0]), (mode_t)ct_value_to_number(ctx, argv[1])) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_fchown_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3 || fchown((int)ct_value_to_number(ctx, argv[0]), (uid_t)ct_value_to_number(ctx, argv[1]), (gid_t)ct_value_to_number(ctx, argv[2])) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static void ct_timeval_from_seconds(double seconds, struct timeval *value) {
+    time_t whole = (time_t)seconds;
+    double fraction = seconds - (double)whole;
+    if (fraction < 0) fraction = 0;
+    value->tv_sec = whole;
+    value->tv_usec = (suseconds_t)(fraction * 1000000.0);
+}
+
+static JSValueRef ct_futimes_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "futimesSync(fd, atime, mtime) requires fd, atime, and mtime");
+        return JSValueMakeUndefined(ctx);
+    }
+    struct timeval times[2];
+    ct_timeval_from_seconds(ct_value_to_number(ctx, argv[1]), &times[0]);
+    ct_timeval_from_seconds(ct_value_to_number(ctx, argv[2]), &times[1]);
+    if (futimes((int)ct_value_to_number(ctx, argv[0]), times) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_truncate_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "truncateSync(path[, len]) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    off_t len = argc >= 2 ? (off_t)ct_value_to_number(ctx, argv[1]) : 0;
+    if (path == NULL || truncate(path, len) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_utimes_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "utimesSync(path, atime, mtime[, follow]) requires path, atime, and mtime");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    struct timeval times[2];
+    ct_timeval_from_seconds(ct_value_to_number(ctx, argv[1]), &times[0]);
+    ct_timeval_from_seconds(ct_value_to_number(ctx, argv[2]), &times[1]);
+    bool follow = argc < 4 || ct_value_to_bool(ctx, argv[3]);
+    int status;
+    if (follow) {
+        status = utimes(path, times);
+    } else {
+#if defined(__APPLE__) || defined(__MACH__)
+        status = lutimes(path, times);
+#elif defined(AT_SYMLINK_NOFOLLOW)
+        struct timespec ts[2];
+        ts[0].tv_sec = times[0].tv_sec;
+        ts[0].tv_nsec = times[0].tv_usec * 1000;
+        ts[1].tv_sec = times[1].tv_sec;
+        ts[1].tv_nsec = times[1].tv_usec * 1000;
+        status = utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
+#else
+        errno = ENOSYS;
+        status = -1;
+#endif
+    }
+    if (path == NULL || status != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_chown_native_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "chownSync(path, uid, gid[, follow]) requires path, uid, and gid");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    uid_t uid = (uid_t)ct_value_to_number(ctx, argv[1]);
+    gid_t gid = (gid_t)ct_value_to_number(ctx, argv[2]);
+    bool follow = argc < 4 || ct_value_to_bool(ctx, argv[3]);
+    int status = follow ? chown(path, uid, gid) : lchown(path, uid, gid);
+    if (path == NULL || status != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_lchmod_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "lchmodSync(path, mode) requires path and mode");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+#if defined(__APPLE__) || defined(__MACH__)
+    int status = lchmod(path, (mode_t)ct_value_to_number(ctx, argv[1]));
+#else
+    errno = ENOSYS;
+    int status = -1;
+#endif
+    if (path == NULL || status != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_link_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "linkSync(existingPath, newPath) requires existingPath and newPath");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *existing_path = ct_value_to_string_copy(ctx, argv[0]);
+    char *new_path = ct_value_to_string_copy(ctx, argv[1]);
+    if (existing_path == NULL || new_path == NULL || link(existing_path, new_path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(existing_path);
+    free(new_path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_symlink_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "symlinkSync(target, path) requires target and path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *target = ct_value_to_string_copy(ctx, argv[0]);
+    char *path = ct_value_to_string_copy(ctx, argv[1]);
+    if (target == NULL || path == NULL || symlink(target, path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(target);
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_rename_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "renameSync(oldPath, newPath) requires oldPath and newPath");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *old_path = ct_value_to_string_copy(ctx, argv[0]);
+    char *new_path = ct_value_to_string_copy(ctx, argv[1]);
+    if (old_path == NULL || new_path == NULL || rename(old_path, new_path) != 0) ct_throw_message(ctx, exception, strerror(errno));
+    free(old_path);
+    free(new_path);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_readlink_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "readlinkSync(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    size_t capacity = 256;
+    char *buffer = NULL;
+    ssize_t count = -1;
+    while (path != NULL) {
+        char *next = (char *)realloc(buffer, capacity + 1);
+        if (next == NULL) {
+            free(buffer);
+            free(path);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        buffer = next;
+        count = readlink(path, buffer, capacity);
+        if (count < 0 || (size_t)count < capacity) break;
+        capacity *= 2;
+    }
+    if (path == NULL || count < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(buffer);
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    buffer[count] = 0;
+    JSValueRef result = ct_make_string_len(ctx, buffer, (size_t)count);
+    free(buffer);
+    free(path);
+    return result;
+}
+
+static JSValueRef ct_realpath_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "realpathSync(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    char *resolved = path != NULL ? realpath(path, NULL) : NULL;
+    if (resolved == NULL) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string(ctx, resolved);
+    free(resolved);
+    free(path);
+    return result;
+}
+
+static JSValueRef ct_statfs_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "statfsSync(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    JSObjectRef result = ct_make_object(ctx);
+#if defined(__APPLE__) || defined(__MACH__)
+    struct statfs value;
+    if (path == NULL || statfs(path, &value) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_property(ctx, result, "type", JSValueMakeNumber(ctx, (double)value.f_type), exception);
+    ct_set_property(ctx, result, "bsize", JSValueMakeNumber(ctx, (double)value.f_bsize), exception);
+    ct_set_property(ctx, result, "blocks", JSValueMakeNumber(ctx, (double)value.f_blocks), exception);
+    ct_set_property(ctx, result, "bfree", JSValueMakeNumber(ctx, (double)value.f_bfree), exception);
+    ct_set_property(ctx, result, "bavail", JSValueMakeNumber(ctx, (double)value.f_bavail), exception);
+    ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, (double)value.f_files), exception);
+    ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, (double)value.f_ffree), exception);
+#else
+    struct statvfs value;
+    if (path == NULL || statvfs(path, &value) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_property(ctx, result, "type", JSValueMakeNumber(ctx, 0), exception);
+    ct_set_property(ctx, result, "bsize", JSValueMakeNumber(ctx, (double)value.f_bsize), exception);
+    ct_set_property(ctx, result, "blocks", JSValueMakeNumber(ctx, (double)value.f_blocks), exception);
+    ct_set_property(ctx, result, "bfree", JSValueMakeNumber(ctx, (double)value.f_bfree), exception);
+    ct_set_property(ctx, result, "bavail", JSValueMakeNumber(ctx, (double)value.f_bavail), exception);
+    ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, (double)value.f_files), exception);
+    ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, (double)value.f_ffree), exception);
+#endif
+    free(path);
+    return result;
 }
 
 static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4523,6 +4971,26 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "readFd", ct_read_fd, runtime);
     ct_install_function(ctx, host, "closeFd", ct_close_fd, runtime);
     ct_install_function(ctx, host, "fdWrite", ct_fd_write, runtime);
+    ct_install_function(ctx, host, "accessSync", ct_access_sync_native, runtime);
+    ct_install_function(ctx, host, "fdReadAt", ct_fd_read_at, runtime);
+    ct_install_function(ctx, host, "fdWriteAt", ct_fd_write_at, runtime);
+    ct_install_function(ctx, host, "fstatSync", ct_fstat_sync, runtime);
+    ct_install_function(ctx, host, "fsyncSync", ct_fsync_sync, runtime);
+    ct_install_function(ctx, host, "fdatasyncSync", ct_fdatasync_sync, runtime);
+    ct_install_function(ctx, host, "ftruncateSync", ct_ftruncate_sync, runtime);
+    ct_install_function(ctx, host, "fchmodSync", ct_fchmod_sync, runtime);
+    ct_install_function(ctx, host, "fchownSync", ct_fchown_sync, runtime);
+    ct_install_function(ctx, host, "futimesSync", ct_futimes_sync, runtime);
+    ct_install_function(ctx, host, "truncateSync", ct_truncate_sync, runtime);
+    ct_install_function(ctx, host, "utimesSync", ct_utimes_sync, runtime);
+    ct_install_function(ctx, host, "chownSync", ct_chown_native_sync, runtime);
+    ct_install_function(ctx, host, "lchmodSync", ct_lchmod_sync, runtime);
+    ct_install_function(ctx, host, "linkSync", ct_link_sync_native, runtime);
+    ct_install_function(ctx, host, "symlinkSync", ct_symlink_sync_native, runtime);
+    ct_install_function(ctx, host, "renameSync", ct_rename_sync_native, runtime);
+    ct_install_function(ctx, host, "readlinkSync", ct_readlink_sync_native, runtime);
+    ct_install_function(ctx, host, "realpathSync", ct_realpath_sync_native, runtime);
+    ct_install_function(ctx, host, "statfsSync", ct_statfs_sync_native, runtime);
     ct_install_function(ctx, host, "fdWatchStart", ct_fd_watch_start, runtime);
     ct_install_function(ctx, host, "fdWatchStop", ct_fd_watch_stop, runtime);
     ct_install_function(ctx, host, "fdSetEventHandler", ct_fd_set_event_handler, runtime);
