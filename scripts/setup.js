@@ -1,16 +1,13 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 const ZIG_VERSION = '0.16.0';
-const QUICKJS_VERSION = '0.14.0';
 const ROOT = process.cwd();
 const ZIG_DIR = join(ROOT, 'vendors', 'zig');
 const ZIG_VERSION_STAMP = join(ZIG_DIR, '.zig-version');
-const QUICKJS_DIR = join(ROOT, 'vendors', 'quickjs');
-const QUICKJS_VERSION_STAMP = join(QUICKJS_DIR, '.quickjs-version');
 
 function fail(message, error) {
   console.error(message);
@@ -65,54 +62,6 @@ function isCurrentZigVendored() {
 function resetVendorDir() {
   rmSync(ZIG_DIR, { recursive: true, force: true });
   mkdirSync(ZIG_DIR, { recursive: true });
-}
-
-function isCurrentQuickjsVendored() {
-  const quickjsHeaderPath = join(QUICKJS_DIR, 'quickjs.h');
-  const quickjsSourcePath = join(QUICKJS_DIR, 'quickjs-amalgam.c');
-
-  if (!existsSync(quickjsHeaderPath) || !existsSync(quickjsSourcePath) || !existsSync(QUICKJS_VERSION_STAMP)) {
-    return false;
-  }
-
-  return readFileSync(QUICKJS_VERSION_STAMP, 'utf8').trim() === QUICKJS_VERSION;
-}
-
-function vendorQuickjs() {
-  if (isCurrentQuickjsVendored()) {
-    console.log(`✓ QuickJS-ng ${QUICKJS_VERSION} already vendored`);
-    return;
-  }
-
-  console.log(`Vendoring QuickJS-ng ${QUICKJS_VERSION}...`);
-
-  rmSync(QUICKJS_DIR, { recursive: true, force: true });
-  mkdirSync(QUICKJS_DIR, { recursive: true });
-
-  const quickjsZipPath = join(ROOT, 'vendors', 'quickjs.zip');
-  const downloadUrl = `https://github.com/quickjs-ng/quickjs/releases/download/v${QUICKJS_VERSION}/quickjs-amalgam.zip`;
-
-  try {
-    execSync(`curl -L ${downloadUrl} -o vendors/quickjs.zip`, { stdio: 'inherit' });
-
-    if (process.platform === 'win32') {
-      execSync(
-        `powershell -ExecutionPolicy Bypass -Command "Expand-Archive -Path 'vendors/quickjs.zip' -DestinationPath 'vendors/quickjs' -Force"`,
-        { stdio: 'inherit' }
-      );
-    } else {
-      execSync(`unzip -oq vendors/quickjs.zip -d vendors/quickjs`, { stdio: 'inherit' });
-    }
-
-    if (existsSync(quickjsZipPath)) {
-      unlinkSync(quickjsZipPath);
-    }
-
-    writeFileSync(QUICKJS_VERSION_STAMP, `${QUICKJS_VERSION}\n`);
-    console.log(`✓ QuickJS-ng ${QUICKJS_VERSION} vendored`);
-  } catch (error) {
-    fail('Failed to vendor QuickJS-ng.', error);
-  }
 }
 
 function vendorZig() {
@@ -178,7 +127,6 @@ function vendorZig() {
 
 function setup() {
   vendorZig();
-  vendorQuickjs();
   console.log('\nSetup complete. Vendored Zig is ready at vendors/zig/zig');
 }
 

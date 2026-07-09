@@ -6,8 +6,6 @@ vendors/zig/
 vendors/zig.zip
 vendors/zig-temp/
 vendors/esbuild/
-vendors/quickjs/
-vendors/quickjs.zip
 .cottontail-tmp/
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/

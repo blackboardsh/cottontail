@@ -1,12 +1,9 @@
 import { assert, binaryName, fail, fs, os, path, proc, runChecked } from './ct-runtime.js';
 
 const ZIG_VERSION = '0.16.0';
-const QUICKJS_VERSION = '0.14.0';
 const ROOT = proc.cwd();
 const ZIG_DIR = path.join(ROOT, 'vendors', 'zig');
 const ZIG_VERSION_STAMP = path.join(ZIG_DIR, '.zig-version');
-const QUICKJS_DIR = path.join(ROOT, 'vendors', 'quickjs');
-const QUICKJS_VERSION_STAMP = path.join(QUICKJS_DIR, '.quickjs-version');
 const ZIG_BINARY = path.join(ZIG_DIR, binaryName('zig'));
 const COTTONTAIL_BINARY = path.join(ROOT, 'zig-out', 'bin', binaryName('cottontail'));
 
@@ -40,14 +37,6 @@ function readStamp(filePath) {
 
 function isCurrentZigVendored() {
   return fs.existsSync(ZIG_BINARY) && readStamp(ZIG_VERSION_STAMP) === ZIG_VERSION;
-}
-
-function isCurrentQuickjsVendored() {
-  return (
-    fs.existsSync(path.join(QUICKJS_DIR, 'quickjs.h')) &&
-    fs.existsSync(path.join(QUICKJS_DIR, 'quickjs-amalgam.c')) &&
-    readStamp(QUICKJS_VERSION_STAMP) === QUICKJS_VERSION
-  );
 }
 
 function resetZigVendorDir() {
@@ -87,42 +76,6 @@ function getHostPlatform() {
 
 function ensureVendorsRoot() {
   fs.mkdirSync(path.join(ROOT, 'vendors'), { recursive: true });
-}
-
-function vendorQuickjs() {
-  if (isCurrentQuickjsVendored()) {
-    console.log(`✓ QuickJS-ng ${QUICKJS_VERSION} already vendored`);
-    return;
-  }
-
-  console.log(`Vendoring QuickJS-ng ${QUICKJS_VERSION}...`);
-
-  ensureVendorsRoot();
-  fs.rmSync(QUICKJS_DIR, { recursive: true, force: true });
-  fs.mkdirSync(QUICKJS_DIR, { recursive: true });
-
-  const quickjsZipPath = path.join(ROOT, 'vendors', 'quickjs.zip');
-  const downloadUrl = `https://github.com/quickjs-ng/quickjs/releases/download/v${QUICKJS_VERSION}/quickjs-amalgam.zip`;
-
-  runChecked('curl', ['-L', downloadUrl, '-o', quickjsZipPath]);
-
-  if (os.platform() === 'win32') {
-    runChecked('powershell', [
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      `Expand-Archive -Path '${quickjsZipPath}' -DestinationPath '${QUICKJS_DIR}' -Force`,
-    ]);
-  } else {
-    runChecked('unzip', ['-oq', quickjsZipPath, '-d', QUICKJS_DIR]);
-  }
-
-  if (fs.existsSync(quickjsZipPath)) {
-    fs.unlinkSync(quickjsZipPath);
-  }
-
-  fs.writeFileSync(QUICKJS_VERSION_STAMP, `${QUICKJS_VERSION}\n`);
-  console.log(`✓ QuickJS-ng ${QUICKJS_VERSION} vendored`);
 }
 
 function vendorZig() {
@@ -201,7 +154,6 @@ function vendorZig() {
 
 function setup() {
   vendorZig();
-  vendorQuickjs();
   console.log('');
   console.log('Setup complete. You can now run: ./zig-out/bin/cottontail scripts/repo.js build');
 }

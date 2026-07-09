@@ -169,7 +169,7 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         execution.allocator,
         script_js_stack_size,
     ) catch {
-        writeStderr(execution.io, "cottontail: failed to initialize the embedded QuickJS runtime\n", .{});
+        writeStderr(execution.io, "cottontail: failed to initialize the embedded JavaScriptCore runtime\n", .{});
         execution.exit_code = 1;
         return;
     };

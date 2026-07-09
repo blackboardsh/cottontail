@@ -2,13 +2,13 @@ const std = @import("std");
 const host = @import("host.zig");
 
 const c = @cImport({
-    @cInclude("qjs_runner.h");
+    @cInclude("jsc_runner.h");
 });
 
 pub const Runtime = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
-    handle: *c.CtQjsRuntime,
+    handle: *c.CtJscRuntime,
     max_script_size: usize = 64 * 1024 * 1024,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Runtime {
@@ -16,7 +16,7 @@ pub const Runtime = struct {
     }
 
     pub fn initWithStackSize(io: std.Io, allocator: std.mem.Allocator, stack_size: usize) !Runtime {
-        const handle = c.ct_qjs_runtime_create_with_stack_size(stack_size) orelse return error.RuntimeInitFailed;
+        const handle = c.ct_jsc_runtime_create_with_stack_size(stack_size) orelse return error.RuntimeInitFailed;
         host.configure(io);
         return .{
             .io = io,
@@ -26,7 +26,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        c.ct_qjs_runtime_destroy(self.handle);
+        c.ct_jsc_runtime_destroy(self.handle);
     }
 
     pub fn setArgs(self: *Runtime, args: []const [:0]const u8) !void {
@@ -41,9 +41,9 @@ pub const Runtime = struct {
         else
             @as([*c]const [*c]const u8, @ptrCast(arg_ptrs.ptr));
 
-        if (c.ct_qjs_runtime_set_args(self.handle, args.len, argv_ptr, &eval_error) != 0) {
+        if (c.ct_jsc_runtime_set_args(self.handle, args.len, argv_ptr, &eval_error) != 0) {
             defer if (eval_error != null) {
-                c.ct_qjs_string_free(eval_error);
+                c.ct_jsc_string_free(eval_error);
             };
 
             if (eval_error != null) {
@@ -76,9 +76,9 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
 
-        if (c.ct_qjs_runtime_eval(self.handle, source_z.ptr, source.len, script_path.ptr, &eval_error) != 0) {
+        if (c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, script_path.ptr, &eval_error) != 0) {
             defer if (eval_error != null) {
-                c.ct_qjs_string_free(eval_error);
+                c.ct_jsc_string_free(eval_error);
             };
 
             if (eval_error != null) {
@@ -95,9 +95,9 @@ pub const Runtime = struct {
 
     pub fn tick(self: *Runtime) !void {
         var eval_error: [*c]u8 = null;
-        if (c.ct_qjs_runtime_tick(self.handle, &eval_error) != 0) {
+        if (c.ct_jsc_runtime_tick(self.handle, &eval_error) != 0) {
             defer if (eval_error != null) {
-                c.ct_qjs_string_free(eval_error);
+                c.ct_jsc_string_free(eval_error);
             };
 
             if (eval_error != null) {

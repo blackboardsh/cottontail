@@ -1,31 +1,5 @@
 const std = @import("std");
 
-const JsEngine = enum {
-    quickjs,
-    jsc,
-};
-
-fn configureQuickjs(step: *std.Build.Step.Compile, b: *std.Build) void {
-    step.root_module.link_libc = true;
-    step.root_module.addIncludePath(b.path("src"));
-    step.root_module.addIncludePath(b.path("vendors/quickjs"));
-    step.root_module.addCSourceFile(.{
-        .file = b.path("vendors/quickjs/quickjs-amalgam.c"),
-        .flags = &[_][]const u8{"-std=c11"},
-    });
-    step.root_module.addCSourceFile(.{
-        .file = b.path("src/qjs_runner.c"),
-        .flags = &[_][]const u8{"-std=c11"},
-    });
-
-    if (step.root_module.resolved_target.?.result.os.tag != .windows) {
-        step.root_module.linkSystemLibrary("m", .{});
-        step.root_module.linkSystemLibrary("ffi", .{});
-        step.root_module.linkSystemLibrary("z", .{});
-        step.root_module.linkSystemLibrary("pthread", .{});
-    }
-}
-
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
@@ -39,26 +13,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         step.root_module.linkSystemLibrary("ffi", .{});
         step.root_module.linkSystemLibrary("pthread", .{});
     } else {
-        @panic("JavaScriptCore backend is currently wired for macOS only");
-    }
-}
-
-fn configureJsEngine(step: *std.Build.Step.Compile, b: *std.Build, engine: JsEngine) void {
-    switch (engine) {
-        .quickjs => configureQuickjs(step, b),
-        .jsc => configureJsc(step, b),
+        @panic("Cottontail currently wires JavaScriptCore through the macOS system framework only");
     }
 }
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const default_engine: JsEngine = if ((target.result.os.tag == .macos) or
-        (target.query.os_tag == null and @import("builtin").os.tag == .macos))
-        .jsc
-    else
-        .quickjs;
-    const engine = b.option(JsEngine, "engine", "JavaScript engine backend") orelse default_engine;
 
     const exe = b.addExecutable(.{
         .name = "cottontail",
@@ -69,7 +30,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    configureJsEngine(exe, b, engine);
+    configureJsc(exe, b);
 
     b.installArtifact(exe);
 
@@ -90,7 +51,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    configureJsEngine(unit_tests, b, engine);
+    configureJsc(unit_tests, b);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

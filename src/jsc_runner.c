@@ -1,4 +1,4 @@
-#include "qjs_runner.h"
+#include "jsc_runner.h"
 
 #include <JavaScriptCore/JavaScript.h>
 #include <arpa/inet.h>
@@ -187,7 +187,7 @@ struct CtWorker {
     pthread_t thread;
     bool terminated;
     pthread_mutex_t mutex;
-    CtQjsRuntime *parent_runtime;
+    CtJscRuntime *parent_runtime;
     CtWorkerMessage *parent_to_worker_head;
     CtWorkerMessage *parent_to_worker_tail;
     CtWorkerMessage *worker_to_parent_head;
@@ -206,7 +206,7 @@ typedef struct CtAsyncProcess {
     int stdin_fd;
     int stdout_fd;
     int stderr_fd;
-    CtQjsRuntime *runtime;
+    CtJscRuntime *runtime;
     pthread_t thread;
     struct CtAsyncProcess *next;
 } CtAsyncProcess;
@@ -215,7 +215,7 @@ typedef struct CtFdWatcher {
     uint32_t id;
     int fd;
     size_t max_bytes;
-    CtQjsRuntime *runtime;
+    CtJscRuntime *runtime;
     pthread_t thread;
     pthread_mutex_t mutex;
     bool active;
@@ -272,7 +272,7 @@ static CtHttpServer *ct_http_servers = NULL;
 static uint32_t ct_next_http_server_id = 1;
 static uint32_t ct_next_http_request_id = 1;
 
-struct CtQjsRuntime {
+struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
     JSObjectRef spawn_event_handler;
@@ -298,15 +298,15 @@ struct CtQjsRuntime {
     uint32_t next_fd_watch_id;
 };
 
-static int ct_qjs_runtime_eval_internal(
-    CtQjsRuntime *runtime,
+static int ct_jsc_runtime_eval_internal(
+    CtJscRuntime *runtime,
     const uint8_t *source,
     size_t source_len,
     const char *filename,
     bool wait_for_active_handles,
     char **error_out
 );
-static int ct_qjs_runtime_tick_with_delay(CtQjsRuntime *runtime, int *delay_ms_out, char **error_out);
+static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out);
 static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, const char *filename);
 
 static char *ct_duplicate_bytes(const char *bytes, size_t len) {
@@ -1062,7 +1062,7 @@ static int ct_parse_env_object(JSContextRef ctx, JSValueRef value, CtHostEnvEntr
     return 0;
 }
 
-static JSValueRef ct_make_function(JSContextRef ctx, const char *name, JSObjectCallAsFunctionCallback callback, CtQjsRuntime *runtime) {
+static JSValueRef ct_make_function(JSContextRef ctx, const char *name, JSObjectCallAsFunctionCallback callback, CtJscRuntime *runtime) {
     JSClassDefinition definition = kJSClassDefinitionEmpty;
     definition.className = name;
     definition.callAsFunction = callback;
@@ -1079,8 +1079,8 @@ static JSValueRef ct_make_plain_function(JSContextRef ctx, const char *name, JSO
     return function;
 }
 
-static CtQjsRuntime *ct_callback_runtime(JSObjectRef function) {
-    return (CtQjsRuntime *)JSObjectGetPrivate(function);
+static CtJscRuntime *ct_callback_runtime(JSObjectRef function) {
+    return (CtJscRuntime *)JSObjectGetPrivate(function);
 }
 
 static JSValueRef ct_console_log_impl(JSContextRef ctx, size_t argc, const JSValueRef argv[], FILE *stream) {
@@ -1217,7 +1217,7 @@ static JSValueRef ct_hostname(JSContextRef ctx, JSObjectRef function, JSObjectRe
 }
 
 struct CtFfiCallback {
-    CtQjsRuntime *runtime;
+    CtJscRuntime *runtime;
     JSContextRef ctx;
     JSObjectRef function;
     CtFfiType returns;
@@ -1605,7 +1605,7 @@ static void ct_write_ffi_return(void *ret, CtFfiType type, CtFfiValue value) {
     }
 }
 
-static void ct_enqueue_callback_job(CtQjsRuntime *runtime, CtFfiCallbackJob *job) {
+static void ct_enqueue_callback_job(CtJscRuntime *runtime, CtFfiCallbackJob *job) {
     pthread_mutex_lock(&runtime->callback_mutex);
     if (runtime->callback_jobs_tail != NULL) {
         runtime->callback_jobs_tail->next = job;
@@ -1616,7 +1616,7 @@ static void ct_enqueue_callback_job(CtQjsRuntime *runtime, CtFfiCallbackJob *job
     pthread_mutex_unlock(&runtime->callback_mutex);
 }
 
-static bool ct_runtime_has_live_callbacks(CtQjsRuntime *runtime) {
+static bool ct_runtime_has_live_callbacks(CtJscRuntime *runtime) {
     bool has_live_callback = false;
     pthread_mutex_lock(&runtime->callback_mutex);
     for (CtFfiCallback *callback = runtime->callbacks; callback != NULL; callback = callback->next) {
@@ -1732,7 +1732,7 @@ static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void 
     ct_write_ffi_return(ret, callback->returns, result);
 }
 
-static int ct_drain_ffi_callbacks(CtQjsRuntime *runtime, char **error_out) {
+static int ct_drain_ffi_callbacks(CtJscRuntime *runtime, char **error_out) {
     (void)error_out;
 
     while (true) {
@@ -1912,7 +1912,7 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
 }
 
 static JSValueRef ct_create_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     CtFfiCallback *callback = NULL;
     (void)thisObject;
 
@@ -1979,7 +1979,7 @@ static JSValueRef ct_create_callback(JSContextRef ctx, JSObjectRef function, JSO
 }
 
 static JSValueRef ct_close_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint64_t code = 0;
     (void)thisObject;
 
@@ -2469,7 +2469,7 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
     return response;
 }
 
-static void ct_queue_spawn_event(CtQjsRuntime *runtime, CtSpawnEvent *event) {
+static void ct_queue_spawn_event(CtJscRuntime *runtime, CtSpawnEvent *event) {
     pthread_mutex_lock(&runtime->spawn_event_mutex);
     if (runtime->spawn_events_tail != NULL) {
         runtime->spawn_events_tail->next = event;
@@ -2480,7 +2480,7 @@ static void ct_queue_spawn_event(CtQjsRuntime *runtime, CtSpawnEvent *event) {
     pthread_mutex_unlock(&runtime->spawn_event_mutex);
 }
 
-static void ct_queue_spawn_text(CtQjsRuntime *runtime, uint32_t id, const char *type, const char *data, size_t data_len) {
+static void ct_queue_spawn_text(CtJscRuntime *runtime, uint32_t id, const char *type, const char *data, size_t data_len) {
     if (data == NULL || data_len == 0) return;
     CtSpawnEvent *event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
     if (event == NULL) return;
@@ -2491,7 +2491,7 @@ static void ct_queue_spawn_text(CtQjsRuntime *runtime, uint32_t id, const char *
     ct_queue_spawn_event(runtime, event);
 }
 
-static void ct_queue_fd_event(CtQjsRuntime *runtime, CtFdEvent *event) {
+static void ct_queue_fd_event(CtJscRuntime *runtime, CtFdEvent *event) {
     pthread_mutex_lock(&runtime->fd_event_mutex);
     if (runtime->fd_events_tail != NULL) {
         runtime->fd_events_tail->next = event;
@@ -2502,7 +2502,7 @@ static void ct_queue_fd_event(CtQjsRuntime *runtime, CtFdEvent *event) {
     pthread_mutex_unlock(&runtime->fd_event_mutex);
 }
 
-static void ct_queue_worker_event(CtQjsRuntime *runtime, uint32_t worker_id) {
+static void ct_queue_worker_event(CtJscRuntime *runtime, uint32_t worker_id) {
     if (runtime == NULL) return;
     CtWorkerEvent *event = (CtWorkerEvent *)calloc(1, sizeof(CtWorkerEvent));
     if (event == NULL) return;
@@ -2517,7 +2517,7 @@ static void ct_queue_worker_event(CtQjsRuntime *runtime, uint32_t worker_id) {
     pthread_mutex_unlock(&runtime->worker_event_mutex);
 }
 
-static void ct_queue_fd_data(CtQjsRuntime *runtime, uint32_t id, const char *data, size_t data_len) {
+static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len) {
     if (data == NULL || data_len == 0) return;
     if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
         fprintf(stderr, "[cottontail:fd] data id=%u bytes=%zu\n", id, data_len);
@@ -2538,7 +2538,7 @@ static void ct_queue_fd_data(CtQjsRuntime *runtime, uint32_t id, const char *dat
     ct_queue_fd_event(runtime, event);
 }
 
-static void ct_queue_fd_simple(CtQjsRuntime *runtime, uint32_t id, const char *type, const char *message) {
+static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message) {
     if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
         fprintf(stderr, "[cottontail:fd] %s id=%u%s%s\n", type, id, message != NULL ? " message=" : "", message != NULL ? message : "");
         fflush(stderr);
@@ -2598,7 +2598,7 @@ static bool ct_fd_watcher_stop_id(uint32_t id) {
     return found;
 }
 
-static bool ct_fd_watchers_has_runtime(CtQjsRuntime *runtime) {
+static bool ct_fd_watchers_has_runtime(CtJscRuntime *runtime) {
     bool found = false;
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
@@ -2611,7 +2611,7 @@ static bool ct_fd_watchers_has_runtime(CtQjsRuntime *runtime) {
     return found;
 }
 
-static void ct_fd_watchers_stop_runtime(CtQjsRuntime *runtime) {
+static void ct_fd_watchers_stop_runtime(CtJscRuntime *runtime) {
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
         if (watcher->runtime == runtime) {
@@ -2621,7 +2621,7 @@ static void ct_fd_watchers_stop_runtime(CtQjsRuntime *runtime) {
     pthread_mutex_unlock(&ct_fd_watchers_mutex);
 }
 
-static void ct_fd_watchers_wait_for_runtime(CtQjsRuntime *runtime) {
+static void ct_fd_watchers_wait_for_runtime(CtJscRuntime *runtime) {
     ct_fd_watchers_stop_runtime(runtime);
     for (int attempt = 0; attempt < 500 && ct_fd_watchers_has_runtime(runtime); attempt += 1) {
         usleep(1000);
@@ -2743,7 +2743,7 @@ static CtAsyncProcess *ct_async_process_find(uint32_t id) {
     return result;
 }
 
-static bool ct_async_processes_has_runtime(CtQjsRuntime *runtime) {
+static bool ct_async_processes_has_runtime(CtJscRuntime *runtime) {
     bool found = false;
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *cursor = ct_async_processes;
@@ -2758,7 +2758,7 @@ static bool ct_async_processes_has_runtime(CtQjsRuntime *runtime) {
     return found;
 }
 
-static void ct_async_processes_stop_runtime(CtQjsRuntime *runtime) {
+static void ct_async_processes_stop_runtime(CtJscRuntime *runtime) {
     pthread_mutex_lock(&ct_async_processes_mutex);
     CtAsyncProcess *cursor = ct_async_processes;
     while (cursor != NULL) {
@@ -2774,7 +2774,7 @@ static void ct_async_processes_stop_runtime(CtQjsRuntime *runtime) {
     pthread_mutex_unlock(&ct_async_processes_mutex);
 }
 
-static void ct_async_processes_wait_for_runtime(CtQjsRuntime *runtime) {
+static void ct_async_processes_wait_for_runtime(CtJscRuntime *runtime) {
     ct_async_processes_stop_runtime(runtime);
     for (int attempt = 0; attempt < 500 && ct_async_processes_has_runtime(runtime); attempt += 1) {
         if (attempt == 250) ct_async_processes_stop_runtime(runtime);
@@ -2882,7 +2882,7 @@ static void *ct_async_process_thread(void *opaque) {
 
 static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (argc < 1) {
         ct_throw_message(ctx, exception, "spawnStart(file, args, options) requires a file");
         return JSValueMakeUndefined(ctx);
@@ -3176,7 +3176,7 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
 static JSValueRef ct_spawn_set_event_handler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime->spawn_event_handler != NULL) {
         JSValueUnprotect(ctx, runtime->spawn_event_handler);
         runtime->spawn_event_handler = NULL;
@@ -3206,7 +3206,7 @@ static JSValueRef ct_undefined(JSContextRef ctx, JSObjectRef function, JSObjectR
     return JSValueMakeUndefined(ctx);
 }
 
-static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtQjsRuntime *runtime, JSValueRef *exception) {
+static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
     if (runtime->spawn_event_handler == NULL) return JSValueMakeUndefined(ctx);
     for (;;) {
         pthread_mutex_lock(&runtime->spawn_event_mutex);
@@ -3239,7 +3239,7 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtQjsRuntime *runti
     return JSValueMakeUndefined(ctx);
 }
 
-static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtQjsRuntime *runtime, JSValueRef *exception) {
+static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
     if (runtime->fd_event_handler == NULL) return JSValueMakeUndefined(ctx);
     for (;;) {
         pthread_mutex_lock(&runtime->fd_event_mutex);
@@ -3271,7 +3271,7 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtQjsRuntime *runtime,
     return JSValueMakeUndefined(ctx);
 }
 
-static JSValueRef ct_dispatch_worker_events(JSContextRef ctx, CtQjsRuntime *runtime, JSValueRef *exception) {
+static JSValueRef ct_dispatch_worker_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
     if (runtime->worker_event_handler == NULL) return JSValueMakeUndefined(ctx);
     for (;;) {
         pthread_mutex_lock(&runtime->worker_event_mutex);
@@ -3297,7 +3297,7 @@ static JSValueRef ct_drain_jobs(JSContextRef ctx, JSObjectRef function, JSObject
     (void)thisObject;
     (void)argc;
     (void)argv;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     ct_dispatch_spawn_events(ctx, runtime, exception);
     if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
     ct_dispatch_fd_events(ctx, runtime, exception);
@@ -3307,7 +3307,7 @@ static JSValueRef ct_drain_jobs(JSContextRef ctx, JSObjectRef function, JSObject
 
 static JSValueRef ct_import_module(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime == NULL || argc < 1) {
         ct_throw_message(ctx, exception, "cottontail.importModule(specifier[, referrer]) requires a module specifier");
         return JSValueMakeUndefined(ctx);
@@ -3433,14 +3433,14 @@ static JSValueRef ct_is_worker(JSContextRef ctx, JSObjectRef function, JSObjectR
     (void)argc;
     (void)argv;
     (void)exception;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     return JSValueMakeBoolean(ctx, runtime != NULL && runtime->worker != NULL);
 }
 
 static JSValueRef ct_worker_post_message(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
-    CtQjsRuntime *parent_runtime = NULL;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *parent_runtime = NULL;
     uint32_t worker_id = 0;
     if (runtime == NULL || runtime->worker == NULL) {
         ct_throw_message(ctx, exception, "workerPostMessage is only available inside a worker");
@@ -3473,7 +3473,7 @@ static JSValueRef ct_worker_poll_incoming_messages(JSContextRef ctx, JSObjectRef
     (void)thisObject;
     (void)argc;
     (void)argv;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime == NULL || runtime->worker == NULL) {
         return ct_make_array(ctx, 0, NULL, exception);
     }
@@ -3544,7 +3544,7 @@ static JSValueRef ct_worker_terminate(JSContextRef ctx, JSObjectRef function, JS
 static JSValueRef ct_worker_set_event_handler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime->worker_event_handler != NULL) {
         JSValueUnprotect(ctx, runtime->worker_event_handler);
         runtime->worker_event_handler = NULL;
@@ -3558,7 +3558,7 @@ static JSValueRef ct_worker_set_event_handler(JSContextRef ctx, JSObjectRef func
 
 static void *ct_worker_entry(void *opaque) {
     CtWorkerStart *start = (CtWorkerStart *)opaque;
-    CtQjsRuntime *runtime = ct_qjs_runtime_create();
+    CtJscRuntime *runtime = ct_jsc_runtime_create();
     char *source = NULL;
     size_t source_len = 0;
     char *error = NULL;
@@ -3638,7 +3638,7 @@ static void *ct_worker_entry(void *opaque) {
         error = ct_copy_exception(runtime->context, bootstrap_exception);
         fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker bootstrap failed");
         free(error);
-        ct_qjs_runtime_destroy(runtime);
+        ct_jsc_runtime_destroy(runtime);
         free(start->script_path);
         free(start);
         return NULL;
@@ -3646,17 +3646,17 @@ static void *ct_worker_entry(void *opaque) {
 
     if (ct_read_file_bytes(start->script_path, &source, &source_len) != 0) {
         fprintf(stderr, "cottontail: failed to load worker script %s\n", start->script_path);
-        ct_qjs_runtime_destroy(runtime);
+        ct_jsc_runtime_destroy(runtime);
         free(start->script_path);
         free(start);
         return NULL;
     }
 
-    if (ct_qjs_runtime_eval(runtime, (const uint8_t *)source, source_len, start->script_path, &error) != 0) {
+    if (ct_jsc_runtime_eval(runtime, (const uint8_t *)source, source_len, start->script_path, &error) != 0) {
         fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
         free(error);
         free(source);
-        ct_qjs_runtime_destroy(runtime);
+        ct_jsc_runtime_destroy(runtime);
         free(start->script_path);
         free(start);
         return NULL;
@@ -3671,7 +3671,7 @@ static void *ct_worker_entry(void *opaque) {
         if (terminated) break;
 
         int delay_ms = 16;
-        if (ct_qjs_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
+        if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
             fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker tick failed");
             free(error);
             break;
@@ -3679,7 +3679,7 @@ static void *ct_worker_entry(void *opaque) {
         usleep((useconds_t)delay_ms * 1000);
     }
 
-    ct_qjs_runtime_destroy(runtime);
+    ct_jsc_runtime_destroy(runtime);
     pthread_mutex_lock(&start->worker->mutex);
     start->worker->terminated = true;
     pthread_mutex_unlock(&start->worker->mutex);
@@ -3690,7 +3690,7 @@ static void *ct_worker_entry(void *opaque) {
 
 static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (argc < 1) {
         ct_throw_message(ctx, exception, "cottontail.spawnWorker(scriptPath) requires a script path");
         return JSValueMakeUndefined(ctx);
@@ -3885,7 +3885,7 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
 
 static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime == NULL || argc < 1) {
         ct_throw_message(ctx, exception, "cottontail.fdWatchStart(fd[, maxBytes]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
@@ -3950,7 +3950,7 @@ static JSValueRef ct_fd_watch_stop(JSContextRef ctx, JSObjectRef function, JSObj
 static JSValueRef ct_fd_set_event_handler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
-    CtQjsRuntime *runtime = ct_callback_runtime(function);
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime->fd_event_handler != NULL) {
         JSValueUnprotect(ctx, runtime->fd_event_handler);
         runtime->fd_event_handler = NULL;
@@ -4200,12 +4200,12 @@ static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef th
     exit(code);
 }
 
-static bool ct_install_function(JSContextRef ctx, JSObjectRef target, const char *name, JSObjectCallAsFunctionCallback callback, CtQjsRuntime *runtime) {
+static bool ct_install_function(JSContextRef ctx, JSObjectRef target, const char *name, JSObjectCallAsFunctionCallback callback, CtJscRuntime *runtime) {
     JSValueRef exception = NULL;
     return ct_set_property(ctx, target, name, ct_make_function(ctx, name, callback, runtime), &exception);
 }
 
-static int ct_install_host_api(CtQjsRuntime *runtime) {
+static int ct_install_host_api(CtJscRuntime *runtime) {
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
@@ -4302,13 +4302,13 @@ static int ct_install_host_api(CtQjsRuntime *runtime) {
     return exception == NULL && bootstrap_exception == NULL ? 0 : -1;
 }
 
-CtQjsRuntime *ct_qjs_runtime_create(void) {
-    return ct_qjs_runtime_create_with_stack_size(0);
+CtJscRuntime *ct_jsc_runtime_create(void) {
+    return ct_jsc_runtime_create_with_stack_size(0);
 }
 
-CtQjsRuntime *ct_qjs_runtime_create_with_stack_size(size_t stack_size) {
+CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
     (void)stack_size;
-    CtQjsRuntime *runtime = (CtQjsRuntime *)calloc(1, sizeof(CtQjsRuntime));
+    CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
     runtime->context = JSGlobalContextCreate(NULL);
     if (runtime->context == NULL) {
@@ -4321,13 +4321,13 @@ CtQjsRuntime *ct_qjs_runtime_create_with_stack_size(size_t stack_size) {
     pthread_mutex_init(&runtime->callback_mutex, NULL);
     runtime->owner_thread = pthread_self();
     if (ct_install_host_api(runtime) != 0) {
-        ct_qjs_runtime_destroy(runtime);
+        ct_jsc_runtime_destroy(runtime);
         return NULL;
     }
     return runtime;
 }
 
-void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
+void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
     ct_async_processes_wait_for_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
@@ -4388,7 +4388,7 @@ void ct_qjs_runtime_destroy(CtQjsRuntime *runtime) {
     free(runtime);
 }
 
-int ct_qjs_runtime_set_args(CtQjsRuntime *runtime, size_t argc, const char *const *argv, char **error_out) {
+int ct_jsc_runtime_set_args(CtJscRuntime *runtime, size_t argc, const char *const *argv, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
@@ -4830,7 +4830,7 @@ static JSValueRef ct_global_value(JSContextRef ctx, const char *name) {
     return ct_get_property(ctx, JSContextGetGlobalObject(ctx), name, &exception);
 }
 
-static bool ct_runtime_has_pending_native_events(CtQjsRuntime *runtime) {
+static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
 
     pthread_mutex_lock(&runtime->callback_mutex);
@@ -4857,7 +4857,7 @@ static bool ct_runtime_has_pending_native_events(CtQjsRuntime *runtime) {
     return ct_fd_watchers_has_runtime(runtime);
 }
 
-static int ct_jsc_runtime_has_active_handles(CtQjsRuntime *runtime, bool *has_active_handles_out, char **error_out) {
+static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_active_handles_out, char **error_out) {
     *has_active_handles_out = false;
     if (ct_runtime_has_pending_native_events(runtime)) {
         *has_active_handles_out = true;
@@ -4882,8 +4882,8 @@ static int ct_jsc_runtime_has_active_handles(CtQjsRuntime *runtime, bool *has_ac
     return 0;
 }
 
-static int ct_qjs_runtime_eval_internal(
-    CtQjsRuntime *runtime,
+static int ct_jsc_runtime_eval_internal(
+    CtJscRuntime *runtime,
     const uint8_t *source,
     size_t source_len,
     const char *filename,
@@ -4911,7 +4911,7 @@ static int ct_qjs_runtime_eval_internal(
     }
 
     for (int index = 0; index < 30000 && !ct_global_bool(ctx, "__ctDone"); index += 1) {
-        if (ct_qjs_runtime_tick(runtime, error_out) != 0) return -1;
+        if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
         usleep(1000);
     }
 
@@ -4933,7 +4933,7 @@ static int ct_qjs_runtime_eval_internal(
         int delay_ms = 16;
         if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
         if (!has_active_handles) break;
-        if (ct_qjs_runtime_tick_with_delay(runtime, &delay_ms, error_out) != 0) return -1;
+        if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, error_out) != 0) return -1;
         usleep((useconds_t)delay_ms * 1000);
     }
 
@@ -4945,11 +4945,11 @@ static int ct_qjs_runtime_eval_internal(
     return 0;
 }
 
-int ct_qjs_runtime_eval(CtQjsRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
-    return ct_qjs_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
+int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t source_len, const char *filename, char **error_out) {
+    return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
 }
 
-static int ct_qjs_runtime_tick_with_delay(CtQjsRuntime *runtime, int *delay_ms_out, char **error_out) {
+static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
     if (delay_ms_out != NULL) *delay_ms_out = 16;
     JSContextRef ctx = runtime->context;
@@ -4980,10 +4980,10 @@ static int ct_qjs_runtime_tick_with_delay(CtQjsRuntime *runtime, int *delay_ms_o
     return 0;
 }
 
-int ct_qjs_runtime_tick(CtQjsRuntime *runtime, char **error_out) {
-    return ct_qjs_runtime_tick_with_delay(runtime, NULL, error_out);
+int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out) {
+    return ct_jsc_runtime_tick_with_delay(runtime, NULL, error_out);
 }
 
-void ct_qjs_string_free(char *value) {
+void ct_jsc_string_free(char *value) {
     free(value);
 }

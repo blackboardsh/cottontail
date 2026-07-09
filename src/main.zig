@@ -18,7 +18,7 @@ const help_text_template =
     \\  cottontail --version
     \\
     \\Status:
-    \\  QuickJS-ng is embedded with ESM imports, async job draining, and a small cottontail host API.
+    \\  JavaScriptCore is embedded with ESM imports, async job draining, and a small cottontail host API.
     \\  Entry points can be classic scripts, ESM modules, or TypeScript transpiled through esbuild.
     \\
 ;
@@ -77,6 +77,6 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "QuickJS-ng") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
 }
