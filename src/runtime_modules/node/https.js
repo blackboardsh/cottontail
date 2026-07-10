@@ -568,8 +568,6 @@ export function createServer(options = {}, requestListener = undefined) {
   return new Server(options, requestListener);
 }
 
-// COTTONTAIL-COMPAT: node:https parser conformance - HTTPS client/server requests run over OpenSSL-backed node:tls sockets with HTTP/1.1 request/response parsing, Agent pooling, keep-alive reuse, 100-continue, chunked trailers, CONNECT, upgrade, and request timeouts; exhaustive llhttp-compatible parser edge cases still need a native parser pass.
-
 export default {
   Agent,
   ClientRequest,

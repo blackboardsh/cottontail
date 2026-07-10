@@ -741,5 +741,3 @@ export default {
   setDefaultAutoSelectFamily,
   setDefaultAutoSelectFamilyAttemptTimeout,
 };
-
-// COTTONTAIL-COMPAT: node:net platform scope - address helpers, BlockList, TCP connect/listen/read/write/end, POSIX path sockets, pause/resume, write backpressure/drain state, timeouts, TCP keepalive/nodelay, and POSIX cross-process socket/server handle wrapping are implemented; Windows named-pipe/handle duplication still needs a platform backend.

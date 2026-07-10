@@ -259,6 +259,40 @@ const resumedText = await new Promise<string>((resolve, reject) => {
 });
 assert(resumedText === "abcdef", "ReadStream.resume data mismatch");
 
+const manualReadClosePath = `${root}/manual-read-close.txt`;
+writeFileSync(manualReadClosePath, "manual");
+const manualReadStream = createReadStream(manualReadClosePath, { autoClose: false });
+let manualReadCloseCount = 0;
+manualReadStream.on("close", () => { manualReadCloseCount += 1; });
+await new Promise<void>((resolve, reject) => {
+  manualReadStream.on("error", reject);
+  manualReadStream.on("end", () => resolve());
+  manualReadStream.resume();
+});
+await new Promise((resolve) => setTimeout(resolve, 5));
+assert(manualReadStream.destroyed === false, "ReadStream autoClose:false should not destroy on end");
+assert(manualReadCloseCount === 0, "ReadStream autoClose:false should not emit close on end");
+assert(typeof manualReadStream.fd === "number" && manualReadStream.fd >= 0, "ReadStream autoClose:false should retain fd");
+const manualReadBuffer = new Uint8Array(1);
+assert(readSync(manualReadStream.fd, manualReadBuffer, 0, 1, 0) === 1, "ReadStream autoClose:false fd should remain readable");
+closeSync(manualReadStream.fd);
+
+const manualWriteClosePath = `${root}/manual-write-close.txt`;
+const manualWriteStream = createWriteStream(manualWriteClosePath, { autoClose: false });
+let manualWriteCloseCount = 0;
+manualWriteStream.on("close", () => { manualWriteCloseCount += 1; });
+await new Promise<void>((resolve, reject) => {
+  manualWriteStream.on("error", reject);
+  manualWriteStream.end("manual", () => resolve());
+});
+await new Promise((resolve) => setTimeout(resolve, 5));
+assert(manualWriteStream.destroyed === false, "WriteStream autoClose:false should not destroy on finish");
+assert(manualWriteCloseCount === 0, "WriteStream autoClose:false should not emit close on finish");
+assert(typeof manualWriteStream.fd === "number" && manualWriteStream.fd >= 0, "WriteStream autoClose:false should retain fd");
+writeSync(manualWriteStream.fd, "!");
+closeSync(manualWriteStream.fd);
+assert(readFileSync(manualWriteClosePath, "utf8") === "manual!", "WriteStream autoClose:false fd should remain writable");
+
 const blob = await openAsBlob(filePath, { type: "text/plain" });
 assert(blob.size === 4, "openAsBlob size mismatch");
 
@@ -287,9 +321,10 @@ try {
   await new Promise<void>((resolve, reject) => {
     const stream = handle.createWriteStream({ start: 3, autoClose: false });
     stream.on("error", reject);
-    stream.on("close", () => resolve());
+    stream.on("finish", () => resolve());
     stream.end("XYZ");
   });
+  assert(handle.fd >= 0, "FileHandle createWriteStream autoClose:false should leave handle open");
   const first = new Uint8Array(3);
   const second = new Uint8Array(3);
   const vectorRead = await handle.readv([first, second], 0);

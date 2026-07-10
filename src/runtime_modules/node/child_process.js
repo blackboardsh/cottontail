@@ -850,6 +850,4 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   }
 }
 
-// COTTONTAIL-COMPAT: node:child_process IPC scope - public spawn/exec/fork paths, JSON IPC, advanced serialized IPC, fd-3 native IPC, and POSIX socket/server handle passing are implemented; Windows handle passing still needs a platform backend.
-
 export default { ChildProcess, _forkChild, exec, execFile, execFileSync, execSync, fork, spawn, spawnSync };

@@ -438,8 +438,8 @@ function defaultLoadForHooks(url) {
   return { format, source: cottontail.readFile(resolved), shortCircuit: true };
 }
 
-function applyLoadHooks(resolved) {
-  if (!moduleHooks.some((hook) => typeof hook.load === "function")) return null;
+function runLoadHooks(resolved) {
+  if (!moduleHooks.some((hook) => typeof hook.load === "function")) return undefined;
   const url = resolvedToUrl(resolved);
   const baseContext = { format: formatForResolved(resolved), importAttributes: {} };
   let index = -1;
@@ -455,10 +455,94 @@ function applyLoadHooks(resolved) {
     return defaultLoadForHooks(nextUrl);
   };
 
-  const result = nextLoad(url, baseContext);
-  if (result.source == null) return null;
-  return executeHookSource(resolved, result.source, result.format ?? baseContext.format);
+  return nextLoad(url, baseContext);
 }
+
+function applyLoadHooks(resolved) {
+  const result = runLoadHooks(resolved);
+  if (result === undefined) return null;
+  if (result.source == null) return null;
+  return executeHookSource(resolved, result.source, result.format ?? formatForResolved(resolved));
+}
+
+function namespaceFromCommonJs(value) {
+  const namespace = { default: value };
+  if (value && (typeof value === "object" || typeof value === "function")) {
+    for (const key of Object.keys(value)) {
+      if (key !== "default") namespace[key] = value[key];
+    }
+  }
+  return namespace;
+}
+
+function transformEsmSourceForDynamicImport(source) {
+  const exportAssignments = [];
+  let output = String(source);
+  output = output.replace(/\bexport\s+default\s+/g, "exports.default = ");
+  output = output.replace(/\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
+    exportAssignments.push(`exports.${name} = ${name};`);
+    return `${kind} ${name} =`;
+  });
+  output = output.replace(/\bexport\s+function\s+([A-Za-z_$][\w$]*)\s*\(/g, (_all, name) => {
+    exportAssignments.push(`exports.${name} = ${name};`);
+    return `function ${name}(`;
+  });
+  output = output.replace(/\bexport\s+class\s+([A-Za-z_$][\w$]*)\s*/g, (_all, name) => {
+    exportAssignments.push(`exports.${name} = ${name};`);
+    return `class ${name} `;
+  });
+  output = output.replace(/\bexport\s*\{([^}]*)\}\s*;?/g, (_all, names) => {
+    for (const part of String(names).split(",")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const pieces = trimmed.split(/\s+as\s+/);
+      const local = pieces[0].trim();
+      const exported = (pieces[1] ?? pieces[0]).trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(exported)) {
+        exportAssignments.push(`exports.${exported} = ${local};`);
+      }
+    }
+    return "";
+  });
+  return `${output}\n${exportAssignments.join("\n")}`;
+}
+
+function executeDynamicImportSource(resolved, source, format) {
+  const effectiveFormat = format ?? formatForResolved(resolved);
+  if (effectiveFormat === "builtin") {
+    const value = builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, ""));
+    return namespaceFromCommonJs(value);
+  }
+  if (effectiveFormat === "json" || String(resolved).endsWith(".json")) {
+    return { default: JSON.parse(String(source ?? "")) };
+  }
+  if (effectiveFormat === "commonjs" || String(resolved).endsWith(".cjs")) {
+    return namespaceFromCommonJs(executeHookSource(resolved, source, "commonjs"));
+  }
+  const namespace = {};
+  const transformed = transformEsmSourceForDynamicImport(source ?? "");
+  maybeRegisterSourceMap(resolved, transformed);
+  recordCompileCache(resolved, transformed);
+  const run = new Function("exports", "require", `${transformed}\n//# sourceURL=${resolved}`);
+  run(namespace, createRequire(resolved));
+  return namespace;
+}
+
+export function __importModule(specifier, referrer = undefined) {
+  const parent = referrer == null
+    ? cottontail.cwd()
+    : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
+  const resolved = resolveRequest(String(specifier), parent);
+  const loadResult = runLoadHooks(resolved);
+  if (loadResult !== undefined) {
+    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
+  }
+  if (builtinModuleMap.has(resolved)) return namespaceFromCommonJs(builtinModuleMap.get(resolved));
+  if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
+  return executeDynamicImportSource(resolved, cottontail.readFile(resolved), formatForResolved(resolved));
+}
+
+globalThis.__cottontailImportModule = __importModule;
 
 function loadCommonJsModule(resolved) {
   const hooked = applyLoadHooks(resolved);
@@ -1192,8 +1276,6 @@ export function stripTypeScriptTypes(source, options = undefined) {
   if (sourceUrl !== undefined) output += `\n\n//# sourceURL=${sourceUrl}`;
   return output;
 }
-
-// COTTONTAIL-COMPAT: node:module compile cache/ESM loaders - CommonJS loader hooks, package exports resolution, resolver/cache state, and sourceMappingURL-backed source maps are implemented; ESM hook isolation, async loader thread behavior, and V8 compile-cache parity need dedicated loader/runtime support.
 
 _initPaths();
 

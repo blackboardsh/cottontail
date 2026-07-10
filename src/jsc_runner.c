@@ -248,6 +248,20 @@ typedef struct CtFdEvent {
 
 typedef struct CtWorker CtWorker;
 
+typedef struct CtSharedBuffer {
+    uint32_t id;
+    uint8_t *bytes;
+    size_t byte_len;
+    uint32_t refs;
+    struct CtSharedBuffer *next;
+} CtSharedBuffer;
+
+typedef struct CtAtomicWaiter {
+    void *ptr;
+    bool notified;
+    struct CtAtomicWaiter *next;
+} CtAtomicWaiter;
+
 typedef struct CtWorkerMessage {
     char *json;
     struct CtWorkerMessage *next;
@@ -312,6 +326,11 @@ static CtFdWatcher *ct_fd_watchers = NULL;
 static pthread_mutex_t ct_workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtWorker *ct_workers = NULL;
 static uint32_t ct_next_worker_id = 1;
+static pthread_mutex_t ct_shared_buffers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ct_shared_buffers_cond = PTHREAD_COND_INITIALIZER;
+static CtSharedBuffer *ct_shared_buffers = NULL;
+static CtAtomicWaiter *ct_atomic_waiters = NULL;
+static uint32_t ct_next_shared_buffer_id = 1;
 
 typedef struct CtHttpRequest {
     uint32_t id;
@@ -8100,6 +8119,357 @@ static JSValueRef ct_memory_view(JSContextRef ctx, JSObjectRef function, JSObjec
     );
 }
 
+static CtSharedBuffer *ct_shared_buffer_find_by_id_locked(uint32_t id) {
+    for (CtSharedBuffer *buffer = ct_shared_buffers; buffer != NULL; buffer = buffer->next) {
+        if (buffer->id == id) return buffer;
+    }
+    return NULL;
+}
+
+static CtSharedBuffer *ct_shared_buffer_find_by_ptr_locked(const void *ptr) {
+    for (CtSharedBuffer *buffer = ct_shared_buffers; buffer != NULL; buffer = buffer->next) {
+        if (buffer->bytes == ptr) return buffer;
+    }
+    return NULL;
+}
+
+static void ct_shared_buffer_unref_locked(CtSharedBuffer *buffer) {
+    if (buffer == NULL || buffer->refs == 0) return;
+    buffer->refs -= 1;
+    if (buffer->refs > 0) return;
+    CtSharedBuffer **cursor = &ct_shared_buffers;
+    while (*cursor != NULL && *cursor != buffer) cursor = &(*cursor)->next;
+    if (*cursor == buffer) *cursor = buffer->next;
+    free(buffer->bytes);
+    free(buffer);
+}
+
+static void ct_shared_array_buffer_deallocator(void *bytes, void *deallocator_context) {
+    (void)bytes;
+    CtSharedBuffer *buffer = (CtSharedBuffer *)deallocator_context;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    ct_shared_buffer_unref_locked(buffer);
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+}
+
+static JSObjectRef ct_shared_buffer_make_array_buffer(JSContextRef ctx, CtSharedBuffer *buffer, JSValueRef *exception) {
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    buffer->refs += 1;
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    JSObjectRef object = JSObjectMakeArrayBufferWithBytesNoCopy(
+        ctx,
+        buffer->byte_len > 0 ? buffer->bytes : NULL,
+        buffer->byte_len,
+        ct_shared_array_buffer_deallocator,
+        buffer,
+        exception
+    );
+    if (object == NULL) {
+        pthread_mutex_lock(&ct_shared_buffers_mutex);
+        ct_shared_buffer_unref_locked(buffer);
+        pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    }
+    return object;
+}
+
+static JSValueRef ct_shared_array_buffer_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    size_t byte_len = argc >= 1 ? (size_t)ct_value_to_number(ctx, argv[0]) : 0;
+    CtSharedBuffer *buffer = (CtSharedBuffer *)calloc(1, sizeof(CtSharedBuffer));
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    buffer->bytes = byte_len > 0 ? (uint8_t *)calloc(1, byte_len) : NULL;
+    if (byte_len > 0 && buffer->bytes == NULL) {
+        free(buffer);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    buffer->byte_len = byte_len;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    buffer->id = ct_next_shared_buffer_id++;
+    if (buffer->id == 0) buffer->id = ct_next_shared_buffer_id++;
+    buffer->next = ct_shared_buffers;
+    ct_shared_buffers = buffer;
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return ct_shared_buffer_make_array_buffer(ctx, buffer, exception);
+}
+
+static JSValueRef ct_shared_array_buffer_wrap(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sharedArrayBufferWrap(id) requires an id");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtSharedBuffer *buffer = ct_shared_buffer_find_by_id_locked(id);
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "SharedArrayBuffer backing store was not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    return ct_shared_buffer_make_array_buffer(ctx, buffer, exception);
+}
+
+static JSValueRef ct_shared_array_buffer_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeNull(ctx);
+    JSObjectRef object = (JSObjectRef)argv[0];
+    JSValueRef local_exception = NULL;
+    JSTypedArrayType type = JSValueGetTypedArrayType(ctx, argv[0], &local_exception);
+    if (local_exception != NULL) return JSValueMakeNull(ctx);
+    JSObjectRef buffer_object = object;
+    if (type != kJSTypedArrayTypeArrayBuffer) {
+        if (type == kJSTypedArrayTypeNone) return JSValueMakeNull(ctx);
+        buffer_object = JSObjectGetTypedArrayBuffer(ctx, object, &local_exception);
+        if (local_exception != NULL || buffer_object == NULL) return JSValueMakeNull(ctx);
+    }
+    void *ptr = JSObjectGetArrayBufferBytesPtr(ctx, buffer_object, &local_exception);
+    if (local_exception != NULL) return JSValueMakeNull(ctx);
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    CtSharedBuffer *buffer = ct_shared_buffer_find_by_ptr_locked(ptr);
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    if (buffer == NULL) return JSValueMakeNull(ctx);
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, buffer->id), exception);
+    ct_set_property(ctx, result, "byteLength", JSValueMakeNumber(ctx, (double)buffer->byte_len), exception);
+    return result;
+}
+
+static size_t ct_atomic_element_size(JSTypedArrayType type) {
+    switch (type) {
+        case kJSTypedArrayTypeInt8Array:
+        case kJSTypedArrayTypeUint8Array:
+            return 1;
+        case kJSTypedArrayTypeInt16Array:
+        case kJSTypedArrayTypeUint16Array:
+            return 2;
+        case kJSTypedArrayTypeInt32Array:
+        case kJSTypedArrayTypeUint32Array:
+            return 4;
+        case kJSTypedArrayTypeBigInt64Array:
+        case kJSTypedArrayTypeBigUint64Array:
+            return 8;
+        default:
+            return 0;
+    }
+}
+
+static int64_t ct_atomic_read_value(void *ptr, JSTypedArrayType type) {
+    switch (type) {
+        case kJSTypedArrayTypeInt8Array: return *(int8_t *)ptr;
+        case kJSTypedArrayTypeUint8Array: return *(uint8_t *)ptr;
+        case kJSTypedArrayTypeInt16Array: return *(int16_t *)ptr;
+        case kJSTypedArrayTypeUint16Array: return *(uint16_t *)ptr;
+        case kJSTypedArrayTypeInt32Array: return *(int32_t *)ptr;
+        case kJSTypedArrayTypeUint32Array: return *(uint32_t *)ptr;
+        case kJSTypedArrayTypeBigInt64Array: return *(int64_t *)ptr;
+        case kJSTypedArrayTypeBigUint64Array: return (int64_t)*(uint64_t *)ptr;
+        default: return 0;
+    }
+}
+
+static void ct_atomic_write_value(void *ptr, JSTypedArrayType type, int64_t value) {
+    switch (type) {
+        case kJSTypedArrayTypeInt8Array: *(int8_t *)ptr = (int8_t)value; break;
+        case kJSTypedArrayTypeUint8Array: *(uint8_t *)ptr = (uint8_t)value; break;
+        case kJSTypedArrayTypeInt16Array: *(int16_t *)ptr = (int16_t)value; break;
+        case kJSTypedArrayTypeUint16Array: *(uint16_t *)ptr = (uint16_t)value; break;
+        case kJSTypedArrayTypeInt32Array: *(int32_t *)ptr = (int32_t)value; break;
+        case kJSTypedArrayTypeUint32Array: *(uint32_t *)ptr = (uint32_t)value; break;
+        case kJSTypedArrayTypeBigInt64Array: *(int64_t *)ptr = (int64_t)value; break;
+        case kJSTypedArrayTypeBigUint64Array: *(uint64_t *)ptr = (uint64_t)value; break;
+        default: break;
+    }
+}
+
+static JSValueRef ct_atomic_result(JSContextRef ctx, JSTypedArrayType type, int64_t value, JSValueRef *exception) {
+    switch (type) {
+        case kJSTypedArrayTypeBigInt64Array:
+            return JSBigIntCreateWithInt64(ctx, value, exception);
+        case kJSTypedArrayTypeBigUint64Array:
+            return JSBigIntCreateWithUInt64(ctx, (uint64_t)value, exception);
+        default:
+            return JSValueMakeNumber(ctx, (double)value);
+    }
+}
+
+static int ct_atomic_view_ptr(JSContextRef ctx, JSValueRef value, size_t index, void **ptr_out, JSTypedArrayType *type_out, JSValueRef *exception) {
+    if (!JSValueIsObject(ctx, value)) {
+        ct_throw_message(ctx, exception, "Atomics operation requires a typed array");
+        return -1;
+    }
+    JSObjectRef object = (JSObjectRef)value;
+    JSValueRef local_exception = NULL;
+    JSTypedArrayType type = JSValueGetTypedArrayType(ctx, value, &local_exception);
+    if (local_exception != NULL || ct_atomic_element_size(type) == 0) {
+        ct_throw_message(ctx, exception, "Atomics operation requires an integer typed array");
+        return -1;
+    }
+    size_t length = JSObjectGetTypedArrayLength(ctx, object, &local_exception);
+    if (local_exception != NULL || index >= length) {
+        ct_throw_message(ctx, exception, "Atomics index is out of range");
+        return -1;
+    }
+    void *base = JSObjectGetTypedArrayBytesPtr(ctx, object, &local_exception);
+    if (local_exception != NULL || base == NULL) {
+        ct_throw_message(ctx, exception, "Atomics typed array backing store is unavailable");
+        return -1;
+    }
+    *ptr_out = (uint8_t *)base + index * ct_atomic_element_size(type);
+    *type_out = type;
+    return 0;
+}
+
+static JSValueRef ct_shared_atomic_op(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "sharedAtomicOp(op, typedArray, index[, value[, replacement]]) requires arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *op = ct_value_to_string_copy(ctx, argv[0]);
+    size_t index = (size_t)ct_value_to_number(ctx, argv[2]);
+    void *ptr = NULL;
+    JSTypedArrayType type = kJSTypedArrayTypeNone;
+    if (ct_atomic_view_ptr(ctx, argv[1], index, &ptr, &type, exception) != 0) {
+        free(op);
+        return JSValueMakeUndefined(ctx);
+    }
+    int64_t value = argc >= 4 ? (int64_t)ct_value_to_number(ctx, argv[3]) : 0;
+    int64_t replacement = argc >= 5 ? (int64_t)ct_value_to_number(ctx, argv[4]) : 0;
+    int64_t old_value = 0;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    old_value = ct_atomic_read_value(ptr, type);
+    if (op != NULL) {
+        if (strcmp(op, "store") == 0) {
+            ct_atomic_write_value(ptr, type, value);
+            old_value = value;
+        } else if (strcmp(op, "add") == 0) {
+            ct_atomic_write_value(ptr, type, old_value + value);
+        } else if (strcmp(op, "sub") == 0) {
+            ct_atomic_write_value(ptr, type, old_value - value);
+        } else if (strcmp(op, "and") == 0) {
+            ct_atomic_write_value(ptr, type, old_value & value);
+        } else if (strcmp(op, "or") == 0) {
+            ct_atomic_write_value(ptr, type, old_value | value);
+        } else if (strcmp(op, "xor") == 0) {
+            ct_atomic_write_value(ptr, type, old_value ^ value);
+        } else if (strcmp(op, "exchange") == 0) {
+            ct_atomic_write_value(ptr, type, value);
+        } else if (strcmp(op, "compareExchange") == 0) {
+            if (old_value == value) ct_atomic_write_value(ptr, type, replacement);
+        }
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    free(op);
+    return ct_atomic_result(ctx, type, old_value, exception);
+}
+
+static JSValueRef ct_shared_atomic_wait(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "sharedAtomicWait(typedArray, index, value[, timeout]) requires arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t index = (size_t)ct_value_to_number(ctx, argv[1]);
+    void *ptr = NULL;
+    JSTypedArrayType type = kJSTypedArrayTypeNone;
+    if (ct_atomic_view_ptr(ctx, argv[0], index, &ptr, &type, exception) != 0) return JSValueMakeUndefined(ctx);
+    if (type != kJSTypedArrayTypeInt32Array && type != kJSTypedArrayTypeBigInt64Array) {
+        ct_throw_message(ctx, exception, "Atomics.wait requires Int32Array or BigInt64Array");
+        return JSValueMakeUndefined(ctx);
+    }
+    int64_t expected = (int64_t)ct_value_to_number(ctx, argv[2]);
+    double timeout_ms = argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) ? ct_value_to_number(ctx, argv[3]) : INFINITY;
+    if (timeout_ms != timeout_ms) timeout_ms = INFINITY;
+    if (timeout_ms < 0) timeout_ms = 0;
+    const char *result = "ok";
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    if (ct_atomic_read_value(ptr, type) != expected) {
+        result = "not-equal";
+    } else if (timeout_ms == 0) {
+        result = "timed-out";
+    } else {
+        CtAtomicWaiter waiter = {
+            .ptr = ptr,
+            .notified = false,
+            .next = ct_atomic_waiters,
+        };
+        ct_atomic_waiters = &waiter;
+        struct timespec deadline;
+        if (timeout_ms != INFINITY) {
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            long seconds = (long)(timeout_ms / 1000.0);
+            long nanos = (long)((timeout_ms - (double)seconds * 1000.0) * 1000000.0);
+            deadline.tv_sec += seconds;
+            deadline.tv_nsec += nanos;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+                deadline.tv_nsec %= 1000000000L;
+            }
+        }
+        while (!waiter.notified) {
+            int status = timeout_ms == INFINITY
+                ? pthread_cond_wait(&ct_shared_buffers_cond, &ct_shared_buffers_mutex)
+                : pthread_cond_timedwait(&ct_shared_buffers_cond, &ct_shared_buffers_mutex, &deadline);
+            if (status == ETIMEDOUT && !waiter.notified) {
+                result = "timed-out";
+                break;
+            }
+        }
+        if (waiter.notified) result = "ok";
+        CtAtomicWaiter **cursor = &ct_atomic_waiters;
+        while (*cursor != NULL && *cursor != &waiter) cursor = &(*cursor)->next;
+        if (*cursor == &waiter) *cursor = waiter.next;
+    }
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return ct_make_string(ctx, result);
+}
+
+static size_t ct_atomic_notify_count(JSContextRef ctx, JSValueRef value) {
+    if (value == NULL || JSValueIsUndefined(ctx, value)) return SIZE_MAX;
+    double number = ct_value_to_number(ctx, value);
+    if (number != number || number <= 0) return 0;
+    if (number == INFINITY) return SIZE_MAX;
+    return (size_t)floor(number);
+}
+
+static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sharedAtomicNotify(typedArray, index[, count]) requires arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t index = (size_t)ct_value_to_number(ctx, argv[1]);
+    void *ptr = NULL;
+    JSTypedArrayType type = kJSTypedArrayTypeNone;
+    if (ct_atomic_view_ptr(ctx, argv[0], index, &ptr, &type, exception) != 0) return JSValueMakeUndefined(ctx);
+    if (type != kJSTypedArrayTypeInt32Array && type != kJSTypedArrayTypeBigInt64Array) {
+        ct_throw_message(ctx, exception, "Atomics.notify requires Int32Array or BigInt64Array");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t limit = ct_atomic_notify_count(ctx, argc >= 3 ? argv[2] : NULL);
+    size_t notified = 0;
+    pthread_mutex_lock(&ct_shared_buffers_mutex);
+    for (CtAtomicWaiter *waiter = ct_atomic_waiters; waiter != NULL && notified < limit; waiter = waiter->next) {
+        if (!waiter->notified && waiter->ptr == ptr) {
+            waiter->notified = true;
+            notified += 1;
+        }
+    }
+    if (notified > 0) pthread_cond_broadcast(&ct_shared_buffers_cond);
+    pthread_mutex_unlock(&ct_shared_buffers_mutex);
+    return JSValueMakeNumber(ctx, (double)notified);
+}
+
 static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     void *handle = NULL;
     void *symbol = NULL;
@@ -9838,6 +10208,33 @@ static JSValueRef ct_import_module(JSContextRef ctx, JSObjectRef function, JSObj
         return JSValueMakeUndefined(ctx);
     }
 
+    JSValueRef hook_value = ct_get_property(ctx, JSContextGetGlobalObject(ctx), "__cottontailImportModule", exception);
+    if (exception != NULL && *exception != NULL) {
+        free(specifier);
+        free(referrer);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (hook_value != NULL && JSValueIsObject(ctx, hook_value)) {
+        JSObjectRef hook = (JSObjectRef)hook_value;
+        if (JSObjectIsFunction(ctx, hook)) {
+            JSValueRef args[2] = {
+                ct_make_string(ctx, specifier),
+                referrer != NULL ? ct_make_string(ctx, referrer) : JSValueMakeUndefined(ctx),
+            };
+            JSValueRef hook_exception = NULL;
+            JSValueRef result = JSObjectCallAsFunction(ctx, hook, NULL, 2, args, &hook_exception);
+            free(specifier);
+            free(referrer);
+            if (hook_exception != NULL) {
+                char *error = ct_copy_exception(ctx, hook_exception);
+                ct_throw_message(ctx, exception, error != NULL ? error : "Dynamic import failed");
+                free(error);
+                return JSValueMakeUndefined(ctx);
+            }
+            return result != NULL ? result : JSValueMakeUndefined(ctx);
+        }
+    }
+
     char *resolved_path = ct_resolve_import_path(specifier, referrer);
     free(specifier);
     free(referrer);
@@ -11421,6 +11818,12 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "stripTypeScriptTypes", ct_strip_typescript_types_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
     ct_install_function(ctx, host, "memoryView", ct_memory_view, runtime);
+    ct_install_function(ctx, host, "sharedArrayBufferCreate", ct_shared_array_buffer_create, runtime);
+    ct_install_function(ctx, host, "sharedArrayBufferWrap", ct_shared_array_buffer_wrap, runtime);
+    ct_install_function(ctx, host, "sharedArrayBufferInfo", ct_shared_array_buffer_info, runtime);
+    ct_install_function(ctx, host, "sharedAtomicOp", ct_shared_atomic_op, runtime);
+    ct_install_function(ctx, host, "sharedAtomicWait", ct_shared_atomic_wait, runtime);
+    ct_install_function(ctx, host, "sharedAtomicNotify", ct_shared_atomic_notify, runtime);
     ct_install_function(ctx, host, "nativeCall", ct_native_call, runtime);
     ct_install_function(ctx, host, "createCallback", ct_create_callback, runtime);
     ct_install_function(ctx, host, "closeCallback", ct_close_callback, runtime);
@@ -11547,10 +11950,55 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "  Promise.reject = function(reason){ globalThis.__ctUnhandledRejection = reason; return reject(reason); };"
         "  Promise.__cottontailPatchedReject = true;"
         "}"
+        "if (typeof globalThis.SharedArrayBuffer !== 'function' && globalThis.cottontail?.sharedArrayBufferCreate) {"
+        "  const __ctSharedBuffers = new WeakSet();"
+        "  const __ctMarkShared = (buffer) => {"
+        "    if (buffer && typeof buffer === 'object') {"
+        "      __ctSharedBuffers.add(buffer);"
+        "      try { Object.setPrototypeOf(buffer, SharedArrayBuffer.prototype); } catch {}"
+        "    }"
+        "    return buffer;"
+        "  };"
+        "  function SharedArrayBuffer(length) {"
+        "    if (!new.target) throw new TypeError(\"Constructor SharedArrayBuffer requires 'new'\");"
+        "    const size = Number(length);"
+        "    if (!Number.isFinite(size) || size < 0) throw new RangeError('Invalid SharedArrayBuffer length');"
+        "    return __ctMarkShared(cottontail.sharedArrayBufferCreate(Math.floor(size)));"
+        "  }"
+        "  SharedArrayBuffer.prototype = Object.create(ArrayBuffer.prototype);"
+        "  SharedArrayBuffer.prototype.constructor = SharedArrayBuffer;"
+        "  try { SharedArrayBuffer.prototype[Symbol.toStringTag] = 'SharedArrayBuffer'; } catch {}"
+        "  globalThis.SharedArrayBuffer = SharedArrayBuffer;"
+        "  globalThis.__cottontailMarkSharedArrayBuffer = __ctMarkShared;"
+        "}"
+        "if (globalThis.cottontail?.sharedAtomicOp && globalThis.Atomics && !globalThis.Atomics.__cottontailPatched) {"
+        "  const __ctAtomics = globalThis.Atomics;"
+        "  const __ctToAtomicNumber = (value) => typeof value === 'bigint' ? Number(value) : Number(value);"
+        "  const __ctAtomic = (op, array, index, value, replacement) => cottontail.sharedAtomicOp(op, array, Number(index), __ctToAtomicNumber(value ?? 0), __ctToAtomicNumber(replacement ?? 0));"
+        "  __ctAtomics.load = (array, index) => __ctAtomic('load', array, index, 0);"
+        "  __ctAtomics.store = (array, index, value) => __ctAtomic('store', array, index, value);"
+        "  __ctAtomics.add = (array, index, value) => __ctAtomic('add', array, index, value);"
+        "  __ctAtomics.sub = (array, index, value) => __ctAtomic('sub', array, index, value);"
+        "  __ctAtomics.and = (array, index, value) => __ctAtomic('and', array, index, value);"
+        "  __ctAtomics.or = (array, index, value) => __ctAtomic('or', array, index, value);"
+        "  __ctAtomics.xor = (array, index, value) => __ctAtomic('xor', array, index, value);"
+        "  __ctAtomics.exchange = (array, index, value) => __ctAtomic('exchange', array, index, value);"
+        "  __ctAtomics.compareExchange = (array, index, expected, replacement) => __ctAtomic('compareExchange', array, index, expected, replacement);"
+        "  __ctAtomics.wait = (array, index, value, timeout) => cottontail.sharedAtomicWait(array, Number(index), __ctToAtomicNumber(value), timeout == null ? Infinity : Number(timeout));"
+        "  __ctAtomics.notify = (array, index, count) => cottontail.sharedAtomicNotify(array, Number(index), count == null ? Infinity : Number(count));"
+        "  __ctAtomics.wake = __ctAtomics.notify;"
+        "  __ctAtomics.waitAsync = (array, index, value, timeout) => ({ async: true, value: Promise.resolve(__ctAtomics.wait(array, index, value, timeout)) });"
+        "  Object.defineProperty(__ctAtomics, '__cottontailPatched', { value: true });"
+        "}"
     );
     JSValueRef bootstrap_exception = NULL;
     JSEvaluateScript(ctx, bootstrap, NULL, NULL, 1, &bootstrap_exception);
     JSStringRelease(bootstrap);
+    if (bootstrap_exception != NULL) {
+        char *message = ct_copy_exception(ctx, bootstrap_exception);
+        fprintf(stderr, "cottontail: host bootstrap failed: %s\n", message != NULL ? message : "unknown error");
+        free(message);
+    }
 
     return exception == NULL && bootstrap_exception == NULL ? 0 : -1;
 }

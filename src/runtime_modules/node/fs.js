@@ -416,7 +416,7 @@ export function readSync(fd, buffer, offset = 0, length = undefined, position = 
   return Number(cottontail.fdReadAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
 }
 
-export function writeSync(fd, data, offset = 0, length = undefined, position = null) {
+export function writeSync(fd, data, offset = undefined, length = undefined, position = null) {
   if (typeof data === "string") {
     const bytes = bytesFromData(data, typeof length === "string" ? length : "utf8");
     return Number(cottontail.fdWriteAt(Number(fd), bytes, 0, bytes.byteLength, offset ?? null));
@@ -688,6 +688,7 @@ export class ReadStream extends Readable {
     this.fd = Object.prototype.hasOwnProperty.call(options ?? {}, "fd") ? Number(options.fd) : null;
     this.autoClose = options?.autoClose !== false;
     this.destroyed = false;
+    this.closed = false;
     this.readableEnded = false;
     this.bytesRead = 0;
     this.pending = true;
@@ -720,7 +721,8 @@ export class ReadStream extends Readable {
   _close() {
     if (this._closed) return;
     this._closed = true;
-    if (this.fd != null && (this.autoClose || this._ownsFd)) {
+    this.closed = true;
+    if (this.fd != null) {
       try { closeSync(this.fd); } catch {}
     }
     this.fd = null;
@@ -728,7 +730,7 @@ export class ReadStream extends Readable {
   }
 
   _pump() {
-    if (this.destroyed || this._paused || this._reading) return;
+    if (this.destroyed || this.readableEnded || this._paused || this._reading) return;
     this._reading = true;
     try {
       this._open();
@@ -762,9 +764,11 @@ export class ReadStream extends Readable {
     if (this.readableEnded) return;
     this.readableEnded = true;
     this.readable = false;
-    this.destroyed = true;
     this.push(null);
-    this._close();
+    if (this.autoClose) {
+      this.destroyed = true;
+      this._close();
+    }
   }
 
   close(callback = undefined) {
@@ -880,7 +884,8 @@ export class WriteStream extends Writable {
     if (chunk != null) this.write(chunk, encoding);
     this.writableEnded = true;
     this.emit("finish");
-    this.close(callback);
+    if (this.autoClose) this.close(callback);
+    else if (typeof callback === "function") queueMicrotask(callback);
     return this;
   }
 
@@ -892,7 +897,7 @@ export class WriteStream extends Writable {
   destroy(error = undefined) {
     if (this.destroyed) return this;
     this.destroyed = true;
-    if (this.fd != null && (this.autoClose || this._ownsFd)) {
+    if (this.fd != null) {
       try { closeSync(this.fd); } catch {}
     }
     this.fd = null;
@@ -1350,8 +1355,6 @@ export function glob(pattern, options = {}, callback = undefined) {
 async function* globIterator(pattern, options = {}) {
   for (const item of globSync(pattern, options)) yield item;
 }
-
-// COTTONTAIL-COMPAT: node:fs stream edge flags - native-backed file operations, recursive readdir, glob options, stat-diff watch/watchFile, FileHandle helpers, ReadStream/WriteStream pause/lifecycle behavior, and highWaterMark drain state are implemented; obscure stream flag combinations still need conformance work.
 
 export const promises = {
   access: async (path, mode = F_OK) => accessSync(path, mode),

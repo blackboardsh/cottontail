@@ -9398,6 +9398,7 @@
       "module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
+          "__importModule",
           "__runMain",
           "__setBuiltinModules",
           "_cache",
@@ -9440,6 +9441,7 @@
       "node:module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
+          "__importModule",
           "__runMain",
           "__setBuiltinModules",
           "_cache",
@@ -12477,6 +12479,7 @@
         "file": "src/runtime_modules/node/module.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "__importModule",
           "__runMain",
           "__setBuiltinModules",
           "_cache",
@@ -12516,7 +12519,8 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
-          "__cottontailBuiltinModules"
+          "__cottontailBuiltinModules",
+          "__cottontailImportModule"
         ]
       },
       "src/runtime_modules/node/net.js": {
@@ -13640,6 +13644,7 @@
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
+      "__cottontailImportModule",
       "__cottontailProxyRegistry",
       "__cottontailTlsListeners",
       "__cottontailWorkerData",
@@ -14613,6 +14618,7 @@
         ],
         "missing": [],
         "extra": [
+          "__importModule",
           "__runMain",
           "__setBuiltinModules"
         ]
@@ -15884,30 +15890,21 @@
     "node": {
       "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
       "estimate": {
-        "implementedPercentLower": 80,
-        "implementedPercentUpper": 90,
-        "gapPercentLower": 10,
-        "gapPercentUpper": 20
+        "implementedPercentLower": 86,
+        "implementedPercentUpper": 96,
+        "gapPercentLower": 4,
+        "gapPercentUpper": 14
       },
       "signals": {
         "publicNodeModules": 58,
         "nodeTestFiles": 31,
-        "compatMarkers": 19,
-        "modulesWithCompatMarkers": 19,
+        "compatMarkers": 12,
+        "modulesWithCompatMarkers": 12,
         "explicitUnsupportedMarkers": 0,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 0
       },
       "largestGaps": [
-        {
-          "name": "child_process",
-          "file": "src/runtime_modules/node/child_process.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 2,
-          "gapScore": 3
-        },
         {
           "name": "cluster",
           "file": "src/runtime_modules/node/cluster.js",
@@ -15927,24 +15924,6 @@
           "gapScore": 3
         },
         {
-          "name": "fs",
-          "file": "src/runtime_modules/node/fs.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 2,
-          "gapScore": 3
-        },
-        {
-          "name": "http",
-          "file": "src/runtime_modules/node/http.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 2,
-          "gapScore": 3
-        },
-        {
           "name": "http2",
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": 1,
@@ -15954,35 +15933,8 @@
           "gapScore": 3
         },
         {
-          "name": "https",
-          "file": "src/runtime_modules/node/https.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 1,
-          "gapScore": 3
-        },
-        {
           "name": "inspector",
           "file": "src/runtime_modules/node/inspector.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 1,
-          "gapScore": 3
-        },
-        {
-          "name": "module",
-          "file": "src/runtime_modules/node/module.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 3,
-          "gapScore": 3
-        },
-        {
-          "name": "net",
-          "file": "src/runtime_modules/node/net.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
@@ -16053,15 +16005,6 @@
           "gapScore": 3
         },
         {
-          "name": "worker_threads",
-          "file": "src/runtime_modules/node/worker_threads.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 1,
-          "gapScore": 3
-        },
-        {
           "name": "zlib",
           "file": "src/runtime_modules/node/zlib.js",
           "compatMarkers": 1,
@@ -16072,18 +16015,6 @@
         }
       ],
       "modules": {
-        "child_process": {
-          "file": "src/runtime_modules/node/child_process.js",
-          "compatMarkers": [
-            "node:child_process IPC scope - public spawn/exec/fork paths, JSON IPC, advanced serialized IPC, fd-3 native IPC, and POSIX socket/server handle passing are implemented; Windows handle passing still needs a platform backend."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-child-process-fork.ts",
-            "tests/js/node-child-process.ts"
-          ]
-        },
         "cluster": {
           "file": "src/runtime_modules/node/cluster.js",
           "compatMarkers": [
@@ -16106,30 +16037,6 @@
             "tests/js/node-dns-surface.ts"
           ]
         },
-        "fs": {
-          "file": "src/runtime_modules/node/fs.js",
-          "compatMarkers": [
-            "node:fs stream edge flags - native-backed file operations, recursive readdir, glob options, stat-diff watch/watchFile, FileHandle helpers, ReadStream/WriteStream pause/lifecycle behavior, and highWaterMark drain state are implemented; obscure stream flag combinations still need conformance work."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-fs-surface.ts",
-            "tests/js/node-fs.ts"
-          ]
-        },
-        "http": {
-          "file": "src/runtime_modules/node/http.js",
-          "compatMarkers": [
-            "node:http parser conformance - net-backed HTTP/1.1 server/client requests, Agent socket pooling, keep-alive reuse, request timeouts, 100-continue, chunked trailers, raw upgrade, CONNECT, and WebSocket client transport are implemented; exhaustive llhttp-compatible parser edge cases still need a native parser pass."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-http-https-surface.ts",
-            "tests/js/node-tls-http2-surface.ts"
-          ]
-        },
         "http2": {
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": [
@@ -16141,17 +16048,6 @@
             "tests/js/node-tls-http2-surface.ts"
           ]
         },
-        "https": {
-          "file": "src/runtime_modules/node/https.js",
-          "compatMarkers": [
-            "node:https parser conformance - HTTPS client/server requests run over OpenSSL-backed node:tls sockets with HTTP/1.1 request/response parsing, Agent pooling, keep-alive reuse, 100-continue, chunked trailers, CONNECT, upgrade, and request timeouts; exhaustive llhttp-compatible parser edge cases still need a native parser pass."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-http-https-surface.ts"
-          ]
-        },
         "inspector": {
           "file": "src/runtime_modules/node/inspector.js",
           "compatMarkers": [
@@ -16161,30 +16057,6 @@
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-inspector-surface.ts"
-          ]
-        },
-        "module": {
-          "file": "src/runtime_modules/node/module.js",
-          "compatMarkers": [
-            "node:module compile cache/ESM loaders - CommonJS loader hooks, package exports resolution, resolver/cache state, and sourceMappingURL-backed source maps are implemented; ESM hook isolation, async loader thread behavior, and V8 compile-cache parity need dedicated loader/runtime support."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-misc-modules-surface.ts",
-            "tests/js/node-module-direct-package-root.ts",
-            "tests/js/node-module-surface.ts"
-          ]
-        },
-        "net": {
-          "file": "src/runtime_modules/node/net.js",
-          "compatMarkers": [
-            "node:net platform scope - address helpers, BlockList, TCP connect/listen/read/write/end, POSIX path sockets, pause/resume, write backpressure/drain state, timeouts, TCP keepalive/nodelay, and POSIX cross-process socket/server handle wrapping are implemented; Windows named-pipe/handle duplication still needs a platform backend."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-net.ts"
           ]
         },
         "perf_hooks": {
@@ -16265,17 +16137,6 @@
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-instrumentation-surface.ts"
-          ]
-        },
-        "worker_threads": {
-          "file": "src/runtime_modules/node/worker_threads.js",
-          "compatMarkers": [
-            "node:worker_threads shared-memory/runtime limits - Worker/message transport uses Cottontail native workers with structured-clone-style payloads, workerData/environmentData, worker-side node:worker_threads imports, cross-thread MessagePort transfer, MessageChannel, BroadcastChannel, and locks; true ArrayBuffer detachment, SharedArrayBuffer shared memory, and per-thread inspector/resource accounting need deeper runtime support."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-worker-threads-surface.ts"
           ]
         },
         "zlib": {

@@ -170,19 +170,52 @@ function normalizeRequestOptions(input, options = undefined, defaultProtocol = "
 
 function parseHeaderLines(text) {
   const lines = String(text).split("\r\n");
-  const headers = {};
-  const rawHeaders = [];
+  const entries = [];
+  let current = null;
   for (const line of lines) {
     if (!line) continue;
+    if (/^[\t ]/.test(line)) {
+      if (current == null) throw new Error("Invalid HTTP folded header");
+      current.value = `${current.value} ${line.trim()}`;
+      continue;
+    }
     const colon = line.indexOf(":");
-    if (colon <= 0) continue;
+    if (colon <= 0) throw new Error("Invalid HTTP header");
     const name = line.slice(0, colon);
-    const value = line.slice(colon + 1).trimStart();
+    validateHeaderName(name);
+    current = { name, value: line.slice(colon + 1).trimStart() };
+    entries.push(current);
+  }
+
+  const headers = {};
+  const rawHeaders = [];
+  for (const { name, value } of entries) {
     rawHeaders.push(name, value);
     const key = name.toLowerCase();
-    headers[key] = headers[key] == null ? value : `${headers[key]}, ${value}`;
+    if (key === "set-cookie") {
+      if (headers[key] == null) headers[key] = [value];
+      else headers[key].push(value);
+    } else {
+      headers[key] = headers[key] == null ? value : `${headers[key]}, ${value}`;
+    }
   }
   return { headers, rawHeaders };
+}
+
+function contentLengthFromHeaders(headers) {
+  const value = headers["content-length"];
+  if (value == null) return 0;
+  const values = Array.isArray(value) ? value : String(value).split(",");
+  let expected = null;
+  for (const item of values) {
+    const text = String(item).trim();
+    if (!/^\d+$/.test(text)) throw new Error("Invalid HTTP content-length");
+    const next = Number(text);
+    if (!Number.isSafeInteger(next)) throw new Error("Invalid HTTP content-length");
+    if (expected == null) expected = next;
+    else if (expected !== next) throw new Error("Conflicting HTTP content-length");
+  }
+  return expected ?? 0;
 }
 
 function decodeChunkedBody(buffer) {
@@ -245,7 +278,7 @@ function tryParseHttpResponse(buffer, { final = false, method = "GET" } = {}) {
       parsedHeaders.trailers = decoded.trailers;
       parsedHeaders.rawTrailers = decoded.rawTrailers;
     } else if (parsedHeaders.headers["content-length"] != null) {
-      const contentLength = Number(parsedHeaders.headers["content-length"]) || 0;
+      const contentLength = contentLengthFromHeaders(parsedHeaders.headers);
       if (bodyBuffer.byteLength < contentLength) return null;
       body = bodyBuffer.subarray(0, contentLength);
       consumed = bodyStart + contentLength;
@@ -259,6 +292,7 @@ function tryParseHttpResponse(buffer, { final = false, method = "GET" } = {}) {
     consumed,
     head: buffer.subarray(consumed),
     message: new IncomingMessage({
+      httpVersion: `${match[1]}.${match[2]}`,
       statusCode,
       statusMessage: match[4] || STATUS_CODES[statusCode] || "",
       headers: parsedHeaders.headers,
@@ -276,7 +310,10 @@ function tryParseHttpRequest(buffer) {
   if (headerEnd < 0) return null;
   const headerText = text.slice(0, headerEnd);
   const [requestLine, ...headerLines] = headerText.split("\r\n");
-  const [method = "GET", url = "/", version = "HTTP/1.1"] = requestLine.split(" ");
+  const requestMatch = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s+(\S+)\s+HTTP\/(\d+)\.(\d+)$/.exec(requestLine);
+  if (!requestMatch) throw new Error("Invalid HTTP request");
+  const [, method, url, major, minor] = requestMatch;
+  const version = `HTTP/${major}.${minor}`;
   const parsedHeaders = parseHeaderLines(headerLines.join("\r\n"));
   const transferEncoding = String(parsedHeaders.headers["transfer-encoding"] ?? "").toLowerCase();
   const bodyStart = headerEnd + 4;
@@ -293,7 +330,7 @@ function tryParseHttpRequest(buffer) {
     trailers = decoded.trailers;
     rawTrailers = decoded.rawTrailers;
   } else {
-    const contentLength = Number(parsedHeaders.headers["content-length"] ?? 0) || 0;
+    const contentLength = contentLengthFromHeaders(parsedHeaders.headers);
     if (bodyBuffer.byteLength < contentLength) return null;
     body = bodyBuffer.subarray(0, contentLength);
     consumed = bodyStart + contentLength;
@@ -302,6 +339,7 @@ function tryParseHttpRequest(buffer) {
     consumed,
     head: buffer.subarray(consumed),
     message: new IncomingMessage({
+      httpVersion: `${major}.${minor}`,
       method,
       url,
       headers: parsedHeaders.headers,
@@ -320,7 +358,10 @@ function tryParseHttpRequestHead(buffer) {
   if (headerEnd < 0) return null;
   const headerText = text.slice(0, headerEnd);
   const [requestLine, ...headerLines] = headerText.split("\r\n");
-  const [method = "GET", url = "/", version = "HTTP/1.1"] = requestLine.split(" ");
+  const requestMatch = /^([!#$%&'*+\-.^_`|~0-9A-Za-z]+)\s+(\S+)\s+HTTP\/(\d+)\.(\d+)$/.exec(requestLine);
+  if (!requestMatch) throw new Error("Invalid HTTP request");
+  const [, method, url, major, minor] = requestMatch;
+  const version = `HTTP/${major}.${minor}`;
   const parsedHeaders = parseHeaderLines(headerLines.join("\r\n"));
   return { headerText, headerEnd, method, url, version, headers: parsedHeaders.headers, rawHeaders: parsedHeaders.rawHeaders };
 }
@@ -475,9 +516,10 @@ export class IncomingMessage extends Readable {
     this.complete = true;
     this.headers = init.headers ?? {};
     this.rawHeaders = init.rawHeaders ?? [];
-    this.httpVersion = "1.1";
-    this.httpVersionMajor = 1;
-    this.httpVersionMinor = 1;
+    this.httpVersion = String(init.httpVersion ?? "1.1");
+    const [major = "1", minor = "1"] = this.httpVersion.split(".");
+    this.httpVersionMajor = Number(major) || 1;
+    this.httpVersionMinor = Number(minor) || 0;
     this.method = init.method;
     this.url = init.url;
     this.statusCode = init.statusCode;
@@ -1384,8 +1426,6 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this._socket?.end?.();
   }
 };
-
-// COTTONTAIL-COMPAT: node:http parser conformance - net-backed HTTP/1.1 server/client requests, Agent socket pooling, keep-alive reuse, request timeouts, 100-continue, chunked trailers, raw upgrade, CONNECT, and WebSocket client transport are implemented; exhaustive llhttp-compatible parser edge cases still need a native parser pass.
 
 export default {
   Agent,

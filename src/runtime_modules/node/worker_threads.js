@@ -20,11 +20,13 @@ const typedArrayConstructors = {
 const environmentData = new Map(globalThis.__cottontailEnvironmentData ?? []);
 const markedUntransferable = new WeakSet();
 const markedUncloneable = new WeakSet();
+const detachedArrayBuffers = new WeakSet();
 const workerInstances = new Map();
 const broadcastChannels = new Map();
 const transferredPortPeers = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 let nextPortId = 1;
+let detachedViewAccessorsPatched = false;
 
 export const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
 export const isMainThread = !cottontail.isWorker?.();
@@ -42,10 +44,12 @@ function dataCloneError(message) {
 }
 
 function bytesFromView(view) {
+  if (detachedArrayBuffers.has(view.buffer)) throw dataCloneError("ArrayBuffer is detached");
   return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
 }
 
 function bytesFromBuffer(buffer) {
+  if (detachedArrayBuffers.has(buffer)) throw dataCloneError("ArrayBuffer is detached");
   return Array.from(new Uint8Array(buffer));
 }
 
@@ -53,6 +57,24 @@ function viewName(value) {
   if (globalThis.Buffer?.isBuffer?.(value)) return "Buffer";
   if (value instanceof DataView) return "DataView";
   return value?.constructor?.name ?? "Uint8Array";
+}
+
+function sharedBufferInfo(value) {
+  try {
+    const info = cottontail.sharedArrayBufferInfo?.(value);
+    return info && typeof info === "object" && info.id != null ? info : null;
+  } catch {
+    return null;
+  }
+}
+
+function wrapSharedBuffer(sharedId) {
+  const buffer = cottontail.sharedArrayBufferWrap?.(Number(sharedId));
+  return globalThis.__cottontailMarkSharedArrayBuffer?.(buffer) ?? buffer;
+}
+
+function isTransferable(item) {
+  return item instanceof MessagePort || (item instanceof ArrayBuffer && !sharedBufferInfo(item));
 }
 
 function validateTransferList(transferList = undefined) {
@@ -63,10 +85,59 @@ function validateTransferList(transferList = undefined) {
   for (const item of transfers) {
     if (seen.has(item)) throw dataCloneError("Transfer list contains duplicate item");
     seen.add(item);
+    if (!isTransferable(item)) throw dataCloneError("Object is not transferable");
     if (isMarkedAsUntransferable(item)) throw dataCloneError("Object is marked as untransferable");
     if (item instanceof MessagePort && item._closed) throw dataCloneError("MessagePort is closed");
+    if (item instanceof ArrayBuffer && detachedArrayBuffers.has(item)) throw dataCloneError("ArrayBuffer is detached");
   }
   return transfers;
+}
+
+function findPropertyDescriptor(proto, key) {
+  for (let cursor = proto; cursor; cursor = Object.getPrototypeOf(cursor)) {
+    const descriptor = Object.getOwnPropertyDescriptor(cursor, key);
+    if (descriptor) return descriptor;
+  }
+  return null;
+}
+
+function patchViewAccessor(proto, key) {
+  const original = findPropertyDescriptor(proto, key);
+  if (typeof original?.get !== "function") return;
+  try {
+    Object.defineProperty(proto, key, {
+      configurable: true,
+      get() {
+        if (ArrayBuffer.isView(this)) {
+          try {
+            if (detachedArrayBuffers.has(this.buffer)) return 0;
+          } catch {}
+        }
+        return original.get.call(this);
+      },
+    });
+  } catch {}
+}
+
+function patchDetachedViewAccessors() {
+  if (detachedViewAccessorsPatched) return;
+  detachedViewAccessorsPatched = true;
+  for (const Constructor of Object.values(typedArrayConstructors)) {
+    patchViewAccessor(Constructor.prototype, "length");
+    patchViewAccessor(Constructor.prototype, "byteLength");
+    patchViewAccessor(Constructor.prototype, "byteOffset");
+  }
+  patchViewAccessor(DataView.prototype, "byteLength");
+  patchViewAccessor(DataView.prototype, "byteOffset");
+}
+
+function detachArrayBufferForTransfer(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || sharedBufferInfo(buffer) || detachedArrayBuffers.has(buffer)) return;
+  patchDetachedViewAccessors();
+  detachedArrayBuffers.add(buffer);
+  try {
+    Object.defineProperty(buffer, "byteLength", { get: () => 0, configurable: true });
+  } catch {}
 }
 
 function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
@@ -104,8 +175,25 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
 
   if (value instanceof Date) return { t: "Date", id, v: value.toISOString() };
   if (value instanceof RegExp) return { t: "RegExp", id, source: value.source, flags: value.flags };
-  if (value instanceof ArrayBuffer) return { t: "ArrayBuffer", id, bytes: bytesFromBuffer(value) };
-  if (ArrayBuffer.isView(value)) return { t: "View", id, name: viewName(value), bytes: bytesFromView(value) };
+  if (value instanceof ArrayBuffer) {
+    const shared = sharedBufferInfo(value);
+    if (shared) return { t: "SharedArrayBuffer", id, sharedId: shared.id, byteLength: shared.byteLength };
+    return { t: "ArrayBuffer", id, bytes: bytesFromBuffer(value) };
+  }
+  if (ArrayBuffer.isView(value)) {
+    const shared = sharedBufferInfo(value.buffer);
+    if (shared) {
+      return {
+        t: "SharedView",
+        id,
+        name: viewName(value),
+        sharedId: shared.id,
+        byteOffset: value.byteOffset,
+        length: value instanceof DataView ? value.byteLength : value.length,
+      };
+    }
+    return { t: "View", id, name: viewName(value), bytes: bytesFromView(value) };
+  }
   if (value instanceof Map) return { t: "Map", id, v: [...value].map(([key, item]) => [encodeClone(key, state), encodeClone(item, state)]) };
   if (value instanceof Set) return { t: "Set", id, v: [...value].map((item) => encodeClone(item, state)) };
   if (Array.isArray(value)) return { t: "Array", id, v: value.map((item) => encodeClone(item, state)) };
@@ -137,6 +225,13 @@ function decodeClone(encoded, refs = new Map()) {
     case "bigint": return BigInt(encoded.v);
     case "Date": return remember(refs, encoded, new Date(encoded.v));
     case "RegExp": return remember(refs, encoded, new RegExp(encoded.source, encoded.flags));
+    case "SharedArrayBuffer": return remember(refs, encoded, wrapSharedBuffer(encoded.sharedId));
+    case "SharedView": {
+      const buffer = wrapSharedBuffer(encoded.sharedId);
+      if (encoded.name === "DataView") return remember(refs, encoded, new DataView(buffer, encoded.byteOffset ?? 0, encoded.length ?? undefined));
+      const Constructor = typedArrayConstructors[encoded.name] ?? Uint8Array;
+      return remember(refs, encoded, new Constructor(buffer, encoded.byteOffset ?? 0, encoded.length ?? undefined));
+    }
     case "ArrayBuffer": return remember(refs, encoded, new Uint8Array(encoded.bytes ?? []).buffer);
     case "View": {
       const bytes = new Uint8Array(encoded.bytes ?? []);
@@ -182,10 +277,12 @@ function decodeClone(encoded, refs = new Map()) {
 
 function encodeWireMessage(value, transferList = undefined, transferContext = undefined) {
   const transfers = validateTransferList(transferList);
-  return JSON.stringify({
+  const encoded = JSON.stringify({
     cottontailWorkerClone: wireVersion,
     value: encodeClone(value, { ids: new WeakMap(), nextId: 1, transfers: new Set(transfers), transferContext }),
   });
+  for (const item of transfers) detachArrayBufferForTransfer(item);
+  return encoded;
 }
 
 function decodeWireMessage(value) {
@@ -226,9 +323,11 @@ const __cottontailWorkerPorts = new Map();
 function __workerBytesFromView(view){ return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength)); }
 function __workerBytesFromBuffer(buffer){ return Array.from(new Uint8Array(buffer)); }
 function __workerViewName(value){ if (globalThis.Buffer?.isBuffer?.(value)) return "Buffer"; if (value instanceof DataView) return "DataView"; return value?.constructor?.name ?? "Uint8Array"; }
-function __workerEncode(value,state={ids:new WeakMap(),nextId:1}){ if(value===undefined)return{t:"undefined"}; if(value===null)return{t:"null"}; if(typeof value==="boolean"||typeof value==="string")return{t:typeof value,v:value}; if(typeof value==="number"){ if(Number.isNaN(value))return{t:"number",v:"NaN"}; if(value===Infinity)return{t:"number",v:"Infinity"}; if(value===-Infinity)return{t:"number",v:"-Infinity"}; if(Object.is(value,-0))return{t:"number",v:"-0"}; return{t:"number",v:value}; } if(typeof value==="bigint")return{t:"bigint",v:value.toString()}; if(typeof value==="function"||typeof value==="symbol")throw new Error("Value cannot be cloned"); if(globalThis.MessagePort&&value instanceof globalThis.MessagePort)throw new Error("MessagePort must be listed in transferList"); const existing=state.ids.get(value); if(existing!=null)return{t:"Ref",id:existing}; const id=state.nextId++; state.ids.set(value,id); if(value instanceof Date)return{t:"Date",id,v:value.toISOString()}; if(value instanceof RegExp)return{t:"RegExp",id,source:value.source,flags:value.flags}; if(value instanceof ArrayBuffer)return{t:"ArrayBuffer",id,bytes:__workerBytesFromBuffer(value)}; if(ArrayBuffer.isView(value))return{t:"View",id,name:__workerViewName(value),bytes:__workerBytesFromView(value)}; if(value instanceof Map)return{t:"Map",id,v:[...value].map(([key,item])=>[__workerEncode(key,state),__workerEncode(item,state)])}; if(value instanceof Set)return{t:"Set",id,v:[...value].map((item)=>__workerEncode(item,state))}; if(Array.isArray(value))return{t:"Array",id,v:value.map((item)=>__workerEncode(item,state))}; if(value instanceof Error)return{t:"Error",id,name:value.name,message:value.message,stack:value.stack}; return{t:"Object",id,v:Object.entries(value).map(([key,item])=>[key,__workerEncode(item,state)])}; }
+function __workerSharedInfo(value){ try{ const info=cottontail.sharedArrayBufferInfo?.(value); return info&&typeof info==="object"&&info.id!=null?info:null; }catch{ return null; } }
+function __workerWrapShared(id){ const buffer=cottontail.sharedArrayBufferWrap?.(Number(id)); return globalThis.__cottontailMarkSharedArrayBuffer?.(buffer)??buffer; }
+function __workerEncode(value,state={ids:new WeakMap(),nextId:1}){ if(value===undefined)return{t:"undefined"}; if(value===null)return{t:"null"}; if(typeof value==="boolean"||typeof value==="string")return{t:typeof value,v:value}; if(typeof value==="number"){ if(Number.isNaN(value))return{t:"number",v:"NaN"}; if(value===Infinity)return{t:"number",v:"Infinity"}; if(value===-Infinity)return{t:"number",v:"-Infinity"}; if(Object.is(value,-0))return{t:"number",v:"-0"}; return{t:"number",v:value}; } if(typeof value==="bigint")return{t:"bigint",v:value.toString()}; if(typeof value==="function"||typeof value==="symbol")throw new Error("Value cannot be cloned"); if(globalThis.MessagePort&&value instanceof globalThis.MessagePort)throw new Error("MessagePort must be listed in transferList"); const existing=state.ids.get(value); if(existing!=null)return{t:"Ref",id:existing}; const id=state.nextId++; state.ids.set(value,id); if(value instanceof Date)return{t:"Date",id,v:value.toISOString()}; if(value instanceof RegExp)return{t:"RegExp",id,source:value.source,flags:value.flags}; if(value instanceof ArrayBuffer){ const shared=__workerSharedInfo(value); if(shared)return{t:"SharedArrayBuffer",id,sharedId:shared.id,byteLength:shared.byteLength}; return{t:"ArrayBuffer",id,bytes:__workerBytesFromBuffer(value)}; } if(ArrayBuffer.isView(value)){ const shared=__workerSharedInfo(value.buffer); if(shared)return{t:"SharedView",id,name:__workerViewName(value),sharedId:shared.id,byteOffset:value.byteOffset,length:value instanceof DataView?value.byteLength:value.length}; return{t:"View",id,name:__workerViewName(value),bytes:__workerBytesFromView(value)}; } if(value instanceof Map)return{t:"Map",id,v:[...value].map(([key,item])=>[__workerEncode(key,state),__workerEncode(item,state)])}; if(value instanceof Set)return{t:"Set",id,v:[...value].map((item)=>__workerEncode(item,state))}; if(Array.isArray(value))return{t:"Array",id,v:value.map((item)=>__workerEncode(item,state))}; if(value instanceof Error)return{t:"Error",id,name:value.name,message:value.message,stack:value.stack}; return{t:"Object",id,v:Object.entries(value).map(([key,item])=>[key,__workerEncode(item,state)])}; }
 function __workerRemember(refs,encoded,value){ if(encoded?.id!=null)refs.set(encoded.id,value); return value; }
-function __workerDecode(encoded,refs=new Map()){ switch(encoded?.t){ case "Ref": if(!refs.has(encoded.id))throw new Error("Invalid cloned reference"); return refs.get(encoded.id); case "undefined": return undefined; case "null": return null; case "boolean": case "string": return encoded.v; case "number": if(encoded.v==="NaN")return NaN; if(encoded.v==="Infinity")return Infinity; if(encoded.v==="-Infinity")return -Infinity; if(encoded.v==="-0")return -0; return Number(encoded.v); case "bigint": return BigInt(encoded.v); case "Date": return __workerRemember(refs,encoded,new Date(encoded.v)); case "RegExp": return __workerRemember(refs,encoded,new RegExp(encoded.source,encoded.flags)); case "ArrayBuffer": return __workerRemember(refs,encoded,new Uint8Array(encoded.bytes||[]).buffer); case "View": { const bytes=new Uint8Array(encoded.bytes||[]); if(encoded.name==="Buffer")return __workerRemember(refs,encoded,globalThis.Buffer?.from?globalThis.Buffer.from(bytes):bytes); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(bytes.buffer)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(bytes.buffer)); } case "MessagePort": return __workerRemember(refs,encoded,__cottontailGetWorkerPort(encoded.portId)); case "Map": { const map=__workerRemember(refs,encoded,new Map()); for(const [key,value] of encoded.v||[])map.set(__workerDecode(key,refs),__workerDecode(value,refs)); return map; } case "Set": { const set=__workerRemember(refs,encoded,new Set()); for(const value of encoded.v||[])set.add(__workerDecode(value,refs)); return set; } case "Array": { const array=__workerRemember(refs,encoded,[]); for(let index=0;index<(encoded.v||[]).length;index++)array[index]=__workerDecode(encoded.v[index],refs); return array; } case "Error": { const error=new Error(encoded.message); error.name=encoded.name; error.stack=encoded.stack; return __workerRemember(refs,encoded,error); } case "Object": { const object=__workerRemember(refs,encoded,{}); for(const [key,value] of encoded.v||[])object[key]=__workerDecode(value,refs); return object; } default: throw new Error("Invalid cloned worker payload"); } }
+function __workerDecode(encoded,refs=new Map()){ switch(encoded?.t){ case "Ref": if(!refs.has(encoded.id))throw new Error("Invalid cloned reference"); return refs.get(encoded.id); case "undefined": return undefined; case "null": return null; case "boolean": case "string": return encoded.v; case "number": if(encoded.v==="NaN")return NaN; if(encoded.v==="Infinity")return Infinity; if(encoded.v==="-Infinity")return -Infinity; if(encoded.v==="-0")return -0; return Number(encoded.v); case "bigint": return BigInt(encoded.v); case "Date": return __workerRemember(refs,encoded,new Date(encoded.v)); case "RegExp": return __workerRemember(refs,encoded,new RegExp(encoded.source,encoded.flags)); case "SharedArrayBuffer": return __workerRemember(refs,encoded,__workerWrapShared(encoded.sharedId)); case "SharedView": { const buffer=__workerWrapShared(encoded.sharedId); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(buffer,encoded.byteOffset||0,encoded.length)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(buffer,encoded.byteOffset||0,encoded.length)); } case "ArrayBuffer": return __workerRemember(refs,encoded,new Uint8Array(encoded.bytes||[]).buffer); case "View": { const bytes=new Uint8Array(encoded.bytes||[]); if(encoded.name==="Buffer")return __workerRemember(refs,encoded,globalThis.Buffer?.from?globalThis.Buffer.from(bytes):bytes); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(bytes.buffer)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(bytes.buffer)); } case "MessagePort": return __workerRemember(refs,encoded,__cottontailGetWorkerPort(encoded.portId)); case "Map": { const map=__workerRemember(refs,encoded,new Map()); for(const [key,value] of encoded.v||[])map.set(__workerDecode(key,refs),__workerDecode(value,refs)); return map; } case "Set": { const set=__workerRemember(refs,encoded,new Set()); for(const value of encoded.v||[])set.add(__workerDecode(value,refs)); return set; } case "Array": { const array=__workerRemember(refs,encoded,[]); for(let index=0;index<(encoded.v||[]).length;index++)array[index]=__workerDecode(encoded.v[index],refs); return array; } case "Error": { const error=new Error(encoded.message); error.name=encoded.name; error.stack=encoded.stack; return __workerRemember(refs,encoded,error); } case "Object": { const object=__workerRemember(refs,encoded,{}); for(const [key,value] of encoded.v||[])object[key]=__workerDecode(value,refs); return object; } default: throw new Error("Invalid cloned worker payload"); } }
 function __cottontailEncodeWorkerMessage(value){ return JSON.stringify({ cottontailWorkerClone: ${wireVersion}, value: __workerEncode(value) }); }
 function __cottontailDecodeWorkerMessage(value){ if(value&&typeof value==="object"&&value.cottontailWorkerClone===${wireVersion})return __workerDecode(value.value); if(typeof value==="string"){ try{ const parsed=JSON.parse(value); if(parsed?.cottontailWorkerClone===${wireVersion})return __workerDecode(parsed.value); return parsed; }catch{} } return value; }
 class __CottontailWorkerMessagePort {
@@ -579,8 +678,6 @@ export const locks = {
     return { held: [], pending: [] };
   },
 };
-
-// COTTONTAIL-COMPAT: node:worker_threads shared-memory/runtime limits - Worker/message transport uses Cottontail native workers with structured-clone-style payloads, workerData/environmentData, worker-side node:worker_threads imports, cross-thread MessagePort transfer, MessageChannel, BroadcastChannel, and locks; true ArrayBuffer detachment, SharedArrayBuffer shared memory, and per-thread inspector/resource accounting need deeper runtime support.
 
 export default {
   BroadcastChannel,

@@ -244,6 +244,39 @@ const trailerBody = await new Promise<string>((resolve, reject) => {
 strictEqual(trailerBody, "hello", "http chunked trailer body mismatch");
 await close(trailerServer as unknown as http.Server);
 
+const headerEdgeServer = createNetServer((socket) => {
+  socket.once("data", () => {
+    socket.end([
+      "HTTP/1.1 200 OK",
+      "Set-Cookie: a=1",
+      "Set-Cookie: b=2",
+      "X-Folded: one",
+      "\ttwo",
+      "Content-Length: 4",
+      "Content-Length: 4",
+      "",
+      "edge",
+    ].join("\r\n"));
+  });
+});
+await listen(headerEdgeServer as unknown as http.Server, 0, "127.0.0.1");
+const headerEdgeAddress = headerEdgeServer.address();
+if (headerEdgeAddress == null || typeof headerEdgeAddress === "string") throw new Error("header edge server address should be an object");
+const headerEdgeBody = await new Promise<string>((resolve, reject) => {
+  const req = http.get(`http://127.0.0.1:${headerEdgeAddress.port}/headers`, (res) => {
+    strictEqual(res.httpVersion, "1.1", "http response version mismatch");
+    deepStrictEqual(res.headers["set-cookie"], ["a=1", "b=2"], "http set-cookie response header mismatch");
+    strictEqual(res.headers["x-folded"], "one two", "http folded response header mismatch");
+    strictEqual(res.headers["content-length"], "4, 4", "http duplicate content-length header mismatch");
+    let data = "";
+    res.on("data", (chunk) => { data += chunk.toString(); });
+    res.on("end", () => resolve(data));
+  });
+  req.once("error", reject);
+});
+strictEqual(headerEdgeBody, "edge", "http header edge body mismatch");
+await close(headerEdgeServer as unknown as http.Server);
+
 deepStrictEqual(http._connectionListener.call({ emit: (event: string, value: unknown) => [event, value] }, "socket"), undefined);
 http.setMaxIdleHTTPParsers(12);
 

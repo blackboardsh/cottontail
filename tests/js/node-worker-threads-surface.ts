@@ -91,6 +91,29 @@ try {
   transferError = error?.name === "DataCloneError";
 }
 assert(transferError, "markAsUntransferable should reject transferList");
+let invalidTransferError = false;
+try {
+  complexChannel.port2.postMessage({ value: "bad-transfer" }, [{} as any]);
+} catch (error) {
+  invalidTransferError = error?.name === "DataCloneError";
+}
+assert(invalidTransferError, "non-transferable objects should reject transferList");
+const transferBuffer = new ArrayBuffer(3);
+const transferView = new Uint8Array(transferBuffer);
+transferView.set([4, 5, 6]);
+complexChannel.port2.postMessage({ transferBuffer }, [transferBuffer]);
+const transferReceived = receiveMessageOnPort(complexChannel.port1)?.message;
+assert(transferBuffer.byteLength === 0, "transferred ArrayBuffer should be detached");
+assert(transferView.byteLength === 0 && transferView.length === 0, "views over transferred ArrayBuffer should be detached");
+assert(transferReceived.transferBuffer instanceof ArrayBuffer, "transferred ArrayBuffer clone mismatch");
+assert(new Uint8Array(transferReceived.transferBuffer).join(",") === "4,5,6", "transferred ArrayBuffer bytes mismatch");
+let detachedTransferError = false;
+try {
+  complexChannel.port2.postMessage({ transferBuffer }, [transferBuffer]);
+} catch (error) {
+  detachedTransferError = error?.name === "DataCloneError";
+}
+assert(detachedTransferError, "detached ArrayBuffer should reject transferList reuse");
 
 let broadcastMessage = "";
 const left = new BroadcastChannel("cottontail-worker-test");
@@ -192,6 +215,69 @@ const portReply = await transferredPortReply;
 assert(portReply.value === "through-port", "transferred MessagePort reply mismatch");
 assert(portReply.map === "port-map", "transferred MessagePort structured clone mismatch");
 assert(portReply.threadId === worker.threadId, "transferred MessagePort worker thread mismatch");
+
+assert(typeof SharedArrayBuffer === "function", "SharedArrayBuffer global missing");
+const sharedBuffer = new SharedArrayBuffer(8);
+assert(sharedBuffer instanceof SharedArrayBuffer, "SharedArrayBuffer instanceof mismatch");
+const sharedView = new Int32Array(sharedBuffer);
+Atomics.store(sharedView, 0, 7);
+Atomics.store(sharedView, 1, 0);
+const sharedReplyPromise = new Promise<any>((resolve, reject) => {
+  const timeout = setTimeout(() => reject(new Error("SharedArrayBuffer worker response timed out")), 1500);
+  worker.on("message", (message) => {
+    if (message.type === "shared-done") {
+      clearTimeout(timeout);
+      resolve(message);
+    }
+  });
+});
+worker.postMessage({ shared: sharedBuffer });
+assert(Atomics.wait(sharedView, 0, 7, 1000) === "ok", "Atomics.wait should be notified by worker");
+const sharedReply = await sharedReplyPromise;
+assert(sharedReply.isShared === true, "worker should receive SharedArrayBuffer");
+assert(sharedReply.before === 7, "worker shared buffer initial value mismatch");
+assert(sharedReply.after === 8, "worker shared buffer updated value mismatch");
+assert(sharedReply.second === 3, "worker shared buffer Atomics.add mismatch");
+assert(Atomics.load(sharedView, 0) === 8, "parent should observe shared buffer mutation");
+assert(Atomics.load(sharedView, 1) === 3, "parent should observe shared Atomics.add mutation");
+assert(Atomics.wait(sharedView, 0, 99, 1) === "not-equal", "Atomics.wait should report not-equal");
+assert(Atomics.wait(sharedView, 0, 8, 0) === "timed-out", "Atomics.wait zero timeout should time out");
+assert(Atomics.notify(sharedView, 0, 1) === 0, "Atomics.notify should report no waiters");
+
+const waitBuffer = new SharedArrayBuffer(8);
+const waitView = new Int32Array(waitBuffer);
+Atomics.store(waitView, 0, 1);
+Atomics.store(waitView, 1, 1);
+const waitStartedPromise = new Promise<void>((resolve, reject) => {
+  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker start timed out")), 1500);
+  worker.on("message", (message) => {
+    if (message.type === "wait-started") {
+      clearTimeout(timeout);
+      resolve();
+    }
+  });
+});
+const waitResultPromise = new Promise<any>((resolve, reject) => {
+  const timeout = setTimeout(() => reject(new Error("Atomics.wait worker result timed out")), 1500);
+  worker.on("message", (message) => {
+    if (message.type === "wait-result") {
+      clearTimeout(timeout);
+      resolve(message);
+    }
+  });
+});
+worker.postMessage({ waitShared: waitBuffer });
+await waitStartedPromise;
+assert(Atomics.notify(waitView, 1, 1) === 0, "Atomics.notify should ignore waiters at other indexes");
+let notifiedWaiters = 0;
+for (let attempt = 0; attempt < 50 && notifiedWaiters === 0; attempt += 1) {
+  notifiedWaiters = Atomics.notify(waitView, 0, 1);
+  if (notifiedWaiters === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+}
+assert(notifiedWaiters === 1, "Atomics.notify should wake one matching waiter");
+const waitResult = await waitResultPromise;
+assert(waitResult.result === "ok", "worker Atomics.wait should return ok after notify");
+assert(Atomics.notify(waitView, 0, 1) === 0, "Atomics.notify should not count completed waiters");
 
 assert(await worker.terminate() === 0, "Worker terminate mismatch");
 

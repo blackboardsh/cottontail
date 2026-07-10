@@ -185,6 +185,29 @@ const loadHook = registerHooks({
 assert(localRequire("virtual-hook").value === "hooked-load", "registerHooks load hook mismatch");
 loadHook.deregister();
 
+const dynamicHook = registerHooks({
+  resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
+    if (specifier === "dynamic-hook") {
+      return { url: `file://${join(root, "dynamic-hook.mjs")}`, format: "module", shortCircuit: true };
+    }
+    return nextResolve(specifier, context);
+  },
+  load(url: string, context: unknown, nextLoad: (url: string, context: unknown) => { format?: string; source?: string | null }) {
+    if (url.endsWith("/dynamic-hook.mjs")) {
+      return {
+        format: "module",
+        source: "export const value = 'dynamic-hooked';\nexport default { value };\n",
+        shortCircuit: true,
+      };
+    }
+    return nextLoad(url, context);
+  },
+});
+const dynamicImported = (globalThis as any).cottontail.importModule("dynamic-hook", `file://${join(root, "entry.js")}`);
+assert(dynamicImported.value === "dynamic-hooked", "dynamic import hook named export mismatch");
+assert(dynamicImported.default.value === "dynamic-hooked", "dynamic import hook default export mismatch");
+dynamicHook.deregister();
+
 const registeredTarget = join(root, "registered-hook.cjs");
 const registeredHooks = join(root, "registered-hooks.cjs");
 writeFileSync(registeredTarget, "module.exports = { value: 'registered' };\n");
