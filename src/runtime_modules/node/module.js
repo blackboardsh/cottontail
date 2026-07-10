@@ -123,6 +123,19 @@ const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const sourceMapCache = new Map();
 let nextModuleHookId = 0;
 
+function bunModuleMockFor(...keys) {
+  const registry = globalThis.__cottontailBunModuleMocks;
+  if (!registry || typeof registry.has !== "function" || typeof registry.get !== "function") {
+    return { found: false, value: undefined };
+  }
+  for (const key of keys) {
+    if (key == null) continue;
+    const text = String(key);
+    if (registry.has(text)) return { found: true, value: registry.get(text) };
+  }
+  return { found: false, value: undefined };
+}
+
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();
   for (const [name, value] of Object.entries(modules || {})) {
@@ -529,10 +542,14 @@ function executeDynamicImportSource(resolved, source, format) {
 }
 
 export function __importModule(specifier, referrer = undefined) {
+  const directMock = bunModuleMockFor(specifier);
+  if (directMock.found) return namespaceFromCommonJs(directMock.value);
   const parent = referrer == null
     ? cottontail.cwd()
     : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
   const resolved = resolveRequest(String(specifier), parent);
+  const resolvedMock = bunModuleMockFor(resolved);
+  if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
   const loadResult = runLoadHooks(resolved);
   if (loadResult !== undefined) {
     return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
@@ -545,6 +562,8 @@ export function __importModule(specifier, referrer = undefined) {
 globalThis.__cottontailImportModule = __importModule;
 
 function loadCommonJsModule(resolved) {
+  const mocked = bunModuleMockFor(resolved);
+  if (mocked.found) return mocked.value;
   const hooked = applyLoadHooks(resolved);
   if (hooked !== null) return hooked;
   if (builtinModuleMap.has(resolved)) return builtinModuleMap.get(resolved);
@@ -564,7 +583,11 @@ export function createRequire(basePath = cottontail.cwd()) {
     ? fileURLToPath(basePath)
     : String(basePath);
   const require = (request) => {
+    const directMock = bunModuleMockFor(request);
+    if (directMock.found) return directMock.value;
     const resolved = resolveRequest(request, normalizedBasePath);
+    const resolvedMock = bunModuleMockFor(resolved);
+    if (resolvedMock.found) return resolvedMock.value;
     return loadCommonJsModule(resolved);
   };
   require.resolve = (request) => resolveRequest(request, normalizedBasePath);
@@ -860,7 +883,11 @@ export function _resolveFilename(request, parent = undefined, isMain = false, op
 }
 
 export function _load(request, parent = undefined, isMain = false) {
+  const directMock = bunModuleMockFor(request);
+  if (directMock.found) return directMock.value;
   const resolved = _resolveFilename(request, parent, isMain);
+  const resolvedMock = bunModuleMockFor(resolved);
+  if (resolvedMock.found) return resolvedMock.value;
   return loadCommonJsModule(resolved);
 }
 

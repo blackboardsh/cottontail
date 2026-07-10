@@ -220,6 +220,9 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
 
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const bun_ffi_module = try runtimeModulePath(ctx, &.{ "bun", "ffi.js" });
+    const bun_jsc_module = try runtimeModulePath(ctx, &.{ "bun", "jsc.js" });
+    const bun_sqlite_module = try runtimeModulePath(ctx, &.{ "bun", "sqlite.js" });
+    const bun_test_module = try runtimeModulePath(ctx, &.{ "bun", "test.js" });
     const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
     const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
@@ -297,6 +300,9 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         "--define:import.meta.main=true",
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun={s}", .{bun_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:ffi={s}", .{bun_ffi_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:jsc={s}", .{bun_jsc_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:sqlite={s}", .{bun_sqlite_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:test={s}", .{bun_test_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs/promises={s}", .{fs_promises_module}),

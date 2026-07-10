@@ -3971,11 +3971,14 @@ static void ct_sqlite_delete_session(CtSqliteSession *session) {
     free(session);
 }
 
-static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, int column, JSValueRef *exception) {
+static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, int column, bool safe_integers, JSValueRef *exception) {
     int type = sqlite3_column_type(stmt, column);
     switch (type) {
-        case SQLITE_INTEGER:
-            return JSValueMakeNumber(ctx, (double)sqlite3_column_int64(stmt, column));
+        case SQLITE_INTEGER: {
+            sqlite3_int64 value = sqlite3_column_int64(stmt, column);
+            if (safe_integers) return JSBigIntCreateWithInt64(ctx, value, exception);
+            return JSValueMakeNumber(ctx, (double)value);
+        }
         case SQLITE_FLOAT:
             return JSValueMakeNumber(ctx, sqlite3_column_double(stmt, column));
         case SQLITE_TEXT:
@@ -3988,12 +3991,12 @@ static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, i
     }
 }
 
-static JSObjectRef ct_sqlite_row_object(JSContextRef ctx, sqlite3_stmt *stmt, JSValueRef *exception) {
+static JSObjectRef ct_sqlite_row_object(JSContextRef ctx, sqlite3_stmt *stmt, bool safe_integers, JSValueRef *exception) {
     int count = sqlite3_column_count(stmt);
     JSObjectRef row = ct_make_object(ctx);
     for (int index = 0; index < count; index += 1) {
         const char *name = sqlite3_column_name(stmt, index);
-        ct_set_property(ctx, row, name != NULL ? name : "", ct_sqlite_column_value(ctx, stmt, index, exception), exception);
+        ct_set_property(ctx, row, name != NULL ? name : "", ct_sqlite_column_value(ctx, stmt, index, safe_integers, exception), exception);
     }
     return row;
 }
@@ -4366,7 +4369,11 @@ static JSValueRef ct_sqlite_open(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
     sqlite3 *db = NULL;
-    int status = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        flags = (int)ct_value_to_number(ctx, argv[2]);
+    }
+    int status = sqlite3_open_v2(path, &db, flags, NULL);
     free(path);
     if (status != SQLITE_OK) {
         ct_sqlite_throw(ctx, exception, db);
@@ -4498,6 +4505,7 @@ static JSValueRef ct_sqlite_prepare(JSContextRef ctx, JSObjectRef function, JSOb
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, stmt_entry->id), exception);
     ct_set_property(ctx, result, "sourceSQL", ct_make_string(ctx, sqlite3_sql(stmt) != NULL ? sqlite3_sql(stmt) : ""), exception);
+    ct_set_property(ctx, result, "paramsCount", JSValueMakeNumber(ctx, sqlite3_bind_parameter_count(stmt)), exception);
     return result;
 }
 
@@ -4532,8 +4540,9 @@ static JSValueRef ct_sqlite_statement_all(JSContextRef ctx, JSObjectRef function
     }
     JSObjectRef rows = ct_make_array(ctx, 0, NULL, exception);
     unsigned row_index = 0;
+    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
     while ((status = sqlite3_step(entry->stmt)) == SQLITE_ROW) {
-        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_object(ctx, entry->stmt, exception), exception);
+        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_object(ctx, entry->stmt, safe_integers, exception), exception);
     }
     if (status != SQLITE_DONE) {
         ct_sqlite_throw(ctx, exception, entry->owner->db);
@@ -4561,9 +4570,10 @@ static JSValueRef ct_sqlite_statement_get(JSContextRef ctx, JSObjectRef function
         ct_sqlite_throw(ctx, exception, entry->owner->db);
         return JSValueMakeUndefined(ctx);
     }
+    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
     status = sqlite3_step(entry->stmt);
     if (status == SQLITE_ROW) {
-        JSObjectRef row = ct_sqlite_row_object(ctx, entry->stmt, exception);
+        JSObjectRef row = ct_sqlite_row_object(ctx, entry->stmt, safe_integers, exception);
         sqlite3_reset(entry->stmt);
         return row;
     }
@@ -4623,16 +4633,33 @@ static JSValueRef ct_sqlite_statement_columns(JSContextRef ctx, JSObjectRef func
     for (int index = 0; index < count; index += 1) {
         JSObjectRef column = ct_make_object(ctx);
         const char *name = sqlite3_column_name(entry->stmt, index);
+        const char *declared_type = sqlite3_column_decltype(entry->stmt, index);
         const char *table = sqlite3_column_table_name(entry->stmt, index);
         const char *database = sqlite3_column_database_name(entry->stmt, index);
         const char *origin = sqlite3_column_origin_name(entry->stmt, index);
         ct_set_property(ctx, column, "name", ct_make_string(ctx, name != NULL ? name : ""), exception);
+        ct_set_property(ctx, column, "type", ct_make_string(ctx, declared_type != NULL ? declared_type : ""), exception);
         ct_set_property(ctx, column, "column", ct_make_string(ctx, origin != NULL ? origin : ""), exception);
         ct_set_property(ctx, column, "table", ct_make_string(ctx, table != NULL ? table : ""), exception);
         ct_set_property(ctx, column, "database", ct_make_string(ctx, database != NULL ? database : ""), exception);
         JSObjectSetPropertyAtIndex(ctx, columns, (unsigned)index, column, exception);
     }
     return columns;
+}
+
+static JSValueRef ct_sqlite_in_transaction(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteInTransaction(id) requires a database id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, sqlite3_get_autocommit(entry->db) == 0);
 }
 
 static JSValueRef ct_sqlite_create_function(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4952,6 +4979,88 @@ static JSValueRef ct_sqlite_backup(JSContextRef ctx, JSObjectRef function, JSObj
     }
     sqlite3_close(destination);
     return JSValueMakeNumber(ctx, (double)pages);
+}
+
+static JSValueRef ct_sqlite_serialize(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteSerialize(id[, schema]) requires a database id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *schema = NULL;
+    if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
+        schema = ct_value_to_string_copy(ctx, argv[1]);
+        if (schema == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    sqlite3_int64 size = 0;
+    unsigned char *bytes = sqlite3_serialize(entry->db, schema != NULL ? schema : "main", &size, 0);
+    free(schema);
+    if (bytes == NULL) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, bytes, (size_t)size, ct_sqlite_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_sqlite_file_control(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "sqliteFileControl(id, fileName, op[, result]) requires database id, file name, and op");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *file_name = NULL;
+    if (!JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
+        file_name = ct_value_to_string_copy(ctx, argv[1]);
+        if (file_name == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    int op = (int)ct_value_to_number(ctx, argv[2]);
+    int result_int = -1;
+    void *result_ptr = NULL;
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3])) {
+        if (ct_get_bytes(ctx, argv[3], &bytes, &bytes_len) == 0) {
+            result_ptr = bytes;
+        } else if (JSValueIsNumber(ctx, argv[3])) {
+            result_int = (int)ct_value_to_number(ctx, argv[3]);
+            result_ptr = &result_int;
+        } else {
+            free(file_name);
+            ct_throw_message(ctx, exception, "sqliteFileControl result must be a number, null, ArrayBuffer, or typed array");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    int status = sqlite3_file_control(entry->db, file_name, op, result_ptr);
+    free(file_name);
+    if (status == SQLITE_ERROR) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, status);
 }
 
 static JSValueRef ct_sqlite_session_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -8795,6 +8904,102 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
     return js_result;
 }
 
+static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    void *handle = NULL;
+    void *symbol = NULL;
+    char *open_error = NULL;
+    (void)function;
+    (void)thisObject;
+
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.nativeSymbol(library, symbol) requires library and symbol names");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *library_path = ct_value_to_string_copy(ctx, argv[0]);
+    char *symbol_name = ct_value_to_string_copy(ctx, argv[1]);
+    if (library_path == NULL || symbol_name == NULL) {
+        free(library_path);
+        free(symbol_name);
+        ct_throw_message(ctx, exception, "cottontail.nativeSymbol requires string library and symbol names");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    handle = ct_get_native_library_handle(library_path, &open_error);
+    if (handle == NULL) {
+        char message[1024];
+        snprintf(message, sizeof(message), "dlopen(%s) failed: %s", library_path, open_error != NULL ? open_error : "unknown error");
+        free(open_error);
+        free(library_path);
+        free(symbol_name);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    symbol = dlsym(handle, symbol_name);
+    if (symbol == NULL) {
+        char message[1024];
+        snprintf(message, sizeof(message), "dlsym(%s) failed: %s", symbol_name, dlerror());
+        free(library_path);
+        free(symbol_name);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    free(library_path);
+    free(symbol_name);
+    return JSValueMakeNumber(ctx, (double)(uintptr_t)symbol);
+}
+
+static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    uint64_t pointer = 0;
+    CtFfiType return_type = CT_FFI_TYPE_VOID;
+    CtFfiType arg_types[CT_FFI_MAX_ARGS];
+    ffi_type *ffi_arg_types[CT_FFI_MAX_ARGS];
+    CtFfiValue arg_values[CT_FFI_MAX_ARGS];
+    void *arg_value_ptrs[CT_FFI_MAX_ARGS];
+    CtFfiValue result;
+    ffi_cif cif;
+    size_t arg_count = 0;
+    (void)function;
+    (void)thisObject;
+
+    memset(&result, 0, sizeof(result));
+
+    if (argc < 4 || ct_value_to_u64(ctx, argv[0], &pointer) != 0 || pointer == 0) {
+        ct_throw_message(ctx, exception, "cottontail.nativeCallPointer(pointer, returnType, argTypes, args) requires a function pointer");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (ct_parse_ffi_type(ctx, argv[1], &return_type, exception) != 0 ||
+        ct_parse_ffi_type_array(ctx, argv[2], arg_types, ffi_arg_types, &arg_count, exception) != 0) {
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (!JSValueIsObject(ctx, argv[3])) {
+        ct_throw_message(ctx, exception, "cottontail.nativeCallPointer args must be an array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef args_array = (JSObjectRef)argv[3];
+    for (size_t index = 0; index < arg_count; index += 1) {
+        JSValueRef item = JSObjectGetPropertyAtIndex(ctx, args_array, (unsigned)index, exception);
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index], exception) != 0) {
+            return JSValueMakeUndefined(ctx);
+        }
+        arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+    }
+
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)arg_count, ct_ffi_libffi_type(return_type), ffi_arg_types) != FFI_OK) {
+        ct_throw_message(ctx, exception, "ffi_prep_cif failed for function pointer");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    ffi_call(&cif, FFI_FN((void *)(uintptr_t)pointer), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
+    return ct_ffi_value_to_js(ctx, return_type, result);
+}
+
 static JSValueRef ct_create_callback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     CtJscRuntime *runtime = ct_callback_runtime(function);
     CtFfiCallback *callback = NULL;
@@ -12051,6 +12256,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sharedAtomicWait", ct_shared_atomic_wait, runtime);
     ct_install_function(ctx, host, "sharedAtomicNotify", ct_shared_atomic_notify, runtime);
     ct_install_function(ctx, host, "nativeCall", ct_native_call, runtime);
+    ct_install_function(ctx, host, "nativeSymbol", ct_native_symbol, runtime);
+    ct_install_function(ctx, host, "nativeCallPointer", ct_native_call_pointer, runtime);
     ct_install_function(ctx, host, "createCallback", ct_create_callback, runtime);
     ct_install_function(ctx, host, "closeCallback", ct_close_callback, runtime);
     ct_install_function(ctx, host, "spawnWorker", ct_worker_spawn, runtime);
@@ -12149,12 +12356,15 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sqliteStatementGet", ct_sqlite_statement_get, runtime);
     ct_install_function(ctx, host, "sqliteStatementRun", ct_sqlite_statement_run, runtime);
     ct_install_function(ctx, host, "sqliteStatementColumns", ct_sqlite_statement_columns, runtime);
+    ct_install_function(ctx, host, "sqliteInTransaction", ct_sqlite_in_transaction, runtime);
     ct_install_function(ctx, host, "sqliteCreateFunction", ct_sqlite_create_function, runtime);
     ct_install_function(ctx, host, "sqliteCreateAggregate", ct_sqlite_create_aggregate, runtime);
     ct_install_function(ctx, host, "sqliteSetAuthorizer", ct_sqlite_set_authorizer, runtime);
     ct_install_function(ctx, host, "sqliteEnableLoadExtension", ct_sqlite_enable_load_extension, runtime);
     ct_install_function(ctx, host, "sqliteLoadExtension", ct_sqlite_load_extension, runtime);
     ct_install_function(ctx, host, "sqliteBackup", ct_sqlite_backup, runtime);
+    ct_install_function(ctx, host, "sqliteSerialize", ct_sqlite_serialize, runtime);
+    ct_install_function(ctx, host, "sqliteFileControl", ct_sqlite_file_control, runtime);
     ct_install_function(ctx, host, "sqliteSessionCreate", ct_sqlite_session_create, runtime);
     ct_install_function(ctx, host, "sqliteSessionChangeset", ct_sqlite_session_changeset, runtime);
     ct_install_function(ctx, host, "sqliteSessionClose", ct_sqlite_session_close, runtime);
@@ -12476,48 +12686,52 @@ static bool ct_append_rewritten_dynamic_imports(
 
         if (!ct_sb_append_bytes(builder, cursor, (size_t)(import_start - cursor))) return false;
 
-        const char *literal_start = open_paren + 1;
-        while (literal_start < end && (*literal_start == ' ' || *literal_start == '\t')) literal_start += 1;
-        if (literal_start >= end || (*literal_start != '"' && *literal_start != '\'')) {
-            if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
-            cursor = open_paren + 1;
-            continue;
-        }
-
-        char quote = *literal_start;
-        const char *literal_end = literal_start + 1;
+        const char *argument_start = open_paren + 1;
+        const char *argument_end = argument_start;
+        int depth = 1;
+        char quote = 0;
         bool escaped = false;
-        while (literal_end < end) {
-            char ch = *literal_end;
-            literal_end += 1;
+        while (argument_end < end) {
+            char ch = *argument_end;
             if (escaped) {
                 escaped = false;
+                argument_end += 1;
+                continue;
+            }
+            if (quote != 0) {
+                if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == quote) {
+                    quote = 0;
+                }
+                argument_end += 1;
+                continue;
+            }
+            if (ch == '"' || ch == '\'' || ch == '`') {
+                quote = ch;
+            } else if (ch == '(') {
+                depth += 1;
+            } else if (ch == ')') {
+                depth -= 1;
+                if (depth == 0) break;
             } else if (ch == '\\') {
                 escaped = true;
-            } else if (ch == quote) {
-                break;
             }
+            argument_end += 1;
         }
-        if (literal_end > end || literal_end[-1] != quote) {
-            if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
-            cursor = open_paren + 1;
-            continue;
-        }
-
-        const char *close_paren = literal_end;
-        while (close_paren < end && (*close_paren == ' ' || *close_paren == '\t')) close_paren += 1;
-        if (close_paren >= end || *close_paren != ')') {
+        if (argument_end >= end || *argument_end != ')') {
             if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
             cursor = open_paren + 1;
             continue;
         }
 
         if (!ct_sb_append_cstr(builder, "cottontail.importModule(")) return false;
-        if (!ct_sb_append_bytes(builder, literal_start, (size_t)(literal_end - literal_start))) return false;
-        if (!ct_sb_append_cstr(builder, ",")) return false;
+        if (!ct_sb_append_cstr(builder, "(")) return false;
+        if (!ct_sb_append_bytes(builder, argument_start, (size_t)(argument_end - argument_start))) return false;
+        if (!ct_sb_append_cstr(builder, "),")) return false;
         if (!ct_sb_append_js_string_literal(builder, filename != NULL ? filename : "<script>")) return false;
         if (!ct_sb_append_cstr(builder, ")")) return false;
-        cursor = close_paren + 1;
+        cursor = argument_end + 1;
     }
 
     return true;

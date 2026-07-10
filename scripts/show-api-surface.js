@@ -190,6 +190,7 @@ const bunModuleExportsTotal = sum(bunModuleRows, (row) => row.total);
 const bunObjectImplemented = manifest.coverage.bun.Bun.implemented.length;
 const bunObjectTotal = bunObjectImplemented + manifest.coverage.bun.Bun.missing.length;
 const nodeBehavior = manifest.behavioral?.node;
+const bunBehavior = manifest.behavioral?.bun;
 
 console.log(paint('Cottontail API Surface', 'bold'));
 console.log(paint(`Node ${manifest.targets.node.version}  ·  Bun ${manifest.targets.bun.version}  ·  ${manifest.note}`, 'dim'));
@@ -208,6 +209,14 @@ if (nodeBehavior) {
 printMetric('Bun object', bunObjectImplemented, bunObjectTotal, `${bunObjectTotal - bunObjectImplemented} missing properties`);
 printMetric('Bun modules', bunModulePresent.length, bunModuleRows.length, `${bunModuleRows.length - bunModulePresent.length} missing modules`);
 printMetric('Bun module exports', bunModuleExportsImplemented, bunModuleExportsTotal, `${bunModuleExportsTotal - bunModuleExportsImplemented} missing names`);
+if (bunBehavior) {
+  printRangeMetric(
+    'Bun behavior',
+    bunBehavior.estimate.implementedPercentLower,
+    bunBehavior.estimate.implementedPercentUpper,
+    `heuristic; ~${bunBehavior.estimate.gapPercentLower}-${bunBehavior.estimate.gapPercentUpper}% gap`,
+  );
+}
 
 section(`Node Modules With Largest Gaps (top ${topCount})`);
 printRows(
@@ -238,6 +247,19 @@ printRows(
   { nameWidth: 16 },
 );
 printList('Missing Bun properties', manifest.coverage.bun.Bun.missing, topCount * 2);
+
+if (bunBehavior) {
+  section(`Bun Behavioral Gap Heuristic (top ${topCount})`);
+  console.log(paint(bunBehavior.note, 'dim'));
+  console.log('');
+  console.log(`${pad('compat markers', 24)} ${bunBehavior.signals.compatMarkers}`);
+  console.log(`${pad('modules with caveats', 24)} ${bunBehavior.signals.modulesWithCompatMarkers}/${bunBehavior.signals.publicBunModules}`);
+  console.log(`${pad('unsupported markers', 24)} ${bunBehavior.signals.explicitUnsupportedMarkers}`);
+  console.log(`${pad('native guard markers', 24)} ${bunBehavior.signals.nativeAvailabilityGuards ?? 0}`);
+  console.log(`${pad('bun test files', 24)} ${bunBehavior.signals.bunTestFiles}`);
+  console.log('');
+  printBehaviorRows(bunBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });
+}
 
 section('Useful Next Targets');
 const nextTargets = [

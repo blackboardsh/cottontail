@@ -1121,6 +1121,36 @@ export function toArrayBuffer(pointer, offset = 0, length = 0) {
   return cottontail.memoryView(pointer, offset, length);
 }
 
+export function toBuffer(pointer, offset = 0, length = 0) {
+  return globalThis.Buffer.from(new Uint8Array(toArrayBuffer(pointer, offset, length)));
+}
+
+function dataView(pointer, byteLength, offset = 0) {
+  return new DataView(toArrayBuffer(pointer, offset, byteLength));
+}
+
+export const read = {
+  u8(pointer, offset = 0) { return dataView(pointer, 1, offset).getUint8(0); },
+  i8(pointer, offset = 0) { return dataView(pointer, 1, offset).getInt8(0); },
+  u16(pointer, offset = 0) { return dataView(pointer, 2, offset).getUint16(0, true); },
+  i16(pointer, offset = 0) { return dataView(pointer, 2, offset).getInt16(0, true); },
+  u32(pointer, offset = 0) { return dataView(pointer, 4, offset).getUint32(0, true); },
+  i32(pointer, offset = 0) { return dataView(pointer, 4, offset).getInt32(0, true); },
+  u64(pointer, offset = 0) { return dataView(pointer, 8, offset).getBigUint64(0, true); },
+  i64(pointer, offset = 0) { return dataView(pointer, 8, offset).getBigInt64(0, true); },
+  ptr(pointer, offset = 0) {
+    const view = dataView(pointer, 8, offset);
+    return Number(view.getBigUint64(0, true));
+  },
+  intptr(pointer, offset = 0) {
+    const view = dataView(pointer, 8, offset);
+    return Number(view.getBigInt64(0, true));
+  },
+  f32(pointer, offset = 0) { return dataView(pointer, 4, offset).getFloat32(0, true); },
+  f64(pointer, offset = 0) { return dataView(pointer, 8, offset).getFloat64(0, true); },
+  cstring(pointer, offset = 0) { return new CString(toNumber(pointer) + Number(offset)); },
+};
+
 function readCString(pointer) {
   if (typeof pointer === "string") return pointer;
   const address = toNumber(pointer);
@@ -1219,16 +1249,116 @@ export function dlopen(path, symbols) {
       const result = cottontail.nativeCall(String(path), name, returns, argTypes, nativeArgs);
       return returnForType(returns, result);
     };
+    wrapped[name].ptr = cottontail.nativeSymbol(String(path), name);
+    wrapped[name].native = true;
   }
   return { symbols: wrapped, close() {} };
 }
 
+export class CFunction {
+  constructor(pointerOrSpec, options = {}) {
+    const spec = pointerOrSpec && typeof pointerOrSpec === "object" && !(pointerOrSpec instanceof ArrayBuffer) && !ArrayBuffer.isView(pointerOrSpec)
+      ? pointerOrSpec
+      : { ptr: pointerOrSpec, ...options };
+    const pointerValue = ptr(spec.ptr ?? spec.pointer);
+    const argTypes = (spec.args || []).map(normalizeType);
+    const returns = normalizeType(spec.returns || FFIType.void);
+    const callable = (...args) => {
+      const nativeArgs = args.map((arg, index) => nativeArg(arg, argTypes[index] || FFIType.ptr));
+      return returnForType(returns, cottontail.nativeCallPointer(pointerValue, returns, argTypes, nativeArgs));
+    };
+    Object.setPrototypeOf(callable, new.target.prototype);
+    callable.ptr = pointerValue;
+    callable.options = spec;
+    callable.args = argTypes;
+    callable.returns = returns;
+    callable.native = true;
+    return callable;
+  }
+}
+
+export function linkSymbols(symbols = {}) {
+  const wrapped = {};
+  for (const [name, spec] of Object.entries(symbols)) {
+    wrapped[name] = new CFunction(spec);
+  }
+  return { symbols: wrapped, close() {} };
+}
+
+function pathJoin(...parts) {
+  return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
+}
+
+function tmpRoot() {
+  const env = globalThis.process?.env ?? cottontail.env();
+  const base = String(env.COTTONTAIL_TMP_DIR || env.TMPDIR || env.TEMP || env.TMP || "/tmp");
+  const dir = pathJoin(base, "cottontail", "bun-ffi-cc");
+  cottontail.mkdirSync(dir, true);
+  return dir;
+}
+
+function compilerCommand() {
+  const env = globalThis.process?.env ?? cottontail.env();
+  if (env.CC) return { file: env.CC, prefix: [] };
+  const zig = pathJoin(cottontail.cwd(), "vendors", "zig", "zig");
+  if (cottontail.existsSync(zig)) return { file: zig, prefix: ["cc"] };
+  return { file: "cc", prefix: [] };
+}
+
+function sourcePathForCc(source) {
+  const text = String(source ?? "");
+  if (cottontail.existsSync(text)) return text;
+  const path = pathJoin(tmpRoot(), `source-${Date.now()}-${Math.floor(Math.random() * 1000000)}.c`);
+  cottontail.writeFile(path, text);
+  return path;
+}
+
+export function cc(options = {}) {
+  const source = options.source ?? options.file ?? options.path;
+  const symbols = options.symbols ?? options.exports;
+  if (source == null) throw new TypeError('Bun.cc requires a "source" file path or source string');
+  if (symbols == null || typeof symbols !== "object") throw new TypeError('Bun.cc requires a "symbols" object');
+
+  const dir = tmpRoot();
+  const output = pathJoin(dir, `libcc-${Date.now()}-${Math.floor(Math.random() * 1000000)}.${suffix}`);
+  const sourcePath = sourcePathForCc(source);
+  const compiler = compilerCommand();
+  const platformName = platform();
+  const sharedArgs = platformName === "darwin"
+    ? ["-dynamiclib", "-undefined", "dynamic_lookup"]
+    : platformName === "win32"
+      ? ["-shared"]
+      : ["-shared", "-fPIC"];
+  const args = [...compiler.prefix, sourcePath, ...sharedArgs, "-o", output, ...(options.flags || []), ...(options.args || [])].map(String);
+  const result = cottontail.spawnSync(compiler.file, args, { stdio: "pipe" });
+  if (Number(result.status ?? 0) !== 0) {
+    throw new Error(String(result.stderr || result.stdout || `Bun.cc failed with status ${result.status}`));
+  }
+  return dlopen(output, symbols);
+}
+
+export const native = {
+  dlopen,
+  callback: JSCallback,
+};
+
+export function viewSource(value) {
+  return String(value);
+}
+
 export default {
+  CFunction,
   CString,
   FFIType,
   JSCallback,
+  cc,
   dlopen,
+  linkSymbols,
+  native,
   ptr,
+  read,
   suffix,
   toArrayBuffer,
+  toBuffer,
+  viewSource,
 };

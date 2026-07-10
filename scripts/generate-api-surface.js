@@ -220,6 +220,9 @@ function runtimeModuleSpecifiers(filePath) {
 
   if (withoutExt === 'bun/index') return ['bun'];
   if (withoutExt === 'bun/ffi') return ['bun:ffi'];
+  if (withoutExt === 'bun/jsc') return ['bun:jsc'];
+  if (withoutExt === 'bun/sqlite') return ['bun:sqlite'];
+  if (withoutExt === 'bun/test') return ['bun:test'];
   if (withoutExt.startsWith('node/')) {
     const specifier = withoutExt.slice('node/'.length);
     return specifier === 'assert'
@@ -338,6 +341,15 @@ function collectNodeTestFiles() {
     .sort();
 }
 
+function collectBunTestFiles() {
+  const testsDir = join(rootDir, 'tests', 'js');
+  if (!existsSync(testsDir)) return [];
+  return readdirSync(testsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.startsWith('bun-') && /\.(?:js|ts)$/.test(entry.name))
+    .map((entry) => `tests/js/${entry.name}`)
+    .sort();
+}
+
 const nodeBehaviorTestAliases = {
   async_hooks: ['node-misc-modules-surface', 'node-stream-surface'],
   perf_hooks: ['node-instrumentation-surface'],
@@ -363,6 +375,75 @@ function testFilesForModule(testFiles, moduleName) {
   });
 }
 
+function bunModuleNameForFile(filePath) {
+  return runtimeModuleSpecifiers(filePath).find((specifier) => specifier === 'bun' || specifier.startsWith('bun:')) ||
+    relative(join(rootDir, 'src', 'runtime_modules', 'bun'), filePath)
+      .split(sep)
+      .join('/')
+      .replace(/\.(?:cjs|js)$/, '');
+}
+
+function testFilesForBunModule(testFiles, moduleName) {
+  const normalized = moduleName === 'bun' ? 'bun' : moduleName.replace(/^bun:/, 'bun-').replace(/[_/]/g, '-');
+  return testFiles.filter((file) => {
+    const name = file.slice('tests/js/'.length).replace(/\.(?:js|ts)$/, '');
+    return name === normalized ||
+      name.startsWith(`${normalized}-`) ||
+      name.includes(normalized) ||
+      (moduleName === 'bun' && ['bun-apis', 'bun-global', 'bun-jsc-and-global'].includes(name));
+  });
+}
+
+function collectSourceBehaviorMarkers(source, options = {}) {
+  const compatMarkers = [];
+  const unsupportedMarkers = [];
+  const nativeAvailabilityGuards = [];
+
+  for (const match of source.matchAll(/\/\/\s*COTTONTAIL-COMPAT:\s*([^\n]+)/g)) {
+    compatMarkers.push(match[1].trim());
+  }
+
+  const lines = source.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lower = line.toLowerCase();
+    const previousLine = lines[index - 1] ?? '';
+    const unsupportedHelperCall =
+      /\bunsupported(?:crypto|tls|http2)?\s*\(/i.test(line) &&
+      !/\bfunction\s+unsupported/i.test(line);
+    const unsupportedTextPattern = options.extendedUnsupportedText
+      ? /(not implemented|requires native|not available in cottontail|requires .*bindings|requires .*support|unsupported|fail loudly|throw until|unavailable in this cottontail build)/i
+      : /(not implemented|requires native|not available in cottontail|requires .*bindings|unsupported|fail loudly|throw until)/i;
+    const throwingUnsupported =
+      /\bthrow\b/.test(line) &&
+      unsupportedTextPattern.test(lower);
+    const unsupportedHelperBody =
+      /\bfunction\s+unsupported(?:crypto|tls|http2)?\s*\(/i.test(previousLine) &&
+      /\bthrow\b/.test(line);
+    const nativeAvailabilityGuard =
+      /\btypeof\s+cottontail\.[A-Za-z_$][\w$]*\s*!==\s*["']function["']/.test(line) &&
+      (unsupportedHelperCall || throwingUnsupported);
+    const validationOnlyUnsupported =
+      /Unsupported Cottontail v8 serialization format/.test(line);
+    if (validationOnlyUnsupported || unsupportedHelperBody) {
+      continue;
+    }
+    if (nativeAvailabilityGuard) {
+      nativeAvailabilityGuards.push({
+        line: index + 1,
+        text: line.trim(),
+      });
+    } else if (unsupportedHelperCall || throwingUnsupported) {
+      unsupportedMarkers.push({
+        line: index + 1,
+        text: line.trim(),
+      });
+    }
+  }
+
+  return { compatMarkers, unsupportedMarkers, nativeAvailabilityGuards };
+}
+
 function collectNodeBehavioralSignals(nodeSurface) {
   const runtimeNodeRoot = join(rootDir, 'src', 'runtime_modules', 'node');
   const files = existsSync(runtimeNodeRoot) ? collectFiles(runtimeNodeRoot) : [];
@@ -375,48 +456,7 @@ function collectNodeBehavioralSignals(nodeSurface) {
   for (const filePath of files) {
     const source = readFileSync(filePath, 'utf8');
     const moduleName = nodeModuleNameForFile(filePath);
-    const compatMarkers = [];
-    const unsupportedMarkers = [];
-    const nativeAvailabilityGuards = [];
-
-    for (const match of source.matchAll(/\/\/\s*COTTONTAIL-COMPAT:\s*([^\n]+)/g)) {
-      compatMarkers.push(match[1].trim());
-    }
-
-    const lines = source.split(/\r?\n/);
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      const lower = line.toLowerCase();
-      const previousLine = lines[index - 1] ?? '';
-      const unsupportedHelperCall =
-        /\bunsupported(?:crypto|tls|http2)?\s*\(/i.test(line) &&
-        !/\bfunction\s+unsupported/i.test(line);
-      const throwingUnsupported =
-        /\bthrow\b/.test(line) &&
-        /(not implemented|requires native|not available in cottontail|requires .*bindings|unsupported|fail loudly|throw until)/i.test(lower);
-      const unsupportedHelperBody =
-        /\bfunction\s+unsupported(?:crypto|tls|http2)?\s*\(/i.test(previousLine) &&
-        /\bthrow\b/.test(line);
-      const nativeAvailabilityGuard =
-        /\btypeof\s+cottontail\.[A-Za-z_$][\w$]*\s*!==\s*["']function["']/.test(line) &&
-        (unsupportedHelperCall || throwingUnsupported);
-      const validationOnlyUnsupported =
-        /Unsupported Cottontail v8 serialization format/.test(line);
-      if (validationOnlyUnsupported || unsupportedHelperBody) {
-        continue;
-      }
-      if (nativeAvailabilityGuard) {
-        nativeAvailabilityGuards.push({
-          line: index + 1,
-          text: line.trim(),
-        });
-      } else if (unsupportedHelperCall || throwingUnsupported) {
-        unsupportedMarkers.push({
-          line: index + 1,
-          text: line.trim(),
-        });
-      }
-    }
+    const { compatMarkers, unsupportedMarkers, nativeAvailabilityGuards } = collectSourceBehaviorMarkers(source);
 
     if (compatMarkers.length > 0 || unsupportedMarkers.length > 0 || nativeAvailabilityGuards.length > 0) {
       modules[moduleName] = {
@@ -441,8 +481,9 @@ function collectNodeBehavioralSignals(nodeSurface) {
     Math.min(30, explicitUnsupportedCount * 0.25) +
     Math.min(10, compatMarkerCount * 0.1);
   const midpoint = Math.round(clamp(100 - penalty, 0, 100));
-  const lower = clamp(midpoint - 5, 0, 100);
-  const upper = clamp(midpoint + 5, 0, 100);
+  const hasBehaviorSignals = compatMarkerCount > 0 || explicitUnsupportedCount > 0 || nativeAvailabilityGuardCount > 0;
+  const lower = hasBehaviorSignals ? clamp(midpoint - 5, 0, 100) : 100;
+  const upper = hasBehaviorSignals ? clamp(midpoint + 5, 0, 100) : 100;
 
   const largestGaps = Object.entries(modules)
     .map(([name, entry]) => ({
@@ -478,6 +519,81 @@ function collectNodeBehavioralSignals(nodeSurface) {
   };
 }
 
+function collectBunBehavioralSignals(bunSurface) {
+  const runtimeBunRoot = join(rootDir, 'src', 'runtime_modules', 'bun');
+  const files = existsSync(runtimeBunRoot) ? collectFiles(runtimeBunRoot) : [];
+  const testFiles = collectBunTestFiles();
+  const modules = {};
+  let compatMarkerCount = 0;
+  let explicitUnsupportedCount = 0;
+  let nativeAvailabilityGuardCount = 0;
+
+  for (const filePath of files) {
+    const source = readFileSync(filePath, 'utf8');
+    const moduleName = bunModuleNameForFile(filePath);
+    const { compatMarkers, unsupportedMarkers, nativeAvailabilityGuards } = collectSourceBehaviorMarkers(source, { extendedUnsupportedText: true });
+
+    if (compatMarkers.length > 0 || unsupportedMarkers.length > 0 || nativeAvailabilityGuards.length > 0) {
+      modules[moduleName] = {
+        file: relative(rootDir, filePath).split(sep).join('/'),
+        compatMarkers,
+        unsupportedMarkers,
+        nativeAvailabilityGuards,
+        tests: testFilesForBunModule(testFiles, moduleName),
+      };
+      compatMarkerCount += compatMarkers.length;
+      explicitUnsupportedCount += unsupportedMarkers.length;
+      nativeAvailabilityGuardCount += nativeAvailabilityGuards.length;
+    }
+  }
+
+  const publicModuleCount = Math.max(1, Object.keys(bunSurface.modules || {}).length);
+  const modulesWithCompatMarkers = Object.values(modules).filter((entry) => entry.compatMarkers.length > 0).length;
+  const modulesWithUnsupportedMarkers = Object.values(modules).filter((entry) => entry.unsupportedMarkers.length > 0).length;
+  const caveatModuleShare = modulesWithCompatMarkers / publicModuleCount;
+  const penalty =
+    caveatModuleShare * 35 +
+    Math.min(35, explicitUnsupportedCount * 1.5) +
+    Math.min(10, compatMarkerCount * 0.5);
+  const midpoint = Math.round(clamp(100 - penalty, 0, 100));
+  const hasBehaviorSignals = compatMarkerCount > 0 || explicitUnsupportedCount > 0 || nativeAvailabilityGuardCount > 0;
+  const lower = hasBehaviorSignals ? clamp(midpoint - 5, 0, 100) : 100;
+  const upper = hasBehaviorSignals ? clamp(midpoint + 5, 0, 100) : 100;
+
+  const largestGaps = Object.entries(modules)
+    .map(([name, entry]) => ({
+      name,
+      file: entry.file,
+      compatMarkers: entry.compatMarkers.length,
+      unsupportedMarkers: entry.unsupportedMarkers.length,
+      nativeAvailabilityGuards: entry.nativeAvailabilityGuards.length,
+      tests: entry.tests.length,
+      gapScore: entry.compatMarkers.length * 3 + entry.unsupportedMarkers.length * 2 + (entry.tests.length === 0 ? 1 : 0),
+    }))
+    .sort((left, right) => right.gapScore - left.gapScore || left.name.localeCompare(right.name));
+
+  return {
+    note: 'Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Bun-focused test files. This is not a conformance result.',
+    estimate: {
+      implementedPercentLower: lower,
+      implementedPercentUpper: upper,
+      gapPercentLower: 100 - upper,
+      gapPercentUpper: 100 - lower,
+    },
+    signals: {
+      publicBunModules: publicModuleCount,
+      bunTestFiles: testFiles.length,
+      compatMarkers: compatMarkerCount,
+      modulesWithCompatMarkers,
+      explicitUnsupportedMarkers: explicitUnsupportedCount,
+      nativeAvailabilityGuards: nativeAvailabilityGuardCount,
+      modulesWithUnsupportedMarkers,
+    },
+    largestGaps,
+    modules,
+  };
+}
+
 const nodeSurface = collectNodeSurface();
 const bunSurface = runBunCollector();
 const cottontailSurface = collectCottontailSurface();
@@ -493,6 +609,7 @@ const manifest = {
   coverage: buildCoverage(nodeSurface, bunSurface, cottontailSurface),
   behavioral: {
     node: collectNodeBehavioralSignals(nodeSurface),
+    bun: collectBunBehavioralSignals(bunSurface),
   },
 };
 

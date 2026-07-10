@@ -115,6 +115,33 @@ try {
       stdoutIncludes: ['bun global passed'],
     },
     {
+      name: 'bun-sqlite',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-sqlite.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun sqlite passed'],
+    },
+    {
+      name: 'bun-ffi-surface',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-ffi-surface.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun ffi surface passed'],
+    },
+    {
+      name: 'bun-test-module',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-test-module.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun test module passed'],
+    },
+    {
+      name: 'bun-jsc-and-global',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-jsc-and-global.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun jsc and global passed'],
+    },
+    {
       name: 'bun-serve-spawn-ts',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-serve-spawn.ts'),
       expectExitCode: 0,

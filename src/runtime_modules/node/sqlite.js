@@ -90,6 +90,8 @@ export class StatementSync {
     this.database = database;
     this.id = native.id;
     this.sourceSQL = native.sourceSQL;
+    this.paramsCount = Number(native.paramsCount ?? 0);
+    this.readBigInts = false;
   }
 
   get expandedSQL() {
@@ -98,12 +100,12 @@ export class StatementSync {
 
   all(...args) {
     this.database._assertOpen();
-    return cottontail.sqliteStatementAll(this.id, bindArgs(args));
+    return cottontail.sqliteStatementAll(this.id, bindArgs(args), this.readBigInts);
   }
 
   get(...args) {
     this.database._assertOpen();
-    return cottontail.sqliteStatementGet(this.id, bindArgs(args));
+    return cottontail.sqliteStatementGet(this.id, bindArgs(args), this.readBigInts);
   }
 
   run(...args) {
@@ -127,7 +129,10 @@ export class StatementSync {
 
   setAllowBareNamedParameters() { return this; }
   setAllowUnknownNamedParameters() { return this; }
-  setReadBigInts() { return this; }
+  setReadBigInts(value = true) {
+    this.readBigInts = Boolean(value);
+    return this;
+  }
   setReturnArrays() { return this; }
 }
 
@@ -209,7 +214,7 @@ export class DatabaseSync {
     sqliteUnavailable();
     this.location = String(location);
     this.options = { ...options };
-    const native = cottontail.sqliteOpen(this.location, this.options.allowExtension === true);
+    const native = cottontail.sqliteOpen(this.location, this.options.allowExtension === true, this.options.openFlags ?? null);
     this.id = native.id;
     this.open = true;
   }

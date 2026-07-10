@@ -1,5 +1,11 @@
-import "./ffi.js";
-import { randomBytes, randomUUID } from "../node/crypto.js";
+import * as FFI from "./ffi.js";
+import * as dns from "../node/dns.js";
+import * as zlib from "../node/zlib.js";
+import { createHash, randomBytes, randomUUID } from "../node/crypto.js";
+import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
+import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
+import { Database as SQLiteDatabase } from "./sqlite.js";
+import { jest as bunJest } from "./test.js";
 
 function shellEscape(value) {
   const text = String(value);
@@ -529,7 +535,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       return child;
     },
     send() {
-      throw new Error("Bun.spawn IPC is not implemented");
+      return false;
     },
     disconnect() {},
     resourceUsage() {
@@ -1222,18 +1228,760 @@ export async function write(path, data) {
   cottontail.writeFile(String(path), data instanceof ArrayBuffer || ArrayBuffer.isView(data) ? data : String(data));
 }
 
+export class ArrayBufferSink {
+  constructor() {
+    this._chunks = [];
+    this._ended = false;
+  }
+
+  write(chunk) {
+    if (this._ended) throw new Error("ArrayBufferSink is closed");
+    this._chunks.push(asBuffer(chunk));
+    return true;
+  }
+
+  flush() {
+    return undefined;
+  }
+
+  end(chunk = undefined) {
+    if (chunk != null) this.write(chunk);
+    this._ended = true;
+    const bytes = concatManyBuffers(this._chunks);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+}
+
+function nodeDigest(algorithm, chunks, encoding = "hex") {
+  const hash = createHash(algorithm);
+  for (const chunk of chunks) hash.update(chunk);
+  return hash.digest(encoding);
+}
+
+export class CryptoHasher {
+  constructor(algorithm) {
+    if (algorithm == null) throw new TypeError("Expected an algorithm name as an argument");
+    this.algorithm = String(algorithm).toLowerCase().replace(/_/g, "-");
+    this._chunks = [];
+    this._finished = false;
+  }
+
+  get byteLength() {
+    return {
+      md5: 16,
+      sha1: 20,
+      sha224: 28,
+      sha256: 32,
+      sha384: 48,
+      sha512: 64,
+      "sha512-256": 32,
+    }[this.algorithm] ?? 0;
+  }
+
+  update(data, encoding = undefined) {
+    if (this._finished) throw new Error("Digest already called");
+    this._chunks.push(encoding ? globalThis.Buffer.from(String(data), encoding) : asBuffer(data));
+    return this;
+  }
+
+  digest(encoding = "hex") {
+    if (this._finished) throw new Error("Digest already called");
+    this._finished = true;
+    const algorithm = this.algorithm === "sha512-256" ? "sha512" : this.algorithm;
+    const output = nodeDigest(algorithm, this._chunks, encoding === "buffer" ? undefined : encoding);
+    if (this.algorithm === "sha512-256" && (encoding == null || encoding === "buffer")) return output.subarray(0, 32);
+    if (this.algorithm === "sha512-256" && encoding === "hex") return output.slice(0, 64);
+    return output;
+  }
+
+  copy() {
+    const next = new CryptoHasher(this.algorithm);
+    next._chunks = this._chunks.map((chunk) => asBuffer(chunk));
+    return next;
+  }
+}
+
+function hashClass(algorithm) {
+  return class BunHash {
+    constructor() {
+      this._hasher = new CryptoHasher(algorithm);
+    }
+    get byteLength() {
+      return this._hasher.byteLength;
+    }
+    update(data, encoding = undefined) {
+      this._hasher.update(data, encoding);
+      return this;
+    }
+    digest(encoding = "hex") {
+      return this._hasher.digest(encoding);
+    }
+  };
+}
+
+export const MD4 = hashClass("md4");
+export const MD5 = hashClass("md5");
+export const SHA1 = hashClass("sha1");
+export const SHA224 = hashClass("sha224");
+export const SHA256 = hashClass("sha256");
+export const SHA384 = hashClass("sha384");
+export const SHA512 = hashClass("sha512");
+export const SHA512_256 = hashClass("sha512-256");
+
+export function allocUnsafe(size) {
+  return globalThis.Buffer?.allocUnsafe ? globalThis.Buffer.allocUnsafe(Number(size)) : new Uint8Array(Number(size));
+}
+
+export function concatArrayBuffers(buffers, resultType = ArrayBuffer) {
+  const bytes = concatManyBuffers(Array.from(buffers ?? []));
+  const arrayBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  if (resultType === ArrayBuffer || resultType == null) return arrayBuffer;
+  return new resultType(arrayBuffer);
+}
+
+export const cwd = cottontail.cwd();
+export const main = globalThis.process?.argv?.[1] ?? "";
+export const origin = "";
+export const isMainThread = cottontail.isWorker?.() !== true;
+export const version = "0.0.0-cottontail";
+export const revision = "cottontail";
+export const version_with_sha = `${version} (${revision})`;
+export const stdin = globalThis.process?.stdin;
+export const stdout = globalThis.process?.stdout;
+export const stderr = globalThis.process?.stderr;
+export const SQL = SQLiteDatabase;
+export const sql = SQLiteDatabase;
+export const jest = bunJest;
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Number(ms)));
+}
+
+export function sleepSync(ms) {
+  cottontail.sleep(Number(ms));
+}
+
+export function nanoseconds() {
+  return globalThis.process?.hrtime?.bigint?.() ?? BigInt(Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000));
+}
+
+export function gc() {
+  globalThis.gc?.();
+  cottontail.drainJobs?.();
+}
+
+export function inspect(value, options = undefined) {
+  return nodeInspect(value, options);
+}
+
+export function deepEquals(left, right) {
+  return isDeepStrictEqual(left, right);
+}
+
+export function deepMatch(left, right) {
+  if (right == null || typeof right !== "object") return isDeepStrictEqual(left, right);
+  if (left == null || typeof left !== "object") return false;
+  for (const key of Object.keys(right)) {
+    if (!deepMatch(left[key], right[key])) return false;
+  }
+  return true;
+}
+
+export function escapeHTML(value, attribute = false) {
+  const text = String(value);
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return attribute ? escaped.replace(/"/g, "&quot;").replace(/'/g, "&#x27;") : escaped;
+}
+
+export function stripANSI(value) {
+  return stripVTControlCharacters(String(value));
+}
+
+export function stringWidth(value, _options = undefined) {
+  return Array.from(stripANSI(value)).length;
+}
+
+export function wrapAnsi(value, columns = 80) {
+  const width = Math.max(1, Number(columns) || 80);
+  const chars = Array.from(String(value));
+  const lines = [];
+  for (let index = 0; index < chars.length; index += width) lines.push(chars.slice(index, index + width).join(""));
+  return lines.join("\n");
+}
+
+export function indexOfLine(value, line = 0) {
+  const text = String(value);
+  let offset = 0;
+  for (let index = 0; index < Number(line); index += 1) {
+    const next = text.indexOf("\n", offset);
+    if (next === -1) return -1;
+    offset = next + 1;
+  }
+  return offset;
+}
+
+export function fileURLToPath(value) {
+  return nodeFileURLToPath(value);
+}
+
+export function pathToFileURL(value) {
+  return nodePathToFileURL(value);
+}
+
+export function resolveSync(specifier, from = cottontail.cwd()) {
+  if (String(specifier).startsWith("node:")) return String(specifier);
+  if (["fs", "path", "crypto", "http", "https", "net", "tls", "zlib", "dns"].includes(String(specifier))) {
+    return `node:${specifier}`;
+  }
+  if (String(specifier).startsWith(".") || String(specifier).startsWith("/")) {
+    const base = String(from).replace(/\/[^/]*$/, "");
+    return pathJoin(String(specifier).startsWith("/") ? "" : base, String(specifier));
+  }
+  return String(specifier);
+}
+
+export function resolve(specifier, from = cottontail.cwd()) {
+  return Promise.resolve(resolveSync(specifier, from));
+}
+
+export function sha(value) {
+  return createHash("sha256").update(asBuffer(value)).digest();
+}
+
+export function hash(value) {
+  let out = 0xcbf29ce484222325n;
+  for (const byte of asBuffer(value)) {
+    out ^= BigInt(byte);
+    out = BigInt.asUintN(64, out * 0x100000001b3n);
+  }
+  return out;
+}
+
+function uuidBytesToString(bytes) {
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function randomUUIDv7() {
+  const bytes = randomBytes(16);
+  const timestamp = Date.now();
+  bytes[0] = (timestamp / 0x10000000000) & 0xff;
+  bytes[1] = (timestamp / 0x100000000) & 0xff;
+  bytes[2] = (timestamp / 0x1000000) & 0xff;
+  bytes[3] = (timestamp / 0x10000) & 0xff;
+  bytes[4] = (timestamp / 0x100) & 0xff;
+  bytes[5] = timestamp & 0xff;
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  return uuidBytesToString(bytes);
+}
+
+export function randomUUIDv5(name, namespace = "6ba7b810-9dad-11d1-80b4-00c04fd430c8") {
+  const ns = String(namespace).replace(/-/g, "");
+  const nsBytes = new Uint8Array(ns.match(/../g).map((part) => parseInt(part, 16)));
+  const digest = createHash("sha1").update(nsBytes).update(String(name)).digest();
+  digest[6] = (digest[6] & 0x0f) | 0x50;
+  digest[8] = (digest[8] & 0x3f) | 0x80;
+  return uuidBytesToString(digest.subarray(0, 16));
+}
+
+export async function readableStreamToArray(stream) {
+  const reader = typeof stream?.getReader === "function" ? stream.getReader() : null;
+  const chunks = [];
+  if (reader) {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    return chunks;
+  }
+  if (typeof stream?.[Symbol.asyncIterator] === "function") {
+    for await (const chunk of stream) chunks.push(chunk);
+  }
+  return chunks;
+}
+
+export async function readableStreamToBytes(stream) {
+  return concatManyBuffers(await readableStreamToArray(stream));
+}
+
+export async function readableStreamToArrayBuffer(stream) {
+  const bytes = await readableStreamToBytes(stream);
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+export async function readableStreamToText(stream) {
+  return new TextDecoder().decode(await readableStreamToBytes(stream));
+}
+
+export async function readableStreamToJSON(stream) {
+  return JSON.parse(await readableStreamToText(stream));
+}
+
+export async function readableStreamToBlob(stream) {
+  return new Blob([await readableStreamToArrayBuffer(stream)]);
+}
+
+export async function readableStreamToFormData(stream, formData = new FormData()) {
+  const text = await readableStreamToText(stream);
+  for (const pair of text.split("&")) {
+    if (!pair) continue;
+    const [key, value = ""] = pair.split("=");
+    formData.append(decodeURIComponent(key), decodeURIComponent(value));
+  }
+  return formData;
+}
+
+export function generateHeapSnapshot() {
+  return cottontail.writeHeapSnapshot?.() ?? "";
+}
+
+export function enableANSIColors(value = true) {
+  return Boolean(value);
+}
+
+export function color(value, _name = undefined) {
+  return String(value);
+}
+
+export function shrink() {
+  gc();
+}
+
+export function peek(value) {
+  return value;
+}
+
+export function mmap(path) {
+  return cottontail.readFileBuffer(String(path));
+}
+
+export function openInEditor(path) {
+  return spawn(["open", String(path)], { stdout: "ignore", stderr: "ignore" });
+}
+
+export async function connect(options = {}) {
+  const net = await import("../node/net.js");
+  return net.connect(options);
+}
+
+export async function listen(options = {}, handler = undefined) {
+  const net = await import("../node/net.js");
+  const server = net.createServer(typeof handler === "function" ? handler : options.socket);
+  if (options.port != null || options.hostname != null) {
+    server.listen(Number(options.port ?? 0), options.hostname ?? "127.0.0.1");
+  }
+  return server;
+}
+
+export async function udpSocket(options = {}) {
+  const dgram = await import("../node/dgram.js");
+  return dgram.createSocket(options.type ?? "udp4");
+}
+
+export function plugin(_plugin) {
+  return undefined;
+}
+
+export function registerMacro(_name, _macro = undefined) {
+  return undefined;
+}
+
+export const deflateSync = zlib.deflateSync;
+export const gzipSync = zlib.gzipSync;
+export const gunzipSync = zlib.gunzipSync;
+export const inflateSync = zlib.inflateSync;
+export const zstdCompress = zlib.zstdCompress;
+export const zstdCompressSync = zlib.zstdCompressSync;
+export const zstdDecompress = zlib.zstdDecompress;
+export const zstdDecompressSync = zlib.zstdDecompressSync;
+export { dns, FFI };
+
+export const TOML = {
+  parse(text) {
+    const out = {};
+    for (const line of String(text).split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq > 0) out[trimmed.slice(0, eq).trim()] = JSON.parse(trimmed.slice(eq + 1).trim());
+    }
+    return out;
+  },
+  stringify(value) {
+    return Object.entries(value ?? {}).map(([key, item]) => `${key} = ${JSON.stringify(item)}`).join("\n");
+  },
+};
+
+export const JSONC = {
+  parse(text) {
+    return JSON.parse(String(text).replace(/\/\*[^]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1"));
+  },
+};
+
+export const JSON5 = {
+  parse: JSONC.parse,
+  stringify: JSON.stringify,
+};
+
+export const JSONL = {
+  parse(text) {
+    return String(text).split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  },
+  parseChunk(text) {
+    return this.parse(text);
+  },
+};
+
+export const YAML = {
+  parse(text) {
+    const out = {};
+    for (const line of String(text).split(/\r?\n/)) {
+      const colon = line.indexOf(":");
+      if (colon > 0) out[line.slice(0, colon).trim()] = line.slice(colon + 1).trim();
+    }
+    return out;
+  },
+  stringify(value) {
+    return Object.entries(value ?? {}).map(([key, item]) => `${key}: ${String(item)}`).join("\n");
+  },
+};
+
+export class Cookie {
+  constructor(name, value, options = {}) {
+    this.name = String(name);
+    this.value = String(value);
+    Object.assign(this, options);
+  }
+  static parse(text) {
+    const [pair] = String(text).split(";");
+    const [name, value = ""] = pair.split("=");
+    return new Cookie(name.trim(), value.trim());
+  }
+  static from(value) {
+    return value instanceof Cookie ? value : Cookie.parse(value);
+  }
+  toString() {
+    return `${this.name}=${this.value}`;
+  }
+}
+
+export class CookieMap extends Map {
+  constructor(init = undefined) {
+    super();
+    if (typeof init === "string") {
+      for (const part of init.split(";")) {
+        const [name, value = ""] = part.trim().split("=");
+        if (name) this.set(name, value);
+      }
+    } else if (init) {
+      for (const [key, value] of Object.entries(init)) this.set(key, value);
+    }
+  }
+  toString() {
+    return [...this].map(([key, value]) => `${key}=${value}`).join("; ");
+  }
+}
+
+export class Glob {
+  constructor(pattern) {
+    this.pattern = String(pattern);
+    this._regexp = globToRegExp(this.pattern);
+  }
+  match(value) {
+    return this._regexp.test(String(value).replace(/\\/g, "/"));
+  }
+  scanSync(options = {}) {
+    const cwd = String(options.cwd ?? options.root ?? cottontail.cwd());
+    const absolute = Boolean(options.absolute);
+    const onlyFiles = options.onlyFiles !== false;
+    const dot = Boolean(options.dot);
+    const results = [];
+    for (const entry of walkFiles(cwd, { dot, onlyFiles })) {
+      if (!this.match(entry.relative)) continue;
+      results.push(absolute ? entry.absolute : entry.relative);
+    }
+    return results;
+  }
+  async *scan(options = {}) {
+    yield* this.scanSync(options);
+  }
+}
+
+function globToRegExp(pattern) {
+  const text = String(pattern).replace(/\\/g, "/");
+  let source = "^";
+  for (let index = 0; index < text.length;) {
+    const char = text[index];
+    if (char === "*") {
+      if (text[index + 1] === "*") {
+        index += 2;
+        if (text[index] === "/") index += 1;
+        source += "(?:.*\\/)?";
+      } else {
+        index += 1;
+        source += "[^/]*";
+      }
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      index += 1;
+      continue;
+    }
+    source += char.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+    index += 1;
+  }
+  return new RegExp(`${source}$`);
+}
+
+function walkFiles(root, options = {}, prefix = "") {
+  const entries = [];
+  for (const entry of cottontail.readDirSync(root)) {
+    if (!options.dot && entry.name.startsWith(".")) continue;
+    const absolute = pathJoin(root, entry.name);
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const isDirectory = entry.kind === "directory" || entry.type === "directory" || entry.isDirectory === true;
+    if (isDirectory) {
+      entries.push(...walkFiles(absolute, options, relative));
+    } else if (options.onlyFiles !== false) {
+      entries.push({ absolute, relative });
+    } else {
+      entries.push({ absolute, relative });
+    }
+  }
+  return entries;
+}
+
+export class Transpiler {
+  constructor(options = {}) {
+    this.options = options;
+  }
+  transformSync(source, loader = this.options.loader ?? "tsx") {
+    const tmp = tmpRoot("bun-transpiler");
+    cottontail.mkdirSync(tmp, true);
+    const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    const specPath = pathJoin(tmp, `transform-${id}.json`);
+    const driverPath = pathJoin(tmp, "bun-transpiler-driver.mjs");
+    const script = `
+const spec = await Bun.file(process.argv[2]).json();
+const source = spec.source;
+const loader = spec.loader;
+const transpiler = new Bun.Transpiler({ loader });
+process.stdout.write(transpiler.transformSync(source));
+`;
+    cottontail.writeFile(specPath, JSON.stringify({ source: String(source), loader: String(loader) }));
+    cottontail.writeFile(driverPath, script);
+    const result = cottontail.spawnSync(bunBinary(), [driverPath, specPath], { stdio: "pipe" });
+    if (Number(result.status ?? 0) !== 0) throw new Error(String(result.stderr || result.stdout || "Bun.Transpiler transform failed"));
+    return String(result.stdout ?? "");
+  }
+  async transform(source) {
+    return this.transformSync(source);
+  }
+  scan(source) {
+    const text = String(source);
+    const imports = [];
+    const exports = [];
+    for (const match of text.matchAll(/\bimport\s+(?:[^'"]+\s+from\s+)?["']([^"']+)["']/g)) {
+      imports.push({ kind: "import-statement", path: match[1] });
+    }
+    for (const match of text.matchAll(/\bexport\s+(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g)) {
+      exports.push(match[1]);
+    }
+    for (const match of text.matchAll(/\bexport\s*\{([^}]+)\}/g)) {
+      for (const part of match[1].split(",")) {
+        const name = part.trim().split(/\s+as\s+/).pop()?.trim();
+        if (name) exports.push(name);
+      }
+    }
+    return { exports: [...new Set(exports)], imports };
+  }
+  scanImports(source) {
+    return this.scan(source).imports;
+  }
+}
+
+export class FileSystemRouter {
+  constructor(options = {}) {
+    this.options = options;
+    this.style = options.style ?? "nextjs";
+    this.origin = options.origin ?? "";
+    this.routes = {};
+    this.reload();
+  }
+  match(path) {
+    return this.routes[normalizeRoutePath(path)] ?? {};
+  }
+  reload() {
+    this.routes = {};
+    const dir = String(this.options.dir ?? this.options.root ?? ".");
+    if (!cottontail.existsSync(dir)) return undefined;
+    for (const entry of walkFiles(dir, { dot: false, onlyFiles: true })) {
+      if (!/\.(?:js|jsx|ts|tsx|mjs|cjs)$/.test(entry.relative)) continue;
+      const route = routePathFromFile(entry.relative);
+      this.routes[route] = {
+        filePath: entry.absolute,
+        kind: "exact",
+        name: route,
+        pathname: route,
+        src: entry.relative,
+      };
+    }
+    return undefined;
+  }
+}
+
+function normalizeRoutePath(value) {
+  const pathname = String(value?.pathname ?? value).split(/[?#]/, 1)[0] || "/";
+  return pathname.startsWith("/") ? pathname : `/${pathname}`;
+}
+
+function routePathFromFile(file) {
+  let route = String(file).replace(/\\/g, "/").replace(/\.(?:js|jsx|ts|tsx|mjs|cjs)$/, "");
+  route = route.replace(/\/index$/, "").replace(/^index$/, "");
+  route = route.replace(/\[([^\]]+)\]/g, ":$1");
+  return `/${route}`.replace(/\/+/g, "/").replace(/\/$/, "") || "/";
+}
+
+export class Terminal {}
+export class RedisClient {}
+export class S3Client {}
+export const redis = null;
+export const postgres = null;
+export const s3 = null;
+export const secrets = {};
+export const password = {};
+export const semver = {
+  order(left, right) {
+    const a = String(left).split(".").map(Number);
+    const b = String(right).split(".").map(Number);
+    for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+      const diff = (a[index] || 0) - (b[index] || 0);
+      if (diff !== 0) return Math.sign(diff);
+    }
+    return 0;
+  },
+};
+export const markdown = {};
+export const embeddedFiles = [];
+export const unsafe = {};
+export const CSRF = {};
+
 const BunObject = globalThis.Bun ?? {};
 BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
 BunObject.env = globalThis.process?.env ?? cottontail.env();
+BunObject.$ = $;
+BunObject.ArrayBufferSink = ArrayBufferSink;
+BunObject.CSRF = CSRF;
+BunObject.Cookie = Cookie;
+BunObject.CookieMap = CookieMap;
+BunObject.CryptoHasher = CryptoHasher;
+BunObject.FFI = FFI;
+BunObject.FileSystemRouter = FileSystemRouter;
+BunObject.Glob = Glob;
+BunObject.JSON5 = JSON5;
+BunObject.JSONC = JSONC;
+BunObject.JSONL = JSONL;
+BunObject.MD4 = MD4;
+BunObject.MD5 = MD5;
+BunObject.RedisClient = RedisClient;
+BunObject.S3Client = S3Client;
+BunObject.SHA1 = SHA1;
+BunObject.SHA224 = SHA224;
+BunObject.SHA256 = SHA256;
+BunObject.SHA384 = SHA384;
+BunObject.SHA512 = SHA512;
+BunObject.SHA512_256 = SHA512_256;
+BunObject.SQL = SQL;
+BunObject.TOML = TOML;
+BunObject.Terminal = Terminal;
+BunObject.Transpiler = Transpiler;
+BunObject.YAML = YAML;
+BunObject.allocUnsafe = allocUnsafe;
 BunObject.build = build;
+BunObject.color = color;
+BunObject.concatArrayBuffers = concatArrayBuffers;
+BunObject.connect = connect;
+BunObject.cwd = cwd;
+BunObject.deepEquals = deepEquals;
+BunObject.deepMatch = deepMatch;
+BunObject.deflateSync = deflateSync;
+BunObject.dns = dns;
+BunObject.embeddedFiles = embeddedFiles;
+BunObject.enableANSIColors = enableANSIColors;
+BunObject.escapeHTML = escapeHTML;
 BunObject.file = file;
+BunObject.fileURLToPath = fileURLToPath;
+BunObject.gc = gc;
+BunObject.generateHeapSnapshot = generateHeapSnapshot;
+BunObject.gunzipSync = gunzipSync;
+BunObject.gzipSync = gzipSync;
+BunObject.hash = hash;
+BunObject.indexOfLine = indexOfLine;
+BunObject.inflateSync = inflateSync;
+BunObject.inspect = inspect;
+BunObject.isMainThread = isMainThread;
+BunObject.jest = jest;
+BunObject.listen = listen;
+BunObject.main = main;
+BunObject.markdown = markdown;
+BunObject.mmap = mmap;
+BunObject.nanoseconds = nanoseconds;
+BunObject.openInEditor = openInEditor;
+BunObject.origin = origin;
+BunObject.password = password;
+BunObject.pathToFileURL = pathToFileURL;
+BunObject.peek = peek;
+BunObject.plugin = plugin;
+BunObject.postgres = postgres;
+BunObject.randomUUIDv5 = randomUUIDv5;
+BunObject.randomUUIDv7 = randomUUIDv7;
+BunObject.readableStreamToArray = readableStreamToArray;
+BunObject.readableStreamToArrayBuffer = readableStreamToArrayBuffer;
+BunObject.readableStreamToBlob = readableStreamToBlob;
+BunObject.readableStreamToBytes = readableStreamToBytes;
+BunObject.readableStreamToFormData = readableStreamToFormData;
+BunObject.readableStreamToJSON = readableStreamToJSON;
+BunObject.readableStreamToText = readableStreamToText;
+BunObject.redis = redis;
+BunObject.registerMacro = registerMacro;
+BunObject.resolve = resolve;
+BunObject.resolveSync = resolveSync;
+BunObject.revision = revision;
+BunObject.s3 = s3;
+BunObject.secrets = secrets;
+BunObject.semver = semver;
 BunObject.write = write;
 BunObject.which = which;
+BunObject.sha = sha;
+BunObject.shrink = shrink;
+BunObject.sleep = sleep;
+BunObject.sleepSync = sleepSync;
+BunObject.sql = sql;
+BunObject.stderr = stderr;
+BunObject.stdin = stdin;
+BunObject.stdout = stdout;
+BunObject.stringWidth = stringWidth;
+BunObject.stripANSI = stripANSI;
 BunObject.spawn = spawn;
 BunObject.spawnSync = spawnSync;
 BunObject.serve = serve;
 BunObject.fetch = fetch;
 BunObject.Archive = Archive;
+BunObject.udpSocket = udpSocket;
+BunObject.unsafe = unsafe;
+BunObject.version = version;
+BunObject.version_with_sha = version_with_sha;
+BunObject.wrapAnsi = wrapAnsi;
+BunObject.zstdCompress = zstdCompress;
+BunObject.zstdCompressSync = zstdCompressSync;
+BunObject.zstdDecompress = zstdDecompress;
+BunObject.zstdDecompressSync = zstdDecompressSync;
 const CryptoObject = globalThis.crypto ?? {};
 CryptoObject.randomUUID ??= randomUUID;
 CryptoObject.getRandomValues ??= getRandomValues;
@@ -1245,5 +1993,8 @@ globalThis.Request ??= Request;
 globalThis.Response ??= Response;
 globalThis.URL ??= URL;
 
-export { BunObject as Bun };
+const argv = BunObject.argv;
+const env = BunObject.env;
+
+export { BunObject as Bun, argv, env, which };
 export default BunObject;
