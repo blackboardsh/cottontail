@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "node": {
+    "version": "24.11.1",
+    "tag": "v24.11.1",
+    "tagObject": "1d10c3c54c18ef2ae8bd09854f494a8d07e2b549",
+    "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
+    "source": "https://github.com/nodejs/node",
+    "snapshot": "compat/upstream/node/v24.11.1"
+  },
+  "bun": {
+    "version": "1.3.10",
+    "tag": "bun-v1.3.10",
+    "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
+    "source": "https://github.com/oven-sh/bun",
+    "snapshot": "compat/upstream/bun/v1.3.10"
+  }
+}

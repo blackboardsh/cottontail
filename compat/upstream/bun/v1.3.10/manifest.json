@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "runtime": "bun",
+  "version": "1.3.10",
+  "tag": "bun-v1.3.10",
+  "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
+  "source": "https://github.com/oven-sh/bun",
+  "copiedAt": "2026-07-10",
+  "copiedPaths": [
+    "test",
+    "LICENSE.md"
+  ],
+  "notes": [
+    "This is an owned Cottontail compatibility-test snapshot copied from Bun.",
+    "Do not edit copied upstream tests in place unless intentionally forking them; document local ownership changes in status.json."
+  ]
+}

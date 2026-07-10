@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "defaultStatus": "not-enabled",
+  "tests": {
+    "test/parallel/test-buffer-badhex.js": {
+      "status": "enabled",
+      "reason": "Initial upstream Node smoke test that also passes through Node's tools/test.py --shell Cottontail harness path."
+    }
+  }
+}

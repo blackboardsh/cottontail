@@ -21,6 +21,60 @@ Regenerate and view in one command with:
 bun run compat:surface:all
 ```
 
+## Upstream Test Snapshots
+
+`compat/upstream/` contains owned Cottontail snapshots copied from the Node and
+Bun repositories. These are intentionally committed into this repo so Cottontail
+can keep testing against known Node/Bun behavior even if those projects change,
+slow down, or Cottontail intentionally diverges.
+
+The pinned upstream targets are recorded in:
+
+```sh
+compat/upstream/targets.json
+```
+
+Each snapshot has:
+
+- `manifest.json` for source tag/commit/provenance
+- `status.json` for Cottontail's current enabled/skipped/expected-failure state
+- the copied upstream test files and upstream license notice
+
+List imported upstream test status:
+
+```sh
+bun run compat:upstream:list
+```
+
+Run the currently enabled upstream tests:
+
+```sh
+bun run compat:upstream
+```
+
+Enabled Node tests run through Node's copied `tools/test.py` harness with
+Cottontail passed as `--shell`, so Node metadata, flags, reporters, and harness
+setup stay in the path. Enabled Bun tests currently run directly against the
+copied test file path.
+
+Run enabled tests plus expected failures, requiring the expected failures to
+still fail:
+
+```sh
+bun run compat:upstream:xfail
+```
+
+Refresh the copied snapshots from the versions in `targets.json`:
+
+```sh
+bun run compat:upstream:import
+```
+
+The copied tests are now part of Cottontail's owned compatibility corpus. Do not
+silently rewrite them to pass. When a copied upstream test needs local
+adaptation, either fix Cottontail/the runner or document the ownership decision
+in the relevant `status.json`.
+
 The generated `api-surface.json` is intentionally an inventory, not a behavior
 test result. It records:
 

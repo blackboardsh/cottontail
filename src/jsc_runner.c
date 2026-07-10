@@ -12529,16 +12529,27 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     free(runtime);
 }
 
-int ct_jsc_runtime_set_args(CtJscRuntime *runtime, size_t argc, const char *const *argv, char **error_out) {
+int ct_jsc_runtime_set_args(
+    CtJscRuntime *runtime,
+    size_t argc,
+    const char *const *argv,
+    size_t user_arg_offset,
+    size_t exec_argc,
+    const char *const *exec_argv,
+    char **error_out
+) {
     if (error_out != NULL) *error_out = NULL;
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
-    size_t user_argc = argc > 0 ? argc - 1 : 0;
+    if (user_arg_offset > argc) user_arg_offset = argc;
+    size_t user_argc = argc - user_arg_offset;
     JSValueRef *arg_values = user_argc > 0 ? (JSValueRef *)calloc(user_argc, sizeof(JSValueRef)) : NULL;
     JSValueRef *argv_values = (JSValueRef *)calloc(argc + 1, sizeof(JSValueRef));
-    if ((user_argc > 0 && arg_values == NULL) || argv_values == NULL) {
+    JSValueRef *exec_arg_values = exec_argc > 0 ? (JSValueRef *)calloc(exec_argc, sizeof(JSValueRef)) : NULL;
+    if ((user_argc > 0 && arg_values == NULL) || argv_values == NULL || (exec_argc > 0 && exec_arg_values == NULL)) {
         free(arg_values);
         free(argv_values);
+        free(exec_arg_values);
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
     }
@@ -12547,18 +12558,24 @@ int ct_jsc_runtime_set_args(CtJscRuntime *runtime, size_t argc, const char *cons
         argv_values[index + 1] = ct_make_string(ctx, argv[index]);
     }
     for (size_t index = 0; index < user_argc; index += 1) {
-        arg_values[index] = ct_make_string(ctx, argv[index + 1]);
+        arg_values[index] = ct_make_string(ctx, argv[index + user_arg_offset]);
+    }
+    for (size_t index = 0; index < exec_argc; index += 1) {
+        exec_arg_values[index] = ct_make_string(ctx, exec_argv[index]);
     }
     JSObjectRef args = ct_make_array(ctx, user_argc, arg_values, &exception);
     JSObjectRef process_argv = exception == NULL ? ct_make_array(ctx, argc + 1, argv_values, &exception) : NULL;
+    JSObjectRef process_exec_argv = exception == NULL ? ct_make_array(ctx, exec_argc, exec_arg_values, &exception) : NULL;
     free(arg_values);
     free(argv_values);
+    free(exec_arg_values);
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
     ct_set_property(ctx, runtime->host_object, "args", args, &exception);
     if (exception == NULL) ct_set_property(ctx, runtime->host_object, "argv", process_argv, &exception);
+    if (exception == NULL) ct_set_property(ctx, runtime->host_object, "execArgv", process_exec_argv, &exception);
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;

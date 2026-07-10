@@ -1872,6 +1872,163 @@ export const embeddedFiles = [];
 export const unsafe = {};
 export const CSRF = {};
 
+class CottontailDOMException extends Error {
+  constructor(message = "", name = "Error") {
+    super(String(message));
+    this.name = String(name);
+    this.code = 0;
+  }
+}
+
+class CottontailEvent {
+  constructor(type, init = {}) {
+    this.type = String(type);
+    this.bubbles = Boolean(init.bubbles);
+    this.cancelable = Boolean(init.cancelable);
+    this.composed = Boolean(init.composed);
+    this.defaultPrevented = false;
+    this.target = null;
+    this.currentTarget = null;
+  }
+
+  preventDefault() {
+    if (this.cancelable) this.defaultPrevented = true;
+  }
+}
+
+class CottontailEventTarget {
+  constructor() {
+    this.__ctEventListeners = new Map();
+  }
+
+  addEventListener(type, listener, options = undefined) {
+    if (listener == null) return;
+    const name = String(type);
+    const listeners = this.__ctEventListeners.get(name) ?? [];
+    if (!listeners.some((entry) => entry.listener === listener)) {
+      listeners.push({ listener, once: Boolean(options && typeof options === "object" && options.once) });
+    }
+    this.__ctEventListeners.set(name, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    const name = String(type);
+    const listeners = this.__ctEventListeners.get(name);
+    if (!listeners) return;
+    this.__ctEventListeners.set(name, listeners.filter((entry) => entry.listener !== listener));
+  }
+
+  dispatchEvent(event) {
+    const dispatched = event && typeof event === "object" ? event : new CottontailEvent(String(event));
+    if (!dispatched.target) dispatched.target = this;
+    dispatched.currentTarget = this;
+    const listeners = [...(this.__ctEventListeners.get(String(dispatched.type)) ?? [])];
+    for (const entry of listeners) {
+      const listener = entry.listener;
+      if (typeof listener === "function") listener.call(this, dispatched);
+      else if (listener && typeof listener.handleEvent === "function") listener.handleEvent(dispatched);
+      if (entry.once) this.removeEventListener(dispatched.type, listener);
+    }
+    const handler = this[`on${dispatched.type}`];
+    if (typeof handler === "function") handler.call(this, dispatched);
+    return !dispatched.defaultPrevented;
+  }
+}
+
+function makeAbortError() {
+  const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
+  return new DOMExceptionClass("This operation was aborted", "AbortError");
+}
+
+class CottontailAbortSignal extends CottontailEventTarget {
+  constructor() {
+    super();
+    this.aborted = false;
+    this.reason = undefined;
+    this.onabort = null;
+  }
+
+  throwIfAborted() {
+    if (this.aborted) throw this.reason;
+  }
+
+  static abort(reason = makeAbortError()) {
+    const controller = new CottontailAbortController();
+    controller.abort(reason);
+    return controller.signal;
+  }
+
+  static timeout(delay) {
+    const controller = new CottontailAbortController();
+    setTimeout(() => {
+      const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
+      controller.abort(new DOMExceptionClass("The operation timed out", "TimeoutError"));
+    }, Math.max(0, Number(delay) || 0));
+    return controller.signal;
+  }
+
+  static any(signals) {
+    const controller = new CottontailAbortController();
+    for (const signal of signals ?? []) {
+      if (signal?.aborted) {
+        controller.abort(signal.reason);
+        break;
+      }
+      signal?.addEventListener?.("abort", () => controller.abort(signal.reason), { once: true });
+    }
+    return controller.signal;
+  }
+}
+
+class CottontailAbortController {
+  constructor() {
+    this.signal = new CottontailAbortSignal();
+  }
+
+  abort(reason = makeAbortError()) {
+    if (this.signal.aborted) return;
+    this.signal.aborted = true;
+    this.signal.reason = reason;
+    const EventClass = globalThis.Event ?? CottontailEvent;
+    this.signal.dispatchEvent(new EventClass("abort"));
+  }
+}
+
+function structuredCloneValue(value, seen) {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value);
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (ArrayBuffer.isView(value)) {
+    const clonedBuffer = structuredCloneValue(value.buffer, seen);
+    if (value instanceof DataView) return new DataView(clonedBuffer, value.byteOffset, value.byteLength);
+    return new value.constructor(clonedBuffer, value.byteOffset, value.length);
+  }
+  if (value instanceof Map) {
+    const result = new Map();
+    seen.set(value, result);
+    for (const [key, item] of value) result.set(structuredCloneValue(key, seen), structuredCloneValue(item, seen));
+    return result;
+  }
+  if (value instanceof Set) {
+    const result = new Set();
+    seen.set(value, result);
+    for (const item of value) result.add(structuredCloneValue(item, seen));
+    return result;
+  }
+  const result = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+  seen.set(value, result);
+  for (const key of Reflect.ownKeys(value)) {
+    result[key] = structuredCloneValue(value[key], seen);
+  }
+  return result;
+}
+
+function cottontailStructuredClone(value) {
+  return structuredCloneValue(value, new WeakMap());
+}
+
 const BunObject = globalThis.Bun ?? {};
 BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
 BunObject.env = globalThis.process?.env ?? cottontail.env();
@@ -1986,6 +2143,12 @@ const CryptoObject = globalThis.crypto ?? {};
 CryptoObject.randomUUID ??= randomUUID;
 CryptoObject.getRandomValues ??= getRandomValues;
 globalThis.crypto = CryptoObject;
+globalThis.DOMException ??= CottontailDOMException;
+globalThis.Event ??= CottontailEvent;
+globalThis.EventTarget ??= CottontailEventTarget;
+globalThis.AbortSignal ??= CottontailAbortSignal;
+globalThis.AbortController ??= CottontailAbortController;
+globalThis.structuredClone ??= cottontailStructuredClone;
 globalThis.fetch ??= fetch;
 globalThis.Bun = BunObject;
 globalThis.Headers ??= Headers;

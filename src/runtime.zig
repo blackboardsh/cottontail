@@ -30,9 +30,23 @@ pub const Runtime = struct {
     }
 
     pub fn setArgs(self: *Runtime, args: []const [:0]const u8) !void {
+        const empty_exec_args: [0][:0]const u8 = .{};
+        try self.setProcessArgs(args, if (args.len > 0) 1 else 0, empty_exec_args[0..]);
+    }
+
+    pub fn setProcessArgs(
+        self: *Runtime,
+        args: []const [:0]const u8,
+        user_arg_offset: usize,
+        exec_args: []const [:0]const u8,
+    ) !void {
         const arg_ptrs = try self.allocator.alloc([*c]const u8, args.len);
         for (args, 0..) |arg, index| {
             arg_ptrs[index] = arg.ptr;
+        }
+        const exec_arg_ptrs = try self.allocator.alloc([*c]const u8, exec_args.len);
+        for (exec_args, 0..) |arg, index| {
+            exec_arg_ptrs[index] = arg.ptr;
         }
 
         var eval_error: [*c]u8 = null;
@@ -40,8 +54,20 @@ pub const Runtime = struct {
             @as([*c]const [*c]const u8, null)
         else
             @as([*c]const [*c]const u8, @ptrCast(arg_ptrs.ptr));
+        const exec_argv_ptr = if (exec_arg_ptrs.len == 0)
+            @as([*c]const [*c]const u8, null)
+        else
+            @as([*c]const [*c]const u8, @ptrCast(exec_arg_ptrs.ptr));
 
-        if (c.ct_jsc_runtime_set_args(self.handle, args.len, argv_ptr, &eval_error) != 0) {
+        if (c.ct_jsc_runtime_set_args(
+            self.handle,
+            args.len,
+            argv_ptr,
+            user_arg_offset,
+            exec_args.len,
+            exec_argv_ptr,
+            &eval_error,
+        ) != 0) {
             defer if (eval_error != null) {
                 c.ct_jsc_string_free(eval_error);
             };

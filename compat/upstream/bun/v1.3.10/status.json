@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "defaultStatus": "not-enabled",
+  "tests": {
+    "test/js/bun/empty-file.test.ts": {
+      "status": "enabled",
+      "reason": "Initial upstream Bun smoke test that runs directly under Cottontail."
+    },
+    "test/js/bun/util/stringWidth.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires npm dependency resolution for string-width from Bun's test package dependencies."
+    },
+    "test/js/bun/test/mock-fn.test.js": {
+      "status": "expected-failure",
+      "reason": "Bun test interop imports vitest, jest-extended, and @jest/globals through upstream fixtures; runner needs dependency/bootstrap support."
+    }
+  }
+}

@@ -19,7 +19,8 @@ function fail(message) {
 }
 
 function runCase(testCase) {
-  const result = spawnSync(binaryPath, [testCase.scriptPath, ...(testCase.args ?? [])], {
+  const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
+  const result = spawnSync(binaryPath, argv, {
     cwd: rootDir,
     env: {
       ...process.env,
@@ -86,6 +87,29 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'async.js'),
       expectExitCode: 0,
       stdoutIncludes: ['async passed'],
+    },
+    {
+      name: 'cli-print-process-arch',
+      argv: ['-p', 'process.arch'],
+      expectExitCode: 0,
+      stdoutIncludes: [process.arch],
+    },
+    {
+      name: 'cli-eval-argv-execargv',
+      argv: [
+        '-e',
+        'console.log(process.argv.slice(1).join("|")); console.log(process.execArgv[0] + ":" + process.execArgv[1].startsWith("console.log"));',
+        'alpha',
+        'beta',
+      ],
+      expectExitCode: 0,
+      stdoutIncludes: ['alpha|beta', '-e:true'],
+    },
+    {
+      name: 'cli-runtime-flag-execargv',
+      argv: ['--no-warnings', '-p', 'process.execArgv.includes("--no-warnings")'],
+      expectExitCode: 0,
+      stdoutIncludes: ['true'],
     },
     {
       name: 'host-api',

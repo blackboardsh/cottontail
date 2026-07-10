@@ -18,7 +18,9 @@ const ScriptExecution = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     runnable_path: [:0]const u8,
-    script_args: []const [:0]const u8,
+    process_args: []const [:0]const u8,
+    process_user_arg_offset: usize,
+    exec_args: []const [:0]const u8,
     exit_code: u8 = 1,
 };
 
@@ -47,15 +49,18 @@ const Context = struct {
 };
 
 pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []const [:0]const u8) !u8 {
+    const empty_exec_args: [0][:0]const u8 = .{};
+    return try runWithExecArgv(init, script_path, script_args, empty_exec_args[0..]);
+}
+
+pub fn runWithExecArgv(
+    init: std.process.Init,
+    script_path: [:0]const u8,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+) !u8 {
     const allocator = init.arena.allocator();
-    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
-    const ctx = Context{
-        .io = init.io,
-        .allocator = allocator,
-        .environ_map = init.environ_map,
-        .cottontail_home = try findCottontailHome(init, allocator, exe_dir),
-        .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
-    };
+    const ctx = try makeContext(init);
 
     const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(script_path))
         try bundleScriptWithEsbuild(&ctx, script_path)
@@ -75,11 +80,55 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
         process_args[index + 1] = arg;
     }
 
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args);
+}
+
+pub fn runEval(
+    init: std.process.Init,
+    source: [:0]const u8,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+    print_result: bool,
+) !u8 {
+    const ctx = try makeContext(init);
+    const tmp_dir = try ensureTempDir(&ctx);
+    const eval_path = try writeEvalEntrypoint(&ctx, tmp_dir, source, print_result, hasModuleInputType(exec_args));
+    const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(eval_path))
+        try bundleScriptWithEsbuild(&ctx, eval_path)
+    else
+        eval_path;
+    const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
+    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args);
+}
+
+fn makeContext(init: std.process.Init) !Context {
+    const allocator = init.arena.allocator();
+    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
+    return .{
+        .io = init.io,
+        .allocator = allocator,
+        .environ_map = init.environ_map,
+        .cottontail_home = try findCottontailHome(init, allocator, exe_dir),
+        .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
+    };
+}
+
+fn runPrepared(
+    init: std.process.Init,
+    ctx: *const Context,
+    runnable_path_z: [:0]const u8,
+    process_args: []const [:0]const u8,
+    process_user_arg_offset: usize,
+    exec_args: []const [:0]const u8,
+) !u8 {
+    const allocator = init.arena.allocator();
     var execution = ScriptExecution{
         .io = init.io,
         .allocator = allocator,
         .runnable_path = runnable_path_z,
-        .script_args = process_args,
+        .process_args = process_args,
+        .process_user_arg_offset = process_user_arg_offset,
+        .exec_args = exec_args,
     };
     const thread = try std.Thread.spawn(
         .{ .stack_size = script_thread_stack_size },
@@ -87,8 +136,8 @@ pub fn run(init: std.process.Init, script_path: [:0]const u8, script_args: []con
         .{&execution},
     );
 
-    if (shouldRunElectrobunMainThread(&ctx)) {
-        const main_thread_status = runElectrobunMainThread(&ctx) catch |err| blk: {
+    if (shouldRunElectrobunMainThread(ctx)) {
+        const main_thread_status = runElectrobunMainThread(ctx) catch |err| blk: {
             ctx.writeStderr("cottontail: failed to run Electrobun main thread: {s}\n", .{@errorName(err)});
             break :blk @as(u8, 1);
         };
@@ -175,7 +224,11 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     };
     defer js_runtime.deinit();
 
-    js_runtime.setArgs(execution.script_args) catch {
+    js_runtime.setProcessArgs(
+        execution.process_args,
+        execution.process_user_arg_offset,
+        execution.exec_args,
+    ) catch {
         writeStderr(execution.io, "cottontail: failed to initialize cottontail.args\n", .{});
         execution.exit_code = 1;
         return;
@@ -290,6 +343,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         "--format=esm",
         "--main-fields=module,main",
         "--target=es2022",
+        "--external:internal/*",
         try std.fmt.allocPrint(ctx.allocator, "--outfile={s}", .{bundle_path}),
         try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dirname={s}", .{script_dir_literal}),
         try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dir={s}", .{script_dir_literal}),
@@ -445,6 +499,8 @@ fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !
         return false;
     }
 
+    if (try sourceLooksCommonJs(ctx, script_abs)) return true;
+
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     return !(try nearestPackageTypeIsModule(ctx, script_dir));
 }
@@ -466,6 +522,19 @@ fn extensionlessEntrypointLooksCommonJs(ctx: *const Context, script_abs: []const
         std.mem.indexOf(u8, shebang, "env") != null;
     if (!looks_node_cli) return false;
 
+    return std.mem.indexOf(u8, source, "require(") != null or
+        std.mem.indexOf(u8, source, "require.resolve") != null or
+        std.mem.indexOf(u8, source, "module.exports") != null or
+        std.mem.indexOf(u8, source, "exports.") != null;
+}
+
+fn sourceLooksCommonJs(ctx: *const Context, script_abs: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(256 * 1024),
+    ) catch return false;
     return std.mem.indexOf(u8, source, "require(") != null or
         std.mem.indexOf(u8, source, "require.resolve") != null or
         std.mem.indexOf(u8, source, "module.exports") != null or
@@ -504,6 +573,67 @@ fn packageJsonDeclaresModuleType(source: []const u8) bool {
         return std.mem.startsWith(u8, value, "\"module\"");
     }
     return false;
+}
+
+fn hasModuleInputType(exec_args: []const [:0]const u8) bool {
+    for (exec_args, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "--input-type=module") or
+            std.mem.eql(u8, arg, "--experimental-default-type=module"))
+        {
+            return true;
+        }
+        if ((std.mem.eql(u8, arg, "--input-type") or
+            std.mem.eql(u8, arg, "--experimental-default-type")) and
+            index + 1 < exec_args.len and
+            std.mem.eql(u8, exec_args[index + 1], "module"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn writeEvalEntrypoint(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    source: []const u8,
+    print_result: bool,
+    module_input: bool,
+) ![]const u8 {
+    const extension = if (module_input) "mjs" else "cjs";
+    const wrapper_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        "eval-entry-{x}.{s}",
+        .{ std.hash.Wyhash.hash(if (print_result) 1 else 0, source), extension },
+    );
+    const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
+    const source_literal = try jsonStringLiteral(ctx, source);
+
+    const eval_source = if (!print_result)
+        source
+    else if (module_input)
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            \\import * as __ctUtil from "node:util";
+            \\const __ctPrintResult = eval({s});
+            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
+            \\
+        ,
+            .{source_literal},
+        )
+    else
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            \\const __ctUtil = require("node:util");
+            \\const __ctPrintResult = eval({s});
+            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
+            \\
+        ,
+            .{source_literal},
+        );
+
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = eval_source });
+    return wrapper_path;
 }
 
 fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {

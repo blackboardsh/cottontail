@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "runtime": "node",
+  "version": "24.11.1",
+  "tag": "v24.11.1",
+  "tagObject": "1d10c3c54c18ef2ae8bd09854f494a8d07e2b549",
+  "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
+  "source": "https://github.com/nodejs/node",
+  "copiedAt": "2026-07-10",
+  "copiedPaths": [
+    "test",
+    "tools",
+    "LICENSE"
+  ],
+  "notes": [
+    "This is an owned Cottontail compatibility-test snapshot copied from Node.js.",
+    "Do not edit copied upstream tests in place unless intentionally forking them; document local ownership changes in status.json."
+  ]
+}

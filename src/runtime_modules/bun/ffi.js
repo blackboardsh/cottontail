@@ -131,7 +131,7 @@ g.process = processObject;
 installProcessApi(g.process);
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;
-g.process.execArgv ??= [];
+g.process.execArgv ??= Array.from(cottontail.execArgv || []);
 g.process.versions ??= { node: "22.0.0", cottontail: "0.0.0-dev" };
 g.process.versions.node ??= "22.0.0";
 g.process.release ??= { name: "cottontail" };
@@ -533,12 +533,22 @@ function normalizeBufferEncoding(encoding = "utf8") {
 }
 
 function hexDecode(input) {
-  const clean = String(input).replace(/[^0-9a-fA-F]/g, "");
-  const out = new Uint8Array(Math.floor(clean.length / 2));
-  for (let index = 0; index < out.length; index += 1) {
-    out[index] = parseInt(clean.slice(index * 2, index * 2 + 2), 16) || 0;
+  const text = String(input);
+  const out = [];
+  for (let index = 0; index + 1 < text.length; index += 2) {
+    const high = hexNibble(text.charCodeAt(index));
+    const low = hexNibble(text.charCodeAt(index + 1));
+    if (high < 0 || low < 0) break;
+    out.push((high << 4) | low);
   }
-  return out;
+  return new Uint8Array(out);
+}
+
+function hexNibble(code) {
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 65 && code <= 70) return code - 55;
+  if (code >= 97 && code <= 102) return code - 87;
+  return -1;
 }
 
 function hexEncode(input) {
@@ -699,6 +709,22 @@ function installBufferMethods(bytes) {
   };
   bytes.includes = function includes(value, byteOffset = 0, encoding = "utf8") {
     return this.indexOf(value, byteOffset, encoding) !== -1;
+  };
+  bytes.write = function write(string, offset = 0, length = undefined, encoding = "utf8") {
+    if (typeof offset === "string") {
+      encoding = offset;
+      offset = 0;
+      length = this.length;
+    } else if (typeof length === "string") {
+      encoding = length;
+      length = undefined;
+    }
+    const start = Math.max(0, Math.min(this.length, Math.trunc(Number(offset) || 0)));
+    const maxLength = length == null ? this.length - start : Math.max(0, Math.trunc(Number(length) || 0));
+    const source = CottontailBuffer.from(String(string), encoding);
+    const written = Math.min(source.length, maxLength, this.length - start);
+    this.set(source.subarray(0, written), start);
+    return written;
   };
   bytes.slice = function slice(start = 0, end = this.length) {
     return makeBufferView(this, start, end);

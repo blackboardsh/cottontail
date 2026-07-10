@@ -13,6 +13,9 @@ int ct_jsc_runtime_set_args(
     CtJscRuntime *runtime,
     size_t argc,
     const char *const *argv,
+    size_t user_arg_offset,
+    size_t exec_argc,
+    const char *const *exec_argv,
     char **error_out
 );
 int ct_jsc_runtime_eval(

@@ -134,12 +134,56 @@ export function callbackify(fn) {
 
 export function isDeepStrictEqual(left, right) {
   if (Object.is(left, right)) return true;
-  try {
-    return JSON.stringify(left, Object.keys(Object(left)).sort()) ===
-      JSON.stringify(right, Object.keys(Object(right)).sort());
-  } catch {
-    return false;
+  return deepEqual(left, right);
+}
+
+function deepEqual(actual, expected, seen = new WeakMap()) {
+  if (Object.is(actual, expected)) return true;
+  if (actual === null || expected === null) return actual === expected;
+  if (typeof actual !== "object" || typeof expected !== "object") return false;
+  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected)) {
+    if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
+    if (actual.byteLength !== expected.byteLength) return false;
+    const left = new Uint8Array(actual.buffer, actual.byteOffset, actual.byteLength);
+    const right = new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength);
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
   }
+  if (actual instanceof Date || expected instanceof Date) {
+    return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
+  }
+  if (actual instanceof RegExp || expected instanceof RegExp) {
+    return actual instanceof RegExp && expected instanceof RegExp && String(actual) === String(expected);
+  }
+  if (seen.get(actual) === expected) return true;
+  seen.set(actual, expected);
+  if (Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
+  if (actual instanceof Map || expected instanceof Map) {
+    if (!(actual instanceof Map) || !(expected instanceof Map) || actual.size !== expected.size) return false;
+    for (const [key, value] of actual) {
+      if (!expected.has(key) || !deepEqual(value, expected.get(key), seen)) return false;
+    }
+    return true;
+  }
+  if (actual instanceof Set || expected instanceof Set) {
+    if (!(actual instanceof Set) || !(expected instanceof Set) || actual.size !== expected.size) return false;
+    for (const value of actual) {
+      if (!expected.has(value)) return false;
+    }
+    return true;
+  }
+  const actualKeys = Reflect.ownKeys(actual);
+  const expectedKeys = Reflect.ownKeys(expected);
+  if (actualKeys.length !== expectedKeys.length) return false;
+  actualKeys.sort((left, right) => String(left).localeCompare(String(right)));
+  expectedKeys.sort((left, right) => String(left).localeCompare(String(right)));
+  for (let index = 0; index < actualKeys.length; index += 1) {
+    if (actualKeys[index] !== expectedKeys[index]) return false;
+    if (!deepEqual(actual[actualKeys[index]], expected[expectedKeys[index]], seen)) return false;
+  }
+  return true;
 }
 
 export function inherits(ctor, superCtor) {

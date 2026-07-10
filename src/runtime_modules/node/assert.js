@@ -55,17 +55,53 @@ function isObject(value) {
   return value !== null && typeof value === "object";
 }
 
-function deepEqualValue(actual, expected, strict) {
-  if (strict ? actual === expected : actual == expected) return true;
-  if (!isObject(actual) || !isObject(expected)) return false;
-  if (Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected) && strict) return false;
+function samePrimitive(actual, expected, strict) {
+  return strict ? Object.is(actual, expected) : actual == expected;
+}
 
-  const actualKeys = Object.keys(actual).sort();
-  const expectedKeys = Object.keys(expected).sort();
+function deepEqualValue(actual, expected, strict, seen = new WeakMap()) {
+  if (samePrimitive(actual, expected, strict)) return true;
+  if (!isObject(actual) || !isObject(expected)) return false;
+  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected)) {
+    if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
+    if (actual.byteLength !== expected.byteLength) return false;
+    const left = new Uint8Array(actual.buffer, actual.byteOffset, actual.byteLength);
+    const right = new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength);
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  }
+  if (actual instanceof Date || expected instanceof Date) {
+    return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
+  }
+  if (actual instanceof RegExp || expected instanceof RegExp) {
+    return actual instanceof RegExp && expected instanceof RegExp && String(actual) === String(expected);
+  }
+  if (seen.get(actual) === expected) return true;
+  seen.set(actual, expected);
+  if (strict && Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
+  if (actual instanceof Map || expected instanceof Map) {
+    if (!(actual instanceof Map) || !(expected instanceof Map) || actual.size !== expected.size) return false;
+    for (const [key, value] of actual) {
+      if (!expected.has(key) || !deepEqualValue(value, expected.get(key), strict, seen)) return false;
+    }
+    return true;
+  }
+  if (actual instanceof Set || expected instanceof Set) {
+    if (!(actual instanceof Set) || !(expected instanceof Set) || actual.size !== expected.size) return false;
+    for (const value of actual) {
+      if (!expected.has(value)) return false;
+    }
+    return true;
+  }
+
+  const actualKeys = Reflect.ownKeys(actual).sort((left, right) => String(left).localeCompare(String(right)));
+  const expectedKeys = Reflect.ownKeys(expected).sort((left, right) => String(left).localeCompare(String(right)));
   if (actualKeys.length !== expectedKeys.length) return false;
   for (let index = 0; index < actualKeys.length; index += 1) {
     if (actualKeys[index] !== expectedKeys[index]) return false;
-    if (!deepEqualValue(actual[actualKeys[index]], expected[expectedKeys[index]], strict)) return false;
+    if (!deepEqualValue(actual[actualKeys[index]], expected[expectedKeys[index]], strict, seen)) return false;
   }
   return true;
 }
