@@ -28,7 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sqlite3.h>
+#include "sqlite3_local.h"
 #include <arpa/nameser.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -408,6 +408,7 @@ typedef struct CtTlsServer {
 } CtTlsServer;
 
 typedef struct CtSqliteStmt CtSqliteStmt;
+typedef struct CtSqliteSession CtSqliteSession;
 typedef struct CtCryptoCipher CtCryptoCipher;
 typedef struct CtSqliteFunction CtSqliteFunction;
 typedef int (*CtSqliteEnableLoadExtensionFn)(sqlite3 *, int);
@@ -417,6 +418,7 @@ typedef struct CtSqliteDb {
     uint32_t id;
     sqlite3 *db;
     CtSqliteStmt *statements;
+    CtSqliteSession *sessions;
     CtSqliteFunction *authorizer;
     bool allow_load_extension;
     bool load_extension_enabled;
@@ -429,6 +431,14 @@ struct CtSqliteStmt {
     CtSqliteDb *owner;
     CtSqliteStmt *owner_next;
     CtSqliteStmt *next;
+};
+
+struct CtSqliteSession {
+    uint32_t id;
+    sqlite3_session *session;
+    CtSqliteDb *owner;
+    CtSqliteSession *owner_next;
+    CtSqliteSession *next;
 };
 
 struct CtCryptoCipher {
@@ -465,6 +475,13 @@ typedef struct CtSqliteAggregateState {
     char *error_message;
 } CtSqliteAggregateState;
 
+typedef struct CtSqliteApplyCallbacks {
+    JSContextRef ctx;
+    JSObjectRef filter;
+    JSObjectRef conflict;
+    char *error_message;
+} CtSqliteApplyCallbacks;
+
 static pthread_mutex_t ct_http_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtHttpServer *ct_http_servers = NULL;
 static uint32_t ct_next_http_server_id = 1;
@@ -476,8 +493,10 @@ static uint32_t ct_next_tls_server_id = 1;
 static uint32_t ct_next_tls_connection_id = 1;
 static CtSqliteDb *ct_sqlite_dbs = NULL;
 static CtSqliteStmt *ct_sqlite_stmts = NULL;
+static CtSqliteSession *ct_sqlite_sessions = NULL;
 static uint32_t ct_next_sqlite_db_id = 1;
 static uint32_t ct_next_sqlite_stmt_id = 1;
+static uint32_t ct_next_sqlite_session_id = 1;
 static CtCryptoCipher *ct_crypto_ciphers = NULL;
 static uint32_t ct_next_crypto_cipher_id = 1;
 
@@ -1086,6 +1105,11 @@ static JSObjectRef ct_make_array(JSContextRef ctx, size_t count, const JSValueRe
 static void ct_array_buffer_free(void *bytes, void *deallocator_context) {
     (void)deallocator_context;
     free(bytes);
+}
+
+static void ct_sqlite_array_buffer_free(void *bytes, void *deallocator_context) {
+    (void)deallocator_context;
+    sqlite3_free(bytes);
 }
 
 static JSValueRef ct_array_buffer_from_copy(JSContextRef ctx, const char *bytes, size_t len, JSValueRef *exception) {
@@ -3868,24 +3892,21 @@ static CtSqliteStmt *ct_sqlite_find_stmt(uint32_t id) {
     return NULL;
 }
 
-static CtSqliteEnableLoadExtensionFn ct_sqlite_enable_load_extension_fn(void) {
-    static bool looked_up = false;
-    static CtSqliteEnableLoadExtensionFn fn = NULL;
-    if (!looked_up) {
-        looked_up = true;
-        fn = (CtSqliteEnableLoadExtensionFn)dlsym(RTLD_DEFAULT, "sqlite3_enable_load_extension");
+static CtSqliteSession *ct_sqlite_find_session(uint32_t id) {
+    CtSqliteSession *cursor = ct_sqlite_sessions;
+    while (cursor != NULL) {
+        if (cursor->id == id) return cursor;
+        cursor = cursor->next;
     }
-    return fn;
+    return NULL;
+}
+
+static CtSqliteEnableLoadExtensionFn ct_sqlite_enable_load_extension_fn(void) {
+    return sqlite3_enable_load_extension;
 }
 
 static CtSqliteLoadExtensionFn ct_sqlite_load_extension_fn(void) {
-    static bool looked_up = false;
-    static CtSqliteLoadExtensionFn fn = NULL;
-    if (!looked_up) {
-        looked_up = true;
-        fn = (CtSqliteLoadExtensionFn)dlsym(RTLD_DEFAULT, "sqlite3_load_extension");
-    }
-    return fn;
+    return sqlite3_load_extension;
 }
 
 static void ct_sqlite_throw(JSContextRef ctx, JSValueRef *exception, sqlite3 *db) {
@@ -3919,6 +3940,35 @@ static void ct_sqlite_finalize_stmt(CtSqliteStmt *stmt) {
     ct_sqlite_unlink_stmt(stmt);
     if (stmt->stmt != NULL) sqlite3_finalize(stmt->stmt);
     free(stmt);
+}
+
+static void ct_sqlite_unlink_session(CtSqliteSession *session) {
+    if (session == NULL) return;
+    CtSqliteSession **global_cursor = &ct_sqlite_sessions;
+    while (*global_cursor != NULL) {
+        if (*global_cursor == session) {
+            *global_cursor = session->next;
+            break;
+        }
+        global_cursor = &(*global_cursor)->next;
+    }
+    if (session->owner != NULL) {
+        CtSqliteSession **owner_cursor = &session->owner->sessions;
+        while (*owner_cursor != NULL) {
+            if (*owner_cursor == session) {
+                *owner_cursor = session->owner_next;
+                break;
+            }
+            owner_cursor = &(*owner_cursor)->owner_next;
+        }
+    }
+}
+
+static void ct_sqlite_delete_session(CtSqliteSession *session) {
+    if (session == NULL) return;
+    ct_sqlite_unlink_session(session);
+    if (session->session != NULL) sqlite3session_delete(session->session);
+    free(session);
 }
 
 static JSValueRef ct_sqlite_column_value(JSContextRef ctx, sqlite3_stmt *stmt, int column, JSValueRef *exception) {
@@ -4361,6 +4411,7 @@ static JSValueRef ct_sqlite_close(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeUndefined(ctx);
     }
     CtSqliteDb *entry = *cursor;
+    while (entry->sessions != NULL) ct_sqlite_delete_session(entry->sessions);
     while (entry->statements != NULL) ct_sqlite_finalize_stmt(entry->statements);
     sqlite3_set_authorizer(entry->db, NULL, NULL);
     if (entry->authorizer != NULL) {
@@ -4901,6 +4952,181 @@ static JSValueRef ct_sqlite_backup(JSContextRef ctx, JSObjectRef function, JSObj
     }
     sqlite3_close(destination);
     return JSValueMakeNumber(ctx, (double)pages);
+}
+
+static JSValueRef ct_sqlite_session_create(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteSessionCreate(id[, dbName, table]) requires a database id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *db_name = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
+    char *table = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
+
+    sqlite3_session *session = NULL;
+    int status = sqlite3session_create(entry->db, db_name != NULL ? db_name : "main", &session);
+    free(db_name);
+    if (status != SQLITE_OK) {
+        free(table);
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    status = sqlite3session_attach(session, table);
+    free(table);
+    if (status != SQLITE_OK) {
+        sqlite3session_delete(session);
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtSqliteSession *session_entry = (CtSqliteSession *)calloc(1, sizeof(CtSqliteSession));
+    if (session_entry == NULL) {
+        sqlite3session_delete(session);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    session_entry->id = ct_next_sqlite_session_id++;
+    if (ct_next_sqlite_session_id == 0) ct_next_sqlite_session_id = 1;
+    session_entry->session = session;
+    session_entry->owner = entry;
+    session_entry->next = ct_sqlite_sessions;
+    ct_sqlite_sessions = session_entry;
+    session_entry->owner_next = entry->sessions;
+    entry->sessions = session_entry;
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, session_entry->id), exception);
+    return result;
+}
+
+static JSValueRef ct_sqlite_session_changeset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteSessionChangeset(id, patchset) requires a session id and patchset flag");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteSession *session = ct_sqlite_find_session((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (session == NULL) {
+        ct_throw_message(ctx, exception, "SQLite session not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int byte_len = 0;
+    void *bytes = NULL;
+    bool patchset = ct_value_to_bool(ctx, argv[1]);
+    int status = patchset
+        ? sqlite3session_patchset(session->session, &byte_len, &bytes)
+        : sqlite3session_changeset(session->session, &byte_len, &bytes);
+    if (status != SQLITE_OK) {
+        if (bytes != NULL) sqlite3_free(bytes);
+        ct_sqlite_throw(ctx, exception, session->owner != NULL ? session->owner->db : NULL);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (bytes == NULL || byte_len <= 0) {
+        if (bytes != NULL) sqlite3_free(bytes);
+        return ct_array_buffer_from_copy(ctx, "", 0, exception);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, bytes, (size_t)byte_len, ct_sqlite_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_sqlite_session_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteSessionClose(id) requires a session id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteSession *session = ct_sqlite_find_session((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (session != NULL) ct_sqlite_delete_session(session);
+    return JSValueMakeUndefined(ctx);
+}
+
+static int ct_sqlite_changeset_filter(void *opaque, const char *table) {
+    CtSqliteApplyCallbacks *callbacks = (CtSqliteApplyCallbacks *)opaque;
+    if (callbacks == NULL || callbacks->filter == NULL) return 1;
+    JSValueRef arg = ct_make_string(callbacks->ctx, table != NULL ? table : "");
+    JSValueRef call_exception = NULL;
+    JSValueRef result = JSObjectCallAsFunction(callbacks->ctx, callbacks->filter, NULL, 1, &arg, &call_exception);
+    if (call_exception != NULL) {
+        callbacks->error_message = ct_copy_exception(callbacks->ctx, call_exception);
+        return 0;
+    }
+    return ct_value_to_bool(callbacks->ctx, result) ? 1 : 0;
+}
+
+static int ct_sqlite_changeset_conflict(void *opaque, int reason, sqlite3_changeset_iter *iterator) {
+    (void)iterator;
+    CtSqliteApplyCallbacks *callbacks = (CtSqliteApplyCallbacks *)opaque;
+    if (callbacks == NULL || callbacks->conflict == NULL) return SQLITE_CHANGESET_ABORT;
+    JSValueRef arg = JSValueMakeNumber(callbacks->ctx, reason);
+    JSValueRef call_exception = NULL;
+    JSValueRef result = JSObjectCallAsFunction(callbacks->ctx, callbacks->conflict, NULL, 1, &arg, &call_exception);
+    if (call_exception != NULL) {
+        callbacks->error_message = ct_copy_exception(callbacks->ctx, call_exception);
+        return SQLITE_CHANGESET_ABORT;
+    }
+    return (int)ct_value_to_number(callbacks->ctx, result);
+}
+
+static JSValueRef ct_sqlite_apply_changeset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteApplyChangeset(id, changeset[, filter, onConflict]) requires database id and changeset");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *bytes = NULL;
+    size_t bytes_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &bytes_len) != 0 || bytes_len > INT_MAX) {
+        ct_throw_message(ctx, exception, "changeset must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtSqliteApplyCallbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.ctx = ctx;
+    if (argc >= 3 && JSValueIsObject(ctx, argv[2]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[2])) {
+        callbacks.filter = (JSObjectRef)argv[2];
+        JSValueProtect(ctx, callbacks.filter);
+    }
+    if (argc >= 4 && JSValueIsObject(ctx, argv[3]) && JSObjectIsFunction(ctx, (JSObjectRef)argv[3])) {
+        callbacks.conflict = (JSObjectRef)argv[3];
+        JSValueProtect(ctx, callbacks.conflict);
+    }
+
+    int status = sqlite3changeset_apply(
+        entry->db,
+        (int)bytes_len,
+        bytes,
+        callbacks.filter != NULL ? ct_sqlite_changeset_filter : NULL,
+        ct_sqlite_changeset_conflict,
+        &callbacks
+    );
+
+    if (callbacks.filter != NULL) JSValueUnprotect(ctx, callbacks.filter);
+    if (callbacks.conflict != NULL) JSValueUnprotect(ctx, callbacks.conflict);
+    if (callbacks.error_message != NULL) {
+        ct_throw_message(ctx, exception, callbacks.error_message);
+        free(callbacks.error_message);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (status == SQLITE_ABORT) return JSValueMakeBoolean(ctx, false);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
 }
 
 static void ct_free_string_array(char **values, size_t count) {
@@ -11929,6 +12155,10 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sqliteEnableLoadExtension", ct_sqlite_enable_load_extension, runtime);
     ct_install_function(ctx, host, "sqliteLoadExtension", ct_sqlite_load_extension, runtime);
     ct_install_function(ctx, host, "sqliteBackup", ct_sqlite_backup, runtime);
+    ct_install_function(ctx, host, "sqliteSessionCreate", ct_sqlite_session_create, runtime);
+    ct_install_function(ctx, host, "sqliteSessionChangeset", ct_sqlite_session_changeset, runtime);
+    ct_install_function(ctx, host, "sqliteSessionClose", ct_sqlite_session_close, runtime);
+    ct_install_function(ctx, host, "sqliteApplyChangeset", ct_sqlite_apply_changeset, runtime);
     ct_install_function(ctx, host, "platform", ct_platform, runtime);
     ct_install_function(ctx, host, "arch", ct_arch, runtime);
     ct_install_function(ctx, host, "hostname", ct_hostname, runtime);

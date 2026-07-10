@@ -122,11 +122,25 @@ function orderedRecords(records, order = defaultResultOrder) {
   return list;
 }
 
-function lookupRecords(hostname, family = 0, order = defaultResultOrder) {
+function resolverNativeOptions(resolverState = undefined) {
+  if (resolverState === null) return undefined;
+  const state = resolverState ?? { _servers: servers };
+  const options = {};
+  const stateServers = Array.isArray(state._servers) ? state._servers : [];
+  if (stateServers.length > 0) options.servers = [...stateServers];
+  if (state.timeout != null) options.timeout = Number(state.timeout);
+  if (state.tries != null) options.tries = Number(state.tries);
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+function lookupRecords(hostname, family = 0, order = defaultResultOrder, resolverState = null) {
   if (hostname == null || String(hostname) === "") return [{ address: null, family: 4 }];
   if (typeof cottontail.dnsLookup !== "function") throw makeDnsError("native DNS lookup is unavailable", "getaddrinfo", hostname);
   try {
-    const records = Array.from(cottontail.dnsLookup(String(hostname), Number(family) || 0) ?? [])
+    const nativeOptions = resolverNativeOptions(resolverState);
+    const records = Array.from((nativeOptions == null
+      ? cottontail.dnsLookup(String(hostname), Number(family) || 0)
+      : cottontail.dnsLookup(String(hostname), Number(family) || 0, nativeOptions)) ?? [])
       .map((record) => ({ address: String(record.address), family: Number(record.family) }))
       .filter((record) => (record.family === 4 || record.family === 6) && record.address);
     if (records.length === 0) throw makeDnsError("no DNS records found", "getaddrinfo", hostname);
@@ -136,26 +150,32 @@ function lookupRecords(hostname, family = 0, order = defaultResultOrder) {
   }
 }
 
-function lookupServiceRecord(address, port) {
+function lookupServiceRecord(address, port, resolverState = null) {
   if (typeof cottontail.dnsLookupService !== "function") throw makeDnsError("native DNS service lookup is unavailable", "getnameinfo", address);
   try {
-    const record = cottontail.dnsLookupService(String(address), Number(port) || 0);
+    const nativeOptions = resolverNativeOptions(resolverState);
+    const record = nativeOptions == null
+      ? cottontail.dnsLookupService(String(address), Number(port) || 0)
+      : cottontail.dnsLookupService(String(address), Number(port) || 0, nativeOptions);
     return { hostname: String(record.hostname), service: String(record.service) };
   } catch (error) {
     throw makeDnsError(error, "getnameinfo", address);
   }
 }
 
-function resolveAddressRecords(hostname, family, options = undefined) {
+function resolveAddressRecords(hostname, family, options = undefined, resolverState = undefined) {
   const ttl = typeof options === "object" && options != null && options.ttl === true;
-  const records = lookupRecords(hostname, family);
+  const records = lookupRecords(hostname, family, defaultResultOrder, resolverState);
   return ttl ? records.map((record) => ({ address: record.address, ttl: 0 })) : records.map((record) => record.address);
 }
 
-function resolveNativeRecords(hostname, type, syscall = `query${type[0]}${type.slice(1).toLowerCase()}`) {
+function resolveNativeRecords(hostname, type, syscall = `query${type[0]}${type.slice(1).toLowerCase()}`, resolverState = undefined) {
   if (typeof cottontail.dnsResolveRecords !== "function") throw makeDnsError("native DNS record resolver is unavailable", syscall, hostname);
   try {
-    const records = Array.from(cottontail.dnsResolveRecords(String(hostname), type) ?? []);
+    const nativeOptions = resolverNativeOptions(resolverState);
+    const records = Array.from((nativeOptions == null
+      ? cottontail.dnsResolveRecords(String(hostname), type)
+      : cottontail.dnsResolveRecords(String(hostname), type, nativeOptions)) ?? []);
     if (records.length === 0) throw makeDnsError("no DNS records found", syscall, hostname, NODATA);
     return records;
   } catch (error) {
@@ -179,7 +199,7 @@ export function lookup(hostname, options = undefined, callback = undefined) {
   }
   const normalized = normalizeLookupOptions(options);
   callbackifyDns(() => {
-    const records = lookupRecords(hostname, normalized.family, normalized.order);
+    const records = lookupRecords(hostname, normalized.family, normalized.order, null);
     if (normalized.all) return [records];
     const first = records[0];
     return [first.address, first.family];
@@ -198,7 +218,7 @@ export function resolve4(hostname, options = undefined, callback = undefined) {
     callback = options;
     options = undefined;
   }
-  callbackifyDns(() => [resolveAddressRecords(hostname, 4, options)], callback);
+  callbackifyDns(() => [resolveAddressRecords(hostname, 4, options, undefined)], callback);
 }
 
 export function resolve6(hostname, options = undefined, callback = undefined) {
@@ -206,37 +226,45 @@ export function resolve6(hostname, options = undefined, callback = undefined) {
     callback = options;
     options = undefined;
   }
-  callbackifyDns(() => [resolveAddressRecords(hostname, 6, options)], callback);
+  callbackifyDns(() => [resolveAddressRecords(hostname, 6, options, undefined)], callback);
 }
 
-export function resolveAny(hostname, callback) {
+function resolveAnyWithState(hostname, callback, resolverState = undefined) {
   callbackifyDns(() => {
     const records = [];
     try {
-      for (const address of resolveAddressRecords(hostname, 4)) records.push({ type: "A", address });
+      for (const address of resolveAddressRecords(hostname, 4, undefined, resolverState)) records.push({ type: "A", address });
     } catch {}
     try {
-      for (const address of resolveAddressRecords(hostname, 6)) records.push({ type: "AAAA", address });
+      for (const address of resolveAddressRecords(hostname, 6, undefined, resolverState)) records.push({ type: "AAAA", address });
     } catch {}
     if (records.length === 0) throw makeDnsError("no DNS records found", "queryAny", hostname);
     return [records];
   }, callback);
 }
 
-export function resolvePtr(hostname, callback) {
+export function resolveAny(hostname, callback) {
+  return resolveAnyWithState(hostname, callback, undefined);
+}
+
+function resolvePtrWithState(hostname, callback, resolverState = undefined) {
   callbackifyDns(() => {
     try {
-      return [resolveNativeRecords(hostname, "PTR", "queryPtr")];
+      return [resolveNativeRecords(hostname, "PTR", "queryPtr", resolverState)];
     } catch {
-      const record = lookupServiceRecord(ptrNameToAddress(hostname), 0);
+      const record = lookupServiceRecord(ptrNameToAddress(hostname), 0, resolverState);
       return [[record.hostname]];
     }
   }, callback);
 }
 
+export function resolvePtr(hostname, callback) {
+  return resolvePtrWithState(hostname, callback, undefined);
+}
+
 export function reverse(ip, callback) {
   callbackifyDns(() => {
-    const record = lookupServiceRecord(ip, 0);
+    const record = lookupServiceRecord(ip, 0, undefined);
     return [[record.hostname]];
   }, callback);
 }
@@ -264,39 +292,39 @@ export function resolve(hostname, rrtype = "A", callback = undefined) {
 }
 
 export function resolveCaa(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "CAA", "queryCaa")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "CAA", "queryCaa", undefined)], callback);
 }
 
 export function resolveCname(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "CNAME", "queryCname")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "CNAME", "queryCname", undefined)], callback);
 }
 
 export function resolveMx(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "MX", "queryMx")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "MX", "queryMx", undefined)], callback);
 }
 
 export function resolveNaptr(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "NAPTR", "queryNaptr")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "NAPTR", "queryNaptr", undefined)], callback);
 }
 
 export function resolveNs(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "NS", "queryNs")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "NS", "queryNs", undefined)], callback);
 }
 
 export function resolveSoa(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "SOA", "querySoa")[0]], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "SOA", "querySoa", undefined)[0]], callback);
 }
 
 export function resolveSrv(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "SRV", "querySrv")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "SRV", "querySrv", undefined)], callback);
 }
 
 export function resolveTlsa(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "TLSA", "queryTlsa")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "TLSA", "queryTlsa", undefined)], callback);
 }
 
 export function resolveTxt(hostname, callback) {
-  callbackifyDns(() => [resolveNativeRecords(hostname, "TXT", "queryTxt")], callback);
+  callbackifyDns(() => [resolveNativeRecords(hostname, "TXT", "queryTxt", undefined)], callback);
 }
 
 export function getDefaultResultOrder() {
@@ -338,21 +366,58 @@ export class Resolver {
   cancel() {}
   getServers() { return [...this._servers]; }
   setServers(nextServers) { this._servers = normalizeServers(nextServers ?? []); }
-  resolve(hostname, rrtype, callback) { return resolve(hostname, rrtype, callback); }
-  resolve4(hostname, options, callback) { return resolve4(hostname, options, callback); }
-  resolve6(hostname, options, callback) { return resolve6(hostname, options, callback); }
-  resolveAny(hostname, callback) { return resolveAny(hostname, callback); }
-  resolveCaa(hostname, callback) { return resolveCaa(hostname, callback); }
-  resolveCname(hostname, callback) { return resolveCname(hostname, callback); }
-  resolveMx(hostname, callback) { return resolveMx(hostname, callback); }
-  resolveNaptr(hostname, callback) { return resolveNaptr(hostname, callback); }
-  resolveNs(hostname, callback) { return resolveNs(hostname, callback); }
-  resolvePtr(hostname, callback) { return resolvePtr(hostname, callback); }
-  resolveSoa(hostname, callback) { return resolveSoa(hostname, callback); }
-  resolveSrv(hostname, callback) { return resolveSrv(hostname, callback); }
-  resolveTlsa(hostname, callback) { return resolveTlsa(hostname, callback); }
-  resolveTxt(hostname, callback) { return resolveTxt(hostname, callback); }
-  reverse(ip, callback) { return reverse(ip, callback); }
+  resolve(hostname, rrtype = "A", callback = undefined) {
+    if (typeof rrtype === "function") {
+      callback = rrtype;
+      rrtype = "A";
+    }
+    const type = String(rrtype || "A").toUpperCase();
+    if (type === "A") return this.resolve4(hostname, callback);
+    if (type === "AAAA") return this.resolve6(hostname, callback);
+    if (type === "ANY") return this.resolveAny(hostname, callback);
+    if (type === "PTR") return this.resolvePtr(hostname, callback);
+    if (type === "CAA") return this.resolveCaa(hostname, callback);
+    if (type === "CNAME") return this.resolveCname(hostname, callback);
+    if (type === "MX") return this.resolveMx(hostname, callback);
+    if (type === "NAPTR") return this.resolveNaptr(hostname, callback);
+    if (type === "NS") return this.resolveNs(hostname, callback);
+    if (type === "SOA") return this.resolveSoa(hostname, callback);
+    if (type === "SRV") return this.resolveSrv(hostname, callback);
+    if (type === "TLSA") return this.resolveTlsa(hostname, callback);
+    if (type === "TXT") return this.resolveTxt(hostname, callback);
+    throw invalidRrtypeError(type);
+  }
+  resolve4(hostname, options = undefined, callback = undefined) {
+    if (typeof options === "function") {
+      callback = options;
+      options = undefined;
+    }
+    callbackifyDns(() => [resolveAddressRecords(hostname, 4, options, this)], callback);
+  }
+  resolve6(hostname, options = undefined, callback = undefined) {
+    if (typeof options === "function") {
+      callback = options;
+      options = undefined;
+    }
+    callbackifyDns(() => [resolveAddressRecords(hostname, 6, options, this)], callback);
+  }
+  resolveAny(hostname, callback) { return resolveAnyWithState(hostname, callback, this); }
+  resolveCaa(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "CAA", "queryCaa", this)], callback); }
+  resolveCname(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "CNAME", "queryCname", this)], callback); }
+  resolveMx(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "MX", "queryMx", this)], callback); }
+  resolveNaptr(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "NAPTR", "queryNaptr", this)], callback); }
+  resolveNs(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "NS", "queryNs", this)], callback); }
+  resolvePtr(hostname, callback) { return resolvePtrWithState(hostname, callback, this); }
+  resolveSoa(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "SOA", "querySoa", this)[0]], callback); }
+  resolveSrv(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "SRV", "querySrv", this)], callback); }
+  resolveTlsa(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "TLSA", "queryTlsa", this)], callback); }
+  resolveTxt(hostname, callback) { callbackifyDns(() => [resolveNativeRecords(hostname, "TXT", "queryTxt", this)], callback); }
+  reverse(ip, callback) {
+    callbackifyDns(() => {
+      const record = lookupServiceRecord(ip, 0, this);
+      return [[record.hostname]];
+    }, callback);
+  }
 }
 
 export class PromisesResolver {
@@ -365,21 +430,21 @@ export class PromisesResolver {
   cancel() {}
   getServers() { return [...this._servers]; }
   setServers(nextServers) { this._servers = normalizeServers(nextServers ?? []); }
-  resolve(hostname, rrtype = "A") { return promises.resolve(hostname, rrtype); }
-  resolve4(hostname, options = undefined) { return promises.resolve4(hostname, options); }
-  resolve6(hostname, options = undefined) { return promises.resolve6(hostname, options); }
-  resolveAny(hostname) { return promises.resolveAny(hostname); }
-  resolveCaa(hostname) { return promises.resolveCaa(hostname); }
-  resolveCname(hostname) { return promises.resolveCname(hostname); }
-  resolveMx(hostname) { return promises.resolveMx(hostname); }
-  resolveNaptr(hostname) { return promises.resolveNaptr(hostname); }
-  resolveNs(hostname) { return promises.resolveNs(hostname); }
-  resolvePtr(hostname) { return promises.resolvePtr(hostname); }
-  resolveSoa(hostname) { return promises.resolveSoa(hostname); }
-  resolveSrv(hostname) { return promises.resolveSrv(hostname); }
-  resolveTlsa(hostname) { return promises.resolveTlsa(hostname); }
-  resolveTxt(hostname) { return promises.resolveTxt(hostname); }
-  reverse(ip) { return promises.reverse(ip); }
+  resolve(hostname, rrtype = "A") { return promiseFromCallback(Resolver.prototype.resolve.bind(this), hostname, rrtype); }
+  resolve4(hostname, options = undefined) { return promiseFromCallback(Resolver.prototype.resolve4.bind(this), hostname, options); }
+  resolve6(hostname, options = undefined) { return promiseFromCallback(Resolver.prototype.resolve6.bind(this), hostname, options); }
+  resolveAny(hostname) { return promiseFromCallback(Resolver.prototype.resolveAny.bind(this), hostname); }
+  resolveCaa(hostname) { return promiseFromCallback(Resolver.prototype.resolveCaa.bind(this), hostname); }
+  resolveCname(hostname) { return promiseFromCallback(Resolver.prototype.resolveCname.bind(this), hostname); }
+  resolveMx(hostname) { return promiseFromCallback(Resolver.prototype.resolveMx.bind(this), hostname); }
+  resolveNaptr(hostname) { return promiseFromCallback(Resolver.prototype.resolveNaptr.bind(this), hostname); }
+  resolveNs(hostname) { return promiseFromCallback(Resolver.prototype.resolveNs.bind(this), hostname); }
+  resolvePtr(hostname) { return promiseFromCallback(Resolver.prototype.resolvePtr.bind(this), hostname); }
+  resolveSoa(hostname) { return promiseFromCallback(Resolver.prototype.resolveSoa.bind(this), hostname); }
+  resolveSrv(hostname) { return promiseFromCallback(Resolver.prototype.resolveSrv.bind(this), hostname); }
+  resolveTlsa(hostname) { return promiseFromCallback(Resolver.prototype.resolveTlsa.bind(this), hostname); }
+  resolveTxt(hostname) { return promiseFromCallback(Resolver.prototype.resolveTxt.bind(this), hostname); }
+  reverse(ip) { return promiseFromCallback(Resolver.prototype.reverse.bind(this), ip); }
 }
 
 export const promises = {
@@ -442,7 +507,7 @@ export const promises = {
   setServers,
 };
 
-// COTTONTAIL-COMPAT: node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and tracked, but record queries still use the platform resolver configuration until per-query resolver state is wired.
+// COTTONTAIL-COMPAT: node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and passed to native calls, but the current platform resolver backend does not yet issue record queries through caller-selected DNS servers.
 
 export default {
   ADDRCONFIG,

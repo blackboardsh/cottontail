@@ -19,9 +19,27 @@ fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
+    step.root_module.addIncludePath(b.path("vendors/bun-zig/src/jsc/bindings/sqlite"));
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
-        .flags = &[_][]const u8{ "-std=c11", "-Wno-deprecated-declarations" },
+        .flags = &[_][]const u8{
+            "-std=c11",
+            "-Wno-deprecated-declarations",
+            "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_SESSION",
+            "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+        },
+    });
+    step.root_module.addCSourceFile(.{
+        .file = b.path("vendors/bun-zig/src/jsc/bindings/sqlite/sqlite3.c"),
+        .flags = &[_][]const u8{
+            "-std=c11",
+            "-Wno-deprecated-declarations",
+            "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_SESSION",
+            "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+            "-DSQLITE_THREADSAFE=1",
+        },
     });
 
     if (step.root_module.resolved_target.?.result.os.tag == .macos) {
@@ -30,7 +48,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         step.root_module.linkSystemLibrary("compression", .{});
         step.root_module.linkSystemLibrary("pthread", .{});
         step.root_module.linkSystemLibrary("resolv", .{});
-        step.root_module.linkSystemLibrary("sqlite3", .{});
         step.root_module.linkSystemLibrary("z", .{});
         step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
         step.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });

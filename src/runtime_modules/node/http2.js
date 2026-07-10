@@ -10,6 +10,21 @@ export class Http2ServerResponse extends ServerResponse {}
 export const sensitiveHeaders = Symbol("sensitiveHeaders");
 
 export const constants = {
+  NGHTTP2_NO_ERROR: 0,
+  NGHTTP2_PROTOCOL_ERROR: 1,
+  NGHTTP2_INTERNAL_ERROR: 2,
+  NGHTTP2_FLOW_CONTROL_ERROR: 3,
+  NGHTTP2_SETTINGS_TIMEOUT: 4,
+  NGHTTP2_STREAM_CLOSED: 5,
+  NGHTTP2_FRAME_SIZE_ERROR: 6,
+  NGHTTP2_REFUSED_STREAM: 7,
+  NGHTTP2_CANCEL: 8,
+  NGHTTP2_COMPRESSION_ERROR: 9,
+  NGHTTP2_CONNECT_ERROR: 10,
+  NGHTTP2_ENHANCE_YOUR_CALM: 11,
+  NGHTTP2_INADEQUATE_SECURITY: 12,
+  NGHTTP2_HTTP_1_1_REQUIRED: 13,
+  NGHTTP2_DEFAULT_WEIGHT: 16,
   NGHTTP2_SETTINGS_HEADER_TABLE_SIZE: 1,
   NGHTTP2_SETTINGS_ENABLE_PUSH: 2,
   NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 3,
@@ -44,7 +59,17 @@ const settingsFields = [
 ];
 
 const clientPreface = Buffer.from("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-const frameTypes = { DATA: 0, HEADERS: 1, SETTINGS: 4, WINDOW_UPDATE: 8 };
+const frameTypes = {
+  DATA: 0,
+  HEADERS: 1,
+  PRIORITY: 2,
+  RST_STREAM: 3,
+  SETTINGS: 4,
+  PUSH_PROMISE: 5,
+  PING: 6,
+  GOAWAY: 7,
+  WINDOW_UPDATE: 8,
+};
 const flags = { END_STREAM: 0x1, END_HEADERS: 0x4, ACK: 0x1 };
 const staticTable = {
   1: [":authority", ""],
@@ -95,6 +120,29 @@ function readUint16BE(buffer, offset) {
 
 function readUint32BE(buffer, offset) {
   return ((buffer[offset] * 0x1000000) + ((buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3])) >>> 0;
+}
+
+function normalizeCode(code, fallback = constants.NGHTTP2_NO_ERROR) {
+  const value = Number(code ?? fallback);
+  return Number.isFinite(value) ? (value >>> 0) : fallback;
+}
+
+function normalizeStreamId(streamId) {
+  const value = Number(streamId ?? 0);
+  return Number.isFinite(value) ? (value >>> 0) & 0x7fffffff : 0;
+}
+
+function eightBytePayload(payload = undefined) {
+  const out = Buffer.alloc(8);
+  if (payload != null) {
+    const bytes = Buffer.from(payload);
+    if (bytes.byteLength !== 8) throw new RangeError("HTTP/2 ping payload must be exactly 8 bytes");
+    out.set(bytes, 0);
+  } else {
+    writeUint32BE(out, 0, Math.floor(Date.now() / 1000));
+    writeUint32BE(out, 4, Math.floor(Math.random() * 0xffffffff));
+  }
+  return out;
 }
 
 function encodeLength(length) {
@@ -265,11 +313,25 @@ export class Http2Stream extends EventEmitter {
     this.headers = headers;
     this.closed = false;
     this.destroyed = false;
+    this.rstCode = constants.NGHTTP2_NO_ERROR;
+    this.closeCode = constants.NGHTTP2_NO_ERROR;
+    this.sentHeaders = false;
+    this.sentTrailers = false;
+    this.state = {
+      state: 0,
+      weight: constants.NGHTTP2_DEFAULT_WEIGHT,
+      sumDependencyWeight: 0,
+      localClose: 0,
+      remoteClose: 0,
+      localWindowSize: 65535,
+    };
   }
 
   respond(headers = {}, options = {}) {
     void options;
     this.session._sendHeaders(this.id, { ":status": headers[":status"] ?? headers.status ?? 200, ...headers }, false);
+    this.sentHeaders = true;
+    return this;
   }
 
   write(chunk) {
@@ -281,6 +343,8 @@ export class Http2Stream extends EventEmitter {
     if (chunk != null) this.session._sendData(this.id, chunk, false);
     this.session._sendData(this.id, Buffer.alloc(0), true);
     this.closed = true;
+    this.closeCode = constants.NGHTTP2_NO_ERROR;
+    this.state.localClose = 1;
     this.emit("close");
     return this;
   }
@@ -288,7 +352,54 @@ export class Http2Stream extends EventEmitter {
   destroy(error = undefined) {
     this.destroyed = true;
     if (error) this.emit("error", error);
+    this.close(constants.NGHTTP2_CANCEL);
+    return this;
+  }
+
+  close(code = constants.NGHTTP2_NO_ERROR, callback = undefined) {
+    if (typeof callback === "function") this.once("close", callback);
+    if (this.closed) return this;
+    const closeCode = normalizeCode(code);
+    this.closed = true;
+    this.destroyed = true;
+    this.rstCode = closeCode;
+    this.closeCode = closeCode;
+    this.state.localClose = 1;
+    this.session._streams.delete(this.id);
+    this.session._sendRstStream(this.id, closeCode);
     this.emit("close");
+    return this;
+  }
+
+  priority(options = {}, callback = undefined) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    const weight = Math.max(1, Math.min(256, Number(options?.weight ?? constants.NGHTTP2_DEFAULT_WEIGHT)));
+    const parent = normalizeStreamId(options?.parent ?? options?.streamDependency ?? 0);
+    const exclusive = options?.exclusive === true;
+    this.state.weight = weight;
+    this.state.sumDependencyWeight = weight;
+    this.session._sendPriority(this.id, { parent, weight, exclusive });
+    if (typeof callback === "function") queueMicrotask(callback);
+    return this;
+  }
+
+  pushStream(headers = {}, callback = undefined) {
+    if (!this.session.isServer) {
+      const error = new Error("HTTP/2 push streams can only be created by a server session");
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      else throw error;
+      return undefined;
+    }
+    const promisedId = this.session._nextStreamId;
+    this.session._nextStreamId += 2;
+    const stream = new Http2Stream(this.session, promisedId, headers);
+    this.session._streams.set(promisedId, stream);
+    this.session._sendPushPromise(this.id, promisedId, headers);
+    if (typeof callback === "function") queueMicrotask(() => callback(null, stream, headers));
+    return stream;
   }
 
   setEncoding(encoding = "utf8") {
@@ -300,6 +411,7 @@ export class Http2Stream extends EventEmitter {
     const chunk = this._encoding ? payload.toString(this._encoding) : Buffer.from(payload);
     if (payload.byteLength > 0) this.emit("data", chunk);
     if (endStream) {
+      this.state.remoteClose = 1;
       this.emit("end");
       this.emit("close");
     }
@@ -318,6 +430,24 @@ class Http2Session extends EventEmitter {
     this._nextStreamId = isServer ? 2 : 1;
     this._streams = new Map();
     this._closeScheduled = false;
+    this.localSettings = defaultSettingsObject();
+    this.remoteSettings = defaultSettingsObject();
+    this._pendingSettingsCallbacks = [];
+    this._pendingPings = new Map();
+    this.localWindowSize = this.localSettings.initialWindowSize;
+    this.remoteWindowSize = this.remoteSettings.initialWindowSize;
+    this.goawayCode = constants.NGHTTP2_NO_ERROR;
+    this.state = {
+      effectiveLocalWindowSize: this.localWindowSize,
+      effectiveRecvDataLength: 0,
+      nextStreamID: this._nextStreamId,
+      localWindowSize: this.localWindowSize,
+      lastProcStreamID: 0,
+      remoteWindowSize: this.remoteWindowSize,
+      outboundQueueSize: 0,
+      deflateDynamicTableSize: this.localSettings.headerTableSize,
+      inflateDynamicTableSize: this.remoteSettings.headerTableSize,
+    };
     socket.on("data", (chunk) => this._receive(chunk));
     socket.on("end", () => this.close());
     socket.on("error", (error) => this.emit("error", error));
@@ -332,8 +462,15 @@ class Http2Session extends EventEmitter {
     }
   }
 
-  _sendSettings(ack = false) {
-    writeFrame(this.socket, frameTypes.SETTINGS, ack ? flags.ACK : 0, 0, Buffer.alloc(0));
+  _sendSettings(settings = undefined, ack = false) {
+    const payload = ack ? Buffer.alloc(0) : getPackedSettings(settings ?? {});
+    if (!ack && payload.byteLength > 0) {
+      this.localSettings = { ...this.localSettings, ...getUnpackedSettings(payload) };
+      this.localWindowSize = this.localSettings.initialWindowSize;
+      this.state.localWindowSize = this.localWindowSize;
+      this.state.effectiveLocalWindowSize = this.localWindowSize;
+    }
+    writeFrame(this.socket, frameTypes.SETTINGS, ack ? flags.ACK : 0, 0, payload);
   }
 
   _sendHeaders(streamId, headers, endStream = false) {
@@ -342,6 +479,46 @@ class Http2Session extends EventEmitter {
 
   _sendData(streamId, data, endStream = false) {
     writeFrame(this.socket, frameTypes.DATA, endStream ? flags.END_STREAM : 0, streamId, Buffer.from(data ?? []));
+  }
+
+  _sendRstStream(streamId, code = constants.NGHTTP2_NO_ERROR) {
+    const payload = Buffer.alloc(4);
+    writeUint32BE(payload, 0, normalizeCode(code));
+    writeFrame(this.socket, frameTypes.RST_STREAM, 0, normalizeStreamId(streamId), payload);
+  }
+
+  _sendPriority(streamId, { parent = 0, weight = constants.NGHTTP2_DEFAULT_WEIGHT, exclusive = false } = {}) {
+    const payload = Buffer.alloc(5);
+    writeUint32BE(payload, 0, normalizeStreamId(parent) | (exclusive ? 0x80000000 : 0));
+    payload[4] = Math.max(0, Math.min(255, Number(weight) - 1));
+    writeFrame(this.socket, frameTypes.PRIORITY, 0, normalizeStreamId(streamId), payload);
+  }
+
+  _sendPushPromise(streamId, promisedId, headers = {}) {
+    const headerBlock = encodeHeaders(headers);
+    const payload = Buffer.alloc(4 + headerBlock.byteLength);
+    writeUint32BE(payload, 0, normalizeStreamId(promisedId));
+    payload.set(headerBlock, 4);
+    writeFrame(this.socket, frameTypes.PUSH_PROMISE, flags.END_HEADERS, normalizeStreamId(streamId), payload);
+  }
+
+  _sendWindowUpdate(streamId, increment) {
+    const amount = Number(increment);
+    if (!Number.isInteger(amount) || amount <= 0 || amount > 0x7fffffff) {
+      throw new RangeError("HTTP/2 window update increment must be between 1 and 2147483647");
+    }
+    const payload = Buffer.alloc(4);
+    writeUint32BE(payload, 0, amount & 0x7fffffff);
+    writeFrame(this.socket, frameTypes.WINDOW_UPDATE, 0, normalizeStreamId(streamId), payload);
+  }
+
+  _sendGoaway(code = constants.NGHTTP2_NO_ERROR, lastStreamID = 0, opaqueData = undefined) {
+    const opaque = opaqueData == null ? Buffer.alloc(0) : Buffer.from(opaqueData);
+    const payload = Buffer.alloc(8 + opaque.byteLength);
+    writeUint32BE(payload, 0, normalizeStreamId(lastStreamID));
+    writeUint32BE(payload, 4, normalizeCode(code));
+    payload.set(opaque, 8);
+    writeFrame(this.socket, frameTypes.GOAWAY, 0, 0, payload);
   }
 
   _receive(chunk) {
@@ -363,7 +540,19 @@ class Http2Session extends EventEmitter {
 
   _handleFrame(frame) {
     if (frame.type === frameTypes.SETTINGS) {
-      if ((frame.flags & flags.ACK) === 0) this._sendSettings(true);
+      if ((frame.flags & flags.ACK) !== 0) {
+        const callback = this._pendingSettingsCallbacks.shift();
+        if (typeof callback === "function") queueMicrotask(() => callback(null, this.localSettings));
+        this.emit("localSettings", this.localSettings);
+      } else {
+        const settings = getUnpackedSettings(frame.payload);
+        this.remoteSettings = { ...this.remoteSettings, ...settings };
+        this.remoteWindowSize = this.remoteSettings.initialWindowSize;
+        this.state.remoteWindowSize = this.remoteWindowSize;
+        this.state.inflateDynamicTableSize = this.remoteSettings.headerTableSize;
+        this.emit("remoteSettings", this.remoteSettings);
+        this._sendSettings(undefined, true);
+      }
       return;
     }
     if (frame.type === frameTypes.HEADERS) {
@@ -380,7 +569,94 @@ class Http2Session extends EventEmitter {
     }
     if (frame.type === frameTypes.DATA) {
       const stream = this._streams.get(frame.streamId);
-      if (stream) stream._receiveData(frame.payload, (frame.flags & flags.END_STREAM) !== 0);
+      if (stream) {
+        stream.state.localWindowSize = Math.max(0, stream.state.localWindowSize - frame.payload.byteLength);
+        this.state.effectiveRecvDataLength += frame.payload.byteLength;
+        stream._receiveData(frame.payload, (frame.flags & flags.END_STREAM) !== 0);
+      }
+      return;
+    }
+    if (frame.type === frameTypes.RST_STREAM) {
+      if (frame.payload.byteLength < 4) return;
+      const stream = this._streams.get(frame.streamId);
+      if (!stream) return;
+      const code = readUint32BE(frame.payload, 0);
+      stream.rstCode = code;
+      stream.closeCode = code;
+      stream.closed = true;
+      stream.destroyed = true;
+      stream.state.remoteClose = 1;
+      this._streams.delete(frame.streamId);
+      if (code !== constants.NGHTTP2_NO_ERROR) stream.emit("aborted");
+      stream.emit("close");
+      return;
+    }
+    if (frame.type === frameTypes.PRIORITY) {
+      if (frame.payload.byteLength < 5) return;
+      const dependency = readUint32BE(frame.payload, 0);
+      const priority = {
+        parent: dependency & 0x7fffffff,
+        exclusive: (dependency & 0x80000000) !== 0,
+        weight: Number(frame.payload[4]) + 1,
+      };
+      const stream = this._streams.get(frame.streamId);
+      if (stream) {
+        stream.state.weight = priority.weight;
+        stream.emit("priority", priority);
+      }
+      this.emit("priority", frame.streamId, priority);
+      return;
+    }
+    if (frame.type === frameTypes.PUSH_PROMISE) {
+      if (frame.payload.byteLength < 4) return;
+      const promisedId = readUint32BE(frame.payload, 0) & 0x7fffffff;
+      const headers = decodeHeaders(frame.payload.subarray(4));
+      const stream = new Http2Stream(this, promisedId, headers);
+      this._streams.set(promisedId, stream);
+      this.emit("stream", stream, headers, frame.streamId);
+      return;
+    }
+    if (frame.type === frameTypes.PING) {
+      if (frame.payload.byteLength !== 8) return;
+      const payload = Buffer.from(frame.payload);
+      const key = payload.toString("hex");
+      if ((frame.flags & flags.ACK) !== 0) {
+        const pending = this._pendingPings.get(key);
+        if (pending) {
+          this._pendingPings.delete(key);
+          queueMicrotask(() => pending.callback(null, Date.now() - pending.start, payload));
+        }
+      } else {
+        this.emit("ping", payload);
+        writeFrame(this.socket, frameTypes.PING, flags.ACK, 0, payload);
+      }
+      return;
+    }
+    if (frame.type === frameTypes.GOAWAY) {
+      if (frame.payload.byteLength < 8) return;
+      const lastStreamID = readUint32BE(frame.payload, 0) & 0x7fffffff;
+      const errorCode = readUint32BE(frame.payload, 4);
+      const opaqueData = Buffer.from(frame.payload.subarray(8));
+      this.goawayCode = errorCode;
+      this.closed = true;
+      this.state.lastProcStreamID = lastStreamID;
+      this.emit("goaway", errorCode, lastStreamID, opaqueData);
+      return;
+    }
+    if (frame.type === frameTypes.WINDOW_UPDATE) {
+      if (frame.payload.byteLength < 4) return;
+      const increment = readUint32BE(frame.payload, 0) & 0x7fffffff;
+      if (frame.streamId === 0) {
+        this.remoteWindowSize += increment;
+        this.state.remoteWindowSize = this.remoteWindowSize;
+        this.emit("windowUpdate", increment);
+      } else {
+        const stream = this._streams.get(frame.streamId);
+        if (stream) {
+          stream.state.localWindowSize += increment;
+          stream.emit("windowUpdate", increment);
+        }
+      }
     }
   }
 
@@ -388,6 +664,7 @@ class Http2Session extends EventEmitter {
     void options;
     const id = this._nextStreamId;
     this._nextStreamId += 2;
+    this.state.nextStreamID = this._nextStreamId;
     const stream = new Http2Stream(this, id, headers);
     this._streams.set(id, stream);
     this._sendHeaders(id, {
@@ -398,6 +675,48 @@ class Http2Session extends EventEmitter {
       ...headers,
     }, false);
     return stream;
+  }
+
+  settings(settings = {}, callback = undefined) {
+    if (typeof settings === "function") {
+      callback = settings;
+      settings = {};
+    }
+    if (typeof callback === "function") this._pendingSettingsCallbacks.push(callback);
+    this._sendSettings(settings ?? {}, false);
+    return this;
+  }
+
+  ping(payload = undefined, callback = undefined) {
+    if (typeof payload === "function") {
+      callback = payload;
+      payload = undefined;
+    }
+    const body = eightBytePayload(payload);
+    if (typeof callback === "function") {
+      this._pendingPings.set(body.toString("hex"), { callback, start: Date.now() });
+    }
+    writeFrame(this.socket, frameTypes.PING, 0, 0, body);
+    return true;
+  }
+
+  goaway(code = constants.NGHTTP2_NO_ERROR, lastStreamID = 0, opaqueData = undefined) {
+    this._sendGoaway(code, lastStreamID, opaqueData);
+    this.goawayCode = normalizeCode(code);
+    return this;
+  }
+
+  setLocalWindowSize(windowSize) {
+    const size = Number(windowSize);
+    if (!Number.isInteger(size) || size < 0 || size > 0x7fffffff) {
+      throw new RangeError("HTTP/2 local window size must be between 0 and 2147483647");
+    }
+    const increment = size - this.localWindowSize;
+    this.localWindowSize = size;
+    this.state.localWindowSize = size;
+    this.state.effectiveLocalWindowSize = size;
+    if (increment > 0) this._sendWindowUpdate(0, increment);
+    return this;
   }
 
   ref() { return this; }
@@ -517,7 +836,7 @@ export function performServerHandshake() {
   return undefined;
 }
 
-// COTTONTAIL-COMPAT: node:http2 sessions - basic socket-backed client/server sessions, SETTINGS, HEADERS, DATA, stream events, settings packing, and HTTP/1-compatible request/response classes are implemented; full HPACK/Huffman, flow control, priority, push, GOAWAY/RST_STREAM, and extended nghttp2 parity need deeper protocol work.
+// COTTONTAIL-COMPAT: node:http2 sessions - socket-backed client/server sessions, SETTINGS/ACK callbacks, HEADERS, DATA, PING, GOAWAY, RST_STREAM, PRIORITY, PUSH_PROMISE, WINDOW_UPDATE, stream events, settings packing, and HTTP/1-compatible request/response classes are implemented; full HPACK/Huffman dynamic tables, enforced flow-control backpressure, trailers, ALTSVC/ORIGIN, and extended nghttp2 parity need deeper protocol work.
 
 export default {
   Http2Stream,

@@ -214,11 +214,53 @@ const backupDb = new DatabaseSync(backupPath);
 strictEqual(backupDb.prepare("select count(*) as count from items").get().count, 3, "backup row count mismatch");
 backupDb.close();
 
+const sessionSource = new DatabaseSync(":memory:");
+sessionSource.exec("create table session_items (id integer primary key, name text not null)");
+const session = sessionSource.createSession({ table: "session_items" });
+strictEqual(session instanceof Session, true, "createSession should return Session");
+sessionSource.prepare("insert into session_items(id, name) values (?, ?)").run(1, "one");
+const changeset = session.changeset();
+const patchset = session.patchset();
+strictEqual(changeset instanceof Uint8Array, true, "Session.changeset should return Uint8Array");
+strictEqual(patchset instanceof Uint8Array, true, "Session.patchset should return Uint8Array");
+ok(changeset.byteLength > 0, "Session.changeset should contain changes");
+ok(patchset.byteLength > 0, "Session.patchset should contain changes");
+
+const sessionTarget = new DatabaseSync(":memory:");
+sessionTarget.exec("create table session_items (id integer primary key, name text not null)");
+strictEqual(sessionTarget.applyChangeset(changeset), true, "applyChangeset should apply insert changes");
+strictEqual(sessionTarget.prepare("select name from session_items where id = 1").get().name, "one", "applyChangeset inserted row mismatch");
+strictEqual(sessionTarget.applyChangeset(changeset), false, "applyChangeset conflict without handler should return false");
+strictEqual(
+  sessionTarget.applyChangeset(changeset, {
+    onConflict(reason) {
+      strictEqual(reason, constants.SQLITE_CHANGESET_CONFLICT, "applyChangeset conflict reason mismatch");
+      return constants.SQLITE_CHANGESET_OMIT;
+    },
+  }),
+  true,
+  "applyChangeset onConflict OMIT should continue",
+);
+strictEqual(
+  sessionTarget.applyChangeset(changeset, {
+    filter(table) {
+      strictEqual(table, "session_items", "applyChangeset filter table mismatch");
+      return false;
+    },
+  }),
+  true,
+  "applyChangeset filter false should skip table",
+);
+session.close();
+throws(() => session.changeset(), /not open/, "Session.changeset after close should fail");
+sessionSource.close();
+sessionTarget.close();
+
 try {
   new Session();
-  throw new Error("Session should require sqlite session extension support");
+  throw new Error("Session constructor should be illegal");
 } catch (error) {
-  ok(String((error as Error).message).includes("session extension"), "Session unsupported error mismatch");
+  ok(String((error as Error).message).includes("Illegal constructor"), "Session illegal constructor error mismatch");
 }
 
 db.close();

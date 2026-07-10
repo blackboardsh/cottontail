@@ -2,6 +2,8 @@ function sqliteUnavailable() {
   if (typeof cottontail.sqliteOpen !== "function") throw new Error("native SQLite support is unavailable");
 }
 
+const sessionConstructorToken = Symbol("sqlite Session constructor token");
+
 function bindArgs(args) {
   if (args.length === 1 && args[0] != null && typeof args[0] === "object" && !Array.isArray(args[0]) && !(args[0] instanceof ArrayBuffer) && !ArrayBuffer.isView(args[0])) {
     return args[0];
@@ -18,6 +20,21 @@ function sqliteArgCount(kind, value, fallback) {
     throw new RangeError(`DatabaseSync.${kind} argument count must be between 0 and 127`);
   }
   return argc;
+}
+
+function invalidState(message) {
+  const error = new Error(message);
+  error.code = "ERR_INVALID_STATE";
+  return error;
+}
+
+function validateSessionOptions(options) {
+  if (options == null) {
+    if (options === undefined) return {};
+    throw new TypeError('The "options" argument must be an object');
+  }
+  if (typeof options !== "object" && typeof options !== "function") throw new TypeError('The "options" argument must be an object');
+  return options;
 }
 
 export const constants = {
@@ -253,11 +270,18 @@ export class DatabaseSync {
   }
 
   createSession() {
-    throw new Error("DatabaseSync.createSession requires SQLite session extension support");
+    this._assertOpen();
+    const options = validateSessionOptions(arguments[0]);
+    const native = cottontail.sqliteSessionCreate(this.id, options.db ?? "main", options.table ?? null);
+    return new Session(native, this, sessionConstructorToken);
   }
 
-  applyChangeset() {
-    throw new Error("DatabaseSync.applyChangeset requires SQLite session extension support");
+  applyChangeset(changeset, options = {}) {
+    this._assertOpen();
+    const normalizedOptions = validateSessionOptions(options);
+    const filter = typeof normalizedOptions.filter === "function" ? normalizedOptions.filter : null;
+    const onConflict = typeof normalizedOptions.onConflict === "function" ? normalizedOptions.onConflict : null;
+    return cottontail.sqliteApplyChangeset(this.id, changeset, filter, onConflict);
   }
 
   enableLoadExtension(enabled = true) {
@@ -278,8 +302,37 @@ export class DatabaseSync {
 }
 
 export class Session {
-  constructor() {
-    throw new Error("node:sqlite Session requires SQLite session extension support");
+  constructor(native = undefined, database = undefined, token = undefined) {
+    if (token !== sessionConstructorToken) {
+      const error = new Error("Illegal constructor");
+      error.code = "ERR_ILLEGAL_CONSTRUCTOR";
+      throw error;
+    }
+    this.id = Number(native?.id);
+    this.database = database;
+    this.open = true;
+  }
+
+  _assertOpen() {
+    if (!this.open || this.id == null) throw invalidState("session is not open");
+    this.database?._assertOpen();
+  }
+
+  changeset() {
+    this._assertOpen();
+    return new Uint8Array(cottontail.sqliteSessionChangeset(this.id, false));
+  }
+
+  patchset() {
+    this._assertOpen();
+    return new Uint8Array(cottontail.sqliteSessionChangeset(this.id, true));
+  }
+
+  close() {
+    if (!this.open || this.id == null) return;
+    cottontail.sqliteSessionClose(this.id);
+    this.id = null;
+    this.open = false;
   }
 }
 
@@ -288,8 +341,6 @@ export function backup(sourceDb, path) {
   sourceDb._assertOpen();
   return Promise.resolve(cottontail.sqliteBackup(sourceDb.id, String(path)));
 }
-
-// COTTONTAIL-COMPAT: node:sqlite session extension - DatabaseSync, StatementSync, SQLTagStore, scalar/aggregate/window user functions, authorizers, backup, extension loading, constants, and synchronous query execution use native sqlite3; Session/changesets need sqlite3 session extension bindings.
 
 export default {
   DatabaseSync,

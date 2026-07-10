@@ -28,6 +28,7 @@ import {
   deflateRawSync,
   deflateSync,
   gzipSync,
+  gunzipSync,
   inflateSync,
   zstdCompress,
   zstdCompressSync,
@@ -77,6 +78,24 @@ assert(createZstdDecompress() instanceof ZstdDecompress, "createZstdDecompress c
 const gzipCompressed = await collectStream(createGzip(), "hello zlib streams");
 const gzipRoundTrip = await collectStream(createGunzip(), gzipCompressed);
 assert(new TextDecoder().decode(gzipRoundTrip) === "hello zlib streams", "gzip/gunzip stream round trip mismatch");
+
+const flushedGzipChunks: Uint8Array[] = [];
+const flushedGzip = createGzip();
+flushedGzip.on("data", (chunk) => flushedGzipChunks.push(chunk));
+flushedGzip.write("flush-");
+await new Promise<void>((resolve, reject) => {
+  flushedGzip.flush((error) => error ? reject(error) : resolve());
+});
+assert(flushedGzipChunks.length > 0, "gzip flush should emit buffered output");
+const flushedBeforeEnd = flushedGzipChunks.length;
+assert(new TextDecoder().decode(gunzipSync(Buffer.concat(flushedGzipChunks))) === "flush-", "gzip flushed chunk round trip mismatch");
+await new Promise<void>((resolve, reject) => {
+  flushedGzip.once("error", reject);
+  flushedGzip.once("end", () => resolve());
+  flushedGzip.end("end");
+});
+assert(flushedGzipChunks.length > flushedBeforeEnd, "gzip end should emit remaining output after flush");
+assert(new TextDecoder().decode(gunzipSync(Buffer.concat(flushedGzipChunks.slice(flushedBeforeEnd)))) === "end", "gzip post-flush end round trip mismatch");
 
 const deflated = await collectStream(createDeflate(), "deflate stream");
 const inflated = await collectStream(createInflate(), deflated);

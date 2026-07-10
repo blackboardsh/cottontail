@@ -15898,8 +15898,8 @@
       "signals": {
         "publicNodeModules": 58,
         "nodeTestFiles": 31,
-        "compatMarkers": 12,
-        "modulesWithCompatMarkers": 12,
+        "compatMarkers": 11,
+        "modulesWithCompatMarkers": 11,
         "explicitUnsupportedMarkers": 0,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 0
@@ -15957,15 +15957,6 @@
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
           "tests": 4,
-          "gapScore": 3
-        },
-        {
-          "name": "sqlite",
-          "file": "src/runtime_modules/node/sqlite.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "nativeAvailabilityGuards": 0,
-          "tests": 1,
           "gapScore": 3
         },
         {
@@ -16029,7 +16020,7 @@
         "dns": {
           "file": "src/runtime_modules/node/dns.js",
           "compatMarkers": [
-            "node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and tracked, but record queries still use the platform resolver configuration until per-query resolver state is wired."
+            "node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and passed to native calls, but the current platform resolver backend does not yet issue record queries through caller-selected DNS servers."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
@@ -16040,7 +16031,7 @@
         "http2": {
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": [
-            "node:http2 sessions - basic socket-backed client/server sessions, SETTINGS, HEADERS, DATA, stream events, settings packing, and HTTP/1-compatible request/response classes are implemented; full HPACK/Huffman, flow control, priority, push, GOAWAY/RST_STREAM, and extended nghttp2 parity need deeper protocol work."
+            "node:http2 sessions - socket-backed client/server sessions, SETTINGS/ACK callbacks, HEADERS, DATA, PING, GOAWAY, RST_STREAM, PRIORITY, PUSH_PROMISE, WINDOW_UPDATE, stream events, settings packing, and HTTP/1-compatible request/response classes are implemented; full HPACK/Huffman dynamic tables, enforced flow-control backpressure, trailers, ALTSVC/ORIGIN, and extended nghttp2 parity need deeper protocol work."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
@@ -16084,21 +16075,10 @@
             "tests/js/node-process.ts"
           ]
         },
-        "sqlite": {
-          "file": "src/runtime_modules/node/sqlite.js",
-          "compatMarkers": [
-            "node:sqlite session extension - DatabaseSync, StatementSync, SQLTagStore, scalar/aggregate/window user functions, authorizers, backup, extension loading, constants, and synchronous query execution use native sqlite3; Session/changesets need sqlite3 session extension bindings."
-          ],
-          "unsupportedMarkers": [],
-          "nativeAvailabilityGuards": [],
-          "tests": [
-            "tests/js/node-sqlite-surface.ts"
-          ]
-        },
         "tls": {
           "file": "src/runtime_modules/node/tls.js",
           "compatMarkers": [
-            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, and default cipher inventory are implemented; renegotiation, OCSP stapling, and resumable session cache wiring need deeper bindings."
+            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, default cipher inventory, session setters, trace toggles, and OCSP/TLS-ticket accessors are implemented; protocol-level renegotiation, OCSP stapling generation, and resumable session cache wiring need deeper bindings."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],

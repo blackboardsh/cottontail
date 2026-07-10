@@ -225,6 +225,8 @@ export class TLSSocket extends Socket {
     this._tlsInfo = null;
     this._encoding = null;
     this._tlsListenerInstalled = false;
+    this._session = bufferFromNativeBytes(options?.session);
+    this._renegotiationDisabled = false;
     this.allowHalfOpen = options?.allowHalfOpen === true;
   }
 
@@ -360,17 +362,40 @@ export class TLSSocket extends Socket {
     const info = this._currentTlsInfo();
     return info?.protocol ?? null;
   }
+  getOCSPResponse() {
+    return bufferFromNativeBytes(this._currentTlsInfo()?.ocspResponse);
+  }
   getSession() {
-    return bufferFromNativeBytes(this._currentTlsInfo()?.session);
+    return bufferFromNativeBytes(this._currentTlsInfo()?.session) ?? this._session;
+  }
+  getTLSTicket() {
+    return bufferFromNativeBytes(this._currentTlsInfo()?.tlsTicket);
   }
   isSessionReused() {
     return Boolean(this._currentTlsInfo()?.sessionReused);
+  }
+  setSession(session) {
+    this._session = bufferFromNativeBytes(session) ?? Buffer.from(session ?? []);
+    return this;
+  }
+  disableRenegotiation() {
+    this._renegotiationDisabled = true;
+    return undefined;
+  }
+  enableTrace() {
+    this._traceEnabled = true;
   }
   renegotiate(options = {}, callback = undefined) {
     if (options == null || typeof options !== "object") {
       throw new TypeError('The "options" argument must be of type object');
     }
-    void callback;
+    if (this._renegotiationDisabled) {
+      const error = new Error("TLS renegotiation is disabled");
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      this.emit("error", error);
+      return false;
+    }
+    if (typeof callback === "function") queueMicrotask(() => callback(null));
     return true;
   }
   setMaxSendFragment() { return false; }
@@ -516,7 +541,7 @@ export function getCiphers() {
   return [...defaultCipherNames];
 }
 
-// COTTONTAIL-COMPAT: node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, and default cipher inventory are implemented; renegotiation, OCSP stapling, and resumable session cache wiring need deeper bindings.
+// COTTONTAIL-COMPAT: node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, default cipher inventory, session setters, trace toggles, and OCSP/TLS-ticket accessors are implemented; protocol-level renegotiation, OCSP stapling generation, and resumable session cache wiring need deeper bindings.
 
 export default {
   CLIENT_RENEG_LIMIT,

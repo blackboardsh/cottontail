@@ -108,6 +108,30 @@ deepStrictEqual(promiseResolver.getServers(), ["1.1.1.1"], "dns promises Resolve
 const promiseResolverAddresses = await promiseResolver.resolve4("localhost");
 ok(promiseResolverAddresses.includes("127.0.0.1"), "dns promises Resolver resolve4 mismatch");
 
+const nativeHost = (globalThis as typeof globalThis & { cottontail?: any }).cottontail;
+if (nativeHost?.dnsResolveRecords) {
+  const originalResolveRecords = nativeHost.dnsResolveRecords;
+  let capturedResolverOptions: any;
+  nativeHost.dnsResolveRecords = (hostname: string, type: string, options: unknown) => {
+    capturedResolverOptions = options;
+    return originalResolveRecords(hostname, type);
+  };
+  try {
+    const statefulResolver = new dns.Resolver({ timeout: 123, tries: 2 });
+    statefulResolver.setServers(["8.8.8.8"]);
+    await new Promise<void>((resolve) => {
+      statefulResolver.resolveMx("cottontail.invalid", () => resolve());
+    });
+    deepStrictEqual(
+      capturedResolverOptions,
+      { servers: ["8.8.8.8"], timeout: 123, tries: 2 },
+      "dns Resolver native options should include local server state",
+    );
+  } finally {
+    nativeHost.dnsResolveRecords = originalResolveRecords;
+  }
+}
+
 try {
   dns.resolve("localhost", "BAD", () => {});
   throw new Error("dns.resolve invalid rrtype should throw");

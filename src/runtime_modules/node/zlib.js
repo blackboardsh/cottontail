@@ -193,6 +193,26 @@ class ZlibTransform extends Transform {
     this.bytesWritten = 0;
   }
 
+  _consumeChunks() {
+    const inputLength = this._chunks.reduce((sum, item) => sum + item.byteLength, 0);
+    const input = new Uint8Array(inputLength);
+    let offset = 0;
+    for (const chunkBytes of this._chunks) {
+      input.set(chunkBytes, offset);
+      offset += chunkBytes.byteLength;
+    }
+    this._chunks = [];
+    return input;
+  }
+
+  _emitBuffered() {
+    if (this._chunks.length === 0) return false;
+    const output = transformSync(this._mode, this._consumeChunks(), this._options);
+    this.bytesWritten += output.byteLength ?? output.length ?? 0;
+    this.push(output);
+    return true;
+  }
+
   write(chunk, encoding = undefined, callback = undefined) {
     if (typeof encoding === "function") {
       callback = encoding;
@@ -215,16 +235,7 @@ class ZlibTransform extends Transform {
     }
     if (chunk != null) this.write(chunk, encoding);
     try {
-      const inputLength = this._chunks.reduce((sum, item) => sum + item.byteLength, 0);
-      const input = new Uint8Array(inputLength);
-      let offset = 0;
-      for (const chunkBytes of this._chunks) {
-        input.set(chunkBytes, offset);
-        offset += chunkBytes.byteLength;
-      }
-      const output = transformSync(this._mode, input, this._options);
-      this.bytesWritten += output.byteLength ?? output.length ?? 0;
-      this.push(output);
+      this._emitBuffered();
       this.push(null);
       this.emit("finish");
       callback?.();
@@ -234,8 +245,19 @@ class ZlibTransform extends Transform {
     }
   }
 
-  flush(callback = undefined) {
-    callback?.();
+  flush(kind = undefined, callback = undefined) {
+    if (typeof kind === "function") {
+      callback = kind;
+      kind = undefined;
+    }
+    void kind;
+    try {
+      this._emitBuffered();
+      callback?.();
+    } catch (error) {
+      this.emit("error", error);
+      callback?.(error);
+    }
   }
 
   close(callback = undefined) {
