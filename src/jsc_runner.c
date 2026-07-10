@@ -15,12 +15,14 @@
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pwd.h>
 #include <pthread.h>
 #include <resolv.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +33,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#if !defined(_WIN32)
+#include <sys/un.h>
+#endif
 #if defined(__APPLE__) || defined(__MACH__)
 #include <mach/mach.h>
 #include <net/if_dl.h>
@@ -57,16 +62,18 @@ extern char **environ;
 #include <mach-o/dyld.h>
 #endif
 
-#if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>)
+#if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>) && __has_include(<openssl/ssl.h>) && __has_include(<openssl/err.h>)
 #define CT_HAS_OPENSSL 1
 #include <openssl/core_names.h>
 #include <openssl/ec.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
 #include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 #if __has_include(<openssl/thread.h>)
 #include <openssl/thread.h>
@@ -97,6 +104,8 @@ extern char **environ;
 #define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
 
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len);
+static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len);
+static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message);
 
 #if defined(__APPLE__)
 #pragma clang diagnostic push
@@ -148,6 +157,7 @@ extern void ct_host_buffer_free(char *value);
 extern bool ct_host_exists(const char *path);
 extern int ct_host_mkdir(const char *path, bool recursive, char **error_out);
 extern int ct_host_rm(const char *path, bool recursive, bool force, char **error_out);
+extern int ct_host_rmdir(const char *path, char **error_out);
 extern int ct_host_unlink(const char *path, char **error_out);
 extern int ct_host_chmod(const char *path, unsigned int mode, char **error_out);
 extern int ct_host_spawn_sync(
@@ -158,6 +168,15 @@ extern int ct_host_spawn_sync(
     CtHostSpawnResult *result_out,
     char **error_out
 );
+extern uint8_t *ct_strip_typescript_types(
+    const uint8_t *source,
+    size_t source_len,
+    int mode,
+    size_t *out_len,
+    char **error_out
+);
+extern void ct_transpiler_free(uint8_t *value, size_t len);
+extern void ct_transpiler_string_free(char *value);
 
 typedef enum {
     CT_FFI_TYPE_VOID,
@@ -210,6 +229,8 @@ typedef struct CtSpawnEvent {
     char *type;
     char *data;
     size_t data_len;
+    int received_fd;
+    bool has_fd;
     int exit_code;
     int signal_code;
     bool killed;
@@ -261,6 +282,7 @@ typedef struct CtAsyncProcess {
     int stdin_fd;
     int stdout_fd;
     int stderr_fd;
+    int ipc_fd;
     CtJscRuntime *runtime;
     pthread_t thread;
     struct CtAsyncProcess *next;
@@ -322,15 +344,63 @@ typedef struct CtHttpServer {
     struct CtHttpServer *next;
 } CtHttpServer;
 
+typedef struct CtTlsConnection {
+    uint32_t id;
+    int fd;
+#if CT_HAS_OPENSSL
+    SSL_CTX *ctx;
+    SSL *ssl;
+#else
+    void *ctx;
+    void *ssl;
+#endif
+    CtJscRuntime *runtime;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool active;
+    bool watcher_started;
+    bool server_side;
+    struct CtTlsConnection *next;
+} CtTlsConnection;
+
+typedef struct CtTlsAccepted {
+    CtTlsConnection *connection;
+    struct CtTlsAccepted *next;
+} CtTlsAccepted;
+
+typedef struct CtTlsServer {
+    uint32_t id;
+    int listen_fd;
+    uint16_t port;
+    char *hostname;
+    bool stopped;
+    bool thread_started;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    CtJscRuntime *runtime;
+    CtTlsAccepted *accepted_head;
+    CtTlsAccepted *accepted_tail;
+#if CT_HAS_OPENSSL
+    SSL_CTX *ctx;
+#else
+    void *ctx;
+#endif
+    struct CtTlsServer *next;
+} CtTlsServer;
+
 typedef struct CtSqliteStmt CtSqliteStmt;
 typedef struct CtCryptoCipher CtCryptoCipher;
 typedef struct CtSqliteFunction CtSqliteFunction;
+typedef int (*CtSqliteEnableLoadExtensionFn)(sqlite3 *, int);
+typedef int (*CtSqliteLoadExtensionFn)(sqlite3 *, const char *, const char *, char **);
 
 typedef struct CtSqliteDb {
     uint32_t id;
     sqlite3 *db;
     CtSqliteStmt *statements;
     CtSqliteFunction *authorizer;
+    bool allow_load_extension;
+    bool load_extension_enabled;
     struct CtSqliteDb *next;
 } CtSqliteDb;
 
@@ -365,6 +435,7 @@ struct CtSqliteFunction {
     JSObjectRef callback;
     JSObjectRef result_callback;
     JSObjectRef start_callback;
+    JSObjectRef inverse_callback;
     JSValueRef start_value;
     bool has_start_value;
 };
@@ -379,6 +450,11 @@ static pthread_mutex_t ct_http_servers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtHttpServer *ct_http_servers = NULL;
 static uint32_t ct_next_http_server_id = 1;
 static uint32_t ct_next_http_request_id = 1;
+static pthread_mutex_t ct_tls_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtTlsServer *ct_tls_servers = NULL;
+static CtTlsConnection *ct_tls_connections = NULL;
+static uint32_t ct_next_tls_server_id = 1;
+static uint32_t ct_next_tls_connection_id = 1;
 static CtSqliteDb *ct_sqlite_dbs = NULL;
 static CtSqliteStmt *ct_sqlite_stmts = NULL;
 static uint32_t ct_next_sqlite_db_id = 1;
@@ -892,6 +968,23 @@ static char *ct_value_to_string_copy(JSContextRef ctx, JSValueRef value) {
     return buffer;
 }
 
+static char *ct_value_to_utf8_copy(JSContextRef ctx, JSValueRef value, size_t *len_out) {
+    *len_out = 0;
+    JSValueRef exception = NULL;
+    JSStringRef string = JSValueToStringCopy(ctx, value, &exception);
+    if (string == NULL) return NULL;
+    size_t size = JSStringGetMaximumUTF8CStringSize(string);
+    char *buffer = (char *)malloc(size > 0 ? size : 1);
+    if (buffer == NULL) {
+        JSStringRelease(string);
+        return NULL;
+    }
+    size_t written = JSStringGetUTF8CString(string, buffer, size);
+    JSStringRelease(string);
+    *len_out = written > 0 ? written - 1 : 0;
+    return buffer;
+}
+
 static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
     if (exception == NULL) return ct_duplicate_bytes("Unknown JavaScript exception", 28);
 
@@ -1295,8 +1388,37 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     }
 
     int level = Z_DEFAULT_COMPRESSION;
+    int window_bits = ct_zlib_window_bits(mode);
+    int mem_level = MAX_MEM_LEVEL;
+    int strategy = Z_DEFAULT_STRATEGY;
+    uint8_t *dictionary = NULL;
+    size_t dictionary_len = 0;
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
-        level = (int)ct_value_to_number(ctx, argv[2]);
+        if (JSValueIsObject(ctx, argv[2])) {
+            JSObjectRef options = (JSObjectRef)argv[2];
+            JSValueRef level_value = ct_get_property(ctx, options, "level", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, level_value) && !JSValueIsNull(ctx, level_value)) level = (int)ct_value_to_number(ctx, level_value);
+            JSValueRef window_bits_value = ct_get_property(ctx, options, "windowBits", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, window_bits_value) && !JSValueIsNull(ctx, window_bits_value)) window_bits = (int)ct_value_to_number(ctx, window_bits_value);
+            JSValueRef mem_level_value = ct_get_property(ctx, options, "memLevel", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, mem_level_value) && !JSValueIsNull(ctx, mem_level_value)) mem_level = (int)ct_value_to_number(ctx, mem_level_value);
+            JSValueRef strategy_value = ct_get_property(ctx, options, "strategy", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, strategy_value) && !JSValueIsNull(ctx, strategy_value)) strategy = (int)ct_value_to_number(ctx, strategy_value);
+            JSValueRef dictionary_value = ct_get_property(ctx, options, "dictionary", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, dictionary_value) && !JSValueIsNull(ctx, dictionary_value)) {
+                if (ct_get_bytes(ctx, dictionary_value, &dictionary, &dictionary_len) != 0) {
+                    ct_throw_message(ctx, exception, "zlib dictionary must be an ArrayBuffer or typed array");
+                    return JSValueMakeUndefined(ctx);
+                }
+            }
+        } else {
+            level = (int)ct_value_to_number(ctx, argv[2]);
+        }
     }
 
     if (mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_BROTLI_DECOMPRESS) {
@@ -1308,6 +1430,9 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     }
 
     if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
+    if (window_bits == 0) window_bits = ct_zlib_window_bits(mode);
+    if (mem_level < 1 || mem_level > MAX_MEM_LEVEL) mem_level = MAX_MEM_LEVEL;
+    if (strategy < Z_DEFAULT_STRATEGY || strategy > Z_FIXED) strategy = Z_DEFAULT_STRATEGY;
 
     const bool compressing = ct_zlib_mode_compresses(mode);
     size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
@@ -1324,12 +1449,21 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     stream.avail_in = (uInt)input_len;
 
     int status = compressing
-        ? deflateInit2(&stream, level, Z_DEFLATED, ct_zlib_window_bits(mode), MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY)
-        : inflateInit2(&stream, ct_zlib_window_bits(mode));
+        ? deflateInit2(&stream, level, Z_DEFLATED, window_bits, mem_level, strategy)
+        : inflateInit2(&stream, window_bits);
     if (status != Z_OK) {
         free(output);
         ct_throw_message(ctx, exception, "Failed to initialize zlib stream");
         return JSValueMakeUndefined(ctx);
+    }
+    if (dictionary != NULL && dictionary_len > 0 && compressing) {
+        status = deflateSetDictionary(&stream, dictionary, (uInt)dictionary_len);
+        if (status != Z_OK) {
+            free(output);
+            deflateEnd(&stream);
+            ct_throw_message(ctx, exception, "Failed to set zlib dictionary");
+            return JSValueMakeUndefined(ctx);
+        }
     }
 
     while (true) {
@@ -1351,6 +1485,10 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
         stream.next_out = output + stream.total_out;
         stream.avail_out = (uInt)(capacity - stream.total_out);
         status = compressing ? deflate(&stream, Z_FINISH) : inflate(&stream, Z_FINISH);
+        if (!compressing && status == Z_NEED_DICT && dictionary != NULL && dictionary_len > 0) {
+            status = inflateSetDictionary(&stream, dictionary, (uInt)dictionary_len);
+            if (status == Z_OK) continue;
+        }
         if (status == Z_STREAM_END) break;
         if (status == Z_OK || status == Z_BUF_ERROR) {
             if (stream.avail_out == 0 || !compressing) continue;
@@ -3684,7 +3822,7 @@ static JSValueRef ct_crypto_cipher_get_auth_tag(JSContextRef ctx, JSObjectRef fu
         ct_throw_message(ctx, exception, "Cipher auth tag is not available");
         return JSValueMakeUndefined(ctx);
     }
-    JSObjectRef result = ct_array_buffer_from_copy(ctx, (const char *)entry->evp_auth_tag, entry->evp_auth_tag_len, exception);
+    JSValueRef result = ct_array_buffer_from_copy(ctx, (const char *)entry->evp_auth_tag, entry->evp_auth_tag_len, exception);
     ct_crypto_cipher_remove(entry);
     return result;
 #else
@@ -3709,6 +3847,26 @@ static CtSqliteStmt *ct_sqlite_find_stmt(uint32_t id) {
         cursor = cursor->next;
     }
     return NULL;
+}
+
+static CtSqliteEnableLoadExtensionFn ct_sqlite_enable_load_extension_fn(void) {
+    static bool looked_up = false;
+    static CtSqliteEnableLoadExtensionFn fn = NULL;
+    if (!looked_up) {
+        looked_up = true;
+        fn = (CtSqliteEnableLoadExtensionFn)dlsym(RTLD_DEFAULT, "sqlite3_enable_load_extension");
+    }
+    return fn;
+}
+
+static CtSqliteLoadExtensionFn ct_sqlite_load_extension_fn(void) {
+    static bool looked_up = false;
+    static CtSqliteLoadExtensionFn fn = NULL;
+    if (!looked_up) {
+        looked_up = true;
+        fn = (CtSqliteLoadExtensionFn)dlsym(RTLD_DEFAULT, "sqlite3_load_extension");
+    }
+    return fn;
 }
 
 static void ct_sqlite_throw(JSContextRef ctx, JSValueRef *exception, sqlite3 *db) {
@@ -3897,6 +4055,9 @@ static void ct_sqlite_function_destroy(void *opaque) {
     if (entry->ctx != NULL && entry->start_callback != NULL) {
         JSValueUnprotect(entry->ctx, entry->start_callback);
     }
+    if (entry->ctx != NULL && entry->inverse_callback != NULL) {
+        JSValueUnprotect(entry->ctx, entry->inverse_callback);
+    }
     if (entry->ctx != NULL && entry->has_start_value && entry->start_value != NULL) {
         JSValueUnprotect(entry->ctx, entry->start_value);
     }
@@ -4017,9 +4178,9 @@ static bool ct_sqlite_aggregate_initialize(sqlite3_context *sqlite_ctx, CtSqlite
     return true;
 }
 
-static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
+static void ct_sqlite_aggregate_call(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv, JSObjectRef callback, const char *name) {
     CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
-    if (entry == NULL || entry->ctx == NULL || entry->callback == NULL) {
+    if (entry == NULL || entry->ctx == NULL || callback == NULL) {
         sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
         return;
     }
@@ -4053,10 +4214,12 @@ static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqli
         }
     }
 
-    JSValueRef result = JSObjectCallAsFunction(entry->ctx, entry->callback, NULL, js_argc, args, &exception);
+    JSValueRef result = JSObjectCallAsFunction(entry->ctx, callback, NULL, js_argc, args, &exception);
     free(args);
     if (exception != NULL) {
-        ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate step callback failed");
+        char fallback[128];
+        snprintf(fallback, sizeof(fallback), "SQLite aggregate %s callback failed", name != NULL ? name : "step");
+        ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), fallback);
         return;
     }
 
@@ -4065,7 +4228,17 @@ static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqli
     state->accumulator = result;
 }
 
-static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
+static void ct_sqlite_aggregate_step(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
+    ct_sqlite_aggregate_call(sqlite_ctx, argc, argv, entry != NULL ? entry->callback : NULL, "step");
+}
+
+static void ct_sqlite_aggregate_inverse(sqlite3_context *sqlite_ctx, int argc, sqlite3_value **argv) {
+    CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
+    ct_sqlite_aggregate_call(sqlite_ctx, argc, argv, entry != NULL ? entry->inverse_callback : NULL, "inverse");
+}
+
+static void ct_sqlite_aggregate_emit_result(sqlite3_context *sqlite_ctx, bool clear_state) {
     CtSqliteFunction *entry = (CtSqliteFunction *)sqlite3_user_data(sqlite_ctx);
     if (entry == NULL || entry->ctx == NULL) {
         sqlite3_result_error(sqlite_ctx, "SQLite aggregate callback is unavailable", -1);
@@ -4079,11 +4252,11 @@ static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
     }
     if (state->error_message != NULL) {
         sqlite3_result_error(sqlite_ctx, state->error_message, -1);
-        ct_sqlite_aggregate_state_clear(entry, state);
+        if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
         return;
     }
     if (!ct_sqlite_aggregate_initialize(sqlite_ctx, entry, state)) {
-        ct_sqlite_aggregate_state_clear(entry, state);
+        if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
         return;
     }
 
@@ -4094,13 +4267,21 @@ static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
         result = JSObjectCallAsFunction(entry->ctx, entry->result_callback, NULL, 1, &arg, &exception);
         if (exception != NULL) {
             ct_sqlite_aggregate_state_set_error(sqlite_ctx, state, ct_copy_exception(entry->ctx, exception), "SQLite aggregate result callback failed");
-            ct_sqlite_aggregate_state_clear(entry, state);
+            if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
             return;
         }
     }
 
     ct_sqlite_result_from_js(sqlite_ctx, entry->ctx, result);
-    ct_sqlite_aggregate_state_clear(entry, state);
+    if (clear_state) ct_sqlite_aggregate_state_clear(entry, state);
+}
+
+static void ct_sqlite_aggregate_value(sqlite3_context *sqlite_ctx) {
+    ct_sqlite_aggregate_emit_result(sqlite_ctx, false);
+}
+
+static void ct_sqlite_aggregate_final(sqlite3_context *sqlite_ctx) {
+    ct_sqlite_aggregate_emit_result(sqlite_ctx, true);
 }
 
 static JSValueRef ct_sqlite_open(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4132,6 +4313,12 @@ static JSValueRef ct_sqlite_open(JSContextRef ctx, JSObjectRef function, JSObjec
     entry->id = ct_next_sqlite_db_id++;
     if (ct_next_sqlite_db_id == 0) ct_next_sqlite_db_id = 1;
     entry->db = db;
+    entry->allow_load_extension = argc >= 2 && ct_value_to_bool(ctx, argv[1]);
+    entry->load_extension_enabled = entry->allow_load_extension;
+    CtSqliteEnableLoadExtensionFn enable_load_extension = ct_sqlite_enable_load_extension_fn();
+    if (enable_load_extension != NULL) {
+        enable_load_extension(db, entry->load_extension_enabled ? 1 : 0);
+    }
     entry->next = ct_sqlite_dbs;
     ct_sqlite_dbs = entry;
 
@@ -4435,8 +4622,8 @@ static JSValueRef ct_sqlite_create_function(JSContextRef ctx, JSObjectRef functi
 static JSValueRef ct_sqlite_create_aggregate(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    if (argc < 7) {
-        ct_throw_message(ctx, exception, "sqliteCreateAggregate(id, name, argc, flags, start, step, result) requires seven arguments");
+    if (argc < 8) {
+        ct_throw_message(ctx, exception, "sqliteCreateAggregate(id, name, argc, flags, start, step, result, inverse) requires eight arguments");
         return JSValueMakeUndefined(ctx);
     }
     CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
@@ -4457,6 +4644,11 @@ static JSValueRef ct_sqlite_create_aggregate(JSContextRef ctx, JSObjectRef funct
     if (!JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6]) && (!JSValueIsObject(ctx, argv[6]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[6]))) {
         free(name);
         ct_throw_message(ctx, exception, "SQLite aggregate result callback must be a function");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7]) && (!JSValueIsObject(ctx, argv[7]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[7]))) {
+        free(name);
+        ct_throw_message(ctx, exception, "SQLite aggregate inverse callback must be a function");
         return JSValueMakeUndefined(ctx);
     }
 
@@ -4481,20 +4673,40 @@ static JSValueRef ct_sqlite_create_aggregate(JSContextRef ctx, JSObjectRef funct
         callback->result_callback = (JSObjectRef)argv[6];
         JSValueProtect(ctx, callback->result_callback);
     }
+    if (!JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7])) {
+        callback->inverse_callback = (JSObjectRef)argv[7];
+        JSValueProtect(ctx, callback->inverse_callback);
+    }
 
     int function_argc = (int)ct_value_to_number(ctx, argv[2]);
     int flags = SQLITE_UTF8 | (int)ct_value_to_number(ctx, argv[3]);
-    int status = sqlite3_create_function_v2(
-        entry->db,
-        name,
-        function_argc,
-        flags,
-        callback,
-        NULL,
-        ct_sqlite_aggregate_step,
-        ct_sqlite_aggregate_final,
-        ct_sqlite_function_destroy
-    );
+    int status;
+    if (callback->inverse_callback != NULL) {
+        status = sqlite3_create_window_function(
+            entry->db,
+            name,
+            function_argc,
+            flags,
+            callback,
+            ct_sqlite_aggregate_step,
+            ct_sqlite_aggregate_final,
+            ct_sqlite_aggregate_value,
+            ct_sqlite_aggregate_inverse,
+            ct_sqlite_function_destroy
+        );
+    } else {
+        status = sqlite3_create_function_v2(
+            entry->db,
+            name,
+            function_argc,
+            flags,
+            callback,
+            NULL,
+            ct_sqlite_aggregate_step,
+            ct_sqlite_aggregate_final,
+            ct_sqlite_function_destroy
+        );
+    }
     free(name);
     if (status != SQLITE_OK) {
         ct_sqlite_function_destroy(callback);
@@ -4547,6 +4759,79 @@ static JSValueRef ct_sqlite_set_authorizer(JSContextRef ctx, JSObjectRef functio
         return JSValueMakeUndefined(ctx);
     }
     entry->authorizer = callback;
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_enable_load_extension(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteEnableLoadExtension(id, enabled) requires database id and enabled");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!entry->allow_load_extension) {
+        ct_throw_message(ctx, exception, "Cannot enable extension loading because it was disabled at database creation.");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    bool enabled = ct_value_to_bool(ctx, argv[1]);
+    CtSqliteEnableLoadExtensionFn enable_load_extension = ct_sqlite_enable_load_extension_fn();
+    if (enable_load_extension == NULL) {
+        if (enabled) {
+            ct_throw_message(ctx, exception, "SQLite extension loading is unavailable in this SQLite build");
+            return JSValueMakeUndefined(ctx);
+        }
+    } else {
+        int status = enable_load_extension(entry->db, enabled ? 1 : 0);
+        if (status != SQLITE_OK) {
+            ct_sqlite_throw(ctx, exception, entry->db);
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    entry->load_extension_enabled = enabled;
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_sqlite_load_extension(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "sqliteLoadExtension(id, path) requires database id and path");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteDb *entry = ct_sqlite_find_db((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite database not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!entry->allow_load_extension || !entry->load_extension_enabled) {
+        ct_throw_message(ctx, exception, "extension loading is not allowed");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteLoadExtensionFn load_extension = ct_sqlite_load_extension_fn();
+    if (load_extension == NULL) {
+        ct_throw_message(ctx, exception, "SQLite extension loading is unavailable in this SQLite build");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char *path = ct_value_to_string_copy(ctx, argv[1]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *error_message = NULL;
+    int status = load_extension(entry->db, path, NULL, &error_message);
+    free(path);
+    if (status != SQLITE_OK) {
+        ct_throw_message(ctx, exception, error_message != NULL ? error_message : sqlite3_errmsg(entry->db));
+        sqlite3_free(error_message);
+        return JSValueMakeUndefined(ctx);
+    }
     return JSValueMakeUndefined(ctx);
 }
 
@@ -4706,6 +4991,32 @@ static int ct_parse_env_object(JSContextRef ctx, JSValueRef value, CtHostEnvEntr
     *out_entries = entries;
     *out_count = count;
     return 0;
+}
+
+static void ct_free_envp(char **envp, size_t count) {
+    if (envp == NULL) return;
+    for (size_t index = 0; index < count; index += 1) free(envp[index]);
+    free(envp);
+}
+
+static char **ct_env_entries_to_envp(const CtHostEnvEntry *entries, size_t count) {
+    char **envp = (char **)calloc(count + 1, sizeof(char *));
+    if (envp == NULL) return NULL;
+    for (size_t index = 0; index < count; index += 1) {
+        size_t name_len = strlen(entries[index].name);
+        size_t value_len = strlen(entries[index].value);
+        envp[index] = (char *)malloc(name_len + value_len + 2);
+        if (envp[index] == NULL) {
+            ct_free_envp(envp, index);
+            return NULL;
+        }
+        memcpy(envp[index], entries[index].name, name_len);
+        envp[index][name_len] = '=';
+        memcpy(envp[index] + name_len + 1, entries[index].value, value_len);
+        envp[index][name_len + value_len + 1] = '\0';
+    }
+    envp[count] = NULL;
+    return envp;
 }
 
 static JSValueRef ct_make_function(JSContextRef ctx, const char *name, JSObjectCallAsFunctionCallback callback, CtJscRuntime *runtime) {
@@ -5397,6 +5708,185 @@ static JSValueRef ct_udp_socket_close(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_udp_socket_set_broadcast(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "udpSocketSetBroadcast(fd[, enabled]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_udp_socket_set_ttl(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "udpSocketSetTTL(fd, ttl[, family]) requires a file descriptor and ttl");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int ttl = (int)ct_value_to_number(ctx, argv[1]);
+    int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
+    int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+#if defined(IPV6_UNICAST_HOPS)
+    int option = family == AF_INET6 ? IPV6_UNICAST_HOPS : IP_TTL;
+#else
+    int option = IP_TTL;
+#endif
+    if (setsockopt(fd, level, option, &ttl, sizeof(ttl)) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, ttl);
+}
+
+static JSValueRef ct_udp_socket_set_multicast_ttl(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "udpSocketSetMulticastTTL(fd, ttl[, family]) requires a file descriptor and ttl");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int ttl = (int)ct_value_to_number(ctx, argv[1]);
+    int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
+    if (family == AF_INET6) {
+#if defined(IPV6_MULTICAST_HOPS)
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &ttl, sizeof(ttl)) != 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            return JSValueMakeUndefined(ctx);
+        }
+#endif
+    } else {
+        unsigned char value = (unsigned char)ttl;
+        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &value, sizeof(value)) != 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    return JSValueMakeNumber(ctx, ttl);
+}
+
+static JSValueRef ct_udp_socket_set_multicast_loopback(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "udpSocketSetMulticastLoopback(fd[, enabled[, family]]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
+    int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
+    if (family == AF_INET6) {
+#if defined(IPV6_MULTICAST_LOOP)
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &enabled, sizeof(enabled)) != 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            return JSValueMakeUndefined(ctx);
+        }
+#endif
+    } else {
+        unsigned char value = (unsigned char)enabled;
+        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &value, sizeof(value)) != 0) {
+            ct_throw_message(ctx, exception, strerror(errno));
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    return JSValueMakeBoolean(ctx, enabled != 0);
+}
+
+static JSValueRef ct_udp_socket_set_buffer_size(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "udpSocketSetBufferSize(fd, send, size) requires fd, send, and size");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int option = ct_value_to_bool(ctx, argv[1]) ? SO_SNDBUF : SO_RCVBUF;
+    int size = (int)ct_value_to_number(ctx, argv[2]);
+    if (setsockopt(fd, SOL_SOCKET, option, &size, sizeof(size)) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, size);
+}
+
+static JSValueRef ct_udp_socket_get_buffer_size(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "udpSocketGetBufferSize(fd, send) requires fd and send");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int option = ct_value_to_bool(ctx, argv[1]) ? SO_SNDBUF : SO_RCVBUF;
+    int size = 0;
+    socklen_t size_len = sizeof(size);
+    if (getsockopt(fd, SOL_SOCKET, option, &size, &size_len) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, size);
+}
+
+static JSValueRef ct_udp_socket_membership(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "udpSocketMembership(fd, multicastAddress[, interfaceAddress[, family[, join]]]) requires fd and multicastAddress");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    char *multicast = ct_value_to_optional_string(ctx, argv[1]);
+    char *iface = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
+    int family = argc >= 4 ? ct_udp_family_from_arg(ctx, argv[3]) : AF_INET;
+    bool join = argc >= 5 ? ct_value_to_bool(ctx, argv[4]) : true;
+    int status = 0;
+    if (family == AF_INET6) {
+#if defined(IPV6_JOIN_GROUP) && defined(IPV6_LEAVE_GROUP)
+        struct ipv6_mreq request;
+        memset(&request, 0, sizeof(request));
+        if (multicast == NULL || inet_pton(AF_INET6, multicast, &request.ipv6mr_multiaddr) != 1) {
+            status = EINVAL;
+        } else {
+            request.ipv6mr_interface = iface != NULL && iface[0] != 0 ? if_nametoindex(iface) : 0;
+            int option = join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP;
+            if (setsockopt(fd, IPPROTO_IPV6, option, &request, sizeof(request)) != 0) status = errno;
+        }
+#else
+        status = ENOSYS;
+#endif
+    } else {
+        struct ip_mreq request;
+        memset(&request, 0, sizeof(request));
+        if (multicast == NULL || inet_pton(AF_INET, multicast, &request.imr_multiaddr) != 1) {
+            status = EINVAL;
+        } else if (iface != NULL && iface[0] != 0) {
+            if (inet_pton(AF_INET, iface, &request.imr_interface) != 1) request.imr_interface.s_addr = htonl(INADDR_ANY);
+        } else {
+            request.imr_interface.s_addr = htonl(INADDR_ANY);
+        }
+        if (status == 0) {
+            int option = join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP;
+            if (setsockopt(fd, IPPROTO_IP, option, &request, sizeof(request)) != 0) status = errno;
+        }
+    }
+    free(multicast);
+    free(iface);
+    if (status != 0) {
+        ct_throw_message(ctx, exception, strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
 static int ct_tcp_family_from_arg(JSContextRef ctx, JSValueRef value) {
     int family = (int)ct_value_to_number(ctx, value);
     return family == 6 ? AF_INET6 : AF_INET;
@@ -5423,6 +5913,11 @@ static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int por
 static void ct_set_nonblocking_fd(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void ct_set_blocking_fd(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 }
 
 static JSObjectRef ct_tcp_address_object(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
@@ -5560,6 +6055,183 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
     return result;
 }
 
+static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "path", ct_make_string(ctx, path != NULL ? path : ""), exception);
+    ct_set_property(ctx, result, "family", ct_make_string(ctx, "Unix"), exception);
+    return result;
+}
+
+static JSObjectRef ct_unix_address_from_fd(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
+#if !defined(_WIN32)
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    socklen_t address_len = sizeof(address);
+    int status = peer
+        ? getpeername(fd, (struct sockaddr *)&address, &address_len)
+        : getsockname(fd, (struct sockaddr *)&address, &address_len);
+    if (status != 0) return ct_unix_address_from_path(ctx, "", exception);
+    size_t base_len = offsetof(struct sockaddr_un, sun_path);
+    size_t path_capacity = address_len > base_len ? (size_t)(address_len - base_len) : 0;
+    size_t path_len = strnlen(address.sun_path, path_capacity);
+    char path[sizeof(address.sun_path) + 1];
+    if (path_len > sizeof(address.sun_path)) path_len = sizeof(address.sun_path);
+    memcpy(path, address.sun_path, path_len);
+    path[path_len] = 0;
+    return ct_unix_address_from_path(ctx, path, exception);
+#else
+    (void)fd;
+    (void)peer;
+    return ct_unix_address_from_path(ctx, "", exception);
+#endif
+}
+
+static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Unix domain sockets are not available on this platform");
+    return JSValueMakeUndefined(ctx);
+#else
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixServerListen(path[, backlog]) requires a socket path");
+        return JSValueMakeUndefined(ctx);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) return JSValueMakeUndefined(ctx);
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        free(path);
+        ct_throw_message(ctx, exception, "Unix socket path is too long");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
+    unlink(path);
+
+    int backlog = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : 128;
+    if (backlog <= 0) backlog = 128;
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, backlog) != 0) {
+        char *message = ct_duplicate_string(strerror(errno));
+        close(fd);
+        unlink(path);
+        free(path);
+        ct_throw_message(ctx, exception, message != NULL ? message : "Unix socket listen failed");
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    ct_set_property(ctx, result, "path", ct_make_string(ctx, path), exception);
+    JSObjectRef local = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "address", local, exception);
+    free(path);
+    return result;
+#endif
+}
+
+static JSValueRef ct_unix_server_accept(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    return JSValueMakeNull(ctx);
+#else
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixServerAccept(fd) requires a server file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int listen_fd = (int)ct_value_to_number(ctx, argv[0]);
+    struct sockaddr_un remote_addr;
+    memset(&remote_addr, 0, sizeof(remote_addr));
+    socklen_t remote_len = sizeof(remote_addr);
+    int fd = accept(listen_fd, (struct sockaddr *)&remote_addr, &remote_len);
+    if (fd < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef local = ct_unix_address_from_fd(ctx, fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_unix_address_from_fd(ctx, fd, true, exception);
+    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    return result;
+#endif
+}
+
+static JSValueRef ct_unix_socket_connect(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Unix domain sockets are not available on this platform");
+    return JSValueMakeUndefined(ctx);
+#else
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "unixSocketConnect(path) requires a socket path");
+        return JSValueMakeUndefined(ctx);
+    }
+    signal(SIGPIPE, SIG_IGN);
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) return JSValueMakeUndefined(ctx);
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        free(path);
+        ct_throw_message(ctx, exception, "Unix socket path is too long");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        free(path);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        char *message = ct_duplicate_string(strerror(errno));
+        close(fd);
+        free(path);
+        ct_throw_message(ctx, exception, message != NULL ? message : "Unix socket connect failed");
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+    JSObjectRef local = ct_unix_address_from_fd(ctx, fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_unix_address_from_path(ctx, path, exception);
+    ct_set_property(ctx, result, "remote", remote, exception);
+    free(path);
+    return result;
+#endif
+}
+
 static JSValueRef ct_tcp_socket_address(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -5571,6 +6243,58 @@ static JSValueRef ct_tcp_socket_address(JSContextRef ctx, JSObjectRef function, 
     bool peer = argc >= 2 ? ct_value_to_bool(ctx, argv[1]) : false;
     JSObjectRef result = ct_tcp_address_object(ctx, fd, peer, exception);
     return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tcp_socket_set_no_delay(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpSocketSetNoDelay(fd[, enabled]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tcp_socket_set_keep_alive(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpSocketSetKeepAlive(fd[, enabled[, initialDelay]]) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    if (enabled && argc >= 3) {
+        double delay_ms = ct_value_to_number(ctx, argv[2]);
+        if (delay_ms > 0) {
+            int delay_seconds = (int)ceil(delay_ms / 1000.0);
+            if (delay_seconds < 1) delay_seconds = 1;
+#if defined(TCP_KEEPALIVE)
+            if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &delay_seconds, sizeof(delay_seconds)) != 0) {
+                ct_throw_message(ctx, exception, strerror(errno));
+                return JSValueMakeUndefined(ctx);
+            }
+#elif defined(TCP_KEEPIDLE)
+            if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &delay_seconds, sizeof(delay_seconds)) != 0) {
+                ct_throw_message(ctx, exception, strerror(errno));
+                return JSValueMakeUndefined(ctx);
+            }
+#else
+            (void)delay_seconds;
+#endif
+        }
+    }
+    return JSValueMakeBoolean(ctx, true);
 }
 
 static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -5587,6 +6311,780 @@ static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function,
     }
     return JSValueMakeUndefined(ctx);
 }
+
+#if CT_HAS_OPENSSL
+static pthread_once_t ct_tls_init_once_control = PTHREAD_ONCE_INIT;
+
+static void ct_tls_init_once(void) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+static char *ct_tls_error_message(const char *fallback) {
+    unsigned long code = ERR_get_error();
+    if (code == 0) return ct_duplicate_string(fallback != NULL ? fallback : "TLS operation failed");
+    char buffer[256];
+    ERR_error_string_n(code, buffer, sizeof(buffer));
+    return ct_duplicate_string(buffer);
+}
+
+static void ct_tls_connection_add(CtTlsConnection *connection) {
+    pthread_mutex_lock(&ct_tls_mutex);
+    connection->next = ct_tls_connections;
+    ct_tls_connections = connection;
+    pthread_mutex_unlock(&ct_tls_mutex);
+}
+
+static void ct_tls_connection_remove(CtTlsConnection *connection) {
+    pthread_mutex_lock(&ct_tls_mutex);
+    CtTlsConnection **cursor = &ct_tls_connections;
+    while (*cursor != NULL) {
+        if (*cursor == connection) {
+            *cursor = connection->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+}
+
+static CtTlsConnection *ct_tls_connection_find(uint32_t id) {
+    CtTlsConnection *result = NULL;
+    pthread_mutex_lock(&ct_tls_mutex);
+    for (CtTlsConnection *connection = ct_tls_connections; connection != NULL; connection = connection->next) {
+        if (connection->id == id) {
+            result = connection;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+    return result;
+}
+
+static void ct_tls_connection_free(CtTlsConnection *connection) {
+    if (connection == NULL) return;
+    ct_tls_connection_remove(connection);
+    if (connection->ssl != NULL) SSL_free(connection->ssl);
+    if (connection->ctx != NULL) SSL_CTX_free(connection->ctx);
+    if (connection->fd >= 0) close(connection->fd);
+    pthread_mutex_destroy(&connection->mutex);
+    free(connection);
+}
+
+static CtTlsServer *ct_tls_server_find(uint32_t id) {
+    CtTlsServer *result = NULL;
+    pthread_mutex_lock(&ct_tls_mutex);
+    for (CtTlsServer *server = ct_tls_servers; server != NULL; server = server->next) {
+        if (server->id == id) {
+            result = server;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+    return result;
+}
+
+static void ct_tls_server_remove(CtTlsServer *server) {
+    pthread_mutex_lock(&ct_tls_mutex);
+    CtTlsServer **cursor = &ct_tls_servers;
+    while (*cursor != NULL) {
+        if (*cursor == server) {
+            *cursor = server->next;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+}
+
+static bool ct_tls_server_is_stopped(CtTlsServer *server) {
+    bool stopped = false;
+    pthread_mutex_lock(&server->mutex);
+    stopped = server->stopped;
+    pthread_mutex_unlock(&server->mutex);
+    return stopped;
+}
+
+static void ct_tls_server_set_stopped(CtTlsServer *server, bool stopped) {
+    pthread_mutex_lock(&server->mutex);
+    server->stopped = stopped;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static void ct_tls_server_push_accepted(CtTlsServer *server, CtTlsConnection *connection) {
+    CtTlsAccepted *accepted = (CtTlsAccepted *)calloc(1, sizeof(CtTlsAccepted));
+    if (accepted == NULL) {
+        ct_tls_connection_free(connection);
+        return;
+    }
+    accepted->connection = connection;
+    pthread_mutex_lock(&server->mutex);
+    if (server->accepted_tail != NULL) server->accepted_tail->next = accepted;
+    else server->accepted_head = accepted;
+    server->accepted_tail = accepted;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static CtTlsConnection *ct_tls_server_pop_accepted(CtTlsServer *server) {
+    pthread_mutex_lock(&server->mutex);
+    CtTlsAccepted *accepted = server->accepted_head;
+    if (accepted == NULL) {
+        pthread_mutex_unlock(&server->mutex);
+        return NULL;
+    }
+    server->accepted_head = accepted->next;
+    if (server->accepted_head == NULL) server->accepted_tail = NULL;
+    pthread_mutex_unlock(&server->mutex);
+    CtTlsConnection *connection = accepted->connection;
+    free(accepted);
+    return connection;
+}
+
+static void ct_tls_server_free(CtTlsServer *server) {
+    if (server == NULL) return;
+    ct_tls_server_remove(server);
+    ct_tls_server_set_stopped(server, true);
+    if (server->listen_fd >= 0) close(server->listen_fd);
+    if (server->thread_started) pthread_join(server->thread, NULL);
+    CtTlsAccepted *accepted = server->accepted_head;
+    while (accepted != NULL) {
+        CtTlsAccepted *next = accepted->next;
+        ct_tls_connection_free(accepted->connection);
+        free(accepted);
+        accepted = next;
+    }
+    if (server->ctx != NULL) SSL_CTX_free(server->ctx);
+    free(server->hostname);
+    pthread_mutex_destroy(&server->mutex);
+    free(server);
+}
+
+static bool ct_tls_connection_is_active(CtTlsConnection *connection) {
+    bool active = false;
+    pthread_mutex_lock(&connection->mutex);
+    active = connection->active;
+    pthread_mutex_unlock(&connection->mutex);
+    return active;
+}
+
+static void ct_tls_connection_set_active(CtTlsConnection *connection, bool active) {
+    pthread_mutex_lock(&connection->mutex);
+    connection->active = active;
+    pthread_mutex_unlock(&connection->mutex);
+}
+
+static int ct_tls_use_cert_pem(JSContextRef ctx, SSL_CTX *ssl_ctx, const char *cert_pem, JSValueRef *exception) {
+    BIO *bio = BIO_new_mem_buf(cert_pem, -1);
+    if (bio == NULL) {
+        ct_throw_message(ctx, exception, "Failed to allocate TLS certificate BIO");
+        return -1;
+    }
+    X509 *cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
+    if (cert == NULL) {
+        BIO_free(bio);
+        char *message = ct_tls_error_message("Failed to parse TLS certificate");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
+    }
+    int ok = SSL_CTX_use_certificate(ssl_ctx, cert);
+    X509_free(cert);
+    BIO_free(bio);
+    if (ok != 1) {
+        char *message = ct_tls_error_message("Failed to use TLS certificate");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
+    }
+    return 0;
+}
+
+static int ct_tls_use_key_pem(JSContextRef ctx, SSL_CTX *ssl_ctx, const char *key_pem, JSValueRef *exception) {
+    BIO *bio = BIO_new_mem_buf(key_pem, -1);
+    if (bio == NULL) {
+        ct_throw_message(ctx, exception, "Failed to allocate TLS private key BIO");
+        return -1;
+    }
+    EVP_PKEY *key = PEM_read_bio_PrivateKey(bio, NULL, 0, NULL);
+    if (key == NULL) {
+        BIO_free(bio);
+        char *message = ct_tls_error_message("Failed to parse TLS private key");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
+    }
+    int ok = SSL_CTX_use_PrivateKey(ssl_ctx, key);
+    EVP_PKEY_free(key);
+    BIO_free(bio);
+    if (ok != 1) {
+        char *message = ct_tls_error_message("Failed to use TLS private key");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
+    }
+    return 0;
+}
+
+static int ct_tls_load_ca_pem(SSL_CTX *ssl_ctx, const char *ca_pem) {
+    if (ca_pem == NULL || ca_pem[0] == '\0') return 0;
+    BIO *bio = BIO_new_mem_buf(ca_pem, -1);
+    if (bio == NULL) return -1;
+    int loaded = 0;
+    for (;;) {
+        X509 *cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
+        if (cert == NULL) break;
+        if (X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), cert) == 1) loaded += 1;
+        X509_free(cert);
+    }
+    BIO_free(bio);
+    ERR_clear_error();
+    return loaded > 0 ? 0 : -1;
+}
+
+static int ct_tls_make_socket(JSContextRef ctx, const char *host, int port, int family, JSValueRef *exception) {
+    struct addrinfo *results = NULL;
+    if (ct_tcp_resolve_address(ctx, host != NULL ? host : "127.0.0.1", port, family, false, &results, exception) != 0) return -1;
+    int fd = -1;
+    int last_errno = ECONNREFUSED;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        if (connect(fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0) break;
+        last_errno = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(results);
+    if (fd < 0) {
+        ct_throw_message(ctx, exception, strerror(last_errno));
+        return -1;
+    }
+    return fd;
+}
+
+static JSValueRef ct_tls_x509_der(JSContextRef ctx, X509 *cert, JSValueRef *exception) {
+    if (cert == NULL) return JSValueMakeNull(ctx);
+    int len = i2d_X509(cert, NULL);
+    if (len <= 0) return JSValueMakeNull(ctx);
+    unsigned char *buffer = (unsigned char *)malloc((size_t)len);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    unsigned char *cursor = buffer;
+    int written = i2d_X509(cert, &cursor);
+    if (written != len) {
+        free(buffer);
+        return JSValueMakeNull(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_tls_session_der(JSContextRef ctx, SSL *ssl, JSValueRef *exception) {
+    if (ssl == NULL) return JSValueMakeNull(ctx);
+    SSL_SESSION *session = SSL_get1_session(ssl);
+    if (session == NULL) return JSValueMakeNull(ctx);
+    int len = i2d_SSL_SESSION(session, NULL);
+    if (len <= 0) {
+        SSL_SESSION_free(session);
+        return JSValueMakeNull(ctx);
+    }
+    unsigned char *buffer = (unsigned char *)malloc((size_t)len);
+    if (buffer == NULL) {
+        SSL_SESSION_free(session);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    unsigned char *cursor = buffer;
+    int written = i2d_SSL_SESSION(session, &cursor);
+    SSL_SESSION_free(session);
+    if (written != len) {
+        free(buffer);
+        return JSValueMakeNull(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *connection, JSValueRef *exception) {
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, connection->id), exception);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, connection->fd), exception);
+    JSObjectRef local = ct_tcp_address_object(ctx, connection->fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_tcp_address_object(ctx, connection->fd, true, exception);
+    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    pthread_mutex_lock(&connection->mutex);
+    const char *protocol = SSL_get_version(connection->ssl);
+    const SSL_CIPHER *cipher = SSL_get_current_cipher(connection->ssl);
+    ct_set_property(ctx, result, "protocol", protocol != NULL ? ct_make_string(ctx, protocol) : JSValueMakeNull(ctx), exception);
+    ct_set_property(ctx, result, "cipher", cipher != NULL ? ct_make_string(ctx, SSL_CIPHER_get_name(cipher)) : JSValueMakeNull(ctx), exception);
+    X509 *local_cert = SSL_get_certificate(connection->ssl);
+    ct_set_property(ctx, result, "localCertificate", ct_tls_x509_der(ctx, local_cert, exception), exception);
+    X509 *peer_cert = SSL_get_peer_certificate(connection->ssl);
+    ct_set_property(ctx, result, "peerCertificate", ct_tls_x509_der(ctx, peer_cert, exception), exception);
+    if (peer_cert != NULL) X509_free(peer_cert);
+    ct_set_property(ctx, result, "session", ct_tls_session_der(ctx, connection->ssl, exception), exception);
+    ct_set_property(ctx, result, "sessionReused", JSValueMakeBoolean(ctx, SSL_session_reused(connection->ssl) == 1), exception);
+    pthread_mutex_unlock(&connection->mutex);
+    return result;
+}
+
+static void *ct_tls_server_thread(void *opaque) {
+    CtTlsServer *server = (CtTlsServer *)opaque;
+    while (!ct_tls_server_is_stopped(server)) {
+        struct pollfd poll_fd;
+        poll_fd.fd = server->listen_fd;
+        poll_fd.events = POLLIN | POLLERR | POLLHUP;
+        poll_fd.revents = 0;
+        int ready = poll(&poll_fd, 1, 50);
+        if (ct_tls_server_is_stopped(server)) break;
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if ((poll_fd.revents & POLLIN) == 0) continue;
+
+        struct sockaddr_storage remote_addr;
+        socklen_t remote_len = sizeof(remote_addr);
+        int fd = accept(server->listen_fd, (struct sockaddr *)&remote_addr, &remote_len);
+        if (fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            break;
+        }
+        ct_set_blocking_fd(fd);
+
+        SSL *ssl = SSL_new(server->ctx);
+        if (ssl == NULL) {
+            close(fd);
+            continue;
+        }
+        SSL_set_fd(ssl, fd);
+        if (SSL_accept(ssl) != 1) {
+            SSL_free(ssl);
+            close(fd);
+            continue;
+        }
+        ct_set_nonblocking_fd(fd);
+
+        CtTlsConnection *connection = (CtTlsConnection *)calloc(1, sizeof(CtTlsConnection));
+        if (connection == NULL) {
+            SSL_free(ssl);
+            close(fd);
+            continue;
+        }
+        pthread_mutex_init(&connection->mutex, NULL);
+        connection->fd = fd;
+        connection->ctx = NULL;
+        connection->ssl = ssl;
+        connection->runtime = server->runtime;
+        connection->active = true;
+        connection->server_side = true;
+        pthread_mutex_lock(&ct_tls_mutex);
+        connection->id = ct_next_tls_connection_id++;
+        if (ct_next_tls_connection_id == 0) ct_next_tls_connection_id = 1;
+        pthread_mutex_unlock(&ct_tls_mutex);
+        ct_tls_connection_add(connection);
+        ct_tls_server_push_accepted(server, connection);
+    }
+    return NULL;
+}
+
+static void *ct_tls_read_thread(void *opaque) {
+    CtTlsConnection *connection = (CtTlsConnection *)opaque;
+    while (ct_tls_connection_is_active(connection)) {
+        struct pollfd poll_fd;
+        poll_fd.fd = connection->fd;
+        poll_fd.events = POLLIN | POLLHUP | POLLERR;
+        poll_fd.revents = 0;
+        int ready = poll(&poll_fd, 1, 50);
+        if (!ct_tls_connection_is_active(connection)) break;
+        if (ready == 0) continue;
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            ct_queue_fd_simple(connection->runtime, connection->id, "error", strerror(errno));
+            break;
+        }
+        if ((poll_fd.revents & POLLNVAL) != 0) {
+            ct_queue_fd_simple(connection->runtime, connection->id, "error", "invalid TLS socket");
+            break;
+        }
+
+        bool terminal = false;
+        for (;;) {
+            char buffer[65536];
+            pthread_mutex_lock(&connection->mutex);
+            int n = connection->ssl != NULL ? SSL_read(connection->ssl, buffer, sizeof(buffer)) : -1;
+            int ssl_error = n <= 0 && connection->ssl != NULL ? SSL_get_error(connection->ssl, n) : SSL_ERROR_SYSCALL;
+            pthread_mutex_unlock(&connection->mutex);
+            if (n > 0) {
+                ct_queue_fd_data(connection->runtime, connection->id, buffer, (size_t)n);
+                continue;
+            }
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) break;
+            if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                ct_queue_fd_simple(connection->runtime, connection->id, "end", NULL);
+                terminal = true;
+                break;
+            }
+            if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) break;
+            char *message = ct_tls_error_message("TLS read failed");
+            if (message != NULL && strstr(message, "unexpected eof") != NULL) {
+                free(message);
+                ct_queue_fd_simple(connection->runtime, connection->id, "end", NULL);
+                terminal = true;
+                break;
+            }
+            ct_queue_fd_simple(connection->runtime, connection->id, "error", message);
+            free(message);
+            terminal = true;
+            break;
+        }
+        if (terminal) break;
+    }
+    ct_tls_connection_set_active(connection, false);
+    ct_tls_connection_free(connection);
+    return NULL;
+}
+
+static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "tlsClientConnect(port, host, servername, rejectUnauthorized[, ca]) requires port, host, servername, and rejectUnauthorized");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    int port = (int)ct_value_to_number(ctx, argv[0]);
+    char *host = ct_value_to_optional_string(ctx, argv[1]);
+    char *servername = ct_value_to_optional_string(ctx, argv[2]);
+    bool reject_unauthorized = ct_value_to_bool(ctx, argv[3]);
+    char *ca = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
+
+    int fd = ct_tls_make_socket(ctx, host != NULL ? host : "127.0.0.1", port, AF_UNSPEC, exception);
+    if (fd < 0) {
+        free(host);
+        free(servername);
+        free(ca);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
+    SSL *ssl = ssl_ctx != NULL ? SSL_new(ssl_ctx) : NULL;
+    if (ssl_ctx == NULL || ssl == NULL) {
+        if (ssl != NULL) SSL_free(ssl);
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        close(fd);
+        free(host);
+        free(servername);
+        free(ca);
+        char *message = ct_tls_error_message("Failed to initialize TLS client");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    SSL_CTX_set_default_verify_paths(ssl_ctx);
+    if (ca != NULL && ca[0] != '\0') ct_tls_load_ca_pem(ssl_ctx, ca);
+    SSL_set_verify(ssl, reject_unauthorized ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+    if (servername != NULL && servername[0] != '\0') SSL_set_tlsext_host_name(ssl, servername);
+    SSL_set_fd(ssl, fd);
+    if (SSL_connect(ssl) != 1) {
+        char *message = ct_tls_error_message("TLS connect failed");
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        free(host);
+        free(servername);
+        free(ca);
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (reject_unauthorized && SSL_get_verify_result(ssl) != X509_V_OK) {
+        const char *verify_error = X509_verify_cert_error_string(SSL_get_verify_result(ssl));
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        free(host);
+        free(servername);
+        free(ca);
+        ct_throw_message(ctx, exception, verify_error != NULL ? verify_error : "TLS certificate verification failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+
+    CtTlsConnection *connection = (CtTlsConnection *)calloc(1, sizeof(CtTlsConnection));
+    if (connection == NULL) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        free(host);
+        free(servername);
+        free(ca);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_init(&connection->mutex, NULL);
+    connection->fd = fd;
+    connection->ctx = ssl_ctx;
+    connection->ssl = ssl;
+    connection->runtime = JSObjectGetPrivate(function);
+    connection->active = true;
+    pthread_mutex_lock(&ct_tls_mutex);
+    connection->id = ct_next_tls_connection_id++;
+    if (ct_next_tls_connection_id == 0) ct_next_tls_connection_id = 1;
+    pthread_mutex_unlock(&ct_tls_mutex);
+    ct_tls_connection_add(connection);
+
+    JSObjectRef result = ct_tls_connection_result(ctx, connection, exception);
+    free(host);
+    free(servername);
+    free(ca);
+    return result;
+}
+
+static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "tlsServerListen(port, host, cert, key) requires port, host, cert, and key");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    int port = (int)ct_value_to_number(ctx, argv[0]);
+    char *host = ct_value_to_optional_string(ctx, argv[1]);
+    char *cert = ct_value_to_string_copy(ctx, argv[2]);
+    char *key = ct_value_to_string_copy(ctx, argv[3]);
+
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (ssl_ctx == NULL || cert == NULL || key == NULL || ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0 || ct_tls_use_key_pem(ctx, ssl_ctx, key, exception) != 0 || SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        if (exception != NULL && *exception == NULL) {
+            char *message = ct_tls_error_message("Failed to initialize TLS server credentials");
+            ct_throw_message(ctx, exception, message);
+            free(message);
+        }
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        free(host);
+        free(cert);
+        free(key);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(cert);
+    free(key);
+
+    struct addrinfo *results = NULL;
+    if (ct_tcp_resolve_address(ctx, host, port, AF_INET, true, &results, exception) != 0) {
+        SSL_CTX_free(ssl_ctx);
+        free(host);
+        return JSValueMakeUndefined(ctx);
+    }
+    int listen_fd = -1;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        listen_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (listen_fd < 0) continue;
+        int yes = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        if (bind(listen_fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0 && listen(listen_fd, 128) == 0) {
+            ct_set_nonblocking_fd(listen_fd);
+            break;
+        }
+        close(listen_fd);
+        listen_fd = -1;
+    }
+    freeaddrinfo(results);
+    if (listen_fd < 0) {
+        SSL_CTX_free(ssl_ctx);
+        free(host);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtTlsServer *server = (CtTlsServer *)calloc(1, sizeof(CtTlsServer));
+    if (server == NULL) {
+        SSL_CTX_free(ssl_ctx);
+        close(listen_fd);
+        free(host);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    server->listen_fd = listen_fd;
+    server->ctx = ssl_ctx;
+    server->hostname = host != NULL ? host : ct_duplicate_string("127.0.0.1");
+    server->runtime = JSObjectGetPrivate(function);
+    pthread_mutex_init(&server->mutex, NULL);
+    pthread_mutex_lock(&ct_tls_mutex);
+    server->id = ct_next_tls_server_id++;
+    if (ct_next_tls_server_id == 0) ct_next_tls_server_id = 1;
+    server->next = ct_tls_servers;
+    ct_tls_servers = server;
+    pthread_mutex_unlock(&ct_tls_mutex);
+    if (pthread_create(&server->thread, NULL, ct_tls_server_thread, server) != 0) {
+        ct_tls_server_free(server);
+        ct_throw_message(ctx, exception, "Failed to start TLS server accept thread");
+        return JSValueMakeUndefined(ctx);
+    }
+    server->thread_started = true;
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, server->id), exception);
+    JSObjectRef address = ct_tcp_address_object(ctx, listen_fd, false, exception);
+    if (address != NULL) ct_set_property(ctx, result, "address", address, exception);
+    return result;
+}
+
+static JSValueRef ct_tls_server_accept(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsServerAccept(id) requires a server id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsServer *server = ct_tls_server_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (server == NULL) return JSValueMakeNull(ctx);
+    CtTlsConnection *connection = ct_tls_server_pop_accepted(server);
+    if (connection == NULL) return JSValueMakeNull(ctx);
+    JSObjectRef result = ct_tls_connection_result(ctx, connection, exception);
+    return result;
+}
+
+static JSValueRef ct_tls_server_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)ctx;
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc >= 1) ct_tls_server_free(ct_tls_server_find((uint32_t)ct_value_to_number(ctx, argv[0])));
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionReadStart(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    if (!connection->watcher_started) {
+        connection->watcher_started = true;
+        if (pthread_create(&connection->thread, NULL, ct_tls_read_thread, connection) != 0) {
+            connection->watcher_started = false;
+            ct_throw_message(ctx, exception, "Failed to start TLS read watcher");
+            return JSValueMakeUndefined(ctx);
+        }
+        pthread_detach(connection->thread);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsConnectionWrite(id, data) requires connection id and data");
+        return JSValueMakeBoolean(ctx, false);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char *text = NULL;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        text = ct_value_to_string_copy(ctx, argv[1]);
+        bytes = (uint8_t *)text;
+        len = text != NULL ? strlen(text) : 0;
+    }
+    size_t written_total = 0;
+    bool ok = true;
+    while (written_total < len) {
+        pthread_mutex_lock(&connection->mutex);
+        int written = SSL_write(connection->ssl, bytes + written_total, (int)(len - written_total));
+        int ssl_error = written <= 0 ? SSL_get_error(connection->ssl, written) : SSL_ERROR_NONE;
+        pthread_mutex_unlock(&connection->mutex);
+        if (written > 0) {
+            written_total += (size_t)written;
+            continue;
+        }
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            usleep(1000);
+            continue;
+        }
+        ok = false;
+        break;
+    }
+    free(text);
+    return JSValueMakeBoolean(ctx, ok);
+}
+
+static JSValueRef ct_tls_connection_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeUndefined(ctx);
+    ct_tls_connection_set_active(connection, false);
+    pthread_mutex_lock(&connection->mutex);
+    if (connection->ssl != NULL) SSL_shutdown(connection->ssl);
+    if (connection->fd >= 0) {
+        shutdown(connection->fd, SHUT_RDWR);
+        close(connection->fd);
+        connection->fd = -1;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    if (!connection->watcher_started) ct_tls_connection_free(connection);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tls_connection_shutdown(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionShutdown(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeUndefined(ctx);
+    pthread_mutex_lock(&connection->mutex);
+    if (connection->ssl != NULL) SSL_shutdown(connection->ssl);
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tls_connection_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionInfo(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeNull(ctx);
+    return ct_tls_connection_result(ctx, connection, exception);
+}
+#else
+static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "native TLS support is unavailable in this Cottontail build");
+    return JSValueMakeUndefined(ctx);
+}
+#define ct_tls_client_connect ct_tls_unavailable
+#define ct_tls_server_listen ct_tls_unavailable
+#define ct_tls_server_accept ct_tls_unavailable
+#define ct_tls_server_close ct_tls_unavailable
+#define ct_tls_connection_read_start ct_tls_unavailable
+#define ct_tls_connection_write ct_tls_unavailable
+#define ct_tls_connection_close ct_tls_unavailable
+#define ct_tls_connection_shutdown ct_tls_unavailable
+#define ct_tls_connection_info ct_tls_unavailable
+#endif
 
 static double ct_rusage_maxrss_bytes(const struct rusage *usage) {
 #if defined(__APPLE__) || defined(__MACH__)
@@ -7078,6 +8576,21 @@ static JSValueRef ct_rm_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_rmdir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "rmdirSync(path) requires a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    char *error = NULL;
+    if (ct_host_rmdir(path, &error) != 0) ct_throw_message(ctx, exception, error != NULL ? error : "rmdir failed");
+    if (error != NULL) ct_host_string_free(error);
+    free(path);
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_unlink_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -7272,6 +8785,56 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
     return response;
 }
 
+static JSValueRef ct_process_execve(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "processExecve(file, args, env) requires file, args, and env");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *file = ct_value_to_string_copy(ctx, argv[0]);
+    char **args = NULL;
+    size_t arg_count = 0;
+    CtHostEnvEntry *env_entries = NULL;
+    size_t env_count = 0;
+    if (file == NULL ||
+        ct_parse_string_array(ctx, argv[1], &args, &arg_count, exception) != 0 ||
+        ct_parse_env_object(ctx, argv[2], &env_entries, &env_count, exception) != 0) {
+        free(file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char **argv_exec = (char **)calloc(arg_count + 1, sizeof(char *));
+    char **envp = ct_env_entries_to_envp(env_entries, env_count);
+    if (argv_exec == NULL || envp == NULL) {
+        free(argv_exec);
+        ct_free_envp(envp, env_count);
+        free(file);
+        ct_free_string_array(args, arg_count);
+        ct_free_env_entries(env_entries, env_count);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    for (size_t index = 0; index < arg_count; index += 1) argv_exec[index] = args[index];
+    argv_exec[arg_count] = NULL;
+
+#if defined(_WIN32)
+    ct_throw_message(ctx, exception, "process.execve is unavailable on this platform");
+#else
+    execve(file, argv_exec, envp);
+    ct_throw_message(ctx, exception, strerror(errno));
+#endif
+
+    free(argv_exec);
+    ct_free_envp(envp, env_count);
+    free(file);
+    ct_free_string_array(args, arg_count);
+    ct_free_env_entries(env_entries, env_count);
+    return JSValueMakeUndefined(ctx);
+}
+
 static void ct_queue_spawn_event(CtJscRuntime *runtime, CtSpawnEvent *event) {
     pthread_mutex_lock(&runtime->spawn_event_mutex);
     if (runtime->spawn_events_tail != NULL) {
@@ -7291,6 +8854,28 @@ static void ct_queue_spawn_text(CtJscRuntime *runtime, uint32_t id, const char *
     event->type = ct_duplicate_bytes(type, strlen(type));
     event->data = ct_duplicate_bytes(data, data_len);
     event->data_len = data_len;
+    ct_queue_spawn_event(runtime, event);
+}
+
+static void ct_queue_spawn_ipc(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len, int received_fd) {
+    if (data == NULL && received_fd < 0) return;
+    CtSpawnEvent *event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
+    if (event == NULL) return;
+    event->process_id = id;
+    event->type = ct_duplicate_bytes("ipc", 3);
+    event->data = data_len > 0 ? ct_duplicate_bytes(data, data_len) : NULL;
+    event->data_len = data_len;
+    if (received_fd >= 0) {
+        event->received_fd = received_fd;
+        event->has_fd = true;
+    }
+    if (event->type == NULL || (data_len > 0 && event->data == NULL)) {
+        free(event->type);
+        free(event->data);
+        if (received_fd >= 0) close(received_fd);
+        free(event);
+        return;
+    }
     ct_queue_spawn_event(runtime, event);
 }
 
@@ -7571,6 +9156,10 @@ static void ct_async_processes_stop_runtime(CtJscRuntime *runtime) {
                 close(cursor->stdin_fd);
                 cursor->stdin_fd = -1;
             }
+            if (cursor->ipc_fd >= 0) {
+                close(cursor->ipc_fd);
+                cursor->ipc_fd = -1;
+            }
         }
         cursor = cursor->next;
     }
@@ -7591,10 +9180,11 @@ static void *ct_async_process_thread(void *opaque) {
     bool exited = false;
     if (process->stdout_fd >= 0) fcntl(process->stdout_fd, F_SETFL, fcntl(process->stdout_fd, F_GETFL, 0) | O_NONBLOCK);
     if (process->stderr_fd >= 0) fcntl(process->stderr_fd, F_SETFL, fcntl(process->stderr_fd, F_GETFL, 0) | O_NONBLOCK);
+    if (process->ipc_fd >= 0) fcntl(process->ipc_fd, F_SETFL, fcntl(process->ipc_fd, F_GETFL, 0) | O_NONBLOCK);
 
-    while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
-        struct pollfd fds[2];
-        const char *types[2];
+    while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0 || process->ipc_fd >= 0) {
+        struct pollfd fds[3];
+        const char *types[3];
         int count = 0;
         if (process->stdout_fd >= 0) {
             fds[count].fd = process->stdout_fd;
@@ -7610,11 +9200,62 @@ static void *ct_async_process_thread(void *opaque) {
             types[count] = "stderr";
             count += 1;
         }
+        if (process->ipc_fd >= 0) {
+            fds[count].fd = process->ipc_fd;
+            fds[count].events = POLLIN | POLLHUP | POLLERR | POLLNVAL;
+            fds[count].revents = 0;
+            types[count] = "ipc";
+            count += 1;
+        }
 
         int ready = count > 0 ? poll(fds, (nfds_t)count, 50) : 0;
         if (ready > 0) {
             for (int index = 0; index < count; index += 1) {
-                if ((fds[index].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+                if ((fds[index].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) continue;
+                if (strcmp(types[index], "ipc") == 0) {
+                    if ((fds[index].revents & POLLNVAL) != 0) {
+                        process->ipc_fd = -1;
+                        continue;
+                    }
+                    for (;;) {
+                        char buffer[65536];
+                        char control[CMSG_SPACE(sizeof(int))];
+                        struct iovec iov;
+                        memset(&iov, 0, sizeof(iov));
+                        iov.iov_base = buffer;
+                        iov.iov_len = sizeof(buffer);
+                        struct msghdr msg;
+                        memset(&msg, 0, sizeof(msg));
+                        memset(control, 0, sizeof(control));
+                        msg.msg_iov = &iov;
+                        msg.msg_iovlen = 1;
+                        msg.msg_control = control;
+                        msg.msg_controllen = sizeof(control);
+                        ssize_t n = recvmsg(fds[index].fd, &msg, 0);
+                        if (n > 0) {
+                            int received_fd = -1;
+                            for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+                                    memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+                                    break;
+                                }
+                            }
+                            ct_queue_spawn_ipc(process->runtime, process->id, buffer, (size_t)n, received_fd);
+                            continue;
+                        }
+                        if (n == 0) {
+                            if (process->ipc_fd >= 0) close(process->ipc_fd);
+                            process->ipc_fd = -1;
+                            break;
+                        }
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (process->ipc_fd >= 0) close(process->ipc_fd);
+                        process->ipc_fd = -1;
+                        break;
+                    }
+                    continue;
+                }
                 char buffer[16384];
                 for (;;) {
                     ssize_t n = read(fds[index].fd, buffer, sizeof(buffer));
@@ -7678,6 +9319,7 @@ static void *ct_async_process_thread(void *opaque) {
         ct_queue_spawn_event(process->runtime, exit_event);
     }
     if (process->stdin_fd >= 0) close(process->stdin_fd);
+    if (process->ipc_fd >= 0) close(process->ipc_fd);
     ct_async_process_remove(process);
     free(process);
     return NULL;
@@ -7698,6 +9340,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     size_t env_count = 0;
     bool clear_env = false;
     bool capture_output = true;
+    bool ipc_enabled = false;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
     CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
@@ -7713,6 +9356,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2]) && JSValueIsObject(ctx, argv[2])) {
         JSObjectRef options = (JSObjectRef)argv[2];
         JSValueRef stdio_value = ct_get_property(ctx, options, "stdio", exception);
+        JSValueRef ipc_value = ct_get_property(ctx, options, "ipc", exception);
         if (exception != NULL && *exception != NULL) {
             free(file);
             ct_free_string_array(args, arg_count);
@@ -7720,6 +9364,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             ct_free_env_entries(env_entries, env_count);
             return JSValueMakeUndefined(ctx);
         }
+        ipc_enabled = JSValueToBoolean(ctx, ipc_value);
 
         if (!JSValueIsUndefined(ctx, stdio_value)) {
             CtProcessStdioMode stdio_mode = stdout_mode;
@@ -7751,6 +9396,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     int stdin_pipe[2] = { -1, -1 };
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
+    int ipc_socket[2] = { -1, -1 };
     if (stdin_mode == CT_PROCESS_STDIO_PIPE && pipe(stdin_pipe) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
@@ -7781,6 +9427,37 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
+#if !defined(_WIN32)
+    if (ipc_enabled && socketpair(AF_UNIX, SOCK_STREAM, 0, ipc_socket) != 0) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+#else
+    if (ipc_enabled) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_throw_message(ctx, exception, "IPC handle passing is unavailable on this platform");
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+#endif
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -7798,6 +9475,14 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdout_pipe[1]);
         ct_process_close_fd(&stderr_pipe[1]);
+        if (ipc_enabled) {
+            ct_process_close_fd(&ipc_socket[0]);
+            if (ipc_socket[1] >= 0) {
+                dup2(ipc_socket[1], 3);
+                if (ipc_socket[1] != 3) close(ipc_socket[1]);
+                setenv("COTTONTAIL_IPC_FD", "3", 1);
+            }
+        }
         char **argv_exec = (char **)calloc(arg_count + 2, sizeof(char *));
         if (argv_exec == NULL) _exit(127);
         argv_exec[0] = file;
@@ -7810,10 +9495,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_process_close_fd(&stdin_pipe[0]);
     ct_process_close_fd(&stdout_pipe[1]);
     ct_process_close_fd(&stderr_pipe[1]);
+    if (ipc_enabled) ct_process_close_fd(&ipc_socket[1]);
     if (pid < 0) {
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
         ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&ipc_socket[0]);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
@@ -7827,6 +9514,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
         ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&ipc_socket[0]);
         ct_throw_message(ctx, exception, "Out of memory");
         free(file);
         ct_free_string_array(args, arg_count);
@@ -7839,6 +9527,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->stdin_fd = stdin_mode == CT_PROCESS_STDIO_PIPE ? stdin_pipe[1] : -1;
     process->stdout_fd = stdout_mode == CT_PROCESS_STDIO_PIPE ? stdout_pipe[0] : -1;
     process->stderr_fd = stderr_mode == CT_PROCESS_STDIO_PIPE ? stderr_pipe[0] : -1;
+    process->ipc_fd = ipc_enabled ? ipc_socket[0] : -1;
     process->runtime = runtime;
     pthread_mutex_lock(&ct_async_processes_mutex);
     process->next = ct_async_processes;
@@ -7851,6 +9540,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     JSObjectRef response = ct_make_object(ctx);
     ct_set_property(ctx, response, "id", JSValueMakeNumber(ctx, id), exception);
     ct_set_property(ctx, response, "pid", JSValueMakeNumber(ctx, pid), exception);
+    if (process->ipc_fd >= 0) ct_set_property(ctx, response, "ipcFd", JSValueMakeNumber(ctx, process->ipc_fd), exception);
 
     free(file);
     ct_free_string_array(args, arg_count);
@@ -7897,6 +9587,23 @@ static JSValueRef ct_spawn_close_stdin(JSContextRef ctx, JSObjectRef function, J
     if (process != NULL && process->stdin_fd >= 0) {
         close(process->stdin_fd);
         process->stdin_fd = -1;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    CtAsyncProcess *process = ct_async_processes;
+    while (process != NULL && process->id != id) process = process->next;
+    if (process != NULL && process->ipc_fd >= 0) {
+        close(process->ipc_fd);
+        process->ipc_fd = -1;
     }
     pthread_mutex_unlock(&ct_async_processes_mutex);
     return JSValueMakeUndefined(ctx);
@@ -8026,6 +9733,13 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
         ct_set_property(ctx, item, "type", ct_make_string(ctx, event->type != NULL ? event->type : ""), exception);
         if (event->data != NULL) {
             ct_set_property(ctx, item, "data", ct_array_buffer_from_copy(ctx, event->data, event->data_len, exception), exception);
+        }
+        if (strcmp(event->type != NULL ? event->type : "", "ipc") == 0) {
+            if (event->has_fd) {
+                ct_set_property(ctx, item, "fd", JSValueMakeNumber(ctx, event->received_fd), exception);
+            } else {
+                ct_set_property(ctx, item, "fd", JSValueMakeNull(ctx), exception);
+            }
         }
         if (strcmp(event->type != NULL ? event->type : "", "exit") == 0) {
             ct_set_property(ctx, item, "exitCode", JSValueMakeNumber(ctx, event->exit_code), exception);
@@ -8238,6 +9952,15 @@ static JSValueRef ct_is_worker(JSContextRef ctx, JSObjectRef function, JSObjectR
     (void)exception;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     return JSValueMakeBoolean(ctx, runtime != NULL && runtime->worker != NULL);
+}
+
+static JSValueRef ct_worker_thread_id(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    return JSValueMakeNumber(ctx, runtime != NULL && runtime->worker != NULL ? runtime->worker->id : 0);
 }
 
 static JSValueRef ct_worker_post_message(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -8702,6 +10425,157 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
 
     free(text);
     return JSValueMakeBoolean(ctx, ok);
+}
+
+static JSValueRef ct_ipc_send(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.ipcSend(fd, data[, sendFd]) requires a socket fd and data");
+        return JSValueMakeBoolean(ctx, false);
+    }
+#if defined(_WIN32)
+    ct_throw_message(ctx, exception, "ipcSend is unavailable on this platform");
+    return JSValueMakeBoolean(ctx, false);
+#else
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int send_fd = argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])
+        ? (int)ct_value_to_number(ctx, argv[2])
+        : -1;
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char *text = NULL;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        text = ct_value_to_string_copy(ctx, argv[1]);
+        bytes = (uint8_t *)text;
+        len = text != NULL ? strlen(text) : 0;
+    }
+    if (fd < 0 || bytes == NULL) {
+        free(text);
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+    char empty = 0;
+    struct iovec iov;
+    iov.iov_base = len > 0 ? (void *)bytes : (void *)&empty;
+    iov.iov_len = len > 0 ? len : 1;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    char control[CMSG_SPACE(sizeof(int))];
+    if (send_fd >= 0) {
+        memset(control, 0, sizeof(control));
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(int));
+    }
+
+    bool ok = false;
+    for (;;) {
+        ssize_t sent = sendmsg(fd, &msg, 0);
+        if (sent >= 0) {
+            ok = true;
+            break;
+        }
+        if (errno == EINTR) continue;
+        break;
+    }
+    free(text);
+    return JSValueMakeBoolean(ctx, ok);
+#endif
+}
+
+static JSValueRef ct_ipc_recv(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.ipcRecv(fd[, maxBytes]) requires a socket fd");
+        return JSValueMakeUndefined(ctx);
+    }
+#if defined(_WIN32)
+    ct_throw_message(ctx, exception, "ipcRecv is unavailable on this platform");
+    return JSValueMakeUndefined(ctx);
+#else
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    size_t max_bytes = argc >= 2 ? (size_t)ct_value_to_number(ctx, argv[1]) : 65536;
+    if (fd < 0) {
+        ct_throw_message(ctx, exception, "invalid IPC file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (max_bytes == 0) max_bytes = 65536;
+    if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
+
+    struct pollfd poll_fd;
+    poll_fd.fd = fd;
+    poll_fd.events = POLLIN | POLLHUP | POLLERR;
+    poll_fd.revents = 0;
+    int ready = poll(&poll_fd, 1, 0);
+    if (ready == 0) return JSValueMakeNull(ctx);
+    if (ready < 0) {
+        if (errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    if ((poll_fd.revents & POLLNVAL) != 0) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "data", ct_array_buffer_from_copy(ctx, "", 0, exception), exception);
+        ct_set_property(ctx, result, "fd", JSValueMakeNull(ctx), exception);
+        ct_set_property(ctx, result, "end", JSValueMakeBoolean(ctx, true), exception);
+        return result;
+    }
+
+    char *buffer = (char *)malloc(max_bytes > 0 ? max_bytes : 1);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec iov;
+    iov.iov_base = buffer;
+    iov.iov_len = max_bytes;
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    memset(control, 0, sizeof(control));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t n;
+    for (;;) {
+        n = recvmsg(fd, &msg, 0);
+        if (n >= 0 || errno != EINTR) break;
+    }
+    if (n < 0) {
+        free(buffer);
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return JSValueMakeNull(ctx);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "data", ct_array_buffer_from_copy(ctx, buffer, (size_t)n, exception), exception);
+    free(buffer);
+    int received_fd = -1;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+            break;
+        }
+    }
+    if (received_fd >= 0) ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, received_fd), exception);
+    else ct_set_property(ctx, result, "fd", JSValueMakeNull(ctx), exception);
+    ct_set_property(ctx, result, "end", JSValueMakeBoolean(ctx, n == 0), exception);
+    return result;
+#endif
 }
 
 static JSValueRef ct_access_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -9424,6 +11298,38 @@ static JSValueRef ct_http_server_stop(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_strip_typescript_types_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "stripTypeScriptTypes(source[, mode]) requires source");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t source_len = 0;
+    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    if (source == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int mode = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : 0;
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_strip_typescript_types((const uint8_t *)source, source_len, mode, &output_len, &error);
+    free(source);
+
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "TypeScript transform failed");
+        if (error != NULL) ct_transpiler_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_transpiler_free(output, output_len);
+    return result;
+}
+
 static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -9464,6 +11370,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "readFd", ct_read_fd, runtime);
     ct_install_function(ctx, host, "closeFd", ct_close_fd, runtime);
     ct_install_function(ctx, host, "fdWrite", ct_fd_write, runtime);
+    ct_install_function(ctx, host, "ipcSend", ct_ipc_send, runtime);
+    ct_install_function(ctx, host, "ipcRecv", ct_ipc_recv, runtime);
     ct_install_function(ctx, host, "accessSync", ct_access_sync_native, runtime);
     ct_install_function(ctx, host, "fdReadAt", ct_fd_read_at, runtime);
     ct_install_function(ctx, host, "fdWriteAt", ct_fd_write_at, runtime);
@@ -9493,12 +11401,15 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "readDirSync", ct_read_dir_sync, runtime);
     ct_install_function(ctx, host, "mkdirSync", ct_mkdir_sync, runtime);
     ct_install_function(ctx, host, "rmSync", ct_rm_sync, runtime);
+    ct_install_function(ctx, host, "rmdirSync", ct_rmdir_sync, runtime);
     ct_install_function(ctx, host, "unlinkSync", ct_unlink_sync, runtime);
     ct_install_function(ctx, host, "chmodSync", ct_chmod_sync, runtime);
     ct_install_function(ctx, host, "spawnSync", ct_spawn_sync, runtime);
+    ct_install_function(ctx, host, "processExecve", ct_process_execve, runtime);
     ct_install_function(ctx, host, "spawnStart", ct_spawn_start, runtime);
     ct_install_function(ctx, host, "spawnWrite", ct_spawn_write, runtime);
     ct_install_function(ctx, host, "spawnCloseStdin", ct_spawn_close_stdin, runtime);
+    ct_install_function(ctx, host, "spawnCloseIpc", ct_spawn_close_ipc, runtime);
     ct_install_function(ctx, host, "spawnKill", ct_spawn_kill, runtime);
     ct_install_function(ctx, host, "spawnDispose", ct_undefined, runtime);
     ct_install_function(ctx, host, "spawnSetEventHandler", ct_spawn_set_event_handler, runtime);
@@ -9507,6 +11418,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "httpServerPoll", ct_http_server_poll, runtime);
     ct_install_function(ctx, host, "httpServerRespond", ct_http_server_respond, runtime);
     ct_install_function(ctx, host, "httpServerStop", ct_http_server_stop, runtime);
+    ct_install_function(ctx, host, "stripTypeScriptTypes", ct_strip_typescript_types_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
     ct_install_function(ctx, host, "memoryView", ct_memory_view, runtime);
     ct_install_function(ctx, host, "nativeCall", ct_native_call, runtime);
@@ -9514,6 +11426,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "closeCallback", ct_close_callback, runtime);
     ct_install_function(ctx, host, "spawnWorker", ct_worker_spawn, runtime);
     ct_install_function(ctx, host, "isWorker", ct_is_worker, runtime);
+    ct_install_function(ctx, host, "workerThreadId", ct_worker_thread_id, runtime);
     ct_install_function(ctx, host, "workerPostMessage", ct_worker_post_message, runtime);
     ct_install_function(ctx, host, "workerPollIncomingMessages", ct_worker_poll_incoming_messages, runtime);
     ct_install_function(ctx, host, "workerPostMessageTo", ct_worker_post_message_to, runtime);
@@ -9572,11 +11485,32 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "udpSocketSend", ct_udp_socket_send, runtime);
     ct_install_function(ctx, host, "udpSocketReceive", ct_udp_socket_receive, runtime);
     ct_install_function(ctx, host, "udpSocketClose", ct_udp_socket_close, runtime);
+    ct_install_function(ctx, host, "udpSocketSetBroadcast", ct_udp_socket_set_broadcast, runtime);
+    ct_install_function(ctx, host, "udpSocketSetTTL", ct_udp_socket_set_ttl, runtime);
+    ct_install_function(ctx, host, "udpSocketSetMulticastTTL", ct_udp_socket_set_multicast_ttl, runtime);
+    ct_install_function(ctx, host, "udpSocketSetMulticastLoopback", ct_udp_socket_set_multicast_loopback, runtime);
+    ct_install_function(ctx, host, "udpSocketSetBufferSize", ct_udp_socket_set_buffer_size, runtime);
+    ct_install_function(ctx, host, "udpSocketGetBufferSize", ct_udp_socket_get_buffer_size, runtime);
+    ct_install_function(ctx, host, "udpSocketMembership", ct_udp_socket_membership, runtime);
     ct_install_function(ctx, host, "tcpServerListen", ct_tcp_server_listen, runtime);
     ct_install_function(ctx, host, "tcpServerAccept", ct_tcp_server_accept, runtime);
     ct_install_function(ctx, host, "tcpSocketConnect", ct_tcp_socket_connect, runtime);
     ct_install_function(ctx, host, "tcpSocketAddress", ct_tcp_socket_address, runtime);
+    ct_install_function(ctx, host, "tcpSocketSetNoDelay", ct_tcp_socket_set_no_delay, runtime);
+    ct_install_function(ctx, host, "tcpSocketSetKeepAlive", ct_tcp_socket_set_keep_alive, runtime);
     ct_install_function(ctx, host, "tcpSocketShutdown", ct_tcp_socket_shutdown, runtime);
+    ct_install_function(ctx, host, "unixServerListen", ct_unix_server_listen, runtime);
+    ct_install_function(ctx, host, "unixServerAccept", ct_unix_server_accept, runtime);
+    ct_install_function(ctx, host, "unixSocketConnect", ct_unix_socket_connect, runtime);
+    ct_install_function(ctx, host, "tlsClientConnect", ct_tls_client_connect, runtime);
+    ct_install_function(ctx, host, "tlsServerListen", ct_tls_server_listen, runtime);
+    ct_install_function(ctx, host, "tlsServerAccept", ct_tls_server_accept, runtime);
+    ct_install_function(ctx, host, "tlsServerClose", ct_tls_server_close, runtime);
+    ct_install_function(ctx, host, "tlsConnectionReadStart", ct_tls_connection_read_start, runtime);
+    ct_install_function(ctx, host, "tlsConnectionWrite", ct_tls_connection_write, runtime);
+    ct_install_function(ctx, host, "tlsConnectionShutdown", ct_tls_connection_shutdown, runtime);
+    ct_install_function(ctx, host, "tlsConnectionClose", ct_tls_connection_close, runtime);
+    ct_install_function(ctx, host, "tlsConnectionInfo", ct_tls_connection_info, runtime);
     ct_install_function(ctx, host, "sqliteOpen", ct_sqlite_open, runtime);
     ct_install_function(ctx, host, "sqliteClose", ct_sqlite_close, runtime);
     ct_install_function(ctx, host, "sqliteExec", ct_sqlite_exec, runtime);
@@ -9589,6 +11523,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sqliteCreateFunction", ct_sqlite_create_function, runtime);
     ct_install_function(ctx, host, "sqliteCreateAggregate", ct_sqlite_create_aggregate, runtime);
     ct_install_function(ctx, host, "sqliteSetAuthorizer", ct_sqlite_set_authorizer, runtime);
+    ct_install_function(ctx, host, "sqliteEnableLoadExtension", ct_sqlite_enable_load_extension, runtime);
+    ct_install_function(ctx, host, "sqliteLoadExtension", ct_sqlite_load_extension, runtime);
     ct_install_function(ctx, host, "sqliteBackup", ct_sqlite_backup, runtime);
     ct_install_function(ctx, host, "platform", ct_platform, runtime);
     ct_install_function(ctx, host, "arch", ct_arch, runtime);

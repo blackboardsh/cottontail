@@ -180,7 +180,7 @@ function parseRuntimeModule(filePath) {
   const globalProperties = [];
 
   const patterns = [
-    /\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+(?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)/g,
     /\bexport\s+class\s+([A-Za-z_$][\w$]*)/g,
     /\bexport\s+const\s+([A-Za-z_$][\w$]*)/g,
     /\bexport\s+let\s+([A-Za-z_$][\w$]*)/g,
@@ -338,15 +338,26 @@ function collectNodeTestFiles() {
     .sort();
 }
 
+const nodeBehaviorTestAliases = {
+  async_hooks: ['node-misc-modules-surface', 'node-stream-surface'],
+  perf_hooks: ['node-instrumentation-surface'],
+  repl: ['node-instrumentation-surface'],
+  url: ['node-small-surface'],
+  vm: ['node-small-surface'],
+  wasi: ['node-instrumentation-surface'],
+};
+
 function testFilesForModule(testFiles, moduleName) {
   const normalized = moduleName.replace(/^node:/, '').replace(/[_/]/g, '-');
   const root = normalized.split('-')[0];
+  const aliases = nodeBehaviorTestAliases[moduleName] || [];
   return testFiles.filter((file) => {
     const name = file.slice('tests/js/'.length).replace(/\.(?:js|ts)$/, '');
     return name === `node-${normalized}` ||
       name.startsWith(`node-${normalized}-`) ||
       name === `node-${root}` ||
       name.startsWith(`node-${root}-`) ||
+      aliases.includes(name) ||
       name.includes(`-${normalized}`) ||
       name.includes(`-${root}-`);
   });
@@ -359,12 +370,14 @@ function collectNodeBehavioralSignals(nodeSurface) {
   const modules = {};
   let compatMarkerCount = 0;
   let explicitUnsupportedCount = 0;
+  let nativeAvailabilityGuardCount = 0;
 
   for (const filePath of files) {
     const source = readFileSync(filePath, 'utf8');
     const moduleName = nodeModuleNameForFile(filePath);
     const compatMarkers = [];
     const unsupportedMarkers = [];
+    const nativeAvailabilityGuards = [];
 
     for (const match of source.matchAll(/\/\/\s*COTTONTAIL-COMPAT:\s*([^\n]+)/g)) {
       compatMarkers.push(match[1].trim());
@@ -374,13 +387,30 @@ function collectNodeBehavioralSignals(nodeSurface) {
     for (let index = 0; index < lines.length; index += 1) {
       const line = lines[index];
       const lower = line.toLowerCase();
+      const previousLine = lines[index - 1] ?? '';
       const unsupportedHelperCall =
         /\bunsupported(?:crypto|tls|http2)?\s*\(/i.test(line) &&
         !/\bfunction\s+unsupported/i.test(line);
       const throwingUnsupported =
         /\bthrow\b/.test(line) &&
         /(not implemented|requires native|not available in cottontail|requires .*bindings|unsupported|fail loudly|throw until)/i.test(lower);
-      if (unsupportedHelperCall || throwingUnsupported) {
+      const unsupportedHelperBody =
+        /\bfunction\s+unsupported(?:crypto|tls|http2)?\s*\(/i.test(previousLine) &&
+        /\bthrow\b/.test(line);
+      const nativeAvailabilityGuard =
+        /\btypeof\s+cottontail\.[A-Za-z_$][\w$]*\s*!==\s*["']function["']/.test(line) &&
+        (unsupportedHelperCall || throwingUnsupported);
+      const validationOnlyUnsupported =
+        /Unsupported Cottontail v8 serialization format/.test(line);
+      if (validationOnlyUnsupported || unsupportedHelperBody) {
+        continue;
+      }
+      if (nativeAvailabilityGuard) {
+        nativeAvailabilityGuards.push({
+          line: index + 1,
+          text: line.trim(),
+        });
+      } else if (unsupportedHelperCall || throwingUnsupported) {
         unsupportedMarkers.push({
           line: index + 1,
           text: line.trim(),
@@ -388,15 +418,17 @@ function collectNodeBehavioralSignals(nodeSurface) {
       }
     }
 
-    if (compatMarkers.length > 0 || unsupportedMarkers.length > 0) {
+    if (compatMarkers.length > 0 || unsupportedMarkers.length > 0 || nativeAvailabilityGuards.length > 0) {
       modules[moduleName] = {
         file: relative(rootDir, filePath).split(sep).join('/'),
         compatMarkers,
         unsupportedMarkers,
+        nativeAvailabilityGuards,
         tests: testFilesForModule(testFiles, moduleName),
       };
       compatMarkerCount += compatMarkers.length;
       explicitUnsupportedCount += unsupportedMarkers.length;
+      nativeAvailabilityGuardCount += nativeAvailabilityGuards.length;
     }
   }
 
@@ -418,6 +450,7 @@ function collectNodeBehavioralSignals(nodeSurface) {
       file: entry.file,
       compatMarkers: entry.compatMarkers.length,
       unsupportedMarkers: entry.unsupportedMarkers.length,
+      nativeAvailabilityGuards: entry.nativeAvailabilityGuards.length,
       tests: entry.tests.length,
       gapScore: entry.compatMarkers.length * 3 + entry.unsupportedMarkers.length * 2 + (entry.tests.length === 0 ? 1 : 0),
     }))
@@ -437,6 +470,7 @@ function collectNodeBehavioralSignals(nodeSurface) {
       compatMarkers: compatMarkerCount,
       modulesWithCompatMarkers,
       explicitUnsupportedMarkers: explicitUnsupportedCount,
+      nativeAvailabilityGuards: nativeAvailabilityGuardCount,
       modulesWithUnsupportedMarkers,
     },
     largestGaps,

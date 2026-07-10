@@ -28,6 +28,7 @@ import {
   deflateRawSync,
   deflateSync,
   gzipSync,
+  inflateSync,
   zstdCompress,
   zstdCompressSync,
   zstdDecompressSync,
@@ -94,6 +95,16 @@ assert(new TextDecoder().decode(brotliRoundTrip) === "brotli streams", "brotli s
 
 assert(deflateSync("sync").byteLength > 0, "deflateSync baseline mismatch");
 assert(deflateRawSync("sync").byteLength > 0, "deflateRawSync baseline mismatch");
+const dictionary = new TextEncoder().encode("common-prefix-");
+const dictionaryCompressed = deflateSync("common-prefix-value", { dictionary, level: 9, windowBits: 15, memLevel: 8, strategy: 0 });
+assert(new TextDecoder().decode(inflateSync(dictionaryCompressed, { dictionary })) === "common-prefix-value", "zlib dictionary round trip mismatch");
+let missingDictionaryFailed = false;
+try {
+  inflateSync(dictionaryCompressed);
+} catch {
+  missingDictionaryFailed = true;
+}
+assert(missingDictionaryFailed, "inflateSync should require the dictionary");
 assert(new TextDecoder().decode(brotliDecompressSync(brotliCompressSync("brotli sync"))) === "brotli sync", "brotli sync round trip mismatch");
 assert(crc32("hello") === 907060870, "crc32 mismatch");
 

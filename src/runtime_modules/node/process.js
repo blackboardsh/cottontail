@@ -1,4 +1,8 @@
 import { createReadableStdio, createWritableStdio } from "./stdio.js";
+import { Buffer } from "./buffer.js";
+import constantsObject from "./constants.js";
+import * as utilTypes from "./util/types.js";
+import * as zlibConstants from "./zlib/constants.js";
 
 const processStartNs = typeof cottontail.nanotime === "function" ? BigInt(Math.floor(cottontail.nanotime())) : 0n;
 const processStartMs = Date.now();
@@ -138,8 +142,526 @@ function makeMemoryUsage() {
 
 makeMemoryUsage.rss = () => Number(processInfo("memoryUsage").rss) || 0;
 
-function unsupported(name) {
-  throw new Error(`${name} is not available in Cottontail's embedded Node compatibility layer`);
+function pickConstants(predicate) {
+  const out = {};
+  for (const [name, value] of Object.entries(constantsObject)) {
+    if (predicate(name, value)) out[name] = value;
+  }
+  return Object.freeze(out);
+}
+
+const errnoConstants = pickConstants((name, value) => /^E[A-Z0-9]+$/.test(name) && Number.isInteger(value));
+const signalConstants = pickConstants((name, value) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value));
+const priorityConstants = pickConstants((name) => name.startsWith("PRIORITY_"));
+const dlopenConstants = pickConstants((name) => name.startsWith("RTLD_"));
+const fsConstants = pickConstants((name) =>
+  name === "F_OK" ||
+  name === "R_OK" ||
+  name === "W_OK" ||
+  name === "X_OK" ||
+  name.startsWith("O_") ||
+  name.startsWith("S_") ||
+  name.startsWith("UV_DIRENT_") ||
+  name.startsWith("UV_FS_") ||
+  name.startsWith("COPYFILE_"));
+const cryptoConstants = pickConstants((name) =>
+  name === "defaultCoreCipherList" ||
+  name === "OPENSSL_VERSION_NUMBER" ||
+  name.startsWith("SSL_") ||
+  name.startsWith("ENGINE_") ||
+  name.startsWith("DH_") ||
+  name.startsWith("RSA_") ||
+  name.startsWith("TLS") ||
+  name.startsWith("POINT_CONVERSION_"));
+const zlibBindingConstants = Object.freeze(Object.fromEntries(
+  Object.entries(zlibConstants).filter(([, value]) => typeof value === "number" || typeof value === "string"),
+));
+
+function bindingError(message, code = undefined) {
+  const error = new Error(message);
+  if (code) error.code = code;
+  return error;
+}
+
+function throwNoSuchBinding(name) {
+  throw bindingError(`No such module: ${name}`);
+}
+
+function bufferView(value) {
+  if (value == null) return new Uint8Array(0);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return Buffer.from(String(value));
+}
+
+function copyBytes(source, target, targetStart = 0, sourceStart = 0, sourceEnd = undefined) {
+  const sourceView = bufferView(source);
+  const targetView = bufferView(target);
+  const start = Math.max(0, Number(sourceStart) || 0);
+  const end = Math.min(sourceView.byteLength, sourceEnd == null ? sourceView.byteLength : Number(sourceEnd) || 0);
+  const targetOffset = Math.max(0, Number(targetStart) || 0);
+  const chunk = sourceView.subarray(start, Math.max(start, end));
+  targetView.set(chunk.subarray(0, Math.max(0, targetView.byteLength - targetOffset)), targetOffset);
+  return Math.min(chunk.byteLength, Math.max(0, targetView.byteLength - targetOffset));
+}
+
+function swapBytes(buffer, width) {
+  const view = bufferView(buffer);
+  if (view.byteLength % width !== 0) throw bindingError(`Buffer size must be a multiple of ${width}`);
+  for (let index = 0; index < view.byteLength; index += width) {
+    for (let offset = 0; offset < width / 2; offset += 1) {
+      const left = index + offset;
+      const right = index + width - offset - 1;
+      const value = view[left];
+      view[left] = view[right];
+      view[right] = value;
+    }
+  }
+  return buffer;
+}
+
+function indexOfBuffer(source, needle, byteOffset = 0) {
+  const haystack = bufferView(source);
+  const target = bufferView(needle);
+  const start = Math.max(0, Number(byteOffset) || 0);
+  if (target.byteLength === 0) return start <= haystack.byteLength ? start : haystack.byteLength;
+  outer: for (let index = start; index <= haystack.byteLength - target.byteLength; index += 1) {
+    for (let offset = 0; offset < target.byteLength; offset += 1) {
+      if (haystack[index + offset] !== target[offset]) continue outer;
+    }
+    return index;
+  }
+  return -1;
+}
+
+function makeBufferBinding() {
+  return Object.freeze({
+    atob: globalThis.atob,
+    btoa: globalThis.btoa,
+    byteLengthUtf8(value) {
+      return Buffer.byteLength ? Buffer.byteLength(String(value), "utf8") : new TextEncoder().encode(String(value)).byteLength;
+    },
+    copy: copyBytes,
+    compare(left, right) {
+      const a = bufferView(left);
+      const b = bufferView(right);
+      const length = Math.min(a.byteLength, b.byteLength);
+      for (let index = 0; index < length; index += 1) {
+        if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+      }
+      if (a.byteLength === b.byteLength) return 0;
+      return a.byteLength < b.byteLength ? -1 : 1;
+    },
+    compareOffset(left, right, targetStart = 0, sourceStart = 0, sourceEnd = undefined) {
+      return this.compare(bufferView(left).subarray(Number(sourceStart) || 0, sourceEnd == null ? undefined : Number(sourceEnd)), bufferView(right).subarray(Number(targetStart) || 0));
+    },
+    fill(buffer, value, offset = 0, end = undefined, encoding = "utf8") {
+      const view = bufferView(buffer);
+      const start = Math.max(0, Number(offset) || 0);
+      const stop = Math.min(view.byteLength, end == null ? view.byteLength : Number(end) || 0);
+      const fillBytes = typeof value === "number" ? Uint8Array.of(Number(value) & 0xff) : bufferView(Buffer.from(String(value), encoding));
+      if (fillBytes.byteLength === 0) return;
+      for (let index = start; index < stop; index += 1) view[index] = fillBytes[(index - start) % fillBytes.byteLength];
+    },
+    indexOfBuffer,
+    indexOfNumber(source, value, byteOffset = 0) {
+      const view = bufferView(source);
+      const target = Number(value) & 0xff;
+      for (let index = Math.max(0, Number(byteOffset) || 0); index < view.byteLength; index += 1) {
+        if (view[index] === target) return index;
+      }
+      return -1;
+    },
+    indexOfString(source, value, byteOffset = 0, encoding = "utf8") {
+      return indexOfBuffer(source, Buffer.from(String(value), encoding), byteOffset);
+    },
+    copyArrayBuffer(source, target, sourceStart = 0, targetStart = 0, length = undefined) {
+      const sourceView = bufferView(source);
+      const targetView = bufferView(target);
+      const start = Math.max(0, Number(sourceStart) || 0);
+      const count = Math.min(
+        length == null ? sourceView.byteLength - start : Number(length) || 0,
+        targetView.byteLength - (Number(targetStart) || 0),
+      );
+      targetView.set(sourceView.subarray(start, start + Math.max(0, count)), Math.max(0, Number(targetStart) || 0));
+    },
+    swap16: (buffer) => swapBytes(buffer, 2),
+    swap32: (buffer) => swapBytes(buffer, 4),
+    swap64: (buffer) => swapBytes(buffer, 8),
+    isUtf8(value) {
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(bufferView(value));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    isAscii(value) {
+      return bufferView(value).every((byte) => byte <= 0x7f);
+    },
+    kMaxLength: Number.MAX_SAFE_INTEGER,
+    kStringMaxLength: 536870888,
+    utf8Slice: (buffer, start = 0, end = undefined) => Buffer.from(bufferView(buffer).subarray(Number(start) || 0, end == null ? undefined : Number(end))).toString("utf8"),
+    latin1Slice: (buffer, start = 0, end = undefined) => Buffer.from(bufferView(buffer).subarray(Number(start) || 0, end == null ? undefined : Number(end))).toString("latin1"),
+    asciiSlice: (buffer, start = 0, end = undefined) => Buffer.from(bufferView(buffer).subarray(Number(start) || 0, end == null ? undefined : Number(end))).toString("ascii"),
+    hexSlice: (buffer, start = 0, end = undefined) => Buffer.from(bufferView(buffer).subarray(Number(start) || 0, end == null ? undefined : Number(end))).toString("hex"),
+    base64Slice: (buffer, start = 0, end = undefined) => Buffer.from(bufferView(buffer).subarray(Number(start) || 0, end == null ? undefined : Number(end))).toString("base64"),
+    getZeroFillToggle: () => [0],
+  });
+}
+
+function maybeCompleteRequest(request, error, result) {
+  if (request && typeof request.oncomplete === "function") {
+    queueMicrotask(() => request.oncomplete(error ?? null, result));
+  }
+  if (error) throw error;
+  return result;
+}
+
+function fsStatKind(path) {
+  try {
+    const stat = cottontail.statSync(String(path), true);
+    if (stat?.isDirectory || ((Number(stat?.mode) & (fsConstants.S_IFMT ?? 0o170000)) === (fsConstants.S_IFDIR ?? 0o040000))) return 1;
+    if (stat?.isFile || ((Number(stat?.mode) & (fsConstants.S_IFMT ?? 0o170000)) === (fsConstants.S_IFREG ?? 0o100000))) return 0;
+    return 0;
+  } catch {
+    return -(errnoConstants.ENOENT ?? 2);
+  }
+}
+
+function makeFsBinding() {
+  const readBuffers = (fd, buffers, position = null, request = undefined) => {
+    let total = 0;
+    let currentPosition = position;
+    for (const buffer of buffers ?? []) {
+      const view = bufferView(buffer);
+      const count = Number(cottontail.fdReadAt(Number(fd), view, 0, view.byteLength, currentPosition ?? null));
+      total += count;
+      if (currentPosition != null) currentPosition += count;
+      if (count < view.byteLength) break;
+    }
+    return maybeCompleteRequest(request, null, total);
+  };
+  const writeBuffers = (fd, buffers, position = null, request = undefined) => {
+    let total = 0;
+    let currentPosition = position;
+    for (const buffer of buffers ?? []) {
+      const view = bufferView(buffer);
+      const count = Number(cottontail.fdWriteAt(Number(fd), view, 0, view.byteLength, currentPosition ?? null));
+      total += count;
+      if (currentPosition != null) currentPosition += count;
+    }
+    return maybeCompleteRequest(request, null, total);
+  };
+  return Object.freeze({
+    access(path, mode = 0, request = undefined) {
+      return maybeCompleteRequest(request, null, cottontail.accessSync(String(path), Number(mode ?? 0)) ?? 0);
+    },
+    close(fd, request = undefined) {
+      return maybeCompleteRequest(request, null, cottontail.closeFd(Number(fd)) ?? 0);
+    },
+    existsSync: (path) => Boolean(cottontail.existsSync(String(path))),
+    open(path, flags = "r", mode = 0o666, request = undefined) {
+      return maybeCompleteRequest(request, null, cottontail.openFd(String(path), flags ?? "r", Number(mode ?? 0o666)));
+    },
+    read(fd, buffer, offset = 0, length = undefined, position = null, request = undefined) {
+      const view = bufferView(buffer);
+      const byteLength = length == null ? view.byteLength - Number(offset || 0) : Number(length);
+      const count = Number(cottontail.fdReadAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
+      return maybeCompleteRequest(request, null, count);
+    },
+    readFileUtf8: (path) => cottontail.readFile(String(path)),
+    readBuffers,
+    fdatasync: (fd, request = undefined) => maybeCompleteRequest(request, null, cottontail.fdatasyncSync(Number(fd)) ?? 0),
+    fsync: (fd, request = undefined) => maybeCompleteRequest(request, null, cottontail.fsyncSync(Number(fd)) ?? 0),
+    rename: (oldPath, newPath, request = undefined) => maybeCompleteRequest(request, null, cottontail.renameSync(String(oldPath), String(newPath)) ?? 0),
+    ftruncate: (fd, length = 0, request = undefined) => maybeCompleteRequest(request, null, cottontail.ftruncateSync(Number(fd), Number(length ?? 0)) ?? 0),
+    rmdir: (path, request = undefined) => maybeCompleteRequest(request, null, cottontail.rmdirSync(String(path)) ?? 0),
+    rmSync: (path, options = {}) => cottontail.rmSync(String(path), Boolean(options?.recursive), Boolean(options?.force)) ?? undefined,
+    mkdir: (path, mode = 0o777, recursive = false, request = undefined) => {
+      void mode;
+      return maybeCompleteRequest(request, null, cottontail.mkdirSync(String(path), Boolean(recursive)) ?? 0);
+    },
+    readdir: (path, options = undefined, request = undefined) => maybeCompleteRequest(request, null, cottontail.readDirSync(String(path), options) ?? []),
+    internalModuleStat: fsStatKind,
+    stat: (path, bigint = false, request = undefined) => maybeCompleteRequest(request, null, cottontail.statSync(String(path), true, Boolean(bigint))),
+    lstat: (path, bigint = false, request = undefined) => maybeCompleteRequest(request, null, cottontail.statSync(String(path), false, Boolean(bigint))),
+    fstat: (fd, bigint = false, request = undefined) => maybeCompleteRequest(request, null, cottontail.fstatSync(Number(fd), Boolean(bigint))),
+    statfs: (path, bigint = false, request = undefined) => maybeCompleteRequest(request, null, cottontail.statfsSync(String(path), Boolean(bigint))),
+    link: (existingPath, newPath, request = undefined) => maybeCompleteRequest(request, null, cottontail.linkSync(String(existingPath), String(newPath)) ?? 0),
+    symlink: (target, path, type = undefined, request = undefined) => maybeCompleteRequest(request, null, cottontail.symlinkSync(String(target), String(path), type) ?? 0),
+    readlink: (path, request = undefined) => maybeCompleteRequest(request, null, cottontail.readlinkSync(String(path))),
+    unlink: (path, request = undefined) => maybeCompleteRequest(request, null, cottontail.unlinkSync(String(path)) ?? 0),
+    writeBuffer(fd, buffer, offset = 0, length = undefined, position = null, request = undefined) {
+      const view = bufferView(buffer);
+      const byteLength = length == null ? view.byteLength - Number(offset || 0) : Number(length);
+      const count = Number(cottontail.fdWriteAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
+      return maybeCompleteRequest(request, null, count);
+    },
+    writeBuffers,
+    writeString(fd, string, offset = 0, length = undefined, position = null, request = undefined) {
+      const view = bufferView(Buffer.from(String(string)));
+      const byteLength = length == null ? view.byteLength - Number(offset || 0) : Number(length);
+      const count = Number(cottontail.fdWriteAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
+      return maybeCompleteRequest(request, null, count);
+    },
+    writeFileUtf8: (path, data) => cottontail.writeFile(String(path), String(data)),
+    realpath: (path, cache = undefined, request = undefined) => maybeCompleteRequest(request, null, cottontail.realpathSync(String(path), cache)),
+    copyFile: (source, destination, flags = 0, request = undefined) => {
+      if ((Number(flags) & (fsConstants.COPYFILE_EXCL ?? 1)) !== 0 && cottontail.existsSync(String(destination))) {
+        throw bindingError(`EEXIST: file already exists, copyfile '${source}' -> '${destination}'`, "EEXIST");
+      }
+      cottontail.writeFile(String(destination), cottontail.readFileBuffer(String(source)));
+      return maybeCompleteRequest(request, null, 0);
+    },
+    chmod: (path, mode, request = undefined) => maybeCompleteRequest(request, null, cottontail.chmodSync(String(path), Number(mode)) ?? 0),
+    fchmod: (fd, mode, request = undefined) => maybeCompleteRequest(request, null, cottontail.fchmodSync(Number(fd), Number(mode)) ?? 0),
+    chown: (path, uid, gid, request = undefined) => maybeCompleteRequest(request, null, cottontail.chownSync(String(path), Number(uid), Number(gid), true) ?? 0),
+    fchown: (fd, uid, gid, request = undefined) => maybeCompleteRequest(request, null, cottontail.fchownSync(Number(fd), Number(uid), Number(gid)) ?? 0),
+    lchown: (path, uid, gid, request = undefined) => maybeCompleteRequest(request, null, cottontail.chownSync(String(path), Number(uid), Number(gid), false) ?? 0),
+    utimes: (path, atime, mtime, request = undefined) => maybeCompleteRequest(request, null, cottontail.utimesSync(String(path), Number(atime), Number(mtime), true) ?? 0),
+    futimes: (fd, atime, mtime, request = undefined) => maybeCompleteRequest(request, null, cottontail.futimesSync(Number(fd), Number(atime), Number(mtime)) ?? 0),
+    lutimes: (path, atime, mtime, request = undefined) => maybeCompleteRequest(request, null, cottontail.utimesSync(String(path), Number(atime), Number(mtime), false) ?? 0),
+    mkdtemp: (prefix, request = undefined) => {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const path = `${String(prefix)}${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+        if (!cottontail.existsSync(path)) {
+          cottontail.mkdirSync(path, true);
+          return maybeCompleteRequest(request, null, path);
+        }
+      }
+      throw bindingError(`mkdtemp failed for prefix ${prefix}`);
+    },
+    kFsStatsFieldsNumber: 18,
+    FSReqCallback: class FSReqCallback { oncomplete() {} },
+    FileHandle: class FileHandle {},
+    kUsePromises: Symbol("kUsePromises"),
+    statValues: new Float64Array(18),
+    bigintStatValues: new BigInt64Array(18),
+    statFsValues: new Float64Array(11),
+    bigintStatFsValues: new BigInt64Array(11),
+  });
+}
+
+function makeOsBinding() {
+  const loadavgValues = () => {
+    if (processObject.platform === "win32") return [0, 0, 0];
+    try {
+      const source = cottontail.existsSync?.("/proc/loadavg") ? cottontail.readFile("/proc/loadavg") : "";
+      const matches = String(source).match(/[-+]?\d+(?:\.\d+)?/g) ?? [];
+      return [0, 1, 2].map((index) => Number(matches[index] ?? 0));
+    } catch {
+      return [0, 0, 0];
+    }
+  };
+  return Object.freeze({
+    getHostname: () => cottontail.hostname(),
+    getLoadAvg(target = undefined) {
+      const values = loadavgValues();
+      if (target && typeof target.length === "number") {
+        for (let index = 0; index < 3; index += 1) target[index] = values[index];
+      }
+      return values;
+    },
+    getUptime: () => Math.max(0, (Date.now() - processStartMs) / 1000),
+    getTotalMem: () => Number(processObject.constrainedMemory?.() || processObject.availableMemory?.() || 0),
+    getFreeMem: () => Number(processObject.availableMemory?.() || 0),
+    getCPUs: () => Array.from({ length: Math.max(1, Number(cottontail.cpuCount?.() || 1)) }, () => ({
+      model: "",
+      speed: 0,
+      times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
+    })),
+    getInterfaceAddresses: () => typeof cottontail.osNetworkInterfaces === "function" ? cottontail.osNetworkInterfaces() : [],
+    getHomeDirectory: () => cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
+    getUserInfo: () => ({
+      uid: Number(processObject.getuid?.() ?? -1),
+      gid: Number(processObject.getgid?.() ?? -1),
+      username: cottontail.env("USER") || cottontail.env("USERNAME") || "",
+      homedir: cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/",
+      shell: cottontail.env("SHELL") || (processObject.platform === "win32" ? cottontail.env("ComSpec") || "cmd.exe" : "/bin/sh"),
+    }),
+    setPriority: (pid, priority) => cottontail.osSetPriority?.(Number(pid || processObject.pid), Number(priority)),
+    getPriority: (pid = 0) => typeof cottontail.osGetPriority === "function" ? Number(cottontail.osGetPriority(Number(pid || processObject.pid))) : 0,
+    getAvailableParallelism: () => Math.max(1, Number(cottontail.cpuCount?.() || 1)),
+    getOSInformation: () => [processObject.platform, processObject.arch, processObject.version],
+    isBigEndian: () => false,
+  });
+}
+
+function makeSpawnSyncBinding() {
+  return Object.freeze({
+    spawn(options = {}) {
+      const file = String(options.file ?? options.args?.[0] ?? "");
+      const rawArgs = Array.isArray(options.args) ? options.args.map(String) : [file];
+      const args = rawArgs[0] === file ? rawArgs.slice(1) : rawArgs;
+      const nativeOptions = {
+        stdio: "pipe",
+        cwd: options.cwd,
+      };
+      if (Array.isArray(options.envPairs)) {
+        nativeOptions.clearEnv = true;
+        nativeOptions.env = Object.fromEntries(options.envPairs.map((entry) => {
+          const text = String(entry);
+          const equals = text.indexOf("=");
+          return equals < 0 ? [text, ""] : [text.slice(0, equals), text.slice(equals + 1)];
+        }));
+      }
+      try {
+        const result = cottontail.spawnSync(file, args, nativeOptions);
+        const stdout = Buffer.from(result.stdout ?? "");
+        const stderr = Buffer.from(result.stderr ?? "");
+        return {
+          status: Number(result.status),
+          signal: result.signal ?? null,
+          output: [null, stdout, stderr],
+          pid: Number(result.pid ?? 0),
+        };
+      } catch (error) {
+        return {
+          error: error?.errno ?? error?.code ?? -1,
+          status: null,
+          signal: null,
+          output: [null, Buffer.alloc(0), Buffer.alloc(0)],
+          pid: 0,
+        };
+      }
+    },
+  });
+}
+
+function crc32(data, value = 0) {
+  let crc = (Number(value) ^ -1) >>> 0;
+  for (const byte of bufferView(data)) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+  }
+  return (crc ^ -1) >>> 0;
+}
+
+function makeZlibBinding() {
+  return Object.freeze({
+    ...zlibBindingConstants,
+    ZLIB_VERSION: zlibBindingConstants.ZLIB_VERSION ?? "1.3.1",
+    crc32,
+    Zlib: class Zlib {},
+    BrotliEncoder: class BrotliEncoder {},
+    BrotliDecoder: class BrotliDecoder {},
+    ZstdCompress: class ZstdCompress {},
+    ZstdDecompress: class ZstdDecompress {},
+  });
+}
+
+function makeNativesBinding() {
+  const names = new Set([
+    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console",
+    "constants", "crypto", "diagnostics_channel", "dgram", "dns", "dns/promises", "domain",
+    "events", "fs", "fs/promises", "http", "http2", "https", "inspector", "inspector/promises",
+    "module", "os", "path", "path/posix", "path/win32", "perf_hooks", "process", "punycode",
+    "querystring", "readline", "readline/promises", "repl", "stream", "stream/consumers",
+    "stream/promises", "stream/web", "string_decoder", "sys", "timers", "timers/promises",
+    "tls", "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi",
+    "worker_threads", "zlib",
+  ]);
+  const map = globalThis.__cottontailBuiltinModules;
+  if (map) {
+    for (const key of map.keys()) names.add(String(key).replace(/^node:/, ""));
+  }
+  const output = {};
+  for (const name of names) {
+    output[name] = `module.exports = require(${JSON.stringify(`node:${name}`)});`;
+  }
+  return Object.freeze(output);
+}
+
+const utilBinding = Object.freeze(Object.fromEntries(
+  [
+    "isAnyArrayBuffer",
+    "isArrayBuffer",
+    "isArrayBufferView",
+    "isAsyncFunction",
+    "isDataView",
+    "isDate",
+    "isExternal",
+    "isMap",
+    "isMapIterator",
+    "isNativeError",
+    "isPromise",
+    "isRegExp",
+    "isSet",
+    "isSetIterator",
+    "isTypedArray",
+    "isUint8Array",
+  ].map((name) => [name, utilTypes[name] ?? (() => false)]),
+));
+const uvBinding = (() => {
+  const byNegativeCode = new Map();
+  const out = {
+    errname(code) {
+      const normalized = Number(code);
+      if (!Number.isInteger(normalized) || normalized >= 0) throw new RangeError(`Unknown system error ${code}`);
+      return byNegativeCode.get(normalized) ?? `Unknown system error ${normalized}`;
+    },
+  };
+  for (const [name, value] of Object.entries(errnoConstants)) {
+    const uvName = `UV_${name}`;
+    const uvValue = -Math.abs(Number(value));
+    out[uvName] = uvValue;
+    byNegativeCode.set(uvValue, name);
+  }
+  return Object.freeze(out);
+})();
+
+const processBindingCache = new Map();
+
+function makeProcessBinding(name) {
+  switch (name) {
+    case "natives":
+      return makeNativesBinding();
+    case "constants":
+      return Object.freeze({
+        os: Object.freeze({
+          dlopen: dlopenConstants,
+          errno: errnoConstants,
+          signals: signalConstants,
+          priority: priorityConstants,
+        }),
+        fs: fsConstants,
+        crypto: cryptoConstants,
+        zlib: zlibBindingConstants,
+        trace: Object.freeze({}),
+        internal: Object.freeze({}),
+      });
+    case "fs":
+      return makeFsBinding();
+    case "buffer":
+      return makeBufferBinding();
+    case "os":
+      return makeOsBinding();
+    case "spawn_sync":
+      return makeSpawnSyncBinding();
+    case "zlib":
+      return makeZlibBinding();
+    case "uv":
+      return uvBinding;
+    case "util":
+      return utilBinding;
+    case "config":
+      return Object.freeze({
+        isDebugBuild: false,
+        openSSLIsBoringSSL: false,
+        hasOpenSSL: true,
+        fipsMode: false,
+        hasIntl: typeof Intl === "object",
+        hasTracing: false,
+        hasNodeOptions: true,
+        hasInspector: Boolean(processObject.features?.inspector),
+        noBrowserGlobals: false,
+        bits: processObject.arch === "x64" || processObject.arch === "arm64" ? 64 : 32,
+        getDefaultLocale: () => Intl.DateTimeFormat().resolvedOptions().locale,
+      });
+    default:
+      throwNoSuchBinding(name);
+  }
 }
 
 function parseEnvLine(line) {
@@ -428,19 +950,25 @@ export const _startProfilerIdleNotifier = processObject._startProfilerIdleNotifi
 export const _stopProfilerIdleNotifier = processObject._stopProfilerIdleNotifier = () => {};
 
 export const binding = processObject.binding = (name) => {
-  unsupported(`process.binding(${String(name)})`);
+  const key = String(name);
+  if (!processBindingCache.has(key)) processBindingCache.set(key, makeProcessBinding(key));
+  return processBindingCache.get(key);
 };
 
 export const _linkedBinding = processObject._linkedBinding = (name) => {
-  unsupported(`process._linkedBinding(${String(name)})`);
+  throw bindingError(`No such binding was linked: ${String(name)}`, "ERR_INVALID_MODULE");
 };
 
-export const dlopen = processObject.dlopen = () => {
-  unsupported("process.dlopen");
+export const dlopen = processObject.dlopen = (module, filename = undefined) => {
+  const target = filename ?? module?.filename ?? module?.id ?? "";
+  throw bindingError(`dlopen(${String(target)}, 0x0001): native add-on loading is pending for Cottontail`, "ERR_DLOPEN_FAILED");
 };
 
-export const execve = processObject.execve = () => {
-  unsupported("process.execve");
+export const execve = processObject.execve = (file, args, execEnv) => {
+  if (typeof file !== "string") throw new TypeError('The "execPath" argument must be of type string');
+  if (!Array.isArray(args)) throw new TypeError('The "args" argument must be an Array');
+  if (execEnv == null || typeof execEnv !== "object" || Array.isArray(execEnv)) throw new TypeError('The "env" argument must be an object');
+  return cottontail.processExecve(file, args.map(String), execEnv);
 };
 
 export const getBuiltinModule = processObject.getBuiltinModule = (specifier) => {
@@ -486,7 +1014,7 @@ export const finalization = processObject.finalization = (() => {
 
 export const report = processObject.report = makeReport();
 
-// COTTONTAIL-COMPAT: node:process internals/addon hooks - unsupported Node internals throw instead of pretending to expose V8/libuv/N-API state.
+// COTTONTAIL-COMPAT: node:process addon ABI - process metadata, credentials, signals, reports, env loading, execve, and common internal bindings use native host APIs; N-API module initialization still needs a Node-compatible ABI entrypoint.
 
 export const on = processObject.on.bind(processObject);
 export const once = processObject.once.bind(processObject);

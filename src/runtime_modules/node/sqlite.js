@@ -192,7 +192,7 @@ export class DatabaseSync {
     sqliteUnavailable();
     this.location = String(location);
     this.options = { ...options };
-    const native = cottontail.sqliteOpen(this.location);
+    const native = cottontail.sqliteOpen(this.location, this.options.allowExtension === true);
     this.id = native.id;
     this.open = true;
   }
@@ -237,16 +237,14 @@ export class DatabaseSync {
     const normalizedOptions = options ?? {};
     if (normalizedOptions.start === undefined) throw new TypeError('The "options.start" argument must be a function or a primitive value');
     if (typeof normalizedOptions.step !== "function") throw new TypeError('The "options.step" argument must be a function');
-    if (normalizedOptions.inverse !== undefined) {
-      if (typeof normalizedOptions.inverse !== "function") throw new TypeError('The "options.inverse" argument must be a function');
-      throw new Error("DatabaseSync.aggregate window inverse requires native SQLite window callback support");
-    }
+    if (normalizedOptions.inverse !== undefined && typeof normalizedOptions.inverse !== "function") throw new TypeError('The "options.inverse" argument must be a function');
     const argc = normalizedOptions.varargs === true ? -1 : sqliteArgCount("aggregate", normalizedOptions.arguments, Math.max(0, normalizedOptions.step.length - 1));
     let flags = 0;
     if (normalizedOptions.deterministic) flags |= SQLITE_DETERMINISTIC;
     if (normalizedOptions.directOnly) flags |= SQLITE_DIRECTONLY;
     const result = typeof normalizedOptions.result === "function" ? normalizedOptions.result : null;
-    cottontail.sqliteCreateAggregate(this.id, String(name), argc, flags, normalizedOptions.start, normalizedOptions.step, result);
+    const inverse = typeof normalizedOptions.inverse === "function" ? normalizedOptions.inverse : null;
+    cottontail.sqliteCreateAggregate(this.id, String(name), argc, flags, normalizedOptions.start, normalizedOptions.step, result, inverse);
   }
 
   createTagStore(maxSize = 1000) {
@@ -262,10 +260,14 @@ export class DatabaseSync {
     throw new Error("DatabaseSync.applyChangeset requires SQLite session extension support");
   }
 
-  enableLoadExtension() {}
+  enableLoadExtension(enabled = true) {
+    this._assertOpen();
+    cottontail.sqliteEnableLoadExtension(this.id, Boolean(enabled));
+  }
 
-  loadExtension() {
-    throw new Error("DatabaseSync.loadExtension requires explicit extension loading support");
+  loadExtension(path) {
+    this._assertOpen();
+    cottontail.sqliteLoadExtension(this.id, String(path));
   }
 
   setAuthorizer(callback) {
@@ -287,7 +289,7 @@ export function backup(sourceDb, path) {
   return Promise.resolve(cottontail.sqliteBackup(sourceDb.id, String(path)));
 }
 
-// COTTONTAIL-COMPAT: node:sqlite session/window extensions - DatabaseSync, StatementSync, SQLTagStore, scalar and aggregate user functions, authorizers, backup, constants, and synchronous query execution use native sqlite3; Session/changesets, window inverse callbacks, and extension loading need additional sqlite3 extension/callback bindings.
+// COTTONTAIL-COMPAT: node:sqlite session extension - DatabaseSync, StatementSync, SQLTagStore, scalar/aggregate/window user functions, authorizers, backup, extension loading, constants, and synchronous query execution use native sqlite3; Session/changesets need sqlite3 session extension bindings.
 
 export default {
   DatabaseSync,

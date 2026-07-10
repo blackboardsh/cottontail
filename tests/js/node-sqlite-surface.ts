@@ -128,11 +128,25 @@ db.aggregate("empty_start", {
   result: (acc) => acc * 2,
 });
 strictEqual(db.prepare("select empty_start(price) as value from items where id < 0").get().value, 10, "SQLite aggregate empty input mismatch");
-throws(
-  () => db.aggregate("window_sum", { start: 0, step: (acc, price) => acc + Number(price), inverse: (acc, price) => acc - Number(price) }),
-  /window inverse/,
-  "SQLite aggregate should reject window inverse callbacks until implemented",
-);
+db.aggregate("moving_sum", {
+  start: 0,
+  step: (acc, price) => acc + Number(price),
+  inverse: (acc, price) => acc - Number(price),
+  result: (acc) => Math.round(acc * 100) / 100,
+});
+const movingTotals = db.prepare("select id, moving_sum(price) over (order by id rows between 1 preceding and current row) as total from items order by id").all();
+strictEqual(movingTotals[0].total, 1.5, "SQLite window aggregate first row mismatch");
+strictEqual(movingTotals[1].total, 3.75, "SQLite window aggregate second row mismatch");
+strictEqual(movingTotals[2].total, 5.75, "SQLite window aggregate inverse mismatch");
+db.aggregate("throw_window_inverse", {
+  start: 0,
+  step: (acc, price) => acc + Number(price),
+  inverse: () => {
+    throw new Error("sqlite inverse boom");
+  },
+  result: (acc) => acc,
+});
+throws(() => db.prepare("select throw_window_inverse(price) over (order by id rows between 1 preceding and current row) from items").all(), /sqlite inverse boom/, "SQLite window inverse thrown error mismatch");
 db.aggregate("throw_aggregate_step", {
   start: 0,
   step: (_acc, _price) => {
@@ -170,6 +184,25 @@ try {
 const columns = db.prepare("select id, name from items").columns();
 ok(columns.some((column) => column.name === "id"), "columns should include id");
 ok(columns.some((column) => column.name === "name"), "columns should include name");
+
+throws(() => db.enableLoadExtension(true), /disabled at database creation/, "SQLite extension loading should require constructor opt-in");
+throws(() => db.loadExtension("/definitely/missing/cottontail-ext"), /not allowed/, "SQLite loadExtension should be disabled by default");
+const extensionDb = new DatabaseSync(":memory:", { allowExtension: true });
+strictEqual(extensionDb.enableLoadExtension(false), undefined, "SQLite enableLoadExtension(false) mismatch");
+throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /not allowed/, "SQLite loadExtension disabled state mismatch");
+let nativeExtensionLoading = true;
+try {
+  extensionDb.enableLoadExtension(true);
+} catch (error) {
+  nativeExtensionLoading = false;
+  ok(String(error).includes("unavailable"), "SQLite enableLoadExtension(true) unavailable error mismatch");
+}
+if (nativeExtensionLoading) {
+  throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /missing|not found|cannot open|dlopen|No such file/i, "SQLite loadExtension should call native loader when enabled");
+} else {
+  throws(() => extensionDb.loadExtension("/definitely/missing/cottontail-ext"), /unavailable|not allowed/, "SQLite loadExtension unavailable build mismatch");
+}
+extensionDb.close();
 
 const tmpDir = process.env.COTTONTAIL_TMP_DIR;
 if (!tmpDir) throw new Error("COTTONTAIL_TMP_DIR is required");

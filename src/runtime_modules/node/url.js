@@ -346,8 +346,6 @@ export function urlToHttpOptions(url) {
   return options;
 }
 
-// COTTONTAIL-COMPAT: node:url URLPattern - supports common component matching, named groups, and wildcards; full URLPattern grammar modifiers and custom regex edge cases need a dedicated parser.
-
 export default {
   URL,
   URLPattern,

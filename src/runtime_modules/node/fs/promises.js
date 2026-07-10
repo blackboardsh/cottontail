@@ -75,8 +75,8 @@ export async function cp(source, destination, options = {}) {
   return cpSync(source, destination, options);
 }
 
-export async function glob(pattern, options = {}) {
-  return globSync(pattern, options);
+export async function* glob(pattern, options = {}) {
+  for (const item of globSync(pattern, options)) yield item;
 }
 
 export async function lchmod(path, mode) {

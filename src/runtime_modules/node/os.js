@@ -45,12 +45,57 @@ export function homedir() {
   return cottontail.env("HOME") || cottontail.env("USERPROFILE") || "/";
 }
 
+function cpuModel() {
+  if (platform() === "linux" && cottontail.existsSync?.("/proc/cpuinfo")) {
+    const match = String(cottontail.readFile("/proc/cpuinfo")).match(/^model name\s*:\s*(.+)$/m);
+    if (match) return match[1].trim();
+  }
+  if (platform() === "darwin") return shell("sysctl -n machdep.cpu.brand_string") || machine();
+  if (platform() === "win32") return cottontail.env("PROCESSOR_IDENTIFIER") || machine();
+  return machine();
+}
+
+function cpuSpeed() {
+  if (platform() === "linux" && cottontail.existsSync?.("/proc/cpuinfo")) {
+    const match = String(cottontail.readFile("/proc/cpuinfo")).match(/^cpu MHz\s*:\s*(.+)$/m);
+    const mhz = Number(match?.[1]);
+    if (Number.isFinite(mhz) && mhz > 0) return Math.round(mhz);
+  }
+  if (platform() === "darwin") {
+    const hz = Number(shell("sysctl -n hw.cpufrequency"));
+    if (Number.isFinite(hz) && hz > 0) return Math.round(hz / 1000000);
+  }
+  return 0;
+}
+
+function linuxCpuTimes() {
+  if (platform() !== "linux" || !cottontail.existsSync?.("/proc/stat")) return [];
+  const lines = String(cottontail.readFile("/proc/stat")).split(/\r?\n/);
+  const output = [];
+  for (const line of lines) {
+    const match = line.match(/^cpu(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const values = match[2].trim().split(/\s+/).map((value) => Number(value) * 10);
+    output[Number(match[1])] = {
+      user: values[0] || 0,
+      nice: values[1] || 0,
+      sys: values[2] || 0,
+      idle: values[3] || 0,
+      irq: values[5] || 0,
+    };
+  }
+  return output;
+}
+
 export function cpus() {
   const count = Number(cottontail.cpuCount?.() || 1);
+  const model = cpuModel();
+  const speed = cpuSpeed();
+  const times = linuxCpuTimes();
   return Array.from({ length: Math.max(1, count) }, () => ({
-    model: "",
-    speed: 0,
-    times: {
+    model,
+    speed,
+    times: times.shift() ?? {
       user: 0,
       nice: 0,
       sys: 0,
@@ -222,8 +267,6 @@ export const constants = {
     PRIORITY_HIGHEST: nodeConstants.PRIORITY_HIGHEST,
   },
 };
-
-// COTTONTAIL-COMPAT: node:os platform details - memory values, network interfaces, and priority use native host APIs; CPU model/timing and some release/version/loadavg details still need deeper platform-specific data.
 
 export default {
   EOL,

@@ -22,6 +22,7 @@ import {
   takeCoverage,
   writeHeapSnapshot,
 } from "node:v8";
+import { Buffer } from "node:buffer";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { text } from "node:stream/consumers";
 
@@ -51,6 +52,42 @@ assert(roundTrip.date instanceof Date && roundTrip.date.getUTCFullYear() === 202
 assert(roundTrip.map.get("a") === 1, "deserialize map mismatch");
 assert(roundTrip.set.has("x"), "deserialize set mismatch");
 assert(roundTrip.bytes[2] === 3, "deserialize typed array mismatch");
+assert(roundTrip.bytes instanceof Uint8Array && !Buffer.isBuffer(roundTrip.bytes), "deserialize Uint8Array type mismatch");
+
+const nestedTypedRoundTrip = deserialize(serialize({ echo: roundTrip.bytes }));
+assert(nestedTypedRoundTrip.echo instanceof Uint8Array, "reserialize Uint8Array type mismatch");
+assert(nestedTypedRoundTrip.echo[2] === 3, "reserialize Uint8Array content mismatch");
+
+const bufferRoundTrip = deserialize(serialize(Buffer.from([4, 5, 6])));
+assert(Buffer.isBuffer(bufferRoundTrip), "deserialize Buffer type mismatch");
+assert(bufferRoundTrip[2] === 6, "deserialize Buffer content mismatch");
+
+const cyclicObject: Record<string, unknown> = { name: "root" };
+cyclicObject.self = cyclicObject;
+cyclicObject.child = { parent: cyclicObject };
+const cyclicRoundTrip = deserialize(serialize(cyclicObject));
+assert(cyclicRoundTrip.self === cyclicRoundTrip, "deserialize object cycle mismatch");
+assert(cyclicRoundTrip.child.parent === cyclicRoundTrip, "deserialize nested object cycle mismatch");
+
+const cyclicArray: unknown[] = [];
+cyclicArray.push(cyclicArray);
+const cyclicArrayRoundTrip = deserialize(serialize(cyclicArray));
+assert(Array.isArray(cyclicArrayRoundTrip), "deserialize cyclic array should return array");
+assert(cyclicArrayRoundTrip[0] === cyclicArrayRoundTrip, "deserialize array cycle mismatch");
+
+const shared = { value: 42 };
+const sharedRoundTrip = deserialize(serialize({ a: shared, b: shared }));
+assert(sharedRoundTrip.a === sharedRoundTrip.b, "deserialize shared reference mismatch");
+
+const cyclicMap = new Map<unknown, unknown>();
+cyclicMap.set("self", cyclicMap);
+const cyclicMapRoundTrip = deserialize(serialize(cyclicMap));
+assert(cyclicMapRoundTrip.get("self") === cyclicMapRoundTrip, "deserialize map cycle mismatch");
+
+const cyclicSet = new Set<unknown>();
+cyclicSet.add(cyclicSet);
+const cyclicSetRoundTrip = deserialize(serialize(cyclicSet));
+assert(cyclicSetRoundTrip.has(cyclicSetRoundTrip), "deserialize set cycle mismatch");
 
 const serializer = new Serializer();
 serializer.writeHeader();

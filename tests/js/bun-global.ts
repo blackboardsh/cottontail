@@ -52,4 +52,24 @@ if (Buffer.from("ff", "hex").toString("base64") !== "/w==") {
   throw new Error("Buffer hex/base64 encoding compatibility failed");
 }
 
+if (typeof Blob !== "function" || typeof File !== "function" || typeof URL.createObjectURL !== "function") {
+  throw new Error("Blob/File object URL globals were not installed");
+}
+const globalBlob = new Blob(["global-blob"], { type: "text/plain" });
+if (globalBlob.size !== 11 || globalBlob.type !== "text/plain" || await globalBlob.text() !== "global-blob") {
+  throw new Error("Blob global behavior mismatch");
+}
+const globalFile = new File(["file"], "sample.txt", { type: "text/plain", lastModified: 1 });
+if (globalFile.name !== "sample.txt" || globalFile.lastModified !== 1 || await globalFile.text() !== "file") {
+  throw new Error("File global behavior mismatch");
+}
+const globalObjectUrl = URL.createObjectURL(globalBlob);
+if (globalThis.resolveObjectURL(globalObjectUrl) !== globalBlob) {
+  throw new Error("global resolveObjectURL failed");
+}
+URL.revokeObjectURL(globalObjectUrl);
+if (globalThis.resolveObjectURL(globalObjectUrl) !== undefined) {
+  throw new Error("global revokeObjectURL failed");
+}
+
 console.log("bun global passed");

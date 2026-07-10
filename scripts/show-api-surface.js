@@ -141,6 +141,7 @@ function printBehaviorRows(rows, options = {}) {
     { name: 'module', width: options.nameWidth || 24, value: (row) => row.name },
     { name: 'caveats', width: 8, value: (row) => String(row.compatMarkers) },
     { name: 'unsupported', width: 11, value: (row) => String(row.unsupportedMarkers) },
+    { name: 'guards', width: 7, value: (row) => String(row.nativeAvailabilityGuards ?? 0) },
     { name: 'tests', width: 6, value: (row) => String(row.tests) },
     { name: 'score', width: 6, value: (row) => String(row.gapScore) },
   ];
@@ -224,6 +225,7 @@ if (nodeBehavior) {
   console.log(`${pad('compat markers', 24)} ${nodeBehavior.signals.compatMarkers}`);
   console.log(`${pad('modules with caveats', 24)} ${nodeBehavior.signals.modulesWithCompatMarkers}/${nodeBehavior.signals.publicNodeModules}`);
   console.log(`${pad('unsupported markers', 24)} ${nodeBehavior.signals.explicitUnsupportedMarkers}`);
+  console.log(`${pad('native guard markers', 24)} ${nodeBehavior.signals.nativeAvailabilityGuards ?? 0}`);
   console.log(`${pad('node test files', 24)} ${nodeBehavior.signals.nodeTestFiles}`);
   console.log('');
   printBehaviorRows(nodeBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });

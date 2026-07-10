@@ -193,6 +193,20 @@ assert((await webReader.read()).done === true, "ReadableStream done mismatch");
 webReader.releaseLock();
 assert(!webReadable.locked, "ReadableStream releaseLock mismatch");
 
+const byobReadable = new ReadableStream({
+  start(controller) {
+    controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+    controller.close();
+  },
+});
+const byobReader = byobReadable.getReader({ mode: "byob" });
+assert(byobReader instanceof ReadableStreamBYOBReader, "ReadableStream BYOB reader class mismatch");
+const byobFirst = await byobReader.read(new Uint8Array(3));
+assert(byobFirst.value.length === 3 && byobFirst.value[0] === 1 && byobFirst.value[2] === 3, "ReadableStream BYOB first read mismatch");
+const byobSecond = await byobReader.read(new Uint8Array(3));
+assert(byobSecond.value.length === 1 && byobSecond.value[0] === 4, "ReadableStream BYOB remainder mismatch");
+assert((await byobReader.read(new Uint8Array(1))).done === true, "ReadableStream BYOB done mismatch");
+
 const writes: string[] = [];
 const webWritable = new WritableStream({
   write(chunk) { writes.push(String(chunk)); },
@@ -235,6 +249,34 @@ assert(new CountQueuingStrategy({ highWaterMark: 4 }).size() === 1, "CountQueuin
 assert(new ByteLengthQueuingStrategy({ highWaterMark: 4 }).size(new Uint8Array(3)) === 3, "ByteLengthQueuingStrategy size mismatch");
 assert(new CompressionStream("gzip").format === "gzip", "CompressionStream format mismatch");
 assert(new DecompressionStream("gzip").format === "gzip", "DecompressionStream format mismatch");
+async function collectWebBytes(stream: ReadableStream) {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  for (;;) {
+    const item = await reader.read();
+    if (item.done) break;
+    chunks.push(item.value instanceof Uint8Array ? item.value : new Uint8Array(item.value));
+  }
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+const compression = new CompressionStream("gzip");
+const compressionWriter = compression.writable.getWriter();
+await compressionWriter.write(new TextEncoder().encode("compressed-web-stream"));
+await compressionWriter.close();
+const compressedBytes = await collectWebBytes(compression.readable);
+assert(compressedBytes.byteLength > 0, "CompressionStream gzip output mismatch");
+const decompression = new DecompressionStream("gzip");
+const decompressionWriter = decompression.writable.getWriter();
+await decompressionWriter.write(compressedBytes);
+await decompressionWriter.close();
+assert(new TextDecoder().decode(await collectWebBytes(decompression.readable)) === "compressed-web-stream", "DecompressionStream gzip mismatch");
 assert(typeof ReadableByteStreamController === "function", "ReadableByteStreamController missing");
 assert(typeof ReadableStreamBYOBReader === "function", "ReadableStreamBYOBReader missing");
 assert(typeof ReadableStreamBYOBRequest === "function", "ReadableStreamBYOBRequest missing");

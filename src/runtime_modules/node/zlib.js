@@ -156,9 +156,10 @@ function transformSync(mode, data, options = undefined) {
     throw new Error("native zlib support is unavailable");
   }
   const level = levelFromOptions(options);
-  const result = level == null
+  const nativeOptions = options && typeof options === "object" ? options : level;
+  const result = nativeOptions == null
     ? cottontail.zlibTransformSync(mode, bytesFromData(data))
-    : cottontail.zlibTransformSync(mode, bytesFromData(data), level);
+    : cottontail.zlibTransformSync(mode, bytesFromData(data), nativeOptions);
   return asBuffer(result);
 }
 
@@ -314,7 +315,7 @@ export const brotliDecompress = callbackifySync(brotliDecompressSync);
 export const zstdCompress = callbackifySync(zstdCompressSync);
 export const zstdDecompress = callbackifySync(zstdDecompressSync);
 
-// COTTONTAIL-COMPAT: node:zlib streaming/options - zlib/gzip/deflate/Brotli/Zstd streams and crc32 are implemented with whole-buffer transforms; advanced flush/window/dictionary streaming semantics need deeper native stream state.
+// COTTONTAIL-COMPAT: node:zlib streaming flush - zlib/gzip/deflate/Brotli/Zstd streams, crc32, compression options, and dictionary transforms are implemented; incremental flush semantics need deeper native stream state.
 
 export default {
   BrotliCompress,

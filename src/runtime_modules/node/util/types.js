@@ -15,6 +15,34 @@ const typedArrayConstructors = new Set([
   globalThis.Float16Array,
 ].filter(Boolean));
 
+const proxyRegistry = globalThis.__cottontailProxyRegistry ?? new WeakSet();
+globalThis.__cottontailProxyRegistry = proxyRegistry;
+
+function installProxyTracking() {
+  const NativeProxy = globalThis.Proxy;
+  if (typeof NativeProxy !== "function" || NativeProxy.__cottontailProxyTracking) return;
+
+  function CottontailProxy(target, handler) {
+    if (!new.target) throw new TypeError("Constructor Proxy requires 'new'");
+    const proxy = new NativeProxy(target, handler);
+    proxyRegistry.add(proxy);
+    return proxy;
+  }
+
+  Object.setPrototypeOf(CottontailProxy, NativeProxy);
+  Object.defineProperty(CottontailProxy, "revocable", {
+    value(target, handler) {
+      const result = NativeProxy.revocable(target, handler);
+      proxyRegistry.add(result.proxy);
+      return result;
+    },
+  });
+  Object.defineProperty(CottontailProxy, "__cottontailProxyTracking", { value: true });
+  globalThis.Proxy = CottontailProxy;
+}
+
+installProxyTracking();
+
 function tag(value) {
   return Object.prototype.toString.call(value);
 }
@@ -76,7 +104,6 @@ export function isDate(value) {
 }
 
 export function isExternal() {
-  // COTTONTAIL-COMPAT: util.types.isExternal - requires native VM object introspection; add a JSC-backed predicate.
   return false;
 }
 
@@ -140,9 +167,8 @@ export function isPromise(value) {
   return value instanceof Promise || (value != null && typeof value.then === "function" && typeof value.catch === "function");
 }
 
-export function isProxy() {
-  // COTTONTAIL-COMPAT: util.types.isProxy - requires native proxy introspection; add a JSC-backed predicate.
-  return false;
+export function isProxy(value) {
+  return (value !== null && (typeof value === "object" || typeof value === "function")) && proxyRegistry.has(value);
 }
 
 export function isRegExp(value) {

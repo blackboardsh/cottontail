@@ -1,3 +1,36 @@
+import { Buffer } from "../buffer.js";
+import {
+  brotliCompressSync,
+  brotliDecompressSync,
+  deflateRawSync,
+  deflateSync,
+  gunzipSync,
+  gzipSync,
+  inflateRawSync,
+  inflateSync,
+} from "../zlib.js";
+
+const textEncoder = new TextEncoder();
+
+function bytesFromChunk(chunk) {
+  if (chunk == null) return new Uint8Array(0);
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (typeof chunk === "string") return textEncoder.encode(chunk);
+  return Buffer.from(String(chunk));
+}
+
+function concatBytes(chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 export class ReadableStreamDefaultController {
   constructor(stream) { this._stream = stream; }
   enqueue(chunk) { this._stream._enqueue(chunk); }
@@ -38,8 +71,9 @@ export class ReadableStream {
     while (this._readers.length > 0) this._readers.shift()(Promise.reject(error));
   }
 
-  getReader() {
+  getReader(options = undefined) {
     this.locked = true;
+    if (options?.mode === "byob") return new ReadableStreamBYOBReader(this);
     return new ReadableStreamDefaultReader(this);
   }
 
@@ -82,7 +116,21 @@ export class ReadableStreamDefaultReader {
   cancel(reason = undefined) { return this._stream.cancel(reason); }
 }
 
-export class ReadableStreamBYOBReader extends ReadableStreamDefaultReader {}
+export class ReadableStreamBYOBReader extends ReadableStreamDefaultReader {
+  read(view) {
+    if (!ArrayBuffer.isView(view)) return Promise.reject(new TypeError("ReadableStreamBYOBReader.read requires an ArrayBuffer view"));
+    const target = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    return super.read().then((item) => {
+      if (item.done) return { value: view.subarray ? view.subarray(0, 0) : view, done: true };
+      const bytes = bytesFromChunk(item.value);
+      const count = Math.min(target.byteLength, bytes.byteLength);
+      target.set(bytes.subarray(0, count));
+      if (count < bytes.byteLength) this._stream._queue.unshift(bytes.subarray(count));
+      const value = view.subarray ? view.subarray(0, count) : new Uint8Array(view.buffer, view.byteOffset, count);
+      return { value, done: false };
+    });
+  }
+}
 export class ReadableStreamBYOBRequest {
   constructor() { this.view = null; }
   respond() {}
@@ -185,21 +233,45 @@ export class TextDecoderStream extends TransformStream {
   }
 }
 
+function compressionMode(format, decompress = false) {
+  const normalized = String(format).toLowerCase();
+  if (decompress) {
+    if (normalized === "gzip") return gunzipSync;
+    if (normalized === "deflate") return inflateSync;
+    if (normalized === "deflate-raw") return inflateRawSync;
+    if (normalized === "br" || normalized === "brotli") return brotliDecompressSync;
+  } else {
+    if (normalized === "gzip") return gzipSync;
+    if (normalized === "deflate") return deflateSync;
+    if (normalized === "deflate-raw") return deflateRawSync;
+    if (normalized === "br" || normalized === "brotli") return brotliCompressSync;
+  }
+  throw new TypeError(`Invalid compression format: ${format}`);
+}
+
 export class CompressionStream extends TransformStream {
   constructor(format) {
-    super();
+    const chunks = [];
+    const transform = compressionMode(format, false);
+    super({
+      transform(chunk) { chunks.push(bytesFromChunk(chunk)); },
+      flush(controller) { controller.enqueue(transform(concatBytes(chunks))); },
+    });
     this.format = String(format);
   }
 }
 
 export class DecompressionStream extends TransformStream {
   constructor(format) {
-    super();
+    const chunks = [];
+    const transform = compressionMode(format, true);
+    super({
+      transform(chunk) { chunks.push(bytesFromChunk(chunk)); },
+      flush(controller) { controller.enqueue(transform(concatBytes(chunks))); },
+    });
     this.format = String(format);
   }
 }
-
-// COTTONTAIL-COMPAT: node:stream/web - implements common reader/writer/enqueue semantics; BYOB and compression byte transforms need deeper Web Streams parity.
 
 export default {
   ByteLengthQueuingStrategy,

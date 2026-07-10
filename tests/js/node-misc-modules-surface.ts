@@ -97,6 +97,29 @@ await new Promise<void>((resolve) => {
   });
 });
 assert(microtaskStoreValue === 11, "AsyncLocalStorage microtask propagation mismatch");
+let promiseThenStoreValue = 0;
+await storage.run({ value: 14 }, () => {
+  return Promise.resolve("ok").then(() => {
+    promiseThenStoreValue = storage.getStore()?.value ?? 0;
+  });
+});
+assert(promiseThenStoreValue === 14, "AsyncLocalStorage promise then propagation mismatch");
+let promiseCatchStoreValue = 0;
+await storage.run({ value: 15 }, () => {
+  return Promise.resolve().then(() => {
+    throw new Error("expected");
+  }).catch(() => {
+    promiseCatchStoreValue = storage.getStore()?.value ?? 0;
+  });
+});
+assert(promiseCatchStoreValue === 15, "AsyncLocalStorage promise catch propagation mismatch");
+let promiseFinallyStoreValue = 0;
+await storage.run({ value: 16 }, () => {
+  return Promise.resolve().finally(() => {
+    promiseFinallyStoreValue = storage.getStore()?.value ?? 0;
+  });
+});
+assert(promiseFinallyStoreValue === 16, "AsyncLocalStorage promise finally propagation mismatch");
 let immediateStoreValue = 0;
 await new Promise<void>((resolve) => {
   storage.run({ value: 12 }, () => {

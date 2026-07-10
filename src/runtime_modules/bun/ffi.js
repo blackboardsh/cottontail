@@ -141,7 +141,9 @@ g.process.stdout ??= createWritableStdio(1);
 g.process.stderr ??= createWritableStdio(2);
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
-if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" && typeof g.process.send !== "function") {
+if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&
+    g.process.env?.COTTONTAIL_IPC_BOOTSTRAP === "bun" &&
+    typeof g.process.send !== "function") {
   g.process.connected = true;
   g.process.send = (message) => {
     if (!g.process.connected) return false;
@@ -371,6 +373,154 @@ function bytesFromString(input) {
 function stringFromBytes(bytes) {
   return textDecoder.decode(bytes);
 }
+
+function normalizeBlobType(type = "") {
+  const text = String(type).toLowerCase();
+  return /[\x00-\x1f\x7f-\xff]/.test(text) ? "" : text;
+}
+
+function bytesFromBlobPart(part) {
+  if (part == null) return new Uint8Array(0);
+  if (typeof part === "string") return bytesFromString(part);
+  if (part instanceof ArrayBuffer) return new Uint8Array(part);
+  if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+  if (part?._bytes instanceof Uint8Array) return new Uint8Array(part._bytes);
+  return bytesFromString(String(part));
+}
+
+function relativeBlobIndex(value, size, fallback) {
+  const number = value == null ? fallback : Number(value);
+  if (!Number.isFinite(number)) return number < 0 ? 0 : size;
+  if (number < 0) return Math.max(size + number, 0);
+  return Math.min(number, size);
+}
+
+function installBlobGlobals() {
+  if (typeof g.Blob !== "function") {
+    class CottontailBlob {
+      constructor(parts = [], options = {}) {
+        const chunks = Array.from(parts ?? [], bytesFromBlobPart);
+        const size = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        this._bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const chunk of chunks) {
+          this._bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        this.type = normalizeBlobType(options?.type);
+      }
+
+      get size() {
+        return this._bytes.byteLength;
+      }
+
+      async arrayBuffer() {
+        return this._bytes.slice().buffer;
+      }
+
+      async bytes() {
+        return this._bytes.slice();
+      }
+
+      async text() {
+        return stringFromBytes(this._bytes);
+      }
+
+      slice(start = 0, end = this.size, type = "") {
+        const relativeStart = relativeBlobIndex(start, this.size, 0);
+        const relativeEnd = relativeBlobIndex(end, this.size, this.size);
+        return new g.Blob([this._bytes.slice(relativeStart, Math.max(relativeStart, relativeEnd))], { type });
+      }
+
+      stream() {
+        const bytes = this._bytes.slice();
+        if (typeof g.ReadableStream === "function") {
+          return new g.ReadableStream({
+            start(controller) {
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          });
+        }
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield bytes;
+          },
+        };
+      }
+    }
+    Object.defineProperty(g, "Blob", {
+      configurable: true,
+      writable: true,
+      value: CottontailBlob,
+    });
+  }
+
+  if (typeof g.File !== "function") {
+    class CottontailFile extends g.Blob {
+      constructor(parts = [], name = "", options = {}) {
+        super(parts, options);
+        this.name = String(name);
+        this.lastModified = Number(options?.lastModified ?? Date.now());
+      }
+    }
+    Object.defineProperty(g, "File", {
+      configurable: true,
+      writable: true,
+      value: CottontailFile,
+    });
+  }
+}
+
+function installObjectURLRegistry() {
+  if (!g.URL || g.URL.__cottontailObjectURLRegistryInstalled) return;
+
+  const registry = g.__cottontailObjectURLRegistry ??= new Map();
+  g.__cottontailObjectURLNextId ??= 1;
+  const nativeCreateObjectURL = typeof g.URL.createObjectURL === "function" ? g.URL.createObjectURL.bind(g.URL) : null;
+  const nativeRevokeObjectURL = typeof g.URL.revokeObjectURL === "function" ? g.URL.revokeObjectURL.bind(g.URL) : null;
+
+  Object.defineProperty(g.URL, "__cottontailObjectURLRegistryInstalled", {
+    value: true,
+    configurable: true,
+  });
+
+  Object.defineProperty(g.URL, "createObjectURL", {
+    configurable: true,
+    writable: true,
+    value(object) {
+      if (!(object instanceof g.Blob)) {
+        if (nativeCreateObjectURL) return nativeCreateObjectURL(object);
+        throw new TypeError("URL.createObjectURL requires a Blob");
+      }
+      const id = `blob:nodedata:${Date.now().toString(36)}-${g.__cottontailObjectURLNextId++}`;
+      registry.set(id, object);
+      return id;
+    },
+  });
+
+  Object.defineProperty(g.URL, "revokeObjectURL", {
+    configurable: true,
+    writable: true,
+    value(id) {
+      const key = String(id);
+      if (!registry.delete(key) && nativeRevokeObjectURL) nativeRevokeObjectURL(id);
+    },
+  });
+
+  if (typeof g.resolveObjectURL !== "function") {
+    Object.defineProperty(g, "resolveObjectURL", {
+      configurable: true,
+      writable: true,
+      value(id) {
+        return registry.get(String(id));
+      },
+    });
+  }
+}
+
+installBlobGlobals();
+installObjectURLRegistry();
 
 function normalizeBufferEncoding(encoding = "utf8") {
   const normalized = String(encoding || "utf8").toLowerCase().replace(/[-_]/g, "");

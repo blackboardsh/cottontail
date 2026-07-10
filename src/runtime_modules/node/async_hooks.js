@@ -134,12 +134,30 @@ function patchGlobalAsyncSchedulers() {
     global.queueMicrotask = (callback) => nativeQueueMicrotask(_wrapAsyncCallback(callback));
     global.queueMicrotask.__cottontailAsyncHooksPatched = true;
   }
-  for (const [setName, clearName] of [["setTimeout", "clearTimeout"], ["setInterval", "clearInterval"]]) {
+  for (const [setName, clearName] of [["setTimeout", "clearTimeout"], ["setInterval", "clearInterval"], ["setImmediate", "clearImmediate"]]) {
     if (typeof global[setName] !== "function" || global[setName].__cottontailAsyncHooksPatched) continue;
     const nativeSet = global[setName].bind(global);
     global[setName] = (callback, delay, ...args) => nativeSet(_wrapAsyncCallback(callback), delay, ...args);
     global[setName].__cottontailAsyncHooksPatched = true;
     if (typeof global[clearName] === "function") global[clearName] = global[clearName].bind(global);
+  }
+  if (typeof global.Promise === "function" && !global.Promise.prototype.then.__cottontailAsyncHooksPatched) {
+    const nativeThen = global.Promise.prototype.then;
+    const nativeFinally = global.Promise.prototype.finally;
+    global.Promise.prototype.then = function then(onFulfilled, onRejected) {
+      return nativeThen.call(this, _wrapAsyncCallback(onFulfilled), _wrapAsyncCallback(onRejected));
+    };
+    global.Promise.prototype.then.__cottontailAsyncHooksPatched = true;
+    global.Promise.prototype.catch = function catchPromise(onRejected) {
+      return this.then(undefined, onRejected);
+    };
+    global.Promise.prototype.catch.__cottontailAsyncHooksPatched = true;
+    if (typeof nativeFinally === "function") {
+      global.Promise.prototype.finally = function finallyPromise(onFinally) {
+        return nativeFinally.call(this, _wrapAsyncCallback(onFinally));
+      };
+      global.Promise.prototype.finally.__cottontailAsyncHooksPatched = true;
+    }
   }
 }
 
@@ -221,8 +239,6 @@ export const asyncWrapProviders = Object.freeze({
   Immediate: 4,
   TickObject: 5,
 });
-
-// COTTONTAIL-COMPAT: node:async_hooks async propagation - synchronous scopes plus timer and microtask AsyncLocalStorage snapshots are tracked; full promise-chain propagation needs native scheduler hooks.
 
 export default {
   AsyncLocalStorage,

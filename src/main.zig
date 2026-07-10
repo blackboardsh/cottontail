@@ -1,8 +1,10 @@
 const std = @import("std");
+const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
 
 comptime {
+    cottontail_transpiler.forceLink();
     host.forceLink();
 }
 

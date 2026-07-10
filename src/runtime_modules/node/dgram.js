@@ -161,6 +161,54 @@ export class Socket extends EventEmitter {
     return { ...this.remote, family: this.family === 6 ? "IPv6" : "IPv4" };
   }
 
+  addMembership(multicastAddress, multicastInterface = undefined) {
+    cottontail.udpSocketMembership(this.fd, String(multicastAddress), multicastInterface == null ? "" : String(multicastInterface), this.family, true);
+    return this;
+  }
+
+  dropMembership(multicastAddress, multicastInterface = undefined) {
+    cottontail.udpSocketMembership(this.fd, String(multicastAddress), multicastInterface == null ? "" : String(multicastInterface), this.family, false);
+    return this;
+  }
+
+  setBroadcast(flag) {
+    cottontail.udpSocketSetBroadcast(this.fd, Boolean(flag));
+    return this;
+  }
+
+  setTTL(ttl) {
+    cottontail.udpSocketSetTTL(this.fd, Number(ttl), this.family);
+    return this;
+  }
+
+  setMulticastTTL(ttl) {
+    cottontail.udpSocketSetMulticastTTL(this.fd, Number(ttl), this.family);
+    return this;
+  }
+
+  setMulticastLoopback(flag) {
+    cottontail.udpSocketSetMulticastLoopback(this.fd, Boolean(flag), this.family);
+    return this;
+  }
+
+  setRecvBufferSize(size) {
+    cottontail.udpSocketSetBufferSize(this.fd, false, Number(size));
+    return this;
+  }
+
+  setSendBufferSize(size) {
+    cottontail.udpSocketSetBufferSize(this.fd, true, Number(size));
+    return this;
+  }
+
+  getRecvBufferSize() {
+    return Number(cottontail.udpSocketGetBufferSize(this.fd, false));
+  }
+
+  getSendBufferSize() {
+    return Number(cottontail.udpSocketGetBufferSize(this.fd, true));
+  }
+
   ref() { return this; }
   unref() { return this; }
 
@@ -187,8 +235,6 @@ export function createSocket(options, callback = undefined) {
   if (typeof options === "string") return new Socket(options, callback);
   return new Socket(options, callback);
 }
-
-// COTTONTAIL-COMPAT: node:dgram multicast/options - UDP bind/send/receive/close are backed by native datagram sockets; multicast membership, broadcast/TTL tuning, and platform-specific socket options need additional native setsockopt bindings.
 
 export default {
   Socket,

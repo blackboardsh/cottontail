@@ -36,6 +36,7 @@ pub fn forceLink() void {
     _ = &ct_host_exists;
     _ = &ct_host_mkdir;
     _ = &ct_host_rm;
+    _ = &ct_host_rmdir;
     _ = &ct_host_unlink;
     _ = &ct_host_chmod;
     _ = &ct_host_spawn_sync;
@@ -147,6 +148,17 @@ export fn ct_host_rm(
             return -1;
         };
     }
+
+    return 0;
+}
+
+export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
+    error_out.* = null;
+
+    std.Io.Dir.cwd().deleteDir(getIo(), std.mem.span(path)) catch |err| {
+        setErrorOut(error_out, @errorName(err));
+        return -1;
+    };
 
     return 0;
 }

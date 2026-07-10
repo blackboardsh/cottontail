@@ -1,5 +1,6 @@
 import processDefault, * as processModule from "node:process";
 import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -109,14 +110,107 @@ assert(process.getBuiltinModule("process") === process, "getBuiltinModule proces
 assert(typeof process.finalization.register === "function", "finalization.register missing");
 assert(typeof process.finalization.unregister === "function", "finalization.unregister missing");
 
-for (const name of ["binding", "_linkedBinding", "dlopen", "execve"] as const) {
-  let threw = false;
-  try {
-    (process as any)[name]("x");
-  } catch {
-    threw = true;
-  }
-  assert(threw, `${name} should throw unsupported`);
+const constantsBinding = (process as any).binding("constants");
+assert(constantsBinding.fs.O_RDONLY === 0, "process.binding constants fs mismatch");
+assert(constantsBinding.os.errno.ENOENT === 2, "process.binding constants errno mismatch");
+assert(constantsBinding.os.signals.SIGTERM === 15, "process.binding constants signals mismatch");
+assert(constantsBinding.crypto.RSA_PKCS1_PADDING === 1, "process.binding constants crypto mismatch");
+assert(Number.isInteger(constantsBinding.zlib.Z_OK), "process.binding constants zlib mismatch");
+assert((process as any).binding("constants") === constantsBinding, "process.binding should cache constants binding");
+
+const uvBinding = (process as any).binding("uv");
+assert(uvBinding.UV_ENOENT === -2, "process.binding uv errno mismatch");
+assert(uvBinding.errname(uvBinding.UV_ENOENT) === "ENOENT", "process.binding uv errname mismatch");
+
+const utilBinding = (process as any).binding("util");
+assert(utilBinding.isArrayBuffer(new ArrayBuffer(1)) === true, "process.binding util isArrayBuffer mismatch");
+assert(utilBinding.isUint8Array(new Uint8Array(1)) === true, "process.binding util isUint8Array mismatch");
+assert(utilBinding.isPromise(Promise.resolve()) === true, "process.binding util isPromise mismatch");
+
+const configBinding = (process as any).binding("config");
+assert(configBinding.hasOpenSSL === true, "process.binding config hasOpenSSL mismatch");
+assert(configBinding.bits === 64 || configBinding.bits === 32, "process.binding config bits mismatch");
+assert(typeof configBinding.getDefaultLocale() === "string", "process.binding config getDefaultLocale mismatch");
+
+const nativesBinding = (process as any).binding("natives");
+assert(typeof nativesBinding.fs === "string" && nativesBinding.fs.includes("node:fs"), "process.binding natives fs mismatch");
+assert(typeof nativesBinding.crypto === "string" && nativesBinding.crypto.includes("node:crypto"), "process.binding natives crypto mismatch");
+
+const fsBinding = (process as any).binding("fs");
+assert(fsBinding.internalModuleStat(workDir) === 1, "process.binding fs internalModuleStat directory mismatch");
+assert(fsBinding.internalModuleStat(`${workDir}/missing`) < 0, "process.binding fs internalModuleStat missing mismatch");
+assert(fsBinding.readFileUtf8(envPath).includes("COTTONTAIL_PROCESS_SURFACE"), "process.binding fs readFileUtf8 mismatch");
+const bindingFile = `${workDir}/binding-fs.txt`;
+const bindingFd = fsBinding.open(bindingFile, "w+", 0o666);
+assert(Number.isInteger(bindingFd), "process.binding fs open mismatch");
+assert(fsBinding.writeString(bindingFd, "binding-ok", 0, "binding-ok".length, null) === "binding-ok".length, "process.binding fs writeString mismatch");
+fsBinding.close(bindingFd);
+assert(readFileSync(bindingFile, "utf8") === "binding-ok", "process.binding fs writeString content mismatch");
+
+const bufferBinding = (process as any).binding("buffer");
+assert(bufferBinding.byteLengthUtf8("hé") === 3, "process.binding buffer byteLengthUtf8 mismatch");
+const filled = Buffer.alloc(4);
+bufferBinding.fill(filled, "ab", 0, 4, "utf8");
+assert(filled.toString() === "abab", "process.binding buffer fill mismatch");
+assert(bufferBinding.indexOfString(Buffer.from("abcabc"), "bc", 0, "utf8") === 1, "process.binding buffer indexOfString mismatch");
+assert(bufferBinding.indexOfNumber(Buffer.from([1, 2, 3]), 2, 0) === 1, "process.binding buffer indexOfNumber mismatch");
+
+const osBinding = (process as any).binding("os");
+assert(typeof osBinding.getHostname() === "string", "process.binding os hostname mismatch");
+const loadAverage = new Float64Array(3);
+osBinding.getLoadAvg(loadAverage);
+assert(loadAverage.length === 3, "process.binding os loadavg mismatch");
+
+const spawnSyncBinding = (process as any).binding("spawn_sync");
+const privateSpawn = spawnSyncBinding.spawn({
+  file: "sh",
+  args: ["sh", "-c", "printf binding-spawn"],
+  stdio: "pipe",
+});
+assert(privateSpawn.status === 0, `process.binding spawn_sync status mismatch: ${privateSpawn.status}`);
+assert(privateSpawn.output[1].toString() === "binding-spawn", "process.binding spawn_sync stdout mismatch");
+
+const zlibBinding = (process as any).binding("zlib");
+assert(zlibBinding.crc32("abc") === 0x352441c2, "process.binding zlib crc32 mismatch");
+
+try {
+  (process as any).binding("definitely_missing");
+  throw new Error("process.binding missing name should throw");
+} catch (error) {
+  assert(String((error as Error).message).includes("No such module"), "process.binding missing error mismatch");
+}
+
+try {
+  (process as any)._linkedBinding("x");
+  throw new Error("process._linkedBinding should throw");
+} catch (error) {
+  assert((error as Error & { code?: string }).code === "ERR_INVALID_MODULE", "process._linkedBinding error code mismatch");
+}
+
+try {
+  (process as any).dlopen({ exports: {} }, "x.node");
+  throw new Error("process.dlopen should throw");
+} catch (error) {
+  assert((error as Error & { code?: string }).code === "ERR_DLOPEN_FAILED", "process.dlopen error code mismatch");
+}
+
+let execveValidationThrew = false;
+try {
+  (process as any).execve("/bin/sh", "bad-args", process.env);
+} catch {
+  execveValidationThrew = true;
+}
+assert(execveValidationThrew, "process.execve should validate args");
+
+if (process.platform !== "win32") {
+  const execveOutput = `${workDir}/execve-output.txt`;
+  const execveChild = new URL("./fixtures/process-execve-child.js", import.meta.url).pathname;
+  const execveResult = spawnSync(process.execPath, [execveChild], {
+    env: { ...process.env, COTTONTAIL_EXECVE_OUTPUT: execveOutput },
+    encoding: "utf8",
+  });
+  assert(execveResult.status === 0, `process.execve child exit mismatch: ${execveResult.status} ${execveResult.stderr}`);
+  assert(readFileSync(execveOutput, "utf8") === "execve-ok", "process.execve output mismatch");
 }
 
 rmSync(workDir, { recursive: true, force: true });

@@ -13,6 +13,7 @@ import {
 import {
   availableParallelism,
   constants as osConstants,
+  cpus,
   devNull,
   freemem,
   getPriority,
@@ -92,8 +93,18 @@ assert(isUtf8(Buffer.from("é")), "isUtf8 true mismatch");
 assert(!isUtf8(new Uint8Array([0xff])), "isUtf8 false mismatch");
 assert(transcode(Buffer.from("hi"), "utf8", "utf16le").length === 4, "transcode utf16 length mismatch");
 assert(resolveObjectURL("blob:nothing") === undefined, "resolveObjectURL missing blob mismatch");
+const objectUrlBlob = new Blob(["blob-ok"], { type: "text/plain" });
+const objectUrl = URL.createObjectURL(objectUrlBlob);
+assert(resolveObjectURL(objectUrl) === objectUrlBlob, "resolveObjectURL should return registered Blob");
+URL.revokeObjectURL(objectUrl);
+assert(resolveObjectURL(objectUrl) === undefined, "resolveObjectURL should return undefined after revoke");
 
 assert(availableParallelism() >= 1, "availableParallelism mismatch");
+const cpuList = cpus();
+assert(cpuList.length >= 1, "cpus length mismatch");
+assert(typeof cpuList[0].model === "string" && cpuList[0].model.length > 0, "cpus model mismatch");
+assert(Number.isFinite(cpuList[0].speed), "cpus speed mismatch");
+assert(Number.isFinite(cpuList[0].times.user) && Number.isFinite(cpuList[0].times.idle), "cpus times mismatch");
 assert(typeof freemem() === "number", "freemem mismatch");
 assert(typeof totalmem() === "number", "totalmem mismatch");
 assert(loadavg().length === 3, "loadavg length mismatch");
@@ -127,6 +138,16 @@ assert(routeMatch?.hash.groups.section === "intro", "URLPattern hash named group
 const filePattern = new URLPattern({ pathname: "/files/*" });
 assert(filePattern.exec({ pathname: "/files/a/b", baseURL: "http://example.com" })?.pathname.groups["0"] === "a/b", "URLPattern wildcard path mismatch");
 assert(!new URLPattern({ pathname: "/users/:id" }).test({ pathname: "/users/a/b", baseURL: "http://example.com" }), "URLPattern segment group should not cross slashes");
+const optionalPattern = new URLPattern({ protocol: "https", hostname: ":sub.example.com", pathname: "/:id(\\d+)?" });
+const optionalMatch = optionalPattern.exec("https://api.example.com/123");
+assert(optionalMatch?.hostname.groups.sub === "api", "URLPattern hostname named group mismatch");
+assert(optionalMatch?.pathname.groups.id === "123", "URLPattern custom regex group mismatch");
+assert(optionalPattern.test("https://api.example.com/"), "URLPattern optional regex group mismatch");
+const repeatedPattern = new URLPattern({ pathname: "/books/:path+" });
+assert(
+  repeatedPattern.exec({ pathname: "/books/a/b", baseURL: "https://example.com" })?.pathname.groups.path === "a/b",
+  "URLPattern plus modifier mismatch",
+);
 
 let control = "";
 const controlStream = { write(text, callback) { control += text; callback?.(); } };
@@ -179,13 +200,16 @@ const execChild = exec(execCommand, { encoding: "utf8" }, (error, stdout) => {
 assert(execChild instanceof ChildProcess, "exec ChildProcess mismatch");
 await new Promise<void>((resolve) => execChild.on("close", () => resolve()));
 
+_forkChild(0, "json");
+assert(typeof process.send === "function", "_forkChild should install process.send");
+process.disconnect?.();
 let forkChildThrew = false;
 try {
-  _forkChild();
+  _forkChild(0, "definitely-not-valid");
 } catch {
   forkChildThrew = true;
 }
-assert(forkChildThrew, "_forkChild should throw outside Node bootstrap");
+assert(forkChildThrew, "_forkChild should validate serialization mode");
 
 const context = createContext({ value: 2 });
 assert(isContext(context), "vm isContext mismatch");

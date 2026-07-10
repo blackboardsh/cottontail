@@ -9,6 +9,7 @@ import {
   statSync,
   symlinkSync,
   unwatchFile,
+  watch,
   watchFile,
   writeFileSync,
 } from "node:fs";
@@ -93,6 +94,21 @@ await new Promise<void>((resolve, reject) => {
   setTimeout(() => writeFileSync(filePath, "HELLO FS"), 200);
 });
 assert(watchFileCount === 1, `watchFile fired unexpected count: ${watchFileCount}`);
+
+const watchEvent = await new Promise<{ eventType: string; filename: string }>((resolve, reject) => {
+  const timeout = setTimeout(() => {
+    watcher.close();
+    reject(new Error("watch timeout"));
+  }, 3000);
+  const watcher = watch(childDir, { interval: 50 }, (eventType, filename) => {
+    clearTimeout(timeout);
+    watcher.close();
+    resolve({ eventType, filename: String(filename) });
+  });
+  setTimeout(() => writeFileSync(filePath, "HELLO FS!"), 200);
+});
+assert(watchEvent.eventType === "change", `watch event type mismatch: ${watchEvent.eventType}`);
+assert(watchEvent.filename === "hello.txt", `watch filename mismatch: ${watchEvent.filename}`);
 
 if (cottontail.platform() !== "win32") {
   symlinkSync(filePath, linkPath);

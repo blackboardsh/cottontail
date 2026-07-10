@@ -1,11 +1,27 @@
 const std = @import("std");
 
+fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const build_options_module = b.createModule(.{
+        .root_source_file = b.path("vendors/bun-zig/src/build_options.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bun_module = b.createModule(.{
+        .root_source_file = b.path("vendors/bun-zig/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bun_module.addImport("build_options", build_options_module);
+    bun_module.addImport("bun", bun_module);
+    return bun_module;
+}
+
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
-        .flags = &[_][]const u8{"-std=c11"},
+        .flags = &[_][]const u8{ "-std=c11", "-Wno-deprecated-declarations" },
     });
 
     if (step.root_module.resolved_target.?.result.os.tag == .macos) {
@@ -21,6 +37,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
         step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
         step.root_module.linkSystemLibrary("crypto", .{});
+        step.root_module.linkSystemLibrary("ssl", .{});
     } else {
         @panic("Cottontail currently wires JavaScriptCore through the macOS system framework only");
     }
@@ -38,6 +55,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("bun", createBunVendorModule(b, target, optimize));
 
     configureJsc(exe, b);
 
@@ -59,6 +77,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    unit_tests.root_module.addImport("bun", createBunVendorModule(b, target, optimize));
 
     configureJsc(unit_tests, b);
 

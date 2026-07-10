@@ -1,4 +1,4 @@
-import { ok, strictEqual } from "node:assert/strict";
+import { deepStrictEqual, ok, strictEqual } from "node:assert/strict";
 import { createRequire } from "node:module";
 import * as dns from "node:dns";
 import * as dnsPromises from "node:dns/promises";
@@ -50,8 +50,19 @@ dns.setDefaultResultOrder("ipv4first");
 strictEqual(dns.getDefaultResultOrder(), "ipv4first", "dns default order setter mismatch");
 dns.setDefaultResultOrder(previousOrder);
 
+dns.setServers(["127.0.0.1", "127.0.0.1:53", "[::1]:53"]);
+deepStrictEqual(dns.getServers(), ["127.0.0.1", "127.0.0.1:53", "[::1]:53"], "dns getServers mismatch");
+try {
+  dns.setServers(["not-an-ip"]);
+  throw new Error("dns.setServers invalid server should throw");
+} catch (error) {
+  strictEqual((error as Error & { code?: string }).code, "ERR_INVALID_IP_ADDRESS", "dns.setServers invalid server code mismatch");
+}
 dns.setServers(["127.0.0.1"]);
-strictEqual(dns.getServers()[0], "127.0.0.1", "dns getServers mismatch");
+const isolatedResolver = new dns.Resolver();
+isolatedResolver.setServers(["8.8.8.8"]);
+deepStrictEqual(isolatedResolver.getServers(), ["8.8.8.8"], "dns Resolver local servers mismatch");
+deepStrictEqual(dns.getServers(), ["127.0.0.1"], "dns Resolver setServers should not mutate global servers");
 dns.setServers([]);
 
 const lookupAll = await new Promise<Array<{ address: string; family: number }>>((resolve, reject) => {
@@ -92,6 +103,8 @@ const resolverAddresses = await new Promise<string[]>((resolve, reject) => {
 ok(resolverAddresses.includes("127.0.0.1"), "dns Resolver resolve4 mismatch");
 
 const promiseResolver = new dnsPromises.Resolver();
+promiseResolver.setServers(["1.1.1.1"]);
+deepStrictEqual(promiseResolver.getServers(), ["1.1.1.1"], "dns promises Resolver local servers mismatch");
 const promiseResolverAddresses = await promiseResolver.resolve4("localhost");
 ok(promiseResolverAddresses.includes("127.0.0.1"), "dns promises Resolver resolve4 mismatch");
 

@@ -45,9 +45,50 @@ export class PerformanceMeasure extends PerformanceEntry {
 }
 
 export class PerformanceResourceTiming extends PerformanceEntry {
-  constructor(name = "", startTime = 0, duration = 0) {
+  constructor(name = "", startTime = 0, duration = 0, timingInfo = {}, initiatorType = "") {
     super(name, "resource", startTime, duration);
-    this.initiatorType = "";
+    this.initiatorType = String(initiatorType ?? "");
+    this.workerStart = Number(timingInfo.workerStart ?? 0);
+    this.redirectStart = Number(timingInfo.redirectStart ?? 0);
+    this.redirectEnd = Number(timingInfo.redirectEnd ?? 0);
+    this.fetchStart = Number(timingInfo.fetchStart ?? startTime);
+    this.domainLookupStart = Number(timingInfo.domainLookupStart ?? 0);
+    this.domainLookupEnd = Number(timingInfo.domainLookupEnd ?? 0);
+    this.connectStart = Number(timingInfo.connectStart ?? 0);
+    this.connectEnd = Number(timingInfo.connectEnd ?? 0);
+    this.secureConnectionStart = Number(timingInfo.secureConnectionStart ?? 0);
+    this.requestStart = Number(timingInfo.requestStart ?? 0);
+    this.responseStart = Number(timingInfo.responseStart ?? 0);
+    this.responseEnd = Number(timingInfo.responseEnd ?? (startTime + duration));
+    this.transferSize = Number(timingInfo.transferSize ?? 0);
+    this.encodedBodySize = Number(timingInfo.encodedBodySize ?? 0);
+    this.decodedBodySize = Number(timingInfo.decodedBodySize ?? 0);
+    this.responseStatus = Number(timingInfo.responseStatus ?? 0);
+    this.deliveryType = String(timingInfo.deliveryType ?? "");
+  }
+
+  toJSON() {
+    return {
+      ...entryJson(this),
+      initiatorType: this.initiatorType,
+      workerStart: this.workerStart,
+      redirectStart: this.redirectStart,
+      redirectEnd: this.redirectEnd,
+      fetchStart: this.fetchStart,
+      domainLookupStart: this.domainLookupStart,
+      domainLookupEnd: this.domainLookupEnd,
+      connectStart: this.connectStart,
+      connectEnd: this.connectEnd,
+      secureConnectionStart: this.secureConnectionStart,
+      requestStart: this.requestStart,
+      responseStart: this.responseStart,
+      responseEnd: this.responseEnd,
+      transferSize: this.transferSize,
+      encodedBodySize: this.encodedBodySize,
+      decodedBodySize: this.decodedBodySize,
+      responseStatus: this.responseStatus,
+      deliveryType: this.deliveryType,
+    };
   }
 }
 
@@ -147,6 +188,7 @@ export class PerformanceObserver {
 export class Performance {
   constructor() {
     this.timeOrigin = origin;
+    this._resourceTimingBufferSize = 250;
   }
 
   now() {
@@ -197,7 +239,33 @@ export class Performance {
     return new PerformanceObserverEntryList(entries).getEntriesByType(type);
   }
 
-  setResourceTimingBufferSize() {}
+  setResourceTimingBufferSize(size = 250) {
+    this._resourceTimingBufferSize = Math.max(0, Number(size) || 0);
+  }
+
+  markResourceTiming(timingInfo = {}, requestedUrl = "", initiatorType = "", global = undefined, cacheMode = "", bodyInfo = undefined, responseStatus = 0, deliveryType = "") {
+    void global;
+    void cacheMode;
+    const startTime = Number(timingInfo.startTime ?? timingInfo.start ?? timingInfo.fetchStart ?? 0);
+    const responseEnd = Number(timingInfo.responseEnd ?? timingInfo.endTime ?? startTime);
+    const body = bodyInfo && typeof bodyInfo === "object" ? bodyInfo : {};
+    const entry = new PerformanceResourceTiming(
+      String(requestedUrl),
+      startTime,
+      Math.max(0, responseEnd - startTime),
+      {
+        ...timingInfo,
+        transferSize: timingInfo.transferSize ?? body.transferSize,
+        encodedBodySize: timingInfo.encodedBodySize ?? body.encodedBodySize,
+        decodedBodySize: timingInfo.decodedBodySize ?? body.decodedBodySize,
+        responseStatus: timingInfo.responseStatus ?? responseStatus,
+        deliveryType: timingInfo.deliveryType ?? deliveryType,
+      },
+      initiatorType,
+    );
+    if (this.getEntriesByType("resource").length >= this._resourceTimingBufferSize) removeEntries("resource", entries.find((item) => item.entryType === "resource")?.name);
+    return addEntry(entry);
+  }
 
   timerify(fn) {
     if (typeof fn !== "function") throw new TypeError("performance.timerify requires a function");
@@ -312,7 +380,7 @@ export const constants = {
 
 export const performance = new Performance();
 
-// COTTONTAIL-COMPAT: node:perf_hooks GC/resource timing - user marks/measures, observers, timerify, and histograms are implemented; native GC/resource entries need JSC instrumentation.
+// COTTONTAIL-COMPAT: node:perf_hooks native entries - user marks/measures, explicit resource timings, observers, timerify, and histograms are implemented; automatic GC/resource entries need JSC instrumentation.
 
 export default {
   Performance,

@@ -46,6 +46,15 @@ assert(sys.format("%s", "ok") === "ok", "sys re-export mismatch");
 assert(isArray([]), "isArray mismatch");
 assert(types.isKeyObject(createSecretKey(Buffer.from("abc"))), "util.types.isKeyObject secret key mismatch");
 assert(!types.isKeyObject({ type: "secret" }), "util.types.isKeyObject plain object mismatch");
+const proxyTarget = {};
+const proxy = new Proxy(proxyTarget, {});
+assert(types.isProxy(proxy), "util.types.isProxy proxy mismatch");
+assert(!types.isProxy(proxyTarget), "util.types.isProxy target mismatch");
+const revocable = Proxy.revocable({}, {});
+assert(types.isProxy(revocable.proxy), "util.types.isProxy revocable mismatch");
+revocable.revoke();
+assert(types.isProxy(revocable.proxy), "util.types.isProxy revoked proxy mismatch");
+assert(types.isExternal({}) === false, "util.types.isExternal plain object mismatch");
 assert(_extend({ a: 1 }, { b: 2 }).b === 2, "_extend mismatch");
 assert(parseEnv("A=1\nB='two'\n# ignored").B === "two", "parseEnv mismatch");
 assert(stripVTControlCharacters("\x1B[31mred\x1B[39m") === "red", "stripVTControlCharacters mismatch");
@@ -85,8 +94,16 @@ const abortedPromise = aborted(signal);
 controller.abort();
 await abortedPromise;
 
-assert(Array.isArray(diff({ a: 1 }, { a: 2 })), "diff mismatch");
-assert(Array.isArray(getCallSites(1)), "getCallSites mismatch");
+const stringDiff = diff("a\nb", "a\nc");
+assert(Array.isArray(stringDiff) && stringDiff.some(([type]) => type === 1) && stringDiff.some(([type]) => type === -1), "diff mismatch");
+const callSites = getCallSites(1);
+assert(
+  Array.isArray(callSites) &&
+    typeof callSites[0]?.scriptName === "string" &&
+    Number.isInteger(callSites[0]?.lineNumber) &&
+    Number.isInteger(callSites[0]?.columnNumber),
+  "getCallSites mismatch",
+);
 assert(typeof debuglog("test") === "function", "debuglog mismatch");
 
 console.log("node util sys surface passed");

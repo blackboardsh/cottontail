@@ -1,5 +1,5 @@
 import { dirname, join, resolve } from "./path.js";
-import { fileURLToPath } from "./url.js";
+import { fileURLToPath, pathToFileURL } from "./url.js";
 import * as assert from "./assert.js";
 import * as assertStrict from "./assert/strict.js";
 import * as asyncHooks from "./async_hooks.js";
@@ -118,6 +118,10 @@ export const builtinModules = [
 
 const commonJsCache = new Map();
 const builtinModuleMap = new Map();
+const moduleHooks = [];
+const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
+const sourceMapCache = new Map();
+let nextModuleHookId = 0;
 
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();
@@ -181,6 +185,10 @@ function resolveAsDirectory(candidate) {
   if (!isDirectory(candidate)) return null;
   const packagePath = join(candidate, "package.json");
   const packageJson = isFile(packagePath) ? readPackageJson(packagePath) : null;
+  if (packageJson?.exports != null) {
+    const exported = resolvePackageExports(candidate, packageJson, "");
+    if (exported) return exported;
+  }
   const mainField = packageJson && typeof packageJson.main === "string" ? packageJson.main : "";
   if (mainField) {
     const mainCandidate = resolve(candidate, mainField);
@@ -190,7 +198,122 @@ function resolveAsDirectory(candidate) {
   return resolveAsFile(join(candidate, "index"));
 }
 
-function resolveRequest(request, basePath) {
+function packageTargetForConditions(target) {
+  if (typeof target === "string") return target;
+  if (Array.isArray(target)) {
+    for (const item of target) {
+      const resolved = packageTargetForConditions(item);
+      if (resolved) return resolved;
+    }
+    return null;
+  }
+  if (target && typeof target === "object") {
+    const activeConditions = new Set(["node", "require", "default"]);
+    for (const [condition, value] of Object.entries(target)) {
+      if (activeConditions.has(condition)) {
+        const resolved = packageTargetForConditions(value);
+        if (resolved) return resolved;
+      }
+    }
+  }
+  return null;
+}
+
+function applyExportPattern(pattern, target, subpath) {
+  const starIndex = pattern.indexOf("*");
+  if (starIndex < 0) return target;
+  const before = pattern.slice(0, starIndex);
+  const after = pattern.slice(starIndex + 1);
+  if (!subpath.startsWith(before) || !subpath.endsWith(after)) return null;
+  const matched = subpath.slice(before.length, subpath.length - after.length);
+  return String(target).replace(/\*/g, matched);
+}
+
+function resolvePackageTarget(root, target) {
+  if (typeof target !== "string" || !target.startsWith("./")) return null;
+  const candidate = resolve(root, target);
+  return resolveAsFile(candidate) || resolveAsDirectory(candidate);
+}
+
+function resolvePackageExports(root, packageJson, suffix = "") {
+  const exportsField = packageJson?.exports;
+  if (exportsField == null) return null;
+  const subpath = suffix ? `./${suffix}` : ".";
+  if (typeof exportsField === "string" || Array.isArray(exportsField)) {
+    if (subpath !== ".") return null;
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField));
+  }
+  if (typeof exportsField !== "object") return null;
+  if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField[subpath]));
+  }
+  for (const [pattern, target] of Object.entries(exportsField)) {
+    if (!pattern.includes("*")) continue;
+    const resolvedTarget = packageTargetForConditions(target);
+    const mapped = resolvedTarget == null ? null : applyExportPattern(pattern, resolvedTarget, subpath);
+    const resolved = mapped == null ? null : resolvePackageTarget(root, mapped);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function isPromiseLike(value) {
+  return value != null && typeof value.then === "function";
+}
+
+function invalidArgType(name, expected, value) {
+  const error = new TypeError(`The "${name}" property must be of type ${expected}. Received type ${typeof value}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function resolvedToUrl(resolved) {
+  const text = String(resolved);
+  if (text.startsWith("node:")) return text;
+  if (builtinModuleMap.has(text)) return `node:${text.replace(/^node:/, "")}`;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
+  return pathToFileURL(text).href;
+}
+
+function urlToResolved(url) {
+  const text = String(url);
+  if (text.startsWith("node:")) return text;
+  if (text.startsWith("file:")) return fileURLToPath(text);
+  return text;
+}
+
+function formatForResolved(resolved) {
+  const text = String(resolved);
+  if (text.startsWith("node:") || builtinModuleMap.has(text)) return "builtin";
+  if (text.endsWith(".json")) return "json";
+  if (text.endsWith(".mjs")) return "module";
+  return "commonjs";
+}
+
+function parentURLForBase(basePath) {
+  const text = String(basePath || cottontail.cwd());
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
+  return pathToFileURL(text).href;
+}
+
+function normalizeResolveHookResult(result) {
+  if (isPromiseLike(result)) throw new TypeError("module.registerHooks resolve hooks must return synchronously");
+  if (typeof result === "string") return { url: result };
+  if (result == null || typeof result !== "object" || typeof result.url !== "string") {
+    throw new TypeError("module.registerHooks resolve hooks must return an object with a string url");
+  }
+  return result;
+}
+
+function normalizeLoadHookResult(result) {
+  if (isPromiseLike(result)) throw new TypeError("module.registerHooks load hooks must return synchronously");
+  if (result == null || typeof result !== "object") {
+    throw new TypeError("module.registerHooks load hooks must return an object");
+  }
+  return result;
+}
+
+function resolveRequestCore(request, basePath) {
   const text = String(request);
   if (builtinModuleMap.has(text)) return text;
   if (text.startsWith("node:") && builtinModuleMap.has(text.slice(5))) return text.slice(5);
@@ -206,6 +329,14 @@ function resolveRequest(request, basePath) {
   const root = packageRootFor(text, startDir);
   if (!root) throw new Error(`Cannot find module '${text}'`);
   const suffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
+  const packageJson = readPackageJson(join(root, "package.json"));
+  if (packageJson?.exports != null) {
+    const exported = resolvePackageExports(root, packageJson, suffix);
+    if (exported) return exported;
+    const error = new Error(`Package subpath '${suffix ? `./${suffix}` : "."}' is not defined by "exports" in ${join(root, "package.json")}`);
+    error.code = "ERR_PACKAGE_PATH_NOT_EXPORTED";
+    throw error;
+  }
   if (suffix) {
     const candidate = join(root, suffix);
     const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
@@ -214,6 +345,35 @@ function resolveRequest(request, basePath) {
   const resolved = resolveAsDirectory(root);
   if (resolved) return resolved;
   throw new Error(`Cannot find module '${text}'`);
+}
+
+function resolveRequest(request, basePath, useHooks = true) {
+  if (!useHooks || !moduleHooks.some((hook) => typeof hook.resolve === "function")) {
+    return resolveRequestCore(request, basePath);
+  }
+
+  const baseContext = {
+    conditions: ["node", "require"],
+    importAttributes: {},
+    parentURL: parentURLForBase(basePath),
+  };
+  let index = -1;
+  const nextResolve = (specifier, context = baseContext) => {
+    index += 1;
+    while (index < moduleHooks.length) {
+      const hook = moduleHooks[index];
+      if (typeof hook.resolve === "function") {
+        return normalizeResolveHookResult(hook.resolve(String(specifier), context ?? baseContext, nextResolve));
+      }
+      index += 1;
+    }
+
+    const parent = context?.parentURL ? fileURLToPath(context.parentURL) : basePath;
+    const resolved = resolveRequestCore(specifier, parent);
+    return { url: resolvedToUrl(resolved), format: formatForResolved(resolved), shortCircuit: true };
+  };
+
+  return urlToResolved(nextResolve(request, baseContext).url);
 }
 
 function makeModule(filename) {
@@ -231,6 +391,8 @@ function makeModule(filename) {
 
 function executeCommonJsModule(module, filename) {
   const source = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  maybeRegisterSourceMap(filename, source);
+  recordCompileCache(filename, source);
   const wrapper = new Function(
     "exports",
     "require",
@@ -244,7 +406,63 @@ function executeCommonJsModule(module, filename) {
   return module.exports;
 }
 
+function executeHookSource(resolved, source, format) {
+  const effectiveFormat = format ?? formatForResolved(resolved);
+  if (effectiveFormat === "builtin") return builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, ""));
+  if (effectiveFormat === "json" || String(resolved).endsWith(".json")) return JSON.parse(String(source ?? ""));
+  if (effectiveFormat === "module" || String(resolved).endsWith(".mjs")) {
+    throw new Error(`Cannot require ES module '${resolved}' from CommonJS`);
+  }
+  if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
+  const module = makeModule(resolved);
+  commonJsCache.set(resolved, module);
+  maybeRegisterSourceMap(resolved, String(source ?? ""));
+  recordCompileCache(resolved, String(source ?? ""));
+  const wrapper = new Function(
+    "exports",
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    `${String(source ?? "")}\n//# sourceURL=${resolved}`,
+  );
+  wrapper(module.exports, createRequire(resolved), module, resolved, dirname(resolved));
+  module.loaded = true;
+  return module.exports;
+}
+
+function defaultLoadForHooks(url) {
+  const resolved = urlToResolved(url);
+  const format = formatForResolved(resolved);
+  if (format === "builtin") return { format, source: null, shortCircuit: true };
+  return { format, source: cottontail.readFile(resolved), shortCircuit: true };
+}
+
+function applyLoadHooks(resolved) {
+  if (!moduleHooks.some((hook) => typeof hook.load === "function")) return null;
+  const url = resolvedToUrl(resolved);
+  const baseContext = { format: formatForResolved(resolved), importAttributes: {} };
+  let index = -1;
+  const nextLoad = (nextUrl, context = baseContext) => {
+    index += 1;
+    while (index < moduleHooks.length) {
+      const hook = moduleHooks[index];
+      if (typeof hook.load === "function") {
+        return normalizeLoadHookResult(hook.load(String(nextUrl), context ?? baseContext, nextLoad));
+      }
+      index += 1;
+    }
+    return defaultLoadForHooks(nextUrl);
+  };
+
+  const result = nextLoad(url, baseContext);
+  if (result.source == null) return null;
+  return executeHookSource(resolved, result.source, result.format ?? baseContext.format);
+}
+
 function loadCommonJsModule(resolved) {
+  const hooked = applyLoadHooks(resolved);
+  if (hooked !== null) return hooked;
   if (builtinModuleMap.has(resolved)) return builtinModuleMap.get(resolved);
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
   if (resolved.endsWith(".json")) return JSON.parse(cottontail.readFile(resolved));
@@ -304,6 +522,8 @@ export class Module {
   }
 
   _compile(source, filename) {
+    maybeRegisterSourceMap(filename, String(source));
+    recordCompileCache(filename, String(source));
     const wrapper = new Function(
       "exports",
       "require",
@@ -324,10 +544,19 @@ export class SourceMap {
   constructor(payload = {}) {
     this.payload = payload;
     this.lineLengths = [];
+    this._entries = decodeSourceMapMappings(payload);
   }
 
   findEntry(lineNumber = 0, columnNumber = 0) {
-    return {
+    const line = Number(lineNumber);
+    const column = Number(columnNumber);
+    let best = null;
+    for (const entry of this._entries) {
+      if (entry.generatedLine !== line) continue;
+      if (entry.generatedColumn > column) continue;
+      if (best == null || entry.generatedColumn >= best.generatedColumn) best = entry;
+    }
+    return best ? { ...best } : {
       generatedLine: Number(lineNumber),
       generatedColumn: Number(columnNumber),
       originalSource: null,
@@ -340,6 +569,104 @@ export class SourceMap {
   findOrigin(lineNumber = 0, columnNumber = 0) {
     return this.findEntry(lineNumber, columnNumber);
   }
+}
+
+const sourceMapBase64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const sourceMapBase64Values = new Map(Array.from(sourceMapBase64Chars, (char, index) => [char, index]));
+
+function decodeVlq(segment) {
+  const values = [];
+  let value = 0;
+  let shift = 0;
+  for (const char of segment) {
+    const digit = sourceMapBase64Values.get(char);
+    if (digit == null) throw new Error("Invalid source map VLQ digit");
+    const continuation = (digit & 32) !== 0;
+    value += (digit & 31) << shift;
+    if (continuation) {
+      shift += 5;
+      continue;
+    }
+    const negative = (value & 1) === 1;
+    values.push(negative ? -(value >> 1) : value >> 1);
+    value = 0;
+    shift = 0;
+  }
+  return values;
+}
+
+function decodeSourceMapMappings(payload = {}) {
+  const mappings = String(payload.mappings ?? "");
+  const sources = Array.from(payload.sources ?? [], String);
+  const names = Array.from(payload.names ?? [], String);
+  const entries = [];
+  let sourceIndex = 0;
+  let originalLine = 0;
+  let originalColumn = 0;
+  let nameIndex = 0;
+  const lines = mappings.split(";");
+  for (let generatedLineIndex = 0; generatedLineIndex < lines.length; generatedLineIndex += 1) {
+    let generatedColumn = 0;
+    const line = lines[generatedLineIndex];
+    if (!line) continue;
+    for (const segment of line.split(",")) {
+      if (!segment) continue;
+      const fields = decodeVlq(segment);
+      generatedColumn += fields[0] ?? 0;
+      if (fields.length >= 4) {
+        sourceIndex += fields[1];
+        originalLine += fields[2];
+        originalColumn += fields[3];
+        if (fields.length >= 5) nameIndex += fields[4];
+        entries.push({
+          generatedLine: generatedLineIndex + 1,
+          generatedColumn,
+          originalSource: sources[sourceIndex] ?? null,
+          originalLine: originalLine + 1,
+          originalColumn,
+          name: fields.length >= 5 ? names[nameIndex] ?? null : null,
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+function sourceMapUrlFromSource(source) {
+  const pattern = /(?:\/\/[#@]\s*sourceMappingURL=([^\r\n]+)|\/\*[#@]\s*sourceMappingURL=([^*]+)\*\/)/g;
+  let match = null;
+  for (;;) {
+    const next = pattern.exec(String(source));
+    if (!next) break;
+    match = next;
+  }
+  return match ? String(match[1] ?? match[2]).trim() : null;
+}
+
+function readSourceMapPayload(filename, source) {
+  const sourceMapUrl = sourceMapUrlFromSource(source);
+  if (!sourceMapUrl) return null;
+  if (sourceMapUrl.startsWith("data:")) {
+    const comma = sourceMapUrl.indexOf(",");
+    if (comma < 0) return null;
+    const meta = sourceMapUrl.slice(5, comma);
+    const body = sourceMapUrl.slice(comma + 1);
+    const text = meta.includes(";base64")
+      ? buffer.Buffer.from(body, "base64").toString("utf8")
+      : decodeURIComponent(body);
+    return JSON.parse(text);
+  }
+  const mapPath = sourceMapUrl.startsWith("file:")
+    ? fileURLToPath(sourceMapUrl)
+    : resolve(dirname(String(filename)), sourceMapUrl);
+  return JSON.parse(cottontail.readFile(mapPath));
+}
+
+function maybeRegisterSourceMap(filename, source) {
+  try {
+    const payload = readSourceMapPayload(filename, source);
+    if (payload) sourceMapCache.set(String(filename), new SourceMap(payload));
+  } catch {}
 }
 
 export const _cache = commonJsCache;
@@ -359,7 +686,27 @@ export const constants = {
 
 export let globalPaths = [];
 let compileCacheDir = undefined;
+const compileCacheEntries = new Map();
 let sourceMapsSupport = { nodeModules: false, generatedCode: false };
+
+function compileCacheKey(filename, source) {
+  return crypto.createHash("sha256").update(`${filename}\0${source}`).digest("hex");
+}
+
+function recordCompileCache(filename, source) {
+  if (compileCacheDir == null) return;
+  try {
+    const key = compileCacheKey(String(filename), String(source));
+    const entry = {
+      filename: String(filename),
+      sourceHash: key,
+      sourceLength: String(source).length,
+      cachedAt: Date.now(),
+    };
+    compileCacheEntries.set(String(filename), entry);
+    cottontail.writeFile(join(compileCacheDir, `${key}.json`), JSON.stringify(entry));
+  } catch {}
+}
 
 export const _extensions = {
   ".js"(module, filename) {
@@ -494,6 +841,14 @@ export function enableCompileCache(cacheDir = undefined) {
 }
 
 export function flushCompileCache() {
+  if (compileCacheDir != null) {
+    try {
+      cottontail.writeFile(join(compileCacheDir, "manifest.json"), JSON.stringify({
+        version: 1,
+        entries: Array.from(compileCacheEntries.values()),
+      }));
+    } catch {}
+  }
   return undefined;
 }
 
@@ -514,9 +869,13 @@ export function setSourceMapsSupport(enabled = true) {
 }
 
 export function findSourceMap(path, error = undefined) {
-  void path;
   void error;
-  return undefined;
+  const key = String(path);
+  if (sourceMapCache.has(key)) return sourceMapCache.get(key);
+  try {
+    maybeRegisterSourceMap(key, cottontail.readFile(key));
+  } catch {}
+  return sourceMapCache.get(key);
 }
 
 export function findPackageJSON(specifier, base = cottontail.cwd()) {
@@ -524,24 +883,317 @@ export function findPackageJSON(specifier, base = cottontail.cwd()) {
   return root ? join(root, "package.json") : undefined;
 }
 
-export function register(specifier, parentURL = undefined, options = undefined) {
-  void specifier;
-  void parentURL;
-  void options;
-  throw new Error("module.register loader hooks are not available in Cottontail yet");
+class ModuleHooks {
+  constructor(resolveHook, loadHook) {
+    this.resolve = resolveHook;
+    this.load = loadHook;
+    Object.defineProperty(this, moduleHookIdKey, {
+      value: Symbol(`module-hook-${nextModuleHookId++}`),
+      configurable: false,
+    });
+  }
+
+  deregister() {
+    const index = moduleHooks.indexOf(this);
+    if (index >= 0) moduleHooks.splice(index, 1);
+  }
 }
 
-export function registerHooks(options = undefined) {
-  void options;
-  throw new Error("module.registerHooks loader hooks are not available in Cottontail yet");
+export function register(specifier, parentURL = undefined, options = undefined) {
+  const parent = parentURL == null ? cottontail.cwd() : fileURLToPath(String(parentURL));
+  const hooksModule = typeof specifier === "object" && specifier !== null
+    ? specifier
+    : createRequire(parent)(String(specifier));
+  const hooks = hooksModule?.resolve || hooksModule?.load ? hooksModule : hooksModule?.default;
+  const registered = registerHooks(hooks ?? {});
+  if (typeof hooksModule?.initialize === "function") hooksModule.initialize(options?.data);
+  else if (typeof hooks?.initialize === "function") hooks.initialize(options?.data);
+  void registered;
+}
+
+export function registerHooks(hooks = undefined) {
+  const { resolve: resolveHook, load: loadHook } = hooks;
+  if (resolveHook !== undefined && typeof resolveHook !== "function") {
+    throw invalidArgType("hooks.resolve", "function", resolveHook);
+  }
+  if (loadHook !== undefined && typeof loadHook !== "function") {
+    throw invalidArgType("hooks.load", "function", loadHook);
+  }
+  const registered = new ModuleHooks(resolveHook, loadHook);
+  moduleHooks.push(registered);
+  return registered;
+}
+
+function isIdentifierStart(char) {
+  return /[A-Za-z_$]/.test(char ?? "");
+}
+
+function isIdentifierPart(char) {
+  return /[0-9A-Za-z_$]/.test(char ?? "");
+}
+
+function previousNonSpace(source, index) {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    if (!/\s/.test(source[cursor])) return cursor;
+  }
+  return -1;
+}
+
+function nextNonSpace(source, index) {
+  for (let cursor = index; cursor < source.length; cursor += 1) {
+    if (!/\s/.test(source[cursor])) return cursor;
+  }
+  return -1;
+}
+
+function wordAt(source, index, word) {
+  return source.slice(index, index + word.length) === word &&
+    !isIdentifierPart(source[index - 1]) &&
+    !isIdentifierPart(source[index + word.length]);
+}
+
+function skipStringLike(source, index) {
+  const quote = source[index];
+  if (quote === "/" && source[index + 1] === "/") {
+    const newline = source.indexOf("\n", index + 2);
+    return newline < 0 ? source.length : newline + 1;
+  }
+  if (quote === "/" && source[index + 1] === "*") {
+    const end = source.indexOf("*/", index + 2);
+    return end < 0 ? source.length : end + 2;
+  }
+  if (quote !== "\"" && quote !== "'" && quote !== "`") return index + 1;
+  for (let cursor = index + 1; cursor < source.length; cursor += 1) {
+    if (source[cursor] === "\\") {
+      cursor += 1;
+      continue;
+    }
+    if (source[cursor] === quote) return cursor + 1;
+  }
+  return source.length;
+}
+
+function addMaskRange(ranges, start, end) {
+  if (end > start) ranges.push([start, end]);
+}
+
+function findStatementEnd(source, start) {
+  let curly = 0;
+  let paren = 0;
+  let square = 0;
+  for (let cursor = start; cursor < source.length; cursor += 1) {
+    const char = source[cursor];
+    if (char === "\"" || char === "'" || char === "`" || (char === "/" && (source[cursor + 1] === "/" || source[cursor + 1] === "*"))) {
+      cursor = skipStringLike(source, cursor) - 1;
+      continue;
+    }
+    if (char === "{") curly += 1;
+    else if (char === "}") {
+      if (curly === 0) return cursor;
+      curly -= 1;
+      if (curly === 0 && paren === 0 && square === 0) return cursor + 1;
+    } else if (char === "(") paren += 1;
+    else if (char === ")") paren = Math.max(0, paren - 1);
+    else if (char === "[") square += 1;
+    else if (char === "]") square = Math.max(0, square - 1);
+    else if ((char === ";" || char === "\n") && curly === 0 && paren === 0 && square === 0) return cursor + (char === ";" ? 1 : 0);
+  }
+  return source.length;
+}
+
+function findBalancedAngleEnd(source, start) {
+  let depth = 0;
+  for (let cursor = start; cursor < source.length; cursor += 1) {
+    const char = source[cursor];
+    if (char === "\"" || char === "'" || char === "`" || (char === "/" && (source[cursor + 1] === "/" || source[cursor + 1] === "*"))) {
+      cursor = skipStringLike(source, cursor) - 1;
+      continue;
+    }
+    if (char === "<") depth += 1;
+    else if (char === ">") {
+      depth -= 1;
+      if (depth === 0) return cursor + 1;
+    } else if (depth === 0 || char === "\n" || char === ";" || char === "{") {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+function findTypeEnd(source, start, terminators) {
+  let angle = 0;
+  let curly = 0;
+  let paren = 0;
+  let square = 0;
+  let sawToken = false;
+  for (let cursor = start; cursor < source.length; cursor += 1) {
+    const char = source[cursor];
+    if (char === "\"" || char === "'" || char === "`" || (char === "/" && (source[cursor + 1] === "/" || source[cursor + 1] === "*"))) {
+      cursor = skipStringLike(source, cursor) - 1;
+      sawToken = true;
+      continue;
+    }
+    if (angle === 0 && curly === 0 && paren === 0 && square === 0 && sawToken && terminators.has(char)) return cursor;
+    if (char === "<") angle += 1;
+    else if (char === ">") angle = Math.max(0, angle - 1);
+    else if (char === "{") curly += 1;
+    else if (char === "}") {
+      if (curly === 0 && sawToken && terminators.has(char)) return cursor;
+      curly = Math.max(0, curly - 1);
+    } else if (char === "(") paren += 1;
+    else if (char === ")") {
+      if (paren === 0 && sawToken && terminators.has(char)) return cursor;
+      paren = Math.max(0, paren - 1);
+    } else if (char === "[") square += 1;
+    else if (char === "]") {
+      if (square === 0 && sawToken && terminators.has(char)) return cursor;
+      square = Math.max(0, square - 1);
+    } else if (char === "\n" && angle === 0 && curly === 0 && paren === 0 && square === 0) {
+      return cursor;
+    } else if (!/\s/.test(char)) {
+      sawToken = true;
+    }
+  }
+  return source.length;
+}
+
+function linePrefix(source, index) {
+  const lineStart = Math.max(source.lastIndexOf("\n", index - 1) + 1, 0);
+  return source.slice(lineStart, index);
+}
+
+function shouldMaskTypeColon(source, index) {
+  const previous = previousNonSpace(source, index);
+  const next = nextNonSpace(source, index + 1);
+  if (previous < 0 || next < 0) return false;
+  if (!isIdentifierPart(source[previous]) && source[previous] !== ")" && source[previous] !== "]" && source[previous] !== "?") return false;
+  if (/['"`0-9]/.test(source[next])) return false;
+  const prefix = linePrefix(source, index);
+  if (/\bcase\s*$/.test(prefix)) return false;
+  return true;
+}
+
+function applyMaskRanges(source, ranges) {
+  if (ranges.length === 0) return source;
+  const chars = Array.from(source);
+  ranges.sort((left, right) => left[0] - right[0]);
+  for (const [start, end] of ranges) {
+    for (let index = start; index < end && index < chars.length; index += 1) {
+      if (chars[index] !== "\n" && chars[index] !== "\r") chars[index] = " ";
+    }
+  }
+  return chars.join("");
+}
+
+function stripTypeScriptTypesPreserveWhitespace(source) {
+  const ranges = [];
+  for (let cursor = 0; cursor < source.length; cursor += 1) {
+    const char = source[cursor];
+    if (char === "\"" || char === "'" || char === "`" || (char === "/" && (source[cursor + 1] === "/" || source[cursor + 1] === "*"))) {
+      cursor = skipStringLike(source, cursor) - 1;
+      continue;
+    }
+    if (wordAt(source, cursor, "interface") ||
+        (wordAt(source, cursor, "type") && !/import\s*\{[^}\n]*$/.test(linePrefix(source, cursor)))) {
+      const prefixWindow = source.slice(Math.max(0, cursor - 24), cursor);
+      const start = prefixWindow.match(/\b(?:export\s+)?(?:declare\s+)?$/)?.index;
+      const maskStart = start == null ? cursor : Math.max(0, cursor - 24) + start;
+      let statementEnd = findStatementEnd(source, cursor);
+      const after = nextNonSpace(source, statementEnd);
+      if (after >= 0 && source[after] === ";") statementEnd = after + 1;
+      addMaskRange(ranges, maskStart, statementEnd);
+      continue;
+    }
+    if (wordAt(source, cursor, "import") && /^\s*type\b/.test(source.slice(cursor + "import".length))) {
+      addMaskRange(ranges, cursor, findStatementEnd(source, cursor));
+      continue;
+    }
+    if (wordAt(source, cursor, "implements")) {
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + "implements".length, new Set(["{", "\n"])));
+      continue;
+    }
+    if (wordAt(source, cursor, "as")) {
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 2, new Set([";", ",", ")", "]", "}", "\n"])));
+      continue;
+    }
+    if (wordAt(source, cursor, "satisfies")) {
+      addMaskRange(ranges, cursor, findTypeEnd(source, cursor + 9, new Set([";", ",", ")", "]", "}", "\n"])));
+      continue;
+    }
+    if (char === "<") {
+      const previous = previousNonSpace(source, cursor);
+      const end = findBalancedAngleEnd(source, cursor);
+      const next = end >= 0 ? nextNonSpace(source, end) : -1;
+      if (previous >= 0 && isIdentifierPart(source[previous]) && next >= 0 && source[next] === "(") addMaskRange(ranges, cursor, end);
+      continue;
+    }
+    if (char === "?") {
+      const next = nextNonSpace(source, cursor + 1);
+      if (next >= 0 && (source[next] === ":" || source[next] === "," || source[next] === ")" || source[next] === ";")) {
+        addMaskRange(ranges, cursor, cursor + 1);
+      }
+      continue;
+    }
+    if (char === ":" && shouldMaskTypeColon(source, cursor)) {
+      const end = findTypeEnd(source, cursor + 1, new Set(["=", ",", ")", ";", "{", "}", "\n"]));
+      if (end > cursor + 1) addMaskRange(ranges, cursor, end);
+      continue;
+    }
+    if (char === "!" && source[cursor + 1] !== "=") {
+      const previous = previousNonSpace(source, cursor);
+      const next = nextNonSpace(source, cursor + 1);
+      if (previous >= 0 && isIdentifierPart(source[previous]) && next >= 0 && /[;,.()[\]}\n]/.test(source[next])) {
+        addMaskRange(ranges, cursor, cursor + 1);
+      }
+    }
+  }
+
+  source.replace(/import\s*\{([^}]*)\}\s*from/g, (match, names, offset) => {
+    const namesStart = offset + match.indexOf("{") + 1;
+    const specifier = /(?:^|,)\s*type\s+[A-Za-z_$][\w$]*(?:\s+as\s+[A-Za-z_$][\w$]*)?\s*,?\s*/g;
+    let item;
+    while ((item = specifier.exec(names)) != null) {
+      addMaskRange(ranges, namesStart + item.index, namesStart + item.index + item[0].length);
+    }
+    return match;
+  });
+
+  return applyMaskRanges(source, ranges);
 }
 
 export function stripTypeScriptTypes(source, options = undefined) {
-  void options;
-  throw new Error("module.stripTypeScriptTypes is not available until the TypeScript parser is exposed as a runtime API");
+  if (typeof source !== "string") {
+    throw new TypeError("module.stripTypeScriptTypes source must be a string");
+  }
+
+  let mode = "strip";
+  let sourceMap = false;
+  let sourceUrl = undefined;
+  if (options != null) {
+    if (typeof options !== "object") throw new TypeError("module.stripTypeScriptTypes options must be an object");
+    if (options.mode != null) mode = String(options.mode);
+    if (options.sourceMap != null) sourceMap = Boolean(options.sourceMap);
+    if (options.sourceUrl != null) sourceUrl = String(options.sourceUrl);
+  }
+
+  if (mode !== "strip" && mode !== "transform") {
+    throw new RangeError("module.stripTypeScriptTypes mode must be 'strip' or 'transform'");
+  }
+  if (sourceMap && mode === "strip") {
+    throw new Error("module.stripTypeScriptTypes sourceMap cannot be used with mode 'strip'");
+  }
+  if (typeof cottontail.stripTypeScriptTypes !== "function") {
+    throw new Error("module.stripTypeScriptTypes native parser is unavailable");
+  }
+
+  let output = mode === "strip"
+    ? stripTypeScriptTypesPreserveWhitespace(source)
+    : cottontail.stripTypeScriptTypes(source, 1);
+  if (sourceUrl !== undefined) output += `\n\n//# sourceURL=${sourceUrl}`;
+  return output;
 }
 
-// COTTONTAIL-COMPAT: node:module loader hooks/source maps/compile cache - exported with real resolver/cache state where available; loader-hook and TS-strip APIs require dedicated parser/loader support.
+// COTTONTAIL-COMPAT: node:module compile cache/ESM loaders - CommonJS loader hooks, package exports resolution, resolver/cache state, and sourceMappingURL-backed source maps are implemented; ESM hook isolation, async loader thread behavior, and V8 compile-cache parity need dedicated loader/runtime support.
 
 _initPaths();
 

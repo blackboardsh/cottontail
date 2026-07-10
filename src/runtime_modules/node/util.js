@@ -266,17 +266,82 @@ export function debuglog(section, callback = undefined) {
 
 export const debug = debuglog;
 
-export function diff(actual, expected) {
-  if (isDeepStrictEqual(actual, expected)) return [];
-  return [
-    { type: "remove", value: actual },
-    { type: "add", value: expected },
-  ];
+function diffSequence(value) {
+  if (typeof value === "string") return Array.from(value);
+  if (Array.isArray(value)) return value;
+  return Array.from(inspect(value));
 }
 
-export function getCallSites(frameCount = 10) {
-  const stack = String(new Error().stack || "").split("\n").slice(1, Number(frameCount) + 1);
-  return stack.map((line) => ({ scriptName: line.trim(), lineNumber: 0, columnNumber: 0, functionName: "" }));
+export function diff(actual, expected) {
+  if (isDeepStrictEqual(actual, expected)) return [];
+  const left = diffSequence(actual);
+  const right = diffSequence(expected);
+  const table = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
+  for (let leftIndex = left.length - 1; leftIndex >= 0; leftIndex -= 1) {
+    for (let rightIndex = right.length - 1; rightIndex >= 0; rightIndex -= 1) {
+      table[leftIndex][rightIndex] = Object.is(left[leftIndex], right[rightIndex])
+        ? table[leftIndex + 1][rightIndex + 1] + 1
+        : Math.max(table[leftIndex + 1][rightIndex], table[leftIndex][rightIndex + 1]);
+    }
+  }
+  const output = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    if (leftIndex < left.length && rightIndex < right.length && Object.is(left[leftIndex], right[rightIndex])) {
+      output.push([0, left[leftIndex++]]);
+      rightIndex += 1;
+    } else if (rightIndex >= right.length || (leftIndex < left.length && table[leftIndex + 1][rightIndex] >= table[leftIndex][rightIndex + 1])) {
+      output.push([1, left[leftIndex++]]);
+    } else {
+      output.push([-1, right[rightIndex++]]);
+    }
+  }
+  return output;
+}
+
+function parseStackLine(line) {
+  const text = String(line).trim();
+  let match = text.match(/^at\s+(.*?)\s+\((.*):(\d+):(\d+)\)$/) ||
+    text.match(/^at\s+(.*):(\d+):(\d+)$/);
+  if (match) {
+    if (match.length === 5) {
+      return {
+        functionName: match[1] || "",
+        scriptId: undefined,
+        scriptName: match[2],
+        lineNumber: Number(match[3]),
+        columnNumber: Number(match[4]),
+        column: Number(match[4]),
+      };
+    }
+    return {
+      functionName: "",
+      scriptId: undefined,
+      scriptName: match[1],
+      lineNumber: Number(match[2]),
+      columnNumber: Number(match[3]),
+      column: Number(match[3]),
+    };
+  }
+  match = text.match(/^(?:(.*?)@)?(.+):(\d+):(\d+)$/);
+  if (match) {
+    return {
+      functionName: match[1] || "",
+      scriptId: undefined,
+      scriptName: match[2],
+      lineNumber: Number(match[3]),
+      columnNumber: Number(match[4]),
+      column: Number(match[4]),
+    };
+  }
+  return { functionName: "", scriptId: undefined, scriptName: text, lineNumber: 0, columnNumber: 0, column: 0 };
+}
+
+export function getCallSites(options = undefined) {
+  const frameCount = typeof options === "number" ? options : Number(options?.frameCount ?? 10);
+  const stack = String(new Error().stack || "").split("\n").slice(1, Math.max(0, frameCount) + 1);
+  return stack.map(parseStackLine);
 }
 
 let traceSigInt = false;
@@ -402,8 +467,6 @@ export class MIMEType {
     return this.toString();
   }
 }
-
-// COTTONTAIL-COMPAT: node:util diagnostics - diff/getCallSites/debug output is simplified; replace with richer inspector-backed data later.
 
 export { types };
 

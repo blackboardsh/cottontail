@@ -7,6 +7,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  createReadStream,
   copyFileSync,
   cpSync,
   createWriteStream,
@@ -169,6 +170,12 @@ writeFileSync(`${nested}/child/match.txt`, "glob");
 cpSync(nested, `${root}/nested-copy`, { recursive: true });
 assert(readFileSync(`${root}/nested-copy/child/match.txt`, "utf8") === "glob", "cpSync recursive mismatch");
 assert(globSync("nested/**/*.txt", { cwd: root }).includes("nested/child/match.txt"), "globSync mismatch");
+const allTxt = globSync("**/*.txt", { cwd: root });
+assert(allTxt.includes("file.txt"), "globSync ** should match root-level files");
+assert(!globSync("**/*.txt", { cwd: root, exclude: ["nested-copy/**"] }).includes("nested-copy/child/match.txt"), "globSync exclude pattern mismatch");
+const globDirents = globSync("nested/**/*.txt", { cwd: new URL(`file://${root}/`), withFileTypes: true });
+assert(globDirents[0]?.name === "match.txt", "globSync withFileTypes name mismatch");
+assert(String(globDirents[0]?.parentPath).endsWith("/nested/child"), "globSync withFileTypes parentPath mismatch");
 
 const disposable = mkdtempDisposableSync(`${root}/dispose-`);
 assert(statSync(disposable.path).isDirectory(), "mkdtempDisposableSync path mismatch");
@@ -189,6 +196,68 @@ await new Promise<void>((resolve, reject) => {
   });
   stream.end("stream-data");
 });
+
+await new Promise<void>((resolve, reject) => {
+  const streamPath = `${root}/stream-lifecycle.txt`;
+  const stream = createWriteStream(streamPath);
+  let openCount = 0;
+  let readyCount = 0;
+  stream.on("open", () => { openCount += 1; });
+  stream.on("ready", () => { readyCount += 1; });
+  stream.on("error", reject);
+  stream.write("life");
+  stream.end("cycle");
+  stream.on("close", () => {
+    try {
+      assert(openCount === 1, `createWriteStream open count mismatch: ${openCount}`);
+      assert(readyCount === 1, `createWriteStream ready count mismatch: ${readyCount}`);
+      assert(stream.writableEnded === true, "createWriteStream writableEnded mismatch");
+      assert(stream.bytesWritten === "lifecycle".length, "createWriteStream bytesWritten mismatch");
+      assert(readFileSync(streamPath, "utf8") === "lifecycle", "createWriteStream lifecycle content mismatch");
+      resolve();
+    } catch (error) {
+      reject(error);
+    }
+  });
+});
+
+await new Promise<void>((resolve, reject) => {
+  const streamPath = `${root}/stream-backpressure.txt`;
+  const stream = createWriteStream(streamPath, { highWaterMark: 2 });
+  let drained = false;
+  stream.on("error", reject);
+  stream.on("drain", () => { drained = true; });
+  const accepted = stream.write("abcd");
+  assert(accepted === false, "createWriteStream should report backpressure over highWaterMark");
+  assert(stream.writableNeedDrain === true, "createWriteStream writableNeedDrain mismatch");
+  stream.end("ef");
+  stream.on("close", () => {
+    try {
+      assert(drained === true, "createWriteStream drain event mismatch");
+      assert(stream.writableLength === 0, "createWriteStream writableLength should drain to zero");
+      assert(stream.writableNeedDrain === false, "createWriteStream writableNeedDrain should reset");
+      assert(readFileSync(streamPath, "utf8") === "abcdef", "createWriteStream backpressure content mismatch");
+      resolve();
+    } catch (error) {
+      reject(error);
+    }
+  });
+});
+
+const pausedReadPath = `${root}/paused-read.txt`;
+writeFileSync(pausedReadPath, "abcdef");
+const pausedRead = createReadStream(pausedReadPath, { encoding: "utf8", highWaterMark: 2 });
+pausedRead.pause();
+let pausedText = "";
+pausedRead.on("data", (chunk: unknown) => { pausedText += String(chunk); });
+await new Promise<void>((resolve) => setTimeout(resolve, 20));
+assert(pausedText === "", "ReadStream.pause should defer data before first chunk");
+const resumedText = await new Promise<string>((resolve, reject) => {
+  pausedRead.on("error", reject);
+  pausedRead.on("end", () => resolve(pausedText));
+  pausedRead.resume();
+});
+assert(resumedText === "abcdef", "ReadStream.resume data mismatch");
 
 const blob = await openAsBlob(filePath, { type: "text/plain" });
 assert(blob.size === 4, "openAsBlob size mismatch");
@@ -263,7 +332,9 @@ try {
 } finally {
   await webHandle.close();
 }
-assert((await fsPromises.glob("nested/**/*.txt", { cwd: root })).includes("nested/child/match.txt"), "fs/promises glob mismatch");
+const promiseGlobMatches: string[] = [];
+for await (const item of fsPromises.glob("nested/**/*.txt", { cwd: root })) promiseGlobMatches.push(String(item));
+assert(promiseGlobMatches.includes("nested/child/match.txt"), "fs/promises glob async iterator mismatch");
 
 rmSync(root, { recursive: true, force: true });
 console.log("node fs surface passed");

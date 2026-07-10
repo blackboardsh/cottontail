@@ -15,6 +15,7 @@ import ModuleDefault, {
   enableCompileCache,
   findPackageJSON,
   findSourceMap,
+  flushCompileCache,
   getCompileCacheDir,
   getSourceMapsSupport,
   globalPaths,
@@ -27,7 +28,8 @@ import ModuleDefault, {
   wrap,
   wrapper,
 } from "node:module";
-import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { Buffer } from "node:buffer";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function assert(value: unknown, message: string): asserts value {
@@ -77,6 +79,12 @@ assert(constructed.exports.compiled === true, "Module#_compile mismatch");
 const sourceMap = new SourceMap({ version: 3, sources: [], mappings: "" });
 assert(sourceMap.findEntry(1, 2).generatedLine === 1, "SourceMap findEntry mismatch");
 assert(findSourceMap(modulePath) === undefined, "findSourceMap should be undefined without maps");
+const mappedPath = join(root, "mapped.cjs");
+const inlineMap = Buffer.from(JSON.stringify({ version: 3, sources: ["original.ts"], names: [], mappings: "AAAA" })).toString("base64");
+writeFileSync(mappedPath, `module.exports = 1;\n//# sourceMappingURL=data:application/json;base64,${inlineMap}\n`);
+assert(localRequire("./mapped.cjs") === 1, "mapped module require mismatch");
+const foundSourceMap = findSourceMap(mappedPath);
+assert(foundSourceMap?.findEntry(1, 0).originalSource === "original.ts", "findSourceMap decoded entry mismatch");
 
 const packageDir = join(root, "package-a");
 mkdirSync(packageDir, { recursive: true });
@@ -84,6 +92,34 @@ writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "package-
 const packageInfo = _readPackage(packageDir);
 assert(packageInfo.exists === true && packageInfo.name === "package-a", "_readPackage mismatch");
 assert(findPackageJSON("package-a", root)?.endsWith("/package-a/package.json"), "findPackageJSON mismatch");
+
+const exportsPackageDir = join(root, "exports-pkg");
+mkdirSync(join(exportsPackageDir, "features"), { recursive: true });
+writeFileSync(join(exportsPackageDir, "package.json"), JSON.stringify({
+  name: "exports-pkg",
+  exports: {
+    ".": {
+      require: "./main.cjs",
+      default: "./default.cjs",
+    },
+    "./feature": "./features/feature.cjs",
+    "./patterns/*": "./features/*.cjs",
+  },
+}));
+writeFileSync(join(exportsPackageDir, "main.cjs"), "module.exports = { value: 'main' };\n");
+writeFileSync(join(exportsPackageDir, "default.cjs"), "module.exports = { value: 'default' };\n");
+writeFileSync(join(exportsPackageDir, "features/feature.cjs"), "module.exports = { value: 'feature' };\n");
+writeFileSync(join(exportsPackageDir, "features/extra.cjs"), "module.exports = { value: 'extra' };\n");
+assert(localRequire("exports-pkg").value === "main", "package exports root mismatch");
+assert(localRequire("exports-pkg/feature").value === "feature", "package exports subpath mismatch");
+assert(localRequire("exports-pkg/patterns/extra").value === "extra", "package exports pattern mismatch");
+let privateExportThrew = false;
+try {
+  localRequire("exports-pkg/features/feature.cjs");
+} catch (error) {
+  privateExportThrew = error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED";
+}
+assert(privateExportThrew, "package exports should block private subpaths");
 
 const cacheResult = enableCompileCache(join(root, "compile-cache"));
 assert(
@@ -93,20 +129,80 @@ assert(
 );
 assert(getCompileCacheDir()?.endsWith("/compile-cache"), "getCompileCacheDir mismatch");
 assert(statSync(getCompileCacheDir()).isDirectory(), "compile cache directory missing");
+const cachedModulePath = join(root, "cached.cjs");
+writeFileSync(cachedModulePath, "module.exports = { cached: true };\n");
+assert(localRequire("./cached.cjs").cached === true, "compile cache module load mismatch");
+flushCompileCache();
+const cacheManifest = JSON.parse(readFileSync(join(getCompileCacheDir(), "manifest.json"), "utf8"));
+assert(cacheManifest.entries.some((entry: any) => entry.filename === cachedModulePath), "compile cache manifest missing module");
 
 setSourceMapsSupport({ nodeModules: true, generatedCode: true });
 const support = getSourceMapsSupport();
 assert(support.nodeModules === true && support.generatedCode === true, "source maps support mismatch");
 assert(globalPaths.length > 0, "globalPaths missing");
 
-for (const fn of [register, registerHooks, stripTypeScriptTypes]) {
+const stripSource = "const x: number = 1;\nexport type Foo = { value: string };\n";
+const stripped = stripTypeScriptTypes(stripSource);
+assert(stripped === `const x${" ".repeat(": number".length)} = 1;\n${" ".repeat("export type Foo = { value: string };".length)}\n`, "stripTypeScriptTypes should preserve strip-mode whitespace");
+assert(stripped.length === stripSource.length, "stripTypeScriptTypes strip mode should preserve source length");
+assert(!stripped.includes(": number"), "stripTypeScriptTypes should remove annotations");
+assert(!stripped.includes("export type"), "stripTypeScriptTypes should remove type-only exports");
+assert(stripTypeScriptTypes("import { type Foo, Bar } from \"x\";\n") === "import {           Bar } from \"x\";\n", "stripTypeScriptTypes should erase named type imports");
+const genericStripSource = "function f<T extends string>(x: T): T { return x }\n";
+const genericStripped = stripTypeScriptTypes(genericStripSource);
+assert(genericStripped.length === genericStripSource.length, "stripTypeScriptTypes generic strip length mismatch");
+assert(genericStripped.includes("function f") && genericStripped.includes("{ return x }"), "stripTypeScriptTypes should preserve generic function runtime code");
+assert(!genericStripped.includes("extends string") && !genericStripped.includes(": T"), "stripTypeScriptTypes should erase generic function types");
+
+const transformed = stripTypeScriptTypes("enum E { A = 1, B }\nconsole.log(E.B);\n", { mode: "transform" });
+assert(transformed.includes("var E"), "stripTypeScriptTypes transform should lower enums");
+assert(transformed.includes("console.log"), "stripTypeScriptTypes transform should preserve runtime code");
+
+const hookTarget = join(root, "hooked.cjs");
+writeFileSync(hookTarget, "module.exports = { value: 'hooked-resolve' };\n");
+const resolveHook = registerHooks({
+  resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
+    if (specifier === "hook-target") return { url: `file://${hookTarget}`, shortCircuit: true };
+    return nextResolve(specifier, context);
+  },
+});
+assert(localRequire("hook-target").value === "hooked-resolve", "registerHooks resolve hook mismatch");
+assert(typeof resolveHook.deregister === "function", "registerHooks should return a deregisterable hook object");
+resolveHook.deregister();
+
+const loadHook = registerHooks({
+  resolve(specifier: string, context: unknown, nextResolve: (specifier: string, context: unknown) => { url: string }) {
+    if (specifier === "virtual-hook") return { url: `file://${join(root, "virtual-hook.cjs")}`, shortCircuit: true };
+    return nextResolve(specifier, context);
+  },
+  load(url: string, context: unknown, nextLoad: (url: string, context: unknown) => { format?: string; source?: string | null }) {
+    if (url.endsWith("/virtual-hook.cjs")) {
+      return { format: "commonjs", source: "module.exports = { value: 'hooked-load' };\n", shortCircuit: true };
+    }
+    return nextLoad(url, context);
+  },
+});
+assert(localRequire("virtual-hook").value === "hooked-load", "registerHooks load hook mismatch");
+loadHook.deregister();
+
+const registeredTarget = join(root, "registered-hook.cjs");
+const registeredHooks = join(root, "registered-hooks.cjs");
+writeFileSync(registeredTarget, "module.exports = { value: 'registered' };\n");
+writeFileSync(registeredHooks, `exports.resolve = (specifier, context, nextResolve) => {
+  if (specifier === "registered-hook") return { url: "file://${registeredTarget}", shortCircuit: true };
+  return nextResolve(specifier, context);
+};\n`);
+assert(register(`./${registeredHooks.slice(root.length + 1)}`, `file://${join(root, "entry.js")}`) === undefined, "register should return undefined");
+assert(localRequire("registered-hook").value === "registered", "register hook module mismatch");
+
+for (const badHooks of [{ resolve: 1 }, { load: 1 }] as never[]) {
   let threw = false;
   try {
-    fn("x" as never);
+    registerHooks(badHooks);
   } catch {
     threw = true;
   }
-  assert(threw, "unsupported module hook should throw");
+  assert(threw, "registerHooks should validate hook functions");
 }
 
 rmSync(root, { recursive: true, force: true });

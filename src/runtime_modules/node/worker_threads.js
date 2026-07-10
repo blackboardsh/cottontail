@@ -3,27 +3,259 @@ import { resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import "../bun/ffi.js";
 
-const environmentData = new Map();
+const wireVersion = 1;
+const typedArrayConstructors = {
+  Int8Array,
+  Uint8Array,
+  Uint8ClampedArray,
+  Int16Array,
+  Uint16Array,
+  Int32Array,
+  Uint32Array,
+  Float32Array,
+  Float64Array,
+  BigInt64Array,
+  BigUint64Array,
+};
+const environmentData = new Map(globalThis.__cottontailEnvironmentData ?? []);
 const markedUntransferable = new WeakSet();
 const markedUncloneable = new WeakSet();
 const workerInstances = new Map();
 const broadcastChannels = new Map();
+const transferredPortPeers = new Map();
+const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 let nextPortId = 1;
 
 export const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
 export const isMainThread = !cottontail.isWorker?.();
 export const isInternalThread = false;
-export const threadId = isMainThread ? 0 : 1;
-export const threadName = isMainThread ? "" : "worker";
+export const threadId = isMainThread ? 0 : Number(cottontail.workerThreadId?.() ?? 1);
+export const threadName = isMainThread ? "" : String(globalThis.__cottontailWorkerThreadName ?? "worker");
 export const workerData = isMainThread ? null : globalThis.__cottontailWorkerData ?? null;
-export const resourceLimits = {};
+export const resourceLimits = isMainThread ? {} : globalThis.__cottontailWorkerResourceLimits ?? {};
 
-function serializeForWrapper(value) {
-  return JSON.stringify(value, (_key, item) => {
-    if (typeof item === "bigint") return item.toString();
-    if (typeof item === "function" || typeof item === "symbol") return undefined;
-    return item;
+function dataCloneError(message) {
+  const error = new Error(message);
+  error.name = "DataCloneError";
+  error.code = "ERR_WORKER_UNSERIALIZABLE_ERROR";
+  return error;
+}
+
+function bytesFromView(view) {
+  return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+}
+
+function bytesFromBuffer(buffer) {
+  return Array.from(new Uint8Array(buffer));
+}
+
+function viewName(value) {
+  if (globalThis.Buffer?.isBuffer?.(value)) return "Buffer";
+  if (value instanceof DataView) return "DataView";
+  return value?.constructor?.name ?? "Uint8Array";
+}
+
+function validateTransferList(transferList = undefined) {
+  if (transferList == null) return [];
+  if (typeof transferList[Symbol.iterator] !== "function") throw new TypeError("transferList must be an iterable");
+  const transfers = Array.from(transferList);
+  const seen = new Set();
+  for (const item of transfers) {
+    if (seen.has(item)) throw dataCloneError("Transfer list contains duplicate item");
+    seen.add(item);
+    if (isMarkedAsUntransferable(item)) throw dataCloneError("Object is marked as untransferable");
+    if (item instanceof MessagePort && item._closed) throw dataCloneError("MessagePort is closed");
+  }
+  return transfers;
+}
+
+function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
+  if (value === undefined) return { t: "undefined" };
+  if (value === null) return { t: "null" };
+  if (typeof value === "boolean" || typeof value === "string") return { t: typeof value, v: value };
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return { t: "number", v: "NaN" };
+    if (value === Infinity) return { t: "number", v: "Infinity" };
+    if (value === -Infinity) return { t: "number", v: "-Infinity" };
+    if (Object.is(value, -0)) return { t: "number", v: "-0" };
+    return { t: "number", v: value };
+  }
+  if (typeof value === "bigint") return { t: "bigint", v: value.toString() };
+  if (typeof value === "function" || typeof value === "symbol") throw dataCloneError("Value cannot be cloned");
+  if (markedUncloneable.has(value)) throw dataCloneError("Object is marked as uncloneable");
+  const existingId = state.ids.get(value);
+  if (existingId != null) return { t: "Ref", id: existingId };
+  if (value instanceof MessagePort) {
+    if (!state.transfers?.has(value)) throw dataCloneError("MessagePort must be listed in transferList");
+    if (value._closed) throw dataCloneError("MessagePort is closed");
+    const id = state.nextId++;
+    state.ids.set(value, id);
+    if (state.transferContext?.threadId > 0) {
+      value._remote = { threadId: state.transferContext.threadId, portId: value._id };
+      if (value._peer) transferredPortPeers.set(value._id, value._peer);
+    }
+    value._transferred = true;
+    value._closed = true;
+    queueMicrotask(() => value.emit("close"));
+    return { t: "MessagePort", id, portId: value._id };
+  }
+  const id = state.nextId++;
+  state.ids.set(value, id);
+
+  if (value instanceof Date) return { t: "Date", id, v: value.toISOString() };
+  if (value instanceof RegExp) return { t: "RegExp", id, source: value.source, flags: value.flags };
+  if (value instanceof ArrayBuffer) return { t: "ArrayBuffer", id, bytes: bytesFromBuffer(value) };
+  if (ArrayBuffer.isView(value)) return { t: "View", id, name: viewName(value), bytes: bytesFromView(value) };
+  if (value instanceof Map) return { t: "Map", id, v: [...value].map(([key, item]) => [encodeClone(key, state), encodeClone(item, state)]) };
+  if (value instanceof Set) return { t: "Set", id, v: [...value].map((item) => encodeClone(item, state)) };
+  if (Array.isArray(value)) return { t: "Array", id, v: value.map((item) => encodeClone(item, state)) };
+  if (value instanceof Error) return { t: "Error", id, name: value.name, message: value.message, stack: value.stack };
+  return { t: "Object", id, v: Object.entries(value).map(([key, item]) => [key, encodeClone(item, state)]) };
+}
+
+function remember(refs, encoded, value) {
+  if (encoded?.id != null) refs.set(encoded.id, value);
+  return value;
+}
+
+function decodeClone(encoded, refs = new Map()) {
+  switch (encoded?.t) {
+    case "Ref": {
+      if (!refs.has(encoded.id)) throw dataCloneError("Invalid cloned reference");
+      return refs.get(encoded.id);
+    }
+    case "undefined": return undefined;
+    case "null": return null;
+    case "boolean":
+    case "string": return encoded.v;
+    case "number":
+      if (encoded.v === "NaN") return NaN;
+      if (encoded.v === "Infinity") return Infinity;
+      if (encoded.v === "-Infinity") return -Infinity;
+      if (encoded.v === "-0") return -0;
+      return Number(encoded.v);
+    case "bigint": return BigInt(encoded.v);
+    case "Date": return remember(refs, encoded, new Date(encoded.v));
+    case "RegExp": return remember(refs, encoded, new RegExp(encoded.source, encoded.flags));
+    case "ArrayBuffer": return remember(refs, encoded, new Uint8Array(encoded.bytes ?? []).buffer);
+    case "View": {
+      const bytes = new Uint8Array(encoded.bytes ?? []);
+      if (encoded.name === "Buffer") return remember(refs, encoded, globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes);
+      if (encoded.name === "DataView") return remember(refs, encoded, new DataView(bytes.buffer));
+      const Constructor = typedArrayConstructors[encoded.name] ?? Uint8Array;
+      return remember(refs, encoded, new Constructor(bytes.buffer));
+    }
+    case "MessagePort": {
+      const port = remember(refs, encoded, new MessagePort());
+      port._id = Number(encoded.portId ?? port._id);
+      return port;
+    }
+    case "Map": {
+      const map = remember(refs, encoded, new Map());
+      for (const [key, value] of encoded.v ?? []) map.set(decodeClone(key, refs), decodeClone(value, refs));
+      return map;
+    }
+    case "Set": {
+      const set = remember(refs, encoded, new Set());
+      for (const value of encoded.v ?? []) set.add(decodeClone(value, refs));
+      return set;
+    }
+    case "Array": {
+      const array = remember(refs, encoded, []);
+      for (let index = 0; index < (encoded.v ?? []).length; index += 1) array[index] = decodeClone(encoded.v[index], refs);
+      return array;
+    }
+    case "Error": {
+      const error = new Error(encoded.message);
+      error.name = encoded.name;
+      error.stack = encoded.stack;
+      return remember(refs, encoded, error);
+    }
+    case "Object": {
+      const object = remember(refs, encoded, {});
+      for (const [key, value] of encoded.v ?? []) object[key] = decodeClone(value, refs);
+      return object;
+    }
+    default: throw dataCloneError("Invalid cloned worker payload");
+  }
+}
+
+function encodeWireMessage(value, transferList = undefined, transferContext = undefined) {
+  const transfers = validateTransferList(transferList);
+  return JSON.stringify({
+    cottontailWorkerClone: wireVersion,
+    value: encodeClone(value, { ids: new WeakMap(), nextId: 1, transfers: new Set(transfers), transferContext }),
   });
+}
+
+function decodeWireMessage(value) {
+  if (value && typeof value === "object" && value.cottontailWorkerClone === wireVersion) return decodeClone(value.value);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed?.cottontailWorkerClone === wireVersion) return decodeClone(parsed.value);
+      return parsed;
+    } catch {}
+  }
+  return value;
+}
+
+function cloneForMessage(value, transferList = undefined) {
+  return decodeClone(JSON.parse(encodeWireMessage(value, transferList)).value);
+}
+
+function makePortMessage(portId, value) {
+  return { [portMessageEnvelopeKey]: { portId, value } };
+}
+
+function dispatchTransferredPortMessage(message) {
+  const packet = message?.[portMessageEnvelopeKey];
+  if (!packet || packet.portId == null) return false;
+  const peer = transferredPortPeers.get(Number(packet.portId));
+  if (!peer || peer._closed) return true;
+  peer._queue.push(packet.value);
+  peer._dispatch();
+  return true;
+}
+
+function workerCodecSource() {
+  return `
+const __workerTypedArrays = { Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array };
+const __cottontailWorkerPortEnvelopeKey = ${JSON.stringify(portMessageEnvelopeKey)};
+const __cottontailWorkerPorts = new Map();
+function __workerBytesFromView(view){ return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength)); }
+function __workerBytesFromBuffer(buffer){ return Array.from(new Uint8Array(buffer)); }
+function __workerViewName(value){ if (globalThis.Buffer?.isBuffer?.(value)) return "Buffer"; if (value instanceof DataView) return "DataView"; return value?.constructor?.name ?? "Uint8Array"; }
+function __workerEncode(value,state={ids:new WeakMap(),nextId:1}){ if(value===undefined)return{t:"undefined"}; if(value===null)return{t:"null"}; if(typeof value==="boolean"||typeof value==="string")return{t:typeof value,v:value}; if(typeof value==="number"){ if(Number.isNaN(value))return{t:"number",v:"NaN"}; if(value===Infinity)return{t:"number",v:"Infinity"}; if(value===-Infinity)return{t:"number",v:"-Infinity"}; if(Object.is(value,-0))return{t:"number",v:"-0"}; return{t:"number",v:value}; } if(typeof value==="bigint")return{t:"bigint",v:value.toString()}; if(typeof value==="function"||typeof value==="symbol")throw new Error("Value cannot be cloned"); if(globalThis.MessagePort&&value instanceof globalThis.MessagePort)throw new Error("MessagePort must be listed in transferList"); const existing=state.ids.get(value); if(existing!=null)return{t:"Ref",id:existing}; const id=state.nextId++; state.ids.set(value,id); if(value instanceof Date)return{t:"Date",id,v:value.toISOString()}; if(value instanceof RegExp)return{t:"RegExp",id,source:value.source,flags:value.flags}; if(value instanceof ArrayBuffer)return{t:"ArrayBuffer",id,bytes:__workerBytesFromBuffer(value)}; if(ArrayBuffer.isView(value))return{t:"View",id,name:__workerViewName(value),bytes:__workerBytesFromView(value)}; if(value instanceof Map)return{t:"Map",id,v:[...value].map(([key,item])=>[__workerEncode(key,state),__workerEncode(item,state)])}; if(value instanceof Set)return{t:"Set",id,v:[...value].map((item)=>__workerEncode(item,state))}; if(Array.isArray(value))return{t:"Array",id,v:value.map((item)=>__workerEncode(item,state))}; if(value instanceof Error)return{t:"Error",id,name:value.name,message:value.message,stack:value.stack}; return{t:"Object",id,v:Object.entries(value).map(([key,item])=>[key,__workerEncode(item,state)])}; }
+function __workerRemember(refs,encoded,value){ if(encoded?.id!=null)refs.set(encoded.id,value); return value; }
+function __workerDecode(encoded,refs=new Map()){ switch(encoded?.t){ case "Ref": if(!refs.has(encoded.id))throw new Error("Invalid cloned reference"); return refs.get(encoded.id); case "undefined": return undefined; case "null": return null; case "boolean": case "string": return encoded.v; case "number": if(encoded.v==="NaN")return NaN; if(encoded.v==="Infinity")return Infinity; if(encoded.v==="-Infinity")return -Infinity; if(encoded.v==="-0")return -0; return Number(encoded.v); case "bigint": return BigInt(encoded.v); case "Date": return __workerRemember(refs,encoded,new Date(encoded.v)); case "RegExp": return __workerRemember(refs,encoded,new RegExp(encoded.source,encoded.flags)); case "ArrayBuffer": return __workerRemember(refs,encoded,new Uint8Array(encoded.bytes||[]).buffer); case "View": { const bytes=new Uint8Array(encoded.bytes||[]); if(encoded.name==="Buffer")return __workerRemember(refs,encoded,globalThis.Buffer?.from?globalThis.Buffer.from(bytes):bytes); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(bytes.buffer)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(bytes.buffer)); } case "MessagePort": return __workerRemember(refs,encoded,__cottontailGetWorkerPort(encoded.portId)); case "Map": { const map=__workerRemember(refs,encoded,new Map()); for(const [key,value] of encoded.v||[])map.set(__workerDecode(key,refs),__workerDecode(value,refs)); return map; } case "Set": { const set=__workerRemember(refs,encoded,new Set()); for(const value of encoded.v||[])set.add(__workerDecode(value,refs)); return set; } case "Array": { const array=__workerRemember(refs,encoded,[]); for(let index=0;index<(encoded.v||[]).length;index++)array[index]=__workerDecode(encoded.v[index],refs); return array; } case "Error": { const error=new Error(encoded.message); error.name=encoded.name; error.stack=encoded.stack; return __workerRemember(refs,encoded,error); } case "Object": { const object=__workerRemember(refs,encoded,{}); for(const [key,value] of encoded.v||[])object[key]=__workerDecode(value,refs); return object; } default: throw new Error("Invalid cloned worker payload"); } }
+function __cottontailEncodeWorkerMessage(value){ return JSON.stringify({ cottontailWorkerClone: ${wireVersion}, value: __workerEncode(value) }); }
+function __cottontailDecodeWorkerMessage(value){ if(value&&typeof value==="object"&&value.cottontailWorkerClone===${wireVersion})return __workerDecode(value.value); if(typeof value==="string"){ try{ const parsed=JSON.parse(value); if(parsed?.cottontailWorkerClone===${wireVersion})return __workerDecode(parsed.value); return parsed; }catch{} } return value; }
+class __CottontailWorkerMessagePort {
+  constructor(id){ this._id=Number(id??Math.floor(Math.random()*1000000000)); this._queue=[]; this._closed=false; this._started=false; this._peer=null; this._handlers=new Set(); this.onmessage=null; this.onmessageerror=null; }
+  postMessage(value){ if(this._closed)return; if(this._peer&&!this._peer._closed){ this._peer._queue.push(__cottontailDecodeWorkerMessage(__cottontailEncodeWorkerMessage(value))); this._peer._dispatch(); return; } cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ [__cottontailWorkerPortEnvelopeKey]: { portId: this._id, value } })); }
+  start(){ this._started=true; this._dispatch(); return this; }
+  close(){ this._closed=true; this._handlers.clear(); return this; }
+  ref(){ return this; }
+  unref(){ return this; }
+  hasRef(){ return true; }
+  on(name,handler){ if(String(name)==="message"&&typeof handler==="function"){ this._handlers.add(handler); this.start(); } return this; }
+  once(name,handler){ if(String(name)!=="message"||typeof handler!=="function")return this; const wrapped=(value)=>{ this.off("message",wrapped); handler(value); }; return this.on(name,wrapped); }
+  off(name,handler){ if(String(name)==="message")this._handlers.delete(handler); return this; }
+  addEventListener(name,handler){ return this.on(name,(value)=>handler({ data: value })); }
+  removeEventListener(_name,_handler){ return this; }
+  _dispatch(){ if(!this._started&&typeof this.onmessage!=="function"&&this._handlers.size===0)return; while(this._queue.length>0){ const value=this._queue.shift(); const event={ data: value }; if(typeof this.onmessage==="function")this.onmessage(event); for(const handler of [...this._handlers])handler(value); } }
+}
+class __CottontailWorkerMessageChannel {
+  constructor(){ this.port1=new __CottontailWorkerMessagePort(); this.port2=new __CottontailWorkerMessagePort(); this.port1._peer=this.port2; this.port2._peer=this.port1; }
+}
+function __cottontailGetWorkerPort(portId){ const id=Number(portId); let port=__cottontailWorkerPorts.get(id); if(!port){ port=new __CottontailWorkerMessagePort(id); __cottontailWorkerPorts.set(id,port); } return port; }
+function __cottontailDispatchWorkerPortMessage(message){ const packet=message?.[__cottontailWorkerPortEnvelopeKey]; if(!packet||packet.portId==null)return false; const port=__cottontailGetWorkerPort(packet.portId); port._queue.push(packet.value); port._dispatch(); return true; }
+globalThis.MessagePort = __CottontailWorkerMessagePort;
+globalThis.MessageChannel = __CottontailWorkerMessageChannel;
+globalThis.__cottontailEncodeWorkerMessage = __cottontailEncodeWorkerMessage;
+globalThis.__cottontailDecodeWorkerMessage = __cottontailDecodeWorkerMessage;
+`;
 }
 
 function normalizeWorkerPath(filename, evalMode = false) {
@@ -44,20 +276,67 @@ function makeWorkerWrapper(targetPath, options = {}) {
   const dir = `${cottontail.cwd()}/.cottontail-tmp`;
   cottontail.mkdirSync?.(dir, true);
   const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
-  const targetUrl = `file://${targetPath}`;
-  const workerDataJson = serializeForWrapper(options.workerData ?? null);
+  const workerDataWire = JSON.stringify(JSON.parse(encodeWireMessage(options.workerData ?? null)));
+  const environmentDataWire = JSON.stringify(JSON.parse(encodeWireMessage([...environmentData])));
+  const resourceLimitsWire = JSON.stringify(JSON.parse(encodeWireMessage(options.resourceLimits ?? {})));
   const source = [
-    `globalThis.__cottontailWorkerData = ${workerDataJson};`,
+    workerCodecSource(),
+    `globalThis.__cottontailWorkerData = __cottontailDecodeWorkerMessage(${workerDataWire});`,
+    `globalThis.__cottontailEnvironmentData = __cottontailDecodeWorkerMessage(${environmentDataWire});`,
+    `globalThis.__cottontailWorkerResourceLimits = __cottontailDecodeWorkerMessage(${resourceLimitsWire});`,
     `globalThis.__cottontailWorkerThreadName = ${JSON.stringify(options.name ?? "")};`,
     `globalThis.workerData = globalThis.__cottontailWorkerData;`,
+    `const __cottontailParentPortHandlers = new Set();`,
+    `globalThis.addEventListener("message", (event) => {`,
+    `  const message = __cottontailDecodeWorkerMessage(event.data);`,
+    `  if (__cottontailDispatchWorkerPortMessage(message)) return;`,
+    `  for (const handler of [...__cottontailParentPortHandlers]) handler(message);`,
+    `});`,
     `globalThis.parentPort = {`,
-    `  on(name, handler) { if (String(name) === "message") globalThis.addEventListener("message", (event) => handler(event.data)); return this; },`,
-    `  once(name, handler) { const wrapped = (value) => { handler(value); }; return this.on(name, wrapped); },`,
-    `  off() { return this; },`,
-    `  postMessage(value) { globalThis.postMessage(value); },`,
+    `  on(name, handler) { if (String(name) === "message" && typeof handler === "function") __cottontailParentPortHandlers.add(handler); return this; },`,
+    `  once(name, handler) { const wrapped = (value) => { __cottontailParentPortHandlers.delete(wrapped); handler(value); }; return this.on(name, wrapped); },`,
+    `  off(name, handler) { if (String(name) === "message") __cottontailParentPortHandlers.delete(handler); return this; },`,
+    `  postMessage(value) { cottontail.workerPostMessage(__cottontailEncodeWorkerMessage(value)); },`,
     `  close() {}, ref() { return this; }, unref() { return this; }`,
     `};`,
-    `await import(${JSON.stringify(targetUrl)});`,
+    `const __cottontailWorkerEnvironmentDataMap = new Map(globalThis.__cottontailEnvironmentData ?? []);`,
+    `function __cottontailWorkerThreadsBuiltin(){ return {`,
+    `  BroadcastChannel: globalThis.BroadcastChannel, MessageChannel: globalThis.MessageChannel, MessagePort: globalThis.MessagePort,`,
+    `  SHARE_ENV: Symbol.for("nodejs.worker_threads.SHARE_ENV"), Worker: globalThis.Worker,`,
+    `  getEnvironmentData: (key) => __cottontailWorkerEnvironmentDataMap.get(key),`,
+    `  setEnvironmentData: (key, value) => { __cottontailWorkerEnvironmentDataMap.set(key, value); },`,
+    `  isInternalThread: false, isMainThread: false, isMarkedAsUntransferable: () => false,`,
+    `  locks: { async request(_name, options, callback){ if (typeof options === "function") callback = options; return callback ? callback({ name: String(_name), mode: "exclusive" }) : undefined; }, async query(){ return { held: [], pending: [] }; } },`,
+    `  markAsUncloneable: () => {}, markAsUntransferable: () => {}, moveMessagePortToContext: (port) => port,`,
+    `  parentPort: globalThis.parentPort, postMessageToThread: async () => false, receiveMessageOnPort: () => undefined,`,
+    `  resourceLimits: globalThis.__cottontailWorkerResourceLimits, threadId: Number(cottontail.workerThreadId?.() ?? 1), threadName: globalThis.__cottontailWorkerThreadName, workerData: globalThis.__cottontailWorkerData`,
+    `}; }`,
+    `function __cottontailWorkerRequire(specifier){`,
+    `  const text = String(specifier);`,
+    `  if (text === "node:worker_threads" || text === "worker_threads") return __cottontailWorkerThreadsBuiltin();`,
+    `  throw new Error("Cannot find module '" + text + "'");`,
+    `}`,
+    `globalThis.require ??= __cottontailWorkerRequire;`,
+    `function __cottontailRewriteWorkerNamedImports(spec){ return spec.split(",").map((part) => { const trimmed = part.trim(); if (!trimmed) return ""; const pieces = trimmed.split(/\\s+as\\s+/); return pieces.length === 2 ? pieces[0].trim() + ": " + pieces[1].trim() : trimmed; }).filter(Boolean).join(", "); }`,
+    `function __cottontailTransformWorkerSource(source, filename){`,
+    `  const dir = String(filename).replace(/\\/[^/]*$/, "") || ".";`,
+    `  const fileUrl = "file://" + String(filename);`,
+    `  let out = String(source);`,
+    `  out = out.replace(/import\\.meta\\.dirname/g, JSON.stringify(dir)).replace(/import\\.meta\\.dir/g, JSON.stringify(dir)).replace(/import\\.meta\\.filename/g, JSON.stringify(filename)).replace(/import\\.meta\\.path/g, JSON.stringify(filename)).replace(/import\\.meta\\.url/g, JSON.stringify(fileUrl)).replace(/import\\.meta\\.main/g, "false");`,
+    `  out = out.replace(/^\\s*import\\s+\\{([^}]*)\\}\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, names, _quote, specifier) => "const { " + __cottontailRewriteWorkerNamedImports(names) + " } = __cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
+    `  out = out.replace(/^\\s*import\\s+\\*\\s+as\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, name, _quote, specifier) => "const " + name + " = __cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
+    `  out = out.replace(/^\\s*import\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, name, _quote, specifier) => "const __module_" + name + " = __cottontailWorkerRequire(" + JSON.stringify(specifier) + "); const " + name + " = __module_" + name + ".default ?? __module_" + name + ";");`,
+    `  out = out.replace(/^\\s*import\\s+(['"])([^'"]+)\\1\\s*;?\\s*$/mg, (_all, _quote, specifier) => "__cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
+    `  out = out.replace(/^\\s*export\\s+\\{[^}]*\\}\\s*;?\\s*$/mg, "");`,
+    `  return out;`,
+    `}`,
+    `async function __cottontailRunWorkerTarget(filename){`,
+    `  const source = __cottontailTransformWorkerSource(cottontail.readFile(filename), filename);`,
+    `  const AsyncFunction = (async function(){}).constructor;`,
+    `  const run = new AsyncFunction("__cottontailWorkerRequire", source + "\\n//# sourceURL=" + filename);`,
+    `  await run(__cottontailWorkerRequire);`,
+    `}`,
+    `await __cottontailRunWorkerTarget(${JSON.stringify(targetPath)});`,
   ].join("\n");
   cottontail.writeFile(wrapperPath, source);
   return wrapperPath;
@@ -85,14 +364,21 @@ export class Worker extends EventEmitter {
     this._worker = new globalThis.Worker(wrapper);
     this.threadId = this._worker.id ?? this._worker.handle?.id ?? 0;
     workerInstances.set(this.threadId, this);
-    this._worker.onmessage = (event) => this.emit("message", event.data);
+    this._worker.onmessage = (event) => {
+      const message = decodeWireMessage(event.data);
+      if (dispatchTransferredPortMessage(message)) return;
+      this.emit("message", message);
+    };
     this._worker.onerror = (event) => this.emit("error", event?.error ?? new Error(String(event?.message ?? event)));
     queueMicrotask(() => this.emit("online"));
   }
 
   postMessage(value, transferList = undefined) {
-    void transferList;
-    this._worker.postMessage(value);
+    if (this.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+      cottontail.workerPostMessageTo(this.threadId, encodeWireMessage(value, transferList, { threadId: this.threadId }));
+      return;
+    }
+    this._worker.postMessage(JSON.parse(encodeWireMessage(value, transferList, { threadId: this.threadId })));
   }
 
   terminate() {
@@ -134,15 +420,22 @@ export class MessagePort extends EventEmitter {
     this._closed = false;
     this._started = false;
     this._peer = null;
+    this._remote = null;
+    this._transferred = false;
     this.onmessage = null;
     this.onmessageerror = null;
     this._ref = true;
   }
 
   postMessage(value, transferList = undefined) {
-    void transferList;
-    if (this._closed || !this._peer || this._peer._closed) return;
-    this._peer._queue.push(value);
+    if (this._closed) return;
+    const remote = this._remote ?? this._peer?._remote;
+    if (remote?.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+      cottontail.workerPostMessageTo(remote.threadId, encodeWireMessage(makePortMessage(remote.portId, value), transferList));
+      return;
+    }
+    if (!this._peer || this._peer._closed) return;
+    this._peer._queue.push(cloneForMessage(value, transferList));
     this._peer._dispatch();
   }
 
@@ -195,8 +488,9 @@ export class BroadcastChannel extends EventEmitter {
   postMessage(value) {
     for (const channel of broadcastChannels.get(this.name) ?? []) {
       if (channel === this || channel._closed) continue;
+      const cloned = cloneForMessage(value);
       queueMicrotask(() => {
-        const event = { data: value };
+        const event = { data: cloned };
         channel.onmessage?.(event);
         channel.emit("message", event);
       });
@@ -215,11 +509,13 @@ export class BroadcastChannel extends EventEmitter {
 export const parentPort = isMainThread ? null : new class ParentPort extends EventEmitter {
   constructor() {
     super();
-    globalThis.addEventListener?.("message", (event) => this.emit("message", event.data));
+    globalThis.addEventListener?.("message", (event) => this.emit("message", decodeWireMessage(event.data)));
   }
 
-  postMessage(value) {
-    globalThis.postMessage?.(value);
+  postMessage(value, transferList = undefined) {
+    validateTransferList(transferList);
+    if (typeof cottontail.workerPostMessage === "function") cottontail.workerPostMessage(encodeWireMessage(value, transferList));
+    else globalThis.postMessage?.(value);
   }
 
   close() {}
@@ -263,11 +559,10 @@ export function receiveMessageOnPort(port) {
 }
 
 export function postMessageToThread(targetThreadId, value, transferList = undefined, timeout = undefined) {
-  void transferList;
   void timeout;
   const worker = workerInstances.get(Number(targetThreadId));
   if (!worker) return Promise.resolve(false);
-  worker.postMessage(value);
+  worker.postMessage(value, transferList);
   return Promise.resolve(true);
 }
 
@@ -285,7 +580,7 @@ export const locks = {
   },
 };
 
-// COTTONTAIL-COMPAT: node:worker_threads - Worker/message transport uses Cottontail native workers; transferable objects, shared memory, and per-thread inspector/resource accounting need deeper runtime support.
+// COTTONTAIL-COMPAT: node:worker_threads shared-memory/runtime limits - Worker/message transport uses Cottontail native workers with structured-clone-style payloads, workerData/environmentData, worker-side node:worker_threads imports, cross-thread MessagePort transfer, MessageChannel, BroadcastChannel, and locks; true ArrayBuffer detachment, SharedArrayBuffer shared memory, and per-thread inspector/resource accounting need deeper runtime support.
 
 export default {
   BroadcastChannel,

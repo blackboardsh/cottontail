@@ -1,3 +1,5 @@
+import { isIP } from "./net.js";
+
 export const ADDRCONFIG = 1024;
 export const V4MAPPED = 2048;
 export const ALL = 256;
@@ -44,6 +46,52 @@ function invalidRrtypeError(type) {
   const error = new TypeError(`The argument 'rrtype' is invalid. Received ${JSON.stringify(String(type))}`);
   error.code = "ERR_INVALID_ARG_VALUE";
   return error;
+}
+
+function invalidServerError(server) {
+  const error = new TypeError(`Invalid IP address: ${server}`);
+  error.code = "ERR_INVALID_IP_ADDRESS";
+  return error;
+}
+
+function validatePort(port, server) {
+  if (port == null || port === "") return;
+  if (!/^\d+$/.test(String(port)) || Number(port) < 0 || Number(port) > 65535) {
+    throw invalidServerError(server);
+  }
+}
+
+function normalizeServer(server) {
+  const text = String(server);
+  let host = text;
+  let port = undefined;
+  if (text.startsWith("[")) {
+    const end = text.indexOf("]");
+    if (end < 0) throw invalidServerError(server);
+    host = text.slice(1, end);
+    const rest = text.slice(end + 1);
+    if (rest) {
+      if (!rest.startsWith(":")) throw invalidServerError(server);
+      port = rest.slice(1);
+    }
+  } else {
+    const firstColon = text.indexOf(":");
+    const lastColon = text.lastIndexOf(":");
+    if (firstColon > 0 && firstColon === lastColon && text.includes(".")) {
+      host = text.slice(0, firstColon);
+      port = text.slice(firstColon + 1);
+    }
+  }
+  if (isIP(host) === 0) throw invalidServerError(server);
+  validatePort(port, server);
+  return text;
+}
+
+function normalizeServers(nextServers) {
+  if (nextServers == null || typeof nextServers[Symbol.iterator] !== "function") {
+    throw new TypeError("servers must be an iterable");
+  }
+  return Array.from(nextServers, normalizeServer);
 }
 
 function callbackifyDns(work, callback) {
@@ -268,7 +316,7 @@ export function getServers() {
 }
 
 export function setServers(nextServers) {
-  servers = Array.from(nextServers ?? [], String);
+  servers = normalizeServers(nextServers ?? []);
 }
 
 function promiseFromCallback(fn, ...args) {
@@ -281,9 +329,15 @@ function promiseFromCallback(fn, ...args) {
 }
 
 export class Resolver {
+  constructor(options = {}) {
+    this._servers = [...servers];
+    this.timeout = options?.timeout;
+    this.tries = options?.tries;
+  }
+
   cancel() {}
-  getServers() { return getServers(); }
-  setServers(nextServers) { return setServers(nextServers); }
+  getServers() { return [...this._servers]; }
+  setServers(nextServers) { this._servers = normalizeServers(nextServers ?? []); }
   resolve(hostname, rrtype, callback) { return resolve(hostname, rrtype, callback); }
   resolve4(hostname, options, callback) { return resolve4(hostname, options, callback); }
   resolve6(hostname, options, callback) { return resolve6(hostname, options, callback); }
@@ -302,9 +356,15 @@ export class Resolver {
 }
 
 export class PromisesResolver {
+  constructor(options = {}) {
+    this._servers = [...servers];
+    this.timeout = options?.timeout;
+    this.tries = options?.tries;
+  }
+
   cancel() {}
-  getServers() { return getServers(); }
-  setServers(nextServers) { return setServers(nextServers); }
+  getServers() { return [...this._servers]; }
+  setServers(nextServers) { this._servers = normalizeServers(nextServers ?? []); }
   resolve(hostname, rrtype = "A") { return promises.resolve(hostname, rrtype); }
   resolve4(hostname, options = undefined) { return promises.resolve4(hostname, options); }
   resolve6(hostname, options = undefined) { return promises.resolve6(hostname, options); }
@@ -382,7 +442,7 @@ export const promises = {
   setServers,
 };
 
-// COTTONTAIL-COMPAT: node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; setServers stores requested servers for API compatibility, but record queries still use the platform resolver configuration until per-query resolver state is wired.
+// COTTONTAIL-COMPAT: node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and tracked, but record queries still use the platform resolver configuration until per-query resolver state is wired.
 
 export default {
   ADDRCONFIG,

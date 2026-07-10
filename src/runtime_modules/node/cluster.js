@@ -44,9 +44,15 @@ export class Worker extends EventEmitter {
   }
 
   send(message, sendHandle = undefined, options = undefined, callback = undefined) {
-    if (typeof sendHandle === "function") callback = sendHandle;
-    else if (typeof options === "function") callback = options;
-    return this.process.send?.(message, callback) ?? false;
+    if (typeof sendHandle === "function") {
+      callback = sendHandle;
+      sendHandle = undefined;
+      options = undefined;
+    } else if (typeof options === "function") {
+      callback = options;
+      options = undefined;
+    }
+    return this.process.send?.(message, sendHandle, options, callback) ?? false;
   }
 
   disconnect() {
@@ -139,6 +145,6 @@ const cluster = Object.assign(emitter, {
   workers,
 });
 
-// COTTONTAIL-COMPAT: node:cluster scheduling - process fork/message lifecycle is implemented; native shared server handles and round-robin socket distribution need net/server bindings.
+// COTTONTAIL-COMPAT: node:cluster scheduling - process fork/message lifecycle and POSIX shared socket/server handles are implemented; primary-managed round-robin distribution still needs a cluster scheduler.
 
 export default cluster;

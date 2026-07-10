@@ -552,7 +552,7 @@ export function rmSync(path, options = {}) {
 
 export function rmdirSync(path, options = {}) {
   if (options?.recursive) return rmSync(path, { recursive: true, force: false });
-  return rmSync(path, { recursive: false, force: false });
+  cottontail.rmdirSync(normalizePath(path));
 }
 
 export function unlinkSync(path) {
@@ -697,21 +697,29 @@ export class ReadStream extends Readable {
     this.highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 64 * 1024), 1024 * 1024));
     this.encoding = options?.encoding;
     this._ownsFd = this.fd == null || Number.isNaN(this.fd);
+    this._paused = false;
+    this._closed = false;
+    this._opened = false;
+    this._reading = false;
 
     queueMicrotask(() => this._pump());
   }
 
   _open() {
+    if (this._opened) return;
     if (this.fd == null || Number.isNaN(this.fd)) {
       this.fd = openSync(this.path, this.flags, this.mode);
       this._ownsFd = true;
     }
+    this._opened = true;
     this.pending = false;
     this.emit("open", this.fd);
     this.emit("ready");
   }
 
   _close() {
+    if (this._closed) return;
+    this._closed = true;
     if (this.fd != null && (this.autoClose || this._ownsFd)) {
       try { closeSync(this.fd); } catch {}
     }
@@ -720,29 +728,43 @@ export class ReadStream extends Readable {
   }
 
   _pump() {
-    if (this.destroyed) return;
+    if (this.destroyed || this._paused || this._reading) return;
+    this._reading = true;
     try {
       this._open();
-      while (!this.destroyed) {
-        const remaining = this.end == null || this.pos == null ? this.highWaterMark : Math.max(0, this.end - this.pos + 1);
-        const length = Math.min(this.highWaterMark, remaining);
-        if (length <= 0) break;
-        const chunk = new Uint8Array(length);
-        const bytesRead = readSync(this.fd, chunk, 0, length, this.pos);
-        if (bytesRead <= 0) break;
-        this.bytesRead += bytesRead;
-        if (this.pos != null) this.pos += bytesRead;
-        const value = chunk.subarray(0, bytesRead);
-        this.push(this.encoding ? decodeBytes(value, this.encoding) : bufferFrom(value));
-        if (bytesRead < length) break;
+      if (this.destroyed || this._paused) return;
+      const remaining = this.end == null || this.pos == null ? this.highWaterMark : Math.max(0, this.end - this.pos + 1);
+      const length = Math.min(this.highWaterMark, remaining);
+      if (length <= 0) {
+        this._finishRead();
+        return;
       }
-      this.readableEnded = true;
-      this.destroyed = true;
-      this.push(null);
-      this._close();
+      const chunk = new Uint8Array(length);
+      const bytesRead = readSync(this.fd, chunk, 0, length, this.pos);
+      if (bytesRead <= 0) {
+        this._finishRead();
+        return;
+      }
+      this.bytesRead += bytesRead;
+      if (this.pos != null) this.pos += bytesRead;
+      const value = chunk.subarray(0, bytesRead);
+      this.push(this.encoding ? decodeBytes(value, this.encoding) : bufferFrom(value));
+      if (bytesRead < length) this._finishRead();
+      else queueMicrotask(() => this._pump());
     } catch (error) {
       this.destroy(error);
+    } finally {
+      this._reading = false;
     }
+  }
+
+  _finishRead() {
+    if (this.readableEnded) return;
+    this.readableEnded = true;
+    this.readable = false;
+    this.destroyed = true;
+    this.push(null);
+    this._close();
   }
 
   close(callback = undefined) {
@@ -753,8 +775,21 @@ export class ReadStream extends Readable {
   destroy(error = undefined) {
     if (this.destroyed && this.fd == null) return this;
     this.destroyed = true;
+    this.readable = false;
     if (error) this.emit("error", error);
     this._close();
+    return this;
+  }
+
+  pause() {
+    this._paused = true;
+    return this;
+  }
+
+  resume() {
+    if (!this._paused) return this;
+    this._paused = false;
+    queueMicrotask(() => this._pump());
     return this;
   }
 }
@@ -777,13 +812,22 @@ export class WriteStream extends Writable {
     this.bytesWritten = 0;
     this.pending = true;
     this.destroyed = false;
+    this.writableEnded = false;
+    this.closed = false;
     this.start = options?.start == null ? null : Number(options.start);
     this.pos = this.start;
+    this.highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 16 * 1024), 1024 * 1024));
+    this.writableHighWaterMark = this.highWaterMark;
+    this.writableLength = 0;
+    this.writableNeedDrain = false;
     this._ownsFd = this.fd == null || Number.isNaN(this.fd);
-    queueMicrotask(() => this._open());
+    queueMicrotask(() => {
+      try { this._open(); } catch (error) { this.destroy(error); }
+    });
   }
 
   _open() {
+    if (!this.pending) return;
     if (this.destroyed) return;
     if (this.fd == null || Number.isNaN(this.fd)) {
       ensureParent(normalizePath(this.path));
@@ -803,15 +847,26 @@ export class WriteStream extends Writable {
     try {
       if (this.pending) this._open();
       const bytes = bytesFromData(chunk, encoding ?? "utf8");
+      this.writableLength += bytes.byteLength;
       const bytesWritten = writeSync(this.fd, bytes, 0, bytes.byteLength, this.pos);
       if (this.pos != null) this.pos += bytesWritten;
       this.bytesWritten += bytesWritten;
-      if (callback) callback(null);
+      const overHighWaterMark = this.writableLength >= this.highWaterMark;
+      if (overHighWaterMark) this.writableNeedDrain = true;
+      queueMicrotask(() => {
+        this.writableLength = Math.max(0, this.writableLength - bytes.byteLength);
+        if (this.writableNeedDrain && this.writableLength === 0) {
+          this.writableNeedDrain = false;
+          this.emit("drain");
+        }
+        if (callback) callback(null);
+      });
+      return !overHighWaterMark;
     } catch (error) {
       if (callback) callback(error);
       this.emit("error", error);
+      return false;
     }
-    return true;
   }
 
   end(chunk = undefined, encoding = undefined, callback = undefined) {
@@ -823,8 +878,10 @@ export class WriteStream extends Writable {
       encoding = undefined;
     }
     if (chunk != null) this.write(chunk, encoding);
+    this.writableEnded = true;
     this.emit("finish");
     this.close(callback);
+    return this;
   }
 
   close(callback = undefined) {
@@ -840,7 +897,8 @@ export class WriteStream extends Writable {
     }
     this.fd = null;
     if (error) this.emit("error", error);
-    this.emit("close");
+    this.closed = true;
+    queueMicrotask(() => this.emit("close"));
     return this;
   }
 
@@ -979,11 +1037,45 @@ export function writev(fd, buffers, position = null, callback = undefined) {
 }
 
 function snapshot(path, recursive) {
-  const command = recursive
-    ? `cd '${String(path).replace(/'/g, "'\\''")}' && find . -type f -o -type d | sort`
-    : `cd '${String(path).replace(/'/g, "'\\''")}' && ls -A | sort`;
-  const result = cottontail.spawnSync("sh", ["-c", command], { stdio: "pipe" });
-  return result.status === 0 ? result.stdout : "";
+  const root = normalizePath(path);
+  const stats = lstatSync(root);
+  const entries = new Map();
+  const add = (relative, fullPath, entryStats = lstatSync(fullPath)) => {
+    entries.set(relative, `${entryStats.mode}:${entryStats.size}:${entryStats.mtimeMs}:${entryStats.ctimeMs}:${entryStats.birthtimeMs}`);
+  };
+  if (!stats.isDirectory()) {
+    add(String(root).split("/").pop() || "", root, stats);
+    return entries;
+  }
+  const walk = (dir, prefix = "") => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const name = String(entry.name);
+      const relative = prefix ? `${prefix}/${name}` : name;
+      const fullPath = join(dir, name);
+      const entryStats = lstatSync(fullPath);
+      add(relative, fullPath, entryStats);
+      if (recursive && entryStats.isDirectory()) walk(fullPath, relative);
+    }
+  };
+  walk(root);
+  return entries;
+}
+
+function watchFilename(name, options) {
+  const encoding = normalizeEncoding(options, "utf8");
+  return encoding === "buffer" ? bufferFrom(encoder.encode(name)) : name;
+}
+
+function diffSnapshots(previous, current) {
+  const events = [];
+  for (const [name, signature] of current) {
+    if (!previous.has(name)) events.push(["rename", name]);
+    else if (previous.get(name) !== signature) events.push(["change", name]);
+  }
+  for (const name of previous.keys()) {
+    if (!current.has(name)) events.push(["rename", name]);
+  }
+  return events;
 }
 
 export function watch(path, options = {}, listener = undefined) {
@@ -994,10 +1086,16 @@ export function watch(path, options = {}, listener = undefined) {
   const listeners = new Map();
   let closed = false;
   let last = snapshot(normalizePath(path), Boolean(options?.recursive));
+  let timer = null;
   const watcher = {
     close() {
+      if (closed) return;
       closed = true;
-      clearInterval(timer);
+      if (timer != null) clearInterval(timer);
+      emit("close");
+    },
+    addListener(name, handler) {
+      return watcher.on(name, handler);
     },
     on(name, handler) {
       const handlers = listeners.get(name) ?? [];
@@ -1020,6 +1118,15 @@ export function watch(path, options = {}, listener = undefined) {
     removeListener(name, handler) {
       return watcher.off(name, handler);
     },
+    removeAllListeners(name = undefined) {
+      if (name == null) listeners.clear();
+      else listeners.delete(name);
+      return watcher;
+    },
+    emit(name, ...args) {
+      emit(name, ...args);
+      return true;
+    },
     ref() { return watcher; },
     unref() { return watcher; },
   };
@@ -1027,12 +1134,21 @@ export function watch(path, options = {}, listener = undefined) {
     for (const handler of listeners.get(name) ?? []) handler(...args);
   };
   if (listener) watcher.on("change", listener);
-  const timer = setInterval(() => {
+  const abort = () => watcher.close();
+  if (options?.signal?.aborted) watcher.close();
+  else options?.signal?.addEventListener?.("abort", abort, { once: true });
+  if (closed) return watcher;
+  timer = setInterval(() => {
     if (closed) return;
-    const next = snapshot(normalizePath(path), Boolean(options?.recursive));
-    if (next !== last) {
+    try {
+      const next = snapshot(normalizePath(path), Boolean(options?.recursive));
+      for (const [eventType, filename] of diffSnapshots(last, next)) {
+        emit("change", eventType, watchFilename(filename, options));
+      }
       last = next;
-      emit("change", "change", "");
+    } catch (error) {
+      emit("error", error);
+      watcher.close();
     }
   }, Number(options?.interval || 500));
   return watcher;
@@ -1100,35 +1216,119 @@ export function unwatchFile(path, listener = undefined) {
   }
 }
 
-function globToRegExp(pattern) {
-  const globstar = "\x00";
-  const escaped = String(pattern)
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, globstar)
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]")
-    .replaceAll(globstar, ".*");
-  return new RegExp(`^${escaped}$`);
+function normalizeGlobPattern(pattern) {
+  return String(pattern).replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-function walkFiles(root, prefix = "") {
+function globSegments(pattern) {
+  return normalizeGlobPattern(pattern).split("/").filter((segment, index) => segment !== "" || index === 0);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.+^${}()|[\]\\]/g, "\\$&");
+}
+
+function segmentToRegExp(segment) {
+  let source = "";
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index];
+    if (char === "*") {
+      source += "[^/]*";
+    } else if (char === "?") {
+      source += "[^/]";
+    } else if (char === "{") {
+      const end = segment.indexOf("}", index + 1);
+      if (end > index) {
+        const alternatives = segment.slice(index + 1, end).split(",").map(escapeRegExp).join("|");
+        source += `(?:${alternatives})`;
+        index = end;
+      } else {
+        source += "\\{";
+      }
+    } else {
+      source += escapeRegExp(char);
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+function matchGlobSegments(patternParts, pathParts, patternIndex = 0, pathIndex = 0) {
+  if (patternIndex >= patternParts.length) return pathIndex >= pathParts.length;
+  const pattern = patternParts[patternIndex];
+  if (pattern === "**") {
+    if (patternIndex === patternParts.length - 1) return true;
+    for (let nextIndex = pathIndex; nextIndex <= pathParts.length; nextIndex += 1) {
+      if (matchGlobSegments(patternParts, pathParts, patternIndex + 1, nextIndex)) return true;
+    }
+    return false;
+  }
+  if (pathIndex >= pathParts.length) return false;
+  return segmentToRegExp(pattern).test(pathParts[pathIndex]) &&
+    matchGlobSegments(patternParts, pathParts, patternIndex + 1, pathIndex + 1);
+}
+
+function globMatches(pattern, relativePath) {
+  const normalized = normalizeGlobPattern(relativePath);
+  return matchGlobSegments(globSegments(pattern), normalized.split("/").filter(Boolean));
+}
+
+function makeExcludeMatcher(exclude) {
+  if (exclude == null) return () => false;
+  if (typeof exclude === "function") return (entry, value) => Boolean(exclude(value));
+  const patterns = (Array.isArray(exclude) ? exclude : [exclude]).map(normalizeGlobPattern);
+  return (entry) => patterns.some((pattern) => globMatches(pattern, entry.relative));
+}
+
+function makeGlobDirent(entry) {
+  return new Dirent(entry.name, entry.stats, entry.parentPath);
+}
+
+function walkGlobEntries(root, options = {}, prefix = "", seenDirectories = new Set(), exclude = () => false, withFileTypes = false) {
   const out = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const relative = prefix ? `${prefix}/${entry.name}` : String(entry.name);
-    out.push(relative);
-    if (entry.isDirectory()) out.push(...walkFiles(join(root, String(entry.name)), relative));
+  for (const dirent of readdirSync(root, { withFileTypes: true })) {
+    const name = String(dirent.name);
+    const fullPath = join(root, name);
+    const relative = prefix ? `${prefix}/${name}` : name;
+    const lstat = lstatSync(fullPath);
+    const entry = {
+      name,
+      fullPath,
+      parentPath: root,
+      relative,
+      stats: lstat,
+    };
+    const excludeValue = withFileTypes ? makeGlobDirent(entry) : entry.relative;
+    const excluded = exclude(entry, excludeValue);
+    if (!excluded) out.push(entry);
+
+    let descend = lstat.isDirectory();
+    if (!descend && options?.followSymlinks && lstat.isSymbolicLink()) {
+      try {
+        descend = statSync(fullPath).isDirectory();
+      } catch {}
+    }
+    if (!descend || excluded) continue;
+
+    let real = fullPath;
+    try { real = realpathSync(fullPath); } catch {}
+    if (seenDirectories.has(real)) continue;
+    seenDirectories.add(real);
+    out.push(...walkGlobEntries(fullPath, options, relative, seenDirectories, exclude, withFileTypes));
   }
   return out;
 }
 
 export function globSync(pattern, options = {}) {
-  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  const patterns = (Array.isArray(pattern) ? pattern : [pattern]).map(normalizeGlobPattern);
   const cwd = normalizePath(options?.cwd ?? ".");
+  const withFileTypes = Boolean(options?.withFileTypes);
+  const exclude = makeExcludeMatcher(options?.exclude);
   const matches = [];
-  for (const item of walkFiles(cwd)) {
-    if (patterns.some((candidate) => globToRegExp(candidate).test(item))) {
-      matches.push(options?.absolute ? resolve(cwd, item) : item);
-    }
+  for (const entry of walkGlobEntries(cwd, options, "", new Set(), exclude, withFileTypes)) {
+    const value = withFileTypes
+      ? makeGlobDirent(entry)
+      : options?.absolute ? resolve(cwd, entry.relative) : entry.relative;
+    if (patterns.some((candidate) => globMatches(candidate, entry.relative))) matches.push(value);
   }
   return matches;
 }
@@ -1147,7 +1347,11 @@ export function glob(pattern, options = {}, callback = undefined) {
   return Promise.resolve(globSync(pattern, options));
 }
 
-// COTTONTAIL-COMPAT: node:fs glob/watch/streams - simplified JS implementations cover common behavior; harden against Node's full option/error edge cases.
+async function* globIterator(pattern, options = {}) {
+  for (const item of globSync(pattern, options)) yield item;
+}
+
+// COTTONTAIL-COMPAT: node:fs stream edge flags - native-backed file operations, recursive readdir, glob options, stat-diff watch/watchFile, FileHandle helpers, ReadStream/WriteStream pause/lifecycle behavior, and highWaterMark drain state are implemented; obscure stream flag combinations still need conformance work.
 
 export const promises = {
   access: async (path, mode = F_OK) => accessSync(path, mode),
@@ -1157,7 +1361,7 @@ export const promises = {
   constants,
   copyFile: async (source, destination, mode = 0) => copyFileSync(source, destination, mode),
   cp: async (source, destination, options = {}) => cpSync(source, destination, options),
-  glob: async (pattern, options = {}) => globSync(pattern, options),
+  glob: (pattern, options = {}) => globIterator(pattern, options),
   lchmod: async (path, mode) => lchmodSync(path, mode),
   lchown: async (path, uid, gid) => lchownSync(path, uid, gid),
   link: async (existingPath, newPath) => linkSync(existingPath, newPath),

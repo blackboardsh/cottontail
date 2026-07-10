@@ -54,6 +54,10 @@ export class REPLServer extends EventEmitter {
     this.prompt = options.prompt ?? "> ";
     this.closed = false;
     this._buffer = "";
+    this.history = [];
+    this.historySize = Math.max(0, Number(options.historySize ?? 1000) || 0);
+    this.removeHistoryDuplicates = Boolean(options.removeHistoryDuplicates);
+    this._historyPath = null;
     this._onData = (chunk) => this._handleData(chunk);
     this.input?.on?.("data", this._onData);
     if (options.terminal !== false) this.displayPrompt();
@@ -72,15 +76,24 @@ export class REPLServer extends EventEmitter {
 
   defineCommand(keyword, command) {
     this.commands ??= Object.create(null);
-    this.commands[keyword] = command;
+    this.commands[String(keyword).replace(/^\./, "")] = command;
   }
 
   clearBufferedCommand() {
     this._buffer = "";
   }
 
-  setupHistory(_historyPath, callback = undefined) {
-    callback?.(null, this);
+  setupHistory(historyPath, callback = undefined) {
+    this._historyPath = String(historyPath);
+    try {
+      if (cottontail.existsSync?.(this._historyPath)) {
+        const text = String(cottontail.readFile?.(this._historyPath) ?? "");
+        this.history = text.split(/\r?\n/).filter(Boolean).reverse().slice(0, this.historySize || undefined);
+      }
+      callback?.(null, this);
+    } catch (error) {
+      callback?.(error);
+    }
   }
 
   _handleData(chunk) {
@@ -99,11 +112,53 @@ export class REPLServer extends EventEmitter {
       this.close();
       return;
     }
+    if (line.startsWith(".")) {
+      this._runCommand(line);
+      return;
+    }
+    this._addHistory(line);
     this.eval(line, this.context, "repl", (error, result) => {
       if (error) this.output?.write?.(`${error.stack ?? error}\n`);
       else if (result !== undefined) this.output?.write?.(`${this.writer(result)}\n`);
       this.displayPrompt();
     });
+  }
+
+  _runCommand(line) {
+    const [keyword, ...rest] = line.slice(1).trim().split(/\s+/);
+    if (keyword === "clear") {
+      this.context = {};
+      this.output?.write?.("Clearing context...\n");
+      this.displayPrompt();
+      return;
+    }
+    if (keyword === "help") {
+      const names = ["break", "clear", "exit", "help", "save", "load", ...(this.commands ? Object.keys(this.commands) : [])];
+      this.output?.write?.(`${[...new Set(names)].map((name) => `.${name}`).join("\n")}\n`);
+      this.displayPrompt();
+      return;
+    }
+    const command = this.commands?.[keyword];
+    if (typeof command === "function") command.call(this, rest.join(" "));
+    else if (typeof command?.action === "function") command.action.call(this, rest.join(" "));
+    else this.output?.write?.(`Invalid REPL keyword\n`);
+    if (!this.closed) this.displayPrompt();
+  }
+
+  _addHistory(line) {
+    if (!line.trim() || this.historySize === 0) return;
+    if (this.removeHistoryDuplicates) this.history = this.history.filter((entry) => entry !== line);
+    if (this.history[0] !== line) this.history.unshift(line);
+    if (this.history.length > this.historySize) this.history.length = this.historySize;
+    this._persistHistory();
+  }
+
+  _persistHistory() {
+    if (!this._historyPath) return;
+    try {
+      const text = `${[...this.history].reverse().join("\n")}${this.history.length ? "\n" : ""}`;
+      cottontail.writeFile?.(this._historyPath, text);
+    } catch {}
   }
 }
 
@@ -119,8 +174,6 @@ function defaultEval(code, context, _filename, callback) {
 export function start(options = {}) {
   return new REPLServer(typeof options === "string" ? { prompt: options } : options);
 }
-
-// COTTONTAIL-COMPAT: node:repl editor/history - basic REPL evaluation is implemented; terminal editing and persistent history need readline TTY integration.
 
 export default {
   REPLServer,

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -41,5 +41,73 @@ assert(inherited.stdout === null, "inherited child stdout should be null");
 assert(inherited.stderr === null, "inherited child stderr should be null");
 assert(inheritedResult.code === 0, `inherited child exit mismatch: ${inheritedResult.code}`);
 assert(inheritedResult.signal === null, `inherited child signal mismatch: ${inheritedResult.signal}`);
+
+const shellChild = spawn("printf shell-ok", { shell: "/bin/sh", stdio: ["ignore", "pipe", "pipe"] });
+shellChild.stdout.setEncoding("utf8");
+let shellOut = "";
+shellChild.stdout.on("data", (chunk) => {
+  shellOut += chunk;
+});
+const shellCode = await new Promise<number | null>((resolve) => {
+  shellChild.on("close", (code) => resolve(code));
+});
+assert(shellCode === 0, `shell child exit mismatch: ${shellCode}`);
+assert(shellOut === "shell-ok", `shell child stdout mismatch: ${JSON.stringify(shellOut)}`);
+
+let piped = "";
+const pipeChild = spawn("sh", ["-c", "printf piped"], { stdio: ["ignore", "pipe", "pipe"] });
+pipeChild.stdout.pipe({
+  write(chunk: unknown) {
+    piped += String(chunk);
+  },
+  end() {},
+});
+await new Promise<void>((resolve) => pipeChild.on("close", () => resolve()));
+assert(piped === "piped", `child stdout pipe mismatch: ${JSON.stringify(piped)}`);
+
+const stdinBackpressureChild = spawn("sh", ["-c", "cat >/dev/null"], { stdio: ["pipe", "ignore", "pipe"], highWaterMark: 2 });
+const stdinAccepted = stdinBackpressureChild.stdin.write("abcd");
+assert(stdinAccepted === false, "child stdin write should report backpressure over highWaterMark");
+assert(stdinBackpressureChild.stdin.writableNeedDrain === true, "child stdin writableNeedDrain mismatch");
+await new Promise<void>((resolve) => stdinBackpressureChild.stdin.once("drain", () => resolve()));
+assert(stdinBackpressureChild.stdin.writableLength === 0, "child stdin writableLength should drain to zero");
+assert(stdinBackpressureChild.stdin.writableNeedDrain === false, "child stdin writableNeedDrain should reset");
+stdinBackpressureChild.stdin.end();
+await new Promise<void>((resolve) => stdinBackpressureChild.on("close", () => resolve()));
+
+const syncResult = spawnSync("sh", ["-c", "printf sync-out; printf sync-err >&2"]);
+assert(syncResult.status === 0, `spawnSync status mismatch: ${syncResult.status}`);
+assert(syncResult.signal === null, "spawnSync signal mismatch");
+assert(syncResult.stdout.toString() === "sync-out", "spawnSync stdout Buffer mismatch");
+assert(syncResult.stderr.toString() === "sync-err", "spawnSync stderr Buffer mismatch");
+assert(syncResult.output[1].toString() === "sync-out", "spawnSync output stdout mismatch");
+
+const maxBufferError = await new Promise<any>((resolve) => {
+  execFile("sh", ["-c", "printf too-long"], { maxBuffer: 3 }, (error) => resolve(error));
+});
+assert(maxBufferError?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "execFile maxBuffer error mismatch");
+
+const controller = {
+  signal: {
+    aborted: false,
+    listener: undefined as undefined | (() => void),
+    addEventListener(name: string, listener: () => void) {
+      if (name === "abort") this.listener = listener;
+    },
+    removeEventListener(name: string, listener: () => void) {
+      if (name === "abort" && this.listener === listener) this.listener = undefined;
+    },
+  },
+  abort() {
+    this.signal.aborted = true;
+    this.signal.listener?.();
+  },
+};
+const abortChild = spawn("sh", ["-c", "sleep 5"], { signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
+const abortError = new Promise<any>((resolve) => abortChild.on("error", resolve));
+controller.abort();
+const aborted = await abortError;
+assert(aborted?.name === "AbortError", "spawn AbortSignal error mismatch");
+await new Promise<void>((resolve) => abortChild.on("close", () => resolve()));
 
 console.log("node child_process spawn passed");

@@ -19,66 +19,118 @@ function bytesFromArray(values) {
   return new Uint8Array(values);
 }
 
-function encodeValue(value, seen = new Set()) {
+const typedArrayTypes = new Set([
+  "Int8Array",
+  "Uint8Array",
+  "Uint8ClampedArray",
+  "Int16Array",
+  "Uint16Array",
+  "Int32Array",
+  "Uint32Array",
+  "Float32Array",
+  "Float64Array",
+  "BigInt64Array",
+  "BigUint64Array",
+  "DataView",
+]);
+
+function viewTypeName(value) {
+  if (Buffer.isBuffer?.(value)) return "Buffer";
+  const name = value?.constructor?.name;
+  return typedArrayTypes.has(name) ? name : "Uint8Array";
+}
+
+function encodeValue(value, state = { ids: new WeakMap(), nextId: 1 }) {
   if (value === undefined) return { type: "undefined" };
   if (value === null) return { type: "null" };
   if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") return { type: typeof value, value };
   if (typeof value === "bigint") return { type: "bigint", value: value.toString() };
   if (typeof value === "symbol" || typeof value === "function") throw new Error("Unserializable value");
-  if (seen.has(value)) throw new Error("Cyclic values are not supported by Cottontail v8 serialization yet");
-  seen.add(value);
-  try {
-    if (value instanceof Date) return { type: "Date", value: value.toISOString() };
-    if (value instanceof RegExp) return { type: "RegExp", source: value.source, flags: value.flags };
-    if (value instanceof ArrayBuffer) return { type: "ArrayBuffer", bytes: encodeBytes(new Uint8Array(value)) };
-    if (ArrayBuffer.isView(value)) {
-      return {
-        type: value.constructor?.name ?? "Uint8Array",
-        bytes: encodeBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)),
-      };
-    }
-    if (value instanceof Map) return { type: "Map", value: [...value].map(([key, item]) => [encodeValue(key, seen), encodeValue(item, seen)]) };
-    if (value instanceof Set) return { type: "Set", value: [...value].map((item) => encodeValue(item, seen)) };
-    if (Array.isArray(value)) return { type: "Array", value: value.map((item) => encodeValue(item, seen)) };
-    if (value instanceof Error) return { type: "Error", name: value.name, message: value.message, stack: value.stack };
-    return { type: "Object", value: Object.entries(value).map(([key, item]) => [key, encodeValue(item, seen)]) };
-  } finally {
-    seen.delete(value);
+  const existingId = state.ids.get(value);
+  if (existingId != null) return { type: "Ref", id: existingId };
+  const id = state.nextId++;
+  state.ids.set(value, id);
+
+  if (value instanceof Date) return { type: "Date", id, value: value.toISOString() };
+  if (value instanceof RegExp) return { type: "RegExp", id, source: value.source, flags: value.flags };
+  if (value instanceof ArrayBuffer) return { type: "ArrayBuffer", id, bytes: encodeBytes(new Uint8Array(value)) };
+  if (ArrayBuffer.isView(value)) {
+    return {
+      type: viewTypeName(value),
+      id,
+      bytes: encodeBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)),
+    };
   }
+  if (value instanceof Map) return { type: "Map", id, value: [...value].map(([key, item]) => [encodeValue(key, state), encodeValue(item, state)]) };
+  if (value instanceof Set) return { type: "Set", id, value: [...value].map((item) => encodeValue(item, state)) };
+  if (Array.isArray(value)) return { type: "Array", id, value: value.map((item) => encodeValue(item, state)) };
+  if (value instanceof Error) return { type: "Error", id, name: value.name, message: value.message, stack: value.stack };
+  return { type: "Object", id, value: Object.entries(value).map(([key, item]) => [key, encodeValue(item, state)]) };
 }
 
-function decodeValue(encoded) {
+function remember(refs, encoded, value) {
+  if (encoded?.id != null) refs.set(encoded.id, value);
+  return value;
+}
+
+function decodeTypedArray(encoded, constructor) {
+  return new constructor(bytesFromArray(encoded.bytes).buffer);
+}
+
+function decodeValue(encoded, refs = new Map()) {
   switch (encoded?.type) {
+    case "Ref": {
+      if (!refs.has(encoded.id)) throw new Error("Invalid serialized Cottontail v8 reference");
+      return refs.get(encoded.id);
+    }
     case "undefined": return undefined;
     case "null": return null;
     case "boolean":
     case "number":
     case "string": return encoded.value;
     case "bigint": return BigInt(encoded.value);
-    case "Date": return new Date(encoded.value);
-    case "RegExp": return new RegExp(encoded.source, encoded.flags);
-    case "ArrayBuffer": return bytesFromArray(encoded.bytes).buffer;
-    case "Uint8Array":
-    case "Buffer": return Buffer.from(bytesFromArray(encoded.bytes));
-    case "Int8Array": return new Int8Array(bytesFromArray(encoded.bytes).buffer);
-    case "Uint8ClampedArray": return new Uint8ClampedArray(bytesFromArray(encoded.bytes).buffer);
-    case "Int16Array": return new Int16Array(bytesFromArray(encoded.bytes).buffer);
-    case "Uint16Array": return new Uint16Array(bytesFromArray(encoded.bytes).buffer);
-    case "Int32Array": return new Int32Array(bytesFromArray(encoded.bytes).buffer);
-    case "Uint32Array": return new Uint32Array(bytesFromArray(encoded.bytes).buffer);
-    case "Float32Array": return new Float32Array(bytesFromArray(encoded.bytes).buffer);
-    case "Float64Array": return new Float64Array(bytesFromArray(encoded.bytes).buffer);
-    case "DataView": return new DataView(bytesFromArray(encoded.bytes).buffer);
-    case "Map": return new Map(encoded.value.map(([key, value]) => [decodeValue(key), decodeValue(value)]));
-    case "Set": return new Set(encoded.value.map(decodeValue));
-    case "Array": return encoded.value.map(decodeValue);
+    case "Date": return remember(refs, encoded, new Date(encoded.value));
+    case "RegExp": return remember(refs, encoded, new RegExp(encoded.source, encoded.flags));
+    case "ArrayBuffer": return remember(refs, encoded, bytesFromArray(encoded.bytes).buffer);
+    case "Uint8Array": return remember(refs, encoded, bytesFromArray(encoded.bytes));
+    case "Buffer": return remember(refs, encoded, Buffer.from(bytesFromArray(encoded.bytes)));
+    case "Int8Array": return remember(refs, encoded, decodeTypedArray(encoded, Int8Array));
+    case "Uint8ClampedArray": return remember(refs, encoded, decodeTypedArray(encoded, Uint8ClampedArray));
+    case "Int16Array": return remember(refs, encoded, decodeTypedArray(encoded, Int16Array));
+    case "Uint16Array": return remember(refs, encoded, decodeTypedArray(encoded, Uint16Array));
+    case "Int32Array": return remember(refs, encoded, decodeTypedArray(encoded, Int32Array));
+    case "Uint32Array": return remember(refs, encoded, decodeTypedArray(encoded, Uint32Array));
+    case "Float32Array": return remember(refs, encoded, decodeTypedArray(encoded, Float32Array));
+    case "Float64Array": return remember(refs, encoded, decodeTypedArray(encoded, Float64Array));
+    case "BigInt64Array": return remember(refs, encoded, decodeTypedArray(encoded, BigInt64Array));
+    case "BigUint64Array": return remember(refs, encoded, decodeTypedArray(encoded, BigUint64Array));
+    case "DataView": return remember(refs, encoded, new DataView(bytesFromArray(encoded.bytes).buffer));
+    case "Map": {
+      const map = remember(refs, encoded, new Map());
+      for (const [key, value] of encoded.value) map.set(decodeValue(key, refs), decodeValue(value, refs));
+      return map;
+    }
+    case "Set": {
+      const set = remember(refs, encoded, new Set());
+      for (const value of encoded.value) set.add(decodeValue(value, refs));
+      return set;
+    }
+    case "Array": {
+      const array = remember(refs, encoded, []);
+      for (let index = 0; index < encoded.value.length; index += 1) array[index] = decodeValue(encoded.value[index], refs);
+      return array;
+    }
     case "Error": {
       const error = new Error(encoded.message);
       error.name = encoded.name;
       error.stack = encoded.stack;
-      return error;
+      return remember(refs, encoded, error);
     }
-    case "Object": return Object.fromEntries(encoded.value.map(([key, value]) => [key, decodeValue(value)]));
+    case "Object": {
+      const object = remember(refs, encoded, {});
+      for (const [key, value] of encoded.value) object[key] = decodeValue(value, refs);
+      return object;
+    }
     default: throw new Error("Invalid serialized Cottontail v8 payload");
   }
 }

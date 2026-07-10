@@ -9227,6 +9227,7 @@
         "file": "src/runtime_modules/node/http.js",
         "exports": [
           "_connectionListener",
+          "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
@@ -9253,6 +9254,7 @@
         "file": "src/runtime_modules/node/http.js",
         "exports": [
           "_connectionListener",
+          "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
@@ -9287,6 +9289,7 @@
           "getUnpackedSettings",
           "Http2ServerRequest",
           "Http2ServerResponse",
+          "Http2Stream",
           "performServerHandshake",
           "sensitiveHeaders"
         ],
@@ -9304,6 +9307,7 @@
           "getUnpackedSettings",
           "Http2ServerRequest",
           "Http2ServerResponse",
+          "Http2Stream",
           "performServerHandshake",
           "sensitiveHeaders"
         ],
@@ -9313,6 +9317,7 @@
         "file": "src/runtime_modules/node/https.js",
         "exports": [
           "Agent",
+          "ClientRequest",
           "createServer",
           "get",
           "globalAgent",
@@ -9325,6 +9330,7 @@
         "file": "src/runtime_modules/node/https.js",
         "exports": [
           "Agent",
+          "ClientRequest",
           "createServer",
           "get",
           "globalAgent",
@@ -9492,7 +9498,8 @@
           "setDefaultAutoSelectFamilyAttemptTimeout",
           "Socket",
           "SocketAddress",
-          "Stream"
+          "Stream",
+          "TCP"
         ],
         "hasDefaultExport": true
       },
@@ -9515,7 +9522,8 @@
           "setDefaultAutoSelectFamilyAttemptTimeout",
           "Socket",
           "SocketAddress",
-          "Stream"
+          "Stream",
+          "TCP"
         ],
         "hasDefaultExport": true
       },
@@ -12374,6 +12382,7 @@
         "hasDefaultExport": true,
         "namedExports": [
           "_connectionListener",
+          "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
@@ -12410,6 +12419,7 @@
           "getUnpackedSettings",
           "Http2ServerRequest",
           "Http2ServerResponse",
+          "Http2Stream",
           "performServerHandshake",
           "sensitiveHeaders"
         ],
@@ -12421,6 +12431,7 @@
         "hasDefaultExport": true,
         "namedExports": [
           "Agent",
+          "ClientRequest",
           "createServer",
           "get",
           "globalAgent",
@@ -12528,7 +12539,8 @@
           "setDefaultAutoSelectFamilyAttemptTimeout",
           "Socket",
           "SocketAddress",
-          "Stream"
+          "Stream",
+          "TCP"
         ],
         "bunObjectProperties": [],
         "globalProperties": [
@@ -13086,7 +13098,10 @@
           "TLSSocket"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailFdWatchHandlerInstalled",
+          "__cottontailTlsListeners"
+        ]
       },
       "src/runtime_modules/node/trace_events.js": {
         "file": "src/runtime_modules/node/trace_events.js",
@@ -13181,7 +13196,10 @@
           "isWeakSet"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailProxyRegistry",
+          "Proxy"
+        ]
       },
       "src/runtime_modules/node/util.js": {
         "file": "src/runtime_modules/node/util.js",
@@ -13309,9 +13327,16 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
+          "__cottontailDecodeWorkerMessage",
+          "__cottontailEncodeWorkerMessage",
+          "__cottontailEnvironmentData",
           "__cottontailWorkerData",
+          "__cottontailWorkerResourceLimits",
           "__cottontailWorkerThreadName",
+          "MessageChannel",
+          "MessagePort",
           "parentPort",
+          "require",
           "workerData"
         ]
       },
@@ -13608,19 +13633,29 @@
     ],
     "globalProperties": [
       "__cottontailBuiltinModules",
+      "__cottontailDecodeWorkerMessage",
       "__cottontailDiagnosticsChannels",
+      "__cottontailEncodeWorkerMessage",
+      "__cottontailEnvironmentData",
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
+      "__cottontailProxyRegistry",
+      "__cottontailTlsListeners",
       "__cottontailWorkerData",
+      "__cottontailWorkerResourceLimits",
       "__cottontailWorkerThreadName",
       "Bun",
       "crypto",
       "fetch",
       "Headers",
+      "MessageChannel",
+      "MessagePort",
       "parentPort",
       "process",
+      "Proxy",
       "Request",
+      "require",
       "resolveObjectURL",
       "Response",
       "URL",
@@ -14469,7 +14504,9 @@
           "validateHeaderValue"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "_writeServerResponse"
+        ]
       },
       "http2": {
         "module": "present",
@@ -14487,7 +14524,9 @@
           "sensitiveHeaders"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "Http2Stream"
+        ]
       },
       "https": {
         "module": "present",
@@ -14500,7 +14539,9 @@
           "request"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "ClientRequest"
+        ]
       },
       "inspector": {
         "module": "present",
@@ -14598,7 +14639,9 @@
           "setDefaultAutoSelectFamilyAttemptTimeout"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "TCP"
+        ]
       },
       "node:sea": {
         "module": "present",
@@ -15841,177 +15884,36 @@
     "node": {
       "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
       "estimate": {
-        "implementedPercentLower": 66,
-        "implementedPercentUpper": 76,
-        "gapPercentLower": 24,
-        "gapPercentUpper": 34
+        "implementedPercentLower": 80,
+        "implementedPercentUpper": 90,
+        "gapPercentLower": 10,
+        "gapPercentUpper": 20
       },
       "signals": {
         "publicNodeModules": 58,
         "nodeTestFiles": 31,
-        "compatMarkers": 29,
-        "modulesWithCompatMarkers": 28,
-        "explicitUnsupportedMarkers": 27,
-        "modulesWithUnsupportedMarkers": 11
+        "compatMarkers": 19,
+        "modulesWithCompatMarkers": 19,
+        "explicitUnsupportedMarkers": 0,
+        "nativeAvailabilityGuards": 0,
+        "modulesWithUnsupportedMarkers": 0
       },
       "largestGaps": [
-        {
-          "name": "process",
-          "file": "src/runtime_modules/node/process.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 6,
-          "tests": 4,
-          "gapScore": 15
-        },
-        {
-          "name": "http2",
-          "file": "src/runtime_modules/node/http2.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 4,
-          "tests": 1,
-          "gapScore": 11
-        },
-        {
-          "name": "net",
-          "file": "src/runtime_modules/node/net.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 3,
-          "tests": 1,
-          "gapScore": 9
-        },
-        {
-          "name": "tls",
-          "file": "src/runtime_modules/node/tls.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 3,
-          "tests": 1,
-          "gapScore": 9
-        },
-        {
-          "name": "wasi",
-          "file": "src/runtime_modules/node/wasi.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 2,
-          "tests": 0,
-          "gapScore": 8
-        },
-        {
-          "name": "http",
-          "file": "src/runtime_modules/node/http.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 2,
-          "tests": 2,
-          "gapScore": 7
-        },
-        {
-          "name": "https",
-          "file": "src/runtime_modules/node/https.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 2,
-          "tests": 1,
-          "gapScore": 7
-        },
-        {
-          "name": "module",
-          "file": "src/runtime_modules/node/module.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 2,
-          "tests": 3,
-          "gapScore": 7
-        },
-        {
-          "name": "util/types",
-          "file": "src/runtime_modules/node/util/types.js",
-          "compatMarkers": 2,
-          "unsupportedMarkers": 0,
-          "tests": 1,
-          "gapScore": 6
-        },
         {
           "name": "child_process",
           "file": "src/runtime_modules/node/child_process.js",
           "compatMarkers": 1,
-          "unsupportedMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 2,
-          "gapScore": 5
-        },
-        {
-          "name": "sqlite",
-          "file": "src/runtime_modules/node/sqlite.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 1,
-          "tests": 1,
-          "gapScore": 5
-        },
-        {
-          "name": "v8",
-          "file": "src/runtime_modules/node/v8.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 1,
-          "tests": 1,
-          "gapScore": 5
-        },
-        {
-          "name": "async_hooks",
-          "file": "src/runtime_modules/node/async_hooks.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
-        },
-        {
-          "name": "buffer",
-          "file": "src/runtime_modules/node/buffer.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
-        },
-        {
-          "name": "perf_hooks",
-          "file": "src/runtime_modules/node/perf_hooks.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
-        },
-        {
-          "name": "repl",
-          "file": "src/runtime_modules/node/repl.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
-        },
-        {
-          "name": "url",
-          "file": "src/runtime_modules/node/url.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
-        },
-        {
-          "name": "vm",
-          "file": "src/runtime_modules/node/vm.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
-          "tests": 0,
-          "gapScore": 4
+          "gapScore": 3
         },
         {
           "name": "cluster",
           "file": "src/runtime_modules/node/cluster.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
-          "tests": 1,
-          "gapScore": 3
-        },
-        {
-          "name": "dgram",
-          "file": "src/runtime_modules/node/dgram.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
@@ -16020,6 +15922,7 @@
           "file": "src/runtime_modules/node/dns.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
@@ -16028,7 +15931,35 @@
           "file": "src/runtime_modules/node/fs.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 2,
+          "gapScore": 3
+        },
+        {
+          "name": "http",
+          "file": "src/runtime_modules/node/http.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 2,
+          "gapScore": 3
+        },
+        {
+          "name": "http2",
+          "file": "src/runtime_modules/node/http2.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "https",
+          "file": "src/runtime_modules/node/https.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
           "gapScore": 3
         },
         {
@@ -16036,30 +15967,88 @@
           "file": "src/runtime_modules/node/inspector.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
         {
-          "name": "os",
-          "file": "src/runtime_modules/node/os.js",
+          "name": "module",
+          "file": "src/runtime_modules/node/module.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 3,
+          "gapScore": 3
+        },
+        {
+          "name": "net",
+          "file": "src/runtime_modules/node/net.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
         {
-          "name": "stream/web",
-          "file": "src/runtime_modules/node/stream/web.js",
+          "name": "perf_hooks",
+          "file": "src/runtime_modules/node/perf_hooks.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
         {
-          "name": "util",
-          "file": "src/runtime_modules/node/util.js",
+          "name": "process",
+          "file": "src/runtime_modules/node/process.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 4,
+          "gapScore": 3
+        },
+        {
+          "name": "sqlite",
+          "file": "src/runtime_modules/node/sqlite.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "tls",
+          "file": "src/runtime_modules/node/tls.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "v8",
+          "file": "src/runtime_modules/node/v8.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "vm",
+          "file": "src/runtime_modules/node/vm.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "wasi",
+          "file": "src/runtime_modules/node/wasi.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
@@ -16068,6 +16057,7 @@
           "file": "src/runtime_modules/node/worker_threads.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 1,
           "gapScore": 3
         },
@@ -16076,38 +16066,19 @@
           "file": "src/runtime_modules/node/zlib.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
           "tests": 2,
           "gapScore": 3
         }
       ],
       "modules": {
-        "async_hooks": {
-          "file": "src/runtime_modules/node/async_hooks.js",
-          "compatMarkers": [
-            "node:async_hooks async propagation - synchronous scopes plus timer and microtask AsyncLocalStorage snapshots are tracked; full promise-chain propagation needs native scheduler hooks."
-          ],
-          "unsupportedMarkers": [],
-          "tests": []
-        },
-        "buffer": {
-          "file": "src/runtime_modules/node/buffer.js",
-          "compatMarkers": [
-            "node:buffer object URL registry - resolveObjectURL delegates to a host registry when one exists; Blob URL creation is not installed globally yet."
-          ],
-          "unsupportedMarkers": [],
-          "tests": []
-        },
         "child_process": {
           "file": "src/runtime_modules/node/child_process.js",
           "compatMarkers": [
-            "node:child_process internals - public spawn/exec/fork paths are implemented; _forkChild remains an internal bootstrap hook."
+            "node:child_process IPC scope - public spawn/exec/fork paths, JSON IPC, advanced serialized IPC, fd-3 native IPC, and POSIX socket/server handle passing are implemented; Windows handle passing still needs a platform backend."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 405,
-              "text": "throw new Error(\"child_process._forkChild is an internal Node bootstrap hook and is not available in Cottontail\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-child-process-fork.ts",
             "tests/js/node-child-process.ts"
@@ -16116,29 +16087,21 @@
         "cluster": {
           "file": "src/runtime_modules/node/cluster.js",
           "compatMarkers": [
-            "node:cluster scheduling - process fork/message lifecycle is implemented; native shared server handles and round-robin socket distribution need net/server bindings."
+            "node:cluster scheduling - process fork/message lifecycle and POSIX shared socket/server handles are implemented; primary-managed round-robin distribution still needs a cluster scheduler."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-cluster-surface.ts"
-          ]
-        },
-        "dgram": {
-          "file": "src/runtime_modules/node/dgram.js",
-          "compatMarkers": [
-            "node:dgram multicast/options - UDP bind/send/receive/close are backed by native datagram sockets; multicast membership, broadcast/TTL tuning, and platform-specific socket options need additional native setsockopt bindings."
-          ],
-          "unsupportedMarkers": [],
-          "tests": [
-            "tests/js/node-dgram-surface.ts"
           ]
         },
         "dns": {
           "file": "src/runtime_modules/node/dns.js",
           "compatMarkers": [
-            "node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; setServers stores requested servers for API compatibility, but record queries still use the platform resolver configuration until per-query resolver state is wired."
+            "node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and tracked, but record queries still use the platform resolver configuration until per-query resolver state is wired."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-dns-surface.ts"
           ]
@@ -16146,9 +16109,10 @@
         "fs": {
           "file": "src/runtime_modules/node/fs.js",
           "compatMarkers": [
-            "node:fs glob/watch/streams - simplified JS implementations cover common behavior; harden against Node's full option/error edge cases."
+            "node:fs stream edge flags - native-backed file operations, recursive readdir, glob options, stat-diff watch/watchFile, FileHandle helpers, ReadStream/WriteStream pause/lifecycle behavior, and highWaterMark drain state are implemented; obscure stream flag combinations still need conformance work."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-fs-surface.ts",
             "tests/js/node-fs.ts"
@@ -16157,18 +16121,10 @@
         "http": {
           "file": "src/runtime_modules/node/http.js",
           "compatMarkers": [
-            "node:http sockets - HTTP server/client behavior is backed by Cottontail's native HTTP server and fetch; the fetch-backed client is synchronous today, and raw socket upgrades, CONNECT tunneling, same-process loopback, and WebSocket transport need native socket/client bindings."
+            "node:http parser conformance - net-backed HTTP/1.1 server/client requests, Agent socket pooling, keep-alive reuse, request timeouts, 100-continue, chunked trailers, raw upgrade, CONNECT, and WebSocket client transport are implemented; exhaustive llhttp-compatible parser edge cases still need a native parser pass."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 342,
-              "text": "throw new Error(\"http.Agent.createConnection requires node:net socket bindings\");"
-            },
-            {
-              "line": 545,
-              "text": "throw new Error(\"WebSocket is not available in Cottontail node:http yet\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-http-https-surface.ts",
             "tests/js/node-tls-http2-surface.ts"
@@ -16177,26 +16133,10 @@
         "http2": {
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": [
-            "node:http2 sessions - constants, settings packing, and HTTP/1-compatible request/response classes are implemented; exported HTTP/2 client/server/session entry points fail loudly until native nghttp2-style bindings land."
+            "node:http2 sessions - basic socket-backed client/server sessions, SETTINGS, HEADERS, DATA, stream events, settings packing, and HTTP/1-compatible request/response classes are implemented; full HPACK/Huffman, flow control, priority, push, GOAWAY/RST_STREAM, and extended nghttp2 parity need deeper protocol work."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 134,
-              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedHttp2(name)));"
-            },
-            {
-              "line": 150,
-              "text": "throw unsupportedHttp2(\"http2.ClientHttp2Session.request\");"
-            },
-            {
-              "line": 169,
-              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedHttp2(`${this._name}.listen`)));"
-            },
-            {
-              "line": 214,
-              "text": "throw unsupportedHttp2(\"http2.performServerHandshake\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-tls-http2-surface.ts"
           ]
@@ -16204,18 +16144,10 @@
         "https": {
           "file": "src/runtime_modules/node/https.js",
           "compatMarkers": [
-            "node:https TLS server - HTTPS client requests use fetch; TLS server creation needs native TLS bindings."
+            "node:https parser conformance - HTTPS client/server requests run over OpenSSL-backed node:tls sockets with HTTP/1.1 request/response parsing, Agent pooling, keep-alive reuse, 100-continue, chunked trailers, CONNECT, upgrade, and request timeouts; exhaustive llhttp-compatible parser edge cases still need a native parser pass."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 13,
-              "text": "throw new Error(\"https.Server requires native TLS bindings in Cottontail\");"
-            },
-            {
-              "line": 36,
-              "text": "throw new Error(\"https.createServer requires native TLS bindings in Cottontail\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-http-https-surface.ts"
           ]
@@ -16226,6 +16158,7 @@
             "node:inspector server - local Session protocol supports Runtime.evaluate and event delivery; DevTools WebSocket server/open(), debugger breakpoints, heap snapshots, and full domain coverage need JavaScriptCore inspector/runtime hooks."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-inspector-surface.ts"
           ]
@@ -16233,18 +16166,10 @@
         "module": {
           "file": "src/runtime_modules/node/module.js",
           "compatMarkers": [
-            "node:module loader hooks/source maps/compile cache - exported with real resolver/cache state where available; loader-hook and TS-strip APIs require dedicated parser/loader support."
+            "node:module compile cache/ESM loaders - CommonJS loader hooks, package exports resolution, resolver/cache state, and sourceMappingURL-backed source maps are implemented; ESM hook isolation, async loader thread behavior, and V8 compile-cache parity need dedicated loader/runtime support."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 531,
-              "text": "throw new Error(\"module.register loader hooks are not available in Cottontail yet\");"
-            },
-            {
-              "line": 536,
-              "text": "throw new Error(\"module.registerHooks loader hooks are not available in Cottontail yet\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-misc-modules-surface.ts",
             "tests/js/node-module-direct-package-root.ts",
@@ -16254,75 +16179,32 @@
         "net": {
           "file": "src/runtime_modules/node/net.js",
           "compatMarkers": [
-            "node:net sockets - address helpers, BlockList, and basic TCP connect/listen/read/write/end are implemented; advanced socket options, backpressure, IPC pipes, and handle sharing need deeper native socket bindings."
-          ],
-          "unsupportedMarkers": [
-            {
-              "line": 147,
-              "text": "if (typeof cottontail.tcpSocketConnect !== \"function\") throw unsupported(\"net.Socket.connect\");"
-            },
-            {
-              "line": 247,
-              "text": "if (typeof cottontail.tcpServerListen !== \"function\") throw unsupported(\"net.Server.listen\");"
-            },
-            {
-              "line": 387,
-              "text": "throw unsupported(\"net._createServerHandle\");"
-            }
-          ],
-          "tests": [
-            "tests/js/node-net.ts"
-          ]
-        },
-        "os": {
-          "file": "src/runtime_modules/node/os.js",
-          "compatMarkers": [
-            "node:os platform details - memory values, network interfaces, and priority use native host APIs; CPU model/timing and some release/version/loadavg details still need deeper platform-specific data."
+            "node:net platform scope - address helpers, BlockList, TCP connect/listen/read/write/end, POSIX path sockets, pause/resume, write backpressure/drain state, timeouts, TCP keepalive/nodelay, and POSIX cross-process socket/server handle wrapping are implemented; Windows named-pipe/handle duplication still needs a platform backend."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
-            "tests/js/node-os.ts"
+            "tests/js/node-net.ts"
           ]
         },
         "perf_hooks": {
           "file": "src/runtime_modules/node/perf_hooks.js",
           "compatMarkers": [
-            "node:perf_hooks GC/resource timing - user marks/measures, observers, timerify, and histograms are implemented; native GC/resource entries need JSC instrumentation."
+            "node:perf_hooks native entries - user marks/measures, explicit resource timings, observers, timerify, and histograms are implemented; automatic GC/resource entries need JSC instrumentation."
           ],
           "unsupportedMarkers": [],
-          "tests": []
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-instrumentation-surface.ts"
+          ]
         },
         "process": {
           "file": "src/runtime_modules/node/process.js",
           "compatMarkers": [
-            "node:process internals/addon hooks - unsupported Node internals throw instead of pretending to expose V8/libuv/N-API state."
+            "node:process addon ABI - process metadata, credentials, signals, reports, env loading, execve, and common internal bindings use native host APIs; N-API module initialization still needs a Node-compatible ABI entrypoint."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 142,
-              "text": "throw new Error(`${name} is not available in Cottontail's embedded Node compatibility layer`);"
-            },
-            {
-              "line": 431,
-              "text": "unsupported(`process.binding(${String(name)})`);"
-            },
-            {
-              "line": 435,
-              "text": "unsupported(`process._linkedBinding(${String(name)})`);"
-            },
-            {
-              "line": 439,
-              "text": "unsupported(\"process.dlopen\");"
-            },
-            {
-              "line": 443,
-              "text": "unsupported(\"process.execve\");"
-            },
-            {
-              "line": 489,
-              "text": "// COTTONTAIL-COMPAT: node:process internals/addon hooks - unsupported Node internals throw instead of pretending to expose V8/libuv/N-API state."
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-child-process-fork.ts",
             "tests/js/node-child-process.ts",
@@ -16330,89 +16212,26 @@
             "tests/js/node-process.ts"
           ]
         },
-        "repl": {
-          "file": "src/runtime_modules/node/repl.js",
-          "compatMarkers": [
-            "node:repl editor/history - basic REPL evaluation is implemented; terminal editing and persistent history need readline TTY integration."
-          ],
-          "unsupportedMarkers": [],
-          "tests": []
-        },
         "sqlite": {
           "file": "src/runtime_modules/node/sqlite.js",
           "compatMarkers": [
-            "node:sqlite session/window extensions - DatabaseSync, StatementSync, SQLTagStore, scalar and aggregate user functions, authorizers, backup, constants, and synchronous query execution use native sqlite3; Session/changesets, window inverse callbacks, and extension loading need additional sqlite3 extension/callback bindings."
-          ],
-          "unsupportedMarkers": [
-            {
-              "line": 242,
-              "text": "throw new Error(\"DatabaseSync.aggregate window inverse requires native SQLite window callback support\");"
-            }
-          ],
-          "tests": [
-            "tests/js/node-sqlite-surface.ts"
-          ]
-        },
-        "stream/web": {
-          "file": "src/runtime_modules/node/stream/web.js",
-          "compatMarkers": [
-            "node:stream/web - implements common reader/writer/enqueue semantics; BYOB and compression byte transforms need deeper Web Streams parity."
+            "node:sqlite session extension - DatabaseSync, StatementSync, SQLTagStore, scalar/aggregate/window user functions, authorizers, backup, extension loading, constants, and synchronous query execution use native sqlite3; Session/changesets need sqlite3 session extension bindings."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
-            "tests/js/node-stream-surface.ts"
+            "tests/js/node-sqlite-surface.ts"
           ]
         },
         "tls": {
           "file": "src/runtime_modules/node/tls.js",
           "compatMarkers": [
-            "node:tls sockets - certificate identity checks, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, and default cipher inventory are implemented; exported TLS socket/server entry points fail loudly until native TLS bindings land."
+            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, and default cipher inventory are implemented; renegotiation, OCSP stapling, and resumable session cache wiring need deeper bindings."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 151,
-              "text": "const error = unsupportedTls(\"tls.TLSSocket.renegotiate\");"
-            },
-            {
-              "line": 168,
-              "text": "queueMicrotask(() => this.emit(\"error\", unsupportedTls(\"tls.Server.listen\")));"
-            },
-            {
-              "line": 178,
-              "text": "queueMicrotask(() => socket.destroy(unsupportedTls(\"tls.connect\")));"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-tls-http2-surface.ts"
-          ]
-        },
-        "url": {
-          "file": "src/runtime_modules/node/url.js",
-          "compatMarkers": [
-            "node:url URLPattern - supports common component matching, named groups, and wildcards; full URLPattern grammar modifiers and custom regex edge cases need a dedicated parser."
-          ],
-          "unsupportedMarkers": [],
-          "tests": []
-        },
-        "util/types": {
-          "file": "src/runtime_modules/node/util/types.js",
-          "compatMarkers": [
-            "util.types.isExternal - requires native VM object introspection; add a JSC-backed predicate.",
-            "util.types.isProxy - requires native proxy introspection; add a JSC-backed predicate."
-          ],
-          "unsupportedMarkers": [],
-          "tests": [
-            "tests/js/node-util-sys-surface.ts"
-          ]
-        },
-        "util": {
-          "file": "src/runtime_modules/node/util.js",
-          "compatMarkers": [
-            "node:util diagnostics - diff/getCallSites/debug output is simplified; replace with richer inspector-backed data later."
-          ],
-          "unsupportedMarkers": [],
-          "tests": [
-            "tests/js/node-util-sys-surface.ts"
           ]
         },
         "v8": {
@@ -16420,12 +16239,8 @@
           "compatMarkers": [
             "node:v8 engine internals - serialization and heap snapshots use Cottontail/JSC data; V8 heap object queries, coverage, and promise hooks need engine instrumentation for full parity."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 93,
-              "text": "if (payload.cottontailV8 !== formatVersion) throw new Error(\"Unsupported Cottontail v8 serialization format\");"
-            }
-          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-v8-surface.ts"
           ]
@@ -16436,31 +16251,29 @@
             "node:vm context isolation - code executes through JSC eval/Function with object scopes; full V8 contextification and heap measurement require native VM support."
           ],
           "unsupportedMarkers": [],
-          "tests": []
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-small-surface.ts"
+          ]
         },
         "wasi": {
           "file": "src/runtime_modules/node/wasi.js",
           "compatMarkers": [
-            "node:wasi syscalls - WASI object lifecycle is implemented; syscall imports throw until a native WASI layer is added."
+            "node:wasi inherited sockets - preview1 lifecycle, args/env, clocks, random, stdio, proc_exit, preopen metadata, fd_readdir, poll_oneoff, and preopen-backed file path operations are implemented; sock_* calls need real inherited socket fd support."
           ],
-          "unsupportedMarkers": [
-            {
-              "line": 3,
-              "text": "throw new Error(`WASI import ${name} is not implemented in Cottontail yet`);"
-            },
-            {
-              "line": 38,
-              "text": "// COTTONTAIL-COMPAT: node:wasi syscalls - WASI object lifecycle is implemented; syscall imports throw until a native WASI layer is added."
-            }
-          ],
-          "tests": []
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-instrumentation-surface.ts"
+          ]
         },
         "worker_threads": {
           "file": "src/runtime_modules/node/worker_threads.js",
           "compatMarkers": [
-            "node:worker_threads - Worker/message transport uses Cottontail native workers; transferable objects, shared memory, and per-thread inspector/resource accounting need deeper runtime support."
+            "node:worker_threads shared-memory/runtime limits - Worker/message transport uses Cottontail native workers with structured-clone-style payloads, workerData/environmentData, worker-side node:worker_threads imports, cross-thread MessagePort transfer, MessageChannel, BroadcastChannel, and locks; true ArrayBuffer detachment, SharedArrayBuffer shared memory, and per-thread inspector/resource accounting need deeper runtime support."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-worker-threads-surface.ts"
           ]
@@ -16468,9 +16281,10 @@
         "zlib": {
           "file": "src/runtime_modules/node/zlib.js",
           "compatMarkers": [
-            "node:zlib streaming/options - zlib/gzip/deflate/Brotli/Zstd streams and crc32 are implemented with whole-buffer transforms; advanced flush/window/dictionary streaming semantics need deeper native stream state."
+            "node:zlib streaming flush - zlib/gzip/deflate/Brotli/Zstd streams, crc32, compression options, and dictionary transforms are implemented; incremental flush semantics need deeper native stream state."
           ],
           "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-constants-zlib-crypto.ts",
             "tests/js/node-zlib-streams-surface.ts"

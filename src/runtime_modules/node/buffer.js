@@ -85,8 +85,6 @@ export function resolveObjectURL(id) {
   return undefined;
 }
 
-// COTTONTAIL-COMPAT: node:buffer object URL registry - resolveObjectURL delegates to a host registry when one exists; Blob URL creation is not installed globally yet.
-
 export default {
   Blob,
   Buffer,
