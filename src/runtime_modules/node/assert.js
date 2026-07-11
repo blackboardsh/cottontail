@@ -1,19 +1,273 @@
 export class AssertionError extends Error {
   constructor(options = {}) {
-    super(options.message || "Assertion failed");
+    super(options.message === undefined ? "Assertion failed" : options.message);
     this.name = "AssertionError";
     this.actual = options.actual;
     this.expected = options.expected;
     this.operator = options.operator;
     this.code = "ERR_ASSERTION";
+    this.generatedMessage = options.generatedMessage === undefined
+      ? options.message === undefined
+      : Boolean(options.generatedMessage);
+    if (options.stackStartFn && typeof this.stack === "string") {
+      const name = options.stackStartFn.name;
+      if (name) {
+        this.stack = this.stack
+          .split("\n")
+          .filter((line) => !new RegExp(`^\\s*at\\s+${name}\\b`).test(line))
+          .join("\n");
+        if (!this.stack.includes(name)) this.stack += `\n    at ${name}`;
+      }
+    }
   }
 }
 
 export class Assert {}
-export class CallTracker {}
 
-export function fail(message = "Assertion failed") {
-  throw new AssertionError({ message });
+function nodeError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  return error;
+}
+
+function invalidArgType(name, expected, actual) {
+  return nodeError(
+    TypeError,
+    "ERR_INVALID_ARG_TYPE",
+    `The "${name}" argument must be ${expected}. Received ${actual === null ? "null" : typeof actual}`,
+  );
+}
+
+function outOfRange(name, range, actual) {
+  return nodeError(
+    RangeError,
+    "ERR_OUT_OF_RANGE",
+    `The value of "${name}" is out of range. It must be ${range}. Received ${actual}`,
+  );
+}
+
+function invalidArgValue(name, value) {
+  return nodeError(
+    TypeError,
+    "ERR_INVALID_ARG_VALUE",
+    `The argument '${name}' is invalid. Received ${value}`,
+  );
+}
+
+function functionName(fn) {
+  return typeof fn?.name === "string" && fn.name.length > 0 ? fn.name : "<anonymous>";
+}
+
+function validateCallCount(exact) {
+  if (typeof exact !== "number") {
+    throw invalidArgType("exact", "a number", exact);
+  }
+  if (!Number.isInteger(exact) || exact < 0) {
+    throw outOfRange("exact", "a non-negative integer", exact);
+  }
+}
+
+const callTrackerState = new WeakMap();
+
+function callTrackerCheck(tracker, fn) {
+  const state = callTrackerState.get(tracker);
+  const check = state?.wrappers.get(fn);
+  if (!check) throw invalidArgValue("fn", fn);
+  return check;
+}
+
+function copyTrackedFunctionProperties(source, target) {
+  const sanitizeDescriptor = (descriptor) => {
+    const clean = Object.create(null);
+    const fields = ["value", "writable", "get", "set", "enumerable", "configurable"];
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index];
+      if (Object.prototype.hasOwnProperty.call(descriptor, field)) clean[field] = descriptor[field];
+    }
+    return clean;
+  };
+  const keys = Reflect.ownKeys(source);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === "arguments" || key === "caller" || key === "name" || key === "prototype") continue;
+    if (key === "length") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (!descriptor) continue;
+    try {
+      Object.defineProperty(target, key, sanitizeDescriptor(descriptor));
+    } catch {
+      // Non-configurable function internals vary across engines; userland
+      // properties are best-effort and should not make tracking fail.
+    }
+  }
+
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(source, "length");
+  if (lengthDescriptor) {
+    try {
+      Object.defineProperty(target, "length", sanitizeDescriptor(lengthDescriptor));
+    } catch {}
+  } else {
+    try {
+      delete target.length;
+    } catch {}
+  }
+}
+
+export class CallTracker {
+  constructor() {
+    callTrackerState.set(this, {
+      checks: [],
+      wrappers: new WeakMap(),
+    });
+  }
+
+  calls(fn = undefined, exact = 1) {
+    if (globalThis.process?._exiting) {
+      throw nodeError(Error, "ERR_UNAVAILABLE_DURING_EXIT", "Cannot call tracker.calls() during process exit");
+    }
+
+    let target = fn;
+    let expected = exact;
+    if (arguments.length === 1 && typeof fn === "number") {
+      expected = fn;
+      target = undefined;
+    }
+    validateCallCount(expected);
+
+    if (target === undefined) {
+      target = function noop() {};
+    } else if (typeof target !== "function") {
+      throw invalidArgType("fn", "a function", target);
+    }
+
+    const state = callTrackerState.get(this);
+    const check = {
+      actual: 0,
+      calls: [],
+      exact: expected,
+      operator: functionName(target),
+      stack: new Error().stack,
+      target,
+    };
+
+    const wrapped = function trackedCall(...args) {
+      check.actual += 1;
+      check.calls.push(Object.freeze({
+        arguments: Object.freeze(Array.prototype.slice.call(args)),
+        thisArg: this,
+      }));
+      return target.apply(this, args);
+    };
+    copyTrackedFunctionProperties(target, wrapped);
+
+    state.checks.push(check);
+    state.wrappers.set(wrapped, check);
+    return wrapped;
+  }
+
+  report() {
+    const state = callTrackerState.get(this);
+    const failures = [];
+    for (let index = 0; index < state.checks.length; index += 1) {
+      const check = state.checks[index];
+      if (check.actual === check.exact) continue;
+      failures.push({
+        message: `Expected the ${check.operator} function to be executed ${check.exact} time(s) but was executed ${check.actual} time(s).`,
+        actual: check.actual,
+        expected: check.exact,
+        operator: check.operator,
+        stack: check.stack,
+      });
+    }
+    return failures;
+  }
+
+  verify() {
+    const failures = this.report();
+    if (failures.length === 0) return;
+    throw new AssertionError({
+      actual: failures,
+      expected: [],
+      message: failures.length === 1
+        ? failures[0].message
+        : "Functions were not called the expected number of times",
+      operator: "callTracker",
+    });
+  }
+
+  getCalls(fn) {
+    const check = callTrackerCheck(this, fn);
+    const calls = new Array(check.calls.length);
+    for (let index = 0; index < check.calls.length; index += 1) {
+      const call = check.calls[index];
+      calls[index] = Object.freeze({
+        arguments: Object.freeze(Array.prototype.slice.call(call.arguments)),
+        thisArg: call.thisArg,
+      });
+    }
+    return Object.freeze(calls);
+  }
+
+  reset(fn = undefined) {
+    const state = callTrackerState.get(this);
+    if (fn === undefined) {
+      for (let index = 0; index < state.checks.length; index += 1) {
+        state.checks[index].actual = 0;
+        state.checks[index].calls = [];
+      }
+      return;
+    }
+    const check = callTrackerCheck(this, fn);
+    check.actual = 0;
+    check.calls = [];
+  }
+}
+
+let legacyFailWarningEmitted = false;
+
+function formatAssertionValue(value) {
+  if (typeof value === "string") return `'${value}'`;
+  return String(value);
+}
+
+function emitLegacyFailWarning() {
+  if (legacyFailWarningEmitted) return;
+  legacyFailWarningEmitted = true;
+  globalThis.process?.emitWarning?.(
+    "assert.fail() with more than one argument is deprecated. Please use assert.strictEqual() instead or only pass a message.",
+    "DeprecationWarning",
+    "DEP0094",
+  );
+}
+
+export function fail(actual = undefined, expected = undefined, message = undefined, operator = undefined, stackStartFn = fail) {
+  if (arguments.length <= 1) {
+    throw new AssertionError({
+      actual,
+      expected: undefined,
+      message: arguments.length === 0 ? "Failed" : actual,
+      operator: "fail",
+      generatedMessage: arguments.length === 0,
+      stackStartFn,
+    });
+  }
+
+  emitLegacyFailWarning();
+  if (message instanceof Error) throw message;
+
+  const assertionOperator = operator ?? (arguments.length >= 3 ? "fail" : "!=");
+  const generatedMessage = message === undefined;
+  const assertionMessage = generatedMessage
+    ? `${formatAssertionValue(actual)} ${assertionOperator} ${formatAssertionValue(expected)}`
+    : String(message);
+  throw new AssertionError({
+    actual,
+    expected,
+    message: assertionMessage,
+    operator: assertionOperator,
+    generatedMessage,
+    stackStartFn,
+  });
 }
 
 export function ok(value, message) {
@@ -132,12 +386,99 @@ export function notDeepEqual(actual, expected, message) {
 
 function expectedMatches(error, expected) {
   if (expected == null) return true;
-  if (typeof expected === "function") return error instanceof expected || expected(error) === true;
+  if (typeof expected === "function") return safeInstanceOf(error, expected) || expected(error) === true;
   if (expected instanceof RegExp) return expected.test(String(error?.message ?? error));
   if (typeof expected === "object") {
     return Object.keys(expected).every((key) => deepEqualValue(error?.[key], expected[key], true));
   }
   return false;
+}
+
+function safeInstanceOf(value, Ctor) {
+  try {
+    return value instanceof Ctor;
+  } catch {
+    return false;
+  }
+}
+
+function describePromiseValue(value) {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return `type string ('${value}')`;
+  if (typeof value === "number") return `type number (${value})`;
+  if (typeof value === "boolean") return `type boolean (${value})`;
+  if (typeof value === "function") return "an instance of Function";
+  const name = value?.constructor?.name;
+  return name ? `an instance of ${name}` : typeof value;
+}
+
+function promiseArgTypeError(value) {
+  return nodeError(
+    TypeError,
+    "ERR_INVALID_ARG_TYPE",
+    `The "promiseFn" argument must be of type function or an instance of Promise. Received ${describePromiseValue(value)}`,
+  );
+}
+
+function invalidReturnValueError(value) {
+  return nodeError(
+    TypeError,
+    "ERR_INVALID_RETURN_VALUE",
+    `Expected instance of Promise to be returned from the "promiseFn" function but got ${describePromiseValue(value)}.`,
+  );
+}
+
+function isValidPromiseLike(value) {
+  return value !== null &&
+    typeof value === "object" &&
+    typeof value.then === "function" &&
+    typeof value.catch === "function";
+}
+
+function getPromiseResult(promiseFn, operator) {
+  if (typeof promiseFn === "function") {
+    let value;
+    try {
+      value = promiseFn();
+    } catch (error) {
+      return { syncError: error };
+    }
+    if (!isValidPromiseLike(value)) return { setupError: invalidReturnValueError(value) };
+    return { promise: value };
+  }
+  if (!isValidPromiseLike(promiseFn)) return { setupError: promiseArgTypeError(promiseFn) };
+  void operator;
+  return { promise: promiseFn };
+}
+
+function markPromiseHandled(promise) {
+  if (promise && typeof promise.catch === "function") {
+    try {
+      promise.catch(() => {});
+    } catch {}
+  }
+}
+
+function expectedLabel(expected) {
+  return typeof expected === "function" && expected.name ? ` (${expected.name})` : "";
+}
+
+function validateExpected(error, expected, operator, message) {
+  if (expected == null) return true;
+  if (typeof expected === "function") {
+    if (safeInstanceOf(error, expected)) return true;
+    const result = expected(error);
+    if (result === true) return true;
+    throw new AssertionError({
+      actual: error,
+      expected,
+      message: message ?? `The "validate" validation function is expected to return "true". Received ${formatAssertionValue(result)}\n\nCaught error:\n\n${String(error)}`,
+      operator,
+      generatedMessage: message == null,
+    });
+  }
+  return expectedMatches(error, expected);
 }
 
 export function throws(fn, expected, message) {
@@ -166,25 +507,50 @@ export function doesNotThrow(fn, expected, message) {
 }
 
 export async function rejects(fn, expected, message) {
+  const result = getPromiseResult(fn, "rejects");
+  if (result.setupError) throw result.setupError;
+  if (result.syncError) throw result.syncError;
+  markPromiseHandled(result.promise);
   try {
-    const value = typeof fn === "function" ? fn() : fn;
-    await value;
+    await result.promise;
   } catch (error) {
-    if (!expectedMatches(error, expected)) {
-      throw new AssertionError({ actual: error, expected, message, operator: "rejects" });
+    if (!validateExpected(error, expected, "rejects", message)) {
+      throw new AssertionError({
+        actual: error,
+        expected,
+        message,
+        operator: "rejects",
+        generatedMessage: message == null,
+        stackStartFn: rejects,
+      });
     }
     return error;
   }
-  throw new AssertionError({ actual: undefined, expected, message, operator: "rejects" });
+  throw new AssertionError({
+    actual: undefined,
+    expected,
+    message: message ?? `Missing expected rejection${expectedLabel(expected)}.`,
+    operator: "rejects",
+    generatedMessage: message == null,
+  });
 }
 
 export async function doesNotReject(fn, expected, message) {
+  const result = getPromiseResult(fn, "doesNotReject");
+  if (result.setupError) throw result.setupError;
+  if (result.syncError) throw result.syncError;
+  markPromiseHandled(result.promise);
   try {
-    const value = typeof fn === "function" ? fn() : fn;
-    return await value;
+    return await result.promise;
   } catch (error) {
-    if (expectedMatches(error, expected)) {
-      throw new AssertionError({ actual: error, expected, message, operator: "doesNotReject" });
+    if (validateExpected(error, expected, "doesNotReject", message)) {
+      throw new AssertionError({
+        actual: error,
+        expected,
+        message: message ?? `Got unwanted rejection.\nActual message: "${String(error?.message ?? error)}"`,
+        operator: "doesNotReject",
+        generatedMessage: message == null,
+      });
     }
     throw error;
   }

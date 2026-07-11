@@ -385,6 +385,13 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `globalThis.__cottontailWorkerResourceLimits = __cottontailDecodeWorkerMessage(${resourceLimitsWire});`,
     `globalThis.__cottontailWorkerThreadName = ${JSON.stringify(options.name ?? "")};`,
     `globalThis.workerData = globalThis.__cottontailWorkerData;`,
+    `let __cottontailWorkerShouldExit = false;`,
+    `const __cottontailWorkerExitSentinel = { cottontailWorkerExit: true };`,
+    `const __cottontailWorkerImmediateQueue = [];`,
+    `globalThis.setImmediate ??= (callback, ...args) => { const handle = { ref(){ return this; }, unref(){ return this; }, hasRef(){ return true; } }; __cottontailWorkerImmediateQueue.push({ callback, args, handle }); queueMicrotask(() => { const index = __cottontailWorkerImmediateQueue.findIndex((item) => item.handle === handle); if (index < 0 || __cottontailWorkerShouldExit) return; const item = __cottontailWorkerImmediateQueue.splice(index, 1)[0]; try { const result = item.callback(...item.args); if (result && typeof result.then === "function") result.catch((error) => { if (error !== __cottontailWorkerExitSentinel) throw error; }); } catch (error) { if (error !== __cottontailWorkerExitSentinel) throw error; } }); return handle; };`,
+    `globalThis.clearImmediate ??= (handle) => { const index = __cottontailWorkerImmediateQueue.findIndex((item) => item.handle === handle); if (index >= 0) __cottontailWorkerImmediateQueue.splice(index, 1); };`,
+    `globalThis.process ??= { exitCode: 0, execArgv: [], env: {}, nextTick: (callback, ...args) => queueMicrotask(() => callback(...args)), exit(code = 0) { this.exitCode = Number(code) || 0; __cottontailWorkerShouldExit = true; cottontail.exit(this.exitCode); throw __cottontailWorkerExitSentinel; } };`,
+    `globalThis.__cottontailHasActiveHandles = () => !__cottontailWorkerShouldExit && (typeof globalThis.onmessage === "function" || __cottontailParentPortHandlers.size > 0 || __cottontailWorkerImmediateQueue.length > 0);`,
     `const __cottontailParentPortHandlers = new Set();`,
     `globalThis.addEventListener("message", (event) => {`,
     `  const message = __cottontailDecodeWorkerMessage(event.data);`,
@@ -410,9 +417,11 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `  parentPort: globalThis.parentPort, postMessageToThread: async () => false, receiveMessageOnPort: () => undefined,`,
     `  resourceLimits: globalThis.__cottontailWorkerResourceLimits, threadId: Number(cottontail.workerThreadId?.() ?? 1), threadName: globalThis.__cottontailWorkerThreadName, workerData: globalThis.__cottontailWorkerData`,
     `}; }`,
+    `function __cottontailWorkerAsyncHooksBuiltin(){ return { createHook(callbacks = {}) { return { enable(){ return this; }, disable(){ return this; }, callbacks }; }, executionAsyncId: () => 0, triggerAsyncId: () => 0, executionAsyncResource: () => ({}), AsyncResource: class AsyncResource { constructor(type){ this.type = String(type); this.id = 0; } asyncId(){ return this.id; } triggerAsyncId(){ return 0; } runInAsyncScope(fn, thisArg, ...args){ return fn.apply(thisArg, args); } emitDestroy(){} bind(fn, thisArg){ return (...args) => this.runInAsyncScope(fn, thisArg, ...args); } } }; }`,
     `function __cottontailWorkerRequire(specifier){`,
     `  const text = String(specifier);`,
     `  if (text === "node:worker_threads" || text === "worker_threads") return __cottontailWorkerThreadsBuiltin();`,
+    `  if (text === "node:async_hooks" || text === "async_hooks") return __cottontailWorkerAsyncHooksBuiltin();`,
     `  throw new Error("Cannot find module '" + text + "'");`,
     `}`,
     `globalThis.require ??= __cottontailWorkerRequire;`,
@@ -433,7 +442,7 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `  const source = __cottontailTransformWorkerSource(cottontail.readFile(filename), filename);`,
     `  const AsyncFunction = (async function(){}).constructor;`,
     `  const run = new AsyncFunction("__cottontailWorkerRequire", source + "\\n//# sourceURL=" + filename);`,
-    `  await run(__cottontailWorkerRequire);`,
+    `  try { await run(__cottontailWorkerRequire); } catch (error) { if (error !== __cottontailWorkerExitSentinel) throw error; }`,
     `}`,
     `await __cottontailRunWorkerTarget(${JSON.stringify(targetPath)});`,
   ].join("\n");
@@ -469,6 +478,10 @@ export class Worker extends EventEmitter {
       this.emit("message", message);
     };
     this._worker.onerror = (event) => this.emit("error", event?.error ?? new Error(String(event?.message ?? event)));
+    this._worker.addEventListener?.("exit", (event) => {
+      workerInstances.delete(this.threadId);
+      this.emit("exit", Number(event?.code ?? 0));
+    });
     queueMicrotask(() => this.emit("online"));
   }
 

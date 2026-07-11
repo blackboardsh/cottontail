@@ -40,6 +40,7 @@ export function inspect(value, options = undefined) {
   if (typeof value === "bigint") return `${value}n`;
   if (typeof value === "symbol") return String(value);
   if (typeof value === "function") return `[Function${value.name ? `: ${value.name}` : ""}]`;
+  if (value instanceof Promise) return "Promise { <pending> }";
   if (value instanceof Error) return value.stack || value.message;
   try {
     return JSON.stringify(value);
@@ -436,11 +437,35 @@ export function transferableAbortSignal(signal) {
   return signal;
 }
 
+function invalidArgType(name, expected, actual) {
+  const error = new TypeError(`The "${name}" argument must be ${expected}. Received ${actual === null ? "null" : typeof actual}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function isAbortSignalLike(signal) {
+  return Boolean(signal) &&
+    typeof signal === "object" &&
+    "aborted" in signal &&
+    typeof signal.addEventListener === "function" &&
+    typeof signal.removeEventListener === "function";
+}
+
 export function aborted(signal, resource = undefined) {
-  void resource;
+  if (!isAbortSignalLike(signal)) {
+    return new Promise((_, reject) => reject(invalidArgType("signal", "an AbortSignal", signal)));
+  }
+  if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
+    return new Promise((_, reject) => reject(invalidArgType("resource", "an object", resource)));
+  }
   if (signal?.aborted) return Promise.resolve();
+  const resourceRef = typeof WeakRef === "function" ? new WeakRef(resource) : null;
   return new Promise((resolve) => {
-    signal?.addEventListener?.("abort", resolve, { once: true });
+    const onAbort = () => {
+      if (resourceRef && resourceRef.deref() === undefined) return;
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 

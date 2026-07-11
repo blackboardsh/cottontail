@@ -36,6 +36,7 @@ class TestContext {
     this.name = record.name;
     this.signal = { aborted: false };
     this.mock = mock;
+    this.assert = assert;
   }
 
   async test(name, options, fn) {
@@ -83,7 +84,28 @@ async function execute(record) {
       await runHookList(beforeHooks);
     }
     await runHookList(beforeEachHooks);
-    if (typeof record.fn === "function") await record.fn(new TestContext(record));
+    if (typeof record.fn === "function") {
+      const context = new TestContext(record);
+      if (record.fn.length >= 2) {
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const done = (error = undefined) => {
+            if (settled) return;
+            settled = true;
+            if (error) reject(error);
+            else resolve();
+          };
+          try {
+            const result = record.fn(context, done);
+            if (result && typeof result.then === "function") result.then(undefined, done);
+          } catch (error) {
+            done(error);
+          }
+        });
+      } else {
+        await record.fn(context);
+      }
+    }
     await runHookList(afterEachHooks);
     emit("test:pass", { name: record.name, duration_ms: (performance?.now?.() ?? Date.now()) - started });
   } catch (error) {

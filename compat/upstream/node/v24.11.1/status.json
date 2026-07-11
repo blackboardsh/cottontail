@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "defaultStatus": "not-enabled",
+  "defaultStatus": "enabled",
   "tests": {
     "test/parallel/test-buffer-badhex.js": {
       "status": "enabled",

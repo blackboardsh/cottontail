@@ -5,6 +5,35 @@ import { connect as netConnect, createServer as createNetServer } from "./net.js
 import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
 import { Headers } from "../bun/index.js";
+import { AsyncResource } from "./async_hooks.js";
+
+const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
+const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
+
+function assignSocketAsyncId(socket) {
+  const previous = socket?.[socketAsyncResourceSymbol];
+  if (previous && typeof previous.emitDestroy === "function") previous.emitDestroy();
+  const resource = new AsyncResource("TCPWRAP");
+  Object.defineProperty(socket, socketAsyncResourceSymbol, {
+    value: resource,
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(socket, asyncIdSymbol, {
+    value: resource.asyncId(),
+    writable: true,
+    configurable: true,
+  });
+}
+
+function markSocketAsyncFree(socket) {
+  const resource = socket?.[socketAsyncResourceSymbol];
+  if (resource && typeof resource.emitDestroy === "function") resource.emitDestroy();
+  if (socket) {
+    socket[socketAsyncResourceSymbol] = null;
+    socket[asyncIdSymbol] = -1;
+  }
+}
 
 export const METHODS = [
   "ACL", "BIND", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET", "HEAD", "LINK", "LOCK",
@@ -721,6 +750,7 @@ export class Agent extends EventEmitter {
     options._agentName = name;
     const socket = this._takeSocket(options);
     if (socket) {
+      this.reuseSocket(socket, request);
       queueMicrotask(() => request.onSocket(socket, true));
       return;
     }
@@ -731,6 +761,7 @@ export class Agent extends EventEmitter {
       return;
     }
     const created = this.createConnection(options, () => {});
+    assignSocketAsyncId(created);
     this._rememberSocket(name, created);
     request.onSocket(created, false);
   }
@@ -753,12 +784,14 @@ export class Agent extends EventEmitter {
 
   reuseSocket(socket, request) {
     socket.ref?.();
+    assignSocketAsyncId(socket);
     request.reusedSocket = true;
   }
 
   _releaseSocket(socket, options = {}) {
     const name = options._agentName ?? this.getName(options);
     this.removeSocket(socket, { ...options, _agentName: name });
+    markSocketAsyncFree(socket);
     const queued = this.requests[name]?.shift();
     if (queued) {
       if ((this.requests[name] ?? []).length === 0) delete this.requests[name];
@@ -810,9 +843,11 @@ export class ClientRequest extends OutgoingMessage {
     this.destroyed = false;
     this._options = normalized.options;
     this._socket = null;
+    this.socket = null;
     this._agentOptions = null;
     this.agent = normalized.options.agent === false ? null : (normalized.options.agent ?? globalAgent);
     this.reusedSocket = false;
+    this._dispatched = false;
     this._responseEmitted = false;
     this._closeEmitted = false;
     this._timeout = 0;
@@ -827,6 +862,12 @@ export class ClientRequest extends OutgoingMessage {
     super.end(chunk, encoding, callback);
     this._dispatch();
     return this;
+  }
+
+  write(chunk, encoding = undefined, callback = undefined) {
+    const ok = super.write(chunk, encoding, callback);
+    this._dispatch();
+    return ok;
   }
 
   abort() {
@@ -885,6 +926,8 @@ export class ClientRequest extends OutgoingMessage {
   _emitParsedResponse(parsed) {
     if (this._responseEmitted || parsed == null) return;
     this._responseEmitted = true;
+    parsed.message.socket = this._socket;
+    parsed.message.connection = this._socket;
     if (this.method === "CONNECT" && parsed.message.statusCode >= 200 && parsed.message.statusCode < 300) {
       this.emit("connect", parsed.message, this._socket, Buffer.from(parsed.head ?? []));
       return;
@@ -897,7 +940,8 @@ export class ClientRequest extends OutgoingMessage {
   }
 
   _dispatch() {
-    if (this.aborted) return;
+    if (this.aborted || this._dispatched) return;
+    this._dispatched = true;
     const requestOptions = {
       ...this._options,
       host: this.url.hostname || "localhost",
@@ -925,6 +969,7 @@ export class ClientRequest extends OutgoingMessage {
       return;
     }
     this._socket = socket;
+    this.socket = socket;
     this.reusedSocket = Boolean(reused);
     let responseBuffer = Buffer.alloc(0);
     let completed = false;
@@ -1147,10 +1192,11 @@ export class Server extends EventEmitter {
               keepAliveTimer = setTimeout(() => socket.destroy?.(), this.keepAliveTimeout);
             }
           });
+          const requestResource = new AsyncResource("HTTPINCOMINGMESSAGE");
           if (String(parsed.message.headers.expect ?? "").toLowerCase() === "100-continue" && this.listenerCount("checkContinue") > 0) {
-            this.emit("checkContinue", parsed.message, response);
+            requestResource.runInAsyncScope(() => this.emit("checkContinue", parsed.message, response), this);
           } else {
-            this.emit("request", parsed.message, response);
+            requestResource.runInAsyncScope(() => this.emit("request", parsed.message, response), this);
           }
         }
       });

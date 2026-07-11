@@ -10,6 +10,7 @@ const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
 const binaryPath = join(rootDir, 'zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail');
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempRoot = mkdtempSync(join(os.tmpdir(), 'cottontail-upstream-tests-'));
+const disabledStatuses = new Set(['disabled', 'skip']);
 
 process.on('exit', () => {
   rmSync(tempRoot, { recursive: true, force: true });
@@ -80,20 +81,54 @@ function countFiles(dir) {
   return count;
 }
 
+function discoverRunnableFiles(snapshotRoot) {
+  const testRoot = join(snapshotRoot, 'test');
+  if (!existsSync(testRoot)) return [];
+  const result = [];
+  const stack = [testRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const name of readdirSync(current)) {
+      const path = join(current, name);
+      const stat = lstatSync(path);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        stack.push(path);
+      } else if (stat.isFile() && /\.(?:js|mjs|cjs)$/i.test(name)) {
+        result.push(path.slice(snapshotRoot.length + 1).replace(/\\/g, '/'));
+      }
+    }
+  }
+  result.sort();
+  return result;
+}
+
 function statusCounts(snapshotRoot, status) {
   const tests = Object.values(status.tests ?? {});
+  const discovered = status.defaultStatus === 'enabled' ? discoverRunnableFiles(snapshotRoot) : [];
+  const disabled = tests.filter((item) => disabledStatuses.has(item.status)).length;
+  const explicitEnabled = tests.filter((item) => item.status === 'enabled').length;
   const counts = {
     copiedFiles: existsSync(snapshotRoot) ? countFiles(snapshotRoot) : 0,
-    enabled: tests.filter((item) => item.status === 'enabled').length,
+    enabled: status.defaultStatus === 'enabled'
+      ? Math.max(0, discovered.length - disabled)
+      : explicitEnabled,
     expectedFailure: tests.filter((item) => item.status === 'expected-failure').length,
-    skipped: tests.filter((item) => item.status === 'skip').length,
+    disabled,
   };
   return counts;
 }
 
-function selectedTests(status, options) {
+function selectedTests(status, options, snapshotRoot) {
   if (options.test) {
     return [{ path: options.test, status: 'enabled', reason: 'selected from CLI' }];
+  }
+  if (status.defaultStatus === 'enabled') {
+    return discoverRunnableFiles(snapshotRoot)
+      .map((path) => ({ path, status: status.tests?.[path]?.status ?? 'enabled', ...(status.tests?.[path] ?? {}) }))
+      .filter((entry) =>
+        entry.status === 'enabled' ||
+        (options.includeExpectedFailures && entry.status === 'expected-failure')
+      );
   }
   return Object.entries(status.tests ?? {})
     .map(([path, entry]) => ({ path, ...entry }))
@@ -119,10 +154,23 @@ function nodeTestSelector(entryPath) {
   return selector;
 }
 
-function runNodeHarness(target, entry, snapshotRoot) {
+function nodeSkipSelectors(status) {
+  return Object.entries(status.tests ?? {})
+    .filter(([, entry]) => disabledStatuses.has(entry.status))
+    .map(([path]) => nodeTestSelector(path));
+}
+
+function runNodeHarness(target, entries, snapshotRoot, status, options) {
+  const selectors = options.test || status.defaultStatus !== 'enabled'
+    ? entries.map((entry) => nodeTestSelector(entry.path))
+    : [];
+  const skipSelectors = options.test ? [] : nodeSkipSelectors(status);
+  const args = ['tools/test.py', '--shell', binaryPath, '-j4'];
+  if (skipSelectors.length > 0) args.push('--skip-tests', skipSelectors.join(','));
+  args.push(...selectors);
   const result = spawnSync(
     pythonPath,
-    ['tools/test.py', '--shell', binaryPath, '-j1', nodeTestSelector(entry.path)],
+    args,
     {
       cwd: snapshotRoot,
       env: makeEnv('node', target),
@@ -145,6 +193,31 @@ function formatSpawnError(runtime, entry, result) {
   return `${runtime} ${entry.path} failed to start: ${result.error.message}`;
 }
 
+function runNode(runtime, target, status, entries, snapshotRoot, options) {
+  const result = runNodeHarness(target, entries, snapshotRoot, status, options);
+  const spawnError = formatSpawnError(runtime, { path: 'tools/test.py' }, result);
+  if (spawnError) {
+    return [{ runtime, ok: false, unexpected: true, message: spawnError }];
+  }
+
+  const exitCode = result.status ?? 1;
+  const shouldFail = entries.length > 0 && entries.every((entry) => entry.status === 'expected-failure');
+  const ok = shouldFail ? exitCode !== 0 : exitCode === 0;
+  const label = options.test
+    ? entries[0]?.path ?? 'selected tests'
+    : status.defaultStatus === 'enabled'
+      ? 'all enabled harness tests'
+      : `${entries.length} enabled harness test(s)`;
+  const message = ok
+    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${label}`
+    : [
+        `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${label} exited ${exitCode}`,
+        result.stdout ? `stdout:\n${result.stdout}` : '',
+        result.stderr ? `stderr:\n${result.stderr}` : '',
+      ].filter(Boolean).join('\n');
+  return [{ runtime, ok, unexpected: !ok, message }];
+}
+
 function runOne(runtime, target, entry) {
   const snapshotRoot = resolve(rootDir, target.snapshot);
   const scriptPath = join(snapshotRoot, entry.path);
@@ -155,9 +228,7 @@ function runOne(runtime, target, entry) {
   if (!stat.isFile()) {
     return { runtime, entry, ok: false, unexpected: true, message: `not a file: ${entry.path}` };
   }
-  const result = runtime === 'node'
-    ? runNodeHarness(target, entry, snapshotRoot)
-    : runDirect(runtime, target, entry, snapshotRoot);
+  const result = runDirect(runtime, target, entry, snapshotRoot);
   const spawnError = formatSpawnError(runtime, entry, result);
   if (spawnError) {
     return { runtime, entry, ok: false, unexpected: true, message: spawnError };
@@ -196,11 +267,14 @@ for (const name of runtimeTargets(runtime, targets)) {
   console.log(`  copied files: ${counts.copiedFiles}`);
   console.log(`  enabled: ${counts.enabled}`);
   console.log(`  expected-failure: ${counts.expectedFailure}`);
-  console.log(`  skipped: ${counts.skipped}`);
+  console.log(`  disabled: ${counts.disabled}`);
   if (options.list) continue;
 
-  for (const entry of selectedTests(status, options)) {
-    const result = runOne(name, target, entry);
+  const entries = selectedTests(status, options, snapshotRoot);
+  const results = name === 'node'
+    ? runNode(name, target, status, entries, snapshotRoot, options)
+    : entries.map((entry) => runOne(name, target, entry));
+  for (const result of results) {
     console.log(result.message);
     if (result.unexpected) unexpected += 1;
   }

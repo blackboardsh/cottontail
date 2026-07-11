@@ -102,11 +102,13 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
 
-        if (c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, script_path.ptr, &eval_error) != 0) {
+        const eval_status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, script_path.ptr, &eval_error);
+        if (eval_status != 0) {
             defer if (eval_error != null) {
                 c.ct_jsc_string_free(eval_error);
             };
 
+            if (eval_status == -13) return 13;
             if (eval_error != null) {
                 self.writeStderrLine(std.mem.span(eval_error));
             } else {
@@ -116,6 +118,64 @@ pub const Runtime = struct {
             return 1;
         }
 
+        return self.emitProcessShutdown();
+    }
+
+    fn emitProcessShutdown(self: *Runtime) u8 {
+        const shutdown_source =
+            \\(() => {
+            \\  const hiddenGlobals = [
+            \\    "SharedArrayBuffer", "cottontail", "__ctUnhandledRejection", "__cottontailMarkSharedArrayBuffer",
+            \\    "__ctDone", "__ctError", "__ctTopLevelPromise", "__cottontailSuppressAsyncHookPromise",
+            \\    "process", "URLSearchParams", "URL", "TextEncoder", "TextDecoder",
+            \\    "__cottontailObjectURLRegistry", "__cottontailObjectURLNextId", "Buffer", "Bun",
+            \\    "__cottontailTimersInstalled", "requestAnimationFrame", "cancelAnimationFrame",
+            \\    "__cottontailRegisterSpawnListener", "__cottontailHasActiveHandles", "__cottontailRunLoopTick",
+            \\    "Worker", "__cottontailProxyRegistry", "__cottontailBunModuleMocks", "DOMException", "Event",
+            \\    "EventTarget", "AbortSignal", "AbortController", "Headers", "Request", "Response",
+            \\    "__cottontailFileWatchers", "__cottontailDiagnosticsChannels", "__cottontailImportModule",
+            \\    "__cottontailBuiltinModules", "Blob", "File", "crypto", "fetch", "structuredClone", "atob", "btoa",
+            \\    "performance", "self", "global", "MessagePort", "MessageChannel", "__cottontailFdWatchListeners",
+            \\    "__cottontailFdWatchHandlerInstalled", "__cottontailTlsListeners", "__cottontailWorkerData",
+            \\    "__cottontailEnvironmentData", "__cottontailWorkerResourceLimits", "__cottontailWorkerThreadName",
+            \\    "__cottontailEncodeWorkerMessage", "__cottontailDecodeWorkerMessage", "parentPort", "workerData"
+            \\  ];
+            \\  const descriptorFields = ["value", "writable", "get", "set", "enumerable", "configurable"];
+            \\  for (let index = 0; index < hiddenGlobals.length; index += 1) {
+            \\    const name = hiddenGlobals[index];
+            \\    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+            \\    if (!descriptor || descriptor.enumerable !== true) continue;
+            \\    const clean = Object.create(null);
+            \\    for (let fieldIndex = 0; fieldIndex < descriptorFields.length; fieldIndex += 1) {
+            \\      const field = descriptorFields[fieldIndex];
+            \\      if (Object.prototype.hasOwnProperty.call(descriptor, field)) clean[field] = descriptor[field];
+            \\    }
+            \\    clean.enumerable = false;
+            \\    try { Object.defineProperty(globalThis, name, clean); } catch {}
+            \\  }
+            \\  const process = globalThis.process;
+            \\  if (!process || typeof process.emit !== "function" || process.__cottontailShutdownEmitted) return;
+            \\  const code = Number(process.exitCode ?? 0) || 0;
+            \\  process.emit("beforeExit", code);
+            \\  process._exiting = true;
+            \\  process.__cottontailShutdownEmitted = true;
+            \\  process.emit("exit", code);
+            \\})();
+        ;
+        var eval_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_eval(self.handle, shutdown_source.ptr, shutdown_source.len, "cottontail:shutdown", &eval_error) != 0) {
+            defer if (eval_error != null) {
+                c.ct_jsc_string_free(eval_error);
+            };
+
+            if (eval_error != null) {
+                self.writeStderrLine(std.mem.span(eval_error));
+            } else {
+                self.writeStderrLine("Unknown JavaScript exception during process shutdown");
+            }
+
+            return 1;
+        }
         return 0;
     }
 

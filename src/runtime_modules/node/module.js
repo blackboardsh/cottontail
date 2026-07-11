@@ -22,6 +22,11 @@ import * as https from "./https.js";
 import * as http2 from "./http2.js";
 import * as inspector from "./inspector.js";
 import * as inspectorPromises from "./inspector/promises.js";
+import * as internalAssertMyersDiff from "./internal/assert/myers_diff.js";
+import * as internalAsyncHooks from "./internal/async_hooks.js";
+import * as internalEventTarget from "./internal/event_target.js";
+import * as internalTestBinding from "./internal/test/binding.js";
+import * as net from "./net.js";
 import * as os from "./os.js";
 import * as path from "./path.js";
 import * as pathPosix from "./path/posix.js";
@@ -80,6 +85,7 @@ export const builtinModules = [
   "inspector",
   "inspector/promises",
   "module",
+  "net",
   "node:sea",
   "node:sqlite",
   "node:test",
@@ -579,9 +585,13 @@ function loadCommonJsModule(resolved) {
 }
 
 export function createRequire(basePath = cottontail.cwd()) {
-  const normalizedBasePath = String(basePath).startsWith("file://")
+  let normalizedBasePath = String(basePath).startsWith("file://")
     ? fileURLToPath(basePath)
     : String(basePath);
+  const callerPath = bundledCallerPathFromStack();
+  if (callerPath && callerPath !== normalizedBasePath && isBundledImportMetaBase(normalizedBasePath)) {
+    normalizedBasePath = callerPath;
+  }
   const require = (request) => {
     const directMock = bunModuleMockFor(request);
     if (directMock.found) return directMock.value;
@@ -594,6 +604,33 @@ export function createRequire(basePath = cottontail.cwd()) {
   require.cache = commonJsCache;
   require.main = null;
   return require;
+}
+
+function isBundledImportMetaBase(path) {
+  const mainPath = globalThis.process?.argv?.[1] ?? processModule.argv?.[1];
+  if (typeof mainPath !== "string" || mainPath.length === 0) return false;
+  const resolvedMainPath = mainPath.startsWith("/") ? mainPath : resolve(cottontail.cwd(), mainPath);
+  return path === resolvedMainPath;
+}
+
+function bundledCallerPathFromStack() {
+  const stack = String(new Error().stack || "");
+  for (const line of stack.split("\n").slice(2)) {
+    const atIndex = line.indexOf("@");
+    if (atIndex <= 0) continue;
+    let frame = line.slice(0, atIndex).trim();
+    if (!/\.(?:cjs|mjs|js)$/.test(frame)) continue;
+    if (frame.startsWith("file://")) {
+      try {
+        frame = fileURLToPath(frame);
+      } catch {
+        continue;
+      }
+    }
+    const candidate = frame.startsWith("/") ? frame : resolve(cottontail.cwd(), frame);
+    if (isFile(candidate)) return candidate;
+  }
+  return null;
 }
 
 export function __runMain(filename) {
@@ -1420,8 +1457,14 @@ __setBuiltinModules({
   "node:inspector": inspector,
   "inspector/promises": inspectorPromises,
   "node:inspector/promises": inspectorPromises,
+  "internal/assert/myers_diff": internalAssertMyersDiff,
+  "internal/async_hooks": internalAsyncHooks,
+  "internal/event_target": internalEventTarget,
+  "internal/test/binding": internalTestBinding,
   module: moduleBuiltin,
   "node:module": moduleBuiltin,
+  net,
+  "node:net": net,
   "node:sea": sea,
   "node:sqlite": sqlite,
   "node:test": nodeTestBuiltin,

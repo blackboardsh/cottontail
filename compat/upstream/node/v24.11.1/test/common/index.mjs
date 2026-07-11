@@ -1,7 +1,16 @@
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
-const common = require('./index.js');
+let common;
+try {
+  common = require('./index.js');
+} catch (error) {
+  if (globalThis.process?.env?.COTTONTAIL_UPSTREAM_RUNTIME) {
+    common = createRequire(`${process.cwd()}/test/common/index.mjs`)('./index.js');
+  } else {
+    throw error;
+  }
+}
 
 const {
   allowGlobals,

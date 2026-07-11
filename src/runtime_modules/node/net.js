@@ -451,8 +451,14 @@ export class Server extends EventEmitter {
 
   address() { return this._address; }
   getConnections(callback) { callback(null, this.connections); }
-  ref() { return this; }
-  unref() { return this; }
+  ref() {
+    this._acceptTimer?.ref?.();
+    return this;
+  }
+  unref() {
+    this._acceptTimer?.unref?.();
+    return this;
+  }
 }
 
 export class TCP {
@@ -524,9 +530,17 @@ export class TCP {
     if (typeof callback === "function") queueMicrotask(callback);
   }
 
-  ref() { return this; }
-  unref() { return this; }
-  hasRef() { return true; }
+  ref() {
+    this._acceptTimer?.ref?.();
+    return this;
+  }
+  unref() {
+    this._acceptTimer?.unref?.();
+    return this;
+  }
+  hasRef() {
+    return this._acceptTimer?.hasRef?.() ?? true;
+  }
 
   getsockname(out = {}) {
     const address = this._address ?? (this.fd == null ? null : cottontail.tcpSocketAddress?.(this.fd, false));

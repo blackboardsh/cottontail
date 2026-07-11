@@ -320,6 +320,8 @@ const knownGlobals = new Set([
 ]);
 
 ['gc',
+ // COTTONTAIL-COMPAT: JavaScriptCore exposes SharedArrayBuffer as an enumerable, non-configurable global.
+ 'SharedArrayBuffer',
  // The following are assumed to be conditionally available in the
  // global object currently. They can likely be added to the fixed
  // set of known globals, however.

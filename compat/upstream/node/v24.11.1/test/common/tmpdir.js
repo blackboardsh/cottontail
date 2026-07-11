@@ -32,8 +32,10 @@ function rmSync(pathname, useSpawn) {
   }
 }
 
+const commonDir = typeof __dirname === 'string' ?
+  __dirname : path.join(process.cwd(), 'test', 'common');
 const testRoot = process.env.NODE_TEST_DIR ?
-  fs.realpathSync(process.env.NODE_TEST_DIR) : path.resolve(__dirname, '..');
+  fs.realpathSync(process.env.NODE_TEST_DIR) : path.resolve(commonDir, '..');
 
 // Using a `.` prefixed name, which is the convention for "hidden" on POSIX,
 // gets tools to ignore it by default or by simple rules, especially eslint.

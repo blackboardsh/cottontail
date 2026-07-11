@@ -269,6 +269,7 @@ typedef struct CtWorkerMessage {
 
 typedef struct CtWorkerEvent {
     uint32_t worker_id;
+    char *type;
     struct CtWorkerEvent *next;
 } CtWorkerEvent;
 
@@ -9691,11 +9692,12 @@ static void ct_queue_fd_event(CtJscRuntime *runtime, CtFdEvent *event) {
     pthread_mutex_unlock(&runtime->fd_event_mutex);
 }
 
-static void ct_queue_worker_event(CtJscRuntime *runtime, uint32_t worker_id) {
+static void ct_queue_worker_event(CtJscRuntime *runtime, uint32_t worker_id, const char *type) {
     if (runtime == NULL) return;
     CtWorkerEvent *event = (CtWorkerEvent *)calloc(1, sizeof(CtWorkerEvent));
     if (event == NULL) return;
     event->worker_id = worker_id;
+    event->type = ct_duplicate_string(type != NULL ? type : "message");
     pthread_mutex_lock(&runtime->worker_event_mutex);
     if (runtime->worker_events_tail != NULL) {
         runtime->worker_events_tail->next = event;
@@ -10517,6 +10519,16 @@ static JSValueRef ct_undefined(JSContextRef ctx, JSObjectRef function, JSObjectR
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    JSGarbageCollect(ctx);
+    return JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
     if (runtime->spawn_event_handler == NULL) return JSValueMakeUndefined(ctx);
     for (;;) {
@@ -10603,8 +10615,10 @@ static JSValueRef ct_dispatch_worker_events(JSContextRef ctx, CtJscRuntime *runt
 
         JSObjectRef item = ct_make_object(ctx);
         ct_set_property(ctx, item, "id", JSValueMakeNumber(ctx, event->worker_id), exception);
+        ct_set_property(ctx, item, "type", ct_make_string(ctx, event->type != NULL ? event->type : "message"), exception);
         JSValueRef arg = item;
         JSObjectCallAsFunction(ctx, runtime->worker_event_handler, NULL, 1, &arg, exception);
+        free(event->type);
         free(event);
         if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
     }
@@ -10819,7 +10833,7 @@ static JSValueRef ct_worker_post_message(JSContextRef ctx, JSObjectRef function,
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
-    ct_queue_worker_event(parent_runtime, worker_id);
+    ct_queue_worker_event(parent_runtime, worker_id, "message");
     return JSValueMakeBoolean(ctx, true);
 }
 
@@ -11037,6 +11051,7 @@ static void *ct_worker_entry(void *opaque) {
     pthread_mutex_lock(&start->worker->mutex);
     start->worker->terminated = true;
     pthread_mutex_unlock(&start->worker->mutex);
+    ct_queue_worker_event(start->worker->parent_runtime, start->worker->id, "exit");
     free(start->script_path);
     free(start);
     return NULL;
@@ -12159,9 +12174,15 @@ static JSValueRef ct_strip_typescript_types_native(JSContextRef ctx, JSObjectRef
 }
 
 static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
     (void)thisObject;
     (void)exception;
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
+    if (runtime != NULL && runtime->worker != NULL) {
+        pthread_mutex_lock(&runtime->worker->mutex);
+        runtime->worker->terminated = true;
+        pthread_mutex_unlock(&runtime->worker->mutex);
+        return JSValueMakeUndefined(ctx);
+    }
     int code = argc >= 1 ? (int)ct_value_to_number(ctx, argv[0]) : 0;
     exit(code);
 }
@@ -12189,6 +12210,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "nanotime", ct_nanotime, runtime);
     ct_install_function(ctx, host, "sleep", ct_sleep, runtime);
     ct_install_function(ctx, host, "drainJobs", ct_drain_jobs, runtime);
+    ct_install_function(ctx, host, "gc", ct_gc, runtime);
     ct_install_function(ctx, host, "importModule", ct_import_module, runtime);
     ct_install_function(ctx, host, "cwd", ct_cwd, runtime);
     ct_install_function(ctx, host, "readFile", ct_read_file, runtime);
@@ -12387,7 +12409,26 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "}"
         "if (typeof Promise === 'function' && !Promise.__cottontailPatchedReject) {"
         "  const reject = Promise.reject.bind(Promise);"
-        "  Promise.reject = function(reason){ globalThis.__ctUnhandledRejection = reason; return reject(reason); };"
+        "  const then = Promise.prototype.then;"
+        "  const catchPromise = Promise.prototype.catch;"
+        "  const pending = [];"
+        "  const markHandled = function(promise){"
+        "    for (let index = 0; index < pending.length; index++) {"
+        "      const entry = pending[index];"
+        "      if (entry.promise !== promise) continue;"
+        "      entry.handled = true;"
+        "      if (globalThis.__ctUnhandledRejection === entry.reason) globalThis.__ctUnhandledRejection = undefined;"
+        "    }"
+        "  };"
+        "  Promise.reject = function(reason){"
+        "    const promise = reject(reason);"
+        "    const entry = { promise, reason, handled: false };"
+        "    pending.push(entry);"
+        "    queueMicrotask(function(){ if (!entry.handled) globalThis.__ctUnhandledRejection = reason; });"
+        "    return promise;"
+        "  };"
+        "  Promise.prototype.then = function(onFulfilled, onRejected){ markHandled(this); return then.call(this, onFulfilled, onRejected); };"
+        "  Promise.prototype.catch = function(onRejected){ markHandled(this); return catchPromise.call(this, onRejected); };"
         "  Promise.__cottontailPatchedReject = true;"
         "}"
         "if (typeof globalThis.SharedArrayBuffer !== 'function' && globalThis.cottontail?.sharedArrayBufferCreate) {"
@@ -12508,6 +12549,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     while (runtime->worker_events_head != NULL) {
         CtWorkerEvent *event = runtime->worker_events_head;
         runtime->worker_events_head = event->next;
+        free(event->type);
         free(event);
     }
     while (runtime->callback_jobs_head != NULL) {
@@ -12965,9 +13007,11 @@ static char *ct_prepare_wrapped_source(const uint8_t *source, size_t source_len,
         source_len,
         filename,
         "globalThis.__ctDone=false;globalThis.__ctError=undefined;"
-        "Promise.resolve((async()=>{\n",
-        "\n})()).then(()=>{globalThis.__ctDone=true;},"
-        "e=>{globalThis.__ctError=e;globalThis.__ctDone=true;});"
+        "(()=>{const __ctTopLevelPromise=(async()=>{\n",
+        "\n})();try{globalThis.__cottontailSuppressAsyncHookPromise=true;"
+        "__ctTopLevelPromise.then(()=>{globalThis.__ctDone=true;},"
+        "e=>{globalThis.__ctError=e;globalThis.__ctDone=true;});}"
+        "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();"
     );
 }
 
@@ -13074,10 +13118,24 @@ static int ct_jsc_runtime_eval_internal(
 
     for (int index = 0; index < 30000 && !ct_global_bool(ctx, "__ctDone"); index += 1) {
         if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
+        if (wait_for_active_handles && !ct_global_bool(ctx, "__ctDone")) {
+            bool has_active_handles = false;
+            if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
+            if (!has_active_handles) return -13;
+        }
         usleep(1000);
     }
-
+    if (!ct_global_bool(ctx, "__ctDone")) return -13;
     JSValueRef error_value = ct_global_value(ctx, "__ctError");
+    if (error_value != NULL && !JSValueIsUndefined(ctx, error_value) && !JSValueIsNull(ctx, error_value)) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, error_value));
+        return -1;
+    }
+    for (int index = 0; index < 16; index += 1) {
+        if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
+    }
+
+    error_value = ct_global_value(ctx, "__ctError");
     if (error_value != NULL && !JSValueIsUndefined(ctx, error_value) && !JSValueIsNull(ctx, error_value)) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, error_value));
         return -1;
@@ -13099,6 +13157,11 @@ static int ct_jsc_runtime_eval_internal(
         usleep((useconds_t)delay_ms * 1000);
     }
 
+    error_value = ct_global_value(ctx, "__ctError");
+    if (error_value != NULL && !JSValueIsUndefined(ctx, error_value) && !JSValueIsNull(ctx, error_value)) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, error_value));
+        return -1;
+    }
     unhandled = ct_global_value(ctx, "__ctUnhandledRejection");
     if (unhandled != NULL && !JSValueIsUndefined(ctx, unhandled) && !JSValueIsNull(ctx, unhandled)) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, unhandled));

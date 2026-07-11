@@ -101,6 +101,27 @@ pub fn runEval(
     return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args);
 }
 
+pub fn runStdin(
+    init: std.process.Init,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+) !u8 {
+    const allocator = init.arena.allocator();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(allocator);
+
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const count = try std.posix.read(std.posix.STDIN_FILENO, &buffer);
+        if (count == 0) break;
+        if (source.items.len + count > 64 * 1024 * 1024) return error.StreamTooLong;
+        try source.appendSlice(allocator, buffer[0..count]);
+    }
+
+    const source_z = try allocator.dupeZ(u8, source.items);
+    return try runEval(init, source_z, script_args, exec_args, false);
+}
+
 fn makeContext(init: std.process.Init) !Context {
     const allocator = init.arena.allocator();
     const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
@@ -865,6 +886,8 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\const eventsBuiltin = events.default ?? events;
+        \\const assertBuiltin = assert.default ?? assert;
+        \\const assertStrictBuiltin = assertStrict.default ?? assertStrict;
         \\const nodeTestBuiltin = nodeTest.default ?? nodeTest;
         \\const streamBuiltin = stream.default ?? stream;
         \\moduleModule.__setBuiltinModules({{
@@ -879,8 +902,8 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  "util/types": utilTypes, "node:util/types": utilTypes,
         \\  events: eventsBuiltin, "node:events": eventsBuiltin,
         \\  async_hooks: asyncHooks, "node:async_hooks": asyncHooks,
-        \\  assert, "node:assert": assert,
-        \\  "assert/strict": assertStrict, "node:assert/strict": assertStrict,
+        \\  assert: assertBuiltin, "node:assert": assertBuiltin,
+        \\  "assert/strict": assertStrictBuiltin, "node:assert/strict": assertStrictBuiltin,
         \\  console: consoleModule, "node:console": consoleModule,
         \\  diagnostics_channel: diagnosticsChannel, "node:diagnostics_channel": diagnosticsChannel,
         \\  domain, "node:domain": domain,

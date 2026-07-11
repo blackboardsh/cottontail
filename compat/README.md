@@ -40,6 +40,11 @@ Each snapshot has:
 - `status.json` for Cottontail's current enabled/skipped/expected-failure state
 - the copied upstream test files and upstream license notice
 
+`status.json` may set `defaultStatus` to `enabled` to run the copied corpus by
+default, then use per-test `disabled` or `skip` entries to quarantine failures
+as they are discovered. Explicit `--test <relative-path>` runs the selected
+test even if it is currently disabled, which keeps reproduction easy.
+
 List imported upstream test status:
 
 ```sh
@@ -53,9 +58,9 @@ bun run compat:upstream
 ```
 
 Enabled Node tests run through Node's copied `tools/test.py` harness with
-Cottontail passed as `--shell`, so Node metadata, flags, reporters, and harness
-setup stay in the path. Enabled Bun tests currently run directly against the
-copied test file path.
+Cottontail passed as `--shell`, so Node metadata, flags, reporters, skip lists,
+and harness setup stay in the path. Enabled Bun tests currently run directly
+against the copied test file path.
 
 Run enabled tests plus expected failures, requiring the expected failures to
 still fail:

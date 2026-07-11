@@ -4,6 +4,7 @@ const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
 const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const nativeClearInterval = globalThis.clearInterval.bind(globalThis);
+const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
 
 export function setTimeout(callback, delay = 0, ...args) {
   if (typeof callback !== "function") throw new TypeError("callback must be a function");
@@ -63,6 +64,15 @@ export const promises = {
     },
   },
 };
+
+Object.defineProperty(setTimeout, promisifyCustom, {
+  value: promises.setTimeout,
+  configurable: true,
+});
+Object.defineProperty(setImmediate, promisifyCustom, {
+  value: promises.setImmediate,
+  configurable: true,
+});
 
 export default {
   clearImmediate,

@@ -130,6 +130,9 @@ export function listenerCount(emitter, eventName) {
 
 export function getEventListeners(emitter, eventName) {
   if (typeof emitter?.listeners === "function") return emitter.listeners(eventName);
+  const eventTargetListeners = emitter?.__ctEventListeners?.get?.(String(eventName));
+  if (eventTargetListeners) return eventTargetListeners.map((entry) => entry.listener ?? entry);
+  if (eventName === "abort" && emitter?._listeners instanceof Set) return [...emitter._listeners];
   return [];
 }
 
@@ -162,6 +165,7 @@ export function once(emitter, name, options = undefined) {
     const cleanup = () => {
       emitter.off?.(name, onEvent);
       emitter.off?.("error", onError);
+      emitter.removeEventListener?.(name, onEvent);
       options?.signal?.removeEventListener?.("abort", onAbort);
     };
     const onEvent = (...args) => {
@@ -176,7 +180,11 @@ export function once(emitter, name, options = undefined) {
       cleanup();
       reject(options.signal.reason ?? new Error("AbortError"));
     };
-    emitter.once?.(name, onEvent);
+    if (typeof emitter.once === "function") {
+      emitter.once(name, onEvent);
+    } else if (typeof emitter.addEventListener === "function") {
+      emitter.addEventListener(name, onEvent, { once: true });
+    }
     if (name !== "error") emitter.once?.("error", onError);
     options?.signal?.addEventListener?.("abort", onAbort, { once: true });
   });
@@ -215,3 +223,23 @@ export function on(emitter, name, options = undefined) {
 export function init() {
   return undefined;
 }
+
+Object.assign(EventEmitter, {
+  EventEmitter,
+  EventEmitterAsyncResource,
+  addAbortListener,
+  captureRejectionSymbol,
+  captureRejections,
+  defaultMaxListeners,
+  errorMonitor,
+  getEventListeners,
+  getMaxListeners,
+  init,
+  kMaxEventTargetListeners,
+  kMaxEventTargetListenersWarned,
+  listenerCount,
+  on,
+  once,
+  setMaxListeners,
+  usingDomains,
+});

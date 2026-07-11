@@ -3,6 +3,11 @@ import { EventEmitter } from "./events.js";
 let defaultReadableHighWaterMark = 16 * 1024;
 let defaultObjectHighWaterMark = 16;
 
+function normalizeEncoding(encoding = "utf8") {
+  const value = String(encoding || "utf8").toLowerCase();
+  return value === "utf8" ? "utf-8" : value;
+}
+
 export class Stream extends EventEmitter {
   pipe(destination, options = {}) {
     this.on("data", (chunk) => destination.write?.(chunk));
@@ -29,6 +34,14 @@ export class Readable extends Stream {
     this.readableEnded = false;
     this._read = typeof options.read === "function" ? options.read : () => {};
     this._queue = [];
+    this._encoding = null;
+  }
+
+  _decodeChunk(chunk) {
+    if (this._encoding == null || typeof chunk === "string") return chunk;
+    if (chunk instanceof ArrayBuffer) return new TextDecoder(this._encoding).decode(new Uint8Array(chunk));
+    if (ArrayBuffer.isView(chunk)) return new TextDecoder(this._encoding).decode(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    return chunk;
   }
 
   push(chunk) {
@@ -37,8 +50,9 @@ export class Readable extends Stream {
       this.emit("end");
       return false;
     }
-    this._queue.push(chunk);
-    this.emit("data", chunk);
+    const value = this._decodeChunk(chunk);
+    this._queue.push(value);
+    this.emit("data", value);
     this.emit("readable");
     return true;
   }
@@ -49,6 +63,12 @@ export class Readable extends Stream {
 
   resume() { return this; }
   pause() { return this; }
+
+  setEncoding(encoding = "utf8") {
+    this._encoding = normalizeEncoding(encoding);
+    this._queue = this._queue.map((chunk) => this._decodeChunk(chunk));
+    return this;
+  }
 
   async *[Symbol.asyncIterator]() {
     while (!this.readableEnded || this._queue.length > 0) {

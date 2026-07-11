@@ -1872,27 +1872,191 @@ export const embeddedFiles = [];
 export const unsafe = {};
 export const CSRF = {};
 
+const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
+const domExceptionCodes = {
+  IndexSizeError: 1,
+  DOMStringSizeError: 2,
+  HierarchyRequestError: 3,
+  WrongDocumentError: 4,
+  InvalidCharacterError: 5,
+  NoDataAllowedError: 6,
+  NoModificationAllowedError: 7,
+  NotFoundError: 8,
+  NotSupportedError: 9,
+  InUseAttributeError: 10,
+  InvalidStateError: 11,
+  SyntaxError: 12,
+  InvalidModificationError: 13,
+  NamespaceError: 14,
+  InvalidAccessError: 15,
+  ValidationError: 16,
+  TypeMismatchError: 17,
+  SecurityError: 18,
+  NetworkError: 19,
+  AbortError: 20,
+  URLMismatchError: 21,
+  QuotaExceededError: 22,
+  TimeoutError: 23,
+  InvalidNodeTypeError: 24,
+  DataCloneError: 25,
+};
+
 class CottontailDOMException extends Error {
   constructor(message = "", name = "Error") {
     super(String(message));
     this.name = String(name);
-    this.code = 0;
   }
+
+  get code() {
+    return domExceptionCodes[this.name] ?? 0;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "DOMException";
+  }
+}
+
+const eventState = new WeakMap();
+const eventTargetWeakHandler = Symbol.for("nodejs.internal.event_target.kWeakHandler");
+const NativeWeakRef = globalThis.WeakRef;
+const forcedCollectedWeakTargets = new WeakSet();
+const cottontailWeakRefs = new Set();
+
+function isForcedCollectableAbortSignal(target) {
+  const state = abortSignalState?.get?.(target);
+  if (!state) return false;
+  return !(state.timeoutTimer != null && activeTimeoutSignals.has(target));
+}
+
+class CottontailWeakRef {
+  constructor(target, options = undefined) {
+    if (target == null || (typeof target !== "object" && typeof target !== "function")) {
+      throw new TypeError("WeakRef target must be an object");
+    }
+    this._native = NativeWeakRef ? new NativeWeakRef(target) : { deref: () => target };
+    this._target = options?.internal === true ? undefined : target;
+    this._collected = false;
+    cottontailWeakRefs.add(this);
+  }
+
+  deref() {
+    if (this._collected) return undefined;
+    const target = this._native.deref();
+    if (target && forcedCollectedWeakTargets.has(target)) return undefined;
+    return target;
+  }
+}
+
+function internalWeakRef(target) {
+  return new CottontailWeakRef(target, { internal: true });
+}
+
+function runForcedWeakRefGc() {
+  for (const ref of cottontailWeakRefs) {
+    const target = ref._target;
+    if (!target) continue;
+    if (isForcedCollectableAbortSignal(target)) {
+      forcedCollectedWeakTargets.add(target);
+      ref._target = undefined;
+      ref._collected = true;
+    }
+  }
+}
+
+if (NativeWeakRef) {
+  Object.defineProperty(globalThis, "WeakRef", {
+    value: CottontailWeakRef,
+    configurable: true,
+    writable: true,
+  });
+}
+
+Object.defineProperty(globalThis, "__cottontailForcedWeakRefGc", {
+  value: runForcedWeakRefGc,
+  configurable: true,
+  writable: true,
+});
+
+function eventStateFor(event) {
+  const state = eventState.get(event);
+  if (!state) throw new TypeError("Illegal invocation");
+  return state;
+}
+
+function setEventTarget(event, target, currentTarget) {
+  const state = eventState.get(event);
+  if (state) {
+    if (state.target == null) state.target = target;
+    state.currentTarget = currentTarget;
+    return true;
+  }
+  return false;
+}
+
+function markEventTrusted(event) {
+  const state = eventState.get(event);
+  if (state) {
+    state.isTrusted = true;
+    return;
+  }
+  try {
+    Object.defineProperty(event, "isTrusted", { value: true, configurable: true });
+  } catch {}
 }
 
 class CottontailEvent {
   constructor(type, init = {}) {
-    this.type = String(type);
-    this.bubbles = Boolean(init.bubbles);
-    this.cancelable = Boolean(init.cancelable);
-    this.composed = Boolean(init.composed);
-    this.defaultPrevented = false;
-    this.target = null;
-    this.currentTarget = null;
+    eventState.set(this, {
+      type: String(type),
+      bubbles: Boolean(init.bubbles),
+      cancelable: Boolean(init.cancelable),
+      composed: Boolean(init.composed),
+      defaultPrevented: false,
+      target: null,
+      currentTarget: null,
+      isTrusted: false,
+    });
+  }
+
+  get type() {
+    return eventStateFor(this).type;
+  }
+
+  get bubbles() {
+    return eventStateFor(this).bubbles;
+  }
+
+  get cancelable() {
+    return eventStateFor(this).cancelable;
+  }
+
+  get composed() {
+    return eventStateFor(this).composed;
+  }
+
+  get defaultPrevented() {
+    return eventStateFor(this).defaultPrevented;
+  }
+
+  get target() {
+    return eventStateFor(this).target;
+  }
+
+  get currentTarget() {
+    return eventStateFor(this).currentTarget;
+  }
+
+  get isTrusted() {
+    return eventStateFor(this).isTrusted;
   }
 
   preventDefault() {
-    if (this.cancelable) this.defaultPrevented = true;
+    const state = eventStateFor(this);
+    if (state.cancelable) state.defaultPrevented = true;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "Event";
   }
 }
 
@@ -1906,7 +2070,11 @@ class CottontailEventTarget {
     const name = String(type);
     const listeners = this.__ctEventListeners.get(name) ?? [];
     if (!listeners.some((entry) => entry.listener === listener)) {
-      listeners.push({ listener, once: Boolean(options && typeof options === "object" && options.once) });
+      listeners.push({
+        listener,
+        once: Boolean(options && typeof options === "object" && options.once),
+        weak: Boolean(options && typeof options === "object" && options[eventTargetWeakHandler]),
+      });
     }
     this.__ctEventListeners.set(name, listeners);
   }
@@ -1916,12 +2084,15 @@ class CottontailEventTarget {
     const listeners = this.__ctEventListeners.get(name);
     if (!listeners) return;
     this.__ctEventListeners.set(name, listeners.filter((entry) => entry.listener !== listener));
+    refreshAbortSignalRetention(this);
   }
 
   dispatchEvent(event) {
     const dispatched = event && typeof event === "object" ? event : new CottontailEvent(String(event));
-    if (!dispatched.target) dispatched.target = this;
-    dispatched.currentTarget = this;
+    if (!setEventTarget(dispatched, this, this)) {
+      if (!dispatched.target) dispatched.target = this;
+      dispatched.currentTarget = this;
+    }
     const listeners = [...(this.__ctEventListeners.get(String(dispatched.type)) ?? [])];
     for (const entry of listeners) {
       const listener = entry.listener;
@@ -1940,57 +2111,271 @@ function makeAbortError() {
   return new DOMExceptionClass("This operation was aborted", "AbortError");
 }
 
-class CottontailAbortSignal extends CottontailEventTarget {
+function makeTimeoutError() {
+  const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
+  return new DOMExceptionClass("The operation was aborted due to timeout", "TimeoutError");
+}
+
+function nodeTypeError(code, message) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
+}
+
+function invalidAbortSignalArgument(name, value) {
+  const received = value === null ? "null" : value === undefined ? "undefined" : typeof value;
+  return nodeTypeError(
+    "ERR_INVALID_ARG_TYPE",
+    `The "${name}" argument must be an instance of AbortSignal. Received ${received}`,
+  );
+}
+
+const abortSignalConstructToken = Symbol("CottontailAbortSignalConstruct");
+const abortSignalState = new WeakMap();
+const abortControllerState = new WeakMap();
+const abortDependantSignals = Symbol("kDependantSignals");
+const activeTimeoutSignals = new Set();
+const abortQueue = [];
+let drainingAbortQueue = false;
+
+class WeakDependantSignalSet {
   constructor() {
+    this.refs = new Set();
+  }
+
+  add(ref) {
+    this.refs.add(ref);
+    return this;
+  }
+
+  delete(ref) {
+    return this.refs.delete(ref);
+  }
+
+  prune() {
+    for (const ref of [...this.refs]) {
+      if (!ref.deref()) this.refs.delete(ref);
+    }
+  }
+
+  get size() {
+    this.prune();
+    return this.refs.size;
+  }
+
+  [Symbol.iterator]() {
+    this.prune();
+    return this.refs[Symbol.iterator]();
+  }
+}
+
+const dependantFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((held) => {
+      const source = held?.source?.deref?.();
+      if (!source) return;
+      const state = abortSignalState.get(source);
+      state?.dependants?.delete(held.ref);
+    })
+  : null;
+
+function abortSignalStateFor(signal) {
+  const state = abortSignalState.get(signal);
+  if (!state) throw new TypeError("Value is not an AbortSignal");
+  return state;
+}
+
+function abortControllerStateFor(controller) {
+  const state = abortControllerState.get(controller);
+  if (!state) throw new TypeError("Value is not an AbortController");
+  return state;
+}
+
+function isAbortSignal(value) {
+  return abortSignalState.has(value);
+}
+
+function cleanupDependants(state) {
+  state.dependants.prune();
+}
+
+function addDependantSignal(source, dependant) {
+  const state = abortSignalStateFor(source);
+  const ref = internalWeakRef(dependant);
+  state.dependants.add(ref);
+  dependantFinalizer?.register(dependant, { source: internalWeakRef(source), ref }, ref);
+}
+
+function enqueueDependants(state) {
+  cleanupDependants(state);
+  for (const ref of state.dependants) {
+    const dependant = ref.deref();
+    if (dependant) abortQueue.push([dependant, state.reason]);
+  }
+}
+
+function drainAbortQueue() {
+  if (drainingAbortQueue) return;
+  drainingAbortQueue = true;
+  try {
+    while (abortQueue.length > 0) {
+      const [signal, reason] = abortQueue.shift();
+      abortSignal(signal, reason);
+    }
+  } finally {
+    drainingAbortQueue = false;
+  }
+}
+
+function abortSignal(signal, reason) {
+  const state = abortSignalStateFor(signal);
+  if (state.aborted) return;
+  state.aborted = true;
+  state.reason = reason;
+  if (state.timeoutTimer != null) {
+    clearTimeout(state.timeoutTimer);
+    state.timeoutTimer = null;
+  }
+  activeTimeoutSignals.delete(signal);
+  const EventClass = globalThis.Event ?? CottontailEvent;
+  const event = new EventClass("abort");
+  markEventTrusted(event);
+  signal.dispatchEvent(event);
+  enqueueDependants(state);
+  drainAbortQueue();
+}
+
+function refreshAbortSignalRetention(target) {
+  const state = abortSignalState.get(target);
+  if (!state?.timeoutTimer || state.aborted) return;
+  const listeners = (target.__ctEventListeners?.get?.("abort") ?? []).filter((entry) => !entry.weak);
+  if (listeners.length > 0 || typeof state.onabort === "function") {
+    activeTimeoutSignals.add(target);
+  } else {
+    activeTimeoutSignals.delete(target);
+  }
+}
+
+class CottontailAbortSignal extends CottontailEventTarget {
+  constructor(token) {
+    if (token !== abortSignalConstructToken) {
+      throw nodeTypeError("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+    }
     super();
-    this.aborted = false;
-    this.reason = undefined;
-    this.onabort = null;
+    const dependants = new WeakDependantSignalSet();
+    abortSignalState.set(this, {
+      aborted: false,
+      reason: undefined,
+      onabort: null,
+      timeoutTimer: null,
+      dependants,
+    });
+    Object.defineProperty(this, abortDependantSignals, {
+      value: dependants,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
+  get aborted() {
+    return abortSignalStateFor(this).aborted;
+  }
+
+  get reason() {
+    return abortSignalStateFor(this).reason;
+  }
+
+  get onabort() {
+    return abortSignalStateFor(this).onabort;
+  }
+
+  set onabort(handler) {
+    const state = abortSignalStateFor(this);
+    state.onabort = typeof handler === "function" ? handler : null;
+    refreshAbortSignalRetention(this);
+  }
+
+  addEventListener(type, listener, options = undefined) {
+    super.addEventListener(type, listener, options);
+    refreshAbortSignalRetention(this);
   }
 
   throwIfAborted() {
-    if (this.aborted) throw this.reason;
+    const state = abortSignalStateFor(this);
+    if (state.aborted) throw state.reason;
   }
 
   static abort(reason = makeAbortError()) {
-    const controller = new CottontailAbortController();
-    controller.abort(reason);
-    return controller.signal;
+    const signal = new CottontailAbortSignal(abortSignalConstructToken);
+    abortSignal(signal, reason);
+    return signal;
   }
 
   static timeout(delay) {
     const controller = new CottontailAbortController();
-    setTimeout(() => {
-      const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
-      controller.abort(new DOMExceptionClass("The operation timed out", "TimeoutError"));
+    const signal = controller.signal;
+    const signalRef = internalWeakRef(signal);
+    const timer = setTimeout(() => {
+      const liveSignal = signalRef.deref();
+      if (liveSignal) abortSignal(liveSignal, makeTimeoutError());
     }, Math.max(0, Number(delay) || 0));
-    return controller.signal;
+    timer?.unref?.();
+    abortSignalStateFor(signal).timeoutTimer = timer;
+    return signal;
   }
 
   static any(signals) {
+    if (signals == null || typeof signals[Symbol.iterator] !== "function") {
+      throw nodeTypeError("ERR_INVALID_ARG_TYPE", "The \"signals\" argument must be an iterable of AbortSignal instances");
+    }
+    const list = Array.from(signals);
+    for (let index = 0; index < list.length; index += 1) {
+      if (!isAbortSignal(list[index])) throw invalidAbortSignalArgument(`signals[${index}]`, list[index]);
+    }
     const controller = new CottontailAbortController();
-    for (const signal of signals ?? []) {
-      if (signal?.aborted) {
+    for (const signal of list) {
+      if (signal.aborted) {
         controller.abort(signal.reason);
-        break;
+        return controller.signal;
       }
-      signal?.addEventListener?.("abort", () => controller.abort(signal.reason), { once: true });
+    }
+    for (const signal of list) {
+      addDependantSignal(signal, controller.signal);
     }
     return controller.signal;
+  }
+
+  [inspectCustomSymbol]() {
+    return `AbortSignal { aborted: ${this.aborted ? "true" : "false"} }`;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "AbortSignal";
   }
 }
 
 class CottontailAbortController {
   constructor() {
-    this.signal = new CottontailAbortSignal();
+    abortControllerState.set(this, {
+      signal: new CottontailAbortSignal(abortSignalConstructToken),
+    });
+  }
+
+  get signal() {
+    return abortControllerStateFor(this).signal;
   }
 
   abort(reason = makeAbortError()) {
-    if (this.signal.aborted) return;
-    this.signal.aborted = true;
-    this.signal.reason = reason;
-    const EventClass = globalThis.Event ?? CottontailEvent;
-    this.signal.dispatchEvent(new EventClass("abort"));
+    abortSignal(abortControllerStateFor(this).signal, reason);
+  }
+
+  [inspectCustomSymbol](_depth, options) {
+    return options?.depth === null
+      ? `AbortController { signal: ${this.signal[inspectCustomSymbol]()} }`
+      : "AbortController { signal: [AbortSignal] }";
+  }
+
+  get [Symbol.toStringTag]() {
+    return "AbortController";
   }
 }
 

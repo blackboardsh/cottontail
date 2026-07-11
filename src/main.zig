@@ -31,7 +31,7 @@ fn printHelp(writer: anytype) !void {
     try writer.print(help_text_template, .{version});
 }
 
-const CliMode = enum { script, eval, print };
+const CliMode = enum { script, eval, print, stdin };
 
 const CliInvocation = struct {
     mode: CliMode,
@@ -183,6 +183,15 @@ fn parseInvocation(allocator: std.mem.Allocator, args: []const [:0]const u8) !Cl
         };
     }
 
+    if (exec_len > 0) {
+        return .{
+            .mode = .stdin,
+            .payload = try allocator.dupeZ(u8, ""),
+            .args = args[args.len..],
+            .exec_args = exec_args_storage[0..exec_len],
+        };
+    }
+
     return CliParseError.MissingEntrypoint;
 }
 
@@ -240,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
         .script => try script_runner.runWithExecArgv(init, invocation.payload, invocation.args, invocation.exec_args),
         .eval => try script_runner.runEval(init, invocation.payload, invocation.args, invocation.exec_args, false),
         .print => try script_runner.runEval(init, invocation.payload, invocation.args, invocation.exec_args, true),
+        .stdin => try script_runner.runStdin(init, invocation.args, invocation.exec_args),
     };
     if (exit_code != 0) {
         try stderr.flush();

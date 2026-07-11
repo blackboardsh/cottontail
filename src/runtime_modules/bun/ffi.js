@@ -132,6 +132,20 @@ installProcessApi(g.process);
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;
 g.process.execArgv ??= Array.from(cottontail.execArgv || []);
+if (typeof cottontail.gc === "function" &&
+    Array.prototype.some.call(g.process.execArgv, (arg) => arg === "--expose-gc" || arg === "--expose_gc")) {
+  Object.defineProperty(g, "gc", {
+    value: (options = undefined) => {
+      const result = cottontail.gc();
+      globalThis.__cottontailForcedWeakRefGc?.();
+      globalThis.__cottontailAsyncHooksOnGc?.();
+      if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
+      return result;
+    },
+    configurable: true,
+    writable: true,
+  });
+}
 g.process.versions ??= { node: "22.0.0", cottontail: "0.0.0-dev" };
 g.process.versions.node ??= "22.0.0";
 g.process.release ??= { name: "cottontail" };
@@ -852,9 +866,30 @@ g.Bun.write ??= bunWrite;
 const timers = new Map();
 const cancelledTimers = new Set();
 let nextTimerId = 1;
+const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
 
 function timerNow() {
   return Number(g.performance.now());
+}
+
+function makeTimerHandle(id) {
+  return {
+    [Symbol.toPrimitive]: () => id,
+    valueOf: () => id,
+    ref() {
+      const timer = timers.get(id);
+      if (timer) timer.ref = true;
+      return this;
+    },
+    unref() {
+      const timer = timers.get(id);
+      if (timer) timer.ref = false;
+      return this;
+    },
+    hasRef() {
+      return timers.get(id)?.ref !== false;
+    },
+  };
 }
 
 function installTimers() {
@@ -863,8 +898,9 @@ function installTimers() {
   g.setTimeout = (callback, ms = 0, ...args) => {
     const id = nextTimerId++;
     cancelledTimers.delete(id);
-    timers.set(id, { id, deadline: timerNow() + Math.max(0, Number(ms) || 0), callback, args, interval: null });
-    return id;
+    const handle = makeTimerHandle(id);
+    timers.set(id, { id, deadline: timerNow() + Math.max(0, Number(ms) || 0), callback, args, interval: null, ref: true, handle });
+    return handle;
   };
   g.clearTimeout = (id) => {
     const key = Number(id);
@@ -875,12 +911,41 @@ function installTimers() {
     const id = nextTimerId++;
     const interval = Math.max(1, Number(ms) || 0);
     cancelledTimers.delete(id);
-    timers.set(id, { id, deadline: timerNow() + interval, callback, args, interval });
-    return id;
+    const handle = makeTimerHandle(id);
+    timers.set(id, { id, deadline: timerNow() + interval, callback, args, interval, ref: true, handle });
+    return handle;
   };
   g.clearInterval = g.clearTimeout;
   g.requestAnimationFrame ??= (callback) => g.setTimeout(() => callback(timerNow()), 16);
   g.cancelAnimationFrame ??= g.clearTimeout;
+  Object.defineProperty(g.setTimeout, promisifyCustom, {
+    value: (ms = 1, value = undefined, options = undefined) => new Promise((resolve, reject) => {
+      if (options?.signal?.aborted) {
+        reject(options.signal.reason ?? new Error("AbortError"));
+        return;
+      }
+      const id = g.setTimeout(() => resolve(value), ms);
+      options?.signal?.addEventListener?.("abort", () => {
+        g.clearTimeout(id);
+        reject(options.signal.reason ?? new Error("AbortError"));
+      }, { once: true });
+    }),
+    configurable: true,
+  });
+  Object.defineProperty(g.setImmediate, promisifyCustom, {
+    value: (value = undefined, options = undefined) => new Promise((resolve, reject) => {
+      if (options?.signal?.aborted) {
+        reject(options.signal.reason ?? new Error("AbortError"));
+        return;
+      }
+      const id = g.setImmediate(() => resolve(value));
+      options?.signal?.addEventListener?.("abort", () => {
+        g.clearImmediate(id);
+        reject(options.signal.reason ?? new Error("AbortError"));
+      }, { once: true });
+    }),
+    configurable: true,
+  });
 }
 
 installTimers();
@@ -997,6 +1062,12 @@ function installWorkerNativeEventHandler() {
   cottontail.workerSetEventHandler((event) => {
     const worker = workerInstances.get(Number(event?.id));
     if (!worker) return;
+    if (event?.type === "exit") {
+      workerInstances.delete(worker.id);
+      if (worker._pollTimer != null) clearInterval(worker._pollTimer);
+      worker._emit("exit", { code: 0 });
+      return;
+    }
     worker._poll();
   });
   return true;
@@ -1017,7 +1088,9 @@ g.__cottontailHasActiveHandles = () => {
     if (hasWorkerMessageListener()) return true;
   }
   if (workerInstances.size > 0) return true;
-  if (timers.size > 0) return true;
+  for (const timer of timers.values()) {
+    if (timer.ref !== false) return true;
+  }
   for (const entry of spawnEventListeners.values()) {
     if (entry.ref !== false) return true;
   }
@@ -1030,7 +1103,7 @@ g.__cottontailRunLoopTick = () => {
   const due = Array.from(timers.values())
     .filter((timer) => timer.deadline <= now)
     .sort((a, b) => a.deadline - b.deadline || a.id - b.id);
-  for (const timer of due) {
+  for (const timer of due.slice(0, 1)) {
     if (!timers.has(timer.id)) continue;
     timers.delete(timer.id);
     timer.callback(...timer.args);

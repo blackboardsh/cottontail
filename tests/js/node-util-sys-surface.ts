@@ -90,7 +90,7 @@ await new Promise<void>((resolve, reject) => {
 
 const controller = transferableAbortController();
 const signal = transferableAbortSignal(controller.signal);
-const abortedPromise = aborted(signal);
+const abortedPromise = aborted(signal, {});
 controller.abort();
 await abortedPromise;
 
