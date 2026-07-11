@@ -142,6 +142,9 @@ typedef struct {
     size_t env_count;
     bool clear_env;
     bool capture_output;
+    bool input_present;
+    const uint8_t *input_ptr;
+    size_t input_len;
 } CtHostSpawnOptions;
 
 typedef struct {
@@ -341,8 +344,12 @@ typedef struct CtHttpRequest {
     char *headers_text;
     char *body;
     size_t body_len;
+    bool keep_alive;
+    bool ready;
     bool claimed;
     bool completed;
+    bool response_started;
+    bool response_streaming;
     int status;
     char *response_headers_text;
     char *response_body;
@@ -357,12 +364,26 @@ typedef struct CtHttpServer {
     int listen_fd;
     uint16_t port;
     char *hostname;
+    char *unix_path;
     bool stopped;
     pthread_t thread;
     pthread_mutex_t mutex;
+    pthread_cond_t clients_cond;
+    size_t active_clients;
     CtHttpRequest *requests;
     struct CtHttpServer *next;
 } CtHttpServer;
+
+typedef struct CtHttpClientTask {
+    CtHttpServer *server;
+    CtHttpRequest *request;
+} CtHttpClientTask;
+
+typedef struct CtHttpReadBuffer {
+    char *data;
+    size_t len;
+    size_t capacity;
+} CtHttpReadBuffer;
 
 typedef struct CtTlsConnection {
     uint32_t id;
@@ -535,6 +556,7 @@ static int ct_jsc_runtime_eval_internal(
     bool wait_for_active_handles,
     char **error_out
 );
+static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_active_handles_out, char **error_out);
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out);
 static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, const char *filename);
 
@@ -747,15 +769,34 @@ static ssize_t ct_http_send_all(int fd, const char *data, size_t len) {
     return (ssize_t)sent;
 }
 
+static void ct_http_clear_request(CtHttpRequest *request) {
+    free(request->method);
+    request->method = NULL;
+    free(request->url);
+    request->url = NULL;
+    free(request->headers_text);
+    request->headers_text = NULL;
+    free(request->body);
+    request->body = NULL;
+    request->body_len = 0;
+    free(request->response_headers_text);
+    request->response_headers_text = NULL;
+    free(request->response_body);
+    request->response_body = NULL;
+    request->response_body_len = 0;
+    request->keep_alive = false;
+    request->ready = false;
+    request->claimed = false;
+    request->completed = false;
+    request->response_started = false;
+    request->response_streaming = false;
+    request->status = 200;
+}
+
 static void ct_http_free_request(CtHttpRequest *request) {
     if (request == NULL) return;
     if (request->client_fd >= 0) close(request->client_fd);
-    free(request->method);
-    free(request->url);
-    free(request->headers_text);
-    free(request->body);
-    free(request->response_headers_text);
-    free(request->response_body);
+    ct_http_clear_request(request);
     pthread_cond_destroy(&request->cond);
     pthread_mutex_destroy(&request->mutex);
     free(request);
@@ -781,97 +822,375 @@ static const char *ct_http_find_header_end(const char *buffer, size_t len) {
     return NULL;
 }
 
-static size_t ct_http_content_length(const char *headers, size_t headers_len) {
-    const char *cursor = headers;
-    const char *end = headers + headers_len;
-    while (cursor < end) {
-        const char *line_end = memchr(cursor, '\n', (size_t)(end - cursor));
-        const char *line_stop = line_end != NULL ? line_end : end;
-        size_t line_len = (size_t)(line_stop - cursor);
-        if (line_len > 0 && cursor[line_len - 1] == '\r') line_len -= 1;
-        if (line_len >= 15 && strncasecmp(cursor, "content-length:", 15) == 0) {
-            const char *value = cursor + 15;
-            while (value < cursor + line_len && (*value == ' ' || *value == '\t')) value += 1;
-            return (size_t)strtoull(value, NULL, 10);
+static bool ct_http_is_token_char(unsigned char value) {
+    if ((value >= '0' && value <= '9') ||
+        (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z')) return true;
+    switch (value) {
+        case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+':
+        case '-': case '.': case '^': case '_': case '`': case '|': case '~': return true;
+        default: return false;
+    }
+}
+
+static bool ct_http_valid_request_target(const char *method, size_t method_len, const char *target, size_t target_len) {
+    if (target_len == 0) return false;
+    for (size_t index = 0; index < target_len; index += 1) {
+        unsigned char value = (unsigned char)target[index];
+        if (value <= 0x20 || value == 0x7f || value == '^' || value == '\\') return false;
+    }
+    if (target[0] == '/' || (target_len == 1 && target[0] == '*')) return true;
+    if (target_len >= 7 && strncasecmp(target, "http://", 7) == 0) return true;
+    if (target_len >= 8 && strncasecmp(target, "https://", 8) == 0) return true;
+    return method_len == 7 && strncasecmp(method, "CONNECT", 7) == 0 && memchr(target, ':', target_len) != NULL;
+}
+
+static int ct_http_parse_transfer_encoding_value(
+    const char *value,
+    const char *value_end,
+    bool *saw_any,
+    bool *saw_chunked
+) {
+    const char *cursor = value;
+    while (cursor < value_end) {
+        while (cursor < value_end && (*cursor == ' ' || *cursor == '\t')) cursor += 1;
+        const char *token = cursor;
+        while (cursor < value_end && *cursor != ',') cursor += 1;
+        const char *token_end = cursor;
+        while (token_end > token && (token_end[-1] == ' ' || token_end[-1] == '\t')) token_end -= 1;
+        if (token == token_end || *saw_chunked) return -1;
+        for (const char *item = token; item < token_end; item += 1) {
+            if (!ct_http_is_token_char((unsigned char)*item)) return -1;
         }
-        if (line_end == NULL) break;
-        cursor = line_end + 1;
+        *saw_any = true;
+        if ((size_t)(token_end - token) == 7 && strncasecmp(token, "chunked", 7) == 0) {
+            *saw_chunked = true;
+        }
+        if (cursor < value_end) cursor += 1;
     }
     return 0;
 }
 
-static int ct_http_read_request(int fd, CtHttpRequest *request) {
-    size_t capacity = 8192;
-    size_t len = 0;
-    char *buffer = (char *)malloc(capacity + 1);
-    const char *header_end = NULL;
-    size_t header_len = 0;
+static bool ct_http_header_value_has_token(const char *value, const char *value_end, const char *expected) {
+    size_t expected_len = strlen(expected);
+    const char *cursor = value;
+    while (cursor < value_end) {
+        while (cursor < value_end && (*cursor == ' ' || *cursor == '\t' || *cursor == ',')) cursor += 1;
+        const char *token = cursor;
+        while (cursor < value_end && *cursor != ',') cursor += 1;
+        const char *token_end = cursor;
+        while (token_end > token && (token_end[-1] == ' ' || token_end[-1] == '\t')) token_end -= 1;
+        if ((size_t)(token_end - token) == expected_len && strncasecmp(token, expected, expected_len) == 0) return true;
+    }
+    return false;
+}
+
+static int ct_http_parse_head(
+    const char *buffer,
+    size_t header_len,
+    size_t *out_content_len,
+    bool *out_chunked,
+    bool *out_keep_alive
+) {
+    const char *head_end = buffer + header_len;
+    const char *request_line_end = strstr(buffer, "\r\n");
+    if (request_line_end == NULL || request_line_end >= head_end) return -1;
+
+    const char *first_space = memchr(buffer, ' ', (size_t)(request_line_end - buffer));
+    if (first_space == NULL || first_space == buffer) return -1;
+    const char *second_space = memchr(first_space + 1, ' ', (size_t)(request_line_end - first_space - 1));
+    if (second_space == NULL || second_space == first_space + 1) return -1;
+    if (memchr(second_space + 1, ' ', (size_t)(request_line_end - second_space - 1)) != NULL) return -1;
+
+    size_t method_len = (size_t)(first_space - buffer);
+    for (size_t index = 0; index < method_len; index += 1) {
+        if (!ct_http_is_token_char((unsigned char)buffer[index])) return -1;
+    }
+    size_t target_len = (size_t)(second_space - first_space - 1);
+    if (!ct_http_valid_request_target(buffer, method_len, first_space + 1, target_len)) return -1;
+
+    const char *version = second_space + 1;
+    size_t version_len = (size_t)(request_line_end - version);
+    bool http_11 = version_len == 8 && memcmp(version, "HTTP/1.1", 8) == 0;
+    bool http_10 = version_len == 8 && memcmp(version, "HTTP/1.0", 8) == 0;
+    if (!http_11 && !http_10) return -1;
+
+    bool has_host = false;
+    bool has_content_length = false;
+    bool has_transfer_encoding = false;
+    bool saw_chunked = false;
+    bool connection_close = false;
+    bool connection_keep_alive = false;
     size_t content_len = 0;
-    if (buffer == NULL) return -1;
+    const char *cursor = request_line_end + 2;
+    while (cursor < head_end) {
+        const char *line_end = memchr(cursor, '\n', (size_t)(head_end - cursor));
+        if (line_end == NULL || line_end == cursor || line_end[-1] != '\r') return -1;
+        size_t line_len = (size_t)(line_end - cursor - 1);
+        if (line_len == 0) break;
+        if (memchr(cursor, '\r', line_len) != NULL || memchr(cursor, '\n', line_len) != NULL) return -1;
+
+        const char *colon = memchr(cursor, ':', line_len);
+        if (colon == NULL || colon == cursor) return -1;
+        size_t name_len = (size_t)(colon - cursor);
+        for (size_t index = 0; index < name_len; index += 1) {
+            if (!ct_http_is_token_char((unsigned char)cursor[index])) return -1;
+        }
+
+        const char *value = colon + 1;
+        const char *value_end = cursor + line_len;
+        while (value < value_end && (*value == ' ' || *value == '\t')) value += 1;
+        while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end -= 1;
+        for (const char *item = value; item < value_end; item += 1) {
+            unsigned char byte = (unsigned char)*item;
+            if ((byte < 0x20 && byte != '\t') || byte == 0x7f) return -1;
+        }
+
+        if (name_len == 4 && strncasecmp(cursor, "host", 4) == 0) {
+            if (value == value_end) return -1;
+            has_host = true;
+        } else if (name_len == 14 && strncasecmp(cursor, "content-length", 14) == 0) {
+            if (value == value_end) return -1;
+            size_t parsed = 0;
+            for (const char *item = value; item < value_end; item += 1) {
+                if (*item < '0' || *item > '9') return -1;
+                size_t digit = (size_t)(*item - '0');
+                if (parsed > (SIZE_MAX - digit) / 10) return -1;
+                parsed = parsed * 10 + digit;
+            }
+            if (parsed > 1024 * 1024) return -1;
+            if (has_content_length && parsed != content_len) return -1;
+            has_content_length = true;
+            content_len = parsed;
+        } else if (name_len == 17 && strncasecmp(cursor, "transfer-encoding", 17) == 0) {
+            if (ct_http_parse_transfer_encoding_value(
+                    value,
+                    value_end,
+                    &has_transfer_encoding,
+                    &saw_chunked
+                ) != 0) return -1;
+        } else if (name_len == 10 && strncasecmp(cursor, "connection", 10) == 0) {
+            connection_close = connection_close || ct_http_header_value_has_token(value, value_end, "close");
+            connection_keep_alive = connection_keep_alive || ct_http_header_value_has_token(value, value_end, "keep-alive");
+        }
+        cursor = line_end + 1;
+    }
+
+    if (http_11 && !has_host) return -1;
+    if (has_transfer_encoding && has_content_length) return -1;
+    if (has_transfer_encoding && !saw_chunked) return -1;
+    *out_content_len = content_len;
+    *out_chunked = saw_chunked;
+    *out_keep_alive = http_11 ? !connection_close : connection_keep_alive;
+    return 0;
+}
+
+static const char *ct_http_find_crlf(const char *data, size_t len) {
+    for (size_t index = 1; index < len; index += 1) {
+        if (data[index - 1] == '\r' && data[index] == '\n') return data + index - 1;
+        if (data[index] == '\n' && data[index - 1] != '\r') return (const char *)-1;
+    }
+    return NULL;
+}
+
+static int ct_http_decode_chunked(
+    const char *data,
+    size_t len,
+    char **out_body,
+    size_t *out_body_len,
+    size_t *out_consumed
+) {
+    size_t position = 0;
+    size_t decoded_len = 0;
+    char *decoded = (char *)malloc(len > 0 ? len : 1);
+    if (decoded == NULL) return -1;
 
     while (true) {
-        if (len == capacity) {
-            size_t next_capacity = capacity * 2;
-            if (next_capacity > 1024 * 1024) {
-                free(buffer);
-                return -1;
-            }
-            char *next = (char *)realloc(buffer, next_capacity + 1);
-            if (next == NULL) {
-                free(buffer);
-                return -1;
-            }
-            buffer = next;
-            capacity = next_capacity;
+        const char *line_end = ct_http_find_crlf(data + position, len - position);
+        if (line_end == (const char *)-1) {
+            free(decoded);
+            return -1;
         }
-        ssize_t read_count = recv(fd, buffer + len, capacity - len, 0);
+        if (line_end == NULL) {
+            free(decoded);
+            return 1;
+        }
+        const char *line = data + position;
+        const char *size_end = memchr(line, ';', (size_t)(line_end - line));
+        if (size_end == NULL) size_end = line_end;
+        while (size_end > line && (size_end[-1] == ' ' || size_end[-1] == '\t')) size_end -= 1;
+        if (size_end == line) {
+            free(decoded);
+            return -1;
+        }
+
+        size_t chunk_size = 0;
+        for (const char *item = line; item < size_end; item += 1) {
+            unsigned char value = (unsigned char)*item;
+            size_t digit;
+            if (value >= '0' && value <= '9') digit = (size_t)(value - '0');
+            else if (value >= 'a' && value <= 'f') digit = (size_t)(value - 'a' + 10);
+            else if (value >= 'A' && value <= 'F') digit = (size_t)(value - 'A' + 10);
+            else {
+                free(decoded);
+                return -1;
+            }
+            if (chunk_size > (SIZE_MAX - digit) / 16) {
+                free(decoded);
+                return -1;
+            }
+            chunk_size = chunk_size * 16 + digit;
+        }
+        if (chunk_size > 1024 * 1024 || decoded_len > 1024 * 1024 - chunk_size) {
+            free(decoded);
+            return -1;
+        }
+        position = (size_t)(line_end - data) + 2;
+
+        if (chunk_size == 0) {
+            while (true) {
+                if (len - position < 2) {
+                    free(decoded);
+                    return 1;
+                }
+                const char *trailer_end = ct_http_find_crlf(data + position, len - position);
+                if (trailer_end == (const char *)-1) {
+                    free(decoded);
+                    return -1;
+                }
+                if (trailer_end == NULL) {
+                    free(decoded);
+                    return 1;
+                }
+                if (trailer_end == data + position) {
+                    *out_body = decoded;
+                    *out_body_len = decoded_len;
+                    *out_consumed = position + 2;
+                    return 0;
+                }
+                const char *colon = memchr(data + position, ':', (size_t)(trailer_end - (data + position)));
+                if (colon == NULL || colon == data + position) {
+                    free(decoded);
+                    return -1;
+                }
+                position = (size_t)(trailer_end - data) + 2;
+            }
+        }
+
+        if (len - position < chunk_size) {
+            free(decoded);
+            return 1;
+        }
+        if (len - position < chunk_size + 1) {
+            free(decoded);
+            return 1;
+        }
+        if (data[position + chunk_size] != '\r') {
+            free(decoded);
+            return -1;
+        }
+        if (len - position < chunk_size + 2) {
+            free(decoded);
+            return 1;
+        }
+        if (data[position + chunk_size + 1] != '\n') {
+            free(decoded);
+            return -1;
+        }
+        if (chunk_size > 0) memcpy(decoded + decoded_len, data + position, chunk_size);
+        decoded_len += chunk_size;
+        position += chunk_size + 2;
+    }
+}
+
+static int ct_http_read_request(int fd, CtHttpRequest *request, CtHttpReadBuffer *input) {
+    if (input->data == NULL) {
+        input->capacity = 8192;
+        input->data = (char *)malloc(input->capacity + 1);
+        if (input->data == NULL) return -1;
+        input->len = 0;
+        input->data[0] = 0;
+    }
+
+    while (true) {
+        const char *header_end = ct_http_find_header_end(input->data, input->len);
+        if (header_end != NULL) {
+            size_t header_len = (size_t)(header_end - input->data);
+            size_t content_len = 0;
+            bool chunked = false;
+            bool keep_alive = false;
+            if (ct_http_parse_head(input->data, header_len, &content_len, &chunked, &keep_alive) != 0) return -1;
+
+            char *decoded_body = NULL;
+            size_t decoded_body_len = 0;
+            size_t chunked_consumed = 0;
+            bool complete = false;
+            if (chunked) {
+                int decode_status = ct_http_decode_chunked(
+                    input->data + header_len,
+                    input->len - header_len,
+                    &decoded_body,
+                    &decoded_body_len,
+                    &chunked_consumed
+                );
+                if (decode_status < 0) return -1;
+                complete = decode_status == 0;
+            } else {
+                complete = input->len >= header_len + content_len;
+            }
+
+            if (complete) {
+                const char *request_line_end = strstr(input->data, "\r\n");
+                if (request_line_end == NULL || request_line_end > header_end) {
+                    free(decoded_body);
+                    return -1;
+                }
+                const char *first_space = memchr(input->data, ' ', (size_t)(request_line_end - input->data));
+                const char *second_space = first_space == NULL
+                    ? NULL
+                    : memchr(first_space + 1, ' ', (size_t)(request_line_end - first_space - 1));
+                if (first_space == NULL || second_space == NULL) {
+                    free(decoded_body);
+                    return -1;
+                }
+
+                request->method = ct_http_copy_range(input->data, (size_t)(first_space - input->data));
+                request->url = ct_http_copy_range(first_space + 1, (size_t)(second_space - first_space - 1));
+                request->headers_text = ct_http_copy_range(request_line_end + 2, (size_t)(header_end - request_line_end - 4));
+                request->body_len = chunked ? decoded_body_len : content_len;
+                request->body = chunked ? decoded_body : (char *)malloc(content_len > 0 ? content_len : 1);
+                request->keep_alive = keep_alive;
+                if (request->method == NULL || request->url == NULL || request->headers_text == NULL || request->body == NULL) {
+                    return -1;
+                }
+                if (!chunked && content_len > 0) memcpy(request->body, input->data + header_len, content_len);
+
+                size_t consumed = header_len + (chunked ? chunked_consumed : content_len);
+                size_t remaining = input->len - consumed;
+                if (remaining > 0) memmove(input->data, input->data + consumed, remaining);
+                input->len = remaining;
+                input->data[remaining] = 0;
+                return 0;
+            }
+        }
+
+        if (input->len == input->capacity) {
+            size_t next_capacity = input->capacity * 2;
+            if (next_capacity > 2 * 1024 * 1024) return -1;
+            char *next = (char *)realloc(input->data, next_capacity + 1);
+            if (next == NULL) return -1;
+            input->data = next;
+            input->capacity = next_capacity;
+        }
+        ssize_t read_count = recv(fd, input->data + input->len, input->capacity - input->len, 0);
         if (read_count < 0) {
             if (errno == EINTR) continue;
-            free(buffer);
             return -1;
         }
-        if (read_count == 0) {
-            free(buffer);
-            return -1;
-        }
-        len += (size_t)read_count;
-        buffer[len] = 0;
-        header_end = ct_http_find_header_end(buffer, len);
-        if (header_end != NULL) {
-            header_len = (size_t)(header_end - buffer);
-            content_len = ct_http_content_length(buffer, header_len);
-            if (len >= header_len + content_len) break;
-        }
+        if (read_count == 0) return -1;
+        input->len += (size_t)read_count;
+        input->data[input->len] = 0;
     }
-
-    const char *request_line_end = strstr(buffer, "\r\n");
-    if (request_line_end == NULL || request_line_end > header_end) {
-        free(buffer);
-        return -1;
-    }
-    const char *first_space = memchr(buffer, ' ', (size_t)(request_line_end - buffer));
-    if (first_space == NULL) {
-        free(buffer);
-        return -1;
-    }
-    const char *second_space = memchr(first_space + 1, ' ', (size_t)(request_line_end - first_space - 1));
-    if (second_space == NULL) {
-        free(buffer);
-        return -1;
-    }
-
-    request->method = ct_http_copy_range(buffer, (size_t)(first_space - buffer));
-    request->url = ct_http_copy_range(first_space + 1, (size_t)(second_space - first_space - 1));
-    request->headers_text = ct_http_copy_range(request_line_end + 2, (size_t)(header_end - request_line_end - 4));
-    request->body_len = content_len;
-    request->body = (char *)malloc(content_len > 0 ? content_len : 1);
-    if (request->method == NULL || request->url == NULL || request->headers_text == NULL || request->body == NULL) {
-        free(buffer);
-        return -1;
-    }
-    if (content_len > 0) memcpy(request->body, buffer + header_len, content_len);
-    free(buffer);
-    return 0;
 }
 
 static void ct_http_send_response(CtHttpRequest *request) {
@@ -882,10 +1201,11 @@ static void ct_http_send_response(CtHttpRequest *request) {
     int head_len = snprintf(
         head,
         sizeof(head),
-        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\n%s\r\n",
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\n%s\r\n",
         status,
         reason,
         request->response_body_len,
+        request->keep_alive ? "keep-alive" : "close",
         headers
     );
     if (head_len < 0) return;
@@ -896,14 +1216,64 @@ static void ct_http_send_response(CtHttpRequest *request) {
     }
 }
 
-static void ct_http_server_add_request(CtHttpServer *server, CtHttpRequest *request) {
-    pthread_mutex_lock(&server->mutex);
-    request->next = server->requests;
-    server->requests = request;
-    pthread_mutex_unlock(&server->mutex);
+static ssize_t ct_http_send_chunked_response_head(CtHttpRequest *request) {
+    int status = request->status > 0 ? request->status : 200;
+    const char *reason = ct_http_reason_phrase(status);
+    const char *headers = request->response_headers_text != NULL ? request->response_headers_text : "";
+    const char *connection = request->keep_alive ? "keep-alive" : "close";
+    int head_len = snprintf(
+        NULL,
+        0,
+        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n%s\r\n",
+        status,
+        reason,
+        connection,
+        headers
+    );
+    if (head_len < 0) return -1;
+
+    char *head = (char *)malloc((size_t)head_len + 1);
+    if (head == NULL) return -1;
+    snprintf(
+        head,
+        (size_t)head_len + 1,
+        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n%s\r\n",
+        status,
+        reason,
+        connection,
+        headers
+    );
+    ssize_t result = ct_http_send_all(request->client_fd, head, (size_t)head_len);
+    free(head);
+    return result;
 }
 
-static void ct_http_server_remove_request(CtHttpServer *server, CtHttpRequest *request) {
+static ssize_t ct_http_send_chunk(CtHttpRequest *request, const uint8_t *data, size_t len) {
+    if (len == 0) return 0;
+
+    char frame_head[2 * sizeof(size_t) + 3];
+    int frame_head_len = snprintf(frame_head, sizeof(frame_head), "%zx\r\n", len);
+    if (frame_head_len < 0 || (size_t)frame_head_len >= sizeof(frame_head)) return -1;
+    if (ct_http_send_all(request->client_fd, frame_head, (size_t)frame_head_len) < 0) return -1;
+    if (ct_http_send_all(request->client_fd, (const char *)data, len) < 0) return -1;
+    if (ct_http_send_all(request->client_fd, "\r\n", 2) < 0) return -1;
+    return (ssize_t)len;
+}
+
+static bool ct_http_server_track_request(CtHttpServer *server, CtHttpRequest *request) {
+    pthread_mutex_lock(&server->mutex);
+    if (server->stopped) {
+        pthread_mutex_unlock(&server->mutex);
+        return false;
+    }
+    request->next = server->requests;
+    server->requests = request;
+    server->active_clients += 1;
+    pthread_mutex_unlock(&server->mutex);
+    return true;
+}
+
+static void ct_http_server_finish_request(CtHttpServer *server, CtHttpRequest *request) {
     pthread_mutex_lock(&server->mutex);
     CtHttpRequest **cursor = &server->requests;
     while (*cursor != NULL) {
@@ -913,7 +1283,55 @@ static void ct_http_server_remove_request(CtHttpServer *server, CtHttpRequest *r
         }
         cursor = &(*cursor)->next;
     }
+    if (server->active_clients > 0) server->active_clients -= 1;
+    pthread_cond_broadcast(&server->clients_cond);
     pthread_mutex_unlock(&server->mutex);
+}
+
+static void *ct_http_client_thread(void *opaque) {
+    CtHttpClientTask *task = (CtHttpClientTask *)opaque;
+    CtHttpServer *server = task->server;
+    CtHttpRequest *request = task->request;
+    CtHttpReadBuffer input = {0};
+    free(task);
+
+    while (!ct_http_server_is_stopped(server)) {
+        if (ct_http_read_request(request->client_fd, request, &input) != 0) {
+            if (!ct_http_server_is_stopped(server) && input.len > 0) {
+                static const char bad_request[] =
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+                ct_http_send_all(request->client_fd, bad_request, sizeof(bad_request) - 1);
+            }
+            break;
+        }
+
+        pthread_mutex_lock(&server->mutex);
+        request->ready = true;
+        pthread_mutex_unlock(&server->mutex);
+
+        pthread_mutex_lock(&request->mutex);
+        while (!request->completed) pthread_cond_wait(&request->cond, &request->mutex);
+        pthread_mutex_unlock(&request->mutex);
+
+        if (ct_http_server_is_stopped(server)) break;
+        if (!request->response_streaming) ct_http_send_response(request);
+        if (!request->keep_alive) break;
+
+        pthread_mutex_lock(&ct_http_servers_mutex);
+        uint32_t next_request_id = ct_next_http_request_id++;
+        if (ct_next_http_request_id == 0) ct_next_http_request_id = 1;
+        pthread_mutex_unlock(&ct_http_servers_mutex);
+
+        pthread_mutex_lock(&server->mutex);
+        ct_http_clear_request(request);
+        request->id = next_request_id;
+        pthread_mutex_unlock(&server->mutex);
+    }
+
+    free(input.data);
+    ct_http_server_finish_request(server, request);
+    ct_http_free_request(request);
+    return NULL;
 }
 
 static void *ct_http_server_thread(void *opaque) {
@@ -925,6 +1343,12 @@ static void *ct_http_server_thread(void *opaque) {
             if (ct_http_server_is_stopped(server)) break;
             continue;
         }
+        int no_delay = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+#if defined(TCP_SENDMOREACKS)
+        int send_more_acks = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_SENDMOREACKS, &send_more_acks, sizeof(send_more_acks));
+#endif
         CtHttpRequest *request = (CtHttpRequest *)calloc(1, sizeof(CtHttpRequest));
         if (request == NULL) {
             close(client_fd);
@@ -940,26 +1364,28 @@ static void *ct_http_server_thread(void *opaque) {
         if (ct_next_http_request_id == 0) ct_next_http_request_id = 1;
         pthread_mutex_unlock(&ct_http_servers_mutex);
 
-        if (ct_http_read_request(client_fd, request) != 0) {
-            static const char bad_request[] =
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
-            ct_http_send_all(client_fd, bad_request, sizeof(bad_request) - 1);
+        if (!ct_http_server_track_request(server, request)) {
+            ct_http_free_request(request);
+            break;
+        }
+
+        CtHttpClientTask *task = (CtHttpClientTask *)calloc(1, sizeof(CtHttpClientTask));
+        if (task == NULL) {
+            ct_http_server_finish_request(server, request);
             ct_http_free_request(request);
             continue;
         }
-        ct_http_server_add_request(server, request);
+        task->server = server;
+        task->request = request;
 
-        pthread_mutex_lock(&request->mutex);
-        while (!request->completed && !ct_http_server_is_stopped(server)) {
-            pthread_cond_wait(&request->cond, &request->mutex);
+        pthread_t client_thread;
+        if (pthread_create(&client_thread, NULL, ct_http_client_thread, task) != 0) {
+            free(task);
+            ct_http_server_finish_request(server, request);
+            ct_http_free_request(request);
+            continue;
         }
-        pthread_mutex_unlock(&request->mutex);
-
-        if (!ct_http_server_is_stopped(server)) {
-            ct_http_send_response(request);
-        }
-        ct_http_server_remove_request(server, request);
-        ct_http_free_request(request);
+        pthread_detach(client_thread);
     }
     return NULL;
 }
@@ -6382,6 +6808,12 @@ static JSValueRef ct_tcp_server_accept(JSContextRef ctx, JSObjectRef function, J
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+    int no_delay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+#if defined(TCP_SENDMOREACKS)
+    int send_more_acks = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_SENDMOREACKS, &send_more_acks, sizeof(send_more_acks));
+#endif
     ct_set_nonblocking_fd(fd);
 
     JSObjectRef result = ct_make_object(ctx);
@@ -6437,6 +6869,8 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, strerror(last_errno));
         return JSValueMakeUndefined(ctx);
     }
+    int no_delay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
     ct_set_nonblocking_fd(fd);
 
     JSObjectRef result = ct_make_object(ctx);
@@ -9471,18 +9905,22 @@ static JSValueRef ct_spawn_result_to_js(JSContextRef ctx, const CtHostSpawnResul
     return response;
 }
 
-static int ct_parse_spawn_options(JSContextRef ctx, JSValueRef value, char **cwd, CtHostEnvEntry **env_entries, size_t *env_count, bool *clear_env, bool *capture_output, JSValueRef *exception) {
+static int ct_parse_spawn_options(JSContextRef ctx, JSValueRef value, char **cwd, CtHostEnvEntry **env_entries, size_t *env_count, bool *clear_env, bool *capture_output, bool *input_present, uint8_t **input_ptr, size_t *input_len, JSValueRef *exception) {
     *cwd = NULL;
     *env_entries = NULL;
     *env_count = 0;
     *clear_env = false;
     *capture_output = true;
+    if (input_present != NULL) *input_present = false;
+    if (input_ptr != NULL) *input_ptr = NULL;
+    if (input_len != NULL) *input_len = 0;
     if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value) || !JSValueIsObject(ctx, value)) return 0;
     JSObjectRef object = (JSObjectRef)value;
     JSValueRef cwd_value = ct_get_property(ctx, object, "cwd", exception);
     JSValueRef env_value = ct_get_property(ctx, object, "env", exception);
     JSValueRef clear_env_value = ct_get_property(ctx, object, "clearEnv", exception);
     JSValueRef stdio_value = ct_get_property(ctx, object, "stdio", exception);
+    JSValueRef input_value = ct_get_property(ctx, object, "input", exception);
     if (exception != NULL && *exception != NULL) return -1;
     *cwd = ct_value_to_optional_string(ctx, cwd_value);
     *clear_env = JSValueToBoolean(ctx, clear_env_value);
@@ -9491,6 +9929,14 @@ static int ct_parse_spawn_options(JSContextRef ctx, JSValueRef value, char **cwd
         char *stdio = ct_value_to_string_copy(ctx, stdio_value);
         if (stdio != NULL && strcmp(stdio, "inherit") == 0) *capture_output = false;
         free(stdio);
+    }
+    if (input_present != NULL && input_ptr != NULL && input_len != NULL &&
+        !JSValueIsUndefined(ctx, input_value) && !JSValueIsNull(ctx, input_value)) {
+        if (ct_get_bytes(ctx, input_value, input_ptr, input_len) != 0) {
+            ct_throw_message(ctx, exception, "spawn input must be an ArrayBuffer or typed array");
+            return -1;
+        }
+        *input_present = true;
     }
     return 0;
 }
@@ -9596,8 +10042,11 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
     size_t env_count = 0;
     bool clear_env = false;
     bool capture_output = true;
+    bool input_present = false;
+    uint8_t *input_ptr = NULL;
+    size_t input_len = 0;
     if (ct_parse_string_array(ctx, argc >= 2 ? argv[1] : NULL, &args, &arg_count, exception) != 0 ||
-        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, exception) != 0) {
+        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, &input_present, &input_ptr, &input_len, exception) != 0) {
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -9612,6 +10061,9 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
             .env_count = env_count,
             .clear_env = clear_env,
             .capture_output = capture_output,
+            .input_present = input_present,
+            .input_ptr = input_ptr,
+            .input_len = input_len,
         }, &result, &error) != 0) {
         ct_throw_message(ctx, exception, error != NULL ? error : "spawn failed");
     }
@@ -10187,7 +10639,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
     CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
     if (ct_parse_string_array(ctx, argc >= 2 ? argv[1] : NULL, &args, &arg_count, exception) != 0 ||
-        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, exception) != 0) {
+        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, NULL, NULL, NULL, exception) != 0) {
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -10483,7 +10935,7 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
     bool clear_env = false;
     bool capture_output = true;
     if (ct_parse_string_array(ctx, argc >= 2 ? argv[1] : NULL, &args, &arg_count, exception) != 0 ||
-        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, exception) != 0) {
+        ct_parse_spawn_options(ctx, argc >= 3 ? argv[2] : NULL, &cwd, &env_entries, &env_count, &clear_env, &capture_output, NULL, NULL, NULL, exception) != 0) {
         free(file);
         ct_free_string_array(args, arg_count);
         free(cwd);
@@ -10594,8 +11046,13 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
             }
         }
         if (strcmp(event->type != NULL ? event->type : "", "exit") == 0) {
-            ct_set_property(ctx, item, "exitCode", JSValueMakeNumber(ctx, event->exit_code), exception);
-            ct_set_property(ctx, item, "signalCode", JSValueMakeNull(ctx), exception);
+            if (event->signal_code > 0) {
+                ct_set_property(ctx, item, "exitCode", JSValueMakeNull(ctx), exception);
+                ct_set_property(ctx, item, "signalCode", JSValueMakeNumber(ctx, event->signal_code), exception);
+            } else {
+                ct_set_property(ctx, item, "exitCode", JSValueMakeNumber(ctx, event->exit_code), exception);
+                ct_set_property(ctx, item, "signalCode", JSValueMakeNull(ctx), exception);
+            }
             ct_set_property(ctx, item, "killed", JSValueMakeBoolean(ctx, event->killed), exception);
         }
         JSValueRef arg = item;
@@ -11083,6 +11540,13 @@ static void *ct_worker_entry(void *opaque) {
             free(error);
             break;
         }
+        bool has_active_handles = false;
+        if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, &error) != 0) {
+            fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker active-handle check failed");
+            free(error);
+            break;
+        }
+        if (!has_active_handles) break;
         usleep((useconds_t)delay_ms * 1000);
     }
 
@@ -11307,6 +11771,46 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
 
     free(text);
     return JSValueMakeBoolean(ctx, ok);
+}
+
+static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.fdWriteSome(fd, data) requires a file descriptor and data");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char *text = NULL;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        text = ct_value_to_string_copy(ctx, argv[1]);
+        bytes = (uint8_t *)text;
+        len = text != NULL ? strlen(text) : 0;
+    }
+    if (fd < 0 || bytes == NULL) {
+        free(text);
+        ct_throw_message(ctx, exception, "invalid file descriptor or data");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (len == 0) {
+        free(text);
+        return JSValueMakeNumber(ctx, 0);
+    }
+
+    ssize_t written;
+    do {
+        written = write(fd, bytes, len);
+    } while (written < 0 && errno == EINTR);
+    free(text);
+    if (written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return JSValueMakeNumber(ctx, 0);
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeNumber(ctx, (double)written);
 }
 
 static JSValueRef ct_ipc_send(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -11955,64 +12459,111 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     (void)thisObject;
     const char *hostname = "127.0.0.1";
     char *hostname_arg = NULL;
+    char *unix_path = NULL;
     int port_value = 0;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
         hostname_arg = ct_value_to_string_copy(ctx, argv[0]);
         if (hostname_arg != NULL) hostname = hostname_arg;
     }
     if (argc >= 2) port_value = (int)ct_value_to_number(ctx, argv[1]);
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        unix_path = ct_value_to_string_copy(ctx, argv[2]);
+        if (unix_path != NULL && unix_path[0] == 0) {
+            free(unix_path);
+            unix_path = NULL;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int listen_fd = socket(unix_path != NULL ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         free(hostname_arg);
+        free(unix_path);
         return JSValueMakeUndefined(ctx);
     }
     int yes = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port_value);
-    if (strcmp(hostname, "0.0.0.0") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (strcmp(hostname, "localhost") == 0) {
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    } else if (inet_pton(AF_INET, hostname, &addr.sin_addr) != 1) {
+    uint16_t bound_port = 0;
+    if (unix_path != NULL) {
+#if defined(_WIN32)
         close(listen_fd);
         free(hostname_arg);
-        ct_throw_message(ctx, exception, "Bun.serve currently requires an IPv4 hostname");
+        free(unix_path);
+        ct_throw_message(ctx, exception, "Unix-domain HTTP listeners are unavailable on this platform");
         return JSValueMakeUndefined(ctx);
-    }
+#else
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        size_t path_len = strlen(unix_path);
+        if (path_len == 0 || path_len >= sizeof(addr.sun_path)) {
+            close(listen_fd);
+            free(hostname_arg);
+            free(unix_path);
+            ct_throw_message(ctx, exception, "Unix socket path is too long");
+            return JSValueMakeUndefined(ctx);
+        }
+        memcpy(addr.sun_path, unix_path, path_len + 1);
+        unlink(unix_path);
+        if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(listen_fd, 128) != 0) {
+            int bind_errno = errno;
+            close(listen_fd);
+            unlink(unix_path);
+            free(hostname_arg);
+            free(unix_path);
+            ct_throw_message(ctx, exception, strerror(bind_errno));
+            return JSValueMakeUndefined(ctx);
+        }
+#endif
+    } else {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port_value);
+        if (strcmp(hostname, "0.0.0.0") == 0 || strcmp(hostname, "0") == 0) {
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        } else if (strcmp(hostname, "localhost") == 0) {
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        } else if (inet_pton(AF_INET, hostname, &addr.sin_addr) != 1) {
+            close(listen_fd);
+            free(hostname_arg);
+            ct_throw_message(ctx, exception, "Bun.serve currently requires an IPv4 hostname");
+            return JSValueMakeUndefined(ctx);
+        }
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(listen_fd);
-        ct_throw_message(ctx, exception, strerror(errno));
-        free(hostname_arg);
-        return JSValueMakeUndefined(ctx);
-    }
-    socklen_t addr_len = sizeof(addr);
-    if (getsockname(listen_fd, (struct sockaddr *)&addr, &addr_len) != 0 ||
-        listen(listen_fd, 128) != 0) {
-        close(listen_fd);
-        ct_throw_message(ctx, exception, strerror(errno));
-        free(hostname_arg);
-        return JSValueMakeUndefined(ctx);
+        if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            close(listen_fd);
+            ct_throw_message(ctx, exception, strerror(errno));
+            free(hostname_arg);
+            return JSValueMakeUndefined(ctx);
+        }
+        socklen_t addr_len = sizeof(addr);
+        if (getsockname(listen_fd, (struct sockaddr *)&addr, &addr_len) != 0 || listen(listen_fd, 128) != 0) {
+            close(listen_fd);
+            ct_throw_message(ctx, exception, strerror(errno));
+            free(hostname_arg);
+            return JSValueMakeUndefined(ctx);
+        }
+        bound_port = ntohs(addr.sin_port);
     }
 
     CtHttpServer *server = (CtHttpServer *)calloc(1, sizeof(CtHttpServer));
     if (server == NULL) {
         close(listen_fd);
+        if (unix_path != NULL) unlink(unix_path);
         ct_throw_message(ctx, exception, "Out of memory");
         free(hostname_arg);
+        free(unix_path);
         return JSValueMakeUndefined(ctx);
     }
     server->listen_fd = listen_fd;
-    server->port = ntohs(addr.sin_port);
-    server->hostname = ct_duplicate_string(hostname);
+    server->port = bound_port;
+    server->hostname = unix_path == NULL ? ct_duplicate_string(hostname) : NULL;
+    server->unix_path = unix_path;
     pthread_mutex_init(&server->mutex, NULL);
+    pthread_cond_init(&server->clients_cond, NULL);
 
     pthread_mutex_lock(&ct_http_servers_mutex);
     server->id = ct_next_http_server_id++;
@@ -12027,6 +12578,9 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         pthread_mutex_unlock(&ct_http_servers_mutex);
         close(listen_fd);
         free(server->hostname);
+        if (server->unix_path != NULL) unlink(server->unix_path);
+        free(server->unix_path);
+        pthread_cond_destroy(&server->clients_cond);
         pthread_mutex_destroy(&server->mutex);
         free(server);
         free(hostname_arg);
@@ -12036,8 +12590,12 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, server->id), exception);
-    ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, server->port), exception);
-    ct_set_property(ctx, result, "hostname", ct_make_string(ctx, server->hostname), exception);
+    if (server->unix_path != NULL) {
+        ct_set_property(ctx, result, "address", ct_make_string(ctx, server->unix_path), exception);
+    } else {
+        ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, server->port), exception);
+        ct_set_property(ctx, result, "hostname", ct_make_string(ctx, server->hostname), exception);
+    }
     free(hostname_arg);
     return result;
 }
@@ -12055,7 +12613,7 @@ static JSValueRef ct_http_server_poll(JSContextRef ctx, JSObjectRef function, JS
     JSObjectRef result = NULL;
     pthread_mutex_lock(&server->mutex);
     CtHttpRequest *request = server->requests;
-    while (request != NULL && request->claimed) request = request->next;
+    while (request != NULL && (!request->ready || request->claimed)) request = request->next;
     if (request != NULL) {
         request->claimed = true;
         result = ct_make_object(ctx);
@@ -12067,6 +12625,48 @@ static JSValueRef ct_http_server_poll(JSContextRef ctx, JSObjectRef function, JS
     }
     pthread_mutex_unlock(&server->mutex);
     return result != NULL ? result : JSValueMakeNull(ctx);
+}
+
+static CtHttpRequest *ct_http_server_lock_request(uint32_t server_id, uint32_t request_id, const char **error_message) {
+    *error_message = NULL;
+
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) pthread_mutex_lock(&server->mutex);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) {
+        *error_message = "HTTP server not found";
+        return NULL;
+    }
+    if (server->stopped) {
+        pthread_mutex_unlock(&server->mutex);
+        *error_message = "HTTP server is stopped";
+        return NULL;
+    }
+
+    CtHttpRequest *request = server->requests;
+    while (request != NULL && request->id != request_id) request = request->next;
+    if (request == NULL) {
+        pthread_mutex_unlock(&server->mutex);
+        *error_message = "HTTP request not found";
+        return NULL;
+    }
+
+    pthread_mutex_lock(&request->mutex);
+    if (request->completed) {
+        pthread_mutex_unlock(&request->mutex);
+        pthread_mutex_unlock(&server->mutex);
+        *error_message = "HTTP response is already complete";
+        return NULL;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return request;
+}
+
+static void ct_http_complete_failed_stream(CtHttpRequest *request) {
+    request->keep_alive = false;
+    request->completed = true;
+    pthread_cond_signal(&request->cond);
 }
 
 static JSValueRef ct_http_server_respond(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -12095,32 +12695,146 @@ static JSValueRef ct_http_server_respond(JSContextRef ctx, JSObjectRef function,
     }
     if (body_len > 0) memcpy(body_copy, body_data, body_len);
 
-    pthread_mutex_lock(&ct_http_servers_mutex);
-    CtHttpServer *server = ct_http_find_server(server_id);
-    pthread_mutex_unlock(&ct_http_servers_mutex);
-    if (server == NULL) {
-        free(headers_text);
-        free(body_copy);
-        ct_throw_message(ctx, exception, "HTTP server not found");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    pthread_mutex_lock(&server->mutex);
-    CtHttpRequest *request = server->requests;
-    while (request != NULL && request->id != request_id) request = request->next;
-    pthread_mutex_unlock(&server->mutex);
+    const char *lookup_error = NULL;
+    CtHttpRequest *request = ct_http_server_lock_request(server_id, request_id, &lookup_error);
     if (request == NULL) {
         free(headers_text);
         free(body_copy);
-        ct_throw_message(ctx, exception, "HTTP request not found");
+        ct_throw_message(ctx, exception, lookup_error);
         return JSValueMakeUndefined(ctx);
     }
 
-    pthread_mutex_lock(&request->mutex);
+    if (request->response_started) {
+        pthread_mutex_unlock(&request->mutex);
+        free(headers_text);
+        free(body_copy);
+        ct_throw_message(ctx, exception, "HTTP response has already started");
+        return JSValueMakeUndefined(ctx);
+    }
+
     request->status = status;
     request->response_headers_text = headers_text;
     request->response_body = body_copy;
     request->response_body_len = body_len;
+    request->response_started = true;
+    request->completed = true;
+    pthread_cond_signal(&request->cond);
+    pthread_mutex_unlock(&request->mutex);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_http_server_response_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "httpServerResponseStart requires server id, request id, status, and headers");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t request_id = (uint32_t)ct_value_to_number(ctx, argv[1]);
+    int status = (int)ct_value_to_number(ctx, argv[2]);
+    char *headers_text = ct_value_to_string_copy(ctx, argv[3]);
+    if (headers_text == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const char *lookup_error = NULL;
+    CtHttpRequest *request = ct_http_server_lock_request(server_id, request_id, &lookup_error);
+    if (request == NULL) {
+        free(headers_text);
+        ct_throw_message(ctx, exception, lookup_error);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (request->response_started) {
+        pthread_mutex_unlock(&request->mutex);
+        free(headers_text);
+        ct_throw_message(ctx, exception, "HTTP response has already started");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    request->status = status;
+    request->response_headers_text = headers_text;
+    request->response_started = true;
+    request->response_streaming = true;
+    if (ct_http_send_chunked_response_head(request) < 0) {
+        ct_http_complete_failed_stream(request);
+        pthread_mutex_unlock(&request->mutex);
+        ct_throw_message(ctx, exception, "Failed to start HTTP response stream");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_unlock(&request->mutex);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_http_server_response_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "httpServerResponseWrite requires server id, request id, and body chunk");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t request_id = (uint32_t)ct_value_to_number(ctx, argv[1]);
+    uint8_t *chunk_data = NULL;
+    size_t chunk_len = 0;
+    if (ct_get_bytes(ctx, argv[2], &chunk_data, &chunk_len) != 0) {
+        ct_throw_message(ctx, exception, "HTTP response chunk must be ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const char *lookup_error = NULL;
+    CtHttpRequest *request = ct_http_server_lock_request(server_id, request_id, &lookup_error);
+    if (request == NULL) {
+        ct_throw_message(ctx, exception, lookup_error);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!request->response_started || !request->response_streaming) {
+        pthread_mutex_unlock(&request->mutex);
+        ct_throw_message(ctx, exception, "HTTP response stream has not started");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (ct_http_send_chunk(request, chunk_data, chunk_len) < 0) {
+        ct_http_complete_failed_stream(request);
+        pthread_mutex_unlock(&request->mutex);
+        ct_throw_message(ctx, exception, "Failed to write HTTP response stream");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_unlock(&request->mutex);
+    return JSValueMakeNumber(ctx, (double)chunk_len);
+}
+
+static JSValueRef ct_http_server_response_end(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "httpServerResponseEnd requires server id and request id");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    uint32_t request_id = (uint32_t)ct_value_to_number(ctx, argv[1]);
+    const char *lookup_error = NULL;
+    CtHttpRequest *request = ct_http_server_lock_request(server_id, request_id, &lookup_error);
+    if (request == NULL) {
+        ct_throw_message(ctx, exception, lookup_error);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!request->response_started || !request->response_streaming) {
+        pthread_mutex_unlock(&request->mutex);
+        ct_throw_message(ctx, exception, "HTTP response stream has not started");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    if (ct_http_send_all(request->client_fd, "0\r\n\r\n", 5) < 0) {
+        ct_http_complete_failed_stream(request);
+        pthread_mutex_unlock(&request->mutex);
+        ct_throw_message(ctx, exception, "Failed to end HTTP response stream");
+        return JSValueMakeUndefined(ctx);
+    }
     request->completed = true;
     pthread_cond_signal(&request->cond);
     pthread_mutex_unlock(&request->mutex);
@@ -12136,6 +12850,7 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
         close(server->listen_fd);
         CtHttpRequest *request = server->requests;
         while (request != NULL) {
+            shutdown(request->client_fd, SHUT_RDWR);
             pthread_mutex_lock(&request->mutex);
             request->completed = true;
             pthread_cond_signal(&request->cond);
@@ -12145,6 +12860,10 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
     }
     pthread_mutex_unlock(&server->mutex);
     pthread_join(server->thread, NULL);
+
+    pthread_mutex_lock(&server->mutex);
+    while (server->active_clients > 0) pthread_cond_wait(&server->clients_cond, &server->mutex);
+    pthread_mutex_unlock(&server->mutex);
 
     if (remove_from_global_list) {
         pthread_mutex_lock(&ct_http_servers_mutex);
@@ -12165,6 +12884,9 @@ static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_li
         request = next;
     }
     free(server->hostname);
+    if (server->unix_path != NULL) unlink(server->unix_path);
+    free(server->unix_path);
+    pthread_cond_destroy(&server->clients_cond);
     pthread_mutex_destroy(&server->mutex);
     free(server);
 }
@@ -12261,6 +12983,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "readFd", ct_read_fd, runtime);
     ct_install_function(ctx, host, "closeFd", ct_close_fd, runtime);
     ct_install_function(ctx, host, "fdWrite", ct_fd_write, runtime);
+    ct_install_function(ctx, host, "fdWriteSome", ct_fd_write_some, runtime);
     ct_install_function(ctx, host, "ipcSend", ct_ipc_send, runtime);
     ct_install_function(ctx, host, "ipcRecv", ct_ipc_recv, runtime);
     ct_install_function(ctx, host, "accessSync", ct_access_sync_native, runtime);
@@ -12308,6 +13031,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "httpServerStart", ct_http_server_start, runtime);
     ct_install_function(ctx, host, "httpServerPoll", ct_http_server_poll, runtime);
     ct_install_function(ctx, host, "httpServerRespond", ct_http_server_respond, runtime);
+    ct_install_function(ctx, host, "httpServerResponseStart", ct_http_server_response_start, runtime);
+    ct_install_function(ctx, host, "httpServerResponseWrite", ct_http_server_response_write, runtime);
+    ct_install_function(ctx, host, "httpServerResponseEnd", ct_http_server_response_end, runtime);
     ct_install_function(ctx, host, "httpServerStop", ct_http_server_stop, runtime);
     ct_install_function(ctx, host, "stripTypeScriptTypes", ct_strip_typescript_types_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);

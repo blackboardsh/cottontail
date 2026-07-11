@@ -41,7 +41,16 @@ export function inspect(value, options = undefined) {
   if (typeof value === "symbol") return String(value);
   if (typeof value === "function") return `[Function${value.name ? `: ${value.name}` : ""}]`;
   if (value instanceof Promise) return "Promise { <pending> }";
-  if (value instanceof Error) return value.stack || value.message;
+  if (value instanceof Error) {
+    const header = `${value.name || "Error"}${value.message ? `: ${value.message}` : ""}`;
+    const stack = value.stack
+      ? String(value.stack).includes(value.message) ? String(value.stack) : `${header}\n${value.stack}`
+      : header;
+    const entries = Object.keys(value)
+      .filter((key) => !["name", "message", "stack"].includes(key))
+      .map((key) => `${key}: ${inspect(value[key], options)}`);
+    return entries.length > 0 ? `${stack}\n${entries.join("\n")}` : stack;
+  }
   try {
     return JSON.stringify(value);
   } catch {
@@ -257,7 +266,116 @@ export function parseEnv(content) {
 }
 
 export function stripVTControlCharacters(str) {
-  return String(str).replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+  const input = String(str);
+  let output = "";
+  let changed = false;
+
+  for (let index = 0; index < input.length;) {
+    const code = input.charCodeAt(index);
+    if (code === 0x9b) {
+      const start = index++;
+      if (input.charCodeAt(index) === 0x5b) {
+        index += 1;
+        changed = true;
+        continue;
+      }
+      let cursor = index;
+      while (cursor < input.length) {
+        const current = input.charCodeAt(cursor);
+        if (current >= 0x40 && current <= 0x7e) {
+          index = cursor + 1;
+          changed = true;
+          break;
+        }
+        cursor += 1;
+      }
+      if (index !== start + 1) continue;
+      const body = input.slice(start + 1);
+      if (body.length === 0 || body.endsWith(";")) {
+        changed = true;
+        break;
+      }
+      output += input.slice(start);
+      break;
+    }
+
+    if (code !== 0x1b) {
+      output += input[index++];
+      continue;
+    }
+
+    const start = index++;
+    if (index >= input.length) {
+      changed = true;
+      break;
+    }
+
+    const next = input.charCodeAt(index);
+    if (next === 0x5d) {
+      index += 1;
+      while (index < input.length) {
+        const current = input.charCodeAt(index);
+        if (current === 0x07 || current === 0x9c) {
+          index += 1;
+          break;
+        }
+        if (current === 0x1b && input.charCodeAt(index + 1) === 0x5c) {
+          index += 2;
+          break;
+        }
+        index += 1;
+      }
+      changed = true;
+      continue;
+    }
+
+    if (next === 0x5b) {
+      index += 1;
+      let cursor = index;
+      while (cursor < input.length) {
+        const current = input.charCodeAt(cursor);
+        if (current >= 0x40 && current <= 0x7e) {
+          index = cursor + 1;
+          changed = true;
+          break;
+        }
+        cursor += 1;
+      }
+      if (index !== start + 2) continue;
+      const body = input.slice(start + 2);
+      if (body.length === 0 || body.endsWith(";")) {
+        changed = true;
+        break;
+      }
+      output += input.slice(start);
+      break;
+    }
+
+    if ("()*+-./#%".includes(input[index])) {
+      index = Math.min(input.length, index + 2);
+      changed = true;
+      continue;
+    }
+
+    if (next >= 0x20 && next <= 0x2f) {
+      index += 1;
+      while (index < input.length && input.charCodeAt(index) >= 0x20 && input.charCodeAt(index) <= 0x2f) index += 1;
+      if (index < input.length) index += 1;
+      changed = true;
+      continue;
+    }
+
+    if ((next >= 0x30 && next <= 0x7e) || (next >= 0x40 && next <= 0x5f)) {
+      index += 1;
+      changed = true;
+      continue;
+    }
+
+    output += input[start];
+    index = start + 1;
+  }
+
+  return changed ? output : input;
 }
 
 const styleCodes = {

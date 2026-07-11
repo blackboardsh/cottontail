@@ -67,6 +67,10 @@ export async function chown(path, uid, gid) {
   return chownSync(path, uid, gid);
 }
 
+export async function close(fd) {
+  return closeSync(fd);
+}
+
 export async function copyFile(source, destination, mode = 0) {
   return copyFileSync(source, destination, mode);
 }
@@ -280,6 +284,7 @@ export default {
   appendFile,
   chmod,
   chown,
+  close,
   constants,
   copyFile,
   cp,

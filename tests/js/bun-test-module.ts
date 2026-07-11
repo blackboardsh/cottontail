@@ -33,8 +33,13 @@ expect("cottontail").toMatch(/tail$/);
 await expect(Promise.resolve(42)).resolves.toBe(42);
 await expect(new Promise((_resolve, reject) => setTimeout(() => reject(new Error("boom")), 0))).rejects.toThrow("boom");
 
-expect("inline snapshot").toMatchInlineSnapshot("inline snapshot");
-expect({ id: 1, name: "Ada" }).toMatchInlineSnapshot({ id: expect.any(Number) }, '{"id":1,"name":"Ada"}');
+expect("inline snapshot").toMatchInlineSnapshot('"inline snapshot"');
+expect({ id: 1, name: "Ada" }).toMatchInlineSnapshot({ id: expect.any(Number) }, `
+{
+  "id": 1,
+  "name": "Ada",
+}
+`);
 expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
 expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
 

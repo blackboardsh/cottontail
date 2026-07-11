@@ -116,6 +116,68 @@ function printRangeMetric(label, lower, upper, detail = '') {
   console.log(`${pad(label, nameWidth)} ${bar(midpoint, 100)}  ${pad(range, 12)} ${paint(detail, 'dim')}`);
 }
 
+function formatInteger(value) {
+  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function upstreamStatusSummary(upstreamStatus) {
+  const fields = ['enabled', 'expectedFailure', 'disabled', 'notEnabled'];
+  const values = Object.fromEntries(fields.map((field) => [field, upstreamStatus[field] ?? 0]));
+  for (const [field, value] of Object.entries(values)) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`${field} must be a non-negative integer`);
+    }
+  }
+
+  const categoryTotal = values.enabled + values.expectedFailure + values.disabled;
+  const classifiedTests = upstreamStatus.classifiedTests ?? upstreamStatus.trackedTests ?? categoryTotal;
+  const discoveredRunnableFiles = upstreamStatus.discoveredRunnableFiles ?? classifiedTests + values.notEnabled;
+  if (!Number.isInteger(classifiedTests) || classifiedTests < 0) {
+    throw new Error('classifiedTests must be a non-negative integer');
+  }
+  if (!Number.isInteger(discoveredRunnableFiles) || discoveredRunnableFiles < 0) {
+    throw new Error('discoveredRunnableFiles must be a non-negative integer');
+  }
+  if (classifiedTests !== categoryTotal) {
+    throw new Error(`${classifiedTests} classified tests do not match ${categoryTotal} resolved classifications`);
+  }
+  if (discoveredRunnableFiles !== classifiedTests + values.notEnabled) {
+    throw new Error(
+      `${discoveredRunnableFiles} discovered runnable files do not match ` +
+      `${classifiedTests} classified + ${values.notEnabled} not-enabled`
+    );
+  }
+  if (upstreamStatus.trackedTests != null && upstreamStatus.trackedTests !== classifiedTests) {
+    throw new Error(`${upstreamStatus.trackedTests} tracked tests do not match ${classifiedTests} classified tests`);
+  }
+
+  return { ...values, classifiedTests, discoveredRunnableFiles };
+}
+
+function printUpstreamMetric(label, upstreamStatus) {
+  if (!upstreamStatus) return;
+  let summary;
+  try {
+    summary = upstreamStatusSummary(upstreamStatus);
+  } catch (error) {
+    fail(`${label}: ${error.message}`);
+  }
+
+  const tierDetail = [
+    'current classified tier',
+    `${summary.expectedFailure} expected-failure`,
+    `${summary.disabled} disabled`,
+  ].join('; ');
+  printMetric(label, summary.enabled, summary.classifiedTests, tierDetail);
+  console.log(
+    `${pad('', 22)} ${paint(
+      `${formatInteger(summary.discoveredRunnableFiles)} discovered runnable files; ` +
+      `${formatInteger(summary.notEnabled)} not-enabled (unclassified)`,
+      'dim'
+    )}`
+  );
+}
+
 function printRows(rows, options = {}) {
   const columns = [
     { name: 'surface', width: options.nameWidth || 24, value: (row) => row.name },
@@ -142,7 +204,7 @@ function printBehaviorRows(rows, options = {}) {
     { name: 'caveats', width: 8, value: (row) => String(row.compatMarkers) },
     { name: 'unsupported', width: 11, value: (row) => String(row.unsupportedMarkers) },
     { name: 'guards', width: 7, value: (row) => String(row.nativeAvailabilityGuards ?? 0) },
-    { name: 'tests', width: 6, value: (row) => String(row.tests) },
+    { name: 'local tests', width: 11, value: (row) => String(row.tests) },
     { name: 'score', width: 6, value: (row) => String(row.gapScore) },
   ];
 
@@ -191,34 +253,30 @@ const bunObjectImplemented = manifest.coverage.bun.Bun.implemented.length;
 const bunObjectTotal = bunObjectImplemented + manifest.coverage.bun.Bun.missing.length;
 const nodeBehavior = manifest.behavioral?.node;
 const bunBehavior = manifest.behavioral?.bun;
+const upstream = manifest.upstream ?? {};
 
 console.log(paint('Cottontail API Surface', 'bold'));
-console.log(paint(`Node ${manifest.targets.node.version}  ·  Bun ${manifest.targets.bun.version}  ·  ${manifest.note}`, 'dim'));
+console.log(paint(`Node ${manifest.targets.node.version}  ·  Bun ${manifest.targets.bun.version}`, 'dim'));
 
-section('Overview');
+section('Upstream Conformance Evidence');
+console.log(paint(
+  'Enabled tests are measured against the current classified tier; not-enabled runnable files remain unclassified.',
+  'dim'
+));
+console.log('');
+printUpstreamMetric('Node upstream tests', upstream.node);
+printUpstreamMetric('Bun upstream tests', upstream.bun);
+
+section('API Name Inventory (Not Conformance)');
+console.log(paint(manifest.note, 'dim'));
+console.log('');
 printMetric('Node modules', nodePresent.length, nodeRows.length, `${nodeMissing.length} missing modules`);
 printMetric('Node exports', nodeExportsImplemented, nodeExportsTotal, `${nodeExportsTotal - nodeExportsImplemented} missing names`);
-if (nodeBehavior) {
-  printRangeMetric(
-    'Node behavior',
-    nodeBehavior.estimate.implementedPercentLower,
-    nodeBehavior.estimate.implementedPercentUpper,
-    `heuristic; ~${nodeBehavior.estimate.gapPercentLower}-${nodeBehavior.estimate.gapPercentUpper}% gap`,
-  );
-}
 printMetric('Bun object', bunObjectImplemented, bunObjectTotal, `${bunObjectTotal - bunObjectImplemented} missing properties`);
 printMetric('Bun modules', bunModulePresent.length, bunModuleRows.length, `${bunModuleRows.length - bunModulePresent.length} missing modules`);
 printMetric('Bun module exports', bunModuleExportsImplemented, bunModuleExportsTotal, `${bunModuleExportsTotal - bunModuleExportsImplemented} missing names`);
-if (bunBehavior) {
-  printRangeMetric(
-    'Bun behavior',
-    bunBehavior.estimate.implementedPercentLower,
-    bunBehavior.estimate.implementedPercentUpper,
-    `heuristic; ~${bunBehavior.estimate.gapPercentLower}-${bunBehavior.estimate.gapPercentUpper}% gap`,
-  );
-}
 
-section(`Node Modules With Largest Gaps (top ${topCount})`);
+section(`Node API Name Gaps (top ${topCount})`);
 printRows(
   [...nodeRows]
     .sort((left, right) => right.missing - left.missing || left.name.localeCompare(right.name))
@@ -227,20 +285,7 @@ printRows(
 );
 printList('Missing Node modules', nodeMissing.map((row) => row.name), topCount);
 
-if (nodeBehavior) {
-  section(`Node Behavioral Gap Heuristic (top ${topCount})`);
-  console.log(paint(nodeBehavior.note, 'dim'));
-  console.log('');
-  console.log(`${pad('compat markers', 24)} ${nodeBehavior.signals.compatMarkers}`);
-  console.log(`${pad('modules with caveats', 24)} ${nodeBehavior.signals.modulesWithCompatMarkers}/${nodeBehavior.signals.publicNodeModules}`);
-  console.log(`${pad('unsupported markers', 24)} ${nodeBehavior.signals.explicitUnsupportedMarkers}`);
-  console.log(`${pad('native guard markers', 24)} ${nodeBehavior.signals.nativeAvailabilityGuards ?? 0}`);
-  console.log(`${pad('node test files', 24)} ${nodeBehavior.signals.nodeTestFiles}`);
-  console.log('');
-  printBehaviorRows(nodeBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });
-}
-
-section('Bun Surface');
+section('Bun API Name Inventory');
 printRows(
   [...bunModuleRows]
     .sort((left, right) => right.missing - left.missing || left.name.localeCompare(right.name)),
@@ -248,15 +293,38 @@ printRows(
 );
 printList('Missing Bun properties', manifest.coverage.bun.Bun.missing, topCount * 2);
 
+if (nodeBehavior) {
+  section(`Node Heuristic Signals (Not Conformance, top ${topCount})`);
+  console.log(paint(nodeBehavior.note, 'dim'));
+  if (nodeBehavior.estimate) {
+    console.log('');
+    printRangeMetric(
+      'heuristic range',
+      nodeBehavior.estimate.implementedPercentLower,
+      nodeBehavior.estimate.implementedPercentUpper,
+      `source/local-test heuristic; ~${nodeBehavior.estimate.gapPercentLower}-${nodeBehavior.estimate.gapPercentUpper}% gap`,
+    );
+  }
+  console.log('');
+  console.log(`${pad('compat markers', 24)} ${nodeBehavior.signals.compatMarkers}`);
+  console.log(`${pad('modules with caveats', 24)} ${nodeBehavior.signals.modulesWithCompatMarkers}/${nodeBehavior.signals.publicNodeModules}`);
+  console.log(`${pad('unsupported markers', 24)} ${nodeBehavior.signals.explicitUnsupportedMarkers}`);
+  console.log(`${pad('native guard markers', 24)} ${nodeBehavior.signals.nativeAvailabilityGuards ?? 0}`);
+  console.log(`${pad('local Node test files', 24)} ${nodeBehavior.signals.nodeTestFiles}`);
+  console.log('');
+  printBehaviorRows(nodeBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });
+}
+
 if (bunBehavior) {
-  section(`Bun Behavioral Gap Heuristic (top ${topCount})`);
+  section(`Bun Heuristic Signals (Not Conformance, top ${topCount})`);
   console.log(paint(bunBehavior.note, 'dim'));
+  console.log(paint('No Bun compatibility percentage is inferred from these source and local-test signals.', 'dim'));
   console.log('');
   console.log(`${pad('compat markers', 24)} ${bunBehavior.signals.compatMarkers}`);
   console.log(`${pad('modules with caveats', 24)} ${bunBehavior.signals.modulesWithCompatMarkers}/${bunBehavior.signals.publicBunModules}`);
   console.log(`${pad('unsupported markers', 24)} ${bunBehavior.signals.explicitUnsupportedMarkers}`);
   console.log(`${pad('native guard markers', 24)} ${bunBehavior.signals.nativeAvailabilityGuards ?? 0}`);
-  console.log(`${pad('bun test files', 24)} ${bunBehavior.signals.bunTestFiles}`);
+  console.log(`${pad('local Bun test files', 24)} ${bunBehavior.signals.bunTestFiles}`);
   console.log('');
   printBehaviorRows(bunBehavior.largestGaps.slice(0, topCount), { nameWidth: 24 });
 }

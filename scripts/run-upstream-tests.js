@@ -147,25 +147,54 @@ function statusEntryForPath(status, path, defaultStatus = status.defaultStatus ?
   };
 }
 
-function statusCounts(snapshotRoot, status, runtime = 'node') {
-  const tests = Object.entries(status.tests ?? {});
-  const hasPatterns = patternEntries(status).length > 0;
-  const discovered = status.defaultStatus === 'enabled' || hasPatterns ? discoverRunnableFiles(snapshotRoot, runtime) : [];
-  const discoveredPaths = new Set(discovered);
-  const discoveredEntries = discovered.map((path) => statusEntryForPath(status, path));
-  const explicitOnlyEntries = tests
-    .filter(([path]) => !discoveredPaths.has(path))
-    .map(([path, entry]) => ({ path, ...entry }));
-  const entries = [...discoveredEntries, ...explicitOnlyEntries];
-  const disabled = entries.filter((item) => disabledStatuses.has(item.status)).length;
-  const explicitEnabled = entries.filter((item) => item.status === 'enabled').length;
-  const counts = {
-    copiedFiles: existsSync(snapshotRoot) ? countFiles(snapshotRoot) : 0,
-    enabled: explicitEnabled,
-    expectedFailure: entries.filter((item) => item.status === 'expected-failure').length,
-    disabled,
+function assertRunnableStatusSummary(summary) {
+  const classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  if (summary.classifiedTests !== classifiedTests) {
+    throw new Error(`classified upstream count mismatch: ${summary.classifiedTests} !== ${classifiedTests}`);
+  }
+  if (summary.discoveredRunnableFiles !== classifiedTests + summary.notEnabled) {
+    throw new Error(
+      `discovered upstream count mismatch: ${summary.discoveredRunnableFiles} !== ` +
+      `${classifiedTests} classified + ${summary.notEnabled} not-enabled`
+    );
+  }
+}
+
+function summarizeRunnableStatuses(entries) {
+  const summary = {
+    discoveredRunnableFiles: entries.length,
+    enabled: 0,
+    expectedFailure: 0,
+    disabled: 0,
+    notEnabled: 0,
+    classifiedTests: 0,
   };
-  return counts;
+  const unknown = [];
+
+  for (const entry of entries) {
+    if (entry.status === 'enabled') summary.enabled += 1;
+    else if (entry.status === 'expected-failure') summary.expectedFailure += 1;
+    else if (disabledStatuses.has(entry.status)) summary.disabled += 1;
+    else if (entry.status === 'not-enabled') summary.notEnabled += 1;
+    else unknown.push(`${entry.path}: ${String(entry.status)}`);
+  }
+
+  if (unknown.length > 0) {
+    throw new Error(`unknown upstream test status(es): ${unknown.join(', ')}`);
+  }
+
+  summary.classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  assertRunnableStatusSummary(summary);
+  return summary;
+}
+
+function statusCounts(snapshotRoot, status, runtime = 'node') {
+  const entries = discoverRunnableFiles(snapshotRoot, runtime)
+    .map((path) => statusEntryForPath(status, path));
+  return {
+    copiedFiles: existsSync(snapshotRoot) ? countFiles(snapshotRoot) : 0,
+    ...summarizeRunnableStatuses(entries),
+  };
 }
 
 function selectedTests(status, options, snapshotRoot, runtime = 'node') {
@@ -246,6 +275,22 @@ function formatSpawnError(runtime, entry, result) {
   return `${runtime} ${entry.path} failed to start: ${result.error.message}`;
 }
 
+function parseBunTestExecution(stderr) {
+  const text = String(stderr ?? '');
+  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n\s*(\d+) fail\s*\n\s*(\d+) expect\(\) calls\s*\nRan (\d+) tests across (\d+) file(?:s)?\./g;
+  let execution = null;
+  for (const match of text.matchAll(pattern)) {
+    execution = {
+      passed: Number(match[1]),
+      failed: Number(match[2]),
+      assertions: Number(match[3]),
+      tests: Number(match[4]),
+      files: Number(match[5]),
+    };
+  }
+  return execution;
+}
+
 function runNode(runtime, target, status, entries, snapshotRoot, options) {
   const result = runNodeHarness(target, entries, snapshotRoot, status, options);
   const spawnError = formatSpawnError(runtime, { path: 'tools/test.py' }, result);
@@ -299,14 +344,18 @@ function runOne(runtime, target, entry) {
   const exitCode = result.status ?? 1;
   const shouldFail = entry.status === 'expected-failure';
   const ok = shouldFail ? exitCode !== 0 : exitCode === 0;
+  const execution = runtime === 'bun' ? parseBunTestExecution(result.stderr) : null;
+  const executionLabel = execution
+    ? ` (${execution.tests} tests, ${execution.assertions} assertions)`
+    : '';
   const message = ok
-    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entry.path}`
+    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entry.path}${executionLabel}`
     : [
         `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${entry.path} exited ${exitCode}`,
         result.stdout ? `stdout:\n${result.stdout}` : '',
         result.stderr ? `stderr:\n${result.stderr}` : '',
       ].filter(Boolean).join('\n');
-  return { runtime, entry, ok, unexpected: !ok, message };
+  return { runtime, entry, ok, unexpected: !ok, message, execution };
 }
 
 function runtimeTargets(runtime, targets) {
@@ -328,19 +377,38 @@ for (const name of runtimeTargets(runtime, targets)) {
   const counts = statusCounts(snapshotRoot, status, name);
   console.log(`${name} ${target.version} (${target.commit.slice(0, 12)})`);
   console.log(`  copied files: ${counts.copiedFiles}`);
+  console.log(`  discovered runnable files: ${counts.discoveredRunnableFiles}`);
+  console.log(`  current classified tier: ${counts.enabled}/${counts.classifiedTests} enabled`);
   console.log(`  enabled: ${counts.enabled}`);
   console.log(`  expected-failure: ${counts.expectedFailure}`);
   console.log(`  disabled: ${counts.disabled}`);
+  console.log(`  not-enabled: ${counts.notEnabled} (unclassified runnable files)`);
   if (options.list) continue;
 
   const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
   const results = name === 'node'
     ? runNode(name, target, status, entries, snapshotRoot, options)
     : entries.map((entry) => runOne(name, target, entry));
+  const executionTotals = { tests: 0, assertions: 0, files: 0, filesWithoutSummary: 0 };
   for (const result of results) {
     console.log(result.message);
+    if (name === 'bun' && result.ok && result.entry?.status === 'enabled') {
+      if (result.execution) {
+        executionTotals.tests += result.execution.tests;
+        executionTotals.assertions += result.execution.assertions;
+        executionTotals.files += 1;
+      } else {
+        executionTotals.filesWithoutSummary += 1;
+      }
+    }
     if (result.unexpected) unexpected += 1;
     if (unexpected >= options.maxFailures) break;
+  }
+  if (name === 'bun' && results.length > 0) {
+    console.log(
+      `  executed bun:test cases: ${executionTotals.tests}; assertions: ${executionTotals.assertions}; ` +
+      `files with summaries: ${executionTotals.files}; files without summaries: ${executionTotals.filesWithoutSummary}`
+    );
   }
   if (unexpected >= options.maxFailures) break;
 }

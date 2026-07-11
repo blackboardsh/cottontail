@@ -40,6 +40,14 @@ function bytesToChunk(bytes, encoding) {
   return globalThis.Buffer?.from ? globalThis.Buffer.from(view) : view;
 }
 
+function chunkByteLength(chunk) {
+  if (chunk == null) return 0;
+  if (typeof chunk === "string") return new TextEncoder().encode(chunk).byteLength;
+  if (chunk instanceof ArrayBuffer) return chunk.byteLength;
+  if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
+  return new TextEncoder().encode(String(chunk)).byteLength;
+}
+
 export function createReadableStdio(fd = 0) {
   const listeners = new Map();
   const stream = {
@@ -138,6 +146,51 @@ export function createReadableStdio(fd = 0) {
   };
   stream.resume = () => start();
   stream.pause = () => stream;
+  stream.pipe = (destination, options = {}) => {
+    stream.on("data", (chunk) => destination?.write?.(chunk));
+    if (options?.end !== false) stream.on("end", () => destination?.end?.());
+    start();
+    return destination;
+  };
+  stream.stream = () => {
+    if (typeof globalThis.ReadableStream !== "function") {
+      return {
+        async *[Symbol.asyncIterator]() {
+          const chunks = [];
+          let done = false;
+          stream.on("data", (chunk) => chunks.push(chunk));
+          stream.on("end", () => { done = true; });
+          stream.resume();
+          while (!done || chunks.length > 0) {
+            if (chunks.length > 0) yield chunks.shift();
+            else await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        },
+      };
+    }
+    return new globalThis.ReadableStream({
+      start(controller) {
+        const onData = (chunk) => controller.enqueue(chunk);
+        const onEnd = () => {
+          cleanup();
+          controller.close();
+        };
+        const onError = (error) => {
+          cleanup();
+          controller.error(error);
+        };
+        const cleanup = () => {
+          stream.off("data", onData);
+          stream.off("end", onEnd);
+          stream.off("error", onError);
+        };
+        stream.on("data", onData);
+        stream.once("end", onEnd);
+        stream.once("error", onError);
+        stream.resume();
+      },
+    });
+  };
   stream.setEncoding = (value = "utf8") => {
     encoding = String(value || "utf8").toLowerCase();
     return stream;
@@ -201,6 +254,24 @@ export function createWritableStdio(fd = 1) {
     emit(listeners, "close");
     if (typeof callback === "function") callback();
   };
+  stream.writer = function writer() {
+    let closed = false;
+    return {
+      write(chunk) {
+        if (closed) return 0;
+        stream.write(chunk);
+        return chunkByteLength(chunk);
+      },
+      flush() {
+        return 0;
+      },
+      end(chunk = undefined) {
+        if (!closed && chunk != null) stream.write(chunk);
+        closed = true;
+        return 0;
+      },
+    };
+  };
   stream.destroy = function destroy(error = undefined) {
     if (stream.destroyed) return stream;
     stream.destroyed = true;
@@ -213,4 +284,3 @@ export function createWritableStdio(fd = 1) {
 
   return stream;
 }
-

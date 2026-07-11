@@ -717,8 +717,11 @@ function makeReport() {
 }
 
 const cottontailExecPath = cottontail.execPath?.() ?? "cottontail";
+const cottontailArgv = Array.isArray(cottontail.argv) ? [...cottontail.argv] : [cottontailExecPath, ...(cottontail.args || [])];
+if (cottontailArgv.length === 0) cottontailArgv.push(cottontailExecPath);
+if (cottontailArgv[0] === "cottontail") cottontailArgv[0] = cottontailExecPath;
 const processObject = globalThis.process ?? {
-  argv: cottontail.argv || [cottontailExecPath, ...(cottontail.args || [])],
+  argv: cottontailArgv,
   argv0: cottontailExecPath,
   execPath: cottontailExecPath,
   env: cottontail.env(),
@@ -732,7 +735,8 @@ const processObject = globalThis.process ?? {
 globalThis.process = processObject;
 createEventApi(processObject);
 
-processObject.argv ??= cottontail.argv || [cottontailExecPath, ...(cottontail.args || [])];
+processObject.argv ??= cottontailArgv;
+if (Array.isArray(processObject.argv) && processObject.argv[0] === "cottontail") processObject.argv[0] = cottontailExecPath;
 processObject.argv0 ??= cottontailExecPath;
 processObject.execPath ??= cottontailExecPath;
 processObject.env ??= cottontail.env();

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "generatedBy": "scripts/generate-api-surface.js",
-  "note": "This is an API-name inventory, not a behavioral compatibility result.",
+  "note": "API coverage is a name inventory; upstream test tiers are the conformance evidence, and heuristic signals are not conformance results.",
   "targets": {
     "node": {
       "source": "local node runtime",
@@ -7649,6 +7649,7 @@
           "file",
           "FileSystemRouter",
           "fileURLToPath",
+          "FormData",
           "gc",
           "generateHeapSnapshot",
           "Glob",
@@ -7656,6 +7657,7 @@
           "gzipSync",
           "hash",
           "Headers",
+          "HTMLRewriter",
           "indexOfLine",
           "inflateSync",
           "inspect",
@@ -7707,6 +7709,9 @@
           "SHA384",
           "SHA512",
           "SHA512_256",
+          "ShellError",
+          "ShellExpression",
+          "ShellOutput",
           "shrink",
           "sleep",
           "sleepSync",
@@ -7735,6 +7740,29 @@
           "zstdCompressSync",
           "zstdDecompress",
           "zstdDecompressSync"
+        ],
+        "hasDefaultExport": true
+      },
+      "bun/internal-for-testing": {
+        "file": "src/runtime_modules/bun/internal-for-testing.js",
+        "exports": [
+          "applyPatchDiff",
+          "canonicalizeIP",
+          "createSocketPair",
+          "cssInternals",
+          "decodeURIComponentSIMD",
+          "escapeRegExp",
+          "escapeRegExpForPackageNameMatching",
+          "hasNonReifiedStatic",
+          "highlightJavaScript",
+          "iniInternals",
+          "isModuleResolveFilenameSlowPathEnabled",
+          "jscInternals",
+          "makePatchDiff",
+          "parsePatchDiff",
+          "patchInternals",
+          "setSocketOptions",
+          "shellInternals"
         ],
         "hasDefaultExport": true
       },
@@ -7780,6 +7808,15 @@
         ],
         "hasDefaultExport": true
       },
+      "bun/json5": {
+        "file": "src/runtime_modules/bun/json5.js",
+        "exports": [
+          "JSON5",
+          "parse",
+          "stringify"
+        ],
+        "hasDefaultExport": true
+      },
       "bun:sqlite": {
         "file": "src/runtime_modules/bun/sqlite.js",
         "exports": [
@@ -7788,6 +7825,20 @@
           "Database",
           "SQLiteError",
           "Statement"
+        ],
+        "hasDefaultExport": true
+      },
+      "bun/string-width": {
+        "file": "src/runtime_modules/bun/string-width.js",
+        "exports": [
+          "stringWidth"
+        ],
+        "hasDefaultExport": true
+      },
+      "bun/strip-ansi": {
+        "file": "src/runtime_modules/bun/strip-ansi.js",
+        "exports": [
+          "stripANSI"
         ],
         "hasDefaultExport": true
       },
@@ -7813,6 +7864,23 @@
           "xdescribe",
           "xit",
           "xtest"
+        ],
+        "hasDefaultExport": true
+      },
+      "bun/toml": {
+        "file": "src/runtime_modules/bun/toml.js",
+        "exports": [
+          "parse",
+          "stringify",
+          "TOML"
+        ],
+        "hasDefaultExport": true
+      },
+      "bun/yaml": {
+        "file": "src/runtime_modules/bun/yaml.js",
+        "exports": [
+          "parse",
+          "stringify"
         ],
         "hasDefaultExport": true
       },
@@ -8638,6 +8706,7 @@
           "createSecretKey",
           "createSign",
           "createVerify",
+          "CryptoKey",
           "decapsulate",
           "Decipheriv",
           "diffieHellman",
@@ -8717,6 +8786,7 @@
           "createSecretKey",
           "createSign",
           "createVerify",
+          "CryptoKey",
           "decapsulate",
           "Decipheriv",
           "diffieHellman",
@@ -8939,6 +9009,7 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getCacheStats",
           "getDefaultResultOrder",
           "getServers",
           "LOADIPHLPAPI",
@@ -8950,6 +9021,7 @@
           "NOTFOUND",
           "NOTIMP",
           "NOTINITIALIZED",
+          "prefetch",
           "promises",
           "PromisesResolver",
           "REFUSED",
@@ -8996,6 +9068,7 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getCacheStats",
           "getDefaultResultOrder",
           "getServers",
           "LOADIPHLPAPI",
@@ -9007,6 +9080,7 @@
           "NOTFOUND",
           "NOTIMP",
           "NOTINITIALIZED",
+          "prefetch",
           "promises",
           "PromisesResolver",
           "REFUSED",
@@ -9109,6 +9183,7 @@
           "appendFile",
           "chmod",
           "chown",
+          "close",
           "constants",
           "copyFile",
           "cp",
@@ -9148,6 +9223,7 @@
           "appendFile",
           "chmod",
           "chown",
+          "close",
           "constants",
           "copyFile",
           "cp",
@@ -10640,7 +10716,9 @@
           "it",
           "mock",
           "only",
+          "onTestFinished",
           "run",
+          "setDefaultTimeout",
           "skip",
           "snapshot",
           "suite",
@@ -10661,7 +10739,9 @@
           "it",
           "mock",
           "only",
+          "onTestFinished",
           "run",
+          "setDefaultTimeout",
           "skip",
           "snapshot",
           "suite",
@@ -11717,6 +11797,55 @@
           "zstdDecompressSync"
         ],
         "hasDefaultExport": true
+      },
+      "vendor/picomatch-path-shim": {
+        "file": "src/runtime_modules/vendor/picomatch-path-shim.js",
+        "exports": [
+          "basename",
+          "sep"
+        ],
+        "hasDefaultExport": true
+      },
+      "vendor/picomatch": {
+        "file": "src/runtime_modules/vendor/picomatch.js",
+        "exports": [],
+        "hasDefaultExport": true
+      },
+      "vendor/yaml": {
+        "file": "src/runtime_modules/vendor/yaml.js",
+        "exports": [
+          "Alias",
+          "Composer",
+          "CST",
+          "default",
+          "Document",
+          "isAlias",
+          "isCollection",
+          "isDocument",
+          "isMap",
+          "isNode",
+          "isPair",
+          "isScalar",
+          "isSeq",
+          "Lexer",
+          "LineCounter",
+          "Pair",
+          "parse",
+          "parseAllDocuments",
+          "parseDocument",
+          "Parser",
+          "Scalar",
+          "Schema",
+          "stringify",
+          "visit",
+          "visitAsync",
+          "YAMLError",
+          "YAMLMap",
+          "YAMLParseError",
+          "YAMLSeq",
+          "YAMLWarning"
+        ],
+        "hasDefaultExport": false
       }
     },
     "files": {
@@ -11740,7 +11869,9 @@
           "viewSource"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "Bun"
+        ]
       },
       "src/runtime_modules/bun/index.js": {
         "file": "src/runtime_modules/bun/index.js",
@@ -11774,6 +11905,7 @@
           "file",
           "FileSystemRouter",
           "fileURLToPath",
+          "FormData",
           "gc",
           "generateHeapSnapshot",
           "Glob",
@@ -11781,6 +11913,7 @@
           "gzipSync",
           "hash",
           "Headers",
+          "HTMLRewriter",
           "indexOfLine",
           "inflateSync",
           "inspect",
@@ -11832,6 +11965,9 @@
           "SHA384",
           "SHA512",
           "SHA512_256",
+          "ShellError",
+          "ShellExpression",
+          "ShellOutput",
           "shrink",
           "sleep",
           "sleepSync",
@@ -11895,6 +12031,7 @@
           "gunzipSync",
           "gzipSync",
           "hash",
+          "HTMLRewriter",
           "indexOfLine",
           "inflateSync",
           "inspect",
@@ -11944,6 +12081,8 @@
           "SHA384",
           "SHA512",
           "SHA512_256",
+          "ShellError",
+          "ShellOutput",
           "shrink",
           "sleep",
           "sleepSync",
@@ -11973,20 +12112,67 @@
           "zstdDecompressSync"
         ],
         "globalProperties": [
+          "__cottontailActiveServeOrigins",
+          "__cottontailBunHasNonReifiedStatic",
+          "__cottontailBunReified",
+          "__cottontailImportMetaResolve",
+          "__cottontailImportMetaResolveSync",
+          "__cottontailPromisePeekStates",
           "AbortController",
           "AbortSignal",
+          "afterAll",
+          "afterEach",
+          "beforeAll",
+          "beforeEach",
           "Bun",
+          "CloseEvent",
           "crypto",
+          "CryptoKey",
+          "CustomEvent",
+          "describe",
           "DOMException",
+          "ErrorEvent",
           "Event",
           "EventTarget",
+          "expect",
           "fetch",
+          "File",
+          "FormData",
           "Headers",
+          "HTMLRewriter",
+          "it",
           "Request",
+          "require",
           "Response",
           "structuredClone",
+          "test",
           "URL"
         ]
+      },
+      "src/runtime_modules/bun/internal-for-testing.js": {
+        "file": "src/runtime_modules/bun/internal-for-testing.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "applyPatchDiff",
+          "canonicalizeIP",
+          "createSocketPair",
+          "cssInternals",
+          "decodeURIComponentSIMD",
+          "escapeRegExp",
+          "escapeRegExpForPackageNameMatching",
+          "hasNonReifiedStatic",
+          "highlightJavaScript",
+          "iniInternals",
+          "isModuleResolveFilenameSlowPathEnabled",
+          "jscInternals",
+          "makePatchDiff",
+          "parsePatchDiff",
+          "patchInternals",
+          "setSocketOptions",
+          "shellInternals"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
       },
       "src/runtime_modules/bun/jsc.js": {
         "file": "src/runtime_modules/bun/jsc.js",
@@ -12032,6 +12218,17 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/bun/json5.js": {
+        "file": "src/runtime_modules/bun/json5.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "JSON5",
+          "parse",
+          "stringify"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/bun/sqlite.js": {
         "file": "src/runtime_modules/bun/sqlite.js",
         "hasDefaultExport": true,
@@ -12046,6 +12243,24 @@
         "globalProperties": [
           "__cottontailCustomSQLitePath"
         ]
+      },
+      "src/runtime_modules/bun/string-width.js": {
+        "file": "src/runtime_modules/bun/string-width.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "stringWidth"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/strip-ansi.js": {
+        "file": "src/runtime_modules/bun/strip-ansi.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "stripANSI"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
       },
       "src/runtime_modules/bun/test.js": {
         "file": "src/runtime_modules/bun/test.js",
@@ -12074,16 +12289,43 @@
         "bunObjectProperties": [],
         "globalProperties": [
           "__cottontailBunModuleMocks",
+          "__cottontailBunTestUsed",
+          "__cottontailCurrentTestName",
+          "__cottontailTestAssertionCount",
+          "Bun",
           "cancelAnimationFrame",
           "clearImmediate",
           "clearInterval",
           "clearTimeout",
           "Date",
+          "jest",
           "requestAnimationFrame",
           "setImmediate",
           "setInterval",
-          "setTimeout"
+          "setTimeout",
+          "vi"
         ]
+      },
+      "src/runtime_modules/bun/toml.js": {
+        "file": "src/runtime_modules/bun/toml.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "parse",
+          "stringify",
+          "TOML"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/bun/yaml.js": {
+        "file": "src/runtime_modules/bun/yaml.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "parse",
+          "stringify"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
       },
       "src/runtime_modules/node/assert/strict.js": {
         "file": "src/runtime_modules/node/assert/strict.js",
@@ -12536,6 +12778,7 @@
           "createSecretKey",
           "createSign",
           "createVerify",
+          "CryptoKey",
           "decapsulate",
           "Decipheriv",
           "diffieHellman",
@@ -12695,6 +12938,7 @@
           "EOF",
           "FILE",
           "FORMERR",
+          "getCacheStats",
           "getDefaultResultOrder",
           "getServers",
           "LOADIPHLPAPI",
@@ -12706,6 +12950,7 @@
           "NOTFOUND",
           "NOTIMP",
           "NOTINITIALIZED",
+          "prefetch",
           "promises",
           "PromisesResolver",
           "REFUSED",
@@ -12780,6 +13025,7 @@
           "appendFile",
           "chmod",
           "chown",
+          "close",
           "constants",
           "copyFile",
           "cp",
@@ -13629,7 +13875,9 @@
           "it",
           "mock",
           "only",
+          "onTestFinished",
           "run",
+          "setDefaultTimeout",
           "skip",
           "snapshot",
           "suite",
@@ -13637,7 +13885,14 @@
           "todo"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailBunTestHeaderPrinted",
+          "__cottontailCurrentTestName",
+          "queueMicrotask",
+          "setImmediate",
+          "setInterval",
+          "setTimeout"
+        ]
       },
       "src/runtime_modules/node/timers/promises.js": {
         "file": "src/runtime_modules/node/timers/promises.js",
@@ -14213,6 +14468,61 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": []
+      },
+      "src/runtime_modules/vendor/picomatch-path-shim.js": {
+        "file": "src/runtime_modules/vendor/picomatch-path-shim.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "basename",
+          "sep"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/vendor/picomatch.js": {
+        "file": "src/runtime_modules/vendor/picomatch.js",
+        "hasDefaultExport": true,
+        "namedExports": [],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/vendor/yaml.js": {
+        "file": "src/runtime_modules/vendor/yaml.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "Alias",
+          "Composer",
+          "CST",
+          "default",
+          "Document",
+          "isAlias",
+          "isCollection",
+          "isDocument",
+          "isMap",
+          "isNode",
+          "isPair",
+          "isScalar",
+          "isSeq",
+          "Lexer",
+          "LineCounter",
+          "Pair",
+          "parse",
+          "parseAllDocuments",
+          "parseDocument",
+          "Parser",
+          "Scalar",
+          "Schema",
+          "stringify",
+          "visit",
+          "visitAsync",
+          "YAMLError",
+          "YAMLMap",
+          "YAMLParseError",
+          "YAMLSeq",
+          "YAMLWarning"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
       }
     },
     "bunObjectProperties": [
@@ -14249,6 +14559,7 @@
       "gunzipSync",
       "gzipSync",
       "hash",
+      "HTMLRewriter",
       "indexOfLine",
       "inflateSync",
       "inspect",
@@ -14298,6 +14609,8 @@
       "SHA384",
       "SHA512",
       "SHA512_256",
+      "ShellError",
+      "ShellOutput",
       "shrink",
       "sleep",
       "sleepSync",
@@ -14327,8 +14640,14 @@
       "zstdDecompressSync"
     ],
     "globalProperties": [
+      "__cottontailActiveServeOrigins",
       "__cottontailBuiltinModules",
+      "__cottontailBunHasNonReifiedStatic",
       "__cottontailBunModuleMocks",
+      "__cottontailBunReified",
+      "__cottontailBunTestHeaderPrinted",
+      "__cottontailBunTestUsed",
+      "__cottontailCurrentTestName",
       "__cottontailCustomSQLitePath",
       "__cottontailDecodeWorkerMessage",
       "__cottontailDiagnosticsChannels",
@@ -14338,9 +14657,13 @@
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
       "__cottontailHasActiveHandles",
+      "__cottontailImportMetaResolve",
+      "__cottontailImportMetaResolveSync",
       "__cottontailImportModule",
+      "__cottontailPromisePeekStates",
       "__cottontailProxyRegistry",
       "__cottontailSuppressAsyncHookPromise",
+      "__cottontailTestAssertionCount",
       "__cottontailTlsListeners",
       "__cottontailWorkerData",
       "__cottontailWorkerResourceLimits",
@@ -14348,24 +14671,40 @@
       "__ctError",
       "AbortController",
       "AbortSignal",
+      "afterAll",
+      "afterEach",
+      "beforeAll",
+      "beforeEach",
       "Bun",
       "cancelAnimationFrame",
       "clearImmediate",
       "clearInterval",
       "clearTimeout",
+      "CloseEvent",
       "crypto",
+      "CryptoKey",
+      "CustomEvent",
       "Date",
+      "describe",
       "DOMException",
+      "ErrorEvent",
       "Event",
       "EventTarget",
+      "expect",
       "fetch",
+      "File",
+      "FormData",
       "Headers",
+      "HTMLRewriter",
+      "it",
+      "jest",
       "MessageChannel",
       "MessagePort",
       "onmessage",
       "parentPort",
       "process",
       "Proxy",
+      "queueMicrotask",
       "Request",
       "requestAnimationFrame",
       "require",
@@ -14375,7 +14714,9 @@
       "setInterval",
       "setTimeout",
       "structuredClone",
+      "test",
       "URL",
+      "vi",
       "workerData"
     ]
   },
@@ -14868,7 +15209,9 @@
           "webcrypto"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "CryptoKey"
+        ]
       },
       "dgram": {
         "module": "present",
@@ -14949,7 +15292,9 @@
         ],
         "missing": [],
         "extra": [
-          "PromisesResolver"
+          "PromisesResolver",
+          "getCacheStats",
+          "prefetch"
         ]
       },
       "dns/promises": {
@@ -15194,7 +15539,9 @@
           "writeFile"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "close"
+        ]
       },
       "http": {
         "module": "present",
@@ -15405,7 +15752,10 @@
           "todo"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "onTestFinished",
+          "setDefaultTimeout"
+        ]
       },
       "node:test/reporters": {
         "module": "present",
@@ -16365,7 +16715,11 @@
           "zstdDecompressSync"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "HTMLRewriter",
+          "ShellError",
+          "ShellOutput"
+        ]
       },
       "modules": {
         "bun": {
@@ -16480,9 +16834,14 @@
           "missing": [],
           "extra": [
             "Bun",
+            "FormData",
+            "HTMLRewriter",
             "Headers",
             "Request",
             "Response",
+            "ShellError",
+            "ShellExpression",
+            "ShellOutput",
             "URL",
             "cwd",
             "jest",
@@ -16598,6 +16957,34 @@
           "extra": []
         }
       }
+    }
+  },
+  "upstream": {
+    "node": {
+      "version": "24.11.1",
+      "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
+      "snapshot": "compat/upstream/node/v24.11.1",
+      "copiedFiles": 9908,
+      "discoveredRunnableFiles": 7015,
+      "enabled": 7015,
+      "expectedFailure": 0,
+      "disabled": 0,
+      "notEnabled": 0,
+      "classifiedTests": 7015,
+      "trackedTests": 7015
+    },
+    "bun": {
+      "version": "1.3.10",
+      "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
+      "snapshot": "compat/upstream/bun/v1.3.10",
+      "copiedFiles": 8325,
+      "discoveredRunnableFiles": 1445,
+      "enabled": 147,
+      "expectedFailure": 179,
+      "disabled": 0,
+      "notEnabled": 1119,
+      "classifiedTests": 326,
+      "trackedTests": 326
     }
   },
   "behavioral": {
@@ -16848,24 +17235,56 @@
       }
     },
     "bun": {
-      "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Bun-focused test files. This is not a conformance result.",
-      "estimate": {
-        "implementedPercentLower": 100,
-        "implementedPercentUpper": 100,
-        "gapPercentLower": 0,
-        "gapPercentUpper": 0
-      },
+      "note": "Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.",
       "signals": {
         "publicBunModules": 5,
         "bunTestFiles": 10,
         "compatMarkers": 0,
         "modulesWithCompatMarkers": 0,
-        "explicitUnsupportedMarkers": 0,
+        "explicitUnsupportedMarkers": 2,
         "nativeAvailabilityGuards": 0,
-        "modulesWithUnsupportedMarkers": 0
+        "modulesWithUnsupportedMarkers": 1
       },
-      "largestGaps": [],
-      "modules": {}
+      "largestGaps": [
+        {
+          "name": "bun",
+          "file": "src/runtime_modules/bun/index.js",
+          "compatMarkers": 0,
+          "unsupportedMarkers": 2,
+          "nativeAvailabilityGuards": 0,
+          "tests": 10,
+          "gapScore": 4
+        }
+      ],
+      "modules": {
+        "bun": {
+          "file": "src/runtime_modules/bun/index.js",
+          "compatMarkers": [],
+          "unsupportedMarkers": [
+            {
+              "line": 5562,
+              "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
+            },
+            {
+              "line": 5578,
+              "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
+            }
+          ],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/bun-apis.js",
+            "tests/js/bun-ffi-surface.ts",
+            "tests/js/bun-global.ts",
+            "tests/js/bun-jsc-and-global.ts",
+            "tests/js/bun-serve-detached.ts",
+            "tests/js/bun-serve-spawn.ts",
+            "tests/js/bun-spawn-execpath-env.ts",
+            "tests/js/bun-spawn-streaming.ts",
+            "tests/js/bun-sqlite.ts",
+            "tests/js/bun-test-module.ts"
+          ]
+        }
+      }
     }
   }
 }

@@ -2,6 +2,7 @@ import constantsObject from "./constants.js";
 import { Buffer } from "./buffer.js";
 
 const supportedHashes = [
+  "md4",
   "md5",
   "ripemd160",
   "sha1",
@@ -9,6 +10,8 @@ const supportedHashes = [
   "sha256",
   "sha384",
   "sha512",
+  "sha512-224",
+  "sha512-256",
   "sha3-224",
   "sha3-256",
   "sha3-384",
@@ -19,6 +22,7 @@ const supportedHashes = [
   "blake2s256",
 ];
 const hashOutputLengths = {
+  md4: 16,
   md5: 16,
   ripemd160: 20,
   sha1: 20,
@@ -26,6 +30,8 @@ const hashOutputLengths = {
   sha256: 32,
   sha384: 48,
   sha512: 64,
+  "sha512-224": 28,
+  "sha512-256": 32,
   "sha3-224": 28,
   "sha3-256": 32,
   "sha3-384": 48,
@@ -139,7 +145,11 @@ function normalizeAlgorithm(algorithm) {
   if (normalized === "shake128" || normalized === "shake256") return normalized;
   if (normalized === "ripemd160" || normalized === "rmd160") return "ripemd160";
   if (normalized === "blake2b512" || normalized === "blake2s256") return normalized;
+  if (normalized === "md4") return "md4";
   if (normalized === "sha" || normalized === "sha1") return "sha1";
+  if (normalized === "sha128") return "sha1";
+  if (normalized === "sha512224") return "sha512-224";
+  if (normalized === "sha512256") return "sha512-256";
   if (normalized.endsWith("sha1")) return "sha1";
   if (normalized.endsWith("sha224")) return "sha224";
   if (normalized.endsWith("sha256")) return "sha256";
@@ -170,6 +180,95 @@ function concatBytes(chunks) {
     offset += chunk.length;
   }
   return out;
+}
+
+function md4Digest(data) {
+  const input = bytesFromData(data);
+  const bitLength = BigInt(input.length) * 8n;
+  const paddedLength = (((input.length + 8) >>> 6) + 1) << 6;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(input);
+  padded[input.length] = 0x80;
+  for (let index = 0; index < 8; index += 1) {
+    padded[paddedLength - 8 + index] = Number((bitLength >> BigInt(index * 8)) & 0xffn);
+  }
+
+  let a = 0x67452301;
+  let b = 0xefcdab89;
+  let c = 0x98badcfe;
+  let d = 0x10325476;
+  const words = new Uint32Array(16);
+  const f = (x, y, z) => ((x & y) | (~x & z)) >>> 0;
+  const g = (x, y, z) => ((x & y) | (x & z) | (y & z)) >>> 0;
+  const h = (x, y, z) => (x ^ y ^ z) >>> 0;
+
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    for (let index = 0; index < 16; index += 1) {
+      const byteOffset = offset + index * 4;
+      words[index] = padded[byteOffset] |
+        (padded[byteOffset + 1] << 8) |
+        (padded[byteOffset + 2] << 16) |
+        (padded[byteOffset + 3] << 24);
+    }
+
+    const aa = a;
+    const bb = b;
+    const cc = c;
+    const dd = d;
+
+    for (let index = 0; index < 16; index += 4) {
+      a = rotateLeft32((a + f(b, c, d) + words[index]) >>> 0, 3);
+      d = rotateLeft32((d + f(a, b, c) + words[index + 1]) >>> 0, 7);
+      c = rotateLeft32((c + f(d, a, b) + words[index + 2]) >>> 0, 11);
+      b = rotateLeft32((b + f(c, d, a) + words[index + 3]) >>> 0, 19);
+    }
+
+    for (const group of [[0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15]]) {
+      a = rotateLeft32((a + g(b, c, d) + words[group[0]] + 0x5a827999) >>> 0, 3);
+      d = rotateLeft32((d + g(a, b, c) + words[group[1]] + 0x5a827999) >>> 0, 5);
+      c = rotateLeft32((c + g(d, a, b) + words[group[2]] + 0x5a827999) >>> 0, 9);
+      b = rotateLeft32((b + g(c, d, a) + words[group[3]] + 0x5a827999) >>> 0, 13);
+    }
+
+    for (const group of [[0, 8, 4, 12], [2, 10, 6, 14], [1, 9, 5, 13], [3, 11, 7, 15]]) {
+      a = rotateLeft32((a + h(b, c, d) + words[group[0]] + 0x6ed9eba1) >>> 0, 3);
+      d = rotateLeft32((d + h(a, b, c) + words[group[1]] + 0x6ed9eba1) >>> 0, 9);
+      c = rotateLeft32((c + h(d, a, b) + words[group[2]] + 0x6ed9eba1) >>> 0, 11);
+      b = rotateLeft32((b + h(c, d, a) + words[group[3]] + 0x6ed9eba1) >>> 0, 15);
+    }
+
+    a = (a + aa) >>> 0;
+    b = (b + bb) >>> 0;
+    c = (c + cc) >>> 0;
+    d = (d + dd) >>> 0;
+  }
+
+  const output = new Uint8Array(16);
+  const values = [a, b, c, d];
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    output[index * 4] = value & 0xff;
+    output[index * 4 + 1] = (value >>> 8) & 0xff;
+    output[index * 4 + 2] = (value >>> 16) & 0xff;
+    output[index * 4 + 3] = (value >>> 24) & 0xff;
+  }
+  return output;
+}
+
+function hmacFallback(algorithm, key, data) {
+  const blockSize = 64;
+  let keyBytes = bytesFromData(key);
+  if (keyBytes.length > blockSize) keyBytes = digestBytes(algorithm, keyBytes);
+  const normalizedKey = new Uint8Array(blockSize);
+  normalizedKey.set(keyBytes);
+  const innerPad = new Uint8Array(blockSize);
+  const outerPad = new Uint8Array(blockSize);
+  for (let index = 0; index < blockSize; index += 1) {
+    innerPad[index] = normalizedKey[index] ^ 0x36;
+    outerPad[index] = normalizedKey[index] ^ 0x5c;
+  }
+  const inner = digestBytes(algorithm, concatBytes([innerPad, bytesFromData(data)]));
+  return digestBytes(algorithm, concatBytes([outerPad, inner]));
 }
 
 function hexFromBytes(bytes) {
@@ -337,6 +436,7 @@ function digestBytes(algorithm, data, outputLength = undefined) {
   if (!supportedHashes.includes(normalized)) {
     throw new Error(`Digest algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
+  if (normalized === "md4") return md4Digest(data);
   if (typeof cottontail.cryptoHashSync !== "function") {
     throw new Error("native crypto hashing is unavailable");
   }
@@ -348,6 +448,7 @@ function hmacBytes(algorithm, key, data) {
   if (!supportedHashes.includes(normalized)) {
     throw new Error(`HMAC algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
+  if (normalized === "md4") return hmacFallback(normalized, key, data);
   if (typeof cottontail.cryptoHmacSync !== "function") {
     throw new Error("native crypto HMAC is unavailable");
   }

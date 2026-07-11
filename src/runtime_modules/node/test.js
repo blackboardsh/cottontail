@@ -1,16 +1,155 @@
 import * as nodeAssert from "./assert.js";
+import { AsyncLocalStorage } from "./async_hooks.js";
+import { readFileSync } from "./fs.js";
 import { Readable } from "./stream.js";
 
 const tests = [];
 const events = [];
-const beforeHooks = [];
-const afterHooks = [];
-const beforeEachHooks = [];
-const afterEachHooks = [];
-let beforeRan = false;
+const runnerSetTimeout = globalThis.setTimeout;
+const runnerClearTimeout = globalThis.clearTimeout;
+const runnerSetInterval = globalThis.setInterval;
+const runnerSetImmediate = globalThis.setImmediate;
+const runnerQueueMicrotask = globalThis.queueMicrotask;
+const runnerNextTick = globalThis.process?.nextTick?.bind(globalThis.process);
+const runnerPromiseThen = globalThis.Promise.prototype.then;
+const runnerPromiseResolve = globalThis.Promise.resolve.bind(globalThis.Promise);
+const runnerPromiseRace = globalThis.Promise.race.bind(globalThis.Promise);
+const runnerPromiseAll = globalThis.Promise.all.bind(globalThis.Promise);
+const executionStorage = new AsyncLocalStorage();
+const failureStorage = new AsyncLocalStorage();
+let uncaughtCaptureInstalled = false;
+let asyncFailureGuardsInstalled = false;
+let currentSuite;
+let activeExecution = null;
 let runScheduled = false;
-let runFinished = false;
+let runnerActive = false;
+let runAgain = false;
 let afterTimer = null;
+let finalizePromise = null;
+let resultsReported = false;
+let hasOnly = false;
+let selectionDirty = true;
+let defaultTimeout = 5000;
+let passedTests = 0;
+let failedTests = 0;
+let skippedTests = 0;
+let todoTests = 0;
+let runnerErrors = 0;
+const failures = [];
+const selectedRecords = new Set();
+
+const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
+const forceConcurrent = testCliArgs.includes("--concurrent");
+const runTodoTests = testCliArgs.includes("--todo");
+
+function cliOption(name, fallback = undefined) {
+  const equals = testCliArgs.find((arg) => String(arg).startsWith(`${name}=`));
+  if (equals != null) return String(equals).slice(name.length + 1);
+  const index = testCliArgs.indexOf(name);
+  return index >= 0 ? testCliArgs[index + 1] : fallback;
+}
+
+function configuredMaxConcurrency() {
+  const value = Number(cliOption("--max-concurrency", 20));
+  if (!Number.isFinite(value) || value < 0) return 20;
+  return value === 0 ? Infinity : Math.max(1, Math.trunc(value));
+}
+
+function bunfigOnlyFailures() {
+  try {
+    const source = String(readFileSync(`${globalThis.process?.cwd?.() ?? "."}/bunfig.toml`, "utf8"));
+    return /\bonlyFailures\s*=\s*true\b/.test(source);
+  } catch {
+    return false;
+  }
+}
+
+const maxConcurrency = configuredMaxConcurrency();
+const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
+
+function currentExecution() {
+  return executionStorage.getStore() ?? activeExecution;
+}
+
+function isNativePromise(value) {
+  return value instanceof Promise || Object.prototype.toString.call(value) === "[object Promise]";
+}
+
+function promiseThen(value, onFulfilled, onRejected) {
+  return isNativePromise(value)
+    ? runnerPromiseThen.call(value, onFulfilled, onRejected)
+    : value.then(onFulfilled, onRejected);
+}
+
+function installUncaughtCapture() {
+  if (uncaughtCaptureInstalled || typeof globalThis.process?.setUncaughtExceptionCaptureCallback !== "function") return;
+  uncaughtCaptureInstalled = true;
+  globalThis.process.setUncaughtExceptionCaptureCallback((error) => {
+    const execution = executionStorage.getStore();
+    if (execution?.failExternal) {
+      execution.failExternal(error);
+      return;
+    }
+    globalThis.process.setUncaughtExceptionCaptureCallback(null);
+    uncaughtCaptureInstalled = false;
+    runnerSetTimeout(() => { throw error; }, 0);
+  });
+}
+
+function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnThrow = true) {
+  const execution = failureStorage.getStore() ?? currentExecution();
+  if (!execution || typeof callback !== "function") return callback;
+  return function guardedTestCallback(...args) {
+    try {
+      const result = callback.apply(this, args);
+      if (captureReturnedPromise && result && typeof result.then === "function") promiseThen(result, undefined, execution.failExternal);
+      return result;
+    } catch (error) {
+      if (!externalOnThrow) throw error;
+      execution.failExternal(error);
+      return undefined;
+    }
+  };
+}
+
+function installAsyncFailureGuards() {
+  if (asyncFailureGuardsInstalled) return;
+  asyncFailureGuardsInstalled = true;
+  globalThis.setTimeout = (callback, ...args) => runnerSetTimeout(guardAsyncCallback(callback), ...args);
+  globalThis.setInterval = (callback, ...args) => runnerSetInterval(guardAsyncCallback(callback), ...args);
+  if (typeof runnerSetImmediate === "function") {
+    globalThis.setImmediate = (callback, ...args) => runnerSetImmediate(guardAsyncCallback(callback), ...args);
+  }
+  globalThis.queueMicrotask = (callback) => runnerQueueMicrotask(guardAsyncCallback(callback));
+  if (runnerNextTick) {
+    globalThis.process.nextTick = (callback, ...args) => runnerNextTick(guardAsyncCallback(callback), ...args);
+  }
+  globalThis.Promise.prototype.then = function testAwareThen(onFulfilled, onRejected) {
+    return runnerPromiseThen.call(this, guardAsyncCallback(onFulfilled, false, false), guardAsyncCallback(onRejected, false, false));
+  };
+}
+
+function createSuite(name, options = {}, parent = null) {
+  return {
+    kind: "suite",
+    name,
+    options,
+    parent,
+    children: [],
+    beforeHooks: [],
+    afterHooks: [],
+    beforeEachHooks: [],
+    afterEachHooks: [],
+    beforeRan: false,
+    afterRan: false,
+    beforeError: null,
+    definitionError: null,
+    definitionErrorReported: false,
+  };
+}
+
+const rootSuite = createSuite("<root>");
+currentSuite = rootSuite;
 
 function emit(type, data = {}) {
   const event = { type, data };
@@ -43,7 +182,13 @@ class TestContext {
   }
 
   async test(name, options, fn) {
-    return test(name, options, fn);
+    const previousSuite = currentSuite;
+    currentSuite = this._record?.suite ?? rootSuite;
+    try {
+      return test(name, options, fn);
+    } finally {
+      currentSuite = previousSuite;
+    }
   }
 
   skip(reason = "skipped") {
@@ -63,28 +208,238 @@ class TestContext {
   }
 }
 
-async function runHookList(hooks) {
-  for (const hook of hooks) await hook.fn();
+function timeoutFor(options = {}) {
+  const value = Number(options.timeout ?? defaultTimeout);
+  return Number.isFinite(value) && value >= 0 ? value : defaultTimeout;
 }
 
-async function finishAfterHooks() {
-  if (runFinished) return;
-  if (afterTimer !== null) {
-    clearTimeout(afterTimer);
-    afterTimer = null;
-  }
-  runFinished = true;
-  await runHookList(afterHooks);
+function timeoutError(duration) {
+  const error = new Error(`Test timed out after ${duration}ms`);
+  error.code = "ERR_TEST_TIMEOUT";
+  return error;
 }
 
-function scheduleAfterHooks() {
-  if (runFinished || afterTimer !== null) return;
-  afterTimer = setTimeout(() => {
-    afterTimer = null;
-    finishAfterHooks().catch((error) => {
-      setTimeout(() => { throw error; }, 0);
+function withTimeout(callback, options = {}) {
+  const duration = timeoutFor(options);
+  if (duration === 0) return promiseThen(runnerPromiseResolve(), callback);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = runnerSetTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(timeoutError(duration));
+    }, duration);
+    promiseThen(promiseThen(runnerPromiseResolve(), callback),
+      (value) => {
+        if (settled) return;
+        settled = true;
+        runnerClearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        runnerClearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function invokeDoneCallback(callback, thisValue, args) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (error = undefined) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    try {
+      const result = callback.apply(thisValue, [...args, done]);
+      if (result && typeof result.then === "function") promiseThen(result, undefined, done);
+    } catch (error) {
+      done(error);
+    }
+  });
+}
+
+function invokeTestCallback(record, context) {
+  return withTimeout(() => {
+    if (typeof record.fn !== "function") return undefined;
+    if (record.fn.length >= 2) return invokeDoneCallback(record.fn, undefined, [context]);
+    return record.fn(context);
+  }, record.options);
+}
+
+function invokeHook(hook, context) {
+  return withTimeout(() => {
+    let rejectExternal;
+    const failure = new Promise((_, reject) => { rejectExternal = reject; });
+    const target = { failExternal: rejectExternal };
+    return failureStorage.run(target, () => {
+      let result;
+      if (typeof hook.fn !== "function") result = undefined;
+      else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
+      else result = hook.fn(context);
+      return runnerPromiseRace([runnerPromiseResolve(result), failure]);
     });
-  }, 0);
+  }, hook.options);
+}
+
+async function runHookList(hooks, context) {
+  let firstError = null;
+  for (const hook of hooks) {
+    try {
+      await invokeHook(hook, context);
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  return firstError;
+}
+
+function suiteChain(suite) {
+  const chain = [];
+  for (let cursor = suite; cursor; cursor = cursor.parent) chain.push(cursor);
+  return chain.reverse();
+}
+
+function inheritedOption(record, name) {
+  if (record.options[name]) return record.options[name];
+  for (let suite = record.suite; suite; suite = suite.parent) {
+    if (suite.options[name]) return suite.options[name];
+  }
+  return false;
+}
+
+function nodeHasOnly(node) {
+  if (node.options?.only) return true;
+  return node.kind === "suite" && node.children.some(nodeHasOnly);
+}
+
+function rebuildSelection() {
+  selectedRecords.clear();
+  const visit = (suite, branchSelected) => {
+    const onlyChildren = suite.children.filter(nodeHasOnly);
+    const children = onlyChildren.length > 0
+      ? onlyChildren
+      : branchSelected || !hasOnly ? suite.children : [];
+    for (const child of children) {
+      if (child.kind === "suite") visit(child, branchSelected || Boolean(child.options.only));
+      else selectedRecords.add(child);
+    }
+  };
+  visit(rootSuite, !hasOnly);
+  selectionDirty = false;
+}
+
+function selectedByOnly(record) {
+  if (selectionDirty) rebuildSelection();
+  return selectedRecords.has(record);
+}
+
+function recordIsRunnable(record) {
+  return !record.ran && selectedByOnly(record) && !inheritedOption(record, "skip") && !inheritedOption(record, "todo");
+}
+
+function suiteHasRunnableTest(suite) {
+  return suite.children.some((child) => child.kind === "suite" ? suiteHasRunnableTest(child) : recordIsRunnable(child));
+}
+
+function suiteHasRunnableWork(suite) {
+  for (let cursor = suite; cursor; cursor = cursor.parent) {
+    if (cursor.options.skip || cursor.options.todo) return false;
+  }
+  if (suiteHasRunnableTest(suite)) return true;
+  if (suite.beforeHooks.length > 0 || suite.afterHooks.length > 0) return true;
+  return suite.children.some((child) => child.kind === "suite" && suiteHasRunnableWork(child));
+}
+
+function suiteBeforeError(suite) {
+  for (const item of suiteChain(suite)) {
+    if (item.beforeError) return item.beforeError;
+  }
+  return null;
+}
+
+function failingTestPassedError() {
+  const error = new nodeAssert.AssertionError({
+    message: "this test is marked as failing but it passed. Remove `.failing` if tested behavior now works",
+  });
+  error.code = "ERR_TEST_FAILING_PASSED";
+  return error;
+}
+
+function todoTestPassedError() {
+  const error = new nodeAssert.AssertionError({ message: "this test is marked as todo but passes" });
+  error.code = "ERR_TEST_TODO_PASSED";
+  return error;
+}
+
+function recordIsConcurrent(record) {
+  if (record.options.serial) return false;
+  return forceConcurrent || Boolean(inheritedOption(record, "concurrent"));
+}
+
+async function executeAttempt(record) {
+  const context = new TestContext(record);
+  context._record = record;
+  const execution = {
+    record,
+    afterBodyHooks: [],
+    finishHooks: [],
+  };
+  return executionStorage.run(execution, async () => {
+    activeExecution = execution;
+    const externalFailure = new Promise((_, reject) => {
+      execution.failExternal = reject;
+    });
+
+    const chain = suiteChain(record.suite);
+    let setupError = suiteBeforeError(record.suite);
+    let bodyError = null;
+    let cleanupError = null;
+    try {
+      if (!setupError) {
+        for (const suite of chain) {
+          const error = await runHookList(suite.beforeEachHooks, context);
+          setupError ??= error;
+          if (error) break;
+        }
+      }
+      if (!setupError) {
+        try {
+          await runnerPromiseRace([invokeTestCallback(record, context), externalFailure]);
+        } catch (error) {
+          bodyError = error;
+        }
+      }
+
+      const afterBodyError = await runHookList(execution.afterBodyHooks, context);
+      cleanupError ??= afterBodyError;
+      for (const suite of Array.from(chain).reverse()) {
+        const afterEachError = await runHookList(suite.afterEachHooks, context);
+        cleanupError ??= afterEachError;
+      }
+      const finishError = await runHookList(execution.finishHooks, context);
+      cleanupError ??= finishError;
+    } finally {
+      if (activeExecution === execution) activeExecution = null;
+    }
+
+    if (record.options.failing && !setupError) {
+      if (bodyError && bodyError.code !== "ERR_TEST_TIMEOUT") bodyError = null;
+      else if (!bodyError) bodyError = failingTestPassedError();
+    }
+    return setupError ?? bodyError ?? cleanupError;
+  });
+}
+
+function attemptCount(record) {
+  if (record.options.repeats != null) return Number(record.options.repeats) + 1;
+  if (record.options.retry != null) return Number(record.options.retry) + 1;
+  return 1;
 }
 
 async function execute(record) {
@@ -92,83 +447,327 @@ async function execute(record) {
   record.ran = true;
   if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:start ${record.name}`);
   emit("test:start", { name: record.name });
-  if (record.options.skip) {
-    emit("test:pass", { name: record.name, skip: record.options.skip === true ? "skipped" : record.options.skip });
+
+  const skipReason = inheritedOption(record, "skip");
+  const todoReason = inheritedOption(record, "todo");
+  if (skipReason || (todoReason && (!runTodoTests || typeof record.fn !== "function"))) {
+    const data = { name: record.name };
+    if (todoReason) {
+      data.todo = todoReason === true ? "todo" : todoReason;
+      record.status = "todo";
+      todoTests += 1;
+    } else {
+      data.skip = skipReason === true ? "skipped" : skipReason;
+      record.status = "skip";
+      skippedTests += 1;
+    }
+    emit("test:pass", data);
+    record.resolve?.();
     return undefined;
   }
-  if (record.options.todo) {
-    emit("test:pass", { name: record.name, todo: record.options.todo === true ? "todo" : record.options.todo });
+  if (!selectedByOnly(record)) {
+    record.status = "filtered";
+    record.resolve?.();
     return undefined;
   }
 
   const started = performance?.now?.() ?? Date.now();
-  try {
-    if (!beforeRan) {
-      beforeRan = true;
-      await runHookList(beforeHooks);
+  let error = null;
+  const totalAttempts = attemptCount(record);
+  for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    error = await executeAttempt(record);
+    if (record.options.repeats != null) {
+      if (error) break;
+    } else if (!error) {
+      break;
     }
-    await runHookList(beforeEachHooks);
-    if (typeof record.fn === "function") {
-      const context = new TestContext(record);
-      if (record.fn.length >= 2) {
-        await new Promise((resolve, reject) => {
-          let settled = false;
-          const done = (error = undefined) => {
-            if (settled) return;
-            settled = true;
-            if (error) reject(error);
-            else resolve();
-          };
-          try {
-            const result = record.fn(context, done);
-            if (result && typeof result.then === "function") result.then(undefined, done);
-          } catch (error) {
-            done(error);
-          }
-        });
-      } else {
-        await record.fn(context);
-      }
+  }
+
+  if (todoReason) {
+    if (error) {
+      todoTests += 1;
+      record.status = "todo";
+      record.todoError = error;
+      emit("test:pass", { name: record.name, todo: todoReason === true ? "todo" : todoReason });
+      record.resolve?.();
+      return undefined;
     }
-    await runHookList(afterEachHooks);
-    emit("test:pass", { name: record.name, duration_ms: (performance?.now?.() ?? Date.now()) - started });
-    if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:pass ${record.name}`);
-  } catch (error) {
-    emit("test:fail", { name: record.name, error, duration_ms: (performance?.now?.() ?? Date.now()) - started });
+    error = todoTestPassedError();
+  }
+
+  const duration_ms = (performance?.now?.() ?? Date.now()) - started;
+  if (error) {
+    if (error.code === "ERR_TEST_SKIP" || error.code === "ERR_TEST_TODO") {
+      record.status = error.code === "ERR_TEST_SKIP" ? "skip" : "todo";
+      if (record.status === "skip") skippedTests += 1;
+      else todoTests += 1;
+      emit("test:pass", { name: record.name, [record.status]: error.message });
+      record.resolve?.();
+      return undefined;
+    }
+    failedTests += 1;
+    failures.push({ record, error });
+    record.status = "fail";
+    record.error = error;
+    emit("test:fail", { name: record.name, error, duration_ms });
+    record.reject?.(error);
     if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:fail ${record.name}: ${error?.stack || error?.message || error}`);
-    throw error;
+    return undefined;
+  }
+  passedTests += 1;
+  record.status = "pass";
+  emit("test:pass", { name: record.name, duration_ms });
+  record.resolve?.();
+  if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:pass ${record.name}`);
+}
+
+function recordHookFailure(name, error, isRunnerError = false) {
+  const record = { name, status: isRunnerError ? "error" : "fail", suite: currentSuite };
+  if (isRunnerError) runnerErrors += 1;
+  else failedTests += 1;
+  failures.push({ record, error });
+  emit("test:fail", { name, error });
+}
+
+function settlesBeforeNextTurn(promise) {
+  return new Promise((resolve) => {
+    let settled = false;
+    promiseThen(promise, () => {
+      if (settled) return;
+      settled = true;
+      resolve(true);
+    });
+    let remainingMicrotasks = 32;
+    const check = () => {
+      if (settled) return;
+      if (remainingMicrotasks-- > 0) queueMicrotask(check);
+      else {
+        settled = true;
+        resolve(false);
+      }
+    };
+    queueMicrotask(check);
+  });
+}
+
+async function runConcurrentRecords(records) {
+  let cursor = 0;
+  while (cursor < records.length) {
+    const first = execute(records[cursor++]);
+    if (await settlesBeforeNextTurn(first)) continue;
+    if (maxConcurrency === 1) {
+      await first;
+      continue;
+    }
+    const workers = [];
+    const worker = async () => {
+      while (cursor < records.length) {
+        const record = records[cursor++];
+        await execute(record);
+      }
+    };
+    const workerCount = Number.isFinite(maxConcurrency)
+      ? Math.min(Math.max(0, maxConcurrency - 1), records.length - cursor)
+      : records.length - cursor;
+    for (let index = 0; index < workerCount; index += 1) workers.push(worker());
+    await runnerPromiseAll([promiseThen(first, worker), ...workers]);
   }
 }
 
+async function flushConcurrent(group) {
+  if (group.length === 0) return;
+  const records = group.splice(0);
+  await runConcurrentRecords(records);
+}
+
+async function executeSuite(suite, concurrentGroup) {
+  if (suite.definitionError && !suite.definitionErrorReported) {
+    await flushConcurrent(concurrentGroup);
+    suite.definitionErrorReported = true;
+    recordHookFailure(suite.name, suite.definitionError, !(suite.definitionError instanceof TypeError));
+  }
+
+  const runnable = suiteHasRunnableWork(suite);
+  if (runnable && !suite.beforeRan) {
+    if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
+    suite.beforeRan = true;
+    suite.beforeError = await runHookList(suite.beforeHooks, new TestContext({ name: suite.name }));
+  }
+
+  for (const child of suite.children) {
+    if (child.kind === "suite") {
+      await executeSuite(child, concurrentGroup);
+    } else if (!child.ran) {
+      if (recordIsConcurrent(child)) concurrentGroup.push(child);
+      else {
+        await flushConcurrent(concurrentGroup);
+        await execute(child);
+      }
+    }
+  }
+
+  if (suite !== rootSuite && suite.beforeRan && !suite.afterRan) {
+    if (suite.afterHooks.length > 0) await flushConcurrent(concurrentGroup);
+    suite.afterRan = true;
+    const error = await runHookList(suite.afterHooks, new TestContext({ name: suite.name }));
+    if (error) recordHookFailure(suite.name, error);
+  }
+}
+
+function hasPendingTests() {
+  return tests.some((record) => !record.ran);
+}
+
+function formatFailure(error) {
+  return String(error?.message ?? error ?? "Test failed");
+}
+
+function fullTestName(record) {
+  const names = [];
+  for (const suite of suiteChain(record.suite)) {
+    if (suite !== rootSuite && suite.name) names.push(suite.name);
+  }
+  if (record.name && record.name !== "<root>") names.push(record.name);
+  return names.join(" > ") || record.name || "test runner";
+}
+
+globalThis.__cottontailCurrentTestName = () => {
+  const execution = executionStorage.getStore?.();
+  return execution?.record ? fullTestName(execution.record) : "";
+};
+
+function appendFailure(lines, record, error) {
+  const name = fullTestName(record);
+  if (error?.code === "ERR_TEST_FAILING_PASSED") {
+    lines.push(`(fail) ${name}`);
+    lines.push(`  ^ ${formatFailure(error)}`);
+    return;
+  }
+  lines.push(`error: ${formatFailure(error)}`);
+  lines.push(`(fail) ${name}`);
+}
+
+function reportResults() {
+  if (resultsReported || (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed)) return;
+  resultsReported = true;
+  const lines = [""];
+  const reportedTests = tests.filter((record) => record.status && record.status !== "filtered");
+  if (reportedTests.length > 0 || failures.length > 0) {
+    let file = String(globalThis.process?.argv?.[1] ?? "test");
+    const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
+    if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
+    file = file.replace(/^\.[\\/]+/, "");
+    lines.push(`${file}:`);
+    for (const record of reportedTests) {
+      if (record.status === "pass") {
+        if (!onlyFailures) lines.push(`(pass) ${fullTestName(record)}`);
+      } else if (record.status === "fail") {
+        appendFailure(lines, record, record.error);
+      } else if (!onlyFailures) {
+        if (record.status === "todo" && record.todoError) lines.push(`error: ${formatFailure(record.todoError)}`);
+        lines.push(`(${record.status}) ${fullTestName(record)}`);
+      }
+    }
+    for (const { record, error } of failures) {
+      if (!tests.includes(record)) appendFailure(lines, record, error);
+    }
+  }
+  const assertionCount = Number(globalThis.__cottontailTestAssertionCount ?? 0);
+  lines.push("");
+  lines.push(` ${passedTests} pass`);
+  if (skippedTests > 0) lines.push(` ${skippedTests} skip`);
+  if (todoTests > 0) lines.push(` ${todoTests} todo`);
+  lines.push(` ${failedTests} fail`);
+  if (runnerErrors > 0) lines.push(` ${runnerErrors} error`);
+  if (assertionCount > 0) lines.push(` ${assertionCount} expect() calls`);
+  const total = passedTests + skippedTests + todoTests + failedTests + runnerErrors;
+  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across 1 file.`);
+  console.error(lines.join("\n"));
+}
+
+async function finalizeRun(exitOnFailure = true) {
+  if (finalizePromise) return finalizePromise;
+  finalizePromise = (async () => {
+    if (afterTimer !== null) {
+      runnerClearTimeout(afterTimer);
+      afterTimer = null;
+    }
+    if (rootSuite.beforeRan && !rootSuite.afterRan) {
+      rootSuite.afterRan = true;
+      const error = await runHookList(rootSuite.afterHooks, new TestContext({ name: rootSuite.name }));
+      if (error) recordHookFailure(rootSuite.name, error);
+    }
+    reportResults();
+    if (exitOnFailure && (failedTests > 0 || runnerErrors > 0)) {
+      if (typeof globalThis.process?.exit === "function") globalThis.process.exit(1);
+      throw failures[0].error;
+    }
+  })();
+  return finalizePromise;
+}
+
+function scheduleAfterHooks() {
+  if (afterTimer !== null || runnerActive || runScheduled || hasPendingTests()) return;
+  afterTimer = runnerSetTimeout(() => {
+    afterTimer = null;
+    promiseThen(finalizeRun(true), undefined, (error) => {
+      runnerSetTimeout(() => { throw error; }, 0);
+    });
+  }, 0);
+}
+
 function scheduleRun() {
+  installUncaughtCapture();
+  installAsyncFailureGuards();
+  if (runnerActive) {
+    runAgain = true;
+    return;
+  }
   if (runScheduled) return;
   if (afterTimer !== null) {
-    clearTimeout(afterTimer);
+    runnerClearTimeout(afterTimer);
     afterTimer = null;
   }
+  finalizePromise = null;
   runScheduled = true;
   queueMicrotask(async () => {
+    runScheduled = false;
+    runnerActive = true;
     try {
-      for (let index = 0; index < tests.length; index += 1) {
-        const record = tests[index];
-        try {
-          await execute(record);
-          record.resolve?.();
-        } catch (error) {
-          record.reject?.(error);
-          throw error;
+      do {
+        runAgain = false;
+        if (globalThis.__cottontailBunTestUsed && !globalThis.__cottontailBunTestHeaderPrinted) {
+          globalThis.__cottontailBunTestHeaderPrinted = true;
+          console.log(`bun test ${globalThis.Bun?.version_with_sha ?? "0.0.0-cottontail (cottontail)"}`);
         }
-      }
-      runScheduled = false;
+        const concurrentGroup = [];
+        await executeSuite(rootSuite, concurrentGroup);
+        await flushConcurrent(concurrentGroup);
+      } while (runAgain || hasPendingTests());
+      runnerActive = false;
       scheduleAfterHooks();
     } catch (error) {
-      runScheduled = false;
-      for (const record of tests) {
-        if (!record.ran) record.reject?.(error);
-      }
-      setTimeout(() => { throw error; }, 0);
+      runnerActive = false;
+      recordHookFailure("test runner", error);
+      scheduleAfterHooks();
     }
   });
+}
+
+function normalizeCountOption(value, name) {
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 0) throw new TypeError(`${name} must be a non-negative integer`);
+  return count;
+}
+
+function validateTestOptions(options) {
+  const normalized = { ...options };
+  if (normalized.retry != null && normalized.repeats != null) {
+    throw new TypeError("Cannot set both retry and repeats");
+  }
+  if (normalized.retry != null) normalized.retry = normalizeCountOption(normalized.retry, "retry");
+  if (normalized.repeats != null) normalized.repeats = normalizeCountOption(normalized.repeats, "repeats");
+  return normalized;
 }
 
 function makeTestFunction(defaultOptions = {}) {
@@ -176,8 +775,9 @@ function makeTestFunction(defaultOptions = {}) {
     const parsed = parseTestArgs(name, options, callback);
     const record = {
       name: parsed.name,
-      options: { ...defaultOptions, ...parsed.options },
+      options: validateTestOptions({ ...defaultOptions, ...parsed.options }),
       fn: parsed.fn,
+      suite: currentSuite,
       ran: false,
       result: null,
     };
@@ -185,7 +785,12 @@ function makeTestFunction(defaultOptions = {}) {
       record.resolve = resolve;
       record.reject = reject;
     });
+    promiseThen(record.result, undefined, () => {});
     tests.push(record);
+    currentSuite.children.push(record);
+    if (record.options.only) hasOnly = true;
+    selectionDirty = true;
+    for (let suite = currentSuite; suite; suite = suite.parent) suite.afterRan = false;
     scheduleRun();
     return record.result;
   };
@@ -195,23 +800,43 @@ function makeTestFunction(defaultOptions = {}) {
 export const test = makeTestFunction();
 export const it = test;
 
-function suiteFunction(name, options, callback) {
+function suiteFunction(name, options, callback, defaultOptions = {}) {
+  installAsyncFailureGuards();
   const parsed = parseTestArgs(name, options, callback);
+  const suiteOptions = { ...defaultOptions, ...parsed.options };
+  const parent = currentSuite;
+  const child = createSuite(parsed.name, suiteOptions, parent);
+  parent.children.push(child);
+  if (suiteOptions.only) hasOnly = true;
+  selectionDirty = true;
   emit("test:suite:start", { name: parsed.name });
+  currentSuite = child;
   try {
-    const result = typeof parsed.fn === "function" ? parsed.fn() : undefined;
+    let rejectExternal;
+    const failure = new Promise((_, reject) => { rejectExternal = reject; });
+    const target = { failExternal: rejectExternal };
+    const result = failureStorage.run(target, () => typeof parsed.fn === "function" ? parsed.fn() : undefined);
+    const completion = runnerPromiseRace([runnerPromiseResolve(result), failure]);
+    promiseThen(completion, undefined, (error) => {
+      child.definitionError = error;
+      scheduleRun();
+    });
     emit("test:suite:finish", { name: parsed.name });
-    return Promise.resolve(result);
+    return promiseThen(completion, undefined, () => {});
   } catch (error) {
-    emit("test:fail", { name: parsed.name, error });
-    return Promise.reject(error);
+    child.definitionError = error;
+    emit("test:suite:finish", { name: parsed.name });
+    scheduleRun();
+    return runnerPromiseResolve();
+  } finally {
+    currentSuite = parent;
   }
 }
 
 export const describe = Object.assign(suiteFunction, {
-  only: (...args) => suiteFunction(args[0], { ...(typeof args[1] === "object" ? args[1] : {}), only: true }, typeof args[1] === "function" ? args[1] : args[2]),
-  skip: (...args) => suiteFunction(args[0], { ...(typeof args[1] === "object" ? args[1] : {}), skip: true }, typeof args[1] === "function" ? args[1] : args[2]),
-  todo: (...args) => suiteFunction(args[0], { ...(typeof args[1] === "object" ? args[1] : {}), todo: true }, typeof args[1] === "function" ? args[1] : args[2]),
+  only: (...args) => suiteFunction(args[0], args[1], args[2], { only: true }),
+  skip: (...args) => suiteFunction(args[0], args[1], args[2], { skip: true }),
+  todo: (...args) => suiteFunction(args[0], args[1], args[2], { todo: true }),
 });
 
 export const suite = describe;
@@ -220,19 +845,49 @@ export const skip = makeTestFunction({ skip: true });
 export const todo = makeTestFunction({ todo: true });
 
 export function before(fn, options = {}) {
-  beforeHooks.push({ fn, options });
+  const execution = currentExecution();
+  if (execution) execution.afterBodyHooks.unshift({ fn, options });
+  else {
+    currentSuite.beforeHooks.push({ fn, options });
+    currentSuite.beforeRan = false;
+    scheduleRun();
+  }
 }
 
 export function after(fn, options = {}) {
-  afterHooks.push({ fn, options });
+  const execution = currentExecution();
+  if (execution) execution.afterBodyHooks.push({ fn, options });
+  else {
+    currentSuite.afterHooks.push({ fn, options });
+    currentSuite.afterRan = false;
+    scheduleRun();
+  }
 }
 
 export function beforeEach(fn, options = {}) {
-  beforeEachHooks.push({ fn, options });
+  currentSuite.beforeEachHooks.push({ fn, options });
+  scheduleRun();
 }
 
 export function afterEach(fn, options = {}) {
-  afterEachHooks.push({ fn, options });
+  currentSuite.afterEachHooks.push({ fn, options });
+  scheduleRun();
+}
+
+export function onTestFinished(fn, options = {}) {
+  if (typeof fn !== "function") throw new TypeError("onTestFinished requires a callback");
+  const execution = currentExecution();
+  if (!execution) throw new Error("Cannot call onTestFinished() outside of a test");
+  if (execution.record.options.concurrent) {
+    throw new Error("Cannot call onTestFinished() here. It cannot be called inside a concurrent test. Use test.serial or remove test.concurrent.");
+  }
+  execution.finishHooks.push({ fn, options });
+}
+
+export function setDefaultTimeout(timeout) {
+  const value = Number(timeout);
+  if (!Number.isFinite(value) || value < 0) throw new TypeError("timeout must be a non-negative number");
+  defaultTimeout = value;
 }
 
 class MockTracker {
@@ -324,10 +979,10 @@ async function *runEvents(options = {}) {
   void options;
   for (const record of tests) {
     try {
-      await execute(record);
+      await record.result;
     } catch {}
   }
-  await finishAfterHooks();
+  await finalizeRun(false);
   yield *events;
 }
 
@@ -344,8 +999,10 @@ Object.assign(test, {
   describe,
   it,
   mock,
+  onTestFinished,
   only,
   run,
+  setDefaultTimeout,
   skip,
   snapshot,
   suite,

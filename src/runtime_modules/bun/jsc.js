@@ -42,7 +42,11 @@ export function memoryUsage() {
 }
 
 export function heapStats() {
-  return getHeapStatistics();
+  const stats = getHeapStatistics();
+  stats.objectTypeCounts ??= { string: 0 };
+  stats.objectTypeCounts.string ??= 0;
+  stats.protectedObjectTypeCounts ??= {};
+  return stats;
 }
 
 export function heapSize() {

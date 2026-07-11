@@ -134,14 +134,18 @@ g.process.argv0 ??= g.process.execPath;
 g.process.execArgv ??= Array.from(cottontail.execArgv || []);
 if (typeof cottontail.gc === "function" &&
     Array.prototype.some.call(g.process.execArgv, (arg) => arg === "--expose-gc" || arg === "--expose_gc")) {
+  let exposedGc;
+  try {
+    exposedGc = (0, eval)("typeof gc === 'function' ? gc : undefined");
+  } catch {}
   Object.defineProperty(g, "gc", {
-    value: (options = undefined) => {
+    value: exposedGc ?? ((options = undefined) => {
       const result = cottontail.gc();
       globalThis.__cottontailForcedWeakRefGc?.();
       globalThis.__cottontailAsyncHooksOnGc?.();
       if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
       return result;
-    },
+    }),
     configurable: true,
     writable: true,
   });
@@ -155,7 +159,55 @@ g.process.stdout ??= createWritableStdio(1);
 g.process.stderr ??= createWritableStdio(2);
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
-if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&
+const nativeIpcFd = Number(g.process.env?.COTTONTAIL_IPC_FD);
+let installNativeProcessIpcReader = null;
+if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
+    g.process.env?.COTTONTAIL_IPC_BOOTSTRAP !== "node" &&
+    typeof cottontail.ipcSend === "function" &&
+    typeof g.process.send !== "function") {
+  g.process.connected = true;
+  g.process.send = (message) => {
+    if (!g.process.connected) return false;
+    return cottontail.ipcSend(nativeIpcFd, `${ipcPrefix}${JSON.stringify(message)}\n`) === true;
+  };
+  g.process.disconnect = () => {
+    if (!g.process.connected) return;
+    g.process.connected = false;
+    g.process.emit("disconnect");
+  };
+
+  if (typeof cottontail.ipcRecv === "function") {
+    installNativeProcessIpcReader = () => {
+      let ipcBuffer = "";
+      const pollIpc = () => {
+        if (!g.process.connected) return;
+        try {
+          for (;;) {
+            const event = cottontail.ipcRecv(nativeIpcFd, 64 * 1024);
+            if (!event) break;
+            if (event.end) {
+              g.process.disconnect();
+              return;
+            }
+            ipcBuffer += new TextDecoder().decode(event.data ?? new ArrayBuffer(0));
+            for (;;) {
+              const newlineIndex = ipcBuffer.indexOf("\n");
+              if (newlineIndex < 0) break;
+              const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+              ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
+              if (!line.startsWith(ipcPrefix)) continue;
+              g.process.emit("message", JSON.parse(line.slice(ipcPrefix.length)));
+            }
+          }
+        } catch (error) {
+          g.process.emit("error", error);
+        }
+      };
+      const ipcTimer = g.setInterval(pollIpc, 4);
+      ipcTimer.unref?.();
+    };
+  }
+} else if (g.process.env?.COTTONTAIL_IPC_STDIO === "1" &&
     g.process.env?.COTTONTAIL_IPC_BOOTSTRAP === "bun" &&
     typeof g.process.send !== "function") {
   g.process.connected = true;
@@ -291,8 +343,21 @@ if (typeof g.URL !== "function" || !("searchParams" in new g.URL("http://example
       const match = /^([A-Za-z][A-Za-z0-9+.-]*:)?(\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(resolved) || [];
       this.protocol = match[1] || "";
       this.host = match[3] || "";
-      this.hostname = this.host.split(":")[0] || "";
-      this.pathname = match[4] || "";
+      if (this.host.startsWith("[")) {
+        const bracket = this.host.indexOf("]");
+        this.hostname = bracket >= 0 ? this.host.slice(0, bracket + 1) : this.host;
+        this.port = bracket >= 0 && this.host[bracket + 1] === ":" ? this.host.slice(bracket + 2) : "";
+      } else {
+        const colon = this.host.lastIndexOf(":");
+        if (colon >= 0 && /^\d+$/.test(this.host.slice(colon + 1))) {
+          this.hostname = this.host.slice(0, colon);
+          this.port = this.host.slice(colon + 1);
+        } else {
+          this.hostname = this.host;
+          this.port = "";
+        }
+      }
+      this.pathname = match[4] || (this.host ? "/" : "");
       this.hash = match[6] || "";
       this.searchParams = new g.URLSearchParams(match[5] || "");
     }
@@ -952,6 +1017,7 @@ function installTimers() {
 }
 
 installTimers();
+installNativeProcessIpcReader?.();
 
 const spawnEventListeners = new Map();
 let spawnEventHandlerInstalled = false;
@@ -1106,7 +1172,7 @@ g.__cottontailRunLoopTick = () => {
   const due = Array.from(timers.values())
     .filter((timer) => timer.deadline <= now)
     .sort((a, b) => a.deadline - b.deadline || a.id - b.id);
-  for (const timer of due.slice(0, 1)) {
+  for (const timer of due) {
     if (!timers.has(timer.id)) continue;
     timers.delete(timer.id);
     timer.callback(...timer.args);
@@ -1121,9 +1187,63 @@ g.__cottontailRunLoopTick = () => {
   return nextRunLoopDelay(timerNow());
 };
 
+function normalizeWorkerScriptPath(scriptPath) {
+  const text = String(scriptPath);
+  if (text.startsWith("file://")) return decodeURIComponent(new URL(text).pathname);
+  return text;
+}
+
+function rewriteWorkerNamedImports(spec) {
+  return String(spec)
+    .split(",")
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return "";
+      const pieces = trimmed.split(/\s+as\s+/);
+      return pieces.length === 2 ? `${pieces[0].trim()}: ${pieces[1].trim()}` : trimmed;
+    })
+    .filter(Boolean)
+    .join(", ");
+}
+
+function prepareWorkerScriptPath(scriptPath) {
+  const target = normalizeWorkerScriptPath(scriptPath);
+  if (target.startsWith("data:")) return target;
+  let source;
+  try {
+    source = cottontail.readFile(target);
+  } catch {
+    return target;
+  }
+  const dir = target.replace(/\/[^/]*$/, "") || ".";
+  const fileUrl = `file://${target}`;
+  const transformed = String(source)
+    .replace(/import\.meta\.dirname/g, JSON.stringify(dir))
+    .replace(/import\.meta\.dir/g, JSON.stringify(dir))
+    .replace(/import\.meta\.filename/g, JSON.stringify(target))
+    .replace(/import\.meta\.path/g, JSON.stringify(target))
+    .replace(/import\.meta\.url/g, JSON.stringify(fileUrl))
+    .replace(/import\.meta\.main/g, "false")
+    .replace(
+      /^\s*import\s+\{([^}]*)\}\s+from\s+(['"])bun\2\s*;?\s*$/mg,
+      (_all, names) => `const { ${rewriteWorkerNamedImports(names)} } = globalThis.Bun;`,
+    );
+  if (transformed === source) return target;
+  const tempDir = `${cottontail.cwd()}/.cottontail-tmp`;
+  cottontail.mkdirSync?.(tempDir, true);
+  const wrapperPath = `${tempDir}/bun-worker-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
+  cottontail.writeFile(wrapperPath, [
+    "globalThis.Bun ??= { isMainThread: false };",
+    "globalThis.Bun.isMainThread = false;",
+    transformed,
+    `\n//# sourceURL=${target}`,
+  ].join("\n"));
+  return wrapperPath;
+}
+
 g.Worker ??= class Worker {
   constructor(scriptPath) {
-    this.scriptPath = String(scriptPath);
+    this.scriptPath = prepareWorkerScriptPath(scriptPath);
     this.handle = cottontail.spawnWorker(this.scriptPath);
     this.id = this.handle.id;
     this.onmessage = null;
@@ -1131,6 +1251,7 @@ g.Worker ??= class Worker {
     this._listeners = new Map();
     workerInstances.set(this.id, this);
     this._pollTimer = installWorkerNativeEventHandler() ? null : setInterval(() => this._poll(), 16);
+    queueMicrotask(() => this._emit("open", { type: "open", target: this }));
   }
   _add(name, handler) {
     if (typeof handler !== "function") return this;

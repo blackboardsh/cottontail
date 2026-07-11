@@ -14,6 +14,9 @@ pub const CtHostSpawnOptions = extern struct {
     env_count: usize,
     clear_env: bool,
     capture_output: bool,
+    input_present: bool,
+    input_ptr: ?[*]const u8,
+    input_len: usize,
 };
 
 pub const CtHostSpawnResult = extern struct {
@@ -249,7 +252,86 @@ export fn ct_host_spawn_sync(
     const env_map_ptr = if (env_map) |*map| map else null;
     const child_cwd = cwdOption(options.cwd);
 
-    if (options.capture_output) {
+    if (options.capture_output and options.input_present) {
+        var child = std.process.spawn(io, .{
+            .argv = argv.items,
+            .cwd = child_cwd,
+            .environ_map = env_map_ptr,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .create_no_window = true,
+        }) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+        defer child.kill(io);
+
+        if (child.stdin) |stdin_file| {
+            const input: []const u8 = if (options.input_ptr) |ptr| ptr[0..options.input_len] else &.{};
+            var stdin_buffer: [8192]u8 = undefined;
+            var stdin_writer = stdin_file.writer(io, &stdin_buffer);
+            stdin_writer.interface.writeAll(input) catch |err| {
+                setErrorOut(error_out, @errorName(err));
+                return -1;
+            };
+            stdin_writer.interface.flush() catch |err| {
+                setErrorOut(error_out, @errorName(err));
+                return -1;
+            };
+            stdin_file.close(io);
+            child.stdin = null;
+        }
+
+        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: std.Io.File.MultiReader = undefined;
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer multi_reader.deinit();
+
+        while (multi_reader.fill(64, .none)) |_| {
+        } else |err| switch (err) {
+            error.EndOfStream => {},
+            else => |e| {
+                setErrorOut(error_out, @errorName(e));
+                return -1;
+            },
+        }
+        multi_reader.checkAnyError() catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+
+        const term = child.wait(io) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+        result_out.exit_code = termToExitCode(term);
+
+        const stdout_slice = multi_reader.toOwnedSlice(0) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+        defer gpa.free(stdout_slice);
+        const stderr_slice = multi_reader.toOwnedSlice(1) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+        defer gpa.free(stderr_slice);
+
+        result_out.stdout_ptr = allocBuffer(stdout_slice) orelse {
+            setErrorOut(error_out, "OutOfMemory");
+            return -1;
+        };
+        result_out.stdout_len = stdout_slice.len;
+        result_out.stderr_ptr = allocBuffer(stderr_slice) orelse {
+            if (result_out.stdout_ptr) |stdout_ptr| ct_host_buffer_free(stdout_ptr);
+            result_out.stdout_ptr = null;
+            result_out.stdout_len = 0;
+            setErrorOut(error_out, "OutOfMemory");
+            return -1;
+        };
+        result_out.stderr_len = stderr_slice.len;
+    } else if (options.capture_output) {
         const run_result = std.process.run(gpa, io, .{
             .argv = argv.items,
             .cwd = child_cwd,

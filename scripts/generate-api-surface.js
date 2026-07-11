@@ -279,6 +279,143 @@ function compareExports(targetNames, currentNames) {
   };
 }
 
+const upstreamDisabledStatuses = new Set(['disabled', 'skip']);
+
+function countAllFiles(dir) {
+  if (!existsSync(dir)) return 0;
+  let count = 0;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        stack.push(path);
+      } else {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
+function discoverUpstreamRunnableFiles(snapshotRoot, runtime) {
+  const testRoot = join(snapshotRoot, 'test');
+  if (!existsSync(testRoot)) return [];
+  const runnablePattern = runtime === 'bun'
+    ? /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i
+    : /\.(?:js|mjs|cjs)$/i;
+  const result = [];
+  const stack = [testRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        stack.push(path);
+      } else if (entry.isFile() && runnablePattern.test(entry.name)) {
+        result.push(relative(snapshotRoot, path).split(sep).join('/'));
+      }
+    }
+  }
+  return result.sort();
+}
+
+function upstreamPatternEntries(status) {
+  return Array.isArray(status.patterns) ? status.patterns : [];
+}
+
+function upstreamPatternStatusForPath(status, path) {
+  let matched = null;
+  for (const pattern of upstreamPatternEntries(status)) {
+    if (!pattern?.pattern || !pattern?.status) continue;
+    if (new RegExp(pattern.pattern).test(path)) matched = pattern;
+  }
+  return matched;
+}
+
+function upstreamStatusEntryForPath(status, path, defaultStatus = status.defaultStatus ?? 'not-enabled') {
+  const patternEntry = upstreamPatternStatusForPath(status, path);
+  return {
+    path,
+    status: defaultStatus,
+    reason: undefined,
+    ...(patternEntry ?? {}),
+    ...(status.tests?.[path] ?? {}),
+  };
+}
+
+function assertUpstreamStatusSummary(summary) {
+  const classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  if (summary.classifiedTests !== classifiedTests) {
+    throw new Error(`classified upstream count mismatch: ${summary.classifiedTests} !== ${classifiedTests}`);
+  }
+  if (summary.discoveredRunnableFiles !== classifiedTests + summary.notEnabled) {
+    throw new Error(
+      `discovered upstream count mismatch: ${summary.discoveredRunnableFiles} !== ` +
+      `${classifiedTests} classified + ${summary.notEnabled} not-enabled`
+    );
+  }
+}
+
+function summarizeUpstreamRunnableStatuses(entries) {
+  const summary = {
+    discoveredRunnableFiles: entries.length,
+    enabled: 0,
+    expectedFailure: 0,
+    disabled: 0,
+    notEnabled: 0,
+    classifiedTests: 0,
+  };
+  const unknown = [];
+
+  for (const entry of entries) {
+    if (entry.status === 'enabled') summary.enabled += 1;
+    else if (entry.status === 'expected-failure') summary.expectedFailure += 1;
+    else if (upstreamDisabledStatuses.has(entry.status)) summary.disabled += 1;
+    else if (entry.status === 'not-enabled') summary.notEnabled += 1;
+    else unknown.push(`${entry.path}: ${String(entry.status)}`);
+  }
+
+  if (unknown.length > 0) {
+    throw new Error(`unknown upstream test status(es): ${unknown.join(', ')}`);
+  }
+
+  summary.classifiedTests = summary.enabled + summary.expectedFailure + summary.disabled;
+  assertUpstreamStatusSummary(summary);
+  return summary;
+}
+
+function collectUpstreamStatus() {
+  const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
+  if (!existsSync(targetsPath)) return {};
+  const targets = JSON.parse(readFileSync(targetsPath, 'utf8'));
+  const result = {};
+
+  for (const runtime of ['node', 'bun']) {
+    const target = targets[runtime];
+    if (!target) continue;
+    const snapshotRoot = join(rootDir, target.snapshot);
+    const statusPath = join(snapshotRoot, 'status.json');
+    if (!existsSync(statusPath)) continue;
+    const status = JSON.parse(readFileSync(statusPath, 'utf8'));
+    const entries = discoverUpstreamRunnableFiles(snapshotRoot, runtime)
+      .map((path) => upstreamStatusEntryForPath(status, path));
+    const summary = summarizeUpstreamRunnableStatuses(entries);
+
+    result[runtime] = {
+      version: target.version,
+      commit: target.commit,
+      snapshot: target.snapshot,
+      copiedFiles: countAllFiles(snapshotRoot),
+      ...summary,
+      trackedTests: summary.classifiedTests,
+    };
+  }
+
+  return result;
+}
+
 function currentExportsForTarget(current, targetNames) {
   const names = [...(current?.exports || [])];
   if (current?.hasDefaultExport && targetNames.includes('default')) {
@@ -550,15 +687,6 @@ function collectBunBehavioralSignals(bunSurface) {
   const publicModuleCount = Math.max(1, Object.keys(bunSurface.modules || {}).length);
   const modulesWithCompatMarkers = Object.values(modules).filter((entry) => entry.compatMarkers.length > 0).length;
   const modulesWithUnsupportedMarkers = Object.values(modules).filter((entry) => entry.unsupportedMarkers.length > 0).length;
-  const caveatModuleShare = modulesWithCompatMarkers / publicModuleCount;
-  const penalty =
-    caveatModuleShare * 35 +
-    Math.min(35, explicitUnsupportedCount * 1.5) +
-    Math.min(10, compatMarkerCount * 0.5);
-  const midpoint = Math.round(clamp(100 - penalty, 0, 100));
-  const hasBehaviorSignals = compatMarkerCount > 0 || explicitUnsupportedCount > 0 || nativeAvailabilityGuardCount > 0;
-  const lower = hasBehaviorSignals ? clamp(midpoint - 5, 0, 100) : 100;
-  const upper = hasBehaviorSignals ? clamp(midpoint + 5, 0, 100) : 100;
 
   const largestGaps = Object.entries(modules)
     .map(([name, entry]) => ({
@@ -573,13 +701,7 @@ function collectBunBehavioralSignals(bunSurface) {
     .sort((left, right) => right.gapScore - left.gapScore || left.name.localeCompare(right.name));
 
   return {
-    note: 'Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Bun-focused test files. This is not a conformance result.',
-    estimate: {
-      implementedPercentLower: lower,
-      implementedPercentUpper: upper,
-      gapPercentLower: 100 - upper,
-      gapPercentUpper: 100 - lower,
-    },
+    note: 'Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.',
     signals: {
       publicBunModules: publicModuleCount,
       bunTestFiles: testFiles.length,
@@ -600,13 +722,14 @@ const cottontailSurface = collectCottontailSurface();
 const manifest = {
   schemaVersion: 1,
   generatedBy: 'scripts/generate-api-surface.js',
-  note: 'This is an API-name inventory, not a behavioral compatibility result.',
+  note: 'API coverage is a name inventory; upstream test tiers are the conformance evidence, and heuristic signals are not conformance results.',
   targets: {
     node: nodeSurface,
     bun: bunSurface,
   },
   cottontail: cottontailSurface,
   coverage: buildCoverage(nodeSurface, bunSurface, cottontailSurface),
+  upstream: collectUpstreamStatus(),
   behavioral: {
     node: collectNodeBehavioralSignals(nodeSurface),
     bun: collectBunBehavioralSignals(bunSurface),

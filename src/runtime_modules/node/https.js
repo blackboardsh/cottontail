@@ -21,7 +21,8 @@ function normalizeRequestOptions(input, options = undefined) {
     const hostname = merged.hostname ?? merged.host ?? "localhost";
     const port = merged.port != null ? `:${merged.port}` : "";
     const path = merged.path ?? `${merged.pathname ?? "/"}${merged.search ?? ""}`;
-    url = new URL(`https://${hostname}${port}${path}`);
+    const urlPath = String(path).startsWith("/") ? path : "/";
+    url = new URL(`https://${hostname}${port}${urlPath}`);
   }
   if (merged.hostname) url.hostname = merged.hostname;
   if (merged.host && !merged.hostname && merged.port == null) url.host = merged.host;

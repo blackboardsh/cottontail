@@ -40,6 +40,48 @@ export class ReadableStreamDefaultController {
 
 export class ReadableByteStreamController extends ReadableStreamDefaultController {}
 
+class HTTPResponseSink extends ReadableStreamDefaultController {
+  constructor(stream) {
+    super(stream);
+    this._active = true;
+  }
+
+  _assertActive() {
+    if (!this._active) {
+      throw new TypeError(
+        'This HTTPResponseSink has already been closed. A "direct" ReadableStream terminates its underlying socket once `async pull()` returns.',
+      );
+    }
+  }
+
+  write(chunk) {
+    if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
+    this._assertActive();
+    this._stream._enqueue(bytesFromChunk(chunk));
+    return chunk?.byteLength ?? chunk?.length ?? String(chunk).length;
+  }
+
+  flush() {
+    if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
+    this._assertActive();
+    return 0;
+  }
+
+  end(chunk = undefined) {
+    if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
+    this._assertActive();
+    if (chunk !== undefined) this._stream._enqueue(bytesFromChunk(chunk));
+    this._finish();
+    return Promise.resolve();
+  }
+
+  _finish() {
+    if (!this._active) return;
+    this._active = false;
+    this._stream._close();
+  }
+}
+
 export class ReadableStream {
   constructor(underlyingSource = {}) {
     this._queue = [];
@@ -47,10 +89,36 @@ export class ReadableStream {
     this._errorValue = undefined;
     this._readers = [];
     this.locked = false;
-    this._controller = new ReadableStreamDefaultController(this);
+    this._direct = underlyingSource.type === "direct";
+    this._pulling = null;
+    this._controller = this._direct
+      ? new HTTPResponseSink(this)
+      : new ReadableStreamDefaultController(this);
     if (typeof underlyingSource.start === "function") underlyingSource.start(this._controller);
     this._pull = underlyingSource.pull;
     this._cancel = underlyingSource.cancel;
+  }
+
+  _requestPull() {
+    if (this._closed || this._pulling || typeof this._pull !== "function") return;
+    let result;
+    try {
+      result = this._pull(this._controller);
+    } catch (error) {
+      this._error(error);
+      return;
+    }
+    this._pulling = Promise.resolve(result).then(
+      () => {
+        this._pulling = null;
+        if (this._direct) this._controller._finish();
+        else if (!this._closed && this._readers.length > 0 && this._queue.length === 0) this._requestPull();
+      },
+      (error) => {
+        this._pulling = null;
+        this._error(error);
+      },
+    );
   }
 
   _enqueue(chunk) {
@@ -79,7 +147,53 @@ export class ReadableStream {
 
   cancel(reason = undefined) {
     this._closed = true;
+    if (this._direct) this._controller._active = false;
     return Promise.resolve(this._cancel?.(reason));
+  }
+
+  async *[Symbol.asyncIterator]() {
+    const reader = this.getReader();
+    try {
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) return;
+        yield item.value;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  pipeThrough(transform, options = undefined) {
+    const readable = transform?.readable;
+    const writable = transform?.writable;
+    if (!readable || !writable) throw new TypeError("ReadableStream.pipeThrough requires a transform with readable and writable streams");
+    void this.pipeTo(writable, options);
+    return readable;
+  }
+
+  async pipeTo(destination, options = {}) {
+    const reader = this.getReader();
+    const writer = destination?.getWriter?.();
+    if (!writer) {
+      reader.releaseLock();
+      throw new TypeError("ReadableStream.pipeTo requires a WritableStream destination");
+    }
+    try {
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) break;
+        await writer.write(item.value);
+      }
+      if (options?.preventClose !== true) await writer.close();
+    } catch (error) {
+      if (options?.preventAbort !== true) await writer.abort?.(error);
+      if (options?.preventCancel !== true) await reader.cancel?.(error);
+      throw error;
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock?.();
+    }
   }
 
   tee() {
@@ -106,7 +220,7 @@ export class ReadableStreamDefaultReader {
     if (this._stream._errorValue) return Promise.reject(this._stream._errorValue);
     if (this._stream._queue.length > 0) return Promise.resolve({ value: this._stream._queue.shift(), done: false });
     if (this._stream._closed) return Promise.resolve({ value: undefined, done: true });
-    this._stream._pull?.(this._stream._controller);
+    this._stream._requestPull();
     if (this._stream._errorValue) return Promise.reject(this._stream._errorValue);
     if (this._stream._queue.length > 0) return Promise.resolve({ value: this._stream._queue.shift(), done: false });
     if (this._stream._closed) return Promise.resolve({ value: undefined, done: true });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
@@ -16,6 +17,7 @@ const help_text_template =
     \\Usage:
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
+    \\  cottontail test [args...]
     \\  cottontail -e|--eval <script> [args...]
     \\  cottontail -p|--print <expression> [args...]
     \\  cottontail --help
@@ -89,7 +91,140 @@ fn isRuntimeFlag(arg: []const u8) bool {
     return std.mem.startsWith(u8, arg, "--");
 }
 
-fn parseInvocation(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliInvocation {
+fn testFlagTakesValue(arg: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
+    const value_flags = [_][]const u8{
+        "--bail",
+        "--max-concurrency",
+        "--preload",
+        "--timeout",
+    };
+    for (value_flags) |candidate| {
+        if (std.mem.eql(u8, arg, candidate)) return true;
+    }
+    return false;
+}
+
+fn testEntrypointIndex(args: []const [:0]const u8) ?usize {
+    var index: usize = 2;
+    while (index < args.len) {
+        const arg = args[index];
+        if (!std.mem.startsWith(u8, arg, "-")) return index;
+        index += if (testFlagTakesValue(arg) and index + 1 < args.len) 2 else 1;
+    }
+    return null;
+}
+
+fn resolveTestEntrypoint(io: std.Io, allocator: std.mem.Allocator, requested: [:0]const u8) ![:0]const u8 {
+    std.Io.Dir.cwd().access(io, requested, .{}) catch {
+        if (std.fs.path.extension(requested).len > 0) return requested;
+        const directory = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer directory.close(io);
+        var iterator = directory.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file or !isTestEntrypoint(entry.name)) continue;
+            if (std.mem.startsWith(u8, entry.name, requested)) return try allocator.dupeZ(u8, entry.name);
+        }
+    };
+    return requested;
+}
+
+fn testScriptArgs(
+    allocator: std.mem.Allocator,
+    args: []const [:0]const u8,
+    entrypoint_index: usize,
+) ![]const [:0]const u8 {
+    const result = try allocator.alloc([:0]const u8, args.len - 3);
+    var output_index: usize = 0;
+    for (args[2..], 2..) |arg, index| {
+        if (index == entrypoint_index) continue;
+        result[output_index] = arg;
+        output_index += 1;
+    }
+    return result;
+}
+
+fn testEntrypointMask(allocator: std.mem.Allocator, args: []const [:0]const u8) ![]bool {
+    const mask = try allocator.alloc(bool, args.len);
+    @memset(mask, false);
+    var index: usize = 2;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.startsWith(u8, arg, "-")) {
+            index += if (testFlagTakesValue(arg) and index + 1 < args.len) 2 else 1;
+            continue;
+        }
+        mask[index] = true;
+        index += 1;
+    }
+    return mask;
+}
+
+fn childExitCode(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| @intCast(@min(code, 255)),
+        .signal, .stopped, .unknown => 1,
+    };
+}
+
+fn isBunShellScript(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".bun.sh");
+}
+
+fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_args: []const [:0]const u8) !u8 {
+    const allocator = init.arena.allocator();
+    const argv = try allocator.alloc([]const u8, script_args.len + 2);
+    argv[0] = "sh";
+    argv[1] = script_path;
+    for (script_args, 0..) |arg, index| {
+        argv[index + 2] = arg;
+    }
+    var child = try std.process.spawn(init.io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    });
+    defer child.kill(init.io);
+    return childExitCode(try child.wait(init.io));
+}
+
+fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8 {
+    if (args.len < 4 or !std.mem.eql(u8, args[1], "test")) return null;
+    const allocator = init.arena.allocator();
+    const entrypoints = try testEntrypointMask(allocator, args);
+    var entrypoint_count: usize = 0;
+    for (entrypoints) |is_entrypoint| entrypoint_count += @intFromBool(is_entrypoint);
+    if (entrypoint_count <= 1) return null;
+
+    var exit_code: u8 = 0;
+    for (entrypoints, 0..) |is_entrypoint, entrypoint_index| {
+        if (!is_entrypoint) continue;
+        const child_args = try allocator.alloc([]const u8, args.len - entrypoint_count + 1);
+        child_args[0] = args[0];
+        child_args[1] = args[1];
+        var child_index: usize = 2;
+        for (args[2..], 2..) |arg, index| {
+            if (entrypoints[index] and index != entrypoint_index) continue;
+            child_args[child_index] = arg;
+            child_index += 1;
+        }
+        var child = try std.process.spawn(init.io, .{
+            .argv = child_args,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .create_no_window = true,
+        });
+        defer child.kill(init.io);
+        const code = childExitCode(try child.wait(init.io));
+        if (code != 0) exit_code = code;
+    }
+    return exit_code;
+}
+
+fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]const u8) !CliInvocation {
     if (args.len <= 1) return CliParseError.MissingEntrypoint;
 
     const exec_args_storage = try allocator.alloc([:0]const u8, args.len);
@@ -101,6 +236,23 @@ fn parseInvocation(allocator: std.mem.Allocator, args: []const [:0]const u8) !Cl
             .mode = .script,
             .payload = args[2],
             .args = args[3..],
+            .exec_args = exec_args_storage[0..0],
+        };
+    }
+
+    if (std.mem.eql(u8, args[1], "test")) {
+        if (testEntrypointIndex(args)) |entrypoint_index| {
+            return .{
+                .mode = .script,
+                .payload = try resolveTestEntrypoint(io, allocator, args[entrypoint_index]),
+                .args = try testScriptArgs(allocator, args, entrypoint_index),
+                .exec_args = exec_args_storage[0..0],
+            };
+        }
+        return .{
+            .mode = .script,
+            .payload = try defaultTestEntrypoint(io, allocator),
+            .args = args[2..],
             .exec_args = exec_args_storage[0..0],
         };
     }
@@ -195,6 +347,44 @@ fn parseInvocation(allocator: std.mem.Allocator, args: []const [:0]const u8) !Cl
     return CliParseError.MissingEntrypoint;
 }
 
+fn isTestEntrypoint(name: []const u8) bool {
+    const extensions = [_][]const u8{ ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts" };
+    if (std.mem.indexOf(u8, name, ".test.") == null) return false;
+    for (extensions) |extension| {
+        if (std.mem.endsWith(u8, name, extension)) return true;
+    }
+    return false;
+}
+
+fn defaultTestEntrypoint(io: std.Io, allocator: std.mem.Allocator) ![:0]const u8 {
+    const candidates = [_][]const u8{
+        "index.test.ts",
+        "index.test.tsx",
+        "index.test.js",
+        "index.test.mjs",
+        "index.test.cjs",
+        "test.ts",
+        "test.js",
+    };
+    for (candidates) |candidate| {
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
+        return try allocator.dupeZ(u8, candidate);
+    }
+
+    const directory = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    var selected: ?[]const u8 = null;
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !isTestEntrypoint(entry.name)) continue;
+        if (selected == null or std.mem.order(u8, entry.name, selected.?) == .lt) {
+            selected = try allocator.dupe(u8, entry.name);
+        }
+    }
+    if (selected) |name| return try allocator.dupeZ(u8, name);
+    return CliParseError.MissingEntrypoint;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -226,7 +416,39 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const invocation = parseInvocation(init.arena.allocator(), args) catch |err| switch (err) {
+    if (std.mem.eql(u8, arg, "exec")) {
+        if (args.len <= 2) {
+            try stderr.print("cottontail: exec requires a command\n", .{});
+            try stderr.flush();
+            std.process.exit(1);
+        }
+        if (builtin.os.tag == .windows) {
+            try stderr.print("cottontail: exec is unavailable on this platform yet\n", .{});
+            try stderr.flush();
+            std.process.exit(1);
+        }
+
+        const allocator = init.arena.allocator();
+        const command_parts = try allocator.alloc([]const u8, args.len - 2);
+        for (command_parts, 0..) |*part, index| {
+            part.* = args[index + 2];
+        }
+        const command = try std.mem.joinZ(allocator, " ", command_parts);
+        const shell = "/bin/sh";
+        const shell_arg = "-c";
+        const exec_args = [_:null]?[*:0]const u8{ shell.ptr, shell_arg.ptr, command.ptr };
+        _ = std.c.execve(shell.ptr, &exec_args, @ptrCast(std.c.environ));
+        try stderr.print("cottontail: exec failed\n", .{});
+        try stderr.flush();
+        std.process.exit(127);
+    }
+
+    if (try runMultipleTestFiles(init, args)) |exit_code| {
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
+    const invocation = parseInvocation(init.io, init.arena.allocator(), args) catch |err| switch (err) {
         CliParseError.MissingEntrypoint => {
             try stderr.print("cottontail: expected an entrypoint script, -e script, or -p expression\n", .{});
             try stderr.flush();
@@ -246,7 +468,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const exit_code = switch (invocation.mode) {
-        .script => try script_runner.runWithExecArgv(init, invocation.payload, invocation.args, invocation.exec_args),
+        .script => if (isBunShellScript(invocation.payload))
+            try runBunShellScript(init, invocation.payload, invocation.args)
+        else
+            try script_runner.runWithExecArgv(init, invocation.payload, invocation.args, invocation.exec_args),
         .eval => try script_runner.runEval(init, invocation.payload, invocation.args, invocation.exec_args, false),
         .print => try script_runner.runEval(init, invocation.payload, invocation.args, invocation.exec_args, true),
         .stdin => try script_runner.runStdin(init, invocation.args, invocation.exec_args),
@@ -261,4 +486,17 @@ test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
+}
+
+test "test entrypoint names use supported test extensions" {
+    try std.testing.expect(isTestEntrypoint("example.test.ts"));
+    try std.testing.expect(isTestEntrypoint("example.test.cjs"));
+    try std.testing.expect(!isTestEntrypoint("example.ts"));
+    try std.testing.expect(!isTestEntrypoint("example.test.txt"));
+}
+
+test "test flags can precede the entrypoint" {
+    const args = [_][:0]const u8{ "cottontail", "test", "--max-concurrency", "3", "suite.test.ts" };
+    try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&args));
+    try std.testing.expectEqual(@as(?usize, null), testEntrypointIndex(args[0..4]));
 }

@@ -31,6 +31,13 @@ export const CANCELLED = "ECANCELLED";
 
 let defaultResultOrder = "verbatim";
 let servers = [];
+const prefetchCache = new Map();
+const cacheStats = {
+  cacheHitsCompleted: 0,
+  cacheHitsInflight: 0,
+  cacheMisses: 0,
+  cacheSize: 0,
+};
 
 function makeDnsError(error, syscall, hostname = undefined, code = NOTFOUND) {
   const message = error instanceof Error ? error.message : String(error);
@@ -204,6 +211,30 @@ export function lookup(hostname, options = undefined, callback = undefined) {
     const first = records[0];
     return [first.address, first.family];
   }, callback);
+}
+
+export function prefetch(hostname, port = 0) {
+  if (arguments.length === 0 || hostname == null) throw new TypeError("dns.prefetch requires a hostname");
+  const key = `${String(hostname)}:${Number(port) || 0}`;
+  if (prefetchCache.has(key)) {
+    cacheStats.cacheHitsCompleted += 1;
+    return;
+  }
+  cacheStats.cacheHitsInflight += 1;
+  try {
+    const records = lookupRecords(hostname, 0, defaultResultOrder, null);
+    prefetchCache.set(key, { records, port: Number(port) || 0, createdAt: Date.now() });
+    cacheStats.cacheHitsCompleted += 1;
+    cacheStats.cacheSize = prefetchCache.size;
+  } catch {
+    cacheStats.cacheMisses += 1;
+  } finally {
+    cacheStats.cacheHitsInflight = Math.max(0, cacheStats.cacheHitsInflight - 1);
+  }
+}
+
+export function getCacheStats() {
+  return { ...cacheStats, cacheSize: prefetchCache.size };
 }
 
 export function lookupService(address, port, callback) {
@@ -473,6 +504,7 @@ export const promises = {
   SERVFAIL,
   TIMEOUT,
   Resolver: PromisesResolver,
+  getCacheStats,
   getDefaultResultOrder,
   getServers,
   lookup: (hostname, options = undefined) => new Promise((resolvePromise, reject) => {
@@ -503,6 +535,7 @@ export const promises = {
   resolveTlsa: (hostname) => promiseFromCallback(resolveTlsa, hostname),
   resolveTxt: (hostname) => promiseFromCallback(resolveTxt, hostname),
   reverse: (ip) => promiseFromCallback(reverse, ip),
+  prefetch,
   setDefaultResultOrder,
   setServers,
 };
@@ -538,11 +571,13 @@ export default {
   SERVFAIL,
   TIMEOUT,
   V4MAPPED,
+  getCacheStats,
   getDefaultResultOrder,
   getServers,
   lookup,
   lookupService,
   promises,
+  prefetch,
   resolve,
   resolve4,
   resolve6,

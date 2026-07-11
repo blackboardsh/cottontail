@@ -643,6 +643,7 @@ export function fork(modulePath, args = [], options = {}) {
     ...process.env,
     ...(options.env ?? {}),
     COTTONTAIL_IPC_STDIO: "1",
+    COTTONTAIL_IPC_BOOTSTRAP: "node",
     COTTONTAIL_IPC_SERIALIZATION: options.serialization === "advanced" ? "advanced" : "json",
   });
   const execArgv = Array.from(options.execArgv ?? process.execArgv ?? [], String);

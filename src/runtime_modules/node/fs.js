@@ -83,6 +83,20 @@ function normalizePath(path) {
   return String(path);
 }
 
+function makeFsError(error, path, syscall = "open") {
+  const normalizedPath = normalizePath(path);
+  const source = String(error?.message ?? error ?? "");
+  const isNoEntry = source.includes("No such file or directory") || source.includes("ENOENT");
+  const code = isNoEntry ? "ENOENT" : String(error?.code ?? "EIO");
+  const reason = isNoEntry ? "no such file or directory" : source || code;
+  const out = new Error(`${code}: ${reason}, ${syscall} '${normalizedPath}'`);
+  out.errno = -(constants[code] ?? 5);
+  out.code = code;
+  out.syscall = syscall;
+  out.path = normalizedPath;
+  return out;
+}
+
 function normalizeEncoding(options, fallback = undefined) {
   if (typeof options === "string") return options;
   if (options && typeof options === "object" && options.encoding != null) return options.encoding;
@@ -368,7 +382,14 @@ export function accessSync(path, mode = F_OK) {
 export function readFileSync(path, options = undefined) {
   if (typeof path === "number") return readFdToEndSync(path, options);
   const encoding = normalizeEncoding(options);
-  const bytes = makeBuffer(cottontail.readFileBuffer(normalizePath(path)));
+  const normalizedPath = normalizePath(path);
+  let raw;
+  try {
+    raw = cottontail.readFileBuffer(normalizedPath);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "open");
+  }
+  const bytes = makeBuffer(raw);
   return encoding ? decodeBytes(bytes, encoding) : bytes;
 }
 
@@ -397,7 +418,12 @@ export function appendFileSync(path, data, options = undefined) {
 }
 
 export function openSync(path, flags = "r", mode = 0o666) {
-  return cottontail.openFd(normalizePath(path), flags ?? "r", Number(mode ?? 0o666));
+  const normalizedPath = normalizePath(path);
+  try {
+    return cottontail.openFd(normalizedPath, flags ?? "r", Number(mode ?? 0o666));
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "open");
+  }
 }
 
 export function closeSync(fd) {

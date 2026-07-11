@@ -63,12 +63,12 @@ pub fn runWithExecArgv(
     const ctx = try makeContext(init);
 
     const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(script_path))
-        try bundleScriptWithEsbuild(&ctx, script_path)
+        try bundleScriptWithEsbuild(&ctx, script_path, exec_args, script_args, null)
     else blk: {
         const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
         if (try shouldBundleCommonJsEntrypoint(&ctx, script_abs)) {
             const tmp_dir = try ensureTempDir(&ctx);
-            break :blk try writeCommonJsEntryWrapper(&ctx, tmp_dir, script_abs);
+            break :blk try writeCommonJsEntryWrapper(&ctx, tmp_dir, script_abs, false);
         }
         break :blk script_abs;
     };
@@ -95,7 +95,7 @@ pub fn runEval(
     const module_input = hasModuleInputType(exec_args) or sourceLooksEsm(source);
     const eval_path = try writeEvalEntrypoint(&ctx, tmp_dir, source, print_result, module_input);
     const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(eval_path))
-        try bundleScriptWithEsbuild(&ctx, eval_path)
+        try bundleScriptWithEsbuild(&ctx, eval_path, exec_args, script_args, ctx.project_root)
     else
         eval_path;
     const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
@@ -274,19 +274,35 @@ fn isTypescriptPath(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".cts");
 }
 
-fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]const u8 {
+fn bundleScriptWithEsbuild(
+    ctx: *const Context,
+    script_path: []const u8,
+    exec_args: []const [:0]const u8,
+    script_args: []const [:0]const u8,
+    source_base_dir: ?[]const u8,
+) ![]const u8 {
     try ensureEsbuild(ctx);
-
     const tmp_dir = try ensureTempDir(ctx);
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
+    defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
+
+    const script_entry_abs = try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir);
+    defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+
     const wrapped_entry = if (try shouldBundleCommonJsEntrypoint(ctx, script_abs))
-        try writeCommonJsEntryWrapper(ctx, tmp_dir, script_abs)
+        try writeCommonJsEntryWrapper(
+            ctx,
+            tmp_dir,
+            script_abs,
+            hasCustomConditions(exec_args) or hasCustomConditions(script_args),
+        )
     else
-        try writeCottontailEntryWrapper(ctx, tmp_dir, script_abs);
+        try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
     const esbuild_bin = try esbuildBinaryPath(ctx);
-    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const script_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{script_abs});
     const script_dir_literal = try jsonStringLiteral(ctx, script_dir);
     const script_basename_literal = try jsonStringLiteral(ctx, std.fs.path.basename(script_abs));
@@ -299,6 +315,8 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const bun_sqlite_module = try runtimeModulePath(ctx, &.{ "bun", "sqlite.js" });
     const bun_test_module = try runtimeModulePath(ctx, &.{ "bun", "test.js" });
     const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
+    const string_width_module = try runtimeModulePath(ctx, &.{ "bun", "string-width.js" });
+    const strip_ansi_module = try runtimeModulePath(ctx, &.{ "bun", "strip-ansi.js" });
     const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
     const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
@@ -358,7 +376,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const dns_promises_module = try runtimeModulePath(ctx, &.{ "node", "dns", "promises.js" });
     const tls_module = try runtimeModulePath(ctx, &.{ "node", "tls.js" });
 
-    const args = [_][]const u8{
+    const base_args = [_][]const u8{
         esbuild_bin,
         wrapped_entry,
         "--bundle",
@@ -384,6 +402,8 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:sqlite={s}", .{bun_sqlite_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:test={s}", .{bun_test_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:internal-for-testing={s}", .{bun_internal_for_testing_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:string-width={s}", .{string_width_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:strip-ansi={s}", .{strip_ansi_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs/promises={s}", .{fs_promises_module}),
@@ -499,8 +519,15 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:tls={s}", .{tls_module}),
     };
 
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(ctx.allocator, &base_args);
+    if (try metadataFileIsEmpty(ctx, script_dir, "tsconfig.json")) {
+        try args.append(ctx.allocator, "--tsconfig-raw={}");
+    }
+    try appendEsbuildConditions(ctx.allocator, &args, exec_args, script_args);
+
     const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = &args,
+        .argv = args.items,
         .cwd = .{ .path = ctx.project_root },
         .create_no_window = true,
     });
@@ -514,6 +541,47 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     }
 
     return bundle_path;
+}
+
+fn collectConditions(
+    allocator: std.mem.Allocator,
+    conditions: *std.ArrayList([]const u8),
+    cli_args: []const [:0]const u8,
+) !void {
+    var index: usize = 0;
+    while (index < cli_args.len) : (index += 1) {
+        const arg: []const u8 = cli_args[index];
+        if (std.mem.startsWith(u8, arg, "--conditions=")) {
+            const value = arg["--conditions=".len..];
+            if (value.len > 0) try conditions.append(allocator, value);
+        } else if (std.mem.eql(u8, arg, "--conditions") and index + 1 < cli_args.len) {
+            index += 1;
+            const value: []const u8 = cli_args[index];
+            if (value.len > 0) try conditions.append(allocator, value);
+        }
+    }
+}
+
+fn hasCustomConditions(cli_args: []const [:0]const u8) bool {
+    for (cli_args) |arg| {
+        if (std.mem.eql(u8, arg, "--conditions") or std.mem.startsWith(u8, arg, "--conditions=")) return true;
+    }
+    return false;
+}
+
+fn appendEsbuildConditions(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayList([]const u8),
+    exec_args: []const [:0]const u8,
+    script_args: []const [:0]const u8,
+) !void {
+    var conditions: std.ArrayList([]const u8) = .empty;
+    try collectConditions(allocator, &conditions, exec_args);
+    try collectConditions(allocator, &conditions, script_args);
+    if (conditions.items.len == 0) return;
+
+    const joined = try std.mem.join(allocator, ",", conditions.items);
+    try args.append(allocator, try std.fmt.allocPrint(allocator, "--conditions={s}", .{joined}));
 }
 
 fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
@@ -581,13 +649,37 @@ fn sourceFileLooksEsm(ctx: *const Context, script_abs: []const u8) !bool {
 }
 
 fn sourceLooksEsm(source: []const u8) bool {
-    if (std.mem.startsWith(u8, source, "import ") or
-        std.mem.startsWith(u8, source, "export "))
+    if (std.mem.indexOf(u8, source, "import(") != null or
+        std.mem.indexOf(u8, source, "import (") != null or
+        std.mem.indexOf(u8, source, "import.meta") != null or
+        (std.mem.indexOf(u8, source, "require(") != null and std.mem.indexOf(u8, source, "?raw") != null) or
+        std.mem.indexOf(u8, source, "await ") != null)
     {
         return true;
     }
-    return std.mem.indexOf(u8, source, "\nimport ") != null or
-        std.mem.indexOf(u8, source, "\nexport ") != null;
+    var remaining = source;
+    while (true) {
+        const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+        if (lineLooksEsm(remaining[0..line_end])) return true;
+        if (line_end == remaining.len) return false;
+        remaining = remaining[line_end + 1 ..];
+    }
+}
+
+fn lineLooksEsm(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    return startsWithModuleKeyword(trimmed, "import", &.{ ' ', '\t', '{', '*' }) or
+        startsWithModuleKeyword(trimmed, "export", &.{ ' ', '\t', '{', '*', 'd', 'c', 'f', 'l', 'v' }) or
+        startsWithModuleKeyword(trimmed, "await", &.{ ' ', '\t' });
+}
+
+fn startsWithModuleKeyword(line: []const u8, keyword: []const u8, delimiters: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, keyword)) return false;
+    if (line.len == keyword.len) return true;
+    for (delimiters) |delimiter| {
+        if (line[keyword.len] == delimiter) return true;
+    }
+    return false;
 }
 
 fn nearestPackageTypeIsModule(ctx: *const Context, start_dir: []const u8) !bool {
@@ -649,7 +741,7 @@ fn writeEvalEntrypoint(
     print_result: bool,
     module_input: bool,
 ) ![]const u8 {
-    const extension = if (module_input) "mjs" else "cjs";
+    const extension = if (module_input) "mts" else "cts";
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
         "eval-entry-{x}.{s}",
@@ -658,12 +750,26 @@ fn writeEvalEntrypoint(
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const source_literal = try jsonStringLiteral(ctx, source);
 
-    const eval_source = if (!print_result)
+    const eval_source = if (!print_result and !module_input)
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            \\(async () => {{
+            \\{s}
+            \\}})().catch((error) => {{
+            \\  console.error(error?.stack ?? error);
+            \\  process.exitCode = 1;
+            \\}});
+            \\
+        ,
+            .{source},
+        )
+    else if (!print_result)
         source
     else if (module_input)
         try std.fmt.allocPrint(
             ctx.allocator,
             \\import * as __ctUtil from "node:util";
+            \\const gc = globalThis.gc;
             \\const __ctPrintResult = eval({s});
             \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
             \\
@@ -674,6 +780,7 @@ fn writeEvalEntrypoint(
         try std.fmt.allocPrint(
             ctx.allocator,
             \\const __ctUtil = require("node:util");
+            \\const gc = globalThis.gc;
             \\const __ctPrintResult = eval({s});
             \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
             \\
@@ -685,7 +792,12 @@ fn writeEvalEntrypoint(
     return wrapper_path;
 }
 
-fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {
+fn writeCottontailEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_import_abs: []const u8,
+    script_abs: []const u8,
+) ![]const u8 {
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
@@ -694,27 +806,1078 @@ fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_
     );
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const bun_literal = try jsonStringLiteral(ctx, bun_module);
+    const script_import_literal = try jsonStringLiteral(ctx, script_import_abs);
     const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    const script_dir_literal = try jsonStringLiteral(ctx, script_dir);
     const source = try std.fmt.allocPrint(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ createRequire as __ctCreateRequire }} from "node:module";
+        \\globalThis.__filename ??= {s};
+        \\globalThis.__dirname ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
+        \\globalThis.__cottontailImportMetaResolve = (specifier, parent = {s}) => {{
+        \\  const resolved = __ctBunModule.resolveSync(specifier, parent);
+        \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
+        \\}};
         \\import.meta.require ??= __ctCreateRequire({s});
         \\import.meta.resolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
         \\import.meta.resolve ??= (specifier) => {{
         \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
-        \\import {s};
+        \\await import({s});
         \\
     ,
-        .{ bun_literal, script_literal, script_literal, script_literal, script_literal },
+        .{
+            bun_literal,
+            script_literal,
+            script_dir_literal,
+            script_literal,
+            script_literal,
+            script_literal,
+            script_literal,
+            script_literal,
+            script_import_literal,
+        },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
 }
 
-fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_abs: []const u8) ![]const u8 {
+fn cleanupGeneratedSource(ctx: *const Context, generated_path: []const u8, original_path: []const u8) void {
+    if (std.mem.eql(u8, generated_path, original_path)) return;
+    std.Io.Dir.cwd().deleteFile(ctx.io, generated_path) catch {};
+}
+
+const EmptyMetadataPatch = struct {
+    path: []const u8 = "",
+    original: []const u8 = "",
+    active: bool = false,
+};
+
+fn maybePatchEmptyPackageJsonForBundle(ctx: *const Context, script_dir: []const u8) !EmptyMetadataPatch {
+    const package_json = try std.fs.path.join(ctx.allocator, &.{ script_dir, "package.json" });
+    const original = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        package_json,
+        ctx.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    if (std.mem.trim(u8, original, " \t\r\n").len != 0) return .{};
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = package_json, .data = "{}\n" });
+    return .{ .path = package_json, .original = original, .active = true };
+}
+
+fn metadataFileIsEmpty(ctx: *const Context, script_dir: []const u8, basename: []const u8) !bool {
+    const path = try std.fs.path.join(ctx.allocator, &.{ script_dir, basename });
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        ctx.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return std.mem.trim(u8, source, " \t\r\n").len == 0;
+}
+
+fn restoreEmptyMetadataPatch(ctx: *const Context, patch: *EmptyMetadataPatch) void {
+    if (!patch.active) return;
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = patch.path, .data = patch.original }) catch {};
+    patch.active = false;
+}
+
+fn writeBunCompatTransformedSource(
+    ctx: *const Context,
+    script_abs: []const u8,
+    source_base_dir: ?[]const u8,
+) ![]const u8 {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return script_abs;
+    var transformed_source: []const u8 = source;
+    var changed = false;
+    if (std.mem.indexOf(u8, source, ".__esModule") != null) {
+        if (try rewriteNamespaceEsModuleAssignments(ctx.allocator, source)) |transformed| {
+            transformed_source = transformed;
+            changed = true;
+        }
+    }
+
+    const resolution_dir = source_base_dir orelse std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    if (try rewriteQueryImports(ctx, transformed_source, resolution_dir)) |transformed| {
+        transformed_source = transformed;
+        changed = true;
+    }
+    if (!changed) return script_abs;
+
+    const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    const ext = blk: {
+        const value = std.fs.path.extension(script_abs);
+        break :blk if (value.len == 0) ".js" else value;
+    };
+    const generated_name = try std.fmt.allocPrint(
+        ctx.allocator,
+        ".cottontail-compat-{x}{s}",
+        .{ std.hash.Wyhash.hash(0, source), ext },
+    );
+    const generated_path = try std.fs.path.join(ctx.allocator, &.{ script_dir, generated_name });
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = transformed_source }) catch return script_abs;
+    return generated_path;
+}
+
+fn isIdentifierStart(byte: u8) bool {
+    return (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z') or
+        byte == '_' or
+        byte == '$';
+}
+
+fn isIdentifierPart(byte: u8) bool {
+    return isIdentifierStart(byte) or (byte >= '0' and byte <= '9');
+}
+
+fn hasNamespaceImport(source: []const u8, name: []const u8, allocator: std.mem.Allocator) !bool {
+    const pattern = try std.fmt.allocPrint(allocator, "import * as {s}", .{name});
+    return std.mem.indexOf(u8, source, pattern) != null;
+}
+
+fn skipWhitespace(source: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < source.len and std.ascii.isWhitespace(source[cursor])) : (cursor += 1) {}
+    return cursor;
+}
+
+const DynamicImportOccurrence = struct {
+    start: usize,
+    end: usize,
+    expression: []const u8,
+    options: []const u8,
+    target_index: ?usize,
+    static_binding: ?[]const u8 = null,
+    is_static: bool = false,
+    needs_await: bool = false,
+};
+
+const DynamicImportTarget = struct {
+    path: []const u8,
+};
+
+fn skipQuotedJavaScript(source: []const u8, start: usize) usize {
+    const quote = source[start];
+    var cursor = start + 1;
+    var escaped = false;
+    while (cursor < source.len) : (cursor += 1) {
+        const byte = source[cursor];
+        if (escaped) {
+            escaped = false;
+        } else if (byte == '\\') {
+            escaped = true;
+        } else if (byte == quote) {
+            return cursor + 1;
+        }
+    }
+    return source.len;
+}
+
+fn skipJavaScriptComment(source: []const u8, start: usize) usize {
+    if (start + 1 >= source.len or source[start] != '/') return start;
+    if (source[start + 1] == '/') {
+        return (std.mem.indexOfScalarPos(u8, source, start + 2, '\n') orelse source.len);
+    }
+    if (source[start + 1] == '*') {
+        const end = std.mem.indexOfPos(u8, source, start + 2, "*/") orelse return source.len;
+        return end + 2;
+    }
+    return start;
+}
+
+fn findClosingParenthesis(source: []const u8, open: usize) ?usize {
+    var depth: usize = 1;
+    var cursor = open + 1;
+    while (cursor < source.len) {
+        const byte = source[cursor];
+        if (byte == '\'' or byte == '"' or byte == '`') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            continue;
+        }
+        if (byte == '/') {
+            const after_comment = skipJavaScriptComment(source, cursor);
+            if (after_comment != cursor) {
+                cursor = after_comment;
+                continue;
+            }
+        }
+        if (byte == '(') {
+            depth += 1;
+        } else if (byte == ')') {
+            depth -= 1;
+            if (depth == 0) return cursor;
+        }
+        cursor += 1;
+    }
+    return null;
+}
+
+fn findTopLevelComma(source: []const u8) ?usize {
+    var parens: usize = 0;
+    var braces: usize = 0;
+    var brackets: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const byte = source[cursor];
+        if (byte == '\'' or byte == '"' or byte == '`') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            continue;
+        }
+        if (byte == '/') {
+            const after_comment = skipJavaScriptComment(source, cursor);
+            if (after_comment != cursor) {
+                cursor = after_comment;
+                continue;
+            }
+        }
+        switch (byte) {
+            '(' => parens += 1,
+            ')' => if (parens > 0) {
+                parens -= 1;
+            },
+            '{' => braces += 1,
+            '}' => if (braces > 0) {
+                braces -= 1;
+            },
+            '[' => brackets += 1,
+            ']' => if (brackets > 0) {
+                brackets -= 1;
+            },
+            ',' => if (parens == 0 and braces == 0 and brackets == 0) return cursor,
+            else => {},
+        }
+        cursor += 1;
+    }
+    return null;
+}
+
+fn decodeJavaScriptStringPrefix(allocator: std.mem.Allocator, expression: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    if (trimmed.len < 2 or (trimmed[0] != '\'' and trimmed[0] != '"')) return null;
+
+    const quote = trimmed[0];
+    var output: std.ArrayList(u8) = .empty;
+    var cursor: usize = 1;
+    while (cursor < trimmed.len) : (cursor += 1) {
+        const byte = trimmed[cursor];
+        if (byte == quote) return try output.toOwnedSlice(allocator);
+        if (byte != '\\' or cursor + 1 >= trimmed.len) {
+            try output.append(allocator, byte);
+            continue;
+        }
+
+        cursor += 1;
+        const escaped = trimmed[cursor];
+        try output.append(allocator, switch (escaped) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'b' => 0x08,
+            'f' => 0x0c,
+            else => escaped,
+        });
+    }
+    return null;
+}
+
+fn pathWithoutQueryOrFragment(path: []const u8) []const u8 {
+    const query = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
+    const fragment = std.mem.indexOfScalar(u8, path, '#') orelse path.len;
+    return path[0..@min(query, fragment)];
+}
+
+fn realPathIfFile(ctx: *const Context, path: []const u8) ?[]const u8 {
+    if (!pathExists(ctx.io, path)) return null;
+    return std.Io.Dir.cwd().realPathFileAlloc(ctx.io, path, ctx.allocator) catch null;
+}
+
+fn resolveDynamicImportTarget(
+    ctx: *const Context,
+    resolution_dir: []const u8,
+    specifier_prefix: []const u8,
+) !?[]const u8 {
+    var bare = pathWithoutQueryOrFragment(specifier_prefix);
+    if (std.mem.startsWith(u8, bare, "file://")) bare = bare["file://".len..];
+    if (bare.len == 0) return null;
+
+    const candidate = if (std.fs.path.isAbsolute(bare))
+        try ctx.allocator.dupe(u8, bare)
+    else if (std.mem.startsWith(u8, bare, "./") or std.mem.startsWith(u8, bare, "../"))
+        try std.fs.path.join(ctx.allocator, &.{ resolution_dir, bare })
+    else
+        return null;
+
+    if (realPathIfFile(ctx, candidate)) |resolved| return resolved;
+    if (std.fs.path.extension(candidate).len != 0) return null;
+    for ([_][]const u8{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json" }) |extension| {
+        const with_extension = try std.mem.concat(ctx.allocator, u8, &.{ candidate, extension });
+        if (realPathIfFile(ctx, with_extension)) |resolved| return resolved;
+    }
+    return null;
+}
+
+fn dynamicTargetIndex(
+    allocator: std.mem.Allocator,
+    targets: *std.ArrayList(DynamicImportTarget),
+    path: []const u8,
+) !usize {
+    for (targets.items, 0..) |target, index| {
+        if (std.mem.eql(u8, target.path, path)) return index;
+    }
+    try targets.append(allocator, .{ .path = path });
+    return targets.items.len - 1;
+}
+
+fn staticImportBinding(allocator: std.mem.Allocator, clause: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, clause, " \t\r\n");
+    if (trimmed.len == 0) return "";
+    if (!std.mem.endsWith(u8, trimmed, "from")) return null;
+    const head = std.mem.trim(u8, trimmed[0 .. trimmed.len - "from".len], " \t\r\n");
+    if (std.mem.startsWith(u8, head, "*")) {
+        const after_star = std.mem.trim(u8, head[1..], " \t\r\n");
+        if (!std.mem.startsWith(u8, after_star, "as")) return null;
+        const binding = std.mem.trim(u8, after_star["as".len..], " \t\r\n");
+        if (binding.len == 0 or !isIdentifierStart(binding[0])) return null;
+        for (binding[1..]) |byte| if (!isIdentifierPart(byte)) return null;
+        return binding;
+    }
+    if (std.mem.indexOfAny(u8, head, "{},") != null) return null;
+    if (head.len == 0 or !isIdentifierStart(head[0])) return null;
+    for (head[1..]) |byte| if (!isIdentifierPart(byte)) return null;
+    return try std.fmt.allocPrint(allocator, "{{ default: {s} }}", .{head});
+}
+
+fn isJsoncLikeSpecifier(specifier: []const u8) bool {
+    const bare = pathWithoutQueryOrFragment(specifier);
+    const basename = std.fs.path.basename(bare);
+    return std.mem.eql(u8, std.fs.path.extension(bare), ".jsonc") or
+        std.mem.eql(u8, basename, "tsconfig.json") or
+        std.mem.eql(u8, basename, "package.json") or
+        std.mem.eql(u8, basename, "bun.lock");
+}
+
+fn isJson5Specifier(specifier: []const u8) bool {
+    const bare = pathWithoutQueryOrFragment(specifier);
+    return std.mem.eql(u8, std.fs.path.extension(bare), ".json5");
+}
+
+fn isTomlSpecifier(specifier: []const u8) bool {
+    const bare = pathWithoutQueryOrFragment(specifier);
+    return std.mem.eql(u8, std.fs.path.extension(bare), ".toml");
+}
+
+fn loaderOptionsLiteral(ctx: *const Context, loader: []const u8) ![]const u8 {
+    const loader_literal = try jsonStringLiteral(ctx, loader);
+    return try std.fmt.allocPrint(ctx.allocator, "{{ with: {{ type: {s} }} }}", .{loader_literal});
+}
+
+fn scanDynamicImports(
+    ctx: *const Context,
+    source: []const u8,
+    resolution_dir: []const u8,
+    occurrences: *std.ArrayList(DynamicImportOccurrence),
+    targets: *std.ArrayList(DynamicImportTarget),
+) !bool {
+    var has_custom_signal = false;
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const byte = source[cursor];
+        if (byte == '\'' or byte == '"' or byte == '`') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            continue;
+        }
+        if (byte == '/') {
+            const after_comment = skipJavaScriptComment(source, cursor);
+            if (after_comment != cursor) {
+                cursor = after_comment;
+                continue;
+            }
+        }
+        if (std.mem.startsWith(u8, source[cursor..], "import.meta.require") and
+            (cursor == 0 or !isIdentifierPart(source[cursor - 1])))
+        {
+            const open = skipWhitespace(source, cursor + "import.meta.require".len);
+            if (open < source.len and source[open] == '(') {
+                if (findClosingParenthesis(source, open)) |close| {
+                    const arguments = source[open + 1 .. close];
+                    const comma = findTopLevelComma(arguments);
+                    const expression = std.mem.trim(u8, if (comma) |index| arguments[0..index] else arguments, " \t\r\n");
+                    const options = std.mem.trim(u8, if (comma) |index| arguments[index + 1 ..] else "undefined", " \t\r\n");
+                    var target_index: ?usize = null;
+                    if (try decodeJavaScriptStringPrefix(ctx.allocator, expression)) |prefix| {
+                        if (try resolveDynamicImportTarget(ctx, resolution_dir, prefix)) |target_path| {
+                            target_index = try dynamicTargetIndex(ctx.allocator, targets, target_path);
+                        }
+                    }
+                    if (comma != null) {
+                        try occurrences.append(ctx.allocator, .{
+                            .start = cursor,
+                            .end = close + 1,
+                            .expression = expression,
+                            .options = options,
+                            .target_index = target_index,
+                            .needs_await = true,
+                        });
+                        has_custom_signal = true;
+                        cursor = close + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if (std.mem.startsWith(u8, source[cursor..], "require") and
+            (cursor == 0 or !isIdentifierPart(source[cursor - 1])) and
+            (cursor + "require".len >= source.len or !isIdentifierPart(source[cursor + "require".len])))
+        {
+            const open = skipWhitespace(source, cursor + "require".len);
+            if (open < source.len and source[open] == '(') {
+                if (findClosingParenthesis(source, open)) |close| {
+                    const arguments = source[open + 1 .. close];
+                    const comma = findTopLevelComma(arguments);
+                    const expression = std.mem.trim(u8, if (comma) |index| arguments[0..index] else arguments, " \t\r\n");
+                    const options = std.mem.trim(u8, if (comma) |index| arguments[index + 1 ..] else "undefined", " \t\r\n");
+                    if (try decodeJavaScriptStringPrefix(ctx.allocator, expression)) |prefix| {
+                        if (comma != null) {
+                            const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
+                            const target_index = if (target_path) |path|
+                                try dynamicTargetIndex(ctx.allocator, targets, path)
+                            else
+                                null;
+                            try occurrences.append(ctx.allocator, .{
+                                .start = cursor,
+                                .end = close + 1,
+                                .expression = expression,
+                                .options = options,
+                                .target_index = target_index,
+                                .needs_await = true,
+                            });
+                            has_custom_signal = true;
+                            cursor = close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if (!std.mem.startsWith(u8, source[cursor..], "import") or
+            (cursor > 0 and isIdentifierPart(source[cursor - 1])) or
+            (cursor + "import".len < source.len and isIdentifierPart(source[cursor + "import".len])))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        const open = skipWhitespace(source, cursor + "import".len);
+        if (open >= source.len or source[open] != '(') {
+            if (open >= source.len or source[open] == '.') {
+                cursor += "import".len;
+                continue;
+            }
+
+            var specifier_start = open;
+            while (specifier_start < source.len and source[specifier_start] != '\'' and source[specifier_start] != '"') : (specifier_start += 1) {}
+            if (specifier_start >= source.len) {
+                cursor += "import".len;
+                continue;
+            }
+            const specifier_end = skipQuotedJavaScript(source, specifier_start);
+            if (specifier_end > source.len) {
+                cursor += "import".len;
+                continue;
+            }
+            const semicolon = std.mem.indexOfScalarPos(u8, source, specifier_end, ';') orelse {
+                cursor = specifier_end;
+                continue;
+            };
+            const expression = source[specifier_start..specifier_end];
+            const prefix = (try decodeJavaScriptStringPrefix(ctx.allocator, expression)) orelse {
+                cursor = semicolon + 1;
+                continue;
+            };
+            const after_specifier = std.mem.trim(u8, source[specifier_end..semicolon], " \t\r\n");
+            const has_attributes = std.mem.startsWith(u8, after_specifier, "with") or
+                std.mem.startsWith(u8, after_specifier, "assert");
+            const has_query = std.mem.indexOfAny(u8, prefix, "?#") != null;
+            const assumes_jsonc = isJsoncLikeSpecifier(prefix);
+            const assumes_json5 = isJson5Specifier(prefix);
+            const assumes_toml = isTomlSpecifier(prefix);
+            const inferred_loader = if (!has_attributes and !has_query) inferredLoaderForTarget(prefix) else null;
+            if (!has_attributes and !has_query and !assumes_jsonc and !assumes_json5 and !assumes_toml and inferred_loader == null) {
+                cursor = semicolon + 1;
+                continue;
+            }
+
+            const binding = (try staticImportBinding(ctx.allocator, source[cursor + "import".len .. specifier_start])) orelse {
+                cursor = semicolon + 1;
+                continue;
+            };
+            const options = if (has_attributes) blk: {
+                const keyword_len: usize = if (std.mem.startsWith(u8, after_specifier, "with")) "with".len else "assert".len;
+                const attributes = std.mem.trim(u8, after_specifier[keyword_len..], " \t\r\n");
+                break :blk try std.fmt.allocPrint(ctx.allocator, "{{ with: {s} }}", .{attributes});
+            } else if (assumes_jsonc)
+                "{ with: { type: \"jsonc\" } }"
+            else if (assumes_json5)
+                "{ with: { type: \"json5\" } }"
+            else if (assumes_toml)
+                "{ with: { type: \"toml\" } }"
+            else if (inferred_loader) |loader|
+                try loaderOptionsLiteral(ctx, loader)
+            else
+                "undefined";
+            const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
+            const target_index = if (target_path) |path|
+                try dynamicTargetIndex(ctx.allocator, targets, path)
+            else
+                null;
+            try occurrences.append(ctx.allocator, .{
+                .start = cursor,
+                .end = semicolon + 1,
+                .expression = expression,
+                .options = options,
+                .target_index = target_index,
+                .static_binding = binding,
+                .is_static = true,
+            });
+            has_custom_signal = true;
+            cursor = semicolon + 1;
+            continue;
+        }
+        const close = findClosingParenthesis(source, open) orelse {
+            cursor = open + 1;
+            continue;
+        };
+        const arguments = source[open + 1 .. close];
+        const comma = findTopLevelComma(arguments);
+        const expression = std.mem.trim(u8, if (comma) |index| arguments[0..index] else arguments, " \t\r\n");
+        var options = std.mem.trim(u8, if (comma) |index| arguments[index + 1 ..] else "undefined", " \t\r\n");
+
+        var target_index: ?usize = null;
+        if (try decodeJavaScriptStringPrefix(ctx.allocator, expression)) |prefix| {
+            if (std.mem.indexOfAny(u8, prefix, "?#") != null) has_custom_signal = true;
+            if (comma == null and isJsoncLikeSpecifier(prefix)) {
+                options = "{ with: { type: \"jsonc\" } }";
+                has_custom_signal = true;
+            } else if (comma == null and isJson5Specifier(prefix)) {
+                options = "{ with: { type: \"json5\" } }";
+                has_custom_signal = true;
+            } else if (comma == null and isTomlSpecifier(prefix)) {
+                options = "{ with: { type: \"toml\" } }";
+                has_custom_signal = true;
+            } else if (comma == null) {
+                if (inferredLoaderForTarget(prefix)) |loader| {
+                    options = try loaderOptionsLiteral(ctx, loader);
+                    has_custom_signal = true;
+                }
+            }
+            if (try resolveDynamicImportTarget(ctx, resolution_dir, prefix)) |target_path| {
+                target_index = try dynamicTargetIndex(ctx.allocator, targets, target_path);
+            }
+        }
+        if (comma != null) has_custom_signal = true;
+        try occurrences.append(ctx.allocator, .{
+            .start = cursor,
+            .end = close + 1,
+            .expression = expression,
+            .options = options,
+            .target_index = target_index,
+        });
+        cursor = close + 1;
+    }
+    return has_custom_signal;
+}
+
+fn transpileDynamicTarget(
+    ctx: *const Context,
+    target_path: []const u8,
+    loader_override: ?[]const u8,
+) !?[]const u8 {
+    const esbuild_bin = try esbuildBinaryPath(ctx);
+    const base_args = [_][]const u8{
+        esbuild_bin,
+        target_path,
+        "--format=cjs",
+        "--platform=neutral",
+        "--target=es2022",
+        "--log-level=silent",
+        "--define:import.meta.url=__ctImportMeta.url",
+        "--define:import.meta.dir=__ctImportMeta.dir",
+        "--define:import.meta.file=__ctImportMeta.file",
+        "--define:import.meta.path=__ctImportMeta.path",
+        "--define:import.meta.dirname=__ctImportMeta.dirname",
+        "--define:import.meta.filename=__ctImportMeta.filename",
+        "--define:import.meta.main=false",
+    };
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(ctx.allocator, &base_args);
+    if (loader_override) |loader| {
+        const extension = std.fs.path.extension(target_path);
+        try args.append(ctx.allocator, try std.fmt.allocPrint(
+            ctx.allocator,
+            "--loader:{s}={s}",
+            .{ extension, loader },
+        ));
+    }
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = args.items,
+        .cwd = .{ .path = ctx.project_root },
+        .create_no_window = true,
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    if (termExitCode(result.term) != 0) return null;
+    return try ctx.allocator.dupe(u8, result.stdout);
+}
+
+fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
+    const bare = pathWithoutQueryOrFragment(path);
+    const basename = std.fs.path.basename(bare);
+    const extension = std.fs.path.extension(bare);
+    if (std.mem.eql(u8, extension, ".json5")) return "json5";
+    if (std.mem.eql(u8, extension, ".jsonc") or std.mem.eql(u8, basename, "bun.lock")) return "jsonc";
+    if (std.mem.eql(u8, extension, ".toml")) return "toml";
+    if (std.mem.eql(u8, extension, ".yaml") or std.mem.eql(u8, extension, ".yml")) return "yaml";
+    if (std.mem.eql(u8, extension, ".js") or
+        std.mem.eql(u8, extension, ".jsx") or
+        std.mem.eql(u8, extension, ".ts") or
+        std.mem.eql(u8, extension, ".tsx") or
+        std.mem.eql(u8, extension, ".mjs") or
+        std.mem.eql(u8, extension, ".cjs") or
+        std.mem.eql(u8, extension, ".json") or
+        extension.len == 0)
+    {
+        return null;
+    }
+    return "file";
+}
+
+fn appendDynamicTargetFactory(
+    ctx: *const Context,
+    output: *std.ArrayList(u8),
+    target: DynamicImportTarget,
+    index: usize,
+) !void {
+    var cjs_source = try transpileDynamicTarget(ctx, target.path, null);
+    const use_runtime_factory = cjs_source == null;
+    var loader_guard: []const u8 = "";
+    if (cjs_source == null) {
+        var allowed: std.ArrayList(u8) = .empty;
+        for ([_][]const u8{ "js", "jsx", "ts", "tsx" }) |loader| {
+            if (try transpileDynamicTarget(ctx, target.path, loader)) |candidate| {
+                if (cjs_source == null) cjs_source = candidate;
+                if (allowed.items.len > 0) try allowed.appendSlice(ctx.allocator, " && ");
+                try allowed.appendSlice(ctx.allocator, "__ctType !== ");
+                try allowed.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, loader));
+            }
+        }
+        loader_guard = if (allowed.items.len == 0)
+            "throw new SyntaxError(\"Unable to parse module with the selected loader\");"
+        else
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "if ({s}) throw new SyntaxError(\"Unable to parse module with the selected loader\");",
+                .{allowed.items},
+            );
+    }
+    const raw_source = try std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        target.path,
+        ctx.allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    const path_literal = try jsonStringLiteral(ctx, target.path);
+    const raw_literal = try jsonStringLiteral(ctx, raw_source);
+    const file_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{target.path});
+    const url_literal = try jsonStringLiteral(ctx, file_url);
+    const dirname = std.fs.path.dirname(target.path) orelse ctx.project_root;
+    const dirname_literal = try jsonStringLiteral(ctx, dirname);
+    const basename_literal = try jsonStringLiteral(ctx, std.fs.path.basename(target.path));
+    const inferred_loader_literal = if (inferredLoaderForTarget(target.path)) |loader|
+        try jsonStringLiteral(ctx, loader)
+    else
+        "null";
+
+    const prefix = try std.fmt.allocPrint(ctx.allocator,
+        \\const __ctPath{d} = {s};
+        \\const __ctURL{d} = {s};
+        \\async function __ctLoad{d}(specifier, options) {{
+        \\  const __ctText = String(specifier);
+        \\  const __ctMarker = __ctText.search(/[?#]/);
+        \\  const __ctSuffix = __ctMarker < 0 ? "" : __ctText.slice(__ctMarker);
+        \\  const __ctInferredType = {s};
+        \\  const __ctType = options?.with?.type ?? options?.assert?.type ?? options?.type ?? (__ctSuffix === "?raw" ? "text" : __ctInferredType);
+        \\  const __ctKey = __ctPath{d} + __ctSuffix + (__ctType == null ? "" : "\\u0000" + __ctType);
+        \\  const __ctRegistry = globalThis.Loader.registry;
+        \\  if (__ctRegistry.has(__ctKey)) return await __ctRegistry.get(__ctKey);
+        \\  const __ctPromise = (async () => {{
+        \\    const __ctImportMeta = {{ url: __ctURL{d} + __ctSuffix, dir: {s}, dirname: {s}, file: {s}, path: __ctPath{d}, filename: __ctPath{d}, main: false }};
+        \\    const __ctRaw = {s};
+        \\    if (__ctType === "text") return {{ default: __ctRaw }};
+        \\    if (__ctType === "file" || __ctType === "css") return {{ default: __ctPath{d} }};
+        \\    if (__ctType === "html") return {{ default: {{ index: __ctPath{d} }} }};
+        \\    if (__ctType === "json") return __ctLoaderNamespace(JSON.parse(__ctRaw));
+        \\    if (__ctType === "jsonc") return __ctLoaderNamespace(__ctParseJSONC(__ctRaw));
+        \\    if (__ctType === "json5") return __ctLoaderNamespace(__ctParseJSON5(__ctRaw));
+        \\    if (__ctType === "toml") return __ctLoaderNamespace(__ctParseRuntimeTOML(__ctRaw));
+        \\    if (__ctType === "yaml") return __ctLoaderNamespace(__ctRaw.trim() === "" ? {{}} : __ctParseRuntimeYAML(__ctRaw));
+        \\    if (__ctType === "wasm" || __ctType === "base64" || __ctType === "dataurl") {{
+        \\      if (__ctRaw.length === 0) return {{ default: __ctPath{d} }};
+        \\    }}
+        \\    if (__ctType === "sqlite" || __ctType === "sqlite_embedded") {{
+        \\      const __ctDatabase = new __ctLoaderDatabase(__ctPath{d});
+        \\      for (const __ctKey of Object.keys(__ctDatabase)) {{
+        \\        if (__ctKey !== "filename") Object.defineProperty(__ctDatabase, __ctKey, {{ enumerable: false }});
+        \\      }}
+        \\      return {{ db: __ctDatabase, default: __ctDatabase }};
+        \\    }}
+        \\    if (__ctType != null && __ctType !== "js" && __ctType !== "jsx" && __ctType !== "ts" && __ctType !== "tsx") {{
+        \\      throw new TypeError(`Unsupported loader type: ${{__ctType}}`);
+        \\    }}
+        \\    {s}
+        \\    const module = {{ exports: {{}} }};
+        \\    const exports = module.exports;
+        \\
+    , .{ index, path_literal, index, url_literal, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, raw_literal, index, index, index, index, loader_guard });
+    try output.appendSlice(ctx.allocator, prefix);
+    if (cjs_source) |transpiled| {
+        if (use_runtime_factory) {
+            const transpiled_literal = try jsonStringLiteral(ctx, transpiled);
+            try output.appendSlice(ctx.allocator, "    new Function(\"module\", \"exports\", \"__ctImportMeta\", ");
+            try output.appendSlice(ctx.allocator, transpiled_literal);
+            try output.appendSlice(ctx.allocator, ")(module, exports, __ctImportMeta);\n");
+        } else {
+            try output.appendSlice(ctx.allocator, transpiled);
+        }
+    }
+    const suffix = try std.fmt.allocPrint(ctx.allocator,
+        \\    return module.exports;
+        \\  }})();
+        \\  __ctRegistry.set(__ctKey, __ctPromise);
+        \\  try {{ return await __ctPromise; }} catch (error) {{ __ctRegistry.delete(__ctKey); throw error; }}
+        \\}}
+        \\
+    , .{});
+    try output.appendSlice(ctx.allocator, suffix);
+}
+
+fn appendDynamicDispatcher(
+    ctx: *const Context,
+    output: *std.ArrayList(u8),
+    targets: []const DynamicImportTarget,
+) !void {
+    try output.appendSlice(ctx.allocator,
+        \\async function __ctImportDynamic(specifier, options) {
+        \\  const __ctText = String(specifier);
+        \\  const __ctMarker = __ctText.search(/[?#]/);
+        \\  const __ctBare = __ctMarker < 0 ? __ctText : __ctText.slice(0, __ctMarker);
+        \\
+    );
+    for (targets, 0..) |target, index| {
+        const path_literal = try jsonStringLiteral(ctx, target.path);
+        const file_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{target.path});
+        const url_literal = try jsonStringLiteral(ctx, file_url);
+        const branch = try std.fmt.allocPrint(
+            ctx.allocator,
+            "  if (__ctBare === {s} || __ctBare === {s}) return __ctLoad{d}(__ctText, options);\n",
+            .{ path_literal, url_literal, index },
+        );
+        try output.appendSlice(ctx.allocator, branch);
+    }
+    try output.appendSlice(ctx.allocator,
+        \\  throw new Error(`Cannot find module '${__ctText}'`);
+        \\}
+        \\
+    );
+}
+
+fn rewriteQueryImports(
+    ctx: *const Context,
+    source: []const u8,
+    resolution_dir: []const u8,
+) !?[]u8 {
+    var occurrences: std.ArrayList(DynamicImportOccurrence) = .empty;
+    var targets: std.ArrayList(DynamicImportTarget) = .empty;
+    if (!(try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets))) return null;
+
+    var output: std.ArrayList(u8) = .empty;
+    const json5_module = try runtimeModulePath(ctx, &.{ "bun", "json5.js" });
+    const json5_literal = try jsonStringLiteral(ctx, json5_module);
+    const toml_module = try runtimeModulePath(ctx, &.{ "bun", "toml.js" });
+    const toml_literal = try jsonStringLiteral(ctx, toml_module);
+    const yaml_module = try runtimeModulePath(ctx, &.{ "bun", "yaml.js" });
+    const yaml_literal = try jsonStringLiteral(ctx, yaml_module);
+    try output.appendSlice(ctx.allocator,
+        \\import { Database as __ctLoaderDatabase } from "bun:sqlite";
+        \\import { parse as __ctParseJSON5 } from 
+    );
+    try output.appendSlice(ctx.allocator, json5_literal);
+    try output.appendSlice(ctx.allocator, ";\n");
+    try output.appendSlice(ctx.allocator, "import { parse as __ctParseRuntimeTOML } from ");
+    try output.appendSlice(ctx.allocator, toml_literal);
+    try output.appendSlice(ctx.allocator, ";\n");
+    try output.appendSlice(ctx.allocator, "import { parse as __ctParseRuntimeYAML } from ");
+    try output.appendSlice(ctx.allocator, yaml_literal);
+    try output.appendSlice(ctx.allocator, ";\n");
+    try output.appendSlice(ctx.allocator,
+        \\globalThis.Loader ??= { registry: new Map() };
+        \\function __ctLoaderNamespace(value) {
+        \\  if (value !== null && typeof value === "object" && !Array.isArray(value)) return Object.assign({ default: value }, value);
+        \\  return { default: value };
+        \\}
+        \\function __ctStripJSONC(source) {
+        \\  let output = "";
+        \\  let quote = "";
+        \\  let escaped = false;
+        \\  for (let index = 0; index < source.length; index++) {
+        \\    const char = source[index];
+        \\    if (quote) {
+        \\      output += char;
+        \\      if (escaped) escaped = false;
+        \\      else if (char === "\\") escaped = true;
+        \\      else if (char === quote) quote = "";
+        \\      continue;
+        \\    }
+        \\    if (char === '"') { quote = char; output += char; continue; }
+        \\    if (char === "/" && source[index + 1] === "/") {
+        \\      while (index < source.length && source[index] !== "\n") index++;
+        \\      output += "\n";
+        \\      continue;
+        \\    }
+        \\    if (char === "/" && source[index + 1] === "*") {
+        \\      index += 2;
+        \\      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index++;
+        \\      index++;
+        \\      continue;
+        \\    }
+        \\    output += char;
+        \\  }
+        \\  return output.replace(/,\s*([}\]])/g, "$1");
+        \\}
+        \\function __ctParseJSONC(source) {
+        \\  if (source.trim() === "") return {};
+        \\  return JSON.parse(__ctStripJSONC(source));
+        \\}
+        \\function __ctStripDataComment(source, marker) {
+        \\  let quote = "";
+        \\  let escaped = false;
+        \\  for (let index = 0; index < source.length; index++) {
+        \\    const char = source[index];
+        \\    if (quote) {
+        \\      if (escaped) escaped = false;
+        \\      else if (char === "\\") escaped = true;
+        \\      else if (char === quote) quote = "";
+        \\    } else if (char === '"' || char === "'") quote = char;
+        \\    else if (char === marker) return source.slice(0, index);
+        \\  }
+        \\  return source;
+        \\}
+        \\function __ctParseDataScalar(source) {
+        \\  const value = source.trim().replace(/,$/, "").trim();
+        \\  if (value === "") return null;
+        \\  if (value === "true") return true;
+        \\  if (value === "false") return false;
+        \\  if (value === "null" || value === "~") return null;
+        \\  if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(value)) return Number(value);
+        \\  if (value[0] === '"') return JSON.parse(value);
+        \\  if (value[0] === "'" && value[value.length - 1] === "'") return value.slice(1, -1).replace(/''/g, "'");
+        \\  if (value[0] === "[" || value[0] === "{") return JSON.parse(value);
+        \\  return value;
+        \\}
+        \\function __ctParseTOML(source) {
+        \\  const root = {};
+        \\  let current = root;
+        \\  for (const rawLine of source.split(/\r?\n/)) {
+        \\    const line = __ctStripDataComment(rawLine, "#").trim();
+        \\    if (!line) continue;
+        \\    if (line.startsWith("[") && line.endsWith("]")) {
+        \\      const path = line.slice(1, -1).trim().split(".");
+        \\      if (path.some(part => !/^[A-Za-z0-9_-]+$/.test(part))) throw new SyntaxError("Invalid TOML section");
+        \\      current = root;
+        \\      for (const part of path) current = current[part] ??= {};
+        \\      continue;
+        \\    }
+        \\    const equals = line.indexOf("=");
+        \\    if (equals <= 0) throw new SyntaxError("Invalid TOML assignment");
+        \\    const key = line.slice(0, equals).trim();
+        \\    if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new SyntaxError("Invalid TOML key");
+        \\    current[key] = __ctParseDataScalar(line.slice(equals + 1));
+        \\  }
+        \\  return root;
+        \\}
+        \\function __ctYAMLColon(line) {
+        \\  let quote = "";
+        \\  for (let index = 0; index < line.length; index++) {
+        \\    const char = line[index];
+        \\    if (quote) { if (char === quote && line[index - 1] !== "\\") quote = ""; }
+        \\    else if (char === '"' || char === "'") quote = char;
+        \\    else if (char === ":") return index;
+        \\  }
+        \\  return -1;
+        \\}
+        \\function __ctParseYAML(source) {
+        \\  if (source.trim() === "") return {};
+        \\  try {
+        \\    const jsonValue = __ctParseJSONC(source);
+        \\    if (jsonValue !== null && typeof jsonValue === "object" && !Array.isArray(jsonValue)) {
+        \\      for (const line of source.split(/\r?\n/)) {
+        \\        const comment = line.match(/\/\/\s*([^,}\r\n]+)\s*[,}]?\s*$/);
+        \\        if (comment) jsonValue[`// ${comment[1].trim()}`] = null;
+        \\      }
+        \\    }
+        \\    return jsonValue;
+        \\  } catch {}
+        \\  const root = {};
+        \\  const stack = [{ indent: -1, value: root }];
+        \\  let sawMapping = false;
+        \\  for (const rawLine of source.split(/\r?\n/)) {
+        \\    if (!rawLine.trim() || rawLine.trim().startsWith("#") || rawLine.trim() === "---") continue;
+        \\    const indent = rawLine.length - rawLine.trimStart().length;
+        \\    const line = __ctStripDataComment(rawLine.trim(), "#").trim();
+        \\    const colon = __ctYAMLColon(line);
+        \\    if (colon <= 0) continue;
+        \\    sawMapping = true;
+        \\    let key = line.slice(0, colon).trim();
+        \\    if ((key[0] === '"' && key.at(-1) === '"') || (key[0] === "'" && key.at(-1) === "'")) key = key.slice(1, -1);
+        \\    while (stack.length > 1 && indent <= stack.at(-1).indent) stack.pop();
+        \\    const parent = stack.at(-1).value;
+        \\    const rest = line.slice(colon + 1).trim();
+        \\    if (rest === "") {
+        \\      const child = {};
+        \\      parent[key] = child;
+        \\      stack.push({ indent, value: child });
+        \\    } else parent[key] = __ctParseDataScalar(rest);
+        \\  }
+        \\  if (sawMapping) return root;
+        \\  if (/\r?\n/.test(source)) throw new SyntaxError("Invalid YAML document");
+        \\  return source.trim();
+        \\}
+        \\
+    );
+    for (targets.items, 0..) |target, index| {
+        try appendDynamicTargetFactory(ctx, &output, target, index);
+    }
+    try appendDynamicDispatcher(ctx, &output, targets.items);
+
+    var copied_until: usize = 0;
+    for (occurrences.items) |occurrence| {
+        try output.appendSlice(ctx.allocator, source[copied_until..occurrence.start]);
+        const function_name = if (occurrence.target_index) |index|
+            try std.fmt.allocPrint(ctx.allocator, "__ctLoad{d}", .{index})
+        else
+            "__ctImportDynamic";
+        if (occurrence.is_static) {
+            if (occurrence.static_binding) |binding| {
+                if (binding.len > 0) {
+                    try output.appendSlice(ctx.allocator, "const ");
+                    try output.appendSlice(ctx.allocator, binding);
+                    try output.appendSlice(ctx.allocator, " = await ");
+                } else {
+                    try output.appendSlice(ctx.allocator, "await ");
+                }
+            }
+        } else if (occurrence.needs_await) {
+            try output.appendSlice(ctx.allocator, "(await ");
+        }
+        try output.appendSlice(ctx.allocator, function_name);
+        try output.append(ctx.allocator, '(');
+        try output.appendSlice(ctx.allocator, occurrence.expression);
+        try output.appendSlice(ctx.allocator, ", ");
+        try output.appendSlice(ctx.allocator, occurrence.options);
+        try output.append(ctx.allocator, ')');
+        if (occurrence.is_static) try output.append(ctx.allocator, ';');
+        if (occurrence.needs_await) try output.append(ctx.allocator, ')');
+        copied_until = occurrence.end;
+    }
+    try output.appendSlice(ctx.allocator, source[copied_until..]);
+    return try output.toOwnedSlice(ctx.allocator);
+}
+
+fn rewriteNamespaceEsModuleAssignments(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
+    const property = ".__esModule";
+    var output: std.ArrayList(u8) = .empty;
+    var copied_until: usize = 0;
+    var search_from: usize = 0;
+    var changed = false;
+
+    while (std.mem.indexOfPos(u8, source, search_from, property)) |dot_index| {
+        var lhs_start = dot_index;
+        while (lhs_start > 0 and isIdentifierPart(source[lhs_start - 1])) : (lhs_start -= 1) {}
+        if (lhs_start == dot_index or !isIdentifierStart(source[lhs_start])) {
+            search_from = dot_index + 1;
+            continue;
+        }
+
+        const lhs = source[lhs_start..dot_index];
+        if (!(try hasNamespaceImport(source, lhs, allocator))) {
+            search_from = dot_index + 1;
+            continue;
+        }
+
+        var cursor = skipWhitespace(source, dot_index + property.len);
+        const is_assignment = cursor < source.len and
+            source[cursor] == '=' and
+            (cursor + 1 >= source.len or (source[cursor + 1] != '=' and source[cursor + 1] != '>'));
+
+        try output.appendSlice(allocator, source[copied_until..lhs_start]);
+        if (is_assignment) {
+            cursor = skipWhitespace(source, cursor + 1);
+            const value_start = cursor;
+            if (std.mem.startsWith(u8, source[value_start..], "true")) {
+                cursor = value_start + "true".len;
+            } else if (std.mem.startsWith(u8, source[value_start..], "false")) {
+                cursor = value_start + "false".len;
+            } else {
+                try output.appendSlice(allocator, source[lhs_start .. dot_index + property.len]);
+                copied_until = dot_index + property.len;
+                search_from = copied_until;
+                changed = true;
+                continue;
+            }
+            try output.appendSlice(allocator, "Object.defineProperty(Object(");
+            try output.appendSlice(allocator, lhs);
+            try output.appendSlice(allocator, "), \"__esModule\", { value: ");
+            try output.appendSlice(allocator, source[value_start..cursor]);
+            try output.appendSlice(allocator, ", configurable: true })");
+            copied_until = cursor;
+            search_from = cursor;
+        } else {
+            try output.appendSlice(allocator, "Object(");
+            try output.appendSlice(allocator, lhs);
+            try output.appendSlice(allocator, ")[\"__esModule\"]");
+            copied_until = dot_index + property.len;
+            search_from = copied_until;
+        }
+        changed = true;
+    }
+
+    if (!changed) return null;
+    try output.appendSlice(allocator, source[copied_until..]);
+    return try output.toOwnedSlice(allocator);
+}
+
+fn writeCommonJsEntryWrapper(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    script_abs: []const u8,
+    bundle_entry: bool,
+) ![]const u8 {
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
         "script-entry-cjs-{x}.mjs",
@@ -723,6 +1886,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
 
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
+    const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
     const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
     const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
@@ -906,6 +2070,7 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\import * as dnsPromises from {s};
         \\import * as tls from {s};
         \\import * as sqlite from {s};
+        \\import * as bunInternalForTesting from {s};
         \\
     ,
         .{
@@ -919,8 +2084,14 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
             try jsonStringLiteral(ctx, dns_promises_module),
             try jsonStringLiteral(ctx, tls_module),
             try jsonStringLiteral(ctx, sqlite_module),
+            try jsonStringLiteral(ctx, bun_internal_for_testing_module),
         },
     );
+    const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const main_statement = if (bundle_entry)
+        try std.fmt.allocPrint(ctx.allocator, "await import({s});", .{script_literal})
+    else
+        try std.fmt.allocPrint(ctx.allocator, "moduleModule.__runMain({s});", .{script_literal});
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\const eventsBuiltin = events.default ?? events;
@@ -986,13 +2157,15 @@ fn writeCommonJsEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_ab
         \\  dgram, "node:dgram": dgram,
         \\  dns, "node:dns": dns,
         \\  "dns/promises": dnsPromises, "node:dns/promises": dnsPromises,
-        \\  tls, "node:tls": tls
+        \\  tls, "node:tls": tls,
+        \\  "bun:internal-for-testing": bunInternalForTesting,
+        \\  "internal-for-testing": bunInternalForTesting
         \\}});
-        \\moduleModule.__runMain({s});
+        \\{s}
         \\
     ,
         .{
-            try jsonStringLiteral(ctx, script_abs),
+            main_statement,
         },
     );
     const source = try std.mem.concat(ctx.allocator, u8, &.{ imports_a, imports_b, imports_c, bootstrap });

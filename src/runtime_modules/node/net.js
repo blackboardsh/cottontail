@@ -75,6 +75,11 @@ export class Socket extends EventEmitter {
     this._paused = false;
     this._pendingData = [];
     this._pendingEnd = false;
+    this._pendingWrites = [];
+    this._outboundWrites = [];
+    this._writeRetryTimer = null;
+    this._drainQueued = false;
+    this._ending = false;
     if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, true);
   }
 
@@ -134,6 +139,7 @@ export class Socket extends EventEmitter {
     if (connected) {
       this.connecting = false;
       queueMicrotask(() => {
+        this._flushPendingWrites();
         this.emit("connect");
         this._startRead();
         this._refreshTimeout();
@@ -143,6 +149,67 @@ export class Socket extends EventEmitter {
     this._startRead();
     this._refreshTimeout();
     return this;
+  }
+
+  _flushPendingWrites(error = undefined) {
+    const pending = this._pendingWrites.splice(0);
+    for (const entry of pending) {
+      if (error) {
+        if (typeof entry.callback === "function") entry.callback(error);
+        continue;
+      }
+      this.write(entry.chunk, entry.encoding, entry.callback);
+    }
+  }
+
+  _scheduleOutboundFlush() {
+    if (this._writeRetryTimer != null || this.destroyed) return;
+    this._writeRetryTimer = globalThis.setTimeout(() => {
+      this._writeRetryTimer = null;
+      this._flushOutboundWrites();
+    }, 1);
+  }
+
+  _flushOutboundWrites() {
+    if (this.destroyed || this.fd == null) return;
+    try {
+      while (this._outboundWrites.length > 0) {
+        const entry = this._outboundWrites[0];
+        const remaining = entry.bytes.subarray(entry.offset);
+        const written = typeof cottontail.fdWriteSome === "function"
+          ? Number(cottontail.fdWriteSome(this.fd, remaining))
+          : cottontail.fdWrite?.(this.fd, remaining) === true ? remaining.byteLength : 0;
+        if (!Number.isFinite(written) || written < 0) throw new Error("socket write failed");
+        if (written === 0) {
+          this._scheduleOutboundFlush();
+          return;
+        }
+        const count = Math.min(remaining.byteLength, Math.trunc(written));
+        entry.offset += count;
+        this.bytesWritten += count;
+        this.writableLength = Math.max(0, this.writableLength - count);
+        this._refreshTimeout();
+        if (entry.offset < entry.bytes.byteLength) continue;
+        this._outboundWrites.shift();
+        if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+      }
+    } catch (error) {
+      this.destroy(error);
+      return;
+    }
+
+    if (this.writableNeedDrain && this.writableLength === 0 && !this._drainQueued) {
+      this._drainQueued = true;
+      queueMicrotask(() => {
+        this._drainQueued = false;
+        if (this.destroyed || this.writableLength !== 0) return;
+        this.writableNeedDrain = false;
+        this.emit("drain");
+      });
+    }
+    if (this._ending && this.fd != null) {
+      try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
+    }
   }
 
   _stopRead() {
@@ -242,6 +309,10 @@ export class Socket extends EventEmitter {
       callback = encoding;
       encoding = undefined;
     }
+    if (this.connecting && this.fd == null && !this.destroyed && this.writable) {
+      this._pendingWrites.push({ chunk, encoding, callback });
+      return true;
+    }
     if (this.destroyed || this.fd == null || !this.writable) {
       const error = new Error("Socket is closed");
       if (typeof callback === "function") queueMicrotask(() => callback(error));
@@ -250,30 +321,21 @@ export class Socket extends EventEmitter {
     }
     const bytes = bytesFrom(chunk, encoding);
     this.writableLength += bytes.byteLength;
-    const ok = cottontail.fdWrite?.(this.fd, bytes) === true;
-    if (ok) this.bytesWritten += bytes.byteLength;
-    if (ok) this._refreshTimeout();
+    this._outboundWrites.push({ bytes, offset: 0, callback });
     const overHighWaterMark = this.writableLength >= this.writableHighWaterMark;
-    if (ok && overHighWaterMark) this.writableNeedDrain = true;
-    queueMicrotask(() => {
-      this.writableLength = Math.max(0, this.writableLength - bytes.byteLength);
-      if (this.writableNeedDrain && this.writableLength === 0) {
-        this.writableNeedDrain = false;
-        this.emit("drain");
-      }
-      if (typeof callback === "function") callback(ok ? undefined : new Error("socket write failed"));
-    });
-    if (!ok) this.emit("error", new Error("socket write failed"));
-    return ok && !overHighWaterMark;
+    if (overHighWaterMark) this.writableNeedDrain = true;
+    this._flushOutboundWrites();
+    return !overHighWaterMark;
   }
 
   end(chunk, encoding, callback) {
     if (typeof chunk === "function") callback = chunk;
     else if (typeof encoding === "function") callback = encoding;
     if (chunk != null) this.write(chunk, encoding);
+    this._ending = true;
     this.writable = false;
     this.emit("finish");
-    if (this.fd != null) {
+    if (this.fd != null && this._outboundWrites.length === 0) {
       try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
     }
     if (typeof callback === "function") callback();
@@ -287,6 +349,16 @@ export class Socket extends EventEmitter {
     this.writable = false;
     this._clearTimeoutTimer();
     this._stopRead();
+    this._flushPendingWrites(error ?? new Error("Socket is closed"));
+    if (this._writeRetryTimer != null) {
+      clearTimeout(this._writeRetryTimer);
+      this._writeRetryTimer = null;
+    }
+    const writeError = error ?? new Error("Socket is closed");
+    for (const entry of this._outboundWrites.splice(0)) {
+      if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(writeError));
+    }
+    this.writableLength = 0;
     if (this.fd != null) {
       try { cottontail.closeFd?.(this.fd); } catch {}
       this.fd = null;

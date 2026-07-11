@@ -180,7 +180,8 @@ function normalizeRequestOptions(input, options = undefined, defaultProtocol = "
     const hostname = merged.hostname ?? merged.host ?? "localhost";
     const port = merged.port != null ? `:${merged.port}` : "";
     const path = merged.path ?? `${merged.pathname ?? "/"}${merged.search ?? ""}`;
-    url = new URL(`${protocol}//${hostname}${port}${path}`);
+    const urlPath = String(path).startsWith("/") ? path : "/";
+    url = new URL(`${protocol}//${hostname}${port}${urlPath}`);
   }
   if (merged.protocol) url.protocol = merged.protocol;
   if (merged.hostname) url.hostname = merged.hostname;

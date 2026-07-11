@@ -5,13 +5,16 @@ import {
   before as nodeBefore,
   beforeEach as nodeBeforeEach,
   describe as nodeDescribe,
-  it as nodeIt,
   mock as nodeMock,
+  onTestFinished as nodeOnTestFinished,
+  setDefaultTimeout as nodeSetDefaultTimeout,
   test as nodeTest,
 } from "../node/test.js";
 
 const mocks = new Set();
 const restores = [];
+const mockRestoreSymbol = Symbol("mockRestore");
+let nextInvocationCallOrder = 1;
 const moduleMocks = globalThis.__cottontailBunModuleMocks ??= new Map();
 const snapshots = new Map();
 const snapshotCounters = new Map();
@@ -34,6 +37,7 @@ const realTimers = {
 let assertionCount = 0;
 let expectedAssertions = null;
 let requireAssertions = false;
+globalThis.__cottontailTestAssertionCount ??= 0;
 
 function isObject(value) {
   return value !== null && typeof value === "object";
@@ -60,6 +64,105 @@ function deepEqual(left, right) {
   } catch {
     return false;
   }
+}
+
+function plainObjectEntries(value) {
+  if (!isObject(value) || Array.isArray(value)) return null;
+  if (value instanceof Date || value instanceof RegExp || value instanceof Map || value instanceof Set) return null;
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return null;
+  const proto = Object.getPrototypeOf(value);
+  const keys = Reflect.ownKeys(value);
+  if (proto !== Object.prototype && proto !== null && keys.length > 0) return null;
+  const entries = keys.map((key) => [key, value[key]]);
+  if (proto !== Object.prototype && proto !== null) {
+    entries.push(["__proto__", proto]);
+  }
+  return entries;
+}
+
+const binaryHashCache = new WeakMap();
+
+function bytesForBinaryValue(value) {
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return null;
+}
+
+function binaryHash(value) {
+  const cached = binaryHashCache.get(value);
+  if (cached) return cached;
+  const bytes = bytesForBinaryValue(value);
+  let fnv = 2166136261;
+  let sum = 0;
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index];
+    fnv = Math.imul(fnv ^ byte, 16777619);
+    sum = (sum + Math.imul(byte + 1, index + 1)) >>> 0;
+  }
+  const hash = `${bytes.length}:${fnv >>> 0}:${sum >>> 0}`;
+  binaryHashCache.set(value, hash);
+  return hash;
+}
+
+function binaryEqual(actual, expected) {
+  const left = bytesForBinaryValue(actual);
+  const right = bytesForBinaryValue(expected);
+  if (!left || !right) return false;
+  if (left.byteLength !== right.byteLength) return false;
+  if (left.buffer === right.buffer && left.byteOffset === right.byteOffset) return true;
+  if (left.byteLength > 64 * 1024) return binaryHash(actual) === binaryHash(expected);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function isBlobLike(value) {
+  return value != null &&
+    typeof value === "object" &&
+    typeof value.size === "number" &&
+    typeof value.type === "string" &&
+    typeof value.arrayBuffer === "function" &&
+    typeof value.text === "function" &&
+    typeof value.slice === "function" &&
+    typeof value.exists !== "function";
+}
+
+function bunDeepEqual(actual, expected, seen = new WeakMap()) {
+  if (Object.is(actual, expected)) return true;
+  if (isBlobLike(actual) || isBlobLike(expected)) {
+    return isBlobLike(actual) && isBlobLike(expected) &&
+      actual.size === expected.size &&
+      actual.type === expected.type;
+  }
+  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected)) {
+    if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
+    return binaryEqual(actual, expected);
+  }
+  if (actual instanceof ArrayBuffer || expected instanceof ArrayBuffer) {
+    if (!(actual instanceof ArrayBuffer) || !(expected instanceof ArrayBuffer)) return false;
+    return binaryEqual(actual, expected);
+  }
+  if (!isObject(actual) || !isObject(expected)) return false;
+  let expectedSeen = seen.get(actual);
+  if (expectedSeen?.has(expected)) return true;
+  if (!expectedSeen) {
+    expectedSeen = new WeakSet();
+    seen.set(actual, expectedSeen);
+  }
+  expectedSeen.add(expected);
+
+  const actualEntries = plainObjectEntries(actual);
+  const expectedEntries = plainObjectEntries(expected);
+  if (!actualEntries || !expectedEntries) return deepEqual(actual, expected);
+  if (actualEntries.length !== expectedEntries.length) return false;
+  actualEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  expectedEntries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+  for (let index = 0; index < actualEntries.length; index += 1) {
+    if (actualEntries[index][0] !== expectedEntries[index][0]) return false;
+    if (!bunDeepEqual(actualEntries[index][1], expectedEntries[index][1], seen)) return false;
+  }
+  return true;
 }
 
 function hasProperty(object, path) {
@@ -95,14 +198,83 @@ function asymmetricMatch(actual, expected) {
       return expected.pattern.test(String(actual));
     case "closeTo":
       return Math.abs(Number(actual) - Number(expected.value)) < 10 ** -Number(expected.precision) / 2;
+    case "custom":
+      return Boolean(expected.matcher(actual, ...expected.args)?.pass);
+    case "not":
+      return !asymmetricMatch(actual, expected.matcher);
     default:
       return false;
   }
 }
 
-function matchesExpected(actual, expected) {
+function matchesExpected(actual, expected, seen = new WeakMap()) {
   if (matcherName(expected)) return asymmetricMatch(actual, expected);
-  return deepEqual(actual, expected);
+  if (Object.is(actual, expected)) return true;
+  if (isBlobLike(actual) || isBlobLike(expected)) return bunDeepEqual(actual, expected);
+  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected) || actual instanceof ArrayBuffer || expected instanceof ArrayBuffer) {
+    return bunDeepEqual(actual, expected);
+  }
+  if (actual instanceof Error || expected instanceof Error) {
+    return actual instanceof Error && expected instanceof Error && actual.name === expected.name && actual.message === expected.message;
+  }
+  if (!isObject(actual) || !isObject(expected)) return false;
+  let expectedSeen = seen.get(actual);
+  if (expectedSeen?.has(expected)) return true;
+  if (!expectedSeen) {
+    expectedSeen = new WeakSet();
+    seen.set(actual, expectedSeen);
+  }
+  expectedSeen.add(expected);
+
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(actual) || actual.length !== expected.length) return false;
+    for (let index = 0; index < expected.length; index += 1) {
+      if (!matchesExpected(actual[index], expected[index], seen)) return false;
+    }
+    return true;
+  }
+  if (expected instanceof Map) {
+    if (!(actual instanceof Map) || actual.size !== expected.size) return false;
+    const unmatched = Array.from(actual.entries());
+    for (const [expectedKey, expectedValue] of expected) {
+      const index = unmatched.findIndex(([key, value]) =>
+        matchesExpected(key, expectedKey, seen) && matchesExpected(value, expectedValue, seen));
+      if (index < 0) return false;
+      unmatched.splice(index, 1);
+    }
+    return true;
+  }
+  if (expected instanceof Set) {
+    if (!(actual instanceof Set) || actual.size !== expected.size) return false;
+    const unmatched = Array.from(actual.values());
+    for (const expectedValue of expected) {
+      const index = unmatched.findIndex((value) => matchesExpected(value, expectedValue, seen));
+      if (index < 0) return false;
+      unmatched.splice(index, 1);
+    }
+    return true;
+  }
+  if (expected instanceof Date || expected instanceof RegExp) return deepEqual(actual, expected);
+
+  const expectedKeys = Reflect.ownKeys(expected);
+  const actualKeys = Reflect.ownKeys(actual);
+  const expectedHasProtoKey = Object.prototype.hasOwnProperty.call(expected, "__proto__");
+  const actualHasProtoKey = Object.prototype.hasOwnProperty.call(actual, "__proto__");
+  const expectedPrototype = Object.getPrototypeOf(expected);
+  const actualPrototype = Object.getPrototypeOf(actual);
+  const expectedVirtualProto = actualHasProtoKey && !expectedHasProtoKey && expectedPrototype !== Object.prototype && expectedPrototype !== null;
+  const actualVirtualProto = expectedHasProtoKey && !actualHasProtoKey && actualPrototype !== Object.prototype && actualPrototype !== null;
+  if (expectedVirtualProto) expectedKeys.push("__proto__");
+  if (actualVirtualProto) actualKeys.push("__proto__");
+  if (actualKeys.length !== expectedKeys.length) return false;
+  for (const key of expectedKeys) {
+    const virtualProtoKey = key === "__proto__";
+    if (!Object.prototype.hasOwnProperty.call(actual, key) && !(virtualProtoKey && actualVirtualProto)) return false;
+    const actualValue = virtualProtoKey && actualVirtualProto ? actualPrototype : actual[key];
+    const expectedValue = virtualProtoKey && expectedVirtualProto ? expectedPrototype : expected[key];
+    if (!matchesExpected(actualValue, expectedValue, seen)) return false;
+  }
+  return true;
 }
 
 function formatValue(value) {
@@ -111,6 +283,56 @@ function formatValue(value) {
   } catch {
     return String(value);
   }
+}
+
+function snapshotQuoteString(value) {
+  const text = String(value);
+  if (text.includes("\n")) return `"${text.replace(/\\/g, "\\\\")}"`;
+  return JSON.stringify(text);
+}
+
+function indentSnapshotBlock(text) {
+  return String(text).split("\n").map((line) => `  ${line}`).join("\n");
+}
+
+function snapshotSerialize(value) {
+  if (typeof value === "string") return snapshotQuoteString(value);
+  if (typeof value === "undefined") return "undefined";
+  if (typeof value === "bigint") return `${value}n`;
+  if (value instanceof Date) return value.toISOString();
+  if (value === null || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]";
+    return [
+      "[",
+      ...value.map((item) => `${indentSnapshotBlock(snapshotSerialize(item))},`),
+      "]",
+    ].join("\n");
+  }
+  const entries = plainObjectEntries(value);
+  if (entries) {
+    if (entries.length === 0) return "{}";
+    entries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
+    return [
+      "{",
+      ...entries.map(([key, item]) => {
+        const serialized = snapshotSerialize(item);
+        if (typeof item === "string" && item.includes("\n")) {
+          return `  ${JSON.stringify(String(key))}: \n${serialized}\n,`;
+        }
+        if (serialized.includes("\n")) {
+          const lines = serialized.split("\n");
+          return [
+            `  ${JSON.stringify(String(key))}: ${lines[0]}`,
+            ...lines.slice(1).map((line) => `  ${line}`),
+          ].join("\n") + ",";
+        }
+        return `  ${JSON.stringify(String(key))}: ${serialized},`;
+      }),
+      "}",
+    ].join("\n");
+  }
+  return formatValue(value);
 }
 
 function iterableIsEmpty(value) {
@@ -156,23 +378,30 @@ function isEmptyObjectValue(value) {
 }
 
 function snapshotText(value) {
-  if (typeof value === "string") return value;
-  if (typeof value === "undefined") return "undefined";
-  if (typeof value === "bigint") return `${value}n`;
-  return formatValue(value);
+  return snapshotSerialize(value);
 }
 
 function normalizeSnapshotText(value) {
-  return String(value).replace(/^\n/, "").replace(/\n\s*$/, "");
+  const text = String(value).replace(/^\n/, "").replace(/\n\s*$/, "");
+  const lines = text.split("\n");
+  const indents = lines
+    .filter((line) => line.trim().length > 0)
+    .map((line) => line.match(/^\s*/)[0].length);
+  const commonIndent = indents.length > 0 ? Math.min(...indents) : 0;
+  return commonIndent > 0
+    ? lines.map((line) => line.slice(Math.min(commonIndent, line.match(/^\s*/)[0].length))).join("\n")
+    : text;
 }
 
 function nextSnapshotKey(hint = undefined) {
   const file = globalThis.process?.argv?.[1] ?? "<script>";
-  if (hint != null) return `${file}:${String(hint)}`;
-  const current = snapshotCounters.get(file) ?? 0;
+  const testName = typeof globalThis.__cottontailCurrentTestName === "function" ? globalThis.__cottontailCurrentTestName() : "";
+  const scope = testName ? `${file}:${testName}` : file;
+  const base = hint != null ? `${scope}:${String(hint)}` : scope;
+  const current = snapshotCounters.get(base) ?? 0;
   const next = current + 1;
-  snapshotCounters.set(file, next);
-  return `${file}:${next}`;
+  snapshotCounters.set(base, next);
+  return `${base}:${next}`;
 }
 
 function compareSnapshot(actual, expected = undefined, hint = undefined) {
@@ -206,6 +435,28 @@ function callRecords(value) {
 
 function resultRecords(value) {
   return value?.mock?.results ?? [];
+}
+
+function mockDisplayName(value) {
+  return typeof value?.getMockName === "function" ? value.getMockName() : "mock function";
+}
+
+function requireNoMatcherArguments(name, args) {
+  if (args.length !== 0) throw new TypeError(`${name} does not accept arguments`);
+}
+
+function requireCallCount(value, name) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new TypeError(`${name} requires a non-negative integer`);
+  }
+  return value;
+}
+
+function requireNthCall(value, name) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new TypeError(`${name} requires a positive integer`);
+  }
+  return value;
 }
 
 function timerClock() {
@@ -336,14 +587,16 @@ function uninstallFakeTimers() {
 }
 
 class Expectation {
-  constructor(actual, negate = false, promiseMode = null) {
+  constructor(actual, negate = false, promiseMode = null, label = undefined, rejectedValue = false) {
     this.actual = actual;
     this._negate = negate;
     this._promiseMode = promiseMode;
+    this._label = label;
+    this._rejectedValue = rejectedValue;
   }
 
   get not() {
-    return new Expectation(this.actual, !this._negate, this._promiseMode);
+    return new Expectation(this.actual, !this._negate, this._promiseMode, this._label, this._rejectedValue);
   }
 
   get resolves() {
@@ -355,7 +608,7 @@ class Expectation {
         });
       },
     );
-    return new Expectation(handled, this._negate, "resolves");
+    return new Expectation(handled, this._negate, "resolves", this._label);
   }
 
   get rejects() {
@@ -367,7 +620,7 @@ class Expectation {
       },
       (error) => error,
     );
-    return new Expectation(handled, this._negate, "rejects");
+    return new Expectation(handled, this._negate, "rejects", this._label);
   }
 
   async _promiseActual() {
@@ -378,22 +631,28 @@ class Expectation {
 
   _check(pass, message) {
     assertionCount += 1;
-    failMatcher(pass, this._negate, message);
+    globalThis.__cottontailTestAssertionCount += 1;
+    const label = this._label == null ? "" : `${String(this._label)}\n\n`;
+    failMatcher(pass, this._negate, `${label}${message}`);
   }
 
   _wrap(check) {
     if (this._promiseMode) {
-      return this._promiseActual().then((actual) => check.call(new Expectation(actual, this._negate, null), actual));
+      const rejectedValue = this._promiseMode === "rejects";
+      return this._promiseActual().then((actual) => check.call(new Expectation(actual, this._negate, null, this._label, rejectedValue), actual));
     }
     return check.call(this, this.actual);
   }
 
   toBe(expected) {
-    return this._wrap((actual) => this._check(Object.is(actual, expected), `Expected ${formatValue(actual)} to be ${formatValue(expected)}`));
+    return this._wrap((actual) => this._check(Object.is(actual, expected), `Expected ${formatValue(expected)}\nReceived ${formatValue(actual)}`));
   }
 
   toEqual(expected) {
-    return this._wrap((actual) => this._check(matchesExpected(actual, expected), `Expected ${formatValue(actual)} to equal ${formatValue(expected)}`));
+    return this._wrap((actual) => {
+      const pass = matchesExpected(actual, expected);
+      this._check(pass, pass ? "" : `Expected ${formatValue(actual)} to equal ${formatValue(expected)}`);
+    });
   }
 
   toStrictEqual(expected) {
@@ -451,12 +710,24 @@ class Expectation {
 
   toContainEqual(expected) { return this.toContain(expected); }
   toInclude(expected) { return this.toContain(expected); }
-  toIncludeRepeated(expected) { return this.toContain(expected); }
+  toIncludeRepeated(expected, count = 1) {
+    return this._wrap((actual) => {
+      const text = String(actual);
+      const needle = String(expected);
+      const occurrences = needle === "" ? 0 : text.split(needle).length - 1;
+      this._check(occurrences === Number(count), `Expected ${needle} to occur ${count} times`);
+    });
+  }
   toStartWith(expected) { return this._wrap((actual) => this._check(String(actual).startsWith(String(expected)), `Expected to start with ${expected}`)); }
   toEndWith(expected) { return this._wrap((actual) => this._check(String(actual).endsWith(String(expected)), `Expected to end with ${expected}`)); }
   toMatch(expected) { return this._wrap((actual) => this._check(expected instanceof RegExp ? expected.test(String(actual)) : String(actual).includes(String(expected)), `Expected to match ${expected}`)); }
   toEqualIgnoringWhitespace(expected) { return this._wrap((actual) => this._check(String(actual).replace(/\s+/g, "") === String(expected).replace(/\s+/g, ""), "Expected equal ignoring whitespace")); }
-  toHaveLength(length) { return this._wrap((actual) => this._check(actual?.length === Number(length), `Expected length ${length}`)); }
+  toHaveLength(length) {
+    return this._wrap((actual) => {
+      const actualLength = actual?.length ?? (actual instanceof ArrayBuffer || ArrayBuffer.isView(actual) ? actual.byteLength : undefined);
+      this._check(actualLength === Number(length), `Expected length ${length}`);
+    });
+  }
   toBeEmpty() { return this._wrap((actual) => this._check(isEmptyValue(actual), "Expected value to be empty")); }
   toBeEmptyObject() { return this._wrap((actual) => this._check(isEmptyObjectValue(actual), "Expected value to be an empty object")); }
 
@@ -477,26 +748,33 @@ class Expectation {
   toContainAllValues(values) { return this.toContainValues(values); }
 
   toThrow(expected = undefined) {
+    const rejectedValue = this._promiseMode === "rejects" || this._rejectedValue;
     return this._wrap((actual) => {
-      const checkThrown = (thrown) => {
-        const pass = thrown && (expected === undefined ||
+      const checkThrown = (didThrow, thrown) => {
+        const objectMatches = (expectedObject) => Object.entries(expectedObject).every(([key, value]) => {
+          const actualValue = thrown?.[key];
+          return value instanceof RegExp ? value.test(String(actualValue)) : matchesExpected(actualValue, value);
+        });
+        const pass = didThrow && (expected === undefined ||
           (expected instanceof RegExp ? expected.test(String(thrown.message ?? thrown)) :
             typeof expected === "function" ? thrown instanceof expected :
+              matcherName(expected) ? matchesExpected(thrown, expected) :
+              expected && typeof expected === "object" ? objectMatches(expected) :
               String(thrown.message ?? thrown).includes(String(expected))));
         this._check(pass, "Expected function to throw");
       };
-      if (typeof actual !== "function") return checkThrown(actual);
+      if (typeof actual !== "function") return checkThrown(rejectedValue, actual);
       try {
         const result = actual();
         if (isPromiseLike(result)) {
           return result.then(
             () => this._check(false, "Expected function to throw"),
-            (error) => checkThrown(error),
+            (error) => checkThrown(true, error),
           );
         }
         return this._check(false, "Expected function to throw");
       } catch (error) {
-        return checkThrown(error);
+        return checkThrown(true, error);
       }
     });
   }
@@ -523,40 +801,80 @@ class Expectation {
       } else if (propertyMatchers && typeof propertyMatchers === "object") {
         assertPropertyMatchers(actual, propertyMatchers);
       }
-      this._check(compareSnapshot(actual, expected), "Expected value to match inline snapshot");
+      const received = snapshotText(actual);
+      const wanted = normalizeSnapshotText(expected);
+      this._check(received === wanted, `Expected value to match inline snapshot\nExpected: ${JSON.stringify(wanted)}\nReceived: ${JSON.stringify(received)}`);
     });
   }
+  pass() { return this._check(true, ""); }
   toSatisfy(predicate) { return this._wrap((actual) => this._check(predicate(actual) === true, "Expected predicate to pass")); }
 
-  toHaveBeenCalled() { return this._wrap((actual) => this._check(callRecords(actual).length > 0, "Expected mock to be called")); }
+  toHaveBeenCalled(...args) {
+    requireNoMatcherArguments("toHaveBeenCalled", args);
+    return this._wrap((actual) => this._check(callRecords(actual).length > 0, `Expected ${mockDisplayName(actual)} to be called`));
+  }
   toBeCalled() { return this.toHaveBeenCalled(); }
   toHaveBeenCalledOnce() { return this.toHaveBeenCalledTimes(1); }
-  toHaveBeenCalledTimes(count) { return this._wrap((actual) => this._check(callRecords(actual).length === Number(count), `Expected ${count} calls`)); }
+  toHaveBeenCalledTimes(count) {
+    const expected = requireCallCount(count, "toHaveBeenCalledTimes");
+    return this._wrap((actual) => this._check(callRecords(actual).length === expected, `Expected ${mockDisplayName(actual)} to have ${expected} calls`));
+  }
   toBeCalledTimes(count) { return this.toHaveBeenCalledTimes(count); }
   toHaveBeenCalledWith(...args) { return this._wrap((actual) => this._check(callRecords(actual).some((call) => matchesExpected(call, args)), "Expected call arguments")); }
   toBeCalledWith(...args) { return this.toHaveBeenCalledWith(...args); }
   toHaveBeenLastCalledWith(...args) { return this.lastCalledWith(...args); }
   lastCalledWith(...args) { return this._wrap((actual) => this._check(matchesExpected(callRecords(actual).at(-1), args), "Expected last call arguments")); }
   toHaveBeenNthCalledWith(index, ...args) { return this.nthCalledWith(index, ...args); }
-  nthCalledWith(index, ...args) { return this._wrap((actual) => this._check(matchesExpected(callRecords(actual)[Number(index) - 1], args), "Expected nth call arguments")); }
+  nthCalledWith(index, ...args) {
+    const nth = requireNthCall(index, "toHaveBeenNthCalledWith");
+    return this._wrap((actual) => this._check(matchesExpected(callRecords(actual)[nth - 1], args), "Expected nth call arguments"));
+  }
 
-  toHaveReturned() { return this._wrap((actual) => this._check(resultRecords(actual).some((result) => result.type === "return"), "Expected mock to return")); }
+  toHaveReturned(...args) {
+    requireNoMatcherArguments("toHaveReturned", args);
+    return this._wrap((actual) => {
+      const results = resultRecords(actual);
+      const returned = results.filter((result) => result.type === "return").length;
+      this._check(returned > 0, [
+        "expect(received).toHaveReturned(expected)",
+        "",
+        "Expected number of succesful returns: >= 1",
+        `Received number of succesful returns:    ${returned}`,
+        `Received number of calls:                ${results.length}`,
+      ].join("\n") + "\n");
+    });
+  }
   toReturn() { return this.toHaveReturned(); }
-  toHaveReturnedTimes(count) { return this._wrap((actual) => this._check(resultRecords(actual).filter((result) => result.type === "return").length === Number(count), `Expected ${count} returns`)); }
+  toHaveReturnedTimes(count) {
+    const expected = requireCallCount(count, "toHaveReturnedTimes");
+    return this._wrap((actual) => this._check(resultRecords(actual).filter((result) => result.type === "return").length === expected, `Expected ${expected} returns`));
+  }
   toHaveReturnedWith(value) { return this._wrap((actual) => this._check(resultRecords(actual).some((result) => result.type === "return" && matchesExpected(result.value, value)), "Expected return value")); }
-  lastReturnedWith(value) { return this._wrap((actual) => this._check(matchesExpected(resultRecords(actual).filter((result) => result.type === "return").at(-1)?.value, value), "Expected last return value")); }
+  lastReturnedWith(value) {
+    return this._wrap((actual) => {
+      const result = resultRecords(actual).at(-1);
+      this._check(result?.type === "return" && matchesExpected(result.value, value), "Expected last return value");
+    });
+  }
   toHaveLastReturnedWith(value) { return this.lastReturnedWith(value); }
-  nthReturnedWith(index, value) { return this._wrap((actual) => this._check(matchesExpected(resultRecords(actual).filter((result) => result.type === "return")[Number(index) - 1]?.value, value), "Expected nth return value")); }
+  nthReturnedWith(index, value) {
+    const nth = requireNthCall(index, "toHaveNthReturnedWith");
+    return this._wrap((actual) => {
+      const result = resultRecords(actual)[nth - 1];
+      this._check(result?.type === "return" && matchesExpected(result.value, value), "Expected nth return value");
+    });
+  }
   toHaveNthReturnedWith(index, value) { return this.nthReturnedWith(index, value); }
 }
 
-export function expect(actual) {
-  return new Expectation(actual);
+export function expect(actual, label = undefined) {
+  return new Expectation(actual, false, null, label);
 }
 
 function installCustomMatchers(matchers = {}) {
   for (const [name, matcher] of Object.entries(matchers)) {
     if (typeof matcher !== "function") continue;
+    expect[name] = (...args) => ({ __expectMatcher: "custom", matcher, args });
     Object.defineProperty(Expectation.prototype, name, {
       configurable: true,
       value: function customMatcher(...args) {
@@ -581,6 +899,12 @@ expect.objectContaining = (shape) => ({ __expectMatcher: "objectContaining", sha
 expect.stringContaining = (text) => ({ __expectMatcher: "stringContaining", text: String(text) });
 expect.stringMatching = (pattern) => ({ __expectMatcher: "stringMatching", pattern: pattern instanceof RegExp ? pattern : new RegExp(String(pattern)) });
 expect.closeTo = (value, precision = 2) => ({ __expectMatcher: "closeTo", value, precision });
+expect.not = {
+  arrayContaining: (items) => ({ __expectMatcher: "not", matcher: expect.arrayContaining(items) }),
+  objectContaining: (shape) => ({ __expectMatcher: "not", matcher: expect.objectContaining(shape) }),
+  stringContaining: (text) => ({ __expectMatcher: "not", matcher: expect.stringContaining(text) }),
+  stringMatching: (pattern) => ({ __expectMatcher: "not", matcher: expect.stringMatching(pattern) }),
+};
 expect.assertions = (count) => { expectedAssertions = Number(count); };
 expect.hasAssertions = () => { requireAssertions = true; };
 expect.extend = installCustomMatchers;
@@ -589,58 +913,177 @@ expect.unreachable = (message = "unreachable") => { throw new nodeAssert.Asserti
 expect.resolvesTo = (value, expected) => expect(value).resolves.toEqual(expected);
 expect.rejectsTo = (value, expected) => expect(value).rejects.toThrow(expected);
 
-function normalizeMockImplementation(implementation) {
-  return typeof implementation === "function" ? implementation : function mockFunction() {};
+function normalizeMockImplementation(implementation, provided = true) {
+  if (typeof implementation === "function") return implementation;
+  return provided ? function mockValue() { return implementation; } : function mockFunction() {};
+}
+
+function mockState() {
+  const state = {
+    calls: [],
+    contexts: [],
+    instances: [],
+    invocationCallOrder: [],
+    results: [],
+  };
+  Object.defineProperty(state, "lastCall", {
+    enumerable: true,
+    get() { return state.calls.at(-1); },
+  });
+  return state;
+}
+
+function implementationName(implementation) {
+  try {
+    if (implementation?._isMockFunction && typeof implementation.getMockName === "function") {
+      return implementation.getMockName();
+    }
+    return typeof implementation?.name === "string" && implementation.name ? implementation.name : "mockConstructor";
+  } catch {
+    return "mockConstructor";
+  }
+}
+
+function invalidMockThis() {
+  const error = new TypeError("Mock function method called with an invalid this value");
+  error.code = "ERR_INVALID_THIS";
+  throw error;
 }
 
 export function mock(implementation = undefined) {
-  let current = normalizeMockImplementation(implementation);
-  const calls = [];
-  const contexts = [];
-  const instances = [];
-  const results = [];
-  const invocationCallOrder = [];
+  const provided = arguments.length > 0;
+  let current = normalizeMockImplementation(implementation, provided);
+  let state = mockState();
+  let name = implementationName(implementation);
+  const once = [];
 
   function mockedFunction(...args) {
-    calls.push(args);
-    contexts.push(this);
-    invocationCallOrder.push(invocationCallOrder.length + 1);
-    if (new.target) instances.push(this);
+    const callState = state;
+    const context = this === globalThis ? undefined : this;
+    callState.calls.push(args);
+    callState.contexts.push(context);
+    callState.instances.push(context);
+    callState.invocationCallOrder.push(nextInvocationCallOrder++);
+    const result = { type: "incomplete", value: undefined };
+    callState.results.push(result);
+    const implementationForCall = once.length > 0 ? once.shift() : current;
     try {
-      const value = current.apply(this, args);
-      results.push({ type: "return", value });
+      const value = implementationForCall.apply(context, args);
+      result.type = "return";
+      result.value = value;
       return value;
     } catch (error) {
-      results.push({ type: "throw", value: error });
+      result.type = "throw";
+      result.value = error;
       throw error;
     }
   }
 
-  mockedFunction.mock = { calls, contexts, instances, invocationCallOrder, results };
-  mockedFunction.mockClear = () => {
-    calls.length = 0;
-    contexts.length = 0;
-    instances.length = 0;
-    invocationCallOrder.length = 0;
-    results.length = 0;
-    return mockedFunction;
+  const prototype = Object.create(Function.prototype);
+  const assertThis = (value) => {
+    if (value !== mockedFunction) invalidMockThis();
   };
-  mockedFunction.mockReset = () => {
-    mockedFunction.mockClear();
-    current = function mockFunction() {};
-    return mockedFunction;
+  const method = (methodName, callback) => {
+    Object.defineProperty(prototype, methodName, {
+      configurable: true,
+      value: function mockMethod(...args) {
+        assertThis(this);
+        return callback(...args);
+      },
+    });
   };
-  mockedFunction.mockImplementation = (next) => {
-    current = normalizeMockImplementation(next);
+
+  Object.defineProperty(prototype, "_isMockFunction", { configurable: true, value: true });
+  Object.defineProperty(prototype, "mock", {
+    configurable: true,
+    get() {
+      assertThis(this);
+      return state;
+    },
+  });
+  method("mockClear", () => {
+    state = mockState();
     return mockedFunction;
-  };
-  mockedFunction.mockReturnValue = (value) => mockedFunction.mockImplementation(() => value);
-  mockedFunction.mockResolvedValue = (value) => mockedFunction.mockImplementation(() => Promise.resolve(value));
-  mockedFunction.mockRejectedValue = (value) => mockedFunction.mockImplementation(() => Promise.reject(value));
-  mockedFunction.mockRestore = () => {
-    mockedFunction.mockReset();
+  });
+  method("mockReset", () => {
+    state = mockState();
+    once.length = 0;
+    current = normalizeMockImplementation(undefined, false);
+    return mockedFunction;
+  });
+  method("mockImplementation", (next) => {
+    if (typeof next !== "function") throw new TypeError("mockImplementation expects a function");
+    current = next;
+    return mockedFunction;
+  });
+  method("mockImplementationOnce", (next) => {
+    if (typeof next !== "function") throw new TypeError("mockImplementationOnce expects a function");
+    once.push(next);
+    return mockedFunction;
+  });
+  method("mockReturnValue", (value) => {
+    current = () => value;
+    return mockedFunction;
+  });
+  method("mockReturnValueOnce", (value) => {
+    once.push(() => value);
+    return mockedFunction;
+  });
+  method("mockResolvedValue", (value) => {
+    current = () => Promise.resolve(value);
+    return mockedFunction;
+  });
+  method("mockResolvedValueOnce", (value) => {
+    once.push(() => Promise.resolve(value));
+    return mockedFunction;
+  });
+  method("mockRejectedValue", (value) => {
+    current = () => Promise.resolve().then(() => { throw value; });
+    return mockedFunction;
+  });
+  method("mockRejectedValueOnce", (value) => {
+    once.push(() => Promise.resolve().then(() => { throw value; }));
+    return mockedFunction;
+  });
+  method("mockName", (nextName) => {
+    if (nextName != null && String(nextName)) {
+      name = String(nextName);
+      try { Object.defineProperty(mockedFunction, "name", { configurable: true, value: name }); } catch {}
+    }
+    return mockedFunction;
+  });
+  method("getMockName", () => name);
+  method("withImplementation", (temporary, callback) => {
+    if (typeof temporary !== "function" || typeof callback !== "function") {
+      throw new TypeError("withImplementation expects two functions");
+    }
+    const previous = current;
+    current = temporary;
+    let value;
+    try {
+      value = callback();
+    } catch (error) {
+      current = previous;
+      throw error;
+    }
+    if (isPromiseLike(value)) return Promise.resolve(value).finally(() => { current = previous; });
+    current = previous;
+    return value;
+  });
+  method("mockRestore", () => {
+    const restore = mockedFunction[mockRestoreSymbol];
+    restore?.();
+    state = mockState();
+    once.length = 0;
+    current = normalizeMockImplementation(undefined, false);
     return undefined;
-  };
+  });
+
+  Object.setPrototypeOf(mockedFunction, prototype);
+  try { Object.defineProperty(mockedFunction, "name", { configurable: true, value: name }); } catch {}
+  if (typeof implementation === "function") {
+    try { Object.defineProperty(mockedFunction, "length", { configurable: true, value: implementation.length }); } catch {}
+  }
   mocks.add(mockedFunction);
   return mockedFunction;
 }
@@ -650,7 +1093,7 @@ mock.clearAllMocks = () => {
 };
 mock.restore = () => {
   for (const restore of restores.splice(0).reverse()) restore();
-  for (const item of mocks) item.mockRestore?.();
+  for (const item of mocks) item.mockReset?.();
   moduleMocks.clear();
   nodeMock.restoreAll?.();
 };
@@ -663,24 +1106,56 @@ mock.module = (specifier, factory = undefined) => {
 
 export function spyOn(object, property, accessType = undefined) {
   if (object == null) throw new TypeError("spyOn requires an object");
-  const descriptor = Object.getOwnPropertyDescriptor(object, property);
+  let owner = object;
+  let descriptor = Object.getOwnPropertyDescriptor(owner, property);
+  while (!descriptor && (owner = Object.getPrototypeOf(owner))) descriptor = Object.getOwnPropertyDescriptor(owner, property);
+  const ownDescriptor = Object.getOwnPropertyDescriptor(object, property);
   const original = object[property];
+  if (original?._isMockFunction) return original;
   let spy;
   if (accessType === "get") {
     spy = mock(descriptor?.get ?? (() => original));
-    Object.defineProperty(object, property, { configurable: true, get: spy });
+    Object.defineProperty(object, property, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get: spy,
+      set: descriptor?.set,
+    });
   } else if (accessType === "set") {
     spy = mock(descriptor?.set ?? (() => undefined));
-    Object.defineProperty(object, property, { configurable: true, set: spy });
+    Object.defineProperty(object, property, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get: descriptor?.get,
+      set: spy,
+    });
+  } else if (typeof original === "function") {
+    spy = mock(original);
+    Object.defineProperty(object, property, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      writable: true,
+      value: spy,
+    });
   } else {
-    spy = mock(typeof original === "function" ? original : () => original);
-    object[property] = spy;
+    let value = original;
+    spy = mock(() => value);
+    Object.defineProperty(object, property, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get() { return spy.call(this); },
+      set(next) { value = next; },
+    });
   }
-  restores.push(() => descriptor ? Object.defineProperty(object, property, descriptor) : delete object[property]);
-  spy.mockRestore = () => {
-    const restore = restores.pop();
-    restore?.();
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    if (ownDescriptor) Object.defineProperty(object, property, ownDescriptor);
+    else delete object[property];
   };
+  restores.push(restore);
+  Object.defineProperty(spy, mockRestoreSymbol, { configurable: true, value: restore });
   return spy;
 }
 
@@ -702,22 +1177,54 @@ export function setSystemTime(value = Date.now()) {
 }
 
 export function setDefaultTimeout(_timeout) {
-  return undefined;
+  nodeSetDefaultTimeout(_timeout);
 }
 
 function wrapDoneCallback(callback) {
   if (typeof callback !== "function" || callback.length === 0) return callback;
   return () => new Promise((resolve, reject) => {
     let settled = false;
+    let callbackReturned = false;
+    let returnedPromise = null;
+    let returnedPromiseSettled = false;
+    let doneCalled = false;
     const done = (error = undefined) => {
       if (settled) return;
-      settled = true;
-      if (error) reject(error);
-      else resolve();
+      if (error) {
+        settled = true;
+        reject(error);
+        return;
+      }
+      doneCalled = true;
+      if (callbackReturned && (!returnedPromise || returnedPromiseSettled)) {
+        settled = true;
+        resolve();
+      }
     };
     try {
       const result = callback(done);
-      if (result && typeof result.then === "function") result.then(undefined, done);
+      returnedPromise = result && typeof result.then === "function" ? result : null;
+      callbackReturned = true;
+      if (returnedPromise) {
+        returnedPromise.then(
+          () => {
+            returnedPromiseSettled = true;
+            if (!settled && doneCalled) {
+              settled = true;
+              resolve();
+            }
+          },
+          (error) => {
+            if (!settled) {
+              settled = true;
+              reject(error);
+            }
+          },
+        );
+      } else if (doneCalled && !settled) {
+        settled = true;
+        resolve();
+      }
     } catch (error) {
       done(error);
     }
@@ -755,7 +1262,7 @@ function wrapTestCallback(callback) {
 
 export function onTestFinished(callback) {
   if (typeof callback !== "function") throw new TypeError("onTestFinished requires a callback");
-  nodeAfter(wrapDoneCallback(callback));
+  nodeOnTestFinished(wrapDoneCallback(callback));
 }
 
 export function expectTypeOf(value) {
@@ -788,18 +1295,43 @@ function normalizeEachValues(row) {
 }
 
 function parseCallbackArgs(args) {
-  if (typeof args[1] === "function") return { name: args[0], options: {}, callback: args[1] };
-  return { name: args[0], options: args[1] ?? {}, callback: args[2] };
+  if (typeof args[0] === "function") {
+    return { name: args[0].name || "<anonymous>", options: normalizeTestOptions(args[1]), callback: args[0] };
+  }
+  if (typeof args[1] === "function") {
+    return { name: args[0], options: normalizeTestOptions(args[2]), callback: args[1] };
+  }
+  return { name: args[0], options: normalizeTestOptions(args[1]), callback: args[2] };
+}
+
+function normalizeTestOptions(options) {
+  if (typeof options === "number") return { timeout: options };
+  return options && typeof options === "object" ? options : {};
+}
+
+function parseDescribeArgs(args) {
+  const first = args[0];
+  if (typeof first !== "function") return parseCallbackArgs(args);
+  if (args.length === 1) {
+    return { name: first.name || "", options: {}, callback: first };
+  }
+  const callback = typeof args[1] === "function" ? args[1] : args[2];
+  const options = normalizeTestOptions(typeof args[1] === "function" ? args[2] : args[1]);
+  if (!first.name) {
+    return {
+      name: "<invalid describe>",
+      options,
+      callback: () => {
+        throw new TypeError("describe() expects first argument to be a named class, named function, number, or string");
+      },
+    };
+  }
+  return { name: first.name, options, callback };
 }
 
 function normalizeTestName(name) {
   if (typeof name === "function") return name.name || String(name);
   return String(name ?? "<anonymous>");
-}
-
-function withOptions(args, extraOptions) {
-  const parsed = parseCallbackArgs(args);
-  return [normalizeTestName(parsed.name), { ...parsed.options, ...extraOptions }, wrapDoneCallback(parsed.callback)];
 }
 
 function makeEach(base) {
@@ -817,64 +1349,96 @@ function makeEach(base) {
 }
 
 function makeBunTestFunction(base) {
-  const fn = (...args) => {
+  const register = (args, extraOptions = {}, requireCallback = false) => {
+    globalThis.__cottontailBunTestUsed = true;
     const parsed = parseCallbackArgs(args);
-    return base(normalizeTestName(parsed.name), parsed.options, wrapTestCallback(parsed.callback));
+    if (requireCallback && typeof parsed.callback !== "function") {
+      throw new TypeError("test.failing expects a function as the second argument");
+    }
+    return base(
+      normalizeTestName(parsed.name),
+      { ...parsed.options, ...extraOptions },
+      wrapTestCallback(parsed.callback),
+    );
   };
+  const variant = (extraOptions, requireCallback = false) => {
+    const result = (...args) => register(args, extraOptions, requireCallback);
+    result.each = makeEach(result);
+    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, requireCallback) : result;
+    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, requireCallback) : result;
+    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, requireCallback);
+    return result;
+  };
+  const fn = (...args) => register(args);
   fn.each = makeEach(fn);
-  fn.only = (...args) => base(...withOptions(args, { only: true }));
-  fn.failing = (...args) => {
-    const parsed = parseCallbackArgs(args);
-    const callback = wrapTestCallback(parsed.callback);
-    return base(normalizeTestName(parsed.name), parsed.options, async () => {
-      try {
-        await callback?.();
-      } catch {
-        return;
-      }
-      throw new nodeAssert.AssertionError({ message: "Expected failing test to fail" });
-    });
-  };
-  fn.skip = (..._args) => undefined;
-  fn.todo = (..._args) => undefined;
+  fn.only = variant({ only: true });
+  fn.failing = variant({ failing: true }, true);
+  fn.skip = variant({ skip: true });
+  fn.todo = variant({ todo: true });
   fn.skipIf = (condition) => condition ? fn.skip : fn;
   fn.todoIf = (condition) => condition ? fn.todo : fn;
   fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = fn;
-  fn.serial = fn;
+  fn.concurrent = variant({ concurrent: true });
+  fn.serial = variant({ serial: true });
   return fn;
 }
 
 function makeBunDescribe(base) {
   const fn = (...args) => {
-    const parsed = parseCallbackArgs(args);
+    globalThis.__cottontailBunTestUsed = true;
+    const parsed = parseDescribeArgs(args);
     return base(normalizeTestName(parsed.name), parsed.options, parsed.callback);
   };
   fn.each = makeEach(fn);
-  fn.only = (...args) => {
-    const parsed = parseCallbackArgs(args);
-    return base(normalizeTestName(parsed.name), { ...parsed.options, only: true }, parsed.callback);
+  const variant = (extraOptions) => {
+    const result = (...args) => {
+      globalThis.__cottontailBunTestUsed = true;
+      const parsed = parseDescribeArgs(args);
+      return base(normalizeTestName(parsed.name), { ...parsed.options, ...extraOptions }, parsed.callback);
+    };
+    result.each = makeEach(result);
+    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;
+    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }) : result;
+    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true });
+    return result;
   };
-  fn.skip = (..._args) => undefined;
-  fn.todo = (..._args) => undefined;
+  fn.only = variant({ only: true });
+  fn.skip = variant({ skip: true });
+  fn.todo = variant({ todo: true });
   fn.skipIf = (condition) => condition ? fn.skip : fn;
   fn.todoIf = (condition) => condition ? fn.todo : fn;
   fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = fn;
-  fn.serial = fn;
+  fn.concurrent = variant({ concurrent: true });
+  fn.serial = variant({ serial: true });
   return fn;
 }
 
-export const beforeAll = (callback, options = {}) => nodeBefore(wrapDoneCallback(callback), options);
-export const afterAll = (callback, options = {}) => nodeAfter(wrapDoneCallback(callback), options);
-export const beforeEach = (callback, options = {}) => nodeBeforeEach(wrapDoneCallback(callback), options);
-export const afterEach = (callback, options = {}) => nodeAfterEach(wrapDoneCallback(callback), options);
+function markBunTestUsed() {
+  globalThis.__cottontailBunTestUsed = true;
+}
+
+export const beforeAll = (callback, options = {}) => {
+  markBunTestUsed();
+  return nodeBefore(wrapDoneCallback(callback), options);
+};
+export const afterAll = (callback, options = {}) => {
+  markBunTestUsed();
+  return nodeAfter(wrapDoneCallback(callback), options);
+};
+export const beforeEach = (callback, options = {}) => {
+  markBunTestUsed();
+  return nodeBeforeEach(wrapDoneCallback(callback), options);
+};
+export const afterEach = (callback, options = {}) => {
+  markBunTestUsed();
+  return nodeAfterEach(wrapDoneCallback(callback), options);
+};
 export const test = makeBunTestFunction(nodeTest);
-export const it = makeBunTestFunction(nodeIt);
+export const it = test;
 export const describe = makeBunDescribe(nodeDescribe);
-export const xit = Object.assign(() => undefined, { skip: () => undefined });
-export const xtest = xit;
-export const xdescribe = xit;
+export const xit = test.skip;
+export const xtest = test.skip;
+export const xdescribe = describe.skip;
 
 export const jest = {
   fn: mock,
@@ -905,7 +1469,7 @@ export const jest = {
     }
     return this;
   },
-  setTimeout(_timeout) {},
+  setTimeout(timeout) { setDefaultTimeout(timeout); return this; },
 };
 
 export const vi = {
@@ -933,5 +1497,88 @@ const defaultExport = {
   xit,
   xtest,
 };
+
+function installShellConstructor() {
+  const shell = globalThis.Bun?.$;
+  if (typeof shell !== "function" || typeof shell.Shell === "function") return;
+
+  class Shell {
+    constructor() {
+      const callable = (strings, ...values) => {
+        const command = shell(strings, ...values);
+        command.throws(callable._throws);
+        if (callable._cwd != null) command.cwd(callable._cwd);
+        if (callable._env != null) command.env(callable._env);
+        return command;
+      };
+      Object.setPrototypeOf(callable, Shell.prototype);
+      callable._cwd = undefined;
+      callable._env = undefined;
+      callable._throws = true;
+      return callable;
+    }
+
+    cwd(value) {
+      this._cwd = String(value);
+      return this;
+    }
+
+    env(value) {
+      this._env = { ...(value ?? {}) };
+      return this;
+    }
+
+    throws(value = true) {
+      this._throws = Boolean(value);
+      return this;
+    }
+
+    nothrow() {
+      return this.throws(false);
+    }
+  }
+
+  Object.setPrototypeOf(Shell.prototype, Function.prototype);
+  shell.Shell = Shell;
+}
+
+function wrapCallerOriginFileURLToPath(fileURLToPath) {
+  const wrapped = (value) => value === ""
+    ? String(globalThis.process?.argv?.[1] ?? "")
+    : fileURLToPath(value);
+  Object.defineProperty(wrapped, "__cottontailCallerOriginFallback", { value: true });
+  return wrapped;
+}
+
+function installCallerOriginFallback() {
+  const bun = globalThis.Bun ??= {};
+  if (bun.__cottontailCallerOriginFallback) return;
+  Object.defineProperty(bun, "__cottontailCallerOriginFallback", { value: true });
+  if (typeof bun.fileURLToPath === "function") {
+    bun.fileURLToPath = wrapCallerOriginFileURLToPath(bun.fileURLToPath);
+    return;
+  }
+  Object.defineProperty(bun, "fileURLToPath", {
+    configurable: true,
+    get() { return undefined; },
+    set(value) {
+      Object.defineProperty(bun, "fileURLToPath", {
+        configurable: true,
+        writable: true,
+        value: typeof value === "function" ? wrapCallerOriginFileURLToPath(value) : value,
+      });
+    },
+  });
+}
+
+globalThis.jest ??= jest;
+globalThis.vi ??= vi;
+installCallerOriginFallback();
+
+queueMicrotask(() => {
+  globalThis.jest ??= jest;
+  globalThis.vi ??= vi;
+  installShellConstructor();
+});
 
 export default defaultExport;

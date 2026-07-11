@@ -1,4 +1,4 @@
-import { dirname, join, resolve } from "./path.js";
+import { basename, dirname, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
 import * as assert from "./assert.js";
 import * as assertStrict from "./assert/strict.js";
@@ -287,11 +287,11 @@ function invalidArgType(name, expected, value) {
 }
 
 function resolvedToUrl(resolved) {
-  const text = String(resolved);
+  const { bare: text, suffix } = splitSpecifierSuffix(resolved);
   if (text.startsWith("node:")) return text;
   if (builtinModuleMap.has(text)) return `node:${text.replace(/^node:/, "")}`;
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
-  return pathToFileURL(text).href;
+  return pathToFileURL(text).href + suffix;
 }
 
 function urlToResolved(url) {
@@ -302,7 +302,7 @@ function urlToResolved(url) {
 }
 
 function formatForResolved(resolved) {
-  const text = String(resolved);
+  const { bare: text } = splitSpecifierSuffix(resolved);
   if (text.startsWith("node:") || builtinModuleMap.has(text)) return "builtin";
   if (text.endsWith(".json")) return "json";
   if (text.endsWith(".mjs")) return "module";
@@ -313,6 +313,49 @@ function parentURLForBase(basePath) {
   const text = String(basePath || cottontail.cwd());
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
   return pathToFileURL(text).href;
+}
+
+function specifierSuffixIndex(value) {
+  const text = String(value);
+  const query = text.indexOf("?");
+  const fragment = text.indexOf("#");
+  if (query < 0) return fragment;
+  if (fragment < 0) return query;
+  return Math.min(query, fragment);
+}
+
+function splitSpecifierSuffix(value) {
+  const text = String(value);
+  const index = specifierSuffixIndex(text);
+  if (index < 0) return { bare: text, suffix: "" };
+  return { bare: text.slice(0, index), suffix: text.slice(index) };
+}
+
+function withSpecifierSuffix(path, suffix) {
+  return suffix ? `${path}${suffix}` : path;
+}
+
+function moduleNotFoundError(request, resolveMessage = false) {
+  const error = new Error(`Cannot find module '${request}'`);
+  error.code = "MODULE_NOT_FOUND";
+  if (resolveMessage) error.name = "ResolveMessage";
+  return error;
+}
+
+function importMetaForModule(filename, suffix = "") {
+  const dir = dirname(filename);
+  const meta = {
+    url: pathToFileURL(filename).href + suffix,
+    dir,
+    dirname: dir,
+    file: basename(filename),
+    path: filename,
+    filename,
+    main: false,
+  };
+  meta.require = createRequire(filename);
+  meta.resolveSync = (specifier, parent = filename) => resolveRequest(specifier, parent);
+  return meta;
 }
 
 function normalizeResolveHookResult(result) {
@@ -333,7 +376,8 @@ function normalizeLoadHookResult(result) {
 }
 
 function resolveRequestCore(request, basePath) {
-  const text = String(request);
+  const originalText = String(request);
+  const { bare: text, suffix } = splitSpecifierSuffix(originalText);
   if (builtinModuleMap.has(text)) return text;
   if (text.startsWith("node:") && builtinModuleMap.has(text.slice(5))) return text.slice(5);
 
@@ -341,29 +385,29 @@ function resolveRequestCore(request, basePath) {
   if (text.startsWith(".") || text.startsWith("/")) {
     const candidate = text.startsWith("/") ? text : resolve(startDir, text);
     const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
-    if (resolved) return resolved;
-    throw new Error(`Cannot find module '${text}'`);
+    if (resolved) return withSpecifierSuffix(resolved, suffix);
+    throw moduleNotFoundError(originalText, Boolean(suffix));
   }
 
   const root = packageRootFor(text, startDir);
-  if (!root) throw new Error(`Cannot find module '${text}'`);
-  const suffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
+  if (!root) throw moduleNotFoundError(originalText, Boolean(suffix));
+  const packageSuffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
   const packageJson = readPackageJson(join(root, "package.json"));
   if (packageJson?.exports != null) {
-    const exported = resolvePackageExports(root, packageJson, suffix);
-    if (exported) return exported;
-    const error = new Error(`Package subpath '${suffix ? `./${suffix}` : "."}' is not defined by "exports" in ${join(root, "package.json")}`);
+    const exported = resolvePackageExports(root, packageJson, packageSuffix);
+    if (exported) return withSpecifierSuffix(exported, suffix);
+    const error = new Error(`Package subpath '${packageSuffix ? `./${packageSuffix}` : "."}' is not defined by "exports" in ${join(root, "package.json")}`);
     error.code = "ERR_PACKAGE_PATH_NOT_EXPORTED";
     throw error;
   }
-  if (suffix) {
-    const candidate = join(root, suffix);
+  if (packageSuffix) {
+    const candidate = join(root, packageSuffix);
     const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
-    if (resolved) return resolved;
+    if (resolved) return withSpecifierSuffix(resolved, suffix);
   }
   const resolved = resolveAsDirectory(root);
-  if (resolved) return resolved;
-  throw new Error(`Cannot find module '${text}'`);
+  if (resolved) return withSpecifierSuffix(resolved, suffix);
+  throw moduleNotFoundError(originalText, Boolean(suffix));
 }
 
 function resolveRequest(request, basePath, useHooks = true) {
@@ -496,7 +540,7 @@ function namespaceFromCommonJs(value) {
 
 function transformEsmSourceForDynamicImport(source) {
   const exportAssignments = [];
-  let output = String(source);
+  let output = String(source).replace(/\bimport\.meta\b/g, "__ctImportMeta");
   output = output.replace(/\bexport\s+default\s+/g, "exports.default = ");
   output = output.replace(/\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
     exportAssignments.push(`exports.${name} = ${name};`);
@@ -527,23 +571,24 @@ function transformEsmSourceForDynamicImport(source) {
 }
 
 function executeDynamicImportSource(resolved, source, format) {
-  const effectiveFormat = format ?? formatForResolved(resolved);
+  const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
+  const effectiveFormat = format ?? formatForResolved(resolvedPath);
   if (effectiveFormat === "builtin") {
-    const value = builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, ""));
+    const value = builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, ""));
     return namespaceFromCommonJs(value);
   }
-  if (effectiveFormat === "json" || String(resolved).endsWith(".json")) {
+  if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
     return { default: JSON.parse(String(source ?? "")) };
   }
-  if (effectiveFormat === "commonjs" || String(resolved).endsWith(".cjs")) {
-    return namespaceFromCommonJs(executeHookSource(resolved, source, "commonjs"));
+  if (effectiveFormat === "commonjs" || String(resolvedPath).endsWith(".cjs")) {
+    return namespaceFromCommonJs(executeHookSource(resolvedPath, String(source ?? "").replace(/\bimport\.meta\b/g, "__ctImportMeta"), "commonjs"));
   }
   const namespace = {};
   const transformed = transformEsmSourceForDynamicImport(source ?? "");
-  maybeRegisterSourceMap(resolved, transformed);
-  recordCompileCache(resolved, transformed);
-  const run = new Function("exports", "require", `${transformed}\n//# sourceURL=${resolved}`);
-  run(namespace, createRequire(resolved));
+  maybeRegisterSourceMap(resolvedPath, transformed);
+  recordCompileCache(resolvedPath, transformed);
+  const run = new Function("exports", "require", "__ctImportMeta", `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`);
+  run(namespace, createRequire(resolvedPath), importMetaForModule(resolvedPath, suffix));
   return namespace;
 }
 
@@ -562,26 +607,48 @@ export function __importModule(specifier, referrer = undefined) {
   }
   if (builtinModuleMap.has(resolved)) return namespaceFromCommonJs(builtinModuleMap.get(resolved));
   if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
-  return executeDynamicImportSource(resolved, cottontail.readFile(resolved), formatForResolved(resolved));
+  return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
 }
 
 globalThis.__cottontailImportModule = __importModule;
 
+function executeQueriedModule(module, filename, suffix) {
+  const source = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  const transformed = transformEsmSourceForDynamicImport(source);
+  maybeRegisterSourceMap(filename, transformed);
+  recordCompileCache(filename, transformed);
+  const wrapper = new Function(
+    "exports",
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    "__ctImportMeta",
+    `${transformed}\n//# sourceURL=${filename}${suffix}`,
+  );
+  wrapper(module.exports, createRequire(filename), module, filename, dirname(filename), importMetaForModule(filename, suffix));
+  module.loaded = true;
+  return module.exports;
+}
+
 function loadCommonJsModule(resolved) {
+  const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const mocked = bunModuleMockFor(resolved);
   if (mocked.found) return mocked.value;
-  const hooked = applyLoadHooks(resolved);
+  const pathMock = suffix ? bunModuleMockFor(resolvedPath) : { found: false, value: undefined };
+  if (pathMock.found) return pathMock.value;
+  const hooked = applyLoadHooks(resolvedPath);
   if (hooked !== null) return hooked;
-  if (builtinModuleMap.has(resolved)) return builtinModuleMap.get(resolved);
+  if (builtinModuleMap.has(resolvedPath)) return builtinModuleMap.get(resolvedPath);
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
-  if (resolved.endsWith(".json")) return JSON.parse(cottontail.readFile(resolved));
-  if (resolved.endsWith(".mjs")) {
-    throw new Error(`Cannot require ES module '${resolved}' from CommonJS`);
+  if (resolvedPath.endsWith(".json")) return JSON.parse(cottontail.readFile(resolvedPath));
+  if (resolvedPath.endsWith(".mjs") && !suffix) {
+    throw new Error(`Cannot require ES module '${resolvedPath}' from CommonJS`);
   }
 
-  const module = makeModule(resolved);
+  const module = makeModule(resolvedPath);
   commonJsCache.set(resolved, module);
-  return executeCommonJsModule(module, resolved);
+  return suffix ? executeQueriedModule(module, resolvedPath, suffix) : executeCommonJsModule(module, resolvedPath);
 }
 
 export function createRequire(basePath = cottontail.cwd()) {
