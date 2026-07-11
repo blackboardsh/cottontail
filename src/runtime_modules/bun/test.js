@@ -1,13 +1,13 @@
 import nodeAssert from "../node/assert.js";
 import {
   after as nodeAfter,
-  afterEach,
+  afterEach as nodeAfterEach,
   before as nodeBefore,
-  beforeEach,
+  beforeEach as nodeBeforeEach,
   describe as nodeDescribe,
-  it,
+  it as nodeIt,
   mock as nodeMock,
-  test,
+  test as nodeTest,
 } from "../node/test.js";
 
 const mocks = new Set();
@@ -37,6 +37,20 @@ let requireAssertions = false;
 
 function isObject(value) {
   return value !== null && typeof value === "object";
+}
+
+function isPromiseLike(value) {
+  return value != null && typeof value.then === "function";
+}
+
+function promiseFromActual(actual, mode) {
+  const value = typeof actual === "function" ? actual() : actual;
+  if (!isPromiseLike(value)) {
+    throw new nodeAssert.AssertionError({
+      message: `Matcher error: received value must be a promise or a function returning a promise for expect.${mode}`,
+    });
+  }
+  return value;
 }
 
 function deepEqual(left, right) {
@@ -97,6 +111,48 @@ function formatValue(value) {
   } catch {
     return String(value);
   }
+}
+
+function iterableIsEmpty(value) {
+  if (value == null || typeof value[Symbol.iterator] !== "function") return false;
+  try {
+    return Boolean(value[Symbol.iterator]().next().done);
+  } catch {
+    return false;
+  }
+}
+
+function isEmptyValue(value) {
+  if (typeof value === "string") return value.length === 0;
+  if (value instanceof String) return String(value).length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (ArrayBuffer.isView(value)) return value.byteLength === 0;
+  if (value instanceof ArrayBuffer) return value.byteLength === 0;
+  if (value instanceof Map || value instanceof Set) return value.size === 0;
+  if (typeof Headers !== "undefined" && value instanceof Headers) return iterableIsEmpty(value);
+  if (typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) return iterableIsEmpty(value);
+  if (typeof FormData !== "undefined" && value instanceof FormData) return iterableIsEmpty(value);
+  if (value && typeof value === "object" && typeof value.size === "number" && typeof value.text === "function") {
+    return value.size === 0;
+  }
+  if (value && typeof value === "object" && typeof value.next === "function") {
+    try {
+      return Boolean(value.next().done);
+    } catch {
+      return false;
+    }
+  }
+  if (value && typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+function isEmptyObjectValue(value) {
+  if (Array.isArray(value)) return value.length === 0;
+  if (!value || typeof value !== "object") return false;
+  if (value instanceof Map || value instanceof Set || value instanceof Date || value instanceof RegExp) return false;
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  return Object.keys(value).length === 0;
 }
 
 function snapshotText(value) {
@@ -291,13 +347,23 @@ class Expectation {
   }
 
   get resolves() {
-    return new Expectation(Promise.resolve(this.actual), this._negate, "resolves");
+    const handled = Promise.resolve().then(() => promiseFromActual(this.actual, "resolves")).then(
+      (value) => value,
+      (error) => {
+        throw new nodeAssert.AssertionError({
+          message: `Received promise rejected instead of resolved: ${formatValue(error)}`,
+        });
+      },
+    );
+    return new Expectation(handled, this._negate, "resolves");
   }
 
   get rejects() {
-    const handled = Promise.resolve(this.actual).then(
+    const handled = Promise.resolve().then(() => promiseFromActual(this.actual, "rejects")).then(
+      (promise) => promise,
+    ).then(
       () => {
-        throw new nodeAssert.AssertionError({ message: "Expected promise to reject" });
+        throw new nodeAssert.AssertionError({ message: "Received promise resolved instead of rejected" });
       },
       (error) => error,
     );
@@ -391,6 +457,8 @@ class Expectation {
   toMatch(expected) { return this._wrap((actual) => this._check(expected instanceof RegExp ? expected.test(String(actual)) : String(actual).includes(String(expected)), `Expected to match ${expected}`)); }
   toEqualIgnoringWhitespace(expected) { return this._wrap((actual) => this._check(String(actual).replace(/\s+/g, "") === String(expected).replace(/\s+/g, ""), "Expected equal ignoring whitespace")); }
   toHaveLength(length) { return this._wrap((actual) => this._check(actual?.length === Number(length), `Expected length ${length}`)); }
+  toBeEmpty() { return this._wrap((actual) => this._check(isEmptyValue(actual), "Expected value to be empty")); }
+  toBeEmptyObject() { return this._wrap((actual) => this._check(isEmptyObjectValue(actual), "Expected value to be an empty object")); }
 
   toHaveProperty(path, expected = undefined) {
     return this._wrap((actual) => {
@@ -410,21 +478,26 @@ class Expectation {
 
   toThrow(expected = undefined) {
     return this._wrap((actual) => {
-      let thrown;
-      if (typeof actual === "function") {
-        try {
-          actual();
-        } catch (error) {
-          thrown = error;
+      const checkThrown = (thrown) => {
+        const pass = thrown && (expected === undefined ||
+          (expected instanceof RegExp ? expected.test(String(thrown.message ?? thrown)) :
+            typeof expected === "function" ? thrown instanceof expected :
+              String(thrown.message ?? thrown).includes(String(expected))));
+        this._check(pass, "Expected function to throw");
+      };
+      if (typeof actual !== "function") return checkThrown(actual);
+      try {
+        const result = actual();
+        if (isPromiseLike(result)) {
+          return result.then(
+            () => this._check(false, "Expected function to throw"),
+            (error) => checkThrown(error),
+          );
         }
-      } else {
-        thrown = actual;
+        return this._check(false, "Expected function to throw");
+      } catch (error) {
+        return checkThrown(error);
       }
-      const pass = thrown && (expected === undefined ||
-        (expected instanceof RegExp ? expected.test(String(thrown.message ?? thrown)) :
-          typeof expected === "function" ? thrown instanceof expected :
-            String(thrown.message ?? thrown).includes(String(expected))));
-      this._check(pass, "Expected function to throw");
     });
   }
 
@@ -481,6 +554,26 @@ export function expect(actual) {
   return new Expectation(actual);
 }
 
+function installCustomMatchers(matchers = {}) {
+  for (const [name, matcher] of Object.entries(matchers)) {
+    if (typeof matcher !== "function") continue;
+    Object.defineProperty(Expectation.prototype, name, {
+      configurable: true,
+      value: function customMatcher(...args) {
+        return this._wrap((actual) => {
+          const finish = (result) => {
+            const pass = Boolean(result?.pass);
+            const message = typeof result?.message === "function" ? result.message() : `Expected custom matcher ${name} to pass`;
+            this._check(pass, message);
+          };
+          const result = matcher.call({ isNot: this._negate, equals: deepEqual }, actual, ...args);
+          return isPromiseLike(result) ? result.then(finish) : finish(result);
+        });
+      },
+    });
+  }
+}
+
 expect.any = (type) => ({ __expectMatcher: "any", type });
 expect.anything = () => ({ __expectMatcher: "anything" });
 expect.arrayContaining = (items) => ({ __expectMatcher: "arrayContaining", items: Array.from(items ?? []) });
@@ -490,7 +583,7 @@ expect.stringMatching = (pattern) => ({ __expectMatcher: "stringMatching", patte
 expect.closeTo = (value, precision = 2) => ({ __expectMatcher: "closeTo", value, precision });
 expect.assertions = (count) => { expectedAssertions = Number(count); };
 expect.hasAssertions = () => { requireAssertions = true; };
-expect.extend = (_matchers) => undefined;
+expect.extend = installCustomMatchers;
 expect.addSnapshotSerializer = (_serializer) => undefined;
 expect.unreachable = (message = "unreachable") => { throw new nodeAssert.AssertionError({ message }); };
 expect.resolvesTo = (value, expected) => expect(value).resolves.toEqual(expected);
@@ -612,19 +705,173 @@ export function setDefaultTimeout(_timeout) {
   return undefined;
 }
 
+function wrapDoneCallback(callback) {
+  if (typeof callback !== "function" || callback.length === 0) return callback;
+  return () => new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (error = undefined) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    try {
+      const result = callback(done);
+      if (result && typeof result.then === "function") result.then(undefined, done);
+    } catch (error) {
+      done(error);
+    }
+  });
+}
+
+function resetAssertionState() {
+  assertionCount = 0;
+  expectedAssertions = null;
+  requireAssertions = false;
+}
+
+function verifyAssertionState() {
+  if (expectedAssertions != null && assertionCount !== expectedAssertions) {
+    throw new nodeAssert.AssertionError({ message: `Expected ${expectedAssertions} assertions, received ${assertionCount}` });
+  }
+  if (requireAssertions && assertionCount === 0) {
+    throw new nodeAssert.AssertionError({ message: "Expected at least one assertion" });
+  }
+}
+
+function wrapTestCallback(callback) {
+  const wrapped = wrapDoneCallback(callback);
+  if (typeof wrapped !== "function") return wrapped;
+  return async () => {
+    resetAssertionState();
+    try {
+      await wrapped();
+      verifyAssertionState();
+    } finally {
+      resetAssertionState();
+    }
+  };
+}
+
 export function onTestFinished(callback) {
   if (typeof callback !== "function") throw new TypeError("onTestFinished requires a callback");
-  nodeAfter(callback);
+  nodeAfter(wrapDoneCallback(callback));
 }
 
 export function expectTypeOf(value) {
-  return expect(value);
+  void value;
+  const chain = new Proxy(function expectTypeOfChain() {}, {
+    get() {
+      return chain;
+    },
+    apply() {
+      return chain;
+    },
+  });
+  return chain;
 }
 
-export const beforeAll = nodeBefore;
-export const afterAll = nodeAfter;
-export { afterEach, beforeEach, it, test };
-export const describe = nodeDescribe;
+function formatEachName(name, values, index) {
+  let valueIndex = 0;
+  return String(name).replace(/%[#psdifjo]/g, (token) => {
+    if (token === "%#") return String(index);
+    const value = values[valueIndex++];
+    if (token === "%s") return String(value);
+    if (token === "%d" || token === "%i") return String(Number(value));
+    if (token === "%f") return String(Number(value));
+    return formatValue(value);
+  });
+}
+
+function normalizeEachValues(row) {
+  return Array.isArray(row) ? row : [row];
+}
+
+function parseCallbackArgs(args) {
+  if (typeof args[1] === "function") return { name: args[0], options: {}, callback: args[1] };
+  return { name: args[0], options: args[1] ?? {}, callback: args[2] };
+}
+
+function normalizeTestName(name) {
+  if (typeof name === "function") return name.name || String(name);
+  return String(name ?? "<anonymous>");
+}
+
+function withOptions(args, extraOptions) {
+  const parsed = parseCallbackArgs(args);
+  return [normalizeTestName(parsed.name), { ...parsed.options, ...extraOptions }, wrapDoneCallback(parsed.callback)];
+}
+
+function makeEach(base) {
+  return (table) => (name, options, callback) => {
+    const parsed = parseCallbackArgs([name, options, callback]);
+    Array.from(table ?? []).forEach((row, index) => {
+      const values = normalizeEachValues(row);
+      const testCallback = parsed.callback?.length > values.length
+        ? (done) => parsed.callback?.(...values, done)
+        : () => parsed.callback?.(...values);
+      base(formatEachName(parsed.name, values, index), parsed.options, testCallback);
+    });
+    return undefined;
+  };
+}
+
+function makeBunTestFunction(base) {
+  const fn = (...args) => {
+    const parsed = parseCallbackArgs(args);
+    return base(normalizeTestName(parsed.name), parsed.options, wrapTestCallback(parsed.callback));
+  };
+  fn.each = makeEach(fn);
+  fn.only = (...args) => base(...withOptions(args, { only: true }));
+  fn.failing = (...args) => {
+    const parsed = parseCallbackArgs(args);
+    const callback = wrapTestCallback(parsed.callback);
+    return base(normalizeTestName(parsed.name), parsed.options, async () => {
+      try {
+        await callback?.();
+      } catch {
+        return;
+      }
+      throw new nodeAssert.AssertionError({ message: "Expected failing test to fail" });
+    });
+  };
+  fn.skip = (..._args) => undefined;
+  fn.todo = (..._args) => undefined;
+  fn.skipIf = (condition) => condition ? fn.skip : fn;
+  fn.todoIf = (condition) => condition ? fn.todo : fn;
+  fn.if = (condition) => condition ? fn : fn.skip;
+  fn.concurrent = fn;
+  fn.serial = fn;
+  return fn;
+}
+
+function makeBunDescribe(base) {
+  const fn = (...args) => {
+    const parsed = parseCallbackArgs(args);
+    return base(normalizeTestName(parsed.name), parsed.options, parsed.callback);
+  };
+  fn.each = makeEach(fn);
+  fn.only = (...args) => {
+    const parsed = parseCallbackArgs(args);
+    return base(normalizeTestName(parsed.name), { ...parsed.options, only: true }, parsed.callback);
+  };
+  fn.skip = (..._args) => undefined;
+  fn.todo = (..._args) => undefined;
+  fn.skipIf = (condition) => condition ? fn.skip : fn;
+  fn.todoIf = (condition) => condition ? fn.todo : fn;
+  fn.if = (condition) => condition ? fn : fn.skip;
+  fn.concurrent = fn;
+  fn.serial = fn;
+  return fn;
+}
+
+export const beforeAll = (callback, options = {}) => nodeBefore(wrapDoneCallback(callback), options);
+export const afterAll = (callback, options = {}) => nodeAfter(wrapDoneCallback(callback), options);
+export const beforeEach = (callback, options = {}) => nodeBeforeEach(wrapDoneCallback(callback), options);
+export const afterEach = (callback, options = {}) => nodeAfterEach(wrapDoneCallback(callback), options);
+export const test = makeBunTestFunction(nodeTest);
+export const it = makeBunTestFunction(nodeIt);
+export const describe = makeBunDescribe(nodeDescribe);
 export const xit = Object.assign(() => undefined, { skip: () => undefined });
 export const xtest = xit;
 export const xdescribe = xit;
@@ -664,17 +911,6 @@ export const jest = {
 export const vi = {
   ...jest,
 };
-
-if (globalThis.process?.on) {
-  globalThis.process.on("beforeExit", () => {
-    if (expectedAssertions != null && assertionCount !== expectedAssertions) {
-      throw new nodeAssert.AssertionError({ message: `Expected ${expectedAssertions} assertions, received ${assertionCount}` });
-    }
-    if (requireAssertions && assertionCount === 0) {
-      throw new nodeAssert.AssertionError({ message: "Expected at least one assertion" });
-    }
-  });
-}
 
 const defaultExport = {
   afterAll,

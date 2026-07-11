@@ -8,6 +8,9 @@ const afterHooks = [];
 const beforeEachHooks = [];
 const afterEachHooks = [];
 let beforeRan = false;
+let runScheduled = false;
+let runFinished = false;
+let afterTimer = null;
 
 function emit(type, data = {}) {
   const event = { type, data };
@@ -64,9 +67,30 @@ async function runHookList(hooks) {
   for (const hook of hooks) await hook.fn();
 }
 
+async function finishAfterHooks() {
+  if (runFinished) return;
+  if (afterTimer !== null) {
+    clearTimeout(afterTimer);
+    afterTimer = null;
+  }
+  runFinished = true;
+  await runHookList(afterHooks);
+}
+
+function scheduleAfterHooks() {
+  if (runFinished || afterTimer !== null) return;
+  afterTimer = setTimeout(() => {
+    afterTimer = null;
+    finishAfterHooks().catch((error) => {
+      setTimeout(() => { throw error; }, 0);
+    });
+  }, 0);
+}
+
 async function execute(record) {
   if (record.ran) return record.result;
   record.ran = true;
+  if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:start ${record.name}`);
   emit("test:start", { name: record.name });
   if (record.options.skip) {
     emit("test:pass", { name: record.name, skip: record.options.skip === true ? "skipped" : record.options.skip });
@@ -108,10 +132,43 @@ async function execute(record) {
     }
     await runHookList(afterEachHooks);
     emit("test:pass", { name: record.name, duration_ms: (performance?.now?.() ?? Date.now()) - started });
+    if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:pass ${record.name}`);
   } catch (error) {
     emit("test:fail", { name: record.name, error, duration_ms: (performance?.now?.() ?? Date.now()) - started });
+    if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:fail ${record.name}: ${error?.stack || error?.message || error}`);
     throw error;
   }
+}
+
+function scheduleRun() {
+  if (runScheduled) return;
+  if (afterTimer !== null) {
+    clearTimeout(afterTimer);
+    afterTimer = null;
+  }
+  runScheduled = true;
+  queueMicrotask(async () => {
+    try {
+      for (let index = 0; index < tests.length; index += 1) {
+        const record = tests[index];
+        try {
+          await execute(record);
+          record.resolve?.();
+        } catch (error) {
+          record.reject?.(error);
+          throw error;
+        }
+      }
+      runScheduled = false;
+      scheduleAfterHooks();
+    } catch (error) {
+      runScheduled = false;
+      for (const record of tests) {
+        if (!record.ran) record.reject?.(error);
+      }
+      setTimeout(() => { throw error; }, 0);
+    }
+  });
 }
 
 function makeTestFunction(defaultOptions = {}) {
@@ -124,8 +181,12 @@ function makeTestFunction(defaultOptions = {}) {
       ran: false,
       result: null,
     };
+    record.result = new Promise((resolve, reject) => {
+      record.resolve = resolve;
+      record.reject = reject;
+    });
     tests.push(record);
-    record.result = Promise.resolve().then(() => execute(record));
+    scheduleRun();
     return record.result;
   };
   return fn;
@@ -266,7 +327,7 @@ async function *runEvents(options = {}) {
       await execute(record);
     } catch {}
   }
-  await runHookList(afterHooks);
+  await finishAfterHooks();
   yield *events;
 }
 

@@ -92,7 +92,8 @@ pub fn runEval(
 ) !u8 {
     const ctx = try makeContext(init);
     const tmp_dir = try ensureTempDir(&ctx);
-    const eval_path = try writeEvalEntrypoint(&ctx, tmp_dir, source, print_result, hasModuleInputType(exec_args));
+    const module_input = hasModuleInputType(exec_args) or sourceLooksEsm(source);
+    const eval_path = try writeEvalEntrypoint(&ctx, tmp_dir, source, print_result, module_input);
     const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(eval_path))
         try bundleScriptWithEsbuild(&ctx, eval_path)
     else
@@ -297,6 +298,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
     const bun_jsc_module = try runtimeModulePath(ctx, &.{ "bun", "jsc.js" });
     const bun_sqlite_module = try runtimeModulePath(ctx, &.{ "bun", "sqlite.js" });
     const bun_test_module = try runtimeModulePath(ctx, &.{ "bun", "test.js" });
+    const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
     const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
     const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
@@ -365,6 +367,9 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         "--main-fields=module,main",
         "--target=es2022",
         "--external:internal/*",
+        "--external:vitest",
+        "--external:jest-extended",
+        "--external:@jest/globals",
         try std.fmt.allocPrint(ctx.allocator, "--outfile={s}", .{bundle_path}),
         try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dirname={s}", .{script_dir_literal}),
         try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dir={s}", .{script_dir_literal}),
@@ -378,6 +383,7 @@ fn bundleScriptWithEsbuild(ctx: *const Context, script_path: []const u8) ![]cons
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:jsc={s}", .{bun_jsc_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:sqlite={s}", .{bun_sqlite_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:test={s}", .{bun_test_module}),
+        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:internal-for-testing={s}", .{bun_internal_for_testing_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:node:fs={s}", .{fs_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:fs/promises={s}", .{fs_promises_module}),
@@ -520,6 +526,7 @@ fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !
         return false;
     }
 
+    if (try sourceFileLooksEsm(ctx, script_abs)) return false;
     if (try sourceLooksCommonJs(ctx, script_abs)) return true;
 
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
@@ -556,10 +563,31 @@ fn sourceLooksCommonJs(ctx: *const Context, script_abs: []const u8) !bool {
         ctx.allocator,
         .limited(256 * 1024),
     ) catch return false;
+    if (sourceLooksEsm(source)) return false;
     return std.mem.indexOf(u8, source, "require(") != null or
         std.mem.indexOf(u8, source, "require.resolve") != null or
         std.mem.indexOf(u8, source, "module.exports") != null or
         std.mem.indexOf(u8, source, "exports.") != null;
+}
+
+fn sourceFileLooksEsm(ctx: *const Context, script_abs: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(256 * 1024),
+    ) catch return false;
+    return sourceLooksEsm(source);
+}
+
+fn sourceLooksEsm(source: []const u8) bool {
+    if (std.mem.startsWith(u8, source, "import ") or
+        std.mem.startsWith(u8, source, "export "))
+    {
+        return true;
+    }
+    return std.mem.indexOf(u8, source, "\nimport ") != null or
+        std.mem.indexOf(u8, source, "\nexport ") != null;
 }
 
 fn nearestPackageTypeIsModule(ctx: *const Context, start_dir: []const u8) !bool {
@@ -669,8 +697,18 @@ fn writeCottontailEntryWrapper(ctx: *const Context, tmp_dir: []const u8, script_
     const script_literal = try jsonStringLiteral(ctx, script_abs);
     const source = try std.fmt.allocPrint(
         ctx.allocator,
-        "import {s};\nimport {s};\n",
-        .{ bun_literal, script_literal },
+        \\import __ctBunModule from {s};
+        \\import {{ createRequire as __ctCreateRequire }} from "node:module";
+        \\import.meta.require ??= __ctCreateRequire({s});
+        \\import.meta.resolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
+        \\import.meta.resolve ??= (specifier) => {{
+        \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
+        \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
+        \\}};
+        \\import {s};
+        \\
+    ,
+        .{ bun_literal, script_literal, script_literal, script_literal, script_literal },
     );
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;

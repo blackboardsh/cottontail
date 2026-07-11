@@ -403,6 +403,9 @@ function encodeDigest(bytes, encoding = "buffer") {
   if (encoding === "latin1" || encoding === "binary") {
     return String.fromCharCode(...bytes);
   }
+  if (encoding === "utf8" || encoding === "utf-8") {
+    return new TextDecoder().decode(bytes);
+  }
   throw new TypeError(`Invalid digest encoding: ${encoding}`);
 }
 
@@ -2168,11 +2171,18 @@ class CipherBase {
     }
     this.encrypt = encrypt;
     this.autoPadding = options?.autoPadding !== false;
+    if (this.info.authTagLength > 0 && options?.authTagLength !== undefined) {
+      const authTagLength = options.authTagLength;
+      if (typeof authTagLength !== "number" || !Number.isInteger(authTagLength) || authTagLength <= 0) {
+        throw new TypeError(`The property 'options.authTagLength' is invalid. Received ${authTagLength}`);
+      }
+    }
     this.authTagLength = this.info.authTagLength > 0
       ? positiveInteger(options?.authTagLength ?? this.info.authTagLength, "authTagLength")
       : 0;
     this.finalized = false;
     this.id = null;
+    this.readBuffer = null;
   }
 
   _ensureCipher() {
@@ -2199,6 +2209,20 @@ class CipherBase {
       this.finalized = true;
       if (!this.encrypt || this.info.authTagLength === 0) this.id = null;
     }
+  }
+
+  end(data = undefined, inputEncoding = undefined) {
+    const chunks = [];
+    if (data != null) chunks.push(bytesFromData(this.update(data, inputEncoding)));
+    chunks.push(bytesFromData(this.final()));
+    this.readBuffer = bufferFromBytes(concatBytes(chunks));
+    return this;
+  }
+
+  read() {
+    const value = this.readBuffer;
+    this.readBuffer = null;
+    return value;
   }
 
   setAAD(buffer, options = undefined) {
@@ -3113,7 +3137,7 @@ function webcryptoUsageList(usages = []) {
   return Array.from(usages ?? [], (usage) => String(usage));
 }
 
-class CryptoKey {
+export class CryptoKey {
   constructor(type, algorithm, extractable, usages, material) {
     this.type = type;
     this.extractable = Boolean(extractable);

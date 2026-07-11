@@ -109,13 +109,20 @@ export class Socket extends EventEmitter {
       callback = address;
       address = undefined;
     }
-    this.remote = { port: Number(port), address: address ?? (this.family === 6 ? "::1" : "127.0.0.1") };
+    if (this.closed) throw new Error("Socket is closed");
+    if (this.remote) throw new Error("Socket is already connected");
+    const normalized = { port: Number(port), address: address ?? (this.family === 6 ? "::1" : "127.0.0.1") };
+    cottontail.udpSocketConnect(this.fd, normalized.port, normalized.address, this.family);
+    this.remote = normalized;
     if (typeof callback === "function") queueMicrotask(callback);
     this.emit("connect");
+    return this;
   }
 
   disconnect() {
+    if (!this.remote) throw new Error("Socket is not connected");
     this.remote = null;
+    return this;
   }
 
   send(...args) {
@@ -219,14 +226,16 @@ export class Socket extends EventEmitter {
 
   _poll() {
     if (this.closed) return;
-    try {
-      for (;;) {
-        const packet = cottontail.udpSocketReceive(this.fd, 65536);
-        if (!packet) break;
-        this.emit("message", Buffer.from(packet.data), packet.rinfo);
+    for (;;) {
+      let packet;
+      try {
+        packet = cottontail.udpSocketReceive(this.fd, 65536);
+      } catch (error) {
+        if (!this.closed) this.emit("error", error);
+        return;
       }
-    } catch (error) {
-      if (!this.closed) this.emit("error", error);
+      if (!packet) break;
+      this.emit("message", Buffer.from(packet.data), packet.rinfo);
     }
   }
 }

@@ -11,8 +11,14 @@ const binaryPath = join(rootDir, 'zig-out', 'bin', process.platform === 'win32' 
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempRoot = mkdtempSync(join(os.tmpdir(), 'cottontail-upstream-tests-'));
 const disabledStatuses = new Set(['disabled', 'skip']);
+const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
+const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
 
 process.on('exit', () => {
+  if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') {
+    console.error(`kept upstream temp root: ${tempRoot}`);
+    return;
+  }
   rmSync(tempRoot, { recursive: true, force: true });
 });
 
@@ -32,6 +38,8 @@ function usage() {
     'Options:',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --list                       Print status counts without running tests.',
+    '  --max-failures <n>           Stop after this many unexpected results.',
+    '  --max-tests <n>              Run at most this many selected tests.',
     '  --test <relative-path>        Run one copied upstream test path.',
   ].join('\n'));
 }
@@ -45,6 +53,8 @@ function parseArgs(argv) {
   const options = {
     includeExpectedFailures: false,
     list: false,
+    maxFailures: Infinity,
+    maxTests: Infinity,
     test: null,
   };
   while (args.length > 0) {
@@ -53,6 +63,14 @@ function parseArgs(argv) {
       options.includeExpectedFailures = true;
     } else if (arg === '--list') {
       options.list = true;
+    } else if (arg === '--max-failures') {
+      const value = Number(args.shift() ?? fail('--max-failures requires a number'));
+      if (!Number.isFinite(value) || value < 1) fail('--max-failures requires a positive number');
+      options.maxFailures = value;
+    } else if (arg === '--max-tests') {
+      const value = Number(args.shift() ?? fail('--max-tests requires a number'));
+      if (!Number.isFinite(value) || value < 1) fail('--max-tests requires a positive number');
+      options.maxTests = value;
     } else if (arg === '--test') {
       options.test = args.shift() ?? fail('--test requires a relative path');
     } else if (arg === '--help' || arg === '-h') {
@@ -81,11 +99,14 @@ function countFiles(dir) {
   return count;
 }
 
-function discoverRunnableFiles(snapshotRoot) {
+function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
   const testRoot = join(snapshotRoot, 'test');
   if (!existsSync(testRoot)) return [];
   const result = [];
   const stack = [testRoot];
+  const runnablePattern = runtime === 'bun'
+    ? /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i
+    : /\.(?:js|mjs|cjs)$/i;
   while (stack.length > 0) {
     const current = stack.pop();
     for (const name of readdirSync(current)) {
@@ -93,7 +114,7 @@ function discoverRunnableFiles(snapshotRoot) {
       const stat = lstatSync(path);
       if (stat.isDirectory() && !stat.isSymbolicLink()) {
         stack.push(path);
-      } else if (stat.isFile() && /\.(?:js|mjs|cjs)$/i.test(name)) {
+      } else if (stat.isFile() && runnablePattern.test(name)) {
         result.push(path.slice(snapshotRoot.length + 1).replace(/\\/g, '/'));
       }
     }
@@ -102,29 +123,58 @@ function discoverRunnableFiles(snapshotRoot) {
   return result;
 }
 
-function statusCounts(snapshotRoot, status) {
-  const tests = Object.values(status.tests ?? {});
-  const discovered = status.defaultStatus === 'enabled' ? discoverRunnableFiles(snapshotRoot) : [];
-  const disabled = tests.filter((item) => disabledStatuses.has(item.status)).length;
-  const explicitEnabled = tests.filter((item) => item.status === 'enabled').length;
+function patternEntries(status) {
+  return Array.isArray(status.patterns) ? status.patterns : [];
+}
+
+function patternStatusForPath(status, path) {
+  let matched = null;
+  for (const pattern of patternEntries(status)) {
+    if (!pattern?.pattern || !pattern?.status) continue;
+    if (new RegExp(pattern.pattern).test(path)) matched = pattern;
+  }
+  return matched;
+}
+
+function statusEntryForPath(status, path, defaultStatus = status.defaultStatus ?? 'not-enabled') {
+  const patternEntry = patternStatusForPath(status, path);
+  return {
+    path,
+    status: defaultStatus,
+    reason: undefined,
+    ...(patternEntry ?? {}),
+    ...(status.tests?.[path] ?? {}),
+  };
+}
+
+function statusCounts(snapshotRoot, status, runtime = 'node') {
+  const tests = Object.entries(status.tests ?? {});
+  const hasPatterns = patternEntries(status).length > 0;
+  const discovered = status.defaultStatus === 'enabled' || hasPatterns ? discoverRunnableFiles(snapshotRoot, runtime) : [];
+  const discoveredPaths = new Set(discovered);
+  const discoveredEntries = discovered.map((path) => statusEntryForPath(status, path));
+  const explicitOnlyEntries = tests
+    .filter(([path]) => !discoveredPaths.has(path))
+    .map(([path, entry]) => ({ path, ...entry }));
+  const entries = [...discoveredEntries, ...explicitOnlyEntries];
+  const disabled = entries.filter((item) => disabledStatuses.has(item.status)).length;
+  const explicitEnabled = entries.filter((item) => item.status === 'enabled').length;
   const counts = {
     copiedFiles: existsSync(snapshotRoot) ? countFiles(snapshotRoot) : 0,
-    enabled: status.defaultStatus === 'enabled'
-      ? Math.max(0, discovered.length - disabled)
-      : explicitEnabled,
-    expectedFailure: tests.filter((item) => item.status === 'expected-failure').length,
+    enabled: explicitEnabled,
+    expectedFailure: entries.filter((item) => item.status === 'expected-failure').length,
     disabled,
   };
   return counts;
 }
 
-function selectedTests(status, options, snapshotRoot) {
+function selectedTests(status, options, snapshotRoot, runtime = 'node') {
   if (options.test) {
     return [{ path: options.test, status: 'enabled', reason: 'selected from CLI' }];
   }
-  if (status.defaultStatus === 'enabled') {
-    return discoverRunnableFiles(snapshotRoot)
-      .map((path) => ({ path, status: status.tests?.[path]?.status ?? 'enabled', ...(status.tests?.[path] ?? {}) }))
+  if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
+    return discoverRunnableFiles(snapshotRoot, runtime)
+      .map((path) => statusEntryForPath(status, path, status.defaultStatus === 'enabled' ? 'enabled' : 'not-enabled'))
       .filter((entry) =>
         entry.status === 'enabled' ||
         (options.includeExpectedFailures && entry.status === 'expected-failure')
@@ -175,6 +225,7 @@ function runNodeHarness(target, entries, snapshotRoot, status, options) {
       cwd: snapshotRoot,
       env: makeEnv('node', target),
       encoding: 'utf8',
+      maxBuffer: directTestMaxBuffer,
     }
   );
   return result;
@@ -185,6 +236,8 @@ function runDirect(runtime, target, entry, snapshotRoot) {
     cwd: snapshotRoot,
     env: makeEnv(runtime, target),
     encoding: 'utf8',
+    timeout: directTestTimeoutMs,
+    maxBuffer: directTestMaxBuffer,
   });
 }
 
@@ -229,6 +282,16 @@ function runOne(runtime, target, entry) {
     return { runtime, entry, ok: false, unexpected: true, message: `not a file: ${entry.path}` };
   }
   const result = runDirect(runtime, target, entry, snapshotRoot);
+  if (result.error?.code === 'ETIMEDOUT') {
+    const shouldFail = entry.status === 'expected-failure';
+    return {
+      runtime,
+      entry,
+      ok: shouldFail,
+      unexpected: !shouldFail,
+      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entry.path} timed out after ${directTestTimeoutMs}ms`,
+    };
+  }
   const spawnError = formatSpawnError(runtime, entry, result);
   if (spawnError) {
     return { runtime, entry, ok: false, unexpected: true, message: spawnError };
@@ -262,7 +325,7 @@ for (const name of runtimeTargets(runtime, targets)) {
   const snapshotRoot = resolve(rootDir, target.snapshot);
   const statusPath = join(snapshotRoot, 'status.json');
   const status = readJson(statusPath);
-  const counts = statusCounts(snapshotRoot, status);
+  const counts = statusCounts(snapshotRoot, status, name);
   console.log(`${name} ${target.version} (${target.commit.slice(0, 12)})`);
   console.log(`  copied files: ${counts.copiedFiles}`);
   console.log(`  enabled: ${counts.enabled}`);
@@ -270,14 +333,16 @@ for (const name of runtimeTargets(runtime, targets)) {
   console.log(`  disabled: ${counts.disabled}`);
   if (options.list) continue;
 
-  const entries = selectedTests(status, options, snapshotRoot);
+  const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
   const results = name === 'node'
     ? runNode(name, target, status, entries, snapshotRoot, options)
     : entries.map((entry) => runOne(name, target, entry));
   for (const result of results) {
     console.log(result.message);
     if (result.unexpected) unexpected += 1;
+    if (unexpected >= options.maxFailures) break;
   }
+  if (unexpected >= options.maxFailures) break;
 }
 
 if (unexpected > 0) fail(`${unexpected} upstream test result(s) were unexpected.`);

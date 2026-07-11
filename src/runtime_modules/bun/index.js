@@ -1,16 +1,131 @@
 import * as FFI from "./ffi.js";
 import * as dns from "../node/dns.js";
 import * as zlib from "../node/zlib.js";
-import { createHash, randomBytes, randomUUID } from "../node/crypto.js";
+import { CryptoKey, createHash, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
+import { createRequire as nodeCreateRequire } from "../node/module.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
 import { Database as SQLiteDatabase } from "./sqlite.js";
+import * as bunTestModule from "./test.js";
 import { jest as bunJest } from "./test.js";
+
+if (Symbol.dispose == null) {
+  Object.defineProperty(Symbol, "dispose", {
+    value: Symbol.for("Symbol.dispose"),
+    configurable: true,
+  });
+}
+
+if (Symbol.asyncDispose == null) {
+  Object.defineProperty(Symbol, "asyncDispose", {
+    value: Symbol.for("Symbol.asyncDispose"),
+    configurable: true,
+  });
+}
 
 function shellEscape(value) {
   const text = String(value);
   if (/^[A-Za-z0-9_/:.,=+@%-]+$/.test(text)) return text;
   return "'" + text.replace(/'/g, "'\\''") + "'";
+}
+
+if (globalThis.console && typeof globalThis.console.table !== "function") {
+  globalThis.console.table = (value, properties = undefined) => {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      throw new TypeError("console.table properties must be an array");
+    }
+    globalThis.console.log(nodeInspect(value, { colors: false }));
+  };
+}
+
+if (globalThis.console) {
+  const consoleTimers = globalThis.console.__cottontailTimers ??= new Map();
+  globalThis.console.time ??= (label = "default") => {
+    consoleTimers.set(String(label), performance?.now?.() ?? Date.now());
+  };
+  globalThis.console.timeLog ??= (label = "default", ...args) => {
+    const key = String(label);
+    const started = consoleTimers.get(key) ?? (performance?.now?.() ?? Date.now());
+    globalThis.console.log(`${key}: ${((performance?.now?.() ?? Date.now()) - started).toFixed(3)}ms`, ...args);
+  };
+  globalThis.console.timeEnd ??= (label = "default") => {
+    const key = String(label);
+    const started = consoleTimers.get(key) ?? (performance?.now?.() ?? Date.now());
+    globalThis.console.log(`${key}: ${((performance?.now?.() ?? Date.now()) - started).toFixed(3)}ms`);
+    consoleTimers.delete(key);
+  };
+}
+
+function consoleInputState() {
+  const state = globalThis.console.__cottontailInput ??= {
+    buffer: "",
+    ended: false,
+    error: null,
+    started: false,
+    waiters: [],
+  };
+  if (!state.started) {
+    state.started = true;
+    const stdin = globalThis.process?.stdin;
+    stdin?.setEncoding?.("utf8");
+    const wake = () => {
+      for (const waiter of state.waiters.splice(0)) waiter();
+    };
+    stdin?.on?.("data", (chunk) => {
+      state.buffer += String(chunk);
+      wake();
+    });
+    stdin?.on?.("end", () => {
+      state.ended = true;
+      wake();
+    });
+    stdin?.on?.("error", (error) => {
+      state.error = error;
+      state.ended = true;
+      wake();
+    });
+    stdin?.resume?.();
+  }
+  return state;
+}
+
+async function consoleReadLine() {
+  const state = consoleInputState();
+  for (;;) {
+    if (state.error) throw state.error;
+    const newline = state.buffer.indexOf("\n");
+    if (newline >= 0) {
+      let line = state.buffer.slice(0, newline);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      state.buffer = state.buffer.slice(newline + 1);
+      return { value: line, done: false };
+    }
+    if (state.ended) {
+      if (state.buffer.length > 0) {
+        const value = state.buffer;
+        state.buffer = "";
+        return { value, done: false };
+      }
+      return { value: undefined, done: true };
+    }
+    await new Promise((resolve) => state.waiters.push(resolve));
+  }
+}
+
+if (globalThis.console && typeof globalThis.console.write !== "function") {
+  globalThis.console.write = (chunk = "") => {
+    globalThis.process?.stdout?.write?.(String(chunk));
+  };
+}
+
+if (globalThis.console && typeof globalThis.console[Symbol.asyncIterator] !== "function") {
+  globalThis.console[Symbol.asyncIterator] = async function* consoleAsyncIterator() {
+    for (;;) {
+      const next = await consoleReadLine();
+      if (next.done) return;
+      yield next.value;
+    }
+  };
 }
 
 function interpolate(strings, values) {
@@ -25,18 +140,40 @@ function interpolate(strings, values) {
   return out;
 }
 
-function runShell(command, capture) {
+const shellDefaults = {
+  cwd: undefined,
+  env: undefined,
+  throws: true,
+};
+
+export class ShellError extends Error {
+  constructor(command = "", result = {}) {
+    super(`Shell command failed${command ? `: ${command}` : ""}`);
+    this.name = "ShellError";
+    this.command = command;
+    this.exitCode = result.exitCode ?? result.status ?? 1;
+    this.stdout = result.stdout ?? "";
+    this.stderr = result.stderr ?? "";
+  }
+}
+
+export class ShellExpression {}
+
+function shellEnv(options) {
+  if (options.env == null) return undefined;
+  return { ...currentProcessEnv(), ...options.env };
+}
+
+function runShell(command, options = {}) {
   const isWin = cottontail.platform() === "win32";
   const result = cottontail.spawnSync(isWin ? "cmd" : "sh", isWin ? ["/d", "/s", "/c", command] : ["-c", command], {
-    stdio: capture ? "pipe" : "inherit",
+    stdio: "pipe",
+    cwd: options.cwd,
+    env: shellEnv(options),
   });
   const output = { exitCode: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
-  if (result.status !== 0) {
-    const error = new Error(`Command failed (${result.status}): ${command}`);
-    error.exitCode = result.status;
-    error.stdout = output.stdout;
-    error.stderr = output.stderr;
-    throw error;
+  if (result.status !== 0 && options.throws !== false) {
+    throw new ShellError(command, output);
   }
   return output;
 }
@@ -53,24 +190,42 @@ function getRandomValues(view) {
   return view;
 }
 
-class ShellCommand {
-  constructor(command) {
+class ShellCommand extends ShellExpression {
+  constructor(command, options = {}) {
+    super();
     this.command = command;
-    this.capture = false;
+    this.options = { ...shellDefaults, ...options };
     this.promise = null;
   }
-  quiet() {
-    this.capture = true;
+  quiet(_value = true) {
     return this;
   }
-  run(capture = this.capture) {
-    if (!this.promise || capture !== this.capture) {
-      this.promise = Promise.resolve().then(() => runShell(this.command, capture));
+  throws(value = true) {
+    this.options.throws = Boolean(value);
+    this.promise = null;
+    return this;
+  }
+  nothrow() {
+    return this.throws(false);
+  }
+  cwd(value) {
+    this.options.cwd = String(value);
+    this.promise = null;
+    return this;
+  }
+  env(value) {
+    this.options.env = { ...(value ?? {}) };
+    this.promise = null;
+    return this;
+  }
+  run() {
+    if (!this.promise) {
+      this.promise = Promise.resolve().then(() => runShell(this.command, this.options));
     }
     return this.promise;
   }
   text() {
-    return this.run(true).then((result) => result.stdout);
+    return this.run().then((result) => result.stdout);
   }
   then(resolve, reject) {
     return this.run().then(resolve, reject);
@@ -81,8 +236,25 @@ class ShellCommand {
 }
 
 export function $(strings, ...values) {
-  return new ShellCommand(interpolate(strings, values));
+  return new ShellCommand(interpolate(strings, values), shellDefaults);
 }
+
+$.ShellError = ShellError;
+$.ShellExpression = ShellExpression;
+$.escape = shellEscape;
+$.throws = (value = true) => {
+  shellDefaults.throws = Boolean(value);
+  return $;
+};
+$.nothrow = () => $.throws(false);
+$.cwd = (value) => {
+  shellDefaults.cwd = String(value);
+  return $;
+};
+$.env = (value) => {
+  shellDefaults.env = { ...(value ?? {}) };
+  return $;
+};
 
 function pathJoin(...parts) {
   return parts.filter(Boolean).join("/").replace(/\/+/g, "/");
@@ -748,6 +920,51 @@ export class Headers {
   }
 }
 
+export class FormData {
+  constructor() {
+    this._entries = [];
+  }
+  append(name, value, filename = undefined) {
+    this._entries.push([String(name), filename === undefined ? value : { value, filename: String(filename) }]);
+  }
+  set(name, value, filename = undefined) {
+    this.delete(name);
+    this.append(name, value, filename);
+  }
+  get(name) {
+    const key = String(name);
+    const found = this._entries.find((entry) => entry[0] === key);
+    return found ? found[1] : null;
+  }
+  getAll(name) {
+    const key = String(name);
+    return this._entries.filter((entry) => entry[0] === key).map((entry) => entry[1]);
+  }
+  has(name) {
+    const key = String(name);
+    return this._entries.some((entry) => entry[0] === key);
+  }
+  delete(name) {
+    const key = String(name);
+    this._entries = this._entries.filter((entry) => entry[0] !== key);
+  }
+  *entries() {
+    yield* this._entries;
+  }
+  *keys() {
+    for (const [key] of this._entries) yield key;
+  }
+  *values() {
+    for (const [, value] of this._entries) yield value;
+  }
+  forEach(callback, thisArg = undefined) {
+    for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
+  }
+  [Symbol.iterator]() {
+    return this.entries();
+  }
+}
+
 export class Request {
   constructor(input, init = {}) {
     this.url = typeof input === "string" ? input : String(input?.url ?? "");
@@ -759,11 +976,31 @@ export class Request {
   async arrayBuffer() {
     return arrayBufferFromBytes(await bytesFromBody(this._body));
   }
+  async bytes() {
+    return new Uint8Array(await this.arrayBuffer());
+  }
+  async blob() {
+    const type = this.headers.get("content-type") ?? "";
+    return new Blob([await this.arrayBuffer()], { type });
+  }
   async text() {
     return new TextDecoder().decode(await bytesFromBody(this._body));
   }
   async json() {
     return JSON.parse(await this.text());
+  }
+  formData() {
+    if (!(this instanceof Request)) {
+      let message = "Expected this to be instanceof Request";
+      if (this === null) message += ", but received null";
+      else if (this !== undefined && typeof this === "object") message += `, but received an instance of ${this.constructor?.name ?? "Object"}`;
+      else if (typeof this === "string") message += `, but received type string ('${this}')`;
+      else if (this !== undefined) message += `, but received type ${typeof this} (${nodeInspect(this)})`;
+      const error = new TypeError(message);
+      error.code = "ERR_INVALID_THIS";
+      throw error;
+    }
+    return Promise.resolve(new FormData());
   }
 }
 
@@ -782,8 +1019,22 @@ export class Response {
   static redirect(url, status = 302) {
     return new Response(null, { status, headers: { location: String(url) } });
   }
+  clone() {
+    return new Response(this._body, {
+      status: this.status,
+      statusText: this.statusText,
+      headers: new Headers(this.headers),
+    });
+  }
   async arrayBuffer() {
     return arrayBufferFromBytes(await bytesFromBody(this._body));
+  }
+  async bytes() {
+    return new Uint8Array(await this.arrayBuffer());
+  }
+  async blob() {
+    const type = this.headers.get("content-type") ?? "";
+    return new Blob([await this.arrayBuffer()], { type });
   }
   async text() {
     return new TextDecoder().decode(await bytesFromBody(this._body));
@@ -958,6 +1209,12 @@ export function serve(options = {}) {
       cottontail.httpServerStop(native.id);
       return Promise.resolve();
     },
+    [Symbol.dispose]() {
+      server.stop();
+    },
+    [Symbol.asyncDispose]() {
+      return server.stop();
+    },
     reload(nextOptions = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
     },
@@ -1104,12 +1361,66 @@ function tarOctal(bytes, offset, length) {
   return raw ? parseInt(raw, 8) || 0 : 0;
 }
 
+function tarOctalField(value, length) {
+  const text = Math.max(0, Number(value) || 0).toString(8).slice(-(length - 1));
+  return `${text.padStart(length - 1, "0")}\0`;
+}
+
+function tarChecksumField(value) {
+  return `${Math.max(0, Number(value) || 0).toString(8).slice(-6).padStart(6, "0")}\0 `;
+}
+
 function safeArchivePath(path) {
-  const normalized = String(path).replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!normalized || normalized.split("/").some((part) => part === "..")) {
+  const parts = [];
+  for (const part of String(path).replace(/\\/g, "/").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) throw new Error(`Unsafe archive path: ${path}`);
+      parts.pop();
+    } else {
+      parts.push(part);
+    }
+  }
+  const normalized = parts.join("/");
+  if (!normalized) {
     throw new Error(`Unsafe archive path: ${path}`);
   }
   return normalized;
+}
+
+async function archiveEntryBytes(value) {
+  if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer());
+  return bytesFromData(value);
+}
+
+async function tarBytesFromEntries(entries) {
+  const encoder = new TextEncoder();
+  const chunks = [];
+  for (const [entryName, entryValue] of entries) {
+    const name = safeArchivePath(entryName);
+    const data = await archiveEntryBytes(entryValue);
+    const header = new Uint8Array(512);
+    const nameBytes = encoder.encode(name);
+    if (nameBytes.byteLength > 100) throw new Error(`Archive path is too long: ${name}`);
+    header.set(nameBytes, 0);
+    header.set(encoder.encode(tarOctalField(0o644, 8)), 100);
+    header.set(encoder.encode(tarOctalField(0, 8)), 108);
+    header.set(encoder.encode(tarOctalField(0, 8)), 116);
+    header.set(encoder.encode(tarOctalField(data.byteLength, 12)), 124);
+    header.set(encoder.encode(tarOctalField(Math.floor(Date.now() / 1000), 12)), 136);
+    header.fill(0x20, 148, 156);
+    header[156] = 0x30;
+    header.set(encoder.encode("ustar\0"), 257);
+    header.set(encoder.encode("00"), 263);
+    let checksum = 0;
+    for (const byte of header) checksum += byte;
+    header.set(encoder.encode(tarChecksumField(checksum)), 148);
+    chunks.push(header, data);
+    const padding = (512 - (data.byteLength % 512)) % 512;
+    if (padding > 0) chunks.push(new Uint8Array(padding));
+  }
+  chunks.push(new Uint8Array(1024));
+  return concatManyBuffers(chunks);
 }
 
 class ArchiveFile {
@@ -1131,9 +1442,33 @@ class ArchiveFile {
 }
 
 export class Archive {
-  constructor(input) {
-    this._bytes = bytesFromData(input);
+  constructor(input, options = {}) {
+    if (arguments.length === 0 || input == null) throw new TypeError("Bun.Archive requires input");
+    if (typeof input !== "object" && typeof input !== "string") throw new TypeError("Bun.Archive input must be an object, Blob, ArrayBuffer, or Uint8Array");
+    if (options?.compress === "gzip" && options.level != null) {
+      const level = Number(options.level);
+      if (!Number.isInteger(level) || level < 1 || level > 12) throw new RangeError("gzip level must be between 1 and 12");
+    }
+    this._blob = input instanceof Blob ? input : null;
+    this._entries = input && typeof input === "object" && !ArrayBuffer.isView(input) && !(input instanceof ArrayBuffer) && !(input instanceof Blob)
+      ? Object.entries(input)
+      : null;
+    this._bytes = this._entries || this._blob ? null : bytesFromData(input);
+    this._options = options ?? {};
     this._files = null;
+  }
+  async _ensureBytes() {
+    if (this._bytes != null) return this._bytes;
+    if (this._blob) {
+      this._bytes = new Uint8Array(await this._blob.arrayBuffer());
+      return this._bytes;
+    }
+    let bytes = await tarBytesFromEntries(this._entries ?? []);
+    if (this._options.compress === "gzip") {
+      bytes = zlib.gzipSync(bytes, { level: Math.max(1, Math.min(9, Number(this._options.level ?? 6))) });
+    }
+    this._bytes = bytes;
+    return bytes;
   }
   _parseFiles() {
     if (this._files) return this._files;
@@ -1156,23 +1491,31 @@ export class Archive {
     return files;
   }
   async files() {
+    await this._ensureBytes();
     return this._parseFiles();
   }
   async extract(destination) {
+    if (arguments.length === 0 || destination == null) throw new TypeError("Archive.extract requires a destination path");
+    if (typeof destination !== "string") throw new TypeError("Archive.extract destination must be a string");
+    const bytes = await this._ensureBytes();
     const dest = String(destination);
     cottontail.mkdirSync(dest, true);
     const archiveTmpRoot = tmpRoot("archive");
     cottontail.mkdirSync(archiveTmpRoot, true);
     const tarPath = pathJoin(archiveTmpRoot, `archive-${Date.now()}-${Math.floor(Math.random() * 1000000)}.tar`);
-    cottontail.writeFile(tarPath, this._bytes);
+    cottontail.writeFile(tarPath, bytes);
     const result = cottontail.spawnSync("tar", ["-xf", tarPath, "-C", dest], { stdio: "pipe" });
     cottontail.unlinkSync(tarPath);
     if (result.status !== 0) {
       throw new Error(result.stderr || result.stdout || `tar extraction failed with status ${result.status}`);
     }
+    return this._parseFiles().size;
   }
   async bytes() {
-    return arrayBufferFromBytes(this._bytes);
+    return new Uint8Array(await this._ensureBytes());
+  }
+  async blob() {
+    return new Blob([await this.bytes()], { type: this._options.compress === "gzip" ? "application/gzip" : "application/x-tar" });
   }
 }
 
@@ -1351,7 +1694,10 @@ export const stdout = globalThis.process?.stdout;
 export const stderr = globalThis.process?.stderr;
 export const SQL = SQLiteDatabase;
 export const sql = SQLiteDatabase;
-export const jest = bunJest;
+export function jest(_source = undefined) {
+  return bunTestModule.default ?? bunTestModule;
+}
+Object.assign(jest, bunJest);
 
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Number(ms)));
@@ -1366,13 +1712,23 @@ export function nanoseconds() {
 }
 
 export function gc() {
-  globalThis.gc?.();
+  cottontail.gc?.();
   cottontail.drainJobs?.();
 }
 
 export function inspect(value, options = undefined) {
   return nodeInspect(value, options);
 }
+
+inspect.table = function table(value, properties = undefined, options = undefined) {
+  if (arguments.length === 0 || value == null) return "";
+  if (typeof value !== "object" && typeof value !== "function") return "";
+  const selected = Array.isArray(properties)
+    ? Object.fromEntries(Array.from(properties).map((key) => [key, value?.[key]]))
+    : value;
+  const tableOptions = Array.isArray(properties) ? options : properties;
+  return nodeInspect(selected, tableOptions);
+};
 
 export function deepEquals(left, right) {
   return isDeepStrictEqual(left, right);
@@ -1652,35 +2008,131 @@ export const YAML = {
 };
 
 export class Cookie {
-  constructor(name, value, options = {}) {
+  constructor(name, value = undefined, options = {}) {
+    if (name && typeof name === "object" && !(name instanceof String)) {
+      options = name;
+      name = options.name;
+      value = options.value;
+    }
     this.name = String(name);
-    this.value = String(value);
-    Object.assign(this, options);
+    this.value = String(value ?? "");
+    this.path = options.path == null ? "/" : String(options.path).trim().replace(/^"|"$/g, "");
+    this.domain = options.domain == null || options.domain === "" ? null : String(options.domain).trim().replace(/^"|"$/g, "");
+    this.secure = Boolean(options.secure);
+    this.httpOnly = Boolean(options.httpOnly);
+    this.partitioned = Boolean(options.partitioned);
+    this.sameSite = String(options.sameSite ?? "lax").toLowerCase();
+    if (options.maxAge != null) this.maxAge = Number(options.maxAge);
+    const expires = normalizeCookieExpires(options.expires);
+    if (expires !== undefined) this.expires = expires;
   }
   static parse(text) {
-    const [pair] = String(text).split(";");
-    const [name, value = ""] = pair.split("=");
-    return new Cookie(name.trim(), value.trim());
+    const parts = String(text).split(";");
+    const first = parts.shift() ?? "";
+    const eq = first.indexOf("=");
+    const name = eq >= 0 ? first.slice(0, eq) : first;
+    const value = eq >= 0 ? first.slice(eq + 1) : "";
+    const options = {};
+    for (const raw of parts) {
+      const part = raw.trim();
+      if (!part) continue;
+      const attrEq = part.indexOf("=");
+      const key = (attrEq >= 0 ? part.slice(0, attrEq) : part).trim().toLowerCase();
+      const attrValue = attrEq >= 0 ? part.slice(attrEq + 1).trim().replace(/^"|"$/g, "") : "";
+      if (key === "domain") options.domain = attrValue;
+      else if (key === "path") options.path = attrValue;
+      else if (key === "max-age") options.maxAge = Number(attrValue);
+      else if (key === "expires") options.expires = new Date(attrValue);
+      else if (key === "secure") options.secure = true;
+      else if (key === "httponly") options.httpOnly = true;
+      else if (key === "partitioned") options.partitioned = true;
+      else if (key === "samesite") options.sameSite = attrValue;
+    }
+    return new Cookie(name.trim(), value.trim(), options);
   }
-  static from(value) {
-    return value instanceof Cookie ? value : Cookie.parse(value);
+  static from(name, value = undefined, options = {}) {
+    if (name instanceof Cookie) return name;
+    if (value === undefined && typeof name === "string" && String(name).includes("=")) return Cookie.parse(name);
+    return new Cookie(name, value, options);
+  }
+  isExpired() {
+    if (this.maxAge != null) return Number(this.maxAge) <= 0;
+    return this.expires instanceof Date && this.expires.getTime() <= Date.now();
+  }
+  serialize() {
+    const parts = [`${this.name}=${this.value}`];
+    if (this.domain) parts.push(`Domain=${this.domain}`);
+    if (this.path != null) parts.push(`Path=${this.path}`);
+    if (this.expires instanceof Date) parts.push(`Expires=${formatCookieDate(this.expires)}`);
+    if (this.maxAge != null) parts.push(`Max-Age=${Math.trunc(Number(this.maxAge))}`);
+    if (this.secure) parts.push("Secure");
+    if (this.httpOnly) parts.push("HttpOnly");
+    if (this.partitioned) parts.push("Partitioned");
+    if (this.sameSite) parts.push(`SameSite=${this.sameSite[0].toUpperCase()}${this.sameSite.slice(1).toLowerCase()}`);
+    return parts.join("; ");
   }
   toString() {
-    return `${this.name}=${this.value}`;
+    return this.serialize();
   }
+}
+
+function normalizeCookieExpires(value) {
+  if (value == null) return undefined;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw new TypeError("expires must be a valid Date (or Number)");
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("expires must be a valid Number");
+    return new Date(value * 1000);
+  }
+  if (typeof value === "string") {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) throw new TypeError("Invalid cookie expiration date");
+    return date;
+  }
+  throw new TypeError(`The argument 'expires' Invalid expires value. Must be a Date or a number. Received ${nodeInspect(value)}`);
+}
+
+function formatCookieDate(date) {
+  if (date.getTime() === 0) return "Fri, 1 Jan 1970 00:00:00 -0000";
+  return date.toUTCString();
 }
 
 export class CookieMap extends Map {
   constructor(init = undefined) {
     super();
+    this._changes = [];
     if (typeof init === "string") {
       for (const part of init.split(";")) {
-        const [name, value = ""] = part.trim().split("=");
-        if (name) this.set(name, value);
+        const trimmed = part.trim();
+        const eq = trimmed.indexOf("=");
+        const name = eq >= 0 ? trimmed.slice(0, eq).trim() : trimmed;
+        const value = eq >= 0 ? trimmed.slice(eq + 1).trim() : "";
+        if (name) Map.prototype.set.call(this, name, value);
       }
-    } else if (init) {
-      for (const [key, value] of Object.entries(init)) this.set(key, value);
+    } else if (Array.isArray(init) || (init && typeof init[Symbol.iterator] === "function")) {
+      for (const [key, value] of init) Map.prototype.set.call(this, String(key), String(value));
+    } else if (init && typeof init === "object") {
+      for (const [key, value] of Object.entries(init)) Map.prototype.set.call(this, key, String(value));
     }
+  }
+  set(name, value = undefined, options = {}) {
+    const cookie = name instanceof Cookie ? name : new Cookie(name, value, options);
+    Map.prototype.set.call(this, cookie.name, cookie.value);
+    this._changes.push(cookie);
+    return this;
+  }
+  get(name) {
+    return super.has(name) ? super.get(name) : null;
+  }
+  delete(name) {
+    const existed = super.delete(name);
+    this._changes.push(new Cookie(name, "", { expires: 0 }));
+    return existed;
+  }
+  toSetCookieHeaders() {
+    return this._changes.map((cookie) => cookie.serialize());
   }
   toString() {
     return [...this].map(([key, value]) => `${key}=${value}`).join("; ");
@@ -1806,6 +2258,12 @@ process.stdout.write(transpiler.transformSync(source));
   }
 }
 
+export class HTMLRewriter {
+  on() { return this; }
+  onDocument() { return this; }
+  transform(response) { return response; }
+}
+
 export class FileSystemRouter {
   constructor(options = {}) {
     this.options = options;
@@ -1856,20 +2314,97 @@ export const postgres = null;
 export const s3 = null;
 export const secrets = {};
 export const password = {};
+
+function parseSemverParts(value) {
+  return String(value)
+    .trim()
+    .replace(/^[^\d]*/, "")
+    .split(/[+-]/, 1)[0]
+    .split(".")
+    .map((part) => {
+      const match = String(part).match(/^\d+/);
+      return match ? Number(match[0]) : 0;
+    });
+}
+
+function compareSemver(left, right) {
+  const a = parseSemverParts(left);
+  const b = parseSemverParts(right);
+  for (let index = 0; index < Math.max(a.length, b.length, 3); index += 1) {
+    const diff = (a[index] || 0) - (b[index] || 0);
+    if (diff !== 0) return Math.sign(diff);
+  }
+  return 0;
+}
+
+function semverComparatorSatisfies(version, comparator) {
+  const text = String(comparator).trim();
+  if (!text || text === "*" || text.toLowerCase() === "x") return true;
+  const match = text.match(/^(<=|>=|<|>|=|==|!=|~\s*|\^\s*)?\s*([^\s]+)$/);
+  if (!match) return false;
+  const operator = (match[1] || "=").trim();
+  const target = match[2];
+  const order = compareSemver(version, target);
+  if (operator === "<") return order < 0;
+  if (operator === "<=") return order <= 0;
+  if (operator === ">") return order > 0;
+  if (operator === ">=") return order >= 0;
+  if (operator === "!=") return order !== 0;
+  if (operator === "^") {
+    const current = parseSemverParts(version);
+    const base = parseSemverParts(target);
+    const upper = [...base];
+    const majorIndex = base.findIndex((part) => part > 0);
+    const bumpIndex = majorIndex < 0 ? 0 : majorIndex;
+    upper[bumpIndex] = (upper[bumpIndex] || 0) + 1;
+    for (let index = bumpIndex + 1; index < Math.max(upper.length, 3); index += 1) upper[index] = 0;
+    return compareSemver(current.join("."), base.join(".")) >= 0 && compareSemver(current.join("."), upper.join(".")) < 0;
+  }
+  if (operator === "~") {
+    const base = parseSemverParts(target);
+    const upper = [...base];
+    const bumpIndex = base.length > 1 ? 1 : 0;
+    upper[bumpIndex] = (upper[bumpIndex] || 0) + 1;
+    for (let index = bumpIndex + 1; index < Math.max(upper.length, 3); index += 1) upper[index] = 0;
+    return compareSemver(version, base.join(".")) >= 0 && compareSemver(version, upper.join(".")) < 0;
+  }
+  return order === 0;
+}
+
+function semverComparators(range) {
+  const tokens = String(range).trim().split(/\s+/).filter(Boolean);
+  const comparators = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (/^(?:<=|>=|<|>|=|==|!=|\^|~)$/.test(tokens[index]) && index + 1 < tokens.length) {
+      comparators.push(`${tokens[index]}${tokens[index + 1]}`);
+      index += 1;
+    } else {
+      comparators.push(tokens[index]);
+    }
+  }
+  return comparators;
+}
+
 export const semver = {
   order(left, right) {
-    const a = String(left).split(".").map(Number);
-    const b = String(right).split(".").map(Number);
-    for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
-      const diff = (a[index] || 0) - (b[index] || 0);
-      if (diff !== 0) return Math.sign(diff);
-    }
-    return 0;
+    return compareSemver(left, right);
+  },
+  satisfies(version, range) {
+    return String(range)
+      .split("||")
+      .some((part) => semverComparators(part).every((comparator) => semverComparatorSatisfies(version, comparator)));
   },
 };
 export const markdown = {};
 export const embeddedFiles = [];
-export const unsafe = {};
+let gcAggressionLevelValue = 0;
+export const unsafe = {
+  gcAggressionLevel(value = undefined) {
+    const previous = gcAggressionLevelValue;
+    if (value !== undefined) gcAggressionLevelValue = Number(value) || 0;
+    return previous;
+  },
+};
 export const CSRF = {};
 
 const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
@@ -2059,6 +2594,48 @@ class CottontailEvent {
     return "Event";
   }
 }
+
+class CottontailCustomEvent extends CottontailEvent {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.detail = init.detail ?? null;
+  }
+}
+
+class CottontailErrorEvent extends CottontailEvent {
+  constructor(type = "error", init = {}) {
+    super(type, init);
+    this.message = String(init.message ?? "");
+    this.filename = String(init.filename ?? "");
+    this.lineno = Number(init.lineno ?? 0);
+    this.colno = Number(init.colno ?? 0);
+    this.error = init.error;
+  }
+}
+
+class CottontailCloseEvent extends CottontailEvent {
+  constructor(type = "close", init = {}) {
+    super(type, init);
+    this.wasClean = Boolean(init.wasClean);
+    this.code = Number(init.code ?? 0);
+    this.reason = String(init.reason ?? "");
+  }
+}
+
+class CottontailFile extends Blob {
+  constructor(parts, name, options = {}) {
+    if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
+    if (parts == null || typeof parts[Symbol.iterator] !== "function") throw new TypeError("File bits must be iterable");
+    super(parts, options);
+    this.name = String(name);
+    this.lastModified = Number(options.lastModified ?? Date.now());
+  }
+}
+
+Object.defineProperty(CottontailCustomEvent, "name", { value: "CustomEvent", configurable: true });
+Object.defineProperty(CottontailErrorEvent, "name", { value: "ErrorEvent", configurable: true });
+Object.defineProperty(CottontailCloseEvent, "name", { value: "CloseEvent", configurable: true });
+Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
 
 class CottontailEventTarget {
   constructor() {
@@ -2426,6 +3003,7 @@ BunObject.CryptoHasher = CryptoHasher;
 BunObject.FFI = FFI;
 BunObject.FileSystemRouter = FileSystemRouter;
 BunObject.Glob = Glob;
+BunObject.HTMLRewriter = HTMLRewriter;
 BunObject.JSON5 = JSON5;
 BunObject.JSONC = JSONC;
 BunObject.JSONL = JSONL;
@@ -2527,16 +3105,53 @@ BunObject.zstdDecompressSync = zstdDecompressSync;
 const CryptoObject = globalThis.crypto ?? {};
 CryptoObject.randomUUID ??= randomUUID;
 CryptoObject.getRandomValues ??= getRandomValues;
+CryptoObject.subtle ??= nodeWebcrypto.subtle;
 globalThis.crypto = CryptoObject;
+globalThis.CryptoKey ??= CryptoKey;
 globalThis.DOMException ??= CottontailDOMException;
 globalThis.Event ??= CottontailEvent;
 globalThis.EventTarget ??= CottontailEventTarget;
+globalThis.CustomEvent ??= CottontailCustomEvent;
+globalThis.ErrorEvent ??= CottontailErrorEvent;
+globalThis.CloseEvent ??= CottontailCloseEvent;
+globalThis.File = CottontailFile;
 globalThis.AbortSignal ??= CottontailAbortSignal;
 globalThis.AbortController ??= CottontailAbortController;
 globalThis.structuredClone ??= cottontailStructuredClone;
 globalThis.fetch ??= fetch;
+for (const [ctor, name] of [
+  [globalThis.Blob, "Blob"],
+  [globalThis.TextDecoder, "TextDecoder"],
+  [globalThis.TextEncoder, "TextEncoder"],
+  [Request, "Request"],
+  [Response, "Response"],
+  [Headers, "Headers"],
+  [HTMLRewriter, "HTMLRewriter"],
+  [Transpiler, "Transpiler"],
+  [globalThis.Buffer, "Buffer"],
+  [globalThis.File, "File"],
+]) {
+  if (typeof ctor === "function") Object.defineProperty(ctor, "name", { value: name, configurable: true });
+}
 globalThis.Bun = BunObject;
+globalThis.HTMLRewriter ??= HTMLRewriter;
+globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cottontail.cwd());
+globalThis.__cottontailImportMetaResolveSync ??= (specifier, parent = globalThis.__cottontailImportMeta?.path ?? cottontail.cwd()) =>
+  resolveSync(specifier, parent);
+globalThis.__cottontailImportMetaResolve ??= (specifier, parent = globalThis.__cottontailImportMeta?.path ?? cottontail.cwd()) => {
+  const resolved = resolveSync(specifier, parent);
+  return String(resolved).startsWith("/") ? pathToFileURL(resolved).href : resolved;
+};
+globalThis.test ??= bunTestModule.test;
+globalThis.it ??= bunTestModule.it;
+globalThis.describe ??= bunTestModule.describe;
+globalThis.expect ??= bunTestModule.expect;
+globalThis.beforeAll ??= bunTestModule.beforeAll;
+globalThis.afterAll ??= bunTestModule.afterAll;
+globalThis.beforeEach ??= bunTestModule.beforeEach;
+globalThis.afterEach ??= bunTestModule.afterEach;
 globalThis.Headers ??= Headers;
+globalThis.FormData ??= FormData;
 globalThis.Request ??= Request;
 globalThis.Response ??= Response;
 globalThis.URL ??= URL;

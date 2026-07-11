@@ -9580,6 +9580,62 @@
         ],
         "hasDefaultExport": true
       },
+      "internal/assert/myers_diff": {
+        "file": "src/runtime_modules/node/internal/assert/myers_diff.js",
+        "exports": [
+          "myersDiff"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:internal/assert/myers_diff": {
+        "file": "src/runtime_modules/node/internal/assert/myers_diff.js",
+        "exports": [
+          "myersDiff"
+        ],
+        "hasDefaultExport": true
+      },
+      "internal/async_hooks": {
+        "file": "src/runtime_modules/node/internal/async_hooks.js",
+        "exports": [
+          "symbols"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:internal/async_hooks": {
+        "file": "src/runtime_modules/node/internal/async_hooks.js",
+        "exports": [
+          "symbols"
+        ],
+        "hasDefaultExport": true
+      },
+      "internal/event_target": {
+        "file": "src/runtime_modules/node/internal/event_target.js",
+        "exports": [
+          "kWeakHandler"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:internal/event_target": {
+        "file": "src/runtime_modules/node/internal/event_target.js",
+        "exports": [
+          "kWeakHandler"
+        ],
+        "hasDefaultExport": true
+      },
+      "internal/test/binding": {
+        "file": "src/runtime_modules/node/internal/test/binding.js",
+        "exports": [
+          "internalBinding"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:internal/test/binding": {
+        "file": "src/runtime_modules/node/internal/test/binding.js",
+        "exports": [
+          "internalBinding"
+        ],
+        "hasDefaultExport": true
+      },
       "module": {
         "file": "src/runtime_modules/node/module.js",
         "exports": [
@@ -11917,12 +11973,18 @@
           "zstdDecompressSync"
         ],
         "globalProperties": [
+          "AbortController",
+          "AbortSignal",
           "Bun",
           "crypto",
+          "DOMException",
+          "Event",
+          "EventTarget",
           "fetch",
           "Headers",
           "Request",
           "Response",
+          "structuredClone",
           "URL"
         ]
       },
@@ -12104,7 +12166,10 @@
           "triggerAsyncId"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailSuppressAsyncHookPromise",
+          "__ctError"
+        ]
       },
       "src/runtime_modules/node/buffer.js": {
         "file": "src/runtime_modules/node/buffer.js",
@@ -12958,6 +13023,42 @@
           "Session",
           "url",
           "waitForDebugger"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/internal/assert/myers_diff.js": {
+        "file": "src/runtime_modules/node/internal/assert/myers_diff.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "myersDiff"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/internal/async_hooks.js": {
+        "file": "src/runtime_modules/node/internal/async_hooks.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "symbols"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/internal/event_target.js": {
+        "file": "src/runtime_modules/node/internal/event_target.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "kWeakHandler"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/internal/test/binding.js": {
+        "file": "src/runtime_modules/node/internal/test/binding.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "internalBinding"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -13821,13 +13922,18 @@
           "__cottontailDecodeWorkerMessage",
           "__cottontailEncodeWorkerMessage",
           "__cottontailEnvironmentData",
+          "__cottontailHasActiveHandles",
           "__cottontailWorkerData",
           "__cottontailWorkerResourceLimits",
           "__cottontailWorkerThreadName",
+          "clearImmediate",
           "MessageChannel",
           "MessagePort",
+          "onmessage",
           "parentPort",
+          "process",
           "require",
+          "setImmediate",
           "workerData"
         ]
       },
@@ -14231,12 +14337,17 @@
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
+      "__cottontailHasActiveHandles",
       "__cottontailImportModule",
       "__cottontailProxyRegistry",
+      "__cottontailSuppressAsyncHookPromise",
       "__cottontailTlsListeners",
       "__cottontailWorkerData",
       "__cottontailWorkerResourceLimits",
       "__cottontailWorkerThreadName",
+      "__ctError",
+      "AbortController",
+      "AbortSignal",
       "Bun",
       "cancelAnimationFrame",
       "clearImmediate",
@@ -14244,10 +14355,14 @@
       "clearTimeout",
       "crypto",
       "Date",
+      "DOMException",
+      "Event",
+      "EventTarget",
       "fetch",
       "Headers",
       "MessageChannel",
       "MessagePort",
+      "onmessage",
       "parentPort",
       "process",
       "Proxy",
@@ -14259,6 +14374,7 @@
       "setImmediate",
       "setInterval",
       "setTimeout",
+      "structuredClone",
       "URL",
       "workerData"
     ]

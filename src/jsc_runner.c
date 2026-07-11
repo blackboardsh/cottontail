@@ -5985,11 +5985,39 @@ static JSValueRef ct_udp_socket_send(JSContextRef ctx, JSObjectRef function, JSO
     }
     free(address);
     ssize_t sent = sendto(fd, data, data_len, 0, (struct sockaddr *)&storage, storage_len);
+    if (sent < 0 && errno == EISCONN) {
+        sent = send(fd, data, data_len, 0);
+    }
     if (sent < 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
     return JSValueMakeNumber(ctx, (double)sent);
+}
+
+static JSValueRef ct_udp_socket_connect(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "udpSocketConnect(fd, port, address, family) requires fd, port, address, and family");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int port = (int)ct_value_to_number(ctx, argv[1]);
+    char *address = ct_value_to_optional_string(ctx, argv[2]);
+    int family = ct_udp_family_from_arg(ctx, argv[3]);
+    struct sockaddr_storage storage;
+    socklen_t storage_len = 0;
+    if (ct_udp_resolve_address(ctx, address, port, family, &storage, &storage_len, exception) != 0) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(address);
+    if (connect(fd, (struct sockaddr *)&storage, storage_len) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -6296,7 +6324,12 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    int port = (int)ct_value_to_number(ctx, argv[0]);
+    double port_number = ct_value_to_number(ctx, argv[0]);
+    if (!isfinite(port_number) || port_number < 0 || port_number > 65535) {
+        ct_throw_message(ctx, exception, "tcpServerListen(port, address[, family]) requires a valid port");
+        return JSValueMakeUndefined(ctx);
+    }
+    int port = (int)port_number;
     char *address = ct_value_to_optional_string(ctx, argv[1]);
     int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_INET;
 
@@ -6368,7 +6401,12 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
     signal(SIGPIPE, SIG_IGN);
-    int port = (int)ct_value_to_number(ctx, argv[0]);
+    double port_number = ct_value_to_number(ctx, argv[0]);
+    if (!isfinite(port_number) || port_number < 0 || port_number > 65535) {
+        ct_throw_message(ctx, exception, "tcpSocketConnect(port, address[, family]) requires a valid port");
+        return JSValueMakeUndefined(ctx);
+    }
+    int port = (int)port_number;
     char *address = ct_value_to_optional_string(ctx, argv[1]);
     int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_INET;
 
@@ -8042,6 +8080,7 @@ static int ct_value_to_u64(JSContextRef ctx, JSValueRef value, uint64_t *out) {
     JSValueRef exception = NULL;
     double number = JSValueToNumber(ctx, value, &exception);
     if (exception == NULL) {
+        if (!isfinite(number) || number < 0) return -1;
         *out = (uint64_t)number;
         return 0;
     }
@@ -11939,6 +11978,8 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
     addr.sin_port = htons((uint16_t)port_value);
     if (strcmp(hostname, "0.0.0.0") == 0) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (strcmp(hostname, "localhost") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     } else if (inet_pton(AF_INET, hostname, &addr.sin_addr) != 1) {
         close(listen_fd);
         free(hostname_arg);
@@ -12341,6 +12382,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "udpSocketBind", ct_udp_socket_bind, runtime);
     ct_install_function(ctx, host, "udpSocketAddress", ct_udp_socket_address, runtime);
     ct_install_function(ctx, host, "udpSocketSend", ct_udp_socket_send, runtime);
+    ct_install_function(ctx, host, "udpSocketConnect", ct_udp_socket_connect, runtime);
     ct_install_function(ctx, host, "udpSocketReceive", ct_udp_socket_receive, runtime);
     ct_install_function(ctx, host, "udpSocketClose", ct_udp_socket_close, runtime);
     ct_install_function(ctx, host, "udpSocketSetBroadcast", ct_udp_socket_set_broadcast, runtime);
@@ -12726,7 +12768,24 @@ static bool ct_append_rewritten_dynamic_imports(
     while (cursor < end) {
         const char *import_start = NULL;
         const char *open_paren = NULL;
+        char scan_quote = 0;
+        bool scan_escaped = false;
         for (const char *scan = cursor; scan + 6 <= end; scan += 1) {
+            char ch = *scan;
+            if (scan_escaped) {
+                scan_escaped = false;
+                continue;
+            }
+            if (scan_quote != 0) {
+                if (ch == '\\') scan_escaped = true;
+                else if (ch == scan_quote) scan_quote = 0;
+                continue;
+            }
+            if (ch == '"' || ch == '\'' || ch == '`') {
+                scan_quote = ch;
+                continue;
+            }
+            if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
             if (strncmp(scan, "import", 6) != 0) continue;
             if (scan > line && ct_is_js_identifier_char(scan[-1])) continue;
             if (scan + 6 < end && ct_is_js_identifier_char(scan[6])) continue;
@@ -12845,8 +12904,8 @@ static bool ct_append_rewritten_import_meta(
 ) {
     const char *cursor = line;
     const char *end = line + line_len;
-    const char *meta_prefix = "import.meta.";
-    size_t meta_prefix_len = strlen(meta_prefix);
+    const char *meta_token = "import.meta";
+    size_t meta_token_len = strlen(meta_token);
     char *dirname = ct_path_dirname(filename);
     char *basename = ct_path_basename_copy(filename);
     char *file_url = ct_file_url_for_path(filename);
@@ -12859,8 +12918,27 @@ static bool ct_append_rewritten_import_meta(
 
     while (cursor < end) {
         const char *found = NULL;
-        for (const char *scan = cursor; scan + meta_prefix_len <= end; scan += 1) {
-            if (strncmp(scan, meta_prefix, meta_prefix_len) == 0) {
+        char scan_quote = 0;
+        bool scan_escaped = false;
+        for (const char *scan = cursor; scan + meta_token_len <= end; scan += 1) {
+            char ch = *scan;
+            if (scan_escaped) {
+                scan_escaped = false;
+                continue;
+            }
+            if (scan_quote != 0) {
+                if (ch == '\\') scan_escaped = true;
+                else if (ch == scan_quote) scan_quote = 0;
+                continue;
+            }
+            if (ch == '"' || ch == '\'' || ch == '`') {
+                scan_quote = ch;
+                continue;
+            }
+            if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
+            if (strncmp(scan, meta_token, meta_token_len) == 0 &&
+                (scan == line || !ct_is_js_identifier_char(scan[-1])) &&
+                (scan + meta_token_len == end || !ct_is_js_identifier_char(scan[meta_token_len]))) {
                 found = scan;
                 break;
             }
@@ -12880,7 +12958,19 @@ static bool ct_append_rewritten_import_meta(
             return false;
         }
 
-        const char *property_start = found + meta_prefix_len;
+        const char *after_meta = found + meta_token_len;
+        if (after_meta >= end || *after_meta != '.') {
+            if (!ct_sb_append_cstr(builder, "globalThis.__cottontailImportMeta")) {
+                free(dirname);
+                free(basename);
+                free(file_url);
+                return false;
+            }
+            cursor = after_meta;
+            continue;
+        }
+
+        const char *property_start = after_meta + 1;
         const char *after = NULL;
         if (ct_match_import_meta_property(property_start, end, "dirname", &after) ||
             ct_match_import_meta_property(property_start, end, "dir", &after)) {
@@ -12924,8 +13014,32 @@ static bool ct_append_rewritten_import_meta(
                 return false;
             }
             cursor = after;
+        } else if (ct_match_import_meta_property(property_start, end, "require", &after)) {
+            if (!ct_sb_append_cstr(builder, "globalThis.require")) {
+                free(dirname);
+                free(basename);
+                free(file_url);
+                return false;
+            }
+            cursor = after;
+        } else if (ct_match_import_meta_property(property_start, end, "resolveSync", &after)) {
+            if (!ct_sb_append_cstr(builder, "globalThis.__cottontailImportMetaResolveSync")) {
+                free(dirname);
+                free(basename);
+                free(file_url);
+                return false;
+            }
+            cursor = after;
+        } else if (ct_match_import_meta_property(property_start, end, "resolve", &after)) {
+            if (!ct_sb_append_cstr(builder, "globalThis.__cottontailImportMetaResolve")) {
+                free(dirname);
+                free(basename);
+                free(file_url);
+                return false;
+            }
+            cursor = after;
         } else {
-            if (!ct_sb_append_bytes(builder, found, meta_prefix_len)) {
+            if (!ct_sb_append_cstr(builder, "globalThis.__cottontailImportMeta.")) {
                 free(dirname);
                 free(basename);
                 free(file_url);
@@ -12941,6 +13055,41 @@ static bool ct_append_rewritten_import_meta(
     return true;
 }
 
+static bool ct_append_import_meta_setup(CtStringBuilder *builder, const char *filename) {
+    char *dirname = ct_path_dirname(filename);
+    char *basename = ct_path_basename_copy(filename);
+    char *file_url = ct_file_url_for_path(filename);
+    if (dirname == NULL || basename == NULL || file_url == NULL) {
+        free(dirname);
+        free(basename);
+        free(file_url);
+        return false;
+    }
+
+    bool ok =
+        ct_sb_append_cstr(builder, "globalThis.__cottontailImportMeta={dirname:") &&
+        ct_sb_append_js_string_literal(builder, dirname) &&
+        ct_sb_append_cstr(builder, ",dir:") &&
+        ct_sb_append_js_string_literal(builder, dirname) &&
+        ct_sb_append_cstr(builder, ",filename:") &&
+        ct_sb_append_js_string_literal(builder, filename != NULL ? filename : "") &&
+        ct_sb_append_cstr(builder, ",path:") &&
+        ct_sb_append_js_string_literal(builder, filename != NULL ? filename : "") &&
+        ct_sb_append_cstr(builder, ",file:") &&
+        ct_sb_append_js_string_literal(builder, basename) &&
+        ct_sb_append_cstr(builder, ",url:") &&
+        ct_sb_append_js_string_literal(builder, file_url) &&
+        ct_sb_append_cstr(builder, ",main:true};") &&
+        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"require\",{get(){return globalThis.require},set(v){globalThis.require=v},configurable:true});") &&
+        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"resolve\",{get(){return globalThis.__cottontailImportMetaResolve},configurable:true});") &&
+        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"resolveSync\",{get(){return globalThis.__cottontailImportMetaResolveSync},configurable:true});");
+
+    free(dirname);
+    free(basename);
+    free(file_url);
+    return ok;
+}
+
 static char *ct_prepare_source_with_wrappers(
     const uint8_t *source,
     size_t source_len,
@@ -12952,6 +13101,10 @@ static char *ct_prepare_source_with_wrappers(
     size_t suffix_len = strlen(suffix);
     CtStringBuilder builder;
     if (!ct_sb_init(&builder, prefix_len + source_len + suffix_len + 1)) return NULL;
+    if (!ct_append_import_meta_setup(&builder, filename)) {
+        free(builder.data);
+        return NULL;
+    }
     if (!ct_sb_append_bytes(&builder, prefix, prefix_len)) {
         free(builder.data);
         return NULL;

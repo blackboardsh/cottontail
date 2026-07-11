@@ -1,6 +1,38 @@
 {
   "schema": 1,
   "defaultStatus": "not-enabled",
+  "patterns": [
+    {
+      "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "enabled",
+      "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
+    },
+    {
+      "pattern": "^test/js/bun/shell/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "expected-failure",
+      "reason": "Bun shell parser/runtime conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
+    },
+    {
+      "pattern": "^test/js/bun/spawn/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "expected-failure",
+      "reason": "Bun.spawn conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
+    },
+    {
+      "pattern": "^test/js/bun/sqlite/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "expected-failure",
+      "reason": "Bun.sqlite conformance needs a dedicated implementation pass."
+    },
+    {
+      "pattern": "^test/js/bun/test/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "expected-failure",
+      "reason": "Bun test-runner conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
+    },
+    {
+      "pattern": "^test/js/bun/util/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
+      "status": "expected-failure",
+      "reason": "Bun utility API conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
+    }
+  ],
   "tests": {
     "test/js/bun/empty-file.test.ts": {
       "status": "enabled",
@@ -10,9 +42,661 @@
       "status": "expected-failure",
       "reason": "Requires npm dependency resolution for string-width from Bun's test package dependencies."
     },
+    "test/js/bun/util/arraybuffersink.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.ArrayBufferSink smoke test passes under Cottontail's current implementation."
+    },
+    "test/js/bun/wasm/wasi.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible WASM import loader and WASI execution behavior."
+    },
+    "test/js/bun/websocket/websocket-server.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun WebSocket server fixture execution and lifecycle behavior."
+    },
+    "test/js/bun/yaml/yaml-test-suite.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.YAML parser conformance against the upstream YAML test suite."
+    },
+    "test/js/bun/yaml/yaml.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.YAML scalar/type parsing semantics."
+    },
     "test/js/bun/test/mock-fn.test.js": {
       "status": "expected-failure",
       "reason": "Bun test interop imports vitest, jest-extended, and @jest/globals through upstream fixtures; runner needs dependency/bootstrap support."
+    },
+    "test/js/bun/test/ci-restrictions.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test runner CI restriction smoke test passes under Cottontail's current bun:test shim."
+    },
+    "test/js/bun/archive.test.ts": {
+      "status": "expected-failure",
+      "reason": "Bun.Archive object/blob creation mostly works, but the full upstream file includes internal tar security extraction/filtering semantics that system tar rejects."
+    },
+    "test/js/bun/console/console-iterator.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.spawnSync stdin input passthrough plus console async-iterator behavior in spawned children."
+    },
+    "test/js/bun/console/console-table.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's exact console.table box-drawing renderer rather than Cottontail's current inspect-based fallback."
+    },
+    "test/js/bun/cookie/cookie.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve request cookie mutation/Set-Cookie behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/cookie/cookie-exotic-inputs.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Cookie parser edge-case compatibility for exotic whitespace, attributes, and expiration formats."
+    },
+    "test/js/bun/cookie/cookie-expires-validation.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun.Cookie expiration validation and error formatting across non-Date/non-number inputs."
+    },
+    "test/js/bun/cookie/cookie-map.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.CookieMap mutation/snapshot serialization semantics beyond the current core implementation."
+    },
+    "test/js/bun/cookie/cookie-security-fuzz.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Cookie security parser parity for fuzzed quoted values, delimiters, and injection-like inputs."
+    },
+    "test/js/bun/crypto/wpt-webcrypto.generateKey.test.ts": {
+      "status": "expected-failure",
+      "reason": "Large WPT-derived WebCrypto generateKey conformance file exceeds current direct-runner timeout and needs deeper WebCrypto validation."
+    },
+    "test/js/bun/css/css.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's real cssInternals parser/minifier implementation from bun:internal-for-testing."
+    },
+    "test/js/bun/css/color.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's real cssInternals color parser/serializer implementation from bun:internal-for-testing."
+    },
+    "test/js/bun/css/css-fuzz.test.ts": {
+      "status": "expected-failure",
+      "reason": "Long-running CSS fuzz coverage currently exceeds the direct upstream runner timeout under Cottontail."
+    },
+    "test/js/bun/css/doesnt_crash.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.build CSS parser/minifier parity across the upstream CSS fixture corpus."
+    },
+    "test/js/bun/dns/dns-prefetch.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.dns prefetch/cache statistics APIs that Cottontail does not implement yet."
+    },
+    "test/js/bun/dns/resolve-dns.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.dns promise-style lookup/resolve behavior with backend selection and TTL metadata."
+    },
+    "test/js/bun/ffi/cc.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream FFI compilation fixture support plus CommonJS __dirname semantics in the bundled direct runner."
+    },
+    "test/js/bun/ffi/ffi-error-messages.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun FFI dlopen/symbol error object shape and messages."
+    },
+    "test/js/bun/ffi/ffi.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires compiled upstream FFI fixtures from make compile-ffi-test and broader Bun FFI pointer/callback parity."
+    },
+    "test/js/bun/glob/scan.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependency fast-glob, which is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/glob/leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun Glob leak fixture setup and filesystem lifecycle behavior not present in the direct copied snapshot."
+    },
+    "test/js/bun/glob/match.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.Glob pattern grammar parity for extglobs, braces, and platform path edge cases."
+    },
+    "test/js/bun/glob/proto.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Glob scan symlink traversal/prototype option parity."
+    },
+    "test/js/bun/globals.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun/Web global constructor and File edge-case semantics beyond the current global polyfills."
+    },
+    "test/js/bun/http/async-iterator-stream.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve streaming body async-iterator behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-connect-x509.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible TLS certificate handling for connect/fetch paths; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-listen-connect-args.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.listen/Bun.connect argument validation and lifecycle behavior; currently times out in the broad direct runner."
+    },
+    "test/js/bun/http/bun-serve-args.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.serve option validation/listen behavior across host, TLS, and socket cases; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-serve-body-json-async.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.serve request body JSON streaming/parsing behavior."
+    },
+    "test/js/bun/http/bun-serve-cookies.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve request cookie mutation and Set-Cookie behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-serve-date.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.serve default Date header behavior."
+    },
+    "test/js/bun/http/bun-serve-file.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.file Blob slicing/range/static response behavior through Bun.serve."
+    },
+    "test/js/bun/http/bun-serve-headers.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.serve request/response header propagation semantics."
+    },
+    "test/js/bun/http/bun-serve-html-entry.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun HTML entry serving pipeline and disposable dev-server helpers."
+    },
+    "test/js/bun/http/bun-serve-html-manifest.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's HTML entry/manifest serving pipeline; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-serve-propagate-errors.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.serve error propagation behavior and upstream fixture runner path handling."
+    },
+    "test/js/bun/http/bun-serve-routes.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.serve route matching and route response behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-serve-ssl.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires real TLS support in Bun.serve; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-serve-static.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.serve static file/Blob response semantics; currently times out under Cottontail."
+    },
+    "test/js/bun/http/bun-server.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires fuller Bun.Server lifecycle and request handling behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/fetch-file-upload.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete multipart file upload/FormData behavior through Bun.serve; currently times out under Cottontail."
+    },
+    "test/js/bun/http/listener-getsockname.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires lower-level listener address/getsockname behavior that Cottontail's Bun.serve wrapper does not fully expose yet."
+    },
+    "test/js/bun/http/proxy.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires fuller HTTP proxy streaming behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/proxy.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependencies axios and https-proxy-agent, which are not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/http/req-url-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve request URL lifecycle behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/request-smuggling.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's hardened HTTP parser behavior for malformed/smuggled requests; currently times out under Cottontail."
+    },
+    "test/js/bun/http/serve-body-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve request body lifecycle behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/serve-if-none-match.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.serve static caching/ETag behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/http/serve-listen.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.serve listen support for TLS, IPv6, and Unix socket cases."
+    },
+    "test/js/bun/http/serve.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream React test dependency plus broad Bun.serve behavior not fully implemented in Cottontail yet."
+    },
+    "test/js/bun/http/tls-keepalive.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires real TLS keepalive support in Bun.serve/fetch; currently times out under Cottontail."
+    },
+    "test/js/bun/http/http-server-chunking.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete HTTP chunked transfer handling through Bun.serve; currently times out under Cottontail."
+    },
+    "test/js/bun/http/decodeURIComponentSIMD.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's decodeURIComponentSIMD percent-decoding edge semantics."
+    },
+    "test/js/bun/http/hspec.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's full low-level HTTP parser/server conformance behavior."
+    },
+    "test/js/bun/http/serve-direct-readable-stream.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.serve DirectReadableStream response behavior."
+    },
+    "test/js/bun/io/fetch/fetch-abort-slow-connect.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible fetch abort behavior for slow connection establishment; currently times out under Cottontail."
+    },
+    "test/js/bun/import-attributes/import-attributes.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun import-attributes loaders for text/file-style module imports."
+    },
+    "test/js/bun/ini/ini.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's INI parser/stringifier edge-case semantics."
+    },
+    "test/js/bun/io/bun-write-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.write leak fixture execution and runner argument compatibility."
+    },
+    "test/js/bun/io/bun-write.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.write data/source/path semantics across Blob, Response, file, and stream inputs."
+    },
+    "test/js/bun/jsc-stress/fixtures/simd-baseline.test.ts": {
+      "status": "expected-failure",
+      "reason": "JSC stress fixture is long-running under the direct upstream runner and currently exceeds the per-file timeout."
+    },
+    "test/js/bun/jsc-stress/jsc-stress.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's JSC stress-test harness behavior and currently exceeds the per-file timeout."
+    },
+    "test/js/bun/jsc/domjit.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun/JSC DOMJIT internals not exposed by Cottontail yet; currently times out under the direct runner."
+    },
+    "test/js/bun/jsc/bun-jsc.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's JSC introspection helpers and code coverage behavior."
+    },
+    "test/js/bun/jsc/shadow.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires ShadowRealm support exposed by Bun/JSC."
+    },
+    "test/js/bun/json5/json5-test-suite.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full JSON5 parser rejection/acceptance parity against the upstream JSON5 suite."
+    },
+    "test/js/bun/json5/json5.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.JSON5 parser/stringifier semantics."
+    },
+    "test/js/bun/jsonc/jsonc.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.JSONC parser/stringifier semantics."
+    },
+    "test/js/bun/jsonl/jsonl-parse.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.JSONL object branding and parser semantics."
+    },
+    "test/js/bun/md/gfm-compat.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.markdown.html/GFM renderer implementation."
+    },
+    "test/js/bun/md/md-heading-ids.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Markdown html renderer heading-id support."
+    },
+    "test/js/bun/md/md-render-callback.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Markdown render callback support."
+    },
+    "test/js/bun/md/md-spec.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Markdown CommonMark/spec rendering parity."
+    },
+    "test/js/bun/md/md-edge-cases.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream React DOM server dependency, which is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/md/md-react.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream React and React DOM server dependencies, which are not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/net/socket.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires fuller Bun TCP socket behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/net/tcp-server.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires fuller Bun TCP server behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/namespace-prototype-pollution.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun disposable namespace/module namespace object behavior."
+    },
+    "test/js/bun/patch/patch.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's bun:internal-for-testing patchInternals makeDiff/applyPatch implementation."
+    },
+    "test/js/bun/perf/static-initializers.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's static initializer/perf startup profile assumptions, which do not match Cottontail's linked dependencies yet."
+    },
+    "test/js/bun/perf_hooks/histogram.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete node:perf_hooks histogram semantics and precision parity."
+    },
+    "test/js/bun/plugin/plugins.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's plugin runtime plus upstream Svelte/virtual-module fixtures not available in Cottontail's copied snapshot yet."
+    },
+    "test/js/bun/repl/repl.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires interactive Bun REPL behavior; currently times out under the direct upstream runner."
+    },
+    "test/js/bun/resolve/build-error.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible bundler error handling for intentionally invalid fixtures; esbuild rejects the fixture before runtime."
+    },
+    "test/js/bun/resolve/bun-lock.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible bun.lock import loader behavior."
+    },
+    "test/js/bun/resolve/esModule-annotation.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun ESM/CommonJS __esModule namespace interop semantics."
+    },
+    "test/js/bun/resolve/esModule.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's ESM/CommonJS interop for requiring a module with top-level await; esbuild rejects this before runtime."
+    },
+    "test/js/bun/resolve/import-custom-condition.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun resolver support for --conditions/import custom package conditions."
+    },
+    "test/js/bun/resolve/import-empty.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun import-attribute loaders for file/html and dynamic type attributes that Cottontail's bundling path does not implement yet."
+    },
+    "test/js/bun/resolve/import-meta.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun import.meta fields and child-process propagation behavior."
+    },
+    "test/js/bun/resolve/import-query.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.Loader query-string import loader behavior."
+    },
+    "test/js/bun/resolve/json5/json5.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's json5 import loader and import attribute support; Cottontail's bundling path does not implement this yet."
+    },
+    "test/js/bun/resolve/jsonc.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's JSONC/package.json resolution behavior for empty JSON-with-comments fixtures."
+    },
+    "test/js/bun/resolve/load-file-loader-a-lot.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun file-loader import query behavior for many unique module specifiers."
+    },
+    "test/js/bun/resolve/load-same-js-file-a-lot.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun import-query cache semantics for repeated JS file imports."
+    },
+    "test/js/bun/resolve/non-english-import.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun disposable tempdir helpers and non-ASCII import path behavior."
+    },
+    "test/js/bun/resolve/png/test-png-import.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible asset/file loader behavior for PNG imports."
+    },
+    "test/js/bun/resolve/require.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun CommonJS require parser/runtime edge semantics for unusual fixture contents."
+    },
+    "test/js/bun/resolve/resolve-error.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible resolution errors for invalid dynamic imports; esbuild rejects the fixtures before runtime."
+    },
+    "test/js/bun/resolve/resolve-ts.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's TypeScript module resolution/execution behavior in spawned Cottontail processes."
+    },
+    "test/js/bun/resolve/resolve.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun resolver behavior for package imports and intentionally invalid dynamic imports that Cottontail's bundling path does not implement yet."
+    },
+    "test/js/bun/resolve/toml/toml.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's TOML import loader and import attribute support; Cottontail's bundling path does not implement this yet."
+    },
+    "test/js/bun/resolve/yaml/yaml.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's YAML import loader and import attribute support; Cottontail's bundling path does not implement this yet."
+    },
+    "test/js/bun/runtime-error.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream packages/bun-error fixture that is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/s3/s3-stream-cancel-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Long-running S3 stream cancellation leak coverage currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/s3/s3-insecure.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.S3Client file/object APIs beyond Cottontail's current S3 surface."
+    },
+    "test/js/bun/s3/s3-list-objects.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.S3Client list object APIs."
+    },
+    "test/js/bun/s3/s3-requester-pays.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.S3Client static file APIs and request-payer option support."
+    },
+    "test/js/bun/s3/s3-storage-class.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.S3Client static file APIs and storage-class option support."
+    },
+    "test/js/bun/secrets-error-codes.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.secrets keychain/credential-store APIs and platform error mapping."
+    },
+    "test/js/bun/secrets.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.secrets keychain/credential-store APIs."
+    },
+    "test/js/bun/shell/bunshell-default.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell default smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/dirname.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell dirname smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/exit.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell exit smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/false.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell false smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/rm.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell rm smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/seq.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell seq smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/true.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell true smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/which.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell which smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/epipe.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell epipe smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/lazy.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell lazy smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/assignments-in-pipeline.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell assignment and pipeline parser/runtime parity."
+    },
+    "test/js/bun/shell/brace.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell brace parser helper APIs."
+    },
+    "test/js/bun/shell/bunshell-file.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun shell file argument interpolation/stringification semantics."
+    },
+    "test/js/bun/shell/bunshell-instance.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.$ Shell constructor and isolated shell instance behavior."
+    },
+    "test/js/bun/shell/bunshell.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires broad Bun shell parser/runtime parity."
+    },
+    "test/js/bun/shell/commands/basename.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell builtin basename parity."
+    },
+    "test/js/bun/shell/exec.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell exec/process behavior that currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/shell/shell-seq-condexpr.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell seq/conditional-expression edge behavior that currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/spawn/spawn-env.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires fuller Bun.spawn environment propagation behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-kill-signal.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires fuller Bun.spawn kill/signal lifecycle behavior; currently times out under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-large-array-length.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.spawn edge handling for very large argument arrays; currently times out under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-maxbuf.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires CommonJS __dirname semantics for bundled upstream Node common fixtures; Cottontail's bundling path does not provide module-local __dirname yet."
+    },
+    "test/js/bun/spawn/spawn-noread-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn no-read leak smoke test passes under Cottontail's current spawn wrapper."
+    },
+    "test/js/bun/spawn/spawn-path.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn PATH resolution smoke test passes under Cottontail's current spawn wrapper."
+    },
+    "test/js/bun/spawn/spawn-pipe-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Long-running Bun.spawn pipe leak coverage currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/spawn/spawn-stdin-readable-stream-integration.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires complete Bun.spawn ReadableStream stdin integration; currently times out under Cottontail."
+    },
+    "test/js/bun/spawn/spawn.test.ts": {
+      "status": "expected-failure",
+      "reason": "Large Bun.spawn conformance file still exceeds the direct upstream runner timeout under Cottontail."
+    },
+    "test/js/bun/terminal/terminal.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun terminal APIs and disposable terminal lifecycle behavior."
+    },
+    "test/js/bun/transpiler/repl-transform.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun transpiler REPL transform output parity."
+    },
+    "test/js/bun/typescript/type-export.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun TypeScript execution/resolution behavior for spawned temporary files."
+    },
+    "test/js/bun/udp/udp_socket.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.udpSocket API and socket metadata parity beyond node:dgram coverage."
+    },
+    "test/js/bun/util/BunObject.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun object identity/branding semantics."
+    },
+    "test/js/bun/util/bun-cryptohasher.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires exact Bun.CryptoHasher algorithm and streaming semantics."
+    },
+    "test/js/bun/util/bun-file-exists.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.file exists() filesystem edge-case parity."
+    },
+    "test/js/bun/util/bun-file-read.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.file Blob slicing/read behavior."
+    },
+    "test/js/bun/util/bun-file-windows.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.file Windows path normalization parity."
+    },
+    "test/js/bun/util/bun-file.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun.file stat/slice/type/path behavior."
+    },
+    "test/js/bun/util/bun-isMainThread.test.js": {
+      "status": "expected-failure",
+      "reason": "Requires Bun.isMainThread and spawned worker/main-thread fixture behavior."
+    },
+    "test/js/bun/stream/direct-readable-stream.test.tsx": {
+      "status": "expected-failure",
+      "reason": "Requires upstream React and React DOM server dependencies, which are not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/test/expect-label.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependency strip-ansi, which is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/test/fake-timers/fake-timers.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun-compatible parsing/runtime support for the fake-timers test's dynamic import form; currently rejected before runtime."
+    },
+    "test/js/bun/test/mock/6874/A.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependency lodash, which is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/test/mock/6874/B.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependency lodash, which is not vendored into the copied Bun snapshot yet."
+    },
+    "test/js/bun/test/mock/mock-module.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's module mock resolver for virtual and intentionally missing modules; esbuild rejects these imports before runtime."
+    },
+    "test/js/bun/test/test-retry-repeats-basic.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun test retry/repeat execution semantics that Cottontail's bun:test shim does not implement yet."
+    },
+    "test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts": {
+      "status": "expected-failure",
+      "reason": "Snapshot conformance file currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/test/spyMatchers.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires upstream test dependency immutable, which is not vendored into the copied Bun snapshot yet."
     }
   }
 }

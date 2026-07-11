@@ -472,12 +472,15 @@ function installBlobGlobals() {
 
   if (typeof g.File !== "function") {
     class CottontailFile extends g.Blob {
-      constructor(parts = [], name = "", options = {}) {
+      constructor(parts, name, options = {}) {
+        if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
+        if (parts == null || typeof parts[Symbol.iterator] !== "function") throw new TypeError("File bits must be iterable");
         super(parts, options);
         this.name = String(name);
         this.lastModified = Number(options?.lastModified ?? Date.now());
       }
     }
+    Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
     Object.defineProperty(g, "File", {
       configurable: true,
       writable: true,
