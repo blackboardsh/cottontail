@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
@@ -21,7 +21,7 @@ function fail(message) {
 function runCase(testCase) {
   const argv = testCase.argv ?? [testCase.scriptPath, ...(testCase.args ?? [])];
   const result = spawnSync(binaryPath, argv, {
-    cwd: rootDir,
+    cwd: testCase.cwd ?? rootDir,
     env: {
       ...process.env,
       ...(testCase.env ?? {}),
@@ -69,6 +69,8 @@ const tempDir = mkdtempSync(join(os.tmpdir(), 'cottontail-js-tests-'));
 const tempFilePath = join(tempDir, 'host-api-output.txt');
 
 try {
+  writeFileSync(join(tempDir, 'eval-data.json'), JSON.stringify({ value: 42 }));
+  writeFileSync(join(tempDir, 'plain.test.js'), 'console.log("plain-test-body");\n');
   const tests = [
     {
       name: 'smoke',
@@ -104,6 +106,37 @@ try {
       ],
       expectExitCode: 0,
       stdoutIncludes: ['alpha|beta', '-e:true'],
+    },
+    {
+      name: 'cli-eval-relative-import',
+      cwd: tempDir,
+      argv: ['-e', 'import data from "./eval-data.json"; console.log(data.value)'],
+      expectExitCode: 0,
+      stdoutIncludes: ['42'],
+    },
+    {
+      name: 'cli-test-banner-without-registered-tests',
+      cwd: tempDir,
+      argv: ['test', 'plain.test.js'],
+      expectExitCode: 0,
+      stdoutIncludes: ['bun test 0.0.0-cottontail (cottontail)', 'plain-test-body'],
+    },
+    {
+      name: 'cli-wasi-entrypoint',
+      scriptPath: join(
+        rootDir,
+        'compat',
+        'upstream',
+        'bun',
+        'v1.3.10',
+        'test',
+        'js',
+        'bun',
+        'wasm',
+        'hello-wasi.wasm'
+      ),
+      expectExitCode: 0,
+      stdoutIncludes: ['hello world'],
     },
     {
       name: 'cli-runtime-flag-execargv',
@@ -158,6 +191,18 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-test-module.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun test module passed'],
+    },
+    {
+      name: 'bun-build-error',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-build-error.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun build error passed'],
+    },
+    {
+      name: 'bun-cjs-interop',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-cjs-interop.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun cjs interop passed'],
     },
     {
       name: 'bun-jsc-and-global',
@@ -473,6 +518,10 @@ try {
 
   for (const testCase of tests) {
     runCase(testCase);
+  }
+
+  if (readdirSync(tempDir).some(name => name.startsWith('.cottontail-eval-'))) {
+    fail('Eval entrypoint was not cleaned up.');
   }
 } finally {
   rmSync(tempDir, { recursive: true, force: true });

@@ -129,6 +129,10 @@ const processObject = g.process ?? {
 };
 g.process = processObject;
 installProcessApi(g.process);
+if (g.process.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1") {
+  globalThis.__cottontailBunTestHeaderPrinted = true;
+  delete g.process.env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
+}
 g.process.execPath ??= cottontailExecPath;
 g.process.argv0 ??= g.process.execPath;
 g.process.execArgv ??= Array.from(cottontail.execArgv || []);
@@ -1320,7 +1324,23 @@ export const suffix = platform() === "win32" ? "dll" : platform() === "darwin" ?
 function normalizeType(type) {
   if (type === FFIType.pointer) return FFIType.ptr;
   if (type === "callback") return FFIType.function;
-  return String(type ?? FFIType.void);
+  const name = String(type ?? FFIType.void);
+  if (name === "uint64_t" || name === "usize" || name === "size_t") return FFIType.u64;
+  if (name === "int64_t" || name === "isize" || name === "ssize_t") return FFIType.i64;
+  return name;
+}
+
+function normalizeLibraryPath(value) {
+  if (value && typeof value === "object") {
+    if (typeof value._bunFilePath === "string") value = value._bunFilePath;
+    else if (typeof value.href === "string") value = value.href;
+    else if (typeof value.name === "string") value = value.name;
+  }
+  const path = String(value);
+  if (!path.startsWith("file:")) return path;
+  const url = new URL(path);
+  if (url.protocol !== "file:") return path;
+  return decodeURIComponent(url.pathname);
 }
 
 function toNumber(value) {
@@ -1454,6 +1474,8 @@ function returnForType(type, value) {
       return Boolean(value);
     case FFIType.cstring:
       return value ? new CString(value) : null;
+    case "napi_value":
+      return value;
     case FFIType.u64:
     case FFIType.i64:
       return typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value || 0)));
@@ -1463,16 +1485,25 @@ function returnForType(type, value) {
 }
 
 export function dlopen(path, symbols) {
+  const libraryPath = normalizeLibraryPath(path);
   const wrapped = {};
   for (const [name, spec] of Object.entries(symbols || {})) {
     const argTypes = (spec.args || []).map(normalizeType);
     const returns = normalizeType(spec.returns || FFIType.void);
     wrapped[name] = (...args) => {
       const nativeArgs = args.map((arg, index) => nativeArg(arg, argTypes[index] || FFIType.ptr));
-      const result = cottontail.nativeCall(String(path), name, returns, argTypes, nativeArgs);
+      const result = cottontail.nativeCall(libraryPath, name, returns, argTypes, nativeArgs);
       return returnForType(returns, result);
     };
-    wrapped[name].ptr = cottontail.nativeSymbol(String(path), name);
+    try {
+      wrapped[name].ptr = cottontail.nativeSymbol(libraryPath, name);
+    } catch (error) {
+      const detail = String(error?.message ?? error);
+      if (/dlopen|failed to open|cannot open|no such file/i.test(detail)) {
+        throw new Error(`Failed to open library "${libraryPath}": ${detail}`);
+      }
+      throw new Error(`Symbol "${name}" not found in library "${libraryPath}": ${detail}`);
+    }
     wrapped[name].native = true;
   }
   return { symbols: wrapped, close() {} };
@@ -1503,6 +1534,9 @@ export class CFunction {
 export function linkSymbols(symbols = {}) {
   const wrapped = {};
   for (const [name, spec] of Object.entries(symbols)) {
+    if (!spec || (typeof spec.ptr !== "number" && typeof spec.ptr !== "bigint") || Number(spec.ptr) === 0) {
+      throw new TypeError(`${name}: you must provide a "ptr" field with the memory address of the native function. This is required by linkSymbols() and CFunction.`);
+    }
     wrapped[name] = new CFunction(spec);
   }
   return { symbols: wrapped, close() {} };
@@ -1552,12 +1586,20 @@ export function cc(options = {}) {
     : platformName === "win32"
       ? ["-shared"]
       : ["-shared", "-fPIC"];
-  const args = [...compiler.prefix, sourcePath, ...sharedArgs, "-o", output, ...(options.flags || []), ...(options.args || [])].map(String);
+  const defines = Object.entries(options.define || {}).map(([name, value]) => `-D${name}=${value == null ? "1" : String(value)}`);
+  const args = [...compiler.prefix, sourcePath, ...sharedArgs, ...defines, "-o", output, ...(options.flags || []), ...(options.args || [])].map(String);
   const result = cottontail.spawnSync(compiler.file, args, { stdio: "pipe" });
   if (Number(result.status ?? 0) !== 0) {
     throw new Error(String(result.stderr || result.stdout || `Bun.cc failed with status ${result.status}`));
   }
-  return dlopen(output, symbols);
+  try {
+    return dlopen(output, symbols);
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    const missing = /Symbol "([^"]+)" not found/.exec(message);
+    if (missing) throw new Error(`Symbol "${missing[1]}" is missing from the compiled library`);
+    throw error;
+  }
 }
 
 export const native = {

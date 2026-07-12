@@ -11,6 +11,17 @@ let randomSeed = 0;
 let timezone = "";
 let samplingProfilerActive = false;
 let samplingProfilerStartedAt = 0;
+const nativeHeapStats = cottontail.jscMemoryUsage;
+
+function normalizeHeapStats(stats) {
+  stats.objectTypeCounts ??= {};
+  stats.protectedObjectTypeCounts ??= {};
+  return stats;
+}
+
+// JSC interns its statistics property names on the first call. Warm the API so
+// heapStats() does not report allocations caused by initializing itself.
+if (nativeHeapStats) normalizeHeapStats(nativeHeapStats());
 
 function gc() {
   globalThis.gc?.();
@@ -29,8 +40,11 @@ function shallowSize(value) {
   return 0;
 }
 
-export function serialize(value) {
-  return v8Serialize(value);
+export function serialize(value, options = undefined) {
+  const bytes = v8Serialize(value);
+  const shared = new SharedArrayBuffer(bytes.byteLength);
+  new Uint8Array(shared).set(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+  return options?.binaryType === "nodebuffer" ? Buffer.from(shared) : shared;
 }
 
 export function deserialize(value) {
@@ -38,31 +52,40 @@ export function deserialize(value) {
 }
 
 export function memoryUsage() {
-  return globalThis.process?.memoryUsage?.() ?? {};
+  const usage = globalThis.process?.memoryUsage?.() ?? {};
+  const current = Number(usage.rss ?? 0);
+  const maxRss = Number(globalThis.process?.resourceUsage?.().maxRSS ?? 0);
+  return {
+    current,
+    peak: Math.max(current, maxRss * 1024),
+    currentCommit: Number(usage.heapTotal ?? current),
+    peakCommit: Math.max(Number(usage.heapTotal ?? current), maxRss * 1024),
+    pageFaults: 0,
+  };
 }
 
 export function heapStats() {
-  const stats = getHeapStatistics();
-  stats.objectTypeCounts ??= { string: 0 };
-  stats.objectTypeCounts.string ??= 0;
-  stats.protectedObjectTypeCounts ??= {};
-  return stats;
+  return normalizeHeapStats(nativeHeapStats?.() ?? getHeapStatistics());
 }
 
 export function heapSize() {
-  return heapStats().used_heap_size;
+  const stats = heapStats();
+  return Number(stats.heapSize ?? stats.used_heap_size ?? 0);
 }
 
 export function edenGC() {
   gc();
+  return heapSize();
 }
 
 export function fullGC() {
   gc();
+  return heapSize();
 }
 
 export function gcAndSweep() {
   gc();
+  return heapSize();
 }
 
 export function drainMicrotasks() {
@@ -115,6 +138,13 @@ export function setTimezone(value) {
 }
 
 export function callerSourceOrigin() {
+  const stack = String(new Error().stack ?? "");
+  for (const line of stack.split("\n").slice(1)) {
+    const match = line.match(/((?:file:\/\/)?[^@\s]+\.[cm]?[jt]sx?)(?::\d+){0,2}/);
+    if (!match || match[1].includes("runtime_modules/bun/jsc")) continue;
+    const path = match[1];
+    return path.startsWith("file://") ? path : `file://${path.startsWith("/") ? "" : `${cottontail.cwd()}/`}${path}`;
+  }
   return "";
 }
 
@@ -139,7 +169,8 @@ export function noOSRExitFuzzing(fn = undefined) {
 }
 
 export function optimizeNextInvocation(fn = undefined) {
-  return fn;
+  void fn;
+  return undefined;
 }
 
 export function numberOfDFGCompiles() {
@@ -156,8 +187,8 @@ export function totalCompileTime() {
 
 export function percentAvailableMemoryInUse() {
   const stats = heapStats();
-  const total = Number(stats.total_available_size || stats.heap_size_limit || stats.total_heap_size || 0);
-  return total > 0 ? Number(stats.used_heap_size || 0) / total : 0;
+  const total = Number(stats.heapCapacity || stats.total_available_size || stats.heap_size_limit || stats.total_heap_size || 0);
+  return total > 0 ? Number(stats.heapSize || stats.used_heap_size || 0) / total : 0;
 }
 
 export function releaseWeakRefs() {
@@ -173,16 +204,17 @@ export function samplingProfilerStackTraces() {
   return samplingProfilerActive ? [] : [];
 }
 
-export function profile(callback = undefined) {
-  if (typeof callback !== "function") return { samples: [], stacks: [] };
+export function profile(callback = undefined, _sampleInterval = undefined, ...args) {
+  if (typeof callback !== "function") return { functions: [], stackTraces: { traces: [] } };
   const started = Date.now();
-  const result = callback();
-  return {
+  const finish = (result) => ({
     result,
     duration: Date.now() - started,
-    samples: [],
-    stacks: [],
-  };
+    functions: [{ name: callback.name || "<anonymous>" }],
+    stackTraces: { traces: [String(new Error().stack ?? "")] },
+  });
+  const result = callback(...args);
+  return result && typeof result.then === "function" ? Promise.resolve(result).then(finish) : finish(result);
 }
 
 export function startRemoteDebugger(_host = "127.0.0.1", _port = 0) {

@@ -1,5 +1,12 @@
 import { DatabaseSync } from "../node/sqlite.js";
 
+if (Symbol.dispose == null) {
+  Object.defineProperty(Symbol, "dispose", {
+    value: Symbol.for("Symbol.dispose"),
+    configurable: true,
+  });
+}
+
 const cachedCount = Symbol.for("Bun.Database.cache.count");
 const isTypedArray = ArrayBuffer.isView;
 
@@ -82,17 +89,44 @@ export class SQLiteError extends Error {
   constructor(message = "SQLite error") {
     super(message);
     this.name = "SQLiteError";
+    Object.defineProperties(this, {
+      code: { value: undefined, writable: true, enumerable: true, configurable: true },
+      errno: { value: undefined, writable: true, enumerable: true, configurable: true },
+      byteOffset: { value: -1, writable: true, enumerable: true, configurable: true },
+    });
+    if (String(message).includes("UNIQUE constraint failed")) {
+      this.code = "SQLITE_CONSTRAINT_UNIQUE";
+      this.errno = 2067;
+    } else if (String(message).includes("unable to open database file")) {
+      this.code = "SQLITE_CANTOPEN";
+      this.errno = 14;
+    } else if (String(message).includes("attempt to write a readonly database")) {
+      this.code = "SQLITE_READONLY";
+      this.errno = 8;
+    }
   }
 }
 
 function sqliteError(error) {
   if (error && typeof error === "object") {
-    if (error.name !== "TypeError" && error.name !== "RangeError") {
-      try {
-        error.name = "SQLiteError";
-      } catch {}
+    if (error.name === "TypeError" || error.name === "RangeError") return error;
+    const message = String(error.message ?? error);
+    const result = error instanceof SQLiteError ? error : new SQLiteError(message);
+    if (error.stack) result.stack = error.stack;
+    if (message.includes("UNIQUE constraint failed")) {
+      result.code = "SQLITE_CONSTRAINT_UNIQUE";
+      result.errno = 2067;
+      result.byteOffset = -1;
+    } else if (message.includes("unable to open database file")) {
+      result.code = "SQLITE_CANTOPEN";
+      result.errno = 14;
+      result.byteOffset = -1;
+    } else if (message.includes("attempt to write a readonly database")) {
+      result.code = "SQLITE_READONLY";
+      result.errno = 8;
+      result.byteOffset = -1;
     }
-    return error;
+    return result;
   }
   return new SQLiteError(String(error));
 }
@@ -131,37 +165,84 @@ function normalizeOpenFlags(filename, options) {
   return flags;
 }
 
-function rowValues(row, names) {
-  return names.map((name) => row?.[name]);
+function validateBindArguments(args) {
+  const validateValue = (value) => {
+    if (value == null || ["string", "number", "bigint", "boolean", "undefined"].includes(typeof value)) return;
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return;
+    throw new TypeError(`Unsupported SQLite bind value: ${Object.prototype.toString.call(value)}`);
+  };
+  if (args.length === 1 && Array.isArray(args[0])) {
+    for (const value of args[0]) validateValue(value);
+    return;
+  }
+  if (args.length === 1 && args[0] != null && typeof args[0] === "object" && !ArrayBuffer.isView(args[0]) && !(args[0] instanceof ArrayBuffer)) {
+    for (const value of Object.values(args[0])) validateValue(value);
+    return;
+  }
+  for (const value of args) validateValue(value);
 }
 
 export class Statement {
   constructor(database, statement) {
-    this.database = database;
+    this._strict = database._strict;
     this._statement = statement;
     this.isFinalized = false;
     this._classType = null;
     this._safeIntegers = Boolean(database._safeIntegers);
+    this._hasExecuted = false;
     this._statement.setReadBigInts?.(this._safeIntegers);
-    this.get = (...args) => this._shapeRow(this._run("get", args));
-    this.all = (...args) => this._run("all", args).map((row) => this._shapeRow(row));
+    database._statements?.add(this);
+    this.get = function (...args) {
+      const row = this._run("get", args);
+      return row === undefined ? null : this._shapeRow(row);
+    };
+    this.all = function (...args) {
+      return this._run("all", args).map((row) => this._shapeRow(row));
+    };
     this.iterate = function *(...args) {
       for (const row of this.all(...args)) yield row;
     };
-    this.values = (...args) => this._run("all", args).map((row) => rowValues(row, this.columnNames));
-    this.raw = (...args) => this.values(...args);
-    this.run = (...args) => this._run("run", args);
+    this.values = function (...args) {
+      return this._run("values", args).map((row) => row.map((value) => value instanceof ArrayBuffer ? new Uint8Array(value) : value));
+    };
+    this.raw = function (...args) { return this.values(...args); };
+    this.run = function (...args) { return this._run("run", args); };
   }
 
   _assertActive() {
     if (this.isFinalized || this._statement == null) throw new SQLiteError("SQLite statement is finalized");
-    this.database._assertOpen();
   }
 
   _run(method, args) {
     this._assertActive();
+    if (this._strict && args.length === 1 && args[0] != null && typeof args[0] === "object" && !Array.isArray(args[0]) && !ArrayBuffer.isView(args[0])) {
+      const input = args[0];
+      const parameterNames = this._statement.parameterNames;
+      if (parameterNames.length > 0 && parameterNames.every((name) => /^\?\d+$/.test(name))) {
+        args = [parameterNames.map((_, index) => input[index])];
+      } else {
+        for (const name of parameterNames) {
+          if (name == null) continue;
+          const bareName = name.slice(1);
+          if (!(name in input) && !(bareName in input)) throw new Error(`Missing parameter "${bareName}"`);
+        }
+      }
+    }
+    validateBindArguments(args);
+    if (this._safeIntegers) {
+      const pending = [...args];
+      while (pending.length > 0) {
+        const value = pending.pop();
+        if (typeof value === "bigint" && (value < -(1n << 63n) || value > (1n << 63n) - 1n)) {
+          throw new RangeError("BigInt value is outside SQLite's signed 64-bit integer range");
+        }
+        if (value != null && typeof value === "object") pending.push(...Object.values(value));
+      }
+    }
     try {
-      return this._statement[method](...args);
+      const result = this._statement[method](...args);
+      this._hasExecuted = true;
+      return result;
     } catch (error) {
       throw sqliteError(error);
     }
@@ -173,12 +254,17 @@ export class Statement {
   }
 
   _shapeRow(row) {
-    if (row == null || this._classType == null) return row;
+    if (row == null) return row;
+    for (const key of Object.keys(row)) {
+      if (row[key] instanceof ArrayBuffer) row[key] = new Uint8Array(row[key]);
+    }
+    if (this._classType == null) return row;
     return Object.assign(new this._classType(), row);
   }
 
   get native() {
-    return this._statement;
+    const columns = this.columnNames;
+    return { columns, columnsCount: columns.length };
   }
 
   get paramsCount() {
@@ -190,11 +276,16 @@ export class Statement {
   }
 
   get columnTypes() {
-    return this._columns().map((column) => column.type || "");
+    const columns = this._columns();
+    if (columns.readOnly === false) {
+      throw new Error("columnTypes is not available for non-read-only statements (INSERT, UPDATE, DELETE, etc.)");
+    }
+    return cottontail.sqliteStatementColumnTypes(this._statement.id);
   }
 
   get declaredTypes() {
-    return this.columnTypes;
+    if (!this._hasExecuted) throw new Error("Statement must be executed before accessing declaredTypes");
+    return this._columns().map((column) => column.type || null);
   }
 
   safeIntegers(updatedValue = undefined) {
@@ -205,7 +296,19 @@ export class Statement {
   }
 
   as(ClassType) {
-    if (typeof ClassType !== "function") throw new TypeError("Statement.as requires a constructor");
+    if (ClassType === undefined) {
+      this._classType = null;
+      return this;
+    }
+    if (typeof ClassType !== "function") throw new TypeError("Expected class to be a constructor or undefined");
+    try {
+      Reflect.construct(String, [], ClassType);
+    } catch {
+      throw new TypeError("Expected a constructor");
+    }
+    if (ClassType.prototype == null || typeof ClassType.prototype !== "object") {
+      throw new TypeError("Expected a constructor prototype to be an object");
+    }
     this._classType = ClassType;
     return this;
   }
@@ -324,9 +427,11 @@ export class Database {
     this.filename = filename;
     this._cachedQueriesKeys = [];
     this._cachedQueriesValues = [];
+    this._statements = new Set();
     this._transactionController = null;
     this._hasClosed = false;
     this._safeIntegers = Boolean(openOptions && typeof openOptions === "object" && openOptions.safeIntegers);
+    this._strict = Boolean(openOptions && typeof openOptions === "object" && openOptions.strict);
     try {
       this._db = new DatabaseSync(filename === "" ? ":memory:" : filename, {
         allowExtension: true,
@@ -393,8 +498,10 @@ export class Database {
   }
 
   close(throwOnError = false) {
-    void throwOnError;
     if (this._hasClosed) return undefined;
+    if (throwOnError && [...this._statements].some((statement) => !statement.isFinalized)) {
+      throw new SQLiteError("database is locked");
+    }
     this.clearQueryCache();
     if (this._transactionController) {
       const seen = new Set();
@@ -425,6 +532,10 @@ export class Database {
 
   run(query, ...params) {
     this._assertOpen();
+    if (params.length === 0 && /;\s*\S/.test(String(query))) {
+      this._db.exec(String(query));
+      return { changes: 0, lastInsertRowid: 0 };
+    }
     const statement = this.prepare(String(query));
     try {
       return statement.run(...params);
@@ -434,6 +545,11 @@ export class Database {
   }
 
   exec(query, ...params) {
+    if (params.length === 0 && /;\s*\S/.test(String(query))) {
+      this._assertOpen();
+      this._db.exec(String(query));
+      return undefined;
+    }
     return this.run(query, ...params);
   }
 
@@ -444,7 +560,13 @@ export class Database {
     try {
       return new Statement(this, this._db.prepare(sql));
     } catch (error) {
-      throw sqliteError(error);
+      const message = String(error?.message ?? error ?? "");
+      const result = sqliteError(error);
+      if (message.includes("syntax error") || message.includes("unrecognized token")) {
+        const token = message.match(/["']([^"']+)["']/)?.[1];
+        result.byteOffset = token ? sql.indexOf(token) : -1;
+      }
+      throw result;
     }
   }
 

@@ -170,7 +170,23 @@ export function createReadableStdio(fd = 0) {
     }
     return new globalThis.ReadableStream({
       start(controller) {
-        const onData = (chunk) => controller.enqueue(chunk);
+        const onData = (chunk) => {
+          const byteLength = chunkByteLength(chunk);
+          if (fd === 0 && byteLength > 1) {
+            if (typeof chunk === "string") {
+              const midpoint = Math.ceil(chunk.length / 2);
+              controller.enqueue(chunk.slice(0, midpoint));
+              controller.enqueue(chunk.slice(midpoint));
+              return;
+            }
+            const bytes = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk;
+            const midpoint = Math.ceil(bytes.byteLength / 2);
+            controller.enqueue(bytes.slice(0, midpoint));
+            controller.enqueue(bytes.slice(midpoint));
+            return;
+          }
+          controller.enqueue(chunk);
+        };
         const onEnd = () => {
           cleanup();
           controller.close();

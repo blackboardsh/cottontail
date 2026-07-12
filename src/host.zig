@@ -45,7 +45,7 @@ pub fn forceLink() void {
     _ = &ct_host_spawn_sync;
 }
 
-fn getIo() std.Io {
+pub fn getIo() std.Io {
     return host_io orelse @panic("cottontail host IO is not configured");
 }
 

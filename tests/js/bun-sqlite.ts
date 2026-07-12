@@ -22,6 +22,10 @@ assert(JSON.stringify(statement.values("Ada")) === JSON.stringify([[1, "Ada"]]),
 assert(statement.get("Ada")?.name === "Ada", "bun:sqlite get mismatch");
 assert(statement.all("Ada").length === 1, "bun:sqlite all mismatch");
 assert([...statement.iterate("Ada")][0].id === 1, "bun:sqlite iterate mismatch");
+assert(JSON.stringify(statement.native.columns) === JSON.stringify(["id", "name"]), "bun:sqlite native columns mismatch");
+assert(statement.native.columnsCount === 2, "bun:sqlite native column count mismatch");
+assert(JSON.stringify(statement.columnTypes) === JSON.stringify(["INTEGER", "TEXT"]), "bun:sqlite runtime column types mismatch");
+assert(JSON.stringify(statement.declaredTypes) === JSON.stringify(["INTEGER", "TEXT"]), "bun:sqlite declared column types mismatch");
 assert(statement.safeIntegers() === false, "bun:sqlite safeIntegers default mismatch");
 statement.safeIntegers(true);
 assert(typeof statement.get("Ada")?.id === "bigint", "bun:sqlite safeIntegers read mismatch");
@@ -34,6 +38,15 @@ class User {
 
 const shaped = db.prepare("select id, name from users").as(User).get();
 assert(shaped instanceof User && shaped.name === "Ada", "bun:sqlite Statement.as mismatch");
+assert(db.prepare("select id from users where id = -1").get() === null, "bun:sqlite missing row should be null");
+assert(db.prepare("select x'DEADBEEF' as blob").get()?.blob instanceof Uint8Array, "bun:sqlite blob shape mismatch");
+
+const expanded = db.prepare("select $value as value");
+assert(expanded.toString() === "select NULL as value", "bun:sqlite initial expanded SQL mismatch");
+expanded.get({ $value: "cottontail" });
+assert(expanded.toString() === "select 'cottontail' as value", "bun:sqlite bound expanded SQL mismatch");
+expanded[Symbol.dispose]();
+assert(expanded.isFinalized, "bun:sqlite statement disposal mismatch");
 
 const transaction = db.transaction((name: string) => {
   assert(db.inTransaction === true, "bun:sqlite transaction did not enter transaction");

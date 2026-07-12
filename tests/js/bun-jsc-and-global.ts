@@ -22,6 +22,7 @@ import {
   startRemoteDebugger,
   startSamplingProfiler,
 } from "bun:jsc";
+import vm from "node:vm";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -29,11 +30,11 @@ function assert(value: unknown, message: string): asserts value {
 
 const payload = { name: "cottontail", values: [1, 2, 3] };
 const encoded = serialize(payload);
-assert(encoded instanceof Uint8Array, "bun:jsc serialize should return bytes");
+assert(encoded instanceof SharedArrayBuffer, "bun:jsc serialize should return shared bytes");
 assert(JSON.stringify(deserialize(encoded)) === JSON.stringify(payload), "bun:jsc deserialize mismatch");
-assert(typeof heapSize() === "number", "bun:jsc heapSize mismatch");
-assert(typeof heapStats().used_heap_size === "number", "bun:jsc heapStats mismatch");
-assert(typeof memoryUsage() === "object", "bun:jsc memoryUsage mismatch");
+assert(heapSize() > 0, "bun:jsc heapSize mismatch");
+assert(heapStats().heapCapacity > 0 && heapStats().objectCount > 0, "bun:jsc heapStats mismatch");
+assert(memoryUsage().current > 0 && memoryUsage().peak > 0, "bun:jsc memoryUsage mismatch");
 assert(percentAvailableMemoryInUse() >= 0, "bun:jsc percentAvailableMemoryInUse mismatch");
 assert(estimateShallowMemoryUsageOf(new Uint8Array(4)) === 4, "bun:jsc shallow size mismatch");
 assert(jscDescribe({ a: 1 }).includes("a"), "bun:jsc describe mismatch");
@@ -45,7 +46,7 @@ assert(process.env.TZ === "UTC", "bun:jsc timezone mismatch");
 const passthrough = () => 7;
 assert(noInline(passthrough)() === 7, "bun:jsc noInline mismatch");
 assert(noFTL(passthrough)() === 7, "bun:jsc noFTL mismatch");
-assert(optimizeNextInvocation(passthrough)() === 7, "bun:jsc optimizeNextInvocation mismatch");
+assert(optimizeNextInvocation(passthrough) === undefined && passthrough() === 7, "bun:jsc optimizeNextInvocation mismatch");
 assert(profile(() => 9).result === 9, "bun:jsc profile mismatch");
 startSamplingProfiler();
 assert(Array.isArray(samplingProfilerStackTraces()), "bun:jsc sampling profiler mismatch");
@@ -83,13 +84,32 @@ assert(glob.match("bun-sqlite.ts"), "Bun.Glob match mismatch");
 assert(glob.scanSync({ cwd: "tests/js" }).includes("bun-sqlite.ts"), "Bun.Glob scanSync mismatch");
 
 const router = new Bun.FileSystemRouter({ style: "nextjs", dir: "tests/js" });
-assert(router.routes["/bun-sqlite"]?.filePath.endsWith("bun-sqlite.ts"), "Bun.FileSystemRouter routes mismatch");
+assert(router.routes["/bun-sqlite"]?.endsWith("bun-sqlite.ts"), "Bun.FileSystemRouter routes mismatch");
 assert(router.match("/bun-sqlite").pathname === "/bun-sqlite", "Bun.FileSystemRouter match mismatch");
+const routerDir = `${cottontail.env("COTTONTAIL_TMP_DIR")}/filesystem-router`;
+cottontail.mkdirSync(`${routerDir}/posts`, true);
+cottontail.writeFile(`${routerDir}/posts/[id].tsx`, "export default null;");
+const dynamicRouter = new Bun.FileSystemRouter({ style: "nextjs", dir: routerDir, origin: "https://example.test", assetPrefix: "/assets" });
+const dynamicRoute = dynamicRouter.match("/posts/42?view=full");
+assert(dynamicRoute.name === "/posts/[id]" && dynamicRoute.params.id === "42", "Bun.FileSystemRouter dynamic route mismatch");
+assert(dynamicRoute.query.view === "full" && dynamicRoute.src === "https://example.test/assets/posts/[id].tsx", "Bun.FileSystemRouter route metadata mismatch");
 
 const transpiler = new Bun.Transpiler({ loader: "ts" });
 const transformed = transpiler.transformSync("export const value: number = 1;");
 assert(transformed.includes("export const value = 1"), "Bun.Transpiler transformSync mismatch");
 const scan = transpiler.scan('import x from "pkg"; export const value = 1;');
 assert(scan.imports[0].path === "pkg" && scan.exports.includes("value"), "Bun.Transpiler scan mismatch");
+const replTranspiler = new Bun.Transpiler({ loader: "tsx", replMode: true });
+const replContext = vm.createContext({ Promise });
+await vm.runInContext(replTranspiler.transformSync("const replValue = await Promise.resolve(21)"), replContext);
+const replResult = await vm.runInContext(replTranspiler.transformSync("replValue * 2"), replContext);
+assert(replContext.replValue === 21 && replResult.value === 42, "Bun.Transpiler replMode persistence mismatch");
+
+const ShadowRealm = (globalThis as any).ShadowRealm;
+assert(typeof ShadowRealm === "function", "ShadowRealm should be enabled");
+const shadowRealm = new ShadowRealm();
+(globalThis as any).shadowRealmValue = 1;
+assert(shadowRealm.evaluate("globalThis.shadowRealmValue = 2") === 2, "ShadowRealm evaluation mismatch");
+assert((globalThis as any).shadowRealmValue === 1, "ShadowRealm global isolation mismatch");
 
 console.log("bun jsc and global passed");

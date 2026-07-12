@@ -1,5 +1,7 @@
-import { expect, jest, mock, spyOn } from "bun:test";
+import { expect, jest, mock, spyOn, vi } from "bun:test";
 import { createRequire } from "node:module";
+import { fn as liveFn, iCallFn, rexported, variable as liveVariable } from "./fixtures/mock-live-fixture";
+import { trimWithLodash } from "./fixtures/mock-package-consumer";
 
 const fn = mock((value: number) => value + 1);
 expect(fn(2)).toBe(3);
@@ -64,6 +66,17 @@ expect(jest.getTimerCount()).toBe(0);
 jest.useRealTimers();
 expect(jest.isFakeTimers()).toBe(false);
 
+vi.useFakeTimers({ now: 1000 });
+expect(Date.now()).toBe(1000);
+expect(performance.now()).toBe(0);
+const pendingCalls: number[] = [];
+setInterval(() => pendingCalls.push(Date.now()), 25);
+setTimeout(() => pendingCalls.push(Date.now()), 100);
+vi.runOnlyPendingTimers();
+expect(pendingCalls).toEqual([1025, 1050, 1075, 1100, 1100]);
+vi.useRealTimers();
+expect(() => vi.getTimerCount()).toThrow("Fake timers are not active");
+
 mock.module("virtual:bun-test-module", () => ({ value: 42 }));
 const require = createRequire(`${process.cwd()}/tests/js/bun-test-module.ts`);
 expect(require("virtual:bun-test-module").value).toBe(42);
@@ -71,6 +84,26 @@ const mockSpecifier = "virtual:bun-test-module";
 const imported = await import(mockSpecifier);
 expect(imported.value).toBe(42);
 expect(imported.default.value).toBe(42);
+mock.restore();
+
+expect(trimWithLodash("  original  ")).toBe("original");
+mock.module(require.resolve("lodash"), () => ({ trim: () => "mocked" }));
+expect(trimWithLodash("  original  ")).toBe("mocked");
+mock.restore();
+expect(trimWithLodash("  original  ")).toBe("original");
+
+expect(liveFn()).toBe(42);
+expect(rexported).toBe(42);
+mock.module("./fixtures/mock-live-fixture.ts", () => ({
+  fn: () => 3,
+  rexported: 43,
+  variable: 10,
+}));
+expect(liveFn(), "live imported function").toBe(3);
+expect(liveVariable).toBe(10);
+expect(rexported).toBe(43);
+expect((await import("./fixtures/mock-live-source")).rexported).toBe(43);
+expect(iCallFn(), "function using rebound export").toBe(3);
 mock.restore();
 
 console.log("bun test module passed");

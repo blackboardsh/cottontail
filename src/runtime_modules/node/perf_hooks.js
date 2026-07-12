@@ -296,53 +296,154 @@ function removeEntries(type, name = undefined) {
   }
 }
 
+const EMPTY_HISTOGRAM_MIN_BIGINT = 9223372036854775807n;
+const MAX_HISTOGRAM_VALUE = Number.MAX_SAFE_INTEGER;
+const histogramPercentiles = [0, 50, 75, 90, 99, 100];
+
+function histogramError(code, message, ErrorType = TypeError) {
+  const error = new ErrorType(message);
+  error.code = code;
+  return error;
+}
+
+function validateHistogramInteger(value, name) {
+  if (typeof value !== "number" && typeof value !== "bigint") {
+    throw histogramError("ERR_INVALID_ARG_TYPE", `The \"${name}\" argument must be of type number or bigint`);
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw histogramError("ERR_OUT_OF_RANGE", `The value of \"${name}\" is out of range`, RangeError);
+  }
+  return number;
+}
+
 class RecordableHistogram {
-  constructor() {
+  constructor(lowest, highest, figures, token) {
+    if (token !== RecordableHistogram) {
+      throw histogramError("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+    }
+    this._lowest = lowest;
+    this._highest = highest;
+    this._figures = figures;
     this._values = [];
-    this.exceeds = 0;
+    this._exceeds = 0;
+    this._lastDelta = undefined;
   }
 
   record(value) {
-    const number = Number(value);
-    if (!Number.isFinite(number) || number < 1) throw new RangeError("histogram value must be a positive number");
+    const number = validateHistogramInteger(value, "val");
+    if (number < 1) {
+      throw histogramError("ERR_OUT_OF_RANGE", "The value of \"val\" is out of range", RangeError);
+    }
+    if (number > this._highest) {
+      this._exceeds += 1;
+      return;
+    }
     this._values.push(number);
   }
 
   recordDelta() {
-    const current = nowMs();
-    const previous = this._last ?? current;
-    this._last = current;
-    this.record(Math.max(1, current - previous));
+    const current = nowMs() * 1e6;
+    if (this._lastDelta !== undefined) this.record(Math.max(1, Math.round(current - this._lastDelta)));
+    this._lastDelta = current;
+  }
+
+  add(other) {
+    if (!(other instanceof RecordableHistogram)) {
+      throw histogramError("ERR_INVALID_ARG_TYPE", "The \"other\" argument must be a Histogram");
+    }
+    for (const value of other._values) {
+      if (value > this._highest) this._exceeds += 1;
+      else this._values.push(value);
+    }
+    this._exceeds += other._exceeds;
   }
 
   reset() {
     this._values = [];
+    this._exceeds = 0;
+    this._lastDelta = undefined;
+  }
+
+  _percentile(percentile) {
+    const value = Number(percentile);
+    if (!Number.isFinite(value) || value <= 0 || value > 100) {
+      throw histogramError("ERR_OUT_OF_RANGE", "The value of \"percentile\" is out of range", RangeError);
+    }
+    if (this._values.length === 0) return 0;
+    const sorted = [...this._values].sort((left, right) => left - right);
+    return sorted[Math.max(0, Math.ceil((value / 100) * sorted.length) - 1)];
   }
 
   percentile(percentile) {
-    if (this._values.length === 0) return 0;
-    const sorted = [...this._values].sort((left, right) => left - right);
-    const index = Math.max(0, Math.min(sorted.length - 1, Math.ceil((Number(percentile) / 100) * sorted.length) - 1));
-    return sorted[index];
+    return this._percentile(percentile);
   }
 
-  percentiles() {
-    return new Map([50, 75, 90, 99].map((percentile) => [percentile, this.percentile(percentile)]));
+  percentileBigInt(percentile) {
+    return BigInt(this._percentile(percentile));
+  }
+
+  get percentiles() {
+    if (this._values.length === 0) return new Map();
+    return new Map(histogramPercentiles.map((percentile) => [percentile, BigInt(percentile === 0 ? this.min : this._percentile(percentile))]));
+  }
+
+  get percentilesBigInt() {
+    return this.percentiles;
   }
 
   get count() { return this._values.length; }
-  get min() { return this._values.length ? Math.min(...this._values) : 0; }
+  get countBigInt() { return BigInt(this.count); }
+  get min() { return this._values.length ? Math.min(...this._values) : Number(EMPTY_HISTOGRAM_MIN_BIGINT); }
+  get minBigInt() { return this._values.length ? BigInt(this.min) : EMPTY_HISTOGRAM_MIN_BIGINT; }
   get max() { return this._values.length ? Math.max(...this._values) : 0; }
-  get mean() { return this._values.length ? this._values.reduce((sum, value) => sum + value, 0) / this._values.length : 0; }
+  get maxBigInt() { return BigInt(this.max); }
+  get exceeds() { return this._exceeds; }
+  get exceedsBigInt() { return BigInt(this._exceeds); }
+  get mean() { return this._values.length ? this._values.reduce((sum, value) => sum + value, 0) / this._values.length : NaN; }
   get stddev() {
-    if (this._values.length === 0) return 0;
+    if (this._values.length === 0) return NaN;
     const mean = this.mean;
     return Math.sqrt(this._values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / this._values.length);
   }
+
+  toJSON() {
+    return {
+      count: this.count,
+      min: this.min,
+      max: this.max,
+      mean: this.mean,
+      exceeds: this.exceeds,
+      stddev: this.stddev,
+      percentiles: Object.fromEntries([...this.percentiles].map(([key, value]) => [key, Number(value)])),
+    };
+  }
+
+  [Symbol.for("nodejs.util.inspect.custom")]() {
+    return `Histogram { min: ${this.min}, max: ${this.max}, mean: ${this.mean}, exceeds: ${this.exceeds}, stddev: ${this.stddev}, count: ${this.count} }`;
+  }
 }
 
-export function createHistogram() {
-  return new RecordableHistogram();
+export function createHistogram(options = {}) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw histogramError("ERR_INVALID_ARG_TYPE", "The \"options\" argument must be of type object");
+  }
+  const lowest = options.lowest === undefined ? 1 : validateHistogramInteger(options.lowest, "options.lowest");
+  const highest = options.highest === undefined ? MAX_HISTOGRAM_VALUE : validateHistogramInteger(options.highest, "options.highest");
+  if (typeof options.figures !== "undefined" && typeof options.figures !== "number") {
+    throw histogramError("ERR_INVALID_ARG_TYPE", "The \"options.figures\" argument must be of type number");
+  }
+  const figures = options.figures === undefined ? 3 : options.figures;
+  if (!Number.isInteger(figures) || figures < 1 || figures > 5) {
+    throw histogramError("ERR_OUT_OF_RANGE", "The value of \"options.figures\" is out of range", RangeError);
+  }
+  if (lowest < 1) {
+    throw histogramError("ERR_OUT_OF_RANGE", "The value of \"options.lowest\" is out of range", RangeError);
+  }
+  if (highest < lowest * 2 || highest > MAX_HISTOGRAM_VALUE) {
+    throw histogramError("ERR_OUT_OF_RANGE", "The value of \"options.highest\" is out of range", RangeError);
+  }
+  return new RecordableHistogram(lowest, highest, figures, RecordableHistogram);
 }
 
 export function monitorEventLoopDelay(options = {}) {

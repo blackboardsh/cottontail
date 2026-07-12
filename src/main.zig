@@ -1,10 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cottontail_hash = @import("cottontail_hash.zig");
+const cottontail_password = @import("cottontail_password.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
 
 comptime {
+    cottontail_hash.forceLink();
+    cottontail_password.forceLink();
     cottontail_transpiler.forceLink();
     host.forceLink();
 }
@@ -446,6 +450,12 @@ pub fn main(init: std.process.Init) !void {
     if (try runMultipleTestFiles(init, args)) |exit_code| {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
+    }
+
+    if (std.mem.eql(u8, arg, "test")) {
+        try stdout.print("bun test 0.0.0-cottontail (cottontail)\n", .{});
+        try stdout.flush();
+        try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
     }
 
     const invocation = parseInvocation(init.io, init.arena.allocator(), args) catch |err| switch (err) {

@@ -17,6 +17,7 @@ fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
 }
 
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
+    step.rdynamic = true;
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
     step.root_module.addIncludePath(b.path("vendors/bun-zig/src/jsc/bindings/sqlite"));
@@ -26,6 +27,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "-std=c11",
             "-Wno-deprecated-declarations",
             "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
         },
@@ -36,6 +38,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "-std=c11",
             "-Wno-deprecated-declarations",
             "-DSQLITE_ENABLE_COLUMN_METADATA",
+            "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
             "-DSQLITE_THREADSAFE=1",

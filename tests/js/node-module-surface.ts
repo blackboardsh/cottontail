@@ -60,6 +60,13 @@ const localRequire = createRequire(`${root}/entry.js`);
 assert(localRequire("./sample.cjs").value === 42, "createRequire local module mismatch");
 assert(_cache.has(modulePath), "_cache should contain required module");
 
+writeFileSync(join(root, "data.jsonc"), "{ // comment\n  \"items\": [1, 2,],\n}\n");
+writeFileSync(join(root, "data.toml"), "[owner]\nname = \"cottontail\"\n");
+writeFileSync(join(root, "data.txt"), "plain text\n");
+assert(localRequire("./data.jsonc").items.join(",") === "1,2", "createRequire JSONC loader mismatch");
+assert(localRequire("./data.toml").owner.name === "cottontail", "createRequire TOML loader mismatch");
+assert(localRequire("./data.txt").default === "plain text\n", "createRequire text loader mismatch");
+
 const paths = _nodeModulePaths(root);
 assert(paths[0].endsWith("/node_modules"), "_nodeModulePaths first entry mismatch");
 assert(Array.isArray(_resolveLookupPaths("left-pad", { filename: `${root}/entry.js` })), "_resolveLookupPaths package mismatch");

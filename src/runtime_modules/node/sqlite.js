@@ -5,6 +5,7 @@ function sqliteUnavailable() {
 const sessionConstructorToken = Symbol("sqlite Session constructor token");
 
 function bindArgs(args) {
+  if (args.length === 1 && Array.isArray(args[0])) return args[0];
   if (args.length === 1 && args[0] != null && typeof args[0] === "object" && !Array.isArray(args[0]) && !(args[0] instanceof ArrayBuffer) && !ArrayBuffer.isView(args[0])) {
     return args[0];
   }
@@ -95,7 +96,13 @@ export class StatementSync {
   }
 
   get expandedSQL() {
-    return this.sourceSQL;
+    this.database._assertOpen();
+    return cottontail.sqliteStatementExpandedSql(this.id);
+  }
+
+  get parameterNames() {
+    this.database._assertOpen();
+    return cottontail.sqliteStatementParameterNames(this.id);
   }
 
   all(...args) {
@@ -106,6 +113,11 @@ export class StatementSync {
   get(...args) {
     this.database._assertOpen();
     return cottontail.sqliteStatementGet(this.id, bindArgs(args), this.readBigInts);
+  }
+
+  values(...args) {
+    this.database._assertOpen();
+    return cottontail.sqliteStatementValues(this.id, bindArgs(args), this.readBigInts);
   }
 
   run(...args) {

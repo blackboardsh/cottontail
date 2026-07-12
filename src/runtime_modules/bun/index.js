@@ -141,6 +141,12 @@ if (typeof Promise === "function") {
   }
 }
 
+function handledRejectedPromise(reason) {
+  const promise = Promise.reject(reason);
+  promise.catch(() => {});
+  return promise;
+}
+
 if (!Object.__cottontailGlobalPrototypePatched) {
   const originalGetPrototypeOf = Object.getPrototypeOf;
   const originalSetPrototypeOf = Object.setPrototypeOf;
@@ -324,6 +330,7 @@ function interpolateShellCommand(strings, values) {
   const parts = Array.isArray(strings?.raw) ? strings.raw : strings;
   let out = "";
   let outputBuffer = undefined;
+  let inputBody = undefined;
   for (let index = 0; index < strings.length; index += 1) {
     let part = parts[index];
     if (index < values.length && binaryOutputView(values[index]) && />\s*$/.test(part) && parts.slice(index + 1).every((item) => String(item).trim() === "")) {
@@ -332,19 +339,27 @@ function interpolateShellCommand(strings, values) {
       outputBuffer = values[index];
       continue;
     }
+    if (index < values.length && values[index] != null && typeof values[index] === "object" &&
+        /<\s*$/.test(part) && parts.slice(index + 1).every((item) => String(item).trim() === "")) {
+      part = part.replace(/<\s*$/, "");
+      out += part;
+      inputBody = values[index];
+      continue;
+    }
     out += part;
     if (index < values.length) {
       const value = values[index];
       out += Array.isArray(value) ? value.map(shellEscape).join(" ") : shellEscape(value);
     }
   }
-  return { command: out.trimEnd(), outputBuffer };
+  return { command: out.trimEnd(), outputBuffer, inputBody };
 }
 
 const shellDefaults = {
   cwd: undefined,
   env: undefined,
   throws: true,
+  quiet: false,
 };
 
 export class ShellOutput {
@@ -504,6 +519,52 @@ function normalizeShellStderr(command, stderr) {
   return text;
 }
 
+function assignmentOnlyPipelineStage(value) {
+  const assignment = String(value).trim();
+  if (!assignment) return false;
+  return /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\\]*(?:\\.[^"\\]*)*"|'[^']*'|\\.|[^\s|])*(?:\s+|$))+$/.test(assignment);
+}
+
+function normalizeAssignmentPipelines(command) {
+  const source = String(command);
+  const parts = [];
+  let start = 0;
+  let quote = "";
+  let escaped = false;
+  let parentheses = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "(") parentheses += 1;
+    else if (char === ")" && parentheses > 0) parentheses -= 1;
+    else if (char === "|" && parentheses === 0 && source[index - 1] !== "|" && source[index + 1] !== "|") {
+      parts.push(source.slice(start, index), "|");
+      start = index + 1;
+    }
+  }
+  if (parts.length === 0) return source;
+  parts.push(source.slice(start));
+  for (let index = 0; index < parts.length; index += 2) {
+    if (assignmentOnlyPipelineStage(parts[index])) parts[index] = `${parts[index].trimEnd()} cat `;
+  }
+  return parts.join("");
+}
+
 function writeOutputBuffer(buffer, data) {
   const view = binaryOutputView(buffer);
   if (!view) return;
@@ -550,12 +611,17 @@ function runShellBuiltin(command, options = {}) {
       stderr: "",
     };
   }
+  if (words[0] === "seq") {
+    const invalid = words.slice(1).find((word) => word !== "--" && /^(?:[+-]?(?:inf(?:inity)?|nan))$/i.test(word));
+    if (invalid) return { exitCode: 1, stdout: "", stderr: `seq: invalid argument '${invalid}'\n` };
+  }
   if (words[0] === "mv") return runShellMv(words, options);
   return null;
 }
 
 function runShell(command, options = {}) {
   validateNoNullByte(command, "command");
+  command = normalizeAssignmentPipelines(command);
   const builtin = runShellBuiltin(command, options);
   if (builtin) {
     const output = new ShellOutput(builtin);
@@ -570,6 +636,7 @@ function runShell(command, options = {}) {
     stdio: "pipe",
     cwd: options.cwd,
     env: shellEnv(options),
+    input: options.input,
   });
   if (options.outputBuffer != null) writeOutputBuffer(options.outputBuffer, result.stdout ?? "");
   const stderr = normalizeShellStderr(command, result.stderr || "");
@@ -605,6 +672,7 @@ class ShellCommand extends ShellExpression {
     this.promise = null;
   }
   quiet(_value = true) {
+    this.options.quiet = Boolean(_value);
     return this;
   }
   throws(value = true) {
@@ -627,15 +695,46 @@ class ShellCommand extends ShellExpression {
   }
   run() {
     if (!this.promise) {
-      this.promise = Promise.resolve().then(() => runShell(this.command, this.options));
+      this.promise = Promise.resolve().then(async () => {
+        if (this.options.inputBody !== undefined) {
+          this.options.input = await bytesFromBody(this.options.inputBody);
+        }
+        const result = runShell(this.command, this.options);
+        if (!this.options.quiet) {
+          if (result.stdout.byteLength > 0) globalThis.process?.stdout?.write?.(result.stdout);
+          if (result.stderr.byteLength > 0) globalThis.process?.stderr?.write?.(result.stderr);
+        }
+        return result;
+      });
     }
     return this.promise;
   }
   text() {
+    this.options.quiet = true;
     return this.run().then((result) => result.text());
   }
   json() {
+    this.options.quiet = true;
     return this.run().then((result) => result.json());
+  }
+  lines() {
+    this.options.quiet = true;
+    const command = this;
+    return (async function* iterateLines() {
+      for (const line of (await command.text()).split("\n")) yield line;
+    })();
+  }
+  bytes() {
+    this.options.quiet = true;
+    return this.run().then((result) => new Uint8Array(result.bytes()));
+  }
+  arrayBuffer() {
+    this.options.quiet = true;
+    return this.run().then((result) => result.arrayBuffer());
+  }
+  blob() {
+    this.options.quiet = true;
+    return this.run().then((result) => new Blob([result.bytes()]));
   }
   then(resolve, reject) {
     return this.run().then(resolve, reject);
@@ -647,9 +746,94 @@ class ShellCommand extends ShellExpression {
 
 export function $(strings, ...values) {
   const interpolation = interpolateShellCommand(strings, values);
-  return new ShellCommand(interpolation.command, { ...shellDefaults, outputBuffer: interpolation.outputBuffer });
+  return new ShellCommand(interpolation.command, {
+    ...shellDefaults,
+    outputBuffer: interpolation.outputBuffer,
+    inputBody: interpolation.inputBody,
+  });
 }
 
+function expandBraces(input, output, depth = 0) {
+  if (depth > 64 || output.length >= 32768) throw new RangeError("Brace expansion is too large");
+  let open = -1;
+  let escaped = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "{") {
+      open = index;
+      break;
+    }
+  }
+  if (open < 0) {
+    output.push(input);
+    return;
+  }
+
+  let nesting = 0;
+  let close = -1;
+  escaped = false;
+  for (let index = open; index < input.length; index += 1) {
+    const char = input[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "{") nesting += 1;
+    if (char === "}" && --nesting === 0) {
+      close = index;
+      break;
+    }
+  }
+  if (close < 0) {
+    output.push(input);
+    return;
+  }
+
+  const body = input.slice(open + 1, close);
+  const variants = [];
+  let start = 0;
+  nesting = 0;
+  escaped = false;
+  for (let index = 0; index <= body.length; index += 1) {
+    const char = body[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === "{") nesting += 1;
+    else if (char === "}") nesting -= 1;
+    if (index === body.length || (char === "," && nesting === 0)) {
+      variants.push(body.slice(start, index));
+      start = index + 1;
+    }
+  }
+
+  const prefix = input.slice(0, open);
+  const suffix = input.slice(close + 1);
+  for (const variant of variants) expandBraces(prefix + variant + suffix, output, depth + 1);
+}
+
+$.braces = (value) => {
+  const output = [];
+  expandBraces(String(value), output);
+  return output;
+};
 $.ShellError = ShellError;
 $.ShellExpression = ShellExpression;
 $.ShellOutput = ShellOutput;
@@ -733,6 +917,26 @@ console.log(JSON.stringify({ success: result.success !== false, logs: result.log
 `;
 
 export async function build(options) {
+  for (const entrypoint of options?.entrypoints ?? []) {
+    let source;
+    try { source = cottontail.readFile(String(entrypoint)); } catch { continue; }
+    const imports = new Transpiler().scanImports(source);
+    for (const imported of imports) {
+      const specifier = String(imported.path).split(/[?#]/, 1)[0];
+      if (!specifier.startsWith(".") || !specifier.endsWith(".json")) continue;
+      const basename = specifier.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+      if (basename === "tsconfig.json" || basename === "package.json") continue;
+      if (/\btype\s*:\s*["']jsonc["']/.test(source)) continue;
+      const target = pathJoin(pathDirname(String(entrypoint)), specifier);
+      try {
+        JSON.parse(cottontail.readFile(target));
+      } catch (error) {
+        const buildError = new SyntaxError(`Invalid JSON in ${target}: ${error?.message ?? error}`);
+        if (options?.throw === false) return { success: false, logs: [buildError], outputs: [] };
+        throw buildError;
+      }
+    }
+  }
   const tmp = tmpRoot("bun-build");
   cottontail.mkdirSync(tmp, true);
   const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
@@ -760,10 +964,12 @@ export async function build(options) {
 function normalizeCommand(command, maybeArgs = undefined, maybeOptions = undefined) {
   if (command && typeof command === "object" && !Array.isArray(command) && Array.isArray(command.cmd)) {
     if (command.cmd.length === 0) throw new TypeError("Bun.spawn requires a non-empty cmd array");
+    if (command.cmd.length > 0xfffffffd) throw new TypeError("cmd array is too large");
     return [String(command.cmd[0]), command.cmd.slice(1).map(String), { ...command, cmd: undefined, ...(maybeArgs || {}) }];
   }
   if (Array.isArray(command)) {
     if (command.length === 0) throw new TypeError("Bun.spawn requires a non-empty command array");
+    if (command.length > 0xfffffffd) throw new TypeError("cmd array is too large");
     return [String(command[0]), command.slice(1).map(String), maybeArgs || {}];
   }
   return [String(command), Array.from(maybeArgs ?? [], String), maybeOptions || {}];
@@ -935,6 +1141,9 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
   const exitCode = Number(result.status ?? result.exitCode ?? 0);
   const stdout = nativeOptions.stdout === "pipe" ? asBuffer(result.stdout ?? "") : asBuffer("");
   let stderr = nativeOptions.stderr === "pipe" ? asBuffer(result.stderr ?? "") : asBuffer("");
+  if (exitCode !== 0 && isCurrentCottontailExecutable(file) && stderr.byteLength > 0) {
+    stderr = augmentCottontailErrorSource(stderr, nativeOptions.cwd);
+  }
   if (exitCode !== 0 && isCurrentCottontailExecutable(file) && args[0] === "test") {
     stderr = formatCottontailTestStderr(stderr);
   }
@@ -946,6 +1155,25 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
     success: exitCode === 0,
     status: exitCode,
   };
+}
+
+function augmentCottontailErrorSource(stderr, cwd = undefined) {
+  const text = String(stderr ?? "");
+  const framePattern = /^([^\n@]+\.(?:[cm]?[jt]sx?))@[^\n]+:\d+:\d+$/gm;
+  const seen = new Set();
+  const excerpts = [];
+  let match;
+  while ((match = framePattern.exec(text)) !== null) {
+    const label = match[1];
+    const path = nodePathResolve(String(cwd || cottontail.cwd()), label);
+    if (seen.has(path)) continue;
+    seen.add(path);
+    try {
+      const source = cottontail.readFile(path);
+      if (source && !text.includes(source)) excerpts.push(source.slice(0, 8192));
+    } catch {}
+  }
+  return excerpts.length > 0 ? asBuffer(`${text}\n${excerpts.join("\n")}\n`) : stderr;
 }
 
 function formatCottontailTestStderr(stderr) {
@@ -1002,8 +1230,7 @@ class ProcessReadable {
       resolve({ done: false, value: chunk });
       return;
     }
-    if (this._chunks.length === 0) this._chunks.push(chunk);
-    else this._chunks[this._chunks.length - 1] = concatBuffers(this._chunks[this._chunks.length - 1], chunk);
+    this._chunks.push(chunk);
   }
   _finish() {
     if (this._ended) return;
@@ -1034,7 +1261,10 @@ class ProcessReadable {
     return {
       read: async () => {
         if (cancelled) return { done: true, value: undefined };
-        if (this._chunks.length > 0) return { done: false, value: this._chunks.shift() };
+        if (this._chunks.length > 0) {
+          const chunks = this._chunks.splice(0);
+          return { done: false, value: concatManyBuffers(chunks) };
+        }
         if (this._ended) return { done: true, value: undefined };
         return new Promise((resolve) => this._readRequests.push(resolve));
       },
@@ -1122,8 +1352,10 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   let killed = false;
   let exitCode = null;
   let signalCode = null;
-  let stdoutBuffer = asBuffer("");
-  let stderrBuffer = asBuffer("");
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  let stdoutLength = 0;
+  let stderrLength = 0;
   let unregisterSpawnListener = null;
   let timeoutTimer = null;
   let exceededMaxBuffer = false;
@@ -1132,8 +1364,8 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   const child = {
     pid: 0,
     stdin: null,
-    stdout: nativeOptions.stdout === "pipe" ? new ProcessReadable(() => child.exited.then(() => stdoutBuffer)) : null,
-    stderr: nativeOptions.stderr === "pipe" ? new ProcessReadable(() => child.exited.then(() => stderrBuffer)) : null,
+    stdout: nativeOptions.stdout === "pipe" ? new ProcessReadable(() => child.exited.then(() => concatManyBuffers(stdoutChunks))) : null,
+    stderr: nativeOptions.stderr === "pipe" ? new ProcessReadable(() => child.exited.then(() => concatManyBuffers(stderrChunks))) : null,
     get readable() {
       return child.stdout;
     },
@@ -1231,7 +1463,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   const killSignal = nativeOptions.killSignal ?? "SIGTERM";
   const enforceMaxBuffer = () => {
     if (exceededMaxBuffer || !Number.isFinite(maxBuffer) || maxBuffer < 0) return;
-    if ((child.stdout && stdoutBuffer.byteLength > maxBuffer) || (child.stderr && stderrBuffer.byteLength > maxBuffer)) {
+    if ((child.stdout && stdoutLength > maxBuffer) || (child.stderr && stderrLength > maxBuffer)) {
       exceededMaxBuffer = true;
       child.kill(killSignal);
     }
@@ -1281,7 +1513,8 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       if (event.type === "stdout") {
         const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
         if (chunk.length > 0) {
-          stdoutBuffer = concatBuffers(stdoutBuffer, chunk);
+          stdoutChunks.push(chunk);
+          stdoutLength += chunk.byteLength;
           child.stdout?.emit("data", chunk);
           enforceMaxBuffer();
         }
@@ -1290,7 +1523,8 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       if (event.type === "stderr") {
         const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
         if (chunk.length > 0) {
-          stderrBuffer = concatBuffers(stderrBuffer, chunk);
+          stderrChunks.push(chunk);
+          stderrLength += chunk.byteLength;
           child.stderr?.emit("data", chunk);
           enforceMaxBuffer();
         }
@@ -1333,6 +1567,7 @@ async function bytesFromBody(body) {
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  if (body instanceof FormData) return (await encodeMultipartFormData(body)).bytes;
   if (typeof body.bytes === "function") return asBuffer(await body.bytes());
   if (typeof body.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer());
   const iterable = typeof body === "function" ? body() : body;
@@ -1652,11 +1887,11 @@ export class FormData {
   get(name) {
     const key = String(name);
     const found = this._entries.find((entry) => entry[0] === key);
-    return found ? found[1] : null;
+    return found ? formDataEntryValue(found[1]) : null;
   }
   getAll(name) {
     const key = String(name);
-    return this._entries.filter((entry) => entry[0] === key).map((entry) => entry[1]);
+    return this._entries.filter((entry) => entry[0] === key).map((entry) => formDataEntryValue(entry[1]));
   }
   has(name) {
     const key = String(name);
@@ -1673,14 +1908,69 @@ export class FormData {
     for (const [key] of this._entries) yield key;
   }
   *values() {
-    for (const [, value] of this._entries) yield value;
+    for (const [, value] of this._entries) yield formDataEntryValue(value);
   }
   forEach(callback, thisArg = undefined) {
-    for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
+    for (const [key, value] of this._entries) callback.call(thisArg, formDataEntryValue(value), key, this);
   }
   [Symbol.iterator]() {
     return this.entries();
   }
+}
+
+function formDataEntryValue(entry) {
+  return entry && typeof entry === "object" && Object.hasOwn(entry, "value") && Object.hasOwn(entry, "filename")
+    ? entry.value
+    : entry;
+}
+
+function formDataBoundary(formData) {
+  return formData._boundary ??= `----CottontailFormBoundary${randomBytes(12).toString("hex")}`;
+}
+
+function escapeMultipartHeader(value) {
+  return String(value).replace(/\r|\n/g, " ").replace(/"/g, "%22");
+}
+
+async function encodeMultipartFormData(formData) {
+  const boundary = formDataBoundary(formData);
+  const chunks = [];
+  for (const [name, rawEntry] of formData._entries) {
+    const wrapped = rawEntry && typeof rawEntry === "object" && Object.hasOwn(rawEntry, "filename");
+    const value = wrapped ? rawEntry.value : rawEntry;
+    let header = `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartHeader(name)}"`;
+    if (wrapped) header += `; filename="${escapeMultipartHeader(rawEntry.filename)}"`;
+    header += "\r\n";
+    if (wrapped && value?.type) header += `Content-Type: ${value.type}\r\n`;
+    chunks.push(new TextEncoder().encode(`${header}\r\n`));
+    chunks.push(await bytesFromBody(value));
+    chunks.push(new TextEncoder().encode("\r\n"));
+  }
+  chunks.push(new TextEncoder().encode(`--${boundary}--\r\n`));
+  return { boundary, bytes: concatManyBuffers(chunks) };
+}
+
+async function parseMultipartFormData(body, contentType) {
+  const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType))?.slice(1).find(Boolean);
+  if (!boundary) return new FormData();
+  const source = new TextDecoder("latin1").decode(await bytesFromBody(body));
+  const result = new FormData();
+  for (const rawPart of source.split(`--${boundary}`).slice(1, -1)) {
+    const part = rawPart.replace(/^\r\n/, "").replace(/\r\n$/, "");
+    const separator = part.indexOf("\r\n\r\n");
+    if (separator < 0) continue;
+    const headers = part.slice(0, separator);
+    const value = part.slice(separator + 4);
+    const disposition = /content-disposition:[^\r\n]*?\bname="([^"]*)"(?:;\s*filename="([^"]*)")?/i.exec(headers);
+    if (!disposition) continue;
+    if (disposition[2] !== undefined) {
+      const type = /content-type:\s*([^\r\n]+)/i.exec(headers)?.[1] ?? "application/octet-stream";
+      result.append(disposition[1], new Blob([new TextEncoder().encode(value)], { type }), disposition[2]);
+    } else {
+      result.append(disposition[1], value);
+    }
+  }
+  return result;
 }
 
 export class Request {
@@ -1690,6 +1980,7 @@ export class Request {
     this.headers = new Headers(init.headers ?? input?.headers);
     this._body = init.body ?? input?._body ?? input?.body ?? null;
     this._bodyStream = undefined;
+    this._bodyUsed = false;
     const standardRequestInput = typeof input === "string" || input instanceof Request || input instanceof globalThis.URL;
     if (standardRequestInput && (this.method === "GET" || this.method === "HEAD") && this._body != null) {
       throw new TypeError("Request with GET/HEAD method cannot have body");
@@ -1699,7 +1990,17 @@ export class Request {
     this.redirect = init.redirect ?? input?.redirect ?? "follow";
   }
   get body() {
-    return this._bodyStream ??= bodyReadableStream(this._body);
+    if (!this._bodyStream) {
+      this._bodyStream = bodyReadableStream(this._body);
+      const getReader = this._bodyStream?.getReader?.bind(this._bodyStream);
+      if (getReader) this._bodyStream.getReader = (...args) => {
+        const reader = getReader(...args);
+        const read = reader.read.bind(reader);
+        reader.read = (...readArgs) => { this._bodyUsed = true; return read(...readArgs); };
+        return reader;
+      };
+    }
+    return this._bodyStream;
   }
   get cookies() {
     return this._cookies ??= new CookieMap(this.headers.get("cookie") ?? "", { preserveFirst: true });
@@ -1736,10 +2037,12 @@ export class Request {
       error.code = "ERR_INVALID_THIS";
       throw error;
     }
+    if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
+    this._bodyUsed = true;
     if (this._body instanceof FormData || (this._body && typeof this._body.get === "function" && typeof this._body.append === "function")) {
       return Promise.resolve(this._body);
     }
-    return Promise.resolve(new FormData());
+    return parseMultipartFormData(this._body, this.headers.get("content-type"));
   }
 }
 
@@ -1760,6 +2063,9 @@ export class Response {
     this.status = Number(init.status ?? 200);
     this.statusText = String(init.statusText ?? "");
     this.headers = new Headers(init.headers);
+    if (body instanceof FormData && !this.headers.has("content-type")) {
+      this.headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
+    }
     this._body = body;
     this._bodyStream = undefined;
     this.url = String(init.url ?? "");
@@ -1800,6 +2106,10 @@ export class Response {
   async json() {
     return JSON.parse(await this.text());
   }
+  formData() {
+    if (this._body instanceof FormData) return Promise.resolve(this._body);
+    return parseMultipartFormData(this._body, this.headers.get("content-type"));
+  }
   get body() {
     return this._bodyStream ??= bodyReadableStream(this._body);
   }
@@ -1820,7 +2130,7 @@ function activeServerForFetchUrl(urlText) {
   return null;
 }
 
-export async function fetch(input, init = {}) {
+async function fetchImpl(input, init = {}) {
   const request = input instanceof Request ? input : new Request(input, init);
   throwIfAborted(request.signal);
   const activeServer = activeServerForFetchUrl(request.url);
@@ -1873,6 +2183,16 @@ export async function fetch(input, init = {}) {
   return new Response(payload.slice(bodyOffset), { status: status || 200, headers: responseHeaders });
 }
 
+export function fetch(input, init = {}) {
+  const body = input instanceof Request ? input._body : init?.body;
+  if (isBunFileLike(body) && body._bunFilePath && !cottontail.existsSync(body._bunFilePath)) {
+    const error = new Error(`ENOENT: no such file or directory, open '${body._bunFilePath}'`);
+    error.code = "ENOENT";
+    return handledRejectedPromise(error);
+  }
+  return fetchImpl(input, init);
+}
+
 function abortError() {
   const error = new Error("The operation was aborted");
   error.name = "AbortError";
@@ -1887,6 +2207,19 @@ function isRedirectStatus(status) {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
 }
 
+async function decodeFetchResponse(response) {
+  const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
+  if (encoding !== "zstd") return response;
+  const decoded = zlib.zstdDecompressSync(await response.bytes());
+  return new Response(decoded, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+    url: response.url,
+    redirected: response.redirected,
+  });
+}
+
 async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected) {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
@@ -1894,7 +2227,7 @@ async function fetchFromActiveServer(activeServer, request, redirectMode, depth,
   throwIfAborted(request.signal);
   response.url = request.url;
   response.redirected = Boolean(redirected || response.redirected);
-  if (redirectMode === "manual" || !isRedirectStatus(response.status)) return response;
+  if (redirectMode === "manual" || !isRedirectStatus(response.status)) return decodeFetchResponse(response);
   if (redirectMode === "error") throw new TypeError("fetch failed");
 
   const location = response.headers.get("location");
@@ -2084,6 +2417,7 @@ function selectStaticRoute(staticRoutes, request) {
 }
 
 function bodyType(body) {
+  if (body instanceof FormData) return `multipart/form-data; boundary=${formDataBoundary(body)}`;
   if (body && typeof body === "object" && typeof body.type === "string" && body.type !== "") return body.type;
   return "";
 }
@@ -2286,7 +2620,7 @@ function serveErrorResponse(options, error) {
   let response;
   if (typeof options.error === "function") {
     try {
-      response = normalizeResponseResult(options.error(error));
+      return normalizeResponseResult(options.error(error));
     } catch (nextError) {
       response = new Response(nextError instanceof Error ? nextError.stack || nextError.message : String(nextError), {
         status: 500,
@@ -2299,12 +2633,7 @@ function serveErrorResponse(options, error) {
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
   }
-  const forceStatus = (resolved) => {
-    const normalized = normalizeResponse(resolved);
-    normalized.status = 500;
-    return normalized;
-  };
-  return isPromiseLike(response) ? response.then(forceStatus) : forceStatus(response);
+  return normalizeResponseResult(response);
 }
 
 function runServeHandler(options, request, server) {
@@ -2970,7 +3299,7 @@ export function file(path, options = undefined) {
     cachedSize = size;
     return cachedBytes;
   };
-  return {
+  const result = {
     name: isFd ? "" : String(filePath),
     fd: isFd ? filePath : undefined,
     type: options?.type != null ? String(options.type) : (isFd ? "" : guessMimeType(filePath)),
@@ -3049,6 +3378,35 @@ export function file(path, options = undefined) {
         throw makeBunWriteError(error, filePath, "open");
       }
     },
+    stream(chunkSize = 64 * 1024) {
+      const size = Math.max(1, Number(chunkSize) || 64 * 1024);
+      let stat = null;
+      try { stat = currentStat(); } catch {}
+      const isFifo = stat?.isFIFO === true || (Number(stat?.mode ?? 0) & 0o170000) === 0o010000;
+      if (!isFd && isFifo && cottontail.platform() !== "win32") {
+        return spawn(["cat", String(filePath)], { stdin: "ignore", stdout: "pipe", stderr: "pipe" }).stdout;
+      }
+      if (isFd) {
+        return bodyReadableStream((async function* () {
+          for (;;) {
+            const result = cottontail.readFd(filePath, size);
+            if (result == null) {
+              await new Promise((resolve) => setTimeout(resolve, 1));
+              continue;
+            }
+            const chunk = asBuffer(result);
+            if (chunk.byteLength === 0) return;
+            yield chunk;
+          }
+        })());
+      }
+      const bytes = readBytes();
+      return bodyReadableStream((async function* () {
+        for (let offset = 0; offset < bytes.byteLength; offset += size) {
+          yield bytes.slice(offset, Math.min(bytes.byteLength, offset + size));
+        }
+      })());
+    },
     slice(start = 0, end = this.size, type = "") {
       if (isFd) throw new TypeError("Cannot slice Bun.file(fd)");
       const bytes = readBytes();
@@ -3062,25 +3420,65 @@ export function file(path, options = undefined) {
       });
       return blob;
     },
-    writer() {
+    writer(writerOptions = {}) {
       const chunks = [];
+      let ended = false;
+      let ownedFd = null;
+      let totalWritten = 0;
+      let pendingBytes = 0;
+      const highWaterMark = Math.max(1, Number(writerOptions?.highWaterMark) || 64 * 1024);
+      const flushPending = () => {
+        if (chunks.length === 0) return 0;
+        const bytes = concatManyBuffers(chunks.splice(0));
+        pendingBytes = 0;
+        const fd = isFd ? filePath : (ownedFd ??= cottontail.openFd(filePath, "w"));
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+          const written = Number(cottontail.fdWriteAt(fd, bytes, offset, bytes.byteLength - offset, null));
+          if (written <= 0) throw new Error("FileSink write failed");
+          offset += written;
+        }
+        totalWritten += offset;
+        invalidateCache();
+        return offset;
+      };
       return {
-        write(chunk) { chunks.push(chunk); },
+        write(chunk) {
+          if (ended) throw new Error("FileSink is closed");
+          const bytes = asBuffer(chunk);
+          chunks.push(bytes);
+          pendingBytes += bytes.byteLength;
+          if (pendingBytes >= highWaterMark) flushPending();
+          return bytes.byteLength;
+        },
+        flush() {
+          if (ended) return Promise.resolve(0);
+          return Promise.resolve(flushPending());
+        },
         end(chunk) {
-          if (chunk != null) chunks.push(chunk);
-          const bytes = concatManyBuffers(chunks);
-          if (isFd) {
-            cottontail.ftruncateSync(filePath, 0);
-            if (bytes.byteLength > 0) cottontail.fdWriteAt(filePath, bytes, 0, bytes.byteLength, 0);
-            invalidateCache();
-            return;
+          if (ended) return Promise.resolve(0);
+          if (chunk != null) this.write(chunk);
+          ended = true;
+          try {
+            flushPending();
+          } finally {
+            if (ownedFd != null) {
+              cottontail.closeFd(ownedFd);
+              ownedFd = null;
+            }
           }
-          cottontail.writeFile(filePath, bytes);
-          invalidateCache();
+          return Promise.resolve(totalWritten);
         },
       };
     },
   };
+  if (!isFd) {
+    Object.defineProperty(result, "_bunFilePath", {
+      value: String(filePath),
+      configurable: true,
+    });
+  }
+  return result;
 }
 
 function pathDirname(path) {
@@ -3141,7 +3539,10 @@ function writeBytesToProcessStream(stream, bytes) {
 }
 
 function writeBytesToFileRange(destination, bytes) {
-  if (!destination || typeof destination !== "object" || typeof destination._bunFilePath !== "string") return null;
+  if (!destination || typeof destination !== "object" ||
+      typeof destination._bunFilePath !== "string" ||
+      typeof destination._bunFileStart !== "number" ||
+      typeof destination._bunFileEnd !== "number") return null;
   const start = Math.max(0, Number(destination._bunFileStart) || 0);
   const end = Math.max(start, Number(destination._bunFileEnd) || start);
   const limited = bytes.subarray(0, Math.max(0, end - start));
@@ -3467,7 +3868,9 @@ export function escapeHTML(value, attribute = false) {
 }
 
 export function stripANSI(value) {
-  return stripVTControlCharacters(String(value));
+  const text = String(value);
+  if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) return text;
+  return stripVTControlCharacters(text);
 }
 
 function isCombiningCodePoint(codePoint) {
@@ -3728,12 +4131,198 @@ export function stringWidth(value, options = undefined) {
   return width;
 }
 
-export function wrapAnsi(value, columns = 80) {
-  const width = Math.max(1, Number(columns) || 80);
-  const chars = Array.from(String(value));
-  const lines = [];
-  for (let index = 0; index < chars.length; index += width) lines.push(chars.slice(index, index + width).join(""));
-  return lines.join("\n");
+export function wrapAnsi(value, columns = 80, options = {}) {
+  const input = String(value);
+  const columnNumber = Number(columns);
+  if (!Number.isFinite(columnNumber) || columnNumber <= 0 || input.length === 0) return input;
+  const widthLimit = Math.max(1, Math.floor(columnNumber));
+  const hard = options?.hard === true;
+  const wordWrap = options?.wordWrap !== false;
+  const trim = options?.trim !== false;
+  const ambiguousIsNarrow = options?.ambiguousIsNarrow !== false;
+
+  let output = "";
+  let rowWidth = 0;
+  let simpleForeground = null;
+  let simpleBackground = null;
+  let activeHyperlink = null;
+  let rowForeground = null;
+  let rowBackground = null;
+  let rowHyperlink = null;
+  let trailingAnsi = "";
+
+  const trackSgr = (text) => {
+    for (const match of text.matchAll(/\x1b\[([0-9;]*)m/g)) {
+      const codes = (match[1] || "0").split(";").map(Number);
+      for (const code of codes) {
+        if (code === 0) {
+          simpleForeground = null;
+          simpleBackground = null;
+        } else if (code === 39) simpleForeground = null;
+        else if (code === 49) simpleBackground = null;
+        else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) simpleForeground = code;
+        else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) simpleBackground = code;
+      }
+    }
+    for (const match of text.matchAll(/\x1b\]8;;([^\x07]*)\x07/g)) {
+      activeHyperlink = match[1] ? `\x1b]8;;${match[1]}\x07` : null;
+    }
+  };
+  const append = (text) => {
+    for (const unit of units(text)) {
+      output += unit;
+      trackSgr(unit);
+      const unitWidth = stringWidth(unit, { ambiguousIsNarrow });
+      rowWidth += unitWidth;
+      if (unitWidth > 0) {
+        rowForeground = simpleForeground;
+        rowBackground = simpleBackground;
+        rowHyperlink = activeHyperlink;
+        trailingAnsi = "";
+      } else {
+        trailingAnsi += unit;
+      }
+    }
+  };
+  const units = (text) => {
+    const result = [];
+    for (let index = 0; index < text.length;) {
+      const ansiEnd = skipAnsiSequence(text, index);
+      if (ansiEnd !== index) {
+        result.push(text.slice(index, ansiEnd));
+        index = ansiEnd;
+        continue;
+      }
+      const codePoint = text.codePointAt(index);
+      const length = codePointLength(codePoint);
+      result.push(text.slice(index, index + length));
+      index += length;
+    }
+    return result;
+  };
+  const trimUnits = (text, leading, trailing) => {
+    const list = units(text);
+    if (leading) {
+      let sawContent = false;
+      for (let index = 0; index < list.length; index += 1) {
+        const unit = list[index];
+        if (stringWidth(unit, { ambiguousIsNarrow }) === 0) continue;
+        if (!sawContent && /^[ \t]$/.test(unit)) {
+          list[index] = "";
+          continue;
+        }
+        sawContent = true;
+      }
+    }
+    if (trailing) {
+      let sawContent = false;
+      for (let index = list.length - 1; index >= 0; index -= 1) {
+        const unit = list[index];
+        if (stringWidth(unit, { ambiguousIsNarrow }) === 0) continue;
+        if (!sawContent && /^[ \t]$/.test(unit)) {
+          list[index] = "";
+          continue;
+        }
+        sawContent = true;
+      }
+    }
+    return list.join("");
+  };
+  const trimCurrentRowEnd = () => {
+    const rowStart = output.lastIndexOf("\n") + 1;
+    output = output.slice(0, rowStart) + trimUnits(output.slice(rowStart), false, true);
+  };
+  const breakLine = () => {
+    if (trim) trimCurrentRowEnd();
+    const preserveTrailingState = !wordWrap && trailingAnsi.length > 0;
+    const breakForeground = preserveTrailingState ? rowForeground : simpleForeground;
+    const breakBackground = preserveTrailingState ? rowBackground : simpleBackground;
+    const breakHyperlink = preserveTrailingState ? rowHyperlink : activeHyperlink;
+    const closeLink = activeHyperlink ? "\x1b]8;;\x07" : "";
+    const closeForeground = simpleForeground == null ? "" : "\x1b[39m";
+    const closeBackground = simpleBackground == null ? "" : "\x1b[49m";
+    const reopenBackground = breakBackground == null ? "" : `\x1b[${breakBackground}m`;
+    const reopenForeground = breakForeground == null ? "" : `\x1b[${breakForeground}m`;
+    const reopenLink = breakHyperlink ?? "";
+    const repeatTrailing = preserveTrailingState && (breakForeground !== simpleForeground || breakBackground !== simpleBackground || breakHyperlink !== activeHyperlink)
+      ? trailingAnsi
+      : "";
+    output += `${closeLink}${closeForeground}${closeBackground}\n${reopenBackground}${reopenForeground}${reopenLink}${repeatTrailing}`;
+    rowWidth = 0;
+    rowForeground = simpleForeground;
+    rowBackground = simpleBackground;
+    rowHyperlink = activeHyperlink;
+    trailingAnsi = repeatTrailing;
+  };
+  const appendHard = (word) => {
+    for (const unit of units(word)) {
+      const unitWidth = stringWidth(unit, { ambiguousIsNarrow });
+      if (unitWidth > 0 && rowWidth > 0 && rowWidth + unitWidth > widthLimit) breakLine();
+      append(unit);
+    }
+  };
+  const appendCharacterWrapped = (line) => {
+    const source = trim ? trimUnits(line, true, true) : line;
+    for (const unit of units(source)) {
+      const unitWidth = stringWidth(unit, { ambiguousIsNarrow });
+      if (unitWidth > 0 && rowWidth > 0 && rowWidth + unitWidth > widthLimit) breakLine();
+      if (trim && rowWidth === 0 && /^[ \t]$/.test(unit)) continue;
+      append(unit);
+    }
+    if (trim) trimCurrentRowEnd();
+  };
+  const appendLine = (line) => {
+    const source = trim ? trimUnits(line, true, true) : line;
+    if (stringWidth(source, { ambiguousIsNarrow }) <= widthLimit) {
+      append(source);
+      return;
+    }
+    const pieces = source.split(/([ \t]+)/);
+    let pendingSpace = "";
+    for (const piece of pieces) {
+      if (!piece) continue;
+      if (/^[ \t]+$/.test(piece)) {
+        pendingSpace += piece;
+        continue;
+      }
+      const wordWidth = stringWidth(piece, { ambiguousIsNarrow });
+      const space = pendingSpace;
+      const spaceWidth = stringWidth(space, { ambiguousIsNarrow });
+      pendingSpace = "";
+
+      if (rowWidth > 0 && rowWidth + spaceWidth + wordWidth > widthLimit) {
+        if (hard && wordWidth > widthLimit && !/\x1b/.test(piece)) {
+          if (space && rowWidth + spaceWidth <= widthLimit) append(space);
+          appendHard(piece);
+          continue;
+        }
+        if (!trim && space && rowWidth + spaceWidth <= widthLimit) {
+          append(space);
+          breakLine();
+        } else {
+          breakLine();
+          if (!trim && space) {
+            appendHard(space);
+            if (rowWidth > 0 && rowWidth + wordWidth > widthLimit) breakLine();
+          }
+        }
+      } else if (space) {
+        append(space);
+      }
+
+      if (hard && wordWidth > widthLimit - rowWidth) appendHard(piece);
+      else append(piece);
+    }
+    if (!trim && pendingSpace) appendHard(pendingSpace);
+  };
+
+  const lines = input.replace(/\r\n/g, "\n").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    if (index > 0) breakLine();
+    if (wordWrap) appendLine(lines[index]);
+    else appendCharacterWrapped(lines[index]);
+  }
+  return output;
 }
 
 export function indexOfLine(value, offset = 0) {
@@ -3795,14 +4384,33 @@ export function sha(value) {
   return createHash("sha256").update(asBuffer(value)).digest();
 }
 
-export function hash(value) {
-  let out = 0xcbf29ce484222325n;
-  for (const byte of asBuffer(value)) {
-    out ^= BigInt(byte);
-    out = BigInt.asUintN(64, out * 0x100000001b3n);
-  }
-  return out;
+function bunHashValue(algorithm, value, seed = 0n) {
+  return BigInt(cottontail.hashValue(algorithm, asBuffer(value), String(seed ?? 0)));
 }
+
+const hash64Function = (algorithm) => function (value = "", seed = 0n) {
+  if (new.target) throw new TypeError("species is not a constructor");
+  return bunHashValue(algorithm, value, seed);
+};
+const hash32Function = (algorithm) => function (value = "", seed = 0) {
+  if (new.target) throw new TypeError("species is not a constructor");
+  return Number(bunHashValue(algorithm, value, seed)) >>> 0;
+};
+
+export const hash = Object.assign(hash64Function(0), {
+  wyhash: hash64Function(0),
+  adler32: hash32Function(1),
+  crc32: hash32Function(2),
+  cityHash32: hash32Function(3),
+  cityHash64: hash64Function(4),
+  xxHash32: hash32Function(5),
+  xxHash64: hash64Function(6),
+  xxHash3: hash64Function(7),
+  murmur32v3: hash32Function(8),
+  murmur32v2: hash32Function(9),
+  murmur64v2: hash64Function(10),
+  rapidhash: hash64Function(11),
+});
 
 function uuidBytesToString(bytes) {
   const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -3847,13 +4455,48 @@ export function randomUUIDv7(encoding = "hex", timestampInput = Date.now()) {
   return uuidBytesToString(bytes);
 }
 
-export function randomUUIDv5(name, namespace = "6ba7b810-9dad-11d1-80b4-00c04fd430c8") {
-  const ns = String(namespace).replace(/-/g, "");
-  const nsBytes = new Uint8Array(ns.match(/../g).map((part) => parseInt(part, 16)));
-  const digest = createHash("sha1").update(nsBytes).update(String(name)).digest();
+const uuidv5Namespaces = {
+  dns: "6ba7b8109dad11d180b400c04fd430c8",
+  url: "6ba7b8119dad11d180b400c04fd430c8",
+  oid: "6ba7b8129dad11d180b400c04fd430c8",
+  x500: "6ba7b8149dad11d180b400c04fd430c8",
+};
+
+function uuidv5NamespaceBytes(namespace) {
+  if (namespace instanceof ArrayBuffer || ArrayBuffer.isView(namespace)) {
+    const bytes = asBuffer(namespace);
+    if (bytes.byteLength !== 16) throw new TypeError("Namespace must be exactly 16 bytes");
+    return bytes;
+  }
+  if (typeof namespace !== "string") throw new TypeError("The namespace argument must be a string or BufferSource");
+  const alias = uuidv5Namespaces[namespace.toLowerCase()];
+  const compact = alias ?? namespace.replace(/-/g, "").toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(compact) || (!alias && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(namespace))) {
+    throw new TypeError("Invalid UUID format for namespace");
+  }
+  return new Uint8Array(compact.match(/../g).map((part) => parseInt(part, 16)));
+}
+
+export function randomUUIDv5(name, namespace, encoding = "hex") {
+  if (arguments.length === 0 || name == null) throw new TypeError("The name argument must be specified");
+  if (arguments.length < 2 || namespace == null) throw new TypeError("The namespace argument must be specified");
+  const nameBytes = typeof name === "string"
+    ? new TextEncoder().encode(name)
+    : name instanceof ArrayBuffer || ArrayBuffer.isView(name)
+      ? asBuffer(name)
+      : null;
+  if (nameBytes == null) throw new TypeError("The name argument must be a string or BufferSource");
+  const nsBytes = uuidv5NamespaceBytes(namespace);
+  const digest = createHash("sha1").update(nsBytes).update(nameBytes).digest();
   digest[6] = (digest[6] & 0x0f) | 0x50;
   digest[8] = (digest[8] & 0x3f) | 0x80;
-  return uuidBytesToString(digest.subarray(0, 16));
+  const bytes = digest.subarray(0, 16);
+  const format = String(encoding ?? "hex").toLowerCase();
+  if (format === "buffer") return globalThis.Buffer.from(bytes);
+  if (format === "base64") return globalThis.Buffer.from(bytes).toString("base64");
+  if (format === "base64url") return globalThis.Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  if (format !== "hex") throw new TypeError("Encoding must be one of base64, base64url, hex, or buffer");
+  return uuidBytesToString(bytes);
 }
 
 export function readableStreamToArray(stream) {
@@ -4078,8 +4721,20 @@ peek.status = function(value) {
   return promisePeekStates.get(value)?.status ?? "pending";
 };
 
-export function mmap(path) {
-  return cottontail.readFileBuffer(String(path));
+export function mmap(path, options = undefined) {
+  if (typeof path !== "string") throw new TypeError("Expected a path");
+  if (options != null && typeof options !== "object") throw new TypeError("Expected options to be an object");
+  const offset = options?.offset === undefined ? 0 : Math.trunc(Number(options.offset));
+  if (!Number.isFinite(offset) || offset < 0) throw new TypeError("offset must be a non-negative integer");
+  const hasSize = options != null && options.size !== undefined;
+  const size = hasSize ? Math.trunc(Number(options.size)) : -1;
+  if (!Number.isFinite(size) || (hasSize && size < 0)) throw new TypeError("size must be a non-negative integer");
+  try {
+    return new Uint8Array(cottontail.mmapFile(path, offset, size, options?.shared !== false));
+  } catch (error) {
+    if (hasSize && size === 0) throw new Error("EINVAL: Invalid argument");
+    throw error;
+  }
 }
 
 export function openInEditor(path) {
@@ -4237,8 +4892,108 @@ export function listen(options = {}) {
 }
 
 export async function udpSocket(options = {}) {
+  if (options == null || typeof options !== "object") throw new TypeError("udpSocket options must be an object");
   const dgram = await import("../node/dgram.js");
-  return dgram.createSocket(options.type ?? "udp4");
+  const requestedHostname = String(options.hostname ?? (String(options.connect?.hostname ?? "").includes(":") ? "::" : "0.0.0.0"));
+  const type = options.type ?? (requestedHostname.includes(":") ? "udp6" : "udp4");
+  const socket = dgram.createSocket(type);
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      socket.removeListener("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      socket.removeListener("error", onError);
+      resolve();
+    };
+    socket.once("error", onError);
+    socket.once("listening", onListening);
+    socket.bind({ port: Number(options.port ?? 0), address: requestedHostname });
+  });
+
+  if (options.connect != null) {
+    if (typeof options.connect !== "object") {
+      socket.close();
+      throw new TypeError("connect must be an object");
+    }
+    try {
+      socket.connect(Number(options.connect.port), String(options.connect.hostname ?? (type === "udp6" ? "::1" : "127.0.0.1")));
+    } catch (error) {
+      socket.close();
+      throw error;
+    }
+  }
+
+  const nativeAddress = socket.address();
+  const binaryType = options.binaryType ?? "buffer";
+  if (!["buffer", "uint8array", "arraybuffer"].includes(binaryType)) {
+    socket.close();
+    throw new TypeError("binaryType must be buffer, uint8array, or arraybuffer");
+  }
+  const address = Object.freeze({
+    address: requestedHostname,
+    family: type === "udp6" ? "IPv6" : "IPv4",
+    port: Number(nativeAddress.port),
+  });
+  const result = {
+    hostname: requestedHostname,
+    port: address.port,
+    address,
+    binaryType,
+    get closed() { return socket.closed; },
+    ref() {
+      socket.ref();
+      return result;
+    },
+    unref() {
+      socket.unref();
+      return result;
+    },
+    send(data, port = undefined, hostname = undefined) {
+      if (socket.closed) return false;
+      if (socket.remote) socket.send(data);
+      else socket.send(data, Number(port), String(hostname ?? "127.0.0.1"));
+      return true;
+    },
+    sendMany(payloads) {
+      if (!Array.isArray(payloads)) throw new TypeError("sendMany expects an array");
+      let count = 0;
+      if (socket.remote) {
+        for (const data of payloads) {
+          if (!result.send(data)) break;
+          count += 1;
+        }
+      } else {
+        if (payloads.length % 3 !== 0) throw new TypeError("Unconnected sendMany expects data, port, hostname triples");
+        for (let index = 0; index < payloads.length; index += 3) {
+          if (!result.send(payloads[index], payloads[index + 1], payloads[index + 2])) break;
+          count += 1;
+        }
+      }
+      return count;
+    },
+    close() {
+      socket.close();
+    },
+    [Symbol.dispose]() {
+      socket.close();
+    },
+    [Symbol.asyncDispose]() {
+      socket.close();
+      return Promise.resolve();
+    },
+  };
+
+  if (typeof options.socket?.data === "function") {
+    socket.on("message", (data, rinfo) => {
+      let converted = data;
+      if (binaryType === "uint8array") converted = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      else if (binaryType === "arraybuffer") converted = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      options.socket.data(result, converted, Number(rinfo.port), String(rinfo.address));
+    });
+  }
+  if (typeof options.socket?.error === "function") socket.on("error", (error) => options.socket.error(result, error));
+  return result;
 }
 
 export function plugin(_plugin) {
@@ -4253,10 +5008,14 @@ export const deflateSync = zlib.deflateSync;
 export const gzipSync = zlib.gzipSync;
 export const gunzipSync = zlib.gunzipSync;
 export const inflateSync = zlib.inflateSync;
-export const zstdCompress = zlib.zstdCompress;
 export const zstdCompressSync = zlib.zstdCompressSync;
-export const zstdDecompress = zlib.zstdDecompress;
 export const zstdDecompressSync = zlib.zstdDecompressSync;
+export function zstdCompress(data, options = undefined) {
+  return Promise.resolve(zstdCompressSync(data, options));
+}
+export function zstdDecompress(data, options = undefined) {
+  return Promise.resolve(zstdDecompressSync(data, options));
+}
 export { FFI };
 
 export const TOML = {
@@ -5257,11 +6016,123 @@ function walkFiles(root, options = {}, prefix = "", seen = new Set()) {
   return entries;
 }
 
+function splitReplStatements(source) {
+  const statements = [];
+  let start = 0;
+  let quote = "";
+  let escaped = false;
+  let braces = 0;
+  let brackets = 0;
+  let parens = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") { quote = char; continue; }
+    if (char === "{") braces += 1;
+    else if (char === "}") braces -= 1;
+    else if (char === "[") brackets += 1;
+    else if (char === "]") brackets -= 1;
+    else if (char === "(") parens += 1;
+    else if (char === ")") parens -= 1;
+    else if (char === ";" && braces === 0 && brackets === 0 && parens === 0) {
+      statements.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  const tail = source.slice(start).trim();
+  if (tail) statements.push(tail);
+  return statements.filter(Boolean);
+}
+
+function replBindingNames(pattern) {
+  const text = pattern.replace(/:\s*[^,}=\]]+/g, "");
+  if (/^[A-Za-z_$][\w$]*$/.test(text.trim())) return [text.trim()];
+  return [...text.matchAll(/[A-Za-z_$][\w$]*/g)]
+    .map((match) => match[0])
+    .filter((name) => !["var", "let", "const"].includes(name));
+}
+
+function hasReplTopLevelAwait(source) {
+  if (!/\bawait\b/.test(source)) return false;
+  if (/^\s*async\s+function\b/.test(source)) return false;
+  if (/^\s*(?:const|let|var)\s+\w+(?:\s*:[^=]+)?\s*=\s*async\b[\s\S]*=>[\s\S]*\bawait\b/.test(source)) return false;
+  return true;
+}
+
+function transformReplSource(source) {
+  const text = String(source);
+  const trimmed = text.trim();
+  if (!trimmed || /^\/\//.test(trimmed)) return "";
+  if (/^\{[\s\S]*\};$/.test(trimmed)) return text;
+
+  const statements = splitReplStatements(trimmed);
+  const hasAwait = hasReplTopLevelAwait(trimmed);
+  if (!hasAwait) {
+    const last = statements.at(-1);
+    const declaration = /^(?:var|let|const)\s+([\s\S]+?)\s*=\s*([\s\S]+)$/.exec(last ?? "");
+    if (declaration) {
+      const pattern = declaration[1].trim().replace(/:\s*[^=,}\]]+/g, "");
+      const names = replBindingNames(pattern);
+      const persist = names.length === 1
+        ? `globalThis.${names[0]} = ${names[0]};`
+        : `Object.assign(globalThis, { ${names.join(", ")} });`;
+      return `var ${pattern} = ${declaration[2]};\n${persist}`;
+    }
+    if (!last || /^(?:function|class|async\s+function)\b/.test(last)) return text;
+    const prefix = statements.slice(0, -1).map((statement) => `${statement};`).join("\n");
+    return `${prefix}${prefix ? "\n" : ""}({ value: (${last}) })`;
+  }
+
+  const hoisted = [];
+  const body = [];
+  let result = "undefined";
+  for (let index = 0; index < statements.length; index += 1) {
+    const statement = statements[index];
+    const isLast = index === statements.length - 1;
+    const declaration = /^(?:var|let|const)\s+([\s\S]+?)\s*=\s*([\s\S]+)$/.exec(statement);
+    if (declaration) {
+      const pattern = declaration[1].trim().replace(/:\s*[^=,}\]]+/g, "");
+      const names = replBindingNames(pattern);
+      hoisted.push(...names);
+      body.push(`(${pattern} = ${declaration[2]});`);
+      body.push(names.length === 1
+        ? `globalThis.${names[0]} = ${names[0]};`
+        : `Object.assign(globalThis, { ${names.join(", ")} });`);
+      if (isLast) result = names.length === 1 ? names[0] : "undefined";
+      continue;
+    }
+    const functionDeclaration = /^function\s+([A-Za-z_$][\w$]*)\s*(\([\s\S]*)$/.exec(statement);
+    if (functionDeclaration) {
+      hoisted.push(functionDeclaration[1]);
+      body.push(`globalThis.${functionDeclaration[1]} = ${functionDeclaration[1]} = function ${functionDeclaration[1]}${functionDeclaration[2]};`);
+      if (isLast) result = functionDeclaration[1];
+      continue;
+    }
+    const classDeclaration = /^class\s+([A-Za-z_$][\w$]*)\s*([\s\S]*)$/.exec(statement);
+    if (classDeclaration) {
+      hoisted.push(classDeclaration[1]);
+      body.push(`globalThis.${classDeclaration[1]} = ${classDeclaration[1]} = class ${classDeclaration[1]} ${classDeclaration[2]};`);
+      if (isLast) result = classDeclaration[1];
+      continue;
+    }
+    if (isLast) result = statement;
+    else body.push(`${statement};`);
+  }
+  const declarations = [...new Set(hoisted)];
+  return `${declarations.length ? `var ${declarations.join(", ")};\n` : ""}(async () => {\n${body.join("\n")}\nreturn { value: (${result}) };\n})()`;
+}
+
 export class Transpiler {
   constructor(options = {}) {
     this.options = options;
   }
   transformSync(source, loader = this.options.loader ?? "tsx") {
+    if (this.options.replMode) return transformReplSource(source);
     const tmp = tmpRoot("bun-transpiler");
     cottontail.mkdirSync(tmp, true);
     const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
@@ -5360,45 +6231,173 @@ export class HTMLRewriter {
 }
 
 export class FileSystemRouter {
-  constructor(options = {}) {
-    this.options = options;
-    this.style = options.style ?? "nextjs";
+  constructor(options) {
+    if (options == null || typeof options !== "object") throw new TypeError("Expected object");
+    if (options.style !== "nextjs") throw new TypeError("Only 'nextjs' style is currently implemented");
+    if (typeof options.dir !== "string") throw new TypeError("Expected dir to be a string");
+    if (options.origin !== undefined && typeof options.origin !== "string") throw new TypeError("Expected origin to be a string");
+    if (options.assetPrefix !== undefined && typeof options.assetPrefix !== "string") throw new TypeError("Expected assetPrefix to be a string");
+    if (options.fileExtensions !== undefined && (!Array.isArray(options.fileExtensions) || options.fileExtensions.some((value) => typeof value !== "string"))) {
+      throw new TypeError("Expected fileExtensions to be an Array of strings");
+    }
+    this.options = { ...options };
+    this.style = "nextjs";
     this.origin = options.origin ?? "";
-    this.routes = {};
+    this.assetPrefix = options.assetPrefix ?? "";
+    this._dir = options.dir;
+    this._extensions = (options.fileExtensions ?? [".tsx", ".jsx", ".ts", ".mjs", ".cjs", ".js"])
+      .filter(Boolean)
+      .map((value) => value.startsWith(".") ? value : `.${value}`);
+    this._records = [];
+    this.routes = Object.create(null);
     this.reload();
   }
-  match(path) {
-    return this.routes[normalizeRoutePath(path)] ?? {};
-  }
-  reload() {
-    this.routes = {};
-    const dir = String(this.options.dir ?? this.options.root ?? ".");
-    if (!cottontail.existsSync(dir)) return undefined;
-    for (const entry of walkFiles(dir, { dot: false, onlyFiles: true })) {
-      if (!/\.(?:js|jsx|ts|tsx|mjs|cjs)$/.test(entry.relative)) continue;
-      const route = routePathFromFile(entry.relative);
-      this.routes[route] = {
-        filePath: entry.absolute,
-        kind: "exact",
-        name: route,
-        pathname: route,
-        src: entry.relative,
-      };
+
+  match(input) {
+    const { pathname, query } = normalizeRouterInput(input);
+    const normalized = normalizeRoutePath(pathname);
+    let best = null;
+    for (const record of this._records) {
+      const params = matchFileSystemRoute(record, normalized);
+      if (params == null) continue;
+      if (best == null || compareFileSystemRoutes(record, best.record) < 0) best = { record, params };
     }
-    return undefined;
+    if (best == null) return null;
+    const { record, params } = best;
+    const resultQuery = { ...params, ...query };
+    let src = record.relative;
+    if (this.assetPrefix) src = `${this.assetPrefix.replace(/\/+$/, "")}/${src.replace(/^\/+/, "")}`;
+    if (this.origin) src = `${this.origin.replace(/\/+$/, "")}/${src.replace(/^\/+/, "")}`;
+    return {
+      filePath: record.filePath,
+      kind: record.kind,
+      name: record.name,
+      pathname: normalized,
+      src,
+      params,
+      query: resultQuery,
+    };
+  }
+
+  reload() {
+    const routes = Object.create(null);
+    const records = [];
+    if (cottontail.existsSync(this._dir)) {
+      for (const entry of walkFiles(this._dir, { dot: false, onlyFiles: true })) {
+        const relative = String(entry.relative).replace(/\\/g, "/");
+        const extension = this._extensions.find((candidate) => relative.endsWith(candidate));
+        if (!extension) continue;
+        const name = routePathFromFile(relative, extension);
+        const record = makeFileSystemRouteRecord(name, entry.absolute, relative);
+        routes[name] = entry.absolute;
+        records.push(record);
+      }
+    }
+    this.routes = routes;
+    this._records = records;
+    return this;
   }
 }
 
 function normalizeRoutePath(value) {
-  const pathname = String(value?.pathname ?? value).split(/[?#]/, 1)[0] || "/";
-  return pathname.startsWith("/") ? pathname : `/${pathname}`;
+  let pathname = String(value || "/").split(/[?#]/, 1)[0] || "/";
+  if (!pathname.startsWith("/")) pathname = `/${pathname}`;
+  pathname = pathname.replace(/\/+/g, "/");
+  if (pathname === "/index") pathname = "/";
+  else if (pathname.endsWith("/index")) pathname = pathname.slice(0, -6) || "/";
+  if (pathname.length > 1) pathname = pathname.replace(/\/+$/, "");
+  return pathname || "/";
 }
 
-function routePathFromFile(file) {
-  let route = String(file).replace(/\\/g, "/").replace(/\.(?:js|jsx|ts|tsx|mjs|cjs)$/, "");
+function normalizeRouterInput(input) {
+  if (input == null) throw new TypeError("Expected string, Request or Response");
+  let raw;
+  if (typeof input === "string") raw = input;
+  else if (typeof input.url === "string") raw = input.url;
+  else if (typeof input.href === "string") raw = input.href;
+  else if (typeof input.pathname === "string") raw = `${input.pathname}${input.search ?? ""}`;
+  else throw new TypeError("Expected string, Request or Response");
+  const query = {};
+  const queryStart = raw.indexOf("?");
+  if (queryStart !== -1) {
+    const hashStart = raw.indexOf("#", queryStart);
+    const queryText = raw.slice(queryStart + 1, hashStart === -1 ? raw.length : hashStart);
+    for (const part of queryText.split("&")) {
+      if (!part) continue;
+      const separator = part.indexOf("=");
+      const decode = (value) => decodeURIComponent(value.replace(/\+/g, " "));
+      const key = decode(separator === -1 ? part : part.slice(0, separator));
+      query[key] = decode(separator === -1 ? "" : part.slice(separator + 1));
+    }
+  }
+  let url;
+  try {
+    url = new URL(raw, "http://cottontail.invalid");
+  } catch {
+    return { pathname: queryStart === -1 ? raw : raw.slice(0, queryStart), query };
+  }
+  return { pathname: url.pathname, query };
+}
+
+function routePathFromFile(file, extension) {
+  let route = String(file).replace(/\\/g, "/").slice(0, -extension.length);
   route = route.replace(/\/index$/, "").replace(/^index$/, "");
-  route = route.replace(/\[([^\]]+)\]/g, ":$1");
   return `/${route}`.replace(/\/+/g, "/").replace(/\/$/, "") || "/";
+}
+
+function makeFileSystemRouteRecord(name, filePath, relative) {
+  const segments = name === "/" ? [] : name.slice(1).split("/");
+  let kind = "exact";
+  let rank = 0;
+  if (segments.some((segment) => /^\[\[\.\.\.[^\]]+\]\]$/.test(segment))) {
+    kind = "catch-all-optional";
+    rank = 3;
+  } else if (segments.some((segment) => /^\[\.\.\.[^\]]+\]$/.test(segment))) {
+    kind = "catch-all";
+    rank = 2;
+  } else if (segments.some((segment) => /^\[[^\]]+\]$/.test(segment))) {
+    kind = "dynamic";
+    rank = 1;
+  }
+  return { name, filePath, relative, segments, kind, rank };
+}
+
+function compareFileSystemRoutes(left, right) {
+  if (left.rank !== right.rank) return left.rank - right.rank;
+  const leftStatic = left.segments.filter((segment) => !segment.startsWith("[")).length;
+  const rightStatic = right.segments.filter((segment) => !segment.startsWith("[")).length;
+  if (leftStatic !== rightStatic) return rightStatic - leftStatic;
+  return right.segments.length - left.segments.length;
+}
+
+function matchFileSystemRoute(record, pathname) {
+  const inputSegments = pathname === "/" ? [] : pathname.slice(1).split("/").map((value) => decodeURIComponent(value));
+  const params = {};
+  let inputIndex = 0;
+  for (let routeIndex = 0; routeIndex < record.segments.length; routeIndex += 1) {
+    const segment = record.segments[routeIndex];
+    const optionalCatchAll = segment.match(/^\[\[\.\.\.([^\]]+)\]\]$/);
+    if (optionalCatchAll) {
+      params[optionalCatchAll[1]] = inputSegments.slice(inputIndex).join("/");
+      inputIndex = inputSegments.length;
+      continue;
+    }
+    const catchAll = segment.match(/^\[\.\.\.([^\]]+)\]$/);
+    if (catchAll) {
+      if (inputIndex >= inputSegments.length) return null;
+      params[catchAll[1]] = inputSegments.slice(inputIndex).join("/");
+      inputIndex = inputSegments.length;
+      continue;
+    }
+    const dynamic = segment.match(/^\[([^\]]+)\]$/);
+    if (dynamic) {
+      if (inputIndex >= inputSegments.length) return null;
+      params[dynamic[1]] = inputSegments[inputIndex++];
+      continue;
+    }
+    if (inputSegments[inputIndex++] !== segment) return null;
+  }
+  return inputIndex === inputSegments.length ? params : null;
 }
 
 export class Terminal {}
@@ -5407,8 +6406,185 @@ export class S3Client {}
 export const redis = null;
 export const postgres = null;
 export const s3 = null;
-export const secrets = {};
-export const password = {};
+function secretsError(message, code = "ERR_INVALID_ARG_TYPE") {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
+}
+
+function validateSecretOptions(method, options, needsValue = false) {
+  if (options == null) throw secretsError(`secrets.${method} requires an options object`);
+  if (typeof options !== "object" || Array.isArray(options)) throw secretsError("Expected options to be an object");
+  if (typeof options.service !== "string" || typeof options.name !== "string") {
+    throw secretsError("Expected service and name to be strings");
+  }
+  if (!options.service || !options.name) throw secretsError("Expected service and name to not be empty");
+  if (needsValue && typeof options.value !== "string") throw secretsError("Expected 'value' to be a string");
+  return options;
+}
+
+function secretCommand(args, input = undefined) {
+  return spawnSync(args, { input, stdin: input == null ? "ignore" : "pipe", stdout: "pipe", stderr: "pipe" });
+}
+
+function secretCommandError(result, operation) {
+  const message = String(result.stderr || result.stdout || `Unable to ${operation} secret`).trim();
+  const error = new Error(message);
+  error.code = "ERR_SECRETS";
+  throw error;
+}
+
+export const secrets = {
+  async get(rawOptions) {
+    const options = validateSecretOptions("get", rawOptions);
+    if (process.platform === "darwin") {
+      const result = secretCommand(["security", "find-generic-password", "-s", options.service, "-a", options.name, "-g"]);
+      if (result.exitCode === 44) return null;
+      if (result.exitCode !== 0) secretCommandError(result, "read");
+      const output = String(result.stderr || result.stdout);
+      const hex = /^password:\s+0x([0-9a-f]+)/im.exec(output);
+      if (hex) return Buffer.from(hex[1], "hex").toString("utf8");
+      const quoted = /^password:\s+"(.*)"\s*$/m.exec(output);
+      if (quoted) return quoted[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+      secretCommandError(result, "read");
+    }
+    if (process.platform === "linux") {
+      const result = secretCommand(["secret-tool", "lookup", "service", options.service, "name", options.name]);
+      if (result.exitCode !== 0 || String(result.stdout).length === 0) return null;
+      return String(result.stdout).replace(/\r?\n$/, "");
+    }
+    throw secretsError(`Bun.secrets is not supported on ${process.platform}`, "ERR_NOT_SUPPORTED");
+  },
+  async set(rawOptions) {
+    const options = validateSecretOptions("set", rawOptions, true);
+    if (options.value === "") {
+      await this.delete(options);
+      return;
+    }
+    if (process.platform === "darwin") {
+      const args = ["security", "add-generic-password", "-U", "-s", options.service, "-a", options.name, "-w", options.value];
+      if (options.allowUnrestrictedAccess === true) args.push("-A");
+      const result = secretCommand(args);
+      if (result.exitCode !== 0) secretCommandError(result, "store");
+      return;
+    }
+    if (process.platform === "linux") {
+      const result = secretCommand(
+        ["secret-tool", "store", `--label=${options.service}`, "service", options.service, "name", options.name],
+        `${options.value}\n`,
+      );
+      if (result.exitCode !== 0) secretCommandError(result, "store");
+      return;
+    }
+    throw secretsError(`Bun.secrets is not supported on ${process.platform}`, "ERR_NOT_SUPPORTED");
+  },
+  async delete(rawOptions) {
+    const options = validateSecretOptions("delete", rawOptions);
+    if (process.platform === "darwin") {
+      const result = secretCommand(["security", "delete-generic-password", "-s", options.service, "-a", options.name]);
+      if (result.exitCode === 44) return false;
+      if (result.exitCode !== 0) secretCommandError(result, "delete");
+      return true;
+    }
+    if (process.platform === "linux") {
+      const existing = await this.get(options);
+      if (existing == null) return false;
+      const result = secretCommand(["secret-tool", "clear", "service", options.service, "name", options.name]);
+      if (result.exitCode !== 0) secretCommandError(result, "delete");
+      return true;
+    }
+    throw secretsError(`Bun.secrets is not supported on ${process.platform}`, "ERR_NOT_SUPPORTED");
+  },
+};
+const passwordAlgorithmIds = { argon2id: 0, argon2i: 1, argon2d: 2, bcrypt: 3 };
+
+function passwordBytes(value, name) {
+  if (typeof value === "symbol") throw new TypeError(`${name} must be a string or BufferSource`);
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return asBuffer(value);
+  return new TextEncoder().encode(String(value));
+}
+
+function passwordAlgorithm(value = undefined) {
+  let label = "argon2id";
+  let timeCost = 2;
+  let memoryCost = 65536;
+  let cost = 10;
+  if (value !== undefined) {
+    if (typeof value === "string") {
+      label = value;
+    } else if (value && typeof value === "object") {
+      if (typeof value.algorithm !== "string") throw new TypeError("options.algorithm must be a string");
+      label = value.algorithm;
+      if (label === "bcrypt" && value.cost !== undefined) cost = Number(value.cost);
+      if (label !== "bcrypt") {
+        if (value.timeCost !== undefined) timeCost = Number(value.timeCost);
+        if (value.memoryCost !== undefined) memoryCost = Number(value.memoryCost);
+      }
+    } else {
+      throw new TypeError("algorithm must be a string or options object");
+    }
+  }
+  if (!(label in passwordAlgorithmIds)) throw new TypeError("Unsupported password algorithm");
+  if (label === "bcrypt") {
+    if (!Number.isInteger(cost) || cost < 4 || cost > 31) throw new RangeError("Rounds must be between 4 and 31");
+  } else {
+    if (!Number.isInteger(timeCost) || timeCost < 1) throw new RangeError("Time cost must be greater than 0");
+    if (!Number.isInteger(memoryCost) || memoryCost < 1) throw new RangeError("Memory cost must be greater than 0");
+  }
+  return { id: passwordAlgorithmIds[label], label, timeCost, memoryCost, cost };
+}
+
+function passwordHashSync(value, algorithm = undefined) {
+  if (arguments.length === 0) throw new TypeError("password is required");
+  const bytes = passwordBytes(value, "password");
+  if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
+  const options = passwordAlgorithm(algorithm);
+  return cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost);
+}
+
+function passwordHash(value, algorithm = undefined) {
+  if (arguments.length === 0) throw new TypeError("password is required");
+  const bytes = passwordBytes(value, "password");
+  if (bytes.byteLength === 0) throw new TypeError("password must not be empty");
+  const options = passwordAlgorithm(algorithm);
+  return Promise.resolve().then(() => cottontail.passwordHashSync(options.id, bytes, options.timeCost, options.memoryCost, options.cost));
+}
+
+function inferPasswordAlgorithm(hash) {
+  if (hash.startsWith("$argon2id$")) return "argon2id";
+  if (hash.startsWith("$argon2i$")) return "argon2i";
+  if (hash.startsWith("$argon2d$")) return "argon2d";
+  if (hash.startsWith("$2") || hash.startsWith("$bcrypt$")) return "bcrypt";
+  throw new TypeError("Unsupported password algorithm");
+}
+
+function passwordVerifySync(value, hashValue, algorithm = undefined) {
+  if (arguments.length < 2) throw new TypeError("password and hash are required");
+  const bytes = passwordBytes(value, "password");
+  const hashBytes = passwordBytes(hashValue, "hash");
+  if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return false;
+  const hash = new TextDecoder().decode(hashBytes);
+  const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
+  return cottontail.passwordVerifySync(options.id, bytes, hashBytes);
+}
+
+function passwordVerify(value, hashValue, algorithm = undefined) {
+  if (arguments.length < 2) throw new TypeError("password and hash are required");
+  const bytes = passwordBytes(value, "password");
+  const hashBytes = passwordBytes(hashValue, "hash");
+  if (bytes.byteLength === 0 || hashBytes.byteLength === 0) return Promise.resolve(false);
+  const hash = new TextDecoder().decode(hashBytes);
+  const options = passwordAlgorithm(algorithm === undefined ? inferPasswordAlgorithm(hash) : algorithm);
+  return Promise.resolve().then(() => cottontail.passwordVerifySync(options.id, bytes, hashBytes));
+}
+
+export const password = {
+  hash: passwordHash,
+  hashSync: passwordHashSync,
+  verify: passwordVerify,
+  verifySync: passwordVerifySync,
+};
 
 function parseSemverParts(value) {
   return String(value)
@@ -6370,6 +7546,28 @@ for (const [ctor, name] of [
   if (typeof ctor === "function") Object.defineProperty(ctor, "name", { value: name, configurable: true });
 }
 globalThis.Bun = BunObject;
+if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncoder.prototype.encodeInto !== "function") {
+  Object.defineProperty(globalThis.TextEncoder.prototype, "encodeInto", {
+    value(source = "", destination) {
+      if (!(destination instanceof Uint8Array)) throw new TypeError("TextEncoder.encodeInto requires a Uint8Array destination");
+      const input = String(source);
+      let read = 0;
+      let written = 0;
+      while (read < input.length) {
+        const codePoint = input.codePointAt(read);
+        const width = codePoint > 0xffff ? 2 : 1;
+        const encoded = this.encode(input.slice(read, read + width));
+        if (written + encoded.byteLength > destination.byteLength) break;
+        destination.set(encoded, written);
+        written += encoded.byteLength;
+        read += width;
+      }
+      return { read, written };
+    },
+    configurable: true,
+    writable: true,
+  });
+}
 nodeSetBuiltinModules({ bun: BunObject });
 globalThis.HTMLRewriter ??= HTMLRewriter;
 globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cottontail.cwd());

@@ -1,5 +1,6 @@
 import { basename, dirname, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
+import { parse as parseTOML } from "../bun/toml.js";
 import * as assert from "./assert.js";
 import * as assertStrict from "./assert/strict.js";
 import * as asyncHooks from "./async_hooks.js";
@@ -129,6 +130,26 @@ const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const sourceMapCache = new Map();
 let nextModuleHookId = 0;
 
+globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
+  let resolved = String(specifier);
+  if (!resolved.startsWith("/") && !resolved.startsWith("file://")) {
+    try { resolved = resolveRequestCore(resolved, cottontail.cwd()); } catch {}
+  }
+  if (resolved.startsWith("file://")) resolved = fileURLToPath(resolved);
+  const cached = commonJsCache.get(resolved)?.exports;
+  if (cached && value && (typeof cached === "object" || typeof cached === "function") && typeof value === "object") {
+    const descriptors = new Map(Object.keys(value).map((name) => [name, Object.getOwnPropertyDescriptor(cached, name)]));
+    Object.assign(cached, value);
+    return () => {
+      for (const [name, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(cached, name, descriptor);
+        else delete cached[name];
+      }
+    };
+  }
+  return undefined;
+};
+
 function bunModuleMockFor(...keys) {
   const registry = globalThis.__cottontailBunModuleMocks;
   if (!registry || typeof registry.has !== "function" || typeof registry.get !== "function") {
@@ -137,7 +158,14 @@ function bunModuleMockFor(...keys) {
   for (const key of keys) {
     if (key == null) continue;
     const text = String(key);
-    if (registry.has(text)) return { found: true, value: registry.get(text) };
+    const candidates = [text];
+    if (text.startsWith("node:")) candidates.push(text.slice(5));
+    else candidates.push(`node:${text}`);
+    if (text.startsWith("file:./")) candidates.push(text.slice(5));
+    else if (text.startsWith("./")) candidates.push(`file:${text}`);
+    for (const candidate of candidates) {
+      if (registry.has(candidate)) return { found: true, value: registry.get(candidate) };
+    }
   }
   return { found: false, value: undefined };
 }
@@ -172,6 +200,40 @@ function readPackageJson(path) {
   } catch {
     return null;
   }
+}
+
+function parseJSONC(source) {
+  let output = "";
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      output += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"') {
+      quote = char;
+      output += char;
+      continue;
+    }
+    if (char === "/" && source[index + 1] === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      output += "\n";
+      continue;
+    }
+    if (char === "/" && source[index + 1] === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index += 1;
+      continue;
+    }
+    output += char;
+  }
+  return JSON.parse(output.replace(/,\s*([}\]])/g, "$1"));
 }
 
 function packageRootFor(request, startDir) {
@@ -411,6 +473,15 @@ function resolveRequestCore(request, basePath) {
 }
 
 function resolveRequest(request, basePath, useHooks = true) {
+  if (bunModuleMockFor(request).found) {
+    const text = String(request).replace(/^file:(?=\.\/)/, "");
+    if (text.startsWith(".") || text.startsWith("/")) {
+      const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+      const absoluteStartDir = startDir.startsWith("/") ? startDir : resolve(cottontail.cwd(), startDir);
+      return text.startsWith("/") ? text : `${absoluteStartDir}/${text}`;
+    }
+    return text;
+  }
   if (!useHooks || !moduleHooks.some((hook) => typeof hook.resolve === "function")) {
     return resolveRequestCore(request, basePath);
   }
@@ -529,10 +600,21 @@ function applyLoadHooks(resolved) {
 }
 
 function namespaceFromCommonJs(value) {
-  const namespace = { default: value };
+  const namespace = {};
+  Object.defineProperty(namespace, "default", {
+    configurable: true,
+    enumerable: true,
+    get: () => value,
+  });
   if (value && (typeof value === "object" || typeof value === "function")) {
     for (const key of Object.keys(value)) {
-      if (key !== "default") namespace[key] = value[key];
+      if (key !== "default") {
+        Object.defineProperty(namespace, key, {
+          configurable: true,
+          enumerable: true,
+          get: () => value[key],
+        });
+      }
     }
   }
   return namespace;
@@ -592,13 +674,25 @@ function executeDynamicImportSource(resolved, source, format) {
   return namespace;
 }
 
-export function __importModule(specifier, referrer = undefined) {
+export function __importModule(specifier, referrer = undefined, options = undefined) {
   const directMock = bunModuleMockFor(specifier);
-  if (directMock.found) return namespaceFromCommonJs(directMock.value);
+  if (directMock.found) {
+    if (directMock.value && typeof directMock.value.then === "function") {
+      return Promise.resolve(directMock.value).then(namespaceFromCommonJs);
+    }
+    return namespaceFromCommonJs(directMock.value);
+  }
   const parent = referrer == null
     ? cottontail.cwd()
     : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
   const resolved = resolveRequest(String(specifier), parent);
+  const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
+  if (loader === "text") {
+    return { default: cottontail.readFile(splitSpecifierSuffix(resolved).bare) };
+  }
+  if (loader === "file") {
+    return { default: splitSpecifierSuffix(resolved).bare };
+  }
   const resolvedMock = bunModuleMockFor(resolved);
   if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
   const loadResult = runLoadHooks(resolved);
@@ -642,6 +736,9 @@ function loadCommonJsModule(resolved) {
   if (builtinModuleMap.has(resolvedPath)) return builtinModuleMap.get(resolvedPath);
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
   if (resolvedPath.endsWith(".json")) return JSON.parse(cottontail.readFile(resolvedPath));
+  if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
+  if (resolvedPath.endsWith(".toml")) return parseTOML(cottontail.readFile(resolvedPath));
+  if (resolvedPath.endsWith(".txt")) return { default: cottontail.readFile(resolvedPath) };
   if (resolvedPath.endsWith(".mjs") && !suffix) {
     throw new Error(`Cannot require ES module '${resolvedPath}' from CommonJS`);
   }

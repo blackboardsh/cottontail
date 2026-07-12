@@ -21,6 +21,7 @@ const snapshotCounters = new Map();
 let fakeSystemTime = null;
 let fakeTimersEnabled = false;
 let fakeNow = Date.now();
+let fakePerformanceOrigin = fakeNow;
 let nextFakeTimerId = 1;
 const fakeTimers = new Map();
 const realTimers = {
@@ -33,6 +34,7 @@ const realTimers = {
   setImmediate: globalThis.setImmediate,
   setInterval: globalThis.setInterval,
   setTimeout: globalThis.setTimeout,
+  performanceNow: globalThis.performance?.now?.bind(globalThis.performance),
 };
 let assertionCount = 0;
 let expectedAssertions = null;
@@ -393,6 +395,11 @@ function normalizeSnapshotText(value) {
     : text;
 }
 
+function inlineSnapshotMatches(received, wanted) {
+  if (received === wanted) return true;
+  return received.replace(/\\(["\\])/g, "$1") === wanted;
+}
+
 function nextSnapshotKey(hint = undefined) {
   const file = globalThis.process?.argv?.[1] ?? "<script>";
   const testName = typeof globalThis.__cottontailCurrentTestName === "function" ? globalThis.__cottontailCurrentTestName() : "";
@@ -434,7 +441,9 @@ function callRecords(value) {
 }
 
 function resultRecords(value) {
-  return value?.mock?.results ?? [];
+  const results = value?.mock?.results;
+  if (!Array.isArray(results)) throw new nodeAssert.AssertionError({ message: "Expected value must be a mock function" });
+  return results;
 }
 
 function mockDisplayName(value) {
@@ -475,29 +484,49 @@ function normalizeTimerCallback(callback) {
   return () => (0, eval)(source);
 }
 
+function fakeTimerHandle(timer) {
+  let referenced = true;
+  return {
+    refresh() {
+      timer.deadline = timerClock() + timer.delay;
+      fakeTimers.set(timer.id, timer);
+      return this;
+    },
+    ref() { referenced = true; return this; },
+    unref() { referenced = false; return this; },
+    hasRef() { return referenced; },
+    [Symbol.toPrimitive]() { return timer.id; },
+  };
+}
+
 function fakeSetTimeout(callback, ms = 0, ...args) {
   const id = nextFakeTimerId++;
-  fakeTimers.set(id, {
+  const delay = Math.max(0, Number(ms) || 0);
+  const timer = {
     id,
     callback: normalizeTimerCallback(callback),
     args,
-    deadline: timerClock() + Math.max(0, Number(ms) || 0),
+    deadline: timerClock() + delay,
+    delay,
     interval: null,
-  });
-  return id;
+  };
+  fakeTimers.set(id, timer);
+  return fakeTimerHandle(timer);
 }
 
 function fakeSetInterval(callback, ms = 0, ...args) {
   const id = nextFakeTimerId++;
   const interval = Math.max(1, Number(ms) || 0);
-  fakeTimers.set(id, {
+  const timer = {
     id,
     callback: normalizeTimerCallback(callback),
     args,
     deadline: timerClock() + interval,
+    delay: interval,
     interval,
-  });
-  return id;
+  };
+  fakeTimers.set(id, timer);
+  return fakeTimerHandle(timer);
 }
 
 function fakeClearTimer(id) {
@@ -544,10 +573,18 @@ function runTimersUntil(target) {
   }
 }
 
-function installFakeTimers() {
-  if (fakeTimersEnabled) return;
+function installFakeTimers(options = undefined) {
+  const hasCustomNow = options != null && typeof options === "object" && Object.prototype.hasOwnProperty.call(options, "now");
+  if (fakeTimersEnabled) {
+    if (hasCustomNow) {
+      setFakeNow(options.now);
+      fakePerformanceOrigin = fakeNow;
+    }
+    return;
+  }
   fakeTimersEnabled = true;
-  setFakeNow(fakeSystemTime ?? realTimers.Date.now());
+  setFakeNow(hasCustomNow ? options.now : realTimers.Date.now());
+  fakePerformanceOrigin = fakeNow;
   class FakeDate extends realTimers.Date {
     constructor(...args) {
       super(...(args.length === 0 ? [timerClock()] : args));
@@ -566,6 +603,7 @@ function installFakeTimers() {
   globalThis.clearImmediate = fakeClearTimer;
   globalThis.requestAnimationFrame = (callback) => fakeSetTimeout(() => callback(timerClock()), 16);
   globalThis.cancelAnimationFrame = fakeClearTimer;
+  if (globalThis.performance) globalThis.performance.now = () => timerClock() - fakePerformanceOrigin;
 }
 
 function uninstallFakeTimers() {
@@ -584,6 +622,7 @@ function uninstallFakeTimers() {
   else globalThis.requestAnimationFrame = realTimers.requestAnimationFrame;
   if (realTimers.cancelAnimationFrame === undefined) delete globalThis.cancelAnimationFrame;
   else globalThis.cancelAnimationFrame = realTimers.cancelAnimationFrame;
+  if (globalThis.performance && realTimers.performanceNow) globalThis.performance.now = realTimers.performanceNow;
 }
 
 class Expectation {
@@ -645,7 +684,10 @@ class Expectation {
   }
 
   toBe(expected) {
-    return this._wrap((actual) => this._check(Object.is(actual, expected), `Expected ${formatValue(expected)}\nReceived ${formatValue(actual)}`));
+    return this._wrap((actual) => {
+      const pass = Object.is(actual, expected);
+      this._check(pass, pass ? "" : `Expected ${formatValue(expected)}\nReceived ${formatValue(actual)}`);
+    });
   }
 
   toEqual(expected) {
@@ -803,7 +845,7 @@ class Expectation {
       }
       const received = snapshotText(actual);
       const wanted = normalizeSnapshotText(expected);
-      this._check(received === wanted, `Expected value to match inline snapshot\nExpected: ${JSON.stringify(wanted)}\nReceived: ${JSON.stringify(received)}`);
+      this._check(inlineSnapshotMatches(received, wanted), `Expected value to match inline snapshot\nExpected: ${JSON.stringify(wanted)}\nReceived: ${JSON.stringify(received)}`);
     });
   }
   pass() { return this._check(true, ""); }
@@ -867,6 +909,12 @@ class Expectation {
   toHaveNthReturnedWith(index, value) { return this.nthReturnedWith(index, value); }
 }
 
+// Initialize the property layout and hot identity matcher before tests take
+// heap snapshots. Bun's native matcher structures are initialized up front.
+new Expectation(undefined).toBe(undefined);
+assertionCount = 0;
+globalThis.__cottontailTestAssertionCount = 0;
+
 export function expect(actual, label = undefined) {
   return new Expectation(actual, false, null, label);
 }
@@ -909,7 +957,7 @@ expect.assertions = (count) => { expectedAssertions = Number(count); };
 expect.hasAssertions = () => { requireAssertions = true; };
 expect.extend = installCustomMatchers;
 expect.addSnapshotSerializer = (_serializer) => undefined;
-expect.unreachable = (message = "unreachable") => { throw new nodeAssert.AssertionError({ message }); };
+expect.unreachable = (message = "reached unreachable code") => { throw new nodeAssert.AssertionError({ message }); };
 expect.resolvesTo = (value, expected) => expect(value).resolves.toEqual(expected);
 expect.rejectsTo = (value, expected) => expect(value).rejects.toThrow(expected);
 
@@ -1078,6 +1126,15 @@ export function mock(implementation = undefined) {
     current = normalizeMockImplementation(undefined, false);
     return undefined;
   });
+  if (typeof Symbol.dispose === "symbol") {
+    Object.defineProperty(prototype, Symbol.dispose, {
+      configurable: true,
+      value: function disposeMock() {
+        assertThis(this);
+        return mockedFunction.mockRestore();
+      },
+    });
+  }
 
   Object.setPrototypeOf(mockedFunction, prototype);
   try { Object.defineProperty(mockedFunction, "name", { configurable: true, value: name }); } catch {}
@@ -1097,10 +1154,44 @@ mock.restore = () => {
   moduleMocks.clear();
   nodeMock.restoreAll?.();
 };
+function notifyModuleBindings(key, value) {
+  const registry = globalThis.__cottontailModuleBindingListeners;
+  const values = globalThis.__cottontailModuleBindingValues ??= new Map();
+  const candidates = [String(key)];
+  if (String(key).startsWith("file:./")) candidates.push(String(key).slice(5));
+  else if (String(key).startsWith("./")) candidates.push(`file:${String(key)}`);
+  if (String(key).startsWith("node:")) candidates.push(String(key).slice(5));
+  else candidates.push(`node:${String(key)}`);
+  for (const candidate of [...candidates]) {
+    const extensionless = candidate.replace(/\.(?:[cm]?[jt]sx?)$/, "");
+    if (extensionless !== candidate) candidates.push(extensionless);
+  }
+  for (const candidate of candidates) {
+    values.set(candidate, value);
+    if (!registry) continue;
+    for (const listener of registry.get(candidate) ?? []) listener(value);
+  }
+}
+globalThis.__cottontailNotifyModuleBindings = notifyModuleBindings;
 mock.module = (specifier, factory = undefined) => {
   const key = String(specifier);
   const value = typeof factory === "function" ? factory() : factory;
+  const restoreCommonJS = globalThis.__cottontailApplyCommonJSModuleMock?.(key, value);
+  if (typeof restoreCommonJS === "function") restores.push(restoreCommonJS);
+  const previous = moduleMocks.get(key);
+  if (previous && value && typeof previous === "object" && typeof value === "object" &&
+      typeof previous.then !== "function" && typeof value.then !== "function") {
+    for (const name of Object.keys(previous)) delete previous[name];
+    Object.assign(previous, value);
+    notifyModuleBindings(key, previous);
+    return previous;
+  }
   moduleMocks.set(key, value);
+  if (value && typeof value.then === "function") {
+    Promise.resolve(value).then((resolved) => notifyModuleBindings(key, resolved));
+  } else {
+    notifyModuleBindings(key, value);
+  }
   return value;
 };
 
@@ -1447,17 +1538,24 @@ export const jest = {
   clearAllMocks,
   resetAllMocks,
   restoreAllMocks,
-  useFakeTimers() { installFakeTimers(); return this; },
+  useFakeTimers(options = undefined) { installFakeTimers(options); return this; },
   useRealTimers() { uninstallFakeTimers(); return this; },
   isFakeTimers() { return fakeTimersEnabled; },
   setSystemTime,
   now() { return fakeTimersEnabled ? timerClock() : Date.now(); },
-  clearAllTimers() { fakeTimers.clear(); return this; },
-  getTimerCount() { return fakeTimers.size; },
+  clearAllTimers() {
+    if (!fakeTimersEnabled) throw new Error("Fake timers are not active");
+    fakeTimers.clear();
+    return this;
+  },
+  getTimerCount() {
+    if (!fakeTimersEnabled) throw new Error("Fake timers are not active");
+    return fakeTimers.size;
+  },
   runAllTimers() { runTimersUntil(Infinity); return this; },
   runOnlyPendingTimers() {
     const pending = dueTimers(Infinity);
-    for (const timer of pending) runFakeTimer(timer);
+    if (pending.length > 0) runTimersUntil(pending[pending.length - 1].deadline);
     return this;
   },
   advanceTimersByTime(ms = 0) { runTimersUntil(timerClock() + Math.max(0, Number(ms) || 0)); return this; },

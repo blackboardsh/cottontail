@@ -199,7 +199,11 @@ function statusCounts(snapshotRoot, status, runtime = 'node') {
 
 function selectedTests(status, options, snapshotRoot, runtime = 'node') {
   if (options.test) {
-    return [{ path: options.test, status: 'enabled', reason: 'selected from CLI' }];
+    return [{
+      ...statusEntryForPath(status, options.test, 'enabled'),
+      status: 'enabled',
+      reason: status.tests?.[options.test]?.reason ?? 'selected from CLI',
+    }];
   }
   if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
     return discoverRunnableFiles(snapshotRoot, runtime)
@@ -261,11 +265,12 @@ function runNodeHarness(target, entries, snapshotRoot, status, options) {
 }
 
 function runDirect(runtime, target, entry, snapshotRoot) {
+  const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
   return spawnSync(binaryPath, [entry.path], {
     cwd: snapshotRoot,
     env: makeEnv(runtime, target),
     encoding: 'utf8',
-    timeout: directTestTimeoutMs,
+    timeout,
     maxBuffer: directTestMaxBuffer,
   });
 }
@@ -329,12 +334,13 @@ function runOne(runtime, target, entry) {
   const result = runDirect(runtime, target, entry, snapshotRoot);
   if (result.error?.code === 'ETIMEDOUT') {
     const shouldFail = entry.status === 'expected-failure';
+    const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
     return {
       runtime,
       entry,
       ok: shouldFail,
       unexpected: !shouldFail,
-      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entry.path} timed out after ${directTestTimeoutMs}ms`,
+      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entry.path} timed out after ${timeout}ms`,
     };
   }
   const spawnError = formatSpawnError(runtime, entry, result);

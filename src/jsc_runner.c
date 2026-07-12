@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #if !defined(_WIN32)
+#include <sys/mman.h>
 #include <sys/un.h>
 #endif
 #if defined(__APPLE__) || defined(__MACH__)
@@ -60,6 +61,8 @@ extern char **environ;
 #include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonHMAC.h>
 #include <mach-o/dyld.h>
+extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
+extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 #endif
 
 #if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>) && __has_include(<openssl/ssl.h>) && __has_include(<openssl/err.h>)
@@ -180,6 +183,25 @@ extern uint8_t *ct_strip_typescript_types(
 );
 extern void ct_transpiler_free(uint8_t *value, size_t len);
 extern void ct_transpiler_string_free(char *value);
+extern uint8_t *ct_password_hash(
+    int algorithm,
+    const uint8_t *password,
+    size_t password_len,
+    uint32_t time_cost,
+    uint32_t memory_cost,
+    uint8_t bcrypt_cost,
+    size_t *out_len,
+    char **error_out
+);
+extern int ct_password_verify(
+    int algorithm,
+    const uint8_t *password,
+    size_t password_len,
+    const uint8_t *hash,
+    size_t hash_len,
+    char **error_out
+);
+extern uint64_t ct_hash_value(int algorithm, const uint8_t *input, size_t input_len, uint64_t seed);
 
 typedef enum {
     CT_FFI_TYPE_VOID,
@@ -197,7 +219,11 @@ typedef enum {
     CT_FFI_TYPE_PTR,
     CT_FFI_TYPE_CSTRING,
     CT_FFI_TYPE_FUNCTION,
+    CT_FFI_TYPE_NAPI_ENV,
+    CT_FFI_TYPE_NAPI_VALUE,
 } CtFfiType;
+
+static _Thread_local JSContextRef ct_active_napi_context = NULL;
 
 typedef union {
     uint8_t u8;
@@ -1418,6 +1444,19 @@ static JSValueRef ct_make_string_len(JSContextRef ctx, const char *value, size_t
     return result;
 }
 
+__attribute__((visibility("default"))) int napi_create_string_utf8(
+    void *env,
+    const char *value,
+    size_t length,
+    void **result
+) {
+    (void)env;
+    if (ct_active_napi_context == NULL || value == NULL || result == NULL) return 1;
+    if (length == (size_t)-1) length = strlen(value);
+    *result = (void *)ct_make_string_len(ct_active_napi_context, value, length);
+    return 0;
+}
+
 static char *ct_value_to_string_copy(JSContextRef ctx, JSValueRef value) {
     JSValueRef exception = NULL;
     JSStringRef string = JSValueToStringCopy(ctx, value, &exception);
@@ -1532,6 +1571,16 @@ static JSObjectRef ct_make_array(JSContextRef ctx, size_t count, const JSValueRe
 static void ct_array_buffer_free(void *bytes, void *deallocator_context) {
     (void)deallocator_context;
     free(bytes);
+}
+
+static void ct_mmap_array_buffer_free(void *bytes, void *deallocator_context) {
+#if !defined(_WIN32)
+    size_t length = (size_t)(uintptr_t)deallocator_context;
+    if (bytes != NULL && length > 0) munmap(bytes, length);
+#else
+    (void)bytes;
+    (void)deallocator_context;
+#endif
 }
 
 static void ct_sqlite_array_buffer_free(void *bytes, void *deallocator_context) {
@@ -2281,6 +2330,100 @@ static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, 
     ct_throw_message(ctx, exception, "Argon2 KDF is unavailable in this build");
     return JSValueMakeUndefined(ctx);
 #endif
+}
+
+static JSValueRef ct_password_hash_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "passwordHashSync requires algorithm, password, timeCost, memoryCost, and bcryptCost");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *password = NULL;
+    size_t password_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &password, &password_len) != 0) {
+        ct_throw_message(ctx, exception, "password must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t result_len = 0;
+    char *error = NULL;
+    uint8_t *result = ct_password_hash(
+        (int)ct_value_to_number(ctx, argv[0]),
+        password,
+        password_len,
+        (uint32_t)ct_value_to_number(ctx, argv[2]),
+        (uint32_t)ct_value_to_number(ctx, argv[3]),
+        (uint8_t)ct_value_to_number(ctx, argv[4]),
+        &result_len,
+        &error
+    );
+    if (result == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Password hashing failed");
+        if (error != NULL) ct_host_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef value = ct_make_string_len(ctx, (const char *)result, result_len);
+    ct_host_buffer_free((char *)result);
+    return value;
+}
+
+static JSValueRef ct_password_verify_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "passwordVerifySync requires algorithm, password, and hash");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *password = NULL;
+    size_t password_len = 0;
+    uint8_t *hash = NULL;
+    size_t hash_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &password, &password_len) != 0 || ct_get_bytes(ctx, argv[2], &hash, &hash_len) != 0) {
+        ct_throw_message(ctx, exception, "password and hash must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *error = NULL;
+    int result = ct_password_verify(
+        (int)ct_value_to_number(ctx, argv[0]),
+        password,
+        password_len,
+        hash,
+        hash_len,
+        &error
+    );
+    if (result < 0) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Password verification failed");
+        if (error != NULL) ct_host_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, result == 1);
+}
+
+static JSValueRef ct_hash_value_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "hashValue requires an algorithm and input");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "hash input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint64_t seed = 0;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
+        char *seed_text = ct_value_to_string_copy(ctx, argv[2]);
+        if (seed_text != NULL) {
+            seed = (uint64_t)strtoull(seed_text, NULL, 10);
+            free(seed_text);
+        }
+    }
+    uint64_t result = ct_hash_value((int)ct_value_to_number(ctx, argv[0]), input, input_len, seed);
+    char result_text[32];
+    snprintf(result_text, sizeof(result_text), "%llu", (unsigned long long)result);
+    return ct_make_string(ctx, result_text);
 }
 
 static JSValueRef ct_crypto_ed25519_generate_key_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4428,6 +4571,15 @@ static JSObjectRef ct_sqlite_row_object(JSContextRef ctx, sqlite3_stmt *stmt, bo
     return row;
 }
 
+static JSObjectRef ct_sqlite_row_array(JSContextRef ctx, sqlite3_stmt *stmt, bool safe_integers, JSValueRef *exception) {
+    int count = sqlite3_column_count(stmt);
+    JSObjectRef row = ct_make_array(ctx, 0, NULL, exception);
+    for (int index = 0; index < count; index += 1) {
+        JSObjectSetPropertyAtIndex(ctx, row, (unsigned)index, ct_sqlite_column_value(ctx, stmt, index, safe_integers, exception), exception);
+    }
+    return row;
+}
+
 static int ct_sqlite_bind_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
     if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return sqlite3_bind_null(stmt, index);
     if (JSValueIsBoolean(ctx, value)) return sqlite3_bind_int(stmt, index, ct_value_to_bool(ctx, value) ? 1 : 0);
@@ -4914,6 +5066,10 @@ static JSValueRef ct_sqlite_prepare(JSContextRef ctx, JSObjectRef function, JSOb
         ct_sqlite_throw(ctx, exception, entry->db);
         return JSValueMakeUndefined(ctx);
     }
+    if (stmt == NULL) {
+        ct_throw_message(ctx, exception, "Query contained no valid SQL statement; likely empty query.");
+        return JSValueMakeUndefined(ctx);
+    }
     CtSqliteStmt *stmt_entry = (CtSqliteStmt *)calloc(1, sizeof(CtSqliteStmt));
     if (stmt_entry == NULL) {
         sqlite3_finalize(stmt);
@@ -5013,6 +5169,37 @@ static JSValueRef ct_sqlite_statement_get(JSContextRef ctx, JSObjectRef function
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_sqlite_statement_values(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementValues(id[, params]) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_sqlite_bind_params(ctx, entry->stmt, argc >= 2 ? argv[1] : NULL, exception);
+    if (status != SQLITE_OK) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef rows = ct_make_array(ctx, 0, NULL, exception);
+    unsigned row_index = 0;
+    bool safe_integers = argc >= 3 && ct_value_to_bool(ctx, argv[2]);
+    while ((status = sqlite3_step(entry->stmt)) == SQLITE_ROW) {
+        JSObjectSetPropertyAtIndex(ctx, rows, row_index++, ct_sqlite_row_array(ctx, entry->stmt, safe_integers, exception), exception);
+    }
+    sqlite3_reset(entry->stmt);
+    if (status != SQLITE_DONE) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return rows;
+}
+
 static JSValueRef ct_sqlite_statement_run(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -5039,7 +5226,7 @@ static JSValueRef ct_sqlite_statement_run(JSContextRef ctx, JSObjectRef function
     sqlite3_reset(entry->stmt);
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "lastInsertRowid", JSValueMakeNumber(ctx, (double)sqlite3_last_insert_rowid(entry->owner->db)), exception);
-    ct_set_property(ctx, result, "changes", JSValueMakeNumber(ctx, sqlite3_changes(entry->owner->db)), exception);
+    ct_set_property(ctx, result, "changes", JSValueMakeNumber(ctx, sqlite3_stmt_readonly(entry->stmt) ? 0 : sqlite3_changes(entry->owner->db)), exception);
     return result;
 }
 
@@ -5057,6 +5244,7 @@ static JSValueRef ct_sqlite_statement_columns(JSContextRef ctx, JSObjectRef func
     }
     int count = sqlite3_column_count(entry->stmt);
     JSObjectRef columns = ct_make_array(ctx, 0, NULL, exception);
+    ct_set_property(ctx, columns, "readOnly", JSValueMakeBoolean(ctx, sqlite3_stmt_readonly(entry->stmt) != 0), exception);
     for (int index = 0; index < count; index += 1) {
         JSObjectRef column = ct_make_object(ctx);
         const char *name = sqlite3_column_name(entry->stmt, index);
@@ -5072,6 +5260,99 @@ static JSValueRef ct_sqlite_statement_columns(JSContextRef ctx, JSObjectRef func
         JSObjectSetPropertyAtIndex(ctx, columns, (unsigned)index, column, exception);
     }
     return columns;
+}
+
+static JSValueRef ct_sqlite_statement_expanded_sql(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementExpandedSql(id) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *expanded = sqlite3_expanded_sql(entry->stmt);
+    if (expanded == NULL) {
+        ct_throw_message(ctx, exception, "Failed to expand SQLite statement");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string(ctx, expanded);
+    sqlite3_free(expanded);
+    return result;
+}
+
+static JSValueRef ct_sqlite_statement_parameter_names(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementParameterNames(id) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    int count = sqlite3_bind_parameter_count(entry->stmt);
+    JSObjectRef names = ct_make_array(ctx, 0, NULL, exception);
+    for (int index = 1; index <= count; index += 1) {
+        const char *name = sqlite3_bind_parameter_name(entry->stmt, index);
+        JSObjectSetPropertyAtIndex(ctx, names, (unsigned)(index - 1), name != NULL ? ct_make_string(ctx, name) : JSValueMakeNull(ctx), exception);
+    }
+    return names;
+}
+
+static const char *ct_sqlite_column_type_name(int type) {
+    switch (type) {
+        case SQLITE_INTEGER: return "INTEGER";
+        case SQLITE_FLOAT: return "FLOAT";
+        case SQLITE_TEXT: return "TEXT";
+        case SQLITE_BLOB: return "BLOB";
+        case SQLITE_NULL:
+        default: return "NULL";
+    }
+}
+
+static JSValueRef ct_sqlite_statement_column_types(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "sqliteStatementColumnTypes(id) requires a statement id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtSqliteStmt *entry = ct_sqlite_find_stmt((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (entry == NULL) {
+        ct_throw_message(ctx, exception, "SQLite statement not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (sqlite3_stmt_readonly(entry->stmt) == 0) {
+        ct_throw_message(ctx, exception, "columnTypes is not available for non-read-only statements (INSERT, UPDATE, DELETE, etc.)");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int status = sqlite3_step(entry->stmt);
+    int count = sqlite3_column_count(entry->stmt);
+    JSObjectRef types = ct_make_array(ctx, 0, NULL, exception);
+    if (status == SQLITE_ROW) {
+        for (int index = 0; index < count; index += 1) {
+            JSObjectSetPropertyAtIndex(
+                ctx,
+                types,
+                (unsigned)index,
+                ct_make_string(ctx, ct_sqlite_column_type_name(sqlite3_column_type(entry->stmt, index))),
+                exception
+            );
+        }
+    }
+    sqlite3_reset(entry->stmt);
+    if (status != SQLITE_ROW && status != SQLITE_DONE) {
+        ct_sqlite_throw(ctx, exception, entry->owner->db);
+        return JSValueMakeUndefined(ctx);
+    }
+    return types;
 }
 
 static JSValueRef ct_sqlite_in_transaction(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -8422,6 +8703,8 @@ static ffi_type *ct_ffi_libffi_type(CtFfiType type) {
         case CT_FFI_TYPE_PTR:
         case CT_FFI_TYPE_CSTRING:
         case CT_FFI_TYPE_FUNCTION:
+        case CT_FFI_TYPE_NAPI_ENV:
+        case CT_FFI_TYPE_NAPI_VALUE:
             return &ffi_type_pointer;
     }
 
@@ -8431,20 +8714,22 @@ static ffi_type *ct_ffi_libffi_type(CtFfiType type) {
 static bool ct_ffi_type_from_name(const char *name, CtFfiType *out) {
     if (strcmp(name, "void") == 0) *out = CT_FFI_TYPE_VOID;
     else if (strcmp(name, "bool") == 0) *out = CT_FFI_TYPE_BOOL;
-    else if (strcmp(name, "u8") == 0) *out = CT_FFI_TYPE_U8;
-    else if (strcmp(name, "i8") == 0) *out = CT_FFI_TYPE_I8;
-    else if (strcmp(name, "u16") == 0) *out = CT_FFI_TYPE_U16;
-    else if (strcmp(name, "i16") == 0) *out = CT_FFI_TYPE_I16;
+    else if (strcmp(name, "u8") == 0 || strcmp(name, "uint8_t") == 0) *out = CT_FFI_TYPE_U8;
+    else if (strcmp(name, "i8") == 0 || strcmp(name, "int8_t") == 0) *out = CT_FFI_TYPE_I8;
+    else if (strcmp(name, "u16") == 0 || strcmp(name, "uint16_t") == 0) *out = CT_FFI_TYPE_U16;
+    else if (strcmp(name, "i16") == 0 || strcmp(name, "int16_t") == 0) *out = CT_FFI_TYPE_I16;
     else if (strcmp(name, "int") == 0) *out = CT_FFI_TYPE_I32;
-    else if (strcmp(name, "u32") == 0) *out = CT_FFI_TYPE_U32;
-    else if (strcmp(name, "i32") == 0) *out = CT_FFI_TYPE_I32;
-    else if (strcmp(name, "u64") == 0) *out = CT_FFI_TYPE_U64;
-    else if (strcmp(name, "i64") == 0) *out = CT_FFI_TYPE_I64;
+    else if (strcmp(name, "u32") == 0 || strcmp(name, "uint32_t") == 0) *out = CT_FFI_TYPE_U32;
+    else if (strcmp(name, "i32") == 0 || strcmp(name, "int32_t") == 0) *out = CT_FFI_TYPE_I32;
+    else if (strcmp(name, "u64") == 0 || strcmp(name, "uint64_t") == 0 || strcmp(name, "usize") == 0 || strcmp(name, "size_t") == 0) *out = CT_FFI_TYPE_U64;
+    else if (strcmp(name, "i64") == 0 || strcmp(name, "int64_t") == 0 || strcmp(name, "isize") == 0 || strcmp(name, "ssize_t") == 0) *out = CT_FFI_TYPE_I64;
     else if (strcmp(name, "f32") == 0) *out = CT_FFI_TYPE_F32;
     else if (strcmp(name, "f64") == 0) *out = CT_FFI_TYPE_F64;
     else if (strcmp(name, "ptr") == 0 || strcmp(name, "pointer") == 0) *out = CT_FFI_TYPE_PTR;
     else if (strcmp(name, "cstring") == 0) *out = CT_FFI_TYPE_CSTRING;
     else if (strcmp(name, "function") == 0 || strcmp(name, "callback") == 0) *out = CT_FFI_TYPE_FUNCTION;
+    else if (strcmp(name, "napi_env") == 0) *out = CT_FFI_TYPE_NAPI_ENV;
+    else if (strcmp(name, "napi_value") == 0) *out = CT_FFI_TYPE_NAPI_VALUE;
     else return false;
     return true;
 }
@@ -8567,6 +8852,8 @@ static int ct_ffi_value_from_js(JSContextRef ctx, JSValueRef value, CtFfiType ty
         case CT_FFI_TYPE_PTR:
         case CT_FFI_TYPE_CSTRING:
         case CT_FFI_TYPE_FUNCTION:
+        case CT_FFI_TYPE_NAPI_ENV:
+        case CT_FFI_TYPE_NAPI_VALUE:
             if (ct_value_to_u64(ctx, value, &native_value) != 0) {
                 ct_throw_message(ctx, exception, "FFI argument must be a number, bigint, ArrayBuffer, typed array, null, or undefined");
                 return -1;
@@ -8604,6 +8891,8 @@ static void *ct_ffi_value_ptr(CtFfiValue *value, CtFfiType type) {
         case CT_FFI_TYPE_PTR:
         case CT_FFI_TYPE_CSTRING:
         case CT_FFI_TYPE_FUNCTION:
+        case CT_FFI_TYPE_NAPI_ENV:
+        case CT_FFI_TYPE_NAPI_VALUE:
             value->ptr = (void *)(uintptr_t)value->u64;
             return &value->ptr;
         case CT_FFI_TYPE_VOID:
@@ -8643,6 +8932,10 @@ static JSValueRef ct_ffi_value_to_js(JSContextRef ctx, CtFfiType type, CtFfiValu
         case CT_FFI_TYPE_CSTRING:
         case CT_FFI_TYPE_FUNCTION:
             return JSValueMakeNumber(ctx, (double)(uintptr_t)value.ptr);
+        case CT_FFI_TYPE_NAPI_ENV:
+            return JSValueMakeNumber(ctx, (double)(uintptr_t)value.ptr);
+        case CT_FFI_TYPE_NAPI_VALUE:
+            return value.ptr != NULL ? (JSValueRef)value.ptr : JSValueMakeNull(ctx);
     }
 
     return JSValueMakeUndefined(ctx);
@@ -9370,7 +9663,10 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
 
+    JSContextRef previous_napi_context = ct_active_napi_context;
+    ct_active_napi_context = ctx;
     ffi_call(&cif, FFI_FN(symbol), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
+    ct_active_napi_context = previous_napi_context;
     JSValueRef js_result = ct_ffi_value_to_js(ctx, return_type, result);
 
     free(library_path);
@@ -9470,7 +9766,10 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
 
+    JSContextRef previous_napi_context = ct_active_napi_context;
+    ct_active_napi_context = ctx;
     ffi_call(&cif, FFI_FN((void *)(uintptr_t)pointer), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
+    ct_active_napi_context = previous_napi_context;
     return ct_ffi_value_to_js(ctx, return_type, result);
 }
 
@@ -9617,6 +9916,61 @@ static JSValueRef ct_read_file_buffer(JSContextRef ctx, JSObjectRef function, JS
     (void)function;
     (void)thisObject;
     return ct_read_file_common(ctx, argc, argv, exception, true);
+}
+
+static JSValueRef ct_mmap_file_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    ct_throw_message(ctx, exception, "Bun.mmap is unavailable on Windows");
+    return JSValueMakeUndefined(ctx);
+#else
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "Expected a path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    int fd = path != NULL ? open(path, O_RDWR) : -1;
+    if (fd < 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    struct stat stat_value;
+    if (fstat(fd, &stat_value) != 0) {
+        int stat_error = errno;
+        close(fd);
+        free(path);
+        ct_throw_message(ctx, exception, strerror(stat_error));
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t offset = argc >= 2 ? (size_t)ct_value_to_number(ctx, argv[1]) : 0;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) offset -= offset % (size_t)page_size;
+    double wanted_number = argc >= 3 ? ct_value_to_number(ctx, argv[2]) : -1;
+    size_t available = (uint64_t)stat_value.st_size > offset ? (size_t)((uint64_t)stat_value.st_size - offset) : 0;
+    size_t map_size = wanted_number >= 0 ? (size_t)wanted_number : available;
+    if (map_size > available) map_size = available;
+    int flags = argc >= 4 && !JSValueToBoolean(ctx, argv[3]) ? MAP_PRIVATE : MAP_SHARED;
+    void *mapping = mmap(NULL, map_size, PROT_READ | PROT_WRITE, flags, fd, (off_t)offset);
+    int map_error = errno;
+    close(fd);
+    free(path);
+    if (mapping == MAP_FAILED) {
+        ct_throw_message(ctx, exception, strerror(map_error));
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(
+        ctx,
+        mapping,
+        map_size,
+        ct_mmap_array_buffer_free,
+        (void *)(uintptr_t)map_size,
+        exception
+    );
+#endif
 }
 
 static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -11011,13 +11365,30 @@ static JSValueRef ct_undefined(JSContextRef ctx, JSObjectRef function, JSObjectR
 }
 
 static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+#if defined(__APPLE__)
+    JSSynchronousGarbageCollectForDebugging(ctx);
+#else
+    JSGarbageCollect(ctx);
+#endif
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
     (void)argc;
     (void)argv;
     (void)exception;
-    JSGarbageCollect(ctx);
-    return JSValueMakeUndefined(ctx);
+#if defined(__APPLE__)
+    JSObjectRef statistics = JSGetMemoryUsageStatistics(ctx);
+    return statistics != NULL ? statistics : ct_make_object(ctx);
+#else
+    return ct_make_object(ctx);
+#endif
 }
 
 static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
@@ -12974,10 +13345,12 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sleep", ct_sleep, runtime);
     ct_install_function(ctx, host, "drainJobs", ct_drain_jobs, runtime);
     ct_install_function(ctx, host, "gc", ct_gc, runtime);
+    ct_install_function(ctx, host, "jscMemoryUsage", ct_jsc_memory_usage, runtime);
     ct_install_function(ctx, host, "importModule", ct_import_module, runtime);
     ct_install_function(ctx, host, "cwd", ct_cwd, runtime);
     ct_install_function(ctx, host, "readFile", ct_read_file, runtime);
     ct_install_function(ctx, host, "readFileBuffer", ct_read_file_buffer, runtime);
+    ct_install_function(ctx, host, "mmapFile", ct_mmap_file_native, runtime);
     ct_install_function(ctx, host, "writeFile", ct_write_file, runtime);
     ct_install_function(ctx, host, "openFd", ct_open_fd, runtime);
     ct_install_function(ctx, host, "readFd", ct_read_fd, runtime);
@@ -13071,6 +13444,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
     ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
     ct_install_function(ctx, host, "cryptoArgon2Sync", ct_crypto_argon2_sync, runtime);
+    ct_install_function(ctx, host, "passwordHashSync", ct_password_hash_sync_native, runtime);
+    ct_install_function(ctx, host, "passwordVerifySync", ct_password_verify_sync_native, runtime);
+    ct_install_function(ctx, host, "hashValue", ct_hash_value_native, runtime);
     ct_install_function(ctx, host, "cryptoEd25519GenerateKeyPair", ct_crypto_ed25519_generate_key_pair, runtime);
     ct_install_function(ctx, host, "cryptoEd25519PublicFromPrivate", ct_crypto_ed25519_public_from_private, runtime);
     ct_install_function(ctx, host, "cryptoEd25519Sign", ct_crypto_ed25519_sign, runtime);
@@ -13144,8 +13520,12 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sqliteStatementFinalize", ct_sqlite_statement_finalize, runtime);
     ct_install_function(ctx, host, "sqliteStatementAll", ct_sqlite_statement_all, runtime);
     ct_install_function(ctx, host, "sqliteStatementGet", ct_sqlite_statement_get, runtime);
+    ct_install_function(ctx, host, "sqliteStatementValues", ct_sqlite_statement_values, runtime);
     ct_install_function(ctx, host, "sqliteStatementRun", ct_sqlite_statement_run, runtime);
     ct_install_function(ctx, host, "sqliteStatementColumns", ct_sqlite_statement_columns, runtime);
+    ct_install_function(ctx, host, "sqliteStatementExpandedSql", ct_sqlite_statement_expanded_sql, runtime);
+    ct_install_function(ctx, host, "sqliteStatementParameterNames", ct_sqlite_statement_parameter_names, runtime);
+    ct_install_function(ctx, host, "sqliteStatementColumnTypes", ct_sqlite_statement_column_types, runtime);
     ct_install_function(ctx, host, "sqliteInTransaction", ct_sqlite_in_transaction, runtime);
     ct_install_function(ctx, host, "sqliteCreateFunction", ct_sqlite_create_function, runtime);
     ct_install_function(ctx, host, "sqliteCreateAggregate", ct_sqlite_create_aggregate, runtime);
@@ -13260,7 +13640,16 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
     (void)stack_size;
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    const char *shadow_realm_option = getenv("JSC_useShadowRealm");
+    char *previous_shadow_realm_option = shadow_realm_option != NULL ? strdup(shadow_realm_option) : NULL;
+    setenv("JSC_useShadowRealm", "true", 1);
     runtime->context = JSGlobalContextCreate(NULL);
+    if (previous_shadow_realm_option != NULL) {
+        setenv("JSC_useShadowRealm", previous_shadow_realm_option, 1);
+        free(previous_shadow_realm_option);
+    } else {
+        unsetenv("JSC_useShadowRealm");
+    }
     if (runtime->context == NULL) {
         free(runtime);
         return NULL;
