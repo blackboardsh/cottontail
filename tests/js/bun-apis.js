@@ -104,6 +104,14 @@ assert(Bun.wrapAnsi("\x1b[31mhello world\x1b[0m", 5).includes("\x1b[39m\n\x1b[31
 assert(Bun.hash("hello world") === 0x668d5e431c3b2573n, "Bun.hash Wyhash mismatch");
 assert(Bun.hash.crc32("hello world") === 0x0d4a1185, "Bun.hash CRC-32 mismatch");
 assert(Bun.hash.xxHash64("", 16269921104521594740n) === 3224619365169652240n, "Bun.hash 64-bit seed mismatch");
+assert(Bun.markdown.html("## Hello **World**\n", { headings: { ids: true } }) === '<h2 id="hello-world">Hello <strong>World</strong></h2>\n', "Bun.markdown.html mismatch");
+assert(Bun.markdown.render("# Hello **world**\n", {
+  heading: (children, { level }) => `<h${level}>${children}</h${level}>`,
+  strong: (children) => `<b>${children}</b>`,
+}) === "<h1>Hello <b>world</b></h1>", "Bun.markdown.render mismatch");
+const markdownReact = Bun.markdown.react("[click](https://example.com)\n", undefined, { reactVersion: 18 });
+assert(markdownReact.$$typeof === Symbol.for("react.element"), "Bun.markdown.react fragment symbol mismatch");
+assert(markdownReact.props.children[0].props.children[0].props.href === "https://example.com", "Bun.markdown.react link props mismatch");
 if (cottontail.platform() !== "win32") {
   const mmapPath = `${tmpDir}/mmap.bin`;
   cottontail.writeFile(mmapPath, "mapped");

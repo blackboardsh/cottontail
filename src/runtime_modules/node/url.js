@@ -233,6 +233,80 @@ export function domainToUnicode(domain) {
 export function parse(input, parseQueryString = false, slashesDenoteHost = false) {
   const text = String(input);
   const out = new Url();
+
+  // Node's legacy parser deliberately accepts inputs that the WHATWG URL
+  // parser rejects. Parse the authority first so malformed percent escapes
+  // and legacy hostname terminators retain node:url semantics.
+  const protocolMatch = text.match(/^([A-Za-z][A-Za-z0-9+.-]*:)(\/\/)?/);
+  const hasProtocolAuthority = Boolean(protocolMatch?.[2]);
+  const hasProtocol = Boolean(protocolMatch);
+  const hasSlashedAuthority = !hasProtocol && slashesDenoteHost && text.startsWith("//");
+  if (hasProtocolAuthority || hasSlashedAuthority) {
+    const authorityStart = hasProtocolAuthority ? protocolMatch[0].length : 2;
+    const authorityEndMatch = text.slice(authorityStart).search(/[\\/?#]/);
+    const authorityEnd = authorityEndMatch < 0 ? text.length : authorityStart + authorityEndMatch;
+    const rawAuthority = text.slice(authorityStart, authorityEnd);
+    const hostnameEndMatch = rawAuthority.search(/[\s'"<>`{}|\\^]/);
+    const validAuthority = hostnameEndMatch < 0 ? rawAuthority : rawAuthority.slice(0, hostnameEndMatch);
+    const remainderPrefix = hostnameEndMatch < 0
+      ? ""
+      : encodeURIComponent(rawAuthority.slice(hostnameEndMatch)).replace(/%2E/gi, ".");
+    const at = validAuthority.lastIndexOf("@");
+    const rawAuth = at < 0 ? "" : validAuthority.slice(0, at);
+    const rawHost = at < 0 ? validAuthority : validAuthority.slice(at + 1);
+    let hostname = rawHost;
+    let port = null;
+    if (rawHost.startsWith("[")) {
+      const end = rawHost.indexOf("]");
+      if (end >= 0) {
+        hostname = rawHost.slice(0, end + 1);
+        port = rawHost[end + 1] === ":" ? rawHost.slice(end + 2) || null : null;
+      }
+    } else {
+      const portMatch = rawHost.match(/:(\d*)$/);
+      if (portMatch) {
+        hostname = rawHost.slice(0, -portMatch[0].length);
+        port = portMatch[1] || null;
+      }
+    }
+
+    let remainder = `${remainderPrefix}${text.slice(authorityEnd)}`;
+    const hashIndex = remainder.indexOf("#");
+    out.hash = hashIndex < 0 ? null : remainder.slice(hashIndex);
+    if (hashIndex >= 0) remainder = remainder.slice(0, hashIndex);
+    const searchIndex = remainder.indexOf("?");
+    out.search = searchIndex < 0 ? null : remainder.slice(searchIndex);
+    const queryText = searchIndex < 0 ? "" : remainder.slice(searchIndex + 1);
+    out.query = parseQueryString ? parseQuery(queryText) : queryText || null;
+    out.pathname = (searchIndex < 0 ? remainder : remainder.slice(0, searchIndex)) || (hasProtocol ? "/" : null);
+    out.path = `${out.pathname ?? ""}${out.search ?? ""}` || null;
+    out.protocol = hasProtocol ? protocolMatch[1].toLowerCase() : null;
+    out.slashes = true;
+    out.auth = rawAuth ? decodeURIComponent(rawAuth) : null;
+    out.host = rawHost ? `${hostname}${port ? `:${port}` : ""}` : null;
+    out.port = port;
+    out.hostname = hostname || null;
+    const prefix = hasProtocol ? `${protocolMatch[1]}//` : "//";
+    const hrefPath = out.path && !out.path.startsWith("/") ? `/${out.path}` : out.path ?? "";
+    out.href = `${prefix}${out.auth ? `${out.auth}@` : ""}${out.host ?? ""}${hrefPath}${out.hash ?? ""}`;
+    return out;
+  }
+
+  if (!hasProtocol) {
+    let remainder = text;
+    const hashIndex = remainder.indexOf("#");
+    out.hash = hashIndex < 0 ? null : remainder.slice(hashIndex);
+    if (hashIndex >= 0) remainder = remainder.slice(0, hashIndex);
+    const searchIndex = remainder.indexOf("?");
+    out.search = searchIndex < 0 ? null : remainder.slice(searchIndex);
+    const queryText = searchIndex < 0 ? "" : remainder.slice(searchIndex + 1);
+    out.query = parseQueryString ? parseQuery(queryText) : queryText || null;
+    out.pathname = searchIndex < 0 ? remainder || null : remainder.slice(0, searchIndex) || null;
+    out.path = `${out.pathname ?? ""}${out.search ?? ""}` || null;
+    out.href = text;
+    return out;
+  }
+
   let parsed = null;
   try {
     parsed = new URL(text, slashesDenoteHost ? "resolve:///" : undefined);

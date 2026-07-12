@@ -558,9 +558,9 @@ export class IncomingMessage extends Readable {
     this.connection = this.socket;
     this.trailers = init.trailers ?? {};
     this.rawTrailers = init.rawTrailers ?? [];
-    this._body = bytesFromBody(init.body);
+    this._incomingBody = bytesFromBody(init.body);
     queueMicrotask(() => {
-      if (this._body.byteLength > 0) this.push(Buffer.from(this._body));
+      if (this._incomingBody.byteLength > 0) this.push(Buffer.from(this._incomingBody));
       this.push(null);
     });
   }
@@ -866,9 +866,7 @@ export class ClientRequest extends OutgoingMessage {
   }
 
   write(chunk, encoding = undefined, callback = undefined) {
-    const ok = super.write(chunk, encoding, callback);
-    this._dispatch();
-    return ok;
+    return super.write(chunk, encoding, callback);
   }
 
   abort() {
@@ -960,7 +958,10 @@ export class ClientRequest extends OutgoingMessage {
       this.agent.addRequest(this, requestOptions);
       return;
     }
-    const socket = netConnect(requestOptions);
+    const socketOptions = { ...requestOptions };
+    if (socketOptions.socketPath != null) socketOptions.path = socketOptions.socketPath;
+    else delete socketOptions.path;
+    const socket = netConnect(socketOptions);
     this.onSocket(socket, false);
   }
 
@@ -1015,7 +1016,11 @@ export class ClientRequest extends OutgoingMessage {
       this._installTimeout();
       const body = this.method === "HEAD" ? Buffer.alloc(0) : this._bodyBuffer();
       if (!this.hasHeader("host")) this.setHeader("Host", this.url.host);
-      if (body.byteLength > 0 && !this.hasHeader("content-length")) this.setHeader("Content-Length", body.byteLength);
+      const usesChunkedEncoding = String(this.getHeader("transfer-encoding") ?? "")
+        .toLowerCase()
+        .split(",")
+        .some((value) => value.trim() === "chunked");
+      if (body.byteLength > 0 && !usesChunkedEncoding && !this.hasHeader("content-length")) this.setHeader("Content-Length", body.byteLength);
       if (!this.hasHeader("connection")) this.setHeader("Connection", this.agent?.keepAlive ? "keep-alive" : "close");
       const lines = [`${this.method} ${this.path} HTTP/1.1`];
       for (const [name, value] of Object.entries(this.getHeaders())) {
@@ -1032,7 +1037,14 @@ export class ClientRequest extends OutgoingMessage {
         socket.write(Buffer.from(lines.join("\r\n")));
         continueTimer = setTimeout(sendContinueBody, 1000);
       } else {
-        socket.write(Buffer.concat([Buffer.from(lines.join("\r\n")), body]));
+        const wireBody = usesChunkedEncoding
+          ? Buffer.concat([
+              Buffer.from(`${body.byteLength.toString(16)}\r\n`),
+              body,
+              Buffer.from("\r\n0\r\n\r\n"),
+            ])
+          : body;
+        socket.write(Buffer.concat([Buffer.from(lines.join("\r\n")), wireBody]));
       }
     };
     const onData = (chunk) => {
@@ -1093,6 +1105,7 @@ export class Server extends EventEmitter {
     this.listening = false;
     this._options = options ?? {};
     this._native = null;
+    this._handle = null;
     this.timeout = Number(options?.timeout ?? 0);
     this.requestTimeout = Number(options?.requestTimeout ?? 300000);
     this.headersTimeout = Number(options?.headersTimeout ?? 60000);
@@ -1207,14 +1220,16 @@ export class Server extends EventEmitter {
       });
     };
     this._native = createNetServer(connectionListener);
+    this._handle = this._native;
     this._native.on("error", (error) => this.emit("error", error));
     this._native.on("close", () => {
       this.listening = false;
+      this._handle = null;
       this.emit("close");
     });
-    this._native.listen(options, () => {
+    this._native.listen(options, (error, host, port) => {
       this.listening = true;
-      this.emit("listening");
+      this.emit("listening", error, host, port);
     });
     return this;
   }
@@ -1227,6 +1242,7 @@ export class Server extends EventEmitter {
     }
     const native = this._native;
     this._native = null;
+    this._handle = null;
     native.close();
     return this;
   }

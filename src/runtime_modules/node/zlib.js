@@ -163,6 +163,12 @@ function transformSync(mode, data, options = undefined) {
   return asBuffer(result);
 }
 
+function defaultStreamFinishFlush(mode) {
+  return mode === "inflate" || mode === "inflateRaw" || mode === "gunzip" || mode === "unzip"
+    ? constants.Z_SYNC_FLUSH
+    : constants.Z_FINISH;
+}
+
 const crc32Table = (() => {
   const table = new Uint32Array(256);
   for (let index = 0; index < 256; index += 1) {
@@ -207,7 +213,10 @@ class ZlibTransform extends Transform {
 
   _emitBuffered() {
     if (this._chunks.length === 0) return false;
-    const output = transformSync(this._mode, this._consumeChunks(), this._options);
+    const output = transformSync(this._mode, this._consumeChunks(), {
+      finishFlush: defaultStreamFinishFlush(this._mode),
+      ...this._options,
+    });
     this.bytesWritten += output.byteLength ?? output.length ?? 0;
     this.push(output);
     return true;

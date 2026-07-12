@@ -56,6 +56,11 @@
 
 extern char **environ;
 
+extern uint8_t *ct_markdown_render_html(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
+extern uint8_t *ct_markdown_parse_events(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
+extern void ct_markdown_free(uint8_t *ptr, size_t len);
+extern void ct_markdown_string_free(char *ptr);
+
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #include <CommonCrypto/CommonCryptor.h>
@@ -263,6 +268,8 @@ typedef struct CtSpawnEvent {
     int exit_code;
     int signal_code;
     bool killed;
+    struct rusage resource_usage;
+    bool has_resource_usage;
     struct CtSpawnEvent *next;
 } CtSpawnEvent;
 
@@ -1910,6 +1917,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     int window_bits = ct_zlib_window_bits(mode);
     int mem_level = MAX_MEM_LEVEL;
     int strategy = Z_DEFAULT_STRATEGY;
+    int finish_flush = Z_FINISH;
     uint8_t *dictionary = NULL;
     size_t dictionary_len = 0;
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
@@ -1927,6 +1935,9 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
             JSValueRef strategy_value = ct_get_property(ctx, options, "strategy", exception);
             if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
             if (!JSValueIsUndefined(ctx, strategy_value) && !JSValueIsNull(ctx, strategy_value)) strategy = (int)ct_value_to_number(ctx, strategy_value);
+            JSValueRef finish_flush_value = ct_get_property(ctx, options, "finishFlush", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, finish_flush_value) && !JSValueIsNull(ctx, finish_flush_value)) finish_flush = (int)ct_value_to_number(ctx, finish_flush_value);
             JSValueRef dictionary_value = ct_get_property(ctx, options, "dictionary", exception);
             if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
             if (!JSValueIsUndefined(ctx, dictionary_value) && !JSValueIsNull(ctx, dictionary_value)) {
@@ -1952,6 +1963,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     if (window_bits == 0) window_bits = ct_zlib_window_bits(mode);
     if (mem_level < 1 || mem_level > MAX_MEM_LEVEL) mem_level = MAX_MEM_LEVEL;
     if (strategy < Z_DEFAULT_STRATEGY || strategy > Z_FIXED) strategy = Z_DEFAULT_STRATEGY;
+    if (finish_flush < Z_NO_FLUSH || finish_flush > Z_TREES) finish_flush = Z_FINISH;
 
     const bool compressing = ct_zlib_mode_compresses(mode);
     size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
@@ -2001,16 +2013,23 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
             capacity = next_capacity;
         }
 
+        const uLong previous_total_out = stream.total_out;
+        const uInt previous_avail_in = stream.avail_in;
         stream.next_out = output + stream.total_out;
         stream.avail_out = (uInt)(capacity - stream.total_out);
-        status = compressing ? deflate(&stream, Z_FINISH) : inflate(&stream, Z_FINISH);
+        status = compressing ? deflate(&stream, finish_flush) : inflate(&stream, finish_flush);
         if (!compressing && status == Z_NEED_DICT && dictionary != NULL && dictionary_len > 0) {
             status = inflateSetDictionary(&stream, dictionary, (uInt)dictionary_len);
             if (status == Z_OK) continue;
         }
         if (status == Z_STREAM_END) break;
+        if (finish_flush != Z_FINISH && stream.avail_in == 0 && (status == Z_OK || status == Z_BUF_ERROR)) {
+            status = Z_STREAM_END;
+            break;
+        }
         if (status == Z_OK || status == Z_BUF_ERROR) {
-            if (stream.avail_out == 0 || !compressing) continue;
+            if (stream.avail_out == 0) continue;
+            if (!compressing && (stream.total_out != previous_total_out || stream.avail_in != previous_avail_in)) continue;
         }
         break;
     }
@@ -3463,23 +3482,42 @@ static JSValueRef ct_crypto_spkac_export_public_key(JSContextRef ctx, JSObjectRe
 
 static EVP_PKEY *ct_read_pem_key_from_bytes(const uint8_t *data, size_t data_len, bool private_key) {
 #if CT_HAS_OPENSSL
+    ERR_clear_error();
     BIO *bio = BIO_new_mem_buf(data, (int)data_len);
     if (bio == NULL) return NULL;
     EVP_PKEY *pkey = private_key ? PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL) : PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
     BIO_free(bio);
-    if (pkey != NULL || private_key) return pkey;
+    if (pkey != NULL) return pkey;
+    ERR_clear_error();
+    if (private_key) return NULL;
 
     bio = BIO_new_mem_buf(data, (int)data_len);
     if (bio == NULL) return NULL;
     RSA *rsa = PEM_read_bio_RSAPublicKey(bio, NULL, NULL, NULL);
     BIO_free(bio);
-    if (rsa == NULL) return NULL;
-    pkey = EVP_PKEY_new();
-    if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
-        if (pkey != NULL) EVP_PKEY_free(pkey);
-        RSA_free(rsa);
+    if (rsa != NULL) {
+        pkey = EVP_PKEY_new();
+        if (pkey == NULL || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+            if (pkey != NULL) EVP_PKEY_free(pkey);
+            RSA_free(rsa);
+            ERR_clear_error();
+            return NULL;
+        }
+        return pkey;
+    }
+    ERR_clear_error();
+
+    bio = BIO_new_mem_buf(data, (int)data_len);
+    if (bio == NULL) return NULL;
+    X509 *certificate = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (certificate == NULL) {
+        ERR_clear_error();
         return NULL;
     }
+    pkey = X509_get_pubkey(certificate);
+    X509_free(certificate);
+    if (pkey == NULL) ERR_clear_error();
     return pkey;
 #else
     (void)data;
@@ -7153,7 +7191,6 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
     int no_delay = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
     ct_set_nonblocking_fd(fd);
-
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
     JSObjectRef local = ct_tcp_address_object(ctx, fd, false, exception);
@@ -7351,6 +7388,30 @@ static JSValueRef ct_tcp_socket_address(JSContextRef ctx, JSObjectRef function, 
     bool peer = argc >= 2 ? ct_value_to_bool(ctx, argv[1]) : false;
     JSObjectRef result = ct_tcp_address_object(ctx, fd, peer, exception);
     return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_socket_pair(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+#if defined(_WIN32)
+    ct_throw_message(ctx, exception, "socketpair is unavailable on Windows");
+    return JSValueMakeUndefined(ctx);
+#else
+    int descriptors[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors) != 0) {
+        ct_throw_message(ctx, exception, strerror(errno));
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(descriptors[0]);
+    ct_set_nonblocking_fd(descriptors[1]);
+    JSValueRef values[2] = {
+        JSValueMakeNumber(ctx, descriptors[0]),
+        JSValueMakeNumber(ctx, descriptors[1]),
+    };
+    return ct_make_array(ctx, 2, values, exception);
+#endif
 }
 
 static JSValueRef ct_tcp_socket_set_no_delay(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -10826,6 +10887,9 @@ static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
     int status = 0;
     bool exited = false;
+    struct rusage resource_usage;
+    memset(&resource_usage, 0, sizeof(resource_usage));
+    bool has_resource_usage = false;
     if (process->stdout_fd >= 0) fcntl(process->stdout_fd, F_SETFL, fcntl(process->stdout_fd, F_GETFL, 0) | O_NONBLOCK);
     if (process->stderr_fd >= 0) fcntl(process->stderr_fd, F_SETFL, fcntl(process->stderr_fd, F_GETFL, 0) | O_NONBLOCK);
     if (process->ipc_fd >= 0) fcntl(process->ipc_fd, F_SETFL, fcntl(process->ipc_fd, F_GETFL, 0) | O_NONBLOCK);
@@ -10936,9 +11000,10 @@ static void *ct_async_process_thread(void *opaque) {
         }
 
         if (!exited) {
-            pid_t wait_result = waitpid(process->pid, &status, WNOHANG);
+            pid_t wait_result = wait4(process->pid, &status, WNOHANG, &resource_usage);
             if (wait_result == process->pid) {
                 exited = true;
+                has_resource_usage = true;
             } else if (wait_result < 0 && errno != EINTR) {
                 exited = true;
             }
@@ -10948,7 +11013,11 @@ static void *ct_async_process_thread(void *opaque) {
     }
 
     if (!exited) {
-        while (waitpid(process->pid, &status, 0) < 0 && errno == EINTR) {}
+        pid_t wait_result;
+        do {
+            wait_result = wait4(process->pid, &status, 0, &resource_usage);
+        } while (wait_result < 0 && errno == EINTR);
+        has_resource_usage = wait_result == process->pid;
     }
     int exit_code = 1;
     int signal_code = 0;
@@ -10964,6 +11033,8 @@ static void *ct_async_process_thread(void *opaque) {
         exit_event->type = ct_duplicate_bytes("exit", 4);
         exit_event->exit_code = exit_code;
         exit_event->signal_code = signal_code;
+        exit_event->resource_usage = resource_usage;
+        exit_event->has_resource_usage = has_resource_usage;
         ct_queue_spawn_event(process->runtime, exit_event);
     }
     if (process->stdin_fd >= 0) close(process->stdin_fd);
@@ -11425,6 +11496,9 @@ static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runti
                 ct_set_property(ctx, item, "signalCode", JSValueMakeNull(ctx), exception);
             }
             ct_set_property(ctx, item, "killed", JSValueMakeBoolean(ctx, event->killed), exception);
+            if (event->has_resource_usage) {
+                ct_set_property(ctx, item, "resourceUsage", ct_rusage_object(ctx, &event->resource_usage, exception), exception);
+            }
         }
         JSValueRef arg = item;
         JSObjectCallAsFunction(ctx, runtime->spawn_event_handler, NULL, 1, &arg, exception);
@@ -13307,6 +13381,70 @@ static JSValueRef ct_strip_typescript_types_native(JSContextRef ctx, JSObjectRef
     return result;
 }
 
+static JSValueRef ct_markdown_html_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "markdownHtml(source[, flags]) requires source");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t source_len = 0;
+    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    if (source == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint64_t flags = argc >= 2 ? (uint64_t)ct_value_to_number(ctx, argv[1]) : 0;
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_markdown_render_html((const uint8_t *)source, source_len, flags, &output_len, &error);
+    free(source);
+
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Markdown rendering failed");
+        if (error != NULL) ct_markdown_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_markdown_free(output, output_len);
+    return result;
+}
+
+static JSValueRef ct_markdown_events_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "markdownEvents(source[, flags]) requires source");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t source_len = 0;
+    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    if (source == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint64_t flags = argc >= 2 ? (uint64_t)ct_value_to_number(ctx, argv[1]) : 0;
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_markdown_parse_events((const uint8_t *)source, source_len, flags, &output_len, &error);
+    free(source);
+
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Markdown parsing failed");
+        if (error != NULL) ct_markdown_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_markdown_free(output, output_len);
+    return result;
+}
+
 static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
@@ -13409,6 +13547,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "httpServerResponseEnd", ct_http_server_response_end, runtime);
     ct_install_function(ctx, host, "httpServerStop", ct_http_server_stop, runtime);
     ct_install_function(ctx, host, "stripTypeScriptTypes", ct_strip_typescript_types_native, runtime);
+    ct_install_function(ctx, host, "markdownHtml", ct_markdown_html_native, runtime);
+    ct_install_function(ctx, host, "markdownEvents", ct_markdown_events_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
     ct_install_function(ctx, host, "memoryView", ct_memory_view, runtime);
     ct_install_function(ctx, host, "sharedArrayBufferCreate", ct_shared_array_buffer_create, runtime);
@@ -13498,6 +13638,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "tcpServerAccept", ct_tcp_server_accept, runtime);
     ct_install_function(ctx, host, "tcpSocketConnect", ct_tcp_socket_connect, runtime);
     ct_install_function(ctx, host, "tcpSocketAddress", ct_tcp_socket_address, runtime);
+    ct_install_function(ctx, host, "socketPair", ct_socket_pair, runtime);
     ct_install_function(ctx, host, "tcpSocketSetNoDelay", ct_tcp_socket_set_no_delay, runtime);
     ct_install_function(ctx, host, "tcpSocketSetKeepAlive", ct_tcp_socket_set_keep_alive, runtime);
     ct_install_function(ctx, host, "tcpSocketShutdown", ct_tcp_socket_shutdown, runtime);

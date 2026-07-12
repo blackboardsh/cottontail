@@ -36,6 +36,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  stat,
   statfsSync,
   symlinkSync,
   truncateSync,
@@ -73,6 +74,18 @@ await new Promise<void>((resolve, reject) => {
 const stats = statSync(filePath);
 assert(stats instanceof Stats, "statSync should return Stats");
 assert(stats.isFile(), "statSync isFile mismatch");
+await new Promise<void>((resolve, reject) => {
+  stat(`${root}/missing`, (error) => {
+    try {
+      assert(error?.code === "ENOENT", "stat callback should expose ENOENT");
+      assert(error?.syscall === "stat", "stat callback syscall mismatch");
+      assert(error?.path === `${root}/missing`, "stat callback path mismatch");
+      resolve();
+    } catch (assertionError) {
+      reject(assertionError);
+    }
+  });
+});
 assert(Number.isFinite(stats.ino), "statSync ino missing");
 assert(statfsSync(root).bsize > 0, "statfsSync bsize missing");
 const bigintStats = statSync(filePath, { bigint: true });

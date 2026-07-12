@@ -21,16 +21,17 @@ function incompleteUtf8Bytes(bytes) {
   return available < expected ? available : 0;
 }
 
-export class StringDecoder {
-  constructor(encoding = "utf8") {
-    this.encoding = String(encoding || "utf8").toLowerCase();
-    this.lastNeed = 0;
-    this.lastTotal = 0;
-    this.lastChar = new Uint8Array(4);
-    this._pending = new Uint8Array(0);
-    this._decoder = new TextDecoder(this.encoding === "utf8" || this.encoding === "utf-8" ? "utf-8" : this.encoding);
-  }
+export function StringDecoder(encoding = "utf8") {
+  if (!(this instanceof StringDecoder)) return new StringDecoder(encoding);
+  this.encoding = String(encoding || "utf8").toLowerCase();
+  this.lastNeed = 0;
+  this.lastTotal = 0;
+  this.lastChar = new Uint8Array(4);
+  this._pending = new Uint8Array(0);
+  this._decoder = new TextDecoder(this.encoding === "utf8" || this.encoding === "utf-8" ? "utf-8" : this.encoding);
+}
 
+Object.assign(StringDecoder.prototype, {
   write(input) {
     const current = bytesFrom(input);
     const combined = new Uint8Array(this._pending.byteLength + current.byteLength);
@@ -45,7 +46,7 @@ export class StringDecoder {
     this.lastChar.set(new Uint8Array(4));
     this.lastChar.set(this._pending.subarray(0, 4));
     return complete.byteLength === 0 ? "" : this._decoder.decode(complete, { stream: true });
-  }
+  },
 
   end(input = undefined) {
     const text = input == null ? "" : this.write(input);
@@ -54,6 +55,6 @@ export class StringDecoder {
     this.lastNeed = 0;
     return text + rest;
   }
-}
+});
 
 export default { StringDecoder };

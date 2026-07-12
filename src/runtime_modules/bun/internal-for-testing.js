@@ -567,7 +567,10 @@ export function setSocketOptions(socket, buffer, size) {
 }
 
 export function createSocketPair() {
-  throw new Error("bun:internal-for-testing createSocketPair is unavailable in Cottontail");
+  if (typeof cottontail.socketPair !== "function") {
+    throw new Error("socketpair is unavailable in this Cottontail build");
+  }
+  return cottontail.socketPair();
 }
 
 export function canonicalizeIP(value) {

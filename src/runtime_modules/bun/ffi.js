@@ -32,7 +32,7 @@ function installProcessApi(processObject) {
   });
 
   processObject.pid ??= cottontail.pid?.() ?? 0;
-  processObject.version ??= "v22.0.0-cottontail";
+  processObject.version ??= "v24.0.0";
   processObject.title ??= "cottontail";
   processObject.browser ??= false;
   processObject.uptime ??= () => (Date.now() - processStartMs) / 1000;
@@ -121,7 +121,7 @@ const processObject = g.process ?? {
   platform: platform(),
   arch: cottontail.arch(),
   pid: cottontail.pid?.() ?? 0,
-  versions: { node: "22.0.0", cottontail: "0.0.0-dev" },
+  versions: { node: "24.0.0", cottontail: "0.0.0-dev" },
   release: { name: "cottontail" },
   cwd: () => cottontail.cwd(),
   exit: (code = 0) => cottontail.exit(code),
@@ -154,8 +154,8 @@ if (typeof cottontail.gc === "function" &&
     writable: true,
   });
 }
-g.process.versions ??= { node: "22.0.0", cottontail: "0.0.0-dev" };
-g.process.versions.node ??= "22.0.0";
+g.process.versions ??= { node: "24.0.0", cottontail: "0.0.0-dev" };
+g.process.versions.node ??= "24.0.0";
 g.process.release ??= { name: "cottontail" };
 g.process.emitWarning ??= (message, type = "Warning") => console.warn(`${type}: ${message}`);
 g.process.stdin ??= createReadableStdio(0);
@@ -609,7 +609,9 @@ installBlobGlobals();
 installObjectURLRegistry();
 
 function normalizeBufferEncoding(encoding = "utf8") {
-  const normalized = String(encoding || "utf8").toLowerCase().replace(/[-_]/g, "");
+  const raw = String(encoding || "utf8").toLowerCase();
+  if (raw === "base64url" || raw === "base64-url") return "base64url";
+  const normalized = raw.replace(/[-_]/g, "");
   if (normalized === "utf8" || normalized === "utf") return "utf8";
   if (normalized === "utf16le" || normalized === "ucs2") return "utf16le";
   if (normalized === "latin1" || normalized === "binary") return "latin1";
@@ -646,7 +648,7 @@ function hexEncode(input) {
 
 function base64Decode(input) {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const clean = String(input).replace(/[^A-Za-z0-9+/=]/g, "");
+  const clean = String(input).replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/=]/g, "");
   const out = [];
   let buffer = 0;
   let bits = 0;
@@ -684,7 +686,7 @@ function base64Encode(input) {
 function bytesFromStringWithEncoding(input, encoding = "utf8") {
   const normalized = normalizeBufferEncoding(encoding);
   const text = String(input);
-  if (normalized === "base64") return base64Decode(text);
+  if (normalized === "base64" || normalized === "base64url") return base64Decode(text);
   if (normalized === "hex") return hexDecode(text);
   if (normalized === "latin1") {
     const bytes = new Uint8Array(text.length);
@@ -707,6 +709,7 @@ function stringFromBytesWithEncoding(bytes, encoding = "utf8", start = 0, end = 
   const normalized = normalizeBufferEncoding(encoding);
   const view = bytes.subarray(Math.max(0, Number(start) || 0), Math.min(bytes.length, end == null ? bytes.length : Number(end)));
   if (normalized === "base64") return base64Encode(view);
+  if (normalized === "base64url") return base64Encode(view).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   if (normalized === "hex") return hexEncode(view);
   if (normalized === "latin1") {
     let output = "";
@@ -738,6 +741,7 @@ g.atob ??= (input) => {
 };
 
 function CottontailBuffer(value, encoding = "utf8") {
+  if (typeof value === "number") return CottontailBuffer.allocUnsafe(value);
   return CottontailBuffer.from(value, encoding);
 }
 CottontailBuffer.prototype = Object.create(Uint8Array.prototype);
@@ -796,6 +800,15 @@ function installBufferMethods(bytes) {
   bytes.includes = function includes(value, byteOffset = 0, encoding = "utf8") {
     return this.indexOf(value, byteOffset, encoding) !== -1;
   };
+  bytes.copy = function copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
+    if (!ArrayBuffer.isView(target)) throw new TypeError("copy target must be a Buffer or Uint8Array");
+    const destinationOffset = Math.max(0, Math.trunc(Number(targetStart) || 0));
+    const start = Math.max(0, Math.min(this.length, Math.trunc(Number(sourceStart) || 0)));
+    const end = Math.max(start, Math.min(this.length, Math.trunc(Number(sourceEnd) || 0)));
+    const length = Math.min(end - start, Math.max(0, target.length - destinationOffset));
+    if (length > 0) target.set(Uint8Array.prototype.slice.call(this, start, start + length), destinationOffset);
+    return length;
+  };
   bytes.write = function write(string, offset = 0, length = undefined, encoding = "utf8") {
     if (typeof offset === "string") {
       encoding = offset;
@@ -843,6 +856,7 @@ CottontailBuffer.alloc = function alloc(size, fill = 0, encoding = "utf8") {
 CottontailBuffer.allocUnsafe = function allocUnsafe(size) {
   return makeBuffer(new Uint8Array(Number(size) || 0));
 };
+CottontailBuffer.allocUnsafeSlow = CottontailBuffer.allocUnsafe;
 CottontailBuffer.concat = function concat(list, totalLength = undefined) {
   if (!Array.isArray(list)) throw new TypeError("Buffer.concat list must be an Array");
   const buffers = list.map((item) => CottontailBuffer.from(item));
@@ -867,6 +881,7 @@ g.Buffer = typeof g.Buffer === "function" ? g.Buffer : CottontailBuffer;
 g.Buffer.from ??= CottontailBuffer.from;
 g.Buffer.alloc ??= CottontailBuffer.alloc;
 g.Buffer.allocUnsafe ??= CottontailBuffer.allocUnsafe;
+g.Buffer.allocUnsafeSlow ??= CottontailBuffer.allocUnsafeSlow;
 g.Buffer.concat ??= CottontailBuffer.concat;
 g.Buffer.isBuffer ??= CottontailBuffer.isBuffer;
 g.Buffer.byteLength ??= CottontailBuffer.byteLength;

@@ -9,7 +9,8 @@ const rootDir = process.cwd();
 const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
 const binaryPath = join(rootDir, 'zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail');
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
-const tempRoot = mkdtempSync(join(os.tmpdir(), 'cottontail-upstream-tests-'));
+const tempBase = process.env.COTTONTAIL_UPSTREAM_TMPDIR ?? (process.platform === 'darwin' ? '/tmp' : os.tmpdir());
+const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
 const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
@@ -87,10 +88,12 @@ function parseArgs(argv) {
 function countFiles(dir) {
   let count = 0;
   const stack = [dir];
+  const installedDependencies = join(dir, 'test', 'node_modules');
   while (stack.length > 0) {
     const current = stack.pop();
     for (const name of readdirSync(current)) {
       const path = join(current, name);
+      if (path === installedDependencies) continue;
       const stat = lstatSync(path);
       if (stat.isDirectory() && !stat.isSymbolicLink()) stack.push(path);
       else count += 1;
@@ -101,6 +104,7 @@ function countFiles(dir) {
 
 function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
   const testRoot = join(snapshotRoot, 'test');
+  const installedDependencies = join(testRoot, 'node_modules');
   if (!existsSync(testRoot)) return [];
   const result = [];
   const stack = [testRoot];
@@ -111,6 +115,7 @@ function discoverRunnableFiles(snapshotRoot, runtime = 'node') {
     const current = stack.pop();
     for (const name of readdirSync(current)) {
       const path = join(current, name);
+      if (path === installedDependencies) continue;
       const stat = lstatSync(path);
       if (stat.isDirectory() && !stat.isSymbolicLink()) {
         stack.push(path);

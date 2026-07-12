@@ -18,9 +18,12 @@ let nextInvocationCallOrder = 1;
 const moduleMocks = globalThis.__cottontailBunModuleMocks ??= new Map();
 const snapshots = new Map();
 const snapshotCounters = new Map();
+const writableSnapshotFiles = new Set();
 let fakeSystemTime = null;
 let fakeTimersEnabled = false;
 let fakeNow = Date.now();
+let fakeDateNanoseconds = BigInt(Math.trunc(fakeNow * 1e6));
+let fakeHrtimeNanoseconds = 0n;
 let fakePerformanceOrigin = fakeNow;
 let nextFakeTimerId = 1;
 const fakeTimers = new Map();
@@ -31,6 +34,7 @@ const realTimers = {
   clearTimeout: globalThis.clearTimeout,
   requestAnimationFrame: globalThis.requestAnimationFrame,
   cancelAnimationFrame: globalThis.cancelAnimationFrame,
+  processHrtime: globalThis.process?.hrtime,
   setImmediate: globalThis.setImmediate,
   setInterval: globalThis.setInterval,
   setTimeout: globalThis.setTimeout,
@@ -187,6 +191,8 @@ function asymmetricMatch(actual, expected) {
       return expected.type === String ? typeof actual === "string" || actual instanceof String
         : expected.type === Number ? typeof actual === "number" || actual instanceof Number
         : expected.type === Boolean ? typeof actual === "boolean" || actual instanceof Boolean
+        : expected.type === BigInt ? typeof actual === "bigint"
+        : expected.type === Symbol ? typeof actual === "symbol"
         : actual instanceof expected.type;
     case "anything":
       return actual != null;
@@ -281,7 +287,8 @@ function matchesExpected(actual, expected, seen = new WeakMap()) {
 
 function formatValue(value) {
   try {
-    return JSON.stringify(value);
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? String(value) : serialized;
   } catch {
     return String(value);
   }
@@ -400,7 +407,7 @@ function inlineSnapshotMatches(received, wanted) {
   return received.replace(/\\(["\\])/g, "$1") === wanted;
 }
 
-function nextSnapshotKey(hint = undefined) {
+function nextSnapshotIdentity(hint = undefined) {
   const file = globalThis.process?.argv?.[1] ?? "<script>";
   const testName = typeof globalThis.__cottontailCurrentTestName === "function" ? globalThis.__cottontailCurrentTestName() : "";
   const scope = testName ? `${file}:${testName}` : file;
@@ -408,7 +415,36 @@ function nextSnapshotKey(hint = undefined) {
   const current = snapshotCounters.get(base) ?? 0;
   const next = current + 1;
   snapshotCounters.set(base, next);
-  return `${base}:${next}`;
+  const exportBase = hint != null ? `${testName}: ${String(hint)}` : testName || file;
+  return { key: `${base}:${next}`, exportKey: `${exportBase} ${next}`, file };
+}
+
+function snapshotFilePath(testFile) {
+  let path = String(testFile);
+  if (!/^(?:[A-Za-z]:)?[\\/]/.test(path)) path = `${cottontail.cwd()}/${path}`;
+  path = path.replace(/\\/g, "/");
+  const slash = path.lastIndexOf("/");
+  const directory = slash >= 0 ? path.slice(0, slash) : cottontail.cwd();
+  const basename = slash >= 0 ? path.slice(slash + 1) : path;
+  return `${directory}/__snapshots__/${basename}.snap`;
+}
+
+function persistSnapshot(identity, text) {
+  if (!globalThis.cottontail?.writeFile || identity.file === "<script>") return;
+  const path = snapshotFilePath(identity.file);
+  let source = "// Jest Snapshot v1, https://bun.sh/docs/test/snapshots\n";
+  try {
+    source = String(cottontail.readFile(path));
+    if (!writableSnapshotFiles.has(path)) return;
+  } catch {
+    const slash = path.lastIndexOf("/");
+    cottontail.mkdirSync(path.slice(0, slash), true);
+    writableSnapshotFiles.add(path);
+  }
+  const escapedKey = String(identity.exportKey).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+  const escapedText = String(text).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+  source += `\nexports[\`${escapedKey}\`] = \`\n${escapedText}\n\`;\n`;
+  cottontail.writeFile(path, source);
 }
 
 function compareSnapshot(actual, expected = undefined, hint = undefined) {
@@ -416,14 +452,24 @@ function compareSnapshot(actual, expected = undefined, hint = undefined) {
   if (expected != null) {
     return text === normalizeSnapshotText(expected);
   }
-  const key = nextSnapshotKey(hint);
-  if (!snapshots.has(key)) snapshots.set(key, text);
-  return snapshots.get(key) === text;
+  const identity = nextSnapshotIdentity(hint);
+  if (!snapshots.has(identity.key)) {
+    snapshots.set(identity.key, text);
+    persistSnapshot(identity, text);
+  }
+  return snapshots.get(identity.key) === text;
 }
 
 function assertPropertyMatchers(actual, propertyMatchers) {
-  const pass = isObject(actual) && Object.keys(propertyMatchers ?? {})
-    .every((key) => matchesExpected(actual[key], propertyMatchers[key]));
+  const matchesProperties = (received, expected) => {
+    if (expected?.__expectMatcher) return matchesExpected(received, expected);
+    if (!isObject(expected) || Array.isArray(expected)) return matchesExpected(received, expected);
+    if (!isObject(received)) return false;
+    return Reflect.ownKeys(expected).every((key) =>
+      Object.prototype.hasOwnProperty.call(received, key) && matchesProperties(received[key], expected[key])
+    );
+  };
+  const pass = matchesProperties(actual, propertyMatchers ?? {});
   if (!pass) {
     throw new nodeAssert.AssertionError({ message: `Expected ${formatValue(actual)} to match snapshot property matchers` });
   }
@@ -472,11 +518,32 @@ function timerClock() {
   return fakeSystemTime ?? fakeNow;
 }
 
-function setFakeNow(value) {
-  fakeNow = value instanceof realTimers.Date ? value.getTime() : Number(value);
-  if (!Number.isFinite(fakeNow)) fakeNow = realTimers.Date.now();
+function millisecondsToNanoseconds(value) {
+  const number = Number(value);
+  return BigInt(Math.trunc((Number.isFinite(number) ? number : 0) * 1e6));
+}
+
+function syncFakeDateClock() {
+  fakeNow = Number(fakeDateNanoseconds / 1000000n);
   fakeSystemTime = fakeNow;
 }
+
+function setFakeNow(value) {
+  let next = value instanceof realTimers.Date ? value.getTime() : Number(value);
+  if (!Number.isFinite(next)) next = realTimers.Date.now();
+  fakeDateNanoseconds = millisecondsToNanoseconds(next);
+  syncFakeDateClock();
+}
+
+function fakeHrtime(previous = undefined) {
+  let value = fakeHrtimeNanoseconds;
+  if (Array.isArray(previous)) {
+    value -= BigInt(previous[0] || 0) * 1000000000n + BigInt(previous[1] || 0);
+  }
+  return [Number(value / 1000000000n), Number(value % 1000000000n)];
+}
+
+fakeHrtime.bigint = () => fakeHrtimeNanoseconds;
 
 function normalizeTimerCallback(callback) {
   if (typeof callback === "function") return callback;
@@ -488,7 +555,7 @@ function fakeTimerHandle(timer) {
   let referenced = true;
   return {
     refresh() {
-      timer.deadline = timerClock() + timer.delay;
+      timer.deadline = fakeDateNanoseconds + timer.delayNanoseconds;
       fakeTimers.set(timer.id, timer);
       return this;
     },
@@ -506,8 +573,9 @@ function fakeSetTimeout(callback, ms = 0, ...args) {
     id,
     callback: normalizeTimerCallback(callback),
     args,
-    deadline: timerClock() + delay,
+    deadline: fakeDateNanoseconds + millisecondsToNanoseconds(delay),
     delay,
+    delayNanoseconds: millisecondsToNanoseconds(delay),
     interval: null,
   };
   fakeTimers.set(id, timer);
@@ -521,8 +589,9 @@ function fakeSetInterval(callback, ms = 0, ...args) {
     id,
     callback: normalizeTimerCallback(callback),
     args,
-    deadline: timerClock() + interval,
+    deadline: fakeDateNanoseconds + millisecondsToNanoseconds(interval),
     delay: interval,
+    delayNanoseconds: millisecondsToNanoseconds(interval),
     interval,
   };
   fakeTimers.set(id, timer);
@@ -539,18 +608,21 @@ function fakeSetImmediate(callback, ...args) {
 
 function dueTimers(until = Infinity) {
   return Array.from(fakeTimers.values())
-    .filter((timer) => timer.deadline <= until)
-    .sort((left, right) => left.deadline - right.deadline || left.id - right.id);
+    .filter((timer) => until === Infinity || timer.deadline <= until)
+    .sort((left, right) => left.deadline < right.deadline ? -1 : left.deadline > right.deadline ? 1 : left.id - right.id);
 }
 
 function runFakeTimer(timer) {
   if (!fakeTimers.has(timer.id)) return;
   fakeTimers.delete(timer.id);
-  fakeNow = Math.max(timer.deadline, fakeNow);
-  fakeSystemTime = fakeNow;
+  if (timer.deadline > fakeDateNanoseconds) {
+    fakeHrtimeNanoseconds += timer.deadline - fakeDateNanoseconds;
+    fakeDateNanoseconds = timer.deadline;
+    syncFakeDateClock();
+  }
   timer.callback(...timer.args);
   if (timer.interval != null && fakeTimersEnabled) {
-    timer.deadline = fakeNow + timer.interval;
+    timer.deadline = fakeDateNanoseconds + timer.delayNanoseconds;
     fakeTimers.set(timer.id, timer);
   }
   cottontail.drainJobs?.();
@@ -567,9 +639,10 @@ function runTimersUntil(target) {
       throw new Error("Aborting after running 100000 timers, assuming an infinite loop");
     }
   }
-  if (Number.isFinite(target)) {
-    fakeNow = Math.max(fakeNow, target);
-    fakeSystemTime = fakeNow;
+  if (target !== Infinity && target > fakeDateNanoseconds) {
+    fakeHrtimeNanoseconds += target - fakeDateNanoseconds;
+    fakeDateNanoseconds = target;
+    syncFakeDateClock();
   }
 }
 
@@ -584,6 +657,7 @@ function installFakeTimers(options = undefined) {
   }
   fakeTimersEnabled = true;
   setFakeNow(hasCustomNow ? options.now : realTimers.Date.now());
+  fakeHrtimeNanoseconds = 0n;
   fakePerformanceOrigin = fakeNow;
   class FakeDate extends realTimers.Date {
     constructor(...args) {
@@ -604,6 +678,7 @@ function installFakeTimers(options = undefined) {
   globalThis.requestAnimationFrame = (callback) => fakeSetTimeout(() => callback(timerClock()), 16);
   globalThis.cancelAnimationFrame = fakeClearTimer;
   if (globalThis.performance) globalThis.performance.now = () => timerClock() - fakePerformanceOrigin;
+  if (globalThis.process && typeof realTimers.processHrtime === "function") globalThis.process.hrtime = fakeHrtime;
 }
 
 function uninstallFakeTimers() {
@@ -623,6 +698,7 @@ function uninstallFakeTimers() {
   if (realTimers.cancelAnimationFrame === undefined) delete globalThis.cancelAnimationFrame;
   else globalThis.cancelAnimationFrame = realTimers.cancelAnimationFrame;
   if (globalThis.performance && realTimers.performanceNow) globalThis.performance.now = realTimers.performanceNow;
+  if (globalThis.process && typeof realTimers.processHrtime === "function") globalThis.process.hrtime = realTimers.processHrtime;
 }
 
 class Expectation {
@@ -849,6 +925,7 @@ class Expectation {
     });
   }
   pass() { return this._check(true, ""); }
+  fail(message = "Explicit failure") { return this._check(false, String(message)); }
   toSatisfy(predicate) { return this._wrap((actual) => this._check(predicate(actual) === true, "Expected predicate to pass")); }
 
   toHaveBeenCalled(...args) {
@@ -1558,7 +1635,10 @@ export const jest = {
     if (pending.length > 0) runTimersUntil(pending[pending.length - 1].deadline);
     return this;
   },
-  advanceTimersByTime(ms = 0) { runTimersUntil(timerClock() + Math.max(0, Number(ms) || 0)); return this; },
+  advanceTimersByTime(ms = 0) {
+    runTimersUntil(fakeDateNanoseconds + millisecondsToNanoseconds(Math.max(0, Number(ms) || 0)));
+    return this;
+  },
   advanceTimersToNextTimer(steps = 1) {
     for (let index = 0; index < Math.max(1, Number(steps) || 1); index += 1) {
       const next = dueTimers(Infinity)[0];

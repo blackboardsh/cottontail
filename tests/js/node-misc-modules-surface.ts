@@ -37,6 +37,12 @@ const euro = new Uint8Array([0xe2, 0x82, 0xac]);
 assert(decoder.write(euro.subarray(0, 2)) === "", "StringDecoder should buffer incomplete UTF-8");
 assert(decoder.write(euro.subarray(2)) === "€", "StringDecoder should complete UTF-8");
 assert(decoder.end() === "", "StringDecoder end mismatch");
+const calledDecoder = StringDecoder("utf8");
+assert(calledDecoder instanceof StringDecoder, "StringDecoder should be callable without new");
+
+const stackError = new TypeError("stack header");
+assert(stackError.stack?.startsWith("TypeError: stack header\n"), "Error stack should include Node-style name and message");
+assert(stackError instanceof TypeError && stackError instanceof Error, "wrapped Error constructors should preserve instanceof");
 
 assert(punycode.encode("mañana") === "maana-pta", "punycode encode mismatch");
 assert(punycode.decode("maana-pta") === "mañana", "punycode decode mismatch");

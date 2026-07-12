@@ -1194,9 +1194,11 @@ function keyObjectFromEncodedInput(input, requestedType = undefined) {
   if (typeof cottontail.cryptoImportKey !== "function") cryptoFeatureError("crypto.importKey");
   const options = input && typeof input === "object" && input.key != null ? input : { key: input };
   const keyData = options.key;
-  const format = String(options.format ?? (typeof keyData === "string" ? "pem" : "der")).toLowerCase();
+  const keyBytes = bytesFromData(keyData);
+  const isPem = keyBytes.length >= 11 && String.fromCharCode(...keyBytes.subarray(0, 11)) === "-----BEGIN ";
+  const format = String(options.format ?? (isPem ? "pem" : "der")).toLowerCase();
   const keyType = String(options.type ?? "");
-  const nativeKey = cottontail.cryptoImportKey(requestedType ?? "", format, keyType, bytesFromData(keyData));
+  const nativeKey = cottontail.cryptoImportKey(requestedType ?? "", format, keyType, keyBytes);
   return keyObjectFromNativeKey(nativeKey, requestedType);
 }
 

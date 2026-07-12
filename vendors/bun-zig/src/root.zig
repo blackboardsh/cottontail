@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Environment = @import("bun_core/env.zig");
 pub const OOM = std.mem.Allocator.Error;
+pub const JSError = error{ JSError, OutOfMemory, JSTerminated };
 pub const default_allocator = std.heap.page_allocator;
 pub const Generation = u16;
 pub const ArenaAllocator = std.heap.ArenaAllocator;
@@ -98,6 +99,7 @@ pub const http = struct {
 };
 
 pub const Transpiler = opaque {};
+pub const md = @import("md/root.zig");
 
 pub const transpiler = struct {
     pub const EntryPoints = struct {

@@ -349,7 +349,7 @@ fn bundleScriptWithEsbuild(
     const domain_module = try runtimeModulePath(ctx, &.{ "node", "domain.js" });
     const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
     const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
-    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
+    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.cjs" });
     const stream_consumers_module = try runtimeModulePath(ctx, &.{ "node", "stream", "consumers.js" });
     const stream_promises_module = try runtimeModulePath(ctx, &.{ "node", "stream", "promises.js" });
     const stream_web_module = try runtimeModulePath(ctx, &.{ "node", "stream", "web.js" });
@@ -396,7 +396,7 @@ fn bundleScriptWithEsbuild(
         "--bundle",
         "--platform=neutral",
         "--format=esm",
-        "--main-fields=module,main",
+        "--main-fields=main,module",
         "--target=es2022",
         "--external:internal/*",
         "--loader:.txt=text",

@@ -633,20 +633,22 @@ export function opendirSync(path, options = {}) {
 }
 
 export function statSync(path, options = undefined) {
+  const normalizedPath = normalizePath(path);
   try {
-    return makeStats(cottontail.statSync(normalizePath(path), true), options);
+    return makeStats(cottontail.statSync(normalizedPath, true), options);
   } catch (error) {
     if (shouldSuppressMissing(options)) return undefined;
-    throw error;
+    throw makeFsError(error, normalizedPath, "stat");
   }
 }
 
 export function lstatSync(path, options = undefined) {
+  const normalizedPath = normalizePath(path);
   try {
-    return makeStats(cottontail.statSync(normalizePath(path), false), options);
+    return makeStats(cottontail.statSync(normalizedPath, false), options);
   } catch (error) {
     if (shouldSuppressMissing(options)) return undefined;
-    throw error;
+    throw makeFsError(error, normalizedPath, "lstat");
   }
 }
 

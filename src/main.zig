@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cottontail_hash = @import("cottontail_hash.zig");
+const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
@@ -8,6 +9,7 @@ const script_runner = @import("script_runner.zig");
 
 comptime {
     cottontail_hash.forceLink();
+    cottontail_markdown.forceLink();
     cottontail_password.forceLink();
     cottontail_transpiler.forceLink();
     host.forceLink();

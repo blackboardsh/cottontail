@@ -8,12 +8,20 @@ function normalizeEncoding(encoding = "utf8") {
   return value === "utf8" ? "utf-8" : value;
 }
 
-export class Stream extends EventEmitter {
+export function Stream(options = {}) {
+  this._events = new Map();
+  this._maxListeners = undefined;
+  this.captureRejections = Boolean(options.captureRejections);
+  this.destroyed = false;
+}
+
+Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
+Object.assign(Stream.prototype, {
   pipe(destination, options = {}) {
     this.on("data", (chunk) => destination.write?.(chunk));
     if (options.end !== false) this.on("end", () => destination.end?.());
     return destination;
-  }
+  },
 
   destroy(error = undefined) {
     this.destroyed = true;
@@ -24,7 +32,7 @@ export class Stream extends EventEmitter {
     this.emit("close");
     return this;
   }
-}
+});
 
 export class Readable extends Stream {
   constructor(options = {}) {
@@ -46,6 +54,7 @@ export class Readable extends Stream {
 
   push(chunk) {
     if (chunk == null) {
+      this.readable = false;
       this.readableEnded = true;
       this.emit("end");
       return false;

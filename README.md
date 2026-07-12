@@ -15,6 +15,26 @@ This repo currently focuses on developer experience:
 - Zig owns script loading and runtime flow; the C layer is kept to a JavaScriptCore bridge.
 - The current runtime supports ESM entrypoints/imports, async job draining, and a minimal `cottontail` host API.
 
+## JavaScriptCore policy
+
+Cottontail treats JavaScriptCore as an engine, not as the implementation layer
+for Bun or Node compatibility. Runtime APIs and compatibility behavior belong in
+Cottontail's Zig, C bridge, and JavaScript modules rather than in private JSC
+patches.
+
+The current macOS build links the system JavaScriptCore framework. Cross-platform
+distribution will eventually use Cottontail-owned builds from
+[`blackboardsh/WebKit`](https://github.com/blackboardsh/WebKit). The only intended
+Cottontail-specific WebKit change is Electrobun's support for packaging ICU data
+separately from the engine. Keeping that boundary allows a future Electrobun
+packaging step to include only the ICU data an application requests, without
+changing JavaScriptCore behavior or its public API.
+
+Bun-specific JSC patches, including test clocks and private runtime hooks, are
+not compatibility dependencies. Tests that rely on them should be adapted to
+exercise Cottontail's public behavior, and required host functionality should be
+exposed by Cottontail itself.
+
 ## Scripts
 
 - `bun run setup` downloads the pinned Zig toolchain if needed.

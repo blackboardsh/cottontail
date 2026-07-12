@@ -1,5 +1,6 @@
 import * as FFI from "./ffi.js";
 import * as nodeDns from "../node/dns.js";
+import * as nodeHttp from "../node/http.js";
 import * as nodeNet from "../node/net.js";
 import * as zlib from "../node/zlib.js";
 import { CryptoKey, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
@@ -15,6 +16,123 @@ import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
 import * as bunTestModule from "./test.js";
 import { jest as bunJest } from "./test.js";
+
+if (typeof globalThis.Performance !== "function") {
+  globalThis.Performance = class Performance {};
+  if (globalThis.performance && typeof globalThis.performance === "object") {
+    Object.setPrototypeOf(globalThis.performance, globalThis.Performance.prototype);
+  }
+}
+
+const nativeCaptureStackTrace = Error.captureStackTrace;
+if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__cottontailStructuredCallSites) {
+  class CottontailCallSite {
+    constructor(frame) {
+      this.functionName = frame.functionName || null;
+      this.fileName = frame.fileName || null;
+      this.lineNumber = frame.lineNumber || null;
+      this.columnNumber = frame.columnNumber || null;
+    }
+    getThis() { return undefined; }
+    getTypeName() { return null; }
+    getFunction() { return undefined; }
+    getFunctionName() { return this.functionName; }
+    getMethodName() { return this.functionName; }
+    getFileName() { return this.fileName; }
+    getLineNumber() { return this.lineNumber; }
+    getColumnNumber() { return this.columnNumber; }
+    getEvalOrigin() { return undefined; }
+    isToplevel() { return true; }
+    isEval() { return false; }
+    isNative() { return false; }
+    isConstructor() { return false; }
+    isAsync() { return false; }
+    isPromiseAll() { return false; }
+    getPromiseIndex() { return null; }
+    toString() {
+      const location = this.fileName
+        ? `${this.fileName}${this.lineNumber == null ? "" : `:${this.lineNumber}${this.columnNumber == null ? "" : `:${this.columnNumber}`}`}`
+        : "<anonymous>";
+      return this.functionName ? `${this.functionName} (${location})` : location;
+    }
+  }
+
+  const parseCallSites = (stack) => String(stack ?? "").split("\n").filter(Boolean).map((line) => {
+    const match = line.match(/^(.*?)@(.+):(\d+):(\d+)$/);
+    if (!match) {
+      const locationOnly = line.match(/^(.*?)@(.+)$/);
+      return new CottontailCallSite(locationOnly
+        ? { functionName: locationOnly[1] || null, fileName: locationOnly[2] }
+        : { functionName: line });
+    }
+    return new CottontailCallSite({
+      functionName: match[1] || null,
+      fileName: match[2] || null,
+      lineNumber: match[3] == null ? null : Number(match[3]),
+      columnNumber: match[4] == null ? null : Number(match[4]),
+    });
+  });
+
+  const captureStackTrace = function(target, constructorOpt = undefined) {
+    const prepare = Error.prepareStackTrace;
+    Error.prepareStackTrace = undefined;
+    try {
+      nativeCaptureStackTrace(target, constructorOpt);
+      const rawStack = target.stack;
+      const callSites = parseCallSites(rawStack);
+      if (typeof prepare === "function") {
+        target.stack = prepare(target, callSites);
+      } else {
+        const name = String(target.name || target.constructor?.name || "Error");
+        const message = target.message == null || target.message === "" ? "" : `: ${String(target.message)}`;
+        const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+        target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
+      }
+    } finally {
+      Error.prepareStackTrace = prepare;
+    }
+  };
+  Object.defineProperty(captureStackTrace, "__cottontailStructuredCallSites", { value: true });
+  Error.captureStackTrace = captureStackTrace;
+}
+
+function installNodeStyleErrorConstructor(name) {
+  const NativeError = globalThis[name];
+  if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
+  const CottontailError = function(...args) {
+    const error = Reflect.construct(NativeError, args, new.target || CottontailError);
+    if (typeof error.stack === "string" && !error.stack.includes(String(error.message ?? ""))) {
+      const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
+      error.stack = `${error.name || name}${message}\n${error.stack}`;
+    }
+    return error;
+  };
+  Object.defineProperty(CottontailError, "name", { value: name });
+  Object.defineProperty(CottontailError, "__cottontailStackHeader", { value: true });
+  Object.setPrototypeOf(CottontailError, NativeError);
+  CottontailError.prototype = NativeError.prototype;
+  globalThis[name] = CottontailError;
+}
+
+for (const errorName of ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
+  installNodeStyleErrorConstructor(errorName);
+}
+
+if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
+  const nativeJSONParse = JSON.parse;
+  const parse = function(text, reviver = undefined) {
+    try {
+      return nativeJSONParse(text, reviver);
+    } catch (error) {
+      if (error && typeof error.stack === "string" && error.message && !error.stack.includes(String(error.message))) {
+        error.stack = `${error.name || "SyntaxError"}: ${error.message}\n${error.stack}`;
+      }
+      throw error;
+    }
+  };
+  Object.defineProperty(parse, "__cottontailStackHeader", { value: true });
+  JSON.parse = parse;
+}
 
 if (Symbol.dispose == null) {
   Object.defineProperty(Symbol, "dispose", {
@@ -516,6 +634,12 @@ function normalizeShellStderr(command, stderr) {
     text = text.replace(/^mv: rename .*? to ([^:]+): Not a directory$/gm, "mv: $1: Not a directory");
     text = text.replace(/^mv: ([^:]+) is not a directory$/gm, "mv: $1: No such file or directory");
   }
+  if (/\bbasename\s*(?:[|;&]|$)/.test(String(command))) {
+    text = text.replace(
+      /^usage: basename string \[suffix\]\n\s*basename \[-a\] \[-s suffix\] string \[\.\.\.\]\n$/,
+      "usage: basename string\n",
+    );
+  }
   return text;
 }
 
@@ -629,10 +753,11 @@ function runShell(command, options = {}) {
     return output;
   }
   const isWin = cottontail.platform() === "win32";
+  const shellExecutable = isWin ? "cmd" : cottontail.platform() === "darwin" ? "/bin/bash" : "sh";
   const shellArgs = isWin
     ? ["/d", "/s", "/c", command]
     : ["-c", command, ...(globalThis.process?.argv ?? [])];
-  const result = cottontail.spawnSync(isWin ? "cmd" : "sh", shellArgs, {
+  const result = cottontail.spawnSync(shellExecutable, shellArgs, {
     stdio: "pipe",
     cwd: options.cwd,
     env: shellEnv(options),
@@ -1360,6 +1485,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   let timeoutTimer = null;
   let exceededMaxBuffer = false;
   let ipcBuffer = "";
+  let resourceUsage = undefined;
 
   const child = {
     pid: 0,
@@ -1414,7 +1540,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     },
     disconnect() {},
     resourceUsage() {
-      return undefined;
+      return resourceUsage;
     },
     [Symbol.dispose]() {
       if (exitCode == null && !killed) child.kill();
@@ -1447,16 +1573,31 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   child.pid = native.pid;
   child.stdin = nativeOptions.stdin === "pipe" && nativeOptions.input === undefined ? new ProcessWritable(native.id) : null;
   if (nativeOptions.input !== undefined) {
-    void Promise.resolve(bytesFromBody(nativeOptions.input)).then(
-      (bytes) => {
-        if (bytes.byteLength > 0) cottontail.spawnWrite?.(native.id, bytes);
-        cottontail.spawnCloseStdin?.(native.id);
-      },
-      (error) => {
-        cottontail.spawnCloseStdin?.(native.id);
-        emit("error", error);
-      },
-    );
+    const input = nativeOptions.input;
+    const iterable = typeof input === "function" ? input() : input;
+    const isStreaming = typeof input?.getReader === "function" || typeof iterable?.[Symbol.asyncIterator] === "function";
+    const writeInput = async () => {
+      try {
+        if (isStreaming) {
+          await consumeStreamingBody(input, (chunk) => {
+            const bytes = asBuffer(chunk);
+            if (bytes.byteLength > 0 && cottontail.spawnWrite?.(native.id, bytes) !== true) {
+              throw new Error("Failed to write subprocess stdin");
+            }
+          });
+        } else {
+          const bytes = await bytesFromBody(input);
+          if (bytes.byteLength > 0) cottontail.spawnWrite?.(native.id, bytes);
+        }
+        return null;
+      } catch (error) {
+        return error;
+      }
+    };
+    void writeInput().then((error) => {
+      cottontail.spawnCloseStdin?.(native.id);
+      if (error != null && (listeners.get("error")?.length ?? 0) > 0) emit("error", error);
+    });
   }
 
   const maxBuffer = nativeOptions.maxBuffer == null ? Infinity : Number(nativeOptions.maxBuffer);
@@ -1487,6 +1628,29 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       exitCode = result.exitCode == null ? null : Number(result.exitCode);
       signalCode = result.signalCode == null ? null : signalName(result.signalCode) ?? String(result.signalCode);
       killed = killed || result.killed === true;
+      if (result.resourceUsage) {
+        const user = BigInt(Math.max(0, Math.trunc(Number(result.resourceUsage.userCPUTime) || 0)));
+        const system = BigInt(Math.max(0, Math.trunc(Number(result.resourceUsage.systemCPUTime) || 0)));
+        resourceUsage = {
+          maxRSS: Number(result.resourceUsage.maxRSS) || 0,
+          shmSize: Number(result.resourceUsage.sharedMemorySize) || 0,
+          swapCount: Number(result.resourceUsage.swappedOut) || 0,
+          messages: {
+            sent: Number(result.resourceUsage.ipcSent) || 0,
+            received: Number(result.resourceUsage.ipcReceived) || 0,
+          },
+          signalCount: Number(result.resourceUsage.signalsCount) || 0,
+          contextSwitches: {
+            voluntary: Number(result.resourceUsage.voluntaryContextSwitches) || 0,
+            involuntary: Number(result.resourceUsage.involuntaryContextSwitches) || 0,
+          },
+          cpuTime: { user, system, total: user + system },
+          ops: {
+            in: Number(result.resourceUsage.fsRead) || 0,
+            out: Number(result.resourceUsage.fsWrite) || 0,
+          },
+        };
+      }
       try {
         if (child.stdout) {
           child.stdout.emit("end");
@@ -1587,7 +1751,12 @@ async function consumeStreamingBody(body, onChunk) {
     const reader = body.getReader();
     try {
       for (;;) {
-        const item = await reader.read();
+        const settled = await reader.read().then(
+          (item) => ({ item, error: null }),
+          (error) => ({ item: null, error }),
+        );
+        if (settled.error != null) throw settled.error;
+        const item = settled.item;
         if (item.done) return;
         await onChunk(item.value);
       }
@@ -2123,21 +2292,192 @@ const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map
 function activeServerForFetchUrl(urlText) {
   try {
     const url = new URL(urlText);
-    const direct = activeServeOrigins.get(`${url.protocol}//${url.host}`);
+    const rawHostname = String(url.hostname).slice(String(url.hostname).lastIndexOf("@") + 1);
+    const hostname = rawHostname.includes(":") && !rawHostname.startsWith("[") ? `[${rawHostname}]` : rawHostname;
+    const authority = `${hostname}${url.port ? `:${url.port}` : ""}`;
+    const direct = activeServeOrigins.get(`${url.protocol}//${authority}`);
     if (direct) return direct;
     if (url.hostname === "localhost") return activeServeOrigins.get(`${url.protocol}//127.0.0.1:${url.port}`);
   } catch {}
   return null;
 }
 
+function fetchProxyConfiguration(urlText, init = {}) {
+  const explicit = init?.proxy;
+  if (explicit != null && String(explicit).trim() !== "") {
+    let value = String(explicit).trim();
+    if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) value = `http://${value}`;
+    return { active: true, explicit: value, environment: null, disabled: false };
+  }
+
+  let protocol = "http:";
+  try { protocol = new URL(urlText).protocol; } catch {}
+  const env = globalThis.process?.env ?? {};
+  const names = protocol === "https:"
+    ? ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]
+    : ["http_proxy", "HTTP_PROXY"];
+  for (const name of names) {
+    if (!Object.prototype.hasOwnProperty.call(env, name)) continue;
+    const value = String(env[name] ?? "").trim();
+    if (value === "" || value === "undefined" || value === "''" || value === '\"\"') {
+      return { active: false, explicit: null, environment: null, disabled: true };
+    }
+    const bypass = noProxyMatches(urlText, env.NO_PROXY ?? env.no_proxy ?? "");
+    return {
+      active: !bypass,
+      explicit: null,
+      environment: bypass ? null : value,
+      disabled: bypass,
+    };
+  }
+  return { active: false, explicit: null, environment: null, disabled: false };
+}
+
+function noProxyMatches(urlText, noProxy) {
+  let url;
+  try { url = new URL(urlText); } catch { return false; }
+  const host = String(url.hostname).slice(String(url.hostname).lastIndexOf("@") + 1).replace(/^\[|\]$/g, "").toLowerCase();
+  const port = String(url.port || (url.protocol === "https:" ? "443" : "80"));
+  for (const rawEntry of String(noProxy).split(",")) {
+    let entry = rawEntry.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry === "*") return true;
+    let entryHost = entry;
+    let entryPort = "";
+    if (entry.startsWith("[")) {
+      const end = entry.indexOf("]");
+      if (end >= 0) {
+        entryHost = entry.slice(1, end);
+        if (entry[end + 1] === ":") entryPort = entry.slice(end + 2);
+      }
+    } else {
+      const colon = entry.lastIndexOf(":");
+      if (colon > 0 && entry.indexOf(":") === colon && /^\d+$/.test(entry.slice(colon + 1))) {
+        entryHost = entry.slice(0, colon);
+        entryPort = entry.slice(colon + 1);
+      }
+    }
+    if (entryPort && entryPort !== port) continue;
+    const normalized = entryHost.replace(/^\./, "");
+    if (host === normalized || host.endsWith(`.${normalized}`)) return true;
+  }
+  return false;
+}
+
+async function fetchFromActiveProxy(activeProxy, proxyUrl, request) {
+  const headers = new Headers(request.headers);
+  headers.set("proxy-connection", "Keep-Alive");
+  try {
+    const authority = String(proxyUrl).match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/)?.[1] ?? "";
+    const at = authority.lastIndexOf("@");
+    if (at >= 0) {
+      const userInfo = authority.slice(0, at);
+      const colon = userInfo.indexOf(":");
+      const username = colon >= 0 ? userInfo.slice(0, colon) : userInfo;
+      const password = colon >= 0 ? userInfo.slice(colon + 1) : "";
+      const credentials = `${decodeURIComponent(username)}:${decodeURIComponent(password)}`;
+      headers.set("proxy-authorization", `Basic ${Buffer.from(credentials).toString("base64")}`);
+    }
+  } catch {}
+  const proxyRequest = new Request(request.url, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request._body,
+    redirect: request.redirect,
+    signal: request.signal,
+  });
+  const response = await activeProxy.fetch(proxyRequest);
+  response.url = request.url;
+  return response;
+}
+
+function isLoopbackHttpUrl(urlText) {
+  try {
+    const url = new URL(urlText);
+    const hostname = String(url.hostname).replace(/^\[|\]$/g, "").toLowerCase();
+    return url.protocol === "http:" && (hostname === "localhost" || hostname === "::1" || hostname.startsWith("127."));
+  } catch {
+    return false;
+  }
+}
+
+async function fetchFromNodeHttp(request) {
+  const body = request.method === "GET" || request.method === "HEAD"
+    ? Buffer.alloc(0)
+    : Buffer.from(await bytesFromBody(request._body));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      request.signal?.removeEventListener?.("abort", onAbort);
+      callback(value);
+    };
+    const clientRequest = nodeHttp.request(request.url, {
+      agent: false,
+      headers: Object.fromEntries(request.headers),
+      method: request.method,
+    }, (incoming) => {
+      const chunks = [];
+      incoming.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      incoming.on("error", (error) => finish(reject, error));
+      incoming.on("end", () => {
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(incoming.headers ?? {})) {
+          if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+          else if (value != null) headers.set(name, value);
+        }
+        finish(resolve, new Response(Buffer.concat(chunks), {
+          headers,
+          status: incoming.statusCode ?? 200,
+          statusText: incoming.statusMessage ?? "",
+          url: request.url,
+        }));
+      });
+    });
+    const onAbort = () => {
+      clientRequest.destroy?.();
+      finish(reject, request.signal?.reason ?? abortError());
+    };
+    clientRequest.on("error", (error) => finish(reject, error));
+    request.signal?.addEventListener?.("abort", onAbort, { once: true });
+    if (request.signal?.aborted) return onAbort();
+    if (body.byteLength > 0) clientRequest.write(body);
+    clientRequest.end();
+  });
+}
+
 async function fetchImpl(input, init = {}) {
-  const request = input instanceof Request ? input : new Request(input, init);
+  let requestInit = init;
+  if (!(input instanceof Request) && init?.body === "") {
+    const method = String(init.method ?? "GET").toUpperCase();
+    if (method === "GET" || method === "HEAD") requestInit = { ...init, body: undefined };
+  }
+  const request = input instanceof Request ? input : new Request(input, requestInit);
   throwIfAborted(request.signal);
+  const proxy = fetchProxyConfiguration(request.url, init);
   const activeServer = activeServerForFetchUrl(request.url);
   const redirectMode = String(init.redirect ?? input?.redirect ?? request.redirect ?? "follow");
-  if (activeServer) return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
+  if (proxy.explicit) {
+    const activeProxy = activeServerForFetchUrl(proxy.explicit);
+    if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
+  }
+  if (activeServer && !proxy.active) return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
+  if (!proxy.active && isLoopbackHttpUrl(request.url)) return await fetchFromNodeHttp(request);
 
   const args = ["-L", "-sS", "-D", "-", "-X", request.method];
+  const timeoutState = abortSignalState.get(request.signal);
+  const timeoutRemaining = timeoutState?.timeoutDeadline == null
+    ? null
+    : Math.max(1, timeoutState.timeoutDeadline - Date.now());
+  if (timeoutRemaining != null) {
+    const seconds = String(timeoutRemaining / 1000);
+    args.push("--connect-timeout", seconds, "--max-time", seconds);
+  }
+  if (proxy.explicit) args.push("--proxy", proxy.explicit);
+  else if (proxy.environment) args.push("--proxy", proxy.environment, "--noproxy", "");
+  else if (proxy.disabled) args.push("--proxy", "", "--noproxy", "*");
+  if (proxy.active) args.push("-H", "Proxy-Connection: Keep-Alive");
   request.headers.forEach((value, key) => {
     args.push("-H", `${key}: ${value}`);
   });
@@ -2163,6 +2503,7 @@ async function fetchImpl(input, init = {}) {
   const status = markerIndex >= 0 ? Number(stdout.slice(markerIndex + marker.length).trim()) || 0 : Number(result.status) || 0;
 
   if (result.status !== 0 && status === 0) {
+    if (timeoutRemaining != null) throw makeTimeoutError();
     throw new Error(String(result.stderr || result.stdout || "fetch failed"));
   }
 
@@ -2958,7 +3299,8 @@ export function serve(options = {}) {
     if (String(item.method).toUpperCase() !== "GET" && String(item.method).toUpperCase() !== "HEAD") {
       requestInit.body = item.body;
     }
-    const request = new Request(`${requestOrigin}${item.url}`, requestInit);
+    const requestUrl = /^https?:\/\//i.test(String(item.url)) ? String(item.url) : `${requestOrigin}${item.url}`;
+    const request = new Request(requestUrl, requestInit);
     try {
       const response = runServeHandler(activeOptions, request, server);
       if (isPromiseLike(response)) {
@@ -4741,17 +5083,31 @@ export function openInEditor(path) {
   return spawn(["open", String(path)], { stdout: "ignore", stderr: "ignore" });
 }
 
-function attachBunSocketHandlers(socket, handlers = {}, data = undefined) {
+const bunSocketCallbackError = Symbol("cottontail.bunSocketCallbackError");
+
+function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connectionState = undefined) {
   socket.data = data;
   if (!socket.__cottontailBunSocketMethods) {
     const nodeWrite = socket.write.bind(socket);
+    const nodeSetTimeout = socket.setTimeout.bind(socket);
     Object.defineProperty(socket, "__cottontailBunSocketMethods", { value: true });
     socket.write = (chunk, encoding = undefined, callback = undefined) => {
+      if (socket.destroyed || !socket.writable) return 0;
       const length = bytesFromData(chunk).byteLength;
-      return nodeWrite(chunk, encoding, callback) ? length : 0;
+      const before = Number(socket.bytesWritten) || 0;
+      const acceptedWithoutBackpressure = nodeWrite(chunk, encoding, callback);
+      const written = Math.max(0, Math.min(length, (Number(socket.bytesWritten) || 0) - before));
+      if (!acceptedWithoutBackpressure) socket.__cottontailScheduleBunDrain?.();
+      return acceptedWithoutBackpressure ? length : written;
     };
     socket.flush = () => 0;
     socket.shutdown = () => socket.end();
+    const timeout = (milliseconds) => {
+      nodeSetTimeout(milliseconds);
+      socket.timeout = timeout;
+      return socket;
+    };
+    socket.timeout = timeout;
   }
   const call = (name, ...args) => {
     const callback = handlers?.[name];
@@ -4759,17 +5115,57 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined) {
     try {
       return callback(...args);
     } catch (error) {
-      if (name !== "error" && typeof handlers?.error === "function") return handlers.error(socket, error);
+      if (name !== "error" && typeof handlers?.error === "function") {
+        handlers.error(socket, error);
+        return { [bunSocketCallbackError]: true, error };
+      }
       throw error;
     }
   };
 
-  socket.on("data", (chunk) => call("data", socket, chunk));
-  socket.on("drain", () => call("drain", socket));
+  socket.on("data", (chunk) => {
+    let value = chunk;
+    if (handlers.binaryType === "arraybuffer") {
+      const bytes = asBuffer(chunk);
+      value = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    } else if (handlers.binaryType === "uint8array") {
+      const bytes = asBuffer(chunk);
+      value = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    }
+    call("data", socket, value);
+  });
+  let drainGeneration = 0;
+  socket.__cottontailScheduleBunDrain = () => {
+    const generation = ++drainGeneration;
+    setTimeout(() => {
+      if (generation !== drainGeneration || socket.destroyed) return;
+      drainGeneration += 1;
+      call("drain", socket);
+    }, 1);
+  };
+  socket.on("drain", () => {
+    drainGeneration += 1;
+    call("drain", socket);
+  });
   socket.on("end", () => call("end", socket));
   socket.on("timeout", () => call("timeout", socket));
-  socket.on("error", (error) => call("error", socket, error));
-  socket.on("close", (hadError) => call("close", socket, hadError ? new Error("Socket closed with an error") : null));
+  socket.on("error", (error) => {
+    if (connectionState?.connecting) {
+      connectionState.connecting = false;
+      connectionState.failed = true;
+      const connectError = new Error("Failed to connect");
+      connectError.code = error?.code ?? "ECONNREFUSED";
+      connectError.errno = error?.errno ?? connectError.code;
+      call("connectError", socket, connectError);
+      connectionState.reject?.(connectError);
+      return;
+    }
+    call("error", socket, error);
+  });
+  socket.on("close", (hadError) => {
+    if (connectionState?.failed && !connectionState.opened) return;
+    call("close", socket, hadError ? new Error("Socket closed with an error") : null);
+  });
   Object.defineProperty(socket, Symbol.dispose, {
     value() {
       socket.end();
@@ -4796,7 +5192,10 @@ function normalizeBunSocketOptions(options) {
   const hostname = suppliedHostname || "127.0.0.1";
   const port = Number(options.port ?? 0);
   if (!unix && (!Number.isFinite(port) || port < 0 || port > 65535)) {
-    throw new RangeError("port must be between 0 and 65535");
+    throw new RangeError("port must be in the range [0, 65535]");
+  }
+  if (options.tls != null && options.tls !== false && options.tls !== true && typeof options.tls !== "object") {
+    throw new TypeError("TLSOptions must be an object");
   }
   return { unix, hostname, port };
 }
@@ -4806,20 +5205,42 @@ export function connect(options = {}) {
   const handlers = options.socket ?? {};
   if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
   return new Promise((resolve, reject) => {
-    const socket = nodeNet.connect(normalized.unix
-      ? { path: normalized.unix }
-      : { host: normalized.hostname, port: normalized.port });
-    const attached = attachBunSocketHandlers(socket, handlers, options.data);
-    socket.once("connect", () => {
+    const state = { connecting: true, opened: false, failed: false, reject };
+    let socket;
+    let attached;
+    if (options.fd != null) {
+      socket = new nodeNet.Socket();
+      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
       try {
-        attached.call("open", socket);
-        resolve(socket);
+        const fd = Number(options.fd);
+        if (!Number.isInteger(fd) || fd < 0) throw new Error("Bad file descriptor");
+        cottontail.fstatSync(fd);
+        socket._attachFd(fd, undefined, undefined, true);
       } catch (error) {
-        socket.destroy();
-        reject(error);
+        state.connecting = false;
+        state.failed = true;
+        const connectError = new Error("Failed to connect");
+        connectError.code = error?.code ?? "EBADF";
+        connectError.errno = error?.errno ?? connectError.code;
+        attached.call("connectError", socket, connectError);
+        reject(connectError);
       }
+    } else {
+      socket = nodeNet.connect(normalized.unix
+        ? { path: normalized.unix }
+        : { host: normalized.hostname, port: normalized.port });
+      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+    }
+    socket.once("connect", () => {
+      if (state.failed) return;
+      state.connecting = false;
+      state.opened = true;
+      const result = attached.call("open", socket);
+      if (result instanceof Error) {
+        attached.call("error", socket, result);
+      }
+      resolve(socket);
     });
-    socket.once("error", reject);
   });
 }
 
@@ -4827,7 +5248,6 @@ export function listen(options = {}) {
   const normalized = normalizeBunSocketOptions(options);
   const handlers = options.socket ?? {};
   if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
-  if (typeof handlers.data !== "function") throw new TypeError("socket.data must be a function");
 
   const native = normalized.unix
     ? cottontail.unixServerListen(normalized.unix, Number(options.backlog ?? 128))
@@ -6666,7 +7086,251 @@ export const semver = {
       .some((part) => semverComparators(part).every((comparator) => semverComparatorSatisfies(version, comparator)));
   },
 };
-export const markdown = {};
+const markdownBooleanOptions = [
+  "tables",
+  "strikethrough",
+  "tasklists",
+  "permissiveAutolinks",
+  "permissiveUrlAutolinks",
+  "permissiveWwwAutolinks",
+  "permissiveEmailAutolinks",
+  "hardSoftBreaks",
+  "wikiLinks",
+  "underline",
+  "latexMath",
+  "collapseWhitespace",
+  "permissiveAtxHeaders",
+  "noIndentedCodeBlocks",
+  "noHtmlBlocks",
+  "noHtmlSpans",
+  "tagFilter",
+  "headingIds",
+  "autolinkHeadings",
+];
+
+function markdownFlags(options = {}) {
+  let flags = 0;
+  const values = { tables: true, strikethrough: true, tasklists: true };
+  if (options && typeof options === "object") Object.assign(values, options);
+  if (values.autolinks === true) values.permissiveAutolinks = true;
+  else if (values.autolinks && typeof values.autolinks === "object") {
+    values.permissiveUrlAutolinks = values.autolinks.url === true;
+    values.permissiveWwwAutolinks = values.autolinks.www === true;
+    values.permissiveEmailAutolinks = values.autolinks.email === true;
+  }
+  if (values.headings === true) {
+    values.headingIds = true;
+    values.autolinkHeadings = true;
+  } else if (values.headings && typeof values.headings === "object") {
+    values.headingIds = values.headings.ids === true;
+    values.autolinkHeadings = values.headings.autolink === true;
+  }
+  for (let index = 0; index < markdownBooleanOptions.length; index += 1) {
+    const camel = markdownBooleanOptions[index];
+    const snake = camel.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+    if (values[camel] === true || values[snake] === true) flags += 2 ** index;
+  }
+  return flags;
+}
+
+function markdownInput(value) {
+  if (value == null) throw new TypeError("Expected a string or buffer to render");
+  if (typeof value === "string") return value;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return new TextDecoder().decode(asBuffer(value));
+  throw new TypeError("Expected a string or buffer to render");
+}
+
+const markdownBlockCallbacks = [
+  null, "blockquote", "list", "list", "listItem", "hr", "heading", "code", "html", "paragraph",
+  "table", "thead", "tbody", "tr", "th", "td",
+];
+const markdownSpanCallbacks = ["emphasis", "strong", "link", "image", "codespan", "strikethrough"];
+
+function markdownBlockMeta(entry, stack, source, slug) {
+  switch (entry.type) {
+    case 2: return { ordered: false, depth: stack.filter((item) => item.type === 2 || item.type === 3).length };
+    case 3: return { ordered: true, start: entry.data, depth: stack.filter((item) => item.type === 2 || item.type === 3).length };
+    case 4: {
+      const parent = stack[stack.length - 1];
+      const ordered = parent?.type === 3;
+      const depth = Math.max(0, stack.filter((item) => item.type === 2 || item.type === 3).length - 1);
+      const meta = { index: entry.childIndex, depth, ordered };
+      if (ordered) meta.start = parent.data;
+      const taskMark = entry.data & 0xff;
+      if (taskMark !== 0) meta.checked = taskMark !== 32;
+      return meta;
+    }
+    case 6: return slug == null ? { level: entry.data } : { level: entry.data, id: slug };
+    case 7: {
+      if ((entry.flags & 0x10) === 0) return undefined;
+      let end = entry.data;
+      while (end < source.length && !/[\s]/.test(source[end])) end += 1;
+      const language = source.slice(entry.data, end);
+      return language ? { language } : undefined;
+    }
+    case 14:
+    case 15: {
+      const align = [undefined, "left", "center", "right"][entry.data & 3];
+      return { align };
+    }
+    default: return undefined;
+  }
+}
+
+function renderMarkdownCallbacks(source, callbacks = {}, options = {}) {
+  const events = JSON.parse(cottontail.markdownEvents(source, markdownFlags(options)));
+  const stack = [{ type: 0, children: "", childIndex: 0 }];
+  const appendResult = (result) => {
+    if (result != null) stack[stack.length - 1].children += String(result);
+  };
+  for (const event of events) {
+    const [kind, type, first, second] = event;
+    if (kind === "b") {
+      if (type === 0) continue;
+      let childIndex = 0;
+      if (type === 4) {
+        const parent = stack[stack.length - 1];
+        childIndex = parent.childIndex++;
+      }
+      stack.push({ type, data: first, flags: second, children: "", childIndex });
+      continue;
+    }
+    if (kind === "s") {
+      stack.push({ type, detail: { href: first, title: second }, children: "", childIndex: 0 });
+      continue;
+    }
+    if (kind === "t") {
+      const content = first;
+      if (type === 1 || type === 2 || type === 3 || typeof callbacks.text !== "function") appendResult(content);
+      else appendResult(callbacks.text(content));
+      continue;
+    }
+    if (kind === "S") {
+      const entry = stack.pop();
+      const name = markdownSpanCallbacks[type];
+      const callback = callbacks?.[name];
+      if (typeof callback !== "function") appendResult(entry.children);
+      else {
+        let meta;
+        if (type === 2) meta = entry.detail.title ? entry.detail : { href: entry.detail.href };
+        else if (type === 3) meta = entry.detail.title
+          ? { src: entry.detail.href, title: entry.detail.title }
+          : { src: entry.detail.href };
+        appendResult(meta === undefined ? callback(entry.children) : callback(entry.children, meta));
+      }
+      continue;
+    }
+    if (kind === "B") {
+      if (type === 0) continue;
+      const entry = stack.pop();
+      const callback = callbacks?.[markdownBlockCallbacks[type]];
+      if (typeof callback !== "function") appendResult(entry.children);
+      else {
+        const meta = markdownBlockMeta(entry, stack, source, first);
+        appendResult(meta === undefined ? callback(entry.children) : callback(entry.children, meta));
+      }
+    }
+  }
+  return stack[0].children;
+}
+
+const markdownBlockTags = [
+  null, "blockquote", "ul", "ol", "li", "hr", null, "pre", "html", "p",
+  "table", "thead", "tbody", "tr", "th", "td",
+];
+const markdownSpanTags = ["em", "strong", "a", "img", "code", "del", "math", "math", "a", "u"];
+
+function renderMarkdownReact(source, components = {}, options = {}) {
+  const events = JSON.parse(cottontail.markdownEvents(source, markdownFlags(options)));
+  const elementSymbol = Symbol.for(Number(options?.reactVersion) <= 18 ? "react.element" : "react.transitional.element");
+  const createElement = (tag, props) => ({
+    $$typeof: elementSymbol,
+    type: components?.[tag] && typeof components[tag] !== "boolean" ? components[tag] : tag,
+    key: null,
+    ref: null,
+    props,
+  });
+  const stack = [{ type: 0, children: [] }];
+  for (const event of events) {
+    const [kind, type, first, second] = event;
+    if (kind === "b") {
+      if (type !== 0) stack.push({ type, data: first, flags: second, children: [] });
+      continue;
+    }
+    if (kind === "s") {
+      stack.push({ type, detail: { href: first, title: second }, children: [] });
+      continue;
+    }
+    if (kind === "t") {
+      if (type === 2) stack[stack.length - 1].children.push(createElement("br", {}));
+      else stack[stack.length - 1].children.push(first);
+      continue;
+    }
+    if (kind === "S") {
+      const entry = stack.pop();
+      const tag = markdownSpanTags[type];
+      const props = {};
+      if (type === 2) {
+        props.href = entry.detail.href;
+        if (entry.detail.title) props.title = entry.detail.title;
+      } else if (type === 3) {
+        props.src = entry.detail.href;
+        if (entry.detail.title) props.title = entry.detail.title;
+        const alt = entry.children.filter((child) => typeof child === "string").join("");
+        if (alt) props.alt = alt;
+      } else if (type === 8) {
+        props.target = entry.detail.href;
+      } else if (type === 7) {
+        props.display = true;
+        props.children = entry.children;
+      }
+      if (type !== 3 && props.children === undefined) props.children = entry.children;
+      stack[stack.length - 1].children.push(createElement(tag, props));
+      continue;
+    }
+    if (kind === "B") {
+      if (type === 0) continue;
+      const entry = stack.pop();
+      const tag = type === 6 ? `h${Math.min(6, Math.max(1, entry.data))}` : markdownBlockTags[type];
+      const props = {};
+      if (type === 6 && first != null) props.id = first;
+      else if (type === 3) props.start = entry.data;
+      else if (type === 4) {
+        const taskMark = entry.data & 0xff;
+        if (taskMark !== 0) props.checked = taskMark !== 32;
+      } else if (type === 7 && (entry.flags & 0x10) !== 0) {
+        let end = entry.data;
+        while (end < source.length && !/[\s]/.test(source[end])) end += 1;
+        const language = source.slice(entry.data, end);
+        if (language) props.language = language;
+      } else if (type === 14 || type === 15) {
+        const align = [undefined, "left", "center", "right"][entry.data & 3];
+        if (align) props.align = align;
+      }
+      if (type !== 5) props.children = entry.children;
+      stack[stack.length - 1].children.push(createElement(tag, props));
+    }
+  }
+  return {
+    $$typeof: elementSymbol,
+    type: Symbol.for("react.fragment"),
+    key: null,
+    ref: null,
+    props: { children: stack[0].children },
+  };
+}
+
+export const markdown = {
+  html(input, options = {}) {
+    return cottontail.markdownHtml(markdownInput(input), markdownFlags(options));
+  },
+  render(input, callbacks = {}, options = {}) {
+    return renderMarkdownCallbacks(markdownInput(input), callbacks, options);
+  },
+  react(input, components = {}, options = {}) {
+    return renderMarkdownReact(markdownInput(input), components, options);
+  },
+};
 export const embeddedFiles = [];
 let gcAggressionLevelValue = 0;
 export const unsafe = {
@@ -7237,6 +7901,7 @@ class CottontailAbortSignal extends CottontailEventTarget {
       reason: undefined,
       onabort: null,
       timeoutTimer: null,
+      timeoutDeadline: null,
       dependants,
     });
     Object.defineProperty(this, abortDependantSignals, {
@@ -7284,12 +7949,15 @@ class CottontailAbortSignal extends CottontailEventTarget {
     const controller = new CottontailAbortController();
     const signal = controller.signal;
     const signalRef = internalWeakRef(signal);
+    const normalizedDelay = Math.max(0, Number(delay) || 0);
     const timer = setTimeout(() => {
       const liveSignal = signalRef.deref();
       if (liveSignal) abortSignal(liveSignal, makeTimeoutError());
-    }, Math.max(0, Number(delay) || 0));
+    }, normalizedDelay);
     timer?.unref?.();
-    abortSignalStateFor(signal).timeoutTimer = timer;
+    const state = abortSignalStateFor(signal);
+    state.timeoutTimer = timer;
+    state.timeoutDeadline = Date.now() + normalizedDelay;
     return signal;
   }
 
@@ -7581,6 +8249,7 @@ globalThis.test ??= bunTestModule.test;
 globalThis.it ??= bunTestModule.it;
 globalThis.describe ??= bunTestModule.describe;
 globalThis.expect ??= bunTestModule.expect;
+globalThis.expectTypeOf ??= bunTestModule.expectTypeOf;
 globalThis.beforeAll ??= bunTestModule.beforeAll;
 globalThis.afterAll ??= bunTestModule.afterAll;
 globalThis.beforeEach ??= bunTestModule.beforeEach;

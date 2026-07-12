@@ -62,6 +62,7 @@ export class Socket extends EventEmitter {
     this.bytesRead = 0;
     this.bytesWritten = 0;
     this.timeout = undefined;
+    this._timeoutValue = 0;
     this.allowHalfOpen = options.allowHalfOpen === true;
     this.writableHighWaterMark = Math.max(1, Math.min(Number(options.highWaterMark || 16 * 1024), 1024 * 1024));
     this.writableLength = 0;
@@ -120,11 +121,11 @@ export class Socket extends EventEmitter {
 
   _refreshTimeout() {
     this._clearTimeoutTimer();
-    const timeout = Number(this.timeout);
+    const timeout = Number(this._timeoutValue);
     if (!this.destroyed && timeout > 0) {
       this._timeoutTimer = globalThis.setTimeout(() => {
         this._timeoutTimer = null;
-        if (!this.destroyed && Number(this.timeout) > 0) this.emit("timeout");
+        if (!this.destroyed && Number(this._timeoutValue) > 0) this.emit("timeout");
       }, timeout);
     }
     return this;
@@ -390,7 +391,8 @@ export class Socket extends EventEmitter {
     return this;
   }
   setTimeout(timeout, callback) {
-    this.timeout = Number(timeout) || 0;
+    this._timeoutValue = Number(timeout) || 0;
+    this.timeout = this._timeoutValue;
     if (typeof callback === "function") this.once("timeout", callback);
     this._refreshTimeout();
     return this;
@@ -443,22 +445,25 @@ export class Server extends EventEmitter {
   listen(...args) {
     const [options, callback] = _normalizeArgs(args);
     if (callback) this.once("listening", callback);
-    queueMicrotask(() => {
-      try {
-        const result = options.path != null
-          ? cottontail.unixServerListen(String(options.path), Number(options.backlog ?? 128))
-          : cottontail.tcpServerListen(Number(options.port ?? 0), options.host ?? "127.0.0.1", Number(options.family ?? 4));
-        this._fd = Number(result.fd);
-        this._isPipe = options.path != null;
-        this._path = this._isPipe ? String(result.path ?? options.path) : null;
-        this._address = this._isPipe ? this._path : result.address ?? null;
-        this.listening = true;
-        this._acceptTimer = setInterval(() => this._acceptPending(), 1);
-        this.emit("listening");
-      } catch (error) {
-        this.emit("error", error);
-      }
-    });
+    try {
+      const result = options.path != null
+        ? cottontail.unixServerListen(String(options.path), Number(options.backlog ?? 128))
+        : cottontail.tcpServerListen(Number(options.port ?? 0), options.host ?? "127.0.0.1", Number(options.family ?? 4));
+      this._fd = Number(result.fd);
+      this._isPipe = options.path != null;
+      this._path = this._isPipe ? String(result.path ?? options.path) : null;
+      this._address = this._isPipe ? this._path : result.address ?? null;
+      this.listening = true;
+      this._acceptTimer = setInterval(() => this._acceptPending(), 1);
+      queueMicrotask(() => this.emit(
+        "listening",
+        undefined,
+        this._isPipe ? this._path : this._address?.address,
+        this._isPipe ? undefined : this._address?.port,
+      ));
+    } catch (error) {
+      queueMicrotask(() => this.emit("error", error));
+    }
     return this;
   }
 

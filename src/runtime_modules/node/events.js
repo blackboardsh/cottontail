@@ -6,6 +6,11 @@ export let captureRejections = false;
 export let defaultMaxListeners = 10;
 export const usingDomains = false;
 
+function eventMap(emitter) {
+  if (!(emitter._events instanceof Map)) emitter._events = new Map();
+  return emitter._events;
+}
+
 export default class EventEmitter {
   constructor(options = {}) {
     this._events = new Map();
@@ -15,9 +20,10 @@ export default class EventEmitter {
 
   on(name, handler) {
     if (typeof handler !== "function") throw new TypeError("listener must be a function");
-    const handlers = this._events.get(name) ?? [];
+    const events = eventMap(this);
+    const handlers = events.get(name) ?? [];
     handlers.push(handler);
-    this._events.set(name, handlers);
+    events.set(name, handlers);
     return this;
   }
 
@@ -27,9 +33,10 @@ export default class EventEmitter {
 
   prependListener(name, handler) {
     if (typeof handler !== "function") throw new TypeError("listener must be a function");
-    const handlers = this._events.get(name) ?? [];
+    const events = eventMap(this);
+    const handlers = events.get(name) ?? [];
     handlers.unshift(handler);
-    this._events.set(name, handlers);
+    events.set(name, handlers);
     return this;
   }
 
@@ -52,9 +59,10 @@ export default class EventEmitter {
   }
 
   off(name, handler) {
-    const handlers = this._events.get(name) ?? [];
-    this._events.set(name, handlers.filter((item) => item !== handler && item.listener !== handler));
-    if ((this._events.get(name) ?? []).length === 0) this._events.delete(name);
+    const events = eventMap(this);
+    const handlers = events.get(name) ?? [];
+    events.set(name, handlers.filter((item) => item !== handler && item.listener !== handler));
+    if ((events.get(name) ?? []).length === 0) events.delete(name);
     return this;
   }
 
@@ -63,19 +71,21 @@ export default class EventEmitter {
   }
 
   removeAllListeners(name = undefined) {
-    if (name == null) this._events.clear();
-    else this._events.delete(name);
+    const events = eventMap(this);
+    if (name == null) events.clear();
+    else events.delete(name);
     return this;
   }
 
   emit(name, ...args) {
-    const handlers = [...(this._events.get(name) ?? [])];
-    const monitors = name === "error" ? [...(this._events.get(errorMonitor) ?? [])] : [];
+    const events = eventMap(this);
+    const handlers = [...(events.get(name) ?? [])];
+    const monitors = name === "error" ? [...(events.get(errorMonitor) ?? [])] : [];
     for (const handler of monitors) handler(...args);
     if (name === "error" && handlers.length === 0) throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
     for (const handler of handlers) {
       const result = handler(...args);
-      if (this.captureRejections && result && typeof result.then === "function") {
+      if ((this.captureRejections ?? captureRejections) && result && typeof result.then === "function") {
         result.catch((error) => this.emit("error", error));
       }
     }
@@ -83,20 +93,20 @@ export default class EventEmitter {
   }
 
   listeners(name) {
-    return [...(this._events.get(name) ?? [])].map((item) => item.listener ?? item);
+    return [...(eventMap(this).get(name) ?? [])].map((item) => item.listener ?? item);
   }
 
   rawListeners(name) {
-    return [...(this._events.get(name) ?? [])];
+    return [...(eventMap(this).get(name) ?? [])];
   }
 
   listenerCount(name, listener = undefined) {
-    const handlers = this._events.get(name) ?? [];
+    const handlers = eventMap(this).get(name) ?? [];
     return listener == null ? handlers.length : handlers.filter((item) => item === listener || item.listener === listener).length;
   }
 
   eventNames() {
-    return [...this._events.keys()];
+    return [...eventMap(this).keys()];
   }
 
   setMaxListeners(value) {
