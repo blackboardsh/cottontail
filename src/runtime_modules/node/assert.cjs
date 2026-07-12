@@ -297,21 +297,65 @@ function isObject(value) {
 }
 
 function samePrimitive(actual, expected, strict) {
+  if (typeof actual === "number" && typeof expected === "number" &&
+      Number.isNaN(actual) && Number.isNaN(expected)) {
+    return true;
+  }
   return strict ? Object.is(actual, expected) : actual == expected;
+}
+
+function objectTag(value) {
+  return Object.prototype.toString.call(value);
+}
+
+function isFloatArrayTag(tag) {
+  return tag === "[object Float16Array]" || tag === "[object Float32Array]" || tag === "[object Float64Array]";
+}
+
+function bytesEqual(left, right) {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function isSharedArrayBufferValue(value) {
+  if (typeof SharedArrayBuffer === "undefined") return false;
+  if (objectTag(value) === "[object SharedArrayBuffer]") return true;
+  return SharedArrayBuffer !== ArrayBuffer && value instanceof SharedArrayBuffer;
 }
 
 function deepEqualValue(actual, expected, strict, seen = new WeakMap()) {
   if (samePrimitive(actual, expected, strict)) return true;
   if (!isObject(actual) || !isObject(expected)) return false;
+  const actualTag = objectTag(actual);
+  if (actualTag !== objectTag(expected)) return false;
+  if (actualTag === "[object ArrayBuffer]" || actualTag === "[object SharedArrayBuffer]") {
+    // The runtime may implement SharedArrayBuffer as an ArrayBuffer subclass,
+    // in which case both share the "[object ArrayBuffer]" tag; distinguish
+    // them via instanceof.
+    if (isSharedArrayBufferValue(actual) !== isSharedArrayBufferValue(expected)) return false;
+    return bytesEqual(new Uint8Array(actual), new Uint8Array(expected));
+  }
   if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected)) {
     if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
+    if (strict && Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
+    if (!strict && isFloatArrayTag(actualTag)) {
+      // Loose comparison of float arrays compares element values, so that
+      // +0 == -0 while NaN != NaN (matching Node.js semantics).
+      if (actual.length !== expected.length) return false;
+      for (let index = 0; index < actual.length; index += 1) {
+        if (actual[index] !== expected[index]) return false;
+      }
+      return true;
+    }
+    // Strict comparison (and loose comparison of non-float views) compares
+    // the underlying bytes, so NaN === NaN (same bits) while +0 !== -0.
     if (actual.byteLength !== expected.byteLength) return false;
     const left = new Uint8Array(actual.buffer, actual.byteOffset, actual.byteLength);
     const right = new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength);
-    for (let index = 0; index < left.length; index += 1) {
-      if (left[index] !== right[index]) return false;
-    }
-    return true;
+    return bytesEqual(left, right);
   }
   if (actual instanceof Date || expected instanceof Date) {
     return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
@@ -543,18 +587,56 @@ async function doesNotReject(fn, expected, message) {
   }
 }
 
-function match(string, regexp, message) {
-  if (!(regexp instanceof RegExp)) throw new TypeError("assert.match requires a RegExp");
-  if (!regexp.test(String(string))) {
-    throw new AssertionError({ actual: string, expected: regexp, message, operator: "match" });
+function describeReceivedForMatch(value) {
+  if (typeof value === "string") return `type string (${JSON.stringify(value)})`;
+  if (typeof value === "bigint") return `type bigint (${value}n)`;
+  if (typeof value === "symbol") return `type symbol (${String(value)})`;
+  if (typeof value === "function") return `type function (${value.name ? `[Function: ${value.name}]` : "[Function (anonymous)]"})`;
+  if (value === null) return "type object (null)";
+  if (typeof value === "object") {
+    let inspected;
+    try {
+      inspected = JSON.stringify(value);
+    } catch {
+      inspected = String(value);
+    }
+    return `type object (${inspected})`;
+  }
+  return `type ${typeof value} (${String(value)})`;
+}
+
+function internalMatch(string, regexp, message, operator) {
+  if (!(regexp instanceof RegExp)) {
+    throw invalidArgType("regexp", "an instance of RegExp", regexp);
+  }
+  const shouldMatch = operator === "match";
+  if (typeof string !== "string" || regexp.test(string) !== shouldMatch) {
+    if (message instanceof Error) throw message;
+    const generatedMessage = !message;
+    if (!message) {
+      message = typeof string !== "string"
+        ? `The "string" argument must be of type string. Received ${describeReceivedForMatch(string)}`
+        : (shouldMatch
+            ? "The input did not match the regular expression "
+            : "The input was expected to not match the regular expression ") +
+          `${regexp}. Input:\n\n'${string}'\n`;
+    }
+    throw new AssertionError({
+      actual: string,
+      expected: regexp,
+      message,
+      operator,
+      generatedMessage,
+    });
   }
 }
 
+function match(string, regexp, message) {
+  internalMatch(string, regexp, message, "match");
+}
+
 function doesNotMatch(string, regexp, message) {
-  if (!(regexp instanceof RegExp)) throw new TypeError("assert.doesNotMatch requires a RegExp");
-  if (regexp.test(String(string))) {
-    throw new AssertionError({ actual: string, expected: regexp, message, operator: "doesNotMatch" });
-  }
+  internalMatch(string, regexp, message, "doesNotMatch");
 }
 
 function ifError(value) {

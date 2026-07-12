@@ -702,6 +702,11 @@ async function finalizeRun(exitOnFailure = true) {
       if (typeof globalThis.process?.exit === "function") globalThis.process.exit(1);
       throw failures[0].error;
     }
+    // Like `bun test`, exit once the run completes even if servers/sockets
+    // are still holding the event loop open.
+    if (exitOnFailure && typeof globalThis.process?.exit === "function") {
+      globalThis.process.exit(globalThis.process.exitCode ?? 0);
+    }
   })();
   return finalizePromise;
 }

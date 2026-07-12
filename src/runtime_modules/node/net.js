@@ -1,5 +1,17 @@
 import { EventEmitter } from "./events.js";
 
+// Module evaluation order can reach this file before bun/index.js installs the
+// Symbol.dispose/asyncDispose polyfills, so ensure the shared symbol here.
+function ensureAsyncDisposeSymbol() {
+  if (Symbol.asyncDispose == null) {
+    Object.defineProperty(Symbol, "asyncDispose", {
+      value: Symbol.for("Symbol.asyncDispose"),
+      configurable: true,
+    });
+  }
+  return Symbol.asyncDispose;
+}
+
 function installFdWatchDispatcher() {
   const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
   if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
@@ -51,6 +63,7 @@ export class Socket extends EventEmitter {
     this.fd = options.fd ?? null;
     this.connecting = false;
     this.destroyed = false;
+    this.encrypted = false;
     this.readable = true;
     this.writable = true;
     this.remoteAddress = undefined;
@@ -81,6 +94,9 @@ export class Socket extends EventEmitter {
     this._writeRetryTimer = null;
     this._drainQueued = false;
     this._ending = false;
+    this._endEmitted = false;
+    this._finishEmitted = false;
+    this._pipes = new Map();
     if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, true);
   }
 
@@ -168,7 +184,7 @@ export class Socket extends EventEmitter {
     this._writeRetryTimer = globalThis.setTimeout(() => {
       this._writeRetryTimer = null;
       this._flushOutboundWrites();
-    }, 1);
+    }, 0);
   }
 
   _flushOutboundWrites() {
@@ -176,7 +192,14 @@ export class Socket extends EventEmitter {
     try {
       while (this._outboundWrites.length > 0) {
         const entry = this._outboundWrites[0];
-        const remaining = entry.bytes.subarray(entry.offset);
+        let remaining = entry.bytes.subarray(entry.offset);
+        // Native write bindings reject buffers >= 2 GiB; write in bounded slices.
+        if (remaining.byteLength > 0x40000000) remaining = remaining.subarray(0, 0x40000000);
+        if (remaining.byteLength === 0) {
+          this._outboundWrites.shift();
+          if (typeof entry.callback === "function") queueMicrotask(() => entry.callback());
+          continue;
+        }
         const written = typeof cottontail.fdWriteSome === "function"
           ? Number(cottontail.fdWriteSome(this.fd, remaining))
           : cottontail.fdWrite?.(this.fd, remaining) === true ? remaining.byteLength : 0;
@@ -211,6 +234,7 @@ export class Socket extends EventEmitter {
     if (this._ending && this.fd != null) {
       try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
     }
+    this._maybeEmitFinish();
   }
 
   _stopRead() {
@@ -225,18 +249,109 @@ export class Socket extends EventEmitter {
   }
 
   _emitData(chunk) {
-    if (this._paused) {
+    if (this._paused || this._pendingData.length > 0) {
       this._pendingData.push(chunk);
+      if (!this._paused) queueMicrotask(() => this._flushPendingData());
       return;
     }
     this.emit("data", chunk);
   }
 
+  unshift(chunk) {
+    if (chunk == null) return this;
+    const bytes = typeof chunk === "string" ? bytesFrom(chunk, this._encoding ?? undefined) : chunk;
+    const wrapped = globalThis.Buffer?.isBuffer?.(bytes) ? bytes : chunkFromBytes(bytes, this._encoding);
+    this._pendingData.unshift(wrapped);
+    if (!this._paused) queueMicrotask(() => this._flushPendingData());
+    return this;
+  }
+
+  read(_size = undefined) {
+    if (this._pendingData.length === 0) return null;
+    const chunks = this._pendingData.splice(0);
+    if (this._encoding) return chunks.join("");
+    const buffers = chunks.map((chunk) => (globalThis.Buffer?.isBuffer?.(chunk) ? chunk : globalThis.Buffer.from(chunk)));
+    const merged = buffers.length === 1 ? buffers[0] : globalThis.Buffer.concat(buffers);
+    if (this._pendingEnd) queueMicrotask(() => this._flushPendingData());
+    return merged;
+  }
+
+  pipe(destination, options = {}) {
+    const onData = (chunk) => {
+      if (destination.destroyed || destination.writable === false) return;
+      const ok = destination.write(chunk);
+      if (ok === false) {
+        this.pause();
+        destination.once?.("drain", onDrain);
+      }
+    };
+    const onDrain = () => this.resume();
+    const onEnd = () => {
+      if (options.end !== false) destination.end?.();
+    };
+    const onClose = () => this.unpipe(destination);
+    this.on("data", onData);
+    this.on("end", onEnd);
+    destination.on?.("close", onClose);
+    this._pipes.set(destination, { onData, onDrain, onEnd, onClose });
+    destination.emit?.("pipe", this);
+    this.resume();
+    return destination;
+  }
+
+  unpipe(destination = undefined) {
+    const targets = destination ? [destination] : Array.from(this._pipes.keys());
+    for (const target of targets) {
+      const handlers = this._pipes.get(target);
+      if (!handlers) continue;
+      this._pipes.delete(target);
+      this.off("data", handlers.onData);
+      this.off("end", handlers.onEnd);
+      target.off?.("drain", handlers.onDrain);
+      target.off?.("close", handlers.onClose);
+      target.emit?.("unpipe", this);
+    }
+    return this;
+  }
+
+  cork() { return this; }
+  uncork() { return this; }
+
+  get bufferSize() {
+    return this.writableLength;
+  }
+
+  get _readableState() {
+    let length = 0;
+    for (const chunk of this._pendingData) length += Number(chunk?.byteLength ?? chunk?.length ?? 0);
+    return {
+      endEmitted: this._endEmitted,
+      ended: this._endEmitted || this._pendingEnd,
+      flowing: this._paused ? false : true,
+      length,
+      destroyed: this.destroyed,
+    };
+  }
+
+  get _writableState() {
+    return {
+      length: this.writableLength,
+      needDrain: this.writableNeedDrain,
+      corked: 0,
+      ended: !this.writable,
+      finished: this._finishEmitted,
+      errorEmitted: false,
+      destroyed: this.destroyed,
+    };
+  }
+
   _emitEnd() {
-    if (this._paused) {
+    if (this._paused || this._pendingData.length > 0) {
       this._pendingEnd = true;
       return;
     }
+    if (this._endEmitted) return;
+    this._endEmitted = true;
     this.emit("end");
     if (!this.allowHalfOpen) this.destroy();
   }
@@ -254,7 +369,7 @@ export class Socket extends EventEmitter {
   _startRead() {
     if (this.fd == null || this.destroyed || this._watchId || typeof cottontail.fdWatchStart !== "function") return this;
     const fdWatchListeners = installFdWatchDispatcher();
-    const watch = cottontail.fdWatchStart(this.fd, 64 * 1024);
+    const watch = cottontail.fdWatchStart(this.fd, 1024 * 1024);
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
     fdWatchListeners.set(this._watchId, (event) => {
@@ -291,13 +406,24 @@ export class Socket extends EventEmitter {
     this.connecting = true;
     queueMicrotask(() => {
       try {
+        let host = options.host ?? "127.0.0.1";
+        // Connecting to a wildcard address targets the local host.
+        if (host === "0.0.0.0") host = "127.0.0.1";
+        else if (host === "::") host = "::1";
         const result = options.path != null
           ? cottontail.unixSocketConnect(String(options.path))
-          : cottontail.tcpSocketConnect(Number(options.port), options.host ?? "127.0.0.1", Number(options.family ?? 4));
+          : cottontail.tcpSocketConnect(Number(options.port), host, Number(options.family ?? 4));
         this._isPipe = options.path != null;
         this._path = options.path;
         this._attachFd(result.fd, result.local, result.remote, true);
-      } catch (error) {
+      } catch (rawError) {
+        const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+        if (error.code == null) {
+          const text = String(error.message);
+          if (/refused|ECONNREFUSED/i.test(text)) error.code = "ECONNREFUSED";
+          else if (/(not known|not found|ENOTFOUND|nodename|no address)/i.test(text)) error.code = "ENOTFOUND";
+          else if (/timed? ?out|ETIMEDOUT/i.test(text)) error.code = "ETIMEDOUT";
+        }
         this.connecting = false;
         this.destroy(error);
       }
@@ -329,17 +455,32 @@ export class Socket extends EventEmitter {
     return !overHighWaterMark;
   }
 
+  _maybeEmitFinish() {
+    if (!this._ending || this._finishEmitted || this._outboundWrites.length > 0) return;
+    this._finishEmitted = true;
+    this.emit("finish");
+  }
+
   end(chunk, encoding, callback) {
-    if (typeof chunk === "function") callback = chunk;
-    else if (typeof encoding === "function") callback = encoding;
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (typeof callback === "function") {
+      if (this._finishEmitted) queueMicrotask(callback);
+      else this.once("finish", callback);
+    }
+    if (this._ending) return this;
     if (chunk != null) this.write(chunk, encoding);
     this._ending = true;
     this.writable = false;
-    this.emit("finish");
     if (this.fd != null && this._outboundWrites.length === 0) {
       try { cottontail.tcpSocketShutdown?.(this.fd); } catch {}
     }
-    if (typeof callback === "function") callback();
+    if (this._outboundWrites.length === 0) this._maybeEmitFinish();
     return this;
   }
 
@@ -448,20 +589,32 @@ export class Server extends EventEmitter {
     try {
       const result = options.path != null
         ? cottontail.unixServerListen(String(options.path), Number(options.backlog ?? 128))
-        : cottontail.tcpServerListen(Number(options.port ?? 0), options.host ?? "127.0.0.1", Number(options.family ?? 4));
+        : cottontail.tcpServerListen(Number(options.port ?? 0), options.host ?? "0.0.0.0", Number(options.family ?? 4));
       this._fd = Number(result.fd);
       this._isPipe = options.path != null;
       this._path = this._isPipe ? String(result.path ?? options.path) : null;
       this._address = this._isPipe ? this._path : result.address ?? null;
       this.listening = true;
       this._acceptTimer = setInterval(() => this._acceptPending(), 1);
-      queueMicrotask(() => this.emit(
-        "listening",
-        undefined,
-        this._isPipe ? this._path : this._address?.address,
-        this._isPipe ? undefined : this._address?.port,
-      ));
-    } catch (error) {
+      queueMicrotask(() => {
+        let host = this._isPipe ? this._path : this._address?.address;
+        // Report a connectable hostname for wildcard binds; server.address()
+        // still exposes the real bound address.
+        if (host === "0.0.0.0") host = "127.0.0.1";
+        else if (host === "::") host = "::1";
+        this.emit("listening", undefined, host, this._isPipe ? undefined : this._address?.port);
+      });
+    } catch (rawError) {
+      const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+      if (error.code == null && /(in use|EADDRINUSE)/i.test(String(error.message))) {
+        error.code = "EADDRINUSE";
+        error.errno = -48;
+        error.syscall = "listen";
+        if (!this._isPipe) {
+          error.address = options.host ?? "0.0.0.0";
+          error.port = Number(options.port ?? 0);
+        }
+      }
       queueMicrotask(() => this.emit("error", error));
     }
     return this;
@@ -526,7 +679,16 @@ export class Server extends EventEmitter {
     return this;
   }
 
-  address() { return this._address; }
+  address() {
+    if (this._isPipe) return this._address;
+    if (!this._address) return null;
+    const address = this._address.address ?? "0.0.0.0";
+    const rawFamily = this._address.family;
+    const family = rawFamily != null
+      ? String(rawFamily).replace(/^ipv/i, "IPv")
+      : (String(address).includes(":") ? "IPv6" : "IPv4");
+    return { address, family, port: Number(this._address.port ?? 0) };
+  }
   getConnections(callback) { callback(null, this.connections); }
   ref() {
     this._acceptTimer?.ref?.();
@@ -535,6 +697,10 @@ export class Server extends EventEmitter {
   unref() {
     this._acceptTimer?.unref?.();
     return this;
+  }
+
+  [ensureAsyncDisposeSymbol()]() {
+    return new Promise((resolve) => this.close(() => resolve()));
   }
 }
 

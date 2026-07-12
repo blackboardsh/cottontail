@@ -1,4 +1,5 @@
 import { isIP } from "./net.js";
+import { readFileSync } from "./fs.js";
 
 export const ADDRCONFIG = 1024;
 export const V4MAPPED = 2048;
@@ -31,6 +32,28 @@ export const CANCELLED = "ECANCELLED";
 
 let defaultResultOrder = "verbatim";
 let servers = [];
+let serversConfigured = false;
+let cachedSystemServers = null;
+
+function systemServers() {
+  if (cachedSystemServers != null) return cachedSystemServers;
+  const found = [];
+  try {
+    const content = String(readFileSync("/etc/resolv.conf", "utf8"));
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length >= 2 && parts[0] === "nameserver") found.push(parts[1]);
+    }
+  } catch {}
+  cachedSystemServers = found;
+  return cachedSystemServers;
+}
+
+function effectiveServers() {
+  return serversConfigured ? [...servers] : [...systemServers()];
+}
 const prefetchCache = new Map();
 const cacheStats = {
   cacheHitsCompleted: 0,
@@ -184,6 +207,14 @@ function resolveNativeRecords(hostname, type, syscall = `query${type[0]}${type.s
       ? cottontail.dnsResolveRecords(String(hostname), type)
       : cottontail.dnsResolveRecords(String(hostname), type, nativeOptions)) ?? []);
     if (records.length === 0) throw makeDnsError("no DNS records found", syscall, hostname, NODATA);
+    if (type === "NAPTR") {
+      // c-ares (and Node) present empty regexp/replacement fields as "", not the DNS root ".".
+      return records.map((record) => ({
+        ...record,
+        regexp: record.regexp === "." ? "" : record.regexp,
+        replacement: record.replacement === "." ? "" : record.replacement,
+      }));
+    }
     return records;
   } catch (error) {
     throw makeDnsError(error, syscall, hostname);
@@ -205,6 +236,15 @@ export function lookup(hostname, options = undefined, callback = undefined) {
     options = {};
   }
   const normalized = normalizeLookupOptions(options);
+  if (!hostname) {
+    // Deprecated behavior (DEP0118): falsy hostname resolves to null address.
+    if (typeof callback !== "function") throw new TypeError("callback must be a function");
+    queueMicrotask(() => {
+      if (normalized.all) callback(null, []);
+      else callback(null, null, normalized.family === 6 ? 6 : 4);
+    });
+    return;
+  }
   callbackifyDns(() => {
     const records = lookupRecords(hostname, normalized.family, normalized.order, null);
     if (normalized.all) return [records];
@@ -237,7 +277,28 @@ export function getCacheStats() {
   return { ...cacheStats, cacheSize: prefetchCache.size };
 }
 
+function validateLookupServiceArgs(address, port) {
+  if (typeof address !== "string" || address.length === 0) {
+    const error = new TypeError("Expected address to be a non-empty string for 'lookupService'.");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (isIP(address) === 0) {
+    const error = new TypeError(`The "address" argument is invalid. Received type string ('${address}')`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const portNumber = typeof port === "string" && /^\d+$/.test(port) ? Number(port) : port;
+  if (typeof portNumber !== "number" || !Number.isInteger(portNumber) || portNumber < 0 || portNumber > 65535) {
+    const received = typeof port === "string" ? `type string ('${port}')` : String(port);
+    const error = new RangeError(`Port should be >= 0 and < 65536. Received ${received}.`);
+    error.code = "ERR_SOCKET_BAD_PORT";
+    throw error;
+  }
+}
+
 export function lookupService(address, port, callback) {
+  validateLookupServiceArgs(address, port);
   callbackifyDns(() => {
     const record = lookupServiceRecord(address, port);
     return [record.hostname, record.service];
@@ -371,11 +432,12 @@ export function setDefaultResultOrder(order) {
 }
 
 export function getServers() {
-  return [...servers];
+  return effectiveServers();
 }
 
 export function setServers(nextServers) {
   servers = normalizeServers(nextServers ?? []);
+  serversConfigured = true;
 }
 
 function promiseFromCallback(fn, ...args) {
@@ -389,7 +451,7 @@ function promiseFromCallback(fn, ...args) {
 
 export class Resolver {
   constructor(options = {}) {
-    this._servers = [...servers];
+    this._servers = effectiveServers();
     this.timeout = options?.timeout;
     this.tries = options?.tries;
   }
@@ -453,7 +515,7 @@ export class Resolver {
 
 export class PromisesResolver {
   constructor(options = {}) {
-    this._servers = [...servers];
+    this._servers = effectiveServers();
     this.timeout = options?.timeout;
     this.tries = options?.tries;
   }
@@ -539,6 +601,26 @@ export const promises = {
   setDefaultResultOrder,
   setServers,
 };
+
+// util.promisify(dns.fn) must return the exact dns.promises implementation (Node behavior).
+const kCustomPromisify = Symbol.for("nodejs.util.promisify.custom");
+lookup[kCustomPromisify] = promises.lookup;
+lookupService[kCustomPromisify] = promises.lookupService;
+resolve[kCustomPromisify] = promises.resolve;
+resolve4[kCustomPromisify] = promises.resolve4;
+resolve6[kCustomPromisify] = promises.resolve6;
+resolveAny[kCustomPromisify] = promises.resolveAny;
+resolveCaa[kCustomPromisify] = promises.resolveCaa;
+resolveCname[kCustomPromisify] = promises.resolveCname;
+resolveMx[kCustomPromisify] = promises.resolveMx;
+resolveNaptr[kCustomPromisify] = promises.resolveNaptr;
+resolveNs[kCustomPromisify] = promises.resolveNs;
+resolvePtr[kCustomPromisify] = promises.resolvePtr;
+resolveSoa[kCustomPromisify] = promises.resolveSoa;
+resolveSrv[kCustomPromisify] = promises.resolveSrv;
+resolveTlsa[kCustomPromisify] = promises.resolveTlsa;
+resolveTxt[kCustomPromisify] = promises.resolveTxt;
+reverse[kCustomPromisify] = promises.reverse;
 
 // COTTONTAIL-COMPAT: node:dns resolver controls - lookup/getaddrinfo and DNS record queries use native system resolvers; global and per-Resolver server state is validated and passed to native calls, but the current platform resolver backend does not yet issue record queries through caller-selected DNS servers.
 

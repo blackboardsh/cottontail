@@ -3,6 +3,16 @@ import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
 const g = globalThis;
 const processStartMs = Date.now();
 
+// Install disposal symbols before ANY other module evaluates: several modules
+// (events.js, the vendored readable-stream primordials, node/http.js) capture
+// Symbol.dispose/asyncDispose at eval time and must all observe the same value.
+if (Symbol.dispose == null) {
+  Object.defineProperty(Symbol, "dispose", { value: Symbol.for("Symbol.dispose"), configurable: true });
+}
+if (Symbol.asyncDispose == null) {
+  Object.defineProperty(Symbol, "asyncDispose", { value: Symbol.for("Symbol.asyncDispose"), configurable: true });
+}
+
 function platform() {
   return cottontail.platform();
 }
@@ -281,10 +291,44 @@ if (nativeConsoleError) {
 console.warn ||= console.error;
 console.info ||= console.log;
 console.debug ||= console.log;
+{
+  const counts = new Map();
+  console.count ||= (label = "default") => {
+    const key = String(label);
+    const next = (counts.get(key) ?? 0) + 1;
+    counts.set(key, next);
+    console.log(`${key}: ${next}`);
+  };
+  console.countReset ||= (label = "default") => {
+    counts.delete(String(label));
+  };
+  console.group ||= (...args) => {
+    if (args.length > 0) console.log(...args);
+  };
+  console.groupEnd ||= () => {};
+  console.groupCollapsed ||= console.group;
+  console.dir ||= (value) => console.log(value);
+  console.assert ||= (condition, ...args) => {
+    if (!condition) console.error("Assertion failed" + (args.length ? ":" : ""), ...args);
+  };
+}
 g.global ??= g;
 g.self ??= g;
-g.performance ??= { now: () => Date.now() };
-g.performance.now ??= () => Date.now();
+g.performance ??= {};
+{
+  const monotonicNow = typeof cottontail?.nanotime === "function"
+    ? (() => { const base = cottontail.nanotime(); return () => Number(cottontail.nanotime() - base) / 1e6; })()
+    : (() => { const base = Date.now(); return () => Date.now() - base; })();
+  const timeOrigin = Date.now() - monotonicNow();
+  if (g.performance.timeOrigin == null || !(g.performance.timeOrigin > 0)) {
+    // Rebase: performance.now() measures from timeOrigin; timeOrigin is the epoch start.
+    g.performance.now = monotonicNow;
+    Object.defineProperty(g.performance, "timeOrigin", { value: timeOrigin, enumerable: true, configurable: true });
+  }
+  g.performance.now ??= monotonicNow;
+  // The full Performance/PerformanceEntry/PerformanceObserver surface is
+  // installed by bun/index.js once EventTarget exists.
+}
 g.setImmediate ??= (callback, ...args) => setTimeout(callback, 0, ...args);
 g.clearImmediate ??= (handle) => clearTimeout(handle);
 
@@ -402,6 +446,8 @@ function encodeUtf8(input) {
         index += 1;
       }
     }
+    // WHATWG: lone surrogates encode as U+FFFD, never CESU-8.
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) codePoint = 0xfffd;
     if (codePoint <= 0x7f) out.push(codePoint);
     else if (codePoint <= 0x7ff) out.push(0xc0 | (codePoint >> 6), 0x80 | (codePoint & 0x3f));
     else if (codePoint <= 0xffff) out.push(0xe0 | (codePoint >> 12), 0x80 | ((codePoint >> 6) & 0x3f), 0x80 | (codePoint & 0x3f));
@@ -435,14 +481,60 @@ function decodeUtf8(input) {
 }
 
 g.TextEncoder ??= class TextEncoder {
+  get encoding() {
+    return "utf-8";
+  }
   encode(input = "") {
     return encodeUtf8(String(input));
   }
+  get [Symbol.toStringTag]() {
+    return "TextEncoder";
+  }
 };
 
+const windows1252HighChars = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ";
+
+function normalizeTextDecoderLabel(label) {
+  const text = String(label).trim().toLowerCase();
+  if (["utf-8", "utf8", "unicode-1-1-utf-8"].includes(text)) return "utf-8";
+  if (["ascii", "us-ascii", "latin1", "iso-8859-1", "iso8859-1", "windows-1252", "cp1252", "x-cp1252", "iso-ir-100", "l1", "cp819", "ibm819"].includes(text)) return "windows-1252";
+  if (["utf-16le", "utf-16", "ucs-2", "unicode"].includes(text)) return "utf-16le";
+  if (["utf-16be"].includes(text)) return "utf-16be";
+  return "utf-8";
+}
+
 g.TextDecoder ??= class TextDecoder {
+  constructor(label = "utf-8", options = {}) {
+    this.encoding = normalizeTextDecoderLabel(label);
+    this.fatal = Boolean(options.fatal);
+    this.ignoreBOM = Boolean(options.ignoreBOM);
+  }
   decode(input = new ArrayBuffer(0)) {
-    return decodeUtf8(input);
+    const bytes = input instanceof ArrayBuffer
+      ? new Uint8Array(input)
+      : ArrayBuffer.isView(input)
+        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+        : new Uint8Array(0);
+    if (this.encoding === "windows-1252") {
+      let output = "";
+      for (const byte of bytes) {
+        output += byte >= 0x80 && byte <= 0x9f ? windows1252HighChars[byte - 0x80] : String.fromCharCode(byte);
+      }
+      return output;
+    }
+    if (this.encoding === "utf-16le" || this.encoding === "utf-16be") {
+      let output = "";
+      const littleEndian = this.encoding === "utf-16le";
+      for (let index = 0; index + 1 < bytes.length; index += 2) {
+        output += String.fromCharCode(littleEndian ? bytes[index] | (bytes[index + 1] << 8) : (bytes[index] << 8) | bytes[index + 1]);
+      }
+      if (!this.ignoreBOM && output.charCodeAt(0) === 0xfeff) output = output.slice(1);
+      return output;
+    }
+    return decodeUtf8(bytes);
+  }
+  get [Symbol.toStringTag]() {
+    return "TextDecoder";
   }
 };
 
@@ -520,14 +612,15 @@ function installBlobGlobals() {
         if (typeof g.ReadableStream === "function") {
           return new g.ReadableStream({
             start(controller) {
-              controller.enqueue(bytes);
+              // An empty blob closes without enqueuing an empty chunk.
+              if (bytes.byteLength > 0) controller.enqueue(bytes);
               controller.close();
             },
           });
         }
         return {
           async *[Symbol.asyncIterator]() {
-            yield bytes;
+            if (bytes.byteLength > 0) yield bytes;
           },
         };
       }
@@ -615,6 +708,7 @@ function normalizeBufferEncoding(encoding = "utf8") {
   if (normalized === "utf8" || normalized === "utf") return "utf8";
   if (normalized === "utf16le" || normalized === "ucs2") return "utf16le";
   if (normalized === "latin1" || normalized === "binary") return "latin1";
+  if (normalized === "ascii" || normalized === "usascii") return "ascii";
   if (normalized === "base64") return "base64";
   if (normalized === "hex") return "hex";
   return "utf8";
@@ -688,7 +782,7 @@ function bytesFromStringWithEncoding(input, encoding = "utf8") {
   const text = String(input);
   if (normalized === "base64" || normalized === "base64url") return base64Decode(text);
   if (normalized === "hex") return hexDecode(text);
-  if (normalized === "latin1") {
+  if (normalized === "latin1" || normalized === "ascii") {
     const bytes = new Uint8Array(text.length);
     for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index) & 0xff;
     return bytes;
@@ -716,6 +810,11 @@ function stringFromBytesWithEncoding(bytes, encoding = "utf8", start = 0, end = 
     for (const byte of view) output += String.fromCharCode(byte);
     return output;
   }
+  if (normalized === "ascii") {
+    let output = "";
+    for (const byte of view) output += String.fromCharCode(byte & 0x7f);
+    return output;
+  }
   if (normalized === "utf16le") {
     let output = "";
     for (let index = 0; index + 1 < view.length; index += 2) {
@@ -726,15 +825,33 @@ function stringFromBytesWithEncoding(bytes, encoding = "utf8", start = 0, end = 
   return stringFromBytes(view);
 }
 
+function invalidCharacterError(message) {
+  if (typeof g.DOMException === "function") return new g.DOMException(message, "InvalidCharacterError");
+  const error = new Error(message);
+  error.name = "InvalidCharacterError";
+  return error;
+}
+
 g.btoa ??= (input) => {
   const text = String(input);
   const bytes = new Uint8Array(text.length);
-  for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index) & 0xff;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code > 0xff) throw invalidCharacterError("The string contains invalid characters.");
+    bytes[index] = code;
+  }
   return base64Encode(bytes);
 };
 
 g.atob ??= (input) => {
-  const bytes = base64Decode(input);
+  // WHATWG forgiving-base64 decode: strip ASCII whitespace, validate
+  // alphabet and padding, throw InvalidCharacterError on anything else.
+  let text = String(input).replace(/[\t\n\f\r ]+/g, "");
+  if (text.length % 4 === 0) text = text.replace(/={1,2}$/, "");
+  if (text.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(text)) {
+    throw invalidCharacterError("The string contains invalid characters.");
+  }
+  const bytes = base64Decode(text);
   let output = "";
   for (const byte of bytes) output += String.fromCharCode(byte);
   return output;
@@ -746,6 +863,13 @@ function CottontailBuffer(value, encoding = "utf8") {
 }
 CottontailBuffer.prototype = Object.create(Uint8Array.prototype);
 CottontailBuffer.prototype.constructor = CottontailBuffer;
+// TypedArray methods that build derived arrays (subarray/slice/map via
+// @@species) must produce plain Uint8Arrays: CottontailBuffer called with a
+// length would allocUnsafe and corrupt results.
+Object.defineProperty(CottontailBuffer, Symbol.species, {
+  get() { return Uint8Array; },
+  configurable: true,
+});
 
 function normalizeSearchOffset(byteOffset, length) {
   let offset = Number(byteOffset ?? 0);
@@ -831,6 +955,29 @@ function installBufferMethods(bytes) {
   bytes.subarray = function subarray(start = 0, end = this.length) {
     return makeBufferView(this, start, end);
   };
+  bytes.fill = function fill(value, offset = 0, end = this.length, encoding = "utf8") {
+    if (typeof offset === "string") {
+      encoding = offset;
+      offset = 0;
+      end = this.length;
+    } else if (typeof end === "string") {
+      encoding = end;
+      end = this.length;
+    }
+    const start = Math.max(0, Math.min(this.length, Math.trunc(Number(offset) || 0)));
+    const stop = Math.max(start, Math.min(this.length, Math.trunc(Number(end) || 0)));
+    if (typeof value === "number") {
+      Uint8Array.prototype.fill.call(this, value & 0xff, start, stop);
+      return this;
+    }
+    const pattern = bufferSearchBytes(value ?? 0, encoding);
+    if (pattern.length === 0) {
+      Uint8Array.prototype.fill.call(this, 0, start, stop);
+      return this;
+    }
+    for (let index = start; index < stop; index += 1) this[index] = pattern[(index - start) % pattern.length];
+    return this;
+  };
   return bytes;
 }
 
@@ -839,9 +986,14 @@ function makeBuffer(bytes) {
   return installBufferMethods(bytes);
 }
 
-CottontailBuffer.from = function from(value = "", encoding = "utf8") {
-  if (value instanceof ArrayBuffer) return makeBuffer(new Uint8Array(value));
-  if (ArrayBuffer.isView(value)) return makeBuffer(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+CottontailBuffer.from = function from(value = "", encoding = "utf8", length = undefined) {
+  if (value instanceof ArrayBuffer) {
+    // Buffer.from(arrayBuffer[, byteOffset[, length]]) shares the memory.
+    const byteOffset = typeof encoding === "number" ? encoding : 0;
+    const viewLength = length == null ? value.byteLength - byteOffset : Number(length);
+    return makeBuffer(new Uint8Array(value, byteOffset, viewLength));
+  }
+  if (ArrayBuffer.isView(value)) return makeBuffer(new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice());
   if (Array.isArray(value)) return makeBuffer(new Uint8Array(value));
   return makeBuffer(bytesFromStringWithEncoding(value, encoding));
 };
@@ -976,6 +1128,20 @@ function makeTimerHandle(id) {
     hasRef() {
       return timers.get(id)?.ref !== false;
     },
+    close() {
+      cancelledTimers.add(id);
+      timers.delete(id);
+      return this;
+    },
+    refresh() {
+      const timer = timers.get(id) ?? this._entry;
+      if (timer) {
+        timer.deadline = timerNow() + (timer.interval ?? timer.duration ?? 0);
+        cancelledTimers.delete(id);
+        timers.set(id, timer);
+      }
+      return this;
+    },
   };
 }
 
@@ -986,7 +1152,10 @@ function installTimers() {
     const id = nextTimerId++;
     cancelledTimers.delete(id);
     const handle = makeTimerHandle(id);
-    timers.set(id, { id, deadline: timerNow() + Math.max(0, Number(ms) || 0), callback, args, interval: null, ref: true, handle });
+    const duration = Math.max(0, Number(ms) || 0);
+    const entry = { id, deadline: timerNow() + duration, duration, callback, args, interval: null, ref: true, handle };
+    handle._entry = entry;
+    timers.set(id, entry);
     return handle;
   };
   g.clearTimeout = (id) => {

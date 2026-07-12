@@ -306,6 +306,14 @@ function indentSnapshotBlock(text) {
 
 function snapshotSerialize(value) {
   if (typeof value === "string") return snapshotQuoteString(value);
+  if (typeof globalThis.ErrorEvent === "function" && value instanceof globalThis.ErrorEvent) {
+    const error = value.error == null
+      ? String(value.error)
+      : value.error instanceof Error
+        ? `[${value.error.name || "Error"}: ${String(value.error.message ?? "")}]`
+        : snapshotSerialize(value.error);
+    return `ErrorEvent {\n  type: ${JSON.stringify(String(value.type))},\n  message: ${JSON.stringify(String(value.message))}, \n  error: ${error}\n}`;
+  }
   if (typeof value === "undefined") return "undefined";
   if (typeof value === "bigint") return `${value}n`;
   if (value instanceof Date) return value.toISOString();
@@ -927,6 +935,31 @@ class Expectation {
   pass() { return this._check(true, ""); }
   fail(message = "Explicit failure") { return this._check(false, String(message)); }
   toSatisfy(predicate) { return this._wrap((actual) => this._check(predicate(actual) === true, "Expected predicate to pass")); }
+
+  // Bun's upstream test/harness.ts registers toRun via expect.extend from a
+  // bunfig preload; Cottontail provides it natively: spawn our own binary
+  // with the given args and require a clean exit (and optional stdout).
+  toRun(optionalStdout = undefined, expectedCode = 0) {
+    return this._wrap((actual) => {
+      const args = Array.isArray(actual) ? actual.map(String) : [String(actual)];
+      const executable = globalThis.process?.execPath ?? cottontail.execPath?.();
+      const result = cottontail.spawnSync(executable, args, {
+        stdio: "pipe",
+        env: { ...(globalThis.process?.env ?? {}), BUN_DEBUG_QUIET_LOGS: "1" },
+      });
+      const exitCode = Number(result.status ?? 1);
+      this._check(
+        exitCode === expectedCode,
+        `Command ${[executable, ...args].join(" ")} exited ${exitCode} (expected ${expectedCode})\n${String(result.stderr ?? "")}\n${String(result.stdout ?? "")}`,
+      );
+      if (optionalStdout != null) {
+        this._check(
+          String(result.stdout ?? "") === String(optionalStdout),
+          `Expected stdout ${JSON.stringify(String(optionalStdout))} but received ${JSON.stringify(String(result.stdout ?? ""))}`,
+        );
+      }
+    });
+  }
 
   toHaveBeenCalled(...args) {
     requireNoMatcherArguments("toHaveBeenCalled", args);

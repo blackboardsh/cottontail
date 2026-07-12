@@ -287,13 +287,13 @@ function formatSpawnError(runtime, entry, result) {
 
 function parseBunTestExecution(stderr) {
   const text = String(stderr ?? '');
-  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n\s*(\d+) fail\s*\n\s*(\d+) expect\(\) calls\s*\nRan (\d+) tests across (\d+) file(?:s)?\./g;
+  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n(?:\s*\d+ (?:todo|skip)(?:ped)?\s*\n)*\s*(\d+) fail\s*\n(?:\s*(\d+) expect\(\) calls\s*\n)?Ran (\d+) tests? across (\d+) file(?:s)?\./g;
   let execution = null;
   for (const match of text.matchAll(pattern)) {
     execution = {
       passed: Number(match[1]),
       failed: Number(match[2]),
-      assertions: Number(match[3]),
+      assertions: Number(match[3] ?? 0),
       tests: Number(match[4]),
       files: Number(match[5]),
     };

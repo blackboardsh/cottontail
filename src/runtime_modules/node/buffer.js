@@ -13,6 +13,49 @@ export const constants = {
   MAX_STRING_LENGTH: kStringMaxLength,
 };
 
+// JavaScriptCore typed arrays cannot exceed this many bytes; Bun surfaces the
+// engine's message when Buffer.concat would exceed it. Mirror that here since
+// our fallback allocation errors ("length too large") differ from Bun's.
+const MAX_TYPED_ARRAY_BYTES = 4294967296;
+
+if (Buffer && typeof Buffer.concat === "function" && !Buffer.concat.__cottontailPatched) {
+  const originalConcat = Buffer.concat.bind(Buffer);
+  const patchedConcat = function concat(list, totalLength) {
+    if (!Array.isArray(list)) {
+      const err = new TypeError('The "list" argument must be an instance of Array. Received ' +
+        (list === null ? "null" : `type ${typeof list}`));
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    let length = 0;
+    if (totalLength === undefined) {
+      for (let index = 0; index < list.length; index += 1) {
+        const item = list[index];
+        length += item?.length ?? 0;
+      }
+    } else {
+      length = Number(totalLength) || 0;
+    }
+    if (length >= MAX_TYPED_ARRAY_BYTES) {
+      throw new RangeError(
+        `Out of memory: JavaScriptCore typed arrays are currently limited to ${MAX_TYPED_ARRAY_BYTES} bytes`,
+      );
+    }
+    try {
+      return originalConcat(list, totalLength);
+    } catch (error) {
+      if (error instanceof RangeError && /length too large|out of memory/i.test(String(error.message))) {
+        throw new RangeError(
+          `Out of memory: JavaScriptCore typed arrays are currently limited to ${MAX_TYPED_ARRAY_BYTES} bytes`,
+        );
+      }
+      throw error;
+    }
+  };
+  patchedConcat.__cottontailPatched = true;
+  Buffer.concat = patchedConcat;
+}
+
 function bytesFrom(value) {
   if (value == null) return new Uint8Array(0);
   if (value instanceof ArrayBuffer) return new Uint8Array(value);

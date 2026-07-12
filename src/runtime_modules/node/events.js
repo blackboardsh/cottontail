@@ -41,18 +41,20 @@ export default class EventEmitter {
   }
 
   once(name, handler) {
-    const wrapped = (...args) => {
-      this.off(name, wrapped);
-      handler(...args);
+    const self = this;
+    const wrapped = function (...args) {
+      self.off(name, wrapped);
+      Reflect.apply(handler, this, args);
     };
     wrapped.listener = handler;
     return this.on(name, wrapped);
   }
 
   prependOnceListener(name, handler) {
-    const wrapped = (...args) => {
-      this.off(name, wrapped);
-      handler(...args);
+    const self = this;
+    const wrapped = function (...args) {
+      self.off(name, wrapped);
+      Reflect.apply(handler, this, args);
     };
     wrapped.listener = handler;
     return this.prependListener(name, wrapped);
@@ -81,10 +83,10 @@ export default class EventEmitter {
     const events = eventMap(this);
     const handlers = [...(events.get(name) ?? [])];
     const monitors = name === "error" ? [...(events.get(errorMonitor) ?? [])] : [];
-    for (const handler of monitors) handler(...args);
+    for (const handler of monitors) Reflect.apply(handler, this, args);
     if (name === "error" && handlers.length === 0) throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
     for (const handler of handlers) {
-      const result = handler(...args);
+      const result = Reflect.apply(handler, this, args);
       if ((this.captureRejections ?? captureRejections) && result && typeof result.then === "function") {
         result.catch((error) => this.emit("error", error));
       }

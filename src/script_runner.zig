@@ -340,7 +340,7 @@ fn bundleScriptWithEsbuild(
     const readline_promises_module = try runtimeModulePath(ctx, &.{ "node", "readline", "promises.js" });
     const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
     const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
-    const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
+    const events_module = try runtimeModulePath(ctx, &.{ "node", "events.cjs" });
     const async_hooks_module = try runtimeModulePath(ctx, &.{ "node", "async_hooks.js" });
     const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
     const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
@@ -365,8 +365,8 @@ fn bundleScriptWithEsbuild(
     const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
     const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
-    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
-    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.cjs" });
+    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.cjs" });
     const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
     const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
     const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
@@ -403,14 +403,25 @@ fn bundleScriptWithEsbuild(
         try std.fmt.allocPrint(ctx.allocator, "--alias:vitest={s}", .{bun_test_module}),
         "--external:jest-extended",
         "--external:@jest/globals",
+        "--sourcemap=external",
+        // Bun resolves .mjs/.cjs for extensionless specifiers; esbuild's default list omits them.
+        "--resolve-extensions=.tsx,.ts,.jsx,.mjs,.js,.cjs,.json",
         try std.fmt.allocPrint(ctx.allocator, "--outfile={s}", .{bundle_path}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dirname={s}", .{script_dir_literal}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.dir={s}", .{script_dir_literal}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.filename={s}", .{script_path_literal}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.file={s}", .{script_basename_literal}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.path={s}", .{script_path_literal}),
-        try std.fmt.allocPrint(ctx.allocator, "--define:import.meta.url={s}", .{script_url_literal}),
-        "--define:import.meta.main=true",
+        // import.meta.* map to bundle-scope vars (seeded via --banner) instead of
+        // string literals so user code can also assign to them (e.g. fs.test.ts
+        // does `import.meta.dir = "."`).
+        "--define:import.meta.dirname=__ctMetaDirname",
+        "--define:import.meta.dir=__ctMetaDir",
+        "--define:import.meta.filename=__ctMetaFilename",
+        "--define:import.meta.file=__ctMetaFile",
+        "--define:import.meta.path=__ctMetaPath",
+        "--define:import.meta.url=__ctMetaUrl",
+        "--define:import.meta.main=__ctMetaMain",
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "--banner:js=var __ctMetaDirname = {s}, __ctMetaDir = {s}, __ctMetaFilename = {s}, __ctMetaFile = {s}, __ctMetaPath = {s}, __ctMetaUrl = {s}, __ctMetaMain = true;",
+            .{ script_dir_literal, script_dir_literal, script_path_literal, script_basename_literal, script_path_literal, script_url_literal },
+        ),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun={s}", .{bun_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:ffi={s}", .{bun_ffi_module}),
         try std.fmt.allocPrint(ctx.allocator, "--alias:bun:jsc={s}", .{bun_jsc_module}),
@@ -848,10 +859,13 @@ fn writeCottontailEntryWrapper(
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
         "";
+    const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+    const bundle_map_literal = try jsonStringLiteral(ctx, bundle_map_path);
     const source = try std.fmt.allocPrint(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ createRequire as __ctCreateRequire }} from "node:module";
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
@@ -872,6 +886,7 @@ fn writeCottontailEntryWrapper(
     ,
         .{
             bun_literal,
+            bundle_map_literal,
             script_literal,
             script_dir_literal,
             script_literal,
@@ -2327,8 +2342,8 @@ fn writeCommonJsEntryWrapper(
     const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
     const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
     const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
-    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.js" });
-    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.js" });
+    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.cjs" });
+    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.cjs" });
     const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
     const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
     const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
@@ -2494,22 +2509,28 @@ fn writeCommonJsEntryWrapper(
         },
     );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
+    const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+    const bundle_map_literal = try jsonStringLiteral(ctx, bundle_map_path);
     const main_statement = if (bundle_entry)
         try std.fmt.allocPrint(ctx.allocator, "await import({s});", .{script_literal})
     else
         try std.fmt.allocPrint(ctx.allocator, "moduleModule.__runMain({s});", .{script_literal});
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
+        \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\const eventsBuiltin = events.default ?? events;
         \\const assertBuiltin = assert.default ?? assert;
         \\const assertStrictBuiltin = assertStrict.default ?? assertStrict;
         \\const nodeTestBuiltin = nodeTest.default ?? nodeTest;
         \\const streamBuiltin = stream.default ?? stream;
+        \\const pathBuiltin = path.default ?? path;
+        \\const pathPosixBuiltin = pathBuiltin.posix ?? pathPosix.default ?? pathPosix;
+        \\const pathWin32Builtin = pathBuiltin.win32 ?? pathWin32.default ?? pathWin32;
         \\moduleModule.__setBuiltinModules({{
         \\  fs, "node:fs": fs,
         \\  "fs/promises": fsPromises, "node:fs/promises": fsPromises,
         \\  os, "node:os": os,
-        \\  path, "node:path": path,
+        \\  path: pathBuiltin, "node:path": pathBuiltin,
         \\  process: processModule, "node:process": processModule,
         \\  readline, "node:readline": readline,
         \\  "readline/promises": readlinePromises, "node:readline/promises": readlinePromises,
@@ -2540,7 +2561,7 @@ fn writeCommonJsEntryWrapper(
         \\  punycode, "node:punycode": punycode,
         \\  querystring, "node:querystring": querystring,
         \\  child_process: childProcess, "node:child_process": childProcess,
-        \\  "path/posix": pathPosix, "node:path/posix": pathPosix,
+        \\  "path/posix": pathPosixBuiltin, "node:path/posix": pathPosixBuiltin,
         \\  "path/win32": pathWin32, "node:path/win32": pathWin32,
         \\  string_decoder: stringDecoder, "node:string_decoder": stringDecoder,
         \\  sys, "node:sys": sys,
@@ -2571,6 +2592,7 @@ fn writeCommonJsEntryWrapper(
         \\
     ,
         .{
+            bundle_map_literal,
             main_statement,
         },
     );

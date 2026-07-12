@@ -657,7 +657,38 @@ export class MIMEType {
 
 export { types };
 
+// Deprecated Node util.is* helpers (DEP0047 family); still used by older
+// ecosystem code and Node's own test fixtures.
+export function isBoolean(value) { return typeof value === "boolean"; }
+export function isNull(value) { return value === null; }
+export function isNullOrUndefined(value) { return value == null; }
+export function isNumber(value) { return typeof value === "number"; }
+export function isString(value) { return typeof value === "string"; }
+export function isSymbol(value) { return typeof value === "symbol"; }
+export function isUndefined(value) { return value === undefined; }
+export function isRegExp(value) { return value instanceof RegExp; }
+export function isObject(value) { return value !== null && typeof value === "object"; }
+export function isDate(value) { return value instanceof Date; }
+export function isError(value) { return value instanceof Error || Object.prototype.toString.call(value) === "[object Error]"; }
+export function isFunction(value) { return typeof value === "function"; }
+export function isPrimitive(value) { return value === null || (typeof value !== "object" && typeof value !== "function"); }
+export function isBuffer(value) { return typeof globalThis.Buffer === "function" && globalThis.Buffer.isBuffer?.(value); }
+
 export default {
+  isBoolean,
+  isNull,
+  isNullOrUndefined,
+  isNumber,
+  isString,
+  isSymbol,
+  isUndefined,
+  isRegExp,
+  isObject,
+  isDate,
+  isError,
+  isFunction,
+  isPrimitive,
+  isBuffer,
   MIMEParams,
   MIMEType,
   TextDecoder,

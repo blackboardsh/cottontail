@@ -218,7 +218,13 @@ class ZlibTransform extends Transform {
       ...this._options,
     });
     this.bytesWritten += output.byteLength ?? output.length ?? 0;
-    this.push(output);
+    // Node's zlib streams emit output in highWaterMark-sized chunks (16 KiB
+    // by default), never one monolithic buffer.
+    const chunkSize = Number(this._options.chunkSize) > 0 ? Number(this._options.chunkSize) : 16 * 1024;
+    const bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
+    for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+      this.push(bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize)));
+    }
     return true;
   }
 

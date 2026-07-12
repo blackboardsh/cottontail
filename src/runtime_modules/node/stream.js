@@ -1,320 +1,648 @@
-import { EventEmitter } from "./events.js";
+// node:stream — backed by a vendored copy of readable-stream@4.7.0 (the
+// userland extraction of the Node.js core streams implementation).
+// See ./stream/readable-stream.js (generated bundle; MIT licensed).
+import Stream from "./stream/readable-stream.js";
 
-let defaultReadableHighWaterMark = 16 * 1024;
-let defaultObjectHighWaterMark = 16;
-
-function normalizeEncoding(encoding = "utf8") {
-  const value = String(encoding || "utf8").toLowerCase();
-  return value === "utf8" ? "utf-8" : value;
-}
-
-export function Stream(options = {}) {
-  this._events = new Map();
-  this._maxListeners = undefined;
-  this.captureRejections = Boolean(options.captureRejections);
-  this.destroyed = false;
-}
-
-Object.setPrototypeOf(Stream.prototype, EventEmitter.prototype);
-Object.assign(Stream.prototype, {
-  pipe(destination, options = {}) {
-    this.on("data", (chunk) => destination.write?.(chunk));
-    if (options.end !== false) this.on("end", () => destination.end?.());
-    return destination;
-  },
-
-  destroy(error = undefined) {
-    this.destroyed = true;
-    if (error) {
-      this._errored = error;
-      this.emit("error", error);
-    }
-    this.emit("close");
-    return this;
-  }
-});
-
-export class Readable extends Stream {
-  constructor(options = {}) {
-    super();
-    this.readable = true;
-    this.destroyed = false;
-    this.readableEnded = false;
-    this._read = typeof options.read === "function" ? options.read : () => {};
-    this._queue = [];
-    this._encoding = null;
-  }
-
-  _decodeChunk(chunk) {
-    if (this._encoding == null || typeof chunk === "string") return chunk;
-    if (chunk instanceof ArrayBuffer) return new TextDecoder(this._encoding).decode(new Uint8Array(chunk));
-    if (ArrayBuffer.isView(chunk)) return new TextDecoder(this._encoding).decode(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-    return chunk;
-  }
-
-  push(chunk) {
-    if (chunk == null) {
-      this.readable = false;
-      this.readableEnded = true;
-      this.emit("end");
-      return false;
-    }
-    const value = this._decodeChunk(chunk);
-    this._queue.push(value);
-    this.emit("data", value);
-    this.emit("readable");
-    return true;
-  }
-
-  read() {
-    return this._queue.length > 0 ? this._queue.shift() : this._read();
-  }
-
-  resume() { return this; }
-  pause() { return this; }
-
-  setEncoding(encoding = "utf8") {
-    this._encoding = normalizeEncoding(encoding);
-    this._queue = this._queue.map((chunk) => this._decodeChunk(chunk));
-    return this;
-  }
-
-  async *[Symbol.asyncIterator]() {
-    while (!this.readableEnded || this._queue.length > 0) {
-      const value = this.read();
-      if (value != null) {
-        yield value;
-      } else {
-        await new Promise((resolve) => this.once("data", resolve).once("end", resolve));
-      }
-    }
-  }
-
-  static from(iterable) {
-    const stream = new Readable();
-    Promise.resolve().then(async () => {
-      for await (const item of iterable) stream.push(item);
-      stream.push(null);
-    });
-    return stream;
-  }
-}
-
-export class Writable extends Stream {
-  constructor(options = {}) {
-    super();
-    this.writable = true;
-    this.destroyed = false;
-    this.writableEnded = false;
-    this._write = typeof options.write === "function" ? options.write : null;
-  }
-
-  write(chunk, encoding = undefined, callback = undefined) {
-    if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
-    }
-    if (this._write) {
-      this._write(chunk, encoding, callback ?? (() => {}));
-      this.emit("data", chunk);
-      return true;
-    }
-    this.emit("data", chunk);
-    if (callback) callback();
-    return true;
-  }
-
-  end(chunk = undefined, encoding = undefined, callback = undefined) {
-    if (typeof chunk === "function") {
-      callback = chunk;
-      chunk = undefined;
-    } else if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
-    }
-    if (chunk != null) this.write(chunk, encoding);
-    this.writableEnded = true;
-    this.emit("finish");
-    this.emit("end");
-    if (callback) callback();
-  }
-}
-
-export class Duplex extends Readable {
-  constructor(options = {}) {
-    super(options);
-    this.writable = true;
-    this._write = typeof options.write === "function" ? options.write : null;
-  }
-
-  write(chunk, encoding = undefined, callback = undefined) {
-    if (this._write) this._write(chunk, encoding, callback ?? (() => {}));
-    else this.push(chunk);
-    if (callback) callback();
-    return true;
-  }
-
-  end(chunk = undefined) {
-    if (chunk != null) this.write(chunk);
-    this.push(null);
-    this.emit("finish");
-  }
-}
-
-export class Transform extends Duplex {
-  constructor(options = {}) {
-    super(options);
-    this._transform = typeof options.transform === "function" ? options.transform : null;
-  }
-
-  write(chunk, encoding = undefined, callback = undefined) {
-    if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
-    }
-    if (this._transform) {
-      this._transform(chunk, encoding, (error, value) => {
-        if (error) this.emit("error", error);
-        if (value != null) this.push(value);
-        if (callback) callback(error);
-      });
-      return true;
-    }
-    this.push(chunk);
-    if (callback) callback();
-    return true;
-  }
-}
-
-export class PassThrough extends Transform {}
-
-export function finished(stream, options = undefined, callback = undefined) {
-  if (typeof options === "function") {
-    callback = options;
-    options = undefined;
-  }
-  const promise = new Promise((resolve, reject) => {
-    const done = (error = undefined) => error ? reject(error) : resolve();
-    stream.once?.("error", done);
-    stream.once?.("end", () => done());
-    stream.once?.("finish", () => done());
-    stream.once?.("close", () => done());
-    options?.signal?.addEventListener?.("abort", () => reject(options.signal.reason ?? new Error("AbortError")), { once: true });
-  });
-  if (callback) promise.then(() => callback(), callback);
-  return callback ? () => {} : promise;
-}
-
-export function pipeline(...streams) {
-  const callback = typeof streams[streams.length - 1] === "function" ? streams.pop() : undefined;
-  for (let index = 0; index < streams.length - 1; index += 1) {
-    streams[index].pipe?.(streams[index + 1]);
-  }
-  const last = streams[streams.length - 1];
-  const promise = finished(last);
-  if (callback) promise.then(() => callback(), callback);
-  return callback ? last : promise;
-}
-
-export const promises = { finished, pipeline };
-
-export function addAbortSignal(signal, stream) {
-  if (signal?.aborted) stream.destroy?.(signal.reason);
-  else signal?.addEventListener?.("abort", () => stream.destroy?.(signal.reason), { once: true });
-  return stream;
-}
-
-export function compose(...streams) {
-  if (streams.length === 1) return streams[0];
-  pipeline(...streams, () => {});
-  return streams[streams.length - 1];
-}
-
-export function duplexPair() {
-  const left = new Duplex();
-  const right = new Duplex();
-  left.write = (chunk, _encoding, callback) => {
-    right.push(chunk);
-    if (callback) callback();
-    return true;
-  };
-  right.write = (chunk, _encoding, callback) => {
-    left.push(chunk);
-    if (callback) callback();
-    return true;
-  };
-  return [left, right];
-}
-
-export function destroy(stream, error = undefined) {
-  return stream?.destroy?.(error);
-}
-
-export function isDestroyed(stream) {
-  return Boolean(stream?.destroyed);
-}
-
-export function isReadable(stream) {
-  return Boolean(stream?.readable && !stream?.destroyed);
-}
-
-export function isWritable(stream) {
-  return Boolean(stream?.writable && !stream?.destroyed);
-}
-
-export function isErrored(stream) {
-  return Boolean(stream?._errored);
-}
-
-export function isDisturbed(stream) {
-  return Boolean(stream?.readableEnded || stream?.destroyed || stream?._disturbed);
-}
-
-export function getDefaultHighWaterMark(objectMode) {
-  return objectMode ? defaultObjectHighWaterMark : defaultReadableHighWaterMark;
-}
-
-export function setDefaultHighWaterMark(objectMode, value) {
-  if (objectMode) defaultObjectHighWaterMark = Number(value);
-  else defaultReadableHighWaterMark = Number(value);
-}
+export const Readable = Stream.Readable;
+export const Writable = Stream.Writable;
+export const Duplex = Stream.Duplex;
+export const Transform = Stream.Transform;
+export const PassThrough = Stream.PassThrough;
+export const addAbortSignal = Stream.addAbortSignal;
+export const compose = Stream.compose;
+export const destroy = Stream.destroy;
+export const finished = Stream.finished;
+export const getDefaultHighWaterMark = Stream.getDefaultHighWaterMark;
+export const setDefaultHighWaterMark = Stream.setDefaultHighWaterMark;
+export const isDestroyed = Stream.isDestroyed;
+export const isDisturbed = Stream.isDisturbed;
+export const isErrored = Stream.isErrored;
+export const isReadable = Stream.isReadable;
+export const isWritable = Stream.isWritable;
+export const pipeline = Stream.pipeline;
+export const promises = Stream.promises;
+// The vendored bundle exposes `promises` as a lazy getter that builds a fresh
+// object per access; pin the captured instance so require("stream").promises
+// and node:stream/promises stay identical.
+Object.defineProperty(Stream, "promises", { value: promises, enumerable: false, configurable: true, writable: true });
+export const _isUint8Array = Stream._isUint8Array;
+export const _uint8ArrayToBuffer = Stream._uint8ArrayToBuffer;
 
 export function _isArrayBufferView(value) {
   return ArrayBuffer.isView(value);
 }
+Stream._isArrayBufferView ??= _isArrayBufferView;
 
-export function _isUint8Array(value) {
-  return value instanceof Uint8Array;
+// ---------------------------------------------------------------------------
+// Compatibility: several runtime modules (fs, http, net, crypto, http2, ...)
+// were written against the previous permissive stream shim and assign to
+// properties that are getter-only accessors on the real Node stream
+// prototypes (closed, readableEnded, writableLength, ...). Real Node throws
+// on such assignments in strict mode. Until those modules are migrated to
+// proper stream subclassing, let assignments shadow the accessor with an own
+// data property instead of throwing.
+// ---------------------------------------------------------------------------
+for (const ctor of [Stream, Readable, Writable, Duplex, Transform, PassThrough]) {
+  const proto = ctor?.prototype;
+  if (!proto) continue;
+  for (const name of Object.getOwnPropertyNames(proto)) {
+    const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+    if (!descriptor || !descriptor.get || descriptor.set || !descriptor.configurable) continue;
+    Object.defineProperty(proto, name, {
+      get: descriptor.get,
+      set(value) {
+        Object.defineProperty(this, name, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      },
+      enumerable: descriptor.enumerable,
+      configurable: true,
+    });
+  }
 }
 
-export function _uint8ArrayToBuffer(value) {
-  return globalThis.Buffer?.from ? globalThis.Buffer.from(value) : value;
+// Legacy modules also assign `stream.destroyed = true/false` directly (the
+// old shim stored it as a plain property). Routing that through the real
+// setter marks _readableState/_writableState destroyed immediately, which
+// suppresses pending 'readable'/'end' delivery. Shadow truthy assignments
+// with an own property instead; real destroy() writes stream state directly
+// and is unaffected.
+for (const proto of [Readable.prototype, Writable.prototype, Duplex.prototype]) {
+  const descriptor = Object.getOwnPropertyDescriptor(proto, "destroyed");
+  if (!descriptor?.get || !descriptor.configurable) continue;
+  Object.defineProperty(proto, "destroyed", {
+    get: descriptor.get,
+    set(value) {
+      if (value) {
+        Object.defineProperty(this, "destroyed", {
+          value: true,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      }
+      // Assigning false (constructor initialization) is a no-op; the getter
+      // already reports the live state.
+    },
+    enumerable: descriptor.enumerable,
+    configurable: true,
+  });
 }
 
-Object.assign(Stream, {
-  Duplex,
-  PassThrough,
-  Readable,
-  Stream,
-  Transform,
-  Writable,
-  _isArrayBufferView,
-  _isUint8Array,
-  _uint8ArrayToBuffer,
-  addAbortSignal,
-  compose,
-  destroy,
-  duplexPair,
-  finished,
-  getDefaultHighWaterMark,
-  isDestroyed,
-  isDisturbed,
-  isErrored,
-  isReadable,
-  isWritable,
-  pipeline,
-  promises,
-  setDefaultHighWaterMark,
-});
+// ---------------------------------------------------------------------------
+// duplexPair (port of node's internal/streams/duplexpair)
+// ---------------------------------------------------------------------------
+const kCallback = Symbol("Callback");
+const kInitOtherSide = Symbol("InitOtherSide");
+const kOtherSide = Symbol("OtherSide");
 
+class DuplexSide extends Duplex {
+  constructor(options) {
+    super(options);
+    this[kCallback] = null;
+    this[kOtherSide] = null;
+  }
+
+  [kInitOtherSide](otherSide) {
+    if (this[kOtherSide] === null) {
+      this[kOtherSide] = otherSide;
+    }
+  }
+
+  _read() {
+    const callback = this[kCallback];
+    if (callback) {
+      this[kCallback] = null;
+      callback();
+    }
+  }
+
+  _write(chunk, encoding, callback) {
+    if (chunk.length === 0) {
+      queueMicrotask(callback);
+    } else {
+      this[kOtherSide].push(chunk);
+      this[kOtherSide][kCallback] = callback;
+    }
+  }
+
+  _final(callback) {
+    this[kOtherSide].on("end", callback);
+    this[kOtherSide].push(null);
+  }
+}
+
+export function duplexPair(options) {
+  const side0 = new DuplexSide(options);
+  const side1 = new DuplexSide(options);
+  side0[kInitOtherSide](side1);
+  side1[kInitOtherSide](side0);
+  return [side0, side1];
+}
+Stream.duplexPair ??= duplexPair;
+
+// ---------------------------------------------------------------------------
+// Web streams adapters (ports of node's internal/webstreams/adapters)
+// ---------------------------------------------------------------------------
+function webReadableStreamCtor() {
+  const ctor = globalThis.ReadableStream;
+  if (typeof ctor !== "function") throw new TypeError("ReadableStream is not available");
+  return ctor;
+}
+
+function webWritableStreamCtor() {
+  const ctor = globalThis.WritableStream;
+  if (typeof ctor !== "function") throw new TypeError("WritableStream is not available");
+  return ctor;
+}
+
+function newAbortError() {
+  const error = new Error("The operation was aborted");
+  error.code = "ABORT_ERR";
+  error.name = "AbortError";
+  return error;
+}
+
+function rethrowLater(error) {
+  queueMicrotask(() => {
+    throw error;
+  });
+}
+
+function newReadableStreamFromStreamReadable(streamReadable, options = {}) {
+  const ReadableStreamCtor = webReadableStreamCtor();
+  if (typeof streamReadable?._readableState !== "object" || streamReadable._readableState === null) {
+    throw new TypeError('The "streamReadable" argument must be an instance of stream.Readable');
+  }
+
+  if (isDestroyed(streamReadable) || !isReadable(streamReadable)) {
+    const readable = new ReadableStreamCtor();
+    readable.cancel();
+    return readable;
+  }
+
+  const objectMode = streamReadable.readableObjectMode;
+  const highWaterMark = streamReadable.readableHighWaterMark;
+  const strategy =
+    options?.strategy ??
+    (objectMode
+      ? { highWaterMark, size: () => 1 }
+      : { highWaterMark, size: (chunk) => chunk?.byteLength ?? 1 });
+
+  let controller;
+  let wasCanceled = false;
+
+  function onData(chunk) {
+    if (ArrayBuffer.isView(chunk)) {
+      chunk = new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+    }
+    controller.enqueue(chunk);
+    const desiredSize = typeof controller.desiredSize === "number" ? controller.desiredSize : 1;
+    if (desiredSize <= 0) streamReadable.pause();
+  }
+
+  streamReadable.pause();
+
+  const cleanup = finished(streamReadable, (error) => {
+    if (error?.code === "ERR_STREAM_PREMATURE_CLOSE") {
+      const err = newAbortError();
+      err.cause = error;
+      error = err;
+    }
+    cleanup();
+    // Prevent uncaught error events after handoff.
+    streamReadable.on("error", () => {});
+    if (error) {
+      try {
+        controller.error(error);
+      } catch {
+        // controller may already be closed/errored
+      }
+      return;
+    }
+    if (!wasCanceled) {
+      try {
+        controller.close();
+      } catch {
+        // controller may already be closed/errored
+      }
+    }
+  });
+
+  streamReadable.on("data", onData);
+
+  return new ReadableStreamCtor(
+    {
+      start(c) {
+        controller = c;
+      },
+      pull() {
+        streamReadable.resume();
+      },
+      cancel(reason) {
+        wasCanceled = true;
+        destroy(streamReadable, reason);
+      },
+    },
+    strategy,
+  );
+}
+
+function newStreamReadableFromReadableStream(readableStream, options = {}) {
+  if (typeof readableStream?.getReader !== "function") {
+    throw new TypeError('The "readableStream" argument must be an instance of ReadableStream');
+  }
+
+  const reader = readableStream.getReader();
+  let closed = false;
+  let reading = false;
+
+  const readable = new Readable({
+    objectMode: options?.objectMode,
+    highWaterMark: options?.highWaterMark,
+    encoding: options?.encoding,
+    signal: options?.signal,
+
+    read() {
+      if (reading) return;
+      reading = true;
+      reader.read().then(
+        (chunk) => {
+          reading = false;
+          if (chunk.done) {
+            closed = true;
+            readable.push(null);
+          } else if (readable.push(chunk.value)) {
+            // keep pulling; _read will be called again as needed
+            this._read();
+          }
+        },
+        (error) => {
+          reading = false;
+          closed = true;
+          readable.destroy(error);
+        },
+      );
+    },
+
+    destroy(error, callback) {
+      function done() {
+        try {
+          callback(error);
+        } catch (err) {
+          rethrowLater(err);
+        }
+      }
+      if (!closed) {
+        const result = error != null ? reader.cancel(error) : reader.cancel();
+        Promise.resolve(result).then(done, done);
+        return;
+      }
+      done();
+    },
+  });
+
+  if (reader.closed && typeof reader.closed.then === "function") {
+    reader.closed.then(
+      () => {
+        closed = true;
+      },
+      (error) => {
+        closed = true;
+        readable.destroy(error);
+      },
+    );
+  }
+
+  return readable;
+}
+
+function newWritableStreamFromStreamWritable(streamWritable) {
+  const WritableStreamCtor = webWritableStreamCtor();
+  if (typeof streamWritable?._writableState !== "object" || streamWritable._writableState === null) {
+    throw new TypeError('The "streamWritable" argument must be an instance of stream.Writable');
+  }
+
+  if (isDestroyed(streamWritable) || !isWritable(streamWritable)) {
+    const writable = new WritableStreamCtor();
+    writable.close();
+    return writable;
+  }
+
+  const highWaterMark = streamWritable.writableHighWaterMark;
+  const strategy = streamWritable.writableObjectMode
+    ? { highWaterMark, size: () => 1 }
+    : { highWaterMark, size: (chunk) => chunk?.byteLength ?? 1 };
+
+  let controller;
+  let backpressurePromise;
+  let closed;
+
+  function onDrain() {
+    if (backpressurePromise !== undefined) {
+      backpressurePromise.resolve();
+      backpressurePromise = undefined;
+    }
+  }
+
+  const cleanup = finished(streamWritable, (error) => {
+    if (error?.code === "ERR_STREAM_PREMATURE_CLOSE") {
+      const err = newAbortError();
+      err.cause = error;
+      error = err;
+    }
+    cleanup();
+    streamWritable.on("error", () => {});
+    if (error != null) {
+      if (backpressurePromise !== undefined) backpressurePromise.reject(error);
+      if (closed !== undefined) {
+        closed.reject(error);
+        closed = undefined;
+      }
+      try {
+        controller?.error(error);
+      } catch {
+        // ignore
+      }
+      controller = undefined;
+      return;
+    }
+    if (closed !== undefined) {
+      closed.resolve();
+      closed = undefined;
+      return;
+    }
+    try {
+      controller?.error(newAbortError());
+    } catch {
+      // ignore
+    }
+    controller = undefined;
+  });
+
+  streamWritable.on("drain", onDrain);
+
+  function deferred() {
+    let resolve, reject;
+    const promise = new Promise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  return new WritableStreamCtor(
+    {
+      start(c) {
+        controller = c;
+      },
+
+      write(chunk) {
+        if (streamWritable.writableNeedDrain || !streamWritable.write(chunk)) {
+          backpressurePromise = deferred();
+          return backpressurePromise.promise;
+        }
+      },
+
+      abort(reason) {
+        destroy(streamWritable, reason);
+      },
+
+      close() {
+        if (closed === undefined && !isWritableEnded(streamWritable)) {
+          closed = deferred();
+          streamWritable.end();
+          return closed.promise;
+        }
+        cleanup();
+        return Promise.resolve();
+      },
+    },
+    strategy,
+  );
+}
+
+function isWritableEnded(stream) {
+  return stream.writableEnded === true;
+}
+
+function newStreamWritableFromWritableStream(writableStream, options = {}) {
+  if (typeof writableStream?.getWriter !== "function") {
+    throw new TypeError('The "writableStream" argument must be an instance of WritableStream');
+  }
+
+  const writer = writableStream.getWriter();
+  let closed = false;
+
+  const writable = new Writable({
+    highWaterMark: options?.highWaterMark,
+    objectMode: options?.objectMode,
+    signal: options?.signal,
+    decodeStrings: options?.decodeStrings !== false,
+
+    write(chunk, encoding, callback) {
+      Promise.resolve(writer.ready).then(
+        () => Promise.resolve(writer.write(chunk)).then(() => callback(), callback),
+        callback,
+      );
+    },
+
+    final(callback) {
+      if (!closed) {
+        Promise.resolve(writer.close()).then(() => callback(), callback);
+        return;
+      }
+      callback();
+    },
+
+    destroy(error, callback) {
+      function done() {
+        try {
+          callback(error);
+        } catch (err) {
+          rethrowLater(err);
+        }
+      }
+      if (!closed) {
+        const result = error != null ? writer.abort(error) : writer.close();
+        Promise.resolve(result).then(done, done);
+        return;
+      }
+      done();
+    },
+  });
+
+  if (writer.closed && typeof writer.closed.then === "function") {
+    writer.closed.then(
+      () => {
+        closed = true;
+      },
+      (error) => {
+        closed = true;
+        writable.destroy(error);
+      },
+    );
+  }
+
+  return writable;
+}
+
+function newReadableWritablePairFromDuplex(duplex) {
+  if (typeof duplex?._writableState !== "object" || typeof duplex?._readableState !== "object") {
+    throw new TypeError('The "duplex" argument must be an instance of stream.Duplex');
+  }
+
+  const writable =
+    isDestroyed(duplex) || !isWritable(duplex)
+      ? (() => {
+          const w = new (webWritableStreamCtor())();
+          w.close();
+          return w;
+        })()
+      : newWritableStreamFromStreamWritable(duplex);
+
+  const readable =
+    isDestroyed(duplex) || !isReadable(duplex)
+      ? (() => {
+          const r = new (webReadableStreamCtor())();
+          r.cancel();
+          return r;
+        })()
+      : newReadableStreamFromStreamReadable(duplex);
+
+  return { writable, readable };
+}
+
+function newStreamDuplexFromReadableWritablePair(pair = {}, options = {}) {
+  const { readable: readableStream, writable: writableStream } = pair;
+  if (typeof readableStream?.getReader !== "function") {
+    throw new TypeError('The "pair.readable" argument must be an instance of ReadableStream');
+  }
+  if (typeof writableStream?.getWriter !== "function") {
+    throw new TypeError('The "pair.writable" argument must be an instance of WritableStream');
+  }
+
+  const writer = writableStream.getWriter();
+  const reader = readableStream.getReader();
+  let writableClosed = false;
+  let readableClosed = false;
+  let reading = false;
+
+  const duplex = new Duplex({
+    allowHalfOpen: true,
+    highWaterMark: options?.highWaterMark,
+    objectMode: options?.objectMode,
+    encoding: options?.encoding,
+    decodeStrings: options?.decodeStrings !== false,
+    signal: options?.signal,
+
+    write(chunk, encoding, callback) {
+      Promise.resolve(writer.ready).then(
+        () => Promise.resolve(writer.write(chunk)).then(() => callback(), callback),
+        callback,
+      );
+    },
+
+    final(callback) {
+      if (!writableClosed) {
+        Promise.resolve(writer.close()).then(() => callback(), callback);
+        return;
+      }
+      callback();
+    },
+
+    read() {
+      if (reading) return;
+      reading = true;
+      reader.read().then(
+        (chunk) => {
+          reading = false;
+          if (chunk.done) {
+            readableClosed = true;
+            duplex.push(null);
+          } else if (duplex.push(chunk.value)) {
+            this._read();
+          }
+        },
+        (error) => {
+          reading = false;
+          readableClosed = true;
+          duplex.destroy(error);
+        },
+      );
+    },
+
+    destroy(error, callback) {
+      function done() {
+        try {
+          callback(error);
+        } catch (err) {
+          rethrowLater(err);
+        }
+      }
+      async function closeAll() {
+        if (!writableClosed) {
+          await (error != null ? writer.abort(error) : writer.close()).catch(() => {});
+          writableClosed = true;
+        }
+        if (!readableClosed) {
+          await reader.cancel(error).catch(() => {});
+          readableClosed = true;
+        }
+      }
+      closeAll().then(done, done);
+    },
+  });
+
+  if (writer.closed && typeof writer.closed.then === "function") {
+    writer.closed.then(
+      () => {
+        writableClosed = true;
+      },
+      (error) => {
+        writableClosed = true;
+        readableClosed = true;
+        duplex.destroy(error);
+      },
+    );
+  }
+  if (reader.closed && typeof reader.closed.then === "function") {
+    reader.closed.then(
+      () => {
+        readableClosed = true;
+      },
+      (error) => {
+        writableClosed = true;
+        readableClosed = true;
+        duplex.destroy(error);
+      },
+    );
+  }
+
+  return duplex;
+}
+
+Readable.fromWeb = function fromWeb(readableStream, options) {
+  return newStreamReadableFromReadableStream(readableStream, options);
+};
+Readable.toWeb = function toWeb(streamReadable, options) {
+  return newReadableStreamFromStreamReadable(streamReadable, options);
+};
+Writable.fromWeb = function fromWeb(writableStream, options) {
+  return newStreamWritableFromWritableStream(writableStream, options);
+};
+Writable.toWeb = function toWeb(streamWritable) {
+  return newWritableStreamFromStreamWritable(streamWritable);
+};
+Duplex.fromWeb = function fromWeb(pair, options) {
+  return newStreamDuplexFromReadableWritablePair(pair, options);
+};
+Duplex.toWeb = function toWeb(duplex) {
+  return newReadableWritablePairFromDuplex(duplex);
+};
+
+export { Stream };
 export default Stream;

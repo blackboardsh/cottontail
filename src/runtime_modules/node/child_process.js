@@ -14,13 +14,155 @@ export class ChildProcess extends EventEmitter {
     this.exitCode = null;
     this.signalCode = null;
   }
+
+  // Node-internal API used by tests: proc.spawn({ file, args }) where args[0] is argv0.
+  spawn(options) {
+    if (options == null || typeof options !== "object") {
+      throw invalidArgTypeError("options", "object", options);
+    }
+    if (typeof options.file !== "string") {
+      throw invalidArgTypeError("options.file", "string", options.file);
+    }
+    if (options.envPairs !== undefined && !Array.isArray(options.envPairs)) {
+      throw invalidArgTypeError("options.envPairs", "Array", options.envPairs);
+    }
+    if (options.stdio !== undefined && !Array.isArray(options.stdio)) {
+      throw invalidArgTypeError("options.stdio", "Array", options.stdio);
+    }
+    if (options.args !== undefined && !Array.isArray(options.args)) {
+      throw invalidArgTypeError("options.args", "Array", options.args);
+    }
+    const file = String(options.file);
+    const argv = Array.isArray(options?.args) ? Array.from(options.args, String) : [];
+    const inner = spawn(file, argv.length > 0 ? argv.slice(1) : [], { ...options, args: undefined, file: undefined });
+    this._inner = inner;
+    this.pid = inner.pid;
+    this.stdin = inner.stdin;
+    this.stdout = inner.stdout;
+    this.stderr = inner.stderr;
+    for (const name of ["spawn", "disconnect"]) inner.on(name, () => this.emit(name));
+    inner.on("exit", (code, signal) => {
+      this.exitCode = code;
+      this.signalCode = signal;
+      this.emit("exit", code, signal);
+    });
+    inner.on("close", (code, signal) => this.emit("close", code, signal));
+    inner.on("error", (error) => this.emit("error", error));
+    inner.on("message", (message, handle) => this.emit("message", message, handle));
+    return this;
+  }
+
+  kill(signal = "SIGTERM") {
+    normalizeKillSignal(signal); // validates; throws ERR_UNKNOWN_SIGNAL
+    if (this._inner == null) return false;
+    const killed = this._inner.kill(signal);
+    this.killed = this._inner.killed;
+    return killed;
+  }
+}
+
+function receivedValueText(value) {
+  const type = typeof value;
+  if (type === "string") return `type string ('${value}')`;
+  if (value === null) return "null";
+  if (type === "symbol") return `type symbol (${String(value)})`;
+  if (type === "function") return `function ${value.name || "(anonymous)"}`;
+  if (type === "object") return `an instance of ${value.constructor?.name ?? "Object"}`;
+  return `type ${type} (${String(value)})`;
+}
+
+function invalidArgTypeError(name, expected, value) {
+  const error = new TypeError(`The "${name}" argument must be of type ${expected}. Received ${receivedValueText(value)}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function invalidFileArgError(file) {
+  return invalidArgTypeError("file", "string", file);
+}
+
+const isDarwinPlatform = typeof cottontail?.platform === "function" ? cottontail.platform() === "darwin" : true;
+
+const signalNumbersByName = {
+  SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGIOT: 6,
+  SIGFPE: 8, SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
+  ...(isDarwinPlatform
+    ? {
+        SIGEMT: 7, SIGBUS: 10, SIGSYS: 12, SIGURG: 16, SIGSTOP: 17, SIGTSTP: 18, SIGCONT: 19,
+        SIGCHLD: 20, SIGTTIN: 21, SIGTTOU: 22, SIGIO: 23, SIGXCPU: 24, SIGXFSZ: 25,
+        SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGINFO: 29, SIGUSR1: 30, SIGUSR2: 31,
+      }
+    : {
+        SIGBUS: 7, SIGUSR1: 10, SIGUSR2: 12, SIGSTKFLT: 16, SIGCHLD: 17, SIGCONT: 18,
+        SIGSTOP: 19, SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24,
+        SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28, SIGIO: 29, SIGPWR: 30, SIGSYS: 31,
+      }),
+};
+
+const signalNamesByNumber = {};
+for (const [name, number] of Object.entries(signalNumbersByName)) {
+  if (signalNamesByNumber[number] == null) signalNamesByNumber[number] = name;
+}
+
+function unknownSignalError(signal) {
+  const error = new TypeError(`Unknown signal: ${String(signal)}`);
+  error.code = "ERR_UNKNOWN_SIGNAL";
+  return error;
+}
+
+function normalizeKillSignal(signal) {
+  if (signal == null) return signalNumbersByName.SIGTERM;
+  if (typeof signal === "number") {
+    if (signal === 0 || signalNamesByNumber[signal] != null) return signal;
+    throw unknownSignalError(signal);
+  }
+  if (typeof signal === "string") {
+    const number = signalNumbersByName[signal.toUpperCase()];
+    if (number != null) return number;
+  }
+  throw unknownSignalError(signal);
+}
+
+function signalNumberToName(signal) {
+  if (signal == null) return null;
+  if (typeof signal === "string") return signal;
+  return signalNamesByNumber[signal] ?? null;
+}
+
+function prepareSyncInput(input, encoding = undefined) {
+  if (input == null) return undefined;
+  if (typeof input === "string") {
+    return Buffer.from(input, encoding && encoding !== "buffer" ? encoding : "utf8");
+  }
+  return input;
+}
+
+function makeSpawnFailureResult(file, cause) {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const notFound = /filenotfound|enoent|no such file/i.test(message);
+  const error = notFound ? new Error(`spawnSync ${file} ENOENT`) : new Error(message);
+  error.code = notFound ? "ENOENT" : (cause?.code ?? "UNKNOWN");
+  if (notFound) error.errno = -2;
+  error.syscall = `spawnSync ${file}`;
+  error.path = String(file);
+  return {
+    status: null,
+    signal: null,
+    error,
+    output: [null, null, null],
+    pid: 0,
+    stdout: null,
+    stderr: null,
+  };
 }
 
 export function execSync(command, options = {}) {
-  const nativeOptions = prepareNativeOptions(cottontail.platform() === "win32" ? "cmd" : "sh", options);
-  const result = normalizeSyncResult(cottontail.spawnSync(cottontail.platform() === "win32" ? "cmd" : "sh", cottontail.platform() === "win32" ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)], {
+  const isWin = cottontail.platform() === "win32";
+  const shell = typeof options.shell === "string" && options.shell !== "" ? options.shell : (isWin ? "cmd" : "sh");
+  const nativeOptions = prepareNativeOptions(shell, options);
+  const result = normalizeSyncResult(cottontail.spawnSync(shell, isWin ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)], {
     stdio: options.stdio === "inherit" ? "inherit" : "pipe",
-    cwd: options.cwd,
+    cwd: normalizeCwdOption(options.cwd),
     env: nativeOptions.env,
     clearEnv: nativeOptions.clearEnv,
   }), options);
@@ -35,16 +177,23 @@ export function execSync(command, options = {}) {
 }
 
 export function execFileSync(file, args = [], options = {}) {
+  if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
-  const result = normalizeSyncResult(cottontail.spawnSync(command.file, command.args, {
-    stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
-    cwd: normalized.options.cwd,
-    env: nativeOptions.env,
-    clearEnv: nativeOptions.clearEnv,
-    input: normalized.options.input,
-  }), normalized.options);
+  let nativeResult;
+  try {
+    nativeResult = cottontail.spawnSync(command.file, command.args, {
+      stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
+      cwd: normalizeCwdOption(normalized.options.cwd),
+      env: nativeOptions.env,
+      clearEnv: nativeOptions.clearEnv,
+      input: prepareSyncInput(normalized.options.input, normalized.options.encoding),
+    });
+  } catch (error) {
+    throw makeSpawnFailureResult(file, error).error;
+  }
+  const result = normalizeSyncResult(nativeResult, normalized.options);
   if (result.status !== 0) {
     const error = new Error(result.stderr?.toString?.() || result.stdout?.toString?.() || `Command failed: ${file}`);
     error.status = result.status;
@@ -57,16 +206,23 @@ export function execFileSync(file, args = [], options = {}) {
 }
 
 export function spawnSync(file, args = [], options = {}) {
+  if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
-  return normalizeSyncResult(cottontail.spawnSync(command.file, command.args, {
-    stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
-    cwd: normalized.options.cwd,
-    env: nativeOptions.env,
-    clearEnv: nativeOptions.clearEnv,
-    input: normalized.options.input,
-  }), normalized.options);
+  let result;
+  try {
+    result = cottontail.spawnSync(command.file, command.args, {
+      stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
+      cwd: normalizeCwdOption(normalized.options.cwd),
+      env: nativeOptions.env,
+      clearEnv: nativeOptions.clearEnv,
+      input: prepareSyncInput(normalized.options.input, normalized.options.encoding),
+    });
+  } catch (error) {
+    return makeSpawnFailureResult(file, error);
+  }
+  return normalizeSyncResult(result, normalized.options);
 }
 
 function withoutElectrobunHostEnv(env) {
@@ -78,26 +234,28 @@ function withoutElectrobunHostEnv(env) {
 }
 
 function prepareNativeOptions(file, options = {}) {
-  if (String(file) === String(process.execPath) && options.env === undefined) {
+  if (options.env === undefined) {
+    // Node inherits the (possibly mutated) process.env object, not the raw environ.
     return {
       ...options,
       env: withoutElectrobunHostEnv(process.env),
       clearEnv: true,
     };
   }
-  if (options.env !== undefined) {
-    return {
-      ...options,
-      clearEnv: true,
-    };
-  }
-  return options;
+  return {
+    ...options,
+    clearEnv: true,
+  };
 }
 
-function shellQuote(value) {
-  const text = String(value);
-  if (/^[A-Za-z0-9_\/:=-]+$/.test(text)) return text;
-  return `'${text.replace(/'/g, `'\\''`)}'`;
+function normalizeCwdOption(cwd) {
+  if (cwd == null || cwd === "") return undefined;
+  if (typeof cwd === "string") return cwd;
+  // file:// URL support (Node accepts URL cwd)
+  if (typeof cwd === "object" && cwd.protocol === "file:" && typeof cwd.pathname === "string") {
+    return decodeURIComponent(cwd.pathname);
+  }
+  return String(cwd);
 }
 
 function normalizeSpawnArgs(args, options) {
@@ -111,9 +269,10 @@ function normalizeSpawnArgs(args, options) {
 function normalizeSpawnCommand(file, args = [], options = {}) {
   if (!options.shell) return { file: String(file), args: Array.from(args ?? [], String) };
   const argList = Array.from(args ?? [], String);
+  // Node joins file and args verbatim (no quoting) when a shell is requested.
   const command = argList.length === 0
     ? String(file)
-    : [String(file), ...argList.map(shellQuote)].join(" ");
+    : [String(file), ...argList].join(" ");
   if (cottontail.platform() === "win32") {
     const shell = typeof options.shell === "string" ? options.shell : "cmd";
     return { file: shell, args: ["/d", "/s", "/c", command] };
@@ -139,10 +298,11 @@ function normalizeSyncResult(result, options = {}) {
   };
 }
 
-function makeAbortError() {
+function makeAbortError(reason = undefined) {
   const error = new Error("The operation was aborted");
   error.name = "AbortError";
   error.code = "ABORT_ERR";
+  if (reason !== undefined) error.cause = reason;
   return error;
 }
 
@@ -156,6 +316,7 @@ function normalizeStdio(value, fallback) {
 }
 
 export function spawn(file, args = [], options = {}) {
+  if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   args = normalized.args;
   options = normalized.options;
@@ -184,7 +345,7 @@ export function spawn(file, args = [], options = {}) {
 
   const nativeOptions = prepareNativeOptions(command.file, options);
   const native = cottontail.spawnStart(command.file, command.args, {
-    cwd: options.cwd,
+    cwd: normalizeCwdOption(options.cwd),
     env: nativeOptions.env,
     clearEnv: nativeOptions.clearEnv,
     stdin: stdinMode,
@@ -209,7 +370,16 @@ export function spawn(file, args = [], options = {}) {
   const makeStream = (map, fd, writeImpl = null) => ({
     fd,
     _encoding: null,
+    _readableBuffer: [],
     destroyed: false,
+    read(size = undefined) {
+      if (this._readableBuffer.length === 0) return null;
+      const chunks = this._readableBuffer;
+      this._readableBuffer = [];
+      if (chunks.length === 1) return chunks[0];
+      if (typeof chunks[0] === "string") return chunks.join("");
+      return Buffer.concat(chunks);
+    },
     writableHighWaterMark: Number(options.highWaterMark || 16 * 1024),
     writableLength: 0,
     writableNeedDrain: false,
@@ -286,9 +456,24 @@ export function spawn(file, args = [], options = {}) {
     return stream?._encoding ? buffer.toString(stream._encoding) : buffer;
   };
 
+  const deliverStreamData = (stream, map, chunk) => {
+    const hasData = (map.get("data") ?? []).length > 0;
+    const hasReadable = (map.get("readable") ?? []).length > 0;
+    if (hasData) emitFrom(map, "data", chunk);
+    if (hasReadable) {
+      stream?._readableBuffer.push(chunk);
+      emitFrom(map, "readable");
+    } else if (!hasData) {
+      // No consumer attached yet; keep the data for a later read().
+      stream?._readableBuffer.push(chunk);
+    }
+  };
+
   const child = Object.assign(new ChildProcess(), {
     pid: native.pid ?? 0,
-    stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => cottontail.spawnWrite(native.id, chunk)) : null,
+    // Convert strings to bytes before crossing into native code: the native
+    // string path measures with strlen and would truncate at embedded NULs.
+    stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => cottontail.spawnWrite(native.id, Buffer.isBuffer(chunk) || ArrayBuffer.isView(chunk) ? chunk : Buffer.from(String(chunk)))) : null,
     stdout: stdoutMode === "pipe" ? makeStream(stdoutListeners, 1) : null,
     stderr: stderrMode === "pipe" ? makeStream(stderrListeners, 2) : null,
     _nativeId: native.id,
@@ -316,8 +501,7 @@ export function spawn(file, args = [], options = {}) {
       return (listeners.get(name) ?? []).length > 0;
     },
     kill(signal = "SIGTERM") {
-      const signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGALRM: 14, SIGTERM: 15 };
-      const signalNumber = typeof signal === "number" ? signal : signals[String(signal).toUpperCase()] ?? 15;
+      const signalNumber = normalizeKillSignal(signal);
       const killed = cottontail.spawnKill?.(native.id, signalNumber) === true;
       child.killed = child.killed || killed;
       return killed;
@@ -341,7 +525,7 @@ export function spawn(file, args = [], options = {}) {
   let abortHandler = null;
   if (options.signal) {
     abortHandler = () => {
-      const error = makeAbortError();
+      const error = makeAbortError(options.signal?.reason);
       child.kill(options.killSignal ?? "SIGTERM");
       child.emit("error", error);
     };
@@ -357,12 +541,12 @@ export function spawn(file, args = [], options = {}) {
     if (!event) return;
     if (event.type === "stdout") {
       const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
-      if (bytes.length > 0) emitFrom(stdoutListeners, "data", streamChunk(child.stdout, bytes));
+      if (bytes.length > 0) deliverStreamData(child.stdout, stdoutListeners, streamChunk(child.stdout, bytes));
       return;
     }
     if (event.type === "stderr") {
       const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
-      if (bytes.length > 0) emitFrom(stderrListeners, "data", streamChunk(child.stderr, bytes));
+      if (bytes.length > 0) deliverStreamData(child.stderr, stderrListeners, streamChunk(child.stderr, bytes));
       return;
     }
     if (event.type === "ipc") {
@@ -385,8 +569,9 @@ export function spawn(file, args = [], options = {}) {
         unregisterSpawnListener();
         unregisterSpawnListener = null;
       }
-      const exitCode = event.exitCode ?? 0;
-      const signalCode = event.signalCode == null ? null : event.signalCode;
+      // Node reports code null + signal name when the child died from a signal.
+      const exitCode = event.exitCode == null ? (event.signalCode == null ? 0 : null) : Number(event.exitCode);
+      const signalCode = signalNumberToName(event.signalCode);
       child.exitCode = exitCode;
       child.signalCode = signalCode;
       if (Array.isArray(child._pendingIpcEvents)) {
@@ -405,10 +590,25 @@ export function spawn(file, args = [], options = {}) {
         emitFrom(stderrListeners, "end");
         emitFrom(stderrListeners, "close");
       }
+      // The IPC channel dies with the child; Node marks it closed before 'exit'
+      // listeners run, then emits 'disconnect'.
+      const wasConnected = child.connected === true;
+      child.connected = false;
+      child._ipcOnExit?.();
       emitChild("exit", exitCode, signalCode);
+      if (wasConnected) emitChild("disconnect");
       emitChild("close", exitCode, signalCode);
       cottontail.spawnDispose?.(native.id);
     }
+  });
+
+  if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
+    installParentIpcChannel(child, options.serialization);
+  }
+
+  // Node emits 'spawn' asynchronously once the process started successfully.
+  queueMicrotask(() => {
+    if (!closed) emitChild("spawn");
   });
 
   return child;
@@ -444,31 +644,40 @@ function collectChild(child, options, callback, commandText) {
     error.stderr = stderrValue;
     callback?.(error, stdoutValue, stderrValue);
   };
-  const append = (target, chunk) => {
-    const next = target + chunk.toString();
+  const handleChunk = (streamName, chunk) => {
+    let next = (streamName === "stdout" ? stdout : stderr) + chunk.toString();
+    let exceeded = false;
     if (maxBuffer >= 0 && Buffer.byteLength(next) > maxBuffer) {
-      const error = new RangeError(`${commandText} stdout maxBuffer length exceeded`);
+      // Node truncates the collected output to exactly maxBuffer bytes.
+      next = Buffer.from(next).subarray(0, maxBuffer).toString();
+      exceeded = true;
+    }
+    if (streamName === "stdout") stdout = next;
+    else stderr = next;
+    if (exceeded) {
+      const error = new RangeError(`${streamName} maxBuffer length exceeded`);
       error.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+      error.cmd = commandText;
       child.kill(options.killSignal ?? "SIGTERM");
       fail(error);
     }
-    return next;
   };
-  child.stdout?.on("data", (chunk) => { stdout = append(stdout, chunk); });
-  child.stderr?.on("data", (chunk) => { stderr = append(stderr, chunk); });
+  child.stdout?.on("data", (chunk) => handleChunk("stdout", chunk));
+  child.stderr?.on("data", (chunk) => handleChunk("stderr", chunk));
   child.on("error", fail);
   child.on("close", (code, signal) => {
     if (settled) return;
     settled = true;
     const stdoutValue = options.encoding === "buffer" || options.encoding === null ? Buffer.from(stdout) : stdout;
     const stderrValue = options.encoding === "buffer" || options.encoding === null ? Buffer.from(stderr) : stderr;
-    if (code === 0) {
+    if (code === 0 && signal == null) {
       callback?.(null, stdoutValue, stderrValue);
       return;
     }
     const error = new Error(`Command failed: ${commandText}`);
     error.code = code;
     error.signal = signal;
+    error.killed = child.killed === true;
     error.stdout = stdoutValue;
     error.stderr = stderrValue;
     callback?.(error, stdoutValue, stderrValue);
@@ -490,14 +699,41 @@ export function exec(command, options = {}, callback = undefined) {
     callback = options;
     options = {};
   }
-  const shell = cottontail.platform() === "win32" ? "cmd" : "sh";
-  const args = cottontail.platform() === "win32" ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)];
+  const isWin = cottontail.platform() === "win32";
+  const shell = typeof options.shell === "string" && options.shell !== "" ? options.shell : (isWin ? "cmd" : "sh");
+  const args = isWin ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)];
   const child = spawn(shell, args, {
     ...options,
+    shell: false, // already wrapped in a shell here; don't re-wrap in spawn()
     stdio: ["ignore", "pipe", "pipe"],
   });
   return collectChild(child, options, callback, String(command));
 }
+
+// util.promisify(exec/execFile) resolves with { stdout, stderr } (Node behavior).
+const kChildProcessPromisify = Symbol.for("nodejs.util.promisify.custom");
+exec[kChildProcessPromisify] = (command, options = undefined) => new Promise((resolvePromise, reject) => {
+  exec(command, options ?? {}, (error, stdout, stderr) => {
+    if (error) {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    } else {
+      resolvePromise({ stdout, stderr });
+    }
+  });
+});
+execFile[kChildProcessPromisify] = (file, args = undefined, options = undefined) => new Promise((resolvePromise, reject) => {
+  execFile(file, args ?? [], options ?? {}, (error, stdout, stderr) => {
+    if (error) {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+    } else {
+      resolvePromise({ stdout, stderr });
+    }
+  });
+});
 
 const ipcPrefix = "__COTTONTAIL_IPC__";
 const ipcEnvelopeKey = "__cottontailIpcEnvelope";
@@ -545,7 +781,9 @@ function ipcHandleInfo(sendHandle = undefined) {
   if (Number.isInteger(sendHandle._handle?.fd) && sendHandle._handle.fd >= 0) {
     return { fd: Number(sendHandle._handle.fd), type: "net.Handle" };
   }
-  throw new TypeError("child_process IPC sendHandle must expose a native file descriptor");
+  // Handle without an underlying descriptor yet (e.g. a net.Server that never
+  // listened): Node still delivers the message; we just cannot pass the handle.
+  return null;
 }
 
 function receivedIpcHandle(fd = undefined, type = "net.Socket") {
@@ -558,20 +796,53 @@ function receivedIpcHandle(fd = undefined, type = "net.Socket") {
   return new NetSocket({ fd, local, remote, pipe: local?.path != null || remote?.path != null, path: local?.path ?? remote?.path });
 }
 
-function encodeNativeIpcPayload(message, mode, handleInfo) {
+function encodeNativeIpcPayload(message, mode, handleInfo, handleSeq = undefined) {
   const payload = handleInfo == null
     ? message
-    : { [ipcEnvelopeKey]: 1, message, handleType: handleInfo.type };
+    : { [ipcEnvelopeKey]: 1, message, handleType: handleInfo.type, handleSeq };
   return `${ipcPrefix}${encodeIpcMessage(payload, mode)}\n`;
 }
 
+// Sockets adopted from a passed fd, keyed by the sender's handle sequence so a
+// follow-up frame can replay bytes the sender's fd watcher had already consumed.
+const adoptedIpcHandles = new Map();
+
+function rememberAdoptedIpcHandle(handleSeq, handle) {
+  if (handleSeq == null || handle == null) return;
+  adoptedIpcHandles.set(handleSeq, handle);
+  if (adoptedIpcHandles.size > 32) {
+    const oldest = adoptedIpcHandles.keys().next().value;
+    adoptedIpcHandles.delete(oldest);
+  }
+}
+
+function deliverAdoptedHandleData(handleSeq, base64Data) {
+  const socket = adoptedIpcHandles.get(handleSeq);
+  adoptedIpcHandles.delete(handleSeq);
+  if (socket == null || !base64Data) return;
+  const bytes = Buffer.from(String(base64Data), "base64");
+  if (bytes.length === 0) return;
+  queueMicrotask(() => {
+    try {
+      const chunk = socket._encoding ? bytes.toString(socket._encoding) : bytes;
+      if (typeof socket._emitData === "function") socket._emitData(chunk);
+      else socket.emit?.("data", chunk);
+    } catch {}
+  });
+}
+
+// Returns null for internal frames that must not surface as 'message' events.
 function decodeNativeIpcPayload(payload, receivedFd = undefined) {
   const decoded = decodeIpcMessage(payload);
   if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 1) {
-    return {
-      message: decoded.message,
-      handle: receivedIpcHandle(receivedFd, decoded.handleType),
-    };
+    const handle = receivedIpcHandle(receivedFd, decoded.handleType);
+    rememberAdoptedIpcHandle(decoded.handleSeq, handle);
+    return { message: decoded.message, handle };
+  }
+  if (decoded && typeof decoded === "object" && decoded[ipcEnvelopeKey] === 3) {
+    if (Number.isInteger(receivedFd) && receivedFd >= 0) cottontail.closeFd?.(receivedFd);
+    deliverAdoptedHandleData(decoded.handleSeq, decoded.data);
+    return null;
   }
   return {
     message: decoded,
@@ -579,24 +850,48 @@ function decodeNativeIpcPayload(payload, receivedFd = undefined) {
   };
 }
 
-function writeNativeIpc(fd, message, mode, sendHandle = undefined) {
+let ipcHandleSeqCounter = 0;
+
+// `finish` (when provided) is always invoked asynchronously: on the next
+// microtask for plain messages, or after the handle-data flush for handle
+// sends, so a callback that destroys the passed socket cannot drop bytes the
+// parent's fd watcher had already consumed.
+function writeNativeIpc(fd, message, mode, sendHandle = undefined, finish = undefined) {
   const handleInfo = ipcHandleInfo(sendHandle);
-  return cottontail.ipcSend?.(Number(fd), encodeNativeIpcPayload(message, mode, handleInfo), handleInfo?.fd ?? -1) === true;
+  let handleSeq;
+  if (handleInfo != null) {
+    handleSeq = ++ipcHandleSeqCounter;
+    // Pause the socket being handed over: bytes its fd watcher already grabbed
+    // then land in _pendingData (instead of being dropped by an unlistened
+    // 'data' emit) and can be forwarded to the receiver below.
+    try { sendHandle?.pause?.(); } catch {}
+  }
+  const ok = cottontail.ipcSend?.(Number(fd), encodeNativeIpcPayload(message, mode, handleInfo, handleSeq), handleInfo?.fd ?? -1) === true;
+  if (handleInfo != null && ok) {
+    setTimeout(() => {
+      try {
+        const pending = Array.isArray(sendHandle?._pendingData) ? sendHandle._pendingData.splice(0) : [];
+        try { sendHandle?._stopRead?.(); } catch {}
+        if (pending.length > 0) {
+          const data = Buffer.concat(pending.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))).toString("base64");
+          const payload = { [ipcEnvelopeKey]: 3, handleSeq, data };
+          cottontail.ipcSend?.(Number(fd), `${ipcPrefix}J:${JSON.stringify(payload)}\n`, -1);
+        }
+      } catch {}
+      finish?.();
+    }, 5);
+  } else if (finish != null) {
+    queueMicrotask(finish);
+  }
+  return ok;
 }
 
 function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = true) {
   if (!Number.isInteger(fd) || fd < 0 || typeof cottontail.ipcRecv !== "function") return null;
   let buffer = "";
   let closed = false;
-  const close = () => {
-    if (closed) return;
-    closed = true;
-    clearInterval(timer);
-    if (closeFd) {
-      try { cottontail.closeFd?.(fd); } catch {}
-    }
-  };
-  const timer = setInterval(() => {
+  let timer = null;
+  const poll = () => {
     if (closed) return;
     try {
       for (;;) {
@@ -622,21 +917,144 @@ function installNativeIpcReader(fd, onFrame, onDisconnect, onError, closeFd = tr
             continue;
           }
           const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
-          onFrame(frame.message, frame.handle);
+          if (frame != null) onFrame(frame.message, frame.handle);
         }
         if (Number.isInteger(pendingFd) && pendingFd >= 0) cottontail.closeFd?.(pendingFd);
       }
     } catch (error) {
       onError?.(error);
     }
-  }, 1);
-  return close;
+  };
+  const control = {
+    // Node keeps the process alive only while the channel is ref'd; we model
+    // ref/unref by starting/stopping the poll interval (no native timer unref).
+    ref() {
+      if (closed || timer != null) return;
+      timer = setInterval(poll, 1);
+    },
+    unref() {
+      if (timer != null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      control.unref();
+      if (closeFd) {
+        try { cottontail.closeFd?.(fd); } catch {}
+      }
+    },
+  };
+  control.ref();
+  return control;
+}
+
+function makeChannelClosedError() {
+  const error = new Error("Channel closed");
+  error.code = "ERR_IPC_CHANNEL_CLOSED";
+  return error;
+}
+
+function emitChildProcessError(child, error) {
+  // Node emits 'error' asynchronously; without a listener the EventEmitter
+  // throws, surfacing as an uncaughtException.
+  queueMicrotask(() => {
+    if (child.emit?.("error", error) === true) return;
+    const handled = globalThis.process?.emit?.("uncaughtException", error) === true;
+    if (!handled) throw error;
+  });
+}
+
+function installParentIpcChannel(child, serialization = undefined) {
+  child.connected = true;
+  child.serialization = serialization === "advanced" ? "advanced" : "json";
+  child._ipcBuffer = "";
+  let nativeIpcPendingFd = undefined;
+
+  child._handleIpcEvent = (event) => {
+    try {
+      const eventFd = Number.isInteger(event.fd) ? Number(event.fd) : undefined;
+      if (Number.isInteger(eventFd) && eventFd >= 0) {
+        if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) cottontail.closeFd?.(nativeIpcPendingFd);
+        nativeIpcPendingFd = eventFd;
+      }
+      child._ipcBuffer += Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
+      for (;;) {
+        const newlineIndex = child._ipcBuffer.indexOf("\n");
+        if (newlineIndex < 0) break;
+        const line = child._ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+        child._ipcBuffer = child._ipcBuffer.slice(newlineIndex + 1);
+        const frameFd = nativeIpcPendingFd;
+        nativeIpcPendingFd = undefined;
+        if (!line.startsWith(ipcPrefix)) {
+          if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
+          continue;
+        }
+        const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
+        if (frame != null) emitChildMessage(child, frame.message, "message", frame.handle);
+      }
+    } catch (error) {
+      emitChildProcessError(child, error);
+    }
+  };
+
+  const pendingEvents = Array.isArray(child._pendingIpcEvents) ? child._pendingIpcEvents : [];
+  child._pendingIpcEvents = [];
+  for (const event of pendingEvents) child._handleIpcEvent(event);
+
+  child._ipcOnExit = () => {
+    child._handleIpcEvent = null;
+    if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) {
+      cottontail.closeFd?.(nativeIpcPendingFd);
+      nativeIpcPendingFd = undefined;
+    }
+  };
+
+  child.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
+    const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
+    const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
+    if (!child.connected) {
+      const error = makeChannelClosedError();
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
+      return false;
+    }
+    let ok = false;
+    try {
+      ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
+        sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
+    } catch (error) {
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
+      return false;
+    }
+    return ok;
+  };
+
+  child.disconnect = () => {
+    if (!child.connected) return;
+    child.connected = false;
+    cottontail.spawnCloseIpc?.(child._nativeId);
+    emitChildMessage(child, undefined, "disconnect");
+  };
 }
 
 export function fork(modulePath, args = [], options = {}) {
+  if (typeof modulePath !== "string" && !Buffer.isBuffer(modulePath) &&
+      !(typeof URL === "function" && modulePath instanceof URL)) {
+    const error = new TypeError(`The "modulePath" argument must be of type string, Buffer, or URL. Received ${receivedValueText(modulePath)}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
   if (!Array.isArray(args)) {
     options = args ?? {};
     args = [];
+  }
+  if (options == null) options = {};
+  if (typeof options !== "object") {
+    throw invalidArgTypeError("options", "object", options);
   }
 
   const env = withoutElectrobunHostEnv({
@@ -654,107 +1072,66 @@ export function fork(modulePath, args = [], options = {}) {
     stdio: ["pipe", "pipe", options.silent ? "pipe" : "inherit"],
   });
 
-  child.connected = true;
-  child.serialization = options.serialization === "advanced" ? "advanced" : "json";
-  let stdoutBuffer = "";
-  let nativeIpcPendingFd = undefined;
-
-  if (Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
-    child._ipcBuffer = "";
-    child._handleIpcEvent = (event) => {
-      try {
-        const eventFd = Number.isInteger(event.fd) ? Number(event.fd) : undefined;
-        if (Number.isInteger(eventFd) && eventFd >= 0) {
-          if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) cottontail.closeFd?.(nativeIpcPendingFd);
-          nativeIpcPendingFd = eventFd;
-        }
-        child._ipcBuffer += Buffer.from(event.data ?? new ArrayBuffer(0)).toString("utf8");
-        for (;;) {
-          const newlineIndex = child._ipcBuffer.indexOf("\n");
-          if (newlineIndex < 0) break;
-          const line = child._ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-          child._ipcBuffer = child._ipcBuffer.slice(newlineIndex + 1);
-          const frameFd = nativeIpcPendingFd;
-          nativeIpcPendingFd = undefined;
-          if (!line.startsWith(ipcPrefix)) {
-            if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
-            continue;
-          }
-          const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
-          emitChildMessage(child, frame.message, "message", frame.handle);
-        }
-      } catch (error) {
-        child.emit?.("error", error);
-      }
-    };
-    const pendingEvents = Array.isArray(child._pendingIpcEvents) ? child._pendingIpcEvents : [];
-    child._pendingIpcEvents = [];
-    for (const event of pendingEvents) child._handleIpcEvent(event);
+  if (typeof child.send === "function" && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
+    // spawn() already installed the native IPC channel; just forward child stdout.
     child.stdout?.on("data", (chunk) => {
       if (!options.silent) process.stdout.write(String(chunk));
     });
-  } else {
-    child.stdout?.on("data", (chunk) => {
-      stdoutBuffer += String(chunk);
-      for (;;) {
-        const newlineIndex = stdoutBuffer.indexOf("\n");
-        if (newlineIndex < 0) break;
-        const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-        if (line.startsWith(ipcPrefix)) {
-          try {
-            emitChildMessage(child, decodeIpcMessage(line.slice(ipcPrefix.length)));
-          } catch (error) {
-            child.emit?.("error", error);
-          }
-        } else if (!options.silent) {
-          process.stdout.write(`${line}\n`);
-        }
-      }
-    });
+    return child;
   }
+
+  // Fallback: no native IPC channel; multiplex IPC frames over stdio.
+  child.connected = true;
+  child.serialization = options.serialization === "advanced" ? "advanced" : "json";
+  let stdoutBuffer = "";
+
+  child.stdout?.on("data", (chunk) => {
+    stdoutBuffer += String(chunk);
+    for (;;) {
+      const newlineIndex = stdoutBuffer.indexOf("\n");
+      if (newlineIndex < 0) break;
+      const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line.startsWith(ipcPrefix)) {
+        try {
+          emitChildMessage(child, decodeIpcMessage(line.slice(ipcPrefix.length)));
+        } catch (error) {
+          emitChildProcessError(child, error);
+        }
+      } else if (!options.silent) {
+        process.stdout.write(`${line}\n`);
+      }
+    }
+  });
 
   child.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
     const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
-    if (!child.connected || (!child.stdin && !Number.isInteger(child._ipcFd))) {
-      if (typeof normalizedSend.callback === "function") normalizedSend.callback(new Error("IPC channel is closed"));
+    const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
+    if (!child.connected || !child.stdin) {
+      const error = makeChannelClosedError();
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
       return false;
     }
     let ok = false;
     try {
-      if (Number.isInteger(child._ipcFd) && child._ipcFd >= 0 && typeof cottontail.ipcSend === "function") {
-        ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle);
-      } else {
-        if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
-        ok = child.stdin.write(`${ipcPrefix}${encodeIpcMessage(message, child.serialization)}\n`);
-      }
+      if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
+      ok = child.stdin.write(`${ipcPrefix}${encodeIpcMessage(message, child.serialization)}\n`);
     } catch (error) {
-      if (typeof normalizedSend.callback === "function") normalizedSend.callback(error);
-      child.emit?.("error", error);
+      // Node invokes the callback asynchronously with the error instead of emitting 'error'.
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else emitChildProcessError(child, error);
       return false;
     }
-    if (typeof normalizedSend.callback === "function") normalizedSend.callback(ok ? null : new Error("write failed"));
+    if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
     return ok;
   };
   child.disconnect = () => {
     if (!child.connected) return;
     child.connected = false;
-    if (Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
-      cottontail.spawnCloseIpc?.(child._nativeId);
-    } else {
-      child.stdin?.end();
-    }
+    child.stdin?.end();
     emitChildMessage(child, undefined, "disconnect");
   };
-
-  child.on("close", () => {
-    child.connected = false;
-    child._handleIpcEvent = null;
-    if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) {
-      cottontail.closeFd?.(nativeIpcPendingFd);
-      nativeIpcPendingFd = undefined;
-    }
-  });
 
   return child;
 }
@@ -787,24 +1164,30 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
 
   processObject.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
     const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
+    const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
     if (!processObject.connected) {
-      if (typeof normalizedSend.callback === "function") normalizedSend.callback(new Error("IPC channel is closed"));
+      const error = new Error("Channel closed");
+      error.code = "ERR_IPC_CHANNEL_CLOSED";
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else processObject.emit?.("error", error);
       return false;
     }
     let ok = false;
     try {
       if (hasNativeIpc) {
-        ok = writeNativeIpc(nativeFd, message, serializationMode, normalizedSend.sendHandle);
-      } else {
-        if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
-        ok = processObject.stdout?.write?.(`${ipcPrefix}${encodeIpcMessage(message, serializationMode)}\n`) === true;
+        ok = writeNativeIpc(nativeFd, message, serializationMode, normalizedSend.sendHandle,
+          sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
+        return ok;
       }
+      if (normalizedSend.sendHandle != null) throw new Error("IPC handle passing is only available on native IPC channels");
+      ok = processObject.stdout?.write?.(`${ipcPrefix}${encodeIpcMessage(message, serializationMode)}\n`) === true;
     } catch (error) {
-      if (typeof normalizedSend.callback === "function") normalizedSend.callback(error);
-      processObject.emit?.("error", error);
+      // Node invokes the callback asynchronously with the error instead of emitting 'error'.
+      if (sendCallback) queueMicrotask(() => sendCallback(error));
+      else processObject.emit?.("error", error);
       return false;
     }
-    if (typeof normalizedSend.callback === "function") normalizedSend.callback(ok ? null : new Error("write failed"));
+    if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
     return ok;
   };
   processObject.disconnect = () => {
@@ -818,7 +1201,7 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   };
 
   if (hasNativeIpc) {
-    stopNativeIpc = installNativeIpcReader(
+    const reader = installNativeIpcReader(
       nativeFd,
       (message, handle) => processObject.emit?.("message", message, handle),
       () => {
@@ -826,6 +1209,46 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
       },
       (error) => processObject.emit?.("error", error),
     );
+    stopNativeIpc = reader == null ? null : () => reader.close();
+    if (reader != null) {
+      // Match Node: the IPC channel only keeps the child alive while there are
+      // 'message'/'disconnect' listeners on process. The runtime's EventEmitter
+      // never emits 'newListener', so wrap the registration methods instead.
+      // node/process.js replaces process.on/off/... during module init (which can
+      // run after this bootstrap), so defer the wrapping to a microtask: it runs
+      // after all synchronous module init and the script's top-level code. Until
+      // then the reader stays ref'd, so startup messages are never dropped.
+      const channelEventNames = new Set(["message", "disconnect"]);
+      const updateChannelRef = () => {
+        const count = (processObject.listenerCount?.("message") ?? 0) +
+          (processObject.listenerCount?.("disconnect") ?? 0);
+        if (count > 0) reader.ref();
+        else reader.unref();
+      };
+      queueMicrotask(() => {
+        try {
+          for (const methodName of ["on", "addListener", "once", "prependListener", "prependOnceListener"]) {
+            const original = processObject[methodName];
+            if (typeof original !== "function") continue;
+            processObject[methodName] = function (name, ...rest) {
+              const result = original.call(this, name, ...rest);
+              if (channelEventNames.has(name)) reader.ref();
+              return result;
+            };
+          }
+          for (const methodName of ["off", "removeListener", "removeAllListeners"]) {
+            const original = processObject[methodName];
+            if (typeof original !== "function") continue;
+            processObject[methodName] = function (name, ...rest) {
+              const result = original.call(this, name, ...rest);
+              if (name === undefined || channelEventNames.has(name)) updateChannelRef();
+              return result;
+            };
+          }
+        } catch {}
+        updateChannelRef();
+      });
+    }
   } else {
     let ipcBuffer = "";
     processObject.stdin?.setEncoding?.("utf8");
@@ -849,6 +1272,14 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
     });
     processObject.stdin?.resume?.();
   }
+}
+
+// COTTONTAIL-COMPAT: forked children are marked with COTTONTAIL_IPC_BOOTSTRAP=node but no
+// startup hook calls _forkChild yet, so bootstrap process.send/disconnect when this module
+// loads in such a child. Children that never require node:child_process still miss out;
+// the process bootstrap (bun/ffi.js or node/process.js) should eventually call _forkChild.
+if (globalThis.process?.env?.COTTONTAIL_IPC_BOOTSTRAP === "node" && typeof globalThis.process?.send !== "function") {
+  try { _forkChild(); } catch {}
 }
 
 export default { ChildProcess, _forkChild, exec, execFile, execFileSync, execSync, fork, spawn, spawnSync };

@@ -2,6 +2,7 @@ import StreamDefault, {
   PassThrough,
   Readable,
   Transform,
+  Duplex,
   Writable,
   _isArrayBufferView,
   _isUint8Array,
@@ -96,38 +97,46 @@ const sink = new Writable({
 });
 await pipelinePromise(Readable.from(["a", "b"]), upper, sink);
 assert(written === "AB", "stream/promises pipeline mismatch");
-assert(streamPromises.pipeline === pipeline, "stream promises export mismatch");
-assert(streamPromises.finished === finished, "stream finished export mismatch");
+// Node keeps the callback and promise pipelines distinct; node:stream/promises
+// re-exports the same functions as stream.promises.
+assert(streamPromises.pipeline === pipelinePromise, "stream promises export mismatch");
+assert(streamPromises.finished === finishedPromise, "stream promises finished mismatch");
+assert(streamPromises.pipeline !== pipeline, "promise pipeline should differ from callback pipeline");
+assert(streamPromises.finished !== finished, "promise finished should differ from callback finished");
 
 const pass = new PassThrough();
 const passDone = finishedPromise(pass);
+// The readable side must drain for "end" to fire (matches real Node).
+pass.resume();
 pass.end("done");
 await passDone;
 
+// Node's compose returns a new Duplex wrapping the chain, not the final stream.
 const composed = compose(Readable.from(["x"]), new PassThrough());
-assert(composed instanceof PassThrough, "compose should return final stream");
+assert(composed instanceof Duplex, "compose should return a Duplex");
+assert(!(composed instanceof PassThrough), "compose should not return the final stream");
 
 const [left, right] = duplexPair();
 const paired = once(right, "data");
 left.write("pair");
-assert((await paired)[0] === "pair", "duplexPair write mismatch");
+// Without an encoding, the paired side receives a Buffer (Node semantics).
+assert(String((await paired)[0]) === "pair", "duplexPair write mismatch");
 
 const readable = Readable.from(["readable"]);
 assert(isReadable(readable), "isReadable mismatch");
 assert(isWritable(new Writable()), "isWritable mismatch");
 const abortedStream = new PassThrough();
-const fakeSignal = {
-  aborted: false,
-  addEventListener(_name, handler) { this.handler = handler; },
-  removeEventListener() {},
-};
-addAbortSignal(fakeSignal as any, abortedStream);
-(fakeSignal as any).handler();
+const abortController = new AbortController();
+addAbortSignal(abortController.signal, abortedStream);
+abortController.abort();
+await new Promise<void>((resolve) => setTimeout(resolve, 0));
 assert(isDestroyed(abortedStream), "addAbortSignal destroy mismatch");
 
 const errored = new PassThrough();
 errored.on("error", () => {});
 errored.destroy(new Error("boom"));
+// The errored state materializes on the next tick (matches real Node).
+await new Promise<void>((resolve) => setTimeout(resolve, 0));
 assert(isErrored(errored), "isErrored mismatch");
 assert(isDisturbed(errored), "isDisturbed mismatch");
 
@@ -194,6 +203,8 @@ webReader.releaseLock();
 assert(!webReadable.locked, "ReadableStream releaseLock mismatch");
 
 const byobReadable = new ReadableStream({
+  // BYOB readers require a byte source (WHATWG spec / Node behavior).
+  type: "bytes",
   start(controller) {
     controller.enqueue(new Uint8Array([1, 2, 3, 4]));
     controller.close();
@@ -225,30 +236,39 @@ const webTransform = new TransformStream({
 });
 const transformReader = webTransform.readable.getReader();
 const transformWriter = webTransform.writable.getWriter();
-await transformWriter.write("go");
-await transformWriter.close();
+// Writes only settle once the readable side pulls (WHATWG backpressure), so
+// read before awaiting the write/close promises.
+const transformWrite = transformWriter.write("go");
+const transformClose = transformWriter.close();
 assert((await transformReader.read()).value === "go!", "TransformStream transform mismatch");
 assert((await transformReader.read()).done === true, "TransformStream close mismatch");
+await transformWrite;
+await transformClose;
 
 const encoderStream = new TextEncoderStream();
 const encoderReader = encoderStream.readable.getReader();
 const encoderWriter = encoderStream.writable.getWriter();
-await encoderWriter.write("encode");
-await encoderWriter.close();
+const encoderWrite = encoderWriter.write("encode");
+const encoderClose = encoderWriter.close();
 const encoded = (await encoderReader.read()).value;
 assert(encoded instanceof Uint8Array && encoded.length > 0, "TextEncoderStream mismatch");
+await encoderWrite;
+await encoderClose;
 
 const decoderStream = new TextDecoderStream();
 const decoderReader = decoderStream.readable.getReader();
 const decoderWriter = decoderStream.writable.getWriter();
-await decoderWriter.write(encoded);
-await decoderWriter.close();
+const decoderWrite = decoderWriter.write(encoded);
+const decoderClose = decoderWriter.close();
 assert((await decoderReader.read()).value === "encode", "TextDecoderStream mismatch");
+await decoderWrite;
+await decoderClose;
 
 assert(new CountQueuingStrategy({ highWaterMark: 4 }).size() === 1, "CountQueuingStrategy size mismatch");
 assert(new ByteLengthQueuingStrategy({ highWaterMark: 4 }).size(new Uint8Array(3)) === 3, "ByteLengthQueuingStrategy size mismatch");
-assert(new CompressionStream("gzip").format === "gzip", "CompressionStream format mismatch");
-assert(new DecompressionStream("gzip").format === "gzip", "DecompressionStream format mismatch");
+// Node exposes no .format property; constructing with a bad format throws.
+assert(new CompressionStream("gzip") instanceof TransformStream, "CompressionStream construct mismatch");
+assert(new DecompressionStream("gzip") instanceof TransformStream, "DecompressionStream construct mismatch");
 async function collectWebBytes(stream: ReadableStream) {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -268,15 +288,21 @@ async function collectWebBytes(stream: ReadableStream) {
 }
 const compression = new CompressionStream("gzip");
 const compressionWriter = compression.writable.getWriter();
-await compressionWriter.write(new TextEncoder().encode("compressed-web-stream"));
-await compressionWriter.close();
+const compressionDone = Promise.all([
+  compressionWriter.write(new TextEncoder().encode("compressed-web-stream")),
+  compressionWriter.close(),
+]);
 const compressedBytes = await collectWebBytes(compression.readable);
+await compressionDone;
 assert(compressedBytes.byteLength > 0, "CompressionStream gzip output mismatch");
 const decompression = new DecompressionStream("gzip");
 const decompressionWriter = decompression.writable.getWriter();
-await decompressionWriter.write(compressedBytes);
-await decompressionWriter.close();
+const decompressionDone = Promise.all([
+  decompressionWriter.write(compressedBytes),
+  decompressionWriter.close(),
+]);
 assert(new TextDecoder().decode(await collectWebBytes(decompression.readable)) === "compressed-web-stream", "DecompressionStream gzip mismatch");
+await decompressionDone;
 assert(typeof ReadableByteStreamController === "function", "ReadableByteStreamController missing");
 assert(typeof ReadableStreamBYOBReader === "function", "ReadableStreamBYOBReader missing");
 assert(typeof ReadableStreamBYOBRequest === "function", "ReadableStreamBYOBRequest missing");

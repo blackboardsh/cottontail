@@ -228,6 +228,7 @@ export class TLSSocket extends Socket {
     this._session = bufferFromNativeBytes(options?.session);
     this._renegotiationDisabled = false;
     this.allowHalfOpen = options?.allowHalfOpen === true;
+    this.connecting = true;
   }
 
   _attachNative(native, connectedEvent = "secureConnect") {
@@ -237,10 +238,12 @@ export class TLSSocket extends Socket {
     this.destroyed = false;
     this.readable = true;
     this.writable = true;
+    this.connecting = false;
     this._setAddressInfo(native.local, native.remote);
     this.authorized = true;
     this.authorizationError = null;
     queueMicrotask(() => {
+      this._flushPendingWrites?.();
       this.emit("connect");
       this.emit(connectedEvent);
       this._startTlsRead();
@@ -266,7 +269,7 @@ export class TLSSocket extends Socket {
         const length = Number(chunk?.byteLength ?? chunk?.length ?? 0);
         if (length > 0) {
           this.bytesRead += length;
-          this.emit("data", chunk);
+          this._emitData(chunk);
           this._refreshTimeout?.();
         }
         return;
@@ -274,8 +277,7 @@ export class TLSSocket extends Socket {
       if (event.type === "end") {
         this.readable = false;
         listeners.delete(this._tlsId);
-        this.emit("end");
-        if (!this.allowHalfOpen) this.destroy();
+        this._emitEnd();
         return;
       }
       if (event.type === "error") {
@@ -291,6 +293,10 @@ export class TLSSocket extends Socket {
     if (typeof encoding === "function") {
       callback = encoding;
       encoding = undefined;
+    }
+    if (this.connecting && this._tlsId == null && !this.destroyed && this.writable) {
+      this._pendingWrites.push({ chunk, encoding, callback });
+      return true;
     }
     if (this.destroyed || this._tlsId == null || !this.writable) {
       const error = new Error("TLS socket is closed");
@@ -310,11 +316,19 @@ export class TLSSocket extends Socket {
   }
 
   end(chunk = undefined, encoding = undefined, callback = undefined) {
-    if (typeof chunk === "function") callback = chunk;
-    else if (typeof encoding === "function") callback = encoding;
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
     if (chunk != null) this.write(chunk, encoding);
     this.writable = false;
-    this.emit("finish");
+    if (!this._finishEmitted) {
+      this._finishEmitted = true;
+      this.emit("finish");
+    }
     if (this._tlsId != null) {
       try { cottontail.tlsConnectionShutdown(this._tlsId); } catch {}
     }
@@ -426,7 +440,7 @@ export class Server extends NetServer {
         this._tlsAddress = native.address ?? null;
         this.listening = true;
         this._tlsAcceptTimer = setInterval(() => this._acceptTls(), 1);
-        this.emit("listening");
+        this.emit("listening", undefined, this._tlsAddress?.address, Number(this._tlsAddress?.port ?? 0));
       } catch (error) {
         this.emit("error", error);
       }
@@ -492,6 +506,7 @@ export function connect(...args) {
     } catch (error) {
       socket.authorized = false;
       socket.authorizationError = error?.message ?? String(error);
+      socket.connecting = false;
       socket.destroy(error);
     }
   });

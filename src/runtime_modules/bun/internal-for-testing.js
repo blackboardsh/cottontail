@@ -577,19 +577,129 @@ export function canonicalizeIP(value) {
   return String(value).toLowerCase();
 }
 
+// COTTONTAIL-COMPAT: bun:internal-for-testing - Bun-private hooks without a
+// Cottontail equivalent surface as call-time errors so importing files still
+// bundle; implement real behavior per hook as coverage requires it.
+function unimplementedInternal(name) {
+  return new Proxy(function () {
+    throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);
+  }, {
+    get(target, property) {
+      if (property === Symbol.toPrimitive || property === "toString") return () => `[${name}]`;
+      if (property in Function.prototype) return Reflect.get(target, property);
+      return unimplementedInternal(`${name}.${String(property)}`);
+    },
+  });
+}
+
+export function isArchitectureMatch(architectures) {
+  const list = Array.isArray(architectures) ? architectures : [architectures];
+  const current = cottontail.arch?.() ?? "arm64";
+  let matched = list.length === 0;
+  for (const entry of list.map(String)) {
+    if (entry.startsWith("!")) {
+      if (entry.slice(1) === current) return false;
+      matched = true;
+    } else if (entry === current || entry === "none") {
+      matched = true;
+    }
+  }
+  return matched;
+}
+
+export function isOperatingSystemMatch(platforms) {
+  const list = Array.isArray(platforms) ? platforms : [platforms];
+  const current = cottontail.platform?.() ?? "darwin";
+  let matched = list.length === 0;
+  for (const entry of list.map(String)) {
+    if (entry.startsWith("!")) {
+      if (entry.slice(1) === current) return false;
+      matched = true;
+    } else if (entry === current || entry === "none") {
+      matched = true;
+    }
+  }
+  return matched;
+}
+
+export function escapePowershell(value) {
+  return String(value).replace(/"/g, '""').replace(/`/g, "``");
+}
+
+export class Dequeue {
+  constructor() {
+    this._items = [];
+    this._head = 0;
+  }
+  get length() { return this._items.length - this._head; }
+  size() { return this.length; }
+  isEmpty() { return this.length === 0; }
+  isNotEmpty() { return this.length > 0; }
+  push(item) { this._items.push(item); }
+  shift() {
+    if (this.isEmpty()) return undefined;
+    const item = this._items[this._head];
+    this._items[this._head] = undefined;
+    this._head += 1;
+    if (this._head > 64 && this._head * 2 > this._items.length) {
+      this._items = this._items.slice(this._head);
+      this._head = 0;
+    }
+    return item;
+  }
+  peek() { return this.isEmpty() ? undefined : this._items[this._head]; }
+}
+
+export function getDevServerDeinitCount() {
+  return 0;
+}
+
+export function memfd_create() {
+  const error = new Error("memfd_create is only available on Linux");
+  error.code = "ENOSYS";
+  throw error;
+}
+
+export function setSyntheticAllocationLimitForTesting(_limit) {
+  return undefined;
+}
+
+export const getEventLoopStats = unimplementedInternal("getEventLoopStats");
+export const install_test_helpers = unimplementedInternal("install_test_helpers");
+export const upgrade_test_helpers = unimplementedInternal("upgrade_test_helpers");
+export const crash_handler = unimplementedInternal("crash_handler");
+export const bindgen = unimplementedInternal("bindgen");
+export const frameworkRouterInternals = unimplementedInternal("frameworkRouterInternals");
+export const hostedGitInfo = unimplementedInternal("hostedGitInfo");
+export const readTarball = unimplementedInternal("readTarball");
+
 export default {
+  Dequeue,
+  bindgen,
+  getEventLoopStats,
   canonicalizeIP,
+  crash_handler,
   createSocketPair,
   cssInternals,
   decodeURIComponentSIMD,
+  escapePowershell,
   escapeRegExp,
   escapeRegExpForPackageNameMatching,
+  frameworkRouterInternals,
+  getDevServerDeinitCount,
   hasNonReifiedStatic,
   highlightJavaScript,
+  hostedGitInfo,
   iniInternals,
+  install_test_helpers,
+  isArchitectureMatch,
   isModuleResolveFilenameSlowPathEnabled,
+  isOperatingSystemMatch,
   jscInternals,
   patchInternals,
+  readTarball,
   setSocketOptions,
+  setSyntheticAllocationLimitForTesting,
   shellInternals,
+  upgrade_test_helpers,
 };

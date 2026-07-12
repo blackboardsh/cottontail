@@ -1,9 +1,11 @@
 import constantsObject from "./constants.js";
 import { Buffer } from "./buffer.js";
+import { Transform, Writable } from "./stream.js";
 
 const supportedHashes = [
   "md4",
   "md5",
+  "md5-sha1",
   "ripemd160",
   "sha1",
   "sha224",
@@ -24,6 +26,7 @@ const supportedHashes = [
 const hashOutputLengths = {
   md4: 16,
   md5: 16,
+  "md5-sha1": 36,
   ripemd160: 20,
   sha1: 20,
   sha224: 28,
@@ -77,6 +80,14 @@ const ed25519StreamErrorMessage = "Unsupported crypto operation";
 const supportedNativeEcCurves = ["secp256k1", "secp384r1", "secp521r1"];
 const smallPrimeBases = [2n, 3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n, 37n];
 const dhGroupPrimes = {
+  // RFC 3526 1536-bit MODP group (group 5).
+  modp5: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08" +
+    "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B" +
+    "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9" +
+    "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6" +
+    "49286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8" +
+    "FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D" +
+    "670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
   modp14: "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08" +
     "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B" +
     "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9" +
@@ -150,6 +161,7 @@ function normalizeAlgorithm(algorithm) {
   if (normalized === "sha128") return "sha1";
   if (normalized === "sha512224") return "sha512-224";
   if (normalized === "sha512256") return "sha512-256";
+  if (normalized === "md5sha1" || normalized === "ssl3md5sha1") return "md5-sha1";
   if (normalized.endsWith("sha1")) return "sha1";
   if (normalized.endsWith("sha224")) return "sha224";
   if (normalized.endsWith("sha256")) return "sha256";
@@ -436,6 +448,9 @@ function digestBytes(algorithm, data, outputLength = undefined) {
   if (!supportedHashes.includes(normalized)) {
     throw new Error(`Digest algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
+  if (normalized === "md5-sha1") {
+    return concatBytes([digestBytes("md5", data), digestBytes("sha1", data)]);
+  }
   if (normalized === "md4") return md4Digest(data);
   if (typeof cottontail.cryptoHashSync !== "function") {
     throw new Error("native crypto hashing is unavailable");
@@ -490,22 +505,99 @@ function cipherInfoForName(name) {
   return supportedCipherMap[normalized] ?? nativeCipherInfo(normalized) ?? nativeCipherInfo(name);
 }
 
+// WHATWG-compliant UTF-8 decode with U+FFFD replacement, matching
+// Buffer.prototype.toString("utf8") in Node.js. Implemented locally because
+// the host TextDecoder is not spec-compliant for invalid sequences.
+function utf8DecodeWithReplacement(bytes) {
+  let out = "";
+  let index = 0;
+  const length = bytes.length;
+  while (index < length) {
+    const byte = bytes[index];
+    if (byte < 0x80) {
+      out += String.fromCharCode(byte);
+      index += 1;
+      continue;
+    }
+    let needed = 0;
+    let codePoint = 0;
+    let lowerBoundary = 0x80;
+    let upperBoundary = 0xbf;
+    if (byte >= 0xc2 && byte <= 0xdf) {
+      needed = 1;
+      codePoint = byte & 0x1f;
+    } else if (byte >= 0xe0 && byte <= 0xef) {
+      if (byte === 0xe0) lowerBoundary = 0xa0;
+      if (byte === 0xed) upperBoundary = 0x9f;
+      needed = 2;
+      codePoint = byte & 0x0f;
+    } else if (byte >= 0xf0 && byte <= 0xf4) {
+      if (byte === 0xf0) lowerBoundary = 0x90;
+      if (byte === 0xf4) upperBoundary = 0x8f;
+      needed = 3;
+      codePoint = byte & 0x07;
+    } else {
+      out += "�";
+      index += 1;
+      continue;
+    }
+    index += 1;
+    let failed = false;
+    for (let seen = 0; seen < needed; seen += 1) {
+      if (index >= length) {
+        failed = true;
+        break;
+      }
+      const next = bytes[index];
+      const lower = seen === 0 ? lowerBoundary : 0x80;
+      const upper = seen === 0 ? upperBoundary : 0xbf;
+      if (next < lower || next > upper) {
+        failed = true;
+        break;
+      }
+      codePoint = (codePoint << 6) | (next & 0x3f);
+      index += 1;
+    }
+    if (failed) {
+      out += "�";
+      continue;
+    }
+    out += String.fromCodePoint(codePoint);
+  }
+  return out;
+}
+
 function encodeDigest(bytes, encoding = "buffer") {
   if (encoding == null || encoding === "buffer") {
     return bufferFromBytes(bytes);
   }
-  if (encoding === "hex") return hexFromBytes(bytes);
-  if (encoding === "base64" || encoding === "base64url") {
+  const normalized = String(encoding).toLowerCase();
+  if (normalized === "hex") return hexFromBytes(bytes);
+  if (normalized === "base64" || normalized === "base64url") {
     const base64 = Buffer?.from
       ? Buffer.from(bytes).toString("base64")
       : btoa(String.fromCharCode(...bytes));
-    return encoding === "base64url" ? base64UrlFromBase64(base64) : base64;
+    return normalized === "base64url" ? base64UrlFromBase64(base64) : base64;
   }
-  if (encoding === "latin1" || encoding === "binary") {
+  if (normalized === "latin1" || normalized === "binary") {
     return String.fromCharCode(...bytes);
   }
-  if (encoding === "utf8" || encoding === "utf-8") {
-    return new TextDecoder().decode(bytes);
+  if (normalized === "ascii") {
+    let out = "";
+    for (let index = 0; index < bytes.length; index += 1) out += String.fromCharCode(bytes[index] & 0x7f);
+    return out;
+  }
+  if (normalized === "utf8" || normalized === "utf-8") {
+    return utf8DecodeWithReplacement(bytes);
+  }
+  if (normalized === "ucs2" || normalized === "ucs-2" || normalized === "utf16le" || normalized === "utf-16le") {
+    // Decode as little-endian UTF-16 code units; a trailing odd byte is
+    // discarded, matching Buffer.prototype.toString("ucs2") in Node.js.
+    let out = "";
+    for (let index = 0; index + 1 < bytes.length; index += 2) {
+      out += String.fromCharCode(bytes[index] | (bytes[index + 1] << 8));
+    }
+    return out;
   }
   throw new TypeError(`Invalid digest encoding: ${encoding}`);
 }
@@ -1688,6 +1780,21 @@ function cryptoFeatureError(name) {
   throw new Error(`${name} is unavailable in this Cottontail build`);
 }
 
+function nodeCryptoError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  return error;
+}
+
+function describeReceivedValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "object") return `an instance of ${value.constructor?.name ?? "Object"}`;
+  if (type === "string") return `type string ('${value}')`;
+  return `type ${type} (${String(value)})`;
+}
+
 function assertNativeCipher() {
   if (typeof cottontail.cryptoCipherCreate !== "function" ||
       typeof cottontail.cryptoCipherUpdate !== "function" ||
@@ -1822,8 +1929,34 @@ function scryptOptions(options = {}) {
   return { N, r, p };
 }
 
-export class Hash {
+// The events shim may invoke listeners without binding `this` to the
+// emitter. readable-stream registers a plain-function 'prefinish' listener
+// that dereferences `this`, so rebind any internal listeners explicitly.
+function rebindStreamInternalListeners(stream) {
+  if (typeof stream.listeners !== "function") return;
+  for (const event of ["prefinish"]) {
+    const fns = stream.listeners(event);
+    if (fns.length === 0) continue;
+    stream.removeAllListeners(event);
+    for (const fn of fns) stream.on(event, fn.bind(stream));
+  }
+}
+
+function streamInputEncoding(instance, chunk, encoding) {
+  let inputEncoding = encoding && encoding !== "buffer" ? encoding : undefined;
+  if (inputEncoding === undefined && typeof chunk === "string") {
+    inputEncoding = instance._streamDefaultEncoding;
+  }
+  return inputEncoding;
+}
+
+export class Hash extends Transform {
   constructor(algorithm, options = undefined) {
+    super(options && typeof options === "object" ? options : {});
+    // The stream shim assigns instance `_transform = null` when no transform
+    // option is given, shadowing the prototype method; remove the shadow.
+    if (this._transform === null) delete this._transform;
+    rebindStreamInternalListeners(this);
     this.algorithm = normalizeAlgorithm(algorithm);
     const requestedOutputLength = options && typeof options === "object" ? options.outputLength : undefined;
     this.outputLength = requestedOutputLength == null
@@ -1831,6 +1964,9 @@ export class Hash {
       : positiveInteger(requestedOutputLength, "outputLength");
     this.chunks = [];
     this.finished = false;
+    this._streamDefaultEncoding = options && typeof options === "object" && options.defaultEncoding
+      ? options.defaultEncoding
+      : undefined;
   }
 
   update(data, inputEncoding = undefined) {
@@ -1850,14 +1986,30 @@ export class Hash {
     next.chunks = this.chunks.map((chunk) => new Uint8Array(chunk));
     return next;
   }
+
+  _transform(chunk, encoding, callback) {
+    this.update(chunk, streamInputEncoding(this, chunk, encoding));
+    callback();
+  }
+
+  _flush(callback) {
+    this.push(this.digest());
+    callback();
+  }
 }
 
-export class Hmac {
-  constructor(algorithm, key) {
+export class Hmac extends Transform {
+  constructor(algorithm, key, options = undefined) {
+    super(options && typeof options === "object" ? options : {});
+    if (this._transform === null) delete this._transform;
+    rebindStreamInternalListeners(this);
     this.algorithm = normalizeAlgorithm(algorithm);
     this.key = bytesFromData(key);
     this.chunks = [];
     this.finished = false;
+    this._streamDefaultEncoding = options && typeof options === "object" && options.defaultEncoding
+      ? options.defaultEncoding
+      : undefined;
   }
 
   update(data, inputEncoding = undefined) {
@@ -1870,6 +2022,16 @@ export class Hmac {
     if (this.finished) throw new Error("Digest already called");
     this.finished = true;
     return encodeDigest(hmacBytes(this.algorithm, this.key, concatBytes(this.chunks)), encoding ?? "buffer");
+  }
+
+  _transform(chunk, encoding, callback) {
+    this.update(chunk, streamInputEncoding(this, chunk, encoding));
+    callback();
+  }
+
+  _flush(callback) {
+    this.push(this.digest());
+    callback();
   }
 }
 
@@ -2165,6 +2327,8 @@ export class DiffieHellman {
     this.generator = params.generator;
     this.privateKey = randomDhPrivateKey(this.prime);
     this.publicKey = undefined;
+    // Own property (not on the prototype), matching Node.js semantics.
+    this.verifyError = 0;
   }
 
   computeSecret(otherPublicKey, inputEncoding = undefined, outputEncoding = undefined) {
@@ -2216,6 +2380,9 @@ export class DiffieHellmanGroup extends DiffieHellman {
     if (!prime) throw new TypeError(`Unknown Diffie-Hellman group: ${name}`);
     super(prime, "hex", 2);
     this.name = normalized;
+    // BoringSSL reports DH_NOT_SUITABLE_GENERATOR (8) for the well-known
+    // MODP groups since they are not generated with DH_generate_parameters.
+    this.verifyError = 8;
   }
 }
 
@@ -2258,8 +2425,11 @@ export class Certificate {
   }
 }
 
-class CipherBase {
+class CipherBase extends Transform {
   constructor(algorithm, key, iv, options = {}, encrypt = true) {
+    super(options && typeof options === "object" ? options : {});
+    if (this._transform === null) delete this._transform;
+    rebindStreamInternalListeners(this);
     this.algorithm = normalizeCipherName(algorithm);
     this.info = cipherInfoForName(this.algorithm);
     if (!this.info) throw new TypeError(`Unknown cipher algorithm: ${algorithm}`);
@@ -2298,6 +2468,14 @@ class CipherBase {
   }
 
   update(data, inputEncoding = undefined, outputEncoding = undefined) {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' +
+          describeReceivedValue(data),
+      );
+    }
     const bytes = bytesFromData(data, inputEncoding);
     const output = new Uint8Array(cottontail.cryptoCipherUpdate(this._ensureCipher(), bytes));
     return encodeDigest(output, outputEncoding ?? "buffer");
@@ -2340,6 +2518,23 @@ class CipherBase {
     if (this.id != null) throw new Error("setAutoPadding must be called before cipher update");
     this.autoPadding = Boolean(autoPadding);
     return this;
+  }
+
+  _transform(chunk, encoding, callback) {
+    try {
+      callback(null, this.update(chunk, encoding && encoding !== "buffer" ? encoding : undefined));
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  _flush(callback) {
+    try {
+      this.push(this.final());
+      callback();
+    } catch (error) {
+      callback(error);
+    }
   }
 }
 
@@ -2457,8 +2652,12 @@ export class ECDH {
   }
 }
 
-export class Sign {
-  constructor(algorithm) {
+export class Sign extends Writable {
+  constructor(algorithm, options = undefined) {
+    super(options && typeof options === "object" ? options : {});
+    // The stream shim assigns instance `_write = null` when no write option is
+    // given, shadowing the prototype method; remove the shadow.
+    if (this._write === null) delete this._write;
     this.algorithm = String(algorithm);
     this.chunks = [];
   }
@@ -2468,8 +2667,9 @@ export class Sign {
     return this;
   }
 
-  end() {
-    return this;
+  _write(chunk, encoding, callback) {
+    this.update(chunk, encoding && encoding !== "buffer" ? encoding : undefined);
+    callback();
   }
 
   sign(privateKey, outputEncoding = undefined) {
@@ -2489,8 +2689,10 @@ export class Sign {
   }
 }
 
-export class Verify {
-  constructor(algorithm) {
+export class Verify extends Writable {
+  constructor(algorithm, options = undefined) {
+    super(options && typeof options === "object" ? options : {});
+    if (this._write === null) delete this._write;
     this.algorithm = String(algorithm);
     this.chunks = [];
   }
@@ -2500,8 +2702,9 @@ export class Verify {
     return this;
   }
 
-  end() {
-    return this;
+  _write(chunk, encoding, callback) {
+    this.update(chunk, encoding && encoding !== "buffer" ? encoding : undefined);
+    callback();
   }
 
   verify(publicKey, signature, signatureEncoding = undefined) {
@@ -2637,11 +2840,57 @@ export function createHash(algorithm, options = undefined) {
   return new Hash(algorithm, options);
 }
 
-export function createHmac(algorithm, key) {
-  return new Hmac(algorithm, key);
+export function createHmac(algorithm, key, options = undefined) {
+  return new Hmac(algorithm, key, options);
 }
 
+const validDigestOutputEncodings = new Set([
+  "buffer",
+  "hex",
+  "base64",
+  "base64url",
+  "latin1",
+  "binary",
+  "ascii",
+  "utf8",
+  "utf-8",
+  "ucs2",
+  "ucs-2",
+  "utf16le",
+  "utf-16le",
+]);
+
 export function hash(algorithm, data, outputEncoding = "hex") {
+  if (typeof algorithm !== "string") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "algorithm" argument must be of type string. Received ${data === null ? "null" : typeof algorithm}`,
+    );
+  }
+  if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      'The "input" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received ' +
+        (data === null ? "null" : typeof data),
+    );
+  }
+  if (outputEncoding === undefined) outputEncoding = "hex";
+  if (typeof outputEncoding !== "string") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "outputEncoding" argument must be of type string. Received ${outputEncoding === null ? "null" : typeof outputEncoding}`,
+    );
+  }
+  if (!validDigestOutputEncodings.has(String(outputEncoding).toLowerCase())) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_VALUE",
+      `The argument 'outputEncoding' is invalid. Received '${outputEncoding}'`,
+    );
+  }
   return encodeDigest(digestBytes(algorithm, bytesFromData(data), hashOutputLengths[normalizeAlgorithm(algorithm)]), outputEncoding);
 }
 
@@ -2746,7 +2995,10 @@ export function checkPrime(candidate, options = undefined, callback = undefined)
 
 export function generatePrimeSync(size, options = {}) {
   const prime = generatePrimeBigint(size, options);
-  return options?.bigint ? prime : bufferFromBytes(bytesFromBigint(prime, Math.ceil(Number(size) / 8)));
+  if (options?.bigint) return prime;
+  // Node.js returns an ArrayBuffer (not a Buffer) for generatePrime(Sync).
+  const bytes = bytesFromBigint(prime, Math.ceil(Number(size) / 8));
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
 export function generatePrime(size, options = undefined, callback = undefined) {
@@ -2754,7 +3006,17 @@ export function generatePrime(size, options = undefined, callback = undefined) {
     callback = options;
     options = {};
   }
-  callbackify(() => generatePrimeSync(size, options ?? {}), callback);
+  if (typeof callback !== "function") throw new TypeError("callback must be a function");
+  queueMicrotask(() => {
+    let prime;
+    try {
+      prime = generatePrimeSync(size, options ?? {});
+    } catch (error) {
+      callback(error);
+      return;
+    }
+    callback(undefined, prime);
+  });
 }
 
 export function createDiffieHellman(primeOrLength, keyEncodingOrGenerator = undefined, generator = undefined, generatorEncoding = undefined) {
@@ -2997,6 +3259,13 @@ export function sign(algorithm, data, key) {
 }
 
 export function verify(algorithm, data, key, signature) {
+  if (!ArrayBuffer.isView(signature)) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "signature" argument must be an instance of Buffer, TypedArray, or DataView. Received ${describeReceivedValue(signature)}`,
+    );
+  }
   const dsaEncoding = normalizeDsaEncoding(key);
   const options = key && typeof key === "object" && key.key != null ? key : undefined;
   const publicKey = keyObjectFromInput(keyInputFromSignOptions(key), "public");
@@ -3076,13 +3345,29 @@ export function secureHeapUsed() {
   return { total: 0, used: 0, utilization: 0, min: 0 };
 }
 
-export function randomBytes(size) {
+export function randomBytes(size, callback = undefined) {
   const length = Number(size) || 0;
   if (length < 0 || !Number.isFinite(length)) {
     throw new RangeError("randomBytes size must be a non-negative finite number");
   }
   if (typeof cottontail.randomBytes !== "function") {
     throw new Error("native randomBytes is unavailable");
+  }
+  if (callback !== undefined && typeof callback !== "function") {
+    throw nodeCryptoError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function');
+  }
+  if (typeof callback === "function") {
+    queueMicrotask(() => {
+      let bytes;
+      try {
+        bytes = bufferFromBytes(cottontail.randomBytes(length));
+      } catch (error) {
+        callback(error);
+        return;
+      }
+      callback(null, bytes);
+    });
+    return;
   }
   return bufferFromBytes(cottontail.randomBytes(length));
 }
@@ -3126,29 +3411,56 @@ export function randomFill(buffer, offset = 0, size = undefined, callback = unde
   });
 }
 
+const RANDOM_INT_MAX_RANGE = 281474976710655; // 2 ** 48 - 1
+
 export function randomInt(min, max = undefined, callback = undefined) {
   if (typeof max === "function") {
     callback = max;
     max = min;
     min = 0;
-  }
-  if (max == null) {
+  } else if (max === undefined) {
     max = min;
     min = 0;
   }
-  const low = Math.ceil(Number(min));
-  const high = Math.floor(Number(max));
-  if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high) || high <= low) {
-    throw new RangeError("randomInt requires a valid integer range");
+  if (callback !== undefined && typeof callback !== "function") {
+    throw nodeCryptoError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function');
   }
-  const range = high - low;
-  const bytes = randomBytes(6);
-  let value = 0;
-  for (const byte of bytes) value = value * 256 + byte;
-  const result = low + (value % range);
+  if (typeof min !== "number" || !Number.isSafeInteger(min)) {
+    throw nodeCryptoError(TypeError, "ERR_INVALID_ARG_TYPE", `The "min" argument must be a safe integer. Received ${min}`);
+  }
+  if (typeof max !== "number" || !Number.isSafeInteger(max)) {
+    throw nodeCryptoError(TypeError, "ERR_INVALID_ARG_TYPE", `The "max" argument must be a safe integer. Received ${max}`);
+  }
+  if (max <= min) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "max" is out of range. It must be greater than the value of "min" (${min}). Received ${max}`,
+    );
+  }
+  const range = max - min;
+  if (range > RANDOM_INT_MAX_RANGE) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "max - min" is out of range. It must be <= ${RANDOM_INT_MAX_RANGE}. Received ${range}`,
+    );
+  }
+  // Rejection sampling over 48 random bits to avoid modulo bias.
+  const limit = 2 ** 48 - ((2 ** 48) % range);
+  let result;
+  for (;;) {
+    const bytes = randomBytes(6);
+    let value = 0;
+    for (const byte of bytes) value = value * 256 + byte;
+    if (value < limit) {
+      result = min + (value % range);
+      break;
+    }
+  }
   if (typeof callback === "function") {
-    queueMicrotask(() => callback(null, result));
-    return;
+    queueMicrotask(() => callback(undefined, result));
+    return undefined;
   }
   return result;
 }
@@ -3620,6 +3932,8 @@ const subtleCrypto = {
   async sign(algorithm, key, data) {
     const cryptoKey = assertCryptoKey(key, "sign");
     const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+    // WebCrypto accepts any BufferSource; node's sign() rejects raw ArrayBuffers.
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
     if (cryptoKey.type === "secret" && cryptoKey.algorithm.name === "HMAC") {
       return arrayBufferFromBytes(hmacBytes(webcryptoHashName(cryptoKey.algorithm.hash), cryptoKey.material, bytesFromData(data)));
     }
@@ -3648,6 +3962,10 @@ const subtleCrypto = {
   async verify(algorithm, key, signature, data) {
     const cryptoKey = assertCryptoKey(key, "verify");
     const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+    // WebCrypto accepts any BufferSource; node's verify() rejects raw
+    // ArrayBuffers, so normalize at this boundary.
+    if (signature instanceof ArrayBuffer) signature = new Uint8Array(signature);
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
     if (cryptoKey.type === "secret" && cryptoKey.algorithm.name === "HMAC") {
       const expected = hmacBytes(webcryptoHashName(cryptoKey.algorithm.hash), cryptoKey.material, bytesFromData(data));
       const actual = bytesFromData(signature);
@@ -3677,6 +3995,8 @@ const subtleCrypto = {
   async encrypt(algorithm, key, data) {
     const cryptoKey = assertCryptoKey(key, "encrypt");
     const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+    // WebCrypto accepts any BufferSource; node primitives reject raw ArrayBuffers.
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
     if (name.startsWith("AES-")) return webcryptoAesEncrypt(algorithm, cryptoKey, data);
     if (name === "RSA-OAEP") {
       return arrayBufferFromBytes(publicEncrypt({
@@ -3692,6 +4012,8 @@ const subtleCrypto = {
   async decrypt(algorithm, key, data) {
     const cryptoKey = assertCryptoKey(key, "decrypt");
     const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+    // WebCrypto accepts any BufferSource; node primitives reject raw ArrayBuffers.
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
     if (name.startsWith("AES-")) return webcryptoAesDecrypt(algorithm, cryptoKey, data);
     if (name === "RSA-OAEP") {
       return arrayBufferFromBytes(privateDecrypt({
@@ -3759,6 +4081,27 @@ export function getFips() {
 
 export function setFips(value) {
   fips = Number(value) ? 1 : 0;
+}
+
+// Bundlers may rename top-level class bindings (e.g. Hash -> Hash2) when the
+// module is inlined next to same-named identifiers; pin the public names.
+for (const [publicName, ctor] of [
+  ["Hash", Hash],
+  ["Hmac", Hmac],
+  ["Sign", Sign],
+  ["Verify", Verify],
+  ["Cipheriv", Cipheriv],
+  ["Decipheriv", Decipheriv],
+  ["DiffieHellman", DiffieHellman],
+  ["DiffieHellmanGroup", DiffieHellmanGroup],
+  ["ECDH", ECDH],
+  ["KeyObject", KeyObject],
+  ["X509Certificate", X509Certificate],
+  ["Certificate", Certificate],
+]) {
+  try {
+    Object.defineProperty(ctor, "name", { value: publicName, configurable: true });
+  } catch {}
 }
 
 export default {

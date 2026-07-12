@@ -1,3 +1,8 @@
+// node:stream/web — WHATWG streams backed by the vendored
+// web-streams-polyfill@4.3.0 (./whatwg.js, MIT licensed), plus Bun's
+// non-standard `type: "direct"` ReadableStream extension and the encoding /
+// compression transform streams.
+import * as whatwg from "./whatwg.js";
 import { Buffer } from "../buffer.js";
 import {
   brotliCompressSync,
@@ -8,16 +13,21 @@ import {
   gzipSync,
   inflateRawSync,
   inflateSync,
+  zstdCompressSync,
+  zstdDecompressSync,
 } from "../zlib.js";
 
 const textEncoder = new TextEncoder();
 
 function bytesFromChunk(chunk) {
   if (chunk == null) return new Uint8Array(0);
-  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
-  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk.slice(0));
+  if (ArrayBuffer.isView(chunk)) {
+    return new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+  }
   if (typeof chunk === "string") return textEncoder.encode(chunk);
-  return Buffer.from(String(chunk));
+  if (typeof chunk === "number") return textEncoder.encode(String(chunk));
+  return textEncoder.encode(String(chunk));
 }
 
 function concatBytes(chunks) {
@@ -31,322 +41,265 @@ function concatBytes(chunks) {
   return out;
 }
 
-export class ReadableStreamDefaultController {
-  constructor(stream) { this._stream = stream; }
-  enqueue(chunk) { this._stream._enqueue(chunk); }
-  close() { this._stream._close(); }
-  error(error) { this._stream._error(error); }
-}
+export const ReadableStreamDefaultController = whatwg.ReadableStreamDefaultController;
+export const ReadableByteStreamController = whatwg.ReadableByteStreamController;
+export const ReadableStreamDefaultReader = whatwg.ReadableStreamDefaultReader;
+export const ReadableStreamBYOBReader = whatwg.ReadableStreamBYOBReader;
+export const ReadableStreamBYOBRequest = whatwg.ReadableStreamBYOBRequest;
+export const WritableStream = whatwg.WritableStream;
+export const WritableStreamDefaultController = whatwg.WritableStreamDefaultController;
+export const WritableStreamDefaultWriter = whatwg.WritableStreamDefaultWriter;
+export const TransformStream = whatwg.TransformStream;
+export const TransformStreamDefaultController = whatwg.TransformStreamDefaultController;
+export const ByteLengthQueuingStrategy = whatwg.ByteLengthQueuingStrategy;
+export const CountQueuingStrategy = whatwg.CountQueuingStrategy;
 
-export class ReadableByteStreamController extends ReadableStreamDefaultController {}
+// ---------------------------------------------------------------------------
+// Bun extension: "direct" ReadableStream. The underlying source's pull()
+// receives a sink with write()/flush()/end()/close() that feeds bytes
+// directly into the stream; when the (possibly async) pull() settles, the
+// stream is closed.
+// ---------------------------------------------------------------------------
+class HTTPResponseSink {
+  #controller;
+  #active = true;
+  #buffered = [];
 
-class HTTPResponseSink extends ReadableStreamDefaultController {
-  constructor(stream) {
-    super(stream);
-    this._active = true;
+  constructor(controller) {
+    this.#controller = controller;
   }
 
-  _assertActive() {
-    if (!this._active) {
+  #assertActive() {
+    if (!this.#active) {
       throw new TypeError(
         'This HTTPResponseSink has already been closed. A "direct" ReadableStream terminates its underlying socket once `async pull()` returns.',
       );
     }
   }
 
+  // Writes within one pull() are coalesced and delivered as a single chunk
+  // on flush()/end()/pull completion, matching Bun's direct streams.
   write(chunk) {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
-    this._assertActive();
-    this._stream._enqueue(bytesFromChunk(chunk));
-    return chunk?.byteLength ?? chunk?.length ?? String(chunk).length;
+    this.#assertActive();
+    const bytes = bytesFromChunk(chunk);
+    if (bytes.byteLength > 0) this.#buffered.push(bytes);
+    return bytes.byteLength;
+  }
+
+  #flushBuffered() {
+    if (this.#buffered.length === 0) return 0;
+    const bytes = concatBytes(this.#buffered);
+    this.#buffered = [];
+    try {
+      this.#controller.enqueue(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    } catch {
+      // already closed or errored
+    }
+    return bytes.byteLength;
   }
 
   flush() {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
-    this._assertActive();
-    return 0;
+    this.#assertActive();
+    return this.#flushBuffered();
   }
 
   end(chunk = undefined) {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
-    this._assertActive();
-    if (chunk !== undefined) this._stream._enqueue(bytesFromChunk(chunk));
+    this.#assertActive();
+    if (chunk !== undefined) this.write(chunk);
     this._finish();
     return Promise.resolve();
   }
 
+  close() {
+    if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
+    this.#assertActive();
+    this._finish();
+  }
+
   _finish() {
-    if (!this._active) return;
-    this._active = false;
-    this._stream._close();
-  }
-}
-
-export class ReadableStream {
-  constructor(underlyingSource = {}) {
-    this._queue = [];
-    this._closed = false;
-    this._errorValue = undefined;
-    this._readers = [];
-    this.locked = false;
-    this._direct = underlyingSource.type === "direct";
-    this._pulling = null;
-    this._controller = this._direct
-      ? new HTTPResponseSink(this)
-      : new ReadableStreamDefaultController(this);
-    if (typeof underlyingSource.start === "function") underlyingSource.start(this._controller);
-    this._pull = underlyingSource.pull;
-    this._cancel = underlyingSource.cancel;
-  }
-
-  _requestPull() {
-    if (this._closed || this._pulling || typeof this._pull !== "function") return;
-    let result;
+    if (!this.#active) return;
+    this.#flushBuffered();
+    this.#active = false;
     try {
-      result = this._pull(this._controller);
-    } catch (error) {
-      this._error(error);
-      return;
+      this.#controller.close();
+    } catch {
+      // already closed or errored
     }
-    this._pulling = Promise.resolve(result).then(
-      () => {
-        this._pulling = null;
-        if (this._direct) this._controller._finish();
-        else if (!this._closed && this._readers.length > 0 && this._queue.length === 0) this._requestPull();
-      },
-      (error) => {
-        this._pulling = null;
-        this._error(error);
-      },
-    );
-  }
-
-  _enqueue(chunk) {
-    if (this._closed) return;
-    const reader = this._readers.shift();
-    if (reader) reader({ value: chunk, done: false });
-    else this._queue.push(chunk);
-  }
-
-  _close() {
-    this._closed = true;
-    while (this._readers.length > 0) this._readers.shift()({ value: undefined, done: true });
   }
 
   _error(error) {
-    this._errorValue = error;
-    this._closed = true;
-    while (this._readers.length > 0) this._readers.shift()(Promise.reject(error));
-  }
-
-  getReader(options = undefined) {
-    this.locked = true;
-    if (options?.mode === "byob") return new ReadableStreamBYOBReader(this);
-    return new ReadableStreamDefaultReader(this);
-  }
-
-  cancel(reason = undefined) {
-    this._closed = true;
-    if (this._direct) this._controller._active = false;
-    return Promise.resolve(this._cancel?.(reason));
-  }
-
-  async *[Symbol.asyncIterator]() {
-    const reader = this.getReader();
+    if (!this.#active) return;
+    this.#active = false;
+    this.#buffered = [];
     try {
+      this.#controller.error(error);
+    } catch {
+      // already closed or errored
+    }
+  }
+
+  _deactivate() {
+    this.#active = false;
+  }
+}
+
+function directUnderlyingSource(underlyingSource) {
+  const pullFn = underlyingSource.pull;
+  const cancelFn = underlyingSource.cancel;
+  const startFn = underlyingSource.start;
+  let sink;
+  let pulled = false;
+  return {
+    start(controller) {
+      sink = new HTTPResponseSink(controller);
+      if (typeof startFn === "function") return startFn.call(underlyingSource, sink);
+    },
+    pull() {
+      if (pulled) return undefined;
+      pulled = true;
+      let result;
+      try {
+        result = typeof pullFn === "function" ? pullFn.call(underlyingSource, sink) : undefined;
+      } catch (error) {
+        sink._error(error);
+        throw error;
+      }
+      return Promise.resolve(result).then(
+        () => {
+          sink._finish();
+        },
+        (error) => {
+          sink._error(error);
+          throw error;
+        },
+      );
+    },
+    cancel(reason) {
+      sink._deactivate();
+      if (typeof cancelFn === "function") return cancelFn.call(underlyingSource, reason);
+      return undefined;
+    },
+  };
+}
+
+// A Proxy keeps instances (including those produced internally by tee(),
+// pipeThrough(), Response bodies, ...) on the polyfill's own prototype while
+// letting us intercept construction for the "direct" extension.
+export const ReadableStream = new Proxy(whatwg.ReadableStream, {
+  construct(target, args, newTarget) {
+    const [underlyingSource, strategy] = args;
+    if (underlyingSource != null && underlyingSource.type === "direct") {
+      const adapted = directUnderlyingSource(underlyingSource);
+      const directStrategy = strategy ?? { highWaterMark: 0 };
+      return Reflect.construct(target, [adapted, directStrategy], newTarget === ReadableStream ? target : newTarget);
+    }
+    return Reflect.construct(target, args, newTarget === ReadableStream ? target : newTarget);
+  },
+});
+
+// Bun extension: reader.readMany() drains every synchronously available
+// chunk in one call.
+if (typeof whatwg.ReadableStreamDefaultReader.prototype.readMany !== "function") {
+  const chunkSize = (chunk) => chunk?.byteLength ?? chunk?.length ?? 0;
+  Object.defineProperty(whatwg.ReadableStreamDefaultReader.prototype, "readMany", {
+    value: async function readMany() {
+      const first = await this.read();
+      if (first.done) return { value: [], size: 0, done: true };
+      const value = [first.value];
+      let size = chunkSize(first.value);
       for (;;) {
-        const item = await reader.read();
-        if (item.done) return;
-        yield item.value;
+        // Only keep reading while the controller queue has chunks ready, so
+        // we never leave a dangling read request.
+        const controller = this._ownerReadableStream?._readableStreamController;
+        if (!controller?._queue?.length) break;
+        const next = await this.read();
+        if (next.done) break;
+        value.push(next.value);
+        size += chunkSize(next.value);
       }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  pipeThrough(transform, options = undefined) {
-    const readable = transform?.readable;
-    const writable = transform?.writable;
-    if (!readable || !writable) throw new TypeError("ReadableStream.pipeThrough requires a transform with readable and writable streams");
-    void this.pipeTo(writable, options);
-    return readable;
-  }
-
-  async pipeTo(destination, options = {}) {
-    const reader = this.getReader();
-    const writer = destination?.getWriter?.();
-    if (!writer) {
-      reader.releaseLock();
-      throw new TypeError("ReadableStream.pipeTo requires a WritableStream destination");
-    }
-    try {
-      for (;;) {
-        const item = await reader.read();
-        if (item.done) break;
-        await writer.write(item.value);
-      }
-      if (options?.preventClose !== true) await writer.close();
-    } catch (error) {
-      if (options?.preventAbort !== true) await writer.abort?.(error);
-      if (options?.preventCancel !== true) await reader.cancel?.(error);
-      throw error;
-    } finally {
-      reader.releaseLock();
-      writer.releaseLock?.();
-    }
-  }
-
-  tee() {
-    const left = new ReadableStream();
-    const right = new ReadableStream();
-    (async () => {
-      const reader = this.getReader();
-      while (true) {
-        const item = await reader.read();
-        if (item.done) break;
-        left._enqueue(item.value);
-        right._enqueue(item.value);
-      }
-      left._close();
-      right._close();
-    })();
-    return [left, right];
-  }
+      return { value, size, done: false };
+    },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
 }
 
-export class ReadableStreamDefaultReader {
-  constructor(stream) { this._stream = stream; }
-  read() {
-    if (this._stream._errorValue) return Promise.reject(this._stream._errorValue);
-    if (this._stream._queue.length > 0) return Promise.resolve({ value: this._stream._queue.shift(), done: false });
-    if (this._stream._closed) return Promise.resolve({ value: undefined, done: true });
-    this._stream._requestPull();
-    if (this._stream._errorValue) return Promise.reject(this._stream._errorValue);
-    if (this._stream._queue.length > 0) return Promise.resolve({ value: this._stream._queue.shift(), done: false });
-    if (this._stream._closed) return Promise.resolve({ value: undefined, done: true });
-    return new Promise((resolve) => this._stream._readers.push(resolve));
-  }
-  releaseLock() { this._stream.locked = false; }
-  cancel(reason = undefined) { return this._stream.cancel(reason); }
-}
+// ---------------------------------------------------------------------------
+// Encoding streams
+// ---------------------------------------------------------------------------
+export class TextEncoderStream extends TransformStream {
+  #encoder = new TextEncoder();
+  #pendingHighSurrogate = null;
 
-export class ReadableStreamBYOBReader extends ReadableStreamDefaultReader {
-  read(view) {
-    if (!ArrayBuffer.isView(view)) return Promise.reject(new TypeError("ReadableStreamBYOBReader.read requires an ArrayBuffer view"));
-    const target = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-    return super.read().then((item) => {
-      if (item.done) return { value: view.subarray ? view.subarray(0, 0) : view, done: true };
-      const bytes = bytesFromChunk(item.value);
-      const count = Math.min(target.byteLength, bytes.byteLength);
-      target.set(bytes.subarray(0, count));
-      if (count < bytes.byteLength) this._stream._queue.unshift(bytes.subarray(count));
-      const value = view.subarray ? view.subarray(0, count) : new Uint8Array(view.buffer, view.byteOffset, count);
-      return { value, done: false };
-    });
-  }
-}
-export class ReadableStreamBYOBRequest {
-  constructor() { this.view = null; }
-  respond() {}
-  respondWithNewView(view) { this.view = view; }
-}
-
-export class WritableStreamDefaultController {
-  constructor(stream) { this._stream = stream; }
-  error(error) { this._stream._errorValue = error; }
-}
-
-export class WritableStream {
-  constructor(underlyingSink = {}) {
-    this._sink = underlyingSink;
-    this._closed = false;
-    this._errorValue = undefined;
-    this.locked = false;
-    this._controller = new WritableStreamDefaultController(this);
-    if (typeof underlyingSink.start === "function") underlyingSink.start(this._controller);
-  }
-
-  getWriter() {
-    this.locked = true;
-    return new WritableStreamDefaultWriter(this);
-  }
-
-  abort(reason = undefined) {
-    this._closed = true;
-    return Promise.resolve(this._sink.abort?.(reason));
-  }
-
-  close() {
-    this._closed = true;
-    return Promise.resolve(this._sink.close?.());
-  }
-}
-
-export class WritableStreamDefaultWriter {
-  constructor(stream) { this._stream = stream; }
-  write(chunk) { return Promise.resolve(this._stream._sink.write?.(chunk, this._stream._controller)); }
-  close() { return this._stream.close(); }
-  abort(reason = undefined) { return this._stream.abort(reason); }
-  releaseLock() { this._stream.locked = false; }
-  get ready() { return Promise.resolve(); }
-  get closed() { return this._stream._closed ? Promise.resolve() : Promise.resolve(); }
-}
-
-export class TransformStreamDefaultController {
-  constructor(stream) { this._stream = stream; }
-  enqueue(chunk) { this._stream._readable._enqueue(chunk); }
-  error(error) { this._stream._readable._error(error); }
-  terminate() { this._stream._readable._close(); }
-}
-
-export class TransformStream {
-  constructor(transformer = {}) {
-    this._readable = new ReadableStream();
-    this._controller = new TransformStreamDefaultController(this);
-    this.readable = this._readable;
-    this.writable = new WritableStream({
-      write: async (chunk) => {
-        if (typeof transformer.transform === "function") {
-          await transformer.transform(chunk, this._controller);
-        } else {
-          this._controller.enqueue(chunk);
+  constructor() {
+    let self;
+    super({
+      transform: (chunk, controller) => {
+        chunk = String(chunk);
+        if (self.#pendingHighSurrogate !== null) {
+          chunk = self.#pendingHighSurrogate + chunk;
+          self.#pendingHighSurrogate = null;
+        }
+        const last = chunk.charCodeAt(chunk.length - 1);
+        if (last >= 0xd800 && last <= 0xdbff) {
+          self.#pendingHighSurrogate = chunk[chunk.length - 1];
+          chunk = chunk.slice(0, -1);
+        }
+        if (chunk.length > 0) controller.enqueue(self.#encoder.encode(chunk));
+      },
+      flush: (controller) => {
+        if (self.#pendingHighSurrogate !== null) {
+          controller.enqueue(new Uint8Array([0xef, 0xbf, 0xbd]));
+          self.#pendingHighSurrogate = null;
         }
       },
-      close: async () => {
-        if (typeof transformer.flush === "function") await transformer.flush(this._controller);
-        this._controller.terminate();
-      },
     });
-    if (typeof transformer.start === "function") transformer.start(this._controller);
+    self = this;
   }
-}
 
-export class ByteLengthQueuingStrategy {
-  constructor(options = {}) { this.highWaterMark = Number(options.highWaterMark ?? 0); }
-  size(chunk) { return Number(chunk?.byteLength ?? chunk?.length ?? 1); }
-}
-
-export class CountQueuingStrategy {
-  constructor(options = {}) { this.highWaterMark = Number(options.highWaterMark ?? 0); }
-  size() { return 1; }
-}
-
-export class TextEncoderStream extends TransformStream {
-  constructor() {
-    const encoder = new TextEncoder();
-    super({ transform(chunk, controller) { controller.enqueue(encoder.encode(String(chunk))); } });
-    this.encoding = "utf-8";
+  get encoding() {
+    return "utf-8";
   }
 }
 
 export class TextDecoderStream extends TransformStream {
-  constructor(encoding = "utf-8") {
-    const decoder = new TextDecoder(encoding);
-    super({ transform(chunk, controller) { controller.enqueue(decoder.decode(chunk)); } });
-    this.encoding = encoding;
+  #decoder;
+
+  constructor(encoding = "utf-8", options = {}) {
+    const decoder = new TextDecoder(encoding, options);
+    super({
+      transform: (chunk, controller) => {
+        const text = decoder.decode(chunk, { stream: true });
+        if (text.length > 0) controller.enqueue(text);
+      },
+      flush: (controller) => {
+        const text = decoder.decode();
+        if (text.length > 0) controller.enqueue(text);
+      },
+    });
+    this.#decoder = decoder;
+  }
+
+  get encoding() {
+    return this.#decoder.encoding;
+  }
+
+  get fatal() {
+    return this.#decoder.fatal;
+  }
+
+  get ignoreBOM() {
+    return this.#decoder.ignoreBOM;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Compression streams (buffered; synchronous codecs from node:zlib)
+// ---------------------------------------------------------------------------
 function compressionMode(format, decompress = false) {
   const normalized = String(format).toLowerCase();
   if (decompress) {
@@ -354,13 +307,23 @@ function compressionMode(format, decompress = false) {
     if (normalized === "deflate") return inflateSync;
     if (normalized === "deflate-raw") return inflateRawSync;
     if (normalized === "br" || normalized === "brotli") return brotliDecompressSync;
+    if (normalized === "zstd") return zstdDecompressSync;
   } else {
     if (normalized === "gzip") return gzipSync;
     if (normalized === "deflate") return deflateSync;
     if (normalized === "deflate-raw") return deflateRawSync;
     if (normalized === "br" || normalized === "brotli") return brotliCompressSync;
+    if (normalized === "zstd") return zstdCompressSync;
   }
   throw new TypeError(`Invalid compression format: ${format}`);
+}
+
+function chunkToBytesStrict(chunk) {
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk.slice(0));
+  if (ArrayBuffer.isView(chunk)) {
+    return new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+  }
+  throw new TypeError("Expected chunk to be an ArrayBuffer or an ArrayBuffer view");
 }
 
 export class CompressionStream extends TransformStream {
@@ -368,8 +331,13 @@ export class CompressionStream extends TransformStream {
     const chunks = [];
     const transform = compressionMode(format, false);
     super({
-      transform(chunk) { chunks.push(bytesFromChunk(chunk)); },
-      flush(controller) { controller.enqueue(transform(concatBytes(chunks))); },
+      transform(chunk) {
+        chunks.push(chunkToBytesStrict(chunk));
+      },
+      flush(controller) {
+        const output = transform(concatBytes(chunks));
+        controller.enqueue(new Uint8Array(output.buffer, output.byteOffset, output.byteLength));
+      },
     });
     this.format = String(format);
   }
@@ -380,8 +348,13 @@ export class DecompressionStream extends TransformStream {
     const chunks = [];
     const transform = compressionMode(format, true);
     super({
-      transform(chunk) { chunks.push(bytesFromChunk(chunk)); },
-      flush(controller) { controller.enqueue(transform(concatBytes(chunks))); },
+      transform(chunk) {
+        chunks.push(chunkToBytesStrict(chunk));
+      },
+      flush(controller) {
+        const output = transform(concatBytes(chunks));
+        controller.enqueue(new Uint8Array(output.buffer, output.byteOffset, output.byteLength));
+      },
     });
     this.format = String(format);
   }

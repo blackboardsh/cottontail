@@ -1,0 +1,381 @@
+// Regenerates ./readable-stream.js from readable-stream@4.7.0.
+//
+// Usage (needs network access and esbuild installed nearby):
+//   node readable-stream.build.mjs [outfile]
+//
+// Downloads readable-stream via `npm pack` into a temp dir, applies the
+// Cottontail compat patches below, and bundles a single ESM file whose only
+// imports are ../events.js, ../buffer.js and ../string_decoder.js.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execSync } from "node:child_process";
+
+const HERE = path.dirname(new URL(import.meta.url).pathname);
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), "readable-stream-build-"));
+
+let esbuild;
+try {
+  esbuild = await import("esbuild");
+} catch {
+  execSync("npm i esbuild@0.28.1 --prefix .", { cwd: SCRATCH, stdio: "inherit" });
+  esbuild = await import(path.join(SCRATCH, "node_modules/esbuild/lib/main.js"));
+  esbuild = esbuild.default ?? esbuild;
+}
+execSync("npm pack readable-stream@4.7.0", { cwd: SCRATCH, stdio: "inherit" });
+execSync("tar xzf readable-stream-4.7.0.tgz", { cwd: SCRATCH, stdio: "inherit" });
+const PKG = path.join(SCRATCH, "package");
+const OUT = process.argv[2] ?? path.join(HERE, "readable-stream.js");
+
+// Entry: readable-stream's full custom stream (Node core port) + promises.
+const entrySource = `
+import Stream from ${JSON.stringify(path.join(PKG, "lib/stream.js"))};
+export default Stream;
+`;
+
+const shims = {
+  "process/": `
+    var p = globalThis.process;
+    if (!p) {
+      p = { env: {}, nextTick: function (cb) { var a = [].slice.call(arguments, 1); queueMicrotask(function () { cb.apply(null, a); }); } };
+    }
+    module.exports = p;
+  `,
+  "abort-controller": `
+    // Lazy shims: the runtime installs globalThis.AbortController/AbortSignal
+    // after this module is evaluated, so delegate at construction/access time.
+    class AbortControllerShim {
+      constructor() {
+        return new globalThis.AbortController();
+      }
+    }
+    const AbortSignalShim = {
+      get any() {
+        const ctor = globalThis.AbortSignal;
+        return ctor && ctor.any ? ctor.any.bind(ctor) : undefined;
+      },
+      get abort() {
+        const ctor = globalThis.AbortSignal;
+        return ctor && ctor.abort ? ctor.abort.bind(ctor) : undefined;
+      },
+      get timeout() {
+        const ctor = globalThis.AbortSignal;
+        return ctor && ctor.timeout ? ctor.timeout.bind(ctor) : undefined;
+      },
+    };
+    module.exports = { AbortController: AbortControllerShim, AbortSignal: AbortSignalShim };
+  `,
+  events: `
+    // The runtime EventEmitter is an ES class, which cannot be invoked via
+    // EE.call(this) the way readable-stream's function constructors do.
+    // Provide a callable constructor sharing the same prototype.
+    function EventEmitter(options) {
+      this._events = new Map();
+      this._maxListeners = undefined;
+      this.captureRejections = Boolean(options && options.captureRejections);
+    }
+    // Use an intermediate prototype (instanceof runtime EventEmitter still
+    // holds) so we can pin non-virtual removeListener/off: the runtime's
+    // EventEmitter.removeListener delegates to this.off, which the stream
+    // prototypes alias back to their own removeListener -> infinite mutual
+    // recursion otherwise.
+    EventEmitter.prototype = Object.create(__ct_EventEmitter.prototype);
+    Object.defineProperty(EventEmitter.prototype, "constructor", {
+      value: EventEmitter,
+      writable: true,
+      configurable: true,
+    });
+    const base = __ct_EventEmitter.prototype;
+    EventEmitter.prototype.removeListener = function removeListener(name, handler) {
+      const hadListener =
+        this._events instanceof Map &&
+        (this._events.get(name) || []).some((item) => item === handler || item.listener === handler);
+      base.off.call(this, name, handler);
+      if (hadListener && this._events instanceof Map && this._events.has("removeListener")) {
+        this.emit("removeListener", name, handler.listener ?? handler);
+      }
+      return this;
+    };
+    EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
+    // The runtime EventEmitter invokes listeners without binding \`this\` and
+    // does not emit newListener events; Node stream internals rely on both.
+    EventEmitter.prototype.on = function on(name, handler) {
+      if (typeof handler !== "function") throw new TypeError("listener must be a function");
+      if (this._events instanceof Map && this._events.has("newListener")) {
+        this.emit("newListener", name, handler.listener ?? handler);
+      }
+      return base.on.call(this, name, handler);
+    };
+    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+    EventEmitter.prototype.prependListener = function prependListener(name, handler) {
+      if (typeof handler !== "function") throw new TypeError("listener must be a function");
+      if (this._events instanceof Map && this._events.has("newListener")) {
+        this.emit("newListener", name, handler.listener ?? handler);
+      }
+      return base.prependListener.call(this, name, handler);
+    };
+    EventEmitter.prototype.once = function once(name, handler) {
+      if (typeof handler !== "function") throw new TypeError("listener must be a function");
+      const self = this;
+      function wrapped(...args) {
+        self.removeListener(name, wrapped);
+        handler.apply(self, args);
+      }
+      wrapped.listener = handler;
+      return this.on(name, wrapped);
+    };
+    EventEmitter.prototype.prependOnceListener = function prependOnceListener(name, handler) {
+      if (typeof handler !== "function") throw new TypeError("listener must be a function");
+      const self = this;
+      function wrapped(...args) {
+        self.removeListener(name, wrapped);
+        handler.apply(self, args);
+      }
+      wrapped.listener = handler;
+      return this.prependListener(name, wrapped);
+    };
+    EventEmitter.prototype.emit = function emit(name, ...args) {
+      const events = this._events instanceof Map ? this._events : null;
+      const handlers = events ? [...(events.get(name) || [])] : [];
+      if (name === "error") {
+        const monitors = events ? [...(events.get(__ct_errorMonitor) || [])] : [];
+        for (const monitor of monitors) monitor.apply(this, args);
+        if (handlers.length === 0) {
+          const error = args[0];
+          throw error instanceof Error ? error : new Error(String(error));
+        }
+      }
+      for (const handler of handlers) {
+        const result = handler.apply(this, args);
+        if (this.captureRejections && result && typeof result.then === "function") {
+          result.then(undefined, (error) => this.emit("error", error));
+        }
+      }
+      return handlers.length > 0;
+    };
+    Object.setPrototypeOf(EventEmitter, __ct_EventEmitter);
+    module.exports = {
+      EventEmitter,
+      addAbortListener: __ct_addAbortListener,
+      once: __ct_events_once,
+    };
+  `,
+  buffer: `
+    module.exports = { Buffer: __ct_Buffer, Blob: __ct_Blob };
+  `,
+  "string_decoder/": `
+    module.exports = { StringDecoder: __ct_StringDecoder };
+  `,
+};
+
+const banner = `// Vendored from readable-stream@4.7.0 (https://github.com/nodejs/readable-stream)
+// A userland copy of the Node.js core streams implementation. License: MIT.
+// Generated by readable-stream.build.mjs (same directory); do not edit by hand.
+//
+// Cottontail deltas from upstream readable-stream:
+// - events/buffer/string_decoder resolve to the runtime modules (banner
+//   imports below); the events shim adds a callable constructor, this-bound
+//   emit, newListener/removeListener events, and non-virtual
+//   removeListener/off (the runtime EventEmitter delegates removeListener to
+//   this.off, which recurses into the stream prototypes' aliases).
+// - abort-controller/process shims resolve lazily to runtime globals.
+// - primordials' ObjectDefineProperty(ies) force accessor descriptors to be
+//   configurable so node/stream.js can install compat setters.
+// - Readable constructor: legacy push-style sources (no _read, overridden
+//   pause/resume) start in flowing mode with a no-op _read.
+// - Writable object-mode writes of non-string chunks report encoding
+//   undefined (Bun behavior).
+// - end-of-stream: a 'close' after EOF (state.ended) is not premature.
+// - async iterator consults _readableState.destroyed (legacy modules shadow
+//   stream.destroyed with an own property).
+// - endReadableNT emits the EOF null-'readable' when a legacy eager source
+//   pushed EOF while data was still buffered.
+// - debuglog traces to console.error when globalThis.__ct_stream_debug.
+import { EventEmitter as __ct_EventEmitter, addAbortListener as __ct_addAbortListener, once as __ct_events_once, errorMonitor as __ct_errorMonitor } from "../events.js";
+import { Buffer as __ct_Buffer, Blob as __ct_Blob } from "../buffer.js";
+import { StringDecoder as __ct_StringDecoder } from "../string_decoder.js";
+`;
+
+// Text patches applied to vendored sources (documented in bundle header).
+const patches = [
+  {
+    // Make prototype accessor properties configurable so node/stream.js can
+    // install permissive setters for legacy runtime-module subclasses.
+    file: /ours\/primordials\.js$/,
+    find: `  ObjectDefineProperties(self, props) {
+    return Object.defineProperties(self, props)
+  },
+  ObjectDefineProperty(self, name, prop) {
+    return Object.defineProperty(self, name, prop)
+  },`,
+    replace: `  ObjectDefineProperties(self, props) {
+    for (const key of Object.keys(props)) {
+      const prop = props[key]
+      if (prop && (prop.get || prop.set) && !('configurable' in prop)) prop.configurable = true
+    }
+    return Object.defineProperties(self, props)
+  },
+  ObjectDefineProperty(self, name, prop) {
+    if (prop && (prop.get || prop.set) && !('configurable' in prop)) {
+      prop = { ...prop, configurable: true }
+    }
+    return Object.defineProperty(self, name, prop)
+  },`,
+  },
+  {
+    // Cottontail compat: several runtime modules (fs.ReadStream, net.Socket,
+    // child_process stdio) are legacy push-style sources: they push() data
+    // themselves, never implement _read, and override pause()/resume() with
+    // versions that do not drive the real flow-control state machine. Start
+    // such streams in flowing mode so buffered chunks are delivered.
+    file: /internal\/streams\/readable\.js$/,
+    find: `  Stream.call(this, options)
+  destroyImpl.construct(this, () => {`,
+    replace: `  Stream.call(this, options)
+  if (
+    this._read === Readable.prototype._read &&
+    (this.resume !== Readable.prototype.resume || this.pause !== Readable.prototype.pause)
+  ) {
+    this._readableState.flowing = true
+    this._read = function () {}
+  }
+  destroyImpl.construct(this, () => {`,
+  },
+  {
+    // Cottontail compat: legacy sources (fs.ReadStream, ...) emit 'close'
+    // manually right after push(null), before 'end' has been delivered.
+    // Once EOF has been signalled (state.ended), a close is not premature.
+    file: /internal\/streams\/end-of-stream\.js$/,
+    find: `    if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
+      if (!isReadableFinished(stream, false)) return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE())
+    }`,
+    replace: `    if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
+      if (!isReadableFinished(stream, false)) {
+        const rEndedState = stream._readableState
+        if (!rEndedState || rEndedState.ended !== true)
+          return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE())
+      }
+    }`,
+  },
+  {
+    // Cottontail compat: legacy sources assign \`stream.destroyed = true\`
+    // (shadowed as an own property by node/stream.js) while buffered data is
+    // still pending; consult the real state so iteration drains the buffer.
+    file: /internal\/streams\/readable\.js$/,
+    find: `      const chunk = stream.destroyed ? null : stream.read()`,
+    replace: `      const chunk = (stream._readableState ? stream._readableState.destroyed : stream.destroyed)
+        ? null
+        : stream.read()`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `      throw new ERR_INVALID_ARG_TYPE('chunk', ['string', 'Buffer', 'Uint8Array'], chunk)
+    }
+  }`,
+    replace: `      throw new ERR_INVALID_ARG_TYPE('chunk', ['string', 'Buffer', 'Uint8Array'], chunk)
+    }
+  } else if (typeof chunk !== 'string' && encoding === state.defaultEncoding) {
+    // Bun/Cottontail: object-mode writes of non-string chunks report an
+    // undefined encoding (matches Bun's native streams).
+    encoding = undefined
+  }`,
+  },
+];
+
+patches.push(
+  {
+    // Cottontail compat: legacy eager sources push EOF while data is still
+    // buffered, so the EOF 'readable' (read() === null) emission fires with
+    // data instead of on an empty queue. Track whether the null 'readable'
+    // was delivered and, if not, emit it once right before 'end' for
+    // 'readable'-listening consumers.
+    file: /internal\/streams\/readable\.js$/,
+    find: `  if (!state.destroyed && !state.errored && (state.length || state.ended)) {
+    stream.emit('readable')
+    state.emittedReadable = false
+  }`,
+    replace: `  if (!state.destroyed && !state.errored && (state.length || state.ended)) {
+    if (state.length === 0 && state.ended) state.ctNullReadableEmitted = true
+    stream.emit('readable')
+    state.emittedReadable = false
+  }`,
+  },
+  {
+    file: /internal\/streams\/readable\.js$/,
+    find: `  if (!state.errored && !state.closeEmitted && !state.endEmitted && state.length === 0) {
+    state.endEmitted = true
+    stream.emit('end')`,
+    replace: `  if (!state.errored && !state.closeEmitted && !state.endEmitted && state.length === 0) {
+    if (state.readableListening && !state.ctNullReadableEmitted && !state.destroyed) {
+      state.ctNullReadableEmitted = true
+      stream.emit('readable')
+      if (state.endEmitted) return
+    }
+    state.endEmitted = true
+    stream.emit('end')`,
+  },
+);
+
+patches.push({
+  // Debug aid: set globalThis.__ct_stream_debug = true to trace stream internals.
+  file: /ours\/util\.js$/,
+  find: `  debuglog() {
+    return function () {}
+  },`,
+  replace: `  debuglog(name) {
+    return function (...args) {
+      if (globalThis.__ct_stream_debug) {
+        try { console.error('[' + name + ']', ...args) } catch {}
+      }
+    }
+  },`,
+});
+
+const shimPlugin = {
+  name: "ct-shims",
+  setup(build) {
+    build.onLoad({ filter: /package\/lib\/.*\.js$/ }, (args) => {
+      let contents = fs.readFileSync(args.path, "utf8");
+      let touched = false;
+      for (const patch of patches) {
+        if (patch.file.test(args.path)) {
+          if (!contents.includes(patch.find)) throw new Error("patch anchor not found in " + args.path);
+          contents = contents.replace(patch.find, patch.replace);
+          touched = true;
+        }
+      }
+      return touched ? { contents, loader: "js" } : undefined;
+    });
+    build.onResolve({ filter: /^(events|buffer|string_decoder\/|process\/|abort-controller)$/ }, (args) => ({
+      path: args.path,
+      namespace: "ct-shim",
+    }));
+    build.onLoad({ filter: /.*/, namespace: "ct-shim" }, (args) => ({
+      contents: shims[args.path],
+      loader: "js",
+    }));
+    build.onResolve({ filter: /^ct-entry$/ }, () => ({ path: "ct-entry", namespace: "ct-entry" }));
+    build.onLoad({ filter: /.*/, namespace: "ct-entry" }, () => ({
+      contents: entrySource,
+      loader: "js",
+      resolveDir: SCRATCH,
+    }));
+  },
+};
+
+await esbuild.build({
+  entryPoints: ["ct-entry"],
+  bundle: true,
+  format: "esm",
+  platform: "neutral",
+  target: "es2022",
+  banner: { js: banner },
+  outfile: OUT,
+  plugins: [shimPlugin],
+  legalComments: "none",
+  logLevel: "warning",
+  // Keeps the per-module path comments in the output stable ("package/lib/...")
+  // instead of leaking the temp directory location.
+  absWorkingDir: SCRATCH,
+});
+console.log("built", OUT, fs.statSync(OUT).size, "bytes");

@@ -1,10 +1,11 @@
+import constantsObject from "../constants.js";
+import { EventEmitter } from "../events.js";
 import {
   accessSync,
   appendFileSync,
   chmodSync,
   chownSync,
   closeSync,
-  constants as fsConstants,
   copyFileSync,
   cpSync,
   createReadStream,
@@ -49,7 +50,75 @@ import {
 } from "../fs.js";
 import { ReadableStream as WebReadableStream } from "../stream/web.js";
 
-export const constants = fsConstants;
+// fs.constants must be the exact same object as fsPromises.constants. Because
+// fs.js and fs/promises.js form an import cycle whose evaluation order depends
+// on which module is reached first, both files construct the object through a
+// shared global registry: whichever module body runs first creates it and the
+// other reuses it. Keep the name list below in sync with fs.js. Do not read
+// fs.js bindings other than hoisted function declarations at module scope.
+const fsConstantNames = [
+  "UV_FS_SYMLINK_DIR",
+  "UV_FS_SYMLINK_JUNCTION",
+  "O_RDONLY",
+  "O_WRONLY",
+  "O_RDWR",
+  "UV_DIRENT_UNKNOWN",
+  "UV_DIRENT_FILE",
+  "UV_DIRENT_DIR",
+  "UV_DIRENT_LINK",
+  "UV_DIRENT_FIFO",
+  "UV_DIRENT_SOCKET",
+  "UV_DIRENT_CHAR",
+  "UV_DIRENT_BLOCK",
+  "S_IFMT",
+  "S_IFREG",
+  "S_IFDIR",
+  "S_IFCHR",
+  "S_IFBLK",
+  "S_IFIFO",
+  "S_IFLNK",
+  "S_IFSOCK",
+  "O_CREAT",
+  "O_EXCL",
+  "UV_FS_O_FILEMAP",
+  "O_NOCTTY",
+  "O_TRUNC",
+  "O_APPEND",
+  "O_DIRECTORY",
+  "O_NOFOLLOW",
+  "O_SYNC",
+  "O_DSYNC",
+  "O_SYMLINK",
+  "O_NONBLOCK",
+  "S_IRWXU",
+  "S_IRUSR",
+  "S_IWUSR",
+  "S_IXUSR",
+  "S_IRWXG",
+  "S_IRGRP",
+  "S_IWGRP",
+  "S_IXGRP",
+  "S_IRWXO",
+  "S_IROTH",
+  "S_IWOTH",
+  "S_IXOTH",
+  "F_OK",
+  "R_OK",
+  "W_OK",
+  "X_OK",
+  "UV_FS_COPYFILE_EXCL",
+  "COPYFILE_EXCL",
+  "UV_FS_COPYFILE_FICLONE",
+  "COPYFILE_FICLONE",
+  "UV_FS_COPYFILE_FICLONE_FORCE",
+  "COPYFILE_FICLONE_FORCE",
+];
+
+export const constants = globalThis.__cottontailFsConstants ??= Object.freeze(Object.fromEntries(
+  fsConstantNames
+    .filter((name) => Object.prototype.hasOwnProperty.call(constantsObject, name))
+    .map((name) => [name, constantsObject[name]]),
+));
 
 export async function access(path, mode = constants.F_OK) {
   return accessSync(path, mode);
@@ -79,9 +148,11 @@ export async function cp(source, destination, options = {}) {
   return cpSync(source, destination, options);
 }
 
-export async function* glob(pattern, options = {}) {
+export async function* glob(pattern, options) {
   for (const item of globSync(pattern, options)) yield item;
 }
+// Keep Node-compatible function name even if a bundler renames the binding.
+Object.defineProperty(glob, "name", { value: "glob" });
 
 export async function lchmod(path, mode) {
   return lchmodSync(path, mode);
@@ -147,25 +218,48 @@ function createReadLinesInterface(stream) {
   return lines;
 }
 
-class FileHandle {
+class FileHandle extends EventEmitter {
   constructor(fd, path) {
+    super();
     this.fd = fd;
     this.path = path;
     this._asyncId = nextFileHandleAsyncId++;
+    this._closed = false;
+  }
+
+  _markClosed() {
+    this.fd = -1;
+    if (!this._closed) {
+      this._closed = true;
+      this.emit("close");
+    }
   }
 
   appendFile(data, options = undefined) { return appendFile(this.fd, data, options); }
   chmod(mode) { return Promise.resolve(fchmodSync(this.fd, mode)); }
   chown(uid, gid) { return Promise.resolve(fchownSync(this.fd, uid, gid)); }
-  close() { const fd = this.fd; this.fd = -1; return Promise.resolve(closeSync(fd)); }
+  close() {
+    const fd = this.fd;
+    this.fd = -1;
+    if (fd != null && fd >= 0) {
+      try {
+        closeSync(fd);
+      } catch (error) {
+        this._markClosed();
+        return Promise.reject(error);
+      }
+    }
+    this._markClosed();
+    return Promise.resolve();
+  }
   createReadStream(options = {}) {
     const stream = createReadStream(this.path, { ...options, fd: this.fd });
-    if (options?.autoClose !== false) stream.once("close", () => { this.fd = -1; });
+    if (options?.autoClose !== false) stream.once("close", () => this._markClosed());
     return stream;
   }
   createWriteStream(options = {}) {
     const stream = createWriteStream(this.path, { ...options, fd: this.fd });
-    if (options?.autoClose !== false) stream.once("close", () => { this.fd = -1; });
+    if (options?.autoClose !== false) stream.once("close", () => this._markClosed());
     return stream;
   }
   datasync() { return Promise.resolve(fdatasyncSync(this.fd)); }
@@ -202,8 +296,24 @@ class FileHandle {
   sync() { return Promise.resolve(fsyncSync(this.fd)); }
   truncate(len = 0) { return Promise.resolve(ftruncateSync(this.fd, len)); }
   utimes(atime, mtime) { return Promise.resolve(futimesSync(this.fd, atime, mtime)); }
-  write(data, offset = 0, length = undefined, position = null) {
-    return Promise.resolve({ bytesWritten: writeSync(this.fd, data, offset, length, position), buffer: data });
+  write(data, offsetOrOptions = undefined, length = undefined, position = undefined) {
+    if (typeof data === "string") {
+      // write(string[, position[, encoding]]): default position null writes at
+      // the current file offset (so append-mode handles keep appending).
+      const stringPosition = typeof offsetOrOptions === "number" ? offsetOrOptions : null;
+      const encoding = typeof length === "string" ? length : "utf8";
+      return Promise.resolve({ bytesWritten: writeSync(this.fd, data, stringPosition, encoding), buffer: data });
+    }
+    let offset = offsetOrOptions;
+    if (offset !== null && typeof offset === "object") {
+      position = offset.position ?? null;
+      length = offset.length;
+      offset = offset.offset ?? 0;
+    }
+    return Promise.resolve({
+      bytesWritten: writeSync(this.fd, data, offset ?? 0, length, position ?? null),
+      buffer: data,
+    });
   }
   writeFile(data, options = undefined) { writeFileSync(this.fd, data, options); return Promise.resolve(); }
   writev(buffers, position = null) {
@@ -275,13 +385,66 @@ export async function watch(path, options = {}) {
   return watchSync(path, options);
 }
 
+function isStreamLikeData(data) {
+  if (data == null || typeof data === "string") return false;
+  if (ArrayBuffer.isView(data) || data instanceof ArrayBuffer) return false;
+  if (typeof data !== "object" && typeof data !== "function") return false;
+  return typeof data[Symbol.asyncIterator] === "function" ||
+    typeof data[Symbol.iterator] === "function" ||
+    (typeof data.pipe === "function" && typeof data.on === "function");
+}
+
+function writeChunkToFd(fd, chunk, encoding) {
+  if (typeof chunk === "string") {
+    writeSync(fd, chunk, null, encoding);
+    return;
+  }
+  if (ArrayBuffer.isView(chunk) || chunk instanceof ArrayBuffer) {
+    writeSync(fd, chunk);
+    return;
+  }
+  const error = new TypeError(
+    'The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView.',
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+}
+
 export async function writeFile(path, data, options = undefined) {
+  if (isStreamLikeData(data)) {
+    const encoding = (typeof options === "string" ? options : options?.encoding) ?? "utf8";
+    const flag = (typeof options === "object" && options?.flag) || "w";
+    // Open before touching the iterator so path errors (e.g. EISDIR) surface
+    // without consuming the input, matching Node.
+    const fileHandleFd = path !== null && typeof path === "object" && typeof path.fd === "number" ? path.fd : null;
+    const fd = fileHandleFd ?? (typeof path === "number" ? path : openSync(path, flag, 0o666));
+    const ownsFd = fileHandleFd == null && typeof path !== "number";
+    try {
+      for await (const chunk of data) {
+        writeChunkToFd(fd, chunk, encoding);
+      }
+    } finally {
+      if (ownsFd) closeSync(fd);
+    }
+    return;
+  }
   return writeFileSync(path, data, options);
+}
+
+// Bun extends fs.promises with exists(); it never rejects.
+export async function exists(path) {
+  try {
+    accessSync(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export default {
   access,
   appendFile,
+  exists,
   chmod,
   chown,
   close,

@@ -765,10 +765,38 @@ export function createRequire(basePath = cottontail.cwd()) {
     return loadCommonJsModule(resolved);
   };
   require.resolve = (request) => resolveRequest(request, normalizedBasePath);
-  require.cache = commonJsCache;
+  require.cache = commonJsCacheObject;
   require.main = null;
   return require;
 }
+
+// Node exposes require.cache as a plain object keyed by resolved path;
+// mirror the internal Map through a Proxy so `delete require.cache[path]`
+// really evicts entries.
+const commonJsCacheObject = new Proxy(Object.create(null), {
+  get(_target, property) {
+    if (typeof property !== "string") return undefined;
+    return commonJsCache.get(property);
+  },
+  set(_target, property, value) {
+    if (typeof property === "string") commonJsCache.set(property, value);
+    return true;
+  },
+  has(_target, property) {
+    return typeof property === "string" && commonJsCache.has(property);
+  },
+  deleteProperty(_target, property) {
+    if (typeof property === "string") commonJsCache.delete(property);
+    return true;
+  },
+  ownKeys() {
+    return [...commonJsCache.keys()];
+  },
+  getOwnPropertyDescriptor(_target, property) {
+    if (typeof property !== "string" || !commonJsCache.has(property)) return undefined;
+    return { value: commonJsCache.get(property), writable: true, enumerable: true, configurable: true };
+  },
+});
 
 function isBundledImportMetaBase(path) {
   const mainPath = globalThis.process?.argv?.[1] ?? processModule.argv?.[1];
@@ -977,7 +1005,7 @@ function maybeRegisterSourceMap(filename, source) {
   } catch {}
 }
 
-export const _cache = commonJsCache;
+export const _cache = commonJsCacheObject;
 export const _pathCache = Object.create(null);
 export const wrapper = [
   "(function (exports, require, module, __filename, __dirname) { ",
@@ -1575,6 +1603,10 @@ const processBuiltin = processModule.default ?? processModule;
 const streamBuiltin = stream.default ?? stream;
 const sysBuiltin = sys.default ?? sys;
 const nodeTestBuiltin = nodeTest.default ?? nodeTest;
+const pathBuiltin = path.default ?? path;
+// require("path/posix") must be the same object as require("path").posix.
+const pathPosixBuiltin = pathBuiltin.posix ?? (pathPosix.default ?? pathPosix);
+const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
 
 __setBuiltinModules({
   assert: assertBuiltin,
@@ -1635,12 +1667,12 @@ __setBuiltinModules({
   "node:test/reporters": testReporters,
   os,
   "node:os": os,
-  path,
-  "node:path": path,
-  "path/posix": pathPosix,
-  "node:path/posix": pathPosix,
-  "path/win32": pathWin32,
-  "node:path/win32": pathWin32,
+  path: pathBuiltin,
+  "node:path": pathBuiltin,
+  "path/posix": pathPosixBuiltin,
+  "node:path/posix": pathPosixBuiltin,
+  "path/win32": pathWin32Builtin,
+  "node:path/win32": pathWin32Builtin,
   perf_hooks: perfHooks,
   "node:perf_hooks": perfHooks,
   process: processBuiltin,

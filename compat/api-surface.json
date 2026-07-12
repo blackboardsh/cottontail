@@ -7730,6 +7730,7 @@
           "udpSocket",
           "unsafe",
           "URL",
+          "URLSearchParams",
           "version",
           "version_with_sha",
           "which",
@@ -7747,22 +7748,37 @@
         "file": "src/runtime_modules/bun/internal-for-testing.js",
         "exports": [
           "applyPatchDiff",
+          "bindgen",
           "canonicalizeIP",
+          "crash_handler",
           "createSocketPair",
           "cssInternals",
           "decodeURIComponentSIMD",
+          "Dequeue",
+          "escapePowershell",
           "escapeRegExp",
           "escapeRegExpForPackageNameMatching",
+          "frameworkRouterInternals",
+          "getDevServerDeinitCount",
+          "getEventLoopStats",
           "hasNonReifiedStatic",
           "highlightJavaScript",
+          "hostedGitInfo",
           "iniInternals",
+          "install_test_helpers",
+          "isArchitectureMatch",
           "isModuleResolveFilenameSlowPathEnabled",
+          "isOperatingSystemMatch",
           "jscInternals",
           "makePatchDiff",
+          "memfd_create",
           "parsePatchDiff",
           "patchInternals",
+          "readTarball",
           "setSocketOptions",
-          "shellInternals"
+          "setSyntheticAllocationLimitForTesting",
+          "shellInternals",
+          "upgrade_test_helpers"
         ],
         "hasDefaultExport": true
       },
@@ -9187,6 +9203,7 @@
           "constants",
           "copyFile",
           "cp",
+          "exists",
           "glob",
           "lchmod",
           "lchown",
@@ -9227,6 +9244,7 @@
           "constants",
           "copyFile",
           "cp",
+          "exists",
           "glob",
           "lchmod",
           "lchown",
@@ -9487,12 +9505,14 @@
       "http": {
         "file": "src/runtime_modules/node/http.js",
         "exports": [
+          "_attachHttpConnection",
           "_connectionListener",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
           "createServer",
+          "ensureAsyncDisposeSymbol",
           "get",
           "globalAgent",
           "IncomingMessage",
@@ -9514,12 +9534,14 @@
       "node:http": {
         "file": "src/runtime_modules/node/http.js",
         "exports": [
+          "_attachHttpConnection",
           "_connectionListener",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
           "createServer",
+          "ensureAsyncDisposeSymbol",
           "get",
           "globalAgent",
           "IncomingMessage",
@@ -9582,8 +9604,12 @@
           "createServer",
           "get",
           "globalAgent",
+          "IncomingMessage",
+          "OutgoingMessage",
           "request",
-          "Server"
+          "Server",
+          "ServerResponse",
+          "STATUS_CODES"
         ],
         "hasDefaultExport": true
       },
@@ -9595,8 +9621,12 @@
           "createServer",
           "get",
           "globalAgent",
+          "IncomingMessage",
+          "OutgoingMessage",
           "request",
-          "Server"
+          "Server",
+          "ServerResponse",
+          "STATUS_CODES"
         ],
         "hasDefaultExport": true
       },
@@ -10486,6 +10516,20 @@
         ],
         "hasDefaultExport": true
       },
+      "stream/readable-stream": {
+        "file": "src/runtime_modules/node/stream/readable-stream.js",
+        "exports": [
+          "default"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:stream/readable-stream": {
+        "file": "src/runtime_modules/node/stream/readable-stream.js",
+        "exports": [
+          "default"
+        ],
+        "hasDefaultExport": true
+      },
       "stream/web": {
         "file": "src/runtime_modules/node/stream/web.js",
         "exports": [
@@ -10531,6 +10575,44 @@
           "WritableStreamDefaultWriter"
         ],
         "hasDefaultExport": true
+      },
+      "stream/whatwg": {
+        "file": "src/runtime_modules/node/stream/whatwg.js",
+        "exports": [
+          "ByteLengthQueuingStrategy",
+          "CountQueuingStrategy",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "hasDefaultExport": false
+      },
+      "node:stream/whatwg": {
+        "file": "src/runtime_modules/node/stream/whatwg.js",
+        "exports": [
+          "ByteLengthQueuingStrategy",
+          "CountQueuingStrategy",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "hasDefaultExport": false
       },
       "stream": {
         "file": "src/runtime_modules/node/stream.js",
@@ -11039,7 +11121,21 @@
           "inherits",
           "inspect",
           "isArray",
+          "isBoolean",
+          "isBuffer",
+          "isDate",
           "isDeepStrictEqual",
+          "isError",
+          "isFunction",
+          "isNull",
+          "isNullOrUndefined",
+          "isNumber",
+          "isObject",
+          "isPrimitive",
+          "isRegExp",
+          "isString",
+          "isSymbol",
+          "isUndefined",
           "MIMEParams",
           "MIMEType",
           "parseArgs",
@@ -11078,7 +11174,21 @@
           "inherits",
           "inspect",
           "isArray",
+          "isBoolean",
+          "isBuffer",
+          "isDate",
           "isDeepStrictEqual",
+          "isError",
+          "isFunction",
+          "isNull",
+          "isNullOrUndefined",
+          "isNumber",
+          "isObject",
+          "isPrimitive",
+          "isRegExp",
+          "isString",
+          "isSymbol",
+          "isUndefined",
           "MIMEParams",
           "MIMEType",
           "parseArgs",
@@ -11811,6 +11921,22 @@
         "exports": [],
         "hasDefaultExport": true
       },
+      "vendor/sourcemap": {
+        "file": "src/runtime_modules/vendor/sourcemap.js",
+        "exports": [
+          "remapPosition",
+          "remapStackString"
+        ],
+        "hasDefaultExport": true
+      },
+      "vendor/whatwg-url": {
+        "file": "src/runtime_modules/vendor/whatwg-url.js",
+        "exports": [
+          "URL",
+          "URLSearchParams"
+        ],
+        "hasDefaultExport": false
+      },
       "vendor/yaml": {
         "file": "src/runtime_modules/vendor/yaml.js",
         "exports": [
@@ -11987,6 +12113,7 @@
           "udpSocket",
           "unsafe",
           "URL",
+          "URLSearchParams",
           "version",
           "version_with_sha",
           "which",
@@ -12119,6 +12246,8 @@
           "__cottontailImportMetaResolve",
           "__cottontailImportMetaResolveSync",
           "__cottontailPromisePeekStates",
+          "__cottontailRemapPosition",
+          "__cottontailRemapStackString",
           "AbortController",
           "AbortSignal",
           "afterAll",
@@ -12145,13 +12274,18 @@
           "it",
           "performance",
           "Performance",
+          "PerformanceEntry",
+          "PerformanceMark",
+          "PerformanceMeasure",
+          "PerformanceObserver",
           "Request",
           "require",
           "Response",
           "structuredClone",
           "test",
           "TextEncoder",
-          "URL"
+          "URL",
+          "URLSearchParams"
         ]
       },
       "src/runtime_modules/bun/internal-for-testing.js": {
@@ -12159,22 +12293,37 @@
         "hasDefaultExport": true,
         "namedExports": [
           "applyPatchDiff",
+          "bindgen",
           "canonicalizeIP",
+          "crash_handler",
           "createSocketPair",
           "cssInternals",
           "decodeURIComponentSIMD",
+          "Dequeue",
+          "escapePowershell",
           "escapeRegExp",
           "escapeRegExpForPackageNameMatching",
+          "frameworkRouterInternals",
+          "getDevServerDeinitCount",
+          "getEventLoopStats",
           "hasNonReifiedStatic",
           "highlightJavaScript",
+          "hostedGitInfo",
           "iniInternals",
+          "install_test_helpers",
+          "isArchitectureMatch",
           "isModuleResolveFilenameSlowPathEnabled",
+          "isOperatingSystemMatch",
           "jscInternals",
           "makePatchDiff",
+          "memfd_create",
           "parsePatchDiff",
           "patchInternals",
+          "readTarball",
           "setSocketOptions",
-          "shellInternals"
+          "setSyntheticAllocationLimitForTesting",
+          "shellInternals",
+          "upgrade_test_helpers"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -12305,6 +12454,7 @@
           "clearInterval",
           "clearTimeout",
           "Date",
+          "ErrorEvent",
           "jest",
           "requestAnimationFrame",
           "setImmediate",
@@ -12999,6 +13149,13 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/events.cjs": {
+        "file": "src/runtime_modules/node/events.cjs",
+        "hasDefaultExport": true,
+        "namedExports": [],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/events.js": {
         "file": "src/runtime_modules/node/events.js",
         "hasDefaultExport": true,
@@ -13036,6 +13193,7 @@
           "constants",
           "copyFile",
           "cp",
+          "exists",
           "glob",
           "lchmod",
           "lchown",
@@ -13064,7 +13222,9 @@
           "writeFile"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "__cottontailFsConstants"
+        ]
       },
       "src/runtime_modules/node/fs.js": {
         "file": "src/runtime_modules/node/fs.js",
@@ -13181,19 +13341,22 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
-          "__cottontailFileWatchers"
+          "__cottontailFileWatchers",
+          "__cottontailFsConstants"
         ]
       },
       "src/runtime_modules/node/http.js": {
         "file": "src/runtime_modules/node/http.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "_attachHttpConnection",
           "_connectionListener",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
           "CloseEvent",
           "createServer",
+          "ensureAsyncDisposeSymbol",
           "get",
           "globalAgent",
           "IncomingMessage",
@@ -13211,7 +13374,10 @@
           "WebSocket"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "ErrorEvent",
+          "WebSocket"
+        ]
       },
       "src/runtime_modules/node/http2.js": {
         "file": "src/runtime_modules/node/http2.js",
@@ -13242,8 +13408,12 @@
           "createServer",
           "get",
           "globalAgent",
+          "IncomingMessage",
+          "OutgoingMessage",
           "request",
-          "Server"
+          "Server",
+          "ServerResponse",
+          "STATUS_CODES"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -13425,6 +13595,13 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/path/posix.cjs": {
+        "file": "src/runtime_modules/node/path/posix.cjs",
+        "hasDefaultExport": true,
+        "namedExports": [],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/path/posix.js": {
         "file": "src/runtime_modules/node/path/posix.js",
         "hasDefaultExport": true,
@@ -13447,6 +13624,13 @@
           "toNamespacedPath",
           "win32"
         ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/path/win32.cjs": {
+        "file": "src/runtime_modules/node/path/win32.cjs",
+        "hasDefaultExport": true,
+        "namedExports": [],
         "bunObjectProperties": [],
         "globalProperties": []
       },
@@ -13751,6 +13935,15 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/stream/readable-stream.js": {
+        "file": "src/runtime_modules/node/stream/readable-stream.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "default"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/stream/web.js": {
         "file": "src/runtime_modules/node/stream/web.js",
         "hasDefaultExport": true,
@@ -13767,6 +13960,27 @@
           "ReadableStreamDefaultReader",
           "TextDecoderStream",
           "TextEncoderStream",
+          "TransformStream",
+          "TransformStreamDefaultController",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/stream/whatwg.js": {
+        "file": "src/runtime_modules/node/stream/whatwg.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "ByteLengthQueuingStrategy",
+          "CountQueuingStrategy",
+          "ReadableByteStreamController",
+          "ReadableStream",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
           "TransformStream",
           "TransformStreamDefaultController",
           "WritableStream",
@@ -14085,7 +14299,21 @@
           "inherits",
           "inspect",
           "isArray",
+          "isBoolean",
+          "isBuffer",
+          "isDate",
           "isDeepStrictEqual",
+          "isError",
+          "isFunction",
+          "isNull",
+          "isNullOrUndefined",
+          "isNumber",
+          "isObject",
+          "isPrimitive",
+          "isRegExp",
+          "isString",
+          "isSymbol",
+          "isUndefined",
           "MIMEParams",
           "MIMEType",
           "parseArgs",
@@ -14102,7 +14330,9 @@
           "types"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "Buffer"
+        ]
       },
       "src/runtime_modules/node/v8.js": {
         "file": "src/runtime_modules/node/v8.js",
@@ -14501,6 +14731,26 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/vendor/sourcemap.js": {
+        "file": "src/runtime_modules/vendor/sourcemap.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "remapPosition",
+          "remapStackString"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/vendor/whatwg-url.js": {
+        "file": "src/runtime_modules/vendor/whatwg-url.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "URL",
+          "URLSearchParams"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/vendor/yaml.js": {
         "file": "src/runtime_modules/vendor/yaml.js",
         "hasDefaultExport": false,
@@ -14672,6 +14922,7 @@
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
+      "__cottontailFsConstants",
       "__cottontailHasActiveHandles",
       "__cottontailImportMetaResolve",
       "__cottontailImportMetaResolveSync",
@@ -14680,6 +14931,8 @@
       "__cottontailNotifyModuleBindings",
       "__cottontailPromisePeekStates",
       "__cottontailProxyRegistry",
+      "__cottontailRemapPosition",
+      "__cottontailRemapStackString",
       "__cottontailSuppressAsyncHookPromise",
       "__cottontailTestAssertionCount",
       "__cottontailTlsListeners",
@@ -14693,6 +14946,7 @@
       "afterEach",
       "beforeAll",
       "beforeEach",
+      "Buffer",
       "Bun",
       "cancelAnimationFrame",
       "clearImmediate",
@@ -14723,6 +14977,10 @@
       "parentPort",
       "performance",
       "Performance",
+      "PerformanceEntry",
+      "PerformanceMark",
+      "PerformanceMeasure",
+      "PerformanceObserver",
       "process",
       "Proxy",
       "queueMicrotask",
@@ -14738,7 +14996,9 @@
       "test",
       "TextEncoder",
       "URL",
+      "URLSearchParams",
       "vi",
+      "WebSocket",
       "workerData"
     ]
   },
@@ -15562,7 +15822,8 @@
         ],
         "missing": [],
         "extra": [
-          "close"
+          "close",
+          "exists"
         ]
       },
       "http": {
@@ -15591,7 +15852,9 @@
         ],
         "missing": [],
         "extra": [
-          "_writeServerResponse"
+          "_attachHttpConnection",
+          "_writeServerResponse",
+          "ensureAsyncDisposeSymbol"
         ]
       },
       "http2": {
@@ -15626,7 +15889,11 @@
         ],
         "missing": [],
         "extra": [
-          "ClientRequest"
+          "ClientRequest",
+          "IncomingMessage",
+          "OutgoingMessage",
+          "STATUS_CODES",
+          "ServerResponse"
         ]
       },
       "inspector": {
@@ -16327,7 +16594,22 @@
           "types"
         ],
         "missing": [],
-        "extra": []
+        "extra": [
+          "isBoolean",
+          "isBuffer",
+          "isDate",
+          "isError",
+          "isFunction",
+          "isNull",
+          "isNullOrUndefined",
+          "isNumber",
+          "isObject",
+          "isPrimitive",
+          "isRegExp",
+          "isString",
+          "isSymbol",
+          "isUndefined"
+        ]
       },
       "util/types": {
         "module": "present",
@@ -16865,6 +17147,7 @@
             "ShellExpression",
             "ShellOutput",
             "URL",
+            "URLSearchParams",
             "cwd",
             "jest",
             "origin",
@@ -16986,7 +17269,7 @@
       "version": "24.11.1",
       "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
       "snapshot": "compat/upstream/node/v24.11.1",
-      "copiedFiles": 9981,
+      "copiedFiles": 9979,
       "discoveredRunnableFiles": 7015,
       "enabled": 7015,
       "expectedFailure": 0,
@@ -16999,14 +17282,14 @@
       "version": "1.3.10",
       "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
       "snapshot": "compat/upstream/bun/v1.3.10",
-      "copiedFiles": 85296,
+      "copiedFiles": 86116,
       "discoveredRunnableFiles": 2257,
-      "enabled": 277,
-      "expectedFailure": 93,
+      "enabled": 598,
+      "expectedFailure": 240,
       "disabled": 0,
-      "notEnabled": 1887,
-      "classifiedTests": 370,
-      "trackedTests": 370
+      "notEnabled": 1419,
+      "classifiedTests": 838,
+      "trackedTests": 838
     }
   },
   "behavioral": {
@@ -17021,13 +17304,22 @@
       "signals": {
         "publicNodeModules": 58,
         "nodeTestFiles": 31,
-        "compatMarkers": 11,
-        "modulesWithCompatMarkers": 11,
+        "compatMarkers": 12,
+        "modulesWithCompatMarkers": 12,
         "explicitUnsupportedMarkers": 0,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 0
       },
       "largestGaps": [
+        {
+          "name": "child_process",
+          "file": "src/runtime_modules/node/child_process.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 2,
+          "gapScore": 3
+        },
         {
           "name": "cluster",
           "file": "src/runtime_modules/node/cluster.js",
@@ -17129,6 +17421,18 @@
         }
       ],
       "modules": {
+        "child_process": {
+          "file": "src/runtime_modules/node/child_process.js",
+          "compatMarkers": [
+            "forked children are marked with COTTONTAIL_IPC_BOOTSTRAP=node but no"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-child-process-fork.ts",
+            "tests/js/node-child-process.ts"
+          ]
+        },
         "cluster": {
           "file": "src/runtime_modules/node/cluster.js",
           "compatMarkers": [
@@ -17261,9 +17565,9 @@
       "signals": {
         "publicBunModules": 5,
         "bunTestFiles": 12,
-        "compatMarkers": 0,
-        "modulesWithCompatMarkers": 0,
-        "explicitUnsupportedMarkers": 6,
+        "compatMarkers": 1,
+        "modulesWithCompatMarkers": 1,
+        "explicitUnsupportedMarkers": 7,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 3
       },
@@ -17280,11 +17584,11 @@
         {
           "name": "internal-for-testing",
           "file": "src/runtime_modules/bun/internal-for-testing.js",
-          "compatMarkers": 0,
-          "unsupportedMarkers": 1,
+          "compatMarkers": 1,
+          "unsupportedMarkers": 2,
           "nativeAvailabilityGuards": 0,
           "tests": 0,
-          "gapScore": 3
+          "gapScore": 8
         },
         {
           "name": "bun:sqlite",
@@ -17302,19 +17606,19 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 6948,
+              "line": 7067,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 6979,
+              "line": 7098,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 7402,
+              "line": 7521,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 7418,
+              "line": 7537,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             }
           ],
@@ -17336,11 +17640,17 @@
         },
         "internal-for-testing": {
           "file": "src/runtime_modules/bun/internal-for-testing.js",
-          "compatMarkers": [],
+          "compatMarkers": [
+            "bun:internal-for-testing - Bun-private hooks without a"
+          ],
           "unsupportedMarkers": [
             {
               "line": 571,
               "text": "throw new Error(\"socketpair is unavailable in this Cottontail build\");"
+            },
+            {
+              "line": 585,
+              "text": "throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);"
             }
           ],
           "nativeAvailabilityGuards": [],

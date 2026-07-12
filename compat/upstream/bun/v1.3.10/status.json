@@ -41,184 +41,198 @@
       "pattern": "^test/js/third_party/express/.*\\.test\\.ts$",
       "status": "enabled",
       "reason": "The copied Express corpus passes with Node-compatible HTTP, streams, body parsing, redirects, legacy URL parsing, file responses, ranges, and filesystem error behavior."
+    },
+    {
+      "pattern": "^test/napi/",
+      "status": "expected-failure",
+      "reason": "Requires a Node-API (NAPI) native addon layer that Cottontail's C host bridge does not implement yet."
+    },
+    {
+      "pattern": "^test/cli/install/",
+      "status": "expected-failure",
+      "reason": "Requires Bun's package-manager CLI (bun install/pm/link/audit registry operations), which Cottontail does not implement yet."
+    },
+    {
+      "pattern": "^test/bake/",
+      "status": "expected-failure",
+      "reason": "Requires Bun's bake dev-server/framework pipeline, which Cottontail does not implement yet."
+    },
+    {
+      "pattern": "^test/cli/hot/",
+      "status": "expected-failure",
+      "reason": "Requires Bun's hot-reload runtime, which Cottontail does not implement yet."
+    },
+    {
+      "pattern": "^test/cli/inspect/",
+      "status": "expected-failure",
+      "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."
     }
   ],
   "tests": {
-    "test/js/third_party/body-parser/express-body-parser-test.test.ts": {
+    "test/bake/deinitialization.test.ts": {
       "status": "enabled",
-      "reason": "The copied body-parser integration coverage passes for iconv decoding, HTTP request bodies, and GET middleware behavior."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
-    "test/js/deno/abort/abort-controller.test.ts": {
+    "test/bake/dev/import-meta-inline-negative.test.ts": {
       "status": "enabled",
-      "reason": "Copied Bun Deno-compat AbortController coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 8 assertions)."
     },
-    "test/js/deno/crypto/random.test.ts": {
+    "test/bundler/bun-build-compile-wasm.test.ts": {
       "status": "enabled",
-      "reason": "Copied Bun Deno-compat crypto random-values coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
     },
-    "test/js/bun/empty-file.test.ts": {
+    "test/bundler/bun-build-compile.test.ts": {
       "status": "enabled",
-      "reason": "Initial upstream Bun smoke test that runs directly under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 23 assertions)."
     },
-    "test/js/bun/util/stringWidth.test.ts": {
+    "test/bundler/bundler_comments.test.ts": {
       "status": "enabled",
-      "reason": "Bun.stringWidth ANSI, emoji, CJK, combining mark, and zero-width coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (42 bun:test cases, 48 assertions)."
     },
-    "test/js/bun/sqlite/column-types.test.js": {
+    "test/bundler/bundler_decorator_metadata.test.ts": {
       "status": "enabled",
-      "reason": "Bun SQLite native column names, runtime value types, declared schema types, expression metadata, and statement-state validation pass through SQLite's native metadata APIs."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/sqlite/sql-timezone.test.js": {
+    "test/bundler/bundler_naming.test.ts": {
       "status": "enabled",
-      "reason": "Bun SQLite datetime binding, expanded SQL, column metadata, null row behavior, and explicit resource disposal pass upstream coverage."
+      "reason": "Copied upstream file passes directly under Cottontail (13 bun:test cases, 14 assertions)."
     },
-    "test/js/bun/sqlite/sqlite.test.js": {
-      "status": "expected-failure",
-      "reason": "68 of 69 active cases pass; the sole failure is Database wrapper collection because Cottontail's system-JSC embedding does not clear WeakRef targets or schedule FinalizationRegistry callbacks across timer turns."
-    },
-    "test/js/bun/util/arraybuffersink.test.ts": {
+    "test/bundler/compile-process-execargv.test.ts": {
       "status": "enabled",
-      "reason": "Bun.ArrayBufferSink smoke test passes under Cottontail's current implementation."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/util/concat.test.js": {
+    "test/bundler/css/css-modules.test.ts": {
       "status": "enabled",
-      "reason": "Bun.concatArrayBuffers max-length and Uint8Array behavior passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 5 assertions)."
     },
-    "test/js/bun/util/escapeHTML.test.js": {
+    "test/bundler/css/is-selector-21169.test.ts": {
       "status": "enabled",
-      "reason": "Bun.escapeHTML upstream utility coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/util/escapeRegExp.test.ts": {
+    "test/bundler/css/view-transition-23600.test.ts": {
       "status": "enabled",
-      "reason": "bun:internal-for-testing escapeRegExp helpers pass under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/util/fileUrl.test.js": {
+    "test/bundler/css/wpt/background-computed.test.ts": {
       "status": "enabled",
-      "reason": "Bun fileURLToPath/pathToFileURL upstream utility coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (24 bun:test cases, 24 assertions)."
     },
-    "test/js/bun/util/file-type.test.ts": {
+    "test/bundler/css/wpt/color-computed-rgb.test.ts": {
       "status": "enabled",
-      "reason": "Bun.file MIME type override and CSS type behavior passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (94 bun:test cases, 94 assertions)."
     },
-    "test/js/bun/util/sleepSync.test.ts": {
+    "test/bundler/css/wpt/color-computed.test.ts": {
       "status": "enabled",
-      "reason": "Bun.sleepSync validation and timing coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (14 bun:test cases, 14 assertions)."
     },
-    "test/js/bun/util/sleep.test.ts": {
+    "test/bundler/css/wpt/relative_color_out_of_gamut.test.ts": {
       "status": "enabled",
-      "reason": "Bun.sleep promise timing, invalid input, and abort behavior coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (27 bun:test cases, 27 assertions)."
     },
-    "test/js/bun/util/stripANSI.test.ts": {
+    "test/bundler/esbuild/lower.test.ts": {
       "status": "enabled",
-      "reason": "Bun.stripANSI and node:util stripVTControlCharacters VT/OSC escape coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (14 bun:test cases, 0 assertions)."
     },
-    "test/js/bun/util/unsafe.test.js": {
+    "test/bundler/resolver/cache-invalidation.test.ts": {
       "status": "enabled",
-      "reason": "Bun.unsafe arrayBufferToString and allocUnsafe coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (8 bun:test cases, 38 assertions)."
     },
-    "test/js/bun/util/cookie.test.js": {
+    "test/bundler/resolver/cache-runtime.test.ts": {
       "status": "enabled",
-      "reason": "Bun.Cookie/CookieMap parser, serializer, snapshot, and known-failing npm-cookie compatibility coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 9 assertions)."
     },
-    "test/js/bun/util/csrf.test.ts": {
+    "test/bundler/transpiler/es-decorators-esbuild.test.ts": {
       "status": "enabled",
-      "reason": "Bun.CSRF generation, verification, expiry, encoding, and algorithm coverage passes under Cottontail."
+      "timeoutMs": 180000,
+      "reason": "Passes (147 bun:test cases); each case spawns a transpile subprocess, so the file needs a longer per-file timeout."
     },
-    "test/js/bun/util/randomUUIDv7.test.ts": {
+    "test/bundler/transpiler/export-default.test.js": {
       "status": "enabled",
-      "reason": "Bun.randomUUIDv7 timestamp, encoding, buffer, and monotonic coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/util/randomUUIDv5.test.ts": {
+    "test/bundler/transpiler/preserve-use-strict-cjs.test.ts": {
       "status": "enabled",
-      "reason": "Bun.randomUUIDv5 namespace aliases, encodings, BufferSource inputs, version/variant bits, validation, and reference vectors pass against uuid 11.1.0."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/util/text-loader.test.ts": {
+    "test/bundler/transpiler/template-literal.test.ts": {
       "status": "enabled",
-      "reason": "Bun text loader static, dynamic, cached stress, CommonJS require, loader-override, Unicode, Latin-1, and backslash fixture coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/util/index-of-line.test.ts": {
+    "test/bundler/transpiler_constant_fold_eqeq.test.ts": {
       "status": "enabled",
-      "reason": "Bun.indexOfLine byte-offset scanning and non-number offset coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/util/peek.test.ts": {
+    "test/cli/install/bun-install-proxy.test.ts": {
       "status": "enabled",
-      "reason": "Bun.peek and peek.status coverage for fulfilled, rejected, pending, subclass, and non-promise values passes under Cottontail."
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
     },
-    "test/js/bun/util/readablestreamtoarraybuffer.test.ts": {
+    "test/cli/install/hosted-git-info/boundary-conditions.test.ts": {
       "status": "enabled",
-      "reason": "Bun.readableStreamToArrayBuffer and global ReadableStream coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/util/which.test.ts": {
+    "test/cli/run/glob-on-fuse.test.ts": {
       "status": "enabled",
-      "reason": "Bun.which PATH, slash-path, and executable-file behavior passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
     },
-    "test/js/bun/wasm/wasi.test.js": {
+    "test/cli/run/log-test.test.ts": {
       "status": "enabled",
-      "reason": "Direct WASM entrypoints instantiate through Cottontail's WASI runtime with preview1 and wasi_unstable imports."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/websocket/websocket-server.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires full Bun WebSocket server fixture execution and lifecycle behavior."
-    },
-    "test/js/bun/yaml/yaml-test-suite.test.ts": {
+    "test/cli/run/run-cjs.test.ts": {
       "status": "enabled",
-      "reason": "Bun.YAML conformance against the generated yaml-test-suite passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/yaml/yaml.test.ts": {
+    "test/cli/run/run-file-on-fuse.test.ts": {
       "status": "enabled",
-      "reason": "Bun.YAML parse/stringify behavior, input types, anchors, aliases, merges, and edge cases pass under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
     },
-    "test/js/bun/test/mock-fn.test.js": {
+    "test/cli/run/self-reference.test.ts": {
       "status": "enabled",
-      "reason": "bun:test mock function implementations, queues, contexts, instances, results, restoration, and validation coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
     },
-    "test/js/bun/test/expect-assertions.test.ts": {
+    "test/cli/run/shell-keepalive.test.ts": {
       "status": "enabled",
-      "reason": "bun:test assertion-count and hasAssertions enforcement coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/test/jest-each.test.ts": {
+    "test/cli/test/expectations.test.ts": {
       "status": "enabled",
-      "reason": "bun:test test.each and describe.each argument and title-formatting coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/test/jest-hooks.test.ts": {
+    "test/cli/update_interactive_snapshots.test.ts": {
       "status": "enabled",
-      "reason": "bun:test nested suite hook ordering and scoping coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 10 assertions)."
     },
-    "test/js/bun/test/test-failing.test.ts": {
+    "test/cli/watch/watch.test.ts": {
       "status": "enabled",
-      "reason": "bun:test test.failing success, failure, async, and assertion behavior passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/test/test-on-test-finished.test.ts": {
+    "test/integration/bun-types/fixture/23347.test.ts": {
       "status": "enabled",
-      "reason": "bun:test onTestFinished callback lifecycle coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 12 assertions)."
     },
-    "test/js/bun/test/ci-restrictions.test.ts": {
+    "test/integration/bun-types/fixture/5396.test.ts": {
       "status": "enabled",
-      "reason": "Bun test runner CI restriction smoke test passes under Cottontail's current bun:test shim."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
-    "test/js/bun/test/concurrent.test.ts": {
+    "test/integration/mysql2/mysql2.test.ts": {
       "status": "enabled",
-      "reason": "bun:test concurrent test scheduling, max-concurrency, and serial override coverage passes under Cottontail."
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
     },
-    "test/js/bun/test/concurrent_immediate.test.ts": {
+    "test/integration/sass/sass.test.ts": {
       "status": "enabled",
-      "reason": "bun:test concurrent immediate scheduling coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/test/describe.test.ts": {
+    "test/integration/svelte/server-side.test.ts": {
       "status": "enabled",
-      "reason": "bun:test describe, nested suite, skip, todo, only, and lifecycle coverage passes under Cottontail."
+      "reason": "Upstream file is entirely commented out / registers no tests; exits 0 as in Bun CI."
     },
-    "test/js/bun/test/done-async.test.ts": {
+    "test/internal/highlighter.test.ts": {
       "status": "enabled",
-      "reason": "bun:test done-callback async failure and completion ownership coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
-    "test/js/bun/test/nested-describes.test.ts": {
+    "test/internal/int_from_float.test.ts": {
       "status": "enabled",
-      "reason": "bun:test nested describe hook and test ordering coverage passes under Cottontail."
-    },
-    "test/js/bun/test/only-inside-only.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test nested only-selection coverage passes under Cottontail."
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 12 assertions)."
     },
     "test/js/bun/archive.test.ts": {
       "status": "enabled",
@@ -231,10 +245,6 @@
     "test/js/bun/console/console-table.test.ts": {
       "status": "enabled",
       "reason": "Bun console.table validation, record table rendering, snapshot fixtures, and repeated table output coverage passes under Cottontail."
-    },
-    "test/js/bun/cookie/cookie.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.CookieMap mutation coalescing, delete options, and Bun.serve Set-Cookie propagation coverage passes under Cottontail."
     },
     "test/js/bun/cookie/cookie-exotic-inputs.test.ts": {
       "status": "enabled",
@@ -252,13 +262,13 @@
       "status": "enabled",
       "reason": "Bun.Cookie security parser coverage for fuzzed quoted values, delimiters, and injection-like inputs passes under Cottontail."
     },
+    "test/js/bun/cookie/cookie.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.CookieMap mutation coalescing, delete options, and Bun.serve Set-Cookie propagation coverage passes under Cottontail."
+    },
     "test/js/bun/crypto/wpt-webcrypto.generateKey.test.ts": {
       "status": "expected-failure",
       "reason": "Large WPT-derived WebCrypto generateKey conformance file exceeds current direct-runner timeout and needs deeper WebCrypto validation."
-    },
-    "test/js/bun/css/css.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun's real cssInternals parser/minifier implementation from bun:internal-for-testing."
     },
     "test/js/bun/css/color.test.ts": {
       "status": "expected-failure",
@@ -267,6 +277,10 @@
     "test/js/bun/css/css-fuzz.test.ts": {
       "status": "expected-failure",
       "reason": "Long-running CSS fuzz coverage currently exceeds the direct upstream runner timeout under Cottontail."
+    },
+    "test/js/bun/css/css.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun's real cssInternals parser/minifier implementation from bun:internal-for-testing."
     },
     "test/js/bun/css/doesnt_crash.test.ts": {
       "status": "enabled",
@@ -280,6 +294,10 @@
       "status": "expected-failure",
       "reason": "Requires Bun.dns promise-style lookup/resolve behavior with backend selection and TTL metadata."
     },
+    "test/js/bun/empty-file.test.ts": {
+      "status": "enabled",
+      "reason": "Initial upstream Bun smoke test that runs directly under Cottontail."
+    },
     "test/js/bun/ffi/cc.test.ts": {
       "status": "enabled",
       "reason": "Bun.cc compilation, defines, native calls, N-API string values, and missing-symbol diagnostics pass upstream coverage."
@@ -292,11 +310,6 @@
       "status": "enabled",
       "reason": "All active upstream FFI cases pass, including URL/Bun.file library inputs, large symbol tables, and pointer hygiene; fixture-dependent cases retain Bun's own skip."
     },
-    "test/js/bun/glob/scan.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.Glob scan/root/cwd/absolute-path, symlink, directory, and snapshot-harness coverage passes under Cottontail.",
-      "timeoutMs": 120000
-    },
     "test/js/bun/glob/leak.test.ts": {
       "status": "enabled",
       "reason": "Bun.Glob scan leak self-spawn coverage passes with spawnable process.argv[0] and TypeScript eval support."
@@ -308,6 +321,11 @@
     "test/js/bun/glob/proto.test.ts": {
       "status": "enabled",
       "reason": "Bun.Glob followSymlinks own-option handling and prototype-pollution guard coverage passes under Cottontail."
+    },
+    "test/js/bun/glob/scan.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.Glob scan/root/cwd/absolute-path, symlink, directory, and snapshot-harness coverage passes under Cottontail.",
+      "timeoutMs": 120000
     },
     "test/js/bun/globals.test.js": {
       "status": "enabled",
@@ -370,8 +388,8 @@
       "reason": "Bun.serve route params, method routes, false route fallback, specificity ordering, reload, validation, and server.fetch coverage passes under Cottontail."
     },
     "test/js/bun/http/bun-serve-ssl.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires real TLS support in Bun.serve; currently times out under Cottontail."
+      "status": "enabled",
+      "reason": "Bun.serve TLS coverage passes with the streaming node:http/https/tls stack (16 bun:test cases, 44 assertions)."
     },
     "test/js/bun/http/bun-serve-static.test.ts": {
       "status": "enabled",
@@ -381,9 +399,21 @@
       "status": "expected-failure",
       "reason": "Requires fuller Bun.Server lifecycle and request handling behavior; currently times out under Cottontail."
     },
+    "test/js/bun/http/decodeURIComponentSIMD.test.ts": {
+      "status": "enabled",
+      "reason": "decodeURIComponentSIMD malformed-percent handling and UTF-8 validation now pass this upstream file."
+    },
     "test/js/bun/http/fetch-file-upload.test.ts": {
       "status": "enabled",
       "reason": "Bun.file request bodies, multipart FormData encoding/decoding, body disturbance, sendfile uploads, response metadata, and immediate missing-file rejection pass upstream coverage."
+    },
+    "test/js/bun/http/hspec.test.ts": {
+      "status": "enabled",
+      "reason": "Concurrent HTTP connection handling and h1spec request-line, target, header, Host, framing, and malformed-body validation coverage passes under Cottontail."
+    },
+    "test/js/bun/http/http-server-chunking.test.ts": {
+      "status": "enabled",
+      "reason": "Fragmented chunk terminators, invalid framing rejection, nonblocking socket backpressure, and persistent pipelined HTTP/1.1 request coverage passes under Cottontail."
     },
     "test/js/bun/http/listener-getsockname.test.ts": {
       "status": "enabled",
@@ -409,6 +439,10 @@
       "status": "expected-failure",
       "reason": "Requires full Bun.serve request body lifecycle behavior; currently times out under Cottontail."
     },
+    "test/js/bun/http/serve-direct-readable-stream.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.serve direct ReadableStream response sink lifecycle, writes, flush, and closed-controller errors pass under Cottontail."
+    },
     "test/js/bun/http/serve-if-none-match.test.ts": {
       "status": "enabled",
       "reason": "Bun.serve static ETag generation, If-None-Match evaluation, HEAD behavior, redirects, and non-GET handling passes under Cottontail."
@@ -424,26 +458,6 @@
     "test/js/bun/http/tls-keepalive.test.ts": {
       "status": "expected-failure",
       "reason": "Requires real TLS keepalive support in Bun.serve/fetch; currently times out under Cottontail."
-    },
-    "test/js/bun/http/http-server-chunking.test.ts": {
-      "status": "enabled",
-      "reason": "Fragmented chunk terminators, invalid framing rejection, nonblocking socket backpressure, and persistent pipelined HTTP/1.1 request coverage passes under Cottontail."
-    },
-    "test/js/bun/http/decodeURIComponentSIMD.test.ts": {
-      "status": "enabled",
-      "reason": "decodeURIComponentSIMD malformed-percent handling and UTF-8 validation now pass this upstream file."
-    },
-    "test/js/bun/http/hspec.test.ts": {
-      "status": "enabled",
-      "reason": "Concurrent HTTP connection handling and h1spec request-line, target, header, Host, framing, and malformed-body validation coverage passes under Cottontail."
-    },
-    "test/js/bun/http/serve-direct-readable-stream.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.serve direct ReadableStream response sink lifecycle, writes, flush, and closed-controller errors pass under Cottontail."
-    },
-    "test/js/bun/io/fetch/fetch-abort-slow-connect.test.ts": {
-      "status": "enabled",
-      "reason": "AbortSignal.timeout applies connect and total fetch deadlines and reports TimeoutError while pre-aborted signals fail immediately."
     },
     "test/js/bun/import-attributes/import-attributes.test.ts": {
       "status": "enabled",
@@ -462,21 +476,25 @@
       "status": "enabled",
       "reason": "Bun.write file, byte-array path, Bun.file, Response, stream, ENOENT, FileRef inspect, HTMLRewriter, and timed stderr coverage passes under Cottontail."
     },
+    "test/js/bun/io/fetch/fetch-abort-slow-connect.test.ts": {
+      "status": "enabled",
+      "reason": "AbortSignal.timeout applies connect and total fetch deadlines and reports TimeoutError while pre-aborted signals fail immediately."
+    },
     "test/js/bun/jsc-stress/fixtures/simd-baseline.test.ts": {
-      "status": "expected-failure",
-      "reason": "JSC stress fixture is long-running under the direct upstream runner and currently exceeds the per-file timeout."
+      "status": "enabled",
+      "reason": "JSC SIMD baseline fixture passes within the runner timeout (28 bun:test cases)."
     },
     "test/js/bun/jsc-stress/jsc-stress.test.ts": {
       "status": "expected-failure",
       "reason": "Requires Bun's JSC stress-test harness behavior and currently exceeds the per-file timeout."
     },
-    "test/js/bun/jsc/domjit.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun/JSC DOMJIT internals not exposed by Cottontail yet; currently times out under the direct runner."
-    },
     "test/js/bun/jsc/bun-jsc.test.ts": {
       "status": "expected-failure",
       "reason": "Requires Bun's JSC introspection helpers and code coverage behavior."
+    },
+    "test/js/bun/jsc/domjit.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun/JSC DOMJIT internals not exposed by Cottontail yet; currently times out under the direct runner."
     },
     "test/js/bun/jsc/shadow.test.js": {
       "status": "enabled",
@@ -502,9 +520,17 @@
       "status": "enabled",
       "reason": "Bun.markdown.html uses Bun's vendored Zig parser and passes GFM compatibility coverage."
     },
+    "test/js/bun/md/md-edge-cases.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with react-dom server rendering available (50 bun:test cases, 358 assertions)."
+    },
     "test/js/bun/md/md-heading-ids.test.ts": {
       "status": "enabled",
       "reason": "Bun.markdown.html heading IDs, deduplication, and autolink heading behavior pass upstream coverage."
+    },
+    "test/js/bun/md/md-react.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with react/react-dom vendored into the snapshot store (68 bun:test cases, 194 assertions)."
     },
     "test/js/bun/md/md-render-callback.test.ts": {
       "status": "enabled",
@@ -514,13 +540,9 @@
       "status": "enabled",
       "reason": "Bun's vendored Zig markdown parser passes the copied 792-case CommonMark and extension specification corpus."
     },
-    "test/js/bun/md/md-edge-cases.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires upstream React DOM server dependency, which is not vendored into the copied Bun snapshot yet."
-    },
-    "test/js/bun/md/md-react.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires upstream React and React DOM server dependencies, which are not vendored into the copied Bun snapshot yet."
+    "test/js/bun/namespace-prototype-pollution.test.ts": {
+      "status": "enabled",
+      "reason": "Bun-compatible module namespace prototype isolation and synthetic __esModule assignment coverage passes under Cottontail."
     },
     "test/js/bun/net/socket.test.ts": {
       "status": "expected-failure",
@@ -529,10 +551,6 @@
     "test/js/bun/net/tcp-server.test.ts": {
       "status": "enabled",
       "reason": "Bun TCP listener validation, remote addresses, bidirectional echo, binary types, and lifecycle coverage passes under Cottontail."
-    },
-    "test/js/bun/namespace-prototype-pollution.test.ts": {
-      "status": "enabled",
-      "reason": "Bun-compatible module namespace prototype isolation and synthetic __esModule assignment coverage passes under Cottontail."
     },
     "test/js/bun/patch/patch.test.ts": {
       "status": "enabled",
@@ -638,10 +656,6 @@
       "status": "expected-failure",
       "reason": "Requires upstream packages/bun-error fixture that is not vendored into the copied Bun snapshot yet."
     },
-    "test/js/bun/s3/s3-stream-cancel-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Long-running S3 stream cancellation leak coverage currently exceeds the direct upstream runner timeout."
-    },
     "test/js/bun/s3/s3-insecure.test.ts": {
       "status": "expected-failure",
       "reason": "Requires Bun.S3Client file/object APIs beyond Cottontail's current S3 surface."
@@ -658,6 +672,10 @@
       "status": "expected-failure",
       "reason": "Requires Bun.S3Client static file APIs and storage-class option support."
     },
+    "test/js/bun/s3/s3-stream-cancel-leak.test.ts": {
+      "status": "expected-failure",
+      "reason": "Long-running S3 stream cancellation leak coverage currently exceeds the direct upstream runner timeout."
+    },
     "test/js/bun/secrets-error-codes.test.ts": {
       "status": "enabled",
       "reason": "Bun.secrets validation, platform error codes, missing credentials, and successful credential lifecycle coverage passes."
@@ -666,9 +684,33 @@
       "status": "enabled",
       "reason": "Bun.secrets passes macOS Keychain lifecycle, replacement, concurrency, empty deletion, special-character, control-byte, and Unicode coverage."
     },
+    "test/js/bun/shell/assignments-in-pipeline.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell assignment-only pipeline stages pass all upstream quoting, chaining, substitution, and stdin passthrough coverage."
+    },
+    "test/js/bun/shell/brace.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell brace expansion passes upstream flat, nested, deeply nested, no-op, and Unicode coverage."
+    },
     "test/js/bun/shell/bunshell-default.test.ts": {
       "status": "enabled",
       "reason": "Bun shell default smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/bunshell-file.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.file shell interpolation path-string behavior passes under Cottontail."
+    },
+    "test/js/bun/shell/bunshell-instance.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell instances, result conversion APIs, environment isolation, and binary stdin/stdout interpolation pass upstream coverage."
+    },
+    "test/js/bun/shell/bunshell.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires broad Bun shell parser/runtime parity."
+    },
+    "test/js/bun/shell/commands/basename.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell basename builtin now handles usage, multiple operands, slash trimming, and Windows-style paths for this upstream file."
     },
     "test/js/bun/shell/commands/dirname.test.ts": {
       "status": "enabled",
@@ -682,13 +724,13 @@
       "status": "enabled",
       "reason": "Bun shell exit smoke test passes under Cottontail's current shell wrapper."
     },
-    "test/js/bun/shell/commands/mv.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell mv file/directory moves and ENOTDIR/ENOENT error behavior coverage passes under Cottontail."
-    },
     "test/js/bun/shell/commands/false.test.ts": {
       "status": "enabled",
       "reason": "Bun shell false smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/mv.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell mv file/directory moves and ENOTDIR/ENOENT error behavior coverage passes under Cottontail."
     },
     "test/js/bun/shell/commands/rm.test.ts": {
       "status": "enabled",
@@ -710,45 +752,37 @@
       "status": "enabled",
       "reason": "Bun shell yes builtin and Buffer redirection coverage passes under Cottontail."
     },
+    "test/js/bun/shell/env.positionals.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell positional parameters and .bun.sh run-script argv behavior passes under Cottontail."
+    },
     "test/js/bun/shell/epipe.test.ts": {
       "status": "enabled",
       "reason": "Bun shell epipe smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/exec.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun shell exec/process behavior that currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/shell/file-io.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell file redirection, append, pipes, large writes, echo -n, and combined stdout/stderr redirect coverage passes under Cottontail."
     },
     "test/js/bun/shell/lazy.test.ts": {
       "status": "enabled",
       "reason": "Bun shell lazy smoke test passes under Cottontail's current shell wrapper."
     },
-    "test/js/bun/shell/assignments-in-pipeline.test.ts": {
+    "test/js/bun/shell/pipeline_stack.test.ts": {
       "status": "enabled",
-      "reason": "Bun shell assignment-only pipeline stages pass all upstream quoting, chaining, substitution, and stdin passthrough coverage."
+      "reason": "Bun shell pipeline nesting, builtins, conditionals, assignments, cleanup, EPIPE, and stress coverage passes under Cottontail."
     },
-    "test/js/bun/shell/brace.test.ts": {
+    "test/js/bun/shell/shell-cmdsub-crash.test.ts": {
       "status": "enabled",
-      "reason": "Bun shell brace expansion passes upstream flat, nested, deeply nested, no-op, and Unicode coverage."
+      "reason": "Bun shell command-substitution crash regression coverage passes under Cottontail."
     },
-    "test/js/bun/shell/bunshell-file.test.ts": {
+    "test/js/bun/shell/shell-hang.test.ts": {
       "status": "enabled",
-      "reason": "Bun.file shell interpolation path-string behavior passes under Cottontail."
-    },
-    "test/js/bun/shell/bunshell-instance.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell instances, result conversion APIs, environment isolation, and binary stdin/stdout interpolation pass upstream coverage."
-    },
-    "test/js/bun/shell/bunshell.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires broad Bun shell parser/runtime parity."
-    },
-    "test/js/bun/shell/env.positionals.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell positional parameters and .bun.sh run-script argv behavior passes under Cottontail."
-    },
-    "test/js/bun/shell/commands/basename.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell basename builtin now handles usage, multiple operands, slash trimming, and Windows-style paths for this upstream file."
-    },
-    "test/js/bun/shell/exec.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun shell exec/process behavior that currently exceeds the direct upstream runner timeout."
+      "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status."
     },
     "test/js/bun/shell/shell-seq-condexpr.test.ts": {
       "status": "enabled",
@@ -762,13 +796,13 @@
       "status": "enabled",
       "reason": "Bun shell throw/nothrow behavior coverage passes under Cottontail."
     },
-    "test/js/bun/spawn/spawn-env.test.ts": {
+    "test/js/bun/shell/yield.test.ts": {
       "status": "enabled",
-      "reason": "Bun.spawn environment propagation now passes this upstream file."
+      "reason": "Bun shell handles a 10,000-element interpolated echo command without overflowing the stack."
     },
-    "test/js/bun/spawn/spawn-kill-signal.test.ts": {
+    "test/js/bun/spawn/job-object-bug.test.ts": {
       "status": "enabled",
-      "reason": "Bun.spawn kill signal defaults, validation, exitCode, and signalCode coverage passes under Cottontail."
+      "reason": "Bun.spawn Windows job-object regression coverage is correctly platform-gated on macOS."
     },
     "test/js/bun/spawn/null-byte-injection.test.ts": {
       "status": "enabled",
@@ -782,13 +816,13 @@
       "status": "enabled",
       "reason": "Bun.spawn empty ArrayBuffer, Uint8Array, and Blob stdin values now close child stdin and pass EOF behavior coverage."
     },
-    "test/js/bun/spawn/spawn-stdin-readable-stream-sync.test.ts": {
+    "test/js/bun/spawn/spawn-env.test.ts": {
       "status": "enabled",
-      "reason": "Bun.spawnSync ReadableStream stdin fixture coverage passes under Cottontail."
+      "reason": "Bun.spawn environment propagation now passes this upstream file."
     },
-    "test/js/bun/spawn/spawn-streaming-stdout.test.ts": {
+    "test/js/bun/spawn/spawn-kill-signal.test.ts": {
       "status": "enabled",
-      "reason": "Bun.spawn streaming stdout iteration, Bun.stdout.writer, and harness heap-stat compatibility coverage passes under Cottontail."
+      "reason": "Bun.spawn kill signal defaults, validation, exitCode, and signalCode coverage passes under Cottontail."
     },
     "test/js/bun/spawn/spawn-large-array-length.test.ts": {
       "status": "enabled",
@@ -810,114 +844,89 @@
       "status": "expected-failure",
       "reason": "Long-running Bun.spawn pipe leak coverage currently exceeds the direct upstream runner timeout."
     },
+    "test/js/bun/spawn/spawn-stdin-destroy.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn piped stdin destruction and subprocess completion coverage passes under Cottontail."
+    },
     "test/js/bun/spawn/spawn-stdin-readable-stream-integration.test.ts": {
       "status": "enabled",
       "reason": "Bun.spawn ReadableStream stdin integration, pipeThrough transforms, and delayed pull scheduling coverage passes under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-stdin-readable-stream-sync.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawnSync ReadableStream stdin fixture coverage passes under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-stream-serve.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn stdout streaming into Bun.serve responses now passes under Cottontail."
     },
     "test/js/bun/spawn/spawn-streaming-stdin.test.ts": {
       "status": "enabled",
       "reason": "Bun.spawn streaming stdin writes, Bun.stdin.stream, and concurrent stdout consumption coverage passes under Cottontail."
     },
+    "test/js/bun/spawn/spawn-streaming-stdout.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn streaming stdout iteration, Bun.stdout.writer, and harness heap-stat compatibility coverage passes under Cottontail."
+    },
+    "test/js/bun/spawn/spawn-stress.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn stress coverage now passes under Cottontail."
+    },
     "test/js/bun/spawn/spawn.test.ts": {
       "status": "expected-failure",
       "reason": "Large Bun.spawn conformance file still exceeds the direct upstream runner timeout under Cottontail."
+    },
+    "test/js/bun/spawn/spawn_waiter_thread.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn waiter-thread coverage passes under Cottontail."
+    },
+    "test/js/bun/spawn/spawnsync-isolated-event-loop.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawnSync remains isolated from pending timers and microtasks across upstream subprocess coverage."
+    },
+    "test/js/bun/sqlite/column-types.test.js": {
+      "status": "enabled",
+      "reason": "Bun SQLite native column names, runtime value types, declared schema types, expression metadata, and statement-state validation pass through SQLite's native metadata APIs."
+    },
+    "test/js/bun/sqlite/sql-timezone.test.js": {
+      "status": "enabled",
+      "reason": "Bun SQLite datetime binding, expanded SQL, column metadata, null row behavior, and explicit resource disposal pass upstream coverage."
+    },
+    "test/js/bun/sqlite/sqlite.test.js": {
+      "status": "expected-failure",
+      "reason": "68 of 69 active cases pass; the sole failure is Database wrapper collection because Cottontail's system-JSC embedding does not clear WeakRef targets or schedule FinalizationRegistry callbacks across timer turns."
+    },
+    "test/js/bun/stream/direct-readable-stream.test.tsx": {
+      "status": "expected-failure",
+      "reason": "React deps are now vendored; direct ReadableStream rendering still times out under Cottontail and needs direct-stream Response integration."
     },
     "test/js/bun/terminal/terminal.test.ts": {
       "status": "expected-failure",
       "reason": "Requires Bun terminal APIs and disposable terminal lifecycle behavior."
     },
-    "test/js/bun/transpiler/repl-transform.test.ts": {
+    "test/js/bun/test/ci-restrictions.test.ts": {
       "status": "enabled",
-      "reason": "Bun.Transpiler replMode passes expression results, top-level await, persistent declarations, object literals, destructuring, and TypeScript stripping coverage."
+      "reason": "Bun test runner CI restriction smoke test passes under Cottontail's current bun:test shim."
     },
-    "test/js/bun/typescript/type-export.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun TypeScript execution/resolution behavior for spawned temporary files."
-    },
-    "test/js/bun/udp/udp_socket.test.ts": {
+    "test/js/bun/test/concurrent.test.ts": {
       "status": "enabled",
-      "reason": "Bun.udpSocket bound and connected sockets, address metadata, send/sendMany, loopback delivery, all supported input forms, and buffer/Uint8Array/ArrayBuffer output modes pass upstream coverage."
+      "reason": "bun:test concurrent test scheduling, max-concurrency, and serial override coverage passes under Cottontail."
     },
-    "test/js/bun/util/BunObject.test.ts": {
+    "test/js/bun/test/concurrent_immediate.test.ts": {
       "status": "enabled",
-      "reason": "Bun object non-reified static detection and dynamic require/import(\"bun\") coverage passes under Cottontail."
+      "reason": "bun:test concurrent immediate scheduling coverage passes under Cottontail."
     },
-    "test/js/bun/util/bun-cryptohasher.test.ts": {
+    "test/js/bun/test/describe.test.ts": {
       "status": "enabled",
-      "reason": "Bun.CryptoHasher hash, HMAC, static helper, alias, and consumed-state coverage passes under Cottontail."
+      "reason": "bun:test describe, nested suite, skip, todo, only, and lifecycle coverage passes under Cottontail."
     },
-    "test/js/bun/util/bun-file-exists.test.js": {
+    "test/js/bun/test/done-async.test.ts": {
       "status": "enabled",
-      "reason": "Bun.file exists() file-vs-directory behavior passes under Cottontail."
+      "reason": "bun:test done-callback async failure and completion ownership coverage passes under Cottontail."
     },
-    "test/js/bun/util/bun-file-read.test.ts": {
+    "test/js/bun/test/expect-assertions.test.ts": {
       "status": "enabled",
-      "reason": "Bun.file slice/read offset behavior passes under Cottontail."
-    },
-    "test/js/bun/util/bun-file-windows.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.file and fs /dev/null compatibility coverage passes under Cottontail."
-    },
-    "test/js/bun/util/bun-file.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.file delete/stat/fd writer behavior passes under Cottontail."
-    },
-    "test/js/bun/util/filesink.test.ts": {
-      "status": "enabled",
-      "reason": "Bun FileSink regular-file and FIFO writes, flushing, high-water-mark options, UTF-8 byte counts, descriptor ownership, and chunked file streams pass upstream coverage."
-    },
-    "test/js/bun/util/password.test.ts": {
-      "status": "enabled",
-      "timeoutMs": 60000,
-      "reason": "Bun.password argument validation, Argon2 variants, bcrypt, synchronous and promise APIs, verification, long-password prehashing, and historical Bun hash compatibility pass using Zig standard-library cryptography."
-    },
-    "test/js/bun/util/zstd.test.ts": {
-      "status": "enabled",
-      "reason": "Bun Zstandard sync and promise APIs, levels 1-22, CLI frame compatibility, validation, roundtrips, and automatic HTTP response decoding pass through native libzstd."
-    },
-    "test/js/bun/util/wrapAnsi.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.wrapAnsi word and hard wrapping, Unicode widths, trimming, ANSI SGR state, extended colors, and column edge cases pass upstream coverage."
-    },
-    "test/js/bun/util/wrapAnsi.npm.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.wrapAnsi passes the upstream npm-derived compatibility suite, including whitespace rows, character wrapping, OSC-8 hyperlinks, background colors, and non-SGR escapes."
-    },
-    "test/js/bun/util/hash.test.js": {
-      "status": "enabled",
-      "reason": "Bun.hash and its Wyhash, Adler-32, CRC-32, CityHash, xxHash, Murmur, and RapidHash variants pass exact upstream vectors and 64-bit seed coverage through Zig implementations."
-    },
-    "test/js/bun/util/mmap.test.js": {
-      "status": "enabled",
-      "reason": "Bun.mmap shared and private POSIX mappings, offset and size handling, write visibility, and argument validation pass upstream coverage through native mmap."
-    },
-    "test/js/bun/util/filesystem_router.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.FileSystemRouter constructor validation, discovery, reloads, route maps, static/dynamic/catch-all matching, Request and URL inputs, params, queries, origins, and asset prefixes pass upstream coverage."
-    },
-    "test/js/bun/util/bun-main.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.main entrypoint path coverage passes under Cottontail."
-    },
-    "test/js/bun/util/error-gc-test.test.js": {
-      "status": "enabled",
-      "reason": "Error stack/inspection GC stress coverage passes with Node-style fs ENOENT errors and Error inspect formatting."
-    },
-    "test/js/bun/util/inspect-error-leak.test.js": {
-      "status": "enabled",
-      "reason": "Bun.inspect error formatting remains below the upstream RSS growth threshold across 100,000 calls with forced garbage collection."
-    },
-    "test/js/bun/util/exotic-global-mutable-prototype.test.ts": {
-      "status": "enabled",
-      "reason": "Object.setPrototypeOf/getPrototypeOf globalThis compatibility coverage passes under Cottontail."
-    },
-    "test/js/bun/util/bun-isMainThread.test.js": {
-      "status": "enabled",
-      "reason": "Bun.isMainThread main-thread and Worker-thread fixture behavior passes under Cottontail."
-    },
-    "test/js/bun/stream/direct-readable-stream.test.tsx": {
-      "status": "expected-failure",
-      "reason": "Requires upstream React and React DOM server dependencies, which are not vendored into the copied Bun snapshot yet."
+      "reason": "bun:test assertion-count and hasAssertions enforcement coverage passes under Cottontail."
     },
     "test/js/bun/test/expect-label.test.ts": {
       "status": "enabled",
@@ -927,29 +936,45 @@
       "status": "enabled",
       "reason": "bun:test toHaveReturnedWith values, objects, promises, thrown calls, negation, and matcher validation pass upstream coverage."
     },
-    "test/js/bun/test/expect/toHaveReturnedWith.test.ts": {
+    "test/js/bun/test/expect-type-doctest.test.ts": {
       "status": "enabled",
-      "reason": "Jest-derived toHaveReturnedWith mock result, asymmetric matcher, negation, and diagnostic coverage passes under Cottontail."
+      "reason": "bun:test expectTypeOf documentation examples compile and execute under Cottontail."
+    },
+    "test/js/bun/test/expect-type-global.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test installs expectTypeOf as a test global alongside expect and lifecycle helpers."
+    },
+    "test/js/bun/test/expect-type.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test expectTypeOf TypeScript compatibility coverage passes under Cottontail."
     },
     "test/js/bun/test/expect-unreaachable.test.ts": {
       "status": "enabled",
       "reason": "bun:test expect.unreachable function, string, Error, and default diagnostic behavior passes upstream coverage."
     },
+    "test/js/bun/test/expect/toHaveReturnedWith.test.ts": {
+      "status": "enabled",
+      "reason": "Jest-derived toHaveReturnedWith mock result, asymmetric matcher, negation, and diagnostic coverage passes under Cottontail."
+    },
     "test/js/bun/test/fake-timers/fake-timers.test.ts": {
       "status": "enabled",
       "reason": "Vitest-compatible fake timers pass upstream clock, Date, performance, interval, pending-timer, and lifecycle coverage."
+    },
+    "test/js/bun/test/fake-timers/sinonjs/fake-timers.test.ts": {
+      "status": "enabled",
+      "reason": "Sinon-style fake timer coverage now passes under the Cottontail bun:test clock."
     },
     "test/js/bun/test/fake-timers/sinonjs/issue-1852.test.ts": {
       "status": "enabled",
       "reason": "Sinon fake-timer issue 1852 regression coverage passes under Cottontail."
     },
-    "test/js/bun/test/fake-timers/sinonjs/issue-207.test.ts": {
-      "status": "enabled",
-      "reason": "Fake Date and process.hrtime clocks preserve nanosecond remainders while exposing integer wall-clock milliseconds."
-    },
     "test/js/bun/test/fake-timers/sinonjs/issue-187.test.ts": {
       "status": "enabled",
       "reason": "Fake timeout refresh scheduling and refiring behavior passes Sinon regression coverage."
+    },
+    "test/js/bun/test/fake-timers/sinonjs/issue-207.test.ts": {
+      "status": "enabled",
+      "reason": "Fake Date and process.hrtime clocks preserve nanosecond remainders while exposing integer wall-clock milliseconds."
     },
     "test/js/bun/test/fake-timers/sinonjs/issue-2086.test.ts": {
       "status": "enabled",
@@ -995,13 +1020,25 @@
       "status": "enabled",
       "reason": "Sinon fake-timer issue 73 regression coverage passes under Cottontail."
     },
-    "test/js/bun/test/mock/6874/A.test.ts": {
+    "test/js/bun/test/jest-each.test.ts": {
       "status": "enabled",
-      "reason": "Late package mocking updates existing CommonJS export references using the copied suite's pinned Lodash dependency."
+      "reason": "bun:test test.each and describe.each argument and title-formatting coverage passes under Cottontail."
+    },
+    "test/js/bun/test/jest-hooks.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test nested suite hook ordering and scoping coverage passes under Cottontail."
     },
     "test/js/bun/test/mock-disposable.test.ts": {
       "status": "enabled",
       "reason": "bun:test mock and spy handles implement Symbol.dispose, clear standalone mocks, and auto-restore own and prototype methods."
+    },
+    "test/js/bun/test/mock-fn.test.js": {
+      "status": "enabled",
+      "reason": "bun:test mock function implementations, queues, contexts, instances, results, restoration, and validation coverage passes under Cottontail."
+    },
+    "test/js/bun/test/mock/6874/A.test.ts": {
+      "status": "enabled",
+      "reason": "Late package mocking updates existing CommonJS export references using the copied suite's pinned Lodash dependency."
     },
     "test/js/bun/test/mock/6874/B.test.ts": {
       "status": "enabled",
@@ -1015,85 +1052,17 @@
       "status": "enabled",
       "reason": "Bun module mocks pass async and virtual modules, missing relative modules, live package and builtin updates, namespace spying, local export rebinding, and re-export propagation."
     },
-    "test/js/bun/test/test-retry-repeats-basic.test.ts": {
+    "test/js/bun/test/nested-describes.test.ts": {
       "status": "enabled",
-      "reason": "bun:test retry and repeat execution semantics and hook interactions pass under Cottontail."
+      "reason": "bun:test nested describe hook and test ordering coverage passes under Cottontail."
     },
-    "test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts": {
-      "status": "expected-failure",
-      "reason": "Snapshot conformance file currently exceeds the direct upstream runner timeout."
-    },
-    "test/js/bun/test/spyMatchers.test.ts": {
+    "test/js/bun/test/only-inside-only.test.ts": {
       "status": "enabled",
-      "reason": "Bun spy matcher coverage passes with the upstream Immutable.js test dependency declared by Cottontail."
-    },
-    "test/js/bun/spawn/job-object-bug.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.spawn Windows job-object regression coverage is correctly platform-gated on macOS."
-    },
-    "test/js/bun/spawn/spawn-stdin-destroy.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.spawn piped stdin destruction and subprocess completion coverage passes under Cottontail."
-    },
-    "test/js/bun/spawn/spawnsync-isolated-event-loop.test.ts": {
-      "status": "enabled",
-      "reason": "Bun.spawnSync remains isolated from pending timers and microtasks across upstream subprocess coverage."
-    },
-    "test/js/bun/shell/shell-cmdsub-crash.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell command-substitution crash regression coverage passes under Cottontail."
-    },
-    "test/js/bun/shell/file-io.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell file redirection, append, pipes, large writes, echo -n, and combined stdout/stderr redirect coverage passes under Cottontail."
-    },
-    "test/js/bun/shell/shell-hang.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status."
-    },
-    "test/js/bun/shell/yield.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell handles a 10,000-element interpolated echo command without overflowing the stack."
-    },
-    "test/js/bun/shell/pipeline_stack.test.ts": {
-      "status": "enabled",
-      "reason": "Bun shell pipeline nesting, builtins, conditionals, assignments, cleanup, EPIPE, and stress coverage passes under Cottontail."
-    },
-    "test/js/bun/util/highlighter.test.ts": {
-      "status": "enabled",
-      "reason": "Bun syntax highlighter upstream coverage passes under Cottontail."
-    },
-    "test/js/bun/test/expect-type-doctest.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test expectTypeOf documentation examples compile and execute under Cottontail."
-    },
-    "test/js/bun/test/expect-type-global.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test installs expectTypeOf as a test global alongside expect and lifecycle helpers."
-    },
-    "test/js/bun/test/expect-type.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test expectTypeOf TypeScript compatibility coverage passes under Cottontail."
-    },
-    "test/js/bun/test/test-auto-import-jest-globals.test.js": {
-      "status": "enabled",
-      "reason": "Bun test globals are automatically available to JavaScript test files."
+      "reason": "bun:test nested only-selection coverage passes under Cottontail."
     },
     "test/js/bun/test/preload-test.test.js": {
       "status": "enabled",
       "reason": "bun:test preload fixture behavior passes upstream coverage."
-    },
-    "test/js/bun/test/snapshot-tests/snapshots/more.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test snapshot serialization edge cases, escaping, names, nesting, and hints pass upstream coverage."
-    },
-    "test/js/bun/test/snapshot-tests/snapshots/more-snapshots/different-directory.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test resolves snapshot storage relative to tests in nested directories."
-    },
-    "test/js/bun/test/snapshot-tests/snapshots/moremore.test.ts": {
-      "status": "enabled",
-      "reason": "bun:test serializes boxed primitives, nested objects, BigInt, and recursive snapshot property matchers."
     },
     "test/js/bun/test/snapshot-tests/bun-snapshots.test.ts": {
       "status": "enabled",
@@ -1107,9 +1076,1338 @@
       "status": "enabled",
       "reason": "bun:test creates missing __snapshots__ directories and Bun-compatible snapshot module files."
     },
+    "test/js/bun/test/snapshot-tests/snapshots/more-snapshots/different-directory.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test resolves snapshot storage relative to tests in nested directories."
+    },
+    "test/js/bun/test/snapshot-tests/snapshots/more.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test snapshot serialization edge cases, escaping, names, nesting, and hints pass upstream coverage."
+    },
+    "test/js/bun/test/snapshot-tests/snapshots/moremore.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test serializes boxed primitives, nested objects, BigInt, and recursive snapshot property matchers."
+    },
+    "test/js/bun/test/snapshot-tests/snapshots/snapshot.test.ts": {
+      "status": "expected-failure",
+      "reason": "Snapshot conformance file currently exceeds the direct upstream runner timeout."
+    },
+    "test/js/bun/test/spyMatchers.test.ts": {
+      "status": "enabled",
+      "reason": "Bun spy matcher coverage passes with the upstream Immutable.js test dependency declared by Cottontail."
+    },
+    "test/js/bun/test/test-auto-import-jest-globals.test.js": {
+      "status": "enabled",
+      "reason": "Bun test globals are automatically available to JavaScript test files."
+    },
+    "test/js/bun/test/test-failing.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test test.failing success, failure, async, and assertion behavior passes under Cottontail."
+    },
+    "test/js/bun/test/test-on-test-finished.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test onTestFinished callback lifecycle coverage passes under Cottontail."
+    },
+    "test/js/bun/test/test-retry-repeats-basic.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test retry and repeat execution semantics and hook interactions pass under Cottontail."
+    },
+    "test/js/bun/transpiler/repl-transform.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.Transpiler replMode passes expression results, top-level await, persistent declarations, object literals, destructuring, and TypeScript stripping coverage."
+    },
+    "test/js/bun/typescript/type-export.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires Bun TypeScript execution/resolution behavior for spawned temporary files."
+    },
+    "test/js/bun/udp/udp_socket.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.udpSocket bound and connected sockets, address metadata, send/sendMany, loopback delivery, all supported input forms, and buffer/Uint8Array/ArrayBuffer output modes pass upstream coverage."
+    },
+    "test/js/bun/util/BunObject.test.ts": {
+      "status": "enabled",
+      "reason": "Bun object non-reified static detection and dynamic require/import(\"bun\") coverage passes under Cottontail."
+    },
+    "test/js/bun/util/arraybuffersink.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.ArrayBufferSink smoke test passes under Cottontail's current implementation."
+    },
+    "test/js/bun/util/bun-cryptohasher.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.CryptoHasher hash, HMAC, static helper, alias, and consumed-state coverage passes under Cottontail."
+    },
+    "test/js/bun/util/bun-file-exists.test.js": {
+      "status": "enabled",
+      "reason": "Bun.file exists() file-vs-directory behavior passes under Cottontail."
+    },
+    "test/js/bun/util/bun-file-read.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.file slice/read offset behavior passes under Cottontail."
+    },
+    "test/js/bun/util/bun-file-windows.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.file and fs /dev/null compatibility coverage passes under Cottontail."
+    },
+    "test/js/bun/util/bun-file.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.file delete/stat/fd writer behavior passes under Cottontail."
+    },
+    "test/js/bun/util/bun-isMainThread.test.js": {
+      "status": "enabled",
+      "reason": "Bun.isMainThread main-thread and Worker-thread fixture behavior passes under Cottontail."
+    },
+    "test/js/bun/util/bun-main.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.main entrypoint path coverage passes under Cottontail."
+    },
+    "test/js/bun/util/concat.test.js": {
+      "status": "enabled",
+      "reason": "Bun.concatArrayBuffers max-length and Uint8Array behavior passes under Cottontail."
+    },
+    "test/js/bun/util/cookie.test.js": {
+      "status": "enabled",
+      "reason": "Bun.Cookie/CookieMap parser, serializer, snapshot, and known-failing npm-cookie compatibility coverage passes under Cottontail."
+    },
+    "test/js/bun/util/csrf.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.CSRF generation, verification, expiry, encoding, and algorithm coverage passes under Cottontail."
+    },
+    "test/js/bun/util/error-gc-test.test.js": {
+      "status": "enabled",
+      "reason": "Error stack/inspection GC stress coverage passes with Node-style fs ENOENT errors and Error inspect formatting."
+    },
+    "test/js/bun/util/escapeHTML.test.js": {
+      "status": "enabled",
+      "reason": "Bun.escapeHTML upstream utility coverage passes under Cottontail."
+    },
+    "test/js/bun/util/escapeRegExp.test.ts": {
+      "status": "enabled",
+      "reason": "bun:internal-for-testing escapeRegExp helpers pass under Cottontail."
+    },
+    "test/js/bun/util/exotic-global-mutable-prototype.test.ts": {
+      "status": "enabled",
+      "reason": "Object.setPrototypeOf/getPrototypeOf globalThis compatibility coverage passes under Cottontail."
+    },
+    "test/js/bun/util/file-type.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.file MIME type override and CSS type behavior passes under Cottontail."
+    },
+    "test/js/bun/util/fileUrl.test.js": {
+      "status": "enabled",
+      "reason": "Bun fileURLToPath/pathToFileURL upstream utility coverage passes under Cottontail."
+    },
+    "test/js/bun/util/filesink.test.ts": {
+      "status": "enabled",
+      "reason": "Bun FileSink regular-file and FIFO writes, flushing, high-water-mark options, UTF-8 byte counts, descriptor ownership, and chunked file streams pass upstream coverage."
+    },
+    "test/js/bun/util/filesystem_router.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.FileSystemRouter constructor validation, discovery, reloads, route maps, static/dynamic/catch-all matching, Request and URL inputs, params, queries, origins, and asset prefixes pass upstream coverage."
+    },
+    "test/js/bun/util/hash.test.js": {
+      "status": "enabled",
+      "reason": "Bun.hash and its Wyhash, Adler-32, CRC-32, CityHash, xxHash, Murmur, and RapidHash variants pass exact upstream vectors and 64-bit seed coverage through Zig implementations."
+    },
+    "test/js/bun/util/highlighter.test.ts": {
+      "status": "enabled",
+      "reason": "Bun syntax highlighter upstream coverage passes under Cottontail."
+    },
+    "test/js/bun/util/index-of-line.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.indexOfLine byte-offset scanning and non-number offset coverage passes under Cottontail."
+    },
+    "test/js/bun/util/inspect-error-leak.test.js": {
+      "status": "enabled",
+      "reason": "Bun.inspect error formatting remains below the upstream RSS growth threshold across 100,000 calls with forced garbage collection."
+    },
+    "test/js/bun/util/mmap.test.js": {
+      "status": "enabled",
+      "reason": "Bun.mmap shared and private POSIX mappings, offset and size handling, write visibility, and argument validation pass upstream coverage through native mmap."
+    },
+    "test/js/bun/util/password.test.ts": {
+      "status": "enabled",
+      "timeoutMs": 60000,
+      "reason": "Bun.password argument validation, Argon2 variants, bcrypt, synchronous and promise APIs, verification, long-password prehashing, and historical Bun hash compatibility pass using Zig standard-library cryptography."
+    },
+    "test/js/bun/util/peek.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.peek and peek.status coverage for fulfilled, rejected, pending, subclass, and non-promise values passes under Cottontail."
+    },
+    "test/js/bun/util/randomUUIDv5.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.randomUUIDv5 namespace aliases, encodings, BufferSource inputs, version/variant bits, validation, and reference vectors pass against uuid 11.1.0."
+    },
+    "test/js/bun/util/randomUUIDv7.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.randomUUIDv7 timestamp, encoding, buffer, and monotonic coverage passes under Cottontail."
+    },
+    "test/js/bun/util/readablestreamtoarraybuffer.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.readableStreamToArrayBuffer and global ReadableStream coverage passes under Cottontail."
+    },
+    "test/js/bun/util/sleep.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.sleep promise timing, invalid input, and abort behavior coverage passes under Cottontail."
+    },
+    "test/js/bun/util/sleepSync.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.sleepSync validation and timing coverage passes under Cottontail."
+    },
+    "test/js/bun/util/stringWidth.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.stringWidth ANSI, emoji, CJK, combining mark, and zero-width coverage passes under Cottontail."
+    },
+    "test/js/bun/util/stripANSI.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.stripANSI and node:util stripVTControlCharacters VT/OSC escape coverage passes under Cottontail."
+    },
+    "test/js/bun/util/text-loader.test.ts": {
+      "status": "enabled",
+      "reason": "Bun text loader static, dynamic, cached stress, CommonJS require, loader-override, Unicode, Latin-1, and backslash fixture coverage passes under Cottontail."
+    },
+    "test/js/bun/util/unsafe.test.js": {
+      "status": "enabled",
+      "reason": "Bun.unsafe arrayBufferToString and allocUnsafe coverage passes under Cottontail."
+    },
+    "test/js/bun/util/which.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.which PATH, slash-path, and executable-file behavior passes under Cottontail."
+    },
+    "test/js/bun/util/wrapAnsi.npm.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.wrapAnsi passes the upstream npm-derived compatibility suite, including whitespace rows, character wrapping, OSC-8 hyperlinks, background colors, and non-SGR escapes."
+    },
+    "test/js/bun/util/wrapAnsi.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.wrapAnsi word and hard wrapping, Unicode widths, trimming, ANSI SGR state, extended colors, and column edge cases pass upstream coverage."
+    },
+    "test/js/bun/util/zstd.test.ts": {
+      "status": "enabled",
+      "reason": "Bun Zstandard sync and promise APIs, levels 1-22, CLI frame compatibility, validation, roundtrips, and automatic HTTP response decoding pass through native libzstd."
+    },
+    "test/js/bun/wasm/wasi.test.js": {
+      "status": "enabled",
+      "reason": "Direct WASM entrypoints instantiate through Cottontail's WASI runtime with preview1 and wasi_unstable imports."
+    },
+    "test/js/bun/websocket/websocket-server.test.ts": {
+      "status": "expected-failure",
+      "reason": "Requires full Bun WebSocket server fixture execution and lifecycle behavior."
+    },
+    "test/js/bun/yaml/yaml-test-suite.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.YAML conformance against the generated yaml-test-suite passes under Cottontail."
+    },
+    "test/js/bun/yaml/yaml.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.YAML parse/stringify behavior, input types, anchors, aliases, merges, and edge cases pass under Cottontail."
+    },
+    "test/js/deno/abort/abort-controller.test.ts": {
+      "status": "enabled",
+      "reason": "Copied Bun Deno-compat AbortController coverage passes under Cottontail."
+    },
+    "test/js/deno/crypto/random.test.ts": {
+      "status": "enabled",
+      "reason": "Copied Bun Deno-compat crypto random-values coverage passes under Cottontail."
+    },
+    "test/js/deno/encoding/encoding.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (23 bun:test cases, 41 assertions)."
+    },
+    "test/js/deno/fetch/body.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 11 assertions)."
+    },
+    "test/js/deno/fetch/request.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (7 bun:test cases, 7 assertions)."
+    },
+    "test/js/deno/performance/performance.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (13 bun:test cases, 44 assertions)."
+    },
+    "test/js/deno/url/url.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (33 bun:test cases, 200 assertions)."
+    },
+    "test/js/deno/v8/error.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/assert/assert-doesNotMatch.test.cjs": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/assert/assert-match.test.cjs": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/assert/assert-typedarray-deepequal.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (44 bun:test cases, 52 assertions)."
+    },
+    "test/js/node/assert/assert.test.cjs": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/buffer-concat.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 10 assertions)."
+    },
+    "test/js/node/buffer-inspectmaxbytes.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 5 assertions)."
+    },
+    "test/js/node/buffer-resolveObjectURL.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 12 assertions)."
+    },
+    "test/js/node/buffer-utf16.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/child_process/child-process-exec.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (11 bun:test cases, 34 assertions)."
+    },
+    "test/js/node/child_process/child_process_ipc.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/child_process/child_process_ipc_large_disconnect.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+    },
+    "test/js/node/child_process/child_process_send_cb.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/crypto/crypto-lazyhash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/crypto/crypto-random.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (8 bun:test cases, 15 assertions)."
+    },
+    "test/js/node/crypto/crypto-sign-regression.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 20 assertions)."
+    },
+    "test/js/node/crypto/node-crypto.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (150 bun:test cases, 365 assertions)."
+    },
+    "test/js/node/crypto/sign-jwk-ieee-p1363.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 12 assertions)."
+    },
+    "test/js/node/dirname.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/dns/dns-lookup-keepalive.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/env-windows.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/fs/cp.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (37 bun:test cases, 89 assertions)."
+    },
+    "test/js/node/fs/dir.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (15 bun:test cases, 22 assertions)."
+    },
+    "test/js/node/fs/fs-birthtime-linux.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/fs/fs-leak.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 8 assertions)."
+    },
+    "test/js/node/fs/fs-mkdir.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (20 bun:test cases, 55 assertions)."
+    },
+    "test/js/node/fs/fs-promises-writeFile-async-iterator.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/fs/fs-stats-truncate.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 28 assertions)."
+    },
+    "test/js/node/fs/glob.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (26 bun:test cases, 41 assertions)."
+    },
+    "test/js/node/harness.test.js": {
+      "status": "enabled",
+      "reason": "Upstream file is entirely commented out / registers no tests; exits 0 as in Bun CI."
+    },
+    "test/js/node/http/client-timeout-error.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 5 assertions)."
+    },
+    "test/js/node/http/node-http-backpressure.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/http/node-http-primoridals.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/http/node-http-proxy-url.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/http/node-http-transfer-encoding.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/http/node-http.compress.leak.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/http/numeric-header.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+    },
+    "test/js/node/module/module-sourcemap.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/path/15704.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/basename.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/dirname.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/extname.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/is-absolute.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/join.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/matches-glob.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (31 bun:test cases, 31 assertions)."
+    },
+    "test/js/node/path/normalize.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/parse-format.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/path.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/posix-exists.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/posix-relative-on-windows.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/relative.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/resolve.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/path/to-namespaced-path.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/win32-exists.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/zero-length-strings.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/process/call-constructor.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/readline/readline_never_unrefs.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/stream/node-stream-uint8array.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 21 assertions)."
+    },
+    "test/js/node/timers.promises/timers.promises.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 7 assertions)."
+    },
+    "test/js/node/tls/node-tls-namedpipes.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/tls/test-node-extra-ca-certs.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/tls/test-system-ca-https.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/tls/test-use-system-ca.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 12 assertions)."
+    },
+    "test/js/node/url/url-canParse-whatwg.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-fileurltopath.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-format-invalid-input.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-is-url.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-null-char.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-parse-invalid-input.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-parse-query.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-revokeobjecturl.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/util/node-inspect-tests/parallel/util-inspect-long-running.test.mjs": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/vm/script-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/vm/vm-sourceUrl.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/worker_threads/15787.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/worker_threads/worker_destruction.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/zlib/deflate-streaming.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/sql/local-sql.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/sql-mysql.auth.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/sql-mysql.helpers.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/sql-mysql.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/sql-mysql.transactions.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/sql.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/js/sql/tls-sql.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/@azure/service-bus/azure-service-bus.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/body-parser/express-body-parser-test.test.ts": {
+      "status": "enabled",
+      "reason": "The copied body-parser integration coverage passes for iconv decoding, HTTP request bodies, and GET middleware behavior."
+    },
+    "test/js/third_party/grpc-js/test-call-credentials.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-certificate-provider.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (9 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-confg-parsing.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (7 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-duration.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-end-to-end.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-metadata.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (29 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-prototype-pollution.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-retry-config.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (28 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-server-credentials.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (11 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-status-builder.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/grpc-js/test-uri-parser.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (22 bun:test cases, 0 assertions)."
+    },
     "test/js/third_party/hono/hello-world.test.ts": {
       "status": "enabled",
       "reason": "The copied Hono application fixture loads and serves its hello-world response under Cottontail."
+    },
+    "test/js/third_party/nodemailer/nodemailer.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-close.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 1 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-handshake.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 10 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-messaging-many.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (20 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-middleware.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (10 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-namespaces.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (38 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-server-attachment.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (17 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-socket-middleware.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-socket-timeout.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io-utility-methods.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (9 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/socket.io/socket.io.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (61 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/solc/solc.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/third_party/stripe/stripe.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/third_party/webpack/webpack.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/integration/complex-operations.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (10 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/reliability/connection-failures.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (13 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/reliability/error-handling.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (55 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/reliability/protocol-handling.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (15 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/unit/basic-operations.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (20 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/unit/buffer-operations.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (9 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/unit/hash-operations.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (14 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/unit/list-operations.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (14 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/unit/ping.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/js/valkey/valkey.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (908 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/console/console-log-utf16.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/js/web/console/console-recursive.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/encoding/encode-bad-chunks.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 14 assertions)."
+    },
+    "test/js/web/encoding/text-encoder-stream.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (19 bun:test cases, 191 assertions)."
+    },
+    "test/js/web/fetch/blob-cow.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 13 assertions)."
+    },
+    "test/js/web/fetch/body-clone.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (24 bun:test cases, 67 assertions)."
+    },
+    "test/js/web/fetch/content-length.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/cookies.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 6 assertions)."
+    },
+    "test/js/web/fetch/encoding.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/fetch/exiting.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/fetch/fetch-args.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (47 bun:test cases, 91 assertions)."
+    },
+    "test/js/web/fetch/fetch-cyclic-reference.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
+    },
+    "test/js/web/fetch/fetch-redirect.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/fetch-url-after-redirect.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/fetch_headers.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 12 assertions)."
+    },
+    "test/js/web/fetch/request-cyclic-reference.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/response-cyclic-reference.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/server-response-stream-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/request/request.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 16 assertions)."
+    },
+    "test/js/web/timers/microtask.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/timers/setImmediate.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 43 assertions)."
+    },
+    "test/js/web/timers/setImmediate2.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/web/url/url.windows.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (16 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/websocket/autobahn.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/websocket/error-event.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 5 assertions)."
+    },
+    "test/js/web/websocket/websocket-close-fragmented.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/package-json-lint.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (21 bun:test cases, 146 assertions)."
+    },
+    "test/regression/brotli-reset-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/012039.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/012040.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/012360.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/013880.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/01466.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/02005.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/02367.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/02368.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 9 assertions)."
+    },
+    "test/regression/issue/02369.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 10 assertions)."
+    },
+    "test/regression/issue/02499/02499.test.ts": {
+      "status": "expected-failure",
+      "reason": "Semantics pass, but the test spawns 40 server subprocesses under a hard internal 10s timeout; Cottontail per-process startup (esbuild bundling) is currently too slow for that budget."
+    },
+    "test/regression/issue/03091.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/03216.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/03830.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/03844/03844.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 8 assertions)."
+    },
+    "test/regression/issue/04011.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/04893.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/06467.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/06946/06946.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/07261.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/07324.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/07397.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/07736.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 14 assertions)."
+    },
+    "test/regression/issue/08040.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/08768.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/08965/08965.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/09279.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/09340.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/09563/09563.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/09778.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/10887.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/11029-crypto-verify-null-algorithm.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 9 assertions)."
+    },
+    "test/regression/issue/11297/11297.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/11664.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/11677.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (9 bun:test cases, 11 assertions)."
+    },
+    "test/regression/issue/11866.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/12250.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/12650.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/13316.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/14477/14477.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/14515.test.tsx": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/14982/14982.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/15314.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/15326.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/16312.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/16476/16476.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 5 assertions)."
+    },
+    "test/regression/issue/16702/16702.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/17244.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 8 assertions)."
+    },
+    "test/regression/issue/17327.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 10 assertions)."
+    },
+    "test/regression/issue/17454/destructure_string.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/17605.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+    },
+    "test/regression/issue/18242.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/18547.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 5 assertions)."
+    },
+    "test/regression/issue/18820.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 8 assertions)."
+    },
+    "test/regression/issue/19107.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/19111.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/19758.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/19875.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/20092.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/20144/20144.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/21311.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/regression/issue/21830.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/22481.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/22635/22635.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/22650-shell-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+    },
+    "test/regression/issue/22712.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 18 assertions)."
+    },
+    "test/regression/issue/22929-module-extensions-asi.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/23133.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 4 assertions)."
+    },
+    "test/regression/issue/23275.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 11 assertions)."
+    },
+    "test/regression/issue/23287-array-comma-value.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/23292.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/23314/zstd-async-compress.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/23314/zstd-large-decompression.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/23314/zstd-large-input.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/23316-long-path-spawn-shell.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/23316-long-path-spawn.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/23382.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/23489.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/23723.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/24007.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 26 assertions)."
+    },
+    "test/regression/issue/24329.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 10 assertions)."
+    },
+    "test/regression/issue/24709.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/25190.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/25398.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 5 assertions)."
+    },
+    "test/regression/issue/25609.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/25716.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 14 assertions)."
+    },
+    "test/regression/issue/25785.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 19 assertions)."
+    },
+    "test/regression/issue/25831.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 24 assertions)."
+    },
+    "test/regression/issue/25862.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/26030.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/regression/issue/26063.test.ts": {
+      "status": "enabled",
+      "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
+    },
+    "test/regression/issue/26377.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 5 assertions)."
+    },
+    "test/regression/issue/26387.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6000 assertions)."
+    },
+    "test/regression/issue/26411.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/26631.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (8 bun:test cases, 8 assertions)."
+    },
+    "test/regression/issue/26669.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/27014.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/27099.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/27389.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/27431.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/3657.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/440.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 8 assertions)."
+    },
+    "test/regression/issue/5738.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/5961.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/8254.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+    },
+    "test/regression/issue/atomics-waitasync-wtftimer-uaf.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 14 assertions)."
+    },
+    "test/regression/issue/circular-error-stack.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 12 assertions)."
+    },
+    "test/regression/issue/comma-operator-this-binding.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/compile-outfile-subdirs.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (8 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/crypto-names.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 300 assertions)."
+    },
+    "test/regression/issue/css-system-color-contexts.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/css-system-color-mix-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 25 assertions)."
+    },
+    "test/regression/issue/issue-12276.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 12 assertions)."
+    },
+    "test/regression/issue/minify-new-array-with-if.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/napi-exception-pending-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/pe-codesigning-integrity.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/server-stop-with-pending-requests.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
+    },
+    "test/regression/issue/stdin-pause-resume.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/update-interactive-formatting.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (5 bun:test cases, 18 assertions)."
+    },
+    "test/regression/issue/utf16-encoding-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 8 assertions)."
+    },
+    "test/snippets/segfault-todo.test.js": {
+      "status": "enabled",
+      "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 0 assertions)."
     }
   }
 }

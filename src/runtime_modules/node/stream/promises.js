@@ -1,11 +1,6 @@
-import { finished as finishedCallback, pipeline as pipelineCallback } from "../stream.js";
+import { promises } from "../stream.js";
 
-export function finished(stream, options = undefined) {
-  return finishedCallback(stream, options);
-}
-
-export function pipeline(...streams) {
-  return pipelineCallback(...streams);
-}
+export const finished = promises.finished;
+export const pipeline = promises.pipeline;
 
 export default { finished, pipeline };

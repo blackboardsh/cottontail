@@ -3,8 +3,12 @@ import { Buffer } from "./buffer.js";
 import { parse as parseQuery, stringify as stringifyQuery } from "./querystring.js";
 import { toASCII, toUnicode } from "./punycode.js";
 
-export const URL = globalThis.URL;
-export const URLSearchParams = globalThis.URLSearchParams;
+// Import the vendor implementation directly: globalThis.URL is only assigned
+// by bun/index.js after this module has already been evaluated, so grabbing
+// the global here would capture the weaker ffi.js bootstrap shim instead.
+import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
+
+export { URL, URLSearchParams };
 
 function normalizePatternComponent(name, value) {
   if (value == null) return "*";

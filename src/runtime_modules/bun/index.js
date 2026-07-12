@@ -14,6 +14,8 @@ import { parse as parseJSON5, stringify as stringifyJSON5 } from "./json5.js";
 import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
 import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
+import { remapPosition as remapBundlePosition, remapStackString as remapBundleStack } from "../vendor/sourcemap.js";
+import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import * as bunTestModule from "./test.js";
 import { jest as bunJest } from "./test.js";
 
@@ -78,7 +80,7 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
     Error.prepareStackTrace = undefined;
     try {
       nativeCaptureStackTrace(target, constructorOpt);
-      const rawStack = target.stack;
+      const rawStack = remapBundleStack(target.stack);
       const callSites = parseCallSites(rawStack);
       if (typeof prepare === "function") {
         target.stack = prepare(target, callSites);
@@ -101,9 +103,13 @@ function installNodeStyleErrorConstructor(name) {
   if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
   const CottontailError = function(...args) {
     const error = Reflect.construct(NativeError, args, new.target || CottontailError);
-    if (typeof error.stack === "string" && !error.stack.includes(String(error.message ?? ""))) {
-      const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
-      error.stack = `${error.name || name}${message}\n${error.stack}`;
+    if (typeof error.stack === "string") {
+      let stack = remapBundleStack(error.stack);
+      if (!stack.includes(String(error.message ?? ""))) {
+        const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
+        stack = `${error.name || name}${message}\n${stack}`;
+      }
+      if (stack !== error.stack) error.stack = stack;
     }
     return error;
   };
@@ -118,14 +124,23 @@ for (const errorName of ["Error", "EvalError", "RangeError", "ReferenceError", "
   installNodeStyleErrorConstructor(errorName);
 }
 
+// Shared hooks so other runtime modules (uncaught-error printing, test
+// reporters) can remap bundle stack positions without importing this module.
+globalThis.__cottontailRemapStackString ??= remapBundleStack;
+globalThis.__cottontailRemapPosition ??= remapBundlePosition;
+
 if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
   const nativeJSONParse = JSON.parse;
   const parse = function(text, reviver = undefined) {
     try {
       return nativeJSONParse(text, reviver);
     } catch (error) {
-      if (error && typeof error.stack === "string" && error.message && !error.stack.includes(String(error.message))) {
-        error.stack = `${error.name || "SyntaxError"}: ${error.message}\n${error.stack}`;
+      if (error && typeof error.stack === "string") {
+        let stack = remapBundleStack(error.stack);
+        if (error.message && !stack.includes(String(error.message))) {
+          stack = `${error.name || "SyntaxError"}: ${error.message}\n${stack}`;
+        }
+        if (stack !== error.stack) error.stack = stack;
       }
       throw error;
     }
@@ -341,11 +356,18 @@ for (const name of [
   "ReadableStreamBYOBRequest",
   "ReadableStreamDefaultController",
   "ReadableStreamDefaultReader",
+  "ReadableByteStreamController",
   "TransformStream",
   "TransformStreamDefaultController",
   "WritableStream",
   "WritableStreamDefaultController",
   "WritableStreamDefaultWriter",
+  "ByteLengthQueuingStrategy",
+  "CountQueuingStrategy",
+  "CompressionStream",
+  "DecompressionStream",
+  "TextEncoderStream",
+  "TextDecoderStream",
 ]) {
   if (typeof globalThis[name] !== "function" && typeof streamWeb[name] === "function") {
     globalThis[name] = streamWeb[name];
@@ -1920,54 +1942,7 @@ function cachedTextForBytes(bytes) {
   return text;
 }
 
-export class URL {
-  constructor(input, base = undefined) {
-    const baseUrl = base == null ? null : base instanceof URL ? base : new URL(String(base));
-    let text = String(input);
-    if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) {
-      if (!baseUrl && !text.startsWith("/")) throw new TypeError("Invalid URL");
-      if (baseUrl) {
-        if (text.startsWith("/")) {
-          text = `${baseUrl.origin}${text}`;
-        } else {
-          const basePath = baseUrl.pathname.endsWith("/")
-            ? baseUrl.pathname
-            : baseUrl.pathname.slice(0, baseUrl.pathname.lastIndexOf("/") + 1);
-          text = `${baseUrl.origin}${basePath}${text}`;
-        }
-      }
-    }
-
-    const match = /^([A-Za-z][A-Za-z0-9+.-]*:)?\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/.exec(text);
-    if (!match) throw new TypeError("Invalid URL");
-
-    this.protocol = match[1] || "http:";
-    this.host = match[2];
-    const colon = this.host.lastIndexOf(":");
-    if (colon >= 0 && /^\d+$/.test(this.host.slice(colon + 1))) {
-      this.hostname = this.host.slice(0, colon);
-      this.port = this.host.slice(colon + 1);
-    } else {
-      this.hostname = this.host;
-      this.port = "";
-    }
-    this.pathname = match[3] || "/";
-    if (!this.pathname.startsWith("/")) this.pathname = `/${this.pathname}`;
-    this.search = match[4] || "";
-    this.hash = match[5] || "";
-    this.origin = `${this.protocol}//${this.host}`;
-    this.href = `${this.origin}${this.pathname}${this.search}${this.hash}`;
-  }
-  toString() {
-    return this.href;
-  }
-  valueOf() {
-    return this.href;
-  }
-  toJSON() {
-    return this.href;
-  }
-}
+export { URL, URLSearchParams };
 
 export class Headers {
   constructor(init = undefined) {
@@ -1988,9 +1963,12 @@ export class Headers {
     const allValues = this._allValues.get(normalized) ?? [];
     allValues.push(stringValue);
     this._allValues.set(normalized, allValues);
+    // Per the fetch spec, cookie is the only header whose values combine with
+    // "; " instead of ", " when appended.
+    const separator = normalized === "cookie" ? "; " : ", ";
     this._values.set(normalized, {
       key: existing?.key ?? String(key),
-      value: existing ? `${existing.value}, ${stringValue}` : stringValue,
+      value: existing ? `${existing.value}${separator}${stringValue}` : stringValue,
     });
   }
   set(key, value) {
@@ -2085,6 +2063,40 @@ export class FormData {
   [Symbol.iterator]() {
     return this.entries();
   }
+  toJSON() {
+    const result = {};
+    for (const [key, raw] of this._entries) {
+      const value = formDataEntryValue(raw);
+      const serialized = typeof value === "string"
+        ? value
+        : { name: raw?.filename ?? value?.name ?? "", size: value?.size ?? 0, type: value?.type ?? "" };
+      if (Object.hasOwn(result, key)) {
+        if (!Array.isArray(result[key])) result[key] = [result[key]];
+        result[key].push(serialized);
+      } else {
+        result[key] = serialized;
+      }
+    }
+    return result;
+  }
+  static from(data, boundary = undefined) {
+    let text;
+    if (typeof data === "string") text = data;
+    else if (data instanceof ArrayBuffer) text = stringLatin1FromBytes(new Uint8Array(data));
+    else if (ArrayBuffer.isView(data)) text = stringLatin1FromBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    else if (data?._bytes instanceof Uint8Array) text = stringLatin1FromBytes(data._bytes);
+    else text = String(data);
+    if (boundary != null) return parseMultipartFormDataText(text, String(boundary));
+    const result = new FormData();
+    for (const [key, value] of new URLSearchParams(text)) result.append(key, value);
+    return result;
+  }
+}
+
+function stringLatin1FromBytes(bytes) {
+  let output = "";
+  for (const byte of bytes) output += String.fromCharCode(byte);
+  return output;
 }
 
 function formDataEntryValue(entry) {
@@ -2123,6 +2135,10 @@ async function parseMultipartFormData(body, contentType) {
   const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType))?.slice(1).find(Boolean);
   if (!boundary) return new FormData();
   const source = new TextDecoder("latin1").decode(await bytesFromBody(body));
+  return parseMultipartFormDataText(source, boundary);
+}
+
+function parseMultipartFormDataText(source, boundary) {
   const result = new FormData();
   for (const rawPart of source.split(`--${boundary}`).slice(1, -1)) {
     const part = rawPart.replace(/^\r\n/, "").replace(/\r\n$/, "");
@@ -2177,6 +2193,22 @@ export class Request {
   set cookies(_) {
     throw new TypeError("Request.cookies is readonly");
   }
+  get bodyUsed() {
+    return this._bodyUsed;
+  }
+  clone() {
+    if (this._bodyUsed) throw new TypeError("Body already used");
+    const cloned = new Request(this.url, {
+      method: this.method,
+      headers: new Headers(this.headers),
+      params: this.params,
+      signal: this.signal,
+      redirect: this.redirect,
+    });
+    cloned._body = teeClonedBody(this);
+    if (this._cookies) cloned._cookies = cloneCookieMap(this._cookies);
+    return cloned;
+  }
   async arrayBuffer() {
     return arrayBufferFromBytes(await bytesFromBody(this._body));
   }
@@ -2215,6 +2247,28 @@ export class Request {
   }
 }
 
+function cloneCookieMap(map) {
+  const cloned = new CookieMap();
+  for (const [name, value] of Map.prototype.entries.call(map)) {
+    Map.prototype.set.call(cloned, name, value);
+  }
+  cloned._changes = map._changes.map((change) => ({ ...change }));
+  cloned._initialKeys = [...map._initialKeys];
+  cloned._dynamicKeys = [...map._dynamicKeys];
+  return cloned;
+}
+
+function teeClonedBody(source) {
+  const body = source._body;
+  if (body && typeof body.tee === "function" && typeof body.getReader === "function") {
+    const [original, cloned] = body.tee();
+    source._body = original;
+    source._bodyStream = undefined;
+    return cloned;
+  }
+  return body;
+}
+
 function normalizeRequestUrl(value) {
   const text = String(value);
   try {
@@ -2249,7 +2303,7 @@ export class Response {
     return new Response(null, { status, headers: { location: String(url) } });
   }
   clone() {
-    return new Response(this._body, {
+    return new Response(teeClonedBody(this), {
       status: this.status,
       statusText: this.statusText,
       headers: new Headers(this.headers),
@@ -2401,7 +2455,46 @@ function isLoopbackHttpUrl(urlText) {
   }
 }
 
-async function fetchFromNodeHttp(request) {
+async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, redirected = false) {
+  if (depth > 20) throw new TypeError("redirect count exceeded");
+  const response = await fetchOnceFromNodeHttp(request, redirected);
+  if (redirectMode === "manual" || !isRedirectStatus(response.status)) return response;
+  if (redirectMode === "error") throw new TypeError("fetch failed");
+  const location = response.headers.get("location");
+  if (!location) return response;
+  const nextUrl = String(new URL(redirectLocationText(location), request.url));
+  const dropBody = response.status === 303 ||
+    ((response.status === 301 || response.status === 302) && request.method === "POST");
+  const nextRequest = new Request(nextUrl, {
+    method: dropBody ? "GET" : request.method,
+    headers: new Headers(request.headers),
+    signal: request.signal,
+    redirect: request.redirect,
+  });
+  if (!dropBody) nextRequest._body = request._body;
+  return fetchFromNodeHttp(nextRequest, redirectMode, depth + 1, true);
+}
+
+// Location header bytes reach JS as latin1 code units; the fetch spec treats
+// them as UTF-8, so reinterpret before URL resolution when that produces
+// valid UTF-8 text. Reinterpret repeatedly (bounded) because the node/http.js
+// server currently serializes header values as UTF-8 instead of latin1, which
+// adds a second mojibake layer when both ends run in this process; each loop
+// iteration strictly requires a clean UTF-8 round-trip, so an extra pass never
+// fires on already-correct text.
+function redirectLocationText(location) {
+  let text = String(location);
+  for (let pass = 0; pass < 3; pass += 1) {
+    if (!/[\x80-\xff]/.test(text) || /[Ā-￿]/.test(text)) return text;
+    const bytes = Buffer.from(text, "latin1");
+    const decoded = bytes.toString("utf8");
+    if (!Buffer.from(decoded, "utf8").equals(bytes) || decoded === text) return text;
+    text = decoded;
+  }
+  return text;
+}
+
+async function fetchOnceFromNodeHttp(request, redirected = false) {
   const body = request.method === "GET" || request.method === "HEAD"
     ? Buffer.alloc(0)
     : Buffer.from(await bytesFromBody(request._body));
@@ -2432,6 +2525,7 @@ async function fetchFromNodeHttp(request) {
           status: incoming.statusCode ?? 200,
           statusText: incoming.statusMessage ?? "",
           url: request.url,
+          redirected,
         }));
       });
     });
@@ -2463,7 +2557,7 @@ async function fetchImpl(input, init = {}) {
     if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
   }
   if (activeServer && !proxy.active) return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
-  if (!proxy.active && isLoopbackHttpUrl(request.url)) return await fetchFromNodeHttp(request);
+  if (!proxy.active && isLoopbackHttpUrl(request.url)) return await fetchFromNodeHttp(request, redirectMode);
 
   const args = ["-L", "-sS", "-D", "-", "-X", request.method];
   const timeoutState = abortSignalState.get(request.signal);
@@ -3742,7 +3836,12 @@ export function file(path, options = undefined) {
           }
         })());
       }
-      const bytes = readBytes();
+      let bytes;
+      try {
+        bytes = readBytes();
+      } catch (error) {
+        throw makeBunWriteError(error, filePath, "open");
+      }
       return bodyReadableStream((async function* () {
         for (let offset = 0; offset < bytes.byteLength; offset += size) {
           yield bytes.slice(offset, Math.min(bytes.byteLength, offset + size));
@@ -3936,22 +4035,36 @@ export class ArrayBufferSink {
   constructor() {
     this._chunks = [];
     this._ended = false;
+    this._asUint8Array = false;
+    this._streaming = false;
+  }
+
+  start(options = {}) {
+    this._chunks = [];
+    this._ended = false;
+    this._asUint8Array = Boolean(options.asUint8Array);
+    this._streaming = Boolean(options.stream);
+    return this;
   }
 
   write(chunk) {
     if (this._ended) throw new Error("ArrayBufferSink is closed");
-    this._chunks.push(asBuffer(chunk));
-    return true;
+    const bytes = typeof chunk === "string" ? asBuffer(chunk) : asBuffer(chunk);
+    this._chunks.push(bytes);
+    return bytes.byteLength;
   }
 
   flush() {
-    return undefined;
+    if (!this._streaming) return 0;
+    const bytes = concatManyBuffers(this._chunks.splice(0));
+    return this._asUint8Array ? bytes : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 
   end(chunk = undefined) {
     if (chunk != null) this.write(chunk);
     this._ended = true;
     const bytes = concatManyBuffers(this._chunks);
+    if (this._asUint8Array) return bytes;
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 }
@@ -4120,7 +4233,13 @@ export function concatArrayBuffers(buffers, maxLength = Infinity, asUint8Array =
   }
   const chunks = Array.from(buffers ?? []).map(asBuffer);
   const limit = Math.max(0, Math.min(Number(maxLength), chunks.reduce((total, chunk) => total + chunk.byteLength, 0)));
-  const out = new Uint8Array(Number.isFinite(limit) ? limit : chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+  const size = Number.isFinite(limit) ? limit : chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  let out;
+  try {
+    out = new Uint8Array(size);
+  } catch {
+    throw new RangeError(`Failed to allocate ${size} bytes`);
+  }
   let offset = 0;
   for (const chunk of chunks) {
     if (offset >= out.byteLength) break;
@@ -7659,7 +7778,19 @@ class CottontailErrorEvent extends CottontailEvent {
     this.filename = String(init.filename ?? "");
     this.lineno = Number(init.lineno ?? 0);
     this.colno = Number(init.colno ?? 0);
-    this.error = init.error;
+    this.error = init.error ?? null;
+  }
+
+  [inspectCustomSymbol]() {
+    let errorText;
+    if (this.error == null) {
+      errorText = this.error === undefined ? "undefined" : "null";
+    } else if (this.error instanceof globalThis.Error) {
+      errorText = `error: ${String(this.error.message ?? "")}\n`;
+    } else {
+      errorText = nodeInspect(this.error);
+    }
+    return `ErrorEvent {\n  type: ${JSON.stringify(String(this.type))},\n  message: ${JSON.stringify(String(this.message))},\n  error: ${errorText},\n}`;
   }
 }
 
@@ -8186,6 +8317,185 @@ globalThis.EventTarget ??= CottontailEventTarget;
 globalThis.CustomEvent ??= CottontailCustomEvent;
 globalThis.ErrorEvent ??= CottontailErrorEvent;
 globalThis.CloseEvent ??= CottontailCloseEvent;
+
+// Web Performance surface: illegal-constructor classes over the basic clock
+// installed by ffi.js, plus mark/measure entries and PerformanceObserver.
+{
+  const allowConstruct = Symbol("cottontail.performance.construct");
+  const perfEntries = [];
+  const perfObservers = new Set();
+  const clock = globalThis.performance ?? {};
+  const perfNow = typeof clock.now === "function" ? clock.now.bind(clock) : () => Date.now();
+  const perfTimeOrigin = Number(clock.timeOrigin ?? Date.now());
+
+  class PerformanceEntry {
+    constructor(...args) {
+      if (args[0] !== allowConstruct) throw new TypeError("Illegal constructor");
+    }
+    toJSON() {
+      return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration };
+    }
+  }
+  const makeEntry = (Ctor, name, entryType, startTime, duration, detail = null) => {
+    const entry = new Ctor(allowConstruct);
+    entry.name = String(name);
+    entry.entryType = entryType;
+    entry.startTime = startTime;
+    entry.duration = duration;
+    if (Ctor !== PerformanceEntry) entry.detail = detail == null ? null : (typeof structuredClone === "function" ? structuredClone(detail) : detail);
+    return entry;
+  };
+  class PerformanceMark extends PerformanceEntry {}
+  class PerformanceMeasure extends PerformanceEntry {}
+
+  const notifyObservers = (entry) => {
+    for (const observer of [...perfObservers]) {
+      if (!observer._types.has(entry.entryType)) continue;
+      observer._buffer.push(entry);
+      if (observer._pending) continue;
+      observer._pending = true;
+      queueMicrotask(() => {
+        observer._pending = false;
+        const records = observer._buffer.splice(0);
+        if (records.length === 0) return;
+        const list = {
+          getEntries: () => [...records],
+          getEntriesByName: (name, type) => records.filter((item) => item.name === String(name) && (type == null || item.entryType === type)),
+          getEntriesByType: (type) => records.filter((item) => item.entryType === String(type)),
+        };
+        observer._callback(list, observer);
+      });
+    }
+  };
+  const entryStart = (reference) => {
+    if (reference == null) return 0;
+    if (typeof reference === "number") return reference;
+    const named = perfEntries.filter((entry) => entry.name === String(reference));
+    if (named.length === 0) throw new TypeError(`No mark named '${reference}' exists`);
+    return named[named.length - 1].startTime;
+  };
+
+  class Performance extends (globalThis.EventTarget ?? CottontailEventTarget) {
+    constructor(...args) {
+      super();
+      if (args[0] !== allowConstruct) throw new TypeError("Illegal constructor");
+    }
+    get timeOrigin() {
+      return perfTimeOrigin;
+    }
+    now() {
+      return perfNow();
+    }
+    mark(name, options = undefined) {
+      const mark = makeEntry(PerformanceMark, name, "mark", options?.startTime ?? perfNow(), 0, options?.detail);
+      perfEntries.push(mark);
+      notifyObservers(mark);
+      return mark;
+    }
+    measure(name, startOrOptions = undefined, endMark = undefined) {
+      let start = 0;
+      let end = perfNow();
+      let detail = null;
+      if (startOrOptions != null && typeof startOrOptions === "object") {
+        detail = startOrOptions.detail ?? null;
+        if (startOrOptions.start != null) start = entryStart(startOrOptions.start);
+        if (startOrOptions.end != null) end = entryStart(startOrOptions.end);
+        if (startOrOptions.duration != null) {
+          if (startOrOptions.end == null) end = start + Number(startOrOptions.duration);
+          else if (startOrOptions.start == null) start = end - Number(startOrOptions.duration);
+        }
+      } else {
+        if (startOrOptions != null) start = entryStart(startOrOptions);
+        if (endMark != null) end = entryStart(endMark);
+      }
+      const measure = makeEntry(PerformanceMeasure, name, "measure", start, end - start, detail);
+      perfEntries.push(measure);
+      notifyObservers(measure);
+      return measure;
+    }
+    getEntries() {
+      return [...perfEntries];
+    }
+    getEntriesByName(name, type = undefined) {
+      return perfEntries.filter((entry) => entry.name === String(name) && (type == null || entry.entryType === type));
+    }
+    getEntriesByType(type) {
+      return perfEntries.filter((entry) => entry.entryType === String(type));
+    }
+    clearMarks(name = undefined) {
+      for (let index = perfEntries.length - 1; index >= 0; index -= 1) {
+        if (perfEntries[index].entryType === "mark" && (name == null || perfEntries[index].name === String(name))) perfEntries.splice(index, 1);
+      }
+    }
+    clearMeasures(name = undefined) {
+      for (let index = perfEntries.length - 1; index >= 0; index -= 1) {
+        if (perfEntries[index].entryType === "measure" && (name == null || perfEntries[index].name === String(name))) perfEntries.splice(index, 1);
+      }
+    }
+    toJSON() {
+      return { timeOrigin: perfTimeOrigin, eventCounts: {} };
+    }
+  }
+
+  class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== "function") throw new TypeError("The callback argument must be a function");
+      this._callback = callback;
+      this._types = new Set();
+      this._buffer = [];
+      this._pending = false;
+    }
+    static get supportedEntryTypes() {
+      return ["mark", "measure"];
+    }
+    observe(options = {}) {
+      if (Array.isArray(options.entryTypes)) this._types = new Set(options.entryTypes.map(String));
+      else if (options.type != null) this._types = new Set([String(options.type)]);
+      else throw new TypeError("Either entryTypes or type must be specified");
+      perfObservers.add(this);
+    }
+    disconnect() {
+      perfObservers.delete(this);
+    }
+    takeRecords() {
+      return this._buffer.splice(0);
+    }
+  }
+
+  const perfInstance = new Performance(allowConstruct);
+  // preserve any extra host-provided members (e.g. eventLoopUtilization from node:perf_hooks)
+  for (const key of Object.keys(clock)) {
+    if (!(key in Performance.prototype) && key !== "timeOrigin") perfInstance[key] = clock[key];
+  }
+  globalThis.performance = perfInstance;
+  globalThis.Performance = Performance;
+  globalThis.PerformanceEntry = PerformanceEntry;
+  globalThis.PerformanceMark = PerformanceMark;
+  globalThis.PerformanceMeasure = PerformanceMeasure;
+  globalThis.PerformanceObserver ??= PerformanceObserver;
+}
+
+// The WebSocket client in node/http.js is backed by EventEmitter, and
+// EventEmitter.emit("error", ...) throws when no "error" listeners exist. A
+// browser-style dispatchEvent must never throw for unhandled error events
+// (e.g. connection refused with only ws.onerror set). Remove this wrapper
+// once node/http.js's dispatchEvent guards the unhandled "error" emit itself.
+{
+  const wsPrototype = nodeHttp.WebSocket?.prototype;
+  const originalDispatch = wsPrototype?.dispatchEvent;
+  if (typeof originalDispatch === "function" && !originalDispatch.__cottontailSafeErrorDispatch) {
+    const dispatchEvent = function dispatchEvent(event) {
+      try {
+        return originalDispatch.call(this, event);
+      } catch (error) {
+        if (event?.type === "error") return true;
+        throw error;
+      }
+    };
+    Object.defineProperty(dispatchEvent, "__cottontailSafeErrorDispatch", { value: true });
+    wsPrototype.dispatchEvent = dispatchEvent;
+  }
+}
 globalThis.File = BunFile;
 globalThis.AbortSignal ??= CottontailAbortSignal;
 globalThis.AbortController ??= CottontailAbortController;
@@ -8236,7 +8546,12 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
-nodeSetBuiltinModules({ bun: BunObject });
+nodeSetBuiltinModules({
+  bun: BunObject,
+  "bun:test": bunTestModule.default ?? bunTestModule,
+  "bun:ffi": FFI.default ?? FFI,
+  "bun:sqlite": { Database: SQLiteDatabase, default: SQLiteDatabase },
+});
 globalThis.HTMLRewriter ??= HTMLRewriter;
 globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cottontail.cwd());
 globalThis.__cottontailImportMetaResolveSync ??= (specifier, parent = globalThis.__cottontailImportMeta?.path ?? cottontail.cwd()) =>
@@ -8265,7 +8580,20 @@ globalThis.Headers ??= Headers;
 globalThis.FormData ??= FormData;
 globalThis.Request ??= Request;
 globalThis.Response ??= Response;
-globalThis.URL ??= URL;
+{
+  // The runtime owns the URL globals; any existing value is only the weaker
+  // ffi.js bootstrap shim. Carry over the object-URL registry statics that
+  // ffi.js may have installed on the shim before replacing it.
+  const priorURL = globalThis.URL;
+  if (priorURL && priorURL !== URL) {
+    for (const key of ["createObjectURL", "revokeObjectURL", "__cottontailObjectURLRegistryInstalled"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(priorURL, key);
+      if (descriptor && !Object.getOwnPropertyDescriptor(URL, key)) Object.defineProperty(URL, key, descriptor);
+    }
+  }
+  globalThis.URL = URL;
+  globalThis.URLSearchParams = URLSearchParams;
+}
 
 const argv = BunObject.argv;
 const env = BunObject.env;

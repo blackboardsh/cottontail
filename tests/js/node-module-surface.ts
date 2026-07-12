@@ -58,7 +58,9 @@ const modulePath = join(root, "sample.cjs");
 writeFileSync(modulePath, "module.exports = { value: 42 };\n");
 const localRequire = createRequire(`${root}/entry.js`);
 assert(localRequire("./sample.cjs").value === 42, "createRequire local module mismatch");
-assert(_cache.has(modulePath), "_cache should contain required module");
+// Node's Module._cache is a plain object keyed by resolved path.
+assert(modulePath in _cache, "_cache should contain required module");
+assert(_cache[modulePath]?.exports?.value === 42, "_cache entry should expose module exports");
 
 writeFileSync(join(root, "data.jsonc"), "{ // comment\n  \"items\": [1, 2,],\n}\n");
 writeFileSync(join(root, "data.toml"), "[owner]\nname = \"cottontail\"\n");

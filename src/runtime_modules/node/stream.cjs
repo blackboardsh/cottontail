@@ -1,7 +1,5 @@
 const stream = require("./stream.js");
 
-const Stream = stream.default;
-Object.assign(Stream, stream);
-Stream.Stream = Stream;
-
-module.exports = Stream;
+// The default export is the legacy Stream constructor carrying every
+// public property (Readable, Writable, promises getter, ...).
+module.exports = stream.default ?? stream;
