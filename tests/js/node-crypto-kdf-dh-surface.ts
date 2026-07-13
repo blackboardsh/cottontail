@@ -563,11 +563,15 @@ strictEqual(crypto.verify("sha256", "rsa pem payload", crypto.createPublicKey(rs
 const rsaCiphertext = crypto.publicEncrypt(rsaPair.publicKey, Buffer.from("hello rsa"));
 strictEqual(crypto.privateDecrypt(rsaPair.privateKey, rsaCiphertext).toString(), "hello rsa", "RSA OAEP roundtrip mismatch");
 const rsaPkcs1Ciphertext = crypto.publicEncrypt({ key: rsaPair.publicKey, padding: crypto.constants.RSA_PKCS1_PADDING }, Buffer.from("pkcs1"));
-strictEqual(
-  crypto.privateDecrypt({ key: rsaPair.privateKey, padding: crypto.constants.RSA_PKCS1_PADDING }, rsaPkcs1Ciphertext).toString(),
-  "pkcs1",
-  "RSA PKCS#1 encrypt/decrypt mismatch",
-);
+// Bun rejects PKCS#1 v1.5 privateDecrypt (Bleichenbacher attack mitigation);
+// Cottontail follows Bun here rather than Node, which still allows it.
+let rsaPkcs1Rejected = false;
+try {
+  crypto.privateDecrypt({ key: rsaPair.privateKey, padding: crypto.constants.RSA_PKCS1_PADDING }, rsaPkcs1Ciphertext);
+} catch {
+  rsaPkcs1Rejected = true;
+}
+strictEqual(rsaPkcs1Rejected, true, "RSA PKCS#1 privateDecrypt should be rejected (Bleichenbacher mitigation)");
 const rsaPrivateCiphertext = crypto.privateEncrypt(rsaPair.privateKey, Buffer.from("private side"));
 strictEqual(crypto.publicDecrypt(rsaPair.publicKey, rsaPrivateCiphertext).toString(), "private side", "RSA privateEncrypt/publicDecrypt mismatch");
 const rsaKem = crypto.encapsulate(rsaPair.publicKey);

@@ -1,7 +1,11 @@
-import { promises } from "../readline.js";
+// node:readline/promises built on the vendored Node.js sources; see
+// ../util/internal/loader.js.
+import { internalRequire } from "../util/internal/loader.js";
 
-export const Interface = promises.Interface;
-export const Readline = promises.Readline;
-export const createInterface = promises.createInterface;
+const promisesModule = internalRequire("readline/promises");
 
-export default { Interface, Readline, createInterface };
+export const Interface = promisesModule.Interface;
+export const Readline = promisesModule.Readline;
+export const createInterface = promisesModule.createInterface;
+
+export default promisesModule;

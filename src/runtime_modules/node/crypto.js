@@ -162,6 +162,9 @@ function normalizeAlgorithm(algorithm) {
   if (normalized === "sha512224") return "sha512-224";
   if (normalized === "sha512256") return "sha512-256";
   if (normalized === "md5sha1" || normalized === "ssl3md5sha1") return "md5-sha1";
+  // Bun/BoringSSL does not support these OpenSSL alias names; leave them
+  // unresolved so createHash throws "Digest method not supported".
+  if (normalized === "rsamd5" || normalized === "ssl3md5" || normalized === "ssl3sha1") return normalized;
   if (normalized.endsWith("sha1")) return "sha1";
   if (normalized.endsWith("sha224")) return "sha224";
   if (normalized.endsWith("sha256")) return "sha256";
@@ -1282,11 +1285,66 @@ function keyObjectFromNativeKey(nativeKey, requestedType = undefined) {
   throw new TypeError(`Invalid encoded key type: ${type}`);
 }
 
+// Decrypt a traditional (Proc-Type: 4,ENCRYPTED) PEM key before handing it
+// to the native importer, which cannot take a passphrase and would otherwise
+// fall through to OpenSSL's interactive prompt.
+function decryptTraditionalPem(pem, passphrase) {
+  const match = pem.match(/-----BEGIN ([A-Z0-9 ]+)-----\r?\nProc-Type: 4,ENCRYPTED\r?\nDEK-Info: ([A-Za-z0-9-]+),([0-9A-Fa-f]+)\r?\n\r?\n([\s\S]*?)-----END \1-----/);
+  if (!match) {
+    const err = new Error("error:1E08010C:DECODER routines::unsupported");
+    err.code = "ERR_OSSL_UNSUPPORTED";
+    throw err;
+  }
+  if (passphrase == null) {
+    const err = new Error("Passphrase required for encrypted key");
+    err.code = "ERR_MISSING_PASSPHRASE";
+    throw err;
+  }
+  const [, label, cipherName, ivHex, body] = match;
+  const iv = Buffer.from(ivHex, "hex");
+  const data = Buffer.from(body.replace(/[^A-Za-z0-9+/=]/g, ""), "base64");
+  const keySizes = { "AES-128-CBC": 16, "AES-192-CBC": 24, "AES-256-CBC": 32, "DES-EDE3-CBC": 24, "DES-CBC": 8 };
+  const keyLength = keySizes[cipherName.toUpperCase()];
+  if (!keyLength) {
+    const err = new Error(`Unsupported encrypted PEM cipher: ${cipherName}`);
+    err.code = "ERR_OSSL_UNSUPPORTED";
+    throw err;
+  }
+  // OpenSSL derives the key via EVP_BytesToKey(MD5, salt = first 8 IV bytes).
+  const salt = new Uint8Array(iv.subarray(0, 8));
+  const pass = bytesFromData(passphrase);
+  let key = new Uint8Array(0);
+  let previous = new Uint8Array(0);
+  while (key.length < keyLength) {
+    previous = digestBytes("md5", concatBytes([previous, pass, salt]));
+    key = concatBytes([key, previous]);
+  }
+  key = key.slice(0, keyLength);
+  let decrypted;
+  try {
+    const decipher = createDecipheriv(cipherName.toLowerCase(), key, iv);
+    decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+  } catch {
+    const err = new Error("error:1C800064:Provider routines::bad decrypt");
+    err.code = "ERR_OSSL_EVP_BAD_DECRYPT";
+    err.reason = "bad decrypt";
+    throw err;
+  }
+  const base64 = decrypted.toString("base64").replace(/(.{64})/g, "$1\n").replace(/\n+$/, "");
+  return `-----BEGIN ${label}-----\n${base64}\n-----END ${label}-----\n`;
+}
+
 function keyObjectFromEncodedInput(input, requestedType = undefined) {
   if (typeof cottontail.cryptoImportKey !== "function") cryptoFeatureError("crypto.importKey");
   const options = input && typeof input === "object" && input.key != null ? input : { key: input };
   const keyData = options.key;
-  const keyBytes = bytesFromData(keyData);
+  let keyBytes = bytesFromData(keyData, options.encoding);
+  if (keyBytes.length >= 11 && String.fromCharCode(...keyBytes.subarray(0, 11)) === "-----BEGIN ") {
+    const pemText = Buffer.from(keyBytes).toString("utf8");
+    if (/Proc-Type: 4,ENCRYPTED/.test(pemText)) {
+      keyBytes = new Uint8Array(Buffer.from(decryptTraditionalPem(pemText, options.passphrase), "utf8"));
+    }
+  }
   const isPem = keyBytes.length >= 11 && String.fromCharCode(...keyBytes.subarray(0, 11)) === "-----BEGIN ";
   const format = String(options.format ?? (isPem ? "pem" : "der")).toLowerCase();
   const keyType = String(options.type ?? "");
@@ -1950,7 +2008,7 @@ function streamInputEncoding(instance, chunk, encoding) {
   return inputEncoding;
 }
 
-export class Hash extends Transform {
+class HashImpl extends Transform {
   constructor(algorithm, options = undefined) {
     super(options && typeof options === "object" ? options : {});
     // The stream shim assigns instance `_transform = null` when no transform
@@ -1958,6 +2016,9 @@ export class Hash extends Transform {
     if (this._transform === null) delete this._transform;
     rebindStreamInternalListeners(this);
     this.algorithm = normalizeAlgorithm(algorithm);
+    if (!supportedHashes.includes(this.algorithm)) {
+      throw new Error("Digest method not supported");
+    }
     const requestedOutputLength = options && typeof options === "object" ? options.outputLength : undefined;
     this.outputLength = requestedOutputLength == null
       ? hashOutputLengths[this.algorithm]
@@ -1982,7 +2043,8 @@ export class Hash extends Transform {
   }
 
   copy() {
-    const next = new Hash(this.algorithm, { outputLength: this.outputLength });
+    if (this.finished) throw new Error("Digest already called");
+    const next = new HashImpl(this.algorithm, { outputLength: this.outputLength });
     next.chunks = this.chunks.map((chunk) => new Uint8Array(chunk));
     return next;
   }
@@ -1998,12 +2060,45 @@ export class Hash extends Transform {
   }
 }
 
-export class Hmac extends Transform {
+// Node allows Hash/Hmac to be invoked without `new`.
+export function Hash(algorithm, options = undefined) {
+  return new HashImpl(algorithm, options);
+}
+Hash.prototype = HashImpl.prototype;
+
+function describeReceived(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "object" || typeof value === "function") return `an instance of ${value.constructor?.name ?? "Object"}`;
+  return `type ${typeof value} (${String(value)})`;
+}
+
+function validateHmacKey(key) {
+  if (typeof key === "string") return;
+  if (key instanceof ArrayBuffer || ArrayBuffer.isView(key)) return;
+  if (key !== null && typeof key === "object" && (key instanceof KeyObject || typeof key.export === "function" || key.algorithm != null)) return;
+  const err = new TypeError(`The "key" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey. Received ${describeReceived(key)}`);
+  err.code = "ERR_INVALID_ARG_TYPE";
+  throw err;
+}
+
+class HmacImpl extends Transform {
   constructor(algorithm, key, options = undefined) {
     super(options && typeof options === "object" ? options : {});
     if (this._transform === null) delete this._transform;
     rebindStreamInternalListeners(this);
+    if (typeof algorithm !== "string") {
+      const err = new TypeError(`The "hmac" argument must be of type string. Received ${describeReceived(algorithm)}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
     this.algorithm = normalizeAlgorithm(algorithm);
+    if (!supportedHashes.includes(this.algorithm)) {
+      const err = new TypeError(`Invalid digest: ${algorithm}`);
+      err.code = "ERR_CRYPTO_INVALID_DIGEST";
+      throw err;
+    }
+    validateHmacKey(key);
     this.key = bytesFromData(key);
     this.chunks = [];
     this.finished = false;
@@ -2019,7 +2114,12 @@ export class Hmac extends Transform {
   }
 
   digest(encoding = undefined) {
-    if (this.finished) throw new Error("Digest already called");
+    // Node returns an empty result (not an error) once the HMAC context has
+    // been finalized.
+    if (this.finished) {
+      const enc = encoding ?? "buffer";
+      return enc === "buffer" ? Buffer.alloc(0) : "";
+    }
     this.finished = true;
     return encodeDigest(hmacBytes(this.algorithm, this.key, concatBytes(this.chunks)), encoding ?? "buffer");
   }
@@ -2034,6 +2134,11 @@ export class Hmac extends Transform {
     callback();
   }
 }
+
+export function Hmac(algorithm, key, options = undefined) {
+  return new HmacImpl(algorithm, key, options);
+}
+Hmac.prototype = HmacImpl.prototype;
 
 export class KeyObject {
   constructor(type, data, options = {}) {
@@ -2266,10 +2371,13 @@ function signaturePadding(options = undefined, fallback = constantsObject.RSA_PK
 function rsaOperationOptions(key, fallbackPadding) {
   const options = key && typeof key === "object" && key.key != null ? key : {};
   return {
-    key: options.key ?? key,
+    // Pass the full options object through so key-decoding options (format,
+    // type, encoding, passphrase) reach keyObjectFromEncodedInput.
+    key,
     padding: options.padding ?? fallbackPadding,
     oaepHash: options.oaepHash ?? "sha1",
     oaepLabel: options.oaepLabel,
+    encoding: options.encoding,
   };
 }
 
@@ -2435,12 +2543,23 @@ class CipherBase extends Transform {
     if (!this.info) throw new TypeError(`Unknown cipher algorithm: ${algorithm}`);
     this.key = bytesFromData(key);
     const ivLength = this.info.ivLength ?? 0;
-    this.iv = ivLength === 0 ? new Uint8Array(0) : bytesFromData(iv);
+    if (iv === null) {
+      this.iv = new Uint8Array(0);
+    } else if (typeof iv === "string" || iv instanceof ArrayBuffer || ArrayBuffer.isView(iv)) {
+      this.iv = bytesFromData(iv);
+    } else {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        'The "iv" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ' +
+          describeReceivedValue(iv),
+      );
+    }
     if (this.key.byteLength !== this.info.keyLength) throw new RangeError("Invalid key length");
     if (this.info.authTagLength > 0) {
       if (this.iv.byteLength === 0) throw new TypeError("Invalid initialization vector");
     } else if (this.iv.byteLength !== ivLength) {
-      throw new TypeError("Invalid initialization vector");
+      throw nodeCryptoError(TypeError, "ERR_CRYPTO_INVALID_IV", "Invalid initialization vector");
     }
     this.encrypt = encrypt;
     this.autoPadding = options?.autoPadding !== false;
@@ -2651,6 +2770,97 @@ export class ECDH {
     this.publicKey = p256DecodePoint(publicKey, encoding);
   }
 }
+
+const ecConvertKeyCurves = {
+  prime256v1: { p: p256.p, a: p256.a, b: p256.b, size: 32 },
+  secp256k1: {
+    p: BigInt("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"),
+    a: 0n,
+    b: 7n,
+    size: 32,
+  },
+  secp384r1: {
+    p: BigInt("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"),
+    a: BigInt("0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffc"),
+    b: BigInt("0xb3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"),
+    size: 48,
+  },
+  secp521r1: {
+    p: (1n << 521n) - 1n,
+    a: (1n << 521n) - 4n,
+    b: BigInt("0x0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00"),
+    size: 66,
+  },
+};
+
+function ecOnCurve(point, params) {
+  return mod(point.y * point.y - (point.x * point.x * point.x + params.a * point.x + params.b), params.p) === 0n;
+}
+
+function ecDecodePointGeneric(bytes, params) {
+  const size = params.size;
+  if (bytes.byteLength === 1 + 2 * size && (bytes[0] === 4 || bytes[0] === 6 || bytes[0] === 7)) {
+    const point = {
+      x: bigintFromBytes(bytes.slice(1, 1 + size)),
+      y: bigintFromBytes(bytes.slice(1 + size)),
+    };
+    if (!ecOnCurve(point, params)) throw new Error("Failed to convert Buffer to EC_POINT");
+    if (bytes[0] !== 4 && Number(point.y & 1n) !== (bytes[0] & 1)) throw new Error("Failed to convert Buffer to EC_POINT");
+    return point;
+  }
+  if (bytes.byteLength === 1 + size && (bytes[0] === 2 || bytes[0] === 3)) {
+    const x = bigintFromBytes(bytes.slice(1));
+    const ySquared = mod(x * x * x + params.a * x + params.b, params.p);
+    // All supported primes are ≡ 3 (mod 4).
+    let y = modPow(ySquared, (params.p + 1n) / 4n, params.p);
+    if (mod(y * y - ySquared, params.p) !== 0n) throw new Error("Failed to convert Buffer to EC_POINT");
+    if (Number(y & 1n) !== (bytes[0] & 1)) y = params.p - y;
+    return { x, y };
+  }
+  throw new Error("Failed to convert Buffer to EC_POINT");
+}
+
+function ecEncodePointGeneric(point, params, format) {
+  const x = bytesFromBigint(point.x, params.size);
+  const y = bytesFromBigint(point.y, params.size);
+  if (format === "compressed") return bufferFromBytes(new Uint8Array([(point.y & 1n) === 0n ? 2 : 3, ...x]));
+  if (format === "hybrid") return bufferFromBytes(new Uint8Array([(point.y & 1n) === 0n ? 6 : 7, ...x, ...y]));
+  return bufferFromBytes(new Uint8Array([4, ...x, ...y]));
+}
+
+ECDH.convertKey = function convertKey(key, curve, inputEncoding = undefined, outputEncoding = undefined, format = "uncompressed") {
+  const curveName = ecCurveName(curve);
+  const params = ecConvertKeyCurves[curveName];
+  if (params == null) {
+    const err = new TypeError("Invalid EC curve name");
+    err.code = "ERR_CRYPTO_INVALID_CURVE";
+    throw err;
+  }
+  let bytes;
+  if (typeof key === "string") {
+    const encoding = String(inputEncoding ?? "utf8").toLowerCase();
+    const knownEncodings = ["utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii", "ucs2", "ucs-2", "utf16le", "utf-16le"];
+    if (!knownEncodings.includes(encoding)) {
+      throw new TypeError(`Unknown encoding: ${inputEncoding}`);
+    }
+    if (encoding === "hex" && (key.length % 2 !== 0 || /[^0-9a-fA-F]/.test(key))) {
+      const err = new TypeError(`The argument 'encoding' is invalid for data of length ${key.length}. Received 'hex'`);
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+    bytes = new Uint8Array(Buffer.from(key, encoding));
+  } else {
+    bytes = bytesFromData(key);
+  }
+  const normalizedFormat = String(format ?? "uncompressed").toLowerCase();
+  if (normalizedFormat !== "compressed" && normalizedFormat !== "uncompressed" && normalizedFormat !== "hybrid") {
+    const err = new TypeError(`Invalid ECDH format: ${format}`);
+    err.code = "ERR_CRYPTO_ECDH_INVALID_FORMAT";
+    throw err;
+  }
+  const point = ecDecodePointGeneric(bytes, params);
+  return encodeDigest(new Uint8Array(ecEncodePointGeneric(point, params, normalizedFormat)), outputEncoding ?? "buffer");
+};
 
 export class Sign extends Writable {
   constructor(algorithm, options = undefined) {
@@ -2921,7 +3131,11 @@ export function hkdfSync(digest, ikm, salt, info, keylen) {
 }
 
 export function hkdf(digest, ikm, salt, info, keylen, callback) {
-  callbackify(() => hkdfSync(digest, ikm, salt, info, keylen), callback);
+  callbackify(() => {
+    // Node's async hkdf yields an ArrayBuffer, not a Buffer.
+    const out = hkdfSync(digest, ikm, salt, info, keylen);
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+  }, callback);
 }
 
 export function pbkdf2Sync(password, salt, iterations, keylen, digest = "sha1") {
@@ -3193,11 +3407,44 @@ export function getCurves() {
   return ["prime256v1", ...supportedNativeEcCurves];
 }
 
+function validateOaepOptions(input) {
+  const options = input && typeof input === "object" && input.key != null ? input : {};
+  if (options.oaepHash !== undefined) {
+    if (typeof options.oaepHash !== "string") {
+      const err = new TypeError(`The "options.oaepHash" property must be of type string. Received ${typeof options.oaepHash}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    if (!supportedHashes.includes(normalizeAlgorithm(options.oaepHash))) {
+      const err = new Error("error:03000098:digital envelope routines::invalid digest");
+      err.code = "ERR_OSSL_EVP_INVALID_DIGEST";
+      throw err;
+    }
+  }
+  if (options.oaepLabel !== undefined) {
+    const label = options.oaepLabel;
+    const valid = typeof label === "string" || label instanceof ArrayBuffer || ArrayBuffer.isView(label);
+    if (!valid) {
+      const err = new TypeError(`The "options.oaepLabel" property must be an instance of Buffer, TypedArray, or DataView. Received ${typeof label}`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+  }
+}
+
 export function privateDecrypt(privateKey, buffer) {
+  validateOaepOptions(privateKey);
   const options = rsaOperationOptions(privateKey, constantsObject.RSA_PKCS1_OAEP_PADDING);
+  if (options.padding === constantsObject.RSA_PKCS1_PADDING) {
+    // Node rejects PKCS#1 v1.5 private decryption (Bleichenbacher hardening)
+    // unless OpenSSL implicit rejection is available.
+    const err = new TypeError("The property 'options.padding' is invalid. Received RSA_PKCS1_PADDING (Bleichenbacher attack mitigation)");
+    err.code = "ERR_INVALID_ARG_VALUE";
+    throw err;
+  }
   const key = keyObjectFromInput(options.key, "private");
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("privateDecrypt requires an RSA private KeyObject");
-  const decrypted = rsaPrivateApply(key, bytesFromData(buffer));
+  const decrypted = rsaPrivateApply(key, bytesFromData(buffer, options.encoding));
   if (options.padding === constantsObject.RSA_NO_PADDING) return decrypted;
   if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPkcs1DecryptBlock(decrypted, 2);
   if (options.padding === constantsObject.RSA_PKCS1_OAEP_PADDING) return rsaOaepDecode(decrypted, options.oaepHash, options.oaepLabel);
@@ -3208,7 +3455,7 @@ export function privateEncrypt(privateKey, buffer) {
   const options = rsaOperationOptions(privateKey, constantsObject.RSA_PKCS1_PADDING);
   const key = keyObjectFromInput(options.key, "private");
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("privateEncrypt requires an RSA private KeyObject");
-  const input = bytesFromData(buffer);
+  const input = bytesFromData(buffer, options.encoding);
   if (options.padding === constantsObject.RSA_NO_PADDING) {
     if (input.byteLength !== rsaModulusLength(key)) throw new RangeError("RSA_NO_PADDING input must match modulus length");
     return rsaPrivateApply(key, input);
@@ -3221,17 +3468,18 @@ export function publicDecrypt(publicKey, buffer) {
   const options = rsaOperationOptions(publicKey, constantsObject.RSA_PKCS1_PADDING);
   const key = resolvePublicKeyObject(options.key);
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("publicDecrypt requires an RSA public KeyObject");
-  const decrypted = rsaPublicApply(key, bytesFromData(buffer));
+  const decrypted = rsaPublicApply(key, bytesFromData(buffer, options.encoding));
   if (options.padding === constantsObject.RSA_NO_PADDING) return decrypted;
   if (options.padding === constantsObject.RSA_PKCS1_PADDING) return rsaPkcs1DecryptBlock(decrypted, 1);
   throw new TypeError("Invalid RSA publicDecrypt padding");
 }
 
 export function publicEncrypt(publicKey, buffer) {
+  validateOaepOptions(publicKey);
   const options = rsaOperationOptions(publicKey, constantsObject.RSA_PKCS1_OAEP_PADDING);
   const key = resolvePublicKeyObject(options.key);
   if (key.asymmetricKeyType !== "rsa") throw new TypeError("publicEncrypt requires an RSA public KeyObject");
-  const input = bytesFromData(buffer);
+  const input = bytesFromData(buffer, options.encoding);
   if (options.padding === constantsObject.RSA_NO_PADDING) {
     if (input.byteLength !== rsaModulusLength(key)) throw new RangeError("RSA_NO_PADDING input must match modulus length");
     return rsaPublicApply(key, input);

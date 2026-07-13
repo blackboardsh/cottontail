@@ -1,0 +1,5 @@
+// Jest Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`/Users/yoav/.dash/stable/workspaces/local_ws_b6fdd7dfa81e45339823498c5f707d68/projects/cottontail/compat/upstream/bun/v1.3.10/test/js/bun/test/cross-file-safety/test2.ts 1`] = `
+25
+`;

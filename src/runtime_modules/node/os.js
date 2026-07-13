@@ -25,7 +25,15 @@ export function hostname() {
 }
 
 export function tmpdir() {
-  return cottontail.env("TMPDIR") || cottontail.env("TEMP") || "/tmp";
+  const env = globalThis.process?.env ?? {};
+  if (platform() === "win32") {
+    let path = env.TEMP || env.TMP || `${env.SystemRoot || env.windir || ""}\\temp`;
+    if (path.length > 1 && path.endsWith("\\") && !path.endsWith(":\\")) path = path.slice(0, -1);
+    return path;
+  }
+  let path = env.TMPDIR || env.TMP || env.TEMP || "/tmp";
+  if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  return path;
 }
 
 export function type() {
@@ -219,7 +227,40 @@ export function networkInterfaces() {
   return parseIfconfig(output);
 }
 
+function makeSystemError(syscall, uvErrno, code, detail) {
+  const message = `A system error occurred: ${syscall} returned ${code} (${detail})`;
+  const err = new Error(message);
+  err.name = "SystemError";
+  err.code = "ERR_SYSTEM_ERROR";
+  err.info = { errno: uvErrno, code, message: detail, syscall };
+  err.errno = uvErrno;
+  err.syscall = syscall;
+  return err;
+}
+
+function processExists(pid) {
+  try {
+    globalThis.process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+function validatePriorityPid(pid, syscall) {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid < -2147483648 || pid > 2147483647) {
+    const err = new TypeError(`The value of "pid" is out of range. It must be an integer. Received ${pid}`);
+    err.code = "ERR_OUT_OF_RANGE";
+    throw err;
+  }
+  // The native binding cannot represent negative/unknown pids; emulate libuv's ESRCH.
+  if (pid < 0 || (pid > 0 && !processExists(pid))) {
+    throw makeSystemError(syscall, -3, "ESRCH", "no such process");
+  }
+}
+
 export function getPriority(pid = 0) {
+  validatePriorityPid(Number(pid ?? 0), "uv_os_getpriority");
   const target = Number(pid || globalThis.process?.pid || 0);
   if (typeof cottontail.osGetPriority === "function") return Number(cottontail.osGetPriority(target));
   const value = shell(`ps -o ni= -p ${target || "$$"}`);
@@ -232,6 +273,7 @@ export function setPriority(pid, priority = undefined) {
     priority = pid;
     pid = globalThis.process?.pid ?? 0;
   }
+  validatePriorityPid(Number(pid ?? 0), "uv_os_setpriority");
   const target = Number(pid || globalThis.process?.pid || 0);
   if (typeof cottontail.osSetPriority === "function") {
     cottontail.osSetPriority(target, Number(priority));
@@ -244,6 +286,14 @@ export function setPriority(pid, priority = undefined) {
 export function version() {
   if (platform() === "win32") return shell("ver");
   return shell("uname -v");
+}
+
+// Node gives these accessors a Symbol.toPrimitive so `os.arch + ""` === `os.arch()`.
+for (const fn of [arch, availableParallelism, endianness, freemem, homedir, hostname, platform, release, tmpdir, totalmem, type, uptime, version, machine]) {
+  Object.defineProperty(fn, Symbol.toPrimitive, {
+    configurable: true,
+    value: () => fn(),
+  });
 }
 
 export const EOL = platform() === "win32" ? "\r\n" : "\n";

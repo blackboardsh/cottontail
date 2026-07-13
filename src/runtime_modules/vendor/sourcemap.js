@@ -178,6 +178,12 @@ export function remapPosition(line, column) {
 
 export function remapStackString(stack) {
   if (typeof stack !== "string" || stack === "") return stack;
+  // Cheap pre-check before getState(): the bundle path is the map path minus
+  // ".map", so stacks that never mention the bundle can skip the expensive
+  // one-time decode of the multi-megabyte source map entirely.
+  const mapPath = globalThis.__cottontailBundleSourceMap;
+  if (typeof mapPath !== "string" || mapPath === "") return stack;
+  if (mapPath.endsWith(".map") && !stack.includes(mapPath.slice(0, -4))) return stack;
   const state = getState();
   if (!state || !state.bundleRegExp || !stack.includes(state.bundlePath)) return stack;
   state.bundleRegExp.lastIndex = 0;

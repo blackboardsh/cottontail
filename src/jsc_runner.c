@@ -157,6 +157,7 @@ typedef struct {
 
 typedef struct {
     int exit_code;
+    int signal_code;
     char *stdout_ptr;
     size_t stdout_len;
     char *stderr_ptr;
@@ -7961,6 +7962,11 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
     SSL_set_verify(ssl, reject_unauthorized ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
     if (servername != NULL && servername[0] != '\0') SSL_set_tlsext_host_name(ssl, servername);
     SSL_set_fd(ssl, fd);
+    /* Bound the handshake: a peer that is not a TLS server would otherwise
+     * leave SSL_connect blocked in read forever and freeze the event loop. */
+    struct timeval handshake_timeout = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &handshake_timeout, sizeof(handshake_timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &handshake_timeout, sizeof(handshake_timeout));
     if (SSL_connect(ssl) != 1) {
         char *message = ct_tls_error_message("TLS connect failed");
         SSL_free(ssl);
@@ -10315,6 +10321,9 @@ static JSValueRef ct_chmod_sync(JSContextRef ctx, JSObjectRef function, JSObject
 static JSValueRef ct_spawn_result_to_js(JSContextRef ctx, const CtHostSpawnResult *result, JSValueRef *exception) {
     JSObjectRef response = ct_make_object(ctx);
     ct_set_property(ctx, response, "status", JSValueMakeNumber(ctx, result->exit_code), exception);
+    ct_set_property(ctx, response, "signalCode",
+                    result->signal_code > 0 ? JSValueMakeNumber(ctx, result->signal_code) : JSValueMakeNull(ctx),
+                    exception);
     ct_set_property(ctx, response, "stdout", ct_make_string_len(ctx, result->stdout_ptr != NULL ? result->stdout_ptr : "", result->stdout_len), exception);
     ct_set_property(ctx, response, "stderr", ct_make_string_len(ctx, result->stderr_ptr != NULL ? result->stderr_ptr : "", result->stderr_len), exception);
     return response;
@@ -11072,10 +11081,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
 
+    char *argv0 = NULL;
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2]) && JSValueIsObject(ctx, argv[2])) {
         JSObjectRef options = (JSObjectRef)argv[2];
         JSValueRef stdio_value = ct_get_property(ctx, options, "stdio", exception);
         JSValueRef ipc_value = ct_get_property(ctx, options, "ipc", exception);
+        JSValueRef argv0_value = ct_get_property(ctx, options, "argv0", exception);
         if (exception != NULL && *exception != NULL) {
             free(file);
             ct_free_string_array(args, arg_count);
@@ -11084,6 +11095,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             return JSValueMakeUndefined(ctx);
         }
         ipc_enabled = JSValueToBoolean(ctx, ipc_value);
+        argv0 = ct_value_to_optional_string(ctx, argv0_value);
 
         if (!JSValueIsUndefined(ctx, stdio_value)) {
             CtProcessStdioMode stdio_mode = stdout_mode;
@@ -11091,6 +11103,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
                 free(file);
                 ct_free_string_array(args, arg_count);
                 free(cwd);
+                free(argv0);
                 ct_free_env_entries(env_entries, env_count);
                 return JSValueMakeUndefined(ctx);
             }
@@ -11105,6 +11118,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             free(file);
             ct_free_string_array(args, arg_count);
             free(cwd);
+            free(argv0);
             ct_free_env_entries(env_entries, env_count);
             return JSValueMakeUndefined(ctx);
         }
@@ -11204,13 +11218,14 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         }
         char **argv_exec = (char **)calloc(arg_count + 2, sizeof(char *));
         if (argv_exec == NULL) _exit(127);
-        argv_exec[0] = file;
+        argv_exec[0] = argv0 != NULL && argv0[0] != '\0' ? argv0 : file;
         for (size_t index = 0; index < arg_count; index += 1) argv_exec[index + 1] = args[index];
         argv_exec[arg_count + 1] = NULL;
         execvp(file, argv_exec);
         _exit(127);
     }
 
+    free(argv0);
     ct_process_close_fd(&stdin_pipe[0]);
     ct_process_close_fd(&stdout_pipe[1]);
     ct_process_close_fd(&stderr_pipe[1]);

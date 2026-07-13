@@ -6,12 +6,10 @@ import * as assertStrict from "./assert/strict.js";
 import * as asyncHooks from "./async_hooks.js";
 import * as buffer from "./buffer.js";
 import * as childProcess from "./child_process.js";
-import * as cluster from "./cluster.js";
 import * as consoleModule from "./console.js";
 import * as nodeConstants from "./constants.js";
 import * as crypto from "./crypto.js";
 import * as diagnosticsChannel from "./diagnostics_channel.js";
-import * as dgram from "./dgram.js";
 import * as dns from "./dns.js";
 import * as dnsPromises from "./dns/promises.js";
 import * as domain from "./domain.js";
@@ -20,9 +18,6 @@ import * as fs from "./fs.js";
 import * as fsPromises from "./fs/promises.js";
 import * as http from "./http.js";
 import * as https from "./https.js";
-import * as http2 from "./http2.js";
-import * as inspector from "./inspector.js";
-import * as inspectorPromises from "./inspector/promises.js";
 import * as internalAssertMyersDiff from "./internal/assert/myers_diff.js";
 import * as internalAsyncHooks from "./internal/async_hooks.js";
 import * as internalEventTarget from "./internal/event_target.js";
@@ -36,32 +31,63 @@ import * as perfHooks from "./perf_hooks.js";
 import * as processModule from "./process.js";
 import * as punycode from "./punycode.js";
 import * as querystring from "./querystring.js";
-import * as readline from "./readline.js";
-import * as readlinePromises from "./readline/promises.js";
-import * as repl from "./repl.js";
-import * as sea from "./sea.js";
-import * as sqlite from "./sqlite.js";
 import * as stream from "./stream.js";
 import * as streamConsumers from "./stream/consumers.js";
 import * as streamPromises from "./stream/promises.js";
 import * as streamWeb from "./stream/web.js";
 import * as stringDecoder from "./string_decoder.js";
 import * as sys from "./sys.js";
-import * as nodeTest from "./test.js";
-import * as testReporters from "./test/reporters.js";
 import * as timers from "./timers.js";
 import * as timersPromises from "./timers/promises.js";
 import * as tls from "./tls.js";
-import * as traceEvents from "./trace_events.js";
 import * as tty from "./tty.js";
 import * as url from "./url.js";
 import * as util from "./util.js";
 import * as utilTypes from "./util/types.js";
-import * as v8 from "./v8.js";
 import * as vm from "./vm.js";
-import * as wasi from "./wasi.js";
-import * as workerThreads from "./worker_threads.js";
 import * as zlib from "./zlib.js";
+
+// Heavy builtins that no startup path touches are pulled in through lazy
+// require() thunks instead of static imports. esbuild still bundles the
+// modules (require of an internal path becomes a synchronous init call), but
+// their top-level code no longer executes during process startup, which
+// matters because every spawned cottontail process re-evaluates this graph.
+const kLazyBuiltin = Symbol.for("cottontail.lazyBuiltin");
+function lazyBuiltin(load) {
+  let cached;
+  let loaded = false;
+  const thunk = () => {
+    if (!loaded) {
+      cached = load();
+      loaded = true;
+    }
+    return cached;
+  };
+  thunk[kLazyBuiltin] = true;
+  return thunk;
+}
+function unwrapBuiltin(value) {
+  return typeof value === "function" && value[kLazyBuiltin] === true ? value() : value;
+}
+const cluster = lazyBuiltin(() => require("./cluster.js"));
+const dgram = lazyBuiltin(() => require("./dgram.js"));
+const http2 = lazyBuiltin(() => require("./http2.js"));
+const inspector = lazyBuiltin(() => require("./inspector.js"));
+const inspectorPromises = lazyBuiltin(() => require("./inspector/promises.js"));
+const readline = lazyBuiltin(() => require("./readline.js"));
+const readlinePromises = lazyBuiltin(() => require("./readline/promises.js"));
+const repl = lazyBuiltin(() => require("./repl.js"));
+const sea = lazyBuiltin(() => require("./sea.js"));
+const sqlite = lazyBuiltin(() => require("./sqlite.js"));
+const nodeTestBuiltin = lazyBuiltin(() => {
+  const namespace = require("./test.js");
+  return namespace.default ?? namespace;
+});
+const testReporters = lazyBuiltin(() => require("./test/reporters.js"));
+const traceEvents = lazyBuiltin(() => require("./trace_events.js"));
+const v8 = lazyBuiltin(() => require("./v8.js"));
+const wasi = lazyBuiltin(() => require("./wasi.js"));
+const workerThreads = lazyBuiltin(() => require("./worker_threads.js"));
 
 export const builtinModules = [
   "assert",
@@ -542,7 +568,7 @@ function executeCommonJsModule(module, filename) {
 
 function executeHookSource(resolved, source, format) {
   const effectiveFormat = format ?? formatForResolved(resolved);
-  if (effectiveFormat === "builtin") return builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, ""));
+  if (effectiveFormat === "builtin") return unwrapBuiltin(builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, "")));
   if (effectiveFormat === "json" || String(resolved).endsWith(".json")) return JSON.parse(String(source ?? ""));
   if (effectiveFormat === "module" || String(resolved).endsWith(".mjs")) {
     throw new Error(`Cannot require ES module '${resolved}' from CommonJS`);
@@ -656,7 +682,7 @@ function executeDynamicImportSource(resolved, source, format) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const effectiveFormat = format ?? formatForResolved(resolvedPath);
   if (effectiveFormat === "builtin") {
-    const value = builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, ""));
+    const value = unwrapBuiltin(builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, "")));
     return namespaceFromCommonJs(value);
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
@@ -699,7 +725,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   if (loadResult !== undefined) {
     return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
   }
-  if (builtinModuleMap.has(resolved)) return namespaceFromCommonJs(builtinModuleMap.get(resolved));
+  if (builtinModuleMap.has(resolved)) return namespaceFromCommonJs(unwrapBuiltin(builtinModuleMap.get(resolved)));
   if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
   return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
 }
@@ -733,7 +759,7 @@ function loadCommonJsModule(resolved) {
   if (pathMock.found) return pathMock.value;
   const hooked = applyLoadHooks(resolvedPath);
   if (hooked !== null) return hooked;
-  if (builtinModuleMap.has(resolvedPath)) return builtinModuleMap.get(resolvedPath);
+  if (builtinModuleMap.has(resolvedPath)) return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
   if (resolvedPath.endsWith(".json")) return JSON.parse(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
@@ -752,8 +778,13 @@ export function createRequire(basePath = cottontail.cwd()) {
   let normalizedBasePath = String(basePath).startsWith("file://")
     ? fileURLToPath(basePath)
     : String(basePath);
-  const callerPath = bundledCallerPathFromStack();
-  if (callerPath && callerPath !== normalizedBasePath && isBundledImportMetaBase(normalizedBasePath)) {
+  // Only inspect the stack when the caller heuristic can actually apply
+  // (basePath is the bundled main-script path). Reading `new Error().stack`
+  // goes through the lazily-remapping stack getter, and the first remap
+  // decodes the multi-megabyte bundle source map (~200ms) — that cost must
+  // not be paid by every createRequire() call in spawned processes.
+  const callerPath = isBundledImportMetaBase(normalizedBasePath) ? bundledCallerPathFromStack() : null;
+  if (callerPath && callerPath !== normalizedBasePath) {
     normalizedBasePath = callerPath;
   }
   const require = (request) => {
@@ -764,7 +795,22 @@ export function createRequire(basePath = cottontail.cwd()) {
     if (resolvedMock.found) return resolvedMock.value;
     return loadCommonJsModule(resolved);
   };
-  require.resolve = (request) => resolveRequest(request, normalizedBasePath);
+  require.resolve = (request, options = undefined) => {
+    if (options !== undefined && options !== null && options.paths !== undefined) {
+      // Route through Module._resolveFilename so user overrides and the
+      // options.paths semantics both apply (matches Node).
+      return Module._resolveFilename(String(request), { filename: normalizedBasePath }, false, options);
+    }
+    return resolveRequest(request, normalizedBasePath);
+  };
+  require.resolve.paths = (request) => {
+    const text = String(request);
+    if (builtinModuleMap.has(text) || (text.startsWith("node:") && builtinModuleMap.has(text.slice(5)))) return null;
+    if (text.startsWith("./") || text.startsWith("../") || text.startsWith("/")) {
+      return [normalizedBasePath.endsWith("/") ? normalizedBasePath.slice(0, -1) : dirname(normalizedBasePath)];
+    }
+    return _nodeModulePaths(normalizedBasePath.endsWith("/") ? normalizedBasePath : dirname(normalizedBasePath));
+  };
   require.cache = commonJsCacheObject;
   require.main = null;
   return require;
@@ -876,34 +922,137 @@ export class Module {
   }
 }
 
+function sourceMapPayloadTypeText(payload) {
+  if (payload === undefined) return "undefined";
+  if (payload === null) return "null";
+  if (typeof payload === "string") return `type string ('${payload}')`;
+  if (typeof payload === "number" || typeof payload === "boolean" || typeof payload === "bigint") {
+    return `type ${typeof payload} (${payload})`;
+  }
+  return `type ${typeof payload}`;
+}
+
+function decodeSourceMapEntries(payload) {
+  // 0-based entries in generated order (the format Node's SourceMap exposes).
+  const mappings = String(payload.mappings ?? "");
+  const sources = Array.from(payload.sources ?? [], String);
+  const names = Array.from(payload.names ?? [], String);
+  const sourceRoot = payload.sourceRoot ? String(payload.sourceRoot) : "";
+  const entries = [];
+  let sourceIndex = 0;
+  let originalLine = 0;
+  let originalColumn = 0;
+  let nameIndex = 0;
+  const lines = mappings.split(";");
+  for (let generatedLine = 0; generatedLine < lines.length; generatedLine += 1) {
+    let generatedColumn = 0;
+    const line = lines[generatedLine];
+    if (!line) continue;
+    for (const segment of line.split(",")) {
+      if (!segment) continue;
+      const fields = decodeVlq(segment);
+      generatedColumn += fields[0] ?? 0;
+      if (fields.length < 4) continue;
+      sourceIndex += fields[1];
+      originalLine += fields[2];
+      originalColumn += fields[3];
+      let name;
+      if (fields.length >= 5) {
+        nameIndex += fields[4];
+        name = names[nameIndex];
+      }
+      const source = sources[sourceIndex];
+      entries.push({
+        generatedLine,
+        generatedColumn,
+        originalSource: source === undefined ? undefined : `${sourceRoot}${source}`,
+        originalLine,
+        originalColumn,
+        name,
+      });
+    }
+  }
+  return entries;
+}
+
 export class SourceMap {
-  constructor(payload = {}) {
-    this.payload = payload;
-    this.lineLengths = [];
-    this._entries = decodeSourceMapMappings(payload);
+  #payload;
+  #lineLengths;
+  #entries;
+
+  constructor(payload, options = undefined) {
+    if (payload === null || typeof payload !== "object") {
+      const error = new TypeError(`The "payload" argument must be of type object. Received ${sourceMapPayloadTypeText(payload)}`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    this.#payload = payload;
+    this.#lineLengths = options?.lineLengths;
+    this.#entries = decodeSourceMapEntries(payload);
   }
 
-  findEntry(lineNumber = 0, columnNumber = 0) {
-    const line = Number(lineNumber);
-    const column = Number(columnNumber);
-    let best = null;
-    for (const entry of this._entries) {
-      if (entry.generatedLine !== line) continue;
-      if (entry.generatedColumn > column) continue;
-      if (best == null || entry.generatedColumn >= best.generatedColumn) best = entry;
+  get payload() {
+    return this.#payload;
+  }
+
+  get lineLengths() {
+    return this.#lineLengths;
+  }
+
+  #findNearestEntry(line, column) {
+    // Entries are in generated order; find the last entry at or before the
+    // requested generated position (matching Node's binary search).
+    let low = 0;
+    let high = this.#entries.length - 1;
+    let best = -1;
+    while (low <= high) {
+      const middle = (low + high) >>> 1;
+      const entry = this.#entries[middle];
+      if (entry.generatedLine < line || (entry.generatedLine === line && entry.generatedColumn <= column)) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
     }
-    return best ? { ...best } : {
-      generatedLine: Number(lineNumber),
-      generatedColumn: Number(columnNumber),
-      originalSource: null,
-      originalLine: null,
-      originalColumn: null,
-      name: null,
+    return best === -1 ? undefined : this.#entries[best];
+  }
+
+  findEntry(lineNumber, columnNumber) {
+    const entry = this.#findNearestEntry(Number(lineNumber), Number(columnNumber));
+    if (entry === undefined) {
+      return {
+        generatedLine: Number(lineNumber),
+        generatedColumn: Number(columnNumber),
+        originalSource: undefined,
+        originalLine: undefined,
+        originalColumn: undefined,
+        name: undefined,
+      };
+    }
+    return {
+      generatedLine: entry.generatedLine,
+      generatedColumn: entry.generatedColumn,
+      originalSource: entry.originalSource,
+      originalLine: entry.originalLine,
+      originalColumn: entry.originalColumn,
+      name: entry.name,
     };
   }
 
-  findOrigin(lineNumber = 0, columnNumber = 0) {
-    return this.findEntry(lineNumber, columnNumber);
+  findOrigin(lineNumber, columnNumber) {
+    const line = Number(lineNumber);
+    const column = Number(columnNumber);
+    const entry = this.#findNearestEntry(line, column);
+    if (entry === undefined || entry.originalSource === undefined) {
+      return { fileName: this.#payload.sources?.[0], lineNumber: line, columnNumber: column };
+    }
+    return {
+      fileName: entry.originalSource,
+      line: entry.originalLine + (line - entry.generatedLine),
+      column: entry.originalColumn + (column - entry.generatedColumn),
+      name: entry.name,
+    };
   }
 }
 
@@ -1107,8 +1256,30 @@ export function _findPath(request, paths = [], isMain = false) {
 
 export function _resolveFilename(request, parent = undefined, isMain = false, options = undefined) {
   void isMain;
-  const base = parent?.filename || parent?.path || options?.paths?.[0] || cottontail.cwd();
-  return resolveRequest(String(request), base);
+  const text = String(request);
+  if (options !== undefined && options !== null && options.paths !== undefined && !Array.isArray(options.paths)) {
+    const error = new TypeError('The "options.paths" property must be an instance of Array.' +
+      ` Received ${options.paths === null ? "null" : `type ${typeof options.paths}`}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (options !== undefined && options !== null && Array.isArray(options.paths)) {
+    // Node semantics: options.paths replaces the default lookup locations.
+    // Relative requests resolve against each entry; bare specifiers search
+    // node_modules starting from each entry.
+    let lastError;
+    for (const searchPath of options.paths) {
+      const baseDir = String(searchPath);
+      try {
+        return resolveRequest(text, baseDir.endsWith("/") ? baseDir : `${baseDir}/`);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? moduleNotFoundError(text);
+  }
+  const base = parent?.filename || parent?.path || cottontail.cwd();
+  return resolveRequest(text, base);
 }
 
 export function _load(request, parent = undefined, isMain = false) {
@@ -1602,7 +1773,6 @@ const eventsBuiltin = events.default ?? events;
 const processBuiltin = processModule.default ?? processModule;
 const streamBuiltin = stream.default ?? stream;
 const sysBuiltin = sys.default ?? sys;
-const nodeTestBuiltin = nodeTest.default ?? nodeTest;
 const pathBuiltin = path.default ?? path;
 // require("path/posix") must be the same object as require("path").posix.
 const pathPosixBuiltin = pathBuiltin.posix ?? (pathPosix.default ?? pathPosix);
@@ -1657,8 +1827,8 @@ __setBuiltinModules({
   "internal/async_hooks": internalAsyncHooks,
   "internal/event_target": internalEventTarget,
   "internal/test/binding": internalTestBinding,
-  module: moduleBuiltin,
-  "node:module": moduleBuiltin,
+  module: Module,
+  "node:module": Module,
   net,
   "node:net": net,
   "node:sea": sea,
@@ -1728,4 +1898,10 @@ __setBuiltinModules({
   "node:zlib": zlib,
 });
 
-export default moduleBuiltin;
+// Node's `module` builtin IS the Module class (module.exports = Module), so
+// mirror every namespace property onto the class and export it as default.
+for (const [propertyName, propertyValue] of Object.entries(moduleBuiltin)) {
+  if (!(propertyName in Module)) Module[propertyName] = propertyValue;
+}
+
+export default Module;

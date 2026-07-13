@@ -1,5 +1,5 @@
 import { Buffer } from "./buffer.js";
-import { X509Certificate } from "./crypto.js";
+import { X509Certificate, createHash, createDecipheriv } from "./crypto.js";
 import { isIP, Server as NetServer, Socket } from "./net.js";
 
 export const CLIENT_RENEG_LIMIT = 3;
@@ -82,6 +82,8 @@ function normalizeListenArgs(args) {
   let options = {};
   if (typeof list[0] === "object" && list[0] !== null) {
     options = { ...list[0] };
+  } else if (typeof list[0] === "string" && !/^\d+$/.test(list[0])) {
+    options.path = list[0];
   } else {
     options.port = list[0] ?? 0;
     if (typeof list[1] === "string") options.host = list[1];
@@ -92,6 +94,73 @@ function normalizeListenArgs(args) {
 function flattenPem(value) {
   if (value == null) return "";
   return Array.isArray(value) ? value.map(String).join("\n") : String(value);
+}
+
+// Decrypt a traditional (Proc-Type: 4,ENCRYPTED) PEM private key in JS: the
+// native TLS binding would otherwise fall through to OpenSSL's interactive
+// terminal passphrase prompt and hang the process.
+function decryptEncryptedPemKey(pem, passphrase) {
+  const match = pem.match(/-----BEGIN ([A-Z0-9 ]+)-----\r?\nProc-Type: 4,ENCRYPTED\r?\nDEK-Info: ([A-Za-z0-9-]+),([0-9A-Fa-f]+)\r?\n\r?\n([\s\S]*?)-----END \1-----/);
+  if (!match) {
+    const err = new Error("error:1E08010C:DECODER routines::unsupported");
+    err.code = "ERR_OSSL_UNSUPPORTED";
+    throw err;
+  }
+  if (passphrase == null) {
+    const err = new Error("Passphrase required for encrypted key");
+    err.code = "ERR_MISSING_PASSPHRASE";
+    throw err;
+  }
+  const [, label, cipherName, ivHex, body] = match;
+  const iv = Buffer.from(ivHex, "hex");
+  const data = Buffer.from(body.replace(/[^A-Za-z0-9+/=]/g, ""), "base64");
+  const keySizes = { "AES-128-CBC": 16, "AES-192-CBC": 24, "AES-256-CBC": 32, "DES-EDE3-CBC": 24, "DES-CBC": 8 };
+  const keyLength = keySizes[cipherName.toUpperCase()];
+  if (!keyLength) {
+    const err = new Error(`Unsupported encrypted PEM cipher: ${cipherName}`);
+    err.code = "ERR_OSSL_UNSUPPORTED";
+    throw err;
+  }
+  // OpenSSL derives the key via EVP_BytesToKey(MD5, salt = first 8 IV bytes).
+  const salt = iv.subarray(0, 8);
+  const pass = Buffer.from(String(passphrase));
+  let key = Buffer.alloc(0);
+  let previous = Buffer.alloc(0);
+  while (key.length < keyLength) {
+    previous = createHash("md5").update(Buffer.concat([previous, pass, salt])).digest();
+    key = Buffer.concat([key, previous]);
+  }
+  key = key.subarray(0, keyLength);
+  let decrypted;
+  try {
+    const decipher = createDecipheriv(cipherName.toLowerCase(), key, iv);
+    decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+  } catch {
+    const err = new Error("error:1C800064:Provider routines::bad decrypt");
+    err.code = "ERR_OSSL_EVP_BAD_DECRYPT";
+    err.reason = "bad decrypt";
+    throw err;
+  }
+  const base64 = decrypted.toString("base64").replace(/(.{64})/g, "$1\n").replace(/\n+$/, "");
+  return `-----BEGIN ${label}-----\n${base64}\n-----END ${label}-----\n`;
+}
+
+function prepareTlsKey(keyOption, passphrase) {
+  const pem = flattenPem(keyOption);
+  if (!pem) return pem;
+  if (/Proc-Type: 4,ENCRYPTED/.test(pem)) return decryptEncryptedPemKey(pem, passphrase);
+  if (/BEGIN ENCRYPTED PRIVATE KEY/.test(pem)) {
+    if (passphrase == null) {
+      const err = new Error("Passphrase required for encrypted key");
+      err.code = "ERR_MISSING_PASSPHRASE";
+      throw err;
+    }
+    // PKCS#8 encrypted keys need native decryption support.
+    const err = new Error("error:1E08010C:DECODER routines::unsupported");
+    err.code = "ERR_OSSL_UNSUPPORTED";
+    throw err;
+  }
+  return pem;
 }
 
 function bytesFrom(chunk, encoding = undefined) {
@@ -208,6 +277,26 @@ export class SecureContext {
 }
 
 export function createSecureContext(options = {}) {
+  const { privateKeyIdentifier, privateKeyEngine } = options ?? {};
+  // Node only validates the engine/identifier pair when an identifier is
+  // provided.
+  if (privateKeyIdentifier !== undefined && privateKeyIdentifier !== null) {
+    if (privateKeyEngine === undefined || privateKeyEngine === null) {
+      const err = new TypeError(`The property 'options.privateKeyEngine' is invalid. Received ${privateKeyEngine === null ? "null" : "undefined"}`);
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+    if (typeof privateKeyEngine !== "string") {
+      const err = new TypeError(`The "options.privateKeyEngine" property must be of type string, null, or undefined. Received ${typeof privateKeyEngine} (${String(privateKeyEngine)})`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+    if (typeof privateKeyIdentifier !== "string") {
+      const err = new TypeError(`The "options.privateKeyIdentifier" property must be of type string, null, or undefined. Received ${typeof privateKeyIdentifier} (${String(privateKeyIdentifier)})`);
+      err.code = "ERR_INVALID_ARG_TYPE";
+      throw err;
+    }
+  }
   return new SecureContext(options);
 }
 
@@ -227,7 +316,8 @@ export class TLSSocket extends Socket {
     this._tlsListenerInstalled = false;
     this._session = bufferFromNativeBytes(options?.session);
     this._renegotiationDisabled = false;
-    this.allowHalfOpen = options?.allowHalfOpen === true;
+    // Node's TLSSocket always disables half-open, ignoring the option.
+    this.allowHalfOpen = false;
     this.connecting = true;
   }
 
@@ -426,15 +516,37 @@ export class Server extends NetServer {
   }
 
   listen(...args) {
+    const first = args?.[0];
+    if (first !== null && typeof first === "object" && !Array.isArray(first)) {
+      if (first.port === undefined && first.path == null && first.fd == null) {
+        const error = new TypeError(`The argument 'options' must have the property "port" or "path". Received ${JSON.stringify(first)}`);
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+    }
     const [listenOptions, callback] = normalizeListenArgs(args);
+    if (listenOptions.port !== undefined && listenOptions.path == null) {
+      const port = Number(listenOptions.port);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        const error = new RangeError(`options.port should be >= 0 and < 65536. Received type ${typeof listenOptions.port} (${listenOptions.port}).`);
+        error.code = "ERR_SOCKET_BAD_PORT";
+        throw error;
+      }
+    }
     if (typeof callback === "function") this.once("listening", callback);
     queueMicrotask(() => {
       try {
+        if (listenOptions.path != null) {
+          const err = new Error("TLS servers over unix domain sockets require native support in Cottontail");
+          err.code = "ERR_NOT_IMPLEMENTED";
+          throw err;
+        }
+        const key = prepareTlsKey(this._tlsOptions.key, this._tlsOptions.passphrase);
         const native = cottontail.tlsServerListen(
-          Number(listenOptions.port ?? 0),
+          Number(listenOptions.port ?? 0) || 0,
           listenOptions.host ?? listenOptions.hostname ?? "127.0.0.1",
           flattenPem(this._tlsOptions.cert),
-          flattenPem(this._tlsOptions.key),
+          key,
         );
         this._tlsServerId = Number(native.id);
         this._tlsAddress = native.address ?? null;
@@ -535,7 +647,7 @@ export function convertALPNProtocols(protocols, out = {}) {
   out.ALPNProtocols = bytes;
 }
 
-export const rootCertificates = systemRootCertificates();
+export const rootCertificates = Object.freeze(systemRootCertificates());
 let defaultCACertificates = [...rootCertificates];
 
 export function getCACertificates(type = "default") {
@@ -558,7 +670,7 @@ export function getCiphers() {
 
 // COTTONTAIL-COMPAT: node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, default cipher inventory, session setters, trace toggles, and OCSP/TLS-ticket accessors are implemented; protocol-level renegotiation, OCSP stapling generation, and resumable session cache wiring need deeper bindings.
 
-export default {
+const tlsDefault = {
   CLIENT_RENEG_LIMIT,
   CLIENT_RENEG_WINDOW,
   DEFAULT_CIPHERS,
@@ -575,6 +687,15 @@ export default {
   createServer,
   getCACertificates,
   getCiphers,
-  rootCertificates,
   setDefaultCACertificates,
 };
+
+// Node exposes rootCertificates as a frozen array behind a read-only property.
+Object.defineProperty(tlsDefault, "rootCertificates", {
+  value: rootCertificates,
+  writable: false,
+  configurable: false,
+  enumerable: true,
+});
+
+export default tlsDefault;

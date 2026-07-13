@@ -5,6 +5,7 @@ import {
   isScalar,
   isSeq,
   parseAllDocuments as parseAllYAMLDocuments,
+  Parser as YAMLParser,
 } from "../vendor/yaml.js";
 
 const decoder = new TextDecoder();
@@ -50,9 +51,51 @@ function syntaxErrorFrom(error) {
   return syntax;
 }
 
+// Enforce YAML directive semantics the vendored parser accepts silently:
+// - "It is an error to specify more than one YAML directive for the same
+//   document" (YAML 1.2, section 6.8.1).
+// - "It is an error to specify more than one TAG directive for the same
+//   handle in the same document" (YAML 1.2, section 6.8.2).
+// - Every directive group must be followed by a document ("---" directives
+//   end marker); directives dangling at the end of the stream are an error.
+function validateDirectives(source) {
+  let sawYamlDirective = false;
+  const tagHandles = new Set();
+  let pendingDirectives = false;
+  for (const token of new YAMLParser().parse(source)) {
+    if (token.type === "directive") {
+      const parts = String(token.source ?? "").trim().split(/[ \t]+/);
+      const name = parts[0];
+      if (name === "%YAML") {
+        if (sawYamlDirective) {
+          throw new SyntaxError("Duplicate %YAML directive in the same document");
+        }
+        sawYamlDirective = true;
+      } else if (name === "%TAG") {
+        const handle = parts[1];
+        if (handle) {
+          if (tagHandles.has(handle)) {
+            throw new SyntaxError(`Duplicate %TAG directive for handle ${handle} in the same document`);
+          }
+          tagHandles.add(handle);
+        }
+      }
+      pendingDirectives = true;
+    } else if (token.type === "document") {
+      sawYamlDirective = false;
+      tagHandles.clear();
+      pendingDirectives = false;
+    }
+  }
+  if (pendingDirectives) {
+    throw new SyntaxError("Missing document after directives; expected directives end marker '---'");
+  }
+}
+
 export function parse(input) {
   const source = yamlTextInput(input);
   try {
+    validateDirectives(source);
     const documents = parseAllYAMLDocuments(source, parseOptions);
     if (documents.length === 0) return null;
     if (documents.length > 1) {

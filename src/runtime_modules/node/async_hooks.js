@@ -107,6 +107,10 @@ export class AsyncResource {
     this.type = String(type);
     this.asyncIdValue = ++nextAsyncId;
     this.triggerAsyncIdValue = triggerAsyncIdValue;
+    // Node semantics: the resource captures the async context (including
+    // AsyncLocalStorage stores) that was active when it was created;
+    // runInAsyncScope/bind re-enter that context.
+    this._storageSnapshot = captureStorageSnapshot();
     this.requireManualDestroy = typeof options === "object" && options?.requireManualDestroy === true;
     if (!this.requireManualDestroy) gcTrackedAsyncResourceIds.add(this.asyncIdValue);
     emitHook("init", this.asyncIdValue, this.type, this.triggerAsyncIdValue, this);
@@ -131,6 +135,9 @@ export class AsyncResource {
     continuationResource = null;
     emitHook("before", this.asyncIdValue);
     try {
+      if (this._storageSnapshot !== undefined) {
+        return runWithStorageSnapshot(this._storageSnapshot, fn, thisArg, args);
+      }
       return fn.apply(thisArg, args);
     } finally {
       emitHook("after", this.asyncIdValue);
@@ -172,20 +179,27 @@ Object.defineProperty(globalThis, "__cottontailAsyncHooksOnGc", {
 const storageStack = [];
 
 function captureStorageSnapshot() {
-  return Array.from(storages, (storage) => [storage, storage.enabled, storage._store, storage._hasStore]);
+  return Array.from(storages, (storage) =>
+    [storage, storage.enabled, storage._store, storage._hasStore, storage._disableGeneration ?? 0]);
 }
 
 function runWithStorageSnapshot(snapshot, fn, thisArg, args) {
   const previous = snapshot.map(([storage]) => [storage, storage.enabled, storage._store, storage._hasStore]);
-  for (const [storage, enabled, store, hasStore] of snapshot) {
+  const restored = [];
+  for (const entry of snapshot) {
+    const [storage, enabled, store, hasStore, generation] = entry;
+    // A disable() issued after the snapshot invalidates it for this storage.
+    if ((storage._disableGeneration ?? 0) !== generation) continue;
     storage.enabled = enabled;
     storage._store = store;
     storage._hasStore = hasStore;
+    restored.push(storage);
   }
   try {
     return fn.apply(thisArg, args);
   } finally {
     for (const [storage, enabled, store, hasStore] of previous) {
+      if (!restored.includes(storage)) continue;
       storage.enabled = enabled;
       storage._store = store;
       storage._hasStore = hasStore;
@@ -229,11 +243,29 @@ export function _wrapAsyncCallback(callback) {
   return wrapped;
 }
 
+// process.nextTick callbacks share the native microtask queue (FIFO with
+// queueMicrotask). Matching Node/Bun's nextTick-before-microtask priority
+// would require an engine hook (e.g. JSC's onEachMicrotaskTick) - without it,
+// reordering from JS breaks code that interleaves promise reactions.
+let nativeQueueMicrotaskRef = null;
+
+export function _enqueueNextTick(job) {
+  (nativeQueueMicrotaskRef ?? queueMicrotask)(job);
+}
+
 function patchGlobalAsyncSchedulers() {
   const global = globalThis;
   if (typeof global.queueMicrotask === "function" && !global.queueMicrotask.__cottontailAsyncHooksPatched) {
     const nativeQueueMicrotask = global.queueMicrotask.bind(global);
-    global.queueMicrotask = (callback) => nativeQueueMicrotask(_wrapAsyncCallback(callback));
+    nativeQueueMicrotaskRef = nativeQueueMicrotask;
+    global.queueMicrotask = function queueMicrotask(callback) {
+      if (typeof callback !== "function") {
+        throw nodeTypeError("ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.');
+      }
+      nativeQueueMicrotask(_wrapAsyncCallback(callback));
+    };
+    // The bundler suffixes identifiers when deduplicating; pin the name.
+    Object.defineProperty(global.queueMicrotask, "name", { value: "queueMicrotask", configurable: true });
     global.queueMicrotask.__cottontailAsyncHooksPatched = true;
   }
   for (const [setName, clearName] of [["setTimeout", "clearTimeout"], ["setInterval", "clearInterval"], ["setImmediate", "clearImmediate"]]) {
@@ -383,6 +415,7 @@ export class AsyncLocalStorage {
       throw nodeTypeError("ERR_INVALID_ARG_TYPE", "The \"options\" argument must be an object");
     }
     this.enabled = true;
+    this._disableGeneration = 0;
     this.name = options.name == null ? "" : String(options.name);
     this._defaultValue = Object.prototype.hasOwnProperty.call(options, "defaultValue") ? options.defaultValue : undefined;
     this._hasDefaultValue = Object.prototype.hasOwnProperty.call(options, "defaultValue");
@@ -393,6 +426,9 @@ export class AsyncLocalStorage {
 
   disable() {
     this.enabled = false;
+    // Invalidate every context snapshot captured before this point (Node's
+    // disable() detaches the storage from all existing async contexts).
+    this._disableGeneration += 1;
     this._store = undefined;
     this._hasStore = false;
   }

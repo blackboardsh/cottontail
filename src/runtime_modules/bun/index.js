@@ -1,7 +1,9 @@
 import * as FFI from "./ffi.js";
 import * as nodeDns from "../node/dns.js";
 import * as nodeHttp from "../node/http.js";
+import * as nodeHttps from "../node/https.js";
 import * as nodeNet from "../node/net.js";
+import { connect as nodeTlsConnect } from "../node/tls.js";
 import * as zlib from "../node/zlib.js";
 import { CryptoKey, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import { __setBuiltinModules as nodeSetBuiltinModules, createRequire as nodeCreateRequire } from "../node/module.js";
@@ -103,13 +105,32 @@ function installNodeStyleErrorConstructor(name) {
   if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
   const CottontailError = function(...args) {
     const error = Reflect.construct(NativeError, args, new.target || CottontailError);
-    if (typeof error.stack === "string") {
-      let stack = remapBundleStack(error.stack);
-      if (!stack.includes(String(error.message ?? ""))) {
-        const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
-        stack = `${error.name || name}${message}\n${stack}`;
-      }
-      if (stack !== error.stack) error.stack = stack;
+    const rawStack = error.stack;
+    if (typeof rawStack === "string") {
+      // Remap lazily: parsing the bundle source map costs ~200ms on first use,
+      // which must not be paid at Error construction time.
+      let cached;
+      let computed = false;
+      Object.defineProperty(error, "stack", {
+        configurable: true,
+        enumerable: false,
+        get() {
+          if (!computed) {
+            computed = true;
+            let stack = remapBundleStack(rawStack);
+            if (!stack.includes(String(error.message ?? ""))) {
+              const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
+              stack = `${error.name || name}${message}\n${stack}`;
+            }
+            cached = stack;
+          }
+          return cached;
+        },
+        set(value) {
+          computed = true;
+          cached = value;
+        },
+      });
     }
     return error;
   };
@@ -1208,6 +1229,269 @@ function asBuffer(value) {
   return new TextEncoder().encode(String(value ?? ""));
 }
 
+// node/http.js's IncomingMessage pushes its buffered body from a queued
+// microtask; consumers that resume the stream in the same tick (body-parser's
+// raw-body) reach Readable's throwing default _read first. Give it the no-op
+// _read a push-style Readable needs. (Runtime patch: http.js is maintained
+// separately; this only adds the method when it is missing.)
+if (nodeHttp.IncomingMessage?.prototype &&
+    !Object.prototype.hasOwnProperty.call(nodeHttp.IncomingMessage.prototype, "_read")) {
+  Object.defineProperty(nodeHttp.IncomingMessage.prototype, "_read", {
+    value: function _read() {},
+    writable: true,
+    configurable: true,
+  });
+}
+
+// The host Blob lacks Bun's json()/formData() helpers and does not strip a
+// UTF-8 BOM in text(); patch the prototype to match Bun.
+(function patchBlobPrototype() {
+  const proto = globalThis.Blob?.prototype;
+  if (!proto) return;
+  if (typeof proto.text === "function" && !proto.text.__cottontailBOM) {
+    const originalText = proto.text;
+    const wrapped = async function text() {
+      return stripUtf8BOMText(String(await originalText.call(this)));
+    };
+    wrapped.__cottontailBOM = true;
+    Object.defineProperty(proto, "text", { value: wrapped, writable: true, configurable: true });
+  }
+  if (typeof proto.json !== "function") {
+    Object.defineProperty(proto, "json", {
+      value: async function json() {
+        return JSON.parse(await this.text());
+      },
+      writable: true,
+      configurable: true,
+    });
+  }
+  if (typeof proto.formData !== "function") {
+    Object.defineProperty(proto, "formData", {
+      value: async function formData() {
+        return parseMultipartFormData(this, this.type);
+      },
+      writable: true,
+      configurable: true,
+    });
+  }
+})();
+
+// ---------------------------------------------------------------------------
+// The host-provided Buffer lacks the numeric read/write API (readUInt16BE,
+// writeUInt32LE, swap16, ...). Fill in the missing prototype methods here so
+// Buffer behaves like node's for the ecosystem (ws, etc.).
+// ---------------------------------------------------------------------------
+(function patchBufferNumericMethods() {
+  const BufferCtor = globalThis.Buffer;
+  const proto = BufferCtor?.prototype;
+  if (!proto || typeof proto.readUInt16BE === "function") return;
+
+  const outOfRange = (name, value, min, max) => {
+    const error = new RangeError(
+      `The value of "${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${value}`,
+    );
+    error.code = "ERR_OUT_OF_RANGE";
+    return error;
+  };
+
+  const checkOffset = (buffer, offset, size) => {
+    const numeric = offset === undefined ? 0 : Number(offset);
+    if (!Number.isInteger(numeric) || numeric < 0 || numeric + size > buffer.length) {
+      throw outOfRange("offset", offset, 0, Math.max(0, buffer.length - size));
+    }
+    return numeric;
+  };
+
+  const checkValue = (value, min, max) => {
+    const numeric = typeof value === "bigint" ? value : Number(value);
+    if (typeof numeric !== "bigint" && !Number.isFinite(numeric)) {
+      throw outOfRange("value", value, min, max);
+    }
+    if (numeric < min || numeric > max) throw outOfRange("value", value, min, max);
+    return numeric;
+  };
+
+  const view = (buffer) => new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  const define = (name, fn) => {
+    if (typeof proto[name] === "function") return;
+    Object.defineProperty(proto, name, { value: fn, writable: true, configurable: true });
+  };
+
+  const fixed = [
+    ["UInt8", 1, "getUint8", "setUint8", 0, 0xff],
+    ["UInt16", 2, "getUint16", "setUint16", 0, 0xffff],
+    ["UInt32", 4, "getUint32", "setUint32", 0, 0xffffffff],
+    ["Int8", 1, "getInt8", "setInt8", -0x80, 0x7f],
+    ["Int16", 2, "getInt16", "setInt16", -0x8000, 0x7fff],
+    ["Int32", 4, "getInt32", "setInt32", -0x80000000, 0x7fffffff],
+  ];
+  for (const [label, size, getter, setter, min, max] of fixed) {
+    const suffixes = size === 1 ? [["", true]] : [["BE", false], ["LE", true]];
+    for (const [suffix, littleEndian] of suffixes) {
+      const endianArgs = size === 1 ? [] : [littleEndian];
+      define(`read${label}${suffix}`, function (offset = 0) {
+        const at = checkOffset(this, offset, size);
+        return view(this)[getter](at, ...endianArgs);
+      });
+      define(`write${label}${suffix}`, function (value, offset = 0) {
+        const at = checkOffset(this, offset, size);
+        view(this)[setter](at, checkValue(value, min, max), ...endianArgs);
+        return at + size;
+      });
+      // node also exposes readUint*/writeUint* aliases.
+      if (label.startsWith("UInt")) {
+        define(`read${label.replace("UInt", "Uint")}${suffix}`, proto[`read${label}${suffix}`]);
+        define(`write${label.replace("UInt", "Uint")}${suffix}`, proto[`write${label}${suffix}`]);
+      }
+    }
+  }
+
+  const bigFixed = [
+    ["BigUInt64", "getBigUint64", "setBigUint64", 0n, 0xffffffffffffffffn],
+    ["BigInt64", "getBigInt64", "setBigInt64", -0x8000000000000000n, 0x7fffffffffffffffn],
+  ];
+  for (const [label, getter, setter, min, max] of bigFixed) {
+    for (const [suffix, littleEndian] of [["BE", false], ["LE", true]]) {
+      define(`read${label}${suffix}`, function (offset = 0) {
+        const at = checkOffset(this, offset, 8);
+        return view(this)[getter](at, littleEndian);
+      });
+      define(`write${label}${suffix}`, function (value, offset = 0) {
+        const at = checkOffset(this, offset, 8);
+        const bigValue = typeof value === "bigint" ? value : BigInt(value);
+        if (bigValue < min || bigValue > max) throw outOfRange("value", value, min, max);
+        view(this)[setter](at, bigValue, littleEndian);
+        return at + 8;
+      });
+      if (label === "BigUInt64") {
+        define(`readBigUint64${suffix}`, proto[`read${label}${suffix}`]);
+        define(`writeBigUint64${suffix}`, proto[`write${label}${suffix}`]);
+      }
+    }
+  }
+
+  for (const [label, size, getter, setter] of [
+    ["Float", 4, "getFloat32", "setFloat32"],
+    ["Double", 8, "getFloat64", "setFloat64"],
+  ]) {
+    for (const [suffix, littleEndian] of [["BE", false], ["LE", true]]) {
+      define(`read${label}${suffix}`, function (offset = 0) {
+        const at = checkOffset(this, offset, size);
+        return view(this)[getter](at, littleEndian);
+      });
+      define(`write${label}${suffix}`, function (value, offset = 0) {
+        const at = checkOffset(this, offset, size);
+        view(this)[setter](at, Number(value), littleEndian);
+        return at + size;
+      });
+    }
+  }
+  const checkByteLength = (byteLength) => {
+    const size = Number(byteLength);
+    if (!Number.isInteger(size) || size < 1 || size > 6) {
+      throw outOfRange("byteLength", byteLength, 1, 6);
+    }
+    return size;
+  };
+
+  define("readUIntBE", function (offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const at = checkOffset(this, offset, size);
+    let value = 0;
+    for (let index = 0; index < size; index += 1) value = value * 0x100 + this[at + index];
+    return value;
+  });
+  define("readUIntLE", function (offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const at = checkOffset(this, offset, size);
+    let value = 0;
+    for (let index = size - 1; index >= 0; index -= 1) value = value * 0x100 + this[at + index];
+    return value;
+  });
+  define("readIntBE", function (offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const unsigned = this.readUIntBE(offset, size);
+    const limit = 2 ** (size * 8 - 1);
+    return unsigned >= limit ? unsigned - 2 ** (size * 8) : unsigned;
+  });
+  define("readIntLE", function (offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const unsigned = this.readUIntLE(offset, size);
+    const limit = 2 ** (size * 8 - 1);
+    return unsigned >= limit ? unsigned - 2 ** (size * 8) : unsigned;
+  });
+  define("writeUIntBE", function (value, offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const at = checkOffset(this, offset, size);
+    let remaining = checkValue(value, 0, 2 ** (size * 8) - 1);
+    for (let index = size - 1; index >= 0; index -= 1) {
+      this[at + index] = remaining & 0xff;
+      remaining = Math.floor(remaining / 0x100);
+    }
+    return at + size;
+  });
+  define("writeUIntLE", function (value, offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const at = checkOffset(this, offset, size);
+    let remaining = checkValue(value, 0, 2 ** (size * 8) - 1);
+    for (let index = 0; index < size; index += 1) {
+      this[at + index] = remaining & 0xff;
+      remaining = Math.floor(remaining / 0x100);
+    }
+    return at + size;
+  });
+  define("writeIntBE", function (value, offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const limit = 2 ** (size * 8 - 1);
+    const numeric = checkValue(value, -limit, limit - 1);
+    return this.writeUIntBE(numeric < 0 ? numeric + 2 ** (size * 8) : numeric, offset, size);
+  });
+  define("writeIntLE", function (value, offset, byteLength) {
+    const size = checkByteLength(byteLength);
+    const limit = 2 ** (size * 8 - 1);
+    const numeric = checkValue(value, -limit, limit - 1);
+    return this.writeUIntLE(numeric < 0 ? numeric + 2 ** (size * 8) : numeric, offset, size);
+  });
+
+  const defineSwap = (name, width) => {
+    define(name, function () {
+      if (this.length % width !== 0) {
+        const error = new RangeError(`Buffer size must be a multiple of ${width * 8}-bit${width > 2 ? "s" : ""}`);
+        error.code = "ERR_INVALID_BUFFER_SIZE";
+        throw error;
+      }
+      for (let index = 0; index < this.length; index += width) {
+        for (let step = 0; step < width / 2; step += 1) {
+          const left = this[index + step];
+          this[index + step] = this[index + width - 1 - step];
+          this[index + width - 1 - step] = left;
+        }
+      }
+      return this;
+    });
+  };
+  defineSwap("swap16", 2);
+  defineSwap("swap32", 4);
+  defineSwap("swap64", 8);
+
+  define("compare", function (target, targetStart = 0, targetEnd = undefined, sourceStart = 0, sourceEnd = undefined) {
+    const other = asBuffer(target);
+    const a = this.subarray(sourceStart, sourceEnd ?? this.length);
+    const b = other.subarray(targetStart, targetEnd ?? other.length);
+    const length = Math.min(a.length, b.length);
+    for (let index = 0; index < length; index += 1) {
+      if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+    }
+    if (a.length === b.length) return 0;
+    return a.length < b.length ? -1 : 1;
+  });
+
+  define("toJSON", function () {
+    return { type: "Buffer", data: Array.from(this) };
+  });
+})();
+
 function concatBuffers(left, right) {
   const lhs = asBuffer(left);
   const rhs = asBuffer(right);
@@ -1590,7 +1874,19 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     return child;
   }
 
-  const native = cottontail.spawnStart(file, args, nativeOptions);
+  let spawnFile = file;
+  let spawnArgs = args;
+  if (
+    nativeOptions.ipc &&
+    !isCurrentCottontailExecutable(file) &&
+    cottontail.platform?.() !== "win32"
+  ) {
+    // Bridge the host IPC pipe to node's IPC protocol so `process.send` works
+    // in non-cottontail children (node writes bare JSON lines on the fd).
+    spawnFile = "/bin/sh";
+    spawnArgs = ["-c", 'NODE_CHANNEL_FD="$COTTONTAIL_IPC_FD" exec "$@"', "sh", file, ...args];
+  }
+  const native = cottontail.spawnStart(spawnFile, spawnArgs, nativeOptions);
   child._id = native.id;
   child.pid = native.pid;
   child.stdin = nativeOptions.stdin === "pipe" && nativeOptions.input === undefined ? new ProcessWritable(native.id) : null;
@@ -1723,10 +2019,16 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
           if (newlineIndex < 0) break;
           const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
           ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
-          if (!line.startsWith("__COTTONTAIL_IPC__")) continue;
+          // Cottontail children frame IPC messages with a prefix; node children
+          // (NODE_CHANNEL_FD bridging) write bare JSON lines.
+          const payload = line.startsWith("__COTTONTAIL_IPC__")
+            ? line.slice("__COTTONTAIL_IPC__".length)
+            : line;
+          if (payload.trim() === "") continue;
           try {
-            options.ipc?.(JSON.parse(line.slice("__COTTONTAIL_IPC__".length)), child);
+            options.ipc?.(JSON.parse(payload), child);
           } catch (error) {
+            if (!line.startsWith("__COTTONTAIL_IPC__")) continue;
             emit("error", error);
           }
         }
@@ -1741,8 +2043,20 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   return child;
 }
 
+function sharedArrayBufferBytes(data) {
+  if (typeof SharedArrayBuffer !== "function" || !(data instanceof SharedArrayBuffer)) return null;
+  // Creating a view over an empty SharedArrayBuffer trips a host bug
+  // ("Buffer is already detached"); avoid touching it.
+  if (data.byteLength === 0) return new Uint8Array(0);
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(new Uint8Array(data));
+  return copy;
+}
+
 function bytesFromData(data) {
   if (data == null) return new Uint8Array(0);
+  const sharedCopy = sharedArrayBufferBytes(data);
+  if (sharedCopy) return sharedCopy;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   return new TextEncoder().encode(String(data));
@@ -1750,6 +2064,8 @@ function bytesFromData(data) {
 
 async function bytesFromBody(body) {
   if (body == null) return new Uint8Array(0);
+  const sharedCopy = sharedArrayBufferBytes(body);
+  if (sharedCopy) return sharedCopy;
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
@@ -1942,21 +2258,107 @@ function cachedTextForBytes(bytes) {
   return text;
 }
 
+// Bun exposes URLSearchParams.prototype.size as configurable + enumerable.
+if (URLSearchParams?.prototype) {
+  const sizeDescriptor = Object.getOwnPropertyDescriptor(URLSearchParams.prototype, "size");
+  if (!sizeDescriptor || !sizeDescriptor.configurable || !sizeDescriptor.enumerable) {
+    Object.defineProperty(URLSearchParams.prototype, "size", {
+      get: sizeDescriptor?.get ?? function size() {
+        let count = 0;
+        for (const _ of this) count += 1;
+        return count;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
+// Bun's non-standard URLSearchParams extensions.
+if (URLSearchParams?.prototype && typeof URLSearchParams.prototype.toJSON !== "function") {
+  Object.defineProperties(URLSearchParams.prototype, {
+    toJSON: {
+      value: function toJSON() {
+        const result = {};
+        for (const [key, value] of this) {
+          if (Object.prototype.hasOwnProperty.call(result, key)) {
+            if (Array.isArray(result[key])) result[key].push(value);
+            else result[key] = [result[key], value];
+          } else {
+            result[key] = value;
+          }
+        }
+        return result;
+      },
+      writable: true,
+      configurable: true,
+    },
+    length: {
+      get() {
+        let count = 0;
+        for (const _ of this) count += 1;
+        return count;
+      },
+      configurable: true,
+    },
+    [Symbol.for("nodejs.util.inspect.custom")]: {
+      value: function inspect() {
+        const entries = Object.entries(this.toJSON());
+        if (entries.length === 0) return "URLSearchParams {}";
+        const lines = entries.map(([key, value]) => {
+          const rendered = Array.isArray(value)
+            ? `[ ${value.map((item) => JSON.stringify(item)).join(", ")} ]`
+            : JSON.stringify(value);
+          return `  ${JSON.stringify(key)}: ${rendered},`;
+        });
+        return `URLSearchParams {\n${lines.join("\n")}\n}`;
+      },
+      writable: true,
+      configurable: true,
+    },
+  });
+}
+
 export { URL, URLSearchParams };
 
 export class Headers {
   constructor(init = undefined) {
     this._values = new Map();
     this._allValues = new Map();
+    if (init === null) {
+      throw new TypeError("Headers cannot be constructed from null");
+    }
     if (init instanceof Headers) {
-      init.forEach((value, key) => this.append(key, value));
-    } else if (Array.isArray(init)) {
-      for (const [key, value] of init) this.append(key, value);
+      // Copy from the internal map to preserve original header casing.
+      for (const [normalized, entry] of init._values) {
+        if (normalized === "set-cookie") {
+          for (const value of init._allValues.get(normalized) ?? []) this.append(entry.key, value);
+        } else {
+          this.append(entry.key, entry.value);
+        }
+      }
+    } else if (init != null && typeof init !== "string" && typeof init[Symbol.iterator] === "function") {
+      for (const entry of init) {
+        const pair = Array.isArray(entry)
+          ? entry
+          : (entry != null && typeof entry !== "string" && typeof entry?.[Symbol.iterator] === "function" ? Array.from(entry) : null);
+        if (pair == null || pair.length !== 2) {
+          throw new TypeError("Headers sequence must contain [name, value] pairs");
+        }
+        this.append(pair[0], pair[1]);
+      }
     } else if (init && typeof init === "object") {
-      for (const key of Object.keys(init)) this.set(key, init[key]);
+      for (const key of Object.keys(init)) this.append(key, init[key]);
     }
   }
+  getSetCookie() {
+    return [...(this._allValues.get("set-cookie") ?? [])];
+  }
   append(key, value) {
+    if (arguments.length < 2) {
+      throw new TypeError(`Headers.append requires 2 arguments, received ${arguments.length}`);
+    }
+    validateHeaderPair(key, value);
     const normalized = String(key).toLowerCase();
     const existing = this._values.get(normalized);
     const stringValue = String(value);
@@ -1972,30 +2374,59 @@ export class Headers {
     });
   }
   set(key, value) {
+    if (arguments.length < 2) {
+      throw new TypeError(`Headers.set requires 2 arguments, received ${arguments.length}`);
+    }
+    validateHeaderPair(key, value);
     const normalized = String(key).toLowerCase();
     const stringValue = String(value);
     this._allValues.set(normalized, [stringValue]);
     this._values.set(normalized, { key: String(key), value: stringValue });
   }
   get(key) {
+    if (arguments.length < 1) {
+      throw new TypeError("Headers.get requires 1 argument, received 0");
+    }
     return this._values.get(String(key).toLowerCase())?.value ?? null;
   }
   getAll(key) {
+    if (arguments.length < 1) {
+      throw new TypeError("Headers.getAll requires 1 argument, received 0");
+    }
     const normalized = String(key).toLowerCase();
-    const allValues = this._allValues.get(normalized);
-    if (allValues) return [...allValues];
-    return headersGetAll.call(this, key);
+    if (normalized !== "set-cookie") {
+      throw new TypeError('getAll() can only be used with the "Set-Cookie" header');
+    }
+    return [...(this._allValues.get(normalized) ?? [])];
   }
   has(key) {
+    if (arguments.length < 1) {
+      throw new TypeError("Headers.has requires 1 argument, received 0");
+    }
     return this._values.has(String(key).toLowerCase());
   }
   delete(key) {
+    if (arguments.length < 1) {
+      throw new TypeError("Headers.delete requires 1 argument, received 0");
+    }
     const normalized = String(key).toLowerCase();
     this._allValues.delete(normalized);
     this._values.delete(normalized);
   }
+  _sortedEntries() {
+    const entries = [];
+    for (const [normalized, entry] of this._values) {
+      if (normalized === "set-cookie") {
+        for (const value of this._allValues.get(normalized) ?? []) entries.push([normalized, value]);
+      } else {
+        entries.push([normalized, entry.value]);
+      }
+    }
+    entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    return entries;
+  }
   forEach(callback, thisArg = undefined) {
-    for (const { key, value } of this._values.values()) callback.call(thisArg, value, key, this);
+    for (const [key, value] of this._sortedEntries()) callback.call(thisArg, value, key, this);
   }
   toJSON() {
     const result = {};
@@ -2006,10 +2437,66 @@ export class Headers {
     return result;
   }
   *entries() {
-    for (const { key, value } of this._values.values()) yield [key, value];
+    yield* this._sortedEntries();
+  }
+  *keys() {
+    for (const [key] of this._sortedEntries()) yield key;
+  }
+  *values() {
+    for (const [, value] of this._sortedEntries()) yield value;
+  }
+  get count() {
+    return this._values.size;
   }
   [Symbol.iterator]() {
     return this.entries();
+  }
+  [Symbol.for("nodejs.util.inspect.custom")]() {
+    const entries = [];
+    for (const [normalized, entry] of this._values) {
+      if (normalized === "set-cookie") {
+        for (const value of this._allValues.get(normalized) ?? []) entries.push([normalized, value]);
+      } else {
+        entries.push([normalized, entry.value]);
+      }
+    }
+    if (entries.length === 0) return "Headers {}";
+    // Bun lists well-known header names before custom ones, each entry with a
+    // trailing comma.
+    const known = entries.filter(([key]) => wellKnownHeaderNames.has(key));
+    const custom = entries.filter(([key]) => !wellKnownHeaderNames.has(key));
+    const lines = [...known, ...custom].map(([key, value]) => `  ${JSON.stringify(key)}: ${JSON.stringify(value)},`);
+    return `Headers {\n${lines.join("\n")}\n}`;
+  }
+}
+
+const wellKnownHeaderNames = new Set([
+  "accept", "accept-charset", "accept-encoding", "accept-language", "accept-ranges",
+  "access-control-allow-credentials", "access-control-allow-headers", "access-control-allow-methods",
+  "access-control-allow-origin", "access-control-expose-headers", "access-control-max-age",
+  "access-control-request-headers", "access-control-request-method", "age", "allow", "authorization",
+  "cache-control", "connection", "content-disposition", "content-encoding", "content-language",
+  "content-length", "content-location", "content-range", "content-security-policy", "content-type",
+  "cookie", "date", "etag", "expect", "expires", "forwarded", "from", "host", "if-match",
+  "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "last-modified", "link",
+  "location", "max-forwards", "origin", "pragma", "proxy-authenticate", "proxy-authorization",
+  "range", "referer", "referrer-policy", "refresh", "retry-after", "sec-websocket-accept",
+  "sec-websocket-extensions", "sec-websocket-key", "sec-websocket-protocol", "sec-websocket-version",
+  "server", "set-cookie", "strict-transport-security", "te", "trailer", "transfer-encoding",
+  "upgrade", "upgrade-insecure-requests", "user-agent", "vary", "via", "warning", "www-authenticate",
+  "x-content-type-options", "x-frame-options", "x-requested-with", "x-xss-protection",
+]);
+
+function validateHeaderPair(name, value) {
+  const nameText = String(name);
+  if (nameText.length === 0 || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(nameText)) {
+    throw new TypeError(`Invalid header name: "${nameText}"`);
+  }
+  const valueText = String(value);
+  for (let index = 0; index < valueText.length; index += 1) {
+    if (valueText.charCodeAt(index) > 0xff) {
+      throw new TypeError(`Header "${nameText}" has invalid value: "${valueText}"`);
+    }
   }
 }
 
@@ -2025,6 +2512,11 @@ export class FormData {
     this._entries = [];
   }
   append(name, value, filename = undefined) {
+    // File entries carry their own filename when none is given explicitly.
+    if (filename === undefined && value != null && typeof value === "object" &&
+        typeof value.arrayBuffer === "function" && typeof value.name === "string" && value.name !== "") {
+      filename = value.name;
+    }
     this._entries.push([String(name), filename === undefined ? value : { value, filename: String(filename) }]);
   }
   set(name, value, filename = undefined) {
@@ -2069,7 +2561,7 @@ export class FormData {
       const value = formDataEntryValue(raw);
       const serialized = typeof value === "string"
         ? value
-        : { name: raw?.filename ?? value?.name ?? "", size: value?.size ?? 0, type: value?.type ?? "" };
+        : { name: raw?.filename ?? value?.name ?? "", size: value?.size ?? 0 };
       if (Object.hasOwn(result, key)) {
         if (!Array.isArray(result[key])) result[key] = [result[key]];
         result[key].push(serialized);
@@ -2131,7 +2623,26 @@ async function encodeMultipartFormData(formData) {
   return { boundary, bytes: concatManyBuffers(chunks) };
 }
 
+function stripUtf8BOMText(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+// Reinterpret latin1-decoded bytes as UTF-8 when that produces valid text.
+function utf8FromLatin1Text(text) {
+  const value = String(text ?? "");
+  if (!/[\x80-\xff]/.test(value)) return value;
+  const bytes = Buffer.from(value, "latin1");
+  const decoded = bytes.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(bytes) ? decoded : value;
+}
+
 async function parseMultipartFormData(body, contentType) {
+  if (/application\/x-www-form-urlencoded/i.test(String(contentType ?? ""))) {
+    const text = stripUtf8BOMText(new TextDecoder().decode(await bytesFromBody(body)));
+    const result = new FormData();
+    for (const [name, value] of new URLSearchParams(text)) result.append(name, value);
+    return result;
+  }
   const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType))?.slice(1).find(Boolean);
   if (!boundary) return new FormData();
   const source = new TextDecoder("latin1").decode(await bytesFromBody(body));
@@ -2146,13 +2657,23 @@ function parseMultipartFormDataText(source, boundary) {
     if (separator < 0) continue;
     const headers = part.slice(0, separator);
     const value = part.slice(separator + 4);
-    const disposition = /content-disposition:[^\r\n]*?\bname="([^"]*)"(?:;\s*filename="([^"]*)")?/i.exec(headers);
-    if (!disposition) continue;
-    if (disposition[2] !== undefined) {
-      const type = /content-type:\s*([^\r\n]+)/i.exec(headers)?.[1] ?? "application/octet-stream";
-      result.append(disposition[1], new Blob([new TextEncoder().encode(value)], { type }), disposition[2]);
+    const dispositionLine = /content-disposition:([^\r\n]*)/i.exec(headers)?.[1] ?? "";
+    const nameMatch = /\bname=(?:"([^"]*)"|([^;\r\n]+))/i.exec(dispositionLine);
+    if (!nameMatch) continue;
+    const fieldName = utf8FromLatin1Text((nameMatch[1] ?? nameMatch[2] ?? "").trim());
+    let filename;
+    const filenameStar = /\bfilename\*=?\s*(?:utf-8|iso-8859-1)?''([^;\r\n]*)/i.exec(dispositionLine);
+    if (filenameStar) {
+      try { filename = decodeURIComponent(filenameStar[1]); } catch { filename = filenameStar[1]; }
     } else {
-      result.append(disposition[1], value);
+      const filenamePlain = /\bfilename=(?:"([^"]*)"|([^;\r\n]+))/i.exec(dispositionLine);
+      if (filenamePlain) filename = utf8FromLatin1Text((filenamePlain[1] ?? filenamePlain[2] ?? "").trim());
+    }
+    if (filename !== undefined) {
+      const type = /content-type:\s*([^\r\n]+)/i.exec(headers)?.[1] ?? "application/octet-stream";
+      result.append(fieldName, new Blob([Buffer.from(value, "latin1")], { type }), filename);
+    } else {
+      result.append(fieldName, utf8FromLatin1Text(value));
     }
   }
   return result;
@@ -2166,10 +2687,6 @@ export class Request {
     this._body = init.body ?? input?._body ?? input?.body ?? null;
     this._bodyStream = undefined;
     this._bodyUsed = false;
-    const standardRequestInput = typeof input === "string" || input instanceof Request || input instanceof globalThis.URL;
-    if (standardRequestInput && (this.method === "GET" || this.method === "HEAD") && this._body != null) {
-      throw new TypeError("Request with GET/HEAD method cannot have body");
-    }
     this.params = init.params ?? input?.params ?? {};
     this.signal = init.signal ?? input?.signal ?? null;
     this.redirect = init.redirect ?? input?.redirect ?? "follow";
@@ -2209,20 +2726,32 @@ export class Request {
     if (this._cookies) cloned._cookies = cloneCookieMap(this._cookies);
     return cloned;
   }
+  _takeBody() {
+    if (this._bodyUsed) throw new TypeError("Body already used");
+    const body = this._body;
+    if (body != null) this._bodyUsed = true;
+    return body;
+  }
   async arrayBuffer() {
-    return arrayBufferFromBytes(await bytesFromBody(this._body));
+    return arrayBufferFromBytes(await bytesFromBody(this._takeBody()));
   }
   async bytes() {
-    return asBuffer(await bytesFromBody(this._body));
+    return asBuffer(await bytesFromBody(this._takeBody()));
   }
   async blob() {
-    const type = this.headers.get("content-type") ?? "";
-    if (this._body instanceof Blob && (!type || this._body.type === type)) return this._body;
-    return cachedBlobForBytes(await bytesFromBody(this._body), type);
+    let type = this.headers.get("content-type") ?? "";
+    // Bun appends the default charset to textual media types on blob().
+    if (/^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded)$)/i.test(type) && !type.includes(";")) {
+      type = `${type};charset=utf-8`;
+    }
+    const body = this._takeBody();
+    if (body instanceof Blob && (!type || body.type === type)) return body;
+    return cachedBlobForBytes(await bytesFromBody(body), type);
   }
   async text() {
-    if (typeof this._body === "string") return this._body;
-    return cachedTextForBytes(await bytesFromBody(this._body));
+    const body = this._takeBody();
+    if (typeof body === "string") return stripUtf8BOMText(body);
+    return stripUtf8BOMText(cachedTextForBytes(await bytesFromBody(body)));
   }
   async json() {
     return JSON.parse(await this.text());
@@ -2291,8 +2820,12 @@ export class Response {
     }
     this._body = body;
     this._bodyStream = undefined;
+    this._bodyUsed = false;
     this.url = String(init.url ?? "");
     this.redirected = Boolean(init.redirected);
+  }
+  get bodyUsed() {
+    return this._bodyUsed === true;
   }
   static json(value, init = {}) {
     const headers = new Headers(init.headers);
@@ -2300,7 +2833,20 @@ export class Response {
     return new Response(JSON.stringify(value), { ...init, headers });
   }
   static redirect(url, status = 302) {
-    return new Response(null, { status, headers: { location: String(url) } });
+    let init = {};
+    let statusCode = 302;
+    if (status !== null && typeof status === "object") {
+      init = status;
+      statusCode = init.status === undefined ? 302 : Number(init.status);
+    } else if (typeof status === "number") {
+      statusCode = status;
+    }
+    if (statusCode !== 301 && statusCode !== 302 && statusCode !== 303 && statusCode !== 307 && statusCode !== 308) {
+      throw new RangeError("Invalid status code");
+    }
+    const headers = new Headers(init.headers);
+    headers.set("location", String(url));
+    return new Response(null, { ...init, status: statusCode, headers });
   }
   clone() {
     return new Response(teeClonedBody(this), {
@@ -2311,25 +2857,39 @@ export class Response {
       redirected: this.redirected,
     });
   }
+  _takeBody() {
+    if (this._bodyUsed) throw new TypeError("Body already used");
+    const body = this._body;
+    if (body != null) this._bodyUsed = true;
+    return body;
+  }
   async arrayBuffer() {
-    return arrayBufferFromBytes(await bytesFromBody(this._body));
+    return arrayBufferFromBytes(await bytesFromBody(this._takeBody()));
   }
   async bytes() {
-    return asBuffer(await bytesFromBody(this._body));
+    return asBuffer(await bytesFromBody(this._takeBody()));
   }
   async blob() {
-    const type = this.headers.get("content-type") ?? "";
-    if (this._body instanceof Blob && (!type || this._body.type === type)) return this._body;
-    return cachedBlobForBytes(await bytesFromBody(this._body), type);
+    let type = this.headers.get("content-type") ?? "";
+    // Bun appends the default charset to textual media types on blob().
+    if (/^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded)$)/i.test(type) && !type.includes(";")) {
+      type = `${type};charset=utf-8`;
+    }
+    const body = this._takeBody();
+    if (body instanceof Blob && (!type || body.type === type)) return body;
+    return cachedBlobForBytes(await bytesFromBody(body), type);
   }
   async text() {
-    if (typeof this._body === "string") return this._body;
-    return cachedTextForBytes(await bytesFromBody(this._body));
+    const body = this._takeBody();
+    if (typeof body === "string") return stripUtf8BOMText(body);
+    return stripUtf8BOMText(cachedTextForBytes(await bytesFromBody(body)));
   }
   async json() {
     return JSON.parse(await this.text());
   }
   formData() {
+    if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
+    if (this._body != null) this._bodyUsed = true;
     if (this._body instanceof FormData) return Promise.resolve(this._body);
     return parseMultipartFormData(this._body, this.headers.get("content-type"));
   }
@@ -2352,6 +2912,10 @@ function activeServerForFetchUrl(urlText) {
     const direct = activeServeOrigins.get(`${url.protocol}//${authority}`);
     if (direct) return direct;
     if (url.hostname === "localhost") return activeServeOrigins.get(`${url.protocol}//127.0.0.1:${url.port}`);
+    if (hostname === "0.0.0.0" || hostname === "[::]") {
+      return activeServeOrigins.get(`${url.protocol}//127.0.0.1:${url.port}`)
+        ?? activeServeOrigins.get(`${url.protocol}//localhost:${url.port}`);
+    }
   } catch {}
   return null;
 }
@@ -2445,23 +3009,119 @@ async function fetchFromActiveProxy(activeProxy, proxyUrl, request) {
   return response;
 }
 
+function responseFromDataUrl(urlText) {
+  const match = /^data:([^,]*),([\s\S]*)$/.exec(urlText);
+  if (!match) throw new TypeError("fetch failed: invalid data URL");
+  const meta = match[1] ?? "";
+  const isBase64 = /;base64$/i.test(meta);
+  const type = meta.replace(/;base64$/i, "") || "text/plain;charset=US-ASCII";
+  let bytes;
+  if (isBase64) {
+    bytes = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+  } else {
+    let text = match[2];
+    try { text = decodeURIComponent(text); } catch {}
+    bytes = Buffer.from(text);
+  }
+  return new Response(bytes, {
+    status: 200,
+    headers: { "content-type": type },
+    url: urlText,
+  });
+}
+
+// fetch.preconnect keeps an opened socket per origin that the raw-socket
+// client will consume for its next request to that origin.
+const preconnectedFetchSockets = new Map();
+
+function takePreconnectedSocket(originKey) {
+  const list = preconnectedFetchSockets.get(originKey);
+  while (list && list.length > 0) {
+    const socket = list.shift();
+    if (!socket.destroyed && socket.writable !== false) return socket;
+  }
+  return null;
+}
+
+function fetchPreconnect(url) {
+  const parsed = new URL(String(url));
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new TypeError("preconnect requires an http: or https: URL");
+  }
+  if (!parsed.hostname) throw new TypeError("preconnect requires a hostname");
+  const isHttps = parsed.protocol === "https:";
+  const port = Number(parsed.port || (isHttps ? 443 : 80));
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new TypeError("preconnect requires a valid port");
+  }
+  let hostname = String(parsed.hostname).replace(/^\[|\]$/g, "");
+  if (hostname === "0.0.0.0") hostname = "127.0.0.1";
+  const key = `${parsed.protocol}//${hostname}:${port}`;
+  const socket = isHttps
+    ? nodeTlsConnect({ host: hostname, port, servername: hostname, rejectUnauthorized: false })
+    : nodeNet.connect(port, hostname);
+  socket.on("error", () => {});
+  socket.once("close", () => {
+    const list = preconnectedFetchSockets.get(key);
+    if (list) {
+      const index = list.indexOf(socket);
+      if (index >= 0) list.splice(index, 1);
+      if (list.length === 0) preconnectedFetchSockets.delete(key);
+    }
+  });
+  const list = preconnectedFetchSockets.get(key) ?? [];
+  list.push(socket);
+  preconnectedFetchSockets.set(key, list);
+  return undefined;
+}
+
+function applyDefaultFetchHeaders(request) {
+  const headers = request.headers;
+  if (!headers.has("user-agent")) {
+    headers.set("User-Agent", globalThis.navigator?.userAgent ?? `Bun/${BunObject.version ?? "1.0.0"}`);
+  }
+  if (!headers.has("accept")) headers.set("Accept", "*/*");
+  if (!headers.has("connection")) headers.set("Connection", "keep-alive");
+  if (!headers.has("accept-encoding")) headers.set("Accept-Encoding", "gzip, deflate, br, zstd");
+  if (!headers.has("host")) {
+    try {
+      const url = new URL(request.url);
+      headers.set("Host", `${url.hostname}${url.port ? `:${url.port}` : ""}`);
+    } catch {}
+  }
+}
+
+function isLoopbackHostname(hostname) {
+  const name = String(hostname).replace(/^\[|\]$/g, "").toLowerCase();
+  return name === "localhost" || name === "::1" || name === "::" || name === "0.0.0.0" || name.startsWith("127.");
+}
+
 function isLoopbackHttpUrl(urlText) {
   try {
     const url = new URL(urlText);
-    const hostname = String(url.hostname).replace(/^\[|\]$/g, "").toLowerCase();
-    return url.protocol === "http:" && (hostname === "localhost" || hostname === "::1" || hostname.startsWith("127."));
+    return url.protocol === "http:" && isLoopbackHostname(url.hostname);
   } catch {
     return false;
   }
 }
 
-async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, redirected = false) {
+function isLoopbackHttpsUrl(urlText) {
+  try {
+    const url = new URL(urlText);
+    return url.protocol === "https:" && isLoopbackHostname(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}) {
   if (depth > 20) throw new TypeError("redirect count exceeded");
-  const response = await fetchOnceFromNodeHttp(request, redirected);
+  const response = await fetchOnceFromNodeHttp(request, redirected, transport);
   if (redirectMode === "manual" || !isRedirectStatus(response.status)) return response;
   if (redirectMode === "error") throw new TypeError("fetch failed");
   const location = response.headers.get("location");
   if (!location) return response;
+  try { response._body?.cancel?.(); } catch {}
   const nextUrl = String(new URL(redirectLocationText(location), request.url));
   const dropBody = response.status === 303 ||
     ((response.status === 301 || response.status === 302) && request.method === "POST");
@@ -2472,7 +3132,25 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
     redirect: request.redirect,
   });
   if (!dropBody) nextRequest._body = request._body;
-  return fetchFromNodeHttp(nextRequest, redirectMode, depth + 1, true);
+  let nextTransport = transport;
+  if (transport.socketPath) {
+    try {
+      if (new URL(nextUrl).origin !== new URL(request.url).origin) {
+        nextTransport = { ...transport, socketPath: undefined };
+      }
+    } catch {
+      nextTransport = { ...transport, socketPath: undefined };
+    }
+  }
+  if (!nextTransport.socketPath) {
+    // Redirect targets that are not loopback/unix should fall back to the
+    // regular fetch dispatch (active-server fast path or curl).
+    const nextIsLocal = isLoopbackHttpUrl(nextUrl) || isLoopbackHttpsUrl(nextUrl) || activeServerForFetchUrl(nextUrl);
+    if (!nextIsLocal) return fetchImpl(nextRequest, { redirect: redirectMode });
+    const nextActive = activeServerForFetchUrl(nextUrl);
+    if (nextActive) return fetchFromActiveServer(nextActive, nextRequest, redirectMode, depth + 1, true);
+  }
+  return fetchFromNodeHttp(nextRequest, redirectMode, depth + 1, true, nextTransport);
 }
 
 // Location header bytes reach JS as latin1 code units; the fetch spec treats
@@ -2494,50 +3172,411 @@ function redirectLocationText(location) {
   return text;
 }
 
-async function fetchOnceFromNodeHttp(request, redirected = false) {
+function decompressFetchBytes(bytes, encoding) {
+  if (encoding === "gzip" || encoding === "x-gzip") return zlib.gunzipSync(bytes);
+  if (encoding === "deflate") {
+    try {
+      return zlib.inflateSync(bytes);
+    } catch {
+      return zlib.inflateRawSync(bytes);
+    }
+  }
+  if (encoding === "br") return zlib.brotliDecompressSync(bytes);
+  if (encoding === "zstd") return zlib.zstdDecompressSync(bytes);
+  return bytes;
+}
+
+function isCompressedFetchEncoding(encoding) {
+  return encoding === "gzip" || encoding === "x-gzip" || encoding === "deflate" || encoding === "br" || encoding === "zstd";
+}
+
+// Minimal streaming HTTP/1.1 client used for loopback and unix-socket fetch.
+// Unlike node/http.js's client (which buffers whole responses before emitting
+// them), this resolves the fetch promise as soon as response headers arrive
+// and streams the body, which SSE/flushHeaders semantics require.
+async function fetchOnceFromNodeHttp(request, redirected = false, transport = {}) {
+  try {
+    return await fetchSocketAttempt(request, redirected, transport, true);
+  } catch (error) {
+    // A pooled (preconnected) socket that died before delivering headers is
+    // retried once on a fresh connection.
+    if (error && error.__cottontailPooledRetry) {
+      return fetchSocketAttempt(request, redirected, transport, false);
+    }
+    throw error;
+  }
+}
+
+const EMPTY_BUFFER = new Uint8Array(0);
+
+async function fetchSocketAttempt(request, redirected, transport, usePool) {
   const body = request.method === "GET" || request.method === "HEAD"
     ? Buffer.alloc(0)
     : Buffer.from(await bytesFromBody(request._body));
   return new Promise((resolve, reject) => {
+    const url = new URL(request.url);
+    const isHttps = url.protocol === "https:";
+    let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
+    if (hostname === "0.0.0.0") hostname = "127.0.0.1";
+    else if (hostname === "::") hostname = "::1";
+    const port = Number(url.port || (isHttps ? 443 : 80));
+
     let settled = false;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      request.signal?.removeEventListener?.("abort", onAbort);
-      callback(value);
+    let streamController = null;
+    let streamDone = false;
+    let finished = false;
+
+    const failure = (error) => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (!streamDone && streamController) {
+        streamDone = true;
+        try { streamController.error(error); } catch {}
+      }
+      cleanup();
     };
-    const clientRequest = nodeHttp.request(request.url, {
-      agent: false,
-      headers: Object.fromEntries(request.headers),
-      method: request.method,
-    }, (incoming) => {
-      const chunks = [];
-      incoming.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-      incoming.on("error", (error) => finish(reject, error));
-      incoming.on("end", () => {
-        const headers = new Headers();
-        for (const [name, value] of Object.entries(incoming.headers ?? {})) {
-          if (Array.isArray(value)) for (const item of value) headers.append(name, item);
-          else if (value != null) headers.set(name, value);
-        }
-        finish(resolve, new Response(Buffer.concat(chunks), {
-          headers,
-          status: incoming.statusCode ?? 200,
-          statusText: incoming.statusMessage ?? "",
-          url: request.url,
-          redirected,
-        }));
-      });
-    });
+
+    const pooledSocket = transport.socketPath || !usePool
+      ? null
+      : takePreconnectedSocket(`${url.protocol}//${hostname}:${port}`);
+    const socket = pooledSocket ?? (transport.socketPath
+      ? nodeNet.connect({ path: transport.socketPath })
+      : isHttps
+        ? nodeTlsConnect({
+            host: hostname,
+            port,
+            servername: url.hostname.replace(/^\[|\]$/g, ""),
+            rejectUnauthorized: transport.rejectUnauthorized !== false,
+          })
+        : nodeNet.connect(port, hostname));
+
+    const cleanup = () => {
+      try { socket.destroy?.(); } catch {}
+    };
+
     const onAbort = () => {
-      clientRequest.destroy?.();
-      finish(reject, request.signal?.reason ?? abortError());
+      request.signal?.removeEventListener?.("abort", onAbort);
+      failure(request.signal?.reason ?? abortError());
     };
-    clientRequest.on("error", (error) => finish(reject, error));
-    request.signal?.addEventListener?.("abort", onAbort, { once: true });
+    request.signal?.addEventListener?.("abort", onAbort);
     if (request.signal?.aborted) return onAbort();
-    if (body.byteLength > 0) clientRequest.write(body);
-    clientRequest.end();
+
+    // ---- request serialization ----------------------------------------
+    // Iterate the internal map (when available) so original header casing is
+    // preserved on the wire; Headers iteration is normalized/sorted.
+    const headerNames = new Set();
+    const headerLines = [];
+    if (request.headers?._values instanceof Map) {
+      for (const [normalized, entry] of request.headers._values) {
+        headerNames.add(normalized);
+        if (normalized === "set-cookie") {
+          for (const value of request.headers._allValues.get(normalized) ?? []) {
+            headerLines.push(`${entry.key}: ${value}`);
+          }
+        } else {
+          headerLines.push(`${entry.key}: ${entry.value}`);
+        }
+      }
+    } else {
+      request.headers.forEach((value, name) => {
+        headerNames.add(String(name).toLowerCase());
+        headerLines.push(`${name}: ${value}`);
+      });
+    }
+    if (!headerNames.has("host")) {
+      headerLines.push(`Host: ${url.hostname}${url.port ? `:${url.port}` : ""}`);
+    }
+    if (!headerNames.has("connection")) headerLines.push("Connection: keep-alive");
+    if (!headerNames.has("accept")) headerLines.push("Accept: */*");
+    if (!headerNames.has("accept-encoding")) headerLines.push("Accept-Encoding: gzip, deflate, br, zstd");
+    if (!headerNames.has("user-agent")) headerLines.push(`User-Agent: Bun/${BunObject.version ?? "1.0.0"}`);
+    if (body.byteLength > 0 && !headerNames.has("content-length") && !headerNames.has("transfer-encoding")) {
+      headerLines.push(`Content-Length: ${body.byteLength}`);
+    } else if (
+      body.byteLength === 0 &&
+      !headerNames.has("content-length") &&
+      !headerNames.has("transfer-encoding") &&
+      request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS"
+    ) {
+      headerLines.push("Content-Length: 0");
+    }
+    const path = `${url.pathname || "/"}${url.search || ""}`;
+    const head = `${request.method} ${path} HTTP/1.1\r\n${headerLines.join("\r\n")}\r\n\r\n`;
+
+    let requestSent = false;
+    const sendRequestHead = () => {
+      if (requestSent || socket.destroyed) return;
+      requestSent = true;
+      socket.write(head);
+      if (body.byteLength > 0) socket.write(body);
+      if (transport.streamBody) {
+        (async () => {
+          try {
+            await consumeStreamingBody(transport.streamBody, (chunk) => {
+              if (!socket.destroyed && socket.writable) socket.write(asBuffer(chunk));
+            });
+          } catch {}
+        })();
+      }
+    };
+    socket.on("connect", sendRequestHead);
+    socket.on("secureConnect", sendRequestHead);
+    if (socket.readyState === "open" || (pooledSocket && !socket.connecting && !socket.destroyed)) {
+      sendRequestHead();
+    }
+
+    // ---- response parsing ----------------------------------------------
+    let phase = "head";
+    let headBuffer = Buffer.alloc(0);
+    let bodyMode = "eof"; // "length" | "chunked" | "eof" | "none"
+    let bodyRemaining = 0;
+    let chunkState = null;
+    let compressedChunks = null;
+    let responseEncoding = "";
+
+    const enqueueBody = (chunk) => {
+      if (chunk.byteLength === 0) return;
+      if (compressedChunks) {
+        compressedChunks.push(Buffer.from(chunk));
+        return;
+      }
+      if (streamDone || !streamController) return;
+      try {
+        streamController.enqueue(Buffer.from(chunk));
+        // Backpressure: stop reading from the socket once the consumer's
+        // queue is full; pull() resumes it.
+        if (streamController.desiredSize <= 0 && !socket.destroyed) socket.pause?.();
+      } catch {}
+    };
+
+    const finishBody = () => {
+      if (finished) return;
+      finished = true;
+      request.signal?.removeEventListener?.("abort", onAbort);
+      if (compressedChunks) {
+        try {
+          const decoded = decompressFetchBytes(Buffer.concat(compressedChunks), responseEncoding);
+          if (!streamDone && streamController) {
+            if (decoded.byteLength > 0) streamController.enqueue(asBuffer(decoded));
+            streamController.close();
+          }
+        } catch (error) {
+          if (!streamDone && streamController) {
+            try { streamController.error(error); } catch {}
+          }
+        }
+        streamDone = true;
+      } else if (!streamDone && streamController) {
+        streamDone = true;
+        try { streamController.close(); } catch {}
+      }
+      cleanup();
+    };
+
+    const startBody = (headers, status, statusText, initialChunk) => {
+      responseEncoding = String(headers.get("content-encoding") ?? "").trim().toLowerCase();
+      if (isCompressedFetchEncoding(responseEncoding)) compressedChunks = [];
+      const transferEncoding = String(headers.get("transfer-encoding") ?? "").toLowerCase();
+      const method = String(request.method).toUpperCase();
+      if (status === 101) {
+        // Upgraded connection: expose the raw byte stream until close.
+        bodyMode = "eof";
+      } else if (method === "HEAD" || status === 204 || status === 304) {
+        bodyMode = "none";
+      } else if (transferEncoding.split(",").some((item) => item.trim() === "chunked")) {
+        bodyMode = "chunked";
+        chunkState = { buffer: EMPTY_BUFFER, size: null, remaining: 0, trailer: false };
+      } else if (headers.get("content-length") != null) {
+        bodyMode = "length";
+        bodyRemaining = Number(headers.get("content-length")) || 0;
+      } else {
+        bodyMode = "eof";
+      }
+      const stream = new globalThis.ReadableStream({
+        start(controller) {
+          streamController = controller;
+        },
+        pull() {
+          if (!finished && !socket.destroyed) socket.resume?.();
+        },
+        cancel() {
+          streamDone = true;
+          cleanup();
+        },
+      }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
+      settled = true;
+      resolve(new Response(stream, {
+        headers,
+        status,
+        statusText,
+        url: request.url,
+        redirected,
+      }));
+      phase = "body";
+      if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
+        if (initialChunk.byteLength > 0) {
+          // Ignore pipelined data.
+        }
+        finishBody();
+        return;
+      }
+      if (initialChunk.byteLength > 0) consumeBody(initialChunk);
+    };
+
+    const consumeChunked = (chunk) => {
+      // Stream chunk payload bytes through as they arrive. Only chunk-size
+      // lines, terminators, and trailers are ever buffered, so a single huge
+      // chunk (e.g. one 2GiB res.write) is O(n) instead of O(n^2) rebuffering.
+      let buffer = chunkState.buffer.byteLength === 0
+        ? asBuffer(chunk)
+        : Buffer.concat([chunkState.buffer, asBuffer(chunk)]);
+      chunkState.buffer = EMPTY_BUFFER;
+      const invalid = () => {
+        const error = new Error("Invalid HTTP response");
+        error.code = "InvalidHTTPResponse";
+        failure(error);
+      };
+      for (;;) {
+        if (chunkState.trailer) {
+          // Consume trailers until a blank line.
+          if (buffer.byteLength >= 2 && buffer[0] === 0x0d && buffer[1] === 0x0a) {
+            finishBody();
+            return;
+          }
+          if (buffer.indexOf("\r\n\r\n") < 0) {
+            chunkState.buffer = buffer;
+            return;
+          }
+          finishBody();
+          return;
+        }
+        if (chunkState.size == null) {
+          const lineEnd = buffer.indexOf("\r\n");
+          if (lineEnd < 0) {
+            chunkState.buffer = buffer;
+            return;
+          }
+          const sizeText = buffer.subarray(0, lineEnd).toString("latin1").split(";")[0].trim();
+          const size = /^[0-9A-Fa-f]+$/.test(sizeText) ? parseInt(sizeText, 16) : NaN;
+          if (!Number.isFinite(size) || size < 0) {
+            invalid();
+            return;
+          }
+          chunkState.size = size;
+          chunkState.remaining = size;
+          buffer = buffer.subarray(lineEnd + 2);
+          if (size === 0) {
+            chunkState.trailer = true;
+            continue;
+          }
+        }
+        if (chunkState.remaining > 0) {
+          const take = Math.min(chunkState.remaining, buffer.byteLength);
+          if (take > 0) {
+            enqueueBody(buffer.subarray(0, take));
+            buffer = buffer.subarray(take);
+            chunkState.remaining -= take;
+          }
+          if (chunkState.remaining > 0) return;
+        }
+        // Validate the CRLF terminator as soon as its bytes are visible so a
+        // malformed chunk surfaces as InvalidHTTPResponse even when the peer
+        // closes the connection right after it.
+        if (buffer.byteLength === 0) {
+          chunkState.buffer = buffer;
+          return;
+        }
+        if (buffer[0] !== 0x0d) {
+          invalid();
+          return;
+        }
+        if (buffer.byteLength < 2) {
+          chunkState.buffer = buffer;
+          return;
+        }
+        if (buffer[1] !== 0x0a) {
+          invalid();
+          return;
+        }
+        buffer = buffer.subarray(2);
+        chunkState.size = null;
+      }
+    };
+
+    const consumeBody = (chunk) => {
+      if (bodyMode === "length") {
+        const take = Math.min(bodyRemaining, chunk.byteLength);
+        enqueueBody(chunk.subarray(0, take));
+        bodyRemaining -= take;
+        if (bodyRemaining <= 0) finishBody();
+        return;
+      }
+      if (bodyMode === "chunked") {
+        consumeChunked(chunk);
+        return;
+      }
+      enqueueBody(chunk);
+    };
+
+    socket.on("data", (data) => {
+      let chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (finished) return;
+      if (phase === "head") {
+        headBuffer = headBuffer.byteLength === 0 ? chunk : Buffer.concat([headBuffer, chunk]);
+        const headerEnd = headBuffer.indexOf("\r\n\r\n");
+        if (headerEnd < 0) return;
+        const headText = headBuffer.subarray(0, headerEnd).toString("latin1");
+        const rest = headBuffer.subarray(headerEnd + 4);
+        const [statusLine, ...headerTextLines] = headText.split("\r\n");
+        const match = /^HTTP\/\d+\.\d+\s+(\d{3})\s*(.*)$/.exec(statusLine);
+        if (!match) {
+          failure(new Error("Invalid HTTP response"));
+          return;
+        }
+        const status = Number(match[1]);
+        if (status >= 100 && status < 200 && status !== 101) {
+          // Informational response: skip it and keep parsing.
+          headBuffer = Buffer.from(rest);
+          if (headBuffer.byteLength > 0) {
+            const again = headBuffer;
+            headBuffer = Buffer.alloc(0);
+            socket.emit("data", again);
+          }
+          return;
+        }
+        const headers = parseHeadersText(headerTextLines.join("\n"));
+        headBuffer = Buffer.alloc(0);
+        startBody(headers, status, match[2] ?? "", rest);
+        return;
+      }
+      consumeBody(chunk);
+    });
+
+    const connectionLost = (rawError) => {
+      if (finished) return;
+      if (settled && bodyMode === "eof" && phase === "body") {
+        finishBody();
+        return;
+      }
+      if (settled && bodyMode === "chunked" && chunkState?.trailer) {
+        finishBody();
+        return;
+      }
+      let error = rawError;
+      if (error == null) {
+        error = new Error("The socket connection was closed unexpectedly.");
+        error.code = "ECONNRESET";
+      }
+      if (pooledSocket && !settled) error.__cottontailPooledRetry = true;
+      failure(error);
+    };
+    socket.on("error", (error) => connectionLost(error));
+    socket.on("end", () => connectionLost(null));
+    socket.on("close", () => connectionLost(null));
   });
 }
 
@@ -2547,8 +3586,59 @@ async function fetchImpl(input, init = {}) {
     const method = String(init.method ?? "GET").toUpperCase();
     if (method === "GET" || method === "HEAD") requestInit = { ...init, body: undefined };
   }
+  // Bun allows a streaming function body on GET requests for protocol
+  // upgrades (e.g. speaking websocket bytes over the raw connection).
+  let upgradeStreamBody = null;
+  if (!(input instanceof Request) && typeof requestInit?.body === "function") {
+    const method = String(requestInit.method ?? "GET").toUpperCase();
+    if (method === "GET" || method === "HEAD") {
+      upgradeStreamBody = requestInit.body;
+      requestInit = { ...requestInit, body: undefined };
+    }
+  }
   const request = input instanceof Request ? input : new Request(input, requestInit);
+  if (
+    upgradeStreamBody == null &&
+    (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") &&
+    request._body != null
+  ) {
+    throw new TypeError("fetch() request with GET/HEAD/OPTIONS method cannot have body.");
+  }
   throwIfAborted(request.signal);
+  // When the request body is a stream, aborting the fetch must stop pulling
+  // from it; cancel any reader created for it once the signal fires.
+  if (request.signal && typeof request._body?.getReader === "function") {
+    const signal = request.signal;
+    const stream = request._body;
+    const originalGetReader = stream.getReader.bind(stream);
+    stream.getReader = (...args) => {
+      const reader = originalGetReader(...args);
+      const onAbort = () => {
+        try { reader.cancel(signal.reason); } catch {}
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener?.("abort", onAbort, { once: true });
+      return reader;
+    };
+  }
+  if (request.url.startsWith("data:")) return responseFromDataUrl(request.url);
+  if (request.url.startsWith("blob:")) {
+    const blob = globalThis.__cottontailObjectURLRegistry?.get(request.url);
+    if (!blob) throw new TypeError("fetch failed: unknown blob URL");
+    return new Response(blob, {
+      status: 200,
+      headers: blob.type ? { "content-type": blob.type } : {},
+      url: request.url,
+    });
+  }
+  const unixSocketPath = init?.unix != null && init.unix !== false ? String(init.unix) : null;
+  const rejectUnauthorized = init?.tls?.rejectUnauthorized === false ? false : undefined;
+  if (unixSocketPath) {
+    return await fetchFromNodeHttp(request, String(init.redirect ?? request.redirect ?? "follow"), 0, false, {
+      socketPath: unixSocketPath,
+      rejectUnauthorized,
+    });
+  }
   const proxy = fetchProxyConfiguration(request.url, init);
   const activeServer = activeServerForFetchUrl(request.url);
   const redirectMode = String(init.redirect ?? input?.redirect ?? request.redirect ?? "follow");
@@ -2556,8 +3646,21 @@ async function fetchImpl(input, init = {}) {
     const activeProxy = activeServerForFetchUrl(proxy.explicit);
     if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
   }
-  if (activeServer && !proxy.active) return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
-  if (!proxy.active && isLoopbackHttpUrl(request.url)) return await fetchFromNodeHttp(request, redirectMode);
+  // Requests that want a protocol upgrade must use a real socket so the
+  // 101 handshake and post-upgrade byte stream work; skip the in-process
+  // fast path for them.
+  const wantsUpgrade = upgradeStreamBody != null ||
+    String(request.headers.get("connection") ?? "").toLowerCase().split(",").some((token) => token.trim() === "upgrade");
+  if (activeServer && !proxy.active && !wantsUpgrade) {
+    applyDefaultFetchHeaders(request);
+    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
+  }
+  if (!proxy.active && isLoopbackHttpUrl(request.url)) {
+    return await fetchFromNodeHttp(request, redirectMode, 0, false, upgradeStreamBody ? { streamBody: upgradeStreamBody } : {});
+  }
+  if (!proxy.active && rejectUnauthorized === false && isLoopbackHttpsUrl(request.url)) {
+    return await fetchFromNodeHttp(request, redirectMode, 0, false, { rejectUnauthorized: false });
+  }
 
   const args = ["-L", "-sS", "-D", "-", "-X", request.method];
   const timeoutState = abortSignalState.get(request.signal);
@@ -2571,6 +3674,7 @@ async function fetchImpl(input, init = {}) {
   if (proxy.explicit) args.push("--proxy", proxy.explicit);
   else if (proxy.environment) args.push("--proxy", proxy.environment, "--noproxy", "");
   else if (proxy.disabled) args.push("--proxy", "", "--noproxy", "*");
+  if (rejectUnauthorized === false) args.push("-k");
   if (proxy.active) args.push("-H", "Proxy-Connection: Keep-Alive");
   request.headers.forEach((value, key) => {
     args.push("-H", `${key}: ${value}`);
@@ -2598,7 +3702,13 @@ async function fetchImpl(input, init = {}) {
 
   if (result.status !== 0 && status === 0) {
     if (timeoutRemaining != null) throw makeTimeoutError();
-    throw new Error(String(result.stderr || result.stdout || "fetch failed"));
+    const stderrText = String(result.stderr || result.stdout || "fetch failed");
+    if (/curl: \((?:5|6|7|28)\)/.test(stderrText)) {
+      const error = new Error("Unable to connect. Is the computer able to access the url?");
+      error.code = "ConnectionRefused";
+      throw error;
+    }
+    throw new Error(stderrText);
   }
 
   let responseHeaders = new Headers();
@@ -2628,6 +3738,8 @@ export function fetch(input, init = {}) {
   return fetchImpl(input, init);
 }
 
+fetch.preconnect = fetchPreconnect;
+
 function abortError() {
   const error = new Error("The operation was aborted");
   error.name = "AbortError";
@@ -2644,8 +3756,13 @@ function isRedirectStatus(status) {
 
 async function decodeFetchResponse(response) {
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  if (encoding !== "zstd") return response;
-  const decoded = zlib.zstdDecompressSync(await response.bytes());
+  if (!isCompressedFetchEncoding(encoding)) return response;
+  let decoded;
+  try {
+    decoded = decompressFetchBytes(await response.bytes(), encoding);
+  } catch {
+    return response;
+  }
   return new Response(decoded, {
     status: response.status,
     statusText: response.statusText,
@@ -2655,10 +3772,28 @@ async function decodeFetchResponse(response) {
   });
 }
 
+function raceWithAbortSignal(promise, signal) {
+  if (!signal || typeof signal.addEventListener !== "function") return promise;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener?.("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener?.("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected) {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
-  const response = await activeServer.fetch(request);
+  const response = await raceWithAbortSignal(activeServer.fetch(request), request.signal);
   throwIfAborted(request.signal);
   response.url = request.url;
   response.redirected = Boolean(redirected || response.redirected);
@@ -3211,7 +4346,14 @@ function normalizeServeHostname(value) {
     ? ""
     : coerceServeOptionString(value, "hostname");
   if (hostname.length === 0) return "localhost";
-  if (hostname.length > 253 || hostname.includes("\0") || hostname.includes(":")) {
+  const bareIpv6 = hostname.replace(/^\[|\]$/g, "");
+  if (bareIpv6.includes(":")) {
+    if (!/^[0-9A-Fa-f:.%]+$/.test(bareIpv6)) {
+      throw new TypeError(`Invalid hostname: ${hostname}`);
+    }
+    return bareIpv6;
+  }
+  if (hostname.length > 253 || hostname.includes("\0")) {
     throw new TypeError(`Invalid hostname: ${hostname}`);
   }
   const labels = hostname.split(".");
@@ -3226,6 +4368,1025 @@ function normalizeServeUnixPath(value) {
   const path = coerceServeOptionString(value, "unix");
   if (path.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Bun.serve websocket + TLS backend (built on node/http.js + node/https.js)
+// ---------------------------------------------------------------------------
+
+const WEBSOCKET_HANDSHAKE_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const serveUpgradeContexts = new WeakMap();
+const serveRequestSockets = new WeakMap();
+
+function websocketAcceptKeyForServe(key) {
+  return createHash("sha1").update(`${key}${WEBSOCKET_HANDSHAKE_GUID}`).digest("base64");
+}
+
+function websocketPayloadBytes(data) {
+  if (typeof data === "string") return Buffer.from(data);
+  if (data == null) return Buffer.alloc(0);
+  return asBuffer(data);
+}
+
+function encodeServerWebSocketFrame(opcode, payload) {
+  const body = websocketPayloadBytes(payload);
+  const length = body.byteLength;
+  let header;
+  if (length < 126) {
+    header = Buffer.from([0x80 | (opcode & 0x0f), length]);
+  } else if (length <= 0xffff) {
+    header = Buffer.from([0x80 | (opcode & 0x0f), 126, (length >> 8) & 0xff, length & 0xff]);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 127;
+    let big = BigInt(length);
+    for (let index = 9; index >= 2; index -= 1) {
+      header[index] = Number(big & 0xffn);
+      big >>= 8n;
+    }
+  }
+  return Buffer.concat([header, body]);
+}
+
+function decodeWebSocketFrames(buffer) {
+  const frames = [];
+  let offset = 0;
+  while (buffer.byteLength - offset >= 2) {
+    const frameStart = offset;
+    const first = buffer[offset++];
+    const second = buffer[offset++];
+    const fin = (first & 0x80) !== 0;
+    const opcode = first & 0x0f;
+    const masked = (second & 0x80) !== 0;
+    let length = second & 0x7f;
+    if (length === 126) {
+      if (buffer.byteLength - offset < 2) return { frames, remaining: buffer.subarray(frameStart) };
+      length = (buffer[offset] << 8) | buffer[offset + 1];
+      offset += 2;
+    } else if (length === 127) {
+      if (buffer.byteLength - offset < 8) return { frames, remaining: buffer.subarray(frameStart) };
+      let big = 0n;
+      for (let index = 0; index < 8; index += 1) big = (big << 8n) | BigInt(buffer[offset + index]);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("WebSocket frame too large");
+      length = Number(big);
+      offset += 8;
+    }
+    if (masked && buffer.byteLength - offset < 4) return { frames, remaining: buffer.subarray(frameStart) };
+    const mask = masked ? buffer.subarray(offset, offset + 4) : null;
+    if (masked) offset += 4;
+    if (buffer.byteLength - offset < length) return { frames, remaining: buffer.subarray(frameStart) };
+    const payload = Buffer.from(buffer.subarray(offset, offset + length));
+    offset += length;
+    if (mask) {
+      for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
+    }
+    frames.push({ fin, opcode, payload });
+  }
+  return { frames, remaining: buffer.subarray(offset) };
+}
+
+function reportServeHandlerError(error) {
+  setTimeout(() => { throw error; }, 0);
+}
+
+function invokeWebSocketHandler(state, name, ...args) {
+  const handlers = state.getHandlers();
+  const handler = handlers?.[name];
+  if (typeof handler !== "function") return undefined;
+  try {
+    const result = handler(...args);
+    if (isPromiseLike(result)) result.then(undefined, reportServeHandlerError);
+    return result;
+  } catch (error) {
+    reportServeHandlerError(error);
+    return undefined;
+  }
+}
+
+function assertWebSocketCompressFlag(compress, name) {
+  if (compress !== undefined && typeof compress !== "boolean") {
+    throw new TypeError(`${name} expects compress to be a boolean`);
+  }
+}
+
+function sendServerWebSocketFrame(state, opcode, data) {
+  if (state.readyState !== 1) return 0;
+  const socket = state.socket;
+  if (!socket || socket.destroyed || !socket.writable) return 0;
+  const payload = websocketPayloadBytes(data);
+  const limit = state.config.backpressureLimit;
+  if (socket.writableLength > limit) {
+    state.wantDrain = true;
+    return 0;
+  }
+  const frame = encodeServerWebSocketFrame(opcode, payload);
+  const ok = socket.write(frame, () => {
+    if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
+  });
+  if (!ok || socket.writableLength > limit) {
+    state.wantDrain = true;
+    return -1;
+  }
+  return payload.byteLength;
+}
+
+function scheduleServerWebSocketDrain(state) {
+  if (!state.wantDrain) return;
+  state.wantDrain = false;
+  queueMicrotask(() => {
+    if (state.readyState === 1) invokeWebSocketHandler(state, "drain", state.ws);
+  });
+}
+
+function convertWebSocketBinary(state, payload) {
+  if (state.binaryType === "arraybuffer") {
+    return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+  }
+  if (state.binaryType === "uint8array") {
+    return new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  }
+  return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+}
+
+function unsubscribeServerWebSocketAll(state) {
+  for (const topic of state.topics) {
+    const set = state.serverState.topics.get(topic);
+    if (set) {
+      set.delete(state);
+      if (set.size === 0) state.serverState.topics.delete(topic);
+    }
+  }
+  state.topics.clear();
+}
+
+function finalizeServerWebSocket(state, code, reason) {
+  if (state.finalized) return;
+  state.finalized = true;
+  state.readyState = 3;
+  unsubscribeServerWebSocketAll(state);
+  const server = state.serverState.server;
+  if (server && server.pendingWebSockets > 0) server.pendingWebSockets -= 1;
+  invokeWebSocketHandler(state, "close", state.ws, code, reason);
+}
+
+function closeServerWebSocket(state, code, reason) {
+  if (state.readyState !== 1) return;
+  state.readyState = 2;
+  const socket = state.socket;
+  if (socket && !socket.destroyed && socket.writable) {
+    const reasonBytes = Buffer.from(String(reason ?? ""));
+    const payload = Buffer.alloc(2 + reasonBytes.byteLength);
+    payload[0] = (code >> 8) & 0xff;
+    payload[1] = code & 0xff;
+    payload.set(reasonBytes, 2);
+    try { socket.write(encodeServerWebSocketFrame(0x8, payload)); } catch {}
+    try { socket.end(); } catch {}
+  }
+  finalizeServerWebSocket(state, code, String(reason ?? ""));
+}
+
+function terminateServerWebSocket(state) {
+  if (state.readyState === 3 && state.finalized) return;
+  state.readyState = 3;
+  try { state.socket?.destroy?.(); } catch {}
+  finalizeServerWebSocket(state, 1006, "");
+}
+
+function publishToWebSocketTopic(serverState, topic, data, opcode, excludeState) {
+  const topicName = String(topic ?? "");
+  if (topicName.length === 0) return 0;
+  const subscribers = serverState.topics.get(topicName);
+  if (!subscribers || subscribers.size === 0) return 0;
+  const payload = websocketPayloadBytes(data);
+  const resolvedOpcode = opcode ?? (typeof data === "string" ? 0x1 : 0x2);
+  let delivered = false;
+  for (const subscriber of Array.from(subscribers)) {
+    if (subscriber === excludeState) continue;
+    const result = sendServerWebSocketFrame(subscriber, resolvedOpcode, payload);
+    if (result !== 0) delivered = true;
+  }
+  if (!delivered) return 0;
+  return payload.byteLength > 0 ? payload.byteLength : 1;
+}
+
+class ServerWebSocket {
+  constructor(state) {
+    this._state = state;
+    this.data = state.data;
+  }
+
+  get readyState() {
+    return this._state.readyState;
+  }
+
+  get remoteAddress() {
+    return this._state.remoteAddress ?? this._state.socket?.remoteAddress ?? "";
+  }
+
+  get binaryType() {
+    return this._state.binaryType;
+  }
+
+  set binaryType(value) {
+    if (value !== "nodebuffer" && value !== "arraybuffer" && value !== "uint8array") {
+      throw new TypeError("binaryType must be 'nodebuffer', 'arraybuffer', or 'uint8array'");
+    }
+    this._state.binaryType = value;
+  }
+
+  get subscriptions() {
+    return Array.from(this._state.topics);
+  }
+
+  getBufferedAmount() {
+    const socket = this._state.socket;
+    return socket && !socket.destroyed ? socket.writableLength : 0;
+  }
+
+  send(data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "send");
+    return sendServerWebSocketFrame(this._state, typeof data === "string" ? 0x1 : 0x2, data);
+  }
+
+  sendText(data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "sendText");
+    return sendServerWebSocketFrame(this._state, 0x1, String(data));
+  }
+
+  sendBinary(data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "sendBinary");
+    return sendServerWebSocketFrame(this._state, 0x2, data);
+  }
+
+  ping(data = undefined) {
+    return sendServerWebSocketFrame(this._state, 0x9, data);
+  }
+
+  pong(data = undefined) {
+    return sendServerWebSocketFrame(this._state, 0xA, data);
+  }
+
+  subscribe(topic) {
+    const name = String(topic ?? "");
+    if (name.length === 0) throw new TypeError("subscribe requires a non-empty topic name");
+    if (this._state.readyState !== 1) return false;
+    this._state.topics.add(name);
+    let set = this._state.serverState.topics.get(name);
+    if (!set) {
+      set = new Set();
+      this._state.serverState.topics.set(name, set);
+    }
+    set.add(this._state);
+    return true;
+  }
+
+  unsubscribe(topic) {
+    const name = String(topic ?? "");
+    if (name.length === 0) throw new TypeError("unsubscribe requires a non-empty topic name");
+    this._state.topics.delete(name);
+    const set = this._state.serverState.topics.get(name);
+    if (set) {
+      set.delete(this._state);
+      if (set.size === 0) this._state.serverState.topics.delete(name);
+    }
+    return true;
+  }
+
+  isSubscribed(topic) {
+    return this._state.topics.has(String(topic ?? ""));
+  }
+
+  publish(topic, data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "publish");
+    const excludeSelf = !this._state.config.publishToSelf;
+    return publishToWebSocketTopic(this._state.serverState, topic, data, undefined, excludeSelf ? this._state : null);
+  }
+
+  publishText(topic, data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "publishText");
+    const excludeSelf = !this._state.config.publishToSelf;
+    return publishToWebSocketTopic(this._state.serverState, topic, String(data), 0x1, excludeSelf ? this._state : null);
+  }
+
+  publishBinary(topic, data, compress = undefined) {
+    assertWebSocketCompressFlag(compress, "publishBinary");
+    const excludeSelf = !this._state.config.publishToSelf;
+    return publishToWebSocketTopic(this._state.serverState, topic, data, 0x2, excludeSelf ? this._state : null);
+  }
+
+  cork(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("cork requires a function");
+    }
+    return callback(this);
+  }
+
+  close(code = 1000, reason = "") {
+    closeServerWebSocket(this._state, Number(code) || 1000, String(reason ?? ""));
+  }
+
+  terminate() {
+    terminateServerWebSocket(this._state);
+  }
+
+  ref() {}
+  unref() {}
+}
+
+function attachServerWebSocket(serverState, socket, head, data) {
+  const websocketOptions = serverState.getWebSocketOptions() ?? {};
+  const state = {
+    serverState,
+    socket,
+    data,
+    readyState: 1,
+    binaryType: "nodebuffer",
+    topics: new Set(),
+    buffer: Buffer.alloc(0),
+    fragments: [],
+    fragmentOpcode: 0,
+    wantDrain: false,
+    finalized: false,
+    remoteAddress: socket.remoteAddress,
+    config: {
+      maxPayloadLength: Number(websocketOptions.maxPayloadLength ?? 16 * 1024 * 1024),
+      backpressureLimit: Number(websocketOptions.backpressureLimit ?? 1024 * 1024),
+      closeOnBackpressureLimit: Boolean(websocketOptions.closeOnBackpressureLimit),
+      publishToSelf: Boolean(websocketOptions.publishToSelf),
+    },
+    getHandlers: () => serverState.getWebSocketOptions() ?? {},
+  };
+  const ws = new ServerWebSocket(state);
+  state.ws = ws;
+  serverState.websockets.add(state);
+  serverState.server.pendingWebSockets += 1;
+
+  const handleFrame = (frame) => {
+    if (frame.opcode === 0x8) {
+      const code = frame.payload.byteLength >= 2 ? ((frame.payload[0] << 8) | frame.payload[1]) : 1000;
+      const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
+      if (state.readyState === 1) {
+        state.readyState = 2;
+        try { socket.write(encodeServerWebSocketFrame(0x8, frame.payload)); } catch {}
+      }
+      try { socket.end(); } catch {}
+      finalizeServerWebSocket(state, code, reason);
+      return;
+    }
+    if (frame.opcode === 0x9) {
+      if (state.readyState === 1) {
+        try { socket.write(encodeServerWebSocketFrame(0xA, frame.payload)); } catch {}
+      }
+      invokeWebSocketHandler(state, "ping", ws, convertWebSocketBinary(state, frame.payload));
+      return;
+    }
+    if (frame.opcode === 0xA) {
+      invokeWebSocketHandler(state, "pong", ws, convertWebSocketBinary(state, frame.payload));
+      return;
+    }
+    if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+      state.fragmentOpcode = frame.opcode;
+      state.fragments = [frame.payload];
+    } else if (frame.opcode === 0x0 && state.fragmentOpcode) {
+      state.fragments.push(frame.payload);
+    } else {
+      return;
+    }
+    const totalLength = state.fragments.reduce((sum, part) => sum + part.byteLength, 0);
+    if (totalLength > state.config.maxPayloadLength) {
+      terminateServerWebSocket(state);
+      return;
+    }
+    if (!frame.fin) return;
+    const payload = state.fragments.length === 1 ? state.fragments[0] : Buffer.concat(state.fragments);
+    const opcode = state.fragmentOpcode;
+    state.fragments = [];
+    state.fragmentOpcode = 0;
+    const message = opcode === 0x1 ? payload.toString("utf8") : convertWebSocketBinary(state, payload);
+    invokeWebSocketHandler(state, "message", ws, message);
+  };
+
+  const handleData = (chunk) => {
+    if (state.finalized) return;
+    const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    state.buffer = state.buffer.byteLength === 0 ? incoming : Buffer.concat([state.buffer, incoming]);
+    let parsed;
+    try {
+      parsed = decodeWebSocketFrames(state.buffer);
+    } catch {
+      terminateServerWebSocket(state);
+      return;
+    }
+    state.buffer = parsed.remaining;
+    for (const frame of parsed.frames) {
+      if (state.finalized) return;
+      handleFrame(frame);
+    }
+  };
+
+  socket.on("data", handleData);
+  socket.on("error", () => {});
+  socket.on("close", () => {
+    serverState.websockets.delete(state);
+    if (!state.finalized) finalizeServerWebSocket(state, 1006, "");
+  });
+  socket.on("drain", () => scheduleServerWebSocketDrain(state));
+
+  queueMicrotask(() => {
+    if (state.finalized) return;
+    invokeWebSocketHandler(state, "open", ws);
+    if (head != null && head.byteLength > 0) handleData(head);
+  });
+  return ws;
+}
+
+function encodeMaskedWebSocketFrame(opcode, data) {
+  const payload = websocketPayloadBytes(data);
+  const length = payload.byteLength;
+  let header;
+  if (length < 126) {
+    header = Buffer.from([0x80 | (opcode & 0x0f), 0x80 | length]);
+  } else if (length <= 0xffff) {
+    header = Buffer.from([0x80 | (opcode & 0x0f), 0x80 | 126, (length >> 8) & 0xff, length & 0xff]);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 0x80 | 127;
+    let big = BigInt(length);
+    for (let index = 9; index >= 2; index -= 1) {
+      header[index] = Number(big & 0xffn);
+      big >>= 8n;
+    }
+  }
+  const mask = randomBytes(4);
+  const masked = Buffer.from(payload);
+  for (let index = 0; index < masked.byteLength; index += 1) masked[index] ^= mask[index % 4];
+  return Buffer.concat([header, mask, masked]);
+}
+
+// Bun extends the standard WebSocket client with terminate()/ping()/pong(),
+// a "nodebuffer" binaryType (the default), ping/pong events, and Blob
+// payload support. The base client lives in node/http.js; add the Bun
+// surface here.
+(function patchWebSocketClientForBun() {
+  const WS = globalThis.WebSocket;
+  const proto = WS?.prototype;
+  if (!proto || typeof proto.terminate === "function" || typeof proto._handleFrame !== "function") return;
+
+  const convertClientBinary = (ws, payload) => {
+    const binaryType = ws.binaryType;
+    if (binaryType === "arraybuffer") {
+      return payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+    }
+    if (binaryType === "uint8array") {
+      return new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+    }
+    if (binaryType === "blob") {
+      return new Blob([payload]);
+    }
+    return Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+  };
+
+  Object.defineProperty(proto, "binaryType", {
+    configurable: true,
+    get() {
+      return this._bunBinaryType ?? "nodebuffer";
+    },
+    set(value) {
+      if (value !== "nodebuffer" && value !== "arraybuffer" && value !== "blob" && value !== "uint8array") {
+        throw new TypeError("binaryType must be 'nodebuffer', 'blob', 'arraybuffer', or 'uint8array'");
+      }
+      // The base constructor assigns "blob" once; Bun's default is
+      // "nodebuffer", so ignore that initial assignment.
+      if (this._bunBinaryType === undefined && value === "blob" && !this._bunBinaryTypeTouched) {
+        this._bunBinaryTypeTouched = true;
+        return;
+      }
+      this._bunBinaryTypeTouched = true;
+      this._bunBinaryType = value;
+    },
+  });
+
+  proto.terminate = function terminate() {
+    try { this._socket?.destroy?.(); } catch {}
+    this._close?.(1006, "", false);
+  };
+
+  const sendControlFrame = (ws, opcode, data) => {
+    if (ws.readyState !== 1) return;
+    const write = (payload) => {
+      try { ws._socket?.write?.(encodeMaskedWebSocketFrame(opcode, payload)); } catch {}
+    };
+    if (data != null && typeof data === "object" && typeof data.arrayBuffer === "function") {
+      data.arrayBuffer().then((buffer) => write(new Uint8Array(buffer)), () => {});
+      return;
+    }
+    write(data);
+  };
+
+  proto.ping = function ping(data = undefined) {
+    sendControlFrame(this, 0x9, data);
+  };
+  proto.pong = function pong(data = undefined) {
+    sendControlFrame(this, 0xA, data);
+  };
+
+  const originalSend = proto.send;
+  proto.send = function send(data) {
+    if (data != null && typeof data === "object" && typeof data.arrayBuffer === "function" &&
+        !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
+      // Blob-like payloads are read asynchronously and sent as binary frames.
+      data.arrayBuffer().then(
+        (buffer) => {
+          try { originalSend.call(this, new Uint8Array(buffer)); } catch {}
+        },
+        () => {},
+      );
+      return;
+    }
+    return originalSend.call(this, data);
+  };
+
+  const originalHandleFrame = proto._handleFrame;
+  proto._handleFrame = function (frame) {
+    if (frame.opcode >= 0x8 && (frame.payload.byteLength > 125 || !frame.fin)) {
+      // RFC 6455 5.5: control frames must not be fragmented or exceed 125
+      // bytes; treat violations as protocol errors.
+      this._fail?.(new Error("Invalid control frame"));
+      return;
+    }
+    if (frame.opcode === 0x9) {
+      if (this.readyState === 1) {
+        try { this._socket?.write?.(encodeMaskedWebSocketFrame(0xA, frame.payload)); } catch {}
+      }
+      this.dispatchEvent?.({ type: "ping", data: convertClientBinary(this, frame.payload), target: this });
+      return;
+    }
+    if (frame.opcode === 0xA) {
+      this.dispatchEvent?.({ type: "pong", data: convertClientBinary(this, frame.payload), target: this });
+      return;
+    }
+    if ((frame.opcode === 0x2 || (frame.opcode === 0x0 && this._fragmentOpcode === 0x2)) && frame.fin &&
+        this.binaryType !== "arraybuffer") {
+      // Deliver binary messages per Bun's binaryType semantics (the base
+      // implementation only understands "arraybuffer" vs Buffer).
+      const payload = this._fragments && this._fragments.length > 0 && frame.opcode === 0x0
+        ? Buffer.concat([...this._fragments, frame.payload])
+        : frame.payload;
+      if (frame.opcode === 0x0) {
+        this._fragments = [];
+        this._fragmentOpcode = 0;
+      }
+      const MessageEventClass = globalThis.MessageEvent ?? nodeHttp.MessageEvent;
+      this.dispatchEvent(new MessageEventClass("message", {
+        data: convertClientBinary(this, payload),
+        origin: this.url,
+        source: this,
+      }));
+      return;
+    }
+    return originalHandleFrame.call(this, frame);
+  };
+})();
+
+function serveTlsMaterialText(value, name) {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => serveTlsMaterialText(item, name)).filter((item) => item != null);
+    return parts.length === 0 ? null : parts.join("\n");
+  }
+  if (typeof value === "string") return value;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    return new TextDecoder().decode(asBuffer(value));
+  }
+  if (isBunFileLike(value) && typeof value._bunFilePath === "string") {
+    return String(cottontail.readFile(value._bunFilePath));
+  }
+  throw new TypeError(`Expected ${name} to be a string, Buffer, TypedArray, or BunFile`);
+}
+
+function assertValidServePem(text, name) {
+  const pattern = /-----BEGIN [A-Z0-9 ]+-----[A-Za-z0-9+/=\r\n]+-----END [A-Z0-9 ]+-----/;
+  if (!pattern.test(String(text ?? ""))) {
+    throw new TypeError(`Invalid ${name} in Bun.serve() TLS options`);
+  }
+}
+
+function validateServeTls(tls) {
+  if (tls == null || tls === false) return null;
+  if (typeof tls !== "object") throw new TypeError("Bun.serve tls option must be an object");
+  const isArray = Array.isArray(tls);
+  const list = isArray ? tls : [tls];
+  if (list.length === 0) return null;
+  const configs = [];
+  for (const entry of list) {
+    if (entry == null || typeof entry !== "object") {
+      throw new TypeError("Bun.serve tls option must be an object");
+    }
+    const key = serveTlsMaterialText(entry.key, "key");
+    const cert = serveTlsMaterialText(entry.cert, "cert");
+    if (key != null) assertValidServePem(key, "key");
+    if (cert != null) assertValidServePem(cert, "cert");
+    if (isArray) {
+      if (typeof entry.serverName !== "string" || entry.serverName.length === 0) {
+        throw new TypeError("Bun.serve tls array entries require a serverName");
+      }
+    }
+    configs.push({
+      key,
+      cert,
+      ca: entry.ca == null ? null : serveTlsMaterialText(entry.ca, "ca"),
+      serverName: entry.serverName,
+      passphrase: entry.passphrase,
+    });
+  }
+  if (!configs.some((config) => config.key != null || config.cert != null)) return null;
+  return configs;
+}
+
+function serveUnixUrlText(unixPath) {
+  if (unixPath.startsWith("\0")) return `abstract://${unixPath.slice(1)}/`;
+  let resolved = unixPath;
+  try { resolved = nodePathResolve(unixPath); } catch {}
+  return `unix://${resolved.startsWith("/") ? "" : "/"}${resolved}`;
+}
+
+function validateServeUnixPathTarget(unixPath) {
+  if (!unixPath || unixPath.startsWith("\0")) return;
+  const limit = process.platform === "linux" ? 108 : 104;
+  if (Buffer.byteLength(unixPath) >= limit) {
+    const error = new Error(`ENAMETOOLONG: File name too long, listen '${unixPath}'`);
+    error.code = "ENAMETOOLONG";
+    throw error;
+  }
+  const slash = unixPath.lastIndexOf("/");
+  if (slash > 0) {
+    const dir = unixPath.slice(0, slash);
+    if (!cottontail.existsSync(dir)) {
+      const error = new Error(`ENOENT: no such file or directory, listen '${unixPath}'`);
+      error.code = "ENOENT";
+      throw error;
+    }
+  }
+}
+
+function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest = false) {
+  const headers = new Headers();
+  const raw = message.rawHeaders ?? [];
+  for (let index = 0; index + 1 < raw.length; index += 2) {
+    headers.append(raw[index], raw[index + 1]);
+  }
+  if (tunnelRequest) {
+    // Bun exposes connection/upgrade header values lowercased for upgrade requests.
+    for (const name of ["connection", "upgrade"]) {
+      const value = headers.get(name);
+      if (value != null) headers.set(name, value.toLowerCase());
+    }
+  }
+  const host = message.headers?.host ?? fallbackHost;
+  const url = `${protocol}//${host}${message.url ?? "/"}`;
+  const controller = new AbortController();
+  const init = {
+    method: message.method,
+    headers,
+    signal: controller.signal,
+  };
+  const method = String(message.method ?? "GET").toUpperCase();
+  const request = new Request(url, init);
+  if (method !== "GET" && method !== "HEAD") {
+    const body = message._incomingBody;
+    if (body != null && body.byteLength > 0) request._body = asBuffer(body);
+  }
+  return { request, controller };
+}
+
+function serveNodeBacked(options, context) {
+  const { hostname, unixPath, tlsConfigs } = context;
+  const isUnix = unixPath.length > 0;
+  const useTls = tlsConfigs != null;
+  const protocol = useTls ? "https:" : "http:";
+  let activeOptions = options;
+  let stopped = false;
+  let publicUrl = null;
+
+  let nodeServer;
+  let boundHostname = hostname;
+  let boundPort = 0;
+  if (useTls) {
+    if (isUnix) throw new TypeError("Bun.serve does not support tls with unix sockets yet");
+    const primary = tlsConfigs.find((config) => config.key != null && config.cert != null) ?? tlsConfigs[0];
+    nodeServer = new nodeHttps.Server({});
+    const listenHost = hostname === "localhost" ? "127.0.0.1" : hostname;
+    let native;
+    try {
+      native = cottontail.tlsServerListen(
+        defaultServePort(options),
+        listenHost,
+        String(primary.cert ?? ""),
+        String(primary.key ?? ""),
+      );
+    } catch (rawError) {
+      const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+      if (error.code == null && /(in use|EADDRINUSE)/i.test(String(error.message))) error.code = "EADDRINUSE";
+      throw error;
+    }
+    // node/tls.js Server.listen() binds asynchronously, but Bun.serve must
+    // expose the bound port synchronously; graft the native listener onto the
+    // https server the same way tls.Server.listen() does.
+    nodeServer._tlsServerId = Number(native.id);
+    nodeServer._tlsAddress = native.address ?? null;
+    nodeServer.listening = true;
+    nodeServer._tlsAcceptTimer = setInterval(() => nodeServer._acceptTls(), 1);
+    boundPort = Number(native.address?.port ?? 0);
+  } else {
+    nodeServer = new nodeHttp.Server();
+    nodeServer.on("error", () => {});
+    const listenHost = hostname === "localhost" ? "127.0.0.1" : hostname;
+    nodeServer.listen(isUnix
+      ? { path: unixPath }
+      : { host: listenHost, port: defaultServePort(options), family: listenHost.includes(":") ? 6 : 4 });
+    if (!nodeServer._native?.listening) {
+      const requestedPort = defaultServePort(options);
+      const error = new Error(
+        isUnix
+          ? `Failed to listen on unix socket ${unixPath}`
+          : `Failed to start server. Is port ${requestedPort} in use?`,
+      );
+      error.code = "EADDRINUSE";
+      throw error;
+    }
+    if (!isUnix) boundPort = Number(nodeServer.address()?.port ?? 0);
+  }
+
+  const displayHostname = boundHostname.includes(":") ? `[${boundHostname}]` : boundHostname;
+  const fallbackHost = isUnix ? "localhost" : `${displayHostname}:${boundPort}`;
+  const requestOrigin = isUnix ? `${protocol}//localhost` : `${protocol}//${displayHostname}:${boundPort}`;
+  const originKeys = isUnix ? [] : [
+    requestOrigin,
+    ...(boundHostname === "0.0.0.0" || boundHostname === "::"
+      ? [`${protocol}//127.0.0.1:${boundPort}`, `${protocol}//localhost:${boundPort}`]
+      : []),
+    ...(boundHostname === "localhost" ? [`${protocol}//127.0.0.1:${boundPort}`] : []),
+  ];
+
+  const serverState = {
+    topics: new Map(),
+    websockets: new Set(),
+    getWebSocketOptions: () => (activeOptions.websocket && typeof activeOptions.websocket === "object" ? activeOptions.websocket : null),
+    server: null,
+  };
+
+  const server = {
+    id: options.id ?? `bun-serve-${boundPort || unixPath}`,
+    hostname: isUnix ? undefined : boundHostname,
+    port: isUnix ? undefined : boundPort,
+    address: isUnix ? unixPath : undefined,
+    development: options.development ?? false,
+    pendingRequests: 0,
+    pendingWebSockets: 0,
+    get url() {
+      publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
+      return publicUrl;
+    },
+    stop(force = false) {
+      if (stopped) return Promise.resolve();
+      stopped = true;
+      for (const origin of originKeys) activeServeOrigins.delete(origin);
+      for (const state of Array.from(serverState.websockets)) {
+        if (force) terminateServerWebSocket(state);
+        else closeServerWebSocket(state, 1001, "Server is shutting down");
+        serverState.websockets.delete(state);
+      }
+      nodeServer.close();
+      if (force) nodeServer.closeAllConnections?.();
+      return Promise.resolve();
+    },
+    [Symbol.dispose]() {
+      return server.stop();
+    },
+    [Symbol.asyncDispose]() {
+      return server.stop();
+    },
+    reload(nextOptions = {}) {
+      activeOptions = { ...activeOptions, ...nextOptions };
+      return server;
+    },
+    async fetch(input, init = {}) {
+      const request = input instanceof Request ? input : new Request(String(input), init);
+      let response;
+      try {
+        response = await runServeHandler(activeOptions, request, server);
+      } catch (error) {
+        if (typeof activeOptions.error !== "function") throw error;
+        response = await serveErrorResponse(activeOptions, error);
+      }
+      response.url = request.url;
+      return response;
+    },
+    ref() {
+      nodeServer.ref?.();
+      return server;
+    },
+    unref() {
+      nodeServer.unref?.();
+      return server;
+    },
+    requestIP(request) {
+      const socket = serveRequestSockets.get(request);
+      if (!socket || socket.destroyed) return null;
+      const address = socket.remoteAddress;
+      if (!address) return null;
+      return {
+        address,
+        port: Number(socket.remotePort ?? 0),
+        family: String(address).includes(":") ? "IPv6" : "IPv4",
+      };
+    },
+    timeout() {},
+    upgrade(request, upgradeOptions = {}) {
+      if (!(request instanceof Request)) {
+        throw new TypeError("upgrade requires a Request object");
+      }
+      const ctx = serveUpgradeContexts.get(request);
+      if (!ctx || ctx.used || ctx.socket.destroyed) return false;
+      const key = request.headers.get("sec-websocket-key");
+      const upgradeName = String(request.headers.get("upgrade") ?? "").toLowerCase();
+      if (!key || upgradeName !== "websocket") return false;
+      if (serverState.getWebSocketOptions() == null) return false;
+      ctx.used = true;
+      const lines = [
+        "HTTP/1.1 101 Switching Protocols",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        `Sec-WebSocket-Accept: ${websocketAcceptKeyForServe(key)}`,
+      ];
+      const extraHeaders = upgradeOptions?.headers;
+      const seen = new Set();
+      if (extraHeaders != null) {
+        const entries = typeof extraHeaders.entries === "function"
+          ? extraHeaders.entries()
+          : Object.entries(extraHeaders);
+        for (const [name, value] of entries) {
+          seen.add(String(name).toLowerCase());
+          lines.push(`${name}: ${value}`);
+        }
+      }
+      if (!seen.has("sec-websocket-protocol")) {
+        const requestedProtocol = request.headers.get("sec-websocket-protocol");
+        if (requestedProtocol) lines.push(`Sec-WebSocket-Protocol: ${requestedProtocol.split(",")[0].trim()}`);
+      }
+      lines.push("", "");
+      try {
+        ctx.socket.write(lines.join("\r\n"));
+      } catch {
+        return false;
+      }
+      attachServerWebSocket(serverState, ctx.socket, ctx.head, upgradeOptions?.data);
+      return true;
+    },
+    publish(topic, data, compress = undefined) {
+      assertWebSocketCompressFlag(compress, "publish");
+      return publishToWebSocketTopic(serverState, topic, data, undefined, null);
+    },
+    subscriberCount(topic) {
+      const set = serverState.topics.get(String(topic ?? ""));
+      return set ? set.size : 0;
+    },
+  };
+  serverState.server = server;
+
+  for (const origin of originKeys) activeServeOrigins.set(origin, server);
+
+  const writeNodeResponse = (nodeResponse, response, request) => {
+    const method = String(request.method ?? "GET").toUpperCase();
+    nodeResponse.statusCode = response.status;
+    if (response.statusText) nodeResponse.statusMessage = response.statusText;
+    const setCookies = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie() : [];
+    response.headers.forEach((value, name) => {
+      if (String(name).toLowerCase() === "set-cookie") return;
+      try { nodeResponse.setHeader(name, value); } catch {}
+    });
+    if (setCookies.length > 0) {
+      try { nodeResponse.setHeader("Set-Cookie", setCookies); } catch {}
+    }
+    const body = response._body;
+    if (method !== "HEAD" && statusAllowsBody(response.status) && isStreamingBody(body)) {
+      nodeResponse.removeHeader("content-length");
+      nodeResponse.writeHead(nodeResponse.statusCode);
+      return consumeStreamingBody(body, (chunk) => {
+        if (nodeResponse.socket == null || nodeResponse.socket.destroyed) {
+          const error = new Error("Socket closed");
+          error.code = "ECONNRESET";
+          throw error;
+        }
+        nodeResponse.write(asBuffer(chunk));
+      }).then(
+        () => { nodeResponse.end(); },
+        () => {
+          try { nodeResponse.socket?.destroy?.(); } catch {}
+          try { nodeResponse.destroy(); } catch {}
+        },
+      );
+    }
+    const finishWithBytes = (bytes) => {
+      if (method === "HEAD" || !statusAllowsBody(response.status)) {
+        nodeResponse.end();
+        return;
+      }
+      nodeResponse.end(Buffer.from(bytes));
+    };
+    if (body == null || typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+      finishWithBytes(bytesFromData(body));
+      return undefined;
+    }
+    return Promise.resolve(bytesFromBody(body)).then(finishWithBytes, () => {
+      try { nodeResponse.socket?.destroy?.(); } catch {}
+    });
+  };
+
+  nodeServer.on("request", (message, nodeResponse) => {
+    server.pendingRequests += 1;
+    const { request, controller } = requestFromNodeIncoming(message, protocol, fallbackHost);
+    const socket = message.socket;
+    if (socket) {
+      serveRequestSockets.set(request, socket);
+      const onSocketClose = () => {
+        if (!nodeResponse.writableEnded) {
+          try { controller.abort(); } catch {}
+        }
+      };
+      socket.once("close", onSocketClose);
+      nodeResponse.once("finish", () => socket.off?.("close", onSocketClose));
+    }
+    const finalize = () => {
+      server.pendingRequests -= 1;
+    };
+    let handled;
+    try {
+      handled = runServeHandler(activeOptions, request, server);
+    } catch (error) {
+      handled = serveErrorResponse(activeOptions, error);
+    }
+    Promise.resolve(handled)
+      .then(
+        (response) => writeNodeResponse(nodeResponse, response, request),
+        (error) => Promise.resolve(serveErrorResponse(activeOptions, error))
+          .then((response) => writeNodeResponse(nodeResponse, response, request)),
+      )
+      .then(finalize, (error) => {
+        finalize();
+        reportServeHandlerError(error);
+      });
+  });
+
+  nodeServer.on("upgrade", (message, socket, head) => {
+    const { request } = requestFromNodeIncoming(message, protocol, fallbackHost, true);
+    serveUpgradeContexts.set(request, { socket, head, used: false });
+    serveRequestSockets.set(request, socket);
+    socket.on("error", () => {});
+    let result;
+    try {
+      result = typeof activeOptions.fetch === "function"
+        ? activeOptions.fetch(request, server)
+        : undefined;
+    } catch (error) {
+      reportServeHandlerError(error);
+      socket.destroy?.();
+      return;
+    }
+    Promise.resolve(result).then(
+      (value) => {
+        const ctx = serveUpgradeContexts.get(request);
+        if (ctx?.used) return;
+        if (value == null) {
+          socket.destroy?.();
+          return;
+        }
+        return Promise.resolve(prepareServeResponseResult(value, request)).then((response) => {
+          const bodyBytes = Promise.resolve(bytesFromBody(response._body));
+          return bodyBytes.then((bytes) => {
+            const lines = [`HTTP/1.1 ${response.status} ${response.statusText || nodeHttp.STATUS_CODES[response.status] || ""}`];
+            response.headers.forEach((value2, name) => {
+              if (String(name).toLowerCase() === "content-length") return;
+              lines.push(`${name}: ${value2}`);
+            });
+            lines.push(`Content-Length: ${bytes.byteLength}`, "Connection: close", "", "");
+            try {
+              socket.write(Buffer.concat([Buffer.from(lines.join("\r\n")), Buffer.from(bytes)]));
+              socket.end();
+            } catch {}
+          });
+        });
+      },
+      (error) => {
+        reportServeHandlerError(error);
+        socket.destroy?.();
+      },
+    );
+  });
+
+  return server;
 }
 
 export function serve(options = {}) {
@@ -3243,9 +5404,23 @@ export function serve(options = {}) {
     throw new TypeError("Bun.serve cannot use hostname with unix");
   }
   const hostname = normalizeServeHostname(options.hostname);
+  if (unixPath) validateServeUnixPathTarget(unixPath);
+
+  const websocketHandlers = options.websocket ?? null;
+  if (websocketHandlers != null && typeof websocketHandlers !== "object") {
+    throw new TypeError("Expected websocket to be an object");
+  }
+  const tlsConfigs = validateServeTls(options.tls);
+  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
+    return serveNodeBacked(options, { hostname, unixPath, tlsConfigs });
+  }
+
   const native = cottontail.httpServerStart(hostname, defaultServePort(options), unixPath || undefined);
   const isUnix = unixPath.length > 0;
-  const requestOrigin = isUnix ? "http://localhost" : `http://${native.hostname}:${native.port}`;
+  const nativeDisplayHostname = String(native.hostname ?? hostname).includes(":") && !String(native.hostname ?? hostname).startsWith("[")
+    ? `[${native.hostname}]`
+    : native.hostname;
+  const requestOrigin = isUnix ? "http://localhost" : `http://${nativeDisplayHostname}:${native.port}`;
   let activeOptions = options;
   let stopped = false;
   let pumping = false;
@@ -3265,7 +5440,7 @@ export function serve(options = {}) {
     pendingRequests: 0,
     pendingWebSockets: 0,
     get url() {
-      publicUrl ??= new globalThis.URL(`${requestOrigin}/`);
+      publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
       return publicUrl;
     },
     stop() {
@@ -3715,7 +5890,10 @@ function guessMimeType(path) {
 
 export function file(path, options = undefined) {
   const isFd = typeof path === "number";
-  const filePath = isFd ? Number(path) : String(path);
+  let filePath = isFd ? Number(path) : String(path);
+  if (!isFd && typeof filePath === "string" && filePath.startsWith("file://")) {
+    try { filePath = nodeFileURLToPath(filePath); } catch {}
+  }
   let cachedBytes = null;
   let cachedMtime = -1;
   let cachedSize = -1;
@@ -4257,7 +6435,65 @@ export const isMainThread = cottontail.isWorker?.() !== true;
 export const version = "0.0.0-cottontail";
 export const revision = "cottontail";
 export const version_with_sha = `${version} (${revision})`;
-export const stdin = globalThis.process?.stdin;
+// Bun.stdin is a BunFile-like object (upstream: a lazy Blob over fd 0) with
+// stream()/text()/json()/bytes()/arrayBuffer(). process.stdin is a real node
+// Readable now, so wrap it rather than exposing it directly.
+function collectStdinBytes() {
+  const source = globalThis.process?.stdin;
+  if (!source) return Promise.resolve(new Uint8Array(0));
+  return (async () => {
+    const chunks = [];
+    for await (const chunk of source) chunks.push(asBuffer(chunk));
+    return concatManyBuffers(chunks);
+  })();
+}
+export const stdin = {
+  name: "",
+  fd: 0,
+  type: "application/octet-stream",
+  [Symbol.for("nodejs.util.inspect.custom")]() {
+    return "FileRef (stdin) {}";
+  },
+  get size() {
+    try { return Number(cottontail.fstatSync(0)?.size ?? 0); } catch { return 0; }
+  },
+  get readable() {
+    return this.stream();
+  },
+  stream() {
+    const source = globalThis.process?.stdin;
+    return bodyReadableStream((async function* () {
+      if (!source) return;
+      for await (const chunk of source) yield asBuffer(chunk);
+    })());
+  },
+  async text() {
+    return new TextDecoder().decode(await collectStdinBytes());
+  },
+  async json() {
+    return JSON.parse(new TextDecoder().decode(await collectStdinBytes()));
+  },
+  async bytes() {
+    return collectStdinBytes();
+  },
+  async arrayBuffer() {
+    const bytes = await collectStdinBytes();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  },
+  async exists() {
+    return true;
+  },
+  // Delegate event-emitter style access so legacy callers treating Bun.stdin
+  // as process.stdin keep working.
+  on(...args) { globalThis.process?.stdin?.on?.(...args); return this; },
+  once(...args) { globalThis.process?.stdin?.once?.(...args); return this; },
+  off(...args) { globalThis.process?.stdin?.off?.(...args); return this; },
+  resume() { globalThis.process?.stdin?.resume?.(); return this; },
+  pause() { globalThis.process?.stdin?.pause?.(); return this; },
+  setEncoding(value) { globalThis.process?.stdin?.setEncoding?.(value); return this; },
+  ref() { globalThis.process?.stdin?.ref?.(); return this; },
+  unref() { globalThis.process?.stdin?.unref?.(); return this; },
+};
 export const stdout = globalThis.process?.stdout;
 export const stderr = globalThis.process?.stderr;
 export const SQL = SQLiteDatabase;
@@ -4331,7 +6567,70 @@ export function escapeHTML(value, attribute = false) {
 export function stripANSI(value) {
   const text = String(value);
   if (text.indexOf("\x1b") === -1 && text.indexOf("\x9b") === -1) return text;
-  return stripVTControlCharacters(text);
+  const length = text.length;
+  let out = "";
+  let plainStart = 0;
+  let index = 0;
+  while (index < length) {
+    const code = text.charCodeAt(index);
+    if (code !== 0x1b && code !== 0x9b) {
+      index += 1;
+      continue;
+    }
+    out += text.slice(plainStart, index);
+    if (code === 0x9b) {
+      // C1 CSI: parse the control sequence body directly.
+      index = stripANSIConsumeCSI(text, index + 1);
+    } else if (index + 1 >= length) {
+      // Lone trailing ESC.
+      index = length;
+    } else {
+      const next = text.charCodeAt(index + 1);
+      if (next === 0x5b) {
+        // ESC [ - CSI sequence.
+        index = stripANSIConsumeCSI(text, index + 2);
+      } else if (next === 0x5d) {
+        // ESC ] - OSC sequence: payload runs to BEL, ST (ESC \ or 0x9C), or end.
+        index = stripANSIConsumeOSC(text, index + 2);
+      } else if (next >= 0x20 && next <= 0x2f) {
+        // ESC <intermediate> <final> - e.g. ESC ( B, ESC # 8, ESC % G, ESC SP x.
+        index = Math.min(index + 3, length);
+      } else {
+        // Two-character escape sequence - e.g. ESC 7, ESC =, ESC M.
+        index += 2;
+      }
+    }
+    plainStart = index;
+  }
+  return out + text.slice(plainStart);
+}
+
+function stripANSIConsumeCSI(text, index) {
+  const length = text.length;
+  while (index < length) {
+    const code = text.charCodeAt(index);
+    if (code >= 0x20 && code <= 0x3f) {
+      // Parameter (0x30-0x3F) and intermediate (0x20-0x2F) bytes.
+      index += 1;
+      continue;
+    }
+    if (code >= 0x40 && code <= 0x7e) return index + 1; // final byte
+    return index; // invalid byte ends the sequence without being consumed
+  }
+  return index; // unterminated sequence consumes the rest
+}
+
+function stripANSIConsumeOSC(text, index) {
+  const length = text.length;
+  while (index < length) {
+    const code = text.charCodeAt(index);
+    if (code === 0x07 || code === 0x9c) return index + 1; // BEL or C1 ST
+    if (code === 0x1b && index + 1 < length && text.charCodeAt(index + 1) === 0x5c) {
+      return index + 2; // ESC \ (ST)
+    }
+    index += 1;
+  }
+  return index; // unterminated OSC consumes the rest
 }
 
 function isCombiningCodePoint(codePoint) {
@@ -4825,10 +7124,80 @@ export function pathToFileURL(value) {
   return new URL(`file://${encoded.startsWith("/") ? "" : "/"}${encoded}`);
 }
 
+function packageImportsTargetForConditions(target) {
+  if (typeof target === "string") return target;
+  if (Array.isArray(target)) {
+    for (const item of target) {
+      const resolved = packageImportsTargetForConditions(item);
+      if (resolved != null) return resolved;
+    }
+    return null;
+  }
+  if (target && typeof target === "object") {
+    for (const condition of ["bun", "node", "import", "require", "default"]) {
+      if (target[condition] !== undefined) {
+        const resolved = packageImportsTargetForConditions(target[condition]);
+        if (resolved != null) return resolved;
+      }
+    }
+  }
+  return null;
+}
+
+function resolvePackageImportsSync(specifier, from) {
+  let fromPath = String(from ?? cottontail.cwd());
+  if (fromPath.startsWith("file:")) {
+    try { fromPath = fileURLToPath(fromPath); } catch { /* keep as-is */ }
+  }
+  if (!fromPath.startsWith("/")) fromPath = nodePathResolve(String(fromPath));
+  let dir = fromPath;
+  while (dir && dir !== "/") {
+    dir = dir.replace(/\/[^/]*$/, "") || "/";
+    const packageJsonPath = dir === "/" ? "/package.json" : `${dir}/package.json`;
+    if (cottontail.existsSync(packageJsonPath)) {
+      let imports;
+      try { imports = JSON.parse(cottontail.readFile(packageJsonPath))?.imports; } catch { imports = undefined; }
+      if (imports && typeof imports === "object") {
+        let target = imports[specifier] !== undefined ? packageImportsTargetForConditions(imports[specifier]) : null;
+        if (target == null) {
+          for (const key of Object.keys(imports)) {
+            const star = key.indexOf("*");
+            if (star === -1) continue;
+            const prefix = key.slice(0, star);
+            const suffix = key.slice(star + 1);
+            if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) continue;
+            if (specifier.length < prefix.length + suffix.length) continue;
+            const wildcard = specifier.slice(prefix.length, specifier.length - suffix.length);
+            const rawTarget = packageImportsTargetForConditions(imports[key]);
+            if (rawTarget != null) {
+              target = rawTarget.replace("*", wildcard);
+              break;
+            }
+          }
+        }
+        if (target != null && !String(target).startsWith("#")) {
+          if (String(target).startsWith(".") || String(target).startsWith("/")) {
+            return nodePathResolve(dir, String(target));
+          }
+          return resolveSync(String(target), `${dir}/package.json`);
+        }
+      }
+      break;
+    }
+  }
+  const error = new Error(`Cannot find module "${specifier}" from "${String(from ?? cottontail.cwd())}"`);
+  error.name = "ResolveMessage";
+  error.code = "ERR_MODULE_NOT_FOUND";
+  throw error;
+}
+
 export function resolveSync(specifier, from = cottontail.cwd()) {
   if (String(specifier).startsWith("node:")) return String(specifier);
   if (["fs", "path", "crypto", "http", "https", "net", "tls", "zlib", "dns"].includes(String(specifier))) {
     return `node:${specifier}`;
+  }
+  if (String(specifier).startsWith("#")) {
+    return resolvePackageImportsSync(String(specifier), from);
   }
   if (String(specifier).startsWith(".") || String(specifier).startsWith("/")) {
     const base = String(from).replace(/\/[^/]*$/, "");
@@ -5038,7 +7407,7 @@ export function readableStreamToArrayBuffer(stream) {
 }
 
 export function readableStreamToText(stream) {
-  return internalThen(readableStreamToBytes(stream), (bytes) => new TextDecoder().decode(bytes));
+  return internalThen(readableStreamToBytes(stream), (bytes) => stripUtf8BOMText(new TextDecoder().decode(bytes)));
 }
 
 export function readableStreamToJSON(stream) {
@@ -5098,12 +7467,18 @@ function installReadableStreamConversionHelpers() {
   });
 }
 
-export function readableStreamToFormData(stream, formData = new FormData()) {
+export function readableStreamToFormData(stream, boundaryOrFormData = undefined) {
+  if (typeof boundaryOrFormData === "string" || boundaryOrFormData instanceof ArrayBuffer || ArrayBuffer.isView(boundaryOrFormData)) {
+    const boundary = typeof boundaryOrFormData === "string"
+      ? boundaryOrFormData
+      : new TextDecoder().decode(asBuffer(boundaryOrFormData));
+    return internalThen(readableStreamToBytes(stream), (bytes) =>
+      parseMultipartFormDataText(stringLatin1FromBytes(bytes), boundary));
+  }
+  const formData = boundaryOrFormData ?? new FormData();
   return internalThen(readableStreamToText(stream), (text) => {
-    for (const pair of text.split("&")) {
-      if (!pair) continue;
-      const [key, value = ""] = pair.split("=");
-      formData.append(decodeURIComponent(key), decodeURIComponent(value));
+    for (const [key, value] of new URLSearchParams(stripUtf8BOMText(text))) {
+      formData.append(key, value);
     }
     return formData;
   });
@@ -5285,6 +7660,15 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
     if (connectionState?.failed && !connectionState.opened) return;
     call("close", socket, hadError ? new Error("Socket closed with an error") : null);
   });
+  if (typeof socket.terminate !== "function") {
+    Object.defineProperty(socket, "terminate", {
+      value() {
+        socket.destroy();
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
   Object.defineProperty(socket, Symbol.dispose, {
     value() {
       socket.end();
@@ -5861,6 +8245,9 @@ function decodeJSONLUtf8(bytes) {
 function jsonlTypedArrayView(input, start, end) {
   if (input == null) throw new TypeError("Expected a string or typed array");
   if (!ArrayBuffer.isView(input) || input instanceof DataView) return null;
+  if (input.buffer?.detached === true) {
+    throw new TypeError("Cannot parse a detached ArrayBuffer");
+  }
 
   const byteLength = typedArrayByteLength.call(input);
   const byteOffset = typedArrayByteOffset.call(input);
@@ -5971,6 +8358,18 @@ function isInvalidCookieName(value) {
   return text.length === 0 || /[\x00-\x20\x7f;=]/.test(text) || /[^\x00-\x7f]/.test(text);
 }
 
+// Set-Cookie values must be ASCII and must not contain characters that would
+// allow header splitting / cookie injection (NUL, CR, LF).
+function isInvalidCookieValue(value) {
+  return /[\x00\r\n]|[^\x00-\x7f]/.test(String(value));
+}
+
+// Attribute names in a Set-Cookie string must be ASCII without control
+// characters; unknown-but-well-formed attributes are ignored by the parser.
+function isInvalidCookieAttributeName(value) {
+  return /[\x00-\x08\x0a-\x1f\x7f]|[^\x00-\x7f]/.test(String(value));
+}
+
 function isInvalidCookieDomain(value) {
   return /[^A-Za-z0-9.-]/.test(String(value));
 }
@@ -6012,12 +8411,18 @@ export class Cookie {
     const eq = first.indexOf("=");
     const name = eq >= 0 ? first.slice(0, eq) : first;
     const value = eq >= 0 ? first.slice(eq + 1) : "";
+    if (isInvalidCookieValue(value)) {
+      throw new TypeError("Invalid cookie value: contains invalid characters");
+    }
     const options = {};
     for (const raw of parts) {
       const part = raw.trim();
       if (!part) continue;
       const attrEq = part.indexOf("=");
       const key = (attrEq >= 0 ? part.slice(0, attrEq) : part).trim().toLowerCase();
+      if (isInvalidCookieAttributeName(key)) {
+        throw new TypeError("Invalid cookie attribute name: contains invalid characters");
+      }
       const attrValue = attrEq >= 0 ? part.slice(attrEq + 1).trim().replace(/^"|"$/g, "") : "";
       if (key === "domain") options.domain = attrValue;
       else if (key === "path") options.path = attrValue;
@@ -6156,7 +8561,11 @@ export class CookieMap extends Map {
         Map.prototype.set.call(this, name, decodeCookieText(value));
       }
     } else if (Array.isArray(init) || (init && typeof init[Symbol.iterator] === "function")) {
-      for (const [key, value] of init) {
+      for (const pair of init) {
+        if (!Array.isArray(pair) || pair.length !== 2) {
+          throw new TypeError("Expected arrays of exactly two strings");
+        }
+        const [key, value] = pair;
         const name = String(key);
         if (!Map.prototype.has.call(this, name)) this._initialKeys.push(name);
         if (!preserveFirst || !Map.prototype.has.call(this, name)) {
@@ -8179,8 +10588,21 @@ function structuredCloneValue(value, seen) {
   return result;
 }
 
-function cottontailStructuredClone(value) {
-  return structuredCloneValue(value, new WeakMap());
+function cottontailStructuredClone(value, options = undefined) {
+  const seen = new WeakMap();
+  const transfer = options?.transfer;
+  if (transfer != null) {
+    for (const item of transfer) {
+      if (item instanceof ArrayBuffer) {
+        if (item.detached === true) {
+          throw new TypeError("Cannot transfer a detached ArrayBuffer");
+        }
+        // Detach the source buffer; clones of it reference the moved buffer.
+        seen.set(item, typeof item.transfer === "function" ? item.transfer() : item.slice(0));
+      }
+    }
+  }
+  return structuredCloneValue(value, seen);
 }
 
 const BunObjectTarget = globalThis.Bun ?? {};
@@ -8305,9 +10727,71 @@ BunObject.zstdCompress = zstdCompress;
 BunObject.zstdCompressSync = zstdCompressSync;
 BunObject.zstdDecompress = zstdDecompress;
 BunObject.zstdDecompressSync = zstdDecompressSync;
+if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.compileStreaming !== "function") {
+  const wasmBytesFromResponseSource = async (source) => {
+    const response = await source;
+    if (!(response instanceof Response) && typeof response?.arrayBuffer !== "function") {
+      throw new TypeError("WebAssembly streaming compile requires a Response");
+    }
+    const type = String(response.headers?.get?.("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    if (type !== "application/wasm") {
+      throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);
+    }
+    if (response.status != null && (response.status < 200 || response.status >= 300)) {
+      throw new TypeError(`WebAssembly response has status ${response.status}`);
+    }
+    return await response.arrayBuffer();
+  };
+  // The host's async WebAssembly.compile/instantiate promises never settle;
+  // back all of these with the synchronous Module/Instance constructors.
+  globalThis.WebAssembly.compile = async function compile(bytes) {
+    return new globalThis.WebAssembly.Module(asBuffer(bytes));
+  };
+  globalThis.WebAssembly.instantiate = async function instantiate(source, importObject = undefined) {
+    if (source instanceof globalThis.WebAssembly.Module) {
+      return new globalThis.WebAssembly.Instance(source, importObject);
+    }
+    const module = new globalThis.WebAssembly.Module(asBuffer(source));
+    return { module, instance: new globalThis.WebAssembly.Instance(module, importObject) };
+  };
+  globalThis.WebAssembly.compileStreaming = async function compileStreaming(source) {
+    return globalThis.WebAssembly.compile(await wasmBytesFromResponseSource(source));
+  };
+  globalThis.WebAssembly.instantiateStreaming = async function instantiateStreaming(source, importObject = undefined) {
+    const module = await globalThis.WebAssembly.compileStreaming(source);
+    return { module, instance: new globalThis.WebAssembly.Instance(module, importObject) };
+  };
+}
+
+if (globalThis.navigator == null) {
+  const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
+    cottontail.platform?.() === "win32" ? "Win32" :
+    `Linux ${cottontail.arch?.() === "arm64" ? "aarch64" : "x86_64"}`;
+  globalThis.navigator = {
+    userAgent: `Bun/${version}`,
+    platform: navigatorPlatform,
+    hardwareConcurrency: Number(cottontail.cpuCount?.() ?? 1) || 1,
+  };
+}
 const CryptoObject = globalThis.crypto ?? {};
 CryptoObject.randomUUID ??= randomUUID;
-CryptoObject.getRandomValues ??= getRandomValues;
+// Bun's crypto.getRandomValues also accepts ArrayBuffer/SharedArrayBuffer and
+// has no 65536-byte quota; wrap the base implementation accordingly.
+CryptoObject.getRandomValues = function getRandomValuesCompat(view) {
+  let bytes;
+  if (view instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && view instanceof SharedArrayBuffer)) {
+    bytes = new Uint8Array(view);
+  } else if (ArrayBuffer.isView(view)) {
+    bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  } else {
+    throw new TypeError("crypto.getRandomValues requires an ArrayBuffer or ArrayBuffer view");
+  }
+  for (let offset = 0; offset < bytes.byteLength; offset += 65536) {
+    const chunk = Math.min(65536, bytes.byteLength - offset);
+    bytes.set(randomBytes(chunk), offset);
+  }
+  return view;
+};
 CryptoObject.subtle ??= nodeWebcrypto.subtle;
 globalThis.crypto = CryptoObject;
 globalThis.CryptoKey ??= CryptoKey;
@@ -8500,7 +10984,10 @@ globalThis.File = BunFile;
 globalThis.AbortSignal ??= CottontailAbortSignal;
 globalThis.AbortController ??= CottontailAbortController;
 globalThis.structuredClone ??= cottontailStructuredClone;
-globalThis.fetch ??= fetch;
+if (globalThis.fetch == null) {
+  Object.defineProperty(fetch, "name", { value: "fetch", configurable: true });
+  globalThis.fetch = fetch;
+}
 Object.defineProperty(globalThis, "self", {
   get() {
     return globalThis;

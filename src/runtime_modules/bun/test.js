@@ -864,9 +864,11 @@ class Expectation {
     });
   }
 
-  toContainKey(key) { return this._wrap((actual) => this._check(isObject(actual) && key in actual, `Expected key ${String(key)}`)); }
-  toContainKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).every((key) => isObject(actual) && key in actual), "Expected keys")); }
-  toContainAnyKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).some((key) => isObject(actual) && key in actual), "Expected any key")); }
+  // Bun checks own properties (hasOwnProperty), which on proxies triggers the
+  // getOwnPropertyDescriptor trap -- trap errors must propagate (issue #11677).
+  toContainKey(key) { return this._wrap((actual) => this._check(isObject(actual) && Object.hasOwn(actual, key), `Expected key ${String(key)}`)); }
+  toContainKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).every((key) => isObject(actual) && Object.hasOwn(actual, key)), "Expected keys")); }
+  toContainAnyKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).some((key) => isObject(actual) && Object.hasOwn(actual, key)), "Expected any key")); }
   toContainAllKeys(keys) { return this.toContainKeys(keys); }
   toContainValue(value) { return this._wrap((actual) => this._check(Object.values(Object(actual)).some((candidate) => matchesExpected(candidate, value)), "Expected object value")); }
   toContainValues(values) { return this._wrap((actual) => this._check(Array.from(values ?? []).every((value) => Object.values(Object(actual)).some((candidate) => matchesExpected(candidate, value))), "Expected object values")); }
@@ -890,18 +892,25 @@ class Expectation {
         this._check(pass, "Expected function to throw");
       };
       if (typeof actual !== "function") return checkThrown(rejectedValue, actual);
+      // Call `actual` inside its own try/catch so assertion failures raised by
+      // `_check` below are never mistaken for the function under test throwing.
+      let didThrow = false;
+      let thrown;
+      let result;
       try {
-        const result = actual();
-        if (isPromiseLike(result)) {
-          return result.then(
-            () => this._check(false, "Expected function to throw"),
-            (error) => checkThrown(true, error),
-          );
-        }
-        return this._check(false, "Expected function to throw");
+        result = actual();
       } catch (error) {
-        return checkThrown(true, error);
+        didThrow = true;
+        thrown = error;
       }
+      if (didThrow) return checkThrown(true, thrown);
+      if (isPromiseLike(result)) {
+        return result.then(
+          () => this._check(false, "Expected function to throw"),
+          (error) => checkThrown(true, error),
+        );
+      }
+      return this._check(false, "Expected function to throw");
     });
   }
 
@@ -909,6 +918,14 @@ class Expectation {
   toThrowErrorMatchingSnapshot() { return this.toThrow(); }
   toThrowErrorMatchingInlineSnapshot() { return this.toThrow(); }
   toMatchSnapshot(propertyMatchers = undefined, hint = undefined) {
+    // Bun validates argument order: with two arguments the first must be a
+    // property-matcher object and the second a string hint.
+    if (arguments.length >= 2) {
+      if (typeof hint !== "string") throw new Error("Expected second argument to be a string");
+      if (!isObject(propertyMatchers)) throw new Error("Expected properties must be an object");
+    } else if (arguments.length === 1 && typeof propertyMatchers !== "string" && !isObject(propertyMatchers)) {
+      throw new Error("Expected first argument to be a string or object");
+    }
     return this._wrap((actual) => {
       let snapshotHint = hint;
       if (typeof propertyMatchers === "string") {

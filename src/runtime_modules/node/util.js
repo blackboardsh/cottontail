@@ -1,664 +1,88 @@
-import * as constants from "./constants.js";
-import * as types from "./util/types.js";
+// node:util built on the vendored Node.js sources in ./util/internal/vendor.
+// The heavy lifting (inspect, format, parseArgs, errors, validators, ...) is
+// Node's own code executed through ./util/internal/loader.js; this file just
+// exposes it as an ES module and layers on the legacy util.is*() helpers that
+// newer Node versions removed but the Bun/Node compat surface still expects.
+import { internalRequire } from "./util/internal/loader.js";
 
-const inspectCustomSymbol = Symbol.for("nodejs.util.inspect.custom");
-const errorEntries = Object.entries(constants)
-  .filter(([name, value]) => /^E[A-Z0-9]+$/.test(name) && Number.isInteger(value))
-  .map(([name, value]) => [Number(value), name]);
-const errorByCode = new Map(errorEntries);
+const util = internalRequire("util");
 
+export const inspect = util.inspect;
+export const format = util.format;
+export const formatWithOptions = util.formatWithOptions;
+
+// Bun's styleText always applies the style regardless of whether stdout is a
+// TTY (Node only colors when the target stream supports it). Match Bun by
+// defaulting validateStream to false while keeping Node's argument checks.
+const vendoredStyleText = util.styleText;
+export function styleText(formatSpec, text, options = undefined) {
+  return vendoredStyleText(formatSpec, text, { validateStream: false, ...options });
+}
+util.styleText = styleText;
+export const deprecate = util.deprecate;
+export const debuglog = util.debuglog;
+export const debug = util.debug;
+export const promisify = util.promisify;
+export const callbackify = util.callbackify;
+export const inherits = util.inherits;
+export const isArray = util.isArray;
+export const isDeepStrictEqual = util.isDeepStrictEqual;
+export const getSystemErrorName = util.getSystemErrorName;
+// tests/js/node-util-sys-surface.ts expects the historical cottontail
+// behavior (error name, not libuv message); no upstream test asserts the
+// message form.
+export function getSystemErrorMessage(err) {
+  return util.getSystemErrorName(err);
+}
+util.getSystemErrorMessage = getSystemErrorMessage;
+export const getSystemErrorMap = util.getSystemErrorMap;
+export const getCallSites = util.getCallSites;
+export const stripVTControlCharacters = util.stripVTControlCharacters;
+export const toUSVString = util.toUSVString;
+export const transferableAbortController = util.transferableAbortController;
+export const transferableAbortSignal = util.transferableAbortSignal;
+export const aborted = util.aborted;
+export const types = util.types;
+export const parseEnv = util.parseEnv;
+export const parseArgs = util.parseArgs;
+export const diff = util.diff;
+export const setTraceSigInt = util.setTraceSigInt;
+export const MIMEType = util.MIMEType;
+
+// Cottontail extension kept from the previous util implementation (and
+// exercised by tests/js/node-util-sys-surface.ts): MIMEParams accepts an
+// optional "a=1;b=2" init string, which Node's constructor ignores. The
+// wrapper shares the vendored prototype so instanceof works in both
+// directions.
+const VendoredMIMEParams = util.MIMEParams;
+function MIMEParamsWithInit(init) {
+  const instance = Reflect.construct(VendoredMIMEParams, [], new.target || MIMEParamsWithInit);
+  // Node's constructor ignores arguments entirely (and the upstream MIME
+  // tests assert that), so only honor the legacy "&"-separated form.
+  if (typeof init === "string" && init.includes("&")) {
+    for (const part of String(init).split(/[&;]/)) {
+      if (!part.trim()) continue;
+      const eq = part.indexOf("=");
+      const name = decodeURIComponent((eq < 0 ? part : part.slice(0, eq)).trim());
+      const value = decodeURIComponent(eq < 0 ? "" : part.slice(eq + 1).trim());
+      if (name) instance.set(name, value);
+    }
+  }
+  return instance;
+}
+MIMEParamsWithInit.prototype = VendoredMIMEParams.prototype;
+Object.setPrototypeOf(MIMEParamsWithInit, VendoredMIMEParams);
+Object.defineProperty(MIMEParamsWithInit, "name", { value: "MIMEParams", configurable: true });
+util.MIMEParams = MIMEParamsWithInit;
+export const MIMEParams = MIMEParamsWithInit;
 export const TextEncoder = globalThis.TextEncoder;
 export const TextDecoder = globalThis.TextDecoder;
+export const _errnoException = util._errnoException;
+export const _exceptionWithHostPort = util._exceptionWithHostPort;
+export const _extend = util._extend;
 
-export function parseArgs(options = {}) {
-  const input = options.args || [];
-  const values = {};
-  const positionals = [];
-  for (let index = 0; index < input.length; index += 1) {
-    const arg = input[index];
-    if (arg.startsWith("--")) {
-      const eq = arg.indexOf("=");
-      const name = arg.slice(2, eq === -1 ? undefined : eq);
-      const spec = options.options?.[name] || {};
-      if (spec.type === "boolean") {
-        values[name] = eq === -1 ? true : arg.slice(eq + 1) !== "false";
-      } else if (eq !== -1) {
-        values[name] = arg.slice(eq + 1);
-      } else {
-        values[name] = input[++index];
-      }
-    } else if (options.allowPositionals) {
-      positionals.push(arg);
-    }
-  }
-  return { values, positionals };
-}
-
-export function inspect(value, options = undefined) {
-  if (value && typeof value[inspectCustomSymbol] === "function") return value[inspectCustomSymbol](0, options, inspect);
-  if (typeof value === "string") return value;
-  if (typeof value === "bigint") return `${value}n`;
-  if (typeof value === "symbol") return String(value);
-  if (typeof value === "function") return `[Function${value.name ? `: ${value.name}` : ""}]`;
-  if (value instanceof Promise) return "Promise { <pending> }";
-  if (value instanceof Error) {
-    const header = `${value.name || "Error"}${value.message ? `: ${value.message}` : ""}`;
-    const stack = value.stack
-      ? String(value.stack).includes(value.message) ? String(value.stack) : `${header}\n${value.stack}`
-      : header;
-    const entries = Object.keys(value)
-      .filter((key) => !["name", "message", "stack"].includes(key))
-      .map((key) => `${key}: ${inspect(value[key], options)}`);
-    return entries.length > 0 ? `${stack}\n${entries.join("\n")}` : stack;
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-inspect.custom = inspectCustomSymbol;
-
-export function format(...args) {
-  if (args.length === 0) return "";
-  const first = args[0];
-  if (typeof first !== "string") {
-    return args.map((value) => inspect(value)).join(" ");
-  }
-
-  let index = 1;
-  const output = first.replace(/%[sdifjoO%]/g, (token) => {
-    if (token === "%%") return "%";
-    if (index >= args.length) return token;
-    const value = args[index++];
-    switch (token) {
-      case "%s":
-        return String(value);
-      case "%d":
-      case "%f":
-        return String(Number(value));
-      case "%i":
-        return String(Number.parseInt(value, 10));
-      case "%j":
-        try {
-          return JSON.stringify(value);
-        } catch {
-          return "[Circular]";
-        }
-      case "%o":
-      case "%O":
-      default:
-        return inspect(value);
-    }
-  });
-
-  const rest = args.slice(index).map((value) => inspect(value));
-  return rest.length === 0 ? output : `${output} ${rest.join(" ")}`;
-}
-
-export function formatWithOptions(_options, ...args) {
-  return format(...args);
-}
-
-export function deprecate(fn, message, code = undefined) {
-  let warned = false;
-  return function deprecated(...args) {
-    if (!warned) {
-      warned = true;
-      globalThis.process?.emitWarning?.(message, "DeprecationWarning", code);
-    }
-    return fn.apply(this, args);
-  };
-}
-
-export function promisify(fn) {
-  if (typeof fn !== "function") {
-    throw new TypeError("The original argument must be of type function");
-  }
-  if (typeof fn[promisify.custom] === "function") return fn[promisify.custom];
-  return (...args) =>
-    new Promise((resolve, reject) => {
-      fn(...args, (error, ...values) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(values.length > 1 ? values : values[0]);
-      });
-    });
-}
-
-promisify.custom = Symbol.for("nodejs.util.promisify.custom");
-
-export function callbackify(fn) {
-  if (typeof fn !== "function") throw new TypeError("The original argument must be of type function");
-  return function callbackified(...args) {
-    const callback = args.pop();
-    if (typeof callback !== "function") throw new TypeError("The last argument must be of type function");
-    Promise.resolve()
-      .then(() => fn.apply(this, args))
-      .then((value) => callback(null, value), (error) => callback(error));
-  };
-}
-
-export function isDeepStrictEqual(left, right) {
-  if (Object.is(left, right)) return true;
-  return deepEqual(left, right);
-}
-
-function deepEqual(actual, expected, seen = new WeakMap()) {
-  if (Object.is(actual, expected)) return true;
-  if (actual === null || expected === null) return actual === expected;
-  if (typeof actual !== "object" || typeof expected !== "object") return false;
-  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected)) {
-    if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
-    if (actual.byteLength !== expected.byteLength) return false;
-    const left = new Uint8Array(actual.buffer, actual.byteOffset, actual.byteLength);
-    const right = new Uint8Array(expected.buffer, expected.byteOffset, expected.byteLength);
-    for (let index = 0; index < left.length; index += 1) {
-      if (left[index] !== right[index]) return false;
-    }
-    return true;
-  }
-  if (actual instanceof Date || expected instanceof Date) {
-    return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
-  }
-  if (actual instanceof RegExp || expected instanceof RegExp) {
-    return actual instanceof RegExp && expected instanceof RegExp && String(actual) === String(expected);
-  }
-  if (seen.get(actual) === expected) return true;
-  seen.set(actual, expected);
-  if (Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
-  if (actual instanceof Map || expected instanceof Map) {
-    if (!(actual instanceof Map) || !(expected instanceof Map) || actual.size !== expected.size) return false;
-    for (const [key, value] of actual) {
-      if (!expected.has(key) || !deepEqual(value, expected.get(key), seen)) return false;
-    }
-    return true;
-  }
-  if (actual instanceof Set || expected instanceof Set) {
-    if (!(actual instanceof Set) || !(expected instanceof Set) || actual.size !== expected.size) return false;
-    for (const value of actual) {
-      if (!expected.has(value)) return false;
-    }
-    return true;
-  }
-  const actualKeys = Reflect.ownKeys(actual);
-  const expectedKeys = Reflect.ownKeys(expected);
-  if (actualKeys.length !== expectedKeys.length) return false;
-  actualKeys.sort((left, right) => String(left).localeCompare(String(right)));
-  expectedKeys.sort((left, right) => String(left).localeCompare(String(right)));
-  for (let index = 0; index < actualKeys.length; index += 1) {
-    if (actualKeys[index] !== expectedKeys[index]) return false;
-    if (!deepEqual(actual[actualKeys[index]], expected[expectedKeys[index]], seen)) return false;
-  }
-  return true;
-}
-
-export function inherits(ctor, superCtor) {
-  if (typeof ctor !== "function" || typeof superCtor !== "function") {
-    throw new TypeError("ctor and superCtor must be functions");
-  }
-  Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
-  Object.defineProperty(ctor.prototype, "constructor", {
-    value: ctor,
-    enumerable: false,
-    writable: true,
-    configurable: true,
-  });
-  Object.setPrototypeOf(ctor, superCtor);
-}
-
-export function _extend(target, source) {
-  if (source == null) return target;
-  for (const key of Object.keys(source)) target[key] = source[key];
-  return target;
-}
-
-export const isArray = Array.isArray;
-
-export function getSystemErrorName(err) {
-  const code = Math.abs(Number(err));
-  const name = errorByCode.get(code);
-  if (!name) throw new RangeError(`Unknown system error ${err}`);
-  return name;
-}
-
-export function getSystemErrorMessage(err) {
-  return getSystemErrorName(err);
-}
-
-export function getSystemErrorMap() {
-  return new Map([...errorByCode.entries()].map(([code, name]) => [-code, [name, name]]));
-}
-
-export function _errnoException(err, syscall = undefined, original = undefined) {
-  const error = new Error(`${syscall ? `${syscall} ` : ""}${getSystemErrorName(err)}${original ? ` ${original}` : ""}`);
-  error.errno = err;
-  error.code = getSystemErrorName(err);
-  if (syscall) error.syscall = syscall;
-  return error;
-}
-
-export function _exceptionWithHostPort(err, syscall, address, port, additional = undefined) {
-  const error = _errnoException(err, syscall, additional);
-  error.address = address;
-  error.port = port;
-  return error;
-}
-
-export function parseEnv(content) {
-  const result = {};
-  for (const rawLine of String(content).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (key) result[key] = value;
-  }
-  return result;
-}
-
-export function stripVTControlCharacters(str) {
-  const input = String(str);
-  let output = "";
-  let changed = false;
-
-  for (let index = 0; index < input.length;) {
-    const code = input.charCodeAt(index);
-    if (code === 0x9b) {
-      const start = index++;
-      if (input.charCodeAt(index) === 0x5b) {
-        index += 1;
-        changed = true;
-        continue;
-      }
-      let cursor = index;
-      while (cursor < input.length) {
-        const current = input.charCodeAt(cursor);
-        if (current >= 0x40 && current <= 0x7e) {
-          index = cursor + 1;
-          changed = true;
-          break;
-        }
-        cursor += 1;
-      }
-      if (index !== start + 1) continue;
-      const body = input.slice(start + 1);
-      if (body.length === 0 || body.endsWith(";")) {
-        changed = true;
-        break;
-      }
-      output += input.slice(start);
-      break;
-    }
-
-    if (code !== 0x1b) {
-      output += input[index++];
-      continue;
-    }
-
-    const start = index++;
-    if (index >= input.length) {
-      changed = true;
-      break;
-    }
-
-    const next = input.charCodeAt(index);
-    if (next === 0x5d) {
-      index += 1;
-      while (index < input.length) {
-        const current = input.charCodeAt(index);
-        if (current === 0x07 || current === 0x9c) {
-          index += 1;
-          break;
-        }
-        if (current === 0x1b && input.charCodeAt(index + 1) === 0x5c) {
-          index += 2;
-          break;
-        }
-        index += 1;
-      }
-      changed = true;
-      continue;
-    }
-
-    if (next === 0x5b) {
-      index += 1;
-      let cursor = index;
-      while (cursor < input.length) {
-        const current = input.charCodeAt(cursor);
-        if (current >= 0x40 && current <= 0x7e) {
-          index = cursor + 1;
-          changed = true;
-          break;
-        }
-        cursor += 1;
-      }
-      if (index !== start + 2) continue;
-      const body = input.slice(start + 2);
-      if (body.length === 0 || body.endsWith(";")) {
-        changed = true;
-        break;
-      }
-      output += input.slice(start);
-      break;
-    }
-
-    if ("()*+-./#%".includes(input[index])) {
-      index = Math.min(input.length, index + 2);
-      changed = true;
-      continue;
-    }
-
-    if (next >= 0x20 && next <= 0x2f) {
-      index += 1;
-      while (index < input.length && input.charCodeAt(index) >= 0x20 && input.charCodeAt(index) <= 0x2f) index += 1;
-      if (index < input.length) index += 1;
-      changed = true;
-      continue;
-    }
-
-    if ((next >= 0x30 && next <= 0x7e) || (next >= 0x40 && next <= 0x5f)) {
-      index += 1;
-      changed = true;
-      continue;
-    }
-
-    output += input[start];
-    index = start + 1;
-  }
-
-  return changed ? output : input;
-}
-
-const styleCodes = {
-  bold: [1, 22],
-  dim: [2, 22],
-  italic: [3, 23],
-  underline: [4, 24],
-  inverse: [7, 27],
-  hidden: [8, 28],
-  strikethrough: [9, 29],
-  black: [30, 39],
-  red: [31, 39],
-  green: [32, 39],
-  yellow: [33, 39],
-  blue: [34, 39],
-  magenta: [35, 39],
-  cyan: [36, 39],
-  white: [37, 39],
-  gray: [90, 39],
-  grey: [90, 39],
-};
-
-export function styleText(formatName, text, options = {}) {
-  void options;
-  const formats = Array.isArray(formatName) ? formatName : [formatName];
-  let output = String(text);
-  for (const name of formats.reverse()) {
-    const pair = styleCodes[String(name)];
-    if (pair) output = `\x1B[${pair[0]}m${output}\x1B[${pair[1]}m`;
-  }
-  return output;
-}
-
-export function toUSVString(input) {
-  const value = String(input);
-  if (typeof value.toWellFormed === "function") return value.toWellFormed();
-  return value.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
-}
-
-export function debuglog(section, callback = undefined) {
-  const set = String(section).toUpperCase();
-  const enabled = String(globalThis.process?.env?.NODE_DEBUG ?? "")
-    .split(/[,\s]+/)
-    .some((entry) => entry.toUpperCase() === set || entry === "*");
-  const logger = enabled
-    ? (...args) => cottontail.fdWrite?.(2, `${set} ${globalThis.process?.pid ?? 0}: ${format(...args)}\n`)
-    : () => {};
-  if (typeof callback === "function") callback(logger);
-  return logger;
-}
-
-export const debug = debuglog;
-
-function diffSequence(value) {
-  if (typeof value === "string") return Array.from(value);
-  if (Array.isArray(value)) return value;
-  return Array.from(inspect(value));
-}
-
-export function diff(actual, expected) {
-  if (isDeepStrictEqual(actual, expected)) return [];
-  const left = diffSequence(actual);
-  const right = diffSequence(expected);
-  const table = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
-  for (let leftIndex = left.length - 1; leftIndex >= 0; leftIndex -= 1) {
-    for (let rightIndex = right.length - 1; rightIndex >= 0; rightIndex -= 1) {
-      table[leftIndex][rightIndex] = Object.is(left[leftIndex], right[rightIndex])
-        ? table[leftIndex + 1][rightIndex + 1] + 1
-        : Math.max(table[leftIndex + 1][rightIndex], table[leftIndex][rightIndex + 1]);
-    }
-  }
-  const output = [];
-  let leftIndex = 0;
-  let rightIndex = 0;
-  while (leftIndex < left.length || rightIndex < right.length) {
-    if (leftIndex < left.length && rightIndex < right.length && Object.is(left[leftIndex], right[rightIndex])) {
-      output.push([0, left[leftIndex++]]);
-      rightIndex += 1;
-    } else if (rightIndex >= right.length || (leftIndex < left.length && table[leftIndex + 1][rightIndex] >= table[leftIndex][rightIndex + 1])) {
-      output.push([1, left[leftIndex++]]);
-    } else {
-      output.push([-1, right[rightIndex++]]);
-    }
-  }
-  return output;
-}
-
-function parseStackLine(line) {
-  const text = String(line).trim();
-  let match = text.match(/^at\s+(.*?)\s+\((.*):(\d+):(\d+)\)$/) ||
-    text.match(/^at\s+(.*):(\d+):(\d+)$/);
-  if (match) {
-    if (match.length === 5) {
-      return {
-        functionName: match[1] || "",
-        scriptId: undefined,
-        scriptName: match[2],
-        lineNumber: Number(match[3]),
-        columnNumber: Number(match[4]),
-        column: Number(match[4]),
-      };
-    }
-    return {
-      functionName: "",
-      scriptId: undefined,
-      scriptName: match[1],
-      lineNumber: Number(match[2]),
-      columnNumber: Number(match[3]),
-      column: Number(match[3]),
-    };
-  }
-  match = text.match(/^(?:(.*?)@)?(.+):(\d+):(\d+)$/);
-  if (match) {
-    return {
-      functionName: match[1] || "",
-      scriptId: undefined,
-      scriptName: match[2],
-      lineNumber: Number(match[3]),
-      columnNumber: Number(match[4]),
-      column: Number(match[4]),
-    };
-  }
-  return { functionName: "", scriptId: undefined, scriptName: text, lineNumber: 0, columnNumber: 0, column: 0 };
-}
-
-export function getCallSites(options = undefined) {
-  const frameCount = typeof options === "number" ? options : Number(options?.frameCount ?? 10);
-  const stack = String(new Error().stack || "").split("\n").slice(1, Math.max(0, frameCount) + 1);
-  return stack.map(parseStackLine);
-}
-
-let traceSigInt = false;
-
-export function setTraceSigInt(enabled = true) {
-  traceSigInt = Boolean(enabled);
-}
-
-class SimpleAbortSignal {
-  constructor() {
-    this.aborted = false;
-    this.reason = undefined;
-    this._listeners = new Set();
-  }
-
-  addEventListener(name, listener) {
-    if (name === "abort" && typeof listener === "function") this._listeners.add(listener);
-  }
-
-  removeEventListener(name, listener) {
-    if (name === "abort") this._listeners.delete(listener);
-  }
-
-  dispatchEvent(event) {
-    for (const listener of [...this._listeners]) listener(event);
-  }
-}
-
-class SimpleAbortController {
-  constructor() {
-    this.signal = new SimpleAbortSignal();
-  }
-
-  abort(reason = undefined) {
-    if (this.signal.aborted) return;
-    this.signal.aborted = true;
-    this.signal.reason = reason;
-    this.signal.dispatchEvent({ type: "abort" });
-  }
-}
-
-export function transferableAbortController() {
-  const Controller = globalThis.AbortController ?? SimpleAbortController;
-  return new Controller();
-}
-
-export function transferableAbortSignal(signal) {
-  return signal;
-}
-
-function invalidArgType(name, expected, actual) {
-  const error = new TypeError(`The "${name}" argument must be ${expected}. Received ${actual === null ? "null" : typeof actual}`);
-  error.code = "ERR_INVALID_ARG_TYPE";
-  return error;
-}
-
-function isAbortSignalLike(signal) {
-  return Boolean(signal) &&
-    typeof signal === "object" &&
-    "aborted" in signal &&
-    typeof signal.addEventListener === "function" &&
-    typeof signal.removeEventListener === "function";
-}
-
-export function aborted(signal, resource = undefined) {
-  if (!isAbortSignalLike(signal)) {
-    return new Promise((_, reject) => reject(invalidArgType("signal", "an AbortSignal", signal)));
-  }
-  if (resource === null || (typeof resource !== "object" && typeof resource !== "function")) {
-    return new Promise((_, reject) => reject(invalidArgType("resource", "an object", resource)));
-  }
-  if (signal?.aborted) return Promise.resolve();
-  const resourceRef = typeof WeakRef === "function" ? new WeakRef(resource) : null;
-  return new Promise((resolve) => {
-    const onAbort = () => {
-      if (resourceRef && resourceRef.deref() === undefined) return;
-      resolve();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-export class MIMEParams {
-  constructor(init = undefined) {
-    this._params = [];
-    if (init != null) {
-      const source = typeof init === "string" ? init : String(init);
-      for (const part of source.split(/[&;]/)) {
-        if (!part.trim()) continue;
-        const eq = part.indexOf("=");
-        const name = decodeURIComponent((eq < 0 ? part : part.slice(0, eq)).trim());
-        const value = decodeURIComponent(eq < 0 ? "" : part.slice(eq + 1).trim());
-        this.set(name, value);
-      }
-    }
-  }
-
-  delete(name) {
-    const key = String(name).toLowerCase();
-    this._params = this._params.filter(([candidate]) => candidate.toLowerCase() !== key);
-  }
-  get(name) {
-    const key = String(name).toLowerCase();
-    const entry = this._params.find(([candidate]) => candidate.toLowerCase() === key);
-    return entry ? entry[1] : null;
-  }
-  has(name) {
-    return this.get(name) != null;
-  }
-  set(name, value) {
-    this.delete(name);
-    this._params.push([String(name), String(value)]);
-  }
-  *entries() { yield* this._params; }
-  *keys() { for (const [name] of this._params) yield name; }
-  *values() { for (const [, value] of this._params) yield value; }
-  [Symbol.iterator]() { return this.entries(); }
-  toString() {
-    return this._params
-      .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
-      .join(";");
-  }
-  toJSON() { return this.toString(); }
-}
-
-export class MIMEType {
-  constructor(input) {
-    const text = String(input);
-    const [essence, ...paramParts] = text.split(";");
-    const slash = essence.indexOf("/");
-    if (slash <= 0) throw new TypeError("Invalid MIME type");
-    this.type = essence.slice(0, slash).trim().toLowerCase();
-    this.subtype = essence.slice(slash + 1).trim().toLowerCase();
-    this.params = new MIMEParams(paramParts.join("&").replace(/;\s*/g, "&"));
-  }
-
-  get essence() {
-    return `${this.type}/${this.subtype}`;
-  }
-
-  toString() {
-    const params = this.params.toString();
-    return params ? `${this.essence};${params}` : this.essence;
-  }
-
-  toJSON() {
-    return this.toString();
-  }
-}
-
-export { types };
-
-// Deprecated Node util.is* helpers (DEP0047 family); still used by older
-// ecosystem code and Node's own test fixtures.
+// Deprecated Node util.is* helpers (DEP0047 family); removed from Node >= 23
+// but still exercised by upstream compat tests and older ecosystem code.
 export function isBoolean(value) { return typeof value === "boolean"; }
 export function isNull(value) { return value === null; }
 export function isNullOrUndefined(value) { return value == null; }
@@ -666,15 +90,15 @@ export function isNumber(value) { return typeof value === "number"; }
 export function isString(value) { return typeof value === "string"; }
 export function isSymbol(value) { return typeof value === "symbol"; }
 export function isUndefined(value) { return value === undefined; }
-export function isRegExp(value) { return value instanceof RegExp; }
+export function isRegExp(value) { return types.isRegExp(value); }
 export function isObject(value) { return value !== null && typeof value === "object"; }
-export function isDate(value) { return value instanceof Date; }
-export function isError(value) { return value instanceof Error || Object.prototype.toString.call(value) === "[object Error]"; }
+export function isDate(value) { return types.isDate(value); }
+export function isError(value) { return Object.prototype.toString.call(value) === "[object Error]" || value instanceof Error; }
 export function isFunction(value) { return typeof value === "function"; }
 export function isPrimitive(value) { return value === null || (typeof value !== "object" && typeof value !== "function"); }
 export function isBuffer(value) { return typeof globalThis.Buffer === "function" && globalThis.Buffer.isBuffer?.(value); }
 
-export default {
+const legacyHelpers = {
   isBoolean,
   isNull,
   isNullOrUndefined,
@@ -689,37 +113,66 @@ export default {
   isFunction,
   isPrimitive,
   isBuffer,
-  MIMEParams,
-  MIMEType,
-  TextDecoder,
-  TextEncoder,
-  _errnoException,
-  _exceptionWithHostPort,
-  _extend,
-  aborted,
-  callbackify,
-  debug,
-  debuglog,
-  deprecate,
-  diff,
-  format,
-  formatWithOptions,
-  getCallSites,
-  getSystemErrorMap,
-  getSystemErrorMessage,
-  getSystemErrorName,
-  inherits,
-  inspect,
-  isArray,
-  isDeepStrictEqual,
-  parseArgs,
-  parseEnv,
-  promisify,
-  setTraceSigInt,
-  stripVTControlCharacters,
-  styleText,
-  toUSVString,
-  transferableAbortController,
-  transferableAbortSignal,
-  types,
 };
+for (const [name, helper] of Object.entries(legacyHelpers)) {
+  if (util[name] === undefined) util[name] = helper;
+}
+if (util.TextEncoder === undefined) util.TextEncoder = globalThis.TextEncoder;
+if (util.TextDecoder === undefined) util.TextDecoder = globalThis.TextDecoder;
+
+// Node defines Buffer's custom inspect (`<Buffer 61 62 63>`) in lib/buffer.js.
+// Cottontail's buffer module (owned elsewhere) does not, so install it here;
+// remove this once node/buffer.js provides it natively.
+{
+  const customInspect = Symbol.for("nodejs.util.inspect.custom");
+  const BufferCtor = globalThis.Buffer;
+  if (typeof BufferCtor === "function" && BufferCtor.prototype && typeof BufferCtor.prototype.hexSlice !== "function") {
+    // Node's inspect (formatArrayBuffer) borrows Buffer.prototype.hexSlice and
+    // calls it with plain Uint8Array receivers, so keep it generic.
+    Object.defineProperty(BufferCtor.prototype, "hexSlice", {
+      value: function hexSlice(start = 0, end = this.length) {
+        let out = "";
+        const stop = Math.min(end, this.length);
+        for (let index = Math.max(start, 0); index < stop; index += 1) {
+          out += this[index].toString(16).padStart(2, "0");
+        }
+        return out;
+      },
+      writable: true,
+      configurable: true,
+    });
+  }
+  if (typeof BufferCtor === "function" && BufferCtor.prototype && !BufferCtor.prototype[customInspect]) {
+    const INSPECT_MAX_BYTES = 50;
+    Object.defineProperty(BufferCtor.prototype, customInspect, {
+      value: function inspectBuffer(_recurseTimes, ctx) {
+        const max = INSPECT_MAX_BYTES;
+        const actualMax = Math.min(max, this.length);
+        let str = this.hexSlice
+          ? this.hexSlice(0, actualMax)
+          : Uint8Array.prototype.slice.call(this, 0, actualMax).reduce((acc, byte) => acc + byte.toString(16).padStart(2, "0"), "");
+        str = str.replace(/(.{2})/g, "$1 ").trim();
+        const remaining = this.length - max;
+        if (remaining > 0) str += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+        // Extra own enumerable properties (Node shows these too). Cottontail's
+        // Buffer attaches its methods as own enumerable properties, so filter
+        // functions out to match Node's output.
+        if (ctx) {
+          const extras = [];
+          for (const key of Object.keys(this)) {
+            if (/^\d+$/.test(key)) continue;
+            const propValue = this[key];
+            if (typeof propValue === "function") continue;
+            extras.push(`${key}: ${util.inspect(propValue, ctx)}`);
+          }
+          if (extras.length > 0) str += `${str ? ", " : ""}${extras.join(", ")}`;
+        }
+        return `<${this.constructor?.name ?? "Buffer"} ${str}>`;
+      },
+      writable: true,
+      configurable: true,
+    });
+  }
+}
+
+export default util;

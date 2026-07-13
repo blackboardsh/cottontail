@@ -844,6 +844,10 @@
       "status": "expected-failure",
       "reason": "Long-running Bun.spawn pipe leak coverage currently exceeds the direct upstream runner timeout."
     },
+    "test/js/bun/spawn/spawn-socketpair-shutdown.test.ts": {
+      "status": "enabled",
+      "reason": "Socketpair shutdown coverage passes with the streaming spawn/net stack (3 bun:test cases, 6 assertions)."
+    },
     "test/js/bun/spawn/spawn-stdin-destroy.test.ts": {
       "status": "enabled",
       "reason": "Bun.spawn piped stdin destruction and subprocess completion coverage passes under Cottontail."
@@ -1291,7 +1295,7 @@
     },
     "test/js/bun/websocket/websocket-server.test.ts": {
       "status": "expected-failure",
-      "reason": "Requires full Bun WebSocket server fixture execution and lifecycle behavior."
+      "reason": "80 of 84 cases pass with Bun.serve websocket support; the remainder are subprocess-timing sensitive under load and one publish edge case still fails."
     },
     "test/js/bun/yaml/yaml-test-suite.test.ts": {
       "status": "enabled",
@@ -1349,6 +1353,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
     },
+    "test/js/node/async_hooks/async_hooks.node.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (4 bun:test cases, 10 assertions)."
+    },
     "test/js/node/buffer-concat.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 10 assertions)."
@@ -1389,9 +1397,21 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (8 bun:test cases, 15 assertions)."
     },
+    "test/js/node/crypto/crypto-rsa.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (22 bun:test cases, 66 assertions)."
+    },
     "test/js/node/crypto/crypto-sign-regression.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 20 assertions)."
+    },
+    "test/js/node/crypto/ecdh.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (13 bun:test cases, 40 assertions)."
+    },
+    "test/js/node/crypto/hkdf-callback-null.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 3 assertions)."
     },
     "test/js/node/crypto/node-crypto.test.js": {
       "status": "enabled",
@@ -1400,6 +1420,10 @@
     "test/js/node/crypto/sign-jwk-ieee-p1363.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 12 assertions)."
+    },
+    "test/js/node/dgram/node-dgram.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 2 assertions)."
     },
     "test/js/node/dirname.test.js": {
       "status": "enabled",
@@ -1412,6 +1436,11 @@
     "test/js/node/env-windows.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/fs/abort-signal-leak-read-write-file.test.ts": {
+      "status": "enabled",
+      "timeoutMs": 120000,
+      "reason": "Passes with the native toRun matcher; the spawned fixture needs a longer per-file timeout (1 bun:test case)."
     },
     "test/js/node/fs/cp.test.ts": {
       "status": "enabled",
@@ -1477,9 +1506,25 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
     },
+    "test/js/node/module/module-resolve-filename-paths.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (6 bun:test cases, 10 assertions)."
+    },
     "test/js/node/module/module-sourcemap.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/module/sourcemap.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (12 bun:test cases, 18 assertions)."
+    },
+    "test/js/node/net/node-net-allowHalfOpen.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/os/os.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (52 bun:test cases, 151 assertions)."
     },
     "test/js/node/path/15704.test.js": {
       "status": "enabled",
@@ -1549,13 +1594,45 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/process-binding.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (2 bun:test cases, 15 assertions)."
+    },
     "test/js/node/process/call-constructor.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 1 assertions)."
     },
+    "test/js/node/process/process-stdio-invalid-utf16.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (24 bun:test cases, 66 assertions)."
+    },
+    "test/js/node/process/process-stdio.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (9 bun:test cases, 20 assertions)."
+    },
+    "test/js/node/readline/getStringWidth.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (3 bun:test cases, 103 assertions)."
+    },
+    "test/js/node/readline/pause_stdin_should_exit.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/node/readline/readline.node.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (79 bun:test cases, 396 assertions)."
+    },
     "test/js/node/readline/readline_never_unrefs.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/readline/readline_promises.node.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (3 bun:test cases, 8 assertions)."
+    },
+    "test/js/node/readline/stdin_fell_asleep.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (2 bun:test cases, 2 assertions)."
     },
     "test/js/node/stream/node-stream-uint8array.test.ts": {
       "status": "enabled",
@@ -1565,9 +1642,21 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 7 assertions)."
     },
+    "test/js/node/tls/node-tls-create-secure-context-args.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (5 bun:test cases, 13 assertions)."
+    },
+    "test/js/node/tls/node-tls-internals.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 270 assertions)."
+    },
     "test/js/node/tls/node-tls-namedpipes.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/tls/node-tls-socket-allow-half-open-option.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 2 assertions)."
     },
     "test/js/node/tls/test-node-extra-ca-certs.test.ts": {
       "status": "enabled",
@@ -1585,6 +1674,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
     },
+    "test/js/node/url/url-domain-ascii-unicode.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (130 bun:test cases, 130 assertions)."
+    },
     "test/js/node/url/url-fileurltopath.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
@@ -1592,6 +1685,14 @@
     "test/js/node/url/url-format-invalid-input.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-format-whatwg.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-format.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 0 assertions)."
     },
     "test/js/node/url/url-is-url.test.js": {
       "status": "enabled",
@@ -1601,6 +1702,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/url/url-parse-format.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (3 bun:test cases, 0 assertions)."
+    },
     "test/js/node/url/url-parse-invalid-input.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
@@ -1609,17 +1714,61 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/url/url-pathtofileurl.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (4 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url-relative.test.js": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (5 bun:test cases, 0 assertions)."
+    },
     "test/js/node/url/url-revokeobjecturl.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/util/custom-inspect.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (13 bun:test cases, 24 assertions)."
+    },
+    "test/js/node/util/mime-api.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (8 bun:test cases, 86 assertions)."
+    },
+    "test/js/node/util/node-inspect-tests/import.test.mjs": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 0 assertions)."
     },
     "test/js/node/util/node-inspect-tests/parallel/util-inspect-long-running.test.mjs": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/util/node-inspect-tests/parallel/util-inspect-proxy.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/util/parse_args/parse-args.test.mjs": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (106 bun:test cases, 113 assertions)."
+    },
+    "test/js/node/util/util-callbackify.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (90 bun:test cases, 261 assertions)."
+    },
+    "test/js/node/util/util-promisify.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (17 bun:test cases, 11 assertions)."
+    },
+    "test/js/node/util/util.test.js": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (192 bun:test cases, 288 assertions)."
+    },
     "test/js/node/vm/script-leak.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/vm/sourcetextmodule-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 1 assertions)."
     },
     "test/js/node/vm/vm-sourceUrl.test.ts": {
       "status": "enabled",
@@ -1632,6 +1781,10 @@
     "test/js/node/worker_threads/worker_destruction.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/zlib/bytesWritten.test.ts": {
+      "status": "enabled",
+      "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (5 bun:test cases, 24 assertions)."
     },
     "test/js/node/zlib/deflate-streaming.test.ts": {
       "status": "enabled",
@@ -1817,6 +1970,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (908 bun:test cases, 0 assertions)."
     },
+    "test/js/web/abort/abort.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (5 bun:test cases, 12 assertions)."
+    },
     "test/js/web/console/console-log-utf16.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
@@ -1841,6 +1998,18 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (24 bun:test cases, 67 assertions)."
     },
+    "test/js/web/fetch/body-mixin-errors.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 6 assertions)."
+    },
+    "test/js/web/fetch/body-stream.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (0 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/fetch/chunked-trailing.test.js": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (23 bun:test cases, 44 assertions)."
+    },
     "test/js/web/fetch/content-length.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
@@ -1861,21 +2030,58 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (47 bun:test cases, 91 assertions)."
     },
+    "test/js/web/fetch/fetch-connection-header.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (10 bun:test cases, 12 assertions)."
+    },
     "test/js/web/fetch/fetch-cyclic-reference.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
+    },
+    "test/js/web/fetch/fetch-gzip.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (5 bun:test cases, 8 assertions)."
     },
     "test/js/web/fetch/fetch-redirect.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/js/web/fetch/fetch-stream-cancel-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/fetch-tcp-stress.test.ts": {
+      "status": "enabled",
+      "timeoutMs": 120000,
+      "reason": "TCP stress coverage passes over the streaming http client; needs a longer per-file timeout (4 bun:test cases)."
+    },
     "test/js/web/fetch/fetch-url-after-redirect.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
+    "test/js/web/fetch/fetch.brotli.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/fetch/fetch.unix.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (5 bun:test cases, 102 assertions)."
+    },
+    "test/js/web/fetch/fetch.upgrade.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
+    },
     "test/js/web/fetch/fetch_headers.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 12 assertions)."
+    },
+    "test/js/web/fetch/headers-case.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (3 bun:test cases, 9 assertions)."
+    },
+    "test/js/web/fetch/headers.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (65 bun:test cases, 86 assertions)."
     },
     "test/js/web/fetch/request-cyclic-reference.test.ts": {
       "status": "enabled",
@@ -1888,6 +2094,10 @@
     "test/js/web/fetch/server-response-stream-leak.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/html/URLSearchParams.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (11 bun:test cases, 29 assertions)."
     },
     "test/js/web/request/request.test.ts": {
       "status": "enabled",
@@ -1917,9 +2127,25 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 5 assertions)."
     },
+    "test/js/web/websocket/websocket-blob.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (3 bun:test cases, 4 assertions)."
+    },
+    "test/js/web/websocket/websocket-client.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (29 bun:test cases, 42 assertions)."
+    },
     "test/js/web/websocket/websocket-close-fragmented.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/websocket/websocket-pong-fragmented.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 1 assertions)."
+    },
+    "test/js/web/websocket/websocket-upgrade.test.ts": {
+      "status": "enabled",
+      "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
     },
     "test/package-json-lint.test.ts": {
       "status": "enabled",

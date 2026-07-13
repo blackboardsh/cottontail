@@ -21,6 +21,7 @@ pub const CtHostSpawnOptions = extern struct {
 
 pub const CtHostSpawnResult = extern struct {
     exit_code: c_int,
+    signal_code: c_int,
     stdout_ptr: ?[*]u8,
     stdout_len: usize,
     stderr_ptr: ?[*]u8,
@@ -77,6 +78,13 @@ fn termToExitCode(term: std.process.Child.Term) c_int {
         .signal => |signal| 128 + @as(c_int, @intCast(@intFromEnum(signal))),
         .stopped => 1,
         .unknown => 1,
+    };
+}
+
+fn termToSignalCode(term: std.process.Child.Term) c_int {
+    return switch (term) {
+        .signal => |signal| @as(c_int, @intCast(@intFromEnum(signal))),
+        else => 0,
     };
 }
 
@@ -204,6 +212,7 @@ export fn ct_host_spawn_sync(
     error_out.* = null;
     result_out.* = .{
         .exit_code = 0,
+        .signal_code = 0,
         .stdout_ptr = null,
         .stdout_len = 0,
         .stderr_ptr = null,
@@ -306,6 +315,7 @@ export fn ct_host_spawn_sync(
             return -1;
         };
         result_out.exit_code = termToExitCode(term);
+        result_out.signal_code = termToSignalCode(term);
 
         const stdout_slice = multi_reader.toOwnedSlice(0) catch |err| {
             setErrorOut(error_out, @errorName(err));
@@ -345,6 +355,7 @@ export fn ct_host_spawn_sync(
         defer gpa.free(run_result.stderr);
 
         result_out.exit_code = termToExitCode(run_result.term);
+        result_out.signal_code = termToSignalCode(run_result.term);
 
         result_out.stdout_ptr = allocBuffer(run_result.stdout) orelse {
             setErrorOut(error_out, "OutOfMemory");
@@ -381,6 +392,7 @@ export fn ct_host_spawn_sync(
         };
 
         result_out.exit_code = termToExitCode(term);
+        result_out.signal_code = termToSignalCode(term);
     }
 
     return 0;

@@ -160,7 +160,16 @@ function transformSync(mode, data, options = undefined) {
   const result = nativeOptions == null
     ? cottontail.zlibTransformSync(mode, bytesFromData(data))
     : cottontail.zlibTransformSync(mode, bytesFromData(data), nativeOptions);
-  return asBuffer(result);
+  const output = asBuffer(result);
+  const maxOutputLength = options && typeof options === "object" && options.maxOutputLength != null
+    ? Number(options.maxOutputLength)
+    : undefined;
+  if (maxOutputLength !== undefined && output.length > maxOutputLength) {
+    const error = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
+    error.code = "ERR_BUFFER_TOO_LARGE";
+    throw error;
+  }
+  return output;
 }
 
 function defaultStreamFinishFlush(mode) {
@@ -189,14 +198,89 @@ export function crc32(data, value = 0) {
   return (crc ^ -1) >>> 0;
 }
 
+const decompressModes = new Set(["inflate", "inflateRaw", "gunzip", "unzip", "brotliDecompress", "zstdDecompress"]);
+
 class ZlibTransform extends Transform {
   constructor(mode, options = {}) {
     super();
     this._mode = mode;
     this._options = options ?? {};
     this._chunks = [];
-    this.bytesRead = 0;
-    this.bytesWritten = 0;
+    this._inputBytes = 0;
+    this._consumedBytes = null;
+    this._finalInput = null;
+    this._finalOutput = null;
+    this._isDecompress = decompressModes.has(mode);
+  }
+
+  // Node's zlib streams expose bytesWritten as the number of input bytes the
+  // engine consumed. For decompressors fed trailing garbage, that stops at
+  // the end of the compressed stream, which we recover lazily by probing the
+  // one-shot native transform (there is no incremental native handle yet).
+  get bytesWritten() {
+    if (!this._isDecompress || this._finalInput === null) return this._inputBytes;
+    if (this._consumedBytes === null) {
+      this._consumedBytes = this._computeConsumed(this._finalInput, this._finalOutput);
+      this._finalInput = null;
+      this._finalOutput = null;
+    }
+    return this._consumedBytes;
+  }
+
+  set bytesWritten(value) {
+    this._inputBytes = value;
+    this._consumedBytes = null;
+    this._finalInput = null;
+  }
+
+  get bytesRead() {
+    return this.bytesWritten;
+  }
+
+  set bytesRead(value) {
+    this.bytesWritten = value;
+  }
+
+  _transformOptions() {
+    return {
+      finishFlush: defaultStreamFinishFlush(this._mode),
+      ...this._options,
+    };
+  }
+
+  _computeConsumed(input, fullOutput) {
+    // Appending junk that cannot continue the stream distinguishes "engine
+    // already saw end-of-stream at offset L" (junk is ignored, output is
+    // unchanged) from "stream still open at L" (junk corrupts the stream).
+    const junk = new Uint8Array([0xde, 0xad, 0x01, 0xff, 0xfe, 0x80, 0x7f]);
+    const options = this._transformOptions();
+    const outputEquals = (candidate) => {
+      const a = candidate instanceof Uint8Array ? candidate : new Uint8Array(candidate);
+      if (a.byteLength !== fullOutput.byteLength) return false;
+      for (let i = 0; i < a.byteLength; i += 1) {
+        if (a[i] !== fullOutput[i]) return false;
+      }
+      return true;
+    };
+    const endedAt = (length) => {
+      const probe = new Uint8Array(length + junk.length);
+      probe.set(input.subarray(0, length), 0);
+      probe.set(junk, length);
+      try {
+        return outputEquals(transformSync(this._mode, probe, options));
+      } catch {
+        return false;
+      }
+    };
+    if (!endedAt(input.byteLength)) return input.byteLength;
+    let low = 0;
+    let high = input.byteLength;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (endedAt(middle)) high = middle;
+      else low = middle + 1;
+    }
+    return low;
   }
 
   _consumeChunks() {
@@ -212,16 +296,64 @@ class ZlibTransform extends Transform {
   }
 
   _emitBuffered() {
-    if (this._chunks.length === 0) return false;
-    const output = transformSync(this._mode, this._consumeChunks(), {
-      finishFlush: defaultStreamFinishFlush(this._mode),
-      ...this._options,
-    });
-    this.bytesWritten += output.byteLength ?? output.length ?? 0;
+    // Compressors must emit a valid (possibly empty) stream even when no
+    // input was ever written; decompressors with no input emit nothing.
+    if (this._chunks.length === 0 && this._isDecompress) return false;
+    const input = this._consumeChunks();
+    const output = transformSync(this._mode, input, this._transformOptions());
+    let bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
+    if (this._isDecompress) {
+      this._finalInput = input;
+      this._finalOutput = bytes;
+      this._consumedBytes = null;
+      // gzip members and zstd frames concatenate; Node's decompressors keep
+      // decoding subsequent members, so loop over the remaining input.
+      if (this._mode === "gunzip" || this._mode === "unzip" || this._mode === "zstdDecompress") {
+        let consumed = this._computeConsumed(input, bytes);
+        if (consumed > 0 && consumed < input.byteLength) {
+          const parts = [bytes];
+          let remaining = input.subarray(consumed);
+          let totalConsumed = consumed;
+          while (remaining.byteLength > 0) {
+            let memberOutput;
+            try {
+              const raw = transformSync(this._mode, remaining, this._transformOptions());
+              memberOutput = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+            } catch {
+              break;
+            }
+            parts.push(memberOutput);
+            const memberConsumed = this._computeConsumed(remaining, memberOutput);
+            if (memberConsumed <= 0) {
+              totalConsumed += remaining.byteLength;
+              break;
+            }
+            totalConsumed += memberConsumed;
+            remaining = remaining.subarray(memberConsumed);
+          }
+          const totalLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+          const combined = new Uint8Array(totalLength);
+          let offset = 0;
+          for (const part of parts) {
+            combined.set(part, offset);
+            offset += part.byteLength;
+          }
+          bytes = combined;
+          this._finalInput = null;
+          this._finalOutput = null;
+          this._consumedBytes = totalConsumed;
+        }
+      }
+    }
+    const maxOutputLength = this._options.maxOutputLength ?? kMaxLengthLimit();
+    if (bytes.byteLength > maxOutputLength) {
+      const error = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
+      error.code = "ERR_BUFFER_TOO_LARGE";
+      throw error;
+    }
     // Node's zlib streams emit output in highWaterMark-sized chunks (16 KiB
     // by default), never one monolithic buffer.
     const chunkSize = Number(this._options.chunkSize) > 0 ? Number(this._options.chunkSize) : 16 * 1024;
-    const bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
     for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
       this.push(bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize)));
     }
@@ -235,7 +367,7 @@ class ZlibTransform extends Transform {
     }
     const bytes = bytesFromData(typeof chunk === "string" && encoding ? globalThis.Buffer?.from(chunk, encoding) ?? chunk : chunk);
     this._chunks.push(bytes);
-    this.bytesRead += bytes.byteLength;
+    this._inputBytes += bytes.byteLength;
     callback?.();
     return true;
   }
@@ -266,13 +398,24 @@ class ZlibTransform extends Transform {
       kind = undefined;
     }
     void kind;
-    try {
-      this._emitBuffered();
-      callback?.();
-    } catch (error) {
-      this.emit("error", error);
-      callback?.(error);
+    // COTTONTAIL-COMPAT: node:zlib flush - no incremental native handle yet.
+    // gzip members and zstd frames concatenate into valid streams, so those
+    // modes can emit a complete member per flush (Node-visible behavior);
+    // deflate/brotli output cannot be segmented safely, so they keep
+    // buffering until end().
+    if (this._mode === "gzip" || this._mode === "zstdCompress") {
+      try {
+        this._emitBuffered();
+      } catch (error) {
+        if (callback) {
+          queueMicrotask(() => callback(error));
+          return;
+        }
+        this.emit("error", error);
+        return;
+      }
     }
+    if (callback) queueMicrotask(callback);
   }
 
   close(callback = undefined) {
@@ -282,9 +425,16 @@ class ZlibTransform extends Transform {
 
   reset() {
     this._chunks = [];
-    this.bytesRead = 0;
-    this.bytesWritten = 0;
+    this._inputBytes = 0;
+    this._consumedBytes = null;
+    this._finalInput = null;
+    this._finalOutput = null;
   }
+}
+
+function kMaxLengthLimit() {
+  const limit = globalThis.Buffer?.kMaxLength;
+  return typeof limit === "number" && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
 }
 
 export class Deflate extends ZlibTransform { constructor(options = {}) { super("deflate", options); } }
@@ -337,7 +487,22 @@ export function gunzipSync(data, options = undefined) { return transformSync("gu
 export function unzipSync(data, options = undefined) { return transformSync("unzip", data, options); }
 export function brotliCompressSync(data, options = undefined) { return transformSync("brotliCompress", data, options); }
 export function brotliDecompressSync(data, options = undefined) { return transformSync("brotliDecompress", data, options); }
-export function zstdCompressSync(data, options = undefined) { return transformSync("zstdCompress", data, options); }
+const ZSTD_MIN_LEVEL = 1;
+const ZSTD_MAX_LEVEL = 22;
+
+function validateZstdCompressOptions(options) {
+  if (options && typeof options === "object" && options.level != null) {
+    const level = Number(options.level);
+    if (!Number.isFinite(level) || level < ZSTD_MIN_LEVEL || level > ZSTD_MAX_LEVEL) {
+      throw new RangeError(`Compression level must be between ${ZSTD_MIN_LEVEL} and ${ZSTD_MAX_LEVEL}`);
+    }
+  }
+}
+
+export function zstdCompressSync(data, options = undefined) {
+  validateZstdCompressOptions(options);
+  return transformSync("zstdCompress", data, options);
+}
 export function zstdDecompressSync(data, options = undefined) { return transformSync("zstdDecompress", data, options); }
 
 export const deflate = callbackifySync(deflateSync);

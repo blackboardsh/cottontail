@@ -145,7 +145,20 @@ export const STATUS_CODES = {
   511: "Network Authentication Required",
 };
 
-export const maxHeaderSize = Number(globalThis.process?.env?.BUN_HTTP_MAX_HEADER_SIZE ?? "") || 16 * 1024;
+function initialMaxHeaderSize() {
+  const fromEnv = Number(globalThis.process?.env?.BUN_HTTP_MAX_HEADER_SIZE ?? "");
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  for (const arg of globalThis.process?.execArgv ?? []) {
+    const match = /^--max-http-header-size=(\d+)$/.exec(String(arg));
+    if (match) return Number(match[1]);
+  }
+  return 16 * 1024;
+}
+
+// Bun allows reassigning http.maxHeaderSize at runtime (Node's is read-only);
+// the live value drives the 431 header-overflow enforcement below.
+let currentMaxHeaderSize = initialMaxHeaderSize();
+export { currentMaxHeaderSize as maxHeaderSize };
 
 const tokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
@@ -1858,9 +1871,21 @@ export function _attachHttpConnection(server, socket) {
           buf = null;
           const idx = findHeaderEnd(req.headBuffer, req.searchPos);
           if (idx < 0) {
+            if (req.headBuffer.byteLength > currentMaxHeaderSize) {
+              const overflow = new Error("Parse Error: Header overflow");
+              overflow.code = "HPE_HEADER_OVERFLOW";
+              fail(overflow, "431 Request Header Fields Too Large");
+              return;
+            }
             req.searchPos = Math.max(0, req.headBuffer.byteLength - 3);
             if (req.headBuffer.byteLength > 0) refreshHeadersTimer();
             break;
+          }
+          if (idx > currentMaxHeaderSize) {
+            const overflow = new Error("Parse Error: Header overflow");
+            overflow.code = "HPE_HEADER_OVERFLOW";
+            fail(overflow, "431 Request Header Fields Too Large");
+            return;
           }
           if (headersTimer != null) {
             clearTimeout(headersTimer);
@@ -2346,7 +2371,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
 // Bun exposes the WebSocket client as a global.
 globalThis.WebSocket ??= WebSocket;
 
-export default {
+const httpDefault = {
   Agent,
   ClientRequest,
   CloseEvent,
@@ -2362,9 +2387,20 @@ export default {
   createServer,
   get,
   globalAgent,
-  maxHeaderSize,
   request,
   setMaxIdleHTTPParsers,
   validateHeaderName,
   validateHeaderValue,
 };
+
+Object.defineProperty(httpDefault, "maxHeaderSize", {
+  enumerable: true,
+  configurable: true,
+  get: () => currentMaxHeaderSize,
+  set: (value) => {
+    const size = Number(value);
+    if (Number.isFinite(size) && size > 0) currentMaxHeaderSize = size;
+  },
+});
+
+export default httpDefault;

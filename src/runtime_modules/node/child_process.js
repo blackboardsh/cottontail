@@ -287,9 +287,11 @@ function normalizeSyncResult(result, options = {}) {
   const stderrBuffer = Buffer.from(result.stderr || "");
   const stdout = encoding ? stdoutBuffer.toString(encoding) : stdoutBuffer;
   const stderr = encoding ? stderrBuffer.toString(encoding) : stderrBuffer;
+  const signal = result.signal ?? signalNumberToName(result.signalCode) ?? null;
   return {
-    status: Number(result.status ?? 0),
-    signal: result.signal ?? null,
+    // Node reports status null when the child died from a signal.
+    status: signal != null ? null : Number(result.status ?? 0),
+    signal,
     error: result.error,
     output: [null, stdout, stderr],
     pid: Number(result.pid ?? 0),
@@ -352,6 +354,7 @@ export function spawn(file, args = [], options = {}) {
     stdout: stdoutMode,
     stderr: stderrMode,
     ipc: ipcRequested,
+    argv0: options.argv0 != null ? String(options.argv0) : undefined,
   });
 
   const emitFrom = (map, name, ...values) => {
@@ -580,25 +583,33 @@ export function spawn(file, args = [], options = {}) {
         }
         child._pendingIpcEvents = [];
       }
-      if (child.stdout) {
-        child.stdout.destroyed = true;
-        emitFrom(stdoutListeners, "end");
-        emitFrom(stdoutListeners, "close");
-      }
-      if (child.stderr) {
-        child.stderr.destroyed = true;
-        emitFrom(stderrListeners, "end");
-        emitFrom(stderrListeners, "close");
-      }
-      // The IPC channel dies with the child; Node marks it closed before 'exit'
-      // listeners run, then emits 'disconnect'.
-      const wasConnected = child.connected === true;
-      child.connected = false;
-      child._ipcOnExit?.();
-      emitChild("exit", exitCode, signalCode);
-      if (wasConnected) emitChild("disconnect");
-      emitChild("close", exitCode, signalCode);
-      cottontail.spawnDispose?.(native.id);
+      // Defer terminal events by one macrotask: the exit event can be
+      // dispatched in the same pump as the JS continuation that attaches
+      // 'exit'/'close' listeners right after spawn()/kill(), and emitting
+      // synchronously here would fire before those listeners exist. The
+      // (ref'd) timer also keeps the event loop alive now that the spawn
+      // listener has been unregistered.
+      setTimeout(() => {
+        if (child.stdout) {
+          child.stdout.destroyed = true;
+          emitFrom(stdoutListeners, "end");
+          emitFrom(stdoutListeners, "close");
+        }
+        if (child.stderr) {
+          child.stderr.destroyed = true;
+          emitFrom(stderrListeners, "end");
+          emitFrom(stderrListeners, "close");
+        }
+        // The IPC channel dies with the child; Node marks it closed before
+        // 'exit' listeners run, then emits 'disconnect'.
+        const wasConnected = child.connected === true;
+        child.connected = false;
+        child._ipcOnExit?.();
+        emitChild("exit", exitCode, signalCode);
+        if (wasConnected) emitChild("disconnect");
+        emitChild("close", exitCode, signalCode);
+        cottontail.spawnDispose?.(native.id);
+      }, 0);
     }
   });
 

@@ -574,7 +574,82 @@ export function createSocketPair() {
 }
 
 export function canonicalizeIP(value) {
-  return String(value).toLowerCase();
+  const text = String(value).trim();
+  const v4 = text.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const octets = v4.slice(1).map(Number);
+    if (octets.some((octet) => octet > 255)) return "";
+    return octets.join(".");
+  }
+  if (!text.includes(":")) return "";
+
+  let head = text;
+  let tail = null;
+  const compression = text.indexOf("::");
+  if (compression !== -1) {
+    if (text.indexOf("::", compression + 1) !== -1) return "";
+    head = text.slice(0, compression);
+    tail = text.slice(compression + 2);
+  }
+  const parseSide = (part, allowV4AtEnd) => {
+    if (part === "") return [];
+    const out = [];
+    const pieces = part.split(":");
+    for (let i = 0; i < pieces.length; i += 1) {
+      const piece = pieces[i];
+      if (/^[0-9a-fA-F]{1,4}$/.test(piece)) {
+        out.push(parseInt(piece, 16));
+        continue;
+      }
+      if (allowV4AtEnd && i === pieces.length - 1 && /^\d{1,3}(\.\d{1,3}){3}$/.test(piece)) {
+        const octets = piece.split(".").map(Number);
+        if (octets.some((octet) => octet > 255)) return null;
+        out.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+        continue;
+      }
+      return null;
+    }
+    return out;
+  };
+  const headGroups = parseSide(head, tail === null);
+  const tailGroups = tail === null ? [] : parseSide(tail, true);
+  if (headGroups === null || tailGroups === null) return "";
+  let groups;
+  if (tail === null) {
+    groups = headGroups;
+  } else {
+    const missing = 8 - headGroups.length - tailGroups.length;
+    if (missing < 1) return "";
+    groups = headGroups.concat(new Array(missing).fill(0), tailGroups);
+  }
+  if (groups.length !== 8) return "";
+
+  // IPv4-mapped addresses render with the dotted quad.
+  if (groups[0] === 0 && groups[1] === 0 && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0xffff) {
+    return `::ffff:${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`;
+  }
+
+  // RFC 5952: compress the longest run of two or more zero groups.
+  let bestStart = -1;
+  let bestLength = 0;
+  let runStart = -1;
+  for (let i = 0; i < 8; i += 1) {
+    if (groups[i] === 0) {
+      if (runStart === -1) runStart = i;
+      const length = i - runStart + 1;
+      if (length > bestLength) {
+        bestStart = runStart;
+        bestLength = length;
+      }
+    } else {
+      runStart = -1;
+    }
+  }
+  const hex = groups.map((group) => group.toString(16));
+  if (bestLength >= 2) {
+    return `${hex.slice(0, bestStart).join(":")}::${hex.slice(bestStart + bestLength).join(":")}`;
+  }
+  return hex.join(":");
 }
 
 // COTTONTAIL-COMPAT: bun:internal-for-testing - Bun-private hooks without a

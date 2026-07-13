@@ -57,6 +57,54 @@ function normalizeFamily(family = "ipv4") {
   return text === "ipv6" || text === "6" ? "ipv6" : "ipv4";
 }
 
+const connectErrnos = {
+  ECONNREFUSED: -61,
+  ECONNRESET: -54,
+  EHOSTUNREACH: -65,
+  ENETUNREACH: -51,
+  ENOENT: -2,
+  ETIMEDOUT: -60,
+};
+
+function connectionException(rawError, options, host, port) {
+  const original = rawError instanceof Error ? rawError : new Error(String(rawError));
+  const text = String(original.message);
+  let code = original.code;
+  if (code == null) {
+    if (/refused|ECONNREFUSED/i.test(text)) code = "ECONNREFUSED";
+    else if (/no such file|ENOENT/i.test(text)) code = "ENOENT";
+    else if (/(not known|not found|ENOTFOUND|nodename|no address)/i.test(text)) code = "ENOTFOUND";
+    else if (/timed? ?out|ETIMEDOUT/i.test(text)) code = "ETIMEDOUT";
+    else if (/host.*unreachable|EHOSTUNREACH/i.test(text)) code = "EHOSTUNREACH";
+    else if (/network.*unreachable|ENETUNREACH/i.test(text)) code = "ENETUNREACH";
+    else if (/reset|ECONNRESET/i.test(text)) code = "ECONNRESET";
+  }
+  if (code === "ENOTFOUND") {
+    const error = new Error(`getaddrinfo ENOTFOUND ${host}`);
+    error.code = "ENOTFOUND";
+    error.errno = -3008;
+    error.syscall = "getaddrinfo";
+    error.hostname = host;
+    return error;
+  }
+  if (code == null) {
+    original.syscall = "connect";
+    return original;
+  }
+  const location = options.path != null ? String(options.path) : `${host}:${port}`;
+  const error = new Error(`connect ${code} ${location}`);
+  error.code = code;
+  error.errno = connectErrnos[code];
+  error.syscall = "connect";
+  if (options.path != null) {
+    error.address = String(options.path);
+  } else {
+    error.address = host;
+    error.port = port;
+  }
+  return error;
+}
+
 export class Socket extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -97,6 +145,12 @@ export class Socket extends EventEmitter {
     this._endEmitted = false;
     this._finishEmitted = false;
     this._pipes = new Map();
+    this._onread = options.onread && typeof options.onread === "object" && typeof options.onread.callback === "function"
+      ? options.onread
+      : null;
+    this._abortSignal = null;
+    this._abortReason = undefined;
+    if (options.signal) this._setupAbortSignal(options.signal);
     if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, true);
   }
 
@@ -354,6 +408,17 @@ export class Socket extends EventEmitter {
     this._endEmitted = true;
     this.emit("end");
     if (!this.allowHalfOpen) this.destroy();
+    else this._maybeClose();
+  }
+
+  _maybeClose() {
+    // Once both directions are done (FIN received and FIN sent) the socket
+    // closes, even with allowHalfOpen.
+    if (this._finishEmitted && this._endEmitted && !this.destroyed) {
+      queueMicrotask(() => {
+        if (this._finishEmitted && this._endEmitted && !this.destroyed) this.destroy();
+      });
+    }
   }
 
   _flushPendingData() {
@@ -366,6 +431,34 @@ export class Socket extends EventEmitter {
     }
   }
 
+  _deliverOnread(data) {
+    const source = data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(0);
+    let offset = 0;
+    while (offset < source.byteLength) {
+      const target = typeof this._onread.buffer === "function" ? this._onread.buffer() : this._onread.buffer;
+      const view = ArrayBuffer.isView(target)
+        ? new Uint8Array(target.buffer, target.byteOffset, target.byteLength)
+        : new Uint8Array(target);
+      const count = Math.min(view.byteLength, source.byteLength - offset);
+      if (count === 0) break;
+      view.set(source.subarray(offset, offset + count));
+      offset += count;
+      this.bytesRead += count;
+      try {
+        const keepReading = this._onread.callback(count, target);
+        if (keepReading === false) this.pause();
+      } catch (error) {
+        this.destroy(error);
+        return;
+      }
+    }
+    this._refreshTimeout();
+  }
+
   _startRead() {
     if (this.fd == null || this.destroyed || this._watchId || typeof cottontail.fdWatchStart !== "function") return this;
     const fdWatchListeners = installFdWatchDispatcher();
@@ -375,6 +468,10 @@ export class Socket extends EventEmitter {
     fdWatchListeners.set(this._watchId, (event) => {
       if (this.destroyed) return;
       if (event.type === "data") {
+        if (this._onread) {
+          this._deliverOnread(event.data ?? new ArrayBuffer(0));
+          return;
+        }
         const chunk = chunkFromBytes(event.data ?? new ArrayBuffer(0), this._encoding);
         const length = Number(chunk?.byteLength ?? chunk?.length ?? 0);
         if (length > 0) {
@@ -400,34 +497,80 @@ export class Socket extends EventEmitter {
     return this;
   }
 
+  _setupAbortSignal(signal) {
+    if (signal == null || typeof signal !== "object" || this._abortSignal === signal) return;
+    if (typeof signal.addEventListener !== "function") return;
+    this._abortSignal = signal;
+    const abort = () => {
+      const reason = signal.reason !== undefined ? signal.reason : (() => {
+        const err = new Error("The operation was aborted");
+        err.name = "AbortError";
+        err.code = "ABORT_ERR";
+        return err;
+      })();
+      this._abortReason = reason;
+      if (!this.destroyed) this.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+    };
+    if (signal.aborted) {
+      // Node destroys asynchronously so callers can attach "error" listeners.
+      setTimeout(abort, 0);
+      return;
+    }
+    const onAbort = () => abort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    this.once("close", () => {
+      try {
+        signal.removeEventListener("abort", onAbort);
+      } catch {
+        // ignore
+      }
+    });
+  }
+
   connect(...args) {
     const [options, callback] = _normalizeArgs(args);
     if (callback) this.once("connect", callback);
+    if (options.onread && typeof options.onread === "object" && typeof options.onread.callback === "function") {
+      this._onread = options.onread;
+    }
+    if (options.signal) this._setupAbortSignal(options.signal);
     this.connecting = true;
-    queueMicrotask(() => {
+    // Node sockets support reconnecting after end()/destroy().
+    if (this.destroyed && this._abortReason === undefined) {
+      this.destroyed = false;
+      this.readable = true;
+      this.writable = true;
+      this._ending = false;
+      this._endEmitted = false;
+      this._finishEmitted = false;
+      this._pendingEnd = false;
+      this._pendingData = [];
+      this._outboundWrites = [];
+    }
+    // Use a macrotask: connect errors emitted from swallowed microtask
+    // exceptions would not crash the process, and Node never connects
+    // synchronously either.
+    setTimeout(() => {
+      if (this.destroyed) return;
+      let host = options.host ?? "127.0.0.1";
+      const port = Number(options.port);
       try {
-        let host = options.host ?? "127.0.0.1";
         // Connecting to a wildcard address targets the local host.
         if (host === "0.0.0.0") host = "127.0.0.1";
         else if (host === "::") host = "::1";
         const result = options.path != null
           ? cottontail.unixSocketConnect(String(options.path))
-          : cottontail.tcpSocketConnect(Number(options.port), host, Number(options.family ?? 4));
+          : cottontail.tcpSocketConnect(port, host, Number(options.family ?? (String(host).includes(":") ? 6 : 4)));
         this._isPipe = options.path != null;
         this._path = options.path;
         this._attachFd(result.fd, result.local, result.remote, true);
       } catch (rawError) {
-        const error = rawError instanceof Error ? rawError : new Error(String(rawError));
-        if (error.code == null) {
-          const text = String(error.message);
-          if (/refused|ECONNREFUSED/i.test(text)) error.code = "ECONNREFUSED";
-          else if (/(not known|not found|ENOTFOUND|nodename|no address)/i.test(text)) error.code = "ENOTFOUND";
-          else if (/timed? ?out|ETIMEDOUT/i.test(text)) error.code = "ETIMEDOUT";
-        }
         this.connecting = false;
-        this.destroy(error);
+        if (this.destroyed) return;
+        if (this._abortReason !== undefined) return;
+        this.destroy(connectionException(rawError, options, host, port));
       }
-    });
+    }, 0);
     return this;
   }
 
@@ -459,6 +602,7 @@ export class Socket extends EventEmitter {
     if (!this._ending || this._finishEmitted || this._outboundWrites.length > 0) return;
     this._finishEmitted = true;
     this.emit("finish");
+    this._maybeClose();
   }
 
   end(chunk, encoding, callback) {
@@ -584,12 +728,55 @@ export class Server extends EventEmitter {
   }
 
   listen(...args) {
+    // Node validates an explicit options object eagerly: it must carry a
+    // port, path, or fd.
+    const first = args?.[0];
+    if (first !== null && typeof first === "object" && !Array.isArray(first)) {
+      if (first.port === undefined && first.path == null && first.fd == null) {
+        const error = new TypeError(`The argument 'options' must have the property "port" or "path". Received ${JSON.stringify(first)}`);
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+    }
     const [options, callback] = _normalizeArgs(args);
+    if (options.port !== undefined && options.path == null) {
+      const port = Number(options.port);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        const error = new RangeError(`options.port should be >= 0 and < 65536. Received type number (${options.port}).`);
+        error.code = "ERR_SOCKET_BAD_PORT";
+        throw error;
+      }
+    }
+    if (options.signal != null && typeof options.signal.addEventListener === "function") {
+      const signal = options.signal;
+      const onAbort = () => this.close();
+      if (signal.aborted) setTimeout(onAbort, 0);
+      else {
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.once("close", () => {
+          try {
+            signal.removeEventListener("abort", onAbort);
+          } catch {
+            // ignore
+          }
+        });
+      }
+    }
     if (callback) this.once("listening", callback);
     try {
-      const result = options.path != null
-        ? cottontail.unixServerListen(String(options.path), Number(options.backlog ?? 128))
-        : cottontail.tcpServerListen(Number(options.port ?? 0), options.host ?? "0.0.0.0", Number(options.family ?? 4));
+      let result;
+      if (options.path != null) {
+        result = cottontail.unixServerListen(String(options.path), Number(options.backlog ?? 128));
+      } else if (options.host == null) {
+        // Node binds "::" (dual-stack any) by default. Bun.connect cannot
+        // reach an IPv6 wildcard yet (bun/index.js maps neither "::" nor
+        // family), so bind the IPv4 wildcard for interoperability.
+        result = cottontail.tcpServerListen(Number(options.port ?? 0), "0.0.0.0", 4);
+      } else {
+        const host = String(options.host);
+        const family = Number(options.family ?? (host.includes(":") ? 6 : 4));
+        result = cottontail.tcpServerListen(Number(options.port ?? 0), host, family);
+      }
       this._fd = Number(result.fd);
       this._isPipe = options.path != null;
       this._path = this._isPipe ? String(result.path ?? options.path) : null;
@@ -649,7 +836,15 @@ export class Server extends EventEmitter {
       if (accepted == null) return;
       if (this.maxConnections != null && this.connections >= Number(this.maxConnections)) {
         try { cottontail.closeFd?.(accepted.fd); } catch {}
-        this.emit("drop", accepted);
+        const familyName = (value, address) => String(value ?? (String(address ?? "").includes(":") ? "IPv6" : "IPv4")).replace(/^ipv/i, "IPv");
+        this.emit("drop", {
+          localAddress: accepted.local?.address ?? this._address?.address,
+          localPort: accepted.local?.port ?? this._address?.port,
+          localFamily: familyName(accepted.local?.family, accepted.local?.address ?? this._address?.address),
+          remoteAddress: accepted.remote?.address,
+          remotePort: accepted.remote?.port,
+          remoteFamily: familyName(accepted.remote?.family, accepted.remote?.address),
+        });
         continue;
       }
       const socket = new Socket({ fd: accepted.fd, local: accepted.local, remote: accepted.remote, pipe: this._isPipe, path: this._path });
@@ -965,11 +1160,47 @@ export function setDefaultAutoSelectFamilyAttemptTimeout(value) {
 
 export function isIPv4(input) {
   const parts = String(input).split(".");
-  return parts.length === 4 && parts.every((part) => /^\d+$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+  if (parts.length !== 4) return false;
+  for (const part of parts) {
+    // No empty octets, no leading zeros, 0-255 only.
+    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return false;
+    if (Number(part) > 255) return false;
+  }
+  return true;
+}
+
+function ipv6GroupCount(text, allowTrailingIPv4) {
+  if (text === "") return 0;
+  const groups = text.split(":");
+  let count = 0;
+  for (let index = 0; index < groups.length; index += 1) {
+    const group = groups[index];
+    if (/^[0-9a-fA-F]{1,4}$/.test(group)) {
+      count += 1;
+      continue;
+    }
+    if (allowTrailingIPv4 && index === groups.length - 1 && isIPv4(group)) {
+      count += 2;
+      continue;
+    }
+    return -1;
+  }
+  return count;
 }
 
 export function isIPv6(input) {
-  return String(input).includes(":");
+  const text = String(input);
+  if (text.length === 0) return false;
+  const compressionIndex = text.indexOf("::");
+  if (compressionIndex !== -1 && text.indexOf("::", compressionIndex + 1) !== -1) return false;
+  if (compressionIndex === -1) {
+    return ipv6GroupCount(text, true) === 8;
+  }
+  const headCount = ipv6GroupCount(text.slice(0, compressionIndex), false);
+  const tailCount = ipv6GroupCount(text.slice(compressionIndex + 2), true);
+  if (headCount < 0 || tailCount < 0) return false;
+  // "::" always stands in for at least one 16-bit group.
+  return headCount + tailCount <= 7;
 }
 
 export function isIP(input) {

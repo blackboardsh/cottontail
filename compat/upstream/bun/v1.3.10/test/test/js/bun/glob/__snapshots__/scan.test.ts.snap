@@ -1,0 +1,1135 @@
+// Jest Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`: absolute: fixtures/* 1`] = `
+[
+  "/fixtures/file.md",
+]
+`;
+
+exports[`: fixtures/* 1`] = `
+[
+  "fixtures/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/** 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: fixtures/** 1`] = `
+[
+  "fixtures/file.md",
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+  "fixtures/third/library/a/book.md",
+  "fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/* 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: fixtures/**/* 1`] = `
+[
+  "fixtures/file.md",
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+  "fixtures/third/library/a/book.md",
+  "fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: fixtures/*/nested 1`] = `
+[]
+`;
+
+exports[`: fixtures/*/nested 1`] = `
+[]
+`;
+
+exports[`: absolute: fixtures/*/nested/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/*/nested/* 1`] = `
+[
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/*/nested/** 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/*/nested/** 1`] = `
+[
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/*/nested/**/* 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/*/nested/**/* 1`] = `
+[
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/nested/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/nested/* 1`] = `
+[
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/nested/** 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/nested/** 1`] = `
+[
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/nested/**/* 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/nested/**/* 1`] = `
+[
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/{first,second} 1`] = `
+[]
+`;
+
+exports[`: fixtures/{first,second} 1`] = `
+[]
+`;
+
+exports[`: absolute: fixtures/{first,second}/* 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/second/file.md",
+]
+`;
+
+exports[`: fixtures/{first,second}/* 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/second/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/{first,second}/** 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/{first,second}/** 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/{first,second}/**/* 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/{first,second}/**/* 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/*/{first,second}/* 1`] = `
+[]
+`;
+
+exports[`: fixtures/*/{first,second}/* 1`] = `
+[]
+`;
+
+exports[`: absolute: fixtures/*/{first,second}/*/{nested,file.md} 1`] = `
+[]
+`;
+
+exports[`: fixtures/*/{first,second}/*/{nested,file.md} 1`] = `
+[]
+`;
+
+exports[`: absolute: fixtures/**/{first,second}/** 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/{first,second}/** 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/{first,second}/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/second/file.md",
+]
+`;
+
+exports[`: fixtures/**/{first,second}/{nested,file.md} 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/second/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/{first,second}/**/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/{first,second}/**/{nested,file.md} 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/{first,second}/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/second/file.md",
+]
+`;
+
+exports[`: fixtures/{first,second}/{nested,file.md} 1`] = `
+[
+  "fixtures/first/file.md",
+  "fixtures/second/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/{first,second}/*/nested/* 1`] = `
+[]
+`;
+
+exports[`: fixtures/{first,second}/*/nested/* 1`] = `
+[]
+`;
+
+exports[`: absolute: fixtures/{first,second}/**/nested/** 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/{first,second}/**/nested/** 1`] = `
+[
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/*/{nested,file.md}/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/*/{nested,file.md}/* 1`] = `
+[
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/{nested,file.md}/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: fixtures/**/{nested,file.md}/* 1`] = `
+[
+  "fixtures/first/nested/file.md",
+  "fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: absolute: ./fixtures/* 1`] = `
+[
+  "/fixtures/file.md",
+]
+`;
+
+exports[`: ./fixtures/* 1`] = `
+[
+  "fixtures/file.md",
+]
+`;
+
+exports[`: absolute: ../. 1`] = `
+[]
+`;
+
+exports[`: ../. 1`] = `
+[]
+`;
+
+exports[`: absolute: * 1`] = `
+[]
+`;
+
+exports[`: * 1`] = `
+[
+  "file.md",
+]
+`;
+
+exports[`: absolute: ** 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: ** 1`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: **/* 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: **/* 1`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: */nested 1`] = `
+[]
+`;
+
+exports[`: */nested 1`] = `
+[]
+`;
+
+exports[`: absolute: */nested/* 1`] = `
+[]
+`;
+
+exports[`: */nested/* 1`] = `
+[
+  "first/nested/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: */nested/** 1`] = `
+[]
+`;
+
+exports[`: */nested/** 1`] = `
+[
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: */nested/**/* 1`] = `
+[]
+`;
+
+exports[`: */nested/**/* 1`] = `
+[
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: **/nested/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/nested/* 1`] = `
+[
+  "first/nested/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: **/nested/** 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/nested/** 1`] = `
+[
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: **/nested/**/* 1`] = `
+[
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/nested/**/* 1`] = `
+[
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: {first,second} 1`] = `
+[]
+`;
+
+exports[`: {first,second} 1`] = `
+[]
+`;
+
+exports[`: absolute: {first,second}/* 1`] = `
+[]
+`;
+
+exports[`: {first,second}/* 1`] = `
+[
+  "first/file.md",
+  "second/file.md",
+]
+`;
+
+exports[`: absolute: {first,second}/** 1`] = `
+[]
+`;
+
+exports[`: {first,second}/** 1`] = `
+[
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: {first,second}/**/* 1`] = `
+[]
+`;
+
+exports[`: {first,second}/**/* 1`] = `
+[
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: */{first,second}/* 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/second/file.md",
+]
+`;
+
+exports[`: */{first,second}/* 1`] = `
+[]
+`;
+
+exports[`: absolute: */{first,second}/*/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: */{first,second}/*/{nested,file.md} 1`] = `
+[]
+`;
+
+exports[`: absolute: **/{first,second}/** 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/{first,second}/** 1`] = `
+[
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: **/{first,second}/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/second/file.md",
+]
+`;
+
+exports[`: **/{first,second}/{nested,file.md} 1`] = `
+[
+  "first/file.md",
+  "second/file.md",
+]
+`;
+
+exports[`: absolute: **/{first,second}/**/{nested,file.md} 1`] = `
+[
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/{first,second}/**/{nested,file.md} 1`] = `
+[
+  "first/file.md",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: {first,second}/{nested,file.md} 1`] = `
+[]
+`;
+
+exports[`: {first,second}/{nested,file.md} 1`] = `
+[
+  "first/file.md",
+  "second/file.md",
+]
+`;
+
+exports[`: absolute: {first,second}/*/nested/* 1`] = `
+[]
+`;
+
+exports[`: {first,second}/*/nested/* 1`] = `
+[]
+`;
+
+exports[`: absolute: {first,second}/**/nested/** 1`] = `
+[]
+`;
+
+exports[`: {first,second}/**/nested/** 1`] = `
+[
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: */{nested,file.md}/* 1`] = `
+[]
+`;
+
+exports[`: */{nested,file.md}/* 1`] = `
+[
+  "first/nested/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: **/{nested,file.md}/* 1`] = `
+[
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/nested/file.md",
+]
+`;
+
+exports[`: **/{nested,file.md}/* 1`] = `
+[
+  "first/nested/file.md",
+  "second/nested/file.md",
+]
+`;
+
+exports[`: absolute: ./* 1`] = `
+[]
+`;
+
+exports[`: ./* 1`] = `
+[
+  "leak.test.ts",
+  "match.test.ts",
+  "proto.test.ts",
+  "scan.test.ts",
+  "stress.test.ts",
+  "util.ts",
+]
+`;
+
+exports[`: absolute: ./* 2`] = `
+[]
+`;
+
+exports[`: ./* 2`] = `
+[
+  "file.md",
+]
+`;
+
+exports[`: absolute: ./** 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: ./** 1`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: ./**/* 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: ./**/* 1`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: ../* 1`] = `
+[]
+`;
+
+exports[`: ../* 1`] = `
+[]
+`;
+
+exports[`: absolute: ../** 1`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: ../** 1`] = `
+[]
+`;
+
+exports[`: absolute: ../../* 1`] = `
+[]
+`;
+
+exports[`: ../../* 1`] = `
+[]
+`;
+
+exports[`: absolute: ../{first,second} 1`] = `
+[]
+`;
+
+exports[`: ../{first,second} 1`] = `
+[]
+`;
+
+exports[`: absolute: ./../* 1`] = `
+[]
+`;
+
+exports[`: ./../* 1`] = `
+[]
+`;
+
+exports[`: absolute: * 2`] = `
+[]
+`;
+
+exports[`: absolute: * 3`] = `
+[
+  "file.md",
+]
+`;
+
+exports[`: absolute: ** 2`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: ** 3`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: **/* 2`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: **/* 3`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: fixtures/* 2`] = `
+[
+  "/fixtures/file.md",
+]
+`;
+
+exports[`: fixtures/* 2`] = `
+[
+  "fixtures/file.md",
+]
+`;
+
+exports[`: absolute: fixtures/** 2`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: fixtures/** 2`] = `
+[
+  "fixtures/file.md",
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+  "fixtures/third/library/a/book.md",
+  "fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: fixtures/**/* 2`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: fixtures/**/* 2`] = `
+[
+  "fixtures/file.md",
+  "fixtures/first/file.md",
+  "fixtures/first/nested/directory/file.json",
+  "fixtures/first/nested/directory/file.md",
+  "fixtures/first/nested/file.md",
+  "fixtures/second/file.md",
+  "fixtures/second/nested/directory/file.md",
+  "fixtures/second/nested/file.md",
+  "fixtures/third/library/a/book.md",
+  "fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: * 4`] = `
+[]
+`;
+
+exports[`: * 2`] = `
+[
+  "file.md",
+]
+`;
+
+exports[`: absolute: ** 4`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: ** 2`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;
+
+exports[`: absolute: **/* 4`] = `
+[
+  "/fixtures/file.md",
+  "/fixtures/first/file.md",
+  "/fixtures/first/nested/directory/file.json",
+  "/fixtures/first/nested/directory/file.md",
+  "/fixtures/first/nested/file.md",
+  "/fixtures/second/file.md",
+  "/fixtures/second/nested/directory/file.md",
+  "/fixtures/second/nested/file.md",
+  "/fixtures/third/library/a/book.md",
+  "/fixtures/third/library/b/book.md",
+]
+`;
+
+exports[`: **/* 2`] = `
+[
+  "file.md",
+  "first/file.md",
+  "first/nested/directory/file.json",
+  "first/nested/directory/file.md",
+  "first/nested/file.md",
+  "second/file.md",
+  "second/nested/directory/file.md",
+  "second/nested/file.md",
+  "third/library/a/book.md",
+  "third/library/b/book.md",
+]
+`;

@@ -142,6 +142,23 @@ fn makeContext(init: std.process.Init) !Context {
     };
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+fn applyRuntimeEnvFlags(allocator: std.mem.Allocator, exec_args: []const [:0]const u8) void {
+    for (exec_args, 0..) |arg, index| {
+        var value: ?[]const u8 = null;
+        if (std.mem.startsWith(u8, arg, "--max-http-header-size=")) {
+            value = arg["--max-http-header-size=".len..];
+        } else if (std.mem.eql(u8, arg, "--max-http-header-size") and index + 1 < exec_args.len) {
+            value = exec_args[index + 1];
+        }
+        if (value) |size_text| {
+            const value_z = allocator.dupeZ(u8, size_text) catch return;
+            _ = setenv("BUN_HTTP_MAX_HEADER_SIZE", value_z.ptr, 1);
+        }
+    }
+}
+
 fn runPrepared(
     init: std.process.Init,
     ctx: *const Context,
@@ -151,6 +168,7 @@ fn runPrepared(
     exec_args: []const [:0]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
+    applyRuntimeEnvFlags(allocator, exec_args);
     var execution = ScriptExecution{
         .io = init.io,
         .allocator = allocator,

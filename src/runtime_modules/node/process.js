@@ -1,31 +1,44 @@
-import { createReadableStdio, createWritableStdio } from "./stdio.js";
+import { createWritableStdio } from "./stdio.js";
+import { Readable } from "./stream.js";
 import { Buffer } from "./buffer.js";
 import constantsObject from "./constants.js";
 import * as utilTypes from "./util/types.js";
 import * as zlibConstants from "./zlib/constants.js";
+import { _enqueueNextTick, _wrapAsyncCallback } from "./async_hooks.js";
+import { uvErrorMap } from "./util/internal/loader.js";
 
 const processStartNs = typeof cottontail.nanotime === "function" ? BigInt(Math.floor(cottontail.nanotime())) : 0n;
 const processStartMs = Date.now();
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
 
+const fallbackSignalNumbers = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGABRT: 6,
+  SIGKILL: 9,
+  SIGUSR1: cottontail.platform?.() === "linux" ? 10 : 30,
+  SIGUSR2: cottontail.platform?.() === "linux" ? 12 : 31,
+  SIGALRM: 14,
+  SIGTERM: 15,
+};
+
+function nodeError(ErrorCtor, code, message) {
+  const error = new ErrorCtor(message);
+  error.code = code;
+  return error;
+}
+
 function signalNumber(signal = "SIGTERM") {
   if (typeof signal === "number") return signal;
   const name = String(signal).toUpperCase();
   if (name === "0") return 0;
-  const signals = {
-    SIGHUP: 1,
-    SIGINT: 2,
-    SIGQUIT: 3,
-    SIGABRT: 6,
-    SIGKILL: 9,
-    SIGUSR1: cottontail.platform?.() === "linux" ? 10 : 30,
-    SIGUSR2: cottontail.platform?.() === "linux" ? 12 : 31,
-    SIGALRM: 14,
-    SIGTERM: 15,
-  };
-  if (signals[name] == null) throw new TypeError(`Unknown signal: ${signal}`);
-  return signals[name];
+  const value = signalConstants[name] ?? fallbackSignalNumbers[name];
+  if (value == null) {
+    throw nodeError(TypeError, "ERR_UNKNOWN_SIGNAL", `Unknown signal: ${signal}`);
+  }
+  return value;
 }
 
 function processInfo(kind, ...args) {
@@ -594,19 +607,22 @@ const utilBinding = Object.freeze(Object.fromEntries(
   ].map((name) => [name, utilTypes[name] ?? (() => false)]),
 ));
 const uvBinding = (() => {
-  const byNegativeCode = new Map();
   const out = {
     errname(code) {
       const normalized = Number(code);
-      if (!Number.isInteger(normalized) || normalized >= 0) throw new RangeError(`Unknown system error ${code}`);
-      return byNegativeCode.get(normalized) ?? `Unknown system error ${normalized}`;
+      const entry = uvErrorMap.get(normalized);
+      return entry ? entry[0] : `Unknown system error: ${normalized}`;
+    },
+    getErrorMap() {
+      return new Map(uvErrorMap);
+    },
+    getErrorMessage(code) {
+      const entry = uvErrorMap.get(Number(code));
+      return entry ? entry[1] : `Unknown system error: ${code}`;
     },
   };
-  for (const [name, value] of Object.entries(errnoConstants)) {
-    const uvName = `UV_${name}`;
-    const uvValue = -Math.abs(Number(value));
-    out[uvName] = uvValue;
-    byNegativeCode.set(uvValue, name);
+  for (const [errno, [name]] of uvErrorMap) {
+    out[`UV_${name}`] = errno;
   }
   return Object.freeze(out);
 })();
@@ -758,9 +774,217 @@ processObject.debugPort ??= 9229;
 processObject.domain ??= null;
 processObject._exiting ??= false;
 processObject.exitCode ??= undefined;
-processObject.stdin ??= createReadableStdio(0);
+function stdinFdKind(fd) {
+  try {
+    const stats = cottontail.fstatSync?.(fd);
+    if (!stats) return "pipe";
+    const fileType = Number(stats.mode) & 0o170000;
+    if (fileType === 0o020000) return "tty";
+    if (fileType === 0o100000) return "file";
+    return "pipe";
+  } catch {
+    return "pipe";
+  }
+}
+
+function installStdinFdDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const listener = listeners.get(Number(event?.id));
+      if (typeof listener === "function") listener(event);
+    });
+  }
+  return listeners;
+}
+
+// process.stdin as a real Readable with Node's pause/resume/ref/unref and
+// TTY/pipe/file differentiation (Node: file stdin has no ref/unref).
+function createStdinStream() {
+  const fd = 0;
+  const kind = stdinFdKind(fd);
+
+  if (kind === "file") {
+    let position = 0;
+    const stream = new Readable({
+      read(size) {
+        try {
+          const chunkSize = Math.max(Number(size) || 0, 64 * 1024);
+          const buffer = Buffer.alloc(chunkSize);
+          const count = Number(cottontail.fdReadAt(fd, buffer, 0, chunkSize, position));
+          if (count <= 0) {
+            this.push(null);
+            return;
+          }
+          position += count;
+          this.push(buffer.subarray(0, count));
+        } catch (error) {
+          this.destroy(error);
+        }
+      },
+    });
+    stream.fd = fd;
+    return stream;
+  }
+
+  let watchId = 0;
+  let wantsData = false;
+  let referenced = true;
+  let ended = false;
+  let pausedByUser = false;
+
+  const stream = new Readable({
+    read() {
+      wantsData = true;
+      maybeStartWatching();
+    },
+    destroy(error, callback) {
+      stopWatching();
+      callback(error);
+    },
+  });
+  stream.fd = fd;
+  if (kind === "tty") {
+    stream.isTTY = true;
+    stream.isRaw = false;
+    stream.setRawMode = function setRawMode(mode) {
+      // Terminal raw mode needs native termios support; track the flag so
+      // readline behaves consistently.
+      this.isRaw = Boolean(mode);
+      return this;
+    };
+  }
+
+  function stopWatching() {
+    if (!watchId) return;
+    // Keep the listener registered: the native reader thread may already have
+    // consumed bytes from the fd for this watch, and its queued events are
+    // still delivered (tagged with the old id) after fdWatchStop. Dropping the
+    // listener here would lose that data forever (Node never loses bytes
+    // already read on pause()). A stopped watch no longer holds the event
+    // loop, so pause/unref lifetime semantics are unaffected; the stale entry
+    // is removed once the old watch delivers end/error or the stream dies.
+    cottontail.fdWatchStop?.(watchId);
+    watchId = 0;
+  }
+
+  function handleWatchEvent(event) {
+    const id = Number(event?.id ?? 0);
+    const listeners = installStdinFdDispatcher();
+    if (stream.destroyed) {
+      if (id) listeners.delete(id);
+      return;
+    }
+    if (event.type === "data") {
+      const bytes = event.data ?? new ArrayBuffer(0);
+      if ((bytes.byteLength ?? 0) === 0) return;
+      const chunk = Buffer.from(new Uint8Array(bytes));
+      if (ended) return;
+      if (!stream.push(chunk)) {
+        wantsData = false;
+        stopWatching();
+      }
+      return;
+    }
+    if (event.type === "end") {
+      if (id) listeners.delete(id);
+      if (ended) return;
+      ended = true;
+      stopWatching();
+      stream.push(null);
+      return;
+    }
+    if (event.type === "error") {
+      if (id) listeners.delete(id);
+      stopWatching();
+      stream.destroy(new Error(event.message || "stdin read failed"));
+    }
+  }
+
+  function maybeStartWatching() {
+    // A paused stdin stops holding the event loop, unless a 'readable'
+    // listener still wants incremental reads (matches Node's handle refs).
+    const pauseBlocks = pausedByUser && stream.listenerCount("readable") === 0;
+    if (watchId || ended || !wantsData || !referenced || pauseBlocks) return;
+    if (typeof cottontail.fdWatchStart !== "function") return;
+    const listeners = installStdinFdDispatcher();
+    const watch = cottontail.fdWatchStart(fd, 64 * 1024);
+    watchId = Number(watch?.id || 0);
+    if (!watchId) return;
+    listeners.set(watchId, handleWatchEvent);
+  }
+
+  const basePause = stream.pause.bind(stream);
+  stream.pause = function pause() {
+    const result = basePause();
+    // Release the fd watcher so a paused stdin no longer keeps the event
+    // loop (and therefore the process) alive - matches Node's handle unref.
+    pausedByUser = true;
+    if (this.listenerCount("readable") === 0) stopWatching();
+    return result;
+  };
+  const baseResume = stream.resume.bind(stream);
+  stream.resume = function resume() {
+    const result = baseResume();
+    pausedByUser = false;
+    wantsData = true;
+    maybeStartWatching();
+    return result;
+  };
+  stream.ref = function ref() {
+    referenced = true;
+    maybeStartWatching();
+    return this;
+  };
+  stream.unref = function unref() {
+    referenced = false;
+    stopWatching();
+    return this;
+  };
+
+  return stream;
+}
+
+// bun/ffi.js may have installed the legacy non-stream stdin first; replace
+// it with the Readable-based one (identified by a working read()).
+if (!processObject.stdin || typeof processObject.stdin.read !== "function") {
+  processObject.stdin = createStdinStream();
+}
 processObject.stdout ??= createWritableStdio(1);
 processObject.stderr ??= createWritableStdio(2);
+
+// Node reports isTTY as true for terminals and *undefined* (not false) for
+// anything else.
+{
+  const fdIsTty = (fd) => {
+    try {
+      const stats = cottontail.fstatSync?.(fd);
+      return stats !== undefined && ((Number(stats.mode) & 0o170000) === 0o020000);
+    } catch {
+      return false;
+    }
+  };
+  for (const [stream, fd] of [[processObject.stdin, 0], [processObject.stdout, 1], [processObject.stderr, 2]]) {
+    if (stream && stream.isTTY === false) {
+      stream.isTTY = fdIsTty(fd) ? true : undefined;
+    }
+  }
+}
+
+// Node replaces unpaired UTF-16 surrogates with U+FFFD when writing to
+// stdio; the underlying native write drops them instead, so sanitize here.
+for (const stdioStream of [processObject.stdout, processObject.stderr]) {
+  if (!stdioStream || typeof stdioStream.write !== "function" || stdioStream.__cottontailWellFormedWrites) continue;
+  const nativeWrite = stdioStream.write.bind(stdioStream);
+  stdioStream.write = (chunk, encoding, callback) => {
+    if (typeof chunk === "string" && typeof chunk.isWellFormed === "function" && !chunk.isWellFormed()) {
+      chunk = chunk.toWellFormed();
+    }
+    return nativeWrite(chunk, encoding, callback);
+  };
+  Object.defineProperty(stdioStream, "__cottontailWellFormedWrites", { value: true, configurable: true });
+}
 processObject.config ??= {
   target_defaults: {
     cflags: [],
@@ -844,9 +1068,19 @@ export const chdir = processObject.chdir = (directory) => {
 };
 
 export const exit = processObject.exit = (code = processObject.exitCode ?? 0) => {
-  processObject._exiting = true;
-  _exiting = true;
-  cottontail.exit(Number(code ?? 0));
+  const exitCodeNumber = Number(code ?? 0);
+  if (!processObject._exiting) {
+    processObject._exiting = true;
+    _exiting = true;
+    processObject.exitCode = exitCodeNumber;
+    try {
+      // Node emits 'exit' synchronously while terminating via process.exit().
+      processObject.emit("exit", exitCodeNumber);
+    } catch {
+      // Never let an exit listener prevent termination.
+    }
+  }
+  cottontail.exit(exitCodeNumber);
 };
 
 export const reallyExit = processObject.reallyExit = (code = processObject.exitCode ?? 0) => {
@@ -857,16 +1091,50 @@ export const abort = processObject.abort = () => {
   cottontail.kill(processObject.pid, signalNumber("SIGABRT"));
 };
 
-export const nextTick = processObject.nextTick = (callback, ...args) => {
-  if (typeof callback !== "function") throw new TypeError("process.nextTick callback must be a function");
-  queueMicrotask(() => callback(...args));
+export const nextTick = processObject.nextTick = function nextTick(callback, ...args) {
+  if (typeof callback !== "function") {
+    throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE",
+      `The "callback" argument must be of type function. Received ${callback === null ? "null" : `type ${typeof callback}`}`);
+  }
+  const wrapped = _wrapAsyncCallback(callback);
+  _enqueueNextTick(args.length === 0 ? wrapped : () => wrapped(...args));
 };
+// The bundler suffixes identifiers when deduplicating; pin the public name.
+Object.defineProperty(nextTick, "name", { value: "nextTick", configurable: true });
 
 export const hrtime = processObject.hrtime = makeHrtime;
 export const uptime = processObject.uptime = () => (Date.now() - processStartMs) / 1000;
 
-export const kill = processObject.kill = (targetPid = processObject.pid, signal = "SIGTERM") =>
-  cottontail.kill(Number(targetPid), signalNumber(signal));
+export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
+  if (targetPid === undefined) targetPid = processObject.pid;
+  const pidNumber = Number(targetPid);
+  if (typeof targetPid !== "number" || !Number.isInteger(pidNumber)) {
+    throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE",
+      `The "pid" argument must be of type number. Received ${targetPid === null ? "null" : `type ${typeof targetPid}`}`);
+  }
+  if (signal != null && typeof signal !== "string" && typeof signal !== "number") {
+    throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE",
+      `The "signal" argument must be one of type string or number. Received type ${typeof signal}`);
+  }
+  const signalValue = signalNumber(signal ?? "SIGTERM");
+  if (!Number.isInteger(signalValue) || signalValue < 0 || signalValue > 64 ||
+      (signalValue !== 0 && !Object.values(signalConstants).includes(signalValue) &&
+        !Object.values(fallbackSignalNumbers).includes(signalValue))) {
+    const error = nodeError(Error, "EINVAL", `kill EINVAL`);
+    error.errno = -(errnoConstants.EINVAL ?? 22);
+    error.syscall = "kill";
+    throw error;
+  }
+  const result = cottontail.kill(pidNumber, signalValue);
+  if (typeof result === "number" && result < 0) {
+    const code = result === -(errnoConstants.ESRCH ?? 3) ? "ESRCH" : result === -(errnoConstants.EPERM ?? 1) ? "EPERM" : "UNKNOWN";
+    const error = nodeError(Error, code, `kill ${code}`);
+    error.errno = result;
+    error.syscall = "kill";
+    throw error;
+  }
+  return true;
+};
 
 export const _kill = processObject._kill = kill;
 
@@ -978,8 +1246,11 @@ export const execve = processObject.execve = (file, args, execEnv) => {
 export const getBuiltinModule = processObject.getBuiltinModule = (specifier) => {
   const text = String(specifier);
   const map = globalThis.__cottontailBuiltinModules;
-  if (map?.has(text)) return map.get(text);
-  if (text.startsWith("node:") && map?.has(text.slice(5))) return map.get(text.slice(5));
+  // node/module.js registers some builtins as lazy thunks (marked with this
+  // symbol) so their top-level code only runs on first use.
+  const unwrap = (value) => (typeof value === "function" && value[Symbol.for("cottontail.lazyBuiltin")] === true ? value() : value);
+  if (map?.has(text)) return unwrap(map.get(text));
+  if (text.startsWith("node:") && map?.has(text.slice(5))) return unwrap(map.get(text.slice(5)));
   if (text === "process" || text === "node:process") return processObject;
   return undefined;
 };

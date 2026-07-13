@@ -168,13 +168,24 @@ export class Socket extends EventEmitter {
     return { ...this.remote, family: this.family === 6 ? "IPv6" : "IPv4" };
   }
 
+  _normalizeMulticastInterface(multicastInterface) {
+    if (multicastInterface == null) return "";
+    let iface = String(multicastInterface);
+    // Node expresses IPv6 interfaces as "<address>%<zone>" (e.g. "::%lo0");
+    // the native binding wants the bare zone/interface name.
+    if (this.family === 6 && iface.includes("%")) {
+      iface = iface.slice(iface.indexOf("%") + 1);
+    }
+    return iface;
+  }
+
   addMembership(multicastAddress, multicastInterface = undefined) {
-    cottontail.udpSocketMembership(this.fd, String(multicastAddress), multicastInterface == null ? "" : String(multicastInterface), this.family, true);
+    cottontail.udpSocketMembership(this.fd, String(multicastAddress), this._normalizeMulticastInterface(multicastInterface), this.family, true);
     return this;
   }
 
   dropMembership(multicastAddress, multicastInterface = undefined) {
-    cottontail.udpSocketMembership(this.fd, String(multicastAddress), multicastInterface == null ? "" : String(multicastInterface), this.family, false);
+    cottontail.udpSocketMembership(this.fd, String(multicastAddress), this._normalizeMulticastInterface(multicastInterface), this.family, false);
     return this;
   }
 
