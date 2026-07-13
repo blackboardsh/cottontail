@@ -66,7 +66,6 @@ const expectedFiles = [
   join(appRoot, 'views', 'mainview', 'index.js'),
   join(appRoot, 'views', 'mainview', 'index.html'),
   join(buildRoot, 'post-build.txt'),
-  join(ROOT, 'vendors', 'esbuild', '.esbuild-version'),
 ];
 
 for (const filePath of expectedFiles) {

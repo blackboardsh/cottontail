@@ -2,7 +2,7 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const root = process.argv[2] ?? "vendors/bun-zig/src";
+const root = process.argv[2] ?? "src/compiler/src";
 
 function isIdentStart(ch) {
   return (ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z") || ch === "_";

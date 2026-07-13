@@ -48,7 +48,7 @@ import * as vm from "./vm.js";
 import * as zlib from "./zlib.js";
 
 // Heavy builtins that no startup path touches are pulled in through lazy
-// require() thunks instead of static imports. esbuild still bundles the
+// require() thunks instead of static imports. The native compiler still bundles the
 // modules (require of an internal path becomes a synchronous init call), but
 // their top-level code no longer executes during process startup, which
 // matters because every spawned cottontail process re-evaluates this graph.

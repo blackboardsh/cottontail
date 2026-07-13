@@ -67,6 +67,7 @@ if (!existsSync(binaryPath)) {
 
 const tempDir = mkdtempSync(join(os.tmpdir(), 'cottontail-js-tests-'));
 const tempFilePath = join(tempDir, 'host-api-output.txt');
+const nativeBuildOutDir = join(tempDir, 'native-build');
 
 try {
   writeFileSync(join(tempDir, 'eval-data.json'), JSON.stringify({ value: 42 }));
@@ -203,6 +204,30 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-build-error.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun build error passed'],
+    },
+    {
+      name: 'bun-build-native',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-build-native.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun build native passed'],
+    },
+    {
+      name: 'native-build-cli',
+      argv: [
+        'build',
+        join(rootDir, 'tests', 'js', 'fixtures', 'bun-build-entry.ts'),
+        '--target=bun',
+        '--outdir',
+        nativeBuildOutDir,
+      ],
+      expectExitCode: 0,
+      stdoutIncludes: [join(nativeBuildOutDir, 'bun-build-entry.js')],
+    },
+    {
+      name: 'native-build-cli-output',
+      scriptPath: join(nativeBuildOutDir, 'bun-build-entry.js'),
+      expectExitCode: 0,
+      stdoutIncludes: ['84'],
     },
     {
       name: 'bun-cjs-interop',

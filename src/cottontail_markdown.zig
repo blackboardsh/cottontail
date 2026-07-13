@@ -1,5 +1,5 @@
 const std = @import("std");
-const bun = @import("bun");
+const compiler = @import("cottontail_compiler");
 
 const c_allocator = std.heap.c_allocator;
 
@@ -15,7 +15,7 @@ fn option(flags: u64, bit: u6) bool {
     return flags & (@as(u64, 1) << bit) != 0;
 }
 
-fn optionsFromFlags(flags: u64) bun.md.Options {
+fn optionsFromFlags(flags: u64) compiler.md.Options {
     return .{
         .tables = option(flags, 0),
         .strikethrough = option(flags, 1),
@@ -43,12 +43,12 @@ const EventRenderer = struct {
     allocator: std.mem.Allocator,
     output: std.ArrayListUnmanaged(u8) = .empty,
     first: bool = true,
-    heading_tracker: bun.md.helpers.HeadingIdTracker,
+    heading_tracker: compiler.md.helpers.HeadingIdTracker,
 
     fn init(allocator: std.mem.Allocator, heading_ids: bool) !EventRenderer {
         var result = EventRenderer{
             .allocator = allocator,
-            .heading_tracker = bun.md.helpers.HeadingIdTracker.init(heading_ids),
+            .heading_tracker = compiler.md.helpers.HeadingIdTracker.init(heading_ids),
         };
         try result.output.append(allocator, '[');
         return result;
@@ -59,11 +59,11 @@ const EventRenderer = struct {
         self.heading_tracker.deinit(self.allocator);
     }
 
-    fn renderer(self: *EventRenderer) bun.md.Renderer {
+    fn renderer(self: *EventRenderer) compiler.md.Renderer {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: bun.md.Renderer.VTable = .{
+    const vtable: compiler.md.Renderer.VTable = .{
         .enterBlock = enterBlock,
         .leaveBlock = leaveBlock,
         .enterSpan = enterSpan,
@@ -92,14 +92,14 @@ const EventRenderer = struct {
         try self.output.appendSlice(self.allocator, value);
     }
 
-    fn enterBlock(ptr: *anyopaque, block_type: bun.md.BlockType, data: u32, flags: u32) bun.JSError!void {
+    fn enterBlock(ptr: *anyopaque, block_type: compiler.md.BlockType, data: u32, flags: u32) compiler.JSError!void {
         const self: *EventRenderer = @ptrCast(@alignCast(ptr));
         if (block_type == .h) self.heading_tracker.enterHeading();
         try self.startEvent();
         try self.appendFormatted("[\"b\",{d},{d},{d}]", .{ @intFromEnum(block_type), data, flags });
     }
 
-    fn leaveBlock(ptr: *anyopaque, block_type: bun.md.BlockType, _: u32) bun.JSError!void {
+    fn leaveBlock(ptr: *anyopaque, block_type: compiler.md.BlockType, _: u32) compiler.JSError!void {
         const self: *EventRenderer = @ptrCast(@alignCast(ptr));
         const slug = if (block_type == .h) self.heading_tracker.leaveHeading(self.allocator) else null;
         try self.startEvent();
@@ -109,7 +109,7 @@ const EventRenderer = struct {
         if (block_type == .h) self.heading_tracker.clearAfterHeading();
     }
 
-    fn enterSpan(ptr: *anyopaque, span_type: bun.md.SpanType, detail: bun.md.SpanDetail) bun.JSError!void {
+    fn enterSpan(ptr: *anyopaque, span_type: compiler.md.SpanType, detail: compiler.md.SpanDetail) compiler.JSError!void {
         const self: *EventRenderer = @ptrCast(@alignCast(ptr));
         try self.startEvent();
         try self.appendFormatted("[\"s\",{d},", .{@intFromEnum(span_type)});
@@ -119,20 +119,20 @@ const EventRenderer = struct {
         try self.output.append(self.allocator, ']');
     }
 
-    fn leaveSpan(ptr: *anyopaque, span_type: bun.md.SpanType) bun.JSError!void {
+    fn leaveSpan(ptr: *anyopaque, span_type: compiler.md.SpanType) compiler.JSError!void {
         const self: *EventRenderer = @ptrCast(@alignCast(ptr));
         try self.startEvent();
         try self.appendFormatted("[\"S\",{d}]", .{@intFromEnum(span_type)});
     }
 
-    fn text(ptr: *anyopaque, text_type: bun.md.TextType, content: []const u8) bun.JSError!void {
+    fn text(ptr: *anyopaque, text_type: compiler.md.TextType, content: []const u8) compiler.JSError!void {
         const self: *EventRenderer = @ptrCast(@alignCast(ptr));
         self.heading_tracker.trackText(text_type, content, self.allocator);
         var entity_buffer: [8]u8 = undefined;
         const rendered = switch (text_type) {
             .null_char => "\xEF\xBF\xBD",
             .br, .softbr => "\n",
-            .entity => bun.md.helpers.decodeEntityToUtf8(content, &entity_buffer) orelse content,
+            .entity => compiler.md.helpers.decodeEntityToUtf8(content, &entity_buffer) orelse content,
             else => content,
         };
         try self.startEvent();
@@ -161,7 +161,7 @@ export fn ct_markdown_render_html(
         setError(error_out, "Markdown source pointer is null", .{});
         return null;
     };
-    const rendered = bun.md.renderToHtmlWithOptions(source, c_allocator, optionsFromFlags(flags)) catch |err| {
+    const rendered = compiler.md.renderToHtmlWithOptions(source, c_allocator, optionsFromFlags(flags)) catch |err| {
         setError(error_out, "Markdown rendering failed: {s}", .{@errorName(err)});
         return null;
     };
@@ -189,7 +189,7 @@ export fn ct_markdown_parse_events(
         return null;
     };
     defer event_renderer.deinit();
-    bun.md.renderWithRenderer(source, c_allocator, options, event_renderer.renderer()) catch |err| {
+    compiler.md.renderWithRenderer(source, c_allocator, options, event_renderer.renderer()) catch |err| {
         setError(error_out, "Markdown parsing failed: {s}", .{@errorName(err)});
         return null;
     };

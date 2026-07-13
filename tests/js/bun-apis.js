@@ -1,5 +1,5 @@
-import { Bun, Archive } from "../../src/runtime_modules/bun/index.js";
-import { dlopen, FFIType } from "../../src/runtime_modules/bun/ffi.js";
+import { Bun, Archive } from "bun";
+import { dlopen, FFIType } from "bun:ffi";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);

@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "jsc_runner.h"
 
 #include <JavaScriptCore/JavaScript.h>
@@ -196,8 +200,31 @@ extern uint8_t *ct_strip_typescript_types(
     size_t *out_len,
     char **error_out
 );
+extern uint8_t *ct_transpiler_process(
+    int operation,
+    const uint8_t *source,
+    size_t source_len,
+    const uint8_t *options,
+    size_t options_len,
+    const uint8_t *loader,
+    size_t loader_len,
+    size_t *out_len,
+    char **error_out
+);
 extern void ct_transpiler_free(uint8_t *value, size_t len);
 extern void ct_transpiler_string_free(char *value);
+extern uint8_t *ct_bundle_entry_point_options(
+    const uint8_t *entry,
+    size_t entry_len,
+    const uint8_t *working_dir,
+    size_t working_dir_len,
+    const uint8_t *options,
+    size_t options_len,
+    size_t *out_len,
+    char **error_out
+);
+extern void ct_bundle_free(uint8_t *value, size_t len);
+extern void ct_bundle_string_free(char *value);
 extern uint8_t *ct_password_hash(
     int algorithm,
     const uint8_t *password,
@@ -214,6 +241,23 @@ extern int ct_password_verify(
     size_t password_len,
     const uint8_t *hash,
     size_t hash_len,
+    char **error_out
+);
+extern int ct_crypto_argon2(
+    int algorithm,
+    const uint8_t *message,
+    size_t message_len,
+    const uint8_t *nonce,
+    size_t nonce_len,
+    uint32_t parallelism,
+    uint32_t memory,
+    uint32_t passes,
+    const uint8_t *secret,
+    size_t secret_len,
+    const uint8_t *associated_data,
+    size_t associated_data_len,
+    uint8_t *output,
+    size_t output_len,
     char **error_out
 );
 extern uint64_t ct_hash_value(int algorithm, const uint8_t *input, size_t input_len, uint64_t seed);
@@ -2285,12 +2329,12 @@ static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
 
-    const char *kdf_name = NULL;
-    if (strcasecmp(algorithm_name, "argon2d") == 0) kdf_name = "ARGON2D";
-    else if (strcasecmp(algorithm_name, "argon2i") == 0) kdf_name = "ARGON2I";
-    else if (strcasecmp(algorithm_name, "argon2id") == 0) kdf_name = "ARGON2ID";
+    int algorithm = -1;
+    if (strcasecmp(algorithm_name, "argon2d") == 0) algorithm = 0;
+    else if (strcasecmp(algorithm_name, "argon2i") == 0) algorithm = 1;
+    else if (strcasecmp(algorithm_name, "argon2id") == 0) algorithm = 2;
     free(algorithm_name);
-    if (kdf_name == NULL) {
+    if (algorithm < 0) {
         ct_throw_message(ctx, exception, "Invalid Argon2 algorithm");
         return JSValueMakeUndefined(ctx);
     }
@@ -2329,58 +2373,37 @@ static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
 
-#if CT_HAS_OPENSSL
     uint8_t *output = (uint8_t *)malloc(tag_len);
     if (output == NULL) {
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
-
-#if __has_include(<openssl/thread.h>)
-    if (parallelism > 1) {
-        (void)OSSL_set_max_threads(NULL, parallelism);
-    }
-#endif
-
-    EVP_KDF *kdf = EVP_KDF_fetch(NULL, kdf_name, NULL);
-    if (kdf == NULL) {
+    char *error = NULL;
+    int status = ct_crypto_argon2(
+        algorithm,
+        message,
+        message_len,
+        nonce,
+        nonce_len,
+        parallelism,
+        memory,
+        passes,
+        has_secret ? secret : NULL,
+        has_secret ? secret_len : 0,
+        has_associated_data ? associated_data : NULL,
+        has_associated_data ? associated_data_len : 0,
+        output,
+        tag_len,
+        &error
+    );
+    if (status != 0) {
         free(output);
-        ct_throw_message(ctx, exception, "Argon2 KDF is unavailable in libcrypto");
-        return JSValueMakeUndefined(ctx);
-    }
-    EVP_KDF_CTX *kdf_ctx = EVP_KDF_CTX_new(kdf);
-    EVP_KDF_free(kdf);
-    if (kdf_ctx == NULL) {
-        free(output);
-        ct_throw_message(ctx, exception, "Failed to create Argon2 KDF context");
-        return JSValueMakeUndefined(ctx);
-    }
-
-    OSSL_PARAM params[9];
-    size_t param_count = 0;
-    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_THREADS, &parallelism);
-    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_LANES, &parallelism);
-    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ARGON2_MEMCOST, &memory);
-    params[param_count++] = OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &passes);
-    params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD, message, message_len);
-    params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, nonce, nonce_len);
-    if (has_secret) params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SECRET, secret, secret_len);
-    if (has_associated_data) params[param_count++] = OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_ARGON2_AD, associated_data, associated_data_len);
-    params[param_count++] = OSSL_PARAM_construct_end();
-
-    int status = EVP_KDF_derive(kdf_ctx, output, tag_len, params);
-    EVP_KDF_CTX_free(kdf_ctx);
-    if (status != 1) {
-        free(output);
-        ct_throw_message(ctx, exception, "Argon2 derivation failed");
+        ct_throw_message(ctx, exception, error != NULL ? error : "Argon2 derivation failed");
+        if (error != NULL) ct_host_string_free(error);
         return JSValueMakeUndefined(ctx);
     }
 
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, tag_len, ct_array_buffer_free, NULL, exception);
-#else
-    ct_throw_message(ctx, exception, "Argon2 KDF is unavailable in this build");
-    return JSValueMakeUndefined(ctx);
-#endif
 }
 
 static JSValueRef ct_password_hash_sync_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4067,7 +4090,9 @@ static const char *ct_evp_cipher_mode_name(const EVP_CIPHER *cipher) {
         case EVP_CIPH_WRAP_MODE: return "wrap";
         case EVP_CIPH_OCB_MODE: return "ocb";
         case EVP_CIPH_SIV_MODE: return "siv";
+#ifdef EVP_CIPH_GCM_SIV_MODE
         case EVP_CIPH_GCM_SIV_MODE: return "gcm-siv";
+#endif
         case EVP_CIPH_STREAM_CIPHER: return "stream";
         default: return "unknown";
     }
@@ -13427,6 +13452,124 @@ static JSValueRef ct_strip_typescript_types_native(JSContextRef ctx, JSObjectRef
     return result;
 }
 
+static JSValueRef ct_transpiler_process_native(JSContextRef ctx, size_t argc, const JSValueRef argv[], JSValueRef *exception, int operation) {
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "transpiler operation requires source");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t source_len = 0;
+    char *source = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    if (source == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t options_len = 0;
+    char *options = argc >= 2 ? ct_value_to_utf8_copy(ctx, argv[1], &options_len) : NULL;
+    size_t loader_len = 0;
+    char *loader = argc >= 3 ? ct_value_to_utf8_copy(ctx, argv[2], &loader_len) : NULL;
+    if ((argc >= 2 && options == NULL) || (argc >= 3 && loader == NULL)) {
+        free(source);
+        free(options);
+        free(loader);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_transpiler_process(
+        operation,
+        (const uint8_t *)source,
+        source_len,
+        (const uint8_t *)options,
+        options_len,
+        (const uint8_t *)loader,
+        loader_len,
+        &output_len,
+        &error
+    );
+    free(source);
+    free(options);
+    free(loader);
+
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "JavaScript transform failed");
+        if (error != NULL) ct_transpiler_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_transpiler_free(output, output_len);
+    return result;
+}
+
+static JSValueRef ct_transpiler_transform_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    return ct_transpiler_process_native(ctx, argc, argv, exception, 0);
+}
+
+static JSValueRef ct_transpiler_scan_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    return ct_transpiler_process_native(ctx, argc, argv, exception, 1);
+}
+
+static JSValueRef ct_transpiler_scan_imports_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    return ct_transpiler_process_native(ctx, argc, argv, exception, 2);
+}
+
+static JSValueRef ct_bundle_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "bundleNative(entrypoint, workingDirectory[, options]) requires two arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t entry_len = 0;
+    size_t working_dir_len = 0;
+    size_t options_len = 0;
+    char *entry = ct_value_to_utf8_copy(ctx, argv[0], &entry_len);
+    char *working_dir = ct_value_to_utf8_copy(ctx, argv[1], &working_dir_len);
+    char *options = argc >= 3 ? ct_value_to_utf8_copy(ctx, argv[2], &options_len) : NULL;
+    if (entry == NULL || working_dir == NULL || (argc >= 3 && options == NULL)) {
+        free(entry);
+        free(working_dir);
+        free(options);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_bundle_entry_point_options(
+        (const uint8_t *)entry,
+        entry_len,
+        (const uint8_t *)working_dir,
+        working_dir_len,
+        (const uint8_t *)options,
+        options_len,
+        &output_len,
+        &error
+    );
+    free(entry);
+    free(working_dir);
+    free(options);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "JavaScript bundle failed");
+        if (error != NULL) ct_bundle_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_bundle_free(output, output_len);
+    return result;
+}
+
 static JSValueRef ct_markdown_html_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -13593,6 +13736,10 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "httpServerResponseEnd", ct_http_server_response_end, runtime);
     ct_install_function(ctx, host, "httpServerStop", ct_http_server_stop, runtime);
     ct_install_function(ctx, host, "stripTypeScriptTypes", ct_strip_typescript_types_native, runtime);
+    ct_install_function(ctx, host, "transpilerTransform", ct_transpiler_transform_native, runtime);
+    ct_install_function(ctx, host, "transpilerScan", ct_transpiler_scan_native, runtime);
+    ct_install_function(ctx, host, "transpilerScanImports", ct_transpiler_scan_imports_native, runtime);
+    ct_install_function(ctx, host, "bundleNative", ct_bundle_native, runtime);
     ct_install_function(ctx, host, "markdownHtml", ct_markdown_html_native, runtime);
     ct_install_function(ctx, host, "markdownEvents", ct_markdown_events_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);

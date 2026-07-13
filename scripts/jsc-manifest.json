@@ -6,19 +6,19 @@
   "assets": {
     "macos-arm64": {
       "name": "cottontail-jsc-macos-arm64.tar.gz",
-      "sha256": "28aee9f025937ed2a9b37027a215cf01075a8e9cc57ae786d19e6620516107ee"
+      "sha256": "2409256e4d1f8a2ca3e18ad5643a2335b6ce25bd2aa30a66d408688ddc558255"
     },
     "linux-amd64": {
       "name": "cottontail-jsc-linux-amd64.tar.gz",
-      "sha256": "6c65c0715957486af99ba943648cb82c0b8a37eac6c4daa9086a9c31ddc00413"
+      "sha256": "46cd9d552903e0ece9cd5bb69b3b273deb96e38c0438dc49cf27287a19cc09e4"
     },
     "linux-arm64": {
       "name": "cottontail-jsc-linux-arm64.tar.gz",
-      "sha256": "a69df0d725afb707d8a7dae31a5bd97194a534e0ac60026e16f7ab671b034b3e"
+      "sha256": "95a3895a8a44db02b3286e28542a74d1f1f429561e4cf6af18038d1d20c797e8"
     },
-    "windows-arm64": {
-      "name": "cottontail-jsc-windows-arm64.tar.gz",
-      "sha256": "2705c49f59c1a0b0359ef3cecfe22f15ea3b400bc1cf3269ef216ae87f918f37"
+    "windows-amd64": {
+      "name": "cottontail-jsc-windows-amd64.tar.gz",
+      "sha256": "19389f9c4d6eb2a8f6699e582a33a402cbb00cb49eb6671d090f519d9f7a4b6b"
     }
   }
 }

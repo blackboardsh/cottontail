@@ -1,4 +1,4 @@
-// Lazy source-map remapper for the cottontail esbuild bundle.
+// Lazy source-map remapper for the Cottontail compiler bundle.
 //
 // Every entrypoint is bundled to <run-dir>/script.bundle.mjs with an external
 // source map (script.bundle.mjs.map); the entry wrapper points

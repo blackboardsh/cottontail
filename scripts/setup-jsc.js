@@ -35,10 +35,6 @@ function getPlatformKey() {
     return 'linux-arm64';
   }
 
-  if (platform === 'win32' && arch === 'arm64') {
-    return 'windows-arm64';
-  }
-
   if (platform === 'win32' && arch === 'x64') {
     return 'windows-amd64';
   }
@@ -68,19 +64,7 @@ function vendorJsc() {
     return;
   }
 
-  let asset = MANIFEST.assets[platformKey];
-
-  if (!asset && platformKey === 'windows-amd64') {
-    const url = process.env.COTTONTAIL_JSC_WINDOWS_X64_URL;
-    const sha256 = process.env.COTTONTAIL_JSC_WINDOWS_X64_SHA256;
-    if (!url || !sha256) {
-      fail(
-        'Windows x64 JavaScriptCore is not published in the pinned manifest. Set ' +
-          'COTTONTAIL_JSC_WINDOWS_X64_URL and COTTONTAIL_JSC_WINDOWS_X64_SHA256.'
-      );
-    }
-    asset = { name: 'cottontail-jsc-windows-amd64.tar.gz', sha256, url };
-  }
+  const asset = MANIFEST.assets[platformKey];
 
   if (!asset) {
     console.log(`- Skipping JavaScriptCore vendoring: no manifest entry for ${platformKey}`);
@@ -111,7 +95,10 @@ function vendorJsc() {
     if (actualSha256 !== asset.sha256) {
       unlinkSync(archivePath);
       fail(
-        `Checksum mismatch for ${asset.name}:\n  expected ${asset.sha256}\n  actual   ${actualSha256}`
+        `The published JSC asset changed after it was pinned in scripts/jsc-manifest.json.\n` +
+          `Asset:    ${url}\n` +
+          `Expected: ${asset.sha256}\n` +
+          `Actual:   ${actualSha256}`
       );
     }
 

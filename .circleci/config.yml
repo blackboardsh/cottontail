@@ -39,18 +39,23 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-macos-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+            - cottontail-macos-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
-            brew install node@24 openssl@3 libffi
-            echo 'export PATH="/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
+            brew install node@24 libffi
+            brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo 'export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-macos-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          key: cottontail-macos-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
+            - ~/.cargo
+            - ~/.rustup
+            - .zig-cache/lolhtml
       - build-test-package-unix
 
   build-linux-x64:
@@ -61,19 +66,24 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+            - cottontail-linux-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          key: cottontail-linux-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
+            - ~/.cargo
+            - ~/.rustup
+            - .zig-cache/lolhtml
       - build-test-package-unix
 
   build-linux-arm64:
@@ -84,19 +94,24 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+            - cottontail-linux-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          key: cottontail-linux-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
+            - ~/.cargo
+            - ~/.rustup
+            - .zig-cache/lolhtml
       - build-test-package-unix
 
   build-windows-x64:
@@ -105,11 +120,22 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-windows-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+            - cottontail-windows-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
-          name: Install Node.js
+          name: Install build dependencies
           shell: powershell.exe
-          command: choco install nodejs-lts -y --no-progress
+          command: |
+            choco install nodejs-lts rustup.install -y --no-progress
+            $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+            $env:Path = "$cargoBin;$env:Path"
+            [Environment]::SetEnvironmentVariable("Path", "$cargoBin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
+            $rustup = Join-Path $cargoBin "rustup.exe"
+            & $rustup default stable
+            & $rustup target add x86_64-pc-windows-msvc
+            $installedTargets = & $rustup target list --installed
+            if ($LASTEXITCODE -ne 0 -or $installedTargets -notcontains "x86_64-pc-windows-msvc") {
+              throw "Rust target x86_64-pc-windows-msvc was not installed by $rustup"
+            }
       - run:
           name: Vendor Zig and JavaScriptCore
           shell: powershell.exe
@@ -117,10 +143,13 @@ jobs:
             node scripts/setup.js
             node scripts/setup-jsc.js
       - save_cache:
-          key: cottontail-windows-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          key: cottontail-windows-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
+            - ~/.cargo
+            - ~/.rustup
+            - .zig-cache/lolhtml
       - run:
           name: Run Zig tests
           shell: powershell.exe
@@ -148,6 +177,17 @@ jobs:
           paths:
             - release
 
+  publish-preview:
+    docker:
+      - image: cimg/node:24.18
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: Publish complete preview release
+          command: node scripts/upload-release-r2.js --all
+
 workflows:
   build-release-matrix:
     jobs:
@@ -155,3 +195,12 @@ workflows:
       - build-linux-x64
       - build-linux-arm64
       - build-windows-x64
+      - publish-preview:
+          requires:
+            - build-macos-arm64
+            - build-linux-x64
+            - build-linux-arm64
+            - build-windows-x64
+          filters:
+            branches:
+              only: main

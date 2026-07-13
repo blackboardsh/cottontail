@@ -1,7 +1,7 @@
 // Regenerates ./readable-stream.js from readable-stream@4.7.0.
 //
-// Usage (needs network access and esbuild installed nearby):
-//   node readable-stream.build.mjs [outfile]
+// Usage (needs network access and npm on PATH):
+//   cottontail readable-stream.build.mjs [outfile]
 //
 // Downloads readable-stream via `npm pack` into a temp dir, applies the
 // Cottontail compat patches below, and bundles a single ESM file whose only
@@ -14,14 +14,6 @@ import { execSync } from "node:child_process";
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), "readable-stream-build-"));
 
-let esbuild;
-try {
-  esbuild = await import("esbuild");
-} catch {
-  execSync("npm i esbuild@0.28.1 --prefix .", { cwd: SCRATCH, stdio: "inherit" });
-  esbuild = await import(path.join(SCRATCH, "node_modules/esbuild/lib/main.js"));
-  esbuild = esbuild.default ?? esbuild;
-}
 execSync("npm pack readable-stream@4.7.0", { cwd: SCRATCH, stdio: "inherit" });
 execSync("tar xzf readable-stream-4.7.0.tgz", { cwd: SCRATCH, stdio: "inherit" });
 const PKG = path.join(SCRATCH, "package");
@@ -363,19 +355,15 @@ const shimPlugin = {
   },
 };
 
-await esbuild.build({
-  entryPoints: ["ct-entry"],
+const result = await Bun.build({
+  entrypoints: ["ct-entry"],
   bundle: true,
   format: "esm",
-  platform: "neutral",
-  target: "es2022",
-  banner: { js: banner },
-  outfile: OUT,
+  target: "browser",
   plugins: [shimPlugin],
-  legalComments: "none",
-  logLevel: "warning",
-  // Keeps the per-module path comments in the output stable ("package/lib/...")
-  // instead of leaking the temp directory location.
-  absWorkingDir: SCRATCH,
 });
+if (!result.success || result.outputs.length !== 1) {
+  throw new AggregateError(result.logs, "Failed to bundle readable-stream");
+}
+fs.writeFileSync(OUT, banner + await result.outputs[0].text());
 console.log("built", OUT, fs.statSync(OUT).size, "bytes");

@@ -70,25 +70,43 @@ exposed by Cottontail itself.
 CircleCI defines native release jobs for macOS arm64, Linux x64, Linux arm64,
 and Windows x64 in `.circleci/config.yml`. Every job is configured to run Zig
 tests, build with `ReleaseSmall`, smoke-test the binary, package the runtime
-modules and platform esbuild binary, and store the archive plus its SHA-256
-file. The Windows job remains a bring-up gate until the x64 JSC input and the
+and store the archive plus its SHA-256 file. The JavaScript runtime modules are
+embedded in the executable at build time. The Windows job remains a bring-up gate until the x64 JSC input and the
 Win32 host implementation described below are complete.
 
-The archive layout is stable for Dash CLI consumption:
+The schema 2 archive layout contains a standalone executable for Dash CLI consumption:
 
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
-- `src/runtime_modules/`
-- `vendors/esbuild/`
 - `cottontail-release.json`
 
-Windows x64 currently requires `COTTONTAIL_JSC_WINDOWS_X64_URL` and
-`COTTONTAIL_JSC_WINDOWS_X64_SHA256` in the CircleCI project environment. The
-URL must point to the same archive layout produced by `blackboardsh/jsc`. Once
-that artifact is published with the pinned JSC release, it should be moved into
-`scripts/jsc-manifest.json` and the temporary environment contract removed.
-The current C host bridge also uses POSIX APIs directly for process, socket,
-DNS, polling, mmap, user/group, and filesystem behavior; those paths still need
+The current C host bridge uses POSIX APIs directly for process, socket, DNS,
+polling, mmap, user/group, and filesystem behavior; those paths still need
 native Win32 implementations before the Windows job can pass.
+
+### Preview publishing
+
+After every `main` branch matrix job succeeds, a fan-in job uploads the complete
+release to Cloudflare R2. Configure these CircleCI project environment variables:
+
+- `COTTONTAIL_R2_ACCOUNT_ID`: Cloudflare account ID used to derive the R2 S3 endpoint.
+- `COTTONTAIL_R2_ACCESS_KEY_ID`: access key from an R2 Object Read & Write token scoped to the release bucket.
+- `COTTONTAIL_R2_SECRET_ACCESS_KEY`: secret for that access key.
+- `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
+
+The target bucket is `electrobun-artifacts`. Preview archives use
+content-addressed keys under
+`cottontail/preview/builds/<git-sha>/<sha256>/`. Consumers discover the complete
+platform matrix through one manifest:
+
+- `cottontail/preview/latest.json`
+- `cottontail/preview/versions/<version>.json`
+
+The publisher uploads every archive before replacing `latest.json`, so a failed
+build or upload cannot advertise a partial matrix. Non-`main` CircleCI builds
+run tests and packaging but skip R2 publishing. Run
+`node scripts/upload-release-r2.js --dry-run` after local packaging to inspect a
+single-platform dry run without requiring credentials. Real publication requires
+all four archives and the `--all` option.
 
 ## Bootstrap
 
@@ -135,10 +153,9 @@ This is a bridge alpha, not Bun compatibility:
 
 This first cut:
 
-- auto-vendors `esbuild` into `vendors/esbuild` on first use through `npm`
 - transpiles and evaluates `electrobun.config.ts`
 - transpiles TS lifecycle hooks like `postBuild.ts` and runs them under `cottontail`
-- builds TypeScript/JavaScript entrypoints through an Electrobun-owned `build.main` contract backed by esbuild's JS API
+- builds TypeScript/JavaScript entrypoints with Cottontail's native Zig compiler
 - can scaffold projects from the Electrobun template directory
 - can build and launch host-platform `mainProcess: "bun"` Electrobun app bundles from the checked-in `dist[-os-arch]` runtime assets
 - can run `dev --watch` with a simple cross-platform polling watcher

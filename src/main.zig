@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const cottontail_compiler = @import("cottontail_compiler");
+const cottontail_bundler = @import("cottontail_bundler.zig");
 const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
@@ -8,6 +10,7 @@ const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
 
 comptime {
+    cottontail_bundler.forceLink();
     cottontail_hash.forceLink();
     cottontail_markdown.forceLink();
     cottontail_password.forceLink();
@@ -31,7 +34,7 @@ const help_text_template =
     \\
     \\Status:
     \\  JavaScriptCore is embedded with ESM imports, async job draining, and a small cottontail host API.
-    \\  Entry points can be classic scripts, ESM modules, or TypeScript transpiled through esbuild.
+    \\  Entry points can be classic scripts, ESM modules, or TypeScript compiled natively.
     \\
 ;
 
@@ -422,42 +425,132 @@ fn runFakeNode(init: std.process.Init, node_args: []const [:0]const u8) !u8 {
     return 1;
 }
 
-fn delegateBuildToBun(init: std.process.Init, args: []const [:0]const u8) !u8 {
+fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
-    if (init.environ_map.get("COTTONTAIL_BUILD_DELEGATED") != null) {
-        var stderr_buffer: [256]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-        const stderr = &stderr_writer.interface;
-        try stderr.print("error: bun build delegation loop detected\n", .{});
-        try stderr.flush();
-        return 1;
-    }
-    var env = try init.environ_map.clone(allocator);
-    try env.put("COTTONTAIL_BUILD_DELEGATED", "1");
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
 
-    const bun_exe: []const u8 = init.environ_map.get("COTTONTAIL_REAL_BUN") orelse "bun";
-    const argv = try allocator.alloc([]const u8, args.len - 1 + 1);
-    argv[0] = bun_exe;
-    for (args[1..], 1..) |arg, index| {
-        argv[index] = arg;
+    var options: cottontail_bundler.BundleOptions = .{};
+    var entries: std.ArrayList([]const u8) = .empty;
+    var outdir: ?[]const u8 = null;
+    var outfile: ?[]const u8 = null;
+    var index: usize = 2;
+    while (index < args.len) : (index += 1) {
+        const arg: []const u8 = args[index];
+        if (std.mem.eql(u8, arg, "--minify")) {
+            options.minify_whitespace = true;
+            options.minify_identifiers = true;
+            options.minify_syntax = true;
+        } else if (std.mem.eql(u8, arg, "--minify-whitespace")) {
+            options.minify_whitespace = true;
+        } else if (std.mem.eql(u8, arg, "--minify-identifiers")) {
+            options.minify_identifiers = true;
+        } else if (std.mem.eql(u8, arg, "--minify-syntax")) {
+            options.minify_syntax = true;
+        } else if (std.mem.eql(u8, arg, "--packages=external")) {
+            options.external_packages = true;
+        } else if (std.mem.startsWith(u8, arg, "--outdir=")) {
+            outdir = arg["--outdir=".len..];
+        } else if (std.mem.eql(u8, arg, "--outdir") and index + 1 < args.len) {
+            index += 1;
+            outdir = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--outfile=")) {
+            outfile = arg["--outfile=".len..];
+        } else if (std.mem.eql(u8, arg, "--outfile") and index + 1 < args.len) {
+            index += 1;
+            outfile = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--format=")) {
+            options.output_format = cottontail_compiler.options.Format.fromString(arg["--format=".len..]) orelse {
+                try stderr.print("error: invalid build format \"{s}\"\n", .{arg["--format=".len..]});
+                try stderr.flush();
+                return 1;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--target=")) {
+            const target = arg["--target=".len..];
+            options.target = if (std.mem.eql(u8, target, "browser"))
+                .browser
+            else if (std.mem.eql(u8, target, "node"))
+                .node
+            else if (std.mem.eql(u8, target, "bun"))
+                .bun
+            else {
+                try stderr.print("error: invalid build target \"{s}\"\n", .{target});
+                try stderr.flush();
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "--sourcemap") or std.mem.eql(u8, arg, "--sourcemap=linked")) {
+            options.source_map = .linked;
+        } else if (std.mem.eql(u8, arg, "--sourcemap=inline")) {
+            options.source_map = .@"inline";
+        } else if (std.mem.eql(u8, arg, "--sourcemap=external")) {
+            options.source_map = .external;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try stderr.print("error: unsupported cottontail build option \"{s}\"\n", .{arg});
+            try stderr.flush();
+            return 1;
+        } else {
+            try entries.append(allocator, arg);
+        }
     }
-    var child = std.process.spawn(init.io, .{
-        .argv = argv,
-        .environ_map = &env,
-        .stdin = .inherit,
-        .stdout = .inherit,
-        .stderr = .inherit,
-        .create_no_window = true,
-    }) catch {
-        var stderr_buffer: [256]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-        const stderr = &stderr_writer.interface;
-        try stderr.print("error: could not find a bun binary to run \"bun build\"\n", .{});
+
+    if (entries.items.len == 0) {
+        try stderr.print("error: cottontail build requires at least one entrypoint\n", .{});
         try stderr.flush();
         return 1;
-    };
-    defer child.kill(init.io);
-    return childExitCode(try child.wait(init.io));
+    }
+    if (outfile != null and entries.items.len != 1) {
+        try stderr.print("error: --outfile requires exactly one entrypoint\n", .{});
+        try stderr.flush();
+        return 1;
+    }
+
+    const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    for (entries.items) |entry| {
+        const entry_abs = if (std.fs.path.isAbsolute(entry)) entry else try std.fs.path.join(allocator, &.{ cwd_abs, entry });
+        std.Io.Dir.cwd().access(init.io, entry_abs, .{}) catch {
+            try stderr.print("error: Module not found \"{s}\"\n", .{entry});
+            try stderr.flush();
+            return 1;
+        };
+
+        var error_message: ?[*:0]u8 = null;
+        const output = cottontail_bundler.bundleEntryPointWithOptions(entry_abs, cwd_abs, options, &error_message) catch |err| {
+            if (error_message) |message| {
+                defer cottontail_bundler.ct_bundle_string_free(message);
+                try stderr.print("error: {s}\n", .{std.mem.span(message)});
+            } else {
+                try stderr.print("error: build failed: {s}\n", .{@errorName(err)});
+            }
+            try stderr.flush();
+            return 1;
+        };
+        defer cottontail_bundler.ct_bundle_free(output.ptr, output.len);
+
+        const destination = outfile orelse if (outdir) |dir| blk: {
+            try std.Io.Dir.cwd().createDirPath(init.io, dir);
+            const base = std.fs.path.basename(entry);
+            const extension = std.fs.path.extension(base);
+            const stem = base[0 .. base.len - extension.len];
+            break :blk try std.fs.path.join(allocator, &.{ dir, try std.fmt.allocPrint(allocator, "{s}.js", .{stem}) });
+        } else null;
+
+        if (destination) |path| {
+            if (std.fs.path.dirname(path)) |parent| {
+                if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(init.io, parent);
+            }
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = output });
+            try stdout.print("{s}\n", .{path});
+        } else {
+            try stdout.writeAll(output);
+            if (output.len == 0 or output[output.len - 1] != '\n') try stdout.writeByte('\n');
+        }
+    }
+    try stdout.flush();
+    return 0;
 }
 
 fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_args: []const [:0]const u8) !u8 {
@@ -822,7 +915,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, arg, "build")) {
-        const exit_code = try delegateBuildToBun(init, args);
+        const exit_code = try nativeBuild(init, args);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }

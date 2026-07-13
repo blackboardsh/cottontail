@@ -16,37 +16,96 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
         },
         .windows => switch (target.cpu.arch) {
             .x86_64 => "windows-amd64",
-            .aarch64 => "windows-arm64",
             else => null,
         },
         else => null,
     };
 }
 
-fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const build_options_module = b.createModule(.{
-        .root_source_file = b.path("vendors/bun-zig/src/build_options.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const bun_module = b.createModule(.{
-        .root_source_file = b.path("vendors/bun-zig/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bun_module.addImport("build_options", build_options_module);
-    bun_module.addImport("bun", bun_module);
-    return bun_module;
+fn rustTargetTriple(target: std.Target) ?[]const u8 {
+    return switch (target.os.tag) {
+        .macos => switch (target.cpu.arch) {
+            .aarch64 => "aarch64-apple-darwin",
+            .x86_64 => "x86_64-apple-darwin",
+            else => null,
+        },
+        .linux => switch (target.cpu.arch) {
+            .aarch64 => "aarch64-unknown-linux-gnu",
+            .x86_64 => "x86_64-unknown-linux-gnu",
+            else => null,
+        },
+        .windows => switch (target.cpu.arch) {
+            .x86_64 => "x86_64-pc-windows-msvc",
+            else => null,
+        },
+        else => null,
+    };
 }
 
-fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
+fn buildLolHtml(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
+    const triple = rustTargetTriple(target.result) orelse {
+        std.debug.print(
+            "error: no LOLHTML Rust target for {s}-{s}\n",
+            .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) },
+        );
+        std.process.exit(1);
+    };
+    const command = b.addSystemCommand(&.{ "node", b.pathFromRoot("scripts/build-lolhtml.js") });
+    const output = command.addOutputFileArg(if (target.result.os.tag == .windows) "lolhtml.lib" else "liblolhtml.a");
+    command.addArg(triple);
+    return output;
+}
+
+fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
+    const command = b.addSystemCommand(&.{"node"});
+    command.addFileArg(b.path("scripts/embed-runtime-modules.js"));
+    const output = command.addOutputFileArg("runtime-modules.bin");
+    command.addDirectoryArg(b.path("src/runtime_modules"));
+    return output;
+}
+
+fn createCompilerModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const build_options_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/src/build_options.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const compiler_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("build_options", build_options_module);
+    const zlib_internal_module = b.createModule(.{
+        .root_source_file = b.path(if (target.result.os.tag == .windows)
+            "src/compiler/src/zlib_sys/win32.zig"
+        else
+            "src/compiler/src/zlib_sys/posix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compiler_module.addImport("zlib-internal", zlib_internal_module);
+    // Imported compiler internals still use Bun's historical self-name.
+    compiler_module.addImport("bun", compiler_module);
+    return compiler_module;
+}
+
+fn copyLinuxSystemLibrary(b: *std.Build, library: []const u8) std.Build.LazyPath {
+    const command = b.addSystemCommand(&.{"node"});
+    command.addFileArg(b.path("scripts/copy-system-library.js"));
+    const output = command.addOutputFileArg(library);
+    command.addArgs(&.{ "g++", library });
+    return output;
+}
+
+fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build.LazyPath) void {
     step.rdynamic = true;
     // Static JSC uses indirectly referenced LLInt/JIT entry points that the
     // release linker otherwise discards, producing SIGBUS at runtime.
     step.link_gc_sections = false;
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
-    step.root_module.addIncludePath(b.path("vendors/bun-zig/src/jsc/bindings/sqlite"));
+    step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
         .flags = &[_][]const u8{
@@ -59,8 +118,9 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "-DCOTTONTAIL_VENDORED_JSC=1",
         },
     });
+    step.root_module.addObjectFile(lolhtml);
     step.root_module.addCSourceFile(.{
-        .file = b.path("vendors/bun-zig/src/jsc/bindings/sqlite/sqlite3.c"),
+        .file = b.path("src/compiler/src/jsc/bindings/sqlite/sqlite3.c"),
         .flags = &[_][]const u8{
             "-std=c11",
             "-Wno-deprecated-declarations",
@@ -104,22 +164,25 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             step.root_module.linkSystemLibrary("resolv", .{});
             step.root_module.linkSystemLibrary("z", .{});
             step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-            step.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
             step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-            step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
         },
         .linux => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
+            requireJscLibrary(b, vendor_dir, "libcottontail_icu.a");
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
-            step.root_module.link_libcpp = true;
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libcottontail_icu.a", .{vendor_dir})));
             inline for (&.{
-                "atomic", "brotlicommon", "brotlidec", "brotlienc", "dl", "ffi", "icudata", "icui18n",
-                "icuuc",  "m",            "pthread",   "resolv",    "z",
+                "atomic", "brotlicommon", "brotlidec", "brotlienc", "ffi", "m", "pthread", "z",
             }) |library| step.root_module.linkSystemLibrary(library, .{});
+            // Zig treats these names as aliases for its own libc/libc++ and
+            // drops them before linking. Concrete files preserve the GNU C++
+            // ABI used by the JSC build and glibc's resolver implementation.
+            step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libstdc++.so"));
+            step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libresolv.a"));
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
         },
@@ -153,6 +216,8 @@ fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8)
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const lolhtml = buildLolHtml(b, target);
+    const runtime_modules_blob = embedRuntimeModules(b);
 
     const exe = b.addExecutable(.{
         .name = "cottontail",
@@ -162,9 +227,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("bun", createBunVendorModule(b, target, optimize));
+    exe.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    exe.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
-    configureJsc(exe, b);
+    configureJsc(exe, b, lolhtml);
 
     b.installArtifact(exe);
 
@@ -184,9 +250,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    unit_tests.root_module.addImport("bun", createBunVendorModule(b, target, optimize));
+    unit_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    unit_tests.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
-    configureJsc(unit_tests, b);
+    configureJsc(unit_tests, b, lolhtml);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

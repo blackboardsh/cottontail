@@ -39,30 +39,10 @@ function gitRevision() {
 
 const platform = platformKey();
 const executableName = process.platform === 'win32' ? 'cottontail.exe' : 'cottontail';
-const esbuildName = process.platform === 'win32' ? 'esbuild.exe' : 'esbuild';
 const executablePath = join(rootDir, 'zig-out', 'bin', executableName);
-const esbuildPath = join(rootDir, 'vendors', 'esbuild', esbuildName);
-const runtimeModulesPath = join(rootDir, 'src', 'runtime_modules');
 
-for (const [label, path] of [
-  ['release executable', executablePath],
-  ['runtime modules', runtimeModulesPath],
-]) {
+for (const [label, path] of [['release executable', executablePath]]) {
   if (!existsSync(path)) fail(`Missing ${label}: ${path}`);
-}
-
-if (!existsSync(esbuildPath)) {
-  const smokePath = join(rootDir, '.zig-cache', 'release-esbuild-smoke.ts');
-  mkdirSync(join(rootDir, '.zig-cache'), { recursive: true });
-  writeFileSync(smokePath, 'const value: number = 42; console.log(value);\n');
-  const provision = spawnSync(executablePath, [smokePath], {
-    cwd: rootDir,
-    encoding: 'utf8',
-  });
-  rmSync(smokePath, { force: true });
-  if (provision.status !== 0 || provision.stdout.trim() !== '42' || !existsSync(esbuildPath)) {
-    fail(`Failed to provision esbuild with the release executable:\n${provision.stderr || provision.stdout}`);
-  }
 }
 
 const releaseRoot = join(rootDir, 'release');
@@ -72,40 +52,31 @@ const archivePath = join(releaseRoot, `${artifactBase}.tar.gz`);
 
 rmSync(packageRoot, { recursive: true, force: true });
 mkdirSync(join(packageRoot, 'bin'), { recursive: true });
-mkdirSync(join(packageRoot, 'src'), { recursive: true });
-mkdirSync(join(packageRoot, 'vendors', 'esbuild'), { recursive: true });
 
 cpSync(executablePath, join(packageRoot, 'bin', executableName));
-cpSync(runtimeModulesPath, join(packageRoot, 'src', 'runtime_modules'), { recursive: true });
-cpSync(join(rootDir, 'vendors', 'esbuild'), join(packageRoot, 'vendors', 'esbuild'), {
-  recursive: true,
-});
 if (process.platform !== 'win32') {
   chmodSync(join(packageRoot, 'bin', executableName), 0o755);
-  chmodSync(join(packageRoot, 'vendors', 'esbuild', esbuildName), 0o755);
 }
 
 const manifest = {
-  schema: 1,
+  schema: 2,
   name: packageJson.name,
   version: packageJson.version,
   platform,
   revision: gitRevision(),
   executable: `bin/${executableName}`,
-  runtimeModules: 'src/runtime_modules',
-  esbuild: `vendors/esbuild/${esbuildName}`,
 };
 writeFileSync(join(packageRoot, 'cottontail-release.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
 const packagedExecutable = join(packageRoot, 'bin', executableName);
 const smoke = spawnSync(packagedExecutable, ['-p', '6 * 7'], {
   cwd: packageRoot,
-  env: { ...process.env, COTTONTAIL_HOME: packageRoot },
   encoding: 'utf8',
 });
 if (smoke.status !== 0 || smoke.stdout.trim() !== '42') {
   fail(`Packaged runtime smoke test failed:\n${smoke.stderr || smoke.stdout}`);
 }
+rmSync(join(packageRoot, '.cottontail-tmp'), { recursive: true, force: true });
 
 rmSync(archivePath, { force: true });
 const tar = spawnSync('tar', ['-czf', archivePath, '-C', releaseRoot, basename(packageRoot)], {

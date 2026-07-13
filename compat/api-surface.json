@@ -18368,23 +18368,23 @@
               "text": "throw new TypeError(\"onBeforeParse() requires a native (NAPI) plugin, which is not supported here\");"
             },
             {
-              "line": 11136,
+              "line": 11003,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11167,
+              "line": 11034,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11590,
+              "line": 11457,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 11606,
+              "line": 11473,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 12398,
+              "line": 12265,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],

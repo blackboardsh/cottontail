@@ -22,18 +22,16 @@ import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import { jest as bunJest } from "./test.js";
 
-// The script bundle is generated with esbuild --platform=neutral, whose
-// __toESM helper strictly honors the __esModule marker: `import x from "cjs"`
+// The generated __toESM helper strictly honors the __esModule marker:
+// `import x from "cjs"`
 // yields x === undefined for CJS modules that set __esModule without an
 // exports.default (e.g. @grpc/grpc-js, TS-compiled CJS). Bun/Node semantics:
 // default falls back to module.exports in that case. The runtime modules are
 // bundled into the same top-level scope as the helper, so rewrap it here
 // (before any user code evaluates) to apply the fallback.
-// The helper must be reached via direct eval: a bare `__toESM` identifier in
-// this source would make esbuild rename its helper (collision avoidance) and
-// the patch would grab nothing. The eval string is opaque to esbuild, and the
-// unminified bundle keeps the helper's canonical name, so the scope-chain
-// lookup finds it.
+// The helper must be reached via direct eval: a bare `__toESM` identifier can
+// be renamed during bundling, while the eval string remains opaque and finds
+// the canonical helper through the scope chain.
 try {
   const ctOriginalToESM = eval('typeof __toESM === "function" ? __toESM : undefined');
   if (ctOriginalToESM && !ctOriginalToESM.__cottontailDefaultInterop) {
@@ -1123,48 +1121,6 @@ function which(command, options = undefined) {
   return null;
 }
 
-function bunBinary() {
-  const exe = cottontail.platform() === "win32" ? "bun.exe" : "bun";
-  const candidate = pathJoin(cottontail.cwd(), "vendors", "bun", exe);
-  return cottontail.existsSync(candidate) ? candidate : exe;
-}
-
-const bunBuildDriver = `
-const spec = await Bun.file(process.argv[2]).json();
-const render = (value) => { try { return Bun.inspect(value); } catch { return String(value); } };
-try {
-  const result = await Bun.build({ ...spec, throw: true });
-  const outputs = [];
-  for (const output of result.outputs || []) {
-    outputs.push({
-      path: output.path || "",
-      text: await output.text(),
-      kind: output.kind ?? "entry-point",
-      hash: output.hash ?? null,
-      loader: output.loader ?? "js",
-    });
-  }
-  const logs = (result.logs || []).map((log) => ({
-    name: log?.name ?? "BuildMessage",
-    level: log?.level ?? "warning",
-    message: log?.message ?? String(log),
-    position: log?.position ?? null,
-    rendered: render(log),
-  }));
-  console.log(JSON.stringify({ ok: true, success: result.success !== false, logs, outputs }));
-} catch (error) {
-  const list = Array.isArray(error?.errors) && error.errors.length > 0 ? error.errors : [error];
-  const logs = list.map((item) => ({
-    name: item?.name ?? "BuildMessage",
-    level: item?.level ?? "error",
-    message: item?.message ?? String(item),
-    position: item?.position ?? null,
-    rendered: render(item),
-  }));
-  console.log(JSON.stringify({ ok: false, name: error?.name ?? "AggregateError", message: error?.message ?? "Bundle failed", logs }));
-}
-`;
-
 class BuildMessage {
   constructor({ name = "BuildMessage", message = "", level = "error", position = null, rendered = null } = {}) {
     this.name = name;
@@ -1182,20 +1138,46 @@ class BuildMessage {
 }
 
 function runBuildDriver(spec) {
-  const tmp = tmpRoot("bun-build");
-  cottontail.mkdirSync(tmp, true);
-  const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-  const specPath = pathJoin(tmp, `build-${id}.json`);
-  const driverPath = pathJoin(tmp, "bun-build-driver.mjs");
-  cottontail.writeFile(specPath, JSON.stringify(spec));
-  cottontail.writeFile(driverPath, bunBuildDriver);
-  const result = cottontail.spawnSync(bunBinary(), [driverPath, specPath], { stdio: "pipe" });
-  if (result.status !== 0) {
-    const error = new Error(result.stderr || result.stdout || "Bun.build failed");
-    error.exitCode = result.status;
-    throw error;
+  try {
+    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+    const outputs = [];
+    for (const entrypoint of spec.entrypoints ?? []) {
+      const entry = String(entrypoint);
+      const absoluteEntry = entry.startsWith("/") || /^[A-Za-z]:[\\/]/.test(entry)
+        ? entry
+        : nodePathResolve(cwd, entry);
+      if (!cottontail.existsSync(absoluteEntry)) {
+        const error = new Error(`ModuleNotFound resolving "${entry}" (entry point)`);
+        error.code = "ERR_MODULE_NOT_FOUND";
+        throw error;
+      }
+      const text = cottontail.bundleNative(absoluteEntry, cwd, JSON.stringify(spec));
+      const sourceName = entry.replace(/\\/g, "/").split("/").pop() || "index.js";
+      const stem = sourceName.replace(/\.[^.]*$/, "");
+      const outputName = `${stem}.js`;
+      const outputPath = spec.outdir ? pathJoin(String(spec.outdir), outputName) : outputName;
+      if (spec.write === true) {
+        const parent = pathDirname(outputPath);
+        if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
+        cottontail.writeFile(outputPath, text);
+      }
+      outputs.push({ path: outputPath, text, kind: "entry-point", hash: null, loader: "js" });
+    }
+    return { ok: true, success: true, logs: [], outputs };
+  } catch (error) {
+    return {
+      ok: false,
+      name: error?.name ?? "AggregateError",
+      message: error?.message ?? "Bundle failed",
+      logs: [{
+        name: error?.name ?? "BuildMessage",
+        level: "error",
+        message: error?.message ?? String(error),
+        position: error?.position ?? null,
+        rendered: error?.stack ?? String(error),
+      }],
+    };
   }
-  return JSON.parse(result.stdout);
 }
 
 function finalizeDriverResult(parsed, options) {
@@ -1209,13 +1191,15 @@ function finalizeDriverResult(parsed, options) {
   return {
     success: parsed.success !== false,
     logs,
-    outputs: (parsed.outputs || []).map((output) => ({
-      path: output.path,
-      kind: output.kind ?? "entry-point",
-      hash: output.hash ?? null,
-      loader: output.loader ?? "js",
-      text: async () => output.text,
-    })),
+    outputs: (parsed.outputs || []).map((output) => new CTBuildArtifact(
+      globalThis.Buffer.from(output.text ?? ""),
+      {
+        path: output.path,
+        kind: output.kind ?? "entry-point",
+        hash: output.hash ?? null,
+        loader: output.loader ?? "js",
+      },
+    )),
   };
 }
 
@@ -1263,6 +1247,7 @@ async function buildWithPlugins(options, plugins) {
   const onResolveRules = [];
   const onLoadRules = [];
   const onStartCallbacks = [];
+  const onEndCallbacks = [];
   const toFilter = (value) => (value instanceof RegExp ? value : new RegExp(String(value ?? ".*")));
   const builder = {
     config: options,
@@ -1280,7 +1265,11 @@ async function buildWithPlugins(options, plugins) {
       onStartCallbacks.push(callback);
       return builder;
     },
-    onEnd() { return builder; },
+    onEnd(callback) {
+      if (typeof callback !== "function") throw new TypeError("onEnd() expects a callback function");
+      onEndCallbacks.push(callback);
+      return builder;
+    },
     onBeforeParse() { return builder; },
   };
   for (const plugin of plugins) {
@@ -1450,18 +1439,17 @@ async function buildWithPlugins(options, plugins) {
   }
 
   const parsed = runBuildDriver({ ...options, plugins: undefined, entrypoints: shadowEntries });
-  return finalizeDriverResult(parsed, options);
+  const result = finalizeDriverResult(parsed, options);
+  await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
+  if (!result.success && options?.throw !== false) {
+    const failures = result.logs.filter((log) => (log?.level ?? "error") === "error");
+    throw new AggregateError(failures.length > 0 ? failures : result.logs, "Bundle failed");
+  }
+  return result;
 }
 
-// ---------------------------------------------------------------------------
-// Bun.build: delegates bundling to the real bun binary. Plugin callbacks
-// (onResolve/onLoad) run HERE in cottontail; a driver script running under
-// real bun registers shim hooks that forward each invocation over a
-// line-delimited JSON RPC on stdin/stdout. onStart/onEnd run entirely in the
-// parent. Build artifacts, logs, and the metafile are marshalled back so the
-// result matches Bun's BuildOutput API (BuildArtifact blobs, BuildMessage
-// logs, AggregateError throw semantics).
-// ---------------------------------------------------------------------------
+// Bun.build artifacts and plugin callbacks are implemented in-process. Plugin
+// module graphs are materialized into a temporary directory before bundling.
 
 const ctInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
 
@@ -1519,239 +1507,9 @@ const CTBuildArtifact = class BuildArtifact extends Blob {
   }
 };
 
-// Runs under REAL bun. Must not contain backticks or dollar-brace sequences.
-const ctBuildDriverSource = `
-import readline from "node:readline";
-
-const specPath = process.argv[2];
-const spec = await Bun.file(specPath).json();
-
-let seq = 0;
-const pendingReplies = new Map();
-const pendingLoads = new Map();
-
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + "\\n");
-}
-
-function encodeThrown(error) {
-  if (error instanceof Error) {
-    return {
-      message: String(error.message),
-      name: error.name || "Error",
-      stack: typeof error.stack === "string" ? error.stack : undefined,
-    };
-  }
-  const type = typeof error;
-  if (error === null || type === "string" || type === "number" || type === "boolean") {
-    return { primitive: true, value: error };
-  }
-  try { return { primitive: true, value: JSON.parse(JSON.stringify(error)) }; } catch {}
-  return { message: String(error), name: "Error" };
-}
-
-function rethrow(encoded) {
-  if (encoded && encoded.primitive) throw encoded.value;
-  const error = new Error(encoded && encoded.message ? encoded.message : "plugin callback failed");
-  if (encoded && encoded.name) error.name = encoded.name;
-  if (encoded && encoded.stack) error.stack = encoded.stack;
-  throw error;
-}
-
-function request(message) {
-  seq += 1;
-  const id = "d" + seq;
-  return new Promise(function (resolve, reject) {
-    pendingReplies.set(id, { resolve: resolve, reject: reject });
-    const withId = Object.assign({}, message);
-    withId.id = id;
-    send(withId);
-  });
-}
-
-async function callParent(message) {
-  try {
-    return await request(message);
-  } catch (encoded) {
-    rethrow(encoded);
-  }
-}
-
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-rl.on("line", function (line) {
-  if (!line) return;
-  let message;
-  try { message = JSON.parse(line); } catch { return; }
-  if (message.t === "reply") {
-    const entry = pendingReplies.get(message.id);
-    if (!entry) return;
-    pendingReplies.delete(message.id);
-    if (message.error) entry.reject(message.error);
-    else entry.resolve(message.value);
-  } else if (message.t === "defer") {
-    const args = pendingLoads.get(message.loadId);
-    Promise.resolve()
-      .then(function () {
-        if (!args || typeof args.defer !== "function") throw new Error("defer() is not available");
-        return args.defer();
-      })
-      .then(
-        function () { send({ t: "reply", id: message.id }); },
-        function (error) { send({ t: "reply", id: message.id, error: encodeThrown(error) }); },
-      );
-  }
-});
-
-function decodeResolveResult(value) {
-  if (!value || value.kind === "u") return undefined;
-  if (value.kind === "p") return value.value;
-  return value.obj || {};
-}
-
-function decodeLoadResult(value) {
-  if (!value || value.kind === "u") return undefined;
-  if (value.kind === "p") return value.value;
-  const result = value.obj || {};
-  if (value.contentsB64 != null) result.contents = Buffer.from(value.contentsB64, "base64");
-  return result;
-}
-
-const plugins = (spec.plugins || [])
-  .filter(function (p) { return Array.isArray(p.hooks) && p.hooks.length > 0; })
-  .map(function (p) {
-    return {
-      name: p.name,
-      setup: function (build) {
-        for (const reg of p.hooks) {
-          const filter = new RegExp(reg.source, reg.flags || "");
-          const constraint = reg.namespace ? { filter: filter, namespace: reg.namespace } : { filter: filter };
-          if (reg.hook === "onResolve") {
-            build.onResolve(constraint, async function (args) {
-              const value = await callParent({
-                t: "onResolve",
-                cb: reg.cbId,
-                args: {
-                  path: args.path,
-                  importer: args.importer,
-                  namespace: args.namespace,
-                  resolveDir: args.resolveDir,
-                  kind: args.kind,
-                  pluginData: args.pluginData,
-                },
-              });
-              return decodeResolveResult(value);
-            });
-          } else if (reg.hook === "onLoad") {
-            build.onLoad(constraint, async function (args) {
-              seq += 1;
-              const loadId = "L" + seq;
-              pendingLoads.set(loadId, args);
-              try {
-                const value = await callParent({
-                  t: "onLoad",
-                  cb: reg.cbId,
-                  loadId: loadId,
-                  args: {
-                    path: args.path,
-                    namespace: args.namespace,
-                    loader: args.loader,
-                    pluginData: args.pluginData,
-                  },
-                });
-                return decodeLoadResult(value);
-              } finally {
-                pendingLoads.delete(loadId);
-              }
-            });
-          }
-        }
-      },
-    };
-  });
-
-const config = Object.assign({}, spec.options);
-config.throw = false;
-if (plugins.length > 0) config.plugins = plugins;
-else delete config.plugins;
-
-let result = null;
-let fatal = null;
-try {
-  result = await Bun.build(config);
-} catch (error) {
-  fatal = encodeThrown(error);
-}
-
-if (fatal) {
-  send({ t: "done", fatal: fatal });
-} else {
-  const list = result.outputs || [];
-  const outputs = [];
-  for (const artifact of list) {
-    let sourcemapIndex = -1;
-    if (artifact.sourcemap) {
-      for (let i = 0; i < list.length; i += 1) {
-        if (list[i] === artifact.sourcemap) { sourcemapIndex = i; break; }
-      }
-    }
-    let b64 = "";
-    try { b64 = Buffer.from(await artifact.arrayBuffer()).toString("base64"); } catch {}
-    outputs.push({
-      path: artifact.path,
-      kind: artifact.kind,
-      loader: artifact.loader,
-      hash: artifact.hash,
-      type: artifact.type,
-      sourcemapIndex: sourcemapIndex,
-      b64: b64,
-    });
-  }
-  const logs = (result.logs || []).map(function (log) {
-    let position = null;
-    try { position = log.position ? JSON.parse(JSON.stringify(log.position)) : null; } catch {}
-    let rendered = null;
-    try { rendered = Bun.inspect(log); } catch {}
-    const entry = {
-      name: log.name || "BuildMessage",
-      message: log.message != null ? String(log.message) : String(log),
-      level: log.level || "error",
-      position: position,
-      rendered: rendered,
-    };
-    if (log.specifier !== undefined) entry.specifier = log.specifier;
-    if (log.importKind !== undefined) entry.importKind = log.importKind;
-    if (log.referrer !== undefined) entry.referrer = log.referrer;
-    return entry;
-  });
-  let metafile = null;
-  if (result.metafile) {
-    try { metafile = JSON.parse(JSON.stringify(result.metafile)); } catch {}
-  }
-  send({ t: "done", success: result.success !== false, logs: logs, outputs: outputs, metafile: metafile });
-}
-process.stdout.write("", function () { process.exit(0); });
-setTimeout(function () { process.exit(0); }, 2000);
-`;
-
 function ctErrorMessage(error) {
   if (error instanceof Error) return error.message != null ? String(error.message) : String(error);
   return String(error);
-}
-
-function ctEncodeThrown(error) {
-  if (error instanceof Error) {
-    return {
-      message: String(error.message ?? error),
-      name: error.name || "Error",
-      stack: typeof error.stack === "string" ? error.stack : undefined,
-    };
-  }
-  const type = typeof error;
-  if (error === null || type === "string" || type === "number" || type === "boolean") {
-    return { primitive: true, value: error };
-  }
-  try { return { primitive: true, value: JSON.parse(JSON.stringify(error)) }; } catch {}
-  return { message: String(error), name: "Error" };
 }
 
 function ctDecodeThrown(encoded) {
@@ -1761,141 +1519,6 @@ function ctDecodeThrown(encoded) {
   if (encoded.name) error.name = encoded.name;
   if (encoded.stack) error.stack = encoded.stack;
   return error;
-}
-
-function ctEncodePluginData(state, value) {
-  if (value === undefined) return undefined;
-  state.pluginDataSeq += 1;
-  const token = `pd${state.pluginDataSeq}`;
-  state.pluginData.set(token, value);
-  return { __ctPluginData: token };
-}
-
-function ctDecodePluginData(state, value) {
-  if (value && typeof value === "object" && typeof value.__ctPluginData === "string") {
-    return state.pluginData.get(value.__ctPluginData);
-  }
-  return value;
-}
-
-function ctEncodeResolveResult(state, result) {
-  if (result == null) return { kind: "u" };
-  if (typeof result !== "object") {
-    const type = typeof result;
-    if (type === "string" || type === "number" || type === "boolean") return { kind: "p", value: result };
-    return { kind: "p", value: null };
-  }
-  const obj = {};
-  if (result.path !== undefined) obj.path = String(result.path);
-  if (result.namespace !== undefined && result.namespace !== null) obj.namespace = String(result.namespace);
-  if (result.external !== undefined) obj.external = Boolean(result.external);
-  if (result.pluginData !== undefined) obj.pluginData = ctEncodePluginData(state, result.pluginData);
-  return { kind: "o", obj };
-}
-
-function ctEncodeLoadResult(state, result) {
-  if (result == null) return { kind: "u" };
-  if (typeof result !== "object") {
-    const type = typeof result;
-    if (type === "string" || type === "number" || type === "boolean") return { kind: "p", value: result };
-    return { kind: "p", value: null };
-  }
-  const encoded = { kind: "o", obj: {} };
-  const contents = result.contents;
-  if (typeof contents === "string") {
-    encoded.obj.contents = contents;
-  } else if (contents != null) {
-    encoded.contentsB64 = globalThis.Buffer.from(asBuffer(contents)).toString("base64");
-  }
-  if (result.loader !== undefined) encoded.obj.loader = String(result.loader);
-  if (result.resolveDir !== undefined) encoded.obj.resolveDir = String(result.resolveDir);
-  if (result.pluginData !== undefined) encoded.obj.pluginData = ctEncodePluginData(state, result.pluginData);
-  if (Array.isArray(result.watchFiles)) encoded.obj.watchFiles = result.watchFiles.map(String);
-  return encoded;
-}
-
-function ctNormalizeMinify(minify) {
-  if (minify === true) return { all: true, whitespace: true, identifiers: true, syntax: true };
-  if (minify && typeof minify === "object") {
-    const whitespace = minify.whitespace === true;
-    const identifiers = minify.identifiers === true;
-    const syntax = minify.syntax === true;
-    return { all: whitespace && identifiers && syntax, whitespace, identifiers, syntax };
-  }
-  return { all: false, whitespace: false, identifiers: false, syntax: false };
-}
-
-function ctEsbuildInitialOptions(options) {
-  const minify = ctNormalizeMinify(options.minify);
-  const platformByTarget = { browser: "browser", node: "node", bun: "node" };
-  return {
-    bundle: true,
-    entryPoints: [...(options.entrypoints ?? [])],
-    external: options.external ?? [],
-    format: options.format ?? "esm",
-    minify: minify.all,
-    minifyIdentifiers: minify.identifiers === true ? true : undefined,
-    minifySyntax: minify.syntax === true ? true : undefined,
-    minifyWhitespace: minify.whitespace === true ? true : undefined,
-    outdir: options.outdir,
-    platform: platformByTarget[options.target ?? "browser"] ?? "browser",
-    sourcemap: options.sourcemap,
-  };
-}
-
-function ctMakeBuilder(options, state, hooks) {
-  const requireFilter = (constraint, hookName) => {
-    if (!constraint || !(constraint.filter instanceof RegExp)) {
-      throw new TypeError(`${hookName}() expects an object with a "filter" RegExp`);
-    }
-  };
-  const registerHook = (hookName, constraint, callback) => {
-    requireFilter(constraint, hookName);
-    if (typeof callback !== "function") throw new TypeError(`${hookName}() expects a callback function`);
-    const cbId = state.callbacks.push(callback) - 1;
-    hooks.push({
-      hook: hookName,
-      source: constraint.filter.source,
-      flags: constraint.filter.flags,
-      namespace: constraint.namespace ? String(constraint.namespace) : undefined,
-      cbId,
-    });
-  };
-  const builder = {
-    config: options,
-    get initialOptions() {
-      return ctEsbuildInitialOptions(options);
-    },
-    target: options.target ?? "browser",
-    onResolve(constraint, callback) {
-      registerHook("onResolve", constraint, callback);
-      return builder;
-    },
-    onLoad(constraint, callback) {
-      registerHook("onLoad", constraint, callback);
-      return builder;
-    },
-    onStart(callback) {
-      if (typeof callback !== "function") throw new TypeError("onStart() expects a callback function");
-      state.onStart.push(callback);
-      return builder;
-    },
-    onEnd(callback) {
-      if (typeof callback !== "function") throw new TypeError("onEnd() expects a callback function");
-      state.onEnd.push(callback);
-      return builder;
-    },
-    onBeforeParse() {
-      throw new TypeError("onBeforeParse() requires a native (NAPI) plugin, which is not supported here");
-    },
-    module() {
-      throw new Error("module() is not supported in Bun.build() yet. Only Bun.plugin() supports module() at runtime");
-    },
-    resolve() {
-      return Promise.reject(new Error("builder.resolve() is not supported in Bun.build()"));
-    },
-  };
-  return builder;
 }
 
 function ctCheckInvalidJsonImports(options) {
@@ -1922,105 +1545,26 @@ function ctCheckInvalidJsonImports(options) {
 }
 
 async function ctRunBuildDriver(options, state) {
-  const tmp = tmpRoot("bun-build");
-  cottontail.mkdirSync(tmp, true);
-  const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-  const specPath = pathJoin(tmp, `build-${id}.json`);
-  const driverPath = pathJoin(tmp, "bun-build-plugin-driver.mjs");
-  const driverOptions = { ...options };
-  delete driverOptions.plugins;
-  delete driverOptions.throw;
-  cottontail.writeFile(specPath, JSON.stringify({ options: driverOptions, plugins: state.pluginSpecs }));
-  cottontail.writeFile(driverPath, ctBuildDriverSource);
-  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-  const child = spawn([bunBinary(), driverPath, specPath], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const stderrChunks = [];
-  child.stderr?.on("data", (chunk) => stderrChunks.push(asBuffer(chunk)));
-  try {
-    return await new Promise((resolve, reject) => {
-      let settled = false;
-      let buffered = "";
-      let parentSeq = 0;
-      const pendingParent = new Map();
-      const finish = (fn, value) => {
-        if (!settled) {
-          settled = true;
-          fn(value);
-        }
-      };
-      const sendMessage = (message) => {
-        try { child.stdin?.write(encoder.encode(`${JSON.stringify(message)}\n`)); } catch {}
-      };
-      const parentRequest = (message) => new Promise((requestResolve, requestReject) => {
-        parentSeq += 1;
-        const requestId = `p${parentSeq}`;
-        pendingParent.set(requestId, { resolve: requestResolve, reject: requestReject });
-        sendMessage({ ...message, id: requestId });
-      });
-      const handleHook = async (message) => {
-        try {
-          const callback = state.callbacks[message.cb];
-          let value;
-          if (message.t === "onResolve") {
-            value = ctEncodeResolveResult(state, await callback({
-              path: message.args.path,
-              importer: message.args.importer,
-              namespace: message.args.namespace,
-              resolveDir: message.args.resolveDir,
-              kind: message.args.kind,
-              pluginData: ctDecodePluginData(state, message.args.pluginData),
-            }));
-          } else {
-            value = ctEncodeLoadResult(state, await callback({
-              path: message.args.path,
-              namespace: message.args.namespace,
-              loader: message.args.loader,
-              pluginData: ctDecodePluginData(state, message.args.pluginData),
-              defer: () => parentRequest({ t: "defer", loadId: message.loadId }),
-            }));
-          }
-          sendMessage({ t: "reply", id: message.id, value });
-        } catch (error) {
-          sendMessage({ t: "reply", id: message.id, error: ctEncodeThrown(error) });
-        }
-      };
-      child.stdout?.on("data", (chunk) => {
-        buffered += decoder.decode(asBuffer(chunk), { stream: true });
-        let newline;
-        while ((newline = buffered.indexOf("\n")) >= 0) {
-          const line = buffered.slice(0, newline);
-          buffered = buffered.slice(newline + 1);
-          if (!line) continue;
-          let message;
-          try { message = JSON.parse(line); } catch { continue; }
-          if (message.t === "done") {
-            finish(resolve, message);
-          } else if (message.t === "reply") {
-            const entry = pendingParent.get(message.id);
-            if (entry) {
-              pendingParent.delete(message.id);
-              if (message.error) entry.reject(ctDecodeThrown(message.error));
-              else entry.resolve(message.value);
-            }
-          } else if (message.t === "onResolve" || message.t === "onLoad") {
-            void handleHook(message);
-          }
-        }
-      });
-      child.exited.then((code) => {
-        for (const entry of pendingParent.values()) entry.reject(new Error("Bun.build driver exited"));
-        pendingParent.clear();
-        if (!settled) {
-          const stderrText = stderrChunks.length > 0 ? new TextDecoder().decode(concatManyBuffers(stderrChunks)) : "";
-          finish(reject, new Error(`Bun.build driver exited with code ${code}${stderrText ? `: ${stderrText}` : ""}`));
-        }
-      }, (error) => finish(reject, error));
-    });
-  } finally {
-    try { child.kill(); } catch {}
+  const parsed = runBuildDriver(options);
+  if (parsed.ok === false) {
+    return { success: false, logs: parsed.logs ?? [], outputs: [], fatal: {
+      message: parsed.message ?? "Bundle failed",
+      name: parsed.name ?? "AggregateError",
+    } };
   }
+  return {
+    success: parsed.success !== false,
+    logs: parsed.logs ?? [],
+    outputs: (parsed.outputs ?? []).map((output) => ({
+      path: output.path,
+      kind: output.kind ?? "entry-point",
+      hash: output.hash ?? null,
+      loader: output.loader ?? "js",
+      b64: globalThis.Buffer.from(output.text ?? "").toString("base64"),
+      sourcemapIndex: null,
+    })),
+    metafile: null,
+  };
 }
 
 function ctMaterializeBuildResult(raw) {
@@ -2151,39 +1695,18 @@ export function build(options) {
       && !["none", "linked", "inline", "external"].includes(sourcemap)) {
     throw new TypeError(`Invalid "sourcemap" value in Bun.build: ${String(sourcemap)}`);
   }
-
-  const state = {
-    callbacks: [],
-    onStart: [],
-    onEnd: [],
-    pluginSpecs: [],
-    setupPromises: [],
-    pluginData: new Map(),
-    pluginDataSeq: 0,
-  };
-
   if (options.plugins != null) {
     if (!Array.isArray(options.plugins)) {
       throw new TypeError("Expected plugins to be an array of objects");
     }
-    for (const plugin of options.plugins) {
-      if (plugin == null || typeof plugin !== "object") {
-        throw new TypeError("Expected plugin to be an object");
-      }
-      if (typeof plugin.setup !== "function") {
-        const error = new TypeError("Expected plugin to have a setup() function");
-        error.code = "ERR_INVALID_ARG_TYPE";
-        throw error;
-      }
-    }
-    for (const plugin of options.plugins) {
-      const hooks = [];
-      const builder = ctMakeBuilder(options, state, hooks);
-      const returned = plugin.setup(builder);
-      if (returned && typeof returned.then === "function") state.setupPromises.push(returned);
-      state.pluginSpecs.push({ name: plugin.name != null ? String(plugin.name) : "plugin", hooks });
-    }
+    return buildWithPlugins(options, options.plugins);
   }
+
+  const state = {
+    onStart: [],
+    onEnd: [],
+    setupPromises: [],
+  };
 
   return ctRunBuild(options, state);
 }
@@ -10440,178 +9963,45 @@ function transformReplSource(source) {
   return `${declarations.length ? `var ${declarations.join(", ")};\n` : ""}(async () => {\n${body.join("\n")}\nreturn { value: (${result}) };\n})()`;
 }
 
-// Bun.Transpiler delegates to the real bun binary. To avoid paying process
-// startup for every transformSync call, a persistent bun helper process is
-// kept alive per cottontail process and requests are exchanged synchronously
-// through numbered request/response files in a private temp directory.
-const TRANSPILER_SERVER_SOURCE = `
-const dir = process.argv[2];
-const parentPid = Number(process.argv[3] || 0);
-const fs = require("node:fs");
-const path = require("node:path");
-const transpilers = new Map();
-fs.writeFileSync(path.join(dir, "alive"), String(Date.now()));
-fs.writeFileSync(path.join(dir, "ready"), "1");
-let lastBeat = Date.now();
-let lastWork = Date.now();
-const shutdown = () => {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-  process.exit(0);
-};
-while (true) {
-  const now = Date.now();
-  if (now - lastBeat > 250) {
-    lastBeat = now;
-    try { fs.writeFileSync(path.join(dir, "alive"), String(now)); } catch { process.exit(0); }
-    if (parentPid > 0) { try { process.kill(parentPid, 0); } catch { shutdown(); } }
-    if (now - lastWork > 120000) shutdown();
-  }
-  let entries;
-  try { entries = fs.readdirSync(dir); } catch { process.exit(0); }
-  const requests = entries.filter((name) => name.endsWith(".req.json"));
-  if (requests.length === 0) { await Bun.sleep(1); continue; }
-  requests.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
-  for (const name of requests) {
-    lastWork = Date.now();
-    const reqPath = path.join(dir, name);
-    let req;
-    try { req = JSON.parse(fs.readFileSync(reqPath, "utf8")); } catch { continue; }
-    try { fs.unlinkSync(reqPath); } catch {}
-    let res;
-    try {
-      const key = JSON.stringify(req.options ?? {});
-      let transpiler = transpilers.get(key);
-      if (!transpiler) { transpiler = new Bun.Transpiler(req.options ?? {}); transpilers.set(key, transpiler); }
-      let result;
-      if (req.method === "transformSync" || req.method === "transform") {
-        result = req.loader == null ? transpiler.transformSync(req.source) : transpiler.transformSync(req.source, req.loader);
-      } else if (req.method === "scan") {
-        result = transpiler.scan(req.source);
-      } else if (req.method === "scanImports") {
-        result = transpiler.scanImports(req.source);
-      } else {
-        throw new Error("Unknown Bun.Transpiler method: " + req.method);
-      }
-      res = { ok: true, result };
-    } catch (error) {
-      const toInfo = (item) => ({
-        name: item?.name,
-        message: item?.message ?? String(item),
-        position: item?.position ?? null,
-      });
-      res = {
-        ok: false,
-        name: error?.name,
-        message: error?.message ?? String(error),
-        errors: Array.isArray(error?.errors) ? error.errors.map(toInfo) : [toInfo(error)],
-      };
-    }
-    const resPath = path.join(dir, name.slice(0, -".req.json".length) + ".res.json");
-    fs.writeFileSync(resPath + ".tmp", JSON.stringify(res));
-    fs.renameSync(resPath + ".tmp", resPath);
-  }
-}
-`;
 
-const transpilerServerState = { dir: null, seq: 0 };
-
-function transpilerServerAliveAt(dir) {
-  try {
-    return Number(String(cottontail.readFile(pathJoin(dir, "alive"))));
-  } catch {
-    return 0;
+function transpilerSourceText(source) {
+  if (typeof source === "string") return source;
+  if (ArrayBuffer.isView(source)) {
+    return new TextDecoder().decode(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
   }
-}
-
-function ensureTranspilerServer() {
-  if (transpilerServerState.dir != null && cottontail.existsSync(pathJoin(transpilerServerState.dir, "ready"))) {
-    return transpilerServerState.dir;
-  }
-  const pid = globalThis.process?.pid ?? Math.floor(Math.random() * 1e6);
-  const dir = pathJoin(tmpRoot("bun-transpiler"), `srv-${pid}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`);
-  cottontail.mkdirSync(dir, true);
-  const serverPath = pathJoin(dir, "server.mjs");
-  cottontail.writeFile(serverPath, TRANSPILER_SERVER_SOURCE);
-  cottontail.spawnDetached(bunBinary(), [serverPath, dir, String(pid)], { stdio: "ignore" });
-  const deadline = Date.now() + 15000;
-  const readyPath = pathJoin(dir, "ready");
-  while (!cottontail.existsSync(readyPath)) {
-    if (Date.now() > deadline) throw new Error("Bun.Transpiler failed to start bun helper process");
-    cottontail.sleep(2);
-  }
-  transpilerServerState.dir = dir;
-  transpilerServerState.seq = 0;
-  return dir;
-}
-
-function makeTranspilerError(info) {
-  const error = new Error(info?.message ?? "Bun.Transpiler failed");
-  if (info?.name && info.name !== "Error") {
-    try { Object.defineProperty(error, "name", { value: info.name, writable: true, configurable: true }); } catch {}
-  }
-  if (info?.position != null) error.position = info.position;
-  return error;
-}
-
-function transpilerRequest(options, method, source, loader) {
-  const dir = ensureTranspilerServer();
-  const seq = ++transpilerServerState.seq;
-  const reqPath = pathJoin(dir, `${seq}.req.json`);
-  const resPath = pathJoin(dir, `${seq}.res.json`);
-  const payload = JSON.stringify({
-    options: options == null ? {} : JSON.parse(JSON.stringify(options)),
-    method,
-    source: typeof source === "string" ? source : ArrayBuffer.isView(source) || source instanceof ArrayBuffer ? new TextDecoder().decode(source) : String(source),
-    loader: loader == null ? null : String(loader),
-  });
-  cottontail.writeFile(`${reqPath}.tmp`, payload);
-  cottontail.renameSync(`${reqPath}.tmp`, reqPath);
-  const deadline = Date.now() + 30000;
-  let sinceAliveCheck = Date.now();
-  while (!cottontail.existsSync(resPath)) {
-    const now = Date.now();
-    if (now > deadline) {
-      transpilerServerState.dir = null;
-      throw new Error("Bun.Transpiler request timed out");
-    }
-    if (now - sinceAliveCheck > 2000) {
-      sinceAliveCheck = now;
-      if (now - transpilerServerAliveAt(dir) > 5000) {
-        transpilerServerState.dir = null;
-        throw new Error("Bun.Transpiler helper process exited unexpectedly");
-      }
-    }
-    cottontail.sleep(0.25);
-  }
-  const response = JSON.parse(String(cottontail.readFile(resPath)));
-  try { cottontail.unlinkSync(resPath); } catch {}
-  if (!response.ok) {
-    const errors = Array.isArray(response.errors) ? response.errors : [];
-    if (errors.length > 1) {
-      throw new AggregateError(errors.map(makeTranspilerError), response.message ?? "");
-    }
-    throw makeTranspilerError(errors[0] ?? response);
-  }
-  return response.result;
+  if (source instanceof ArrayBuffer) return new TextDecoder().decode(source);
+  return String(source);
 }
 
 export class Transpiler {
   constructor(options = {}) {
+    if (options == null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("Expected an object");
+    }
     this.options = options;
+    this.optionsJson = JSON.stringify(options);
   }
   transformSync(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return transpilerRequest(this.options, "transformSync", source, typeof loader === "string" ? loader : undefined);
+    return cottontail.transpilerTransform(
+      transpilerSourceText(source),
+      this.optionsJson,
+      typeof loader === "string" ? loader : "",
+    );
   }
   async transform(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return transpilerRequest(this.options, "transform", source, typeof loader === "string" ? loader : undefined);
+    return cottontail.transpilerTransform(
+      transpilerSourceText(source),
+      this.optionsJson,
+      typeof loader === "string" ? loader : "",
+    );
   }
   scan(source) {
-    return transpilerRequest(this.options, "scan", source, undefined);
+    return JSON.parse(cottontail.transpilerScan(transpilerSourceText(source), this.optionsJson, ""));
   }
   scanImports(source) {
-    return transpilerRequest(this.options, "scanImports", source, undefined);
+    return JSON.parse(cottontail.transpilerScanImports(transpilerSourceText(source), this.optionsJson, ""));
   }
 }
 

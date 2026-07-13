@@ -99,6 +99,23 @@ const transformed = transpiler.transformSync("export const value: number = 1;");
 assert(transformed.includes("export const value = 1"), "Bun.Transpiler transformSync mismatch");
 const scan = transpiler.scan('import x from "pkg"; export const value = 1;');
 assert(scan.imports[0].path === "pkg" && scan.exports.includes("value"), "Bun.Transpiler scan mismatch");
+const imports = transpiler.scanImports('import "side-effect"; const lazy = import("dynamic"); const common = require("common");');
+assert(imports.some((item) => item.path === "side-effect" && item.kind === "import-statement"), "Bun.Transpiler static import scan mismatch");
+assert(imports.some((item) => item.path === "dynamic" && item.kind === "dynamic-import"), "Bun.Transpiler dynamic import scan mismatch");
+assert(imports.some((item) => item.path === "common" && item.kind === "require-call"), "Bun.Transpiler require scan mismatch");
+const configuredTranspiler = new Bun.Transpiler({
+  loader: "js",
+  target: "bun",
+  define: { "process.env.RUNTIME": '"cottontail"' },
+  minify: { syntax: true, whitespace: true },
+});
+const configuredOutput = configuredTranspiler.transformSync(
+  new TextEncoder().encode('const runtime = process.env.RUNTIME; export { runtime };'),
+);
+assert(configuredOutput.includes('"cottontail"'), "Bun.Transpiler define mismatch");
+assert(!configuredOutput.includes("process.env.RUNTIME"), "Bun.Transpiler define should replace source expression");
+const loaderOverride = new Bun.Transpiler({ loader: "js" }).transformSync("const count: number = 2;", "ts");
+assert(loaderOverride.includes("const count = 2"), "Bun.Transpiler loader override mismatch");
 const replTranspiler = new Bun.Transpiler({ loader: "tsx", replMode: true });
 const replContext = vm.createContext({ Promise });
 await vm.runInContext(replTranspiler.transformSync("const replValue = await Promise.resolve(21)"), replContext);

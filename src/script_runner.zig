@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
+const native_bundler = @import("cottontail_bundler.zig");
+const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 
-const esbuild_version = "0.28.0";
 const script_thread_stack_size = 128 * 1024 * 1024;
 const script_js_stack_size = 96 * 1024 * 1024;
 
@@ -33,7 +34,6 @@ const Context = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
-    cottontail_home: []const u8,
     project_root: []const u8,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
@@ -79,16 +79,7 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
 
-    const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(script_path))
-        try bundleScriptWithEsbuild(&ctx, script_path, exec_args, script_args, null)
-    else blk: {
-        const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
-        if (try shouldBundleCommonJsEntrypoint(&ctx, script_abs)) {
-            const tmp_dir = try ensureTempDir(&ctx);
-            break :blk try writeCommonJsEntryWrapper(&ctx, tmp_dir, script_abs, false, "");
-        }
-        break :blk script_abs;
-    };
+    const runnable_path = try bundleScriptNative(&ctx, script_path, exec_args, script_args, null);
     defer cleanupRunnableDirectory(&ctx, runnable_path);
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
@@ -113,10 +104,7 @@ pub fn runEval(
     const eval_path = try writeEvalEntrypoint(&ctx, ctx.project_root, source, print_result, module_input);
     var eval_path_active = true;
     defer if (eval_path_active) std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
-    const runnable_path = if (runtimeModulesAvailable(&ctx) or isTypescriptPath(eval_path))
-        try bundleScriptWithEsbuild(&ctx, eval_path, exec_args, script_args, ctx.project_root)
-    else
-        eval_path;
+    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root);
     if (!std.mem.eql(u8, runnable_path, eval_path)) {
         std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
         eval_path_active = false;
@@ -153,12 +141,10 @@ pub fn runStdin(
 
 fn makeContext(init: std.process.Init) !Context {
     const allocator = init.arena.allocator();
-    const exe_dir = try std.process.executableDirPathAlloc(init.io, allocator);
     return .{
         .io = init.io,
         .allocator = allocator,
         .environ_map = init.environ_map,
-        .cottontail_home = try findCottontailHome(init, allocator, exe_dir),
         .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
     };
 }
@@ -358,14 +344,119 @@ fn rejectInvalidBunCjsPragma(ctx: *const Context, script_path: []const u8) !bool
     return true;
 }
 
-fn bundleScriptWithEsbuild(
+const NodeRuntimeAlias = struct {
+    specifier: []const u8,
+    relative_path: []const u8,
+};
+
+const node_runtime_aliases = [_]NodeRuntimeAlias{
+    .{ .specifier = "fs", .relative_path = "node/fs.js" },
+    .{ .specifier = "fs/promises", .relative_path = "node/fs/promises.js" },
+    .{ .specifier = "os", .relative_path = "node/os.js" },
+    .{ .specifier = "path", .relative_path = "node/path.js" },
+    .{ .specifier = "path/posix", .relative_path = "node/path/posix.cjs" },
+    .{ .specifier = "path/win32", .relative_path = "node/path/win32.cjs" },
+    .{ .specifier = "process", .relative_path = "node/process.js" },
+    .{ .specifier = "readline", .relative_path = "node/readline.js" },
+    .{ .specifier = "readline/promises", .relative_path = "node/readline/promises.js" },
+    .{ .specifier = "util", .relative_path = "node/util.js" },
+    .{ .specifier = "util/types", .relative_path = "node/util/types.js" },
+    .{ .specifier = "events", .relative_path = "node/events.cjs" },
+    .{ .specifier = "async_hooks", .relative_path = "node/async_hooks.js" },
+    .{ .specifier = "assert", .relative_path = "node/assert.cjs" },
+    .{ .specifier = "assert/strict", .relative_path = "node/assert/strict.js" },
+    .{ .specifier = "console", .relative_path = "node/console.js" },
+    .{ .specifier = "diagnostics_channel", .relative_path = "node/diagnostics_channel.js" },
+    .{ .specifier = "domain", .relative_path = "node/domain.js" },
+    .{ .specifier = "sys", .relative_path = "node/sys.js" },
+    .{ .specifier = "repl", .relative_path = "node/repl.js" },
+    .{ .specifier = "sea", .relative_path = "node/sea.js" },
+    .{ .specifier = "sqlite", .relative_path = "node/sqlite.js" },
+    .{ .specifier = "test", .relative_path = "node/test.js" },
+    .{ .specifier = "test/reporters", .relative_path = "node/test/reporters.js" },
+    .{ .specifier = "tty", .relative_path = "node/tty.js" },
+    .{ .specifier = "v8", .relative_path = "node/v8.js" },
+    .{ .specifier = "stream", .relative_path = "node/stream.cjs" },
+    .{ .specifier = "stream/consumers", .relative_path = "node/stream/consumers.js" },
+    .{ .specifier = "stream/promises", .relative_path = "node/stream/promises.js" },
+    .{ .specifier = "stream/web", .relative_path = "node/stream/web.js" },
+    .{ .specifier = "perf_hooks", .relative_path = "node/perf_hooks.js" },
+    .{ .specifier = "vm", .relative_path = "node/vm.js" },
+    .{ .specifier = "module", .relative_path = "node/module.js" },
+    .{ .specifier = "net", .relative_path = "node/net.js" },
+    .{ .specifier = "url", .relative_path = "node/url.js" },
+    .{ .specifier = "constants", .relative_path = "node/constants.js" },
+    .{ .specifier = "crypto", .relative_path = "node/crypto.js" },
+    .{ .specifier = "buffer", .relative_path = "node/buffer.js" },
+    .{ .specifier = "cluster", .relative_path = "node/cluster.js" },
+    .{ .specifier = "punycode", .relative_path = "node/punycode.js" },
+    .{ .specifier = "querystring", .relative_path = "node/querystring.js" },
+    .{ .specifier = "child_process", .relative_path = "node/child_process.js" },
+    .{ .specifier = "string_decoder", .relative_path = "node/string_decoder.js" },
+    .{ .specifier = "timers", .relative_path = "node/timers.js" },
+    .{ .specifier = "timers/promises", .relative_path = "node/timers/promises.js" },
+    .{ .specifier = "trace_events", .relative_path = "node/trace_events.js" },
+    .{ .specifier = "wasi", .relative_path = "node/wasi.js" },
+    .{ .specifier = "worker_threads", .relative_path = "node/worker_threads.js" },
+    .{ .specifier = "zlib", .relative_path = "node/zlib.js" },
+    .{ .specifier = "http", .relative_path = "node/http.js" },
+    .{ .specifier = "https", .relative_path = "node/https.js" },
+    .{ .specifier = "http2", .relative_path = "node/http2.js" },
+    .{ .specifier = "inspector", .relative_path = "node/inspector.js" },
+    .{ .specifier = "inspector/promises", .relative_path = "node/inspector/promises.js" },
+    .{ .specifier = "dgram", .relative_path = "node/dgram.js" },
+    .{ .specifier = "dns", .relative_path = "node/dns.js" },
+    .{ .specifier = "dns/promises", .relative_path = "node/dns/promises.js" },
+    .{ .specifier = "tls", .relative_path = "node/tls.js" },
+};
+
+fn runtimeModuleRelativePath(ctx: *const Context, relative_path: []const u8) ![]const u8 {
+    return embedded_runtime_modules.virtualPath(ctx.allocator, ctx.project_root, relative_path);
+}
+
+fn appendRuntimeAlias(
+    ctx: *const Context,
+    aliases: *std.ArrayList(native_bundler.RuntimeAlias),
+    specifier: []const u8,
+    relative_path: []const u8,
+) !void {
+    try aliases.append(ctx.allocator, .{
+        .specifier = specifier,
+        .path = try runtimeModuleRelativePath(ctx, relative_path),
+    });
+}
+
+fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias {
+    var aliases: std.ArrayList(native_bundler.RuntimeAlias) = .empty;
+    try appendRuntimeAlias(ctx, &aliases, "bun", "bun/index.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:ffi", "bun/ffi.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:jsc", "bun/jsc.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:sqlite", "bun/sqlite.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:test", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:internal-for-testing", "bun/internal-for-testing.js");
+    try appendRuntimeAlias(ctx, &aliases, "vitest", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, "string-width", "bun/string-width.js");
+    try appendRuntimeAlias(ctx, &aliases, "strip-ansi", "bun/strip-ansi.js");
+
+    for (node_runtime_aliases) |alias| {
+        try appendRuntimeAlias(ctx, &aliases, alias.specifier, alias.relative_path);
+        try appendRuntimeAlias(
+            ctx,
+            &aliases,
+            try std.fmt.allocPrint(ctx.allocator, "node:{s}", .{alias.specifier}),
+            alias.relative_path,
+        );
+    }
+    return aliases.toOwnedSlice(ctx.allocator);
+}
+
+fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
     exec_args: []const [:0]const u8,
     script_args: []const [:0]const u8,
     source_base_dir: ?[]const u8,
 ) ![]const u8 {
-    try ensureEsbuild(ctx);
     const tmp_dir = try ensureTempDir(ctx);
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 
@@ -394,269 +485,36 @@ fn bundleScriptWithEsbuild(
         )
     else
         try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs, preload_imports);
+
+    var conditions: std.ArrayList([]const u8) = .empty;
+    try collectConditions(ctx.allocator, &conditions, exec_args);
+    try collectConditions(ctx.allocator, &conditions, script_args);
+    const aliases = try buildRuntimeAliases(ctx);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
-    const esbuild_bin = try esbuildBinaryPath(ctx);
-    const script_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{script_abs});
-    const script_dir_literal = try jsonStringLiteral(ctx, script_dir);
-    const script_basename_literal = try jsonStringLiteral(ctx, std.fs.path.basename(script_abs));
-    const script_path_literal = try jsonStringLiteral(ctx, script_abs);
-    const script_url_literal = try jsonStringLiteral(ctx, script_url);
 
-    const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
-    const bun_ffi_module = try runtimeModulePath(ctx, &.{ "bun", "ffi.js" });
-    const bun_jsc_module = try runtimeModulePath(ctx, &.{ "bun", "jsc.js" });
-    const bun_sqlite_module = try runtimeModulePath(ctx, &.{ "bun", "sqlite.js" });
-    const bun_test_module = try runtimeModulePath(ctx, &.{ "bun", "test.js" });
-    const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
-    const string_width_module = try runtimeModulePath(ctx, &.{ "bun", "string-width.js" });
-    const strip_ansi_module = try runtimeModulePath(ctx, &.{ "bun", "strip-ansi.js" });
-    const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
-    const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
-    const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
-    const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
-    const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
-    const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
-    const readline_promises_module = try runtimeModulePath(ctx, &.{ "node", "readline", "promises.js" });
-    const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
-    const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
-    const events_module = try runtimeModulePath(ctx, &.{ "node", "events.cjs" });
-    const async_hooks_module = try runtimeModulePath(ctx, &.{ "node", "async_hooks.js" });
-    const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.cjs" });
-    const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
-    const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
-    const diagnostics_channel_module = try runtimeModulePath(ctx, &.{ "node", "diagnostics_channel.js" });
-    const domain_module = try runtimeModulePath(ctx, &.{ "node", "domain.js" });
-    const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
-    const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
-    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.cjs" });
-    const stream_consumers_module = try runtimeModulePath(ctx, &.{ "node", "stream", "consumers.js" });
-    const stream_promises_module = try runtimeModulePath(ctx, &.{ "node", "stream", "promises.js" });
-    const stream_web_module = try runtimeModulePath(ctx, &.{ "node", "stream", "web.js" });
-    const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
-    const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
-    const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
-    const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
-    const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
-    const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
-    const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
-    const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
-    const cluster_module = try runtimeModulePath(ctx, &.{ "node", "cluster.js" });
-    const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
-    const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
-    const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
-    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.cjs" });
-    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.cjs" });
-    const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
-    const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
-    const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
-    const sea_module = try runtimeModulePath(ctx, &.{ "node", "sea.js" });
-    const sqlite_module = try runtimeModulePath(ctx, &.{ "node", "sqlite.js" });
-    const node_test_module = try runtimeModulePath(ctx, &.{ "node", "test.js" });
-    const test_reporters_module = try runtimeModulePath(ctx, &.{ "node", "test", "reporters.js" });
-    const timers_module = try runtimeModulePath(ctx, &.{ "node", "timers.js" });
-    const timers_promises_module = try runtimeModulePath(ctx, &.{ "node", "timers", "promises.js" });
-    const trace_events_module = try runtimeModulePath(ctx, &.{ "node", "trace_events.js" });
-    const wasi_module = try runtimeModulePath(ctx, &.{ "node", "wasi.js" });
-    const worker_threads_module = try runtimeModulePath(ctx, &.{ "node", "worker_threads.js" });
-    const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
-    const http_module = try runtimeModulePath(ctx, &.{ "node", "http.js" });
-    const https_module = try runtimeModulePath(ctx, &.{ "node", "https.js" });
-    const http2_module = try runtimeModulePath(ctx, &.{ "node", "http2.js" });
-    const inspector_module = try runtimeModulePath(ctx, &.{ "node", "inspector.js" });
-    const inspector_promises_module = try runtimeModulePath(ctx, &.{ "node", "inspector", "promises.js" });
-    const dgram_module = try runtimeModulePath(ctx, &.{ "node", "dgram.js" });
-    const dns_module = try runtimeModulePath(ctx, &.{ "node", "dns.js" });
-    const dns_promises_module = try runtimeModulePath(ctx, &.{ "node", "dns", "promises.js" });
-    const tls_module = try runtimeModulePath(ctx, &.{ "node", "tls.js" });
-
-    const base_args = [_][]const u8{
-        esbuild_bin,
+    var error_message: ?[*:0]u8 = null;
+    const output = native_bundler.bundleEntryPointWithOptions(
         wrapped_entry,
-        "--bundle",
-        "--platform=neutral",
-        "--format=esm",
-        "--main-fields=main,module",
-        "--target=es2022",
-        "--external:internal/*",
-        "--loader:.txt=text",
-        try std.fmt.allocPrint(ctx.allocator, "--alias:vitest={s}", .{bun_test_module}),
-        "--external:jest-extended",
-        "--external:@jest/globals",
-        "--sourcemap=external",
-        // Bun resolves .mjs/.cjs for extensionless specifiers; esbuild's default list omits them.
-        "--resolve-extensions=.tsx,.ts,.jsx,.mjs,.js,.cjs,.json",
-        try std.fmt.allocPrint(ctx.allocator, "--outfile={s}", .{bundle_path}),
-        // import.meta.* map to bundle-scope vars (seeded via --banner) instead of
-        // string literals so user code can also assign to them (e.g. fs.test.ts
-        // does `import.meta.dir = "."`).
-        "--define:import.meta.dirname=__ctMetaDirname",
-        "--define:import.meta.dir=__ctMetaDir",
-        "--define:import.meta.filename=__ctMetaFilename",
-        "--define:import.meta.file=__ctMetaFile",
-        "--define:import.meta.path=__ctMetaPath",
-        "--define:import.meta.url=__ctMetaUrl",
-        "--define:import.meta.main=__ctMetaMain",
-        "--define:import.meta.env=__ctMetaEnv",
-        "--define:import.meta.require=__ctMetaRequire",
-        "--define:import.meta.resolveSync=__ctMetaResolveSync",
-        "--define:import.meta.resolve=__ctMetaResolve",
-        try std.fmt.allocPrint(
-            ctx.allocator,
-            "--banner:js=/* cottontail:module-syntax-lowered */ var __ctMetaDirname = {s}, __ctMetaDir = {s}, __ctMetaFilename = {s}, __ctMetaFile = {s}, __ctMetaPath = {s}, __ctMetaUrl = {s}, __ctMetaMain = true, __ctMetaEnv, __ctMetaRequire, __ctMetaResolveSync, __ctMetaResolve;",
-            .{ script_dir_literal, script_dir_literal, script_path_literal, script_basename_literal, script_path_literal, script_url_literal },
-        ),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun={s}", .{bun_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:ffi={s}", .{bun_ffi_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:jsc={s}", .{bun_jsc_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:sqlite={s}", .{bun_sqlite_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:test={s}", .{bun_test_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:bun:internal-for-testing={s}", .{bun_internal_for_testing_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:string-width={s}", .{string_width_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:strip-ansi={s}", .{strip_ansi_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:fs={s}", .{fs_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:fs={s}", .{fs_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:fs/promises={s}", .{fs_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:fs/promises={s}", .{fs_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:os={s}", .{os_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:os={s}", .{os_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:path={s}", .{path_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:path={s}", .{path_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:path/posix={s}", .{path_posix_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:path/posix={s}", .{path_posix_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:path/win32={s}", .{path_win32_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:path/win32={s}", .{path_win32_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:process={s}", .{process_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:process={s}", .{process_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:readline={s}", .{readline_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline={s}", .{readline_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:readline/promises={s}", .{readline_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:readline/promises={s}", .{readline_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:util={s}", .{util_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:util={s}", .{util_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:util/types={s}", .{util_types_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:util/types={s}", .{util_types_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:events={s}", .{events_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:events={s}", .{events_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:async_hooks={s}", .{async_hooks_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:async_hooks={s}", .{async_hooks_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:assert={s}", .{assert_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert={s}", .{assert_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:assert/strict={s}", .{assert_strict_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:assert/strict={s}", .{assert_strict_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:console={s}", .{console_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:console={s}", .{console_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:diagnostics_channel={s}", .{diagnostics_channel_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:diagnostics_channel={s}", .{diagnostics_channel_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:domain={s}", .{domain_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:domain={s}", .{domain_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:sys={s}", .{sys_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sys={s}", .{sys_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:repl={s}", .{repl_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:repl={s}", .{repl_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sea={s}", .{sea_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:sqlite={s}", .{sqlite_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:test={s}", .{node_test_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:test/reporters={s}", .{test_reporters_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:test/reporters={s}", .{test_reporters_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:tty={s}", .{tty_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:tty={s}", .{tty_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:v8={s}", .{v8_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:v8={s}", .{v8_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:stream={s}", .{stream_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream={s}", .{stream_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/consumers={s}", .{stream_consumers_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/consumers={s}", .{stream_consumers_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/promises={s}", .{stream_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/promises={s}", .{stream_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:stream/web={s}", .{stream_web_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:stream/web={s}", .{stream_web_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:perf_hooks={s}", .{perf_hooks_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:perf_hooks={s}", .{perf_hooks_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:vm={s}", .{vm_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:vm={s}", .{vm_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:module={s}", .{module_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:module={s}", .{module_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:net={s}", .{net_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:net={s}", .{net_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:url={s}", .{url_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:url={s}", .{url_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:constants={s}", .{constants_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:constants={s}", .{constants_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:crypto={s}", .{crypto_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:crypto={s}", .{crypto_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:buffer={s}", .{buffer_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:buffer={s}", .{buffer_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:cluster={s}", .{cluster_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:cluster={s}", .{cluster_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:punycode={s}", .{punycode_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:punycode={s}", .{punycode_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:querystring={s}", .{querystring_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:querystring={s}", .{querystring_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:child_process={s}", .{child_process_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:child_process={s}", .{child_process_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:string_decoder={s}", .{string_decoder_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:string_decoder={s}", .{string_decoder_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:timers={s}", .{timers_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:timers={s}", .{timers_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:timers/promises={s}", .{timers_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:timers/promises={s}", .{timers_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:trace_events={s}", .{trace_events_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:trace_events={s}", .{trace_events_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:wasi={s}", .{wasi_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:wasi={s}", .{wasi_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:worker_threads={s}", .{worker_threads_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:worker_threads={s}", .{worker_threads_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:zlib={s}", .{zlib_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:zlib={s}", .{zlib_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:http={s}", .{http_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:http={s}", .{http_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:https={s}", .{https_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:https={s}", .{https_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:http2={s}", .{http2_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:http2={s}", .{http2_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:inspector={s}", .{inspector_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:inspector={s}", .{inspector_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:inspector/promises={s}", .{inspector_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:inspector/promises={s}", .{inspector_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:dgram={s}", .{dgram_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dgram={s}", .{dgram_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:dns={s}", .{dns_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dns={s}", .{dns_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:dns/promises={s}", .{dns_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:dns/promises={s}", .{dns_promises_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:tls={s}", .{tls_module}),
-        try std.fmt.allocPrint(ctx.allocator, "--alias:node:tls={s}", .{tls_module}),
-    };
-
-    var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(ctx.allocator, &base_args);
-    if (try tsconfigOverridePath(ctx, exec_args)) |tsconfig_path| {
-        try args.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "--tsconfig={s}", .{tsconfig_path}));
-    } else if (try metadataFileIsEmpty(ctx, script_dir, "tsconfig.json")) {
-        try args.append(ctx.allocator, "--tsconfig-raw={}");
-    }
-    try appendEsbuildConditions(ctx.allocator, &args, exec_args, script_args);
-
-    const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = args.items,
-        .cwd = .{ .path = ctx.project_root },
-        .create_no_window = true,
-    });
-    defer ctx.allocator.free(result.stdout);
-    defer ctx.allocator.free(result.stderr);
-
-    if (termExitCode(result.term) != 0) {
-        if (result.stdout.len > 0) ctx.writeStdout("{s}", .{result.stdout});
-        if (result.stderr.len > 0) ctx.writeStderr("{s}", .{result.stderr});
-        if (std.mem.indexOf(u8, result.stderr, "Could not resolve \"")) |marker| {
-            const spec_start = marker + "Could not resolve \"".len;
-            if (std.mem.indexOfScalarPos(u8, result.stderr, spec_start, '"')) |spec_end| {
-                ctx.writeStderr("error: Cannot find module \"{s}\"\n", .{result.stderr[spec_start..spec_end]});
-            }
+        ctx.project_root,
+        .{
+            .aliases = aliases,
+            .conditions = conditions.items,
+            .tsconfig_override = try tsconfigOverridePath(ctx, exec_args),
+            .include_runtime_modules = true,
+            .inline_import_meta_properties = true,
+        },
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| {
+            defer native_bundler.ct_bundle_string_free(message);
+            ctx.writeStderr("{s}\n", .{std.mem.span(message)});
+        } else {
+            ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
         }
-        return error.EsbuildFailed;
-    }
-
+        return error.NativeBundleFailed;
+    };
+    defer native_bundler.ct_bundle_free(output.ptr, output.len);
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output });
     return bundle_path;
 }
 
@@ -678,6 +536,7 @@ fn tsconfigOverridePath(ctx: *const Context, exec_args: []const [:0]const u8) !?
 }
 
 fn cleanupRunnableDirectory(ctx: *const Context, runnable_path: []const u8) void {
+    if (ctx.environ_map.get("COTTONTAIL_KEEP_TEMP") != null) return;
     const directory = std.fs.path.dirname(runnable_path) orelse return;
     const run_root = std.fs.path.dirname(directory) orelse return;
     if (!std.mem.eql(u8, std.fs.path.basename(run_root), "run")) return;
@@ -714,21 +573,6 @@ fn hasCustomConditions(cli_args: []const [:0]const u8) bool {
         if (std.mem.eql(u8, arg, "--conditions") or std.mem.startsWith(u8, arg, "--conditions=")) return true;
     }
     return false;
-}
-
-fn appendEsbuildConditions(
-    allocator: std.mem.Allocator,
-    args: *std.ArrayList([]const u8),
-    exec_args: []const [:0]const u8,
-    script_args: []const [:0]const u8,
-) !void {
-    var conditions: std.ArrayList([]const u8) = .empty;
-    try collectConditions(allocator, &conditions, exec_args);
-    try collectConditions(allocator, &conditions, script_args);
-    if (conditions.items.len == 0) return;
-
-    const joined = try std.mem.join(allocator, ",", conditions.items);
-    try args.append(allocator, try std.fmt.allocPrint(allocator, "--conditions={s}", .{joined}));
 }
 
 fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
@@ -1086,9 +930,9 @@ fn writeCottontailEntryWrapper(
         \\  const resolved = __ctBunModule.resolveSync(specifier, parent);
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
-        \\__ctMetaRequire ??= __ctCreateRequire({s});
-        \\__ctMetaResolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
-        \\__ctMetaResolve ??= (specifier) => {{
+        \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});
+        \\globalThis.__ctMetaResolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
+        \\globalThis.__ctMetaResolve ??= (specifier) => {{
         \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
@@ -1218,8 +1062,8 @@ fn writeBunCompatTransformedSource(
         transformed_source = transformed;
         changed = true;
     }
-    // Bun treats extensionless entrypoints as TypeScript; esbuild would parse
-    // them as plain JS, so rewrite them into a generated .ts file.
+    // Bun treats extensionless entrypoints as TypeScript, so rewrite them into
+    // a generated .ts file before invoking the compiler.
     const extensionless = std.fs.path.extension(script_abs).len == 0;
     if (extensionless) changed = true;
     if (!changed) return script_abs;
@@ -1811,55 +1655,28 @@ fn transpileDynamicTarget(
     target_path: []const u8,
     loader_override: ?[]const u8,
     external_packages: bool,
+    build_error: *?[]const u8,
 ) !?[]const u8 {
-    const esbuild_bin = try esbuildBinaryPath(ctx);
-    const base_args = [_][]const u8{
-        esbuild_bin,
+    var error_message: ?[*:0]u8 = null;
+    const output = native_bundler.bundleEntryPointWithOptions(
         target_path,
-        "--format=cjs",
-        "--platform=neutral",
-        "--target=es2022",
-        "--log-level=silent",
-        "--define:import.meta.url=__ctImportMeta.url",
-        "--define:import.meta.dir=__ctImportMeta.dir",
-        "--define:import.meta.file=__ctImportMeta.file",
-        "--define:import.meta.path=__ctImportMeta.path",
-        "--define:import.meta.dirname=__ctImportMeta.dirname",
-        "--define:import.meta.filename=__ctImportMeta.filename",
-        "--define:import.meta.main=false",
+        ctx.project_root,
+        .{
+            .output_format = .cjs,
+            .target = .node,
+            .loader = loader_override,
+            .external_packages = external_packages,
+        },
+        &error_message,
+    ) catch {
+        if (error_message) |message| {
+            defer native_bundler.ct_bundle_string_free(message);
+            if (build_error.* == null) build_error.* = try ctx.allocator.dupe(u8, std.mem.span(message));
+        }
+        return null;
     };
-    var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(ctx.allocator, &base_args);
-    if (loader_override) |loader| {
-        const extension = std.fs.path.extension(target_path);
-        try args.append(ctx.allocator, try std.fmt.allocPrint(
-            ctx.allocator,
-            "--loader:{s}={s}",
-            .{ extension, loader },
-        ));
-    }
-    if (external_packages) try args.append(ctx.allocator, "--packages=external");
-    try args.append(ctx.allocator, "--bundle");
-    const bundled_result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = args.items,
-        .cwd = .{ .path = ctx.project_root },
-        .create_no_window = true,
-    });
-    defer ctx.allocator.free(bundled_result.stdout);
-    defer ctx.allocator.free(bundled_result.stderr);
-    if (termExitCode(bundled_result.term) == 0) return try ctx.allocator.dupe(u8, bundled_result.stdout);
-
-    _ = args.pop();
-    if (external_packages) _ = args.pop();
-    const result = try std.process.run(ctx.allocator, ctx.io, .{
-        .argv = args.items,
-        .cwd = .{ .path = ctx.project_root },
-        .create_no_window = true,
-    });
-    defer ctx.allocator.free(result.stdout);
-    defer ctx.allocator.free(result.stderr);
-    if (termExitCode(result.term) != 0) return null;
-    return try ctx.allocator.dupe(u8, result.stdout);
+    defer native_bundler.ct_bundle_free(output.ptr, output.len);
+    return try ctx.allocator.dupe(u8, output);
 }
 
 fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
@@ -1894,24 +1711,32 @@ fn appendDynamicTargetFactory(
     index: usize,
 ) !void {
     const inferred_loader = inferredLoaderForTarget(target.path);
+    var build_error: ?[]const u8 = null;
     var cjs_source = try transpileDynamicTarget(
         ctx,
         target.path,
         if (inferred_loader != null and std.mem.eql(u8, inferred_loader.?, "text")) "text" else null,
         target.mutable_namespace,
+        &build_error,
     );
     var loader_guard: []const u8 = "";
     if (cjs_source == null) {
         var allowed: std.ArrayList(u8) = .empty;
         for ([_][]const u8{ "js", "jsx", "ts", "tsx" }) |loader| {
-            if (try transpileDynamicTarget(ctx, target.path, loader, target.mutable_namespace)) |candidate| {
+            if (try transpileDynamicTarget(ctx, target.path, loader, target.mutable_namespace, &build_error)) |candidate| {
                 if (cjs_source == null) cjs_source = candidate;
                 if (allowed.items.len > 0) try allowed.appendSlice(ctx.allocator, " && ");
                 try allowed.appendSlice(ctx.allocator, "__ctType !== ");
                 try allowed.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, loader));
             }
         }
-        loader_guard = if (allowed.items.len == 0)
+        loader_guard = if (allowed.items.len == 0 and build_error != null and std.mem.indexOf(u8, build_error.?, "Could not resolve:") != null)
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "{{ const error = new Error({s}); error.code = \"MODULE_NOT_FOUND\"; throw error; }}",
+                .{try jsonStringLiteral(ctx, build_error.?)},
+            )
+        else if (allowed.items.len == 0)
             "{ const error = new SyntaxError(\"Unable to parse module with the selected loader\"); error.name = \"BuildMessage\"; throw error; }"
         else
             try std.fmt.allocPrint(
@@ -2832,18 +2657,8 @@ fn jsonStringLiteral(ctx: *const Context, value: []const u8) ![]const u8 {
 }
 
 fn runtimeModulePath(ctx: *const Context, parts: []const []const u8) ![]const u8 {
-    const all_parts = try ctx.allocator.alloc([]const u8, parts.len + 2);
-    all_parts[0] = ctx.cottontail_home;
-    all_parts[1] = "src/runtime_modules";
-    for (parts, 0..) |part, index| {
-        all_parts[index + 2] = part;
-    }
-    return try std.fs.path.join(ctx.allocator, all_parts);
-}
-
-fn runtimeModulesAvailable(ctx: *const Context) bool {
-    const bun_module = runtimeModulePath(ctx, &.{ "bun", "index.js" }) catch return false;
-    return pathExists(ctx.io, bun_module);
+    const relative_path = try std.fs.path.join(ctx.allocator, parts);
+    return embedded_runtime_modules.virtualPath(ctx.allocator, ctx.project_root, relative_path);
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
@@ -2929,81 +2744,6 @@ fn osTempBase(ctx: *const Context) []const u8 {
     return if (builtin.os.tag == .windows) "C:\\Temp" else "/tmp";
 }
 
-fn findCottontailHome(init: std.process.Init, allocator: std.mem.Allocator, exe_dir: []const u8) ![]const u8 {
-    if (init.environ_map.get("COTTONTAIL_HOME")) |home| {
-        const absolute = try resolvePathForCwd(init.io, allocator, home);
-        if (looksLikeCottontailRuntimeHome(init.io, allocator, absolute)) {
-            return absolute;
-        }
-    }
-
-    if (init.environ_map.get("DASH_COTTONTAIL_ROOT")) |home| {
-        const absolute = try resolvePathForCwd(init.io, allocator, home);
-        if (looksLikeCottontailRuntimeHome(init.io, allocator, absolute)) {
-            return absolute;
-        }
-    }
-
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
-    if (try findCottontailHomeNear(init.io, allocator, cwd)) |home| return home;
-    if (try findCottontailHomeNear(init.io, allocator, exe_dir)) |home| return home;
-
-    const sibling_candidates = [_][]const u8{
-        try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "..", "cottontail" }),
-        try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "..", "..", "cottontail" }),
-        try std.fs.path.join(allocator, &.{ exe_dir, "..", "cottontail" }),
-    };
-    for (sibling_candidates) |candidate| {
-        const absolute = std.Io.Dir.cwd().realPathFileAlloc(init.io, candidate, allocator) catch candidate;
-        if (looksLikeCottontailHome(init.io, allocator, absolute)) return absolute;
-    }
-
-    var current: []const u8 = try allocator.dupe(u8, exe_dir);
-    while (true) {
-        if (looksLikeCottontailHome(init.io, allocator, current)) return current;
-        const parent = std.fs.path.dirname(current) orelse break;
-        if (std.mem.eql(u8, parent, current)) break;
-        current = parent;
-    }
-
-    return try allocator.dupe(u8, exe_dir);
-}
-
-fn findCottontailHomeNear(io: std.Io, allocator: std.mem.Allocator, start_dir: []const u8) !?[]const u8 {
-    var current: []const u8 = try allocator.dupe(u8, start_dir);
-    while (true) {
-        if (looksLikeCottontailHome(io, allocator, current)) {
-            return current;
-        }
-
-        const sibling = try std.fs.path.join(allocator, &.{ current, "cottontail" });
-        const sibling_absolute = std.Io.Dir.cwd().realPathFileAlloc(io, sibling, allocator) catch sibling;
-        if (looksLikeCottontailHome(io, allocator, sibling_absolute)) {
-            return sibling_absolute;
-        }
-
-        const parent = std.fs.path.dirname(current) orelse return null;
-        if (std.mem.eql(u8, parent, current)) return null;
-        current = parent;
-    }
-}
-
-fn looksLikeCottontailHome(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) bool {
-    const package_json = std.fs.path.join(allocator, &.{ candidate, "package.json" }) catch return false;
-    defer allocator.free(package_json);
-    const src_main = std.fs.path.join(allocator, &.{ candidate, "src", "main.zig" }) catch return false;
-    defer allocator.free(src_main);
-    return pathExists(io, package_json) and pathExists(io, src_main);
-}
-
-fn looksLikeCottontailRuntimeHome(io: std.Io, allocator: std.mem.Allocator, candidate: []const u8) bool {
-    if (looksLikeCottontailHome(io, allocator, candidate)) return true;
-
-    const runtime_module = std.fs.path.join(allocator, &.{ candidate, "src", "runtime_modules", "bun", "index.js" }) catch return false;
-    defer allocator.free(runtime_module);
-    return pathExists(io, runtime_module);
-}
-
 fn resolvePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     if (std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
     return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
@@ -3016,84 +2756,6 @@ fn pathExists(io: std.Io, path: []const u8) bool {
         std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     }
     return true;
-}
-
-fn ensureEsbuild(ctx: *const Context) !void {
-    const vendor_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "vendors", "esbuild" });
-    const version_file = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, ".esbuild-version" });
-    const esbuild_bin = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, esbuildBinaryName() });
-
-    if (pathExists(ctx.io, version_file) and pathExists(ctx.io, esbuild_bin)) {
-        const current_version = std.Io.Dir.cwd().readFileAlloc(ctx.io, version_file, ctx.allocator, .limited(64)) catch "";
-        if (std.mem.eql(u8, std.mem.trim(u8, current_version, " \r\n\t"), esbuild_version)) return;
-    }
-
-    if (pathExists(ctx.io, vendor_dir)) {
-        std.Io.Dir.cwd().deleteTree(ctx.io, vendor_dir) catch {};
-    }
-    try std.Io.Dir.cwd().createDirPath(ctx.io, vendor_dir);
-
-    const package_name = try esbuildPackageName();
-    const tarball_name = try esbuildTarballName();
-    const url = try std.fmt.allocPrint(ctx.allocator, "https://registry.npmjs.org/@esbuild/{s}/-/{s}-{s}.tgz", .{ package_name, tarball_name, esbuild_version });
-    const tarball_path = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "esbuild.tgz" });
-    const extract_dir = try std.fs.path.join(ctx.allocator, &.{ vendor_dir, "extract" });
-
-    ctx.writeStdout("Vendoring esbuild {s} ({s})...\n", .{ esbuild_version, package_name });
-
-    try runInherited(ctx, &[_][]const u8{ "curl", "-L", "--fail", "-o", tarball_path, url }, ctx.cottontail_home);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, extract_dir);
-    try runInherited(ctx, &[_][]const u8{ "tar", "-xzf", tarball_path, "-C", extract_dir }, ctx.cottontail_home);
-
-    const extracted_bin = try std.fs.path.join(ctx.allocator, &.{ extract_dir, "package", "bin", esbuildBinaryName() });
-    try std.Io.Dir.copyFileAbsolute(extracted_bin, esbuild_bin, ctx.io, .{});
-    if (builtin.os.tag != .windows) {
-        try runInherited(ctx, &[_][]const u8{ "chmod", "+x", esbuild_bin }, ctx.cottontail_home);
-    }
-
-    std.Io.Dir.cwd().deleteFile(ctx.io, tarball_path) catch {};
-    std.Io.Dir.cwd().deleteTree(ctx.io, extract_dir) catch {};
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = version_file, .data = esbuild_version ++ "\n" });
-}
-
-fn esbuildBinaryPath(ctx: *const Context) ![]const u8 {
-    return try std.fs.path.join(ctx.allocator, &.{ ctx.cottontail_home, "vendors", "esbuild", esbuildBinaryName() });
-}
-
-fn esbuildBinaryName() []const u8 {
-    return if (builtin.os.tag == .windows) "esbuild.exe" else "esbuild";
-}
-
-fn esbuildPackageName() ![]const u8 {
-    return switch (builtin.os.tag) {
-        .macos => switch (builtin.cpu.arch) {
-            .aarch64 => "darwin-arm64",
-            .x86_64 => "darwin-x64",
-            else => error.UnsupportedEsbuildPlatform,
-        },
-        .linux => switch (builtin.cpu.arch) {
-            .aarch64 => "linux-arm64",
-            .x86_64 => "linux-x64",
-            else => error.UnsupportedEsbuildPlatform,
-        },
-        .windows => switch (builtin.cpu.arch) {
-            .aarch64 => "win32-arm64",
-            .x86_64 => "win32-x64",
-            else => error.UnsupportedEsbuildPlatform,
-        },
-        else => error.UnsupportedEsbuildPlatform,
-    };
-}
-
-fn esbuildTarballName() ![]const u8 {
-    return switch (builtin.os.tag) {
-        .windows => switch (builtin.cpu.arch) {
-            .aarch64 => "win32-arm64",
-            .x86_64 => "win32-x64",
-            else => error.UnsupportedEsbuildPlatform,
-        },
-        else => try esbuildPackageName(),
-    };
 }
 
 fn runInherited(ctx: *const Context, argv: []const []const u8, cwd: []const u8) !void {
