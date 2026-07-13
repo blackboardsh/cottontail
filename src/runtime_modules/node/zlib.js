@@ -172,6 +172,114 @@ function transformSync(mode, data, options = undefined) {
   return output;
 }
 
+function computeConsumedSync(mode, options, input, fullOutput) {
+  // Appending junk that cannot continue the stream distinguishes "engine
+  // already saw end-of-stream at offset L" (junk is ignored, output is
+  // unchanged) from "stream still open at L" (junk corrupts the stream).
+  const junk = new Uint8Array([0xde, 0xad, 0x01, 0xff, 0xfe, 0x80, 0x7f]);
+  const outputEquals = (candidate) => {
+    const a = candidate instanceof Uint8Array ? candidate : new Uint8Array(candidate);
+    if (a.byteLength !== fullOutput.byteLength) return false;
+    for (let i = 0; i < a.byteLength; i += 1) {
+      if (a[i] !== fullOutput[i]) return false;
+    }
+    return true;
+  };
+  const endedAt = (length) => {
+    const probe = new Uint8Array(length + junk.length);
+    probe.set(input.subarray(0, length), 0);
+    probe.set(junk, length);
+    try {
+      return outputEquals(transformSync(mode, probe, options));
+    } catch {
+      return false;
+    }
+  };
+  if (!endedAt(input.byteLength)) return input.byteLength;
+  let low = 0;
+  let high = input.byteLength;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (endedAt(middle)) high = middle;
+    else low = middle + 1;
+  }
+  return low;
+}
+
+// gzip members and zstd frames concatenate into a single valid stream;
+// Node's sync decompressors keep decoding subsequent members, so loop over
+// any input remaining after each member ends.
+function zstdFrameBoundaries(input) {
+  const positions = [];
+  for (let i = 1; i + 3 < input.byteLength; i += 1) {
+    if (input[i] === 0x28 && input[i + 1] === 0xb5 && input[i + 2] === 0x2f && input[i + 3] === 0xfd) positions.push(i);
+  }
+  return positions;
+}
+
+function decompressMembersSync(mode, data, options) {
+  const input = bytesFromData(data);
+  let first;
+  try {
+    first = transformSync(mode, input, options);
+  } catch (error) {
+    // The native zstd decoder rejects inputs with data trailing the first
+    // frame instead of decoding it; split on frame magics and decode each
+    // candidate frame separately (Node concatenates all frames).
+    if (mode !== "zstdDecompress") throw error;
+    const boundaries = zstdFrameBoundaries(input);
+    if (boundaries.length === 0) throw error;
+    const parts = [];
+    let start = 0;
+    for (const boundary of boundaries) {
+      try {
+        const piece = transformSync(mode, input.subarray(start, boundary), options);
+        parts.push(piece instanceof Uint8Array ? piece : new Uint8Array(piece));
+        start = boundary;
+      } catch {
+        // Magic bytes occurred inside compressed payload; keep scanning.
+      }
+    }
+    if (start === 0) throw error;
+    const last = transformSync(mode, input.subarray(start), options);
+    parts.push(last instanceof Uint8Array ? last : new Uint8Array(last));
+    const totalLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const combined = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const part of parts) {
+      combined.set(part, offset);
+      offset += part.byteLength;
+    }
+    return asBuffer(combined);
+  }
+  const firstBytes = first instanceof Uint8Array ? first : new Uint8Array(first);
+  const consumed = computeConsumedSync(mode, options, input, firstBytes);
+  if (consumed <= 0 || consumed >= input.byteLength) return asBuffer(firstBytes);
+  const parts = [firstBytes];
+  let remaining = input.subarray(consumed);
+  while (remaining.byteLength > 0) {
+    let memberOutput;
+    try {
+      const raw = transformSync(mode, remaining, options);
+      memberOutput = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    } catch {
+      break;
+    }
+    parts.push(memberOutput);
+    const memberConsumed = computeConsumedSync(mode, options, remaining, memberOutput);
+    if (memberConsumed <= 0) break;
+    remaining = remaining.subarray(memberConsumed);
+  }
+  const totalLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    combined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return asBuffer(combined);
+}
+
 function defaultStreamFinishFlush(mode) {
   return mode === "inflate" || mode === "inflateRaw" || mode === "gunzip" || mode === "unzip"
     ? constants.Z_SYNC_FLUSH
@@ -249,38 +357,7 @@ class ZlibTransform extends Transform {
   }
 
   _computeConsumed(input, fullOutput) {
-    // Appending junk that cannot continue the stream distinguishes "engine
-    // already saw end-of-stream at offset L" (junk is ignored, output is
-    // unchanged) from "stream still open at L" (junk corrupts the stream).
-    const junk = new Uint8Array([0xde, 0xad, 0x01, 0xff, 0xfe, 0x80, 0x7f]);
-    const options = this._transformOptions();
-    const outputEquals = (candidate) => {
-      const a = candidate instanceof Uint8Array ? candidate : new Uint8Array(candidate);
-      if (a.byteLength !== fullOutput.byteLength) return false;
-      for (let i = 0; i < a.byteLength; i += 1) {
-        if (a[i] !== fullOutput[i]) return false;
-      }
-      return true;
-    };
-    const endedAt = (length) => {
-      const probe = new Uint8Array(length + junk.length);
-      probe.set(input.subarray(0, length), 0);
-      probe.set(junk, length);
-      try {
-        return outputEquals(transformSync(this._mode, probe, options));
-      } catch {
-        return false;
-      }
-    };
-    if (!endedAt(input.byteLength)) return input.byteLength;
-    let low = 0;
-    let high = input.byteLength;
-    while (low < high) {
-      const middle = (low + high) >> 1;
-      if (endedAt(middle)) high = middle;
-      else low = middle + 1;
-    }
-    return low;
+    return computeConsumedSync(this._mode, this._transformOptions(), input, fullOutput);
   }
 
   _consumeChunks() {
@@ -384,10 +461,24 @@ class ZlibTransform extends Transform {
     try {
       this._emitBuffered();
       this.push(null);
+      // Our write()/end() bypass Writable's state machine, so mark the
+      // writable side complete manually; eos()/finished() reads these flags
+      // when 'close' arrives to distinguish completion from premature close.
+      const writableState = this._writableState;
+      if (writableState) {
+        writableState.ending = true;
+        writableState.ended = true;
+        writableState.finished = true;
+      }
       this.emit("finish");
+      // Node's zlib streams autoDestroy once both sides complete, emitting
+      // 'close'; finished()/eos() waits for it (willEmitClose), so destroy
+      // after the readable side has fully drained.
+      this.once("end", () => this.destroy());
       callback?.();
     } catch (error) {
       this.emit("error", error);
+      this.destroy();
       callback?.(error);
     }
   }
@@ -483,10 +574,21 @@ export function deflateRawSync(data, options = undefined) { return transformSync
 export function gzipSync(data, options = undefined) { return transformSync("gzip", data, options); }
 export function inflateSync(data, options = undefined) { return transformSync("inflate", data, options); }
 export function inflateRawSync(data, options = undefined) { return transformSync("inflateRaw", data, options); }
-export function gunzipSync(data, options = undefined) { return transformSync("gunzip", data, options); }
-export function unzipSync(data, options = undefined) { return transformSync("unzip", data, options); }
+export function gunzipSync(data, options = undefined) { return decompressMembersSync("gunzip", data, options); }
+export function unzipSync(data, options = undefined) { return decompressMembersSync("unzip", data, options); }
 export function brotliCompressSync(data, options = undefined) { return transformSync("brotliCompress", data, options); }
-export function brotliDecompressSync(data, options = undefined) { return transformSync("brotliDecompress", data, options); }
+export function brotliDecompressSync(data, options = undefined) {
+  try {
+    return transformSync("brotliDecompress", data, options);
+  } catch (error) {
+    // One-byte empty-stream encodings (0x3b: Node/libbrotli's empty output;
+    // 0x06: an empty last metablock) are valid brotli, but the native decoder
+    // rejects them. Node decodes both to an empty buffer.
+    const input = bytesFromData(data);
+    if (input.byteLength === 1 && (input[0] === 0x3b || input[0] === 0x06)) return asBuffer(new Uint8Array(0));
+    throw error;
+  }
+}
 const ZSTD_MIN_LEVEL = 1;
 const ZSTD_MAX_LEVEL = 22;
 
@@ -503,7 +605,7 @@ export function zstdCompressSync(data, options = undefined) {
   validateZstdCompressOptions(options);
   return transformSync("zstdCompress", data, options);
 }
-export function zstdDecompressSync(data, options = undefined) { return transformSync("zstdDecompress", data, options); }
+export function zstdDecompressSync(data, options = undefined) { return decompressMembersSync("zstdDecompress", data, options); }
 
 export const deflate = callbackifySync(deflateSync);
 export const deflateRaw = callbackifySync(deflateRawSync);

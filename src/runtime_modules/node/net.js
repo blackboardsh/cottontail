@@ -154,6 +154,24 @@ export class Socket extends EventEmitter {
     if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, true);
   }
 
+  // Node exposes the libuv wrap as socket._handle with an fd property; tools
+  // and tests read socket._handle.fd. Surface a small stand-in over this.fd.
+  get _handle() {
+    if (this.__handleOverride !== undefined) return this.__handleOverride;
+    if (this.fd == null) return null;
+    if (this.__handleWrap == null) {
+      const self = this;
+      this.__handleWrap = {
+        get fd() { return self.fd ?? -1; },
+      };
+    }
+    return this.__handleWrap;
+  }
+
+  set _handle(value) {
+    this.__handleOverride = value;
+  }
+
   _setAddressInfo(local = undefined, remote = undefined) {
     if (local) {
       if (local.path != null) {

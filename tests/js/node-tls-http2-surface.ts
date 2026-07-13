@@ -190,7 +190,7 @@ const h2Payload = await new Promise<string>((resolve, reject) => {
     let data = "";
     req.setEncoding("utf8");
     req.once("response", (headers) => {
-      strictEqual(headers[":status"], "200", "http2 response status mismatch");
+      strictEqual(headers[":status"], 200, "http2 response status mismatch");
       strictEqual(headers["x-h2"], "yes", "http2 response header mismatch");
     });
     req.on("data", (chunk) => {

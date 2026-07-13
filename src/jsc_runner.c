@@ -14406,6 +14406,9 @@ static char *ct_prepare_source_with_wrappers(
 
     const char *start = (const char *)source;
     const char *end = start + source_len;
+    const char *lowered_marker = "/* cottontail:module-syntax-lowered */";
+    bool module_syntax_lowered = source_len >= strlen(lowered_marker) &&
+        memcmp(source, lowered_marker, strlen(lowered_marker)) == 0;
     while (start < end) {
         const char *line_end = memchr(start, '\n', (size_t)(end - start));
         if (line_end == NULL) line_end = end;
@@ -14417,6 +14420,18 @@ static char *ct_prepare_source_with_wrappers(
         }
         if (!skip) {
             size_t line_len = (size_t)(line_end - start);
+            if (module_syntax_lowered) {
+                if (!ct_sb_append_bytes(&builder, start, line_len)) {
+                    free(builder.data);
+                    return NULL;
+                }
+                if (line_end < end && !ct_sb_append_cstr(&builder, "\n")) {
+                    free(builder.data);
+                    return NULL;
+                }
+                start = line_end < end ? line_end + 1 : end;
+                continue;
+            }
             CtStringBuilder meta_builder;
             if (!ct_sb_init(&meta_builder, line_len + 1)) {
                 free(builder.data);

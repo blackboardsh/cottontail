@@ -285,10 +285,12 @@ function countAllFiles(dir) {
   if (!existsSync(dir)) return 0;
   let count = 0;
   const stack = [dir];
+  const installedDependencies = join(dir, 'test', 'node_modules');
   while (stack.length > 0) {
     const current = stack.pop();
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
+      if (path === installedDependencies) continue;
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
         stack.push(path);
       } else {
@@ -301,6 +303,7 @@ function countAllFiles(dir) {
 
 function discoverUpstreamRunnableFiles(snapshotRoot, runtime) {
   const testRoot = join(snapshotRoot, 'test');
+  const installedDependencies = join(testRoot, 'node_modules');
   if (!existsSync(testRoot)) return [];
   const runnablePattern = runtime === 'bun'
     ? /\.test\.(?:js|mjs|cjs|ts|tsx|mts|cts)$/i
@@ -311,6 +314,7 @@ function discoverUpstreamRunnableFiles(snapshotRoot, runtime) {
     const current = stack.pop();
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
+      if (path === installedDependencies) continue;
       if (entry.isDirectory() && !entry.isSymbolicLink()) {
         stack.push(path);
       } else if (entry.isFile() && runnablePattern.test(entry.name)) {

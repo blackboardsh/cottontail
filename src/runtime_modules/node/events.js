@@ -62,9 +62,21 @@ export default class EventEmitter {
 
   off(name, handler) {
     const events = eventMap(this);
-    const handlers = events.get(name) ?? [];
-    events.set(name, handlers.filter((item) => item !== handler && item.listener !== handler));
-    if ((events.get(name) ?? []).length === 0) events.delete(name);
+    const handlers = events.get(name);
+    if (!handlers || handlers.length === 0) return this;
+    let index = -1;
+    for (let position = handlers.length - 1; position >= 0; position -= 1) {
+      if (handlers[position] === handler || handlers[position].listener === handler) {
+        index = position;
+        break;
+      }
+    }
+    if (index < 0) return this;
+    const [removed] = handlers.splice(index, 1);
+    if (handlers.length === 0) events.delete(name);
+    if (events.has("removeListener")) {
+      this.emit("removeListener", name, removed.listener ?? removed);
+    }
     return this;
   }
 
@@ -74,8 +86,26 @@ export default class EventEmitter {
 
   removeAllListeners(name = undefined) {
     const events = eventMap(this);
-    if (name == null) events.clear();
-    else events.delete(name);
+    if (!events.has("removeListener")) {
+      if (name == null) events.clear();
+      else events.delete(name);
+      return this;
+    }
+    if (name == null) {
+      // Remove everything except "removeListener" first so its meta-listeners
+      // observe each removal, then remove those last (Node semantics).
+      for (const key of [...events.keys()]) {
+        if (key === "removeListener") continue;
+        this.removeAllListeners(key);
+      }
+      this.removeAllListeners("removeListener");
+      return this;
+    }
+    const handlers = events.get(name);
+    if (!handlers) return this;
+    for (let position = handlers.length - 1; position >= 0; position -= 1) {
+      this.off(name, handlers[position]);
+    }
     return this;
   }
 
@@ -202,34 +232,103 @@ export function once(emitter, name, options = undefined) {
   });
 }
 
-async function *eventIterator(emitter, name, options = undefined) {
-  const queue = [];
-  let done = false;
-  let notify = null;
-  const listener = (...args) => {
-    queue.push(args);
-    notify?.();
-  };
-  const abort = () => {
-    done = true;
-    notify?.();
-  };
-  emitter.on?.(name, listener);
-  options?.signal?.addEventListener?.("abort", abort, { once: true });
-  try {
-    while (!done) {
-      if (queue.length === 0) await new Promise((resolve) => { notify = resolve; });
-      notify = null;
-      while (queue.length > 0) yield queue.shift();
-    }
-  } finally {
-    emitter.off?.(name, listener);
-    options?.signal?.removeEventListener?.("abort", abort);
-  }
+function makeAbortError(signal) {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  if (signal && "reason" in signal) error.cause = signal.reason;
+  return error;
 }
 
+// Matches Node's lib/events.js `on()`: listeners (including the implicit
+// "error" listener) are attached eagerly when on() is called, and abort/close
+// tear everything down synchronously.
 export function on(emitter, name, options = undefined) {
-  return eventIterator(emitter, name, options);
+  const signal = options?.signal;
+  if (signal?.aborted) throw makeAbortError(signal);
+
+  const unconsumedEvents = [];
+  const unconsumedPromises = [];
+  let error = null;
+  let finished = false;
+  const removers = [];
+
+  function addListener(target, event, handler) {
+    if (typeof target.on === "function") {
+      target.on(event, handler);
+      removers.push(() => target.removeListener?.(event, handler) ?? target.off?.(event, handler));
+    } else if (typeof target.addEventListener === "function") {
+      const wrapped = (arg) => handler(arg);
+      target.addEventListener(event, wrapped);
+      removers.push(() => target.removeEventListener?.(event, wrapped));
+    }
+  }
+
+  function eventHandler(...args) {
+    if (unconsumedPromises.length > 0) unconsumedPromises.shift().resolve({ value: args, done: false });
+    else unconsumedEvents.push(args);
+  }
+
+  function errorHandler(err) {
+    if (unconsumedPromises.length > 0) unconsumedPromises.shift().reject(err);
+    else error = err;
+    closeHandler();
+  }
+
+  function closeHandler() {
+    if (!finished) {
+      finished = true;
+      for (const remove of removers.splice(0)) remove();
+      if (signal) signal.removeEventListener?.("abort", abortListener);
+    }
+    const doneResult = { value: undefined, done: true };
+    while (unconsumedPromises.length > 0) unconsumedPromises.shift().resolve(doneResult);
+    return Promise.resolve(doneResult);
+  }
+
+  function abortListener() {
+    errorHandler(makeAbortError(signal));
+  }
+
+  addListener(emitter, name, eventHandler);
+  if (name !== "error" && typeof emitter.on === "function") {
+    addListener(emitter, "error", errorHandler);
+  }
+  const closeEvents = options?.close;
+  if (closeEvents?.length) {
+    for (const closeEvent of closeEvents) addListener(emitter, closeEvent, closeHandler);
+  }
+  signal?.addEventListener?.("abort", abortListener, { once: true });
+
+  return {
+    next() {
+      if (unconsumedEvents.length > 0) {
+        return Promise.resolve({ value: unconsumedEvents.shift(), done: false });
+      }
+      if (error) {
+        const p = Promise.reject(error);
+        error = null;
+        return p;
+      }
+      if (finished) return closeHandler();
+      return new Promise((resolve, reject) => {
+        unconsumedPromises.push({ resolve, reject });
+      });
+    },
+    return() {
+      return closeHandler();
+    },
+    throw(err) {
+      if (!err || !(err instanceof Error)) {
+        throw new TypeError(`The "EventEmitter.AsyncIterator" property must be an instance of Error. Received ${typeof err}`);
+      }
+      errorHandler(err);
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
 }
 
 export function init() {

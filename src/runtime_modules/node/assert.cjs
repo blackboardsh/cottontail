@@ -308,6 +308,19 @@ function objectTag(value) {
   return Object.prototype.toString.call(value);
 }
 
+function boxedPrimitiveValue(value, tag) {
+  try {
+    switch (tag) {
+      case "[object Number]": return { boxed: true, value: Number.prototype.valueOf.call(value) };
+      case "[object Boolean]": return { boxed: true, value: Boolean.prototype.valueOf.call(value) };
+      case "[object String]": return { boxed: true, value: String.prototype.valueOf.call(value) };
+      case "[object BigInt]": return { boxed: true, value: BigInt.prototype.valueOf.call(value) };
+      case "[object Symbol]": return { boxed: true, value: Symbol.prototype.valueOf.call(value) };
+    }
+  } catch {}
+  return { boxed: false };
+}
+
 function isFloatArrayTag(tag) {
   return tag === "[object Float16Array]" || tag === "[object Float32Array]" || tag === "[object Float64Array]";
 }
@@ -363,6 +376,15 @@ function deepEqualValue(actual, expected, strict, seen = new WeakMap()) {
   if (actual instanceof RegExp || expected instanceof RegExp) {
     return actual instanceof RegExp && expected instanceof RegExp && String(actual) === String(expected);
   }
+  {
+    // Boxed primitives (new Number(1), new Boolean(true), ...) compare by
+    // their internal [[PrimitiveValue]] in addition to own properties.
+    const actualBoxed = boxedPrimitiveValue(actual, actualTag);
+    if (actualBoxed.boxed) {
+      const expectedBoxed = boxedPrimitiveValue(expected, actualTag);
+      if (!expectedBoxed.boxed || !samePrimitive(actualBoxed.value, expectedBoxed.value, strict)) return false;
+    }
+  }
   if (seen.get(actual) === expected) return true;
   seen.set(actual, expected);
   if (strict && Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
@@ -390,9 +412,33 @@ function deepEqualValue(actual, expected, strict, seen = new WeakMap()) {
   return true;
 }
 
+function inspectForMessage(value) {
+  try {
+    return require("node:util").inspect(value, { depth: 4 });
+  } catch {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+}
+
+function deepEqualFailureMessage(header, actual, expected) {
+  return `${header}:\n\n+ actual - expected\n\n+ ${inspectForMessage(actual)}\n- ${inspectForMessage(expected)}\n`;
+}
+
 function deepStrictEqual(actual, expected, message) {
   if (!deepEqualValue(actual, expected, true)) {
-    throw new AssertionError({ actual, expected, message, operator: "deepStrictEqual" });
+    throw new AssertionError({
+      actual,
+      expected,
+      message: message === undefined
+        ? deepEqualFailureMessage("Expected values to be strictly deep-equal", actual, expected)
+        : message,
+      generatedMessage: message === undefined,
+      operator: "deepStrictEqual",
+    });
   }
 }
 
@@ -643,9 +689,87 @@ function ifError(value) {
   if (value) throw value instanceof Error ? value : new AssertionError({ actual: value, expected: null, operator: "ifError" });
 }
 
+function partialDeepEqualValue(actual, expected, seen = new WeakMap()) {
+  if (samePrimitive(actual, expected, true)) return true;
+  if (!isObject(actual) || !isObject(expected)) return false;
+  if (seen.get(actual) === expected) return true;
+
+  if (expected instanceof Map) {
+    if (!(actual instanceof Map) || expected.size > actual.size) return false;
+    seen.set(actual, expected);
+    for (const [key, value] of expected) {
+      if (actual.has(key)) {
+        if (partialDeepEqualValue(actual.get(key), value, seen)) continue;
+        return false;
+      }
+      // Non-primitive keys require deep matching against actual's keys.
+      let found = false;
+      if (isObject(key)) {
+        for (const [actualKey, actualValue] of actual) {
+          if (isObject(actualKey) &&
+              deepEqualValue(actualKey, key, true) &&
+              partialDeepEqualValue(actualValue, value, seen)) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  if (expected instanceof Set) {
+    if (!(actual instanceof Set) || expected.size > actual.size) return false;
+    seen.set(actual, expected);
+    for (const value of expected) {
+      if (actual.has(value)) continue;
+      let found = false;
+      if (isObject(value)) {
+        for (const actualValue of actual) {
+          if (isObject(actualValue) && deepEqualValue(actualValue, value, true)) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) return false;
+    }
+    return true;
+  }
+
+  if (actual instanceof Date || expected instanceof Date ||
+      actual instanceof RegExp || expected instanceof RegExp ||
+      ArrayBuffer.isView(expected) || objectTag(expected) === "[object ArrayBuffer]" ||
+      objectTag(expected) === "[object SharedArrayBuffer]") {
+    return deepEqualValue(actual, expected, true, seen);
+  }
+
+  seen.set(actual, expected);
+  const expectedKeys = [
+    ...Object.keys(expected),
+    ...Object.getOwnPropertySymbols(expected).filter((symbol) =>
+      Object.getOwnPropertyDescriptor(expected, symbol)?.enumerable),
+  ];
+  for (const key of expectedKeys) {
+    if (!(key in actual) && !Object.prototype.hasOwnProperty.call(actual, key)) return false;
+    if (!partialDeepEqualValue(actual[key], expected[key], seen)) return false;
+  }
+  return true;
+}
+
 function partialDeepStrictEqual(actual, expected, message) {
-  if (!isObject(actual) || !isObject(expected)) return deepStrictEqual(actual, expected, message);
-  for (const key of Object.keys(expected)) deepStrictEqual(actual[key], expected[key], message);
+  if (!partialDeepEqualValue(actual, expected)) {
+    throw new AssertionError({
+      actual,
+      expected,
+      message: message === undefined
+        ? deepEqualFailureMessage("Expected values to be partially and strictly deep-equal", actual, expected)
+        : message,
+      generatedMessage: message === undefined,
+      operator: "partialDeepStrictEqual",
+    });
+  }
 }
 
 class Assert {}

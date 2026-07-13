@@ -29,7 +29,12 @@ export function ensureAsyncDisposeSymbol() {
 // CottontailBuffer.
 (() => {
   const BufferCtor = globalThis.Buffer;
-  if (typeof BufferCtor !== "function" || BufferCtor[Symbol.species] != null) return;
+  if (typeof BufferCtor !== "function") return;
+  // Install when Buffer has no species, or when the inherited species would
+  // produce plain Uint8Array views (which breaks ws's FastBuffer usage:
+  // message payloads would stringify as comma-joined byte lists).
+  const currentSpecies = (() => { try { return BufferCtor[Symbol.species]; } catch { return null; } })();
+  if (currentSpecies != null && currentSpecies !== Uint8Array) return;
   function BufferSpecies(input, byteOffset = undefined, length = undefined) {
     if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer)) {
       const offset = Number(byteOffset ?? 0);
@@ -780,6 +785,23 @@ export class OutgoingMessage extends Writable {
     if (existing == null) return this.setHeader(name, value);
     const next = Array.isArray(existing) ? [...existing, value] : [existing, value];
     return this.setHeader(name, next);
+  }
+
+  setHeaders(headers) {
+    if (this.headersSent) {
+      const error = new Error("Cannot set headers after they are sent to the client");
+      error.code = "ERR_HTTP_HEADERS_SENT";
+      throw error;
+    }
+    if (!headers || Array.isArray(headers) || typeof headers.keys !== "function" || typeof headers.get !== "function") {
+      const error = new TypeError(
+        'The "headers" argument must be an instance of Headers or Map. Received ' + (headers === null ? "null" : typeof headers),
+      );
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    for (const key of headers.keys()) this.setHeader(key, headers.get(key));
+    return this;
   }
 
   getHeader(name) {
@@ -1535,13 +1557,24 @@ export class ClientRequest extends OutgoingMessage {
     const onConnect = () => {
       if (this.aborted || this.destroyed) return;
       this._installTimeout();
-      const body = this.method === "HEAD" ? Buffer.alloc(0) : this._bodyBuffer();
+      // HEAD requests may still carry a body the caller explicitly wrote
+      // (issue #26143); dropping it would desync a server that trusts the
+      // request's Content-Length header.
+      const body = this._bodyBuffer();
       if (!this.hasHeader("host")) this.setHeader("Host", this.url.host);
-      const usesChunkedEncoding = String(this.getHeader("transfer-encoding") ?? "")
+      let usesChunkedEncoding = String(this.getHeader("transfer-encoding") ?? "")
         .toLowerCase()
         .split(",")
         .some((value) => value.trim() === "chunked");
-      if (body.byteLength > 0 && !usesChunkedEncoding && !this.hasHeader("content-length")) this.setHeader("Content-Length", body.byteLength);
+      if (usesChunkedEncoding) {
+        // Explicit Transfer-Encoding takes precedence; Node never sends both.
+        this.removeHeader("content-length");
+      } else if (body.byteLength > 0 && !this.hasHeader("content-length")) {
+        // Node streams request bodies with chunked encoding unless the caller
+        // set an explicit Content-Length.
+        this.setHeader("Transfer-Encoding", "chunked");
+        usesChunkedEncoding = true;
+      }
       if (!this.hasHeader("connection")) this.setHeader("Connection", this.agent?.keepAlive ? "keep-alive" : "close");
       const lines = [`${this.method} ${this.path} HTTP/1.1`];
       for (const [name, value] of Object.entries(this.getHeaders())) {
@@ -1552,19 +1585,19 @@ export class ClientRequest extends OutgoingMessage {
         }
       }
       lines.push("", "");
+      const wireBody = usesChunkedEncoding
+        ? Buffer.concat([
+            Buffer.from(`${body.byteLength.toString(16)}\r\n`),
+            body,
+            Buffer.from("\r\n0\r\n\r\n"),
+          ])
+        : body;
       const expectsContinue = String(this.getHeader("expect") ?? "").toLowerCase() === "100-continue";
       if (expectsContinue && body.byteLength > 0) {
-        continueBody = body;
+        continueBody = wireBody;
         socket.write(Buffer.from(lines.join("\r\n")));
         continueTimer = setTimeout(sendContinueBody, 1000);
       } else {
-        const wireBody = usesChunkedEncoding
-          ? Buffer.concat([
-              Buffer.from(`${body.byteLength.toString(16)}\r\n`),
-              body,
-              Buffer.from("\r\n0\r\n\r\n"),
-            ])
-          : body;
         socket.write(Buffer.concat([Buffer.from(lines.join("\r\n")), wireBody]));
       }
     };
@@ -2213,6 +2246,20 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
     this._fragmentOpcode = 0;
+    // Bun accepts an options object ({ headers, protocols, protocol }) in
+    // place of the protocols argument.
+    let options = null;
+    if (protocols != null && typeof protocols === "object" && !Array.isArray(protocols) &&
+        typeof protocols[Symbol.iterator] !== "function") {
+      options = protocols;
+      protocols = options.protocols ?? options.protocol ?? undefined;
+    }
+    this._customHeaders = [];
+    const rawHeaders = options?.headers;
+    if (rawHeaders != null) {
+      const entries = typeof rawHeaders.entries === "function" ? rawHeaders.entries() : Object.entries(rawHeaders);
+      for (const [name, value] of entries) this._customHeaders.push([String(name), String(value)]);
+    }
     this._protocols = Array.isArray(protocols) ? protocols.map(String) : protocols == null ? [] : [String(protocols)];
     this._connect(parsed);
   }
@@ -2253,6 +2300,16 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
         "Sec-WebSocket-Version: 13",
       ];
       if (this._protocols.length > 0) lines.push(`Sec-WebSocket-Protocol: ${this._protocols.join(", ")}`);
+      const customHeaders = this._customHeaders ?? [];
+      for (const [name, value] of customHeaders) lines.push(`${name}: ${value}`);
+      // URL-embedded credentials become a Basic Authorization header unless
+      // the caller supplied an explicit Authorization header (Bun semantics).
+      const hasAuthHeader = customHeaders.some(([name]) => name.toLowerCase() === "authorization");
+      if (!hasAuthHeader && (parsed.username !== "" || parsed.password !== "")) {
+        const decode = (part) => { try { return decodeURIComponent(part); } catch { return part; } };
+        const credentials = `${decode(parsed.username)}:${decode(parsed.password)}`;
+        lines.push(`Authorization: Basic ${Buffer.from(credentials).toString("base64")}`);
+      }
       lines.push("", "");
       socket.write(lines.join("\r\n"));
     });

@@ -66,6 +66,47 @@ function bunfigOnlyFailures() {
 
 const maxConcurrency = configuredMaxConcurrency();
 const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
+const runnerDateNow = Date.now.bind(Date);
+
+function isTruthyEnvValue(value) {
+  if (value == null) return false;
+  const text = String(value).toLowerCase();
+  return text !== "" && text !== "0" && text !== "false";
+}
+
+// Bun hides passing/skipped/todo lines (failures + summary only) when it
+// detects an agent session: CLAUDECODE truthy while AGENT is not set at all.
+// Setting AGENT (even to "false", as bun's test harness does) disables it.
+const agentQuietMode = isTruthyEnvValue(globalThis.process?.env?.CLAUDECODE) &&
+  globalThis.process?.env?.AGENT === undefined;
+
+function bunfigTestSection() {
+  try {
+    const source = String(readFileSync(`${globalThis.process?.cwd?.() ?? "."}/bunfig.toml`, "utf8"));
+    const match = /(?:^|\n)\[test\]([^]*?)(?=\n\[|$)/.exec(source);
+    return match ? match[1] : "";
+  } catch {
+    return "";
+  }
+}
+
+function configuredRetry() {
+  const cli = Number(cliOption("--retry"));
+  if (Number.isFinite(cli) && cli >= 0) return Math.trunc(cli);
+  const match = /(?:^|\n)\s*retry\s*=\s*(\d+)/.exec(bunfigTestSection());
+  return match ? Number(match[1]) : 0;
+}
+
+const defaultRetry = configuredRetry();
+
+function configuredRerunEach() {
+  const value = Number(cliOption("--rerun-each", 1));
+  return Number.isFinite(value) && value > 1 ? Math.trunc(value) : 1;
+}
+
+const rerunEach = configuredRerunEach();
+let completedRerunCount = 0;
+const completedRuns = [];
 
 function currentExecution() {
   return executionStorage.getStore() ?? activeExecution;
@@ -112,13 +153,31 @@ function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnT
   };
 }
 
+function copyTimerMetadata(wrapper, original) {
+  // Preserve util.promisify(setTimeout) & friends: the promisify.custom symbol
+  // lives on the original global timer functions and must survive wrapping.
+  const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
+  const custom = original?.[promisifyCustom];
+  if (custom) Object.defineProperty(wrapper, promisifyCustom, { value: custom, configurable: true });
+  return wrapper;
+}
+
 function installAsyncFailureGuards() {
   if (asyncFailureGuardsInstalled) return;
   asyncFailureGuardsInstalled = true;
-  globalThis.setTimeout = (callback, ...args) => runnerSetTimeout(guardAsyncCallback(callback), ...args);
-  globalThis.setInterval = (callback, ...args) => runnerSetInterval(guardAsyncCallback(callback), ...args);
+  globalThis.setTimeout = copyTimerMetadata(
+    (callback, ...args) => runnerSetTimeout(guardAsyncCallback(callback), ...args),
+    runnerSetTimeout,
+  );
+  globalThis.setInterval = copyTimerMetadata(
+    (callback, ...args) => runnerSetInterval(guardAsyncCallback(callback), ...args),
+    runnerSetInterval,
+  );
   if (typeof runnerSetImmediate === "function") {
-    globalThis.setImmediate = (callback, ...args) => runnerSetImmediate(guardAsyncCallback(callback), ...args);
+    globalThis.setImmediate = copyTimerMetadata(
+      (callback, ...args) => runnerSetImmediate(guardAsyncCallback(callback), ...args),
+      runnerSetImmediate,
+    );
   }
   globalThis.queueMicrotask = (callback) => runnerQueueMicrotask(guardAsyncCallback(callback));
   if (runnerNextTick) {
@@ -216,12 +275,17 @@ function timeoutFor(options = {}) {
 function timeoutError(duration) {
   const error = new Error(`Test timed out after ${duration}ms`);
   error.code = "ERR_TEST_TIMEOUT";
+  error.duration = duration;
   return error;
 }
 
 function withTimeout(callback, options = {}) {
   const duration = timeoutFor(options);
   if (duration === 0) return promiseThen(runnerPromiseResolve(), callback);
+  // Bun's watchdog fails a test that overran an explicit timeout even when
+  // the event loop was blocked (e.g. by spawnSync) so the timer never fired.
+  const enforceElapsed = options.timeout != null;
+  const startedAt = runnerDateNow();
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = runnerSetTimeout(() => {
@@ -234,6 +298,10 @@ function withTimeout(callback, options = {}) {
         if (settled) return;
         settled = true;
         runnerClearTimeout(timer);
+        if (enforceElapsed && runnerDateNow() - startedAt > duration) {
+          reject(timeoutError(duration));
+          return;
+        }
         resolve(value);
       },
       (error) => {
@@ -265,10 +333,22 @@ function invokeDoneCallback(callback, thisValue, args) {
 }
 
 function invokeTestCallback(record, context) {
-  return withTimeout(() => {
-    if (typeof record.fn !== "function") return undefined;
-    if (record.fn.length >= 2) return invokeDoneCallback(record.fn, undefined, [context]);
-    return record.fn(context);
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (execution && record.options.timeout != null) {
+    const duration = timeoutFor(record.options);
+    if (duration > 0) execution.deadline = runnerDateNow() + duration;
+  }
+  return withTimeout(async () => {
+    let value;
+    if (typeof record.fn !== "function") value = undefined;
+    else if (record.fn.length >= 2) value = await invokeDoneCallback(record.fn, undefined, [context]);
+    else value = await record.fn(context);
+    // Bun keeps a test alive until matcher-produced promises settle (e.g.
+    // expect(asyncFn).toThrow() — issue #23865); they race the test timeout.
+    while (execution?.pendingPromises?.length) {
+      await runnerPromiseAll(execution.pendingPromises.splice(0));
+    }
+    return value;
   }, record.options);
 }
 
@@ -382,6 +462,22 @@ function recordIsConcurrent(record) {
   return forceConcurrent || Boolean(inheritedOption(record, "concurrent"));
 }
 
+function reapDanglingProcesses(execution) {
+  let killed = Number(execution.danglingKilled ?? 0);
+  for (const proc of execution.subprocesses ?? []) {
+    try {
+      if (proc.killed || proc.exitCode != null) continue;
+      proc.kill(9);
+      killed += 1;
+    } catch {}
+  }
+  execution.subprocesses?.clear?.();
+  execution.danglingKilled = 0;
+  if (killed > 0) {
+    console.error(`killed ${killed} dangling process${killed === 1 ? "" : "es"}`);
+  }
+}
+
 async function executeAttempt(record) {
   const context = new TestContext(record);
   context._record = record;
@@ -414,6 +510,8 @@ async function executeAttempt(record) {
         } catch (error) {
           bodyError = error;
         }
+        // Like bun, a timed-out test kills subprocesses it left running.
+        if (bodyError?.code === "ERR_TEST_TIMEOUT") reapDanglingProcesses(execution);
       }
 
       const afterBodyError = await runHookList(execution.afterBodyHooks, context);
@@ -439,6 +537,7 @@ async function executeAttempt(record) {
 function attemptCount(record) {
   if (record.options.repeats != null) return Number(record.options.repeats) + 1;
   if (record.options.retry != null) return Number(record.options.retry) + 1;
+  if (defaultRetry > 0) return defaultRetry + 1;
   return 1;
 }
 
@@ -474,8 +573,11 @@ async function execute(record) {
   const started = performance?.now?.() ?? Date.now();
   let error = null;
   const totalAttempts = attemptCount(record);
+  const retryMode = record.options.repeats == null;
   for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
     error = await executeAttempt(record);
+    record.attempts = attempt + 1;
+    if (retryMode && error) (record.attemptErrors ??= []).push(error);
     if (record.options.repeats != null) {
       if (error) break;
     } else if (!error) {
@@ -636,6 +738,45 @@ globalThis.__cottontailCurrentTestName = () => {
   return execution?.record ? fullTestName(execution.record) : "";
 };
 
+// Registers a promise the currently-running test must wait for before it can
+// complete (subject to its timeout). Returns true when a test is active.
+globalThis.__cottontailRegisterTestPendingPromise = (promise) => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (!execution) return false;
+  (execution.pendingPromises ??= []).push(promise);
+  return true;
+};
+
+// Track subprocesses spawned inside a test so a timeout can kill the ones
+// still running ("killed N dangling process(es)"), matching bun.
+globalThis.__cottontailRegisterTestSubprocess = (proc) => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (!execution || !proc || typeof proc !== "object") return false;
+  const subprocesses = execution.subprocesses ??= new Set();
+  subprocesses.add(proc);
+  if (typeof proc.exited?.then === "function") {
+    promiseThen(proc.exited, () => subprocesses.delete(proc), () => subprocesses.delete(proc));
+  }
+  return true;
+};
+
+// A blocking child that had to be SIGKILLed at the test deadline counts as a
+// dangling process killed by the timeout.
+globalThis.__cottontailNoteDanglingProcessKilled = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (!execution) return false;
+  execution.danglingKilled = Number(execution.danglingKilled ?? 0) + 1;
+  return true;
+};
+
+// Milliseconds left before the current test's explicit timeout, or null when
+// no explicit per-test timeout is active.
+globalThis.__cottontailCurrentTestRemainingMs = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (!execution || execution.deadline == null) return null;
+  return Math.max(0, execution.deadline - runnerDateNow());
+};
+
 function appendFailure(lines, record, error) {
   const name = fullTestName(record);
   if (error?.code === "ERR_TEST_FAILING_PASSED") {
@@ -643,31 +784,71 @@ function appendFailure(lines, record, error) {
     lines.push(`  ^ ${formatFailure(error)}`);
     return;
   }
+  if (error?.code === "ERR_TEST_TIMEOUT") {
+    // Match `bun test` output for timeouts (no leading "error:" line).
+    const duration = error.duration ?? timeoutFor(record.options ?? {});
+    lines.push(`(fail) ${name}`);
+    lines.push(`  ^ this test timed out after ${duration}ms.`);
+    return;
+  }
   lines.push(`error: ${formatFailure(error)}`);
   lines.push(`(fail) ${name}`);
+}
+
+function snapshotRecordView(record) {
+  return {
+    record,
+    status: record.status,
+    error: record.error,
+    todoError: record.todoError,
+    attempts: record.attempts,
+    attemptErrors: record.attemptErrors,
+  };
+}
+
+function appendRunRecords(lines, views) {
+  const suppressPassing = onlyFailures || agentQuietMode;
+  for (const view of views) {
+    if (view.status === "pass") {
+      // Failed retry attempts print their errors even though the test passed.
+      for (const attemptError of view.attemptErrors ?? []) {
+        lines.push(`error: ${formatFailure(attemptError)}`);
+      }
+      if (!suppressPassing) {
+        const retried = (view.attempts ?? 1) > 1 && view.record.options?.repeats == null;
+        const suffix = retried ? ` (attempt ${view.attempts})` : "";
+        lines.push(`(pass) ${fullTestName(view.record)}${suffix}`);
+      }
+    } else if (view.status === "fail") {
+      for (const attemptError of (view.attemptErrors ?? []).slice(0, -1)) {
+        lines.push(`error: ${formatFailure(attemptError)}`);
+      }
+      appendFailure(lines, view.record, view.error);
+    } else if (!suppressPassing) {
+      if (view.status === "todo" && view.todoError) lines.push(`error: ${formatFailure(view.todoError)}`);
+      lines.push(`(${view.status}) ${fullTestName(view.record)}`);
+    }
+  }
 }
 
 function reportResults() {
   if (resultsReported || (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed)) return;
   resultsReported = true;
   const lines = [""];
-  const reportedTests = tests.filter((record) => record.status && record.status !== "filtered");
-  if (reportedTests.length > 0 || failures.length > 0) {
+  const currentViews = tests
+    .filter((record) => record.status && record.status !== "filtered")
+    .map(snapshotRecordView);
+  const runs = completedRuns.length > 0 ? [...completedRuns, currentViews] : [currentViews];
+  if (runs.some((views) => views.length > 0) || failures.length > 0) {
     let file = String(globalThis.process?.argv?.[1] ?? "test");
     const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
     if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
     file = file.replace(/^\.[\\/]+/, "");
-    lines.push(`${file}:`);
-    for (const record of reportedTests) {
-      if (record.status === "pass") {
-        if (!onlyFailures) lines.push(`(pass) ${fullTestName(record)}`);
-      } else if (record.status === "fail") {
-        appendFailure(lines, record, record.error);
-      } else if (!onlyFailures) {
-        if (record.status === "todo" && record.todoError) lines.push(`error: ${formatFailure(record.todoError)}`);
-        lines.push(`(${record.status}) ${fullTestName(record)}`);
-      }
-    }
+    runs.forEach((views, index) => {
+      if (index > 0) lines.push("");
+      lines.push(runs.length > 1 ? `${file}: (run #${index + 1})` : `${file}:`);
+      appendRunRecords(lines, views);
+    });
     for (const { record, error } of failures) {
       if (!tests.includes(record)) appendFailure(lines, record, error);
     }
@@ -721,6 +902,26 @@ function scheduleAfterHooks() {
   }, 0);
 }
 
+function resetForRerun() {
+  for (const record of tests) {
+    record.ran = false;
+    record.status = null;
+    record.error = null;
+    record.todoError = null;
+    record.attempts = undefined;
+    record.attemptErrors = undefined;
+  }
+  const resetSuite = (suite) => {
+    suite.beforeRan = false;
+    suite.afterRan = false;
+    suite.beforeError = null;
+    for (const child of suite.children) {
+      if (child.kind === "suite") resetSuite(child);
+    }
+  };
+  resetSuite(rootSuite);
+}
+
 function scheduleRun() {
   installUncaughtCapture();
   installAsyncFailureGuards();
@@ -748,6 +949,16 @@ function scheduleRun() {
         const concurrentGroup = [];
         await executeSuite(rootSuite, concurrentGroup);
         await flushConcurrent(concurrentGroup);
+        // --rerun-each=N runs every test N times (bun re-evaluates the file;
+        // module state persists there too, so re-running records matches).
+        if (!runAgain && !hasPendingTests() && completedRerunCount + 1 < rerunEach) {
+          completedRerunCount += 1;
+          completedRuns.push(tests
+            .filter((record) => record.status && record.status !== "filtered")
+            .map(snapshotRecordView));
+          resetForRerun();
+          runAgain = true;
+        }
       } while (runAgain || hasPendingTests());
       runnerActive = false;
       scheduleAfterHooks();

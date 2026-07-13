@@ -124,6 +124,7 @@ function makeFsError(error, path, syscall = "open") {
     else if (source.includes("Is a directory") || source.includes("IsDir")) code = "EISDIR";
     else if (source.includes("Directory not empty") || source.includes("DirNotEmpty")) code = "ENOTEMPTY";
     else if (source.includes("Bad file descriptor")) code = "EBADF";
+    else if (source.includes("Device not configured") || source.includes("No such device or address") || source.includes("NoDevice")) code = "ENXIO";
     else code = "EIO";
   }
   const reason = messageByCode[code] ?? (source || code);
@@ -398,12 +399,30 @@ function makeStatFs(result, options = undefined) {
   return out;
 }
 
+// Node's Dirent constructor takes a libuv dirent type (UV_DIRENT_*), not a
+// file mode. Map those to S_IF* mode bits; UV_DIRENT_UNKNOWN (0) maps to 0 so
+// every is*() check returns false.
+const uvDirentTypeToMode = [
+  0, // UV_DIRENT_UNKNOWN
+  0o100000, // UV_DIRENT_FILE -> S_IFREG
+  0o040000, // UV_DIRENT_DIR -> S_IFDIR
+  0o120000, // UV_DIRENT_LINK -> S_IFLNK
+  0o010000, // UV_DIRENT_FIFO -> S_IFIFO
+  0o140000, // UV_DIRENT_SOCKET -> S_IFSOCK
+  0o020000, // UV_DIRENT_CHAR -> S_IFCHR
+  0o060000, // UV_DIRENT_BLOCK -> S_IFBLK
+];
+
 export class Dirent {
   constructor(name, typeOrStats = 0, path = undefined) {
     this.name = name;
     this.parentPath = path;
     this.path = path;
-    this._mode = typeof typeOrStats === "object" ? Number(typeOrStats.mode) || 0 : Number(typeOrStats) || 0;
+    if (typeof typeOrStats === "object" && typeOrStats !== null) {
+      this._mode = Number(typeOrStats.mode) || 0;
+    } else {
+      this._mode = uvDirentTypeToMode[Number(typeOrStats)] ?? 0;
+    }
   }
 
   isDirectory() { return modeMatches(this._mode, constants.S_IFDIR ?? 0o040000); }
@@ -517,7 +536,14 @@ export function writeFileSync(path, data, options = undefined) {
     appendFileSync(path, data, options);
     return;
   }
-  cottontail.writeFile(normalizePath(path), bytesFromData(data, encoding));
+  const normalizedPath = normalizePath(path);
+  cottontail.writeFile(normalizedPath, bytesFromData(data, encoding));
+  const mode = typeof options === "object" && options !== null ? options.mode : undefined;
+  if (mode !== undefined && mode !== null) {
+    try {
+      cottontail.chmodSync(normalizedPath, parseMode(mode));
+    } catch {}
+  }
 }
 
 export function appendFileSync(path, data, options = undefined) {

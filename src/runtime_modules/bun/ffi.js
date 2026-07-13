@@ -257,25 +257,184 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
   g.process.stdin.resume();
 }
 
+// Bun-flavored value formatter for console output. Mirrors bun's console
+// inspector: objects always print multiline with trailing commas, keys are
+// bare only when they are ASCII identifiers, functions print as
+// [Function: name], small arrays print inline, plain objects deeper than the
+// depth limit collapse to [Object ...].
+const consoleInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+const consoleIdentifierKey = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+const formatFunctionValue = (value) => {
+  let kind = "Function";
+  try {
+    const text = Function.prototype.toString.call(value);
+    if (/^class[\s{]/.test(text)) return value.name ? `[class ${value.name}]` : "[class (anonymous)]";
+    if (value.constructor?.name === "AsyncFunction") kind = "AsyncFunction";
+    else if (value.constructor?.name === "GeneratorFunction") kind = "GeneratorFunction";
+    else if (value.constructor?.name === "AsyncGeneratorFunction") kind = "AsyncGeneratorFunction";
+  } catch {}
+  return value.name ? `[${kind}: ${value.name}]` : `[${kind}]`;
+};
+
+const formatConsoleKey = (key) => {
+  if (typeof key === "symbol") return `[${String(key)}]`;
+  // Bun quotes keys unless they are plain ASCII identifiers.
+  return consoleIdentifierKey.test(key) ? key : JSON.stringify(key);
+};
+
+const wrapInlineItems = (items, indent) => {
+  const pad = " ".repeat(indent + 2);
+  const lines = [];
+  let line = "";
+  for (const item of items) {
+    if (line === "") line = item;
+    else if (line.length + 2 + item.length > 78 - indent) {
+      lines.push(line + ",");
+      line = item;
+    } else line = `${line}, ${item}`;
+  }
+  if (line !== "") lines.push(line);
+  return lines.map((text) => pad + text).join("\n");
+};
+
+const formatArrayBody = (items, indent, prefix = "") => {
+  if (items.length === 0) return `${prefix}[]`;
+  const hasNewline = items.some((item) => item.includes("\n"));
+  if (!hasNewline) {
+    const inline = `${prefix}[ ${items.join(", ")} ]`;
+    if (inline.length + indent <= 100) return inline;
+    return `${prefix}[\n${wrapInlineItems(items, indent)}\n${" ".repeat(indent)}]`;
+  }
+  const pad = " ".repeat(indent + 2);
+  return `${prefix}[\n${pad}${items.join(", ")}\n${" ".repeat(indent)}]`;
+};
+
+const formatConsoleValue = (value, seen, objectDepth, indent) => {
+  switch (typeof value) {
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+      return Object.is(value, -0) ? "-0" : String(value);
+    case "bigint":
+      return `${value}n`;
+    case "boolean":
+    case "undefined":
+      return String(value);
+    case "symbol":
+      return value.toString();
+    case "function":
+      return formatFunctionValue(value);
+  }
+  if (value === null) return "null";
+  if (seen.has(value)) return "[Circular]";
+
+  try {
+    const custom = value[consoleInspectCustom];
+    if (typeof custom === "function") {
+      const result = custom.call(value, 2, { depth: 2, stylize: (text) => text });
+      if (typeof result === "string") return result;
+    }
+  } catch {}
+
+  if (value instanceof Error) {
+    const name = value.name ?? "Error";
+    const header = value.message ? `${name}: ${value.message}` : String(name);
+    const stack = typeof value.stack === "string" && value.stack.length > 0 ? value.stack : "";
+    if (!stack) return header;
+    return stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`;
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
+  }
+  if (value instanceof RegExp) return String(value);
+  if (typeof Promise !== "undefined" && value instanceof Promise) return "Promise { <pending> }";
+
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const items = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (!(index in value)) {
+          items.push("empty item");
+          continue;
+        }
+        items.push(formatConsoleValue(value[index], seen, objectDepth, indent + 2));
+      }
+      return formatArrayBody(items, indent);
+    }
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
+      const shown = Array.from(value.subarray(0, 50), (byte) => byte.toString(16).padStart(2, "0"));
+      const suffix = value.length > 50 ? ` ... ${value.length - 50} more bytes` : "";
+      return `<Buffer ${shown.join(" ")}${suffix}>`;
+    }
+    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+      const items = Array.from(value, (item) => formatConsoleValue(item, seen, objectDepth, indent + 2));
+      return formatArrayBody(items, indent, `${value.constructor?.name ?? "TypedArray"}(${value.length}) `);
+    }
+    if (value instanceof ArrayBuffer) {
+      const items = Array.from(new Uint8Array(value), (byte) => String(byte));
+      return formatArrayBody(items, indent, `ArrayBuffer(${value.byteLength}) `);
+    }
+    if (value instanceof Map) {
+      if (value.size === 0) return "Map {}";
+      const pad = " ".repeat(indent + 2);
+      let out = `Map(${value.size}) {\n`;
+      for (const [key, item] of value) {
+        out += `${pad}${formatConsoleValue(key, seen, objectDepth, indent + 2)}: ${formatConsoleValue(item, seen, objectDepth, indent + 2)},\n`;
+      }
+      return `${out}${" ".repeat(indent)}}`;
+    }
+    if (value instanceof Set) {
+      if (value.size === 0) return "Set {}";
+      const pad = " ".repeat(indent + 2);
+      let out = `Set(${value.size}) {\n`;
+      for (const item of value) {
+        out += `${pad}${formatConsoleValue(item, seen, objectDepth, indent + 2)},\n`;
+      }
+      return `${out}${" ".repeat(indent)}}`;
+    }
+
+    if (objectDepth > 2) return "[Object ...]";
+    const prototype = Object.getPrototypeOf(value);
+    let prefix = "";
+    if (prototype === null) prefix = "[Object: null prototype] ";
+    else if (prototype !== Object.prototype) {
+      const name = value.constructor?.name;
+      if (name && name !== "Object") prefix = `${name} `;
+    }
+    const keys = Object.keys(value);
+    const symbols = Object.getOwnPropertySymbols(value).filter((symbol) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, symbol);
+      return descriptor?.enumerable;
+    });
+    if (keys.length === 0 && symbols.length === 0) return `${prefix}{}`;
+    const pad = " ".repeat(indent + 2);
+    let out = `${prefix}{\n`;
+    for (const key of [...keys, ...symbols]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      let rendered;
+      if (descriptor && !("value" in descriptor)) {
+        rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
+      } else {
+        rendered = formatConsoleValue(descriptor ? descriptor.value : value[key], seen, objectDepth + 1, indent + 2);
+      }
+      out += `${pad}${formatConsoleKey(key)}: ${rendered},\n`;
+    }
+    return `${out}${" ".repeat(indent)}}`;
+  } finally {
+    seen.delete(value);
+  }
+};
+
 const formatConsoleArg = (value) => {
   if (value instanceof Error && value.stack) return value.stack;
+  if (typeof value === "string") return value;
   if (typeof value === "bigint") return `${value}n`;
-  if (typeof value !== "object" || value === null) return value;
-
-  const seen = new Set();
+  if (typeof value !== "object" && typeof value !== "function") return value;
+  if (value === null) return value;
   try {
-    return JSON.stringify(
-      value,
-      (_key, item) => {
-        if (typeof item === "bigint") return `${item}n`;
-        if (typeof item === "object" && item !== null) {
-          if (seen.has(item)) return "[Circular]";
-          seen.add(item);
-        }
-        return item;
-      },
-      2,
-    );
+    return formatConsoleValue(value, new Set(), 0, 0);
   } catch {
     return String(value);
   }
@@ -1115,6 +1274,9 @@ function makeTimerHandle(id) {
   return {
     [Symbol.toPrimitive]: () => id,
     valueOf: () => id,
+    // Node's Timeout exposes _idleStart (ms since process start when the timer
+    // was scheduled); frameworks like Next.js read and write it.
+    _idleStart: timerNow(),
     ref() {
       const timer = timers.get(id);
       if (timer) timer.ref = true;

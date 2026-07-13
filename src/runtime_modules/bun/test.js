@@ -677,6 +677,9 @@ function installFakeTimers(options = undefined) {
     }
   }
   globalThis.Date = FakeDate;
+  // testing-library and user-event detect fake timers via an own `clock`
+  // property on globalThis.setTimeout (issue #25869 / #26284).
+  Object.defineProperty(fakeSetTimeout, "clock", { configurable: true, enumerable: false, writable: true, value: true });
   globalThis.setTimeout = fakeSetTimeout;
   globalThis.clearTimeout = fakeClearTimer;
   globalThis.setInterval = fakeSetInterval;
@@ -694,6 +697,9 @@ function uninstallFakeTimers() {
   fakeTimersEnabled = false;
   fakeTimers.clear();
   fakeSystemTime = null;
+  // The `clock` marker must be deleted (not set to false) so that
+  // hasOwnProperty checks report real timers (issue #26284).
+  delete fakeSetTimeout.clock;
   globalThis.Date = realTimers.Date;
   globalThis.setTimeout = realTimers.setTimeout;
   globalThis.clearTimeout = realTimers.clearTimeout;
@@ -753,8 +759,11 @@ class Expectation {
   }
 
   _check(pass, message) {
-    assertionCount += 1;
-    globalThis.__cottontailTestAssertionCount += 1;
+    if (this._skipAssertionCount) this._skipAssertionCount = false;
+    else {
+      assertionCount += 1;
+      globalThis.__cottontailTestAssertionCount += 1;
+    }
     const label = this._label == null ? "" : `${String(this._label)}\n\n`;
     failMatcher(pass, this._negate, `${label}${message}`);
   }
@@ -905,10 +914,19 @@ class Expectation {
       }
       if (didThrow) return checkThrown(true, thrown);
       if (isPromiseLike(result)) {
-        return result.then(
+        const settled = result.then(
           () => this._check(false, "Expected function to throw"),
           (error) => checkThrown(true, error),
         );
+        // Bun keeps the running test alive until this promise settles
+        // (issue #23865) and counts the expect() call immediately — the
+        // test may time out before the promise resolves.
+        if (!this._promiseMode && globalThis.__cottontailRegisterTestPendingPromise?.(settled)) {
+          assertionCount += 1;
+          globalThis.__cottontailTestAssertionCount += 1;
+          this._skipAssertionCount = true;
+        }
+        return settled;
       }
       return this._check(false, "Expected function to throw");
     });
@@ -1202,6 +1220,10 @@ export function mock(implementation = undefined) {
   });
   method("mockReturnValueOnce", (value) => {
     once.push(() => value);
+    return mockedFunction;
+  });
+  method("mockReturnThis", () => {
+    current = function mockConstructorReturnThis() { return this; };
     return mockedFunction;
   });
   method("mockResolvedValue", (value) => {
@@ -1569,6 +1591,7 @@ function makeEach(base) {
 function makeBunTestFunction(base) {
   const register = (args, extraOptions = {}, requireCallback = false) => {
     globalThis.__cottontailBunTestUsed = true;
+    if (extraOptions.only) assertOnlyAllowed();
     const parsed = parseCallbackArgs(args);
     if (requireCallback && typeof parsed.callback !== "function") {
       throw new TypeError("test.failing expects a function as the second argument");
@@ -1611,6 +1634,7 @@ function makeBunDescribe(base) {
   const variant = (extraOptions) => {
     const result = (...args) => {
       globalThis.__cottontailBunTestUsed = true;
+      if (extraOptions.only) assertOnlyAllowed();
       const parsed = parseDescribeArgs(args);
       return base(normalizeTestName(parsed.name), { ...parsed.options, ...extraOptions }, parsed.callback);
     };
@@ -1633,6 +1657,30 @@ function makeBunDescribe(base) {
 
 function markBunTestUsed() {
   globalThis.__cottontailBunTestUsed = true;
+}
+
+function isTruthyEnvValue(value) {
+  if (value == null) return false;
+  const text = String(value).toLowerCase();
+  return text !== "" && text !== "0" && text !== "false";
+}
+
+function isCIEnvironment() {
+  const env = globalThis.process?.env ?? {};
+  if (env.CI != null) return isTruthyEnvValue(env.CI);
+  if (env.JENKINS_URL != null || env.BUILD_ID != null) return true;
+  return ["GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "TRAVIS", "BUILDKITE", "APPVEYOR", "TEAMCITY_VERSION"]
+    .some((name) => isTruthyEnvValue(env[name]));
+}
+
+// Bun refuses .only when running in a CI environment: the call throws while
+// the test file is being evaluated, so the run errors out with exit code 1.
+function assertOnlyAllowed() {
+  if (!isCIEnvironment()) return;
+  throw new Error(
+    ".only is disabled in CI environments to prevent accidentally skipping tests. " +
+    "To override, set the environment variable CI=false.",
+  );
 }
 
 export const beforeAll = (callback, options = {}) => {
@@ -1658,9 +1706,21 @@ export const xit = test.skip;
 export const xtest = test.skip;
 export const xdescribe = describe.skip;
 
+// Bun's jest.mock() is module mocking (mock.module), not the mock-function
+// factory. It validates its arguments with TypeErrors (ENG-24434).
+function jestMockModule(specifier, factory = undefined) {
+  if (typeof specifier !== "string") {
+    throw new TypeError("jest.mock() expects a string module path as the first argument");
+  }
+  if (typeof factory !== "function") {
+    throw new TypeError("jest.mock() requires a module factory function as the second argument");
+  }
+  return mock.module(specifier, factory);
+}
+
 export const jest = {
   fn: mock,
-  mock,
+  mock: jestMockModule,
   spyOn,
   clearAllMocks,
   resetAllMocks,
@@ -1770,6 +1830,55 @@ function installShellConstructor() {
   shell.Shell = Shell;
 }
 
+// Track subprocesses started inside tests so a test timeout can kill the
+// dangling ones, like bun does. Blocking Bun.spawnSync calls inside a test
+// with an explicit timeout get a watchdog that SIGKILLs the child at the
+// test deadline (bun's watchdog terminates blocked tests the same way).
+function installTestSubprocessTracking() {
+  const bun = globalThis.Bun;
+  if (!bun || bun.__cottontailTestSpawnTracked) return;
+  const originalSpawn = bun.spawn;
+  const originalSpawnSync = bun.spawnSync;
+  if (typeof originalSpawn !== "function" || typeof originalSpawnSync !== "function") return;
+  Object.defineProperty(bun, "__cottontailTestSpawnTracked", { value: true });
+
+  const wrappedSpawn = function spawn(...args) {
+    const proc = originalSpawn.apply(bun, args);
+    globalThis.__cottontailRegisterTestSubprocess?.(proc);
+    return proc;
+  };
+  Object.assign(wrappedSpawn, originalSpawn);
+  bun.spawn = wrappedSpawn;
+
+  const deadlineCommand = (cmd, remainingMs) => {
+    const seconds = Math.max(Number(remainingMs), 5) / 1000;
+    const script = `"$@" & CT_CHILD=$!; ( sleep ${seconds}; kill -9 $CT_CHILD 2>/dev/null ) >/dev/null 2>&1 & CT_WATCH=$!; ` +
+      "{ wait $CT_CHILD; } 2>/dev/null; CT_STATUS=$?; kill $CT_WATCH 2>/dev/null; exit $CT_STATUS";
+    return ["/bin/sh", "-c", script, "sh", ...cmd.map(String)];
+  };
+
+  const wrappedSpawnSync = function spawnSync(command, ...rest) {
+    const remaining = globalThis.__cottontailCurrentTestRemainingMs?.();
+    const platform = globalThis.process?.platform;
+    if (remaining != null && Number.isFinite(remaining) && platform !== "win32") {
+      let wrappedCommand = null;
+      if (Array.isArray(command)) {
+        wrappedCommand = deadlineCommand(command, remaining);
+      } else if (command && typeof command === "object" && Array.isArray(command.cmd)) {
+        wrappedCommand = { ...command, cmd: deadlineCommand(command.cmd, remaining) };
+      }
+      if (wrappedCommand != null) {
+        const result = originalSpawnSync.call(bun, wrappedCommand, ...rest);
+        if (Number(result?.exitCode) === 137) globalThis.__cottontailNoteDanglingProcessKilled?.();
+        return result;
+      }
+    }
+    return originalSpawnSync.call(bun, command, ...rest);
+  };
+  Object.assign(wrappedSpawnSync, originalSpawnSync);
+  bun.spawnSync = wrappedSpawnSync;
+}
+
 function wrapCallerOriginFileURLToPath(fileURLToPath) {
   const wrapped = (value) => value === ""
     ? String(globalThis.process?.argv?.[1] ?? "")
@@ -1802,11 +1911,13 @@ function installCallerOriginFallback() {
 globalThis.jest ??= jest;
 globalThis.vi ??= vi;
 installCallerOriginFallback();
+installTestSubprocessTracking();
 
 queueMicrotask(() => {
   globalThis.jest ??= jest;
   globalThis.vi ??= vi;
   installShellConstructor();
+  installTestSubprocessTracking();
 });
 
 export default defaultExport;

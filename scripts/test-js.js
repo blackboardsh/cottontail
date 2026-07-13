@@ -85,6 +85,12 @@ try {
       stdoutIncludes: ['module imports passed'],
     },
     {
+      name: 'module-syntax-in-multiline-string',
+      scriptPath: join(rootDir, 'tests', 'js', 'module-syntax-in-multiline-string.js'),
+      expectExitCode: 0,
+      stdoutIncludes: ['module syntax string passed'],
+    },
+    {
       name: 'async',
       scriptPath: join(rootDir, 'tests', 'js', 'async.js'),
       expectExitCode: 0,
@@ -163,7 +169,7 @@ try {
         COTTONTAIL_TMP_DIR: tempDir,
       },
       expectExitCode: 0,
-      stdoutIncludes: ['"cottontailConsoleObject": true', 'bun apis passed'],
+      stdoutIncludes: ['cottontailConsoleObject: true', 'bun apis passed'],
     },
     {
       name: 'bun-global',

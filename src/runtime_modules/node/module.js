@@ -259,7 +259,101 @@ function parseJSONC(source) {
     }
     output += char;
   }
-  return JSON.parse(output.replace(/,\s*([}\]])/g, "$1"));
+  output = output.replace(/,\s*([}\]])/g, "$1");
+  // Tolerate a trailing comma after the root value (bun's package.json parser does).
+  output = output.replace(/[,\s]+$/, "");
+  return JSON.parse(output);
+}
+
+// ---------------------------------------------------------------------------
+// tsconfig.json "paths" mapping (Bun honors these at runtime, e.g. the
+// upstream test suite maps "harness" -> test/harness.ts).
+// ---------------------------------------------------------------------------
+const tsconfigPathsCache = new Map();
+
+function loadTsconfigPaths(dir) {
+  if (tsconfigPathsCache.has(dir)) return tsconfigPathsCache.get(dir);
+  let entry = null;
+  try {
+    const file = join(dir, "tsconfig.json");
+    if (isFile(file)) {
+      const parsed = parseJSONC(String(cottontail.readFile(file)));
+      const paths = parsed?.compilerOptions?.paths;
+      const explicitBaseUrl = typeof parsed?.compilerOptions?.baseUrl === "string";
+      if ((paths && typeof paths === "object") || explicitBaseUrl) {
+        entry = {
+          baseUrl: resolve(dir, String(parsed?.compilerOptions?.baseUrl ?? ".")),
+          paths: paths && typeof paths === "object" ? paths : {},
+          explicitBaseUrl,
+        };
+      }
+    }
+  } catch {}
+  if (!entry) {
+    const parent = dirname(dir);
+    entry = parent && parent !== dir ? loadTsconfigPaths(parent) : null;
+  }
+  tsconfigPathsCache.set(dir, entry);
+  return entry;
+}
+
+function resolveTsconfigPathsMapping(request, startDir) {
+  const config = loadTsconfigPaths(startDir);
+  if (!config) return null;
+  const tryTargets = (targets, starMatch) => {
+    for (const target of Array.isArray(targets) ? targets : [targets]) {
+      if (typeof target !== "string") continue;
+      const substituted = starMatch == null ? target : target.replace("*", starMatch);
+      const candidate = resolve(config.baseUrl, substituted);
+      const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
+      if (resolved) return resolved;
+    }
+    return null;
+  };
+  if (Object.prototype.hasOwnProperty.call(config.paths, request)) {
+    const resolved = tryTargets(config.paths[request], null);
+    if (resolved) return resolved;
+  }
+  let best = null;
+  for (const key of Object.keys(config.paths)) {
+    const star = key.indexOf("*");
+    if (star < 0) continue;
+    const prefix = key.slice(0, star);
+    const keySuffix = key.slice(star + 1);
+    if (!request.startsWith(prefix) || !request.endsWith(keySuffix)) continue;
+    if (request.length < prefix.length + keySuffix.length) continue;
+    if (best == null || prefix.length > best.prefixLength) {
+      best = {
+        key,
+        prefixLength: prefix.length,
+        match: request.slice(prefix.length, request.length - keySuffix.length),
+      };
+    }
+  }
+  if (best) {
+    const resolved = tryTargets(config.paths[best.key], best.match);
+    if (resolved) return resolved;
+  }
+  // With an explicit baseUrl, TypeScript (and Bun) also resolve bare
+  // specifiers relative to it (e.g. "_util/numeric.ts" from test/).
+  if (config.explicitBaseUrl) {
+    const candidate = resolve(config.baseUrl, request);
+    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function packageDirRealPath(candidate) {
+  try {
+    // Store-based installs expose packages through node_modules symlinks. Do
+    // not canonicalize ordinary package paths: on macOS that would also turn
+    // /var into /private/var even though the package itself is not symlinked.
+    if (!cottontail.statSync(candidate, false)?.isSymbolicLink) return candidate;
+    const real = cottontail.realpathSync(candidate);
+    if (typeof real === "string" && real.length > 0) return real;
+  } catch {}
+  return candidate;
 }
 
 function packageRootFor(request, startDir) {
@@ -268,10 +362,22 @@ function packageRootFor(request, startDir) {
   let dir = startDir;
   while (true) {
     const nodeModulesCandidate = join(dir, "node_modules", packageName);
-    if (cottontail.existsSync(join(nodeModulesCandidate, "package.json"))) return nodeModulesCandidate;
+    if (cottontail.existsSync(join(nodeModulesCandidate, "package.json"))) return packageDirRealPath(nodeModulesCandidate);
 
+    // A sibling directory that merely shares the package name is not a
+    // package root (e.g. test fixtures at third_party/<name>/package.json);
+    // only accept it when its package.json "name" actually matches.
     const directCandidate = join(dir, packageName);
-    if (cottontail.existsSync(join(directCandidate, "package.json"))) return directCandidate;
+    const directManifest = join(directCandidate, "package.json");
+    if (cottontail.existsSync(directManifest)) {
+      let manifestName;
+      try {
+        manifestName = readPackageJson(directManifest)?.name;
+      } catch {
+        manifestName = undefined;
+      }
+      if (manifestName === packageName) return packageDirRealPath(directCandidate);
+    }
 
     const parent = dirname(dir);
     if (parent === dir) break;
@@ -351,6 +457,13 @@ function resolvePackageExports(root, packageJson, suffix = "") {
     return resolvePackageTarget(root, packageTargetForConditions(exportsField));
   }
   if (typeof exportsField !== "object") return null;
+  // "exports" sugar: an object whose keys are all conditions (none start
+  // with ".") is the conditions target for the root subpath, e.g.
+  // { "require": "./index.js", "import": "./esm/wrapper.js" }.
+  if (!Object.keys(exportsField).some((key) => key.startsWith("."))) {
+    if (subpath !== ".") return null;
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField));
+  }
   if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
     return resolvePackageTarget(root, packageTargetForConditions(exportsField[subpath]));
   }
@@ -463,11 +576,35 @@ function normalizeLoadHookResult(result) {
   return result;
 }
 
+function unknownBuiltinError(request) {
+  const error = new Error(`No such built-in module: ${request}`);
+  error.code = "ERR_UNKNOWN_BUILTIN_MODULE";
+  return error;
+}
+
+// Bun does not implement node:sqlite (bun:sqlite is its API); when running
+// the Bun compat profile, treat it as an unknown builtin so dynamic import
+// rejects with ERR_UNKNOWN_BUILTIN_MODULE like Bun does.
+function isBuiltinHiddenByCompatProfile(id) {
+  if (String(id).replace(/^node:/, "") !== "sqlite") return false;
+  try {
+    return globalThis.process?.env?.COTTONTAIL_UPSTREAM_RUNTIME === "bun";
+  } catch {
+    return false;
+  }
+}
+
 function resolveRequestCore(request, basePath) {
   const originalText = String(request);
   const { bare: text, suffix } = splitSpecifierSuffix(originalText);
-  if (builtinModuleMap.has(text)) return text;
+  if (builtinModuleMap.has(text)) {
+    if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
+    return text;
+  }
   if (text.startsWith("node:") && builtinModuleMap.has(text.slice(5))) return text.slice(5);
+  // Unknown "node:" specifiers can never resolve to files; both Node and Bun
+  // reject them with ERR_UNKNOWN_BUILTIN_MODULE.
+  if (text.startsWith("node:")) throw unknownBuiltinError(text);
 
   const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
   if (text.startsWith(".") || text.startsWith("/")) {
@@ -476,6 +613,9 @@ function resolveRequestCore(request, basePath) {
     if (resolved) return withSpecifierSuffix(resolved, suffix);
     throw moduleNotFoundError(originalText, Boolean(suffix));
   }
+
+  const tsMapped = resolveTsconfigPathsMapping(text, startDir);
+  if (tsMapped) return withSpecifierSuffix(tsMapped, suffix);
 
   const root = packageRootFor(text, startDir);
   if (!root) throw moduleNotFoundError(originalText, Boolean(suffix));
@@ -549,17 +689,76 @@ function makeModule(filename) {
   };
 }
 
+// Detects top-level ESM declarations (static import / export statements).
+// Files reaching the CommonJS executor with ESM syntax must be transformed
+// first: `import x from "y"` inside new Function() is a parse error.
+const esmSyntaxPattern = /^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
+
+// TypeScript sources loaded through the JS module executor must have their
+// type syntax removed first; new Function() only parses JavaScript.
+const typeScriptExtensionPattern = /\.(?:ts|mts|cts|tsx)$/i;
+
+function maybeStripTypeScript(filename, source) {
+  if (!typeScriptExtensionPattern.test(String(filename))) return source;
+  if (typeof cottontail.stripTypeScriptTypes !== "function") return source;
+  try {
+    return String(cottontail.stripTypeScriptTypes(String(source), 1));
+  } catch {
+    return source;
+  }
+}
+
+// new Function("a", "b", body) prepends "function anonymous(a,b\n) {\n"
+// before the body, so JSC parse-error line numbers are offset by 2.
+const FUNCTION_WRAPPER_LINE_OFFSET = 2;
+
+function markModuleCompileError(error, filename, source) {
+  if (error instanceof SyntaxError) {
+    const line = Number(error.line);
+    error.__ctModuleCompileError = {
+      filename,
+      source: String(source),
+      line: Number.isFinite(line) ? line - FUNCTION_WRAPPER_LINE_OFFSET : 1,
+    };
+  }
+  return error;
+}
+
+function compileModuleWrapper(args, source, filename) {
+  try {
+    return new Function(...args, `${source}\n//# sourceURL=${filename}`);
+  } catch (error) {
+    throw markModuleCompileError(error, filename, source);
+  }
+}
+
 function executeCommonJsModule(module, filename) {
-  const source = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  maybeRegisterSourceMap(filename, source);
-  recordCompileCache(filename, source);
-  const wrapper = new Function(
-    "exports",
-    "require",
-    "module",
-    "__filename",
-    "__dirname",
-    `${source}\n//# sourceURL=${filename}`,
+  const source = maybeStripTypeScript(filename, cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
+  if (esmSyntaxPattern.test(source)) {
+    const transformed = transformEsmSourceForDynamicImport(source);
+    maybeRegisterSourceMap(filename, transformed);
+    recordCompileCache(filename, transformed);
+    const run = compileModuleWrapper(["exports", "require", "__ctImportMeta"], transformed, filename);
+    run(module.exports, createRequire(filename), importMetaForModule(filename));
+    module.loaded = true;
+    return module.exports;
+  }
+  // Route dynamic import() in plain CJS through the runtime module loader so
+  // it resolves like Bun/Node (e.g. unknown node: builtins reject with
+  // ERR_UNKNOWN_BUILTIN_MODULE instead of an opaque engine error). The helper
+  // is prepended on the same line to keep line numbers stable.
+  let effectiveSource = source;
+  if (/(?<![.\w$])import\s*\(/.test(effectiveSource)) {
+    effectiveSource =
+      "const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), __filename, options); " +
+      effectiveSource.replace(/(?<![.\w$])import\s*\(/g, "__ctDynamicImport(");
+  }
+  maybeRegisterSourceMap(filename, effectiveSource);
+  recordCompileCache(filename, effectiveSource);
+  const wrapper = compileModuleWrapper(
+    ["exports", "require", "module", "__filename", "__dirname"],
+    effectiveSource,
+    filename,
   );
   wrapper(module.exports, createRequire(filename), module, filename, dirname(filename));
   module.loaded = true;
@@ -646,17 +845,108 @@ function namespaceFromCommonJs(value) {
   return namespace;
 }
 
+function rewriteImportBindings(names) {
+  return String(names)
+    .split(",")
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return "";
+      const pieces = trimmed.split(/\s+as\s+/);
+      return pieces.length === 2 ? `${pieces[0].trim()}: ${pieces[1].trim()}` : trimmed;
+    })
+    .filter(Boolean)
+    .join(", ");
+}
+
+// Single line (no trailing newline) so prepending it does not shift line
+// numbers of the transformed module source.
+const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
+
 function transformEsmSourceForDynamicImport(source) {
   const exportAssignments = [];
+  // Import declarations are hoisted to the top of the transformed output
+  // (matching ESM semantics, where imports are initialized before any module
+  // code runs, even when the import statement appears at the bottom).
+  const importDeclarations = [];
   let output = String(source).replace(/\bimport\.meta\b/g, "__ctImportMeta");
+  // Static import declarations are rewritten to synchronous requires so the
+  // source can run inside new Function() (where `import x from "..."` would
+  // otherwise parse as a malformed dynamic import call).
+  output = output.replace(
+    /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, name, spec) => {
+      importDeclarations.push(`const ${name} = __ctStaticImport(${spec});`);
+      return ";";
+    },
+  );
+  output = output.replace(
+    /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, def, names, spec) => {
+      importDeclarations.push(`const { default: ${def}, ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
+      return ";";
+    },
+  );
+  output = output.replace(
+    /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, names, spec) => {
+      importDeclarations.push(`const { ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
+      return ";";
+    },
+  );
+  output = output.replace(
+    /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, def, spec) => {
+      importDeclarations.push(`const { default: ${def} } = __ctStaticImport(${spec});`);
+      return ";";
+    },
+  );
+  output = output.replace(/\bimport\s*(['"][^'"]+['"])\s*;?/g, (_all, spec) => {
+    importDeclarations.push(`__ctStaticImport(${spec});`);
+    return ";";
+  });
+  // Dynamic import() cannot execute inside new Function()-compiled code for
+  // formats JSC's own loader cannot parse (e.g. TypeScript); route it through
+  // the runtime module loader, which also consults the CommonJS cache.
+  output = output.replace(/\bimport\s*\(/g, "__ctDynamicImport(");
+  // Re-exports must be rewritten before the plain `export { ... }` handler
+  // below, which would otherwise leave a dangling `from "..."` clause behind.
+  output = output.replace(
+    /\bexport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, names, spec) => {
+      const statements = [];
+      for (const part of String(names).split(",")) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        const pieces = trimmed.split(/\s+as\s+/);
+        const local = pieces[0].trim();
+        const exported = (pieces[1] ?? pieces[0]).trim();
+        statements.push(`exports.${exported} = __ctStaticImport(${spec}).${local};`);
+      }
+      return statements.join(" ");
+    },
+  );
+  output = output.replace(
+    /\bexport\s*\*\s*from\s*(['"][^'"]+['"])\s*;?/g,
+    (_all, spec) => `{ const __ctNs = __ctStaticImport(${spec}); for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") exports[__ctKey] = __ctNs[__ctKey]; } }`,
+  );
   output = output.replace(/\bexport\s+default\s+/g, "exports.default = ");
   output = output.replace(/\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
     exportAssignments.push(`exports.${name} = ${name};`);
     return `${kind} ${name} =`;
   });
-  output = output.replace(/\bexport\s+function\s+([A-Za-z_$][\w$]*)\s*\(/g, (_all, name) => {
+  // Declarations without initializer (e.g. the `export var ns;` emitted for
+  // TypeScript namespaces by the type stripper).
+  output = output.replace(/\bexport\s+(let|var)\s+([A-Za-z_$][\w$]*)\s*;/g, (_all, kind, name) => {
     exportAssignments.push(`exports.${name} = ${name};`);
-    return `function ${name}(`;
+    return `${kind} ${name};`;
+  });
+  output = output.replace(/\bexport\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+    exportAssignments.push(`exports.${name} = ${name};`);
+    return `async function ${star}${name}(`;
+  });
+  output = output.replace(/\bexport\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+    exportAssignments.push(`exports.${name} = ${name};`);
+    return `function ${star}${name}(`;
   });
   output = output.replace(/\bexport\s+class\s+([A-Za-z_$][\w$]*)\s*/g, (_all, name) => {
     exportAssignments.push(`exports.${name} = ${name};`);
@@ -675,7 +965,7 @@ function transformEsmSourceForDynamicImport(source) {
     }
     return "";
   });
-  return `${output}\n${exportAssignments.join("\n")}`;
+  return `${staticImportHelperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
 }
 
 function executeDynamicImportSource(resolved, source, format) {
@@ -686,13 +976,19 @@ function executeDynamicImportSource(resolved, source, format) {
     return namespaceFromCommonJs(value);
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
-    return { default: JSON.parse(String(source ?? "")) };
+    const jsonSource = String(source ?? "");
+    try {
+      return { default: JSON.parse(jsonSource) };
+    } catch (error) {
+      if (/(^|[\\/])package\.json$/.test(String(resolvedPath))) return { default: parseJSONC(jsonSource) };
+      throw error;
+    }
   }
   if (effectiveFormat === "commonjs" || String(resolvedPath).endsWith(".cjs")) {
     return namespaceFromCommonJs(executeHookSource(resolvedPath, String(source ?? "").replace(/\bimport\.meta\b/g, "__ctImportMeta"), "commonjs"));
   }
   const namespace = {};
-  const transformed = transformEsmSourceForDynamicImport(source ?? "");
+  const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, source ?? ""));
   maybeRegisterSourceMap(resolvedPath, transformed);
   recordCompileCache(resolvedPath, transformed);
   const run = new Function("exports", "require", "__ctImportMeta", `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`);
@@ -730,10 +1026,24 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
 }
 
-globalThis.__cottontailImportModule = __importModule;
+// The native dynamic-import shim (cottontail.importModule) stringifies any
+// exception thrown synchronously by this hook, losing error identity (e.g.
+// error.code). Return a rejected promise instead so the original Error object
+// reaches the awaiting caller intact.
+globalThis.__cottontailImportModule = (specifier, referrer, options) => {
+  try {
+    return __importModule(specifier, referrer, options);
+  } catch (error) {
+    const rejected = Promise.reject(error);
+    // Pre-attach a no-op handler so the runtime's unhandled-rejection tracker
+    // does not flag it before the awaiting caller attaches its own handler.
+    rejected.catch(() => {});
+    return rejected;
+  }
+};
 
 function executeQueriedModule(module, filename, suffix) {
-  const source = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  const source = maybeStripTypeScript(filename, cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
   const transformed = transformEsmSourceForDynamicImport(source);
   maybeRegisterSourceMap(filename, transformed);
   recordCompileCache(filename, transformed);
@@ -871,13 +1181,46 @@ function bundledCallerPathFromStack() {
   return null;
 }
 
+// A parse error in the entry module is a startup failure: print a
+// Bun-style parse diagnostic (code frame + "error: Syntax Error") and
+// exit 1, matching how `bun <file>` reports transpiler errors. Nested
+// require() of invalid files keeps throwing a catchable SyntaxError.
+function reportMainCompileError(error, info) {
+  const lines = String(info.source).split("\n");
+  const line = Math.min(Math.max(Number(info.line) || 1, 1), lines.length || 1);
+  const text = lines[line - 1] ?? "";
+  const columnIndex = Math.max(text.length - text.trimStart().length, 0);
+  const gutter = `${line} | `;
+  const output = [
+    `${gutter}${text}`,
+    `${" ".repeat(gutter.length + columnIndex)}^`,
+    `error: Syntax Error: ${error?.message ?? error}`,
+    `    at ${info.filename}:${line}:${columnIndex + 1}`,
+    "",
+    `${error?.name ?? "SyntaxError"}: ${error?.message ?? error}`,
+    "",
+  ].join("\n");
+  try {
+    globalThis.process?.stderr?.write?.(output);
+  } catch {
+    console.error(output);
+  }
+  cottontail.exit(1);
+}
+
 export function __runMain(filename) {
   const resolved = resolve(String(filename));
   const module = makeModule(resolved);
   commonJsCache.set(resolved, module);
   const require = createRequire(resolved);
   require.main = module;
-  return executeCommonJsModule(module, resolved);
+  try {
+    return executeCommonJsModule(module, resolved);
+  } catch (error) {
+    const info = error?.__ctModuleCompileError;
+    if (info) reportMainCompileError(error, info);
+    throw error;
+  }
 }
 
 export class Module {
@@ -1201,7 +1544,13 @@ export const _extensions = {
     return executeCommonJsModule(module, filename);
   },
   ".json"(module, filename) {
-    module.exports = JSON.parse(cottontail.readFile(filename));
+    const source = cottontail.readFile(filename);
+    try {
+      module.exports = JSON.parse(source);
+    } catch (error) {
+      if (/(^|[\\/])package\.json$/.test(String(filename))) module.exports = parseJSONC(source);
+      else throw error;
+    }
     module.loaded = true;
   },
 };

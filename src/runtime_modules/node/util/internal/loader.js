@@ -822,6 +822,18 @@ const externalFactories = {
 // The require() implementation shared by all vendored modules.
 const moduleCache = new Map();
 
+// Bootstrap steps Node's loader performs right after a vendored module's
+// factory runs. Without these the module-level state stays uninitialized
+// (e.g. debuglog's `testEnabled` is undefined until initializeDebugEnv runs,
+// making util.debuglog() throw "testEnabled is not a function").
+const postInitHooks = {
+  "internal/util/debuglog": (exports) => {
+    if (typeof exports.initializeDebugEnv === "function") {
+      exports.initializeDebugEnv(globalThis.process?.env?.NODE_DEBUG ?? "");
+    }
+  },
+};
+
 export function internalRequire(rawId) {
   const id = String(rawId).replace(/^node:/, "");
   const cached = moduleCache.get(id);
@@ -833,6 +845,7 @@ export function internalRequire(rawId) {
     moduleCache.set(id, module);
     try {
       factory(module, module.exports, internalRequire, internalBinding, primordials);
+      postInitHooks[id]?.(module.exports);
     } catch (error) {
       moduleCache.delete(id);
       throw error;

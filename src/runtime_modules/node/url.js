@@ -1137,6 +1137,16 @@ export function fileURLToPathBuffer(url) {
 // input an invalid domain, for which Node (and Bun) return "".
 const forbiddenDomainChars = /[\0\t\n\r #%/:<>?@[\\\]^|"{}`]/;
 
+// A label beginning with the ACE prefix "xn--" must already be pure ASCII
+// punycode; if it still contains non-ASCII characters the domain is invalid
+// and Node (and Bun) return "" from domainToASCII/domainToUnicode.
+function hasInvalidAcePrefixLabel(text) {
+  for (const label of text.split(".")) {
+    if (/^xn--/i.test(label) && /[^\x00-\x7f]/.test(label)) return true;
+  }
+  return false;
+}
+
 export function domainToASCII(domain) {
   if (arguments.length < 1) {
     const err = new TypeError('The "domain" argument must be specified');
@@ -1148,6 +1158,7 @@ export function domainToASCII(domain) {
   const text = String(domain);
   if (text === "") return "";
   if (forbiddenDomainChars.test(text)) return "";
+  if (hasInvalidAcePrefixLabel(text)) return "";
   try {
     return toASCII(text);
   } catch {

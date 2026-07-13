@@ -333,7 +333,14 @@ function pemFromDer(label, der) {
 }
 
 function derFromPemOrBytes(value, label) {
-  if (typeof value !== "string") return bytesFromData(value);
+  if (typeof value !== "string") {
+    const bytes = bytesFromData(value);
+    // Node accepts PEM text supplied as a Buffer/TypedArray too; sniff for a
+    // PEM armor header before treating the bytes as raw DER.
+    const prefix = String.fromCharCode(...bytes.slice(0, 64)).trimStart();
+    if (!prefix.startsWith("-----BEGIN ")) return bytes;
+    value = new TextDecoder("latin1").decode(bytes);
+  }
   const match = value.match(new RegExp(`-----BEGIN ${label}-----([\\s\\S]*?)-----END ${label}-----`));
   if (!match) throw new Error("PEM start line not found");
   return bytesFromData(match[1].replace(/\s+/g, ""), "base64");
@@ -3358,6 +3365,18 @@ export function generateKeyPair(type, options, callback) {
     }
   });
 }
+
+// util.promisify(crypto.generateKeyPair) resolves with { publicKey, privateKey }
+// (Node tags the callback args via kCustomPromisifyArgsSymbol).
+Object.defineProperty(generateKeyPair, Symbol.for("nodejs.util.promisify.custom"), {
+  value: (type, options = undefined) => new Promise((resolvePair, rejectPair) => {
+    generateKeyPair(type, options ?? {}, (error, publicKey, privateKey) => {
+      if (error) rejectPair(error);
+      else resolvePair({ publicKey, privateKey });
+    });
+  }),
+  configurable: true,
+});
 
 export function generateKeySync(type, options = {}) {
   const normalized = String(type).toLowerCase();

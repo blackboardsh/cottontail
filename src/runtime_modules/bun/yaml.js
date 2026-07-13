@@ -46,7 +46,9 @@ function yamlTextInput(input) {
 }
 
 function syntaxErrorFrom(error) {
-  const syntax = new SyntaxError(error?.message ?? String(error));
+  const original = String(error?.message ?? error);
+  const message = original.startsWith("YAML Parse error") ? original : `YAML Parse error: ${original}`;
+  const syntax = new SyntaxError(message);
   if (error?.stack) syntax.stack = error.stack;
   return syntax;
 }
@@ -92,10 +94,154 @@ function validateDirectives(source) {
   }
 }
 
+// --- Memory-lean fast path -------------------------------------------------
+// The vendored full YAML parser builds a CST token tree plus an AST document
+// for every parse, which has a very large transient allocation footprint on
+// big-but-simple documents (issue #26088 upstream). For strictly simple block
+// YAML (plain ASCII scalars, block maps/seqs, no quotes/flow/anchors/tags/
+// directives/comments/tabs/multi-line scalars) we can produce the identical
+// core-schema result directly from the source lines with a tiny fraction of
+// the allocations. Anything outside that strict subset bails out to the full
+// parser, so semantics never diverge.
+const FAST_BAIL = Symbol("yaml.fast.bail");
+// Any character with special YAML meaning that the fast subset does not
+// model triggers a bail-out for the whole document.
+const FAST_UNSAFE = /[\t\r%&*!|>'"{}[\],#?~`@\\<]|^\s*-\s*$|^---|^\.\.\./m;
+const FAST_KEY = /^([A-Za-z0-9_](?:[A-Za-z0-9_. /-]*[A-Za-z0-9_./-])?):(?: (\S(?:.*\S)?))?$/;
+
+function fastResolveScalar(text) {
+  if (text === "" || text === "null" || text === "Null" || text === "NULL") return null;
+  if (text === "true" || text === "True" || text === "TRUE") return true;
+  if (text === "false" || text === "False" || text === "FALSE") return false;
+  if (/^[-+]?[0-9]+$/.test(text)) return Number(text);
+  if (/^0o[0-7]+$/.test(text)) return Number.parseInt(text.slice(2), 8);
+  if (/^0x[0-9a-fA-F]+$/.test(text)) return Number.parseInt(text.slice(2), 16);
+  if (/^[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?$/.test(text)) return Number(text);
+  if (/^[-+]?\.(?:inf|Inf|INF)$/.test(text)) return text[0] === "-" ? -Infinity : Infinity;
+  if (/^\.(?:nan|NaN|NAN)$/.test(text)) return Number.NaN;
+  return text;
+}
+
+function fastScalarOrBail(text) {
+  // Values containing ":" (e.g. URLs) or leading/odd spacing are legal YAML
+  // but outside the audited subset; punt to the full parser.
+  if (text.includes(":") || text.startsWith(" ") || text.endsWith(" ") || text === "-" || text.startsWith("- ")) throw FAST_BAIL;
+  return fastResolveScalar(text);
+}
+
+function fastIsSeqItem(content) {
+  return content === "-" || (content.charCodeAt(0) === 45 && content.charCodeAt(1) === 32);
+}
+
+// state: { indents: number[], contents: string[], count, i }
+function fastParseNode(state) {
+  const { indents, contents } = state;
+  const indent = indents[state.i];
+  if (fastIsSeqItem(contents[state.i])) {
+    const out = [];
+    while (state.i < state.count) {
+      if (indents[state.i] !== indent) break;
+      const content = contents[state.i];
+      if (!fastIsSeqItem(content)) break;
+      state.i += 1;
+      if (content === "-") {
+        if (state.i < state.count && indents[state.i] > indent) out.push(fastParseNode(state));
+        else throw FAST_BAIL; // "-" with no inline value and no nested block
+      } else {
+        // Dedupe repeated item lines (very common in large documents) so a
+        // 10k-item list allocates one value, not 10k slices.
+        let value = state.cache.get(content);
+        if (value === undefined && !state.cache.has(content)) {
+          value = fastScalarOrBail(content.slice(2).trim());
+          state.cache.set(content, value);
+        }
+        out.push(value);
+        if (state.i < state.count && indents[state.i] > indent) throw FAST_BAIL; // continuation line
+      }
+    }
+    if (state.i < state.count && indents[state.i] > indent) throw FAST_BAIL;
+    return out;
+  }
+
+  if (!FAST_KEY.test(contents[state.i])) throw FAST_BAIL;
+  const out = {};
+  while (state.i < state.count) {
+    if (indents[state.i] !== indent) break;
+    const content = contents[state.i];
+    if (fastIsSeqItem(content)) break;
+    const match = FAST_KEY.exec(content);
+    if (!match) throw FAST_BAIL;
+    const key = match[1];
+    const rest = match[2];
+    state.i += 1;
+    if (rest === undefined) {
+      if (state.i < state.count && indents[state.i] > indent) {
+        out[key] = fastParseNode(state);
+      } else if (state.i < state.count && indents[state.i] === indent && fastIsSeqItem(contents[state.i])) {
+        out[key] = fastParseNode(state);
+      } else {
+        out[key] = null;
+      }
+    } else {
+      out[key] = fastScalarOrBail(rest);
+      if (state.i < state.count && indents[state.i] > indent) throw FAST_BAIL; // continuation line
+    }
+  }
+  if (state.i < state.count && indents[state.i] > indent) throw FAST_BAIL;
+  return out;
+}
+
+// After heavy fast-path churn, nudge the collector so transient line/string
+// garbage does not ratchet RSS upward (the full parser fix for #26088).
+let fastChurnBytes = 0;
+const FAST_CHURN_GC_THRESHOLD = 1024 * 1024;
+
+function tryFastParse(source) {
+  if (typeof source !== "string" || source.length === 0) return FAST_BAIL;
+  if (FAST_UNSAFE.test(source)) return FAST_BAIL;
+  const indents = [];
+  const contents = [];
+  const length = source.length;
+  let offset = 0;
+  while (offset < length) {
+    let end = source.indexOf("\n", offset);
+    if (end === -1) end = length;
+    let start = offset;
+    while (start < end && source.charCodeAt(start) === 32) start += 1;
+    let stop = end;
+    while (stop > start && source.charCodeAt(stop - 1) === 32) stop -= 1;
+    if (stop > start) {
+      indents.push(start - offset);
+      contents.push(source.slice(start, stop));
+    }
+    offset = end + 1;
+  }
+  if (contents.length === 0) return FAST_BAIL;
+  // Only handle top-level block maps/seqs; scalar documents fall back.
+  if (!(fastIsSeqItem(contents[0]) || FAST_KEY.test(contents[0]))) return FAST_BAIL;
+  try {
+    const state = { indents, contents, count: contents.length, i: 0, cache: new Map() };
+    const value = fastParseNode(state);
+    if (state.i !== state.count) return FAST_BAIL;
+    fastChurnBytes += length;
+    if (fastChurnBytes >= FAST_CHURN_GC_THRESHOLD) {
+      fastChurnBytes = 0;
+      globalThis.cottontail?.gc?.();
+    }
+    return { value };
+  } catch (error) {
+    if (error === FAST_BAIL) return FAST_BAIL;
+    throw error;
+  }
+}
+// ---------------------------------------------------------------------------
+
 export function parse(input) {
   const source = yamlTextInput(input);
+  const fast = tryFastParse(source);
+  if (fast !== FAST_BAIL) return fast.value;
   try {
-    validateDirectives(source);
+    if (source.includes("%")) validateDirectives(source);
     const documents = parseAllYAMLDocuments(source, parseOptions);
     if (documents.length === 0) return null;
     if (documents.length > 1) {

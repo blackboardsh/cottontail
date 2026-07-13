@@ -56,6 +56,21 @@ if (Buffer && typeof Buffer.concat === "function" && !Buffer.concat.__cottontail
   Buffer.concat = patchedConcat;
 }
 
+if (Buffer && typeof Buffer.isEncoding !== "function") {
+  const knownEncodings = new Set([
+    "utf8", "utf-8",
+    "hex",
+    "base64", "base64url",
+    "ascii",
+    "latin1", "binary",
+    "ucs2", "ucs-2",
+    "utf16le", "utf-16le",
+  ]);
+  Buffer.isEncoding = function isEncoding(encoding) {
+    return typeof encoding === "string" && encoding.length !== 0 && knownEncodings.has(encoding.toLowerCase());
+  };
+}
+
 function bytesFrom(value) {
   if (value == null) return new Uint8Array(0);
   if (value instanceof ArrayBuffer) return new Uint8Array(value);

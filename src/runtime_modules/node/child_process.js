@@ -2,6 +2,8 @@ import { EventEmitter } from "./events.js";
 import { Buffer } from "./buffer.js";
 import { deserialize, serialize } from "./v8.js";
 import { Server as NetServer, Socket as NetSocket } from "./net.js";
+import { Readable as ReadableStreamClass, Writable as WritableStreamClass } from "./stream.js";
+import { accessSync, statSync, constants as fsConstants } from "./fs.js";
 
 export class ChildProcess extends EventEmitter {
   constructor() {
@@ -233,17 +235,29 @@ function withoutElectrobunHostEnv(env) {
   return next;
 }
 
+function sanitizeEnvObject(env) {
+  if (env === undefined || env === null) return env;
+  const sanitized = {};
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (value === undefined) continue;
+    sanitized[key] = String(value);
+  }
+  return sanitized;
+}
+
 function prepareNativeOptions(file, options = {}) {
   if (options.env === undefined) {
     // Node inherits the (possibly mutated) process.env object, not the raw environ.
     return {
       ...options,
-      env: withoutElectrobunHostEnv(process.env),
+      env: sanitizeEnvObject(withoutElectrobunHostEnv(process.env)),
       clearEnv: true,
     };
   }
   return {
     ...options,
+    env: sanitizeEnvObject(options.env),
     clearEnv: true,
   };
 }
@@ -309,12 +323,43 @@ function makeAbortError(reason = undefined) {
 }
 
 function normalizeStdio(value, fallback) {
-  if (value === undefined) return fallback;
-  if (value === null) return "ignore";
+  // Node treats both null and undefined stdio entries as the default (pipe
+  // for fds 0-2).
+  if (value === undefined || value === null) return fallback;
   if (value === "pipe" || value === "inherit" || value === "ignore") return value;
   if (value === "ipc") return "pipe";
   if (typeof value === "number") return "inherit";
   return fallback;
+}
+
+// Node surfaces exec failures (missing file, not executable) as an async
+// 'error' event with ENOENT/EACCES rather than an exit code; approximate the
+// spawn syscall's checks for direct paths before handing off to the native
+// spawner.
+function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
+  if (!String(resolvedFile).includes("/")) return null;
+  const makeError = (code, errno) => {
+    const error = new Error(`spawn ${originalFile} ${code}`);
+    error.code = code;
+    error.errno = errno;
+    error.syscall = `spawn ${originalFile}`;
+    error.path = String(originalFile);
+    error.spawnargs = Array.from(spawnargs ?? [], String);
+    return error;
+  };
+  let stats;
+  try {
+    stats = statSync(resolvedFile);
+  } catch {
+    return makeError("ENOENT", -2);
+  }
+  try {
+    accessSync(resolvedFile, fsConstants.X_OK);
+  } catch {
+    return makeError("EACCES", -13);
+  }
+  if (stats.isDirectory()) return makeError("EACCES", -13);
+  return null;
 }
 
 export function spawn(file, args = [], options = {}) {
@@ -323,6 +368,7 @@ export function spawn(file, args = [], options = {}) {
   args = normalized.args;
   options = normalized.options;
   const command = normalizeSpawnCommand(file, args, options);
+  const preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
   const listeners = new Map();
   const stdoutListeners = new Map();
   const stderrListeners = new Map();
@@ -370,7 +416,10 @@ export function spawn(file, args = [], options = {}) {
     map.set(name, handlers.filter((item) => item !== handler));
   };
 
-  const makeStream = (map, fd, writeImpl = null) => ({
+  // The prototype makes `child.stdout instanceof stream.Readable` (and stdin
+  // instanceof stream.Writable) hold, matching Node; every method these pipe
+  // objects actually support is an own property assigned below.
+  const makeStream = (map, fd, writeImpl = null) => Object.assign(Object.create(fd === 0 ? WritableStreamClass.prototype : ReadableStreamClass.prototype), {
     fd,
     _encoding: null,
     _readableBuffer: [],
@@ -519,6 +568,10 @@ export function spawn(file, args = [], options = {}) {
     },
   });
 
+  // Node exposes stdio as an enumerable own property (libraries such as
+  // tinyspawn rely on Object.assign copying stdin/stdout/stderr/stdio).
+  child.stdio = [child.stdin, child.stdout, child.stderr];
+
   if (options.timeout != null && Number(options.timeout) > 0) {
     child._timeoutTimer = setTimeout(() => {
       child.kill(options.killSignal ?? "SIGTERM");
@@ -615,6 +668,12 @@ export function spawn(file, args = [], options = {}) {
 
   if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
     installParentIpcChannel(child, options.serialization);
+  }
+
+  if (preflightError) {
+    // Failed exec: 'error' fires asynchronously instead of 'spawn'.
+    queueMicrotask(() => emitChild("error", preflightError));
+    return child;
   }
 
   // Node emits 'spawn' asynchronously once the process started successfully.

@@ -297,6 +297,10 @@ export function createWritableStdio(fd = 1) {
   };
   stream.ref = () => stream;
   stream.unref = () => stream;
+  // Node's stdout/stderr are Duplex-like and expose Symbol.asyncIterator
+  // (tools like execa feature-detect this); iterating a write-only stream
+  // completes immediately without yielding values.
+  stream[Symbol.asyncIterator] = async function* asyncIterator() {};
 
   return stream;
 }
