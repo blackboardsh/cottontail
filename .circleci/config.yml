@@ -1,0 +1,157 @@
+version: 2.1
+
+orbs:
+  win: circleci/windows@5.0
+
+commands:
+  setup-unix:
+    steps:
+      - run:
+          name: Vendor Zig and JavaScriptCore
+          command: node scripts/setup.js && node scripts/setup-jsc.js
+  build-test-package-unix:
+    steps:
+      - run:
+          name: Run Zig tests
+          command: node scripts/zig.js build test
+      - run:
+          name: Build release binary
+          command: node scripts/zig.js build -Doptimize=ReleaseSmall
+      - run:
+          name: Smoke test release binary
+          command: test "$(./zig-out/bin/cottontail -p '6 * 7')" = "42"
+      - run:
+          name: Package release
+          command: node scripts/package-release.js
+      - store_artifacts:
+          path: release
+      - persist_to_workspace:
+          root: .
+          paths:
+            - release
+
+jobs:
+  build-macos-arm64:
+    macos:
+      xcode: 26.4.0
+    resource_class: m4pro.medium
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cottontail-macos-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+      - run:
+          name: Install build dependencies
+          command: |
+            brew install node@24 openssl@3 libffi
+            echo 'export PATH="/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
+      - setup-unix
+      - save_cache:
+          key: cottontail-macos-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          paths:
+            - vendors/zig
+            - vendors/jsc
+      - build-test-package-unix
+
+  build-linux-x64:
+    machine:
+      image: ubuntu-2404:current
+    resource_class: medium
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cottontail-linux-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+      - run:
+          name: Install build dependencies
+          command: |
+            curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+            sudo apt-get install -y \
+              nodejs libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+      - setup-unix
+      - save_cache:
+          key: cottontail-linux-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          paths:
+            - vendors/zig
+            - vendors/jsc
+      - build-test-package-unix
+
+  build-linux-arm64:
+    machine:
+      image: arm-default
+    resource_class: arm.medium
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cottontail-linux-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+      - run:
+          name: Install build dependencies
+          command: |
+            curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+            sudo apt-get install -y \
+              nodejs libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+      - setup-unix
+      - save_cache:
+          key: cottontail-linux-arm64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          paths:
+            - vendors/zig
+            - vendors/jsc
+      - build-test-package-unix
+
+  build-windows-x64:
+    executor: win/default
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - cottontail-windows-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+      - run:
+          name: Install Node.js
+          shell: powershell.exe
+          command: choco install nodejs-lts -y --no-progress
+      - run:
+          name: Vendor Zig and JavaScriptCore
+          shell: powershell.exe
+          command: |
+            node scripts/setup.js
+            node scripts/setup-jsc.js
+      - save_cache:
+          key: cottontail-windows-x64-v1-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/setup.js" }}
+          paths:
+            - vendors/zig
+            - vendors/jsc
+      - run:
+          name: Run Zig tests
+          shell: powershell.exe
+          command: node scripts/zig.js build test
+      - run:
+          name: Build release binary
+          shell: powershell.exe
+          command: node scripts/zig.js build -Doptimize=ReleaseSmall
+      - run:
+          name: Smoke test release binary
+          shell: powershell.exe
+          command: |
+            $output = & .\zig-out\bin\cottontail.exe -p '6 * 7'
+            if ($LASTEXITCODE -ne 0 -or $output.Trim() -ne '42') {
+              throw "Cottontail smoke test failed: $output"
+            }
+      - run:
+          name: Package release
+          shell: powershell.exe
+          command: node scripts/package-release.js
+      - store_artifacts:
+          path: release
+      - persist_to_workspace:
+          root: .
+          paths:
+            - release
+
+workflows:
+  build-release-matrix:
+    jobs:
+      - build-macos-arm64
+      - build-linux-x64
+      - build-linux-arm64
+      - build-windows-x64

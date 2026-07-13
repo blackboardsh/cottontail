@@ -12,6 +12,7 @@
     "check-zig-version": "bun run setup && node scripts/zig.js version",
     "build": "bun run setup && node scripts/zig.js build",
     "build:release": "bun run setup && node scripts/zig.js build -Doptimize=ReleaseSmall",
+    "package:release": "node scripts/package-release.js",
     "run": "bun run setup && node scripts/run.js",
     "dev": "bun run run -- test.js",
     "bench:build": "bun run build:release",

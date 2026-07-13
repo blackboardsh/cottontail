@@ -28,9 +28,11 @@ is the build: the earlier macOS system-framework path has been removed. `bun run
 setup` downloads the release pinned in `scripts/jsc-manifest.json` into the
 gitignored `vendors/jsc/` directory (with sha256 verification), and the regular
 `node scripts/zig.js build` links the vendored static libraries. Cross-platform
-distribution will use these Cottontail-owned builds (the pinned release also
-ships linux-amd64, linux-arm64, and windows-arm64 archives; only macOS arm64 is
-wired up so far). The only intended Cottontail-specific WebKit change is
+distribution uses these Cottontail-owned builds. The pinned release ships
+macOS arm64, Linux x64/arm64, and Windows arm64 archives. Cottontail's release
+matrix uses the first three directly; Windows x64 is checksum-gated on an x64
+JSC archive until that target is added to the pinned release. The only intended
+Cottontail-specific WebKit change is
 Electrobun's support for packaging ICU data separately from the engine. Keeping
 that boundary allows a future Electrobun packaging step to include only the ICU
 data an application requests, without changing JavaScriptCore behavior or its
@@ -51,6 +53,7 @@ exposed by Cottontail itself.
 - `bun run setup:jsc` vendors only the pinned JavaScriptCore build (see `scripts/jsc-manifest.json`).
 - `bun run build` builds the debug executable.
 - `bun run build:release` builds with `ReleaseSmall`.
+- `bun run package:release` creates a platform archive and SHA-256 file under `release/`.
 - `bun run run -- test.js` builds and runs a JavaScript file through `cottontail`.
 - `bun run dev` vendors, builds, and runs the smoke test in `test.js`.
 - `bun run bench` builds a release binary and runs dedicated startup / loop / JSON / async benchmarks.
@@ -61,6 +64,31 @@ exposed by Cottontail itself.
 - `bun run electrobun:window` opens a native window through the local Electrobun core.
 - `bun run test` runs both the Zig and JavaScript tests.
 - `bun run check-zig-version` prints the vendored Zig version through the local wrapper script.
+
+## Release builds
+
+CircleCI defines native release jobs for macOS arm64, Linux x64, Linux arm64,
+and Windows x64 in `.circleci/config.yml`. Every job is configured to run Zig
+tests, build with `ReleaseSmall`, smoke-test the binary, package the runtime
+modules and platform esbuild binary, and store the archive plus its SHA-256
+file. The Windows job remains a bring-up gate until the x64 JSC input and the
+Win32 host implementation described below are complete.
+
+The archive layout is stable for Dash CLI consumption:
+
+- `bin/cottontail` (`bin/cottontail.exe` on Windows)
+- `src/runtime_modules/`
+- `vendors/esbuild/`
+- `cottontail-release.json`
+
+Windows x64 currently requires `COTTONTAIL_JSC_WINDOWS_X64_URL` and
+`COTTONTAIL_JSC_WINDOWS_X64_SHA256` in the CircleCI project environment. The
+URL must point to the same archive layout produced by `blackboardsh/jsc`. Once
+that artifact is published with the pinned JSC release, it should be moved into
+`scripts/jsc-manifest.json` and the temporary environment contract removed.
+The current C host bridge also uses POSIX APIs directly for process, socket,
+DNS, polling, mmap, user/group, and filesystem behavior; those paths still need
+native Win32 implementations before the Windows job can pass.
 
 ## Bootstrap
 

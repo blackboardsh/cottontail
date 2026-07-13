@@ -15,6 +15,7 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
             else => null,
         },
         .windows => switch (target.cpu.arch) {
+            .x86_64 => "windows-amd64",
             .aarch64 => "windows-arm64",
             else => null,
         },
@@ -40,6 +41,9 @@ fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
 
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.rdynamic = true;
+    // Static JSC uses indirectly referenced LLInt/JIT entry points that the
+    // release linker otherwise discards, producing SIGBUS at runtime.
+    step.link_gc_sections = false;
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
     step.root_module.addIncludePath(b.path("vendors/bun-zig/src/jsc/bindings/sqlite"));
@@ -70,51 +74,80 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
 
     const resolved_target = step.root_module.resolved_target.?.result;
 
-    if (resolved_target.os.tag == .macos) {
-        const platform_key = jscVendorPlatformKey(resolved_target) orelse {
-            std.debug.print(
-                "error: no vendored JavaScriptCore asset for this target; supported: macos-arm64, linux-amd64, linux-arm64, windows-arm64\n",
-                .{},
-            );
-            std.process.exit(1);
-        };
-        const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
-        std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})), .{}) catch {
-            std.debug.print(
-                "error: vendored JavaScriptCore not found at {s}; run `bun run setup` (or `node scripts/setup-jsc.js`) first\n",
-                .{vendor_dir},
-            );
-            std.process.exit(1);
-        };
-        // The vendored build is a JSCOnly static build: link the archives
-        // directly plus the system pieces the jsc binary itself depends on
-        // (Apple libc++, libicucore for i18n, Foundation/objc for CF glue).
-        step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
-        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
-        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
-        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
-        step.root_module.link_libcpp = true;
-        step.root_module.linkSystemLibrary("icucore", .{});
-        step.root_module.linkSystemLibrary("objc", .{});
-        step.root_module.linkFramework("Foundation", .{});
-        step.root_module.linkSystemLibrary("ffi", .{});
-        step.root_module.linkSystemLibrary("compression", .{});
-        step.root_module.linkSystemLibrary("pthread", .{});
-        step.root_module.linkSystemLibrary("resolv", .{});
-        step.root_module.linkSystemLibrary("z", .{});
-        step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        step.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
-        step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-        step.root_module.linkSystemLibrary("crypto", .{});
-        step.root_module.linkSystemLibrary("ssl", .{});
-    } else {
+    const platform_key = jscVendorPlatformKey(resolved_target) orelse {
         std.debug.print(
-            "error: cottontail currently links the vendored JavaScriptCore on macOS only. Linux/Windows wiring against the vendored static JSC build (vendors/jsc) is coming.\n",
-            .{},
+            "error: no vendored JavaScriptCore target for {s}-{s}\n",
+            .{ @tagName(resolved_target.os.tag), @tagName(resolved_target.cpu.arch) },
         );
         std.process.exit(1);
+    };
+    const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
+    step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
+
+    switch (resolved_target.os.tag) {
+        .macos => {
+            requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
+            // The vendored build is a JSCOnly static build: link the archives
+            // directly plus the system pieces the jsc binary itself depends on
+            // (Apple libc++, libicucore for i18n, Foundation/objc for CF glue).
+            step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
+            step.root_module.link_libcpp = true;
+            step.root_module.linkSystemLibrary("icucore", .{});
+            step.root_module.linkSystemLibrary("objc", .{});
+            step.root_module.linkFramework("Foundation", .{});
+            step.root_module.linkSystemLibrary("ffi", .{});
+            step.root_module.linkSystemLibrary("compression", .{});
+            step.root_module.linkSystemLibrary("pthread", .{});
+            step.root_module.linkSystemLibrary("resolv", .{});
+            step.root_module.linkSystemLibrary("z", .{});
+            step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            step.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
+            step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+            step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
+            step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+        },
+        .linux => {
+            requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
+            step.root_module.link_libcpp = true;
+            inline for (&.{
+                "atomic", "brotlicommon", "brotlidec", "brotlienc", "dl", "ffi", "icudata", "icui18n",
+                "icuuc",  "m",            "pthread",   "resolv",    "z",
+            }) |library| step.root_module.linkSystemLibrary(library, .{});
+            step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
+            step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+        },
+        .windows => {
+            requireJscLibrary(b, vendor_dir, "JavaScriptCore.lib");
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/JavaScriptCore.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/WTF.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/bmalloc.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicudt.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicuin.lib", .{vendor_dir})));
+            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicuuc.lib", .{vendor_dir})));
+            inline for (&.{ "advapi32", "bcrypt", "shell32", "userenv", "winmm", "ws2_32" }) |library| {
+                step.root_module.linkSystemLibrary(library, .{});
+            }
+        },
+        else => unreachable,
     }
+}
+
+fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8) void {
+    const path = b.fmt("{s}/lib/{s}", .{ vendor_dir, library });
+    std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(path), .{}) catch {
+        std.debug.print(
+            "error: vendored JavaScriptCore library not found at {s}; run `bun run setup:jsc` first\n",
+            .{path},
+        );
+        std.process.exit(1);
+    };
 }
 
 pub fn build(b: *std.Build) void {

@@ -14,6 +14,11 @@ const RunElectrobunMainThreadFn = *const fn (
 ) callconv(.c) c_int;
 const ElectrobunLastErrorFn = *const fn () callconv(.c) ?[*:0]const u8;
 
+const Win32Library = opaque {};
+extern "kernel32" fn LoadLibraryA(path: [*:0]const u8) callconv(.c) ?*Win32Library;
+extern "kernel32" fn GetProcAddress(library: *Win32Library, name: [*:0]const u8) callconv(.c) ?*anyopaque;
+extern "kernel32" fn FreeLibrary(library: *Win32Library) callconv(.c) c_int;
+
 const ScriptExecution = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -130,9 +135,13 @@ pub fn runStdin(
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(allocator);
 
+    var reader_buffer: [8192]u8 = undefined;
     var buffer: [8192]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &reader_buffer);
     while (true) {
-        const count = try std.posix.read(std.posix.STDIN_FILENO, &buffer);
+        const count = stdin_reader.interface.readSliceShort(&buffer) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+        };
         if (count == 0) break;
         if (source.items.len + count > 64 * 1024 * 1024) return error.StreamTooLong;
         try source.appendSlice(allocator, buffer[0..count]);
@@ -232,17 +241,37 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
     const dist_dir = ctx.environ_map.get("COTTONTAIL_ELECTROBUN_DIST") orelse return 0;
     const core_path = try std.fs.path.join(ctx.allocator, &.{ dist_dir, electrobunCoreFileName() });
 
-    var core = try std.DynLib.open(core_path);
-    defer core.close();
+    var windows_core: ?*Win32Library = null;
+    var unix_core: std.DynLib = undefined;
+    var unix_core_open = false;
+    defer if (builtin.os.tag == .windows) {
+        if (windows_core) |core| _ = FreeLibrary(core);
+    } else if (unix_core_open) {
+        unix_core.close();
+    };
 
-    const run_main_thread = core.lookup(
-        RunElectrobunMainThreadFn,
-        "electrobun_core_run_main_thread",
-    ) orelse return error.MissingElectrobunRunMainThread;
-    const last_error = core.lookup(
-        ElectrobunLastErrorFn,
-        "electrobun_core_last_error",
-    ) orelse return error.MissingElectrobunLastError;
+    const run_main_thread: RunElectrobunMainThreadFn, const last_error: ElectrobunLastErrorFn = if (builtin.os.tag == .windows) blk: {
+        const core_path_z = try ctx.allocator.dupeZ(u8, core_path);
+        const core = LoadLibraryA(core_path_z.ptr) orelse return error.OpenElectrobunCoreFailed;
+        windows_core = core;
+        const run_symbol = GetProcAddress(core, "electrobun_core_run_main_thread") orelse
+            return error.MissingElectrobunRunMainThread;
+        const error_symbol = GetProcAddress(core, "electrobun_core_last_error") orelse
+            return error.MissingElectrobunLastError;
+        break :blk .{ @ptrCast(run_symbol), @ptrCast(error_symbol) };
+    } else blk: {
+        unix_core = try std.DynLib.open(core_path);
+        unix_core_open = true;
+        const run_symbol = unix_core.lookup(
+            RunElectrobunMainThreadFn,
+            "electrobun_core_run_main_thread",
+        ) orelse return error.MissingElectrobunRunMainThread;
+        const error_symbol = unix_core.lookup(
+            ElectrobunLastErrorFn,
+            "electrobun_core_last_error",
+        ) orelse return error.MissingElectrobunLastError;
+        break :blk .{ run_symbol, error_symbol };
+    };
 
     const identifier = try ctx.allocator.dupeZ(
         u8,

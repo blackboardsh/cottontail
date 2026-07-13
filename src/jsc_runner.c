@@ -2,11 +2,20 @@
 
 #include <JavaScriptCore/JavaScript.h>
 #include <arpa/inet.h>
+#if defined(__APPLE__) || defined(__MACH__)
 #include <compression.h>
+#else
+#include <brotli/decode.h>
+#include <brotli/encode.h>
+#endif
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#if __has_include(<ffi/ffi.h>)
 #include <ffi/ffi.h>
+#else
+#include <ffi.h>
+#endif
 #include <fcntl.h>
 #include <grp.h>
 #include <ifaddrs.h>
@@ -1745,9 +1754,15 @@ static int ct_zlib_window_bits(CtZlibMode mode) {
 }
 
 static JSValueRef ct_brotli_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, JSValueRef *exception) {
+#if defined(__APPLE__) || defined(__MACH__)
     size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
         ? input_len + (input_len / 4) + 1024
         : input_len * 4 + 1024;
+#else
+    size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
+        ? BrotliEncoderMaxCompressedSize(input_len)
+        : input_len * 4 + 1024;
+#endif
     if (output_capacity < 1024) output_capacity = 1024;
 
     for (int attempt = 0; attempt < 12; attempt += 1) {
@@ -1756,10 +1771,26 @@ static JSValueRef ct_brotli_transform_sync(JSContextRef ctx, CtZlibMode mode, co
             ct_throw_message(ctx, exception, "Out of memory");
             return JSValueMakeUndefined(ctx);
         }
-        size_t output_len = mode == CT_ZLIB_BROTLI_COMPRESS
+        size_t output_len = output_capacity;
+#if defined(__APPLE__) || defined(__MACH__)
+        output_len = mode == CT_ZLIB_BROTLI_COMPRESS
             ? compression_encode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI)
             : compression_decode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI);
-        if (output_len > 0 || input_len == 0) {
+        bool succeeded = output_len > 0 || input_len == 0;
+#else
+        bool succeeded = mode == CT_ZLIB_BROTLI_COMPRESS
+            ? BrotliEncoderCompress(
+                BROTLI_DEFAULT_QUALITY,
+                BROTLI_DEFAULT_WINDOW,
+                BROTLI_MODE_GENERIC,
+                input_len,
+                input,
+                &output_len,
+                output
+            ) == BROTLI_TRUE
+            : BrotliDecoderDecompress(input_len, input, &output_len, output) == BROTLI_DECODER_RESULT_SUCCESS;
+#endif
+        if (succeeded) {
             return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
         }
         free(output);

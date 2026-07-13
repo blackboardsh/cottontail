@@ -39,6 +39,10 @@ function getPlatformKey() {
     return 'windows-arm64';
   }
 
+  if (platform === 'win32' && arch === 'x64') {
+    return 'windows-amd64';
+  }
+
   return null;
 }
 
@@ -64,7 +68,19 @@ function vendorJsc() {
     return;
   }
 
-  const asset = MANIFEST.assets[platformKey];
+  let asset = MANIFEST.assets[platformKey];
+
+  if (!asset && platformKey === 'windows-amd64') {
+    const url = process.env.COTTONTAIL_JSC_WINDOWS_X64_URL;
+    const sha256 = process.env.COTTONTAIL_JSC_WINDOWS_X64_SHA256;
+    if (!url || !sha256) {
+      fail(
+        'Windows x64 JavaScriptCore is not published in the pinned manifest. Set ' +
+          'COTTONTAIL_JSC_WINDOWS_X64_URL and COTTONTAIL_JSC_WINDOWS_X64_SHA256.'
+      );
+    }
+    asset = { name: 'cottontail-jsc-windows-amd64.tar.gz', sha256, url };
+  }
 
   if (!asset) {
     console.log(`- Skipping JavaScriptCore vendoring: no manifest entry for ${platformKey}`);
@@ -80,7 +96,8 @@ function vendorJsc() {
     return;
   }
 
-  const url = `https://github.com/${MANIFEST.repo}/releases/download/${MANIFEST.tag}/${asset.name}`;
+  const url = asset.url ??
+    `https://github.com/${MANIFEST.repo}/releases/download/${MANIFEST.tag}/${asset.name}`;
   const archivePath = join(JSC_ROOT, asset.name);
 
   console.log(`Vendoring JavaScriptCore ${MANIFEST.tag} (${platformKey})...`);
