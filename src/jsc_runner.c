@@ -13700,6 +13700,11 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "hostname", ct_hostname, runtime);
     JSObjectRef args = ct_make_array(ctx, 0, NULL, &exception);
     ct_set_property(ctx, host, "args", args, &exception);
+#if defined(COTTONTAIL_VENDORED_JSC)
+    ct_set_property(ctx, host, "jscVendored", JSValueMakeBoolean(ctx, true), &exception);
+#else
+    ct_set_property(ctx, host, "jscVendored", JSValueMakeBoolean(ctx, false), &exception);
+#endif
     ct_set_property(ctx, global, "cottontail", host, &exception);
 
     JSStringRef bootstrap = ct_js_string(
@@ -13796,16 +13801,34 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
     (void)stack_size;
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    /* Use JSGlobalContextCreateInGroup(NULL, ...) rather than JSGlobalContextCreate(NULL):
+     * on Darwin, JSGlobalContextCreate falls back to one process-wide shared VM when the
+     * binary is not linked against the JavaScriptCore dylib (NSVersionOfLinkTimeLibrary
+     * returns -1 for our statically linked vendored build). A shared VM couples every
+     * cottontail runtime (main thread + workers) to one JSLock/microtask queue, which
+     * stalls the parent's microtask drain whenever a worker blocks inside a host call.
+     * JSGlobalContextCreateInGroup(NULL, ...) always creates a fresh VM per runtime and
+     * behaves identically on the system framework. */
+#if defined(COTTONTAIL_VENDORED_JSC)
+    /* The vendored JSCOnly static build crashes on `new ShadowRealm()` when the
+     * global object was created through the C API (JSGlobalContextCreate): the
+     * non-Apple port's C-API global object cannot derive a ShadowRealm global,
+     * so construction dereferences a null hook. Leave the option off so the
+     * constructor is absent instead of a segfault. (The Apple system framework's
+     * JSAPIGlobalObject supported it, but cottontail no longer links that.) */
+    runtime->context = JSGlobalContextCreateInGroup(NULL, NULL);
+#else
     const char *shadow_realm_option = getenv("JSC_useShadowRealm");
     char *previous_shadow_realm_option = shadow_realm_option != NULL ? strdup(shadow_realm_option) : NULL;
     setenv("JSC_useShadowRealm", "true", 1);
-    runtime->context = JSGlobalContextCreate(NULL);
+    runtime->context = JSGlobalContextCreateInGroup(NULL, NULL);
     if (previous_shadow_realm_option != NULL) {
         setenv("JSC_useShadowRealm", previous_shadow_realm_option, 1);
         free(previous_shadow_realm_option);
     } else {
         unsetenv("JSC_useShadowRealm");
     }
+#endif
     if (runtime->context == NULL) {
         free(runtime);
         return NULL;

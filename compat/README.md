@@ -75,6 +75,12 @@ Refresh the copied snapshots from the versions in `targets.json`:
 bun run compat:upstream:import
 ```
 
+Upstream tests run against the vendored JavaScriptCore build — the only engine
+Cottontail links (see the README's JavaScriptCore policy section). Engine
+expectations recorded in `status.json` reflect that build; for example,
+`test/js/bun/jsc/shadow.test.js` is an expected failure because ShadowRealm is
+intentionally disabled on the vendored JSCOnly build.
+
 The copied tests are now part of Cottontail's owned compatibility corpus. Do not
 silently rewrite them to pass. When a copied upstream test needs local
 adaptation, either fix Cottontail/the runner or document the ownership decision

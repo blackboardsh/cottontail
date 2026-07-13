@@ -9,3 +9,4 @@ vendors/esbuild/
 .cottontail-tmp/
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
+vendors/jsc/

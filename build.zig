@@ -1,5 +1,27 @@
 const std = @import("std");
 
+/// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
+const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6";
+
+fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
+    return switch (target.os.tag) {
+        .macos => switch (target.cpu.arch) {
+            .aarch64 => "macos-arm64",
+            else => null,
+        },
+        .linux => switch (target.cpu.arch) {
+            .x86_64 => "linux-amd64",
+            .aarch64 => "linux-arm64",
+            else => null,
+        },
+        .windows => switch (target.cpu.arch) {
+            .aarch64 => "windows-arm64",
+            else => null,
+        },
+        else => null,
+    };
+}
+
 fn createBunVendorModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const build_options_module = b.createModule(.{
         .root_source_file = b.path("vendors/bun-zig/src/build_options.zig"),
@@ -30,6 +52,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
             "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+            "-DCOTTONTAIL_VENDORED_JSC=1",
         },
     });
     step.root_module.addCSourceFile(.{
@@ -45,8 +68,35 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         },
     });
 
-    if (step.root_module.resolved_target.?.result.os.tag == .macos) {
-        step.root_module.linkFramework("JavaScriptCore", .{});
+    const resolved_target = step.root_module.resolved_target.?.result;
+
+    if (resolved_target.os.tag == .macos) {
+        const platform_key = jscVendorPlatformKey(resolved_target) orelse {
+            std.debug.print(
+                "error: no vendored JavaScriptCore asset for this target; supported: macos-arm64, linux-amd64, linux-arm64, windows-arm64\n",
+                .{},
+            );
+            std.process.exit(1);
+        };
+        const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
+        std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})), .{}) catch {
+            std.debug.print(
+                "error: vendored JavaScriptCore not found at {s}; run `bun run setup` (or `node scripts/setup-jsc.js`) first\n",
+                .{vendor_dir},
+            );
+            std.process.exit(1);
+        };
+        // The vendored build is a JSCOnly static build: link the archives
+        // directly plus the system pieces the jsc binary itself depends on
+        // (Apple libc++, libicucore for i18n, Foundation/objc for CF glue).
+        step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
+        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
+        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
+        step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
+        step.root_module.link_libcpp = true;
+        step.root_module.linkSystemLibrary("icucore", .{});
+        step.root_module.linkSystemLibrary("objc", .{});
+        step.root_module.linkFramework("Foundation", .{});
         step.root_module.linkSystemLibrary("ffi", .{});
         step.root_module.linkSystemLibrary("compression", .{});
         step.root_module.linkSystemLibrary("pthread", .{});
@@ -59,7 +109,11 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
         step.root_module.linkSystemLibrary("crypto", .{});
         step.root_module.linkSystemLibrary("ssl", .{});
     } else {
-        @panic("Cottontail currently wires JavaScriptCore through the macOS system framework only");
+        std.debug.print(
+            "error: cottontail currently links the vendored JavaScriptCore on macOS only. Linux/Windows wiring against the vendored static JSC build (vendors/jsc) is coming.\n",
+            .{},
+        );
+        std.process.exit(1);
     }
 }
 

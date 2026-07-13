@@ -22,13 +22,23 @@ for Bun or Node compatibility. Runtime APIs and compatibility behavior belong in
 Cottontail's Zig, C bridge, and JavaScript modules rather than in private JSC
 patches.
 
-The current macOS build links the system JavaScriptCore framework. Cross-platform
-distribution will eventually use Cottontail-owned builds from
-[`blackboardsh/WebKit`](https://github.com/blackboardsh/WebKit). The only intended
-Cottontail-specific WebKit change is Electrobun's support for packaging ICU data
-separately from the engine. Keeping that boundary allows a future Electrobun
-packaging step to include only the ICU data an application requests, without
-changing JavaScriptCore behavior or its public API.
+Cottontail links a Cottontail-owned static JSC build (JSCOnly, published at
+[`blackboardsh/jsc`](https://github.com/blackboardsh/jsc)). This vendored build
+is the build: the earlier macOS system-framework path has been removed. `bun run
+setup` downloads the release pinned in `scripts/jsc-manifest.json` into the
+gitignored `vendors/jsc/` directory (with sha256 verification), and the regular
+`node scripts/zig.js build` links the vendored static libraries. Cross-platform
+distribution will use these Cottontail-owned builds (the pinned release also
+ships linux-amd64, linux-arm64, and windows-arm64 archives; only macOS arm64 is
+wired up so far). The only intended Cottontail-specific WebKit change is
+Electrobun's support for packaging ICU data separately from the engine. Keeping
+that boundary allows a future Electrobun packaging step to include only the ICU
+data an application requests, without changing JavaScriptCore behavior or its
+public API.
+
+Known engine difference: ShadowRealm stays disabled because the JSCOnly port
+cannot construct ShadowRealms from C-API-created contexts (the constructor
+segfaults), so Cottontail keeps the option off and the constructor absent.
 
 Bun-specific JSC patches, including test clocks and private runtime hooks, are
 not compatibility dependencies. Tests that rely on them should be adapted to
@@ -37,7 +47,8 @@ exposed by Cottontail itself.
 
 ## Scripts
 
-- `bun run setup` downloads the pinned Zig toolchain if needed.
+- `bun run setup` downloads the pinned Zig toolchain and the pinned JavaScriptCore build if needed.
+- `bun run setup:jsc` vendors only the pinned JavaScriptCore build (see `scripts/jsc-manifest.json`).
 - `bun run build` builds the debug executable.
 - `bun run build:release` builds with `ReleaseSmall`.
 - `bun run run -- test.js` builds and runs a JavaScript file through `cottontail`.

@@ -105,11 +105,10 @@ await vm.runInContext(replTranspiler.transformSync("const replValue = await Prom
 const replResult = await vm.runInContext(replTranspiler.transformSync("replValue * 2"), replContext);
 assert(replContext.replValue === 21 && replResult.value === 42, "Bun.Transpiler replMode persistence mismatch");
 
-const ShadowRealm = (globalThis as any).ShadowRealm;
-assert(typeof ShadowRealm === "function", "ShadowRealm should be enabled");
-const shadowRealm = new ShadowRealm();
-(globalThis as any).shadowRealmValue = 1;
-assert(shadowRealm.evaluate("globalThis.shadowRealmValue = 2") === 2, "ShadowRealm evaluation mismatch");
-assert((globalThis as any).shadowRealmValue === 1, "ShadowRealm global isolation mismatch");
+// Cottontail always links the vendored JSCOnly static build. That build cannot
+// construct ShadowRealms from C-API-created contexts (it segfaults), so
+// cottontail keeps the option off and the constructor absent.
+assert((globalThis as any).cottontail.jscVendored === true, "cottontail should run on the vendored JSC build");
+assert(typeof (globalThis as any).ShadowRealm === "undefined", "ShadowRealm should stay disabled on the vendored JSC build");
 
 console.log("bun jsc and global passed");
