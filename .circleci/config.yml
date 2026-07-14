@@ -122,7 +122,7 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-windows-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-windows-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           shell: powershell.exe
@@ -149,6 +149,12 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or $installedTargets -notcontains "x86_64-pc-windows-msvc") {
               throw "Rust target x86_64-pc-windows-msvc was not installed by $rustup"
             }
+            # rustup metadata can survive a stale cache while the std files do not;
+            # prove the target works by actually compiling with it.
+            Set-Content -Path "$env:TEMP\rust-probe.rs" -Value "fn main() {}"
+            $rustc = Join-Path $cargoBin "rustc.exe"
+            & $rustc --target x86_64-pc-windows-msvc -o "$env:TEMP\rust-probe.exe" "$env:TEMP\rust-probe.rs"
+            if ($LASTEXITCODE -ne 0) { throw "Rust msvc target is present in metadata but cannot compile; toolchain is broken" }
       - run:
           name: Vendor Zig and JavaScriptCore
           shell: powershell.exe
@@ -158,7 +164,7 @@ jobs:
             node scripts/setup-jsc.js
             if ($LASTEXITCODE -ne 0) { throw "JavaScriptCore setup failed" }
       - save_cache:
-          key: cottontail-windows-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-windows-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
