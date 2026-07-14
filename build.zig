@@ -180,20 +180,29 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             }) |library| step.root_module.linkSystemLibrary(library, .{});
             // Zig treats these names as aliases for its own libc/libc++ and
             // drops them before linking. Concrete files preserve the GNU C++
-            // ABI used by the JSC build and glibc's resolver implementation.
+            // ABI and unwind runtime used by the JSC/Rust archives, plus
+            // glibc's resolver implementation.
             step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libstdc++.so"));
+            step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libgcc_s.so.1"));
             step.root_module.addObjectFile(copyLinuxSystemLibrary(b, "libresolv.a"));
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
+            // OpenSSL 3.4+ can use Zstandard from its static libcrypto archive.
+            // Keep this after crypto so the linker can resolve that private dependency.
+            step.root_module.linkSystemLibrary("zstd", .{
+                .use_pkg_config = .no,
+                .preferred_link_mode = .static,
+                .search_strategy = .no_fallback,
+            });
         },
         .windows => {
             requireJscLibrary(b, vendor_dir, "JavaScriptCore.lib");
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/JavaScriptCore.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/WTF.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/bmalloc.lib", .{vendor_dir})));
-            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicudt.lib", .{vendor_dir})));
-            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicuin.lib", .{vendor_dir})));
-            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/sicuuc.lib", .{vendor_dir})));
+            // This JSC build uses the operating-system ICU data and API. The
+            // Windows SDK provides its import library as icu.lib.
+            step.root_module.linkSystemLibrary("icu", .{});
             inline for (&.{ "advapi32", "bcrypt", "shell32", "userenv", "winmm", "ws2_32" }) |library| {
                 step.root_module.linkSystemLibrary(library, .{});
             }
@@ -206,7 +215,7 @@ fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8)
     const path = b.fmt("{s}/lib/{s}", .{ vendor_dir, library });
     std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(path), .{}) catch {
         std.debug.print(
-            "error: vendored JavaScriptCore library not found at {s}; run `bun run setup:jsc` first\n",
+            "error: vendored JavaScriptCore library not found at {s}; run `node scripts/setup-jsc.js` first\n",
             .{path},
         );
         std.process.exit(1);

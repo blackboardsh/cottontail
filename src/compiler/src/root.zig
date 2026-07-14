@@ -1121,7 +1121,7 @@ pub const sys = struct {
     pub fn openA(pathname: []const u8, flags: i32, _: Mode) SysMaybe(FD) {
         const io_instance = std.Io.Threaded.global_single_threaded.io();
         if (flags & O.DIRECTORY != 0) {
-            const directory = std.Io.Dir.cwd().openDir(io_instance, pathname, .{}) catch return .{ .err = .{ .path = pathname } };
+            const directory = std.Io.Dir.cwd().openDir(io_instance, pathname, .{ .iterate = true }) catch return .{ .err = .{ .path = pathname } };
             return .{ .result = FD.fromStdDir(directory) };
         }
         const mode: std.Io.Dir.OpenFileOptions.Mode = if (flags & O.WRONLY != 0) .write_only else .read_only;
@@ -1136,7 +1136,7 @@ pub const sys = struct {
     pub fn openat(dirfd: FD, pathname: [:0]const u8, flags: i32, _: Mode) SysMaybe(FD) {
         const io_instance = std.Io.Threaded.global_single_threaded.io();
         if (flags & O.DIRECTORY != 0) {
-            const directory = dirfd.stdDir().openDir(io_instance, pathname, .{}) catch return .{ .err = .{ .path = pathname, .syscall = "openat" } };
+            const directory = dirfd.stdDir().openDir(io_instance, pathname, .{ .iterate = true }) catch return .{ .err = .{ .path = pathname, .syscall = "openat" } };
             return .{ .result = FD.fromStdDir(directory) };
         }
         const file = if (flags & O.CREAT != 0)
@@ -2587,6 +2587,20 @@ pub fn openDirForIteration(parent: FD, path_name: []const u8) OpenDirResult {
         .{ .iterate = true },
     ) catch |err| return .{ .err = err };
     return .{ .result = FD.fromStdDir(directory) };
+}
+
+test "directory descriptors opened through sys can be iterated" {
+    const directory = try sys.openA(".", O.DIRECTORY | O.RDONLY, 0).unwrap();
+    defer directory.close();
+
+    var iterator = iterateDir(directory);
+    _ = try iterator.next().unwrap();
+
+    const child = try sys.openat(directory, ".", O.DIRECTORY | O.RDONLY, 0).unwrap();
+    defer child.close();
+
+    var child_iterator = iterateDir(child);
+    _ = try child_iterator.next().unwrap();
 }
 
 pub fn getcwdAlloc(allocator: std.mem.Allocator) ![:0]u8 {

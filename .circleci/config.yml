@@ -39,7 +39,7 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-macos-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-macos-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
@@ -49,7 +49,7 @@ jobs:
             echo 'export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-macos-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-macos-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
@@ -60,24 +60,24 @@ jobs:
 
   build-linux-x64:
     machine:
-      image: ubuntu-2404:current
+      image: ubuntu-2404:2026.05.1
     resource_class: medium
     steps:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-linux-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-linux-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
@@ -88,24 +88,24 @@ jobs:
 
   build-linux-arm64:
     machine:
-      image: arm-default
+      image: ubuntu-2404:2026.05.1
     resource_class: arm.medium
     steps:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-linux-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev zlib1g-dev
+              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-arm64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-linux-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
@@ -115,23 +115,36 @@ jobs:
       - build-test-package-unix
 
   build-windows-x64:
-    executor: win/default
+    executor:
+      name: win/default
+      version: "2026.05.1"
     steps:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-windows-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-windows-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           shell: powershell.exe
           command: |
-            choco install nodejs-lts rustup.install -y --no-progress
+            nvm install 24.18.0 64
+            if ($LASTEXITCODE -ne 0) { throw "Node.js 24.18.0 installation failed through nvm" }
+            nvm use 24.18.0 64
+            if ($LASTEXITCODE -ne 0) { throw "Could not select Node.js 24.18.0 x64 through nvm" }
+            choco install rustup.install -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "rustup installation failed" }
+            $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
+            if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 x64") {
+              throw "Expected Node 24.18.0 win32 x64, got '$nodeIdentity'"
+            }
             $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
             $env:Path = "$cargoBin;$env:Path"
             [Environment]::SetEnvironmentVariable("Path", "$cargoBin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
             $rustup = Join-Path $cargoBin "rustup.exe"
             & $rustup default stable
+            if ($LASTEXITCODE -ne 0) { throw "Could not select the stable Rust toolchain" }
             & $rustup target add x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) { throw "Could not install the x86_64-pc-windows-msvc Rust target" }
             $installedTargets = & $rustup target list --installed
             if ($LASTEXITCODE -ne 0 -or $installedTargets -notcontains "x86_64-pc-windows-msvc") {
               throw "Rust target x86_64-pc-windows-msvc was not installed by $rustup"
@@ -141,9 +154,11 @@ jobs:
           shell: powershell.exe
           command: |
             node scripts/setup.js
+            if ($LASTEXITCODE -ne 0) { throw "Zig setup failed" }
             node scripts/setup-jsc.js
+            if ($LASTEXITCODE -ne 0) { throw "JavaScriptCore setup failed" }
       - save_cache:
-          key: cottontail-windows-x64-v3-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-windows-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
@@ -153,11 +168,15 @@ jobs:
       - run:
           name: Run Zig tests
           shell: powershell.exe
-          command: node scripts/zig.js build test
+          command: |
+            node scripts/zig.js build test
+            if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
       - run:
           name: Build release binary
           shell: powershell.exe
-          command: node scripts/zig.js build -Doptimize=ReleaseSmall
+          command: |
+            node scripts/zig.js build -Doptimize=ReleaseSmall
+            if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
       - run:
           name: Smoke test release binary
           shell: powershell.exe
@@ -169,7 +188,9 @@ jobs:
       - run:
           name: Package release
           shell: powershell.exe
-          command: node scripts/package-release.js
+          command: |
+            node scripts/package-release.js
+            if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed" }
       - store_artifacts:
           path: release
       - persist_to_workspace:
