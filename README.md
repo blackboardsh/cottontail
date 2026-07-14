@@ -29,9 +29,8 @@ setup` downloads the release pinned in `scripts/jsc-manifest.json` into the
 gitignored `vendors/jsc/` directory (with sha256 verification), and the regular
 `node scripts/zig.js build` links the vendored static libraries. Cross-platform
 distribution uses these Cottontail-owned builds. The pinned release ships
-macOS arm64, Linux x64/arm64, and Windows arm64 archives. Cottontail's release
-matrix uses the first three directly; Windows x64 is checksum-gated on an x64
-JSC archive until that target is added to the pinned release. The only intended
+macOS arm64, Linux x64/arm64, and Windows x64 archives. Cottontail's release
+matrix uses all four directly. The only intended
 Cottontail-specific WebKit change is
 Electrobun's support for packaging ICU data separately from the engine. Keeping
 that boundary allows a future Electrobun packaging step to include only the ICU
@@ -71,8 +70,11 @@ CircleCI defines native release jobs for macOS arm64, Linux x64, Linux arm64,
 and Windows x64 in `.circleci/config.yml`. Every job is configured to run Zig
 tests, build with `ReleaseSmall`, smoke-test the binary, package the runtime
 and store the archive plus its SHA-256 file. The JavaScript runtime modules are
-embedded in the executable at build time. The Windows job remains a bring-up gate until the x64 JSC input and the
-Win32 host implementation described below are complete.
+embedded in the executable at build time. The Windows job remains a bring-up
+gate until its native host implementation and release sequence are complete.
+
+For native VM setup, exact Circle-equivalent commands, diagnostics, and the
+cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-platform-bringup.md).
 
 The schema 2 archive layout contains a standalone executable for Dash CLI consumption:
 
