@@ -239,11 +239,16 @@ fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8)
 }
 
 pub fn build(b: *std.Build) void {
-    // Zig's native Windows target defaults to the GNU ABI. The vendored JSC,
-    // Rust static library, Visual Studio SDK, and vcpkg dependencies all use
-    // MSVC, so keep the default native build in that single ABI universe.
+    // The Windows release is x86-64 MSVC even when the host is Windows ARM.
+    // Make both the architecture and ABI explicit so Zig does not derive a
+    // native CPU model from the CI host. The vendored JSC, Rust static library,
+    // Visual Studio SDK, and vcpkg dependencies all use this same target.
     const target = b.standardTargetOptions(.{
-        .default_target = if (builtin.os.tag == .windows) .{ .abi = .msvc } else .{},
+        .default_target = if (builtin.os.tag == .windows) .{
+            .cpu_arch = .x86_64,
+            .os_tag = .windows,
+            .abi = .msvc,
+        } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
     const lolhtml = buildLolHtml(b, target);
