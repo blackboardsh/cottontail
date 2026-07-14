@@ -12,12 +12,14 @@ if (!outputPath || !targetTriple) {
 }
 
 const targetDir = join(rootDir, '.zig-cache', 'lolhtml', targetTriple);
-const rustupCargo = join(process.env.USERPROFILE ?? '', '.cargo', 'bin', 'cargo.exe');
-const cargo = process.env.CARGO ??
-  (process.platform === 'win32' && existsSync(rustupCargo) ? rustupCargo : 'cargo');
+const rustup = join(process.env.USERPROFILE ?? '', '.cargo', 'bin', 'rustup.exe');
+const useRustup = process.env.CARGO == null && process.platform === 'win32' && existsSync(rustup);
+const cargo = process.env.CARGO ?? (useRustup ? rustup : 'cargo');
+const cargoArgs = useRustup ? ['run', 'stable', 'cargo'] : [];
 const result = spawnSync(
   cargo,
   [
+    ...cargoArgs,
     'build',
     '--manifest-path',
     join(rootDir, 'vendors', 'lol-html', 'c-api', 'Cargo.toml'),

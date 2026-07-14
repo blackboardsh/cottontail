@@ -143,17 +143,18 @@ jobs:
             $rustup = Join-Path $cargoBin "rustup.exe"
             & $rustup default stable
             if ($LASTEXITCODE -ne 0) { throw "Could not select the stable Rust toolchain" }
-            & $rustup target add x86_64-pc-windows-msvc
+            & $rustup target add --toolchain stable x86_64-pc-windows-msvc
             if ($LASTEXITCODE -ne 0) { throw "Could not install the x86_64-pc-windows-msvc Rust target" }
-            $installedTargets = & $rustup target list --installed
+            $installedTargets = & $rustup target list --toolchain stable --installed
             if ($LASTEXITCODE -ne 0 -or $installedTargets -notcontains "x86_64-pc-windows-msvc") {
               throw "Rust target x86_64-pc-windows-msvc was not installed by $rustup"
             }
-            # rustup metadata can survive a stale cache while the std files do not;
-            # prove the target works by actually compiling with it.
+            # Select Cargo and Rustc through the same rustup toolchain. A later
+            # CircleCI step does not inherit this step's process-level PATH.
+            & $rustup run stable cargo -vV
+            if ($LASTEXITCODE -ne 0) { throw "Cargo is unavailable in the stable Rust toolchain" }
             Set-Content -Path "$env:TEMP\rust-probe.rs" -Value "fn main() {}"
-            $rustc = Join-Path $cargoBin "rustc.exe"
-            & $rustc --target x86_64-pc-windows-msvc -o "$env:TEMP\rust-probe.exe" "$env:TEMP\rust-probe.rs"
+            & $rustup run stable rustc --target x86_64-pc-windows-msvc -o "$env:TEMP\rust-probe.exe" "$env:TEMP\rust-probe.rs"
             if ($LASTEXITCODE -ne 0) { throw "Rust msvc target is present in metadata but cannot compile; toolchain is broken" }
       - run:
           name: Vendor Zig and JavaScriptCore
