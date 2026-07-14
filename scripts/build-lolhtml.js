@@ -13,13 +13,44 @@ if (!outputPath || !targetTriple) {
 
 const targetDir = join(rootDir, '.zig-cache', 'lolhtml', targetTriple);
 const rustup = join(process.env.USERPROFILE ?? '', '.cargo', 'bin', 'rustup.exe');
-const useRustup = process.env.CARGO == null && process.platform === 'win32' && existsSync(rustup);
-const cargo = process.env.CARGO ?? (useRustup ? rustup : 'cargo');
-const cargoArgs = useRustup ? ['run', 'stable', 'cargo'] : [];
+const useRustup = process.platform === 'win32' && targetTriple.includes('windows');
+let cargo = process.env.CARGO ?? 'cargo';
+let cargoEnv = process.env;
+
+function runRustup(args, options = {}) {
+  const result = spawnSync(rustup, args, { cwd: rootDir, ...options });
+  if (result.error || result.status !== 0) {
+    console.error(result.error?.message ?? result.stderr ?? `rustup ${args.join(' ')} failed`);
+    process.exit(result.status ?? 1);
+  }
+  return result;
+}
+
+if (useRustup) {
+  if (!existsSync(rustup)) {
+    console.error(`rustup was not found at ${rustup}`);
+    process.exit(1);
+  }
+
+  runRustup(['target', 'add', '--toolchain', 'stable', targetTriple], { stdio: 'inherit' });
+  cargo = runRustup(['which', '--toolchain', 'stable', 'cargo'], { encoding: 'utf8' }).stdout.trim();
+  const rustc = runRustup(['which', '--toolchain', 'stable', 'rustc'], { encoding: 'utf8' }).stdout.trim();
+  cargoEnv = {
+    ...process.env,
+    CARGO: cargo,
+    RUSTC: rustc,
+    RUSTUP_TOOLCHAIN: 'stable',
+  };
+  delete cargoEnv.RUSTC_WRAPPER;
+  delete cargoEnv.RUSTC_WORKSPACE_WRAPPER;
+  delete cargoEnv.CARGO_BUILD_RUSTC;
+  console.error(`[lolhtml] cargo: ${cargo}`);
+  console.error(`[lolhtml] rustc: ${rustc}`);
+}
+
 const result = spawnSync(
   cargo,
   [
-    ...cargoArgs,
     'build',
     '--manifest-path',
     join(rootDir, 'vendors', 'lol-html', 'c-api', 'Cargo.toml'),
@@ -30,7 +61,7 @@ const result = spawnSync(
     '--target-dir',
     targetDir,
   ],
-  { cwd: rootDir, stdio: 'inherit' },
+  { cwd: rootDir, env: cargoEnv, stdio: 'inherit' },
 );
 
 if (result.error) {

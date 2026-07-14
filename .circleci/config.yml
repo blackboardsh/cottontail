@@ -122,7 +122,7 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-windows-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-windows-x64-v6-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
       - run:
           name: Install build dependencies
           shell: powershell.exe
@@ -165,13 +165,13 @@ jobs:
             node scripts/setup-jsc.js
             if ($LASTEXITCODE -ne 0) { throw "JavaScriptCore setup failed" }
       - save_cache:
-          key: cottontail-windows-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-windows-x64-v6-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
           paths:
             - vendors/zig
             - vendors/jsc
             - vendors/windows-deps
-            - ~/.cargo
-            - ~/.rustup
+            - ~/.cargo/registry
+            - ~/.cargo/git
             - .zig-cache/lolhtml
       - run:
           name: Run Zig tests
