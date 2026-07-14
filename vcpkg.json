@@ -10,5 +10,11 @@
     "libffi",
     "openssl",
     "zlib"
+  ],
+  "overrides": [
+    {
+      "name": "libffi",
+      "version": "3.4.6"
+    }
   ]
 }
