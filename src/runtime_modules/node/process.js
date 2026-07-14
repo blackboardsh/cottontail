@@ -1332,17 +1332,20 @@ export const memoryUsage = processObject.memoryUsage = makeMemoryUsage;
 export const availableMemory = processObject.availableMemory = () => Number(processInfo("availableMemory")) || 0;
 export const constrainedMemory = processObject.constrainedMemory = () => Number(processInfo("constrainedMemory")) || 0;
 
-export const getuid = processObject.getuid = () => Number(processInfo("getuid"));
-export const geteuid = processObject.geteuid = () => Number(processInfo("geteuid"));
-export const getgid = processObject.getgid = () => Number(processInfo("getgid"));
-export const getegid = processObject.getegid = () => Number(processInfo("getegid"));
-export const getgroups = processObject.getgroups = () => Array.from(processInfo("getgroups") ?? [], Number);
-export const setuid = processObject.setuid = (id) => processInfo("setuid", Number(id));
-export const seteuid = processObject.seteuid = (id) => processInfo("seteuid", Number(id));
-export const setgid = processObject.setgid = (id) => processInfo("setgid", Number(id));
-export const setegid = processObject.setegid = (id) => processInfo("setegid", Number(id));
-export const setgroups = processObject.setgroups = (groups) => processInfo("setgroups", Array.from(groups ?? [], Number));
-export const initgroups = processObject.initgroups = (user, extraGroup) => processInfo("initgroups", String(user), Number(extraGroup));
+export const getuid = processObject.platform === "win32" ? undefined : () => Number(processInfo("getuid"));
+export const geteuid = processObject.platform === "win32" ? undefined : () => Number(processInfo("geteuid"));
+export const getgid = processObject.platform === "win32" ? undefined : () => Number(processInfo("getgid"));
+export const getegid = processObject.platform === "win32" ? undefined : () => Number(processInfo("getegid"));
+export const getgroups = processObject.platform === "win32" ? undefined : () => Array.from(processInfo("getgroups") ?? [], Number);
+export const setuid = processObject.platform === "win32" ? undefined : (id) => processInfo("setuid", Number(id));
+export const seteuid = processObject.platform === "win32" ? undefined : (id) => processInfo("seteuid", Number(id));
+export const setgid = processObject.platform === "win32" ? undefined : (id) => processInfo("setgid", Number(id));
+export const setegid = processObject.platform === "win32" ? undefined : (id) => processInfo("setegid", Number(id));
+export const setgroups = processObject.platform === "win32" ? undefined : (groups) => processInfo("setgroups", Array.from(groups ?? [], Number));
+export const initgroups = processObject.platform === "win32" ? undefined : (user, extraGroup) => processInfo("initgroups", String(user), Number(extraGroup));
+if (processObject.platform !== "win32") {
+  Object.assign(processObject, { getuid, geteuid, getgid, getegid, getgroups, setuid, seteuid, setgid, setegid, setgroups, initgroups });
+}
 export const umask = processObject.umask = (mask = undefined) => processInfo("umask", mask == null ? undefined : Number(mask));
 
 export const openStdin = processObject.openStdin = () => {

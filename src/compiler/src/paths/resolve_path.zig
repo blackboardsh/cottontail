@@ -1996,7 +1996,7 @@ pub const PosixToWinNormalizer = struct {
             if (root.len == 1) {
                 assert(isSepAny(root[0]));
                 if (bun.strings.isWindowsAbsolutePathMissingDriveLetter(u8, maybe_posix_path)) {
-                    const cwd = try std.posix.getcwd(buf);
+                    const cwd = try bun.getcwd(buf);
                     assert(cwd.ptr == buf.ptr);
                     const source_root = windowsFilesystemRoot(cwd);
                     assert(source_root.ptr == source_root.ptr);

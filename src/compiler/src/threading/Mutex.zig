@@ -98,18 +98,22 @@ const WindowsImpl = struct {
     srwlock: Type = .{},
 
     fn tryLock(self: *@This()) bool {
-        return windows.kernel32.TryAcquireSRWLockExclusive(&self.srwlock) != windows.FALSE;
+        return TryAcquireSRWLockExclusive(&self.srwlock) != windows.FALSE;
     }
 
     fn lock(self: *@This()) void {
-        windows.kernel32.AcquireSRWLockExclusive(&self.srwlock);
+        AcquireSRWLockExclusive(&self.srwlock);
     }
 
     fn unlock(self: *@This()) void {
-        windows.kernel32.ReleaseSRWLockExclusive(&self.srwlock);
+        ReleaseSRWLockExclusive(&self.srwlock);
     }
 
     const windows = std.os.windows;
+
+    extern "kernel32" fn TryAcquireSRWLockExclusive(srwlock: *windows.SRWLOCK) callconv(.winapi) windows.BOOLEAN;
+    extern "kernel32" fn AcquireSRWLockExclusive(srwlock: *windows.SRWLOCK) callconv(.winapi) void;
+    extern "kernel32" fn ReleaseSRWLockExclusive(srwlock: *windows.SRWLOCK) callconv(.winapi) void;
 
     pub const Type = windows.SRWLOCK;
 };

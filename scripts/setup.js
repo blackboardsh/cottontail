@@ -158,11 +158,94 @@ function vendorZig() {
   }
 }
 
+function findVcpkg() {
+  const candidates = [
+    process.env.VCPKG_ROOT && join(process.env.VCPKG_ROOT, 'vcpkg.exe'),
+    process.env['ProgramFiles(x86)'] &&
+      join(
+        process.env['ProgramFiles(x86)'],
+        'Microsoft Visual Studio',
+        '2022',
+        'BuildTools',
+        'VC',
+        'vcpkg',
+        'vcpkg.exe'
+      ),
+    'C:\\vcpkg\\vcpkg.exe',
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  const vswhere = process.env['ProgramFiles(x86)'] &&
+    join(process.env['ProgramFiles(x86)'], 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+  if (vswhere && existsSync(vswhere)) {
+    try {
+      const installationPath = execFileSync(
+        vswhere,
+        [
+          '-latest',
+          '-products',
+          '*',
+          '-requires',
+          'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+          '-property',
+          'installationPath',
+        ],
+        { encoding: 'utf8' }
+      ).trim();
+      const candidate = join(installationPath, 'VC', 'vcpkg', 'vcpkg.exe');
+      if (existsSync(candidate)) return candidate;
+    } catch {}
+  }
+
+  try {
+    const discovered = execFileSync('where.exe', ['vcpkg.exe'], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .find(Boolean);
+    if (discovered) return discovered;
+  } catch {}
+
+  throw new Error(
+    'vcpkg.exe was not found. Install Visual Studio 2022 Build Tools with the Desktop development with C++ workload.'
+  );
+}
+
+function vendorWindowsDependencies() {
+  if (process.platform !== 'win32') return;
+  if (process.arch !== 'x64') {
+    throw new Error(`Windows release dependencies require x64 Node, found ${process.arch}`);
+  }
+
+  const vcpkg = findVcpkg();
+  const installRoot = join(ROOT, 'vendors', 'windows-deps');
+  console.log('Installing pinned Windows native dependencies...');
+  execFileSync(
+    vcpkg,
+    [
+      'install',
+      '--triplet',
+      'x64-windows-static',
+      '--host-triplet',
+      'x64-windows',
+      `--x-install-root=${installRoot}`,
+    ],
+    { cwd: ROOT, stdio: 'inherit' }
+  );
+  console.log('✓ Windows native dependencies are ready');
+}
+
 function setup() {
   try {
     vendorZig();
   } catch (error) {
     fail('Failed to vendor Zig.', error);
+  }
+  try {
+    vendorWindowsDependencies();
+  } catch (error) {
+    fail('Failed to vendor Windows native dependencies.', error);
   }
   console.log(`\nSetup complete. Vendored Zig is ready at vendors/zig/${getZigBinaryName()}`);
 }

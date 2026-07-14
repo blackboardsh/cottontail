@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cottontail-native-dependencies",
+  "version-string": "0.1.1-beta.0",
+  "builtin-baseline": "db4723bd0a99eab031f1a3dee4336dca43049c87",
+  "dependencies": [
+    "brotli",
+    "dirent",
+    "dlfcn-win32",
+    "libffi",
+    "openssl",
+    "zlib"
+  ]
+}

@@ -10,4 +10,7 @@ vendors/esbuild/
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
 vendors/jsc/
+vendors/windows-deps/
 release/
+vm-*-test.log
+vm-*-release.log

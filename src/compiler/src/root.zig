@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Environment = @import("bun_core/env.zig");
+pub const windows = @import("sys/windows/windows.zig");
 pub const deprecated = @import("bun_core/deprecated.zig");
 pub const OOM = std.mem.Allocator.Error;
 pub const JSError = error{ JSError, OutOfMemory, JSTerminated };
@@ -62,6 +63,82 @@ pub const patch = @import("patch/patch.zig");
 pub const MaxHeapAllocator = @import("bun_alloc/MaxHeapAllocator.zig");
 pub const uws = @import("uws/uws.zig");
 pub const simdutf = struct {
+    pub const convert = struct {
+        pub const Status = enum { success, surrogate, invalid };
+        pub const Result = struct {
+            status: Status,
+            count: usize,
+
+            pub fn isSuccessful(self: @This()) bool {
+                return self.status == .success;
+            }
+        };
+
+        pub const utf8 = struct {
+            pub const to = struct {
+                pub const utf16 = struct {
+                    fn convertImpl(input: []const u8, output: []u16) Result {
+                        const count = std.unicode.utf8ToUtf16Le(output, input) catch return .{ .status = .invalid, .count = 0 };
+                        return .{ .status = .success, .count = count };
+                    }
+
+                    pub const with_errors = struct {
+                        pub fn le(input: []const u8, output: []u16) Result {
+                            return convertImpl(input, output);
+                        }
+                    };
+
+                    pub fn le(input: []const u8, output: []u16) usize {
+                        const result = convertImpl(input, output);
+                        return if (result.status == .success) result.count else 0;
+                    }
+                };
+            };
+        };
+
+        pub const utf16 = struct {
+            pub const to = struct {
+                pub const utf8 = struct {
+                    fn convertImpl(input: []const u16, output: []u8) Result {
+                        const count = std.unicode.utf16LeToUtf8(output, input) catch return .{ .status = .surrogate, .count = 0 };
+                        return .{ .status = .success, .count = count };
+                    }
+
+                    pub const with_errors = struct {
+                        pub fn le(input: []const u16, output: []u8) Result {
+                            return convertImpl(input, output);
+                        }
+                    };
+
+                    pub fn le(input: []const u16, output: []u8) usize {
+                        const result = convertImpl(input, output);
+                        return if (result.status == .success) result.count else 0;
+                    }
+                };
+            };
+        };
+
+        pub const utf32 = struct {
+            pub const to = struct {
+                pub const utf8 = struct {
+                    pub const with_errors = struct {
+                        pub fn le(input: []const u32, output: []u8) Result {
+                            var count: usize = 0;
+                            for (input) |codepoint| {
+                                if (codepoint > 0x10FFFF or (codepoint >= 0xD800 and codepoint <= 0xDFFF)) {
+                                    return .{ .status = .invalid, .count = count };
+                                }
+                                count += std.unicode.utf8Encode(@intCast(codepoint), output[count..]) catch
+                                    return .{ .status = .invalid, .count = count };
+                            }
+                            return .{ .status = .success, .count = count };
+                        }
+                    };
+                };
+            };
+        };
+    };
+
     pub const validate = struct {
         pub fn utf8(input: []const u8) bool {
             return std.unicode.utf8ValidateSlice(input);
@@ -297,7 +374,6 @@ pub const jsc = struct {
         pub fn wakeup(self: *AnyEventLoop) void {
             self.condition.broadcast();
         }
-
     };
     pub const C = struct {};
     pub const API = struct {
@@ -1056,6 +1132,11 @@ pub const perf = struct {
 };
 
 pub const sys = struct {
+    pub const WindowsFileAttributes = struct {
+        is_directory: bool,
+        is_reparse_point: bool,
+    };
+
     pub fn syslog(comptime format: []const u8, arguments: anytype) void {
         if (@import("builtin").mode == .Debug) std.debug.print(format ++ "\n", arguments);
     }
@@ -1146,6 +1227,20 @@ pub const sys = struct {
         return .{ .result = FD.fromStdFile(file) };
     }
 
+    pub fn openDirAtWindowsA(dirfd: FD, pathname: []const u8, open_options_input: anytype) SysMaybe(FD) {
+        const io_instance = std.Io.Threaded.global_single_threaded.io();
+        const follow_symlinks = if (@hasField(@TypeOf(open_options_input), "no_follow")) !open_options_input.no_follow else true;
+        const open_options: std.Io.Dir.OpenOptions = .{
+            .iterate = if (@hasField(@TypeOf(open_options_input), "iterable")) open_options_input.iterable else false,
+            .follow_symlinks = follow_symlinks,
+        };
+        const directory = if (dirfd.isValid())
+            dirfd.stdDir().openDir(io_instance, pathname, open_options)
+        else
+            std.Io.Dir.openDirAbsolute(io_instance, pathname, open_options);
+        return .{ .result = FD.fromStdDir(directory catch return .{ .err = .{ .path = pathname, .syscall = "open" } }) };
+    }
+
     pub fn renameat(from_dir: FD, from: [:0]const u8, to_dir: FD, to: [:0]const u8) SysMaybe(void) {
         std.Io.Dir.rename(from_dir.stdDir(), from, to_dir.stdDir(), to, std.Io.Threaded.global_single_threaded.io()) catch
             return .{ .err = .{ .path = from, .syscall = "renameat" } };
@@ -1159,6 +1254,19 @@ pub const sys = struct {
 
     pub fn existsZ(pathname: [:0]const u8) bool {
         return exists(pathname);
+    }
+
+    pub fn getFileAttributes(pathname: anytype) ?WindowsFileAttributes {
+        const path_slice = std.mem.sliceTo(pathname, 0);
+        const stat_value = std.Io.Dir.cwd().statFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            path_slice,
+            .{ .follow_symlinks = false },
+        ) catch return null;
+        return .{
+            .is_directory = stat_value.kind == .directory,
+            .is_reparse_point = stat_value.kind == .sym_link,
+        };
     }
 
     pub fn getErrno(result: anytype) SystemErrno {
@@ -1779,11 +1887,15 @@ pub const install = @import("install/install.zig");
 pub const PackageManager = install.PackageManager;
 
 pub fn StringArrayHashMap(comptime Type: type) type {
+    return ManagedStringArrayHashMap(Type, std.StringArrayHashMapUnmanaged(Type));
+}
+
+fn ManagedStringArrayHashMap(comptime Type: type, comptime UnmanagedType: type) type {
     return struct {
         unmanaged: Unmanaged = .empty,
         allocator: std.mem.Allocator,
 
-        pub const Unmanaged = std.StringArrayHashMapUnmanaged(Type);
+        pub const Unmanaged = UnmanagedType;
         pub const Entry = Unmanaged.Entry;
         pub const Iterator = Unmanaged.Iterator;
 
@@ -1907,6 +2019,29 @@ pub fn StringArrayHashMap(comptime Type: type) type {
             };
         }
     };
+}
+
+pub const CaseInsensitiveASCIIStringContext = struct {
+    pub fn hash(_: @This(), input: []const u8) u32 {
+        var buffer: [1024]u8 = undefined;
+        var remaining = input;
+        var hasher = std.hash.Wyhash.init(0);
+        while (remaining.len > 0) {
+            const length = @min(remaining.len, buffer.len);
+            hasher.update(strings.copyLowercase(remaining[0..length], &buffer));
+            remaining = remaining[length..];
+        }
+        return @truncate(hasher.final());
+    }
+
+    pub fn eql(_: @This(), a: []const u8, b: []const u8, _: usize) bool {
+        return strings.eqlCaseInsensitiveASCIIICheckLength(a, b);
+    }
+};
+
+pub fn CaseInsensitiveASCIIStringArrayHashMap(comptime Type: type) type {
+    const Unmanaged = std.array_hash_map.Custom([]const u8, Type, CaseInsensitiveASCIIStringContext, true);
+    return ManagedStringArrayHashMap(Type, Unmanaged);
 }
 
 pub fn StringArrayHashMapUnmanaged(comptime Type: type) type {
@@ -2448,7 +2583,13 @@ pub inline fn wrappingNegation(value: anytype) @TypeOf(value) {
 }
 
 pub const FD = struct {
-    value: std.posix.fd_t = -1,
+    value: Native = invalid_value,
+
+    const Native = std.Io.File.Handle;
+    const invalid_value: Native = if (Environment.isWindows)
+        std.os.windows.INVALID_HANDLE_VALUE
+    else
+        -1;
 
     pub const invalid: FD = .{};
 
@@ -2460,8 +2601,8 @@ pub const FD = struct {
         return .{ .value = file.handle };
     }
 
-    pub fn fromNative(value: anytype) FD {
-        return .{ .value = @intCast(value) };
+    pub fn fromNative(value: Native) FD {
+        return .{ .value = value };
     }
 
     pub fn cwd() FD {
@@ -2469,19 +2610,26 @@ pub const FD = struct {
     }
 
     pub fn isValid(self: FD) bool {
-        return self.value >= 0;
+        return if (Environment.isWindows)
+            self.value != std.os.windows.INVALID_HANDLE_VALUE
+        else
+            self.value >= 0;
     }
 
     pub fn unwrapValid(self: FD) ?FD {
         return if (self.isValid()) self else null;
     }
 
-    pub fn native(self: FD) std.posix.fd_t {
+    pub fn native(self: FD) Native {
         return self.value;
     }
 
     pub fn format(self: FD, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("{d}", .{self.value});
+        if (Environment.isWindows) {
+            try writer.print("0x{x}", .{@intFromPtr(self.value)});
+        } else {
+            try writer.print("{d}", .{self.value});
+        }
     }
 
     pub const cast = native;
@@ -2521,6 +2669,12 @@ pub const FD = struct {
     pub const Stdio = enum { stdin, stdout, stderr };
 
     pub fn stdioTag(self: FD) ?Stdio {
+        if (Environment.isWindows) {
+            if (self.value == std.Io.File.stdin().handle) return .stdin;
+            if (self.value == std.Io.File.stdout().handle) return .stdout;
+            if (self.value == std.Io.File.stderr().handle) return .stderr;
+            return null;
+        }
         return switch (self.value) {
             0 => .stdin,
             1 => .stdout,
@@ -2603,14 +2757,21 @@ test "directory descriptors opened through sys can be iterated" {
     _ = try child_iterator.next().unwrap();
 }
 
-pub fn getcwdAlloc(allocator: std.mem.Allocator) ![:0]u8 {
-    if (comptime @import("builtin").os.tag == .windows) return error.UnsupportedPlatform;
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const result = getcwd(&buffer, buffer.len) orelse return error.CurrentWorkingDirectoryUnavailable;
-    return try allocator.dupeZ(u8, std.mem.sliceTo(result, 0));
+pub fn getcwd(buffer: []u8) ![]u8 {
+    if (comptime Environment.isWindows) {
+        const result = _getcwd(buffer.ptr, @intCast(buffer.len)) orelse return error.CurrentWorkingDirectoryUnavailable;
+        return std.mem.sliceTo(result, 0);
+    }
+    return std.posix.getcwd(buffer);
 }
 
-extern fn getcwd(buffer: [*]u8, size: usize) callconv(.c) ?[*:0]u8;
+pub fn getcwdAlloc(allocator: std.mem.Allocator) ![:0]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const result = try getcwd(&buffer);
+    return try allocator.dupeZ(u8, result);
+}
+
+extern fn _getcwd(buffer: [*]u8, size: c_int) callconv(.c) ?[*:0]u8;
 
 pub fn getenvZ(name: [:0]const u8) ?[:0]const u8 {
     const value = std.c.getenv(name.ptr) orelse return null;

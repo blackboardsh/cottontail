@@ -1,11 +1,22 @@
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
+#if defined(_WIN32) && !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
 
 #include "jsc_runner.h"
 
 #include <JavaScriptCore/JavaScript.h>
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <windns.h>
+#include <winioctl.h>
+#else
 #include <arpa/inet.h>
+#endif
 #if defined(__APPLE__) || defined(__MACH__)
 #include <compression.h>
 #else
@@ -21,18 +32,28 @@
 #include <ffi.h>
 #endif
 #include <fcntl.h>
+#if !defined(_WIN32)
 #include <grp.h>
 #include <ifaddrs.h>
+#endif
 #include <limits.h>
 #include <math.h>
+#if !defined(_WIN32)
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pwd.h>
+#endif
+#if defined(_WIN32)
+#include <bmalloc/pas_thread.h>
+#else
 #include <pthread.h>
+#endif
+#if !defined(_WIN32)
 #include <resolv.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -40,16 +61,46 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#include <psapi.h>
+#include <iphlpapi.h>
+#include <tlhelp32.h>
+#define chdir _chdir
+#define dup2 _dup2
+#define getcwd _getcwd
+#define open _open
+#define O_SYNC 0
+#define F_OK 0
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#define SHUT_WR SD_SEND
+#define SHUT_RDWR SD_BOTH
+#define umask _umask
+typedef SSIZE_T ssize_t;
+typedef long suseconds_t;
+typedef int mode_t;
+typedef int pid_t;
+typedef unsigned int useconds_t;
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
+#else
 #include <strings.h>
+#endif
 #include "sqlite3_local.h"
+#if !defined(_WIN32)
 #include <arpa/nameser.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/resource.h>
-#if !defined(_WIN32)
 #include <sys/mman.h>
 #include <sys/un.h>
 #endif
+#include <sys/stat.h>
 #if defined(__APPLE__) || defined(__MACH__)
 #include <mach/mach.h>
 #include <net/if_dl.h>
@@ -58,16 +109,723 @@
 #elif defined(__linux__)
 #include <netpacket/packet.h>
 #include <sys/statvfs.h>
-#else
+#elif !defined(_WIN32)
 #include <sys/statvfs.h>
 #endif
+#if !defined(_WIN32)
 #include <sys/time.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
+#endif
+#include <time.h>
 #include <zlib.h>
 
+#if defined(_WIN32)
+#define environ _environ
+
+#ifndef PTHREAD_MUTEX_INITIALIZER
+#define PTHREAD_MUTEX_INITIALIZER SRWLOCK_INIT
+#endif
+#ifndef PTHREAD_COND_INITIALIZER
+#define PTHREAD_COND_INITIALIZER CONDITION_VARIABLE_INIT
+#endif
+
+typedef struct {
+    void *(*start_routine)(void *);
+    void *argument;
+} CtWindowsThreadStart;
+
+static unsigned __stdcall ct_windows_thread_entry(void *opaque) {
+    CtWindowsThreadStart *start = (CtWindowsThreadStart *)opaque;
+    void *(*start_routine)(void *) = start->start_routine;
+    void *argument = start->argument;
+    free(start);
+    (void)start_routine(argument);
+    return 0;
+}
+
+static int ct_windows_thread_create(
+    pthread_t *thread,
+    size_t stack_size,
+    void *(*start_routine)(void *),
+    void *argument
+) {
+    CtWindowsThreadStart *start = (CtWindowsThreadStart *)malloc(sizeof(*start));
+    if (start == NULL) return ENOMEM;
+    start->start_routine = start_routine;
+    start->argument = argument;
+    uintptr_t handle = _beginthreadex(NULL, (unsigned)stack_size, ct_windows_thread_entry, start, 0, NULL);
+    if (handle == 0) {
+        int error = errno == 0 ? EAGAIN : errno;
+        free(start);
+        return error;
+    }
+    *thread = handle;
+    return 0;
+}
+
+static int ct_windows_thread_detach(pthread_t thread) {
+    return CloseHandle((HANDLE)thread) ? 0 : EINVAL;
+}
+
+static int ct_windows_thread_join(pthread_t thread, void **result) {
+    if (result != NULL) *result = NULL;
+    DWORD wait_result = WaitForSingleObject((HANDLE)thread, INFINITE);
+    if (wait_result != WAIT_OBJECT_0) return EINVAL;
+    return CloseHandle((HANDLE)thread) ? 0 : EINVAL;
+}
+
+static int ct_windows_mutex_destroy(pthread_mutex_t *mutex) {
+    (void)mutex;
+    return 0;
+}
+
+static int ct_windows_cond_destroy(pthread_cond_t *cond) {
+    (void)cond;
+    return 0;
+}
+
+static int ct_windows_cond_signal(pthread_cond_t *cond) {
+    WakeConditionVariable(cond);
+    return 0;
+}
+
+#define pthread_create(thread, attr, start, argument) \
+    ct_windows_thread_create((thread), 0, (start), (argument))
+#define pthread_detach ct_windows_thread_detach
+#define pthread_join ct_windows_thread_join
+#define pthread_equal(left, right) ((left) == (right))
+#define pthread_mutex_destroy ct_windows_mutex_destroy
+#define pthread_cond_destroy ct_windows_cond_destroy
+#define pthread_cond_signal ct_windows_cond_signal
+
+// Recent MSVC STL headers vectorize std::unique through this runtime entry
+// point. JSC may be built with newer headers than the consumer's installed
+// toolset, so provide the scalar-equivalent algorithm only when the runtime
+// itself does not define it.
+void *__stdcall ct_std_unique_8_fallback(void *first_value, void *last_value) {
+    uint64_t *first = (uint64_t *)first_value;
+    uint64_t *last = (uint64_t *)last_value;
+    if (first == last) return first;
+    uint64_t *result = first;
+    for (uint64_t *current = first + 1; current != last; current++) {
+        if (*result != *current) {
+            result++;
+            *result = *current;
+        }
+    }
+    return result + 1;
+}
+#pragma comment(linker, "/alternatename:__std_unique_8=ct_std_unique_8_fallback")
+
+struct rusage {
+    struct timeval ru_utime;
+    struct timeval ru_stime;
+    SIZE_T ru_maxrss;
+    long ru_ixrss;
+    long ru_idrss;
+    long ru_isrss;
+    long ru_minflt;
+    long ru_majflt;
+    long ru_nswap;
+    long ru_inblock;
+    long ru_oublock;
+    long ru_msgsnd;
+    long ru_msgrcv;
+    long ru_nsignals;
+    long ru_nvcsw;
+    long ru_nivcsw;
+};
+
+#define RUSAGE_SELF 0
+
+int unsetenv(const char *name) {
+    return _putenv_s(name, "");
+}
+
+int setenv(const char *name, const char *value, int overwrite) {
+    if (!overwrite && getenv(name) != NULL) return 0;
+    return _putenv_s(name, value);
+}
+
+static int ct_lstat(const char *path, struct stat *stat_value) {
+    if (stat(path, stat_value) != 0) return -1;
+    DWORD attributes = GetFileAttributesA(path);
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        stat_value->st_mode = (stat_value->st_mode & ~S_IFMT) | S_IFLNK;
+    }
+    return 0;
+}
+
+static ssize_t ct_pread(int fd, void *buffer, size_t length, off_t offset) {
+    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    overlapped.Offset = (DWORD)((uint64_t)offset & 0xffffffffu);
+    overlapped.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+    DWORD transferred = 0;
+    DWORD amount = length > UINT32_MAX ? UINT32_MAX : (DWORD)length;
+    if (!ReadFile(handle, buffer, amount, &transferred, &overlapped)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)transferred;
+}
+
+static ssize_t ct_pwrite(int fd, const void *buffer, size_t length, off_t offset) {
+    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    overlapped.Offset = (DWORD)((uint64_t)offset & 0xffffffffu);
+    overlapped.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+    DWORD transferred = 0;
+    DWORD amount = length > UINT32_MAX ? UINT32_MAX : (DWORD)length;
+    if (!WriteFile(handle, buffer, amount, &transferred, &overlapped)) {
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)transferred;
+}
+
+static int ct_fchmod(int fd, mode_t mode) {
+    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    WCHAR path[32768];
+    DWORD length = GetFinalPathNameByHandleW(handle, path, (DWORD)(sizeof(path) / sizeof(path[0])), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (length == 0 || length >= sizeof(path) / sizeof(path[0])) {
+        errno = EIO;
+        return -1;
+    }
+    const WCHAR *normalized = wcsncmp(path, L"\\\\?\\", 4) == 0 ? path + 4 : path;
+    return _wchmod(normalized, mode);
+}
+
+static void ct_windows_filetime_from_timeval(const struct timeval *value, FILETIME *filetime) {
+    const uint64_t epoch_delta = 11644473600ULL;
+    uint64_t ticks = ((uint64_t)value->tv_sec + epoch_delta) * 10000000ULL + (uint64_t)value->tv_usec * 10ULL;
+    filetime->dwLowDateTime = (DWORD)ticks;
+    filetime->dwHighDateTime = (DWORD)(ticks >> 32);
+}
+
+static int ct_futimes(int fd, const struct timeval times[2]) {
+    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    FILETIME access_time;
+    FILETIME modification_time;
+    ct_windows_filetime_from_timeval(&times[0], &access_time);
+    ct_windows_filetime_from_timeval(&times[1], &modification_time);
+    if (!SetFileTime(handle, NULL, &access_time, &modification_time)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int ct_utimes(const char *path, const struct timeval times[2]) {
+    HANDLE handle = CreateFileA(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = ENOENT;
+        return -1;
+    }
+    FILETIME access_time;
+    FILETIME modification_time;
+    ct_windows_filetime_from_timeval(&times[0], &access_time);
+    ct_windows_filetime_from_timeval(&times[1], &modification_time);
+    BOOL ok = SetFileTime(handle, NULL, &access_time, &modification_time);
+    CloseHandle(handle);
+    if (!ok) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int ct_truncate(const char *path, off_t length) {
+    int fd = _open(path, _O_WRONLY | _O_BINARY);
+    if (fd < 0) return -1;
+    int status = _chsize_s(fd, length) == 0 ? 0 : -1;
+    _close(fd);
+    return status;
+}
+
+static int ct_unsupported_ownership(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+static int ct_link(const char *existing_path, const char *new_path) {
+    if (CreateHardLinkA(new_path, existing_path, NULL)) return 0;
+    errno = EIO;
+    return -1;
+}
+
+static int ct_symlink(const char *target, const char *path) {
+    DWORD attributes = GetFileAttributesA(target);
+    DWORD flags = (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        ? SYMBOLIC_LINK_FLAG_DIRECTORY
+        : 0;
+#if defined(SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)
+    if (CreateSymbolicLinkA(path, target, flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) return 0;
+#endif
+    if (CreateSymbolicLinkA(path, target, flags)) return 0;
+    errno = GetLastError() == ERROR_PRIVILEGE_NOT_HELD ? EPERM : EIO;
+    return -1;
+}
+
+typedef struct {
+    DWORD tag;
+    WORD data_length;
+    WORD reserved;
+    union {
+        struct {
+            WORD substitute_name_offset;
+            WORD substitute_name_length;
+            WORD print_name_offset;
+            WORD print_name_length;
+            ULONG flags;
+            WCHAR path_buffer[1];
+        } symbolic_link;
+        struct {
+            WORD substitute_name_offset;
+            WORD substitute_name_length;
+            WORD print_name_offset;
+            WORD print_name_length;
+            WCHAR path_buffer[1];
+        } mount_point;
+    } data;
+} CtReparseDataBuffer;
+
+static ssize_t ct_readlink(const char *path, char *buffer, size_t capacity) {
+    HANDLE handle = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = ENOENT;
+        return -1;
+    }
+    unsigned char storage[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0, storage, sizeof(storage), &bytes, NULL);
+    CloseHandle(handle);
+    if (!ok) {
+        errno = EINVAL;
+        return -1;
+    }
+    CtReparseDataBuffer *reparse = (CtReparseDataBuffer *)storage;
+    const WCHAR *wide = NULL;
+    int wide_len = 0;
+    if (reparse->tag == IO_REPARSE_TAG_SYMLINK) {
+        wide = reparse->data.symbolic_link.path_buffer + reparse->data.symbolic_link.print_name_offset / sizeof(WCHAR);
+        wide_len = reparse->data.symbolic_link.print_name_length / sizeof(WCHAR);
+    } else if (reparse->tag == IO_REPARSE_TAG_MOUNT_POINT) {
+        wide = reparse->data.mount_point.path_buffer + reparse->data.mount_point.print_name_offset / sizeof(WCHAR);
+        wide_len = reparse->data.mount_point.print_name_length / sizeof(WCHAR);
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    int required = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, NULL, 0, NULL, NULL);
+    if (required < 0) {
+        errno = EILSEQ;
+        return -1;
+    }
+    if ((size_t)required > capacity) return (ssize_t)capacity;
+    int written = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, buffer, (int)capacity, NULL, NULL);
+    if (written <= 0 && wide_len > 0) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return written;
+}
+
+static char *ct_realpath(const char *path, char *resolved) {
+    return _fullpath(resolved, path, resolved != NULL ? PATH_MAX : 0);
+}
+
+static void ct_usleep(unsigned long usec) {
+    Sleep((DWORD)((usec + 999) / 1000));
+}
+
+static int ct_clock_gettime(int clock_id, struct timespec *value) {
+    if (clock_id == 0) {
+        FILETIME file_time;
+        ULARGE_INTEGER ticks;
+        GetSystemTimePreciseAsFileTime(&file_time);
+        ticks.LowPart = file_time.dwLowDateTime;
+        ticks.HighPart = file_time.dwHighDateTime;
+        const uint64_t unix_ticks = ticks.QuadPart - 116444736000000000ULL;
+        value->tv_sec = (time_t)(unix_ticks / 10000000ULL);
+        value->tv_nsec = (long)((unix_ticks % 10000000ULL) * 100ULL);
+        return 0;
+    }
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&counter)) {
+        errno = EINVAL;
+        return -1;
+    }
+    value->tv_sec = (time_t)(counter.QuadPart / frequency.QuadPart);
+    value->tv_nsec = (long)(((counter.QuadPart % frequency.QuadPart) * 1000000000LL) / frequency.QuadPart);
+    return 0;
+}
+
+static int ct_windows_socket_errno(void);
+
+static int ct_setsockopt(SOCKET socket, int level, int option, const void *value, int length) {
+    int result = setsockopt(socket, level, option, (const char *)value, length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_getsockopt(SOCKET socket, int level, int option, void *value, int *length) {
+    int result = getsockopt(socket, level, option, (char *)value, length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_socket_errno(void) {
+    int error = WSAGetLastError();
+    switch (error) {
+        case WSANOTINITIALISED: return ENETDOWN;
+        case WSAEINVAL: return EINVAL;
+        case WSAEINTR: return EINTR;
+        case WSAEWOULDBLOCK: return EWOULDBLOCK;
+        case WSAEINPROGRESS: return EINPROGRESS;
+        case WSAEALREADY: return EALREADY;
+        case WSAENOTSOCK: return ENOTSOCK;
+        case WSAEDESTADDRREQ: return EDESTADDRREQ;
+        case WSAEMSGSIZE: return EMSGSIZE;
+        case WSAEPROTOTYPE: return EPROTOTYPE;
+        case WSAENOPROTOOPT: return ENOPROTOOPT;
+        case WSAEPROTONOSUPPORT: return EPROTONOSUPPORT;
+        case WSAEOPNOTSUPP: return EOPNOTSUPP;
+        case WSAEAFNOSUPPORT: return EAFNOSUPPORT;
+        case WSAEADDRINUSE: return EADDRINUSE;
+        case WSAEADDRNOTAVAIL: return EADDRNOTAVAIL;
+        case WSAENETDOWN: return ENETDOWN;
+        case WSAENETUNREACH: return ENETUNREACH;
+        case WSAECONNABORTED: return ECONNABORTED;
+        case WSAECONNRESET: return ECONNRESET;
+        case WSAENOBUFS: return ENOBUFS;
+        case WSAEISCONN: return EISCONN;
+        case WSAENOTCONN: return ENOTCONN;
+        case WSAESHUTDOWN: return EPIPE;
+        case WSAETIMEDOUT: return ETIMEDOUT;
+        case WSAECONNREFUSED: return ECONNREFUSED;
+        case WSAEHOSTUNREACH: return EHOSTUNREACH;
+        default: return EIO;
+    }
+}
+
+static SOCKET ct_windows_socket_from_fd(int fd) {
+    return (SOCKET)(uintptr_t)(uint32_t)fd;
+}
+
+static INIT_ONCE ct_winsock_once = INIT_ONCE_STATIC_INIT;
+static int ct_winsock_status = WSANOTINITIALISED;
+
+static BOOL CALLBACK ct_windows_initialize_winsock(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)parameter;
+    (void)context;
+    WSADATA data;
+    ct_winsock_status = WSAStartup(MAKEWORD(2, 2), &data);
+    return TRUE;
+}
+
+static int ct_windows_ensure_winsock(void) {
+    if (!InitOnceExecuteOnce(&ct_winsock_once, ct_windows_initialize_winsock, NULL, NULL)) return EIO;
+    return ct_winsock_status == 0 ? 0 : ENETDOWN;
+}
+
+static int ct_windows_socket_create(int family, int type, int protocol) {
+    int startup_error = ct_windows_ensure_winsock();
+    if (startup_error != 0) {
+        errno = startup_error;
+        return -1;
+    }
+    SOCKET socket_value = socket(family, type, protocol);
+    if (socket_value == INVALID_SOCKET) {
+        errno = ct_windows_socket_errno();
+        return -1;
+    }
+    return (int)(uint32_t)(uintptr_t)socket_value;
+}
+
+static int ct_windows_accept(int fd, struct sockaddr *address, int *address_length) {
+    SOCKET accepted = accept(ct_windows_socket_from_fd(fd), address, address_length);
+    if (accepted == INVALID_SOCKET) {
+        errno = ct_windows_socket_errno();
+        return -1;
+    }
+    return (int)(uint32_t)(uintptr_t)accepted;
+}
+
+static int ct_windows_bind(int fd, const struct sockaddr *address, int address_length) {
+    int result = bind(ct_windows_socket_from_fd(fd), address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_connect(int fd, const struct sockaddr *address, int address_length) {
+    int result = connect(ct_windows_socket_from_fd(fd), address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_getpeername(int fd, struct sockaddr *address, int *address_length) {
+    int result = getpeername(ct_windows_socket_from_fd(fd), address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_getsockname(int fd, struct sockaddr *address, int *address_length) {
+    int result = getsockname(ct_windows_socket_from_fd(fd), address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_listen(int fd, int backlog) {
+    int result = listen(ct_windows_socket_from_fd(fd), backlog);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_poll(WSAPOLLFD *fds, ULONG count, int timeout) {
+    int result = WSAPoll(fds, count, timeout);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_recv(int fd, char *buffer, int length, int flags) {
+    int result = recv(ct_windows_socket_from_fd(fd), buffer, length, flags);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_recvfrom(int fd, char *buffer, int length, int flags, struct sockaddr *address, int *address_length) {
+    int result = recvfrom(ct_windows_socket_from_fd(fd), buffer, length, flags, address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_send(int fd, const char *buffer, int length, int flags) {
+    int result = send(ct_windows_socket_from_fd(fd), buffer, length, flags);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_sendto(int fd, const char *buffer, int length, int flags, const struct sockaddr *address, int address_length) {
+    int result = sendto(ct_windows_socket_from_fd(fd), buffer, length, flags, address, address_length);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static int ct_windows_shutdown(int fd, int how) {
+    int result = shutdown(ct_windows_socket_from_fd(fd), how);
+    if (result == SOCKET_ERROR) errno = ct_windows_socket_errno();
+    return result;
+}
+
+static bool ct_windows_is_socket(int fd) {
+    if (fd < 0) return false;
+    int socket_type = 0;
+    int length = sizeof(socket_type);
+    int previous_error = WSAGetLastError();
+    bool is_socket = getsockopt(ct_windows_socket_from_fd(fd), SOL_SOCKET, SO_TYPE, (char *)&socket_type, &length) == 0;
+    WSASetLastError(previous_error);
+    return is_socket;
+}
+
+static int ct_windows_close(int fd) {
+    if (ct_windows_is_socket(fd)) {
+        int result = closesocket(ct_windows_socket_from_fd(fd));
+        if (result != 0) errno = ct_windows_socket_errno();
+        return result;
+    }
+    return _close(fd);
+}
+
+static ssize_t ct_windows_read(int fd, void *buffer, size_t length) {
+    if (!ct_windows_is_socket(fd)) return _read(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+    int result = recv(ct_windows_socket_from_fd(fd), (char *)buffer, length > INT_MAX ? INT_MAX : (int)length, 0);
+    if (result == SOCKET_ERROR) {
+        errno = ct_windows_socket_errno();
+        return -1;
+    }
+    return result;
+}
+
+static ssize_t ct_windows_write(int fd, const void *buffer, size_t length) {
+    if (!ct_windows_is_socket(fd)) return _write(fd, buffer, length > UINT_MAX ? UINT_MAX : (unsigned int)length);
+    int result = send(ct_windows_socket_from_fd(fd), (const char *)buffer, length > INT_MAX ? INT_MAX : (int)length, 0);
+    if (result == SOCKET_ERROR) {
+        errno = ct_windows_socket_errno();
+        return -1;
+    }
+    return result;
+}
+
+static int ct_windows_descriptor_read_ready(int fd) {
+    if (ct_windows_is_socket(fd)) {
+        SOCKET socket_value = ct_windows_socket_from_fd(fd);
+        fd_set read_fds;
+        fd_set error_fds;
+        FD_ZERO(&read_fds);
+        FD_ZERO(&error_fds);
+        FD_SET(socket_value, &read_fds);
+        FD_SET(socket_value, &error_fds);
+        struct timeval timeout = { 0, 0 };
+        int result = select(0, &read_fds, NULL, &error_fds, &timeout);
+        if (result == SOCKET_ERROR) {
+            errno = ct_windows_socket_errno();
+            return -1;
+        }
+        return result;
+    }
+    intptr_t raw_handle = _get_osfhandle(fd);
+    if (raw_handle == -1) {
+        errno = EBADF;
+        return -1;
+    }
+    HANDLE handle = (HANDLE)raw_handle;
+    if (GetFileType(handle) == FILE_TYPE_PIPE) {
+        DWORD available = 0;
+        if (PeekNamedPipe(handle, NULL, 0, NULL, &available, NULL)) return available > 0 ? 1 : 0;
+        DWORD error = GetLastError();
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) return 1;
+        errno = EIO;
+        return -1;
+    }
+    if (GetFileType(handle) == FILE_TYPE_DISK) return 1;
+    DWORD wait_result = WaitForSingleObject(handle, 0);
+    if (wait_result == WAIT_OBJECT_0) return 1;
+    if (wait_result == WAIT_TIMEOUT) return 0;
+    errno = EIO;
+    return -1;
+}
+
+static int ct_kill(pid_t pid, int signal_number) {
+    HANDLE process = OpenProcess(signal_number == 0 ? PROCESS_QUERY_LIMITED_INFORMATION : PROCESS_TERMINATE, FALSE, (DWORD)pid);
+    if (process == NULL) {
+        errno = GetLastError() == ERROR_ACCESS_DENIED ? EPERM : ESRCH;
+        return -1;
+    }
+    BOOL ok = signal_number == 0 || TerminateProcess(process, (UINT)signal_number);
+    CloseHandle(process);
+    if (!ok) {
+        errno = EPERM;
+        return -1;
+    }
+    return 0;
+}
+
+static pid_t ct_getppid(void) {
+    DWORD current_pid = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    pid_t parent_pid = 0;
+    if (Process32First(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == current_pid) {
+                parent_pid = (pid_t)entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return parent_pid;
+}
+
+static int ct_getrusage(int who, struct rusage *usage) {
+    (void)who;
+    memset(usage, 0, sizeof(*usage));
+    FILETIME creation_time;
+    FILETIME exit_time;
+    FILETIME kernel_time;
+    FILETIME user_time;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time, &kernel_time, &user_time)) return -1;
+    ULARGE_INTEGER kernel;
+    ULARGE_INTEGER user;
+    kernel.LowPart = kernel_time.dwLowDateTime;
+    kernel.HighPart = kernel_time.dwHighDateTime;
+    user.LowPart = user_time.dwLowDateTime;
+    user.HighPart = user_time.dwHighDateTime;
+    usage->ru_stime.tv_sec = (long)(kernel.QuadPart / 10000000ULL);
+    usage->ru_stime.tv_usec = (long)((kernel.QuadPart % 10000000ULL) / 10ULL);
+    usage->ru_utime.tv_sec = (long)(user.QuadPart / 10000000ULL);
+    usage->ru_utime.tv_usec = (long)((user.QuadPart % 10000000ULL) / 10ULL);
+    PROCESS_MEMORY_COUNTERS memory;
+    memset(&memory, 0, sizeof(memory));
+    memory.cb = sizeof(memory);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) usage->ru_maxrss = memory.PeakWorkingSetSize;
+    return 0;
+}
+
+#define getppid ct_getppid
+#define getpid _getpid
+#define getrusage ct_getrusage
+#define accept ct_windows_accept
+#define bind ct_windows_bind
+#define close ct_windows_close
+#define connect ct_windows_connect
+#define getpeername ct_windows_getpeername
+#define getsockopt ct_getsockopt
+#define getsockname ct_windows_getsockname
+#define kill ct_kill
+#define lstat ct_lstat
+#define pread ct_pread
+#define pwrite ct_pwrite
+#define read ct_windows_read
+#define fsync _commit
+#define fdatasync _commit
+#define ftruncate(fd, length) (_chsize_s((fd), (length)) == 0 ? 0 : -1)
+#define fchmod ct_fchmod
+#define fchown(fd, uid, gid) ct_unsupported_ownership()
+#define chown(path, uid, gid) ct_unsupported_ownership()
+#define lchown(path, uid, gid) ct_unsupported_ownership()
+#define futimes ct_futimes
+#define truncate ct_truncate
+#define utimes ct_utimes
+#define link ct_link
+#define symlink ct_symlink
+#define readlink ct_readlink
+#define listen ct_windows_listen
+#define poll ct_windows_poll
+#define realpath ct_realpath
+#define recv ct_windows_recv
+#define recvfrom ct_windows_recvfrom
+#define send ct_windows_send
+#define sendto ct_windows_sendto
+#define setsockopt ct_setsockopt
+#define shutdown ct_windows_shutdown
+#define socket ct_windows_socket_create
+#define usleep ct_usleep
+#define write ct_windows_write
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+#define clock_gettime ct_clock_gettime
+#else
 extern char **environ;
+#endif
 
 extern uint8_t *ct_markdown_render_html(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
 extern uint8_t *ct_markdown_parse_events(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
@@ -107,6 +865,8 @@ extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 #define CT_PLATFORM_STRING "darwin"
 #elif defined(__linux__)
 #define CT_PLATFORM_STRING "linux"
+#elif defined(_WIN32)
+#define CT_PLATFORM_STRING "win32"
 #else
 #define CT_PLATFORM_STRING "unknown"
 #endif
@@ -390,6 +1150,9 @@ typedef struct CtAsyncProcess {
     int ipc_fd;
     CtJscRuntime *runtime;
     pthread_t thread;
+#if defined(_WIN32)
+    HANDLE process_handle;
+#endif
     struct CtAsyncProcess *next;
 } CtAsyncProcess;
 
@@ -6425,6 +7188,7 @@ static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, 
     return result;
 }
 
+#if !defined(_WIN32)
 static int ct_dns_type_from_name(const char *type) {
     if (strcasecmp(type, "CNAME") == 0) return ns_t_cname;
     if (strcasecmp(type, "MX") == 0) return ns_t_mx;
@@ -6643,6 +7407,145 @@ static JSValueRef ct_dns_resolve_records(JSContextRef ctx, JSObjectRef function,
     }
     return results;
 }
+#else
+static int ct_dns_type_from_name(const char *type) {
+    if (strcasecmp(type, "CNAME") == 0) return DNS_TYPE_CNAME;
+    if (strcasecmp(type, "MX") == 0) return DNS_TYPE_MX;
+    if (strcasecmp(type, "NS") == 0) return DNS_TYPE_NS;
+    if (strcasecmp(type, "PTR") == 0) return DNS_TYPE_PTR;
+    if (strcasecmp(type, "SOA") == 0) return DNS_TYPE_SOA;
+    if (strcasecmp(type, "SRV") == 0) return DNS_TYPE_SRV;
+    if (strcasecmp(type, "TXT") == 0) return DNS_TYPE_TEXT;
+    if (strcasecmp(type, "NAPTR") == 0) return DNS_TYPE_NAPTR;
+    if (strcasecmp(type, "TLSA") == 0) return 52;
+    if (strcasecmp(type, "CAA") == 0) return 257;
+    return -1;
+}
+
+static JSValueRef ct_dns_windows_record_to_js(JSContextRef ctx, const DNS_RECORDA *record, int requested_type, JSValueRef *exception) {
+    if ((int)record->wType != requested_type) return JSValueMakeUndefined(ctx);
+
+    if (requested_type == DNS_TYPE_CNAME || requested_type == DNS_TYPE_NS || requested_type == DNS_TYPE_PTR) {
+        return ct_make_string(ctx, record->Data.PTR.pNameHost);
+    }
+    if (requested_type == DNS_TYPE_MX) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "exchange", ct_make_string(ctx, record->Data.MX.pNameExchange), exception);
+        ct_set_property(ctx, result, "priority", JSValueMakeNumber(ctx, record->Data.MX.wPreference), exception);
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "MX"), exception);
+        return result;
+    }
+    if (requested_type == DNS_TYPE_TEXT) {
+        JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+        for (DWORD index = 0; index < record->Data.TXT.dwStringCount; index += 1) {
+            JSObjectSetPropertyAtIndex(ctx, result, index, ct_make_string(ctx, record->Data.TXT.pStringArray[index]), exception);
+        }
+        return result;
+    }
+    if (requested_type == DNS_TYPE_SOA) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "nsname", ct_make_string(ctx, record->Data.SOA.pNamePrimaryServer), exception);
+        ct_set_property(ctx, result, "hostmaster", ct_make_string(ctx, record->Data.SOA.pNameAdministrator), exception);
+        ct_set_property(ctx, result, "serial", JSValueMakeNumber(ctx, record->Data.SOA.dwSerialNo), exception);
+        ct_set_property(ctx, result, "refresh", JSValueMakeNumber(ctx, record->Data.SOA.dwRefresh), exception);
+        ct_set_property(ctx, result, "retry", JSValueMakeNumber(ctx, record->Data.SOA.dwRetry), exception);
+        ct_set_property(ctx, result, "expire", JSValueMakeNumber(ctx, record->Data.SOA.dwExpire), exception);
+        ct_set_property(ctx, result, "minttl", JSValueMakeNumber(ctx, record->Data.SOA.dwDefaultTtl), exception);
+        return result;
+    }
+    if (requested_type == DNS_TYPE_SRV) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "priority", JSValueMakeNumber(ctx, record->Data.SRV.wPriority), exception);
+        ct_set_property(ctx, result, "weight", JSValueMakeNumber(ctx, record->Data.SRV.wWeight), exception);
+        ct_set_property(ctx, result, "port", JSValueMakeNumber(ctx, record->Data.SRV.wPort), exception);
+        ct_set_property(ctx, result, "name", ct_make_string(ctx, record->Data.SRV.pNameTarget), exception);
+        return result;
+    }
+    if (requested_type == DNS_TYPE_NAPTR) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "order", JSValueMakeNumber(ctx, record->Data.NAPTR.wOrder), exception);
+        ct_set_property(ctx, result, "preference", JSValueMakeNumber(ctx, record->Data.NAPTR.wPreference), exception);
+        ct_set_property(ctx, result, "flags", ct_make_string(ctx, record->Data.NAPTR.pFlags), exception);
+        ct_set_property(ctx, result, "service", ct_make_string(ctx, record->Data.NAPTR.pService), exception);
+        ct_set_property(ctx, result, "regexp", ct_make_string(ctx, record->Data.NAPTR.pRegularExpression), exception);
+        ct_set_property(ctx, result, "replacement", ct_make_string(ctx, record->Data.NAPTR.pReplacement), exception);
+        return result;
+    }
+    if (requested_type == 52) {
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "usage", JSValueMakeNumber(ctx, record->Data.TLSA.bCertUsage), exception);
+        ct_set_property(ctx, result, "selector", JSValueMakeNumber(ctx, record->Data.TLSA.bSelector), exception);
+        ct_set_property(ctx, result, "matchingType", JSValueMakeNumber(ctx, record->Data.TLSA.bMatchingType), exception);
+        ct_set_property(ctx, result, "cert", ct_array_buffer_from_copy(ctx, (const char *)record->Data.TLSA.bCertificateAssociationData, record->Data.TLSA.bCertificateAssociationDataLength, exception), exception);
+        return result;
+    }
+    if (requested_type == 257) {
+        const BYTE *data = record->Data.UNKNOWN.bData;
+        DWORD data_len = record->Data.UNKNOWN.dwByteCount;
+        if (data_len < 2 || 2u + data[1] > data_len) {
+            ct_throw_message(ctx, exception, "Invalid CAA record");
+            return JSValueMakeUndefined(ctx);
+        }
+        unsigned tag_len = data[1];
+        char tag[256];
+        memcpy(tag, data + 2, tag_len);
+        tag[tag_len] = '\0';
+        JSObjectRef result = ct_make_object(ctx);
+        ct_set_property(ctx, result, "critical", JSValueMakeNumber(ctx, (data[0] & 0x80) ? 1 : 0), exception);
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "CAA"), exception);
+        ct_set_property(ctx, result, tag, ct_make_string_len(ctx, (const char *)(data + 2 + tag_len), data_len - 2 - tag_len), exception);
+        return result;
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_dns_resolve_records(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "dnsResolveRecords(hostname, type) requires hostname and type");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *hostname = ct_value_to_string_copy(ctx, argv[0]);
+    char *type_name = ct_value_to_string_copy(ctx, argv[1]);
+    if (hostname == NULL || type_name == NULL) {
+        free(hostname);
+        free(type_name);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int record_type = ct_dns_type_from_name(type_name);
+    free(type_name);
+    if (record_type < 0) {
+        free(hostname);
+        ct_throw_message(ctx, exception, "Unsupported DNS record type");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    DNS_RECORDA *records = NULL;
+    DNS_STATUS status = DnsQuery_A(hostname, (WORD)record_type, DNS_QUERY_STANDARD, NULL, &records, NULL);
+    free(hostname);
+    if (status != ERROR_SUCCESS) {
+        char message[80];
+        snprintf(message, sizeof(message), "DNS query failed with status %ld", (long)status);
+        ct_throw_message(ctx, exception, message);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef results = ct_make_array(ctx, 0, NULL, exception);
+    unsigned result_index = 0;
+    for (DNS_RECORDA *record = records; record != NULL; record = record->pNext) {
+        JSValueRef parsed = ct_dns_windows_record_to_js(ctx, record, record_type, exception);
+        if (exception != NULL && *exception != NULL) {
+            DnsRecordListFree(records, DnsFreeRecordList);
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!JSValueIsUndefined(ctx, parsed)) JSObjectSetPropertyAtIndex(ctx, results, result_index++, parsed, exception);
+    }
+    DnsRecordListFree(records, DnsFreeRecordList);
+    return results;
+}
+#endif
 
 static JSObjectRef ct_udp_make_address(JSContextRef ctx, const struct sockaddr *addr, socklen_t addr_len, JSValueRef *exception) {
     char host[NI_MAXHOST];
@@ -6700,8 +7603,13 @@ static JSValueRef ct_udp_socket_create(JSContextRef ctx, JSObjectRef function, J
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+#if defined(_WIN32)
+    u_long nonblocking = 1;
+    ioctlsocket(fd, FIONBIO, &nonblocking);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
@@ -6786,9 +7694,9 @@ static JSValueRef ct_udp_socket_send(JSContextRef ctx, JSObjectRef function, JSO
         return JSValueMakeUndefined(ctx);
     }
     free(address);
-    ssize_t sent = sendto(fd, data, data_len, 0, (struct sockaddr *)&storage, storage_len);
+    ssize_t sent = sendto(fd, (const char *)data, (int)data_len, 0, (struct sockaddr *)&storage, storage_len);
     if (sent < 0 && errno == EISCONN) {
-        sent = send(fd, data, data_len, 0);
+        sent = send(fd, (const char *)data, (int)data_len, 0);
     }
     if (sent < 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -6834,22 +7742,28 @@ static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, 
     if (max_bytes == 0) max_bytes = 65536;
     if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
 
+#ifdef _WIN32
+    int ready = ct_windows_descriptor_read_ready(fd);
+#else
     struct pollfd poll_fd;
     poll_fd.fd = fd;
     poll_fd.events = POLLIN | POLLERR | POLLHUP;
     poll_fd.revents = 0;
     int ready = poll(&poll_fd, 1, 0);
+#endif
     if (ready == 0) return JSValueMakeNull(ctx);
     if (ready < 0) {
         if (errno == EINTR) return JSValueMakeNull(ctx);
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+#ifndef _WIN32
     if ((poll_fd.revents & POLLNVAL) != 0) {
         ct_throw_message(ctx, exception, "invalid UDP socket");
         return JSValueMakeUndefined(ctx);
     }
     if ((poll_fd.revents & POLLIN) == 0) return JSValueMakeNull(ctx);
+#endif
 
     char *buffer = (char *)malloc(max_bytes > 0 ? max_bytes : 1);
     if (buffer == NULL) {
@@ -7096,13 +8010,23 @@ static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int por
 }
 
 static void ct_set_nonblocking_fd(int fd) {
+#if defined(_WIN32)
+    u_long nonblocking = 1;
+    ioctlsocket(fd, FIONBIO, &nonblocking);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
 static void ct_set_blocking_fd(int fd) {
+#if defined(_WIN32)
+    u_long nonblocking = 0;
+    ioctlsocket(fd, FIONBIO, &nonblocking);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+#endif
 }
 
 static JSObjectRef ct_tcp_address_object(JSContextRef ctx, int fd, bool peer, JSValueRef *exception) {
@@ -7125,7 +8049,9 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
         ct_throw_message(ctx, exception, "tcpServerListen(port, address[, family]) requires a port and address");
         return JSValueMakeUndefined(ctx);
     }
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif
     double port_number = ct_value_to_number(ctx, argv[0]);
     if (!isfinite(port_number) || port_number < 0 || port_number > 65535) {
         ct_throw_message(ctx, exception, "tcpServerListen(port, address[, family]) requires a valid port");
@@ -7208,7 +8134,9 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "tcpSocketConnect(port, address[, family]) requires a port and address");
         return JSValueMakeUndefined(ctx);
     }
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif
     double port_number = ct_value_to_number(ctx, argv[0]);
     if (!isfinite(port_number) || port_number < 0 || port_number > 65535) {
         ct_throw_message(ctx, exception, "tcpSocketConnect(port, address[, family]) requires a valid port");
@@ -8404,6 +9332,7 @@ static JSObjectRef ct_rusage_object(JSContextRef ctx, const struct rusage *usage
     return result;
 }
 
+#if !defined(_WIN32)
 static int ct_process_setgroups(JSContextRef ctx, JSValueRef value, JSValueRef *exception) {
     if (!JSValueIsObject(ctx, value)) return -1;
     JSObjectRef array = (JSObjectRef)value;
@@ -8426,6 +9355,7 @@ static int ct_process_setgroups(JSContextRef ctx, JSValueRef value, JSValueRef *
     free(groups);
     return status;
 }
+#endif
 
 static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
@@ -8451,6 +9381,7 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         free(kind);
         return JSValueMakeNumber(ctx, (double)getppid());
     }
+#if !defined(_WIN32)
     if (strcmp(kind, "getuid") == 0) {
         free(kind);
         return JSValueMakeNumber(ctx, (double)getuid());
@@ -8528,6 +9459,7 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         free(kind);
         return JSValueMakeUndefined(ctx);
     }
+#endif
     if (strcmp(kind, "umask") == 0) {
         if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
             mode_t old = umask((mode_t)ct_value_to_number(ctx, argv[1]));
@@ -8623,6 +9555,7 @@ static bool ct_sockaddr_to_ip(const struct sockaddr *address, char *buffer, size
     return false;
 }
 
+#if !defined(_WIN32)
 static void ct_mac_for_interface(struct ifaddrs *interfaces, const char *name, char out[18]) {
     snprintf(out, 18, "00:00:00:00:00:00");
     if (interfaces == NULL || name == NULL) return;
@@ -8705,10 +9638,118 @@ static JSValueRef ct_os_network_interfaces(JSContextRef ctx, JSObjectRef functio
     freeifaddrs(interfaces);
     return result;
 }
+#else
+static void ct_windows_adapter_name(const WCHAR *wide_name, char *name, size_t name_len) {
+    if (wide_name == NULL || name_len == 0) {
+        if (name_len > 0) name[0] = '\0';
+        return;
+    }
+    int length = WideCharToMultiByte(CP_UTF8, 0, wide_name, -1, name, (int)name_len, NULL, NULL);
+    if (length <= 0) name[0] = '\0';
+}
+
+static void ct_windows_netmask(ADDRESS_FAMILY family, unsigned prefix, char *out, size_t out_len) {
+    if (family == AF_INET) {
+        struct in_addr mask;
+        mask.s_addr = htonl(prefix == 0 ? 0u : 0xffffffffu << (32 - (prefix > 32 ? 32 : prefix)));
+        if (inet_ntop(AF_INET, &mask, out, (socklen_t)out_len) == NULL) out[0] = '\0';
+        return;
+    }
+    struct in6_addr mask;
+    memset(&mask, 0, sizeof(mask));
+    if (prefix > 128) prefix = 128;
+    for (unsigned index = 0; index < 16; index += 1) {
+        unsigned remaining = prefix > index * 8 ? prefix - index * 8 : 0;
+        mask.s6_addr[index] = remaining >= 8 ? 0xff : remaining == 0 ? 0 : (unsigned char)(0xff << (8 - remaining));
+    }
+    if (inet_ntop(AF_INET6, &mask, out, (socklen_t)out_len) == NULL) out[0] = '\0';
+}
+
+static JSValueRef ct_os_network_interfaces(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    ULONG size = 16 * 1024;
+    IP_ADAPTER_ADDRESSES *adapters = NULL;
+    ULONG status = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 3 && status == ERROR_BUFFER_OVERFLOW; attempt += 1) {
+        free(adapters);
+        adapters = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (adapters == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        status = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, adapters, &size);
+    }
+    if (status != NO_ERROR) {
+        free(adapters);
+        ct_throw_message(ctx, exception, "GetAdaptersAddresses failed");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+    unsigned index = 0;
+    for (IP_ADAPTER_ADDRESSES *adapter = adapters; adapter != NULL; adapter = adapter->Next) {
+        char name[512];
+        ct_windows_adapter_name(adapter->FriendlyName, name, sizeof(name));
+        char mac[18] = "00:00:00:00:00:00";
+        if (adapter->PhysicalAddressLength >= 6) {
+            const unsigned char *bytes = adapter->PhysicalAddress;
+            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x", bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+        }
+        for (IP_ADAPTER_UNICAST_ADDRESS *unicast = adapter->FirstUnicastAddress; unicast != NULL; unicast = unicast->Next) {
+            const struct sockaddr *socket_address = unicast->Address.lpSockaddr;
+            int family = socket_address != NULL ? socket_address->sa_family : AF_UNSPEC;
+            if (family != AF_INET && family != AF_INET6) continue;
+            char address[INET6_ADDRSTRLEN];
+            char netmask[INET6_ADDRSTRLEN];
+            unsigned scope_id = 0;
+            if (!ct_sockaddr_to_ip(socket_address, address, sizeof(address), &scope_id)) continue;
+            ct_windows_netmask((ADDRESS_FAMILY)family, unicast->OnLinkPrefixLength, netmask, sizeof(netmask));
+
+            JSObjectRef item = ct_make_object(ctx);
+            ct_set_property(ctx, item, "name", ct_make_string(ctx, name), exception);
+            ct_set_property(ctx, item, "address", ct_make_string(ctx, address), exception);
+            ct_set_property(ctx, item, "netmask", ct_make_string(ctx, netmask), exception);
+            ct_set_property(ctx, item, "family", ct_make_string(ctx, family == AF_INET6 ? "IPv6" : "IPv4"), exception);
+            ct_set_property(ctx, item, "mac", ct_make_string(ctx, mac), exception);
+            ct_set_property(ctx, item, "internal", JSValueMakeBoolean(ctx, adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK), exception);
+            char cidr[INET6_ADDRSTRLEN + 8];
+            snprintf(cidr, sizeof(cidr), "%s/%u", address, (unsigned)unicast->OnLinkPrefixLength);
+            ct_set_property(ctx, item, "cidr", ct_make_string(ctx, cidr), exception);
+            if (family == AF_INET6) ct_set_property(ctx, item, "scopeid", JSValueMakeNumber(ctx, (double)scope_id), exception);
+            JSObjectSetPropertyAtIndex(ctx, result, index++, item, exception);
+        }
+    }
+    free(adapters);
+    return result;
+}
+#endif
 
 static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
+#if defined(_WIN32)
+    DWORD pid = argc >= 1 ? (DWORD)ct_value_to_number(ctx, argv[0]) : 0;
+    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL) {
+        ct_throw_message(ctx, exception, "Unable to open process");
+        return JSValueMakeUndefined(ctx);
+    }
+    DWORD priority_class = GetPriorityClass(process);
+    if (pid != 0) CloseHandle(process);
+    if (priority_class == 0) {
+        ct_throw_message(ctx, exception, "GetPriorityClass failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    int priority = priority_class == REALTIME_PRIORITY_CLASS ? -20
+        : priority_class == HIGH_PRIORITY_CLASS ? -14
+        : priority_class == ABOVE_NORMAL_PRIORITY_CLASS ? -7
+        : priority_class == BELOW_NORMAL_PRIORITY_CLASS ? 7
+        : priority_class == IDLE_PRIORITY_CLASS ? 19
+        : 0;
+#else
     id_t pid = argc >= 1 ? (id_t)ct_value_to_number(ctx, argv[0]) : 0;
     errno = 0;
     int priority = getpriority(PRIO_PROCESS, pid);
@@ -8716,6 +9757,7 @@ static JSValueRef ct_os_get_priority(JSContextRef ctx, JSObjectRef function, JSO
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+#endif
     return JSValueMakeNumber(ctx, (double)priority);
 }
 
@@ -8726,12 +9768,28 @@ static JSValueRef ct_os_set_priority(JSContextRef ctx, JSObjectRef function, JSO
         ct_throw_message(ctx, exception, "osSetPriority(pid, priority) requires pid and priority");
         return JSValueMakeUndefined(ctx);
     }
-    id_t pid = (id_t)ct_value_to_number(ctx, argv[0]);
+    int pid = (int)ct_value_to_number(ctx, argv[0]);
     int priority = (int)ct_value_to_number(ctx, argv[1]);
+#if defined(_WIN32)
+    DWORD priority_class = priority <= -20 ? REALTIME_PRIORITY_CLASS
+        : priority <= -14 ? HIGH_PRIORITY_CLASS
+        : priority <= -7 ? ABOVE_NORMAL_PRIORITY_CLASS
+        : priority >= 19 ? IDLE_PRIORITY_CLASS
+        : priority >= 7 ? BELOW_NORMAL_PRIORITY_CLASS
+        : NORMAL_PRIORITY_CLASS;
+    HANDLE process = pid == 0 ? GetCurrentProcess() : OpenProcess(PROCESS_SET_INFORMATION, FALSE, (DWORD)pid);
+    if (process == NULL || !SetPriorityClass(process, priority_class)) {
+        if (process != NULL && pid != 0) CloseHandle(process);
+        ct_throw_message(ctx, exception, "SetPriorityClass failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (pid != 0) CloseHandle(process);
+#else
     if (setpriority(PRIO_PROCESS, pid, priority) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+#endif
     return JSValueMakeUndefined(ctx);
 }
 
@@ -9132,6 +10190,8 @@ static void ct_write_ffi_return(void *ret, CtFfiType type, CtFfiValue value) {
         case CT_FFI_TYPE_PTR:
         case CT_FFI_TYPE_CSTRING:
         case CT_FFI_TYPE_FUNCTION:
+        case CT_FFI_TYPE_NAPI_ENV:
+        case CT_FFI_TYPE_NAPI_VALUE:
             *((void **)ret) = (void *)(uintptr_t)value.u64;
             return;
     }
@@ -9213,6 +10273,8 @@ static void ct_ffi_callback_dispatch(ffi_cif *cif, void *ret, void **args, void 
             case CT_FFI_TYPE_PTR:
             case CT_FFI_TYPE_CSTRING:
             case CT_FFI_TYPE_FUNCTION:
+            case CT_FFI_TYPE_NAPI_ENV:
+            case CT_FFI_TYPE_NAPI_VALUE:
                 values[index].u64 = (uint64_t)(uintptr_t)*((void **)args[index]);
                 break;
             case CT_FFI_TYPE_VOID:
@@ -10796,18 +11858,58 @@ static void *ct_fd_watcher_thread(void *opaque) {
         fprintf(stderr, "[cottontail:fd] thread start id=%u fd=%d max=%zu\n", watcher->id, watcher->fd, watcher->max_bytes);
         fflush(stderr);
     }
+#if defined(_WIN32)
+    bool is_socket = ct_windows_is_socket(watcher->fd);
+    intptr_t os_handle = is_socket ? -1 : _get_osfhandle(watcher->fd);
+    bool is_crt_handle = os_handle != -1;
+    bool is_crt_pipe = is_crt_handle && GetFileType((HANDLE)os_handle) == FILE_TYPE_PIPE;
+    if (!is_crt_handle) ct_set_nonblocking_fd(watcher->fd);
+#else
     int flags = fcntl(watcher->fd, F_GETFL, 0);
     if (flags >= 0) {
         (void)fcntl(watcher->fd, F_SETFL, flags | O_NONBLOCK);
     }
+#endif
 
     while (ct_fd_watcher_is_active(watcher)) {
+#if defined(_WIN32)
+        if (is_crt_pipe) {
+            DWORD available = 0;
+            if (!PeekNamedPipe((HANDLE)os_handle, NULL, 0, NULL, &available, NULL)) {
+                DWORD error = GetLastError();
+                if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) {
+                    ct_queue_fd_simple(watcher->runtime, watcher->id, "end", NULL);
+                } else {
+                    ct_queue_fd_simple(watcher->runtime, watcher->id, "error", "PeekNamedPipe failed");
+                }
+                break;
+            }
+            if (available == 0) {
+                Sleep(10);
+                continue;
+            }
+        }
+#endif
         struct pollfd poll_fd;
         poll_fd.fd = watcher->fd;
         poll_fd.events = POLLIN | POLLHUP | POLLERR;
         poll_fd.revents = 0;
+#if defined(_WIN32)
+        if (is_crt_handle) poll_fd.revents = POLLIN;
+#endif
 
+#if defined(_WIN32)
+        int ready;
+        if (is_crt_handle) {
+            poll_fd.revents = POLLIN;
+            ready = 1;
+        } else {
+            ready = ct_windows_descriptor_read_ready(watcher->fd);
+            if (ready > 0) poll_fd.revents = POLLIN;
+        }
+#else
         int ready = poll(&poll_fd, 1, 50);
+#endif
         if (!ct_fd_watcher_is_active(watcher)) break;
         if (ready == 0) continue;
         if (ready < 0) {
@@ -10948,8 +12050,321 @@ static void ct_async_processes_wait_for_runtime(CtJscRuntime *runtime) {
     }
 }
 
+#if defined(_WIN32)
+typedef struct {
+    char *data;
+    size_t len;
+    size_t capacity;
+} CtWindowsCommandLine;
+
+static bool ct_windows_command_append(CtWindowsCommandLine *command, const char *data, size_t len) {
+    if (command->len + len + 1 > command->capacity) {
+        size_t capacity = command->capacity > 0 ? command->capacity : 128;
+        while (capacity < command->len + len + 1) capacity *= 2;
+        char *next = (char *)realloc(command->data, capacity);
+        if (next == NULL) return false;
+        command->data = next;
+        command->capacity = capacity;
+    }
+    memcpy(command->data + command->len, data, len);
+    command->len += len;
+    command->data[command->len] = '\0';
+    return true;
+}
+
+static bool ct_windows_command_append_char(CtWindowsCommandLine *command, char value) {
+    return ct_windows_command_append(command, &value, 1);
+}
+
+static bool ct_windows_command_append_arg(CtWindowsCommandLine *command, const char *arg) {
+    if (command->len > 0 && !ct_windows_command_append_char(command, ' ')) return false;
+    size_t len = strlen(arg);
+    bool quote = len == 0 || strpbrk(arg, " \t\n\v\"") != NULL;
+    if (!quote) return ct_windows_command_append(command, arg, len);
+    if (!ct_windows_command_append_char(command, '\"')) return false;
+    size_t backslashes = 0;
+    for (const char *cursor = arg;; cursor += 1) {
+        if (*cursor == '\\') {
+            backslashes += 1;
+            continue;
+        }
+        if (*cursor == '\"' || *cursor == '\0') {
+            size_t count = backslashes * 2 + (*cursor == '\"' ? 1 : 0);
+            for (size_t index = 0; index < count; index += 1) {
+                if (!ct_windows_command_append_char(command, '\\')) return false;
+            }
+            backslashes = 0;
+            if (*cursor == '\0') break;
+        } else {
+            for (size_t index = 0; index < backslashes; index += 1) {
+                if (!ct_windows_command_append_char(command, '\\')) return false;
+            }
+            backslashes = 0;
+        }
+        if (!ct_windows_command_append_char(command, *cursor)) return false;
+    }
+    return ct_windows_command_append_char(command, '\"');
+}
+
+static WCHAR *ct_windows_utf8_to_wide(const char *value) {
+    if (value == NULL) return NULL;
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, NULL, 0);
+    if (length <= 0) return NULL;
+    WCHAR *wide = (WCHAR *)malloc(sizeof(WCHAR) * (size_t)length);
+    if (wide == NULL) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, wide, length) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static int ct_windows_env_entry_compare(const void *left, const void *right) {
+    const CtHostEnvEntry *const *left_entry = (const CtHostEnvEntry *const *)left;
+    const CtHostEnvEntry *const *right_entry = (const CtHostEnvEntry *const *)right;
+    return _stricmp((*left_entry)->name, (*right_entry)->name);
+}
+
+static WCHAR *ct_windows_environment_block(const CtHostEnvEntry *entries, size_t count) {
+    const CtHostEnvEntry **sorted = count > 0 ? (const CtHostEnvEntry **)malloc(sizeof(*sorted) * count) : NULL;
+    if (count > 0 && sorted == NULL) return NULL;
+    for (size_t index = 0; index < count; index += 1) sorted[index] = &entries[index];
+    qsort(sorted, count, sizeof(*sorted), ct_windows_env_entry_compare);
+
+    size_t capacity = 1;
+    for (size_t index = 0; index < count; index += 1) {
+        int name_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->name, -1, NULL, 0);
+        int value_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->value, -1, NULL, 0);
+        if (name_len <= 0 || value_len <= 0) {
+            free(sorted);
+            return NULL;
+        }
+        capacity += (size_t)name_len + (size_t)value_len;
+    }
+    WCHAR *block = (WCHAR *)calloc(capacity, sizeof(WCHAR));
+    if (block == NULL) {
+        free(sorted);
+        return NULL;
+    }
+    size_t cursor = 0;
+    for (size_t index = 0; index < count; index += 1) {
+        int name_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->name, -1, block + cursor, (int)(capacity - cursor));
+        cursor += (size_t)name_len - 1;
+        block[cursor++] = L'=';
+        int value_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sorted[index]->value, -1, block + cursor, (int)(capacity - cursor));
+        cursor += (size_t)value_len;
+    }
+    block[cursor] = L'\0';
+    free(sorted);
+    return block;
+}
+
+static HANDLE ct_windows_null_handle(DWORD access) {
+    SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
+    return CreateFileW(L"NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+static bool ct_windows_create_pipe(HANDLE *parent_end, HANDLE *child_end, bool parent_writes) {
+    SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
+    HANDLE read_handle = NULL;
+    HANDLE write_handle = NULL;
+    if (!CreatePipe(&read_handle, &write_handle, &security, 0)) return false;
+    *parent_end = parent_writes ? write_handle : read_handle;
+    *child_end = parent_writes ? read_handle : write_handle;
+    if (!SetHandleInformation(*parent_end, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(read_handle);
+        CloseHandle(write_handle);
+        return false;
+    }
+    return true;
+}
+
+static int ct_windows_handle_to_fd(HANDLE handle, int flags) {
+    if (handle == NULL || handle == INVALID_HANDLE_VALUE) return -1;
+    int fd = _open_osfhandle((intptr_t)handle, flags | _O_BINARY);
+    if (fd < 0) CloseHandle(handle);
+    return fd;
+}
+
+static bool ct_windows_spawn_process(
+    const char *file,
+    char *const *args,
+    size_t arg_count,
+    const char *argv0,
+    const char *cwd,
+    const CtHostEnvEntry *env_entries,
+    size_t env_count,
+    bool clear_env,
+    CtProcessStdioMode stdin_mode,
+    CtProcessStdioMode stdout_mode,
+    CtProcessStdioMode stderr_mode,
+    bool detached,
+    HANDLE *process_out,
+    DWORD *pid_out,
+    int *stdin_fd_out,
+    int *stdout_fd_out,
+    int *stderr_fd_out
+) {
+    *process_out = NULL;
+    *pid_out = 0;
+    *stdin_fd_out = -1;
+    *stdout_fd_out = -1;
+    *stderr_fd_out = -1;
+
+    CtWindowsCommandLine command = { 0 };
+    if (!ct_windows_command_append_arg(&command, argv0 != NULL && argv0[0] != '\0' ? argv0 : file)) goto fail;
+    for (size_t index = 0; index < arg_count; index += 1) {
+        if (!ct_windows_command_append_arg(&command, args[index])) goto fail;
+    }
+    WCHAR *file_wide = ct_windows_utf8_to_wide(file);
+    WCHAR *command_wide = ct_windows_utf8_to_wide(command.data);
+    WCHAR *cwd_wide = cwd != NULL ? ct_windows_utf8_to_wide(cwd) : NULL;
+    WCHAR *environment = (clear_env || env_count > 0) ? ct_windows_environment_block(env_entries, env_count) : NULL;
+    if (file_wide == NULL || command_wide == NULL || (cwd != NULL && cwd_wide == NULL) || ((clear_env || env_count > 0) && environment == NULL)) {
+        free(file_wide); free(command_wide); free(cwd_wide); free(environment);
+        goto fail;
+    }
+
+    HANDLE parent_stdin = NULL, child_stdin = NULL;
+    HANDLE parent_stdout = NULL, child_stdout = NULL;
+    HANDLE parent_stderr = NULL, child_stderr = NULL;
+    if (stdin_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdin, &child_stdin, true)) goto handles_fail;
+    if (stdout_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stdout, &child_stdout, false)) goto handles_fail;
+    if (stderr_mode == CT_PROCESS_STDIO_PIPE && !ct_windows_create_pipe(&parent_stderr, &child_stderr, false)) goto handles_fail;
+    if (stdin_mode == CT_PROCESS_STDIO_INHERIT) child_stdin = GetStdHandle(STD_INPUT_HANDLE);
+    else if (stdin_mode == CT_PROCESS_STDIO_IGNORE) child_stdin = ct_windows_null_handle(GENERIC_READ);
+    if (stdout_mode == CT_PROCESS_STDIO_INHERIT) child_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    else if (stdout_mode == CT_PROCESS_STDIO_IGNORE) child_stdout = ct_windows_null_handle(GENERIC_WRITE);
+    if (stderr_mode == CT_PROCESS_STDIO_INHERIT) child_stderr = GetStdHandle(STD_ERROR_HANDLE);
+    else if (stderr_mode == CT_PROCESS_STDIO_IGNORE) child_stderr = ct_windows_null_handle(GENERIC_WRITE);
+    if (child_stdin == INVALID_HANDLE_VALUE || child_stdout == INVALID_HANDLE_VALUE || child_stderr == INVALID_HANDLE_VALUE) goto handles_fail;
+
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process_info;
+    memset(&startup, 0, sizeof(startup));
+    memset(&process_info, 0, sizeof(process_info));
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = child_stdin;
+    startup.hStdOutput = child_stdout;
+    startup.hStdError = child_stderr;
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : CREATE_NO_WINDOW);
+    BOOL created = CreateProcessW(file_wide, command_wide, NULL, NULL, TRUE, flags, environment, cwd_wide, &startup, &process_info);
+
+    if (stdin_mode != CT_PROCESS_STDIO_INHERIT && child_stdin != NULL) CloseHandle(child_stdin);
+    if (stdout_mode != CT_PROCESS_STDIO_INHERIT && child_stdout != NULL) CloseHandle(child_stdout);
+    if (stderr_mode != CT_PROCESS_STDIO_INHERIT && child_stderr != NULL) CloseHandle(child_stderr);
+    free(file_wide); free(command_wide); free(cwd_wide); free(environment); free(command.data);
+    if (!created) {
+        if (parent_stdin != NULL) CloseHandle(parent_stdin);
+        if (parent_stdout != NULL) CloseHandle(parent_stdout);
+        if (parent_stderr != NULL) CloseHandle(parent_stderr);
+        return false;
+    }
+    CloseHandle(process_info.hThread);
+    *process_out = process_info.hProcess;
+    *pid_out = process_info.dwProcessId;
+    *stdin_fd_out = ct_windows_handle_to_fd(parent_stdin, _O_WRONLY);
+    *stdout_fd_out = ct_windows_handle_to_fd(parent_stdout, _O_RDONLY);
+    *stderr_fd_out = ct_windows_handle_to_fd(parent_stderr, _O_RDONLY);
+    return true;
+
+handles_fail:
+    if (parent_stdin != NULL) CloseHandle(parent_stdin);
+    if (parent_stdout != NULL) CloseHandle(parent_stdout);
+    if (parent_stderr != NULL) CloseHandle(parent_stderr);
+    if (stdin_mode != CT_PROCESS_STDIO_INHERIT && child_stdin != NULL && child_stdin != INVALID_HANDLE_VALUE) CloseHandle(child_stdin);
+    if (stdout_mode != CT_PROCESS_STDIO_INHERIT && child_stdout != NULL && child_stdout != INVALID_HANDLE_VALUE) CloseHandle(child_stdout);
+    if (stderr_mode != CT_PROCESS_STDIO_INHERIT && child_stderr != NULL && child_stderr != INVALID_HANDLE_VALUE) CloseHandle(child_stderr);
+    free(file_wide); free(command_wide); free(cwd_wide); free(environment);
+fail:
+    free(command.data);
+    return false;
+}
+
+static bool ct_windows_drain_process_pipe(CtAsyncProcess *process, int *fd, const char *type) {
+    if (*fd < 0) return false;
+    intptr_t raw_handle = _get_osfhandle(*fd);
+    if (raw_handle == -1) {
+        close(*fd);
+        *fd = -1;
+        return false;
+    }
+    DWORD available = 0;
+    if (!PeekNamedPipe((HANDLE)raw_handle, NULL, 0, NULL, &available, NULL)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) {
+            close(*fd);
+            *fd = -1;
+        }
+        return false;
+    }
+    if (available == 0) return false;
+    char buffer[16384];
+    unsigned int amount = available < sizeof(buffer) ? (unsigned int)available : (unsigned int)sizeof(buffer);
+    int count = read(*fd, buffer, amount);
+    if (count > 0) {
+        ct_queue_spawn_text(process->runtime, process->id, type, buffer, (size_t)count);
+        return true;
+    }
+    return false;
+}
+
+static void ct_windows_rusage_for_process(HANDLE process, struct rusage *usage) {
+    memset(usage, 0, sizeof(*usage));
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (GetProcessTimes(process, &creation_time, &exit_time, &kernel_time, &user_time)) {
+        ULARGE_INTEGER kernel = { .LowPart = kernel_time.dwLowDateTime, .HighPart = kernel_time.dwHighDateTime };
+        ULARGE_INTEGER user = { .LowPart = user_time.dwLowDateTime, .HighPart = user_time.dwHighDateTime };
+        usage->ru_stime.tv_sec = (long)(kernel.QuadPart / 10000000ULL);
+        usage->ru_stime.tv_usec = (long)((kernel.QuadPart % 10000000ULL) / 10ULL);
+        usage->ru_utime.tv_sec = (long)(user.QuadPart / 10000000ULL);
+        usage->ru_utime.tv_usec = (long)((user.QuadPart % 10000000ULL) / 10ULL);
+    }
+    PROCESS_MEMORY_COUNTERS memory = { 0 };
+    memory.cb = sizeof(memory);
+    if (GetProcessMemoryInfo(process, &memory, sizeof(memory))) usage->ru_maxrss = memory.PeakWorkingSetSize;
+}
+#endif
+
 static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
+#if defined(_WIN32)
+    bool exited = false;
+    DWORD exit_code = 1;
+    while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
+        bool read_data = false;
+        read_data |= ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
+        read_data |= ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
+        if (!exited && WaitForSingleObject(process->process_handle, 0) == WAIT_OBJECT_0) {
+            exited = true;
+            GetExitCodeProcess(process->process_handle, &exit_code);
+        }
+        if (exited && !read_data) {
+            ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
+            ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
+            if (process->stdout_fd >= 0) { close(process->stdout_fd); process->stdout_fd = -1; }
+            if (process->stderr_fd >= 0) { close(process->stderr_fd); process->stderr_fd = -1; }
+        }
+        if (!read_data && !exited) Sleep(10);
+    }
+    struct rusage resource_usage;
+    ct_windows_rusage_for_process(process->process_handle, &resource_usage);
+    CtSpawnEvent *exit_event = (CtSpawnEvent *)calloc(1, sizeof(CtSpawnEvent));
+    if (exit_event != NULL) {
+        exit_event->process_id = process->id;
+        exit_event->type = ct_duplicate_bytes("exit", 4);
+        exit_event->exit_code = (int)exit_code;
+        exit_event->resource_usage = resource_usage;
+        exit_event->has_resource_usage = true;
+        ct_queue_spawn_event(process->runtime, exit_event);
+    }
+    if (process->stdin_fd >= 0) close(process->stdin_fd);
+    CloseHandle(process->process_handle);
+    ct_async_process_remove(process);
+    free(process);
+    return NULL;
+#else
     int status = 0;
     bool exited = false;
     struct rusage resource_usage;
@@ -11107,6 +12522,7 @@ static void *ct_async_process_thread(void *opaque) {
     ct_async_process_remove(process);
     free(process);
     return NULL;
+#endif
 }
 
 static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -11182,6 +12598,71 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
 
     uint32_t id = ++runtime->next_process_id;
 
+#if defined(_WIN32)
+    if (ipc_enabled) {
+        ct_throw_message(ctx, exception, "IPC handle passing is unavailable on this platform");
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+    HANDLE process_handle = NULL;
+    DWORD pid = 0;
+    int stdin_fd = -1;
+    int stdout_fd = -1;
+    int stderr_fd = -1;
+    if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
+                                  stdin_mode, stdout_mode, stderr_mode, false, &process_handle, &pid,
+                                  &stdin_fd, &stdout_fd, &stderr_fd)) {
+        ct_throw_message(ctx, exception, "CreateProcessW failed");
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+    CtAsyncProcess *process = (CtAsyncProcess *)calloc(1, sizeof(CtAsyncProcess));
+    if (process == NULL) {
+        TerminateProcess(process_handle, 1);
+        CloseHandle(process_handle);
+        if (stdin_fd >= 0) close(stdin_fd);
+        if (stdout_fd >= 0) close(stdout_fd);
+        if (stderr_fd >= 0) close(stderr_fd);
+        ct_throw_message(ctx, exception, "Out of memory");
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        free(argv0);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+    process->id = id;
+    process->pid = (pid_t)pid;
+    process->stdin_fd = stdin_fd;
+    process->stdout_fd = stdout_fd;
+    process->stderr_fd = stderr_fd;
+    process->ipc_fd = -1;
+    process->runtime = runtime;
+    process->process_handle = process_handle;
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    process->next = ct_async_processes;
+    ct_async_processes = process;
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    if (pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) pthread_detach(process->thread);
+
+    JSObjectRef response = ct_make_object(ctx);
+    ct_set_property(ctx, response, "id", JSValueMakeNumber(ctx, id), exception);
+    ct_set_property(ctx, response, "pid", JSValueMakeNumber(ctx, (double)pid), exception);
+    free(file);
+    ct_free_string_array(args, arg_count);
+    free(cwd);
+    free(argv0);
+    ct_free_env_entries(env_entries, env_count);
+    return response;
+#else
     int stdin_pipe[2] = { -1, -1 };
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
@@ -11337,6 +12818,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     free(cwd);
     ct_free_env_entries(env_entries, env_count);
     return response;
+#endif
 }
 
 static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -11439,6 +12921,21 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
         return JSValueMakeNumber(ctx, 0);
     }
 
+#if defined(_WIN32)
+    HANDLE process_handle = NULL;
+    DWORD pid = 0;
+    int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
+    if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
+                                  CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
+                                  true, &process_handle, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
+        ct_throw_message(ctx, exception, "CreateProcessW failed");
+        pid = 0;
+    }
+    if (process_handle != NULL) CloseHandle(process_handle);
+    if (stdin_fd >= 0) close(stdin_fd);
+    if (stdout_fd >= 0) close(stdout_fd);
+    if (stderr_fd >= 0) close(stderr_fd);
+#else
     pid_t pid = fork();
     if (pid == 0) {
         if (cwd != NULL) chdir(cwd);
@@ -11466,6 +12963,7 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
         ct_throw_message(ctx, exception, strerror(errno));
         pid = 0;
     }
+#endif
     free(file);
     ct_free_string_array(args, arg_count);
     free(cwd);
@@ -12108,6 +13606,10 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     start->script_path = script_path;
     start->worker = worker;
 
+    pthread_t thread;
+#if defined(_WIN32)
+    int create_status = ct_windows_thread_create(&thread, CT_WORKER_STACK_SIZE, ct_worker_entry, start);
+#else
     pthread_attr_t attr;
     int attr_status = pthread_attr_init(&attr);
     if (attr_status != 0) {
@@ -12132,9 +13634,9 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeUndefined(ctx);
     }
 
-    pthread_t thread;
     int create_status = pthread_create(&thread, &attr, ct_worker_entry, start);
     pthread_attr_destroy(&attr);
+#endif
     if (create_status != 0) {
         pthread_mutex_lock(&worker->mutex);
         worker->terminated = true;
@@ -12205,12 +13707,15 @@ static JSValueRef ct_read_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
     if (max_bytes == 0) max_bytes = 65536;
     if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
 
+#if defined(_WIN32)
+    int ready = ct_windows_descriptor_read_ready(fd);
+#else
     struct pollfd poll_fd;
     poll_fd.fd = fd;
     poll_fd.events = POLLIN | POLLHUP | POLLERR;
     poll_fd.revents = 0;
-
     int ready = poll(&poll_fd, 1, 0);
+#endif
     if (ready == 0) {
         return JSValueMakeNull(ctx);
     }
@@ -12219,6 +13724,7 @@ static JSValueRef ct_read_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
     }
+#if !defined(_WIN32)
     if ((poll_fd.revents & POLLNVAL) != 0) {
         ct_throw_message(ctx, exception, "invalid file descriptor");
         return JSValueMakeUndefined(ctx);
@@ -12226,6 +13732,7 @@ static JSValueRef ct_read_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
     if ((poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
         return JSValueMakeNull(ctx);
     }
+#endif
 
     char *buffer = (char *)malloc(max_bytes > 0 ? max_bytes : 1);
     if (buffer == NULL) {
@@ -12872,7 +14379,7 @@ static JSValueRef ct_statfs_sync_native(JSContextRef ctx, JSObjectRef function, 
     ct_set_property(ctx, result, "bavail", JSValueMakeNumber(ctx, (double)value.f_bavail), exception);
     ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, (double)value.f_files), exception);
     ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, (double)value.f_ffree), exception);
-#else
+#elif defined(__linux__)
     struct statvfs value;
     if (path == NULL || statvfs(path, &value) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -12886,6 +14393,23 @@ static JSValueRef ct_statfs_sync_native(JSContextRef ctx, JSObjectRef function, 
     ct_set_property(ctx, result, "bavail", JSValueMakeNumber(ctx, (double)value.f_bavail), exception);
     ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, (double)value.f_files), exception);
     ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, (double)value.f_ffree), exception);
+#else
+    ULARGE_INTEGER available;
+    ULARGE_INTEGER total;
+    ULARGE_INTEGER free_bytes;
+    if (path == NULL || !GetDiskFreeSpaceExA(path, &available, &total, &free_bytes)) {
+        ct_throw_message(ctx, exception, "GetDiskFreeSpaceEx failed");
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
+    const double block_size = 4096.0;
+    ct_set_property(ctx, result, "type", JSValueMakeNumber(ctx, 0), exception);
+    ct_set_property(ctx, result, "bsize", JSValueMakeNumber(ctx, block_size), exception);
+    ct_set_property(ctx, result, "blocks", JSValueMakeNumber(ctx, (double)total.QuadPart / block_size), exception);
+    ct_set_property(ctx, result, "bfree", JSValueMakeNumber(ctx, (double)free_bytes.QuadPart / block_size), exception);
+    ct_set_property(ctx, result, "bavail", JSValueMakeNumber(ctx, (double)available.QuadPart / block_size), exception);
+    ct_set_property(ctx, result, "files", JSValueMakeNumber(ctx, 0), exception);
+    ct_set_property(ctx, result, "ffree", JSValueMakeNumber(ctx, 0), exception);
 #endif
     free(path);
     return result;
@@ -12990,7 +14514,9 @@ static JSValueRef ct_http_server_start(JSContextRef ctx, JSObjectRef function, J
         }
     }
 
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif
     int listen_fd = socket(unix_path != NULL ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -13977,6 +15503,9 @@ CtJscRuntime *ct_jsc_runtime_create(void) {
 
 CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
     (void)stack_size;
+#if defined(_WIN32)
+    if (ct_windows_ensure_winsock() != 0) return NULL;
+#endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
     /* Use JSGlobalContextCreateInGroup(NULL, ...) rather than JSGlobalContextCreate(NULL):

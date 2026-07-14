@@ -408,7 +408,13 @@ pub const Transpiler = struct {
             file_path = client_entry_point.source.path;
         }
 
-        file_path.pretty = Linker.relative_paths_list.append(string, transpiler.fs.relativeTo(file_path.text)) catch unreachable;
+        const relative_path = transpiler.fs.relativeTo(file_path.text);
+        var pretty_path_buffer: bun.PathBuffer = undefined;
+        const pretty_path = if (comptime bun.Environment.isWindows)
+            bun.path.pathToPosixBuf(u8, relative_path, &pretty_path_buffer)
+        else
+            relative_path;
+        file_path.pretty = Linker.relative_paths_list.append(string, pretty_path) catch unreachable;
 
         var output_file = options.OutputFile{
             .src_path = file_path,

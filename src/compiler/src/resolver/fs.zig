@@ -1420,22 +1420,9 @@ pub const FileSystem = struct {
                 // error was swallowed at `Entry.kind`, and a directory symlink
                 // was permanently misclassified as `.file` — surfacing as
                 // EISDIR at module load time.
-                const w = std.os.windows;
-                const wbuf = bun.w_path_buffer_pool.get();
-                defer bun.w_path_buffer_pool.put(wbuf);
-                const wpath = bun.strings.toKernel32Path(wbuf, absolute_path_c);
-                const handle = w.kernel32.CreateFileW(
-                    wpath.ptr,
-                    0,
-                    w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
-                    null,
-                    w.OPEN_EXISTING,
-                    // FILE_FLAG_BACKUP_SEMANTICS lets us open directories;
-                    // omitting FILE_FLAG_OPEN_REPARSE_POINT makes Windows
-                    // follow the full reparse chain to the final target.
-                    w.FILE_FLAG_BACKUP_SEMANTICS,
-                    null,
-                );
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const real_path_len = std.Io.Dir.cwd().realPathFile(io, absolute_path_c, &outpath) catch return cache;
+                const target_stat = std.Io.Dir.cwd().statFile(io, absolute_path_c, .{ .follow_symlinks = true }) catch return cache;
                 // Dangling link / loop / EACCES: `cache.kind` is already set
                 // from the link's own directory bit, which is correct for all
                 // of those. `Entry.kind`/`Entry.symlink` swallow errors and
@@ -1443,20 +1430,8 @@ pub const FileSystem = struct {
                 // the half-populated cache is strictly better than `try`.
                 // Empty `cache.symlink` makes the resolver fall back to
                 // `parent.abs_real_path + base`.
-                if (handle == w.INVALID_HANDLE_VALUE) return cache;
-                defer _ = bun.windows.CloseHandle(handle);
-
-                var info: w.BY_HANDLE_FILE_INFORMATION = undefined;
-                if (bun.windows.GetFileInformationByHandle(handle, &info) != 0) {
-                    cache.kind = if (info.dwFileAttributes & w.FILE_ATTRIBUTE_DIRECTORY != 0) .dir else .file;
-                }
-
-                const buf2 = bun.path_buffer_pool.get();
-                defer bun.path_buffer_pool.put(buf2);
-                switch (bun.sys.getFdPath(.fromNative(handle), buf2)) {
-                    .result => |real| cache.symlink = PathString.init(try FilenameStore.instance.append([]const u8, real)),
-                    .err => {},
-                }
+                cache.kind = if (target_stat.kind == .directory) .dir else .file;
+                cache.symlink = PathString.init(try FilenameStore.instance.append([]const u8, outpath[0..real_path_len]));
                 return cache;
             }
 

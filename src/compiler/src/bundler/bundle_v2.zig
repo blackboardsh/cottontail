@@ -562,8 +562,10 @@ pub const BundleV2 = struct {
                         }
                         break :brk Fs.Path.init(path_primary.text).loader(&transpiler.options.loaders) orelse options.Loader.file;
                     };
-                    // For virtual files, use the path text as-is (no relative path computation needed).
-                    path_primary.pretty = bun.handleOom(this.allocator().dupe(u8, path_primary.text));
+                    // For virtual files, preserve the native lookup path while keeping the
+                    // display/hash path deterministic across platforms.
+                    path_primary.pretty = path_primary.text;
+                    path_primary = bun.handleOom(path_primary.dupeAllocFixPretty(this.allocator()));
                     const idx = this.enqueueParseTask(
                         &file_map_result,
                         &.{
@@ -697,7 +699,7 @@ pub const BundleV2 = struct {
 
         if (path.pretty.ptr == path.text.ptr) {
             // TODO: outbase
-            const rel = bun.path.relativePlatform(transpiler.fs.top_level_dir, path.text, .loose, false);
+            const rel = bun.path.relativePlatform(transpiler.fs.top_level_dir, path.text, .posix, false);
             path.pretty = bun.handleOom(this.allocator().dupe(u8, rel));
         }
         path.assertPrettyIsValid();
@@ -3061,8 +3063,10 @@ pub const BundleV2 = struct {
                         continue;
                     }
 
-                    // For virtual files, use the path text as-is (no relative path computation needed).
-                    path_primary.pretty = bun.handleOom(this.allocator().dupe(u8, path_primary.text));
+                    // For virtual files, preserve the native lookup path while keeping the
+                    // display/hash path deterministic across platforms.
+                    path_primary.pretty = path_primary.text;
+                    path_primary = bun.handleOom(path_primary.dupeAllocFixPretty(this.allocator()));
                     import_record.path = path_primary;
                     resolve_entry.key_ptr.* = path_primary.text;
                     debug("created ParseTask from FileMap: {s}", .{path_primary.text});

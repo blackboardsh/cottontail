@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
 const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6";
@@ -50,7 +51,8 @@ fn buildLolHtml(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyP
         );
         std.process.exit(1);
     };
-    const command = b.addSystemCommand(&.{ "node", b.pathFromRoot("scripts/build-lolhtml.js") });
+    const command = b.addSystemCommand(&.{"node"});
+    command.addFileArg(b.path("scripts/build-lolhtml.js"));
     const output = command.addOutputFileArg(if (target.result.os.tag == .windows) "lolhtml.lib" else "liblolhtml.a");
     command.addArg(triple);
     return output;
@@ -116,6 +118,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
             "-DCOTTONTAIL_VENDORED_JSC=1",
+            "-DJS_NO_EXPORT=1",
         },
     });
     step.root_module.addObjectFile(lolhtml);
@@ -196,14 +199,21 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             });
         },
         .windows => {
+            const dependency_dir = "vendors/windows-deps/x64-windows-static";
             requireJscLibrary(b, vendor_dir, "JavaScriptCore.lib");
+            step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{dependency_dir})));
+            step.root_module.addLibraryPath(b.path(b.fmt("{s}/lib", .{dependency_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/JavaScriptCore.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/WTF.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/bmalloc.lib", .{vendor_dir})));
+            inline for (&.{
+                "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib", "dl.lib", "ffi.lib", "libcrypto.lib", "libssl.lib", "zs.lib",
+            }) |library| {
+                step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ dependency_dir, library })));
+            }
             // This JSC build uses the operating-system ICU data and API. The
             // Windows SDK provides its import library as icu.lib.
-            step.root_module.linkSystemLibrary("icu", .{});
-            inline for (&.{ "advapi32", "bcrypt", "shell32", "userenv", "winmm", "ws2_32" }) |library| {
+            inline for (&.{ "advapi32", "bcrypt", "crypt32", "dnsapi", "icu", "iphlpapi", "psapi", "shell32", "user32", "userenv", "winmm", "ws2_32" }) |library| {
                 step.root_module.linkSystemLibrary(library, .{});
             }
         },
@@ -223,7 +233,12 @@ fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8)
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Zig's native Windows target defaults to the GNU ABI. The vendored JSC,
+    // Rust static library, Visual Studio SDK, and vcpkg dependencies all use
+    // MSVC, so keep the default native build in that single ABI universe.
+    const target = b.standardTargetOptions(.{
+        .default_target = if (builtin.os.tag == .windows) .{ .abi = .msvc } else .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
     const lolhtml = buildLolHtml(b, target);
     const runtime_modules_blob = embedRuntimeModules(b);

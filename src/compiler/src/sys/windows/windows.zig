@@ -3872,8 +3872,14 @@ fn @"windows process.dlopen"(str: *bun.String) callconv(.c) ?*anyopaque {
     };
     buf[data.len] = 0;
     const LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
-    return bun.windows.kernel32.LoadLibraryExW(buf[0..data.len :0].ptr, null, LOAD_WITH_ALTERED_SEARCH_PATH);
+    return LoadLibraryExW(buf[0..data.len :0].ptr, null, LOAD_WITH_ALTERED_SEARCH_PATH);
 }
+
+extern "kernel32" fn LoadLibraryExW(
+    file_name: windows.LPCWSTR,
+    file: ?windows.HANDLE,
+    flags: windows.DWORD,
+) callconv(.winapi) ?win32.HMODULE;
 
 pub const windows_enable_stdio_inheritance = @import("../../windows_sys/externs.zig").windows_enable_stdio_inheritance;
 
