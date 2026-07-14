@@ -128,7 +128,10 @@ pub fn generateCodeForFileInChunkJS(
 
     // The top-level directive must come first (the non-wrapped case is handled
     // by the chunk generation code, although only for the entry point)
-    if (flags.wrap != .none and ast.flags.has_explicit_use_strict_directive and !chunk.isEntryPoint() and !output_format.isAlwaysStrictMode()) {
+    if (flags.wrap != .none and ast.flags.has_explicit_use_strict_directive and
+        (c.resolver.opts.preserve_strict_directives_in_wrappers or
+            (!chunk.isEntryPoint() and !output_format.isAlwaysStrictMode())))
+    {
         stmts.inside_wrapper_prefix.appendNonDependency(Stmt.alloc(S.Directive, .{
             .value = "use strict",
         }, Logger.Loc.Empty)) catch unreachable;

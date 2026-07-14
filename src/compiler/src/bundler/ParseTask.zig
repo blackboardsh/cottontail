@@ -143,8 +143,24 @@ fn getRuntimeSourceComptime(comptime target: options.Target) RuntimeSource {
         // Previously, Bun inlined `import.meta.require` at all usages. This broke
         // code that called `fn.toString()` and parsed the code outside a module
         // context.
+        // Cottontail: real Bun provides `import.meta.require`; Cottontail's
+        // runtime does not, but its script-runner sets up
+        // `globalThis.__ctMetaRequire` (a Node-style createRequire bound to
+        // the entry script). That setup lives in the entry-wrapper module
+        // INSIDE the bundle, which evaluates after this runtime chunk, so the
+        // fallback must be resolved lazily (at first call/property access),
+        // not at chunk evaluation time. On real Bun `import.meta.require` is
+        // defined and this behaves exactly like upstream.
         .bun, .bun_macro =>
-        \\export var __require = import.meta.require;
+        \\export var __require = import.meta.require ?? /* @__PURE__ */ (x =>
+        \\  typeof Proxy !== 'undefined' ? new Proxy(x, {
+        \\    get: (a, b) => (import.meta.require ?? globalThis.__ctMetaRequire ?? globalThis.require ?? a)[b]
+        \\  }) : x
+        \\)(function (x) {
+        \\  const r = import.meta.require ?? globalThis.__ctMetaRequire ?? globalThis.require;
+        \\  if (r) return r.apply(this, arguments);
+        \\  throw Error('Dynamic require of "' + x + '" is not supported');
+        \\});
         ,
 
         .node =>
@@ -1232,8 +1248,9 @@ fn runWithSourceCode(
     opts.features.unwrap_commonjs_packages = transpiler.options.unwrap_commonjs_packages;
     opts.features.bundler_feature_flags = transpiler.options.bundler_feature_flags;
     // JavaScriptCore implements `using` / `await using` natively, so when
-    // targeting Bun there is no need to lower them.
-    opts.features.lower_using = !target.isBun();
+    // targeting Bun there is no need to lower them. Cottontail's vendored JSC
+    // does not, so runtime bundles set `force_lower_using`.
+    opts.features.lower_using = !target.isBun() or transpiler.options.force_lower_using;
     opts.features.hot_module_reloading = output_format == .internal_bake_dev and !source.index.isRuntime();
     opts.features.auto_polyfill_require = output_format == .esm and !opts.features.hot_module_reloading;
     opts.features.react_fast_refresh = transpiler.options.react_fast_refresh and

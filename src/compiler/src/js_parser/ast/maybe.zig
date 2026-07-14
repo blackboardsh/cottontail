@@ -419,8 +419,8 @@ pub fn AstMaybe(
                         } else if (strings.eqlComptime(name, "file")) {
                             // Inline import.meta.file (filename only)
                             return p.newExpr(E.String.init(p.source.path.name.filename), name_loc);
-                        } else if (strings.eqlComptime(name, "path")) {
-                            // Inline import.meta.path (full path)
+                        } else if (strings.eqlComptime(name, "path") or strings.eqlComptime(name, "filename")) {
+                            // Inline import.meta.path / import.meta.filename (full path)
                             return p.newExpr(E.String.init(p.source.path.text), name_loc);
                         } else if (strings.eqlComptime(name, "url")) {
                             // Inline import.meta.url as file:// URL

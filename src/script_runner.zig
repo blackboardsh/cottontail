@@ -502,15 +502,19 @@ fn bundleScriptNative(
             .tsconfig_override = try tsconfigOverridePath(ctx, exec_args),
             .include_runtime_modules = true,
             .inline_import_meta_properties = true,
+            .skip_teardown = true,
         },
         &error_message,
     ) catch |err| {
         if (error_message) |message| {
             defer native_bundler.ct_bundle_string_free(message);
             ctx.writeStderr("{s}\n", .{std.mem.span(message)});
-        } else {
-            ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
+            // A build/resolve error was already reported to the user. Match
+            // `bun run` by exiting cleanly instead of unwinding through main,
+            // which prints a (slow to symbolize) Zig error-return trace.
+            std.process.exit(1);
         }
+        ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
         return error.NativeBundleFailed;
     };
     defer native_bundler.ct_bundle_free(output.ptr, output.len);
@@ -1057,10 +1061,22 @@ fn writeBunCompatTransformedSource(
         }
     }
 
+    // Pre-inline `import.meta.url`/`.path`/`.file(name)` with the original
+    // file's values BEFORE the dynamic-import rewrite embeds module sources
+    // as string literals. If no other transform fires, the original file is
+    // used untouched and the bundler inlines the correct values itself; when
+    // a `.cottontail-compat-*` sibling is written, this keeps its
+    // `import.meta` from leaking the generated file's name.
+    const meta_inlined = try rewriteImportMetaToOriginalPath(ctx, transformed_source, script_abs);
+
     const resolution_dir = source_base_dir orelse std.fs.path.dirname(script_abs) orelse ctx.project_root;
-    if (try rewriteQueryImports(ctx, transformed_source, resolution_dir)) |transformed| {
+    if (try rewriteQueryImports(ctx, meta_inlined, resolution_dir)) |transformed| {
         transformed_source = transformed;
         changed = true;
+    } else {
+        // Harmless if unchanged: when no transform fires below, the original
+        // file is returned and this buffer is discarded.
+        transformed_source = meta_inlined;
     }
     // Bun treats extensionless entrypoints as TypeScript, so rewrite them into
     // a generated .ts file before invoking the compiler.
@@ -1088,6 +1104,55 @@ fn writeBunCompatTransformedSource(
     const generated_path = try std.fs.path.join(ctx.allocator, &.{ script_dir, generated_name });
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = transformed_source }) catch return script_abs;
     return generated_path;
+}
+
+/// Replace `import.meta.url`, `import.meta.path`, `import.meta.filename` and
+/// `import.meta.file` with string literals for `original_path`. Used when a
+/// source is rewritten into a generated `.cottontail-compat-*` sibling file so
+/// that the bundler's later inlining doesn't leak the generated file's name.
+fn rewriteImportMetaToOriginalPath(
+    ctx: *const Context,
+    source: []const u8,
+    original_path: []const u8,
+) ![]const u8 {
+    const needle = "import.meta.";
+    if (std.mem.indexOf(u8, source, needle) == null) return source;
+
+    const url_value = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{original_path});
+    const url_literal = try jsonStringLiteral(ctx, url_value);
+    const path_literal = try jsonStringLiteral(ctx, original_path);
+    const file_literal = try jsonStringLiteral(ctx, std.fs.path.basename(original_path));
+
+    const Replacement = struct { property: []const u8, literal: []const u8 };
+    var output: std.ArrayList(u8) = .empty;
+    var copied_until: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, needle)) |found| {
+        cursor = found + needle.len;
+        // Reject matches like `x.import.meta.url` or `reimport.meta.url`.
+        if (found > 0 and (isIdentifierPart(source[found - 1]) or source[found - 1] == '.')) continue;
+        // Order matters: longer property names first.
+        const replacements = [_]Replacement{
+            .{ .property = "filename", .literal = path_literal },
+            .{ .property = "file", .literal = file_literal },
+            .{ .property = "path", .literal = path_literal },
+            .{ .property = "url", .literal = url_literal },
+        };
+        for (replacements) |replacement| {
+            const property_end = cursor + replacement.property.len;
+            if (property_end > source.len) continue;
+            if (!std.mem.eql(u8, source[cursor..property_end], replacement.property)) continue;
+            if (property_end < source.len and isIdentifierPart(source[property_end])) continue;
+            try output.appendSlice(ctx.allocator, source[copied_until..found]);
+            try output.appendSlice(ctx.allocator, replacement.literal);
+            copied_until = property_end;
+            cursor = property_end;
+            break;
+        }
+    }
+    if (copied_until == 0) return source;
+    try output.appendSlice(ctx.allocator, source[copied_until..]);
+    return try output.toOwnedSlice(ctx.allocator);
 }
 
 fn isIdentifierStart(byte: u8) bool {
@@ -1666,6 +1731,15 @@ fn transpileDynamicTarget(
             .target = .node,
             .loader = loader_override,
             .external_packages = external_packages,
+            // The factory wrapper (`appendDynamicTargetFactory`) evaluates
+            // this output inside `new Function(..., "__ctImportMeta", ...)`
+            // and computes the true URL — including any `?query`/`#fragment`
+            // suffix from the dynamic import specifier — at runtime. Without
+            // this define, the cjs conversion inlines `import.meta.url` as a
+            // literal file URL and the suffix is lost (upstream Bun keeps the
+            // suffix; see test/js/bun/resolve/import-query.test.ts).
+            .define_keys = &.{"import.meta.url"},
+            .define_values = &.{"__ctImportMeta.url"},
         },
         &error_message,
     ) catch {

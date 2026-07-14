@@ -60,7 +60,16 @@ pub fn postProcessCSSChunk(ctx: GenerateChunkCtx, worker: *ThreadPool.Worker, ch
         }
 
         // Save the offset to the start of the stored JavaScript
-        j.push(compile_result.code(), bun.default_allocator);
+        //
+        // NOTE: CSS compile-result code is allocated with a worker's arena
+        // (`generateCompileResultForCssChunk` prints into `worker.allocator`),
+        // NOT `bun.default_allocator`. Labeling it as owned by
+        // `default_allocator` made the joiner free arena memory through the
+        // page allocator, which panics with "incorrect alignment" on
+        // Cottontail (upstream gets away with it because both are the same
+        // mimalloc heap there). The arena owns the memory and frees it in
+        // bulk at bundle teardown, so push without transferring ownership.
+        j.pushStatic(compile_result.code());
 
         if (compile_result.sourceMapChunk()) |source_map_chunk| {
             if (c.options.source_maps != .none) {

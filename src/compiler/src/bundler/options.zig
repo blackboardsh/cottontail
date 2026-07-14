@@ -1799,6 +1799,33 @@ pub const BundleOptions = struct {
 
     supports_multiple_outputs: bool = true,
 
+    /// Cottontail: when bundling for the Bun runtime (`bun run` / `bun test`
+    /// emulation, which produces a single in-memory output), a
+    /// `require.resolve(...)` whose target would otherwise be copied into the
+    /// output directory as an asset (loader `.file`, etc.) is instead left as
+    /// a runtime `require.resolve("<resolved absolute path>")` call. Upstream
+    /// Bun's runtime doesn't bundle, so `require.resolve` always yields the
+    /// on-disk path there; this preserves those semantics. `bun build` keeps
+    /// this off so CLI behavior matches upstream (which errors when multiple
+    /// outputs have nowhere to go).
+    externalize_runtime_require_resolve: bool = false,
+
+    /// Cottontail: lower `using` / `await using` declarations even when
+    /// targeting Bun. Upstream Bun's JSC build implements explicit resource
+    /// management natively, but the JSC vendored by Cottontail does not, so
+    /// bundles that will execute on Cottontail's runtime must have them
+    /// lowered (otherwise they are a SyntaxError at load time). `bun build`
+    /// output destined for real Bun keeps upstream behavior.
+    force_lower_using: bool = false,
+
+    /// Cottontail evaluates runtime bundles as classic (sloppy-mode) scripts,
+    /// so a CommonJS module's `"use strict"` directive must be re-emitted
+    /// inside its `__commonJS` wrapper closure — including for the entry
+    /// point — or the module silently loses strict-mode semantics. Real Bun
+    /// omits the directive in always-strict ESM output, so `bun build`
+    /// parity paths leave this false.
+    preserve_strict_directives_in_wrappers: bool = false,
+
     /// This is set by the process environment, which is used to override the
     /// JSX configuration. When this is unspecified, the tsconfig.json is used
     /// to determine if a development jsx-runtime is used (by going between

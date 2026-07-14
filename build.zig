@@ -66,7 +66,13 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     return output;
 }
 
-fn createCompilerModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn createCompilerModule(b: *std.Build, target: std.Build.ResolvedTarget, root_optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    // The vendored Bun compiler (parser/bundler/CSS pipeline) is hot code on
+    // every `cottontail run` — a Debug build spends ~300ms bundling the
+    // runtime modules per child process, which starves spawn-heavy upstream
+    // tests. Build it optimized (with safety checks) even in Debug builds of
+    // the surrounding runtime.
+    const optimize = if (root_optimize == .Debug) .ReleaseFast else root_optimize;
     const build_options_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/src/build_options.zig"),
         .target = target,

@@ -10,7 +10,13 @@ pub fn postProcessJSChunk(ctx: GenerateChunkCtx, worker: *ThreadPool.Worker, chu
     js_ast.Expr.Data.Store.create();
     js_ast.Stmt.Data.Store.create();
 
-    defer chunk.renamer.deinit(bun.default_allocator);
+    // The renamer (and its reserved-names map) was allocated with a worker's
+    // mimalloc arena in `generateJSRenamer_`. Free it with a mimalloc-backed
+    // allocator: mimalloc frees by pointer so cross-heap frees are safe, but
+    // Cottontail's `bun.default_allocator` is the page allocator, and freeing
+    // a mimalloc allocation through it panics with "incorrect alignment"
+    // (seen with --minify-identifiers via the in-process Bun.build API).
+    defer chunk.renamer.deinit(worker.allocator);
 
     var arena = bun.ArenaAllocator.init(worker.allocator);
     defer arena.deinit();

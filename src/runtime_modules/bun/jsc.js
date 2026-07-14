@@ -23,7 +23,7 @@ function normalizeHeapStats(stats) {
 // heapStats() does not report allocations caused by initializing itself.
 if (nativeHeapStats) normalizeHeapStats(nativeHeapStats());
 
-function gc() {
+function runInternalGc() {
   globalThis.gc?.();
   cottontail.drainJobs?.();
 }
@@ -74,17 +74,17 @@ export function heapSize() {
 }
 
 export function edenGC() {
-  gc();
+  runInternalGc();
   return heapSize();
 }
 
 export function fullGC() {
-  gc();
+  runInternalGc();
   return heapSize();
 }
 
 export function gcAndSweep() {
-  gc();
+  runInternalGc();
   return heapSize();
 }
 
@@ -192,7 +192,7 @@ export function percentAvailableMemoryInUse() {
 }
 
 export function releaseWeakRefs() {
-  gc();
+  runInternalGc();
 }
 
 export function startSamplingProfiler() {

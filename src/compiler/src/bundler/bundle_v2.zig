@@ -1554,15 +1554,51 @@ pub const BundleV2 = struct {
         fetcher: ?*DependenciesScanner,
         file_map: ?*const jsc.API.JSBundler.FileMap,
     ) !BuildResult {
+        return generateFromCLIReleasable(
+            transpiler,
+            alloc,
+            event_loop,
+            enable_reloading,
+            reachable_files_count,
+            minify_duration,
+            source_code_size,
+            fetcher,
+            file_map,
+            null,
+            null,
+        );
+    }
+
+    /// Same as `generateFromCLI`, but exposes the constructed BundleV2 so a
+    /// long-lived embedder (Cottontail's runtime bundler) can release its
+    /// thread-local arena, worker pool, and graph memory after copying the
+    /// outputs. The CLI never bothers because the process exits right after,
+    /// but a resident process leaks >100MB per bundle without this.
+    /// `bundle_out` is set as soon as the bundle exists, including on error
+    /// paths, so the caller can always tear it down.
+    pub fn generateFromCLIReleasable(
+        transpiler: *Transpiler,
+        alloc: std.mem.Allocator,
+        event_loop: EventLoop,
+        comptime enable_reloading: bool,
+        reachable_files_count: *usize,
+        minify_duration: *u64,
+        source_code_size: *u64,
+        fetcher: ?*DependenciesScanner,
+        file_map: ?*const jsc.API.JSBundler.FileMap,
+        bundle_out: ?*?*BundleV2,
+        worker_pool: ?*ThreadPoolLib,
+    ) !BuildResult {
         var this = try BundleV2.init(
             transpiler,
             null,
             alloc,
             event_loop,
             enable_reloading,
-            null,
+            worker_pool,
             .init(),
         );
+        if (bundle_out) |out| out.* = this;
         this.file_map = file_map;
         this.unique_key = generateUniqueKey();
 
@@ -2203,11 +2239,25 @@ pub const BundleV2 = struct {
         }
     }
 
+    /// Full teardown for embedders that used `generateFromCLIReleasable`:
+    /// shuts down the worker pool, frees the graph arena, and destroys the
+    /// BundleV2 allocated from `alloc`. Output file buffers are allocated
+    /// from the page/default allocators and survive this call.
+    /// Only safe when the BundleV2 was created with an external worker pool
+    /// (otherwise the owned ThreadPoolLib lives inside the arena being freed
+    /// while its parked threads still reference it).
+    pub fn deinitFromCLI(this: *BundleV2, alloc: std.mem.Allocator) void {
+        var heap = this.graph.heap;
+        this.deinitWithoutFreeingArena();
+        heap.deinit();
+        alloc.destroy(this);
+    }
+
     pub fn deinitWithoutFreeingArena(this: *BundleV2) void {
         {
             // We do this first to make it harder for any dangling pointers to data to be used in there.
             var on_parse_finalizers = this.finalizers;
-            this.finalizers = .{};
+            this.finalizers = .empty;
             for (on_parse_finalizers.items) |finalizer| {
                 finalizer.call();
             }
@@ -2966,7 +3016,19 @@ pub const BundleV2 = struct {
             }
 
             if (ctx.target.isBun() and this.transpiler.resolver.runtimeAlias(import_record.path.text) == null) {
-                if (jsc.ModuleLoader.HardcodedModule.Alias.get(import_record.path.text, .bun, .{ .rewrite_jest_for_tests = this.transpiler.options.rewrite_jest_for_tests })) |replacement| {
+                if (jsc.ModuleLoader.HardcodedModule.Alias.get(import_record.path.text, .bun, .{ .rewrite_jest_for_tests = this.transpiler.options.rewrite_jest_for_tests })) |replacement| skip_hardcoded: {
+                    // Cottontail runtime bundles: real Bun overrides some npm
+                    // packages ("ws", "node-fetch", "undici", ...) with
+                    // built-in native shims. Cottontail's runtime has no such
+                    // shims, so those specifiers must resolve normally through
+                    // node_modules (node: builtins and bun: modules are still
+                    // provided via runtime aliases / the module loader).
+                    if (this.transpiler.options.externalize_runtime_require_resolve and
+                        !replacement.node_builtin and
+                        !strings.hasPrefixComptime(replacement.path, "bun"))
+                    {
+                        break :skip_hardcoded;
+                    }
                     // When bundling node builtins, remove the "node:" prefix.
                     // This supports special use cases where the bundle is put
                     // into a non-node module resolver that doesn't support
@@ -3132,6 +3194,25 @@ pub const BundleV2 = struct {
                 switch (err) {
                     error.ModuleNotFound => {
                         const addError = Logger.Log.addResolveErrorWithTextDupe;
+
+                        // Cottontail runtime bundles: `require()`,
+                        // `require.resolve()` and dynamic `import()` are
+                        // runtime operations in Bun's runtime (which doesn't
+                        // pre-bundle), so an unresolvable specifier must fail
+                        // (or succeed) at the call site when it actually
+                        // executes — e.g. a `require("internal/url")` inside a
+                        // skipped test must not fail the whole bundle. This
+                        // mirrors upstream's runtime linker
+                        // (`Linker.whenModuleNotFound`, is_bun branch).
+                        if (ctx.target.isBun() and
+                            this.transpiler.options.externalize_runtime_require_resolve and
+                            (import_record.kind == .require or import_record.kind == .require_resolve or import_record.kind == .dynamic))
+                        {
+                            import_record.path.is_disabled = false;
+                            import_record.source_index = Index.invalid;
+                            import_record.flags.is_external_without_side_effects = true;
+                            continue :outer;
+                        }
 
                         if (!import_record.flags.handles_import_errors and !this.transpiler.options.ignore_module_resolution_errors) {
                             last_error = err;
@@ -3309,6 +3390,18 @@ pub const BundleV2 = struct {
                 break :brk resolved_loader;
             };
             import_record.loader = import_record_loader;
+
+            // Cottontail: keep `require.resolve(<asset>)` a runtime call when
+            // bundling for the Bun runtime (see the option's doc comment).
+            if (import_record.kind == .require_resolve and
+                this.transpiler.options.externalize_runtime_require_resolve and
+                import_record_loader.shouldCopyForBundling())
+            {
+                import_record.path = bun.handleOom(this.pathWithPrettyInitialized(path.*, target));
+                import_record.source_index = Index.invalid;
+                import_record.flags.is_external_without_side_effects = true;
+                continue;
+            }
 
             const is_html_entrypoint = import_record_loader == .html and target.isServerSide() and this.transpiler.options.dev_server == null;
 

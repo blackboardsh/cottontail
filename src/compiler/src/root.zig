@@ -6,6 +6,12 @@ pub const deprecated = @import("bun_core/deprecated.zig");
 pub const OOM = std.mem.Allocator.Error;
 pub const JSError = error{ JSError, OutOfMemory, JSTerminated };
 pub const Maybe = jsc.Node.Maybe;
+// NOTE: page_allocator (mmap-backed) rather than the libc allocator on
+// purpose: upstream tests run cottontail children under libgmalloc
+// (harness.forceGuardMalloc), and routing the compiler's allocation firehose
+// through guarded malloc makes process startup exceed test timeouts. Bulk
+// allocations flow through arenas, so per-allocation page rounding is mostly
+// amortized.
 pub const default_allocator = std.heap.page_allocator;
 /// Package-manager sources are owned by Cottontail. Resolver auto-install stays
 /// disabled until its network and event-loop path is integrated with the runtime.
@@ -1152,6 +1158,22 @@ pub const sys = struct {
         errno: SystemErrno = .SUCCESS,
         syscall: []const u8 = "",
         path: []const u8 = "",
+        /// The concrete zig error that produced this failure, when known.
+        /// Preserved so callers (e.g. the resolver's directory cache) can
+        /// distinguish a soft miss like `error.FileNotFound` from a real
+        /// I/O failure instead of collapsing everything into
+        /// `error.SystemError`, which escalated missing directories into
+        /// fatal bundle errors.
+        zig_error: anyerror = error.SystemError,
+
+        pub fn fromZigErr(err_value: anyerror, syscall_name: []const u8, pathname: []const u8) Error {
+            return .{
+                .errno = if (err_value == error.FileNotFound) .NOENT else .SUCCESS,
+                .syscall = syscall_name,
+                .path = pathname,
+                .zig_error = err_value,
+            };
+        }
 
         pub fn toSystemError(self: Error) Error {
             return self;
@@ -1193,7 +1215,7 @@ pub const sys = struct {
             pub fn unwrap(self: @This()) !Type {
                 return switch (self) {
                     .result => |value| value,
-                    .err => error.SystemError,
+                    .err => |e| e.zig_error,
                 };
             }
         };
@@ -1202,11 +1224,11 @@ pub const sys = struct {
     pub fn openA(pathname: []const u8, flags: i32, _: Mode) SysMaybe(FD) {
         const io_instance = std.Io.Threaded.global_single_threaded.io();
         if (flags & O.DIRECTORY != 0) {
-            const directory = std.Io.Dir.cwd().openDir(io_instance, pathname, .{ .iterate = true }) catch return .{ .err = .{ .path = pathname } };
+            const directory = std.Io.Dir.cwd().openDir(io_instance, pathname, .{ .iterate = true }) catch |err| return .{ .err = .fromZigErr(err, "open", pathname) };
             return .{ .result = FD.fromStdDir(directory) };
         }
         const mode: std.Io.Dir.OpenFileOptions.Mode = if (flags & O.WRONLY != 0) .write_only else .read_only;
-        const file = std.Io.Dir.cwd().openFile(io_instance, pathname, .{ .mode = mode }) catch return .{ .err = .{ .path = pathname } };
+        const file = std.Io.Dir.cwd().openFile(io_instance, pathname, .{ .mode = mode }) catch |err| return .{ .err = .fromZigErr(err, "open", pathname) };
         return .{ .result = FD.fromStdFile(file) };
     }
 
@@ -1217,13 +1239,13 @@ pub const sys = struct {
     pub fn openat(dirfd: FD, pathname: [:0]const u8, flags: i32, _: Mode) SysMaybe(FD) {
         const io_instance = std.Io.Threaded.global_single_threaded.io();
         if (flags & O.DIRECTORY != 0) {
-            const directory = dirfd.stdDir().openDir(io_instance, pathname, .{ .iterate = true }) catch return .{ .err = .{ .path = pathname, .syscall = "openat" } };
+            const directory = dirfd.stdDir().openDir(io_instance, pathname, .{ .iterate = true }) catch |err| return .{ .err = .fromZigErr(err, "openat", pathname) };
             return .{ .result = FD.fromStdDir(directory) };
         }
         const file = if (flags & O.CREAT != 0)
-            dirfd.stdDir().createFile(io_instance, pathname, .{ .truncate = flags & O.TRUNC != 0 }) catch return .{ .err = .{ .path = pathname, .syscall = "openat" } }
+            dirfd.stdDir().createFile(io_instance, pathname, .{ .truncate = flags & O.TRUNC != 0 }) catch |err| return .{ .err = .fromZigErr(err, "openat", pathname) }
         else
-            dirfd.stdDir().openFile(io_instance, pathname, .{ .mode = if (flags & O.WRONLY != 0) .write_only else .read_only }) catch return .{ .err = .{ .path = pathname, .syscall = "openat" } };
+            dirfd.stdDir().openFile(io_instance, pathname, .{ .mode = if (flags & O.WRONLY != 0) .write_only else .read_only }) catch |err| return .{ .err = .fromZigErr(err, "openat", pathname) };
         return .{ .result = FD.fromStdFile(file) };
     }
 
@@ -1238,7 +1260,7 @@ pub const sys = struct {
             dirfd.stdDir().openDir(io_instance, pathname, open_options)
         else
             std.Io.Dir.openDirAbsolute(io_instance, pathname, open_options);
-        return .{ .result = FD.fromStdDir(directory catch return .{ .err = .{ .path = pathname, .syscall = "open" } }) };
+        return .{ .result = FD.fromStdDir(directory catch |err| return .{ .err = .fromZigErr(err, "open", pathname) }) };
     }
 
     pub fn renameat(from_dir: FD, from: [:0]const u8, to_dir: FD, to: [:0]const u8) SysMaybe(void) {
@@ -2334,10 +2356,94 @@ pub fn reinterpretSlice(comptime To: type, input: anytype) []const To {
 }
 
 pub const cpp = struct {
+    /// Emulates WTF::dtoa: ECMAScript Number::toString(10) semantics
+    /// (shortest round-trip digits, exponential notation for exponents
+    /// >= 21 or <= -7). The previous `{d}` formatting expanded large and
+    /// tiny values to their full decimal form (e.g. 3.40282e38 became a
+    /// 39-digit integer) and overflowed the buffer for subnormals.
     pub fn WTF__dtoa(buf: anytype, number: f64) usize {
         const out_ptr: [*]u8 = @ptrCast(buf);
-        const out = std.fmt.bufPrint(out_ptr[0..128], "{d}", .{number}) catch return 0;
-        return out.len;
+        const out = out_ptr[0..124];
+        const write = struct {
+            fn write(destination: []u8, text: []const u8) usize {
+                @memcpy(destination[0..text.len], text);
+                return text.len;
+            }
+        }.write;
+        if (std.math.isNan(number)) return write(out, "NaN");
+        if (std.math.isPositiveInf(number)) return write(out, "Infinity");
+        if (std.math.isNegativeInf(number)) return write(out, "-Infinity");
+        if (number == 0) return write(out, "0");
+
+        // Shortest round-trip scientific form: [-]d[.ddd]e[-]X
+        var scientific_buf: [64]u8 = undefined;
+        const scientific = std.fmt.bufPrint(&scientific_buf, "{e}", .{number}) catch return 0;
+        var rest: []const u8 = scientific;
+        var length: usize = 0;
+        if (rest.len > 0 and rest[0] == '-') {
+            out[length] = '-';
+            length += 1;
+            rest = rest[1..];
+        }
+        const e_index = std.mem.indexOfScalar(u8, rest, 'e') orelse return write(out, scientific);
+        const mantissa = rest[0..e_index];
+        const exponent = std.fmt.parseInt(i32, rest[e_index + 1 ..], 10) catch return write(out, scientific);
+
+        // Digits without the decimal point.
+        var digits_buf: [32]u8 = undefined;
+        var digit_count: usize = 0;
+        for (mantissa) |char| {
+            if (char == '.') continue;
+            digits_buf[digit_count] = char;
+            digit_count += 1;
+        }
+        // Strip trailing zeros (shortest form should not have them, but be safe).
+        while (digit_count > 1 and digits_buf[digit_count - 1] == '0') digit_count -= 1;
+        const digits = digits_buf[0..digit_count];
+        const k: i32 = @intCast(digit_count);
+        const n: i32 = exponent + 1; // decimal point position: value = 0.digits * 10^n
+
+        if (k <= n and n <= 21) {
+            // Integer with trailing zeros.
+            length += write(out[length..], digits);
+            var index: i32 = 0;
+            while (index < n - k) : (index += 1) {
+                out[length] = '0';
+                length += 1;
+            }
+        } else if (0 < n and n <= 21) {
+            // Decimal point inside the digits.
+            length += write(out[length..], digits[0..@intCast(n)]);
+            out[length] = '.';
+            length += 1;
+            length += write(out[length..], digits[@intCast(n)..]);
+        } else if (-6 < n and n <= 0) {
+            // 0.000digits
+            length += write(out[length..], "0.");
+            var index: i32 = n;
+            while (index < 0) : (index += 1) {
+                out[length] = '0';
+                length += 1;
+            }
+            length += write(out[length..], digits);
+        } else {
+            // Exponential notation.
+            out[length] = digits[0];
+            length += 1;
+            if (digit_count > 1) {
+                out[length] = '.';
+                length += 1;
+                length += write(out[length..], digits[1..]);
+            }
+            out[length] = 'e';
+            length += 1;
+            const printed = std.fmt.bufPrint(out[length..], "{s}{d}", .{
+                if (n - 1 >= 0) "+" else "",
+                n - 1,
+            }) catch return 0;
+            length += printed.len;
+        }
+        return length;
     }
 
     pub fn JSC__jsToNumber(bytes_ptr: [*]const u8, len: usize) f64 {
@@ -2762,7 +2868,8 @@ pub fn getcwd(buffer: []u8) ![]u8 {
         const result = _getcwd(buffer.ptr, @intCast(buffer.len)) orelse return error.CurrentWorkingDirectoryUnavailable;
         return std.mem.sliceTo(result, 0);
     }
-    return std.posix.getcwd(buffer);
+    const len = try std.process.currentPath(std.Io.Threaded.global_single_threaded.io(), buffer);
+    return buffer[0..len];
 }
 
 pub fn getcwdAlloc(allocator: std.mem.Allocator) ![:0]u8 {

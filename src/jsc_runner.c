@@ -53,6 +53,7 @@
 #endif
 #if !defined(_WIN32)
 #include <resolv.h>
+#include <spawn.h>
 #endif
 #include <signal.h>
 #include <stdbool.h>
@@ -980,6 +981,14 @@ extern uint8_t *ct_bundle_entry_point_options(
     size_t working_dir_len,
     const uint8_t *options,
     size_t options_len,
+    size_t *out_len,
+    char **error_out
+);
+extern uint8_t *ct_bundle_build(
+    const uint8_t *request,
+    size_t request_len,
+    const uint8_t *working_dir,
+    size_t working_dir_len,
     size_t *out_len,
     char **error_out
 );
@@ -12525,6 +12534,137 @@ static void *ct_async_process_thread(void *opaque) {
 #endif
 }
 
+#if !defined(_WIN32)
+static void ct_free_spawn_envp(char **envp) {
+    if (envp == NULL) return;
+    for (size_t index = 0; envp[index] != NULL; index += 1) free(envp[index]);
+    free(envp);
+}
+
+static char *ct_format_env_entry(const char *name, const char *value) {
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value != NULL ? value : "");
+    char *entry = (char *)malloc(name_len + value_len + 2);
+    if (entry == NULL) return NULL;
+    memcpy(entry, name, name_len);
+    entry[name_len] = '=';
+    memcpy(entry + name_len + 1, value != NULL ? value : "", value_len);
+    entry[name_len + value_len + 1] = 0;
+    return entry;
+}
+
+static bool ct_env_entry_matches(const char *entry, const char *name) {
+    size_t name_len = strlen(name);
+    return strncmp(entry, name, name_len) == 0 && entry[name_len] == '=';
+}
+
+/// execvp resolves the executable against the CHILD environment's PATH (the
+/// pre-fork code mutated the child's environ before execvp), but
+/// posix_spawnp searches the PARENT's PATH. Resolve manually against the
+/// spawned process's PATH so `env: { PATH: ... }` is honored. Returns a
+/// malloc'd absolute/relative candidate path, or NULL to spawn `file` as-is.
+static char *ct_resolve_spawn_executable(const char *file, char *const *envp, const char *cwd) {
+    if (file == NULL || strchr(file, '/') != NULL) return NULL;
+    const char *path_value = NULL;
+    for (size_t index = 0; envp != NULL && envp[index] != NULL; index += 1) {
+        if (strncmp(envp[index], "PATH=", 5) == 0) {
+            path_value = envp[index] + 5;
+            break;
+        }
+    }
+    if (path_value == NULL || path_value[0] == 0) return NULL;
+    size_t file_len = strlen(file);
+    const char *cursor = path_value;
+    while (true) {
+        const char *entry_end = strchr(cursor, ':');
+        size_t entry_len = entry_end != NULL ? (size_t)(entry_end - cursor) : strlen(cursor);
+        const char *entry = cursor;
+        // Empty PATH entry means the current directory.
+        const char *effective_entry = entry_len > 0 ? entry : ".";
+        size_t effective_len = entry_len > 0 ? entry_len : 1;
+        bool is_relative = effective_entry[0] != '/';
+        size_t cwd_len = (is_relative && cwd != NULL) ? strlen(cwd) : 0;
+        char *candidate = (char *)malloc(cwd_len + 1 + effective_len + 1 + file_len + 1);
+        if (candidate != NULL) {
+            size_t out = 0;
+            if (cwd_len > 0) {
+                memcpy(candidate, cwd, cwd_len);
+                out = cwd_len;
+                candidate[out] = '/';
+                out += 1;
+            }
+            memcpy(candidate + out, effective_entry, effective_len);
+            out += effective_len;
+            candidate[out] = '/';
+            out += 1;
+            memcpy(candidate + out, file, file_len);
+            out += file_len;
+            candidate[out] = 0;
+            struct stat candidate_stat;
+            if (access(candidate, X_OK) == 0 &&
+                stat(candidate, &candidate_stat) == 0 &&
+                S_ISREG(candidate_stat.st_mode)) {
+                return candidate;
+            }
+            free(candidate);
+        }
+        if (entry_end == NULL) break;
+        cursor = entry_end + 1;
+    }
+    return NULL;
+}
+
+/// Builds the child environment array for posix_spawn: the parent environ
+/// (unless clear_env) with `env_entries` overrides applied, plus the IPC fd
+/// variable when IPC is enabled.
+static char **ct_build_spawn_envp(const CtHostEnvEntry *env_entries, size_t env_count, bool clear_env, bool ipc_enabled) {
+    size_t inherited_count = 0;
+    if (!clear_env && environ != NULL) {
+        while (environ[inherited_count] != NULL) inherited_count += 1;
+    }
+    char **envp = (char **)calloc(inherited_count + env_count + 2, sizeof(char *));
+    if (envp == NULL) return NULL;
+    size_t out = 0;
+    if (!clear_env && environ != NULL) {
+        for (size_t index = 0; environ[index] != NULL; index += 1) {
+            bool overridden = false;
+            for (size_t entry = 0; entry < env_count && !overridden; entry += 1) {
+                overridden = ct_env_entry_matches(environ[index], env_entries[entry].name);
+            }
+            if (ipc_enabled && !overridden) {
+                overridden = ct_env_entry_matches(environ[index], "COTTONTAIL_IPC_FD");
+            }
+            if (overridden) continue;
+            envp[out] = strdup(environ[index]);
+            if (envp[out] == NULL) {
+                ct_free_spawn_envp(envp);
+                return NULL;
+            }
+            out += 1;
+        }
+    }
+    for (size_t entry = 0; entry < env_count; entry += 1) {
+        if (ipc_enabled && strcmp(env_entries[entry].name, "COTTONTAIL_IPC_FD") == 0) continue;
+        envp[out] = ct_format_env_entry(env_entries[entry].name, env_entries[entry].value);
+        if (envp[out] == NULL) {
+            ct_free_spawn_envp(envp);
+            return NULL;
+        }
+        out += 1;
+    }
+    if (ipc_enabled) {
+        envp[out] = ct_format_env_entry("COTTONTAIL_IPC_FD", "3");
+        if (envp[out] == NULL) {
+            ct_free_spawn_envp(envp);
+            return NULL;
+        }
+        out += 1;
+    }
+    envp[out] = NULL;
+    return envp;
+}
+#endif
+
 static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
@@ -12729,38 +12869,102 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     }
 #endif
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (cwd != NULL) chdir(cwd);
-        if (clear_env) ct_clear_environment();
-        for (size_t index = 0; index < env_count; index += 1) {
-            setenv(env_entries[index].name, env_entries[index].value, 1);
-        }
-        ct_process_close_fd(&stdin_pipe[1]);
-        ct_process_close_fd(&stdout_pipe[0]);
-        ct_process_close_fd(&stderr_pipe[0]);
-        ct_child_apply_input_stdio(stdin_mode, stdin_pipe[0]);
-        ct_child_apply_output_stdio(stdout_mode, stdout_pipe[1], STDOUT_FILENO);
-        ct_child_apply_output_stdio(stderr_mode, stderr_pipe[1], STDERR_FILENO);
-        ct_process_close_fd(&stdin_pipe[0]);
-        ct_process_close_fd(&stdout_pipe[1]);
-        ct_process_close_fd(&stderr_pipe[1]);
-        if (ipc_enabled) {
-            ct_process_close_fd(&ipc_socket[0]);
-            if (ipc_socket[1] >= 0) {
-                dup2(ipc_socket[1], 3);
-                if (ipc_socket[1] != 3) close(ipc_socket[1]);
-                setenv("COTTONTAIL_IPC_FD", "3", 1);
-            }
-        }
-        char **argv_exec = (char **)calloc(arg_count + 2, sizeof(char *));
-        if (argv_exec == NULL) _exit(127);
+    // Spawn with posix_spawn instead of fork()+execvp(): this parent is a
+    // large, heavily multithreaded process (JSC + bundler worker threads),
+    // and code between fork() and exec() may only use async-signal-safe
+    // functions. The previous child-side calloc()/setenv() calls could grab
+    // a malloc/environ lock held by another thread at fork time and deadlock
+    // the child forever (observed as "dangling processes" whenever many
+    // subprocesses were spawned concurrently).
+    char **argv_exec = (char **)calloc(arg_count + 2, sizeof(char *));
+    char **envp_exec = ct_build_spawn_envp(env_entries, env_count, clear_env, ipc_enabled);
+    posix_spawn_file_actions_t spawn_actions;
+    bool spawn_actions_ok = posix_spawn_file_actions_init(&spawn_actions) == 0;
+    pid_t pid = -1;
+    if (argv_exec == NULL || envp_exec == NULL || !spawn_actions_ok) {
+        errno = ENOMEM;
+    } else {
         argv_exec[0] = argv0 != NULL && argv0[0] != '\0' ? argv0 : file;
         for (size_t index = 0; index < arg_count; index += 1) argv_exec[index + 1] = args[index];
         argv_exec[arg_count + 1] = NULL;
-        execvp(file, argv_exec);
-        _exit(127);
+
+        if (cwd != NULL) posix_spawn_file_actions_addchdir_np(&spawn_actions, cwd);
+        if (stdin_mode == CT_PROCESS_STDIO_PIPE && stdin_pipe[0] >= 0) {
+            posix_spawn_file_actions_adddup2(&spawn_actions, stdin_pipe[0], STDIN_FILENO);
+        } else if (stdin_mode != CT_PROCESS_STDIO_INHERIT) {
+            posix_spawn_file_actions_addopen(&spawn_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+        }
+        if (stdout_mode == CT_PROCESS_STDIO_PIPE && stdout_pipe[1] >= 0) {
+            posix_spawn_file_actions_adddup2(&spawn_actions, stdout_pipe[1], STDOUT_FILENO);
+        } else if (stdout_mode != CT_PROCESS_STDIO_INHERIT) {
+            posix_spawn_file_actions_addopen(&spawn_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        }
+        if (stderr_mode == CT_PROCESS_STDIO_PIPE && stderr_pipe[1] >= 0) {
+            posix_spawn_file_actions_adddup2(&spawn_actions, stderr_pipe[1], STDERR_FILENO);
+        } else if (stderr_mode != CT_PROCESS_STDIO_INHERIT) {
+            posix_spawn_file_actions_addopen(&spawn_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        }
+        // Close the parent's pipe ends and the child's already-dup2'd pipe
+        // ends BEFORE wiring the IPC fd: any of these descriptors may happen
+        // to be fd 3, and closing it after the IPC dup2 would sever the IPC
+        // channel.
+        if (stdin_pipe[1] >= 0) posix_spawn_file_actions_addclose(&spawn_actions, stdin_pipe[1]);
+        if (stdout_pipe[0] >= 0) posix_spawn_file_actions_addclose(&spawn_actions, stdout_pipe[0]);
+        if (stderr_pipe[0] >= 0) posix_spawn_file_actions_addclose(&spawn_actions, stderr_pipe[0]);
+        if (stdin_pipe[0] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stdin_pipe[0]);
+        if (stdout_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stdout_pipe[1]);
+        if (stderr_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stderr_pipe[1]);
+        if (ipc_enabled) {
+            if (ipc_socket[0] >= 0 && ipc_socket[0] != ipc_socket[1]) {
+                posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[0]);
+            }
+            if (ipc_socket[1] >= 0 && ipc_socket[1] != 3) {
+                posix_spawn_file_actions_adddup2(&spawn_actions, ipc_socket[1], 3);
+                if (ipc_socket[1] > 3) posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[1]);
+            }
+        }
+
+        char *resolved_file = ct_resolve_spawn_executable(file, envp_exec, cwd);
+        if (resolved_file == NULL && cwd != NULL && file[0] != '/' && strchr(file, '/') != NULL) {
+            // posix_spawn resolves the executable path before the addchdir_np
+            // file action takes effect, so anchor relative paths to the
+            // requested cwd ourselves.
+            size_t cwd_len = strlen(cwd);
+            size_t file_len = strlen(file);
+            resolved_file = (char *)malloc(cwd_len + 1 + file_len + 1);
+            if (resolved_file != NULL) {
+                memcpy(resolved_file, cwd, cwd_len);
+                resolved_file[cwd_len] = '/';
+                memcpy(resolved_file + cwd_len + 1, file, file_len);
+                resolved_file[cwd_len + 1 + file_len] = 0;
+            }
+        }
+        const char *spawn_file = resolved_file != NULL ? resolved_file : file;
+        int spawn_result = resolved_file != NULL
+            ? posix_spawn(&pid, spawn_file, &spawn_actions, NULL, argv_exec, envp_exec)
+            : posix_spawnp(&pid, spawn_file, &spawn_actions, NULL, argv_exec, envp_exec);
+        if (spawn_result == ENOEXEC) {
+            // execvp falls back to interpreting non-binaries (e.g. empty or
+            // shebang-less scripts) with /bin/sh; posix_spawn does not.
+            char **sh_argv = (char **)calloc(arg_count + 3, sizeof(char *));
+            if (sh_argv != NULL) {
+                sh_argv[0] = (char *)"/bin/sh";
+                sh_argv[1] = (char *)spawn_file;
+                for (size_t index = 0; index < arg_count; index += 1) sh_argv[index + 2] = args[index];
+                sh_argv[arg_count + 2] = NULL;
+                spawn_result = posix_spawn(&pid, "/bin/sh", &spawn_actions, NULL, sh_argv, envp_exec);
+                free(sh_argv);
+            }
+        }
+        free(resolved_file);
+        if (spawn_result != 0) {
+            pid = -1;
+            errno = spawn_result;
+        }
     }
+    if (spawn_actions_ok) posix_spawn_file_actions_destroy(&spawn_actions);
+    free(argv_exec);
+    ct_free_spawn_envp(envp_exec);
 
     free(argv0);
     ct_process_close_fd(&stdin_pipe[0]);
@@ -15096,6 +15300,47 @@ static JSValueRef ct_bundle_native(JSContextRef ctx, JSObjectRef function, JSObj
     return result;
 }
 
+static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "buildNative(optionsJson, workingDirectory) requires two arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t request_len = 0;
+    size_t working_dir_len = 0;
+    char *request = ct_value_to_utf8_copy(ctx, argv[0], &request_len);
+    char *working_dir = ct_value_to_utf8_copy(ctx, argv[1], &working_dir_len);
+    if (request == NULL || working_dir == NULL) {
+        free(request);
+        free(working_dir);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_bundle_build(
+        (const uint8_t *)request,
+        request_len,
+        (const uint8_t *)working_dir,
+        working_dir_len,
+        &output_len,
+        &error
+    );
+    free(request);
+    free(working_dir);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "JavaScript bundle failed");
+        if (error != NULL) ct_bundle_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_bundle_free(output, output_len);
+    return result;
+}
+
 static JSValueRef ct_markdown_html_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -15266,6 +15511,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "transpilerScan", ct_transpiler_scan_native, runtime);
     ct_install_function(ctx, host, "transpilerScanImports", ct_transpiler_scan_imports_native, runtime);
     ct_install_function(ctx, host, "bundleNative", ct_bundle_native, runtime);
+    ct_install_function(ctx, host, "buildNative", ct_build_native, runtime);
     ct_install_function(ctx, host, "markdownHtml", ct_markdown_html_native, runtime);
     ct_install_function(ctx, host, "markdownEvents", ct_markdown_events_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
@@ -15757,20 +16003,57 @@ static bool ct_is_js_identifier_char(char ch) {
         ch == '$';
 }
 
+// Tracks whether a scan position is inside a string/template literal. The
+// source is processed line by line, but template literals span lines, so the
+// state must be carried across line boundaries (otherwise `import.meta.*`
+// inside a multi-line template gets falsely rewritten).
+typedef struct {
+    char quote;
+    bool escaped;
+} CtJsScanState;
+
+static void ct_js_scan_advance_line(CtJsScanState *state, const char *bytes, size_t len) {
+    for (size_t i = 0; i < len; i += 1) {
+        char ch = bytes[i];
+        if (state->escaped) {
+            state->escaped = false;
+            continue;
+        }
+        if (state->quote != 0) {
+            if (ch == '\\') state->escaped = true;
+            else if (ch == state->quote) state->quote = 0;
+            continue;
+        }
+        if (ch == '"' || ch == '\'' || ch == '`') {
+            state->quote = ch;
+            continue;
+        }
+        if (ch == '/' && i + 1 < len && bytes[i + 1] == '/') break;
+    }
+    // Line boundary: an escape at end of line consumes the newline (string
+    // continues); otherwise only template literals stay open across lines.
+    if (state->escaped) {
+        state->escaped = false;
+    } else if (state->quote == '"' || state->quote == '\'') {
+        state->quote = 0;
+    }
+}
+
 static bool ct_append_rewritten_dynamic_imports(
     CtStringBuilder *builder,
     const char *line,
     size_t line_len,
-    const char *filename
+    const char *filename,
+    CtJsScanState line_state
 ) {
     const char *cursor = line;
     const char *end = line + line_len;
+    char scan_quote = line_state.quote;
+    bool scan_escaped = line_state.escaped;
 
     while (cursor < end) {
         const char *import_start = NULL;
         const char *open_paren = NULL;
-        char scan_quote = 0;
-        bool scan_escaped = false;
         for (const char *scan = cursor; scan + 6 <= end; scan += 1) {
             char ch = *scan;
             if (scan_escaped) {
@@ -15901,7 +16184,8 @@ static bool ct_append_rewritten_import_meta(
     CtStringBuilder *builder,
     const char *line,
     size_t line_len,
-    const char *filename
+    const char *filename,
+    CtJsScanState line_state
 ) {
     const char *cursor = line;
     const char *end = line + line_len;
@@ -15917,10 +16201,10 @@ static bool ct_append_rewritten_import_meta(
         return false;
     }
 
+    char scan_quote = line_state.quote;
+    bool scan_escaped = line_state.escaped;
     while (cursor < end) {
         const char *found = NULL;
-        char scan_quote = 0;
-        bool scan_escaped = false;
         for (const char *scan = cursor; scan + meta_token_len <= end; scan += 1) {
             char ch = *scan;
             if (scan_escaped) {
@@ -16116,52 +16400,63 @@ static char *ct_prepare_source_with_wrappers(
     const char *lowered_marker = "/* cottontail:module-syntax-lowered */";
     bool module_syntax_lowered = source_len >= strlen(lowered_marker) &&
         memcmp(source, lowered_marker, strlen(lowered_marker)) == 0;
+    CtJsScanState scan_state = { 0, false };
+    // Reused across lines: allocating a fresh builder per line costs two
+    // heap operations per source line (ruinous under libgmalloc, which some
+    // upstream tests inject into spawned cottontail processes).
+    CtStringBuilder meta_builder;
+    if (!ct_sb_init(&meta_builder, 256)) {
+        free(builder.data);
+        return NULL;
+    }
     while (start < end) {
         const char *line_end = memchr(start, '\n', (size_t)(end - start));
         if (line_end == NULL) line_end = end;
+        size_t line_len = (size_t)(line_end - start);
+        const CtJsScanState line_state = scan_state;
+        ct_js_scan_advance_line(&scan_state, start, line_len);
         const char *trim = start;
         while (trim < line_end && (*trim == ' ' || *trim == '\t')) trim += 1;
         bool skip = false;
-        if ((size_t)(line_end - trim) >= 9 && strncmp(trim, "export {", 8) == 0) {
+        if (line_state.quote == 0 &&
+            (size_t)(line_end - trim) >= 9 && strncmp(trim, "export {", 8) == 0) {
             skip = true;
         }
         if (!skip) {
-            size_t line_len = (size_t)(line_end - start);
             if (module_syntax_lowered) {
                 if (!ct_sb_append_bytes(&builder, start, line_len)) {
+                    free(meta_builder.data);
                     free(builder.data);
                     return NULL;
                 }
                 if (line_end < end && !ct_sb_append_cstr(&builder, "\n")) {
+                    free(meta_builder.data);
                     free(builder.data);
                     return NULL;
                 }
                 start = line_end < end ? line_end + 1 : end;
                 continue;
             }
-            CtStringBuilder meta_builder;
-            if (!ct_sb_init(&meta_builder, line_len + 1)) {
-                free(builder.data);
-                return NULL;
-            }
-            if (!ct_append_rewritten_import_meta(&meta_builder, start, line_len, filename)) {
+            meta_builder.len = 0;
+            if (!ct_append_rewritten_import_meta(&meta_builder, start, line_len, filename, line_state)) {
                 free(meta_builder.data);
                 free(builder.data);
                 return NULL;
             }
-            if (!ct_append_rewritten_dynamic_imports(&builder, meta_builder.data, meta_builder.len, filename)) {
+            if (!ct_append_rewritten_dynamic_imports(&builder, meta_builder.data, meta_builder.len, filename, line_state)) {
                 free(meta_builder.data);
                 free(builder.data);
                 return NULL;
             }
-            free(meta_builder.data);
             if (line_end < end && !ct_sb_append_cstr(&builder, "\n")) {
+                free(meta_builder.data);
                 free(builder.data);
                 return NULL;
             }
         }
         start = line_end < end ? line_end + 1 : end;
     }
+    free(meta_builder.data);
 
     if (!ct_sb_append_bytes(&builder, suffix, suffix_len)) {
         free(builder.data);

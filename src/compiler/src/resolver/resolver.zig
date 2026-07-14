@@ -732,10 +732,20 @@ pub const Resolver = struct {
         }
 
         if (r.opts.mark_builtins_as_external) {
-            if (strings.hasPrefixComptime(import_path, "node:") or
+            const is_external_builtin = strings.hasPrefixComptime(import_path, "node:") or
                 strings.hasPrefixComptime(import_path, "bun:") or
-                bun.jsc.ModuleLoader.HardcodedModule.Alias.has(import_path, r.opts.target, .{ .rewrite_jest_for_tests = r.opts.rewrite_jest_for_tests }))
-            {
+                if (bun.jsc.ModuleLoader.HardcodedModule.Alias.get(import_path, r.opts.target, .{ .rewrite_jest_for_tests = r.opts.rewrite_jest_for_tests })) |alias|
+                    // Cottontail runtime bundles: real Bun overrides some npm
+                    // packages ("ws", "node-fetch", "undici", ...) with
+                    // built-in native shims. Cottontail's runtime has no such
+                    // shims, so those specifiers must resolve normally
+                    // through node_modules instead of being kept external.
+                    (!r.opts.externalize_runtime_require_resolve or
+                        alias.node_builtin or
+                        strings.hasPrefixComptime(alias.path, "bun"))
+                else
+                    false;
+            if (is_external_builtin) {
                 return .{
                     .success = Result{
                         .import_kind = kind,
@@ -2940,7 +2950,10 @@ pub const Resolver = struct {
                         r.dir_cache.markNotFound(queue_top.result);
                         rfs.entries.markNotFound(cached_dir_entry_result);
                         switch (@as(anyerror, err)) {
-                            error.ENOENT, error.FileNotFound => {},
+                            // A missing or unreadable directory during module
+                            // resolution is a soft cache-miss (the directory is
+                            // treated as absent), never a fatal bundle error.
+                            error.ENOENT, error.FileNotFound, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
                             else => {
                                 if (comptime enable_logging) {
                                     const pretty = queue_top.unsafe_path;
@@ -3830,7 +3843,10 @@ pub const Resolver = struct {
 
         if (@as(Fs.FileSystem.RealFS.EntriesOption.Tag, dir_entry.*) == .err) {
             switch (dir_entry.err.original_err) {
-                error.ENOENT, error.FileNotFound, error.ENOTDIR, error.NotDir => {},
+                // Missing, non-directory, or unreadable parents are a soft
+                // miss: the path simply does not resolve here. Only truly
+                // unexpected I/O failures should surface as bundle errors.
+                error.ENOENT, error.FileNotFound, error.ENOTDIR, error.NotDir, error.EACCES, error.EPERM, error.AccessDenied, error.PermissionDenied => {},
                 else => {
                     r.log.addErrorFmt(
                         null,

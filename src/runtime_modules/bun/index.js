@@ -1138,32 +1138,56 @@ class BuildMessage {
 }
 
 function runBuildDriver(spec) {
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const toAbsolute = (value) => (
+    value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
+  );
   try {
-    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-    const outputs = [];
+    const entrypoints = [];
     for (const entrypoint of spec.entrypoints ?? []) {
       const entry = String(entrypoint);
-      const absoluteEntry = entry.startsWith("/") || /^[A-Za-z]:[\\/]/.test(entry)
-        ? entry
-        : nodePathResolve(cwd, entry);
+      const absoluteEntry = toAbsolute(entry);
       if (!cottontail.existsSync(absoluteEntry)) {
-        const error = new Error(`ModuleNotFound resolving "${entry}" (entry point)`);
-        error.code = "ERR_MODULE_NOT_FOUND";
-        throw error;
+        return {
+          ok: false,
+          name: "AggregateError",
+          message: "Bundle failed",
+          logs: [{
+            name: "BuildMessage",
+            level: "error",
+            message: `ModuleNotFound resolving "${entry}" (entry point)`,
+            position: null,
+          }],
+        };
       }
-      const text = cottontail.bundleNative(absoluteEntry, cwd, JSON.stringify(spec));
-      const sourceName = entry.replace(/\\/g, "/").split("/").pop() || "index.js";
-      const stem = sourceName.replace(/\.[^.]*$/, "");
-      const outputName = `${stem}.js`;
-      const outputPath = spec.outdir ? pathJoin(String(spec.outdir), outputName) : outputName;
-      if (spec.write === true) {
-        const parent = pathDirname(outputPath);
-        if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
-        cottontail.writeFile(outputPath, text);
-      }
-      outputs.push({ path: outputPath, text, kind: "entry-point", hash: null, loader: "js" });
+      entrypoints.push(absoluteEntry);
     }
-    return { ok: true, success: true, logs: [], outputs };
+    const request = { ...spec, plugins: undefined, entrypoints };
+    const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
+    // Real Bun writes output files whenever `outdir` is set (the `write`
+    // option does not suppress it); in-memory builds have no outdir.
+    const outdir = spec.outdir != null ? toAbsolute(String(spec.outdir)) : null;
+    for (const output of parsed.outputs ?? []) {
+      const relative = String(output.path ?? "").replace(/^\.\//, "");
+      if (outdir) {
+        const absolute = nodePathResolve(outdir, relative);
+        const parent = pathDirname(absolute);
+        if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
+        cottontail.writeFile(absolute, globalThis.Buffer.from(output.b64 ?? "", "base64"));
+        output.path = absolute;
+      } else {
+        output.path = `./${relative}`;
+      }
+    }
+    if (parsed.success === false) {
+      return {
+        ok: false,
+        name: "AggregateError",
+        message: "Bundle failed",
+        logs: parsed.logs ?? [],
+      };
+    }
+    return { ok: true, success: true, logs: parsed.logs ?? [], outputs: parsed.outputs ?? [] };
   } catch (error) {
     return {
       ok: false,
@@ -1184,7 +1208,8 @@ function finalizeDriverResult(parsed, options) {
   const logs = (parsed.logs || []).map((entry) => new BuildMessage(entry));
   if (parsed.ok === false) {
     if (options?.throw === false) return { success: false, logs, outputs: [] };
-    const error = new AggregateError(logs, parsed.message || "Bundle failed");
+    const errors = logs.filter((log) => (log?.level ?? "error") === "error");
+    const error = new AggregateError(errors.length > 0 ? errors : logs, parsed.message || "Bundle failed");
     if (parsed.name) error.name = parsed.name;
     throw error;
   }
@@ -1192,7 +1217,7 @@ function finalizeDriverResult(parsed, options) {
     success: parsed.success !== false,
     logs,
     outputs: (parsed.outputs || []).map((output) => new CTBuildArtifact(
-      globalThis.Buffer.from(output.text ?? ""),
+      globalThis.Buffer.from(output.b64 ?? "", "base64"),
       {
         path: output.path,
         kind: output.kind ?? "entry-point",
@@ -1560,8 +1585,8 @@ async function ctRunBuildDriver(options, state) {
       kind: output.kind ?? "entry-point",
       hash: output.hash ?? null,
       loader: output.loader ?? "js",
-      b64: globalThis.Buffer.from(output.text ?? "").toString("base64"),
-      sourcemapIndex: null,
+      b64: output.b64 ?? "",
+      sourcemapIndex: output.sourcemapIndex ?? null,
     })),
     metafile: null,
   };
@@ -1650,16 +1675,18 @@ async function ctRunBuild(options, state) {
 
   const raw = await ctRunBuildDriver(options, state);
   if (raw.fatal) {
-    const error = ctDecodeThrown(raw.fatal);
+    const logs = (raw.logs ?? []).map((log) => (
+      log.name === "ResolveMessage" ? new CTResolveMessage(log) : new CTBuildMessage(log)
+    ));
+    if (logs.length === 0) logs.push(new CTBuildMessage({ message: raw.fatal.message ?? "Bundle failed" }));
     if (options.throw === false) {
-      const result = {
-        success: false,
-        outputs: [],
-        logs: [new CTBuildMessage({ message: ctErrorMessage(error) })],
-      };
+      const result = { success: false, outputs: [], logs };
       await ctRunOnEnd(state, result);
       return result;
     }
+    const errors = logs.filter((log) => (log?.level ?? "error") === "error");
+    const error = new AggregateError(errors.length > 0 ? errors : logs, raw.fatal.message ?? "Bundle failed");
+    if (raw.fatal.name) error.name = raw.fatal.name;
     throw error;
   }
 
@@ -7329,10 +7356,11 @@ export function nanoseconds() {
   return globalThis.process?.hrtime?.bigint?.() ?? BigInt(Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000));
 }
 
-export function gc() {
+function bunForceGc() {
   cottontail.gc?.();
   cottontail.drainJobs?.();
 }
+export { bunForceGc as gc };
 
 const bunInspectQuote = (text) => JSON.stringify(String(text));
 
@@ -8422,7 +8450,7 @@ export function color(value, _name = undefined) {
 }
 
 export function shrink() {
-  gc();
+  bunForceGc();
 }
 
 function isPromiseForPeek(value) {
@@ -11712,7 +11740,7 @@ BunObject.enableANSIColors = enableANSIColors;
 BunObject.escapeHTML = escapeHTML;
 BunObject.file = file;
 BunObject.fileURLToPath = fileURLToPath;
-BunObject.gc = gc;
+BunObject.gc = bunForceGc;
 BunObject.generateHeapSnapshot = generateHeapSnapshot;
 BunObject.gunzipSync = gunzipSync;
 BunObject.gzipSync = gzipSync;

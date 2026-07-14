@@ -1421,7 +1421,13 @@ pub const FileSystem = struct {
                 // was permanently misclassified as `.file` — surfacing as
                 // EISDIR at module load time.
                 const io = std.Io.Threaded.global_single_threaded.io();
-                const real_path_len = std.Io.Dir.cwd().realPathFile(io, absolute_path_c, &outpath) catch return cache;
+                // NOTE: `absolute_path_c` points into `outpath`, so the
+                // realpath result must go into a separate buffer — writing it
+                // into `outpath` would clobber the input path before the
+                // follow-symlink stat below reads it.
+                const realpath_buf = bun.path_buffer_pool.get();
+                defer bun.path_buffer_pool.put(realpath_buf);
+                const real_path_len = std.Io.Dir.cwd().realPathFile(io, absolute_path_c, realpath_buf) catch return cache;
                 const target_stat = std.Io.Dir.cwd().statFile(io, absolute_path_c, .{ .follow_symlinks = true }) catch return cache;
                 // Dangling link / loop / EACCES: `cache.kind` is already set
                 // from the link's own directory bit, which is correct for all
@@ -1431,7 +1437,7 @@ pub const FileSystem = struct {
                 // Empty `cache.symlink` makes the resolver fall back to
                 // `parent.abs_real_path + base`.
                 cache.kind = if (target_stat.kind == .directory) .dir else .file;
-                cache.symlink = PathString.init(try FilenameStore.instance.append([]const u8, outpath[0..real_path_len]));
+                cache.symlink = PathString.init(try FilenameStore.instance.append([]const u8, realpath_buf[0..real_path_len]));
                 return cache;
             }
 
@@ -1442,11 +1448,23 @@ pub const FileSystem = struct {
 
             var symlink: []const u8 = "";
 
+            // NOTE: `absolute_path_c` points into `outpath`, so the realpath
+            // result must go into a separate buffer — writing it into
+            // `outpath` would clobber the input path before the
+            // follow-symlink stat below reads it. That corruption made the
+            // stat fail (or stat an unrelated path), the caller swallowed the
+            // error, and directory symlinks (e.g. isolated installs'
+            // `node_modules/<pkg>` -> `.bun/...` links) were permanently
+            // misclassified as files. The buffer must stay alive until
+            // `symlink` is copied into the FilenameStore below.
+            const realpath_buf = bun.path_buffer_pool.get();
+            defer bun.path_buffer_pool.put(realpath_buf);
+
             if (is_symlink) {
                 _ = existing_fd;
                 _ = store_fd;
-                const real_path_len = try std.Io.Dir.cwd().realPathFile(io, absolute_path_c, &outpath);
-                symlink = outpath[0..real_path_len];
+                const real_path_len = try std.Io.Dir.cwd().realPathFile(io, absolute_path_c, realpath_buf);
+                symlink = realpath_buf[0..real_path_len];
                 const file_stat = try std.Io.Dir.cwd().statFile(io, absolute_path_c, .{ .follow_symlinks = true });
                 file_kind = file_stat.kind;
             }

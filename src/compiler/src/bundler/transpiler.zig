@@ -929,7 +929,9 @@ pub const Transpiler = struct {
                 opts.warn_about_unbundled_modules = !target.isBun();
                 // JavaScriptCore implements `using` / `await using` natively, so
                 // when targeting Bun there is no need to lower them.
-                opts.features.lower_using = !target.isBun();
+                // Cottontail's vendored JSC does not, so runtime bundles set
+                // `force_lower_using`.
+                opts.features.lower_using = !target.isBun() or transpiler.options.force_lower_using;
 
                 opts.features.inject_jest_globals = this_parse.inject_jest_globals;
                 opts.features.minify_syntax = transpiler.options.minify_syntax;

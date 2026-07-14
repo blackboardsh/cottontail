@@ -11,7 +11,11 @@ pub fn postProcessHTMLChunk(ctx: GenerateChunkCtx, worker: *ThreadPool.Worker, c
     const compile_results = chunk.compile_results_for_chunk;
 
     for (compile_results) |compile_result| {
-        j.push(compile_result.code(), bun.default_allocator);
+        // NOTE: HTML compile-result code is allocated with a worker's arena
+        // (`generateCompileResultForHtmlChunk` builds `output` with
+        // `worker.allocator`), so it must not be freed through
+        // `bun.default_allocator` (see postProcessCSSChunk.zig).
+        j.pushStatic(compile_result.code());
     }
 
     j.ensureNewlineAtEnd();
