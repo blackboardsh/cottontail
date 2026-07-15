@@ -1,0 +1,26 @@
+{
+  "inputs": {
+    "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-json_1784087249488-116790/main.js": {
+      "bytes": 24,
+      "imports": [
+      ],
+      "format": "esm"
+    }
+  },
+  "outputs": {
+    "./main.js": {
+      "bytes": 181,
+      "inputs": {
+        "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-json_1784087249488-116790/main.js": {
+          "bytesInOutput": 16
+        }
+      },
+      "imports": [
+      ],
+      "exports": [
+        "value"
+      ],
+      "entryPoint": "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-json_1784087249488-116790/main.js"
+    }
+  }
+}

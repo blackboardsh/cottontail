@@ -1,4 +1,4 @@
-import { format, inspect } from "./util.js";
+import { format, formatWithOptions, inspect } from "./util.js";
 
 function writeStream(stream, text) {
   if (stream && typeof stream.write === "function") {
@@ -8,18 +8,54 @@ function writeStream(stream, text) {
   cottontail.fdWrite?.(stream === globalThis.process?.stderr ? 2 : 1, text);
 }
 
+function defineStreamProperty(target, name, value) {
+  Object.defineProperty(target, name, {
+    value,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+}
+
 export class Console {
-  constructor(stdout = globalThis.process?.stdout, stderr = globalThis.process?.stderr, ignoreErrors = true) {
-    this._stdout = stdout;
-    this._stderr = stderr || stdout;
-    this._ignoreErrors = ignoreErrors;
-    this._times = new Map();
-    this._counts = new Map();
-    this._groupIndent = "";
+  constructor(options, stderr = undefined, ignoreErrors = true) {
+    let stdout = options;
+    let colorMode = "auto";
+    let inspectOptions;
+    let groupIndentation = 2;
+    if (options && typeof options.write !== "function" && typeof options === "object") {
+      // Options-object form: new Console({ stdout, stderr, ... })
+      ({ stdout, stderr, ignoreErrors = true, colorMode = "auto", inspectOptions, groupIndentation = 2 } = options);
+    }
+    if (stdout === undefined) stdout = globalThis.process?.stdout;
+    if (stderr === undefined) stderr = globalThis.process?.stderr;
+    if (colorMode !== "auto" && typeof colorMode !== "boolean") {
+      const error = new TypeError(
+        `The argument 'colorMode' is invalid. Received ${inspect(colorMode)}`,
+      );
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
+    defineStreamProperty(this, "_stdout", stdout);
+    defineStreamProperty(this, "_stderr", stderr || stdout);
+    defineStreamProperty(this, "_ignoreErrors", ignoreErrors);
+    defineStreamProperty(this, "_times", new Map());
+    defineStreamProperty(this, "_counts", new Map());
+    defineStreamProperty(this, "_groupIndent", "");
+    defineStreamProperty(this, "_colorMode", colorMode);
+    defineStreamProperty(this, "_inspectOptions", inspectOptions);
+    defineStreamProperty(this, "_groupIndentation", groupIndentation);
+  }
+
+  _shouldColorize(stream) {
+    const colorMode = this._colorMode ?? "auto";
+    if (colorMode === "auto") return Boolean(stream?.isTTY);
+    return colorMode === true;
   }
 
   _write(stream, args) {
-    const text = `${this._groupIndent}${format(...args)}\n`;
+    const options = { ...this._inspectOptions, colors: this._shouldColorize(stream) };
+    const text = `${this._groupIndent}${formatWithOptions(options, ...args)}\n`;
     try {
       writeStream(stream, text);
     } catch (error) {
@@ -88,6 +124,36 @@ export class Console {
 
   groupEnd() {
     this._groupIndent = this._groupIndent.slice(0, -2);
+  }
+}
+
+const globalConsole = globalThis.console;
+if (globalConsole && typeof globalConsole === "object" && !(globalConsole instanceof Console)) {
+  // Node.js: the global console inherits from Console.prototype and exposes
+  // non-enumerable _stdout/_stderr properties bound to the process streams.
+  try {
+    Object.setPrototypeOf(globalConsole, Console.prototype);
+  } catch {}
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_stdout")) {
+    defineStreamProperty(globalConsole, "_stdout", globalThis.process?.stdout);
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_stderr")) {
+    defineStreamProperty(globalConsole, "_stderr", globalThis.process?.stderr);
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_ignoreErrors")) {
+    defineStreamProperty(globalConsole, "_ignoreErrors", true);
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_times")) {
+    defineStreamProperty(globalConsole, "_times", new Map());
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_counts")) {
+    defineStreamProperty(globalConsole, "_counts", new Map());
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_groupIndent")) {
+    defineStreamProperty(globalConsole, "_groupIndent", "");
+  }
+  if (!Object.prototype.hasOwnProperty.call(globalConsole, "_colorMode")) {
+    defineStreamProperty(globalConsole, "_colorMode", "auto");
   }
 }
 

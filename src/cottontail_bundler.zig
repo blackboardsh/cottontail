@@ -29,6 +29,13 @@ pub const BundleOptions = struct {
     /// `Bun.build({ reactFastRefresh: true })`: annotate JSX components with
     /// $RefreshReg$/$RefreshSig$ registration calls.
     react_fast_refresh: bool = false,
+    jsx_factory: ?[]const u8 = null,
+    jsx_fragment: ?[]const u8 = null,
+    jsx_runtime: ?compiler.schema.api.JsxRuntime = null,
+    metafile: bool = false,
+    metafile_json_path: []const u8 = "",
+    metafile_markdown_path: []const u8 = "",
+    code_splitting: bool = false,
     /// `Bun.build({ external: [...] })`: import specifiers left unresolved.
     external: []const []const u8 = &.{},
     /// `Bun.build({ naming: ... })` templates (Bun's defaults when unset).
@@ -46,6 +53,41 @@ pub const BundleOptions = struct {
 /// into BundleV2 keeps the (thread-owning) ThreadPool out of the per-bundle
 /// arena, which is what makes freeing that arena after each bundle safe.
 var shared_worker_pool: ?*compiler.ThreadPool = null;
+
+/// Dev-only (`COTTONTAIL_RUNTIME_MODULES_DIR`): populate the runtime module
+/// file map from a directory on disk instead of the embedded blob so that
+/// runtime module edits can be tested without rebuilding the binary.
+fn loadRuntimeModulesFromDisk(
+    dir_path: []const u8,
+    working_dir: []const u8,
+    runtime_file_map: *compiler.jsc.API.JSBundler.FileMap,
+    runtime_file_keys: *std.ArrayList([]u8),
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(c_allocator);
+    defer walker.deinit();
+    var loaded_any = false;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        // Contents intentionally leak (dev path only): the bundle borrows the
+        // slices for its lifetime, matching the embedded blob's static data.
+        const contents = try dir.readFileAlloc(io, entry.path, c_allocator, .unlimited);
+        const relative = try c_allocator.dupe(u8, entry.path);
+        defer c_allocator.free(relative);
+        if (std.fs.path.sep != '/') {
+            for (relative) |*byte| {
+                if (byte.* == std.fs.path.sep) byte.* = '/';
+            }
+        }
+        const path = try embedded_runtime_modules.virtualPath(c_allocator, working_dir, relative);
+        try runtime_file_keys.append(c_allocator, path);
+        try runtime_file_map.map.put(c_allocator, path, contents);
+        loaded_any = true;
+    }
+    if (!loaded_any) return error.EmptyRuntimeModulesDirectory;
+}
 
 fn sharedWorkerPool() ?*compiler.ThreadPool {
     if (shared_worker_pool) |pool| return pool;
@@ -166,13 +208,27 @@ pub fn bundleEntryPointWithOptions(
     // modules with an explicit "use strict" must keep the directive inside
     // their wrapper closures (including the entry point).
     transpiler.options.preserve_strict_directives_in_wrappers = true;
+    // Linker configuration must run before defines: configureLinker() seeds
+    // options.jsx wholesale from the root tsconfig (development=true for
+    // "react-jsx"/"react-jsxdev"), and configureDefines() then applies the
+    // NODE_ENV production/development override on top (matching upstream
+    // bun's configureLinker -> configureDefines ordering).
+    transpiler.configureLinker();
     transpiler.configureDefines() catch |err| {
         setBuildError(error_out, &log, err);
         return err;
     };
-    transpiler.configureLinker();
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
+
+    if (std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
+        std.debug.print("dbg jsx: production={} jsx.development={} behavior={s} env_prod={}\n", .{
+            transpiler.options.production,
+            transpiler.options.jsx.development,
+            @tagName(transpiler.options.env.behavior),
+            transpiler.env.isProduction(),
+        });
+    }
 
     var reachable_files_count: usize = 0;
     var minify_duration: u64 = 0;
@@ -185,11 +241,26 @@ pub fn bundleEntryPointWithOptions(
         runtime_file_keys.deinit(c_allocator);
     }
     if (options.include_runtime_modules) {
-        var iterator = try embedded_runtime_modules.Iterator.init();
-        while (try iterator.next()) |entry| {
-            const path = try embedded_runtime_modules.virtualPath(c_allocator, working_dir, entry.path);
-            try runtime_file_keys.append(c_allocator, path);
-            try runtime_file_map.map.put(c_allocator, path, entry.contents);
+        // Dev override: load runtime modules from a directory on disk instead
+        // of the embedded blob so module edits do not require a rebuild.
+        var used_override = false;
+        if (std.c.getenv("COTTONTAIL_RUNTIME_MODULES_DIR")) |dir_pointer| {
+            const dir_path = std.mem.span(dir_pointer);
+            if (dir_path.len > 0) {
+                if (loadRuntimeModulesFromDisk(dir_path, working_dir, &runtime_file_map, &runtime_file_keys)) {
+                    used_override = true;
+                } else |_| {
+                    // Fall back to the embedded blob on any error.
+                }
+            }
+        }
+        if (!used_override) {
+            var iterator = try embedded_runtime_modules.Iterator.init();
+            while (try iterator.next()) |entry| {
+                const path = try embedded_runtime_modules.virtualPath(c_allocator, working_dir, entry.path);
+                try runtime_file_keys.append(c_allocator, path);
+                try runtime_file_map.map.put(c_allocator, path, entry.contents);
+            }
         }
     }
     const runtime_file_map_ptr = if (runtime_file_map.map.count() > 0) &runtime_file_map else null;
@@ -344,6 +415,52 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     if (object.get("reactFastRefresh")) |value| {
         if (value == .bool) options.react_fast_refresh = value.bool;
     }
+    if (object.get("jsx")) |value| {
+        if (value == .object) {
+            if (value.object.get("factory")) |item| {
+                if (item == .string) options.jsx_factory = item.string;
+            }
+            if (value.object.get("fragment")) |item| {
+                if (item == .string) options.jsx_fragment = item.string;
+            }
+            if (value.object.get("runtime")) |item| {
+                if (item == .string) {
+                    options.jsx_runtime = if (std.ascii.eqlIgnoreCase(item.string, "classic"))
+                        .classic
+                    else if (std.ascii.eqlIgnoreCase(item.string, "automatic"))
+                        .automatic
+                    else
+                        return error.InvalidJSXRuntime;
+                }
+            }
+        }
+    }
+    if (object.get("metafile")) |value| switch (value) {
+        .bool => |enabled| options.metafile = enabled,
+        .string => |path| {
+            options.metafile = true;
+            options.metafile_json_path = path;
+        },
+        .object => |metafile| {
+            options.metafile = true;
+            if (metafile.get("json")) |item| {
+                if (item == .string) options.metafile_json_path = item.string;
+            }
+            if (metafile.get("markdown")) |item| {
+                if (item == .string) options.metafile_markdown_path = item.string;
+            }
+        },
+        else => {},
+    };
+    if (object.get("splitting")) |value| {
+        if (value == .bool) options.code_splitting = value.bool;
+    }
+    if (object.get("includeRuntimeModules")) |value| {
+        if (value == .bool) options.include_runtime_modules = value.bool;
+    }
+    if (object.get("inlineImportMetaProperties")) |value| {
+        if (value == .bool) options.inline_import_meta_properties = value.bool;
+    }
     if (object.get("external")) |value| {
         if (value == .array) {
             var external: std.ArrayList([]const u8) = .empty;
@@ -424,6 +541,8 @@ const BuildResultJson = struct {
     success: bool,
     logs: []const BuildLogJson,
     outputs: []const BuildOutputJson,
+    metafile: ?[]const u8 = null,
+    metafileMarkdown: ?[]const u8 = null,
 };
 
 fn buildLogFromMessage(allocator: std.mem.Allocator, message: *const compiler.logger.Msg) !BuildLogJson {
@@ -540,6 +659,14 @@ pub fn buildEntryPointsJson(
     transform_options.external = options.external;
     transform_options.disable_hmr = true;
     transform_options.main_fields = &.{ "main", "module" };
+    if (options.jsx_factory != null or options.jsx_fragment != null or options.jsx_runtime != null) {
+        transform_options.jsx = .{
+            .factory = options.jsx_factory orelse "",
+            .runtime = options.jsx_runtime orelse .automatic,
+            .fragment = options.jsx_fragment orelse "",
+            .import_source = "",
+        };
+    }
     if (options.define_keys.len > 0) {
         transform_options.define = .{
             .keys = options.define_keys,
@@ -581,16 +708,56 @@ pub fn buildEntryPointsJson(
     transpiler.options.entry_naming = options.entry_naming;
     transpiler.options.chunk_naming = options.chunk_naming;
     transpiler.options.asset_naming = options.asset_naming;
+    transpiler.options.metafile = options.metafile;
+    transpiler.options.metafile_json_path = options.metafile_json_path;
+    transpiler.options.metafile_markdown_path = options.metafile_markdown_path;
+    transpiler.options.code_splitting = options.code_splitting;
     transpiler.options.supports_multiple_outputs = true;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them so Bun.build outputs can run on this runtime.
     transpiler.options.force_lower_using = true;
+    // Linker configuration must run before defines: configureLinker() seeds
+    // options.jsx wholesale from the root tsconfig (development=true for
+    // "react-jsx"/"react-jsxdev"), and configureDefines() then applies the
+    // NODE_ENV production/development override on top (matching upstream
+    // bun's configureLinker -> configureDefines ordering).
+    transpiler.configureLinker();
+    if (options.jsx_factory) |factory| {
+        transpiler.options.jsx.factory = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            arena_allocator,
+            transpiler.options.jsx.factory,
+            factory,
+        );
+    }
+    if (options.jsx_fragment) |fragment| {
+        transpiler.options.jsx.fragment = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            arena_allocator,
+            transpiler.options.jsx.fragment,
+            fragment,
+        );
+    }
+    if (options.jsx_runtime) |runtime| transpiler.options.jsx.runtime = runtime;
     transpiler.configureDefines() catch |err| {
         return try buildFailureJson(arena_allocator, &log, err);
     };
-    transpiler.configureLinker();
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
+
+    var input_file_map: compiler.jsc.API.JSBundler.FileMap = .{};
+    if (request_object.get("files")) |files_value| {
+        if (files_value == .object) {
+            var iterator = files_value.object.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                const path = if (std.fs.path.isAbsolute(entry.key_ptr.*))
+                    try arena_allocator.dupe(u8, entry.key_ptr.*)
+                else
+                    try std.fs.path.resolve(arena_allocator, &.{ working_dir, entry.key_ptr.* });
+                try input_file_map.map.put(arena_allocator, path, entry.value_ptr.string);
+            }
+        }
+    }
+    const input_file_map_ptr = if (input_file_map.map.count() > 0) &input_file_map else null;
 
     var reachable_files_count: usize = 0;
     var minify_duration: u64 = 0;
@@ -614,7 +781,7 @@ pub fn buildEntryPointsJson(
         &minify_duration,
         &source_code_size,
         null,
-        null,
+        input_file_map_ptr,
         &bundle,
         worker_pool,
     ) catch |err| {
@@ -645,10 +812,16 @@ pub fn buildEntryPointsJson(
         });
     }
 
+    const metafile_markdown = result.metafile_markdown orelse if (options.metafile_markdown_path.len > 0 and result.metafile != null)
+        try compiler.bundle_v2.LinkerContext.MetafileBuilder.generateMarkdown(arena_allocator, result.metafile.?)
+    else
+        null;
     const result_json = BuildResultJson{
         .success = true,
         .logs = try buildLogsFromLogger(arena_allocator, &log, false),
         .outputs = outputs.items,
+        .metafile = result.metafile,
+        .metafileMarkdown = metafile_markdown,
     };
     const json = try std.json.Stringify.valueAlloc(arena_allocator, result_json, .{});
     return try c_allocator.dupe(u8, json);

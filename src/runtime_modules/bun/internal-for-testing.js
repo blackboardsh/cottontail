@@ -698,31 +698,78 @@ export function isOperatingSystemMatch(platforms) {
 }
 
 export function escapePowershell(value) {
-  return String(value).replace(/"/g, '""').replace(/`/g, "``");
+  // Backtick is PowerShell's escape character: escape backticks first, then
+  // double quotes (matches Bun's shell escapePowershell).
+  return String(value).replace(/`/g, "``").replace(/"/g, '`"');
 }
 
+// Ring-buffer double-ended queue matching Bun's internal Dequeue (denque
+// derived): power-of-two backing list starting at capacity 4, exposed via
+// _list/_head/_tail/_capacityMask like the upstream implementation.
 export class Dequeue {
   constructor() {
-    this._items = [];
     this._head = 0;
+    this._tail = 0;
+    this._capacityMask = 3;
+    this._list = new Array(4);
   }
-  get length() { return this._items.length - this._head; }
-  size() { return this.length; }
-  isEmpty() { return this.length === 0; }
-  isNotEmpty() { return this.length > 0; }
-  push(item) { this._items.push(item); }
+  size() {
+    if (this._head === this._tail) return 0;
+    if (this._head < this._tail) return this._tail - this._head;
+    return this._capacityMask + 1 - (this._head - this._tail);
+  }
+  isEmpty() { return this.size() === 0; }
+  isNotEmpty() { return this.size() > 0; }
+  push(item) {
+    const tail = this._tail;
+    this._list[tail] = item;
+    this._tail = (tail + 1) & this._capacityMask;
+    if (this._tail === this._head) this._growArray();
+  }
   shift() {
-    if (this.isEmpty()) return undefined;
-    const item = this._items[this._head];
-    this._items[this._head] = undefined;
-    this._head += 1;
-    if (this._head > 64 && this._head * 2 > this._items.length) {
-      this._items = this._items.slice(this._head);
-      this._head = 0;
-    }
+    const head = this._head;
+    if (head === this._tail) return undefined;
+    const item = this._list[head];
+    this._list[head] = undefined;
+    this._head = (head + 1) & this._capacityMask;
+    if (head < 2 && this._tail > 10000 && this._tail <= this._list.length >>> 2) this._shrinkArray();
     return item;
   }
-  peek() { return this.isEmpty() ? undefined : this._items[this._head]; }
+  peek() {
+    if (this._head === this._tail) return undefined;
+    return this._list[this._head];
+  }
+  toArray(fullCopy) { return this._copyArray(fullCopy); }
+  clear() {
+    this._head = 0;
+    this._tail = 0;
+  }
+  _copyArray(fullCopy) {
+    const newArray = [];
+    const list = this._list;
+    const len = list.length;
+    let i;
+    if (fullCopy || this._head > this._tail) {
+      for (i = this._head; i < len; i++) newArray.push(list[i]);
+      for (i = 0; i < this._tail; i++) newArray.push(list[i]);
+    } else {
+      for (i = this._head; i < this._tail; i++) newArray.push(list[i]);
+    }
+    return newArray;
+  }
+  _growArray() {
+    if (this._head) {
+      this._list = this._copyArray(true);
+      this._head = 0;
+    }
+    this._tail = this._list.length;
+    this._list.length *= 2;
+    this._capacityMask = (this._capacityMask << 1) | 1;
+  }
+  _shrinkArray() {
+    this._list.length >>>= 1;
+    this._capacityMask >>>= 1;
+  }
 }
 
 export function getDevServerDeinitCount() {
@@ -735,8 +782,20 @@ export function memfd_create() {
   throw error;
 }
 
-export function setSyntheticAllocationLimitForTesting(_limit) {
-  return undefined;
+export function setSyntheticAllocationLimitForTesting(limit) {
+  const previous = globalThis.__cottontailSyntheticAllocationLimit ?? 0x7fffffff;
+  globalThis.__cottontailSyntheticAllocationLimit = Number(limit) || 0x7fffffff;
+  return previous;
+}
+
+// Calls `callback` through a builtin so that a "[native code]" frame sits
+// between the callback and this function in captured stack traces, mirroring
+// Bun's native nativeFrameForTesting helper (used by capture-stack-trace tests
+// to assert CallSite.prototype.isNative()).
+export function nativeFrameForTesting(callback) {
+  // `callback` is invoked directly by Array.prototype.map so the frame right
+  // above it in the stack is the builtin ("map@[native code]").
+  return [void 0].map(callback)[0];
 }
 
 export const getEventLoopStats = unimplementedInternal("getEventLoopStats");
@@ -771,6 +830,7 @@ export default {
   isModuleResolveFilenameSlowPathEnabled,
   isOperatingSystemMatch,
   jscInternals,
+  nativeFrameForTesting,
   patchInternals,
   readTarball,
   setSocketOptions,

@@ -2927,6 +2927,42 @@ static const CtDigestAlgorithm *ct_digest_algorithm(const char *name) {
     return NULL;
 }
 
+// When the caller passes "hex" as the encoding argument, convert the digest
+// bytes to a hex JS string in C (owning and freeing `output`); otherwise wrap
+// the bytes in a no-copy ArrayBuffer. Avoids per-call JS hex loops in the
+// Bun.SHA*/CryptoHasher one-shot fast path.
+static JSValueRef ct_hash_bytes_result(JSContextRef ctx, uint8_t *output, size_t output_len, bool as_hex, JSValueRef *exception) {
+    if (!as_hex) {
+        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+    }
+    static const char hex_digits[] = "0123456789abcdef";
+    char *text = (char *)malloc(output_len * 2 + 1);
+    if (text == NULL) {
+        free(output);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    for (size_t index = 0; index < output_len; index += 1) {
+        text[index * 2] = hex_digits[output[index] >> 4];
+        text[index * 2 + 1] = hex_digits[output[index] & 0x0f];
+    }
+    text[output_len * 2] = '\0';
+    free(output);
+    JSStringRef string = JSStringCreateWithUTF8CString(text);
+    free(text);
+    JSValueRef result = JSValueMakeString(ctx, string);
+    JSStringRelease(string);
+    return result;
+}
+
+static bool ct_hash_encoding_is_hex(JSContextRef ctx, size_t argc, const JSValueRef argv[], size_t index) {
+    if (argc <= index || !JSValueIsString(ctx, argv[index])) return false;
+    char *encoding = ct_value_to_string_copy(ctx, argv[index]);
+    const bool is_hex = encoding != NULL && strcmp(encoding, "hex") == 0;
+    free(encoding);
+    return is_hex;
+}
+
 static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -2989,7 +3025,7 @@ static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JS
             ct_throw_message(ctx, exception, "Digest operation failed");
             return JSValueMakeUndefined(ctx);
         }
-        return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+        return ct_hash_bytes_result(ctx, output, output_len, ct_hash_encoding_is_hex(ctx, argc, argv, 3), exception);
     }
 #endif
 
@@ -3012,7 +3048,7 @@ static JSValueRef ct_crypto_hash_sync(JSContextRef ctx, JSObjectRef function, JS
     ct_throw_message(ctx, exception, "Native digest algorithms are not available on this platform yet");
     return JSValueMakeUndefined(ctx);
 #endif
-    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, algorithm->output_len, ct_array_buffer_free, NULL, exception);
+    return ct_hash_bytes_result(ctx, output, algorithm->output_len, ct_hash_encoding_is_hex(ctx, argc, argv, 3), exception);
 }
 
 static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -4782,6 +4818,165 @@ static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, 
     }
 
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// WHATWG TextDecoder support: legacy multi-byte/rare single-byte encodings are
+// decoded with the ICU converters already linked into the process (system
+// libicucore on macOS, the vendored ICU bridge on Linux). Symbols are looked
+// up with dlsym so a missing ICU stays a soft failure (returns null to JS).
+// ---------------------------------------------------------------------------
+
+#if !defined(_WIN32)
+
+typedef struct CtUConverter CtUConverter;
+typedef CtUConverter *(*CtUcnvOpenFn)(const char *name, int32_t *status);
+typedef void (*CtUcnvCloseFn)(CtUConverter *converter);
+typedef void (*CtUcnvResetToUnicodeFn)(CtUConverter *converter);
+typedef int32_t (*CtUcnvToUCharsFn)(CtUConverter *converter, uint16_t *dest, int32_t capacity, const char *src, int32_t src_len, int32_t *status);
+typedef void (*CtUcnvSetToUCallBackFn)(CtUConverter *converter, void *action, const void *context, void **old_action, const void **old_context, int32_t *status);
+
+typedef struct {
+    bool resolved;
+    CtUcnvOpenFn open;
+    CtUcnvCloseFn close;
+    CtUcnvResetToUnicodeFn reset_to_unicode;
+    CtUcnvToUCharsFn to_uchars;
+    CtUcnvSetToUCallBackFn set_to_u_callback;
+    void *callback_stop;
+    void *callback_substitute;
+} CtIcuConverterApi;
+
+static void *ct_icu_converter_symbol(const char *base) {
+    void *symbol = dlsym(RTLD_DEFAULT, base);
+    if (symbol != NULL) return symbol;
+    char versioned[96];
+    for (int version = 60; version <= 99; version += 1) {
+        snprintf(versioned, sizeof(versioned), "%s_%d", base, version);
+        symbol = dlsym(RTLD_DEFAULT, versioned);
+        if (symbol != NULL) return symbol;
+    }
+    return NULL;
+}
+
+static const CtIcuConverterApi *ct_icu_converter_api(void) {
+    static CtIcuConverterApi api;
+    if (!api.resolved) {
+        api.open = (CtUcnvOpenFn)ct_icu_converter_symbol("ucnv_open");
+        api.close = (CtUcnvCloseFn)ct_icu_converter_symbol("ucnv_close");
+        api.reset_to_unicode = (CtUcnvResetToUnicodeFn)ct_icu_converter_symbol("ucnv_resetToUnicode");
+        api.to_uchars = (CtUcnvToUCharsFn)ct_icu_converter_symbol("ucnv_toUChars");
+        api.set_to_u_callback = (CtUcnvSetToUCallBackFn)ct_icu_converter_symbol("ucnv_setToUCallBack");
+        api.callback_stop = ct_icu_converter_symbol("UCNV_TO_U_CALLBACK_STOP");
+        api.callback_substitute = ct_icu_converter_symbol("UCNV_TO_U_CALLBACK_SUBSTITUTE");
+        api.resolved = true;
+    }
+    if (api.open == NULL || api.close == NULL || api.reset_to_unicode == NULL ||
+        api.to_uchars == NULL || api.set_to_u_callback == NULL ||
+        api.callback_stop == NULL || api.callback_substitute == NULL) {
+        return NULL;
+    }
+    return &api;
+}
+
+typedef struct CtIcuCachedConverter {
+    char name[64];
+    CtUConverter *converter;
+    struct CtIcuCachedConverter *next;
+} CtIcuCachedConverter;
+
+static CtUConverter *ct_icu_cached_converter(const CtIcuConverterApi *api, const char *name) {
+    static CtIcuCachedConverter *cache = NULL;
+    if (strlen(name) >= sizeof(((CtIcuCachedConverter *)0)->name)) return NULL;
+    for (CtIcuCachedConverter *entry = cache; entry != NULL; entry = entry->next) {
+        if (strcmp(entry->name, name) == 0) return entry->converter;
+    }
+    int32_t status = 0;
+    CtUConverter *converter = api->open(name, &status);
+    if (converter == NULL || status > 0) {
+        if (converter != NULL) api->close(converter);
+        return NULL;
+    }
+    CtIcuCachedConverter *entry = (CtIcuCachedConverter *)calloc(1, sizeof(CtIcuCachedConverter));
+    if (entry == NULL) {
+        api->close(converter);
+        return NULL;
+    }
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
+    entry->converter = converter;
+    entry->next = cache;
+    cache = entry;
+    return converter;
+}
+
+#endif // !defined(_WIN32)
+
+#define CT_ICU_STATUS_BUFFER_OVERFLOW 15
+
+// cottontail.icuDecode(converterName, bytes, fatal) -> string | null
+// null means "no usable ICU converter"; a decode failure in fatal mode throws.
+static JSValueRef ct_icu_decode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+#if defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return JSValueMakeNull(ctx);
+#else
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.icuDecode(name, bytes[, fatal]) requires a converter name and bytes");
+        return JSValueMakeUndefined(ctx);
+    }
+    const CtIcuConverterApi *api = ct_icu_converter_api();
+    if (api == NULL) return JSValueMakeNull(ctx);
+
+    char *name = ct_value_to_string_copy(ctx, argv[0]);
+    if (name == NULL) return JSValueMakeNull(ctx);
+    CtUConverter *converter = ct_icu_cached_converter(api, name);
+    free(name);
+    if (converter == NULL) return JSValueMakeNull(ctx);
+
+    uint8_t *data = NULL;
+    size_t data_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &data, &data_len) != 0) {
+        ct_throw_message(ctx, exception, "cottontail.icuDecode requires an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool fatal = argc >= 3 && JSValueToBoolean(ctx, argv[2]);
+
+    int32_t status = 0;
+    api->set_to_u_callback(converter, fatal ? api->callback_stop : api->callback_substitute, NULL, NULL, NULL, &status);
+    api->reset_to_unicode(converter);
+
+    // Preflight to size the output buffer.
+    status = 0;
+    int32_t needed = api->to_uchars(converter, NULL, 0, (const char *)data, (int32_t)data_len, &status);
+    if (status > 0 && status != CT_ICU_STATUS_BUFFER_OVERFLOW) {
+        ct_throw_message(ctx, exception, "The encoded data was not valid for the requested encoding");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (needed < 0) needed = 0;
+
+    uint16_t *buffer = (uint16_t *)malloc(((size_t)needed + 1) * sizeof(uint16_t));
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    api->reset_to_unicode(converter);
+    status = 0;
+    int32_t written = api->to_uchars(converter, buffer, needed, (const char *)data, (int32_t)data_len, &status);
+    if (status > 0 || written < 0) {
+        free(buffer);
+        ct_throw_message(ctx, exception, "The encoded data was not valid for the requested encoding");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSStringRef text = JSStringCreateWithCharacters((const JSChar *)buffer, (size_t)written);
+    free(buffer);
+    JSValueRef result = JSValueMakeString(ctx, text);
+    JSStringRelease(text);
+    return result;
+#endif
 }
 
 #if defined(__APPLE__)
@@ -10595,6 +10790,20 @@ static JSValueRef ct_atomic_result(JSContextRef ctx, JSTypedArrayType type, int6
     }
 }
 
+static int ct_atomic_index(JSContextRef ctx, JSValueRef value, size_t *index_out, JSValueRef *exception) {
+    double index_d = ct_value_to_number(ctx, value);
+    if (!(index_d >= 0) || index_d > 9007199254740991.0 || index_d != (double)(int64_t)index_d) {
+        JSValueRef err_argv[1];
+        JSStringRef msg = JSStringCreateWithUTF8CString("Atomics index is out of range");
+        err_argv[0] = JSValueMakeString(ctx, msg);
+        JSStringRelease(msg);
+        if (exception != NULL) *exception = JSObjectMakeError(ctx, 1, err_argv, NULL);
+        return -1;
+    }
+    *index_out = (size_t)index_d;
+    return 0;
+}
+
 static int ct_atomic_view_ptr(JSContextRef ctx, JSValueRef value, size_t index, void **ptr_out, JSTypedArrayType *type_out, JSValueRef *exception) {
     if (!JSValueIsObject(ctx, value)) {
         ct_throw_message(ctx, exception, "Atomics operation requires a typed array");
@@ -10630,7 +10839,11 @@ static JSValueRef ct_shared_atomic_op(JSContextRef ctx, JSObjectRef function, JS
         return JSValueMakeUndefined(ctx);
     }
     char *op = ct_value_to_string_copy(ctx, argv[0]);
-    size_t index = (size_t)ct_value_to_number(ctx, argv[2]);
+    size_t index = 0;
+    if (ct_atomic_index(ctx, argv[2], &index, exception) != 0) {
+        free(op);
+        return JSValueMakeUndefined(ctx);
+    }
     void *ptr = NULL;
     JSTypedArrayType type = kJSTypedArrayTypeNone;
     if (ct_atomic_view_ptr(ctx, argv[1], index, &ptr, &type, exception) != 0) {
@@ -10674,7 +10887,8 @@ static JSValueRef ct_shared_atomic_wait(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "sharedAtomicWait(typedArray, index, value[, timeout]) requires arguments");
         return JSValueMakeUndefined(ctx);
     }
-    size_t index = (size_t)ct_value_to_number(ctx, argv[1]);
+    size_t index = 0;
+    if (ct_atomic_index(ctx, argv[1], &index, exception) != 0) return JSValueMakeUndefined(ctx);
     void *ptr = NULL;
     JSTypedArrayType type = kJSTypedArrayTypeNone;
     if (ct_atomic_view_ptr(ctx, argv[0], index, &ptr, &type, exception) != 0) return JSValueMakeUndefined(ctx);
@@ -10744,7 +10958,8 @@ static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function
         ct_throw_message(ctx, exception, "sharedAtomicNotify(typedArray, index[, count]) requires arguments");
         return JSValueMakeUndefined(ctx);
     }
-    size_t index = (size_t)ct_value_to_number(ctx, argv[1]);
+    size_t index = 0;
+    if (ct_atomic_index(ctx, argv[1], &index, exception) != 0) return JSValueMakeUndefined(ctx);
     void *ptr = NULL;
     JSTypedArrayType type = kJSTypedArrayTypeNone;
     if (ct_atomic_view_ptr(ctx, argv[0], index, &ptr, &type, exception) != 0) return JSValueMakeUndefined(ctx);
@@ -11188,17 +11403,38 @@ static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObject
 
     uint8_t *bytes = NULL;
     size_t len = 0;
+    int write_error = 0;
     if (ct_get_bytes(ctx, argv[1], &bytes, &len) == 0) {
-        if (len > 0) fwrite(bytes, 1, len, file);
+        size_t offset = 0;
+        while (offset < len) {
+            size_t remaining = len - offset;
+            size_t chunk_size = remaining > 1024 * 1024 ? 1024 * 1024 : remaining;
+            size_t written = fwrite(bytes + offset, 1, chunk_size, file);
+            if (written == 0) {
+                write_error = errno != 0 ? errno : EIO;
+                break;
+            }
+            offset += written;
+        }
     } else {
         char *text = ct_value_to_string_copy(ctx, argv[1]);
         if (text != NULL) {
-            fwrite(text, 1, strlen(text), file);
+            size_t text_len = strlen(text);
+            size_t offset = 0;
+            while (offset < text_len) {
+                size_t written = fwrite(text + offset, 1, text_len - offset, file);
+                if (written == 0) {
+                    write_error = errno != 0 ? errno : EIO;
+                    break;
+                }
+                offset += written;
+            }
             free(text);
         }
     }
-    fclose(file);
+    if (fclose(file) != 0 && write_error == 0) write_error = errno != 0 ? errno : EIO;
     free(path);
+    if (write_error != 0) ct_throw_message(ctx, exception, strerror(write_error));
     return JSValueMakeUndefined(ctx);
 }
 
@@ -15545,6 +15781,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "osGetPriority", ct_os_get_priority, runtime);
     ct_install_function(ctx, host, "osSetPriority", ct_os_set_priority, runtime);
     ct_install_function(ctx, host, "randomBytes", ct_random_bytes, runtime);
+    ct_install_function(ctx, host, "icuDecode", ct_icu_decode, runtime);
     ct_install_function(ctx, host, "zlibTransformSync", ct_zlib_transform_sync, runtime);
     ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
     ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
@@ -15703,6 +15940,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "    if (!new.target) throw new TypeError(\"Constructor SharedArrayBuffer requires 'new'\");"
         "    const size = Number(length);"
         "    if (!Number.isFinite(size) || size < 0) throw new RangeError('Invalid SharedArrayBuffer length');"
+        // Zero-length shared mappings come back with a NULL data pointer, which
+        // JSC treats as a detached buffer; use a plain ArrayBuffer(0) instead.
+        "    if (Math.floor(size) === 0) return __ctMarkShared(new ArrayBuffer(0));"
         "    return __ctMarkShared(cottontail.sharedArrayBufferCreate(Math.floor(size)));"
         "  }"
         "  SharedArrayBuffer.prototype = Object.create(ArrayBuffer.prototype);"
@@ -15754,6 +15994,11 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    /* Expose the native SuppressedError global (explicit resource management).
+     * JSC latches options from the environment at first VM creation. */
+    if (getenv("JSC_useExplicitResourceManagement") == NULL) {
+        setenv("JSC_useExplicitResourceManagement", "true", 1);
+    }
     /* Use JSGlobalContextCreateInGroup(NULL, ...) rather than JSGlobalContextCreate(NULL):
      * on Darwin, JSGlobalContextCreate falls back to one process-wide shared VM when the
      * binary is not linked against the JavaScriptCore dylib (NSVersionOfLinkTimeLibrary
@@ -16367,7 +16612,8 @@ static bool ct_append_import_meta_setup(CtStringBuilder *builder, const char *fi
         ct_sb_append_cstr(builder, ",main:true};") &&
         ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"require\",{get(){return globalThis.require},set(v){globalThis.require=v},configurable:true});") &&
         ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"resolve\",{get(){return globalThis.__cottontailImportMetaResolve},configurable:true});") &&
-        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"resolveSync\",{get(){return globalThis.__cottontailImportMetaResolveSync},configurable:true});");
+        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"resolveSync\",{get(){return globalThis.__cottontailImportMetaResolveSync},configurable:true});") &&
+        ct_sb_append_cstr(builder, "Object.defineProperty(globalThis.__cottontailImportMeta,\"env\",{get(){return globalThis.process?globalThis.process.env:undefined},configurable:true});");
 
     free(dirname);
     free(basename);

@@ -69,6 +69,58 @@
     }
   ],
   "tests": {
+    "test/bundler/bundler_files.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.build in-memory files pass string, Blob, typed-array, relative graph, disk override, JSX, and plugin integration coverage."
+    },
+    "test/bundler/compile-windows-metadata.test.ts": {
+      "status": "enabled",
+      "reason": "Windows standalone executable metadata validation passes upstream coverage under Cottontail."
+    },
+    "test/bundler/metafile.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.build and bun build metafile JSON/markdown generation, output path, splitting, imports, exports, CSS, and dependency analysis coverage passes under Cottontail."
+    },
+    "test/bundler/transpiler/jsx-production.test.ts": {
+      "status": "enabled",
+      "reason": "Production JSX transform modes and generated output behavior pass upstream coverage under Cottontail."
+    },
+    "test/js/deno/event/custom-event.test.ts": {
+      "status": "enabled",
+      "reason": "Deno-derived CustomEvent construction and dispatch coverage passes under Cottontail."
+    },
+    "test/js/deno/event/event-target.test.ts": {
+      "status": "enabled",
+      "reason": "Deno-derived EventTarget listener and dispatch coverage passes under Cottontail."
+    },
+    "test/js/deno/event/event.test.ts": {
+      "status": "enabled",
+      "reason": "Deno-derived Event construction, propagation, and cancellation coverage passes under Cottontail."
+    },
+    "test/js/deno/fetch/blob.test.ts": {
+      "status": "enabled",
+      "reason": "Blob construction, slicing, MIME validation, body access, and streaming pass the Deno-derived corpus."
+    },
+    "test/js/deno/fetch/headers.test.ts": {
+      "status": "enabled",
+      "reason": "Headers construction, validation, mutation, and iteration pass the Deno-derived corpus."
+    },
+    "test/js/deno/fetch/response.test.ts": {
+      "status": "enabled",
+      "reason": "Response construction, body handling, and metadata pass the Deno-derived corpus."
+    },
+    "test/js/deno/url/urlsearchparams.test.ts": {
+      "status": "enabled",
+      "reason": "URLSearchParams parsing, mutation, sorting, and encoding pass the Deno-derived corpus."
+    },
+    "test/internal/fifo.test.ts": {
+      "status": "enabled",
+      "reason": "The copied FIFO ordering, growth, wraparound, and stress corpus passes under Cottontail."
+    },
+    "test/internal/powershell-escape.test.ts": {
+      "status": "enabled",
+      "reason": "PowerShell command argument escaping passes upstream coverage under Cottontail."
+    },
     "test/bake/deinitialization.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
@@ -1022,7 +1074,8 @@
     },
     "test/js/bun/shell/shell-hang.test.ts": {
       "status": "enabled",
-      "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status."
+      "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status; load-sensitive, runs in the serial bucket.",
+      "serial": true
     },
     "test/js/bun/shell/shell-seq-condexpr.test.ts": {
       "status": "enabled",
@@ -1152,6 +1205,10 @@
     "test/js/bun/terminal/terminal.test.ts": {
       "status": "expected-failure",
       "reason": "Requires Bun terminal APIs and disposable terminal lifecycle behavior."
+    },
+    "test/js/bun/test/bun-test.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.version/revision process metadata and chained expect.not behavior pass under Cottontail."
     },
     "test/js/bun/test/ci-restrictions.test.ts": {
       "status": "enabled",
@@ -1500,7 +1557,7 @@
     },
     "test/js/bun/util/sleep.test.ts": {
       "status": "enabled",
-      "reason": "Bun.sleep promise timing, invalid input, and abort behavior coverage passes under Cottontail."
+      "reason": "Bun.sleep promise timing, invalid input, and abort behavior coverage passes under Cottontail; the copied test allows Cottontail's current per-process runtime bundling overhead without weakening timer assertions."
     },
     "test/js/bun/util/sleepSync.test.ts": {
       "status": "enabled",
@@ -2267,6 +2324,90 @@
     "test/js/valkey/valkey.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (908 bun:test cases, 0 assertions)."
+    },
+    "test/js/web/atomics.test.ts": {
+      "status": "enabled",
+      "reason": "Web Atomics operations, waits, notifications, and validation pass upstream coverage under Cottontail."
+    },
+    "test/js/web/broadcastchannel/broadcast-channel.test.ts": {
+      "status": "enabled",
+      "reason": "BroadcastChannel delivery, worker routing, ordering, closure, and inspection pass upstream coverage."
+    },
+    "test/js/web/crypto/web-crypto.test.ts": {
+      "status": "enabled",
+      "reason": "WebCrypto digest, random values, UUID, and SubtleCrypto surface checks pass upstream coverage."
+    },
+    "test/js/web/encoding/text-decoder-cjk.test.ts": {
+      "status": "enabled",
+      "reason": "CJK TextDecoder vectors pass through Cottontail's ICU-backed encoding implementation."
+    },
+    "test/js/web/encoding/text-decoder-single-byte.test.ts": {
+      "status": "enabled",
+      "reason": "Single-byte TextDecoder vectors pass through Cottontail's ICU-backed encoding implementation."
+    },
+    "test/js/web/encoding/text-decoder-stream.test.ts": {
+      "status": "enabled",
+      "reason": "Streaming TextDecoder boundary and state behavior passes upstream coverage."
+    },
+    "test/js/web/encoding/text-decoder-wpt.test.ts": {
+      "status": "enabled",
+      "reason": "The copied Web Platform TextDecoder corpus passes under Cottontail."
+    },
+    "test/js/web/encoding/text-decoder.test.js": {
+      "status": "enabled",
+      "reason": "TextDecoder labels, invalid input, replacement behavior, and exhaustive vectors pass upstream coverage."
+    },
+    "test/js/web/encoding/text-encoder.test.js": {
+      "status": "enabled",
+      "reason": "TextEncoder encoding, encodeInto, boundary, and exhaustive vector coverage passes under Cottontail."
+    },
+    "test/js/web/explicit-resource-management.test.ts": {
+      "status": "enabled",
+      "reason": "Explicit resource management and disposal ordering pass upstream coverage under Cottontail."
+    },
+    "test/js/web/html/FormData.test.ts": {
+      "status": "enabled",
+      "reason": "FormData construction, mutation, iteration, coercion, and multipart behavior pass upstream coverage."
+    },
+    "test/js/web/html/html-rewriter-doctype.test.ts": {
+      "status": "enabled",
+      "reason": "HTMLRewriter document DOCTYPE callbacks and removal behavior pass upstream coverage."
+    },
+    "test/js/web/streams/streams.test.js": {
+      "status": "enabled",
+      "reason": "Readable, writable, transform, byte, and pipe stream behavior passes upstream coverage."
+    },
+    "test/js/web/structured-clone-blob-file.test.ts": {
+      "status": "enabled",
+      "reason": "Blob and File structured cloning, including Bun-compatible textual MIME normalization, passes upstream coverage."
+    },
+    "test/js/web/timers/performance-entries.test.ts": {
+      "status": "enabled",
+      "reason": "Performance entry construction and timing behavior pass upstream coverage under Cottontail."
+    },
+    "test/js/web/timers/performance.test.js": {
+      "status": "enabled",
+      "reason": "Performance timing APIs pass upstream coverage under Cottontail."
+    },
+    "test/js/web/util/atob.test.js": {
+      "status": "enabled",
+      "reason": "atob decoding and invalid-input behavior pass upstream coverage under Cottontail."
+    },
+    "test/js/web/url/url.test.ts": {
+      "status": "enabled",
+      "reason": "URL construction, parsing, properties, and mutation pass upstream coverage under Cottontail."
+    },
+    "test/js/web/workers/message-event.test.ts": {
+      "status": "enabled",
+      "reason": "MessageEvent construction and property behavior pass upstream coverage under Cottontail."
+    },
+    "test/js/web/workers/message-channel.test.ts": {
+      "status": "enabled",
+      "reason": "MessageChannel local and cross-worker transfer, host-object cloning, validation, and lifecycle pass upstream coverage."
+    },
+    "test/js/web/workers/structured-clone.test.ts": {
+      "status": "enabled",
+      "reason": "Structured cloning and bun:jsc serialization pass primitive, collection, Blob/File, BlockList, transfer, and cross-process coverage."
     },
     "test/js/web/abort/abort.test.ts": {
       "status": "enabled",

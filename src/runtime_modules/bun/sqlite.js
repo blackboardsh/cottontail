@@ -499,9 +499,9 @@ export class Database {
 
   close(throwOnError = false) {
     if (this._hasClosed) return undefined;
-    if (throwOnError && [...this._statements].some((statement) => !statement.isFinalized)) {
-      throw new SQLiteError("database is locked");
-    }
+    // Finalize internal statements (query cache, transaction controller)
+    // before the locked check: only user-held unfinalized statements should
+    // make close(true) throw (issue #14709).
     this.clearQueryCache();
     if (this._transactionController) {
       const seen = new Set();
@@ -514,6 +514,9 @@ export class Database {
         }
       }
       this._transactionController = null;
+    }
+    if (throwOnError && [...this._statements].some((statement) => !statement.isFinalized)) {
+      throw new SQLiteError("database is locked");
     }
     try {
       this._db.close();

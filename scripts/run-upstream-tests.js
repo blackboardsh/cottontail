@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import os from 'os';
 import { join, resolve } from 'path';
 
@@ -14,14 +14,28 @@ const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
 const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
+const activeChildren = new Set();
+
+function removeTemp(path) {
+  if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') return;
+  try { rmSync(path, { recursive: true, force: true }); } catch {}
+}
 
 process.on('exit', () => {
   if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') {
     console.error(`kept upstream temp root: ${tempRoot}`);
     return;
   }
-  rmSync(tempRoot, { recursive: true, force: true });
+  removeTemp(tempRoot);
 });
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    for (const child of activeChildren) killProcessTree(child);
+    removeTemp(tempRoot);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
 
 function fail(message) {
   console.error(message);
@@ -41,6 +55,8 @@ function usage() {
     '  --list                       Print status counts without running tests.',
     '  --max-failures <n>           Stop after this many unexpected results.',
     '  --max-tests <n>              Run at most this many selected tests.',
+    '  --match <regexp>             Select tests whose relative path matches.',
+    '  --only-status <status>       Select enabled, expected-failure, or not-enabled tests.',
     '  --test <relative-path>        Run one copied upstream test path.',
   ].join('\n'));
 }
@@ -55,7 +71,11 @@ function parseArgs(argv) {
     includeExpectedFailures: false,
     list: false,
     maxFailures: Infinity,
+    jobs: 1,
+    fastXfail: false,
     maxTests: Infinity,
+    match: null,
+    onlyStatus: null,
     test: null,
   };
   while (args.length > 0) {
@@ -68,10 +88,29 @@ function parseArgs(argv) {
       const value = Number(args.shift() ?? fail('--max-failures requires a number'));
       if (!Number.isFinite(value) || value < 1) fail('--max-failures requires a positive number');
       options.maxFailures = value;
+    } else if (arg === '--jobs') {
+      const value = Number(args.shift() ?? fail('--jobs requires a number'));
+      if (!Number.isFinite(value) || value < 1) fail('--jobs requires a positive number');
+      options.jobs = Math.trunc(value);
+    } else if (arg === '--fast-xfail') {
+      options.fastXfail = true;
     } else if (arg === '--max-tests') {
       const value = Number(args.shift() ?? fail('--max-tests requires a number'));
       if (!Number.isFinite(value) || value < 1) fail('--max-tests requires a positive number');
       options.maxTests = value;
+    } else if (arg === '--match') {
+      const value = args.shift() ?? fail('--match requires a regular expression');
+      try {
+        options.match = new RegExp(value);
+      } catch (error) {
+        fail(`invalid --match regular expression: ${error.message}`);
+      }
+    } else if (arg === '--only-status') {
+      const value = args.shift() ?? fail('--only-status requires a status');
+      if (!['enabled', 'expected-failure', 'not-enabled'].includes(value)) {
+        fail('--only-status must be enabled, expected-failure, or not-enabled');
+      }
+      options.onlyStatus = value;
     } else if (arg === '--test') {
       options.test = args.shift() ?? fail('--test requires a relative path');
     } else if (arg === '--help' || arg === '-h') {
@@ -210,26 +249,33 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
       reason: status.tests?.[options.test]?.reason ?? 'selected from CLI',
     }];
   }
+  let entries;
   if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
-    return discoverRunnableFiles(snapshotRoot, runtime)
+    entries = discoverRunnableFiles(snapshotRoot, runtime)
       .map((path) => statusEntryForPath(status, path, status.defaultStatus === 'enabled' ? 'enabled' : 'not-enabled'))
       .filter((entry) =>
         entry.status === 'enabled' ||
-        (options.includeExpectedFailures && entry.status === 'expected-failure')
+        (options.includeExpectedFailures && entry.status === 'expected-failure') ||
+        (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
+      );
+  } else {
+    entries = Object.entries(status.tests ?? {})
+      .map(([path, entry]) => ({ path, ...entry }))
+      .filter((entry) =>
+        entry.status === 'enabled' ||
+        (options.includeExpectedFailures && entry.status === 'expected-failure') ||
+        (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
       );
   }
-  return Object.entries(status.tests ?? {})
-    .map(([path, entry]) => ({ path, ...entry }))
-    .filter((entry) =>
-      entry.status === 'enabled' ||
-      (options.includeExpectedFailures && entry.status === 'expected-failure')
-    );
+  if (options.onlyStatus) entries = entries.filter((entry) => entry.status === options.onlyStatus);
+  if (options.match) entries = entries.filter((entry) => options.match.test(entry.path));
+  return entries;
 }
 
-function makeEnv(runtime, target) {
+function makeEnv(runtime, target, runTemp = tempRoot) {
   return {
     ...process.env,
-    COTTONTAIL_TMP_DIR: tempRoot,
+    COTTONTAIL_TMP_DIR: runTemp,
     COTTONTAIL_UPSTREAM_RUNTIME: runtime,
     COTTONTAIL_UPSTREAM_VERSION: target.version,
   };
@@ -278,6 +324,174 @@ function runDirect(runtime, target, entry, snapshotRoot) {
     timeout,
     maxBuffer: directTestMaxBuffer,
   });
+}
+
+
+function entryTimeout(entry, options) {
+  const base = Number(entry.timeoutMs ?? directTestTimeoutMs);
+  if (options?.fastXfail && entry.status === 'expected-failure' && entry.timeoutMs == null) {
+    // Confirming a known failure does not need the full budget; a kill still
+    // counts as failing. Full budgets remain available without --fast-xfail.
+    return Math.min(base, 8000);
+  }
+  return base;
+}
+
+function killProcessTree(child) {
+  if (!child.pid) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' });
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try { child.kill('SIGKILL'); } catch {}
+  }
+}
+
+function runDirectAsync(runtime, target, entry, snapshotRoot, options) {
+  const timeout = entryTimeout(entry, options);
+  const runTemp = mkdtempSync(join(tempRoot, 'run-'));
+  return new Promise((resolveResult) => {
+    const child = spawn(binaryPath, [entry.path], {
+      cwd: snapshotRoot,
+      env: makeEnv(runtime, target, runTemp),
+      detached: process.platform !== 'win32',
+    });
+    activeChildren.add(child);
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child);
+    }, timeout);
+    child.stdout.on('data', (d) => { if (stdout.length < directTestMaxBuffer) stdout += d; });
+    child.stderr.on('data', (d) => { if (stderr.length < directTestMaxBuffer) stderr += d; });
+    const settle = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // A test owns its process group. Remove any grandchildren it left
+      // behind after either a timeout or a normal/failed test exit.
+      killProcessTree(child);
+      activeChildren.delete(child);
+      removeTemp(runTemp);
+      resolveResult({
+        status: code,
+        signal,
+        stdout,
+        stderr,
+        error: timedOut ? Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) : undefined,
+      });
+    };
+    // 'exit' plus a grace beat: orphaned grandchildren can hold stdio pipes
+    // open forever, so never wait solely on 'close'.
+    child.on('exit', (code, signal) => setTimeout(() => settle(code, signal), 250));
+    child.on('close', (code, signal) => settle(code, signal));
+    child.on('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      activeChildren.delete(child);
+      removeTemp(runTemp);
+      resolveResult({ status: null, signal: null, stdout: '', stderr: '', error });
+    });
+  });
+}
+
+function classifyResult(runtime, entry, result, options) {
+  if (result.error?.code === 'ETIMEDOUT') {
+    const shouldFail = entry.status === 'expected-failure';
+    const timeout = entryTimeout(entry, options);
+    return {
+      runtime,
+      entry,
+      ok: shouldFail,
+      unexpected: !shouldFail,
+      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entry.path} timed out after ${timeout}ms`,
+    };
+  }
+  const spawnError = formatSpawnError(runtime, entry, result);
+  if (spawnError) {
+    return { runtime, entry, ok: false, unexpected: true, message: spawnError };
+  }
+  const exitCode = result.status ?? 1;
+  const shouldFail = entry.status === 'expected-failure';
+  const ok = shouldFail ? exitCode !== 0 : exitCode === 0;
+  const execution = runtime === 'bun' ? parseBunTestExecution(result.stderr) : null;
+  const executionLabel = execution
+    ? ` (${execution.tests} tests, ${execution.assertions} assertions)`
+    : '';
+  const message = ok
+    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entry.path}${executionLabel}`
+    : [
+        `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${entry.path} exited ${exitCode}`,
+        result.stdout ? `stdout:\n${result.stdout}` : '',
+        result.stderr ? `stderr:\n${result.stderr}` : '',
+      ].filter(Boolean).join('\n');
+  return { runtime, entry, ok, unexpected: !ok, message, execution };
+}
+
+async function runBunEntries(runtime, target, entries, options) {
+  const snapshotRoot = resolve(rootDir, target.snapshot);
+  if (options.jobs <= 1) {
+    const results = [];
+    for (const entry of entries) results.push(await runOneAsync(runtime, target, entry, snapshotRoot, options));
+    return results;
+  }
+  // Load-sensitive files (anything with a timeout override or an explicit
+  // serial flag) run alone after the parallel phase.
+  const serialIndexes = new Set();
+  entries.forEach((entry, index) => {
+    if (entry.timeoutMs != null || entry.serial === true) serialIndexes.add(index);
+  });
+  const results = new Array(entries.length);
+  const queue = entries.map((entry, index) => ({ entry, index })).filter(({ index }) => !serialIndexes.has(index));
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const item = queue[cursor++];
+      if (!item) return;
+      const scriptPath = join(snapshotRoot, item.entry.path);
+      if (!existsSync(scriptPath)) {
+        results[item.index] = { runtime, entry: item.entry, ok: false, unexpected: true, message: `missing copied upstream test: ${item.entry.path}` };
+        continue;
+      }
+      const raw = await runDirectAsync(runtime, target, item.entry, snapshotRoot, options);
+      results[item.index] = classifyResult(runtime, item.entry, raw, options);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(options.jobs, queue.length) || 1 }, worker));
+  // Anything unexpected in the parallel phase gets one serial retry so load
+  // artifacts can never masquerade as real failures.
+  for (let index = 0; index < entries.length; index += 1) {
+    if (serialIndexes.has(index)) continue;
+    if (results[index]?.unexpected) {
+      results[index] = await runOneAsync(runtime, target, entries[index], snapshotRoot, options);
+    }
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    if (serialIndexes.has(index)) {
+      results[index] = await runOneAsync(runtime, target, entries[index], snapshotRoot, options);
+    }
+  }
+  return results;
+}
+
+async function runOneAsync(runtime, target, entry, snapshotRoot, options) {
+  const scriptPath = join(snapshotRoot, entry.path);
+  if (!existsSync(scriptPath)) {
+    return { runtime, entry, ok: false, unexpected: true, message: `missing copied upstream test: ${entry.path}` };
+  }
+  const stat = statSync(scriptPath);
+  if (!stat.isFile()) {
+    return { runtime, entry, ok: false, unexpected: true, message: `not a file: ${entry.path}` };
+  }
+  const result = await runDirectAsync(runtime, target, entry, snapshotRoot, options);
+  return classifyResult(runtime, entry, result, options);
 }
 
 function formatSpawnError(runtime, entry, result) {
@@ -399,7 +613,7 @@ for (const name of runtimeTargets(runtime, targets)) {
   const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
   const results = name === 'node'
     ? runNode(name, target, status, entries, snapshotRoot, options)
-    : entries.map((entry) => runOne(name, target, entry));
+    : await runBunEntries(name, target, entries, options);
   const executionTotals = { tests: 0, assertions: 0, files: 0, filesWithoutSummary: 0 };
   for (const result of results) {
     console.log(result.message);

@@ -806,6 +806,7 @@ pub const BundleV2 = struct {
         task.task.node.next = null;
         task.tree_shaking = this.linker.options.tree_shaking;
         task.known_target = target;
+        task.jsx = t.options.jsx;
         task.jsx.development = switch (t.options.force_node_env) {
             .development => true,
             .production => false,
@@ -871,6 +872,7 @@ pub const BundleV2 = struct {
         task.known_target = target;
         {
             const bundler = this.transpilerForTarget(target);
+            task.jsx = bundler.options.jsx;
             task.jsx.development = switch (bundler.options.force_node_env) {
                 .development => true,
                 .production => false,

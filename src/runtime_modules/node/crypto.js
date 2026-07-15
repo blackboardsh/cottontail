@@ -43,7 +43,13 @@ const hashOutputLengths = {
   shake256: 32,
   blake2b512: 64,
   blake2s256: 32,
+  blake2b256: 32,
 };
+// Digests accepted by createHash/createHmac beyond getHashes(); Bun/BoringSSL
+// accepts blake2b256 even though it is not listed by getHashes().
+function isSupportedDigest(normalized) {
+  return supportedHashes.includes(normalized) || normalized === "blake2b256";
+}
 const supportedCiphers = [
   ["aes-128-cbc", "cbc", 16, 16, 16],
   ["aes-192-cbc", "cbc", 16, 16, 24],
@@ -150,12 +156,15 @@ const x509EcCurveOids = {
 };
 
 function normalizeAlgorithm(algorithm) {
+  // BoringSSL's digest lookup accepts the exact OpenSSL signature name
+  // "RSA-MD5" (case-sensitive) but rejects "rsa-md5"/"Rsa-Md5" variants.
+  if (algorithm === "RSA-MD5") return "md5";
   const normalized = String(algorithm).toLowerCase().replace(/[^a-z0-9]/g, "");
   const sha3Match = normalized.match(/^sha3(224|256|384|512)$/);
   if (sha3Match) return `sha3-${sha3Match[1]}`;
   if (normalized === "shake128" || normalized === "shake256") return normalized;
   if (normalized === "ripemd160" || normalized === "rmd160") return "ripemd160";
-  if (normalized === "blake2b512" || normalized === "blake2s256") return normalized;
+  if (normalized === "blake2b512" || normalized === "blake2s256" || normalized === "blake2b256") return normalized;
   if (normalized === "md4") return "md4";
   if (normalized === "sha" || normalized === "sha1") return "sha1";
   if (normalized === "sha128") return "sha1";
@@ -270,8 +279,106 @@ function md4Digest(data) {
   return output;
 }
 
+// Pure-JS BLAKE2b (RFC 7693). Needed because the native hash backend only
+// exposes blake2b512; Bun/BoringSSL additionally supports blake2b256, which
+// is a distinct parameterization (digest length is part of the parameter
+// block), not a truncation of blake2b512.
+const BLAKE2B_IV = [
+  0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn,
+  0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
+  0x510e527fade682d1n, 0x9b05688c2b3e6c1fn,
+  0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n,
+];
+const BLAKE2B_SIGMA = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+  [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+  [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+  [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+  [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+  [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+  [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+  [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+  [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+];
+const BLAKE2B_MASK64 = (1n << 64n) - 1n;
+
+function blake2bRotr(x, n) {
+  return ((x >> n) | (x << (64n - n))) & BLAKE2B_MASK64;
+}
+
+function blake2bG(v, a, b, c, d, x, y) {
+  v[a] = (v[a] + v[b] + x) & BLAKE2B_MASK64;
+  v[d] = blake2bRotr(v[d] ^ v[a], 32n);
+  v[c] = (v[c] + v[d]) & BLAKE2B_MASK64;
+  v[b] = blake2bRotr(v[b] ^ v[c], 24n);
+  v[a] = (v[a] + v[b] + y) & BLAKE2B_MASK64;
+  v[d] = blake2bRotr(v[d] ^ v[a], 16n);
+  v[c] = (v[c] + v[d]) & BLAKE2B_MASK64;
+  v[b] = blake2bRotr(v[b] ^ v[c], 63n);
+}
+
+function blake2bCompress(h, block, t, last) {
+  const v = new Array(16);
+  const m = new Array(16);
+  for (let i = 0; i < 8; i += 1) {
+    v[i] = h[i];
+    v[i + 8] = BLAKE2B_IV[i];
+  }
+  v[12] ^= t & BLAKE2B_MASK64;
+  v[13] ^= (t >> 64n) & BLAKE2B_MASK64;
+  if (last) v[14] ^= BLAKE2B_MASK64;
+  const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+  for (let i = 0; i < 16; i += 1) m[i] = view.getBigUint64(i * 8, true);
+  for (let round = 0; round < 12; round += 1) {
+    const s = BLAKE2B_SIGMA[round];
+    blake2bG(v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+    blake2bG(v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+    blake2bG(v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+    blake2bG(v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+    blake2bG(v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+    blake2bG(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+    blake2bG(v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+    blake2bG(v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+  }
+  for (let i = 0; i < 8; i += 1) h[i] = h[i] ^ v[i] ^ v[i + 8];
+}
+
+function blake2bDigest(data, outLen = 64, keyBytes = new Uint8Array(0)) {
+  const h = BLAKE2B_IV.slice();
+  h[0] ^= BigInt(0x01010000 ^ (keyBytes.length << 8) ^ outLen);
+  let message = data;
+  if (keyBytes.length > 0) {
+    const keyBlock = new Uint8Array(128);
+    keyBlock.set(keyBytes);
+    message = concatBytes([keyBlock, data]);
+  }
+  let t = 0n;
+  if (message.length === 0) {
+    blake2bCompress(h, new Uint8Array(128), 0n, true);
+  } else {
+    let offset = 0;
+    while (message.length - offset > 128) {
+      t += 128n;
+      blake2bCompress(h, message.subarray(offset, offset + 128), t, false);
+      offset += 128;
+    }
+    const lastBlock = new Uint8Array(128);
+    lastBlock.set(message.subarray(offset));
+    t += BigInt(message.length - offset);
+    blake2bCompress(h, lastBlock, t, true);
+  }
+  const out = new Uint8Array(outLen);
+  for (let i = 0; i < outLen; i += 1) {
+    out[i] = Number((h[i >> 3] >> BigInt((i & 7) * 8)) & 0xffn);
+  }
+  return out;
+}
+
 function hmacFallback(algorithm, key, data) {
-  const blockSize = 64;
+  const blockSize = algorithm === "blake2b256" ? 128 : 64;
   let keyBytes = bytesFromData(key);
   if (keyBytes.length > blockSize) keyBytes = digestBytes(algorithm, keyBytes);
   const normalizedKey = new Uint8Array(blockSize);
@@ -455,13 +562,14 @@ function formatX509Date(date) {
 
 function digestBytes(algorithm, data, outputLength = undefined) {
   const normalized = normalizeAlgorithm(algorithm);
-  if (!supportedHashes.includes(normalized)) {
+  if (!isSupportedDigest(normalized)) {
     throw new Error(`Digest algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
   if (normalized === "md5-sha1") {
     return concatBytes([digestBytes("md5", data), digestBytes("sha1", data)]);
   }
   if (normalized === "md4") return md4Digest(data);
+  if (normalized === "blake2b256") return blake2bDigest(data, 32);
   if (typeof cottontail.cryptoHashSync !== "function") {
     throw new Error("native crypto hashing is unavailable");
   }
@@ -470,10 +578,10 @@ function digestBytes(algorithm, data, outputLength = undefined) {
 
 function hmacBytes(algorithm, key, data) {
   const normalized = normalizeAlgorithm(algorithm);
-  if (!supportedHashes.includes(normalized)) {
+  if (!isSupportedDigest(normalized)) {
     throw new Error(`HMAC algorithm is not supported in Cottontail yet: ${algorithm}`);
   }
-  if (normalized === "md4") return hmacFallback(normalized, key, data);
+  if (normalized === "md4" || normalized === "blake2b256") return hmacFallback(normalized, key, data);
   if (typeof cottontail.cryptoHmacSync !== "function") {
     throw new Error("native crypto HMAC is unavailable");
   }
@@ -877,7 +985,17 @@ function nativeEcJwkFromKey(keyObject) {
     y: base64UrlFromBytes(publicKey.slice(1 + size, 1 + size * 2)),
     crv: nativeEcWebCurveName(namedCurve),
   };
-  if (keyObject.type === "private") jwk.d = base64UrlFromBytes(keyObject.privateKeyBytes);
+  if (keyObject.type === "private") {
+    // Left-zero-pad the scalar to the curve size: P-521 scalars are often 65
+    // bytes but JWK "d" must be the fixed 66-byte width (issue 24399).
+    let d = bytesFromData(keyObject.privateKeyBytes);
+    if (d.byteLength < size) {
+      const padded = new Uint8Array(size);
+      padded.set(d, size - d.byteLength);
+      d = padded;
+    }
+    jwk.d = base64UrlFromBytes(d);
+  }
   return jwk;
 }
 
@@ -2023,7 +2141,7 @@ class HashImpl extends Transform {
     if (this._transform === null) delete this._transform;
     rebindStreamInternalListeners(this);
     this.algorithm = normalizeAlgorithm(algorithm);
-    if (!supportedHashes.includes(this.algorithm)) {
+    if (!isSupportedDigest(this.algorithm)) {
       throw new Error("Digest method not supported");
     }
     const requestedOutputLength = options && typeof options === "object" ? options.outputLength : undefined;
@@ -2100,7 +2218,7 @@ class HmacImpl extends Transform {
       throw err;
     }
     this.algorithm = normalizeAlgorithm(algorithm);
-    if (!supportedHashes.includes(this.algorithm)) {
+    if (!isSupportedDigest(this.algorithm)) {
       const err = new TypeError(`Invalid digest: ${algorithm}`);
       err.code = "ERR_CRYPTO_INVALID_DIGEST";
       throw err;
@@ -2581,7 +2699,6 @@ class CipherBase extends Transform {
       : 0;
     this.finalized = false;
     this.id = null;
-    this.readBuffer = null;
   }
 
   _ensureCipher() {
@@ -2616,20 +2733,6 @@ class CipherBase extends Transform {
       this.finalized = true;
       if (!this.encrypt || this.info.authTagLength === 0) this.id = null;
     }
-  }
-
-  end(data = undefined, inputEncoding = undefined) {
-    const chunks = [];
-    if (data != null) chunks.push(bytesFromData(this.update(data, inputEncoding)));
-    chunks.push(bytesFromData(this.final()));
-    this.readBuffer = bufferFromBytes(concatBytes(chunks));
-    return this;
-  }
-
-  read() {
-    const value = this.readBuffer;
-    this.readBuffer = null;
-    return value;
   }
 
   setAAD(buffer, options = undefined) {
@@ -4337,6 +4440,26 @@ const subtleCrypto = {
 };
 
 export const constants = constantsObject;
+// Web-facing SubtleCrypto class: crypto.subtle must be an instance of a class
+// named "SubtleCrypto" (exposed as a global by bun/index.js).
+export class SubtleCrypto {
+  constructor() {
+    throw new TypeError("Illegal constructor");
+  }
+  get [Symbol.toStringTag]() {
+    return "SubtleCrypto";
+  }
+}
+Object.defineProperty(SubtleCrypto, "name", { value: "SubtleCrypto", configurable: true });
+for (const method of Object.keys(subtleCrypto)) {
+  Object.defineProperty(SubtleCrypto.prototype, method, {
+    value: subtleCrypto[method],
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+Object.setPrototypeOf(subtleCrypto, SubtleCrypto.prototype);
 export const webcrypto = globalThis.crypto ?? { getRandomValues, randomUUID };
 if (webcrypto.subtle == null) webcrypto.subtle = subtleCrypto;
 export const subtle = webcrypto.subtle;
@@ -4365,6 +4488,7 @@ for (const [publicName, ctor] of [
   ["KeyObject", KeyObject],
   ["X509Certificate", X509Certificate],
   ["Certificate", Certificate],
+  ["CryptoKey", CryptoKey],
 ]) {
   try {
     Object.defineProperty(ctor, "name", { value: publicName, configurable: true });

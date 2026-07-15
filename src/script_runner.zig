@@ -437,6 +437,9 @@ fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias
     try appendRuntimeAlias(ctx, &aliases, "vitest", "bun/test.js");
     try appendRuntimeAlias(ctx, &aliases, "string-width", "bun/string-width.js");
     try appendRuntimeAlias(ctx, &aliases, "strip-ansi", "bun/strip-ansi.js");
+    // Bun ships built-in overrides for these npm packages.
+    try appendRuntimeAlias(ctx, &aliases, "node-fetch", "vendor/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, "abort-controller", "vendor/abort-controller.js");
 
     for (node_runtime_aliases) |alias| {
         try appendRuntimeAlias(ctx, &aliases, alias.specifier, alias.relative_path);
@@ -929,9 +932,18 @@ fn writeCottontailEntryWrapper(
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
-        \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
+        \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = {s}) => {{
+        \\  const text = String(specifier);
+        \\  if (text.startsWith("node:") || text.startsWith("bun:")) return text;
+        \\  return __ctBunModule.resolveSync(text, parent);
+        \\}};
         \\globalThis.__cottontailImportMetaResolve = (specifier, parent = {s}) => {{
-        \\  const resolved = __ctBunModule.resolveSync(specifier, parent);
+        \\  const text = String(specifier);
+        \\  if (text.startsWith("node:") || text.startsWith("bun:") || text.startsWith("file:")) return text;
+        \\  if (text.startsWith(".") || text.startsWith("/")) {{
+        \\    return new URL(text, __ctBunModule.pathToFileURL(parent).href).href;
+        \\  }}
+        \\  const resolved = __ctBunModule.resolveSync(text, parent);
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
         \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});

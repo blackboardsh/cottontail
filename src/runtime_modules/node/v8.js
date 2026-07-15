@@ -43,7 +43,14 @@ function viewTypeName(value) {
 function encodeValue(value, state = { ids: new WeakMap(), nextId: 1 }) {
   if (value === undefined) return { type: "undefined" };
   if (value === null) return { type: "null" };
-  if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") return { type: typeof value, value };
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) return { type: "number", value: "NaN" };
+    if (value === Infinity) return { type: "number", value: "Infinity" };
+    if (value === -Infinity) return { type: "number", value: "-Infinity" };
+    if (Object.is(value, -0)) return { type: "number", value: "-0" };
+    return { type: "number", value };
+  }
+  if (typeof value === "boolean" || typeof value === "string") return { type: typeof value, value };
   if (typeof value === "bigint") return { type: "bigint", value: value.toString() };
   if (typeof value === "symbol" || typeof value === "function") throw new Error("Unserializable value");
   const existingId = state.ids.get(value);
@@ -65,6 +72,35 @@ function encodeValue(value, state = { ids: new WeakMap(), nextId: 1 }) {
   if (value instanceof Set) return { type: "Set", id, value: [...value].map((item) => encodeValue(item, state)) };
   if (Array.isArray(value)) return { type: "Array", id, value: value.map((item) => encodeValue(item, state)) };
   if (value instanceof Error) return { type: "Error", id, name: value.name, message: value.message, stack: value.stack };
+  const isBunFile = typeof value?.exists === "function" && typeof value?.writer === "function";
+  if (isBunFile) {
+    let bytes = new Uint8Array(Math.max(0, Number(value.size) || 0));
+    if (typeof value._bunFilePath === "string") {
+      try { bytes = new Uint8Array(cottontail.readFileBuffer(value._bunFilePath)); } catch {}
+    }
+    return {
+      type: "File",
+      id,
+      bytes: encodeBytes(bytes),
+      mime: String(value.type ?? ""),
+      name: String(value.name ?? ""),
+      lastModified: Number(value.lastModified ?? 0),
+    };
+  }
+  if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
+    const bytes = value._bytes instanceof Uint8Array ? value._bytes : new Uint8Array(0);
+    if (typeof globalThis.File === "function" && value instanceof globalThis.File) {
+      return {
+        type: "File",
+        id,
+        bytes: encodeBytes(bytes),
+        mime: String(value.type ?? ""),
+        name: String(value.name ?? ""),
+        lastModified: Number(value.lastModified ?? 0),
+      };
+    }
+    return { type: "Blob", id, bytes: encodeBytes(bytes), mime: String(value.type ?? "") };
+  }
   return { type: "Object", id, value: Object.entries(value).map(([key, item]) => [key, encodeValue(item, state)]) };
 }
 
@@ -86,8 +122,14 @@ function decodeValue(encoded, refs = new Map()) {
     case "undefined": return undefined;
     case "null": return null;
     case "boolean":
-    case "number":
     case "string": return encoded.value;
+    case "number": {
+      if (encoded.value === "NaN") return NaN;
+      if (encoded.value === "Infinity") return Infinity;
+      if (encoded.value === "-Infinity") return -Infinity;
+      if (encoded.value === "-0") return -0;
+      return Number(encoded.value);
+    }
     case "bigint": return BigInt(encoded.value);
     case "Date": return remember(refs, encoded, new Date(encoded.value));
     case "RegExp": return remember(refs, encoded, new RegExp(encoded.source, encoded.flags));
@@ -126,6 +168,13 @@ function decodeValue(encoded, refs = new Map()) {
       error.stack = encoded.stack;
       return remember(refs, encoded, error);
     }
+    case "Blob":
+      return remember(refs, encoded, new globalThis.Blob([bytesFromArray(encoded.bytes)], { type: encoded.mime ?? "" }));
+    case "File":
+      return remember(refs, encoded, new globalThis.File([bytesFromArray(encoded.bytes)], encoded.name ?? "", {
+        type: encoded.mime ?? "",
+        lastModified: Number(encoded.lastModified ?? 0),
+      }));
     case "Object": {
       const object = remember(refs, encoded, {});
       for (const [key, value] of encoded.value) object[key] = decodeValue(value, refs);

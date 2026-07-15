@@ -63,6 +63,16 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     command.addFileArg(b.path("scripts/embed-runtime-modules.js"));
     const output = command.addOutputFileArg("runtime-modules.bin");
     command.addDirectoryArg(b.path("src/runtime_modules"));
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var directory = std.Io.Dir.cwd().openDir(io, "src/runtime_modules", .{ .iterate = true }) catch
+        @panic("failed to open src/runtime_modules");
+    defer directory.close(io);
+    var walker = directory.walk(b.allocator) catch @panic("failed to walk src/runtime_modules");
+    defer walker.deinit();
+    while (walker.next(io) catch @panic("failed to walk src/runtime_modules")) |entry| {
+        if (entry.kind != .file) continue;
+        command.addFileInput(b.path(b.fmt("src/runtime_modules/{s}", .{entry.path})));
+    }
     return output;
 }
 

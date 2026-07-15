@@ -617,7 +617,7 @@ export async function rejects(fn, expected, message) {
         stackStartFn: rejects,
       });
     }
-    return error;
+    return;
   }
   throw new AssertionError({
     actual: undefined,
@@ -634,7 +634,8 @@ export async function doesNotReject(fn, expected, message) {
   if (result.syncError) throw result.syncError;
   markPromiseHandled(result.promise);
   try {
-    return await result.promise;
+    await result.promise;
+    return;
   } catch (error) {
     if (validateExpected(error, expected, "doesNotReject", message)) {
       throw new AssertionError({

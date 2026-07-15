@@ -35,9 +35,67 @@ function throwCodeGenerationError() {
   throw new EvalError("Code generation from strings disallowed for this context");
 }
 
-function makeScopeProxy(context) {
+// JSC in this embedding does not honor `//# sourceURL` for Error.prototype
+// stack strings, so scripts run with a `filename` option would otherwise
+// produce stack frames with empty URLs ("eval code@"). To emulate Node's
+// behavior (stack traces show the vm filename), identifier lookups of `Error`
+// inside vm code resolve to a Proxy that constructs a real Error and then
+// rewrites empty-URL frames to point at the filename.
+function makeStackFilenameFixer(filename) {
+  const safeName = String(filename).replace(/[\r\n]/g, " ");
+  return error => {
+    try {
+      const stack = error?.stack;
+      if (typeof stack === "string" && stack.length > 0) {
+        error.stack = stack.replace(/@(?=\n|$)/g, `@${safeName}`);
+      }
+    } catch {
+      // stack may be non-writable; filename annotation is best-effort
+    }
+    return error;
+  };
+}
+
+function makeFilenameErrorConstructor(RealError, filename) {
+  const fix = makeStackFilenameFixer(filename);
+  return new Proxy(RealError, {
+    construct(target, args, newTarget) {
+      return fix(Reflect.construct(target, args, newTarget ?? target));
+    },
+    apply(target, thisArg, args) {
+      return fix(Reflect.apply(target, thisArg, args));
+    },
+  });
+}
+
+// Copy-on-write stand-in for Object.prototype handed to compileFunction()
+// scopes: reads fall through to the real prototype, but `with (Object.
+// prototype) { toString = ... }` style attacks create own properties on the
+// shadow instead of mutating the shared intrinsic.
+function makeShadowObjectIntrinsic() {
+  const shadowPrototype = {};
+  return new Proxy(Object, {
+    get(target, key, receiver) {
+      if (key === "prototype") return shadowPrototype;
+      return Reflect.get(target, key, receiver);
+    },
+    getOwnPropertyDescriptor(target, key) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+      if (key === "prototype" && descriptor && "value" in descriptor) {
+        descriptor.value = shadowPrototype;
+      }
+      return descriptor;
+    },
+  });
+}
+
+function makeScopeProxy(context, scopeOptions = undefined) {
   const codeGeneration = contextCodeGeneration.get(context);
   const stringsDisallowed = codeGeneration?.strings === false;
+  const filename = scopeOptions?.filename;
+  const shadowPrototypes = scopeOptions?.shadowPrototypes === true;
+  let patchedError;
+  let shadowObject;
   // The first `eval` lookup comes from our own runner bootstrapping the
   // script; subsequent lookups originate from the script itself.
   let evalBootstrapDone = false;
@@ -61,6 +119,12 @@ function makeScopeProxy(context) {
           return intrinsics.get("eval");
         }
         return throwCodeGenerationError;
+      }
+      if (filename != null && key === "Error") {
+        return (patchedError ??= makeFilenameErrorConstructor(intrinsics.get("Error"), filename));
+      }
+      if (shadowPrototypes && key === "Object") {
+        return (shadowObject ??= makeShadowObjectIntrinsic());
       }
       if (typeof key === "string" && intrinsics.has(key)) return intrinsics.get(key);
       return undefined;
@@ -111,7 +175,7 @@ function withSourceURL(code, filename) {
 
 function runCodeInContext(code, context, options = undefined) {
   const { filename } = normalizeRunOptions(options);
-  const scope = makeScopeProxy(context);
+  const scope = makeScopeProxy(context, { filename });
   // Scope chain seen by the eval'd code, innermost first:
   //   1. `with (context)`         - context properties, like Node's global
   //   2. arrow function var scope - receives `var`/function declarations that
@@ -139,7 +203,16 @@ function runCodeInContext(code, context, options = undefined) {
 
 export function runInThisContext(code, options = undefined) {
   const { filename } = normalizeRunOptions(options);
-  return (0, eval)(withSourceURL(code, filename));
+  if (filename == null) return (0, eval)(withSourceURL(code, filename));
+  // Temporarily swap the global Error so stacks captured by the (synchronous)
+  // script show the requested filename; see makeFilenameErrorConstructor.
+  const RealError = globalThis.Error;
+  globalThis.Error = makeFilenameErrorConstructor(RealError, filename);
+  try {
+    return (0, eval)(withSourceURL(code, filename));
+  } finally {
+    globalThis.Error = RealError;
+  }
 }
 
 export function runInContext(code, contextifiedObject, options = undefined) {
@@ -269,7 +342,7 @@ export function compileFunction(code, params = [], options = {}) {
     scopeTarget = {};
   }
 
-  const scope = makeScopeProxy(scopeTarget);
+  const scope = makeScopeProxy(scopeTarget, { shadowPrototypes: true });
   // Extensions layer additional lookup objects over the context scope.
   let builder = `return function (${names.join(", ")}) {\n${code}\n}`;
   const extensionParams = contextExtensions.map((_, index) => `__cottontail_ext_${index}__`);

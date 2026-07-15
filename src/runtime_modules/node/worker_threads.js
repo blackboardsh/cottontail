@@ -359,7 +359,7 @@ globalThis.__cottontailDecodeWorkerMessage = __cottontailDecodeWorkerMessage;
 
 function normalizeWorkerPath(filename, evalMode = false) {
   if (evalMode) {
-    const dir = `${cottontail.cwd()}/.cottontail-tmp`;
+    const dir = workerTempDir();
     cottontail.mkdirSync?.(dir, true);
     const sourcePath = `${dir}/worker-eval-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
     cottontail.writeFile(sourcePath, String(filename));
@@ -371,13 +371,27 @@ function normalizeWorkerPath(filename, evalMode = false) {
   return resolve(text);
 }
 
+function workerTempDir() {
+  const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
+  return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
+}
+
+const workerWrapperCache = new Map();
+
 function makeWorkerWrapper(targetPath, options = {}) {
-  const dir = `${cottontail.cwd()}/.cottontail-tmp`;
-  cottontail.mkdirSync?.(dir, true);
-  const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
   const workerDataWire = JSON.stringify(JSON.parse(encodeWireMessage(options.workerData ?? null)));
   const environmentDataWire = JSON.stringify(JSON.parse(encodeWireMessage([...environmentData])));
   const resourceLimitsWire = JSON.stringify(JSON.parse(encodeWireMessage(options.resourceLimits ?? {})));
+  const cacheable = !(options.transferList?.length > 0) && !workerDataWire.includes('"t":"Port"');
+  const cacheKey = cacheable
+    ? JSON.stringify([targetPath, workerDataWire, environmentDataWire, resourceLimitsWire, options.name ?? ""])
+    : null;
+  const cached = cacheKey == null ? null : workerWrapperCache.get(cacheKey);
+  if (cached && cottontail.existsSync?.(cached)) return cached;
+
+  const dir = workerTempDir();
+  cottontail.mkdirSync?.(dir, true);
+  const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
   const source = [
     workerCodecSource(),
     `globalThis.__cottontailWorkerData = __cottontailDecodeWorkerMessage(${workerDataWire});`,
@@ -424,7 +438,7 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `  if (text === "node:async_hooks" || text === "async_hooks") return __cottontailWorkerAsyncHooksBuiltin();`,
     `  throw new Error("Cannot find module '" + text + "'");`,
     `}`,
-    `globalThis.require ??= __cottontailWorkerRequire;`,
+    `globalThis.require = __cottontailWorkerRequire;`,
     `function __cottontailRewriteWorkerNamedImports(spec){ return spec.split(",").map((part) => { const trimmed = part.trim(); if (!trimmed) return ""; const pieces = trimmed.split(/\\s+as\\s+/); return pieces.length === 2 ? pieces[0].trim() + ": " + pieces[1].trim() : trimmed; }).filter(Boolean).join(", "); }`,
     `function __cottontailTransformWorkerSource(source, filename){`,
     `  const dir = String(filename).replace(/\\/[^/]*$/, "") || ".";`,
@@ -447,6 +461,7 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `await __cottontailRunWorkerTarget(${JSON.stringify(targetPath)});`,
   ].join("\n");
   cottontail.writeFile(wrapperPath, source);
+  if (cacheKey != null) workerWrapperCache.set(cacheKey, wrapperPath);
   return wrapperPath;
 }
 

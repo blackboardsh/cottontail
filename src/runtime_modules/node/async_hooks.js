@@ -178,33 +178,77 @@ Object.defineProperty(globalThis, "__cottontailAsyncHooksOnGc", {
 
 const storageStack = [];
 
+// Attach a settle-time callback with the native (unpatched) promise
+// machinery: the patched Promise.prototype.then restores its captured
+// storage snapshot after each reaction, which would clobber the restore.
+function deferRestoreUntilSettled(thenable, restore) {
+  const previousFlag = globalThis.__cottontailSuppressAsyncHookPromise;
+  globalThis.__cottontailSuppressAsyncHookPromise = true;
+  try {
+    Promise.resolve(thenable).then(restore, restore);
+  } finally {
+    globalThis.__cottontailSuppressAsyncHookPromise = previousFlag;
+  }
+}
+
 function captureStorageSnapshot() {
   return Array.from(storages, (storage) =>
     [storage, storage.enabled, storage._store, storage._hasStore, storage._disableGeneration ?? 0]);
 }
 
 function runWithStorageSnapshot(snapshot, fn, thisArg, args) {
-  const previous = snapshot.map(([storage]) => [storage, storage.enabled, storage._store, storage._hasStore]);
-  const restored = [];
+  const frames = [];
   for (const entry of snapshot) {
     const [storage, enabled, store, hasStore, generation] = entry;
     // A disable() issued after the snapshot invalidates it for this storage.
     if ((storage._disableGeneration ?? 0) !== generation) continue;
+    frames.push({
+      storage,
+      enabled,
+      store,
+      hasStore,
+      prevEnabled: storage.enabled,
+      prevStore: storage._store,
+      prevHasStore: storage._hasStore,
+    });
     storage.enabled = enabled;
     storage._store = store;
     storage._hasStore = hasStore;
-    restored.push(storage);
   }
   try {
     return fn.apply(thisArg, args);
   } finally {
-    for (const [storage, enabled, store, hasStore] of previous) {
-      if (!restored.includes(storage)) continue;
-      storage.enabled = enabled;
-      storage._store = store;
-      storage._hasStore = hasStore;
+    for (const frame of frames) {
+      // Only undo values this frame installed: an inner AsyncLocalStorage.run
+      // with an async callback (or a nested wrapped callback) may have opened
+      // a deferred context window that must survive this frame's exit; its
+      // own settle handler restores it.
+      const { storage } = frame;
+      if (storage._store === frame.store && storage._hasStore === frame.hasStore && storage.enabled === frame.enabled) {
+        storage.enabled = frame.prevEnabled;
+        storage._store = frame.prevStore;
+        storage._hasStore = frame.prevHasStore;
+      }
     }
   }
+}
+
+// PromiseResolveThenableJob invokes `thenable.then` from the engine's
+// microtask queue where the async context is gone. Hand the engine a wrapper
+// whose `then` re-enters the context captured right now. The wrapper is never
+// observable: the engine consumes it internally.
+function contextWrappedThenable(thenable) {
+  const originalThen = thenable.then;
+  return {
+    then: _wrapAsyncCallback(function then(...args) {
+      return originalThen.apply(thenable, args);
+    }),
+  };
+}
+
+function isNonPromiseThenable(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function") &&
+    !(value instanceof Promise) && typeof value.then === "function";
 }
 
 export function _wrapAsyncCallback(callback) {
@@ -350,7 +394,10 @@ function patchGlobalAsyncSchedulers() {
     const nativeResolve = global.Promise.resolve.bind(global.Promise);
     global.Promise.resolve = function resolve(value) {
       if (globalThis.__cottontailSuppressAsyncHookPromise === true) return nativeResolve(value);
-      const promise = nativeResolve(value);
+      // Resolving with a thenable defers to PromiseResolveThenableJob, which
+      // calls `value.then` outside the current async context; wrap it so the
+      // user's `then` observes the context active at Promise.resolve() time.
+      const promise = nativeResolve(isNonPromiseThenable(value) ? contextWrappedThenable(value) : value);
       const asyncId = registerPromiseResource(promise, currentAsyncId);
       emitHook("promiseResolve", asyncId);
       return promise;
@@ -374,7 +421,21 @@ function patchGlobalAsyncSchedulers() {
         continuationResource = null;
         if (childAsyncId) emitHook("before", childAsyncId);
         try {
-          if (typeof callback === "function") return runWithStorageSnapshot(snapshot, callback, this, [value]);
+          if (typeof callback === "function") {
+            const callbackResult = runWithStorageSnapshot(snapshot, callback, this, [value]);
+            // A returned thenable is adopted by the engine's
+            // PromiseResolveThenableJob outside any context; wrap it so its
+            // `then` re-enters this reaction's context (the attach-time
+            // snapshot - the reaction's own stores are already restored by
+            // the time the wrapper is built).
+            if (isNonPromiseThenable(callbackResult)) {
+              const originalThen = callbackResult.then;
+              return {
+                then: (...thenArgs) => runWithStorageSnapshot(snapshot, originalThen, callbackResult, thenArgs),
+              };
+            }
+            return callbackResult;
+          }
           if (isReject) throw value;
           return value;
         } finally {
@@ -449,18 +510,49 @@ export class AsyncLocalStorage {
     const previous = this._store;
     const previousHasStore = this._hasStore;
     const previousEnabled = this.enabled;
+    const generation = this._disableGeneration;
     this.enabled = true;
     this._store = store;
     this._hasStore = true;
     storageStack.push(this);
-    try {
-      return callback(...args);
-    } finally {
-      storageStack.pop();
+    let restored = false;
+    const restore = (onlyIfStillOurs) => {
+      if (restored) return;
+      restored = true;
+      // disable() after this run started detaches the storage; don't undo it.
+      if (this._disableGeneration !== generation) return;
+      // The deferred (settle-time) restore must not clobber a store installed
+      // by someone else in the meantime.
+      if (onlyIfStillOurs && !(this._store === store && this._hasStore === true)) return;
       this._store = previous;
       this._hasStore = previousHasStore;
       this.enabled = previousEnabled;
+    };
+    let result;
+    try {
+      result = callback(...args);
+    } catch (error) {
+      storageStack.pop();
+      restore(false);
+      throw error;
     }
+    storageStack.pop();
+    // Async callback: JSC's `await` continuations bypass the patched
+    // Promise.prototype.then, so a synchronous restore would clear the store
+    // before the continuation observes it. Keep the store active until the
+    // returned promise settles (engine-level async context propagation is not
+    // reachable from the JSC C API). Attaching here - before the caller can
+    // await - guarantees the restore reaction runs before the awaiter's.
+    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+      try {
+        deferRestoreUntilSettled(result, () => restore(true));
+        return result;
+      } catch {
+        // fall through to synchronous restore on scheduling failure
+      }
+    }
+    restore(false);
+    return result;
   }
 
   exit(callback, ...args) {

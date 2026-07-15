@@ -269,8 +269,16 @@ export class TextEncoderStream extends TransformStream {
 export class TextDecoderStream extends TransformStream {
   #decoder;
 
-  constructor(encoding = "utf-8", options = {}) {
-    const decoder = new TextDecoder(encoding, options);
+  constructor(encoding = "utf-8", options = undefined) {
+    // Coerce dictionary members with plain WebIDL boolean semantics; the
+    // stricter validation TextDecoder itself applies would reject objects.
+    let fatal = false;
+    let ignoreBOM = false;
+    if (options !== undefined && options !== null) {
+      fatal = Boolean(options.fatal);
+      ignoreBOM = Boolean(options.ignoreBOM);
+    }
+    const decoder = new TextDecoder(`${encoding}`, { fatal, ignoreBOM });
     super({
       transform: (chunk, controller) => {
         const text = decoder.decode(chunk, { stream: true });

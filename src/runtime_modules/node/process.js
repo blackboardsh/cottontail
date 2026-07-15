@@ -765,7 +765,8 @@ processObject.versions ??= { node: "24.0.0", cottontail: "0.0.0-dev" };
 processObject.versions.node ??= "24.0.0";
 processObject.versions.cottontail ??= "0.0.0-dev";
 processObject.release ??= { name: "cottontail" };
-processObject.title ??= "cottontail";
+// Bun reports "bun" as the process title (upstream regression 23183).
+processObject.title ??= "bun";
 processObject.browser ??= false;
 processObject.execArgv ??= Array.from(cottontail.execArgv || []);
 processObject._preload_modules ??= [];

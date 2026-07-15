@@ -118,10 +118,134 @@ function installIteratorTracking() {
 
 installIteratorTracking();
 
-export function getTrackedIteratorInfo(value) {
+// Not exported as a named binding: `import * as ns from "util/types"` must
+// only expose the Node predicate set (upstream tests iterate the keys).
+// util.inspect's previewEntries reaches it through the default export, where
+// it is attached non-enumerably below.
+function getTrackedIteratorInfo(value) {
   if (value === null || typeof value !== "object") return undefined;
   return iteratorInfo.get(value);
 }
+
+// SharedArrayBuffer shim fixes: the embedded bootstrap installs a minimal
+// pure-JS SharedArrayBuffer when JSC lacks the native one. That shim rejects
+// `new SharedArrayBuffer()` (length must default to 0 via ToIndex) and knows
+// nothing about growable buffers ({ maxByteLength }). Replace it with a
+// Node-faithful constructor that reuses the same prototype object (so
+// instanceof keeps working across worker_threads structured clones).
+const sharedBufferRegistry = (globalThis.__cottontailSharedBufferRegistry ??= new WeakSet());
+const sharedBufferGrowState = (globalThis.__cottontailSharedBufferGrowState ??= new WeakMap());
+
+function installSharedArrayBufferShimFixes() {
+  const Shim = globalThis.SharedArrayBuffer;
+  const nativeMark = globalThis.__cottontailMarkSharedArrayBuffer;
+  // Only patch the pure-JS shim; a real native SharedArrayBuffer needs no fix.
+  if (typeof Shim !== "function" || typeof nativeMark !== "function") return;
+  if (Shim.__cottontailNodeSemantics) return;
+
+  const proto = Shim.prototype;
+  const nativeCreate = globalThis.cottontail?.sharedArrayBufferCreate;
+  const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+
+  const markShared = (buffer) => {
+    if (buffer !== null && typeof buffer === "object") sharedBufferRegistry.add(buffer);
+    return nativeMark(buffer);
+  };
+  // Keep worker_threads (which calls this dynamically) registering clones here too.
+  globalThis.__cottontailMarkSharedArrayBuffer = markShared;
+
+  const toIndex = (value, message) => {
+    if (value === undefined) return 0;
+    let n = Number(value);
+    n = Number.isNaN(n) ? 0 : Math.trunc(n);
+    if (n < 0 || n > Number.MAX_SAFE_INTEGER) throw new RangeError(message);
+    return n;
+  };
+
+  const allocate = (size) => {
+    // Zero-length shared mappings come back with a NULL data pointer, which
+    // JSC treats as a detached buffer; use a plain ArrayBuffer(0) instead.
+    const buffer = size === 0 || typeof nativeCreate !== "function"
+      ? new ArrayBuffer(size)
+      : nativeCreate(size);
+    return markShared(buffer);
+  };
+
+  function SharedArrayBuffer(length, options) {
+    if (!new.target) throw new TypeError("Constructor SharedArrayBuffer requires 'new'");
+    const size = toIndex(length, "Invalid SharedArrayBuffer length");
+    let maxByteLength;
+    if (options !== null && typeof options === "object" && options.maxByteLength !== undefined) {
+      maxByteLength = toIndex(options.maxByteLength, "Invalid options.maxByteLength");
+      if (maxByteLength < size) throw new RangeError("Invalid options.maxByteLength");
+    }
+    if (maxByteLength === undefined) return allocate(size);
+    // Growable buffer: reserve the maximum capacity up front and track the
+    // logical byteLength; grow() only bumps the logical size.
+    const buffer = allocate(maxByteLength);
+    sharedBufferGrowState.set(buffer, { byteLength: size, maxByteLength });
+    return buffer;
+  }
+  Object.defineProperty(SharedArrayBuffer, "__cottontailNodeSemantics", { value: true });
+  // Module transpilation may rename the binding (e.g. SharedArrayBuffer2);
+  // pin the observable function name.
+  Object.defineProperty(SharedArrayBuffer, "name", { value: "SharedArrayBuffer", configurable: true });
+  SharedArrayBuffer.prototype = proto;
+  Object.defineProperty(proto, "constructor", { value: SharedArrayBuffer, writable: true, configurable: true });
+  // The bootstrap shim assigns Symbol.toStringTag with `=`, which the
+  // non-writable inherited ArrayBuffer tag silently rejects; define it properly.
+  Object.defineProperty(proto, Symbol.toStringTag, { value: "SharedArrayBuffer", configurable: true });
+
+  const requireShared = (value) => {
+    if (value === null || typeof value !== "object" || !sharedBufferRegistry.has(value)) {
+      throw new TypeError("Receiver must be a SharedArrayBuffer");
+    }
+  };
+  Object.defineProperty(proto, "byteLength", {
+    configurable: true,
+    get: function byteLength() {
+      requireShared(this);
+      const state = sharedBufferGrowState.get(this);
+      if (state !== undefined) return state.byteLength;
+      return arrayBufferByteLengthGetter.call(this);
+    },
+  });
+  Object.defineProperty(proto, "growable", {
+    configurable: true,
+    get: function growable() {
+      requireShared(this);
+      return sharedBufferGrowState.has(this);
+    },
+  });
+  Object.defineProperty(proto, "maxByteLength", {
+    configurable: true,
+    get: function maxByteLength() {
+      requireShared(this);
+      const state = sharedBufferGrowState.get(this);
+      if (state !== undefined) return state.maxByteLength;
+      return arrayBufferByteLengthGetter.call(this);
+    },
+  });
+  Object.defineProperty(proto, "grow", {
+    writable: true,
+    configurable: true,
+    value: function grow(newLength) {
+      requireShared(this);
+      const state = sharedBufferGrowState.get(this);
+      if (state === undefined) throw new TypeError("SharedArrayBuffer.prototype.grow called on a non-growable SharedArrayBuffer");
+      const size = toIndex(newLength, "Invalid SharedArrayBuffer length");
+      if (size < state.byteLength || size > state.maxByteLength) {
+        throw new RangeError("SharedArrayBuffer.prototype.grow requires a length between the current byteLength and maxByteLength");
+      }
+      state.byteLength = size;
+      return undefined;
+    },
+  });
+
+  globalThis.SharedArrayBuffer = SharedArrayBuffer;
+}
+
+installSharedArrayBufferShimFixes();
 
 function tag(value) {
   return Object.prototype.toString.call(value);
@@ -174,6 +298,9 @@ export function isArgumentsObject(value) {
 }
 
 export function isArrayBuffer(value) {
+  // The SharedArrayBuffer shim backs shared buffers with real ArrayBuffers;
+  // those must not report as plain ArrayBuffers (Node keeps them disjoint).
+  if (value !== null && typeof value === "object" && sharedBufferRegistry.has(value)) return false;
   return brand((v) => arrayBufferByteLength.call(v), value);
 }
 
@@ -370,7 +497,7 @@ export function isWeakSet(value) {
   return brand((v) => weakSetHas.call(v, weakSetHas), value);
 }
 
-export default {
+const typesDefault = {
   isAnyArrayBuffer,
   isArgumentsObject,
   isArrayBuffer,
@@ -416,3 +543,13 @@ export default {
   isWeakMap,
   isWeakSet,
 };
+
+// Internal hook for util.inspect's iterator previews; non-enumerable so it
+// never shows up when consumers enumerate the Node predicate set.
+Object.defineProperty(typesDefault, "getTrackedIteratorInfo", {
+  value: getTrackedIteratorInfo,
+  writable: true,
+  configurable: true,
+});
+
+export default typesDefault;

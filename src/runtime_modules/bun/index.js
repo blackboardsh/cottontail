@@ -5,8 +5,13 @@ import * as nodeHttps from "../node/https.js";
 import * as nodeNet from "../node/net.js";
 import { connect as nodeTlsConnect } from "../node/tls.js";
 import * as zlib from "../node/zlib.js";
-import { CryptoKey, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
-import { __setBuiltinModules as nodeSetBuiltinModules, createRequire as nodeCreateRequire } from "../node/module.js";
+import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
+import {
+  __setBuiltinModules as nodeSetBuiltinModules,
+  _resolveFilename as nodeResolveFilename,
+  createRequire as nodeCreateRequire,
+  isBuiltin as nodeIsBuiltin,
+} from "../node/module.js";
 import { resolve as nodePathResolve } from "../node/path.js";
 import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
@@ -18,6 +23,9 @@ import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
 import { remapPosition as remapBundlePosition, remapStackString as remapBundleStack } from "../vendor/sourcemap.js";
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
+import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
+import { S3Client, s3 } from "./s3.js";
+import { SQL } from "./sql.js";
 import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import { jest as bunJest } from "./test.js";
@@ -126,7 +134,7 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
       nativeCaptureStackTrace(target, constructorOpt);
       const rawStack = remapBundleStack(target.stack);
       const callSites = parseCallSites(rawStack);
-      if (typeof prepare === "function") {
+      if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
         target.stack = prepare(target, callSites);
       } else {
         const name = String(target.name || target.constructor?.name || "Error");
@@ -164,7 +172,7 @@ function installNodeStyleErrorConstructor(name) {
             // value becomes the stack (pino et al. rely on this to collect
             // caller file names).
             const prepare = Error.prepareStackTrace;
-            if (typeof prepare === "function") {
+            if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
               try {
                 cached = prepare(error, parseCallSites(remapBundleStack(rawStack)));
                 return cached;
@@ -196,6 +204,29 @@ function installNodeStyleErrorConstructor(name) {
 
 for (const errorName of ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
   installNodeStyleErrorConstructor(errorName);
+}
+
+// Bun ships a default Error.prepareStackTrace (unlike Node, where it is
+// undefined). It formats "Name: message" plus V8-style "    at " frames and
+// tolerates non-array traces. The __cottontailDefaultPrepare marker lets the
+// stack machinery above treat it as "not user-installed".
+if (Error.prepareStackTrace === undefined) {
+  const defaultPrepareStackTrace = function prepareStackTrace(error, trace) {
+    let header;
+    try {
+      header = error == null ? String(error) : Error.prototype.toString.call(error);
+    } catch {
+      header = "<error>";
+    }
+    if (!Array.isArray(trace)) {
+      if (trace == null) return header;
+      trace = [""];
+    }
+    if (trace.length === 0) return header;
+    return `${header}\n    at ${trace.map((site) => String(site)).join("\n    at ")}`;
+  };
+  Object.defineProperty(defaultPrepareStackTrace, "__cottontailDefaultPrepare", { value: true });
+  Error.prepareStackTrace = defaultPrepareStackTrace;
 }
 
 // Shared hooks so other runtime modules (uncaught-error printing, test
@@ -1144,10 +1175,11 @@ function runBuildDriver(spec) {
   );
   try {
     const entrypoints = [];
+    const virtualFiles = spec.files && typeof spec.files === "object" ? spec.files : null;
     for (const entrypoint of spec.entrypoints ?? []) {
       const entry = String(entrypoint);
       const absoluteEntry = toAbsolute(entry);
-      if (!cottontail.existsSync(absoluteEntry)) {
+      if (!Object.prototype.hasOwnProperty.call(virtualFiles ?? {}, absoluteEntry) && !cottontail.existsSync(absoluteEntry)) {
         return {
           ok: false,
           name: "AggregateError",
@@ -1164,9 +1196,26 @@ function runBuildDriver(spec) {
     }
     const request = { ...spec, plugins: undefined, entrypoints };
     const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
+    const metafile = parsed.metafile == null ? null : JSON.parse(parsed.metafile);
+    const outdir = spec.outdir != null ? toAbsolute(String(spec.outdir)) : null;
+    const writeMetafile = (path, contents) => {
+      if (path == null || contents == null) return;
+      const value = String(path);
+      const absolute = value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)
+        ? value
+        : nodePathResolve(outdir ?? cwd, value);
+      const parent = pathDirname(absolute);
+      if (parent && parent !== ".") cottontail.mkdirSync(parent, true);
+      cottontail.writeFile(absolute, contents);
+    };
+    if (typeof spec.metafile === "string") {
+      writeMetafile(spec.metafile, parsed.metafile);
+    } else if (spec.metafile && typeof spec.metafile === "object") {
+      writeMetafile(spec.metafile.json, parsed.metafile);
+      writeMetafile(spec.metafile.markdown, parsed.metafileMarkdown);
+    }
     // Real Bun writes output files whenever `outdir` is set (the `write`
     // option does not suppress it); in-memory builds have no outdir.
-    const outdir = spec.outdir != null ? toAbsolute(String(spec.outdir)) : null;
     for (const output of parsed.outputs ?? []) {
       const relative = String(output.path ?? "").replace(/^\.\//, "");
       if (outdir) {
@@ -1187,7 +1236,7 @@ function runBuildDriver(spec) {
         logs: parsed.logs ?? [],
       };
     }
-    return { ok: true, success: true, logs: parsed.logs ?? [], outputs: parsed.outputs ?? [] };
+    return { ok: true, success: true, logs: parsed.logs ?? [], outputs: parsed.outputs ?? [], metafile };
   } catch (error) {
     return {
       ok: false,
@@ -1225,6 +1274,7 @@ function finalizeDriverResult(parsed, options) {
         loader: output.loader ?? "js",
       },
     )),
+    ...(parsed.metafile != null ? { metafile: parsed.metafile } : {}),
   };
 }
 
@@ -1238,6 +1288,34 @@ const bundleLoaderExtensions = {
   text: ".txt",
   wasm: ".wasm",
 };
+
+async function ctNormalizeBuildFiles(options) {
+  if (options?.files == null || typeof options.files !== "object") return options;
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const files = {};
+  for (const [path, value] of Object.entries(options.files)) {
+    const absolute = String(path).startsWith("/") || /^[A-Za-z]:[\\/]/.test(String(path))
+      ? String(path)
+      : nodePathResolve(cwd, String(path));
+    if (typeof value === "string") {
+      files[absolute] = value;
+    } else if (value instanceof ArrayBuffer) {
+      files[absolute] = new TextDecoder().decode(new Uint8Array(value));
+    } else if (ArrayBuffer.isView(value)) {
+      files[absolute] = new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    } else if (typeof value?.text === "function") {
+      files[absolute] = String(await value.text());
+    } else {
+      throw new TypeError(`Bun.build files[${JSON.stringify(path)}] must be a string, Blob, ArrayBuffer, or typed array`);
+    }
+  }
+  return { ...options, files };
+}
+
+function ctBuildVirtualFile(options, path) {
+  if (options?.files == null) return undefined;
+  return Object.prototype.hasOwnProperty.call(options.files, path) ? options.files[path] : undefined;
+}
 
 function bundleLoaderForPath(path) {
   const match = /\.([a-zA-Z0-9]+)$/.exec(String(path));
@@ -1269,6 +1347,7 @@ function scanBundleImports(source) {
 // resolved module graph into a shadow directory, and delegates the actual
 // bundling of the materialized files to the plugin-free build pipeline.
 async function buildWithPlugins(options, plugins) {
+  options = await ctNormalizeBuildFiles(options);
   const onResolveRules = [];
   const onLoadRules = [];
   const onStartCallbacks = [];
@@ -1344,6 +1423,7 @@ async function buildWithPlugins(options, plugins) {
     for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".json"]) candidates.push(base + ext);
     for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".json"]) candidates.push(`${base}/index${ext}`);
     for (const candidate of candidates) {
+      if (ctBuildVirtualFile(options, candidate) !== undefined) return { path: candidate, namespace: "file" };
       try {
         if (cottontail.statSync(candidate, true)?.isFile) return { path: candidate, namespace: "file" };
       } catch {}
@@ -1368,7 +1448,11 @@ async function buildWithPlugins(options, plugins) {
         : new TextDecoder().decode(result.contents);
       return { contents, loader: result.loader ? String(result.loader) : undefined };
     }
-    if (record.namespace === "file") return { contents: cottontail.readFile(record.path), loader: undefined };
+    if (record.namespace === "file") {
+      const virtual = ctBuildVirtualFile(options, record.path);
+      if (virtual !== undefined) return { contents: virtual, loader: undefined };
+      return { contents: cottontail.readFile(record.path), loader: undefined };
+    }
     throw new Error(`Could not load: "${record.namespace}:${record.path}" (no onLoad plugin returned contents)`);
   };
 
@@ -1436,7 +1520,7 @@ async function buildWithPlugins(options, plugins) {
     if (resolved?.external) continue;
     if (!resolved) {
       const abs = entry.startsWith("/") ? entry : nodePathResolve(entry);
-      if (!cottontail.existsSync(abs)) {
+      if (ctBuildVirtualFile(options, abs) === undefined && !cottontail.existsSync(abs)) {
         errors.push(new BuildMessage({ message: `ModuleNotFound resolving "${entry}" (entry point)` }));
         continue;
       }
@@ -1588,7 +1672,7 @@ async function ctRunBuildDriver(options, state) {
       b64: output.b64 ?? "",
       sourcemapIndex: output.sourcemapIndex ?? null,
     })),
-    metafile: null,
+    metafile: parsed.metafile ?? null,
   };
 }
 
@@ -1646,6 +1730,7 @@ async function ctRunOnEnd(state, result) {
 
 async function ctRunBuild(options, state) {
   if (state.setupPromises.length > 0) await Promise.all(state.setupPromises);
+  options = await ctNormalizeBuildFiles(options);
 
   const preError = ctCheckInvalidJsonImports(options);
   if (preError) {
@@ -1798,6 +1883,13 @@ function normalizeSpawnOptions(options = {}, defaults = {}) {
   const stderrFilePath = options.stderr != null && isBunFileLike(options.stderr) && typeof options.stderr._bunFilePath === "string"
     ? options.stderr._bunFilePath
     : undefined;
+  let timeout = options.timeout;
+  if (timeout !== undefined) {
+    timeout = Number(timeout);
+    if (!Number.isFinite(timeout) || timeout < 0 || timeout > Number.MAX_SAFE_INTEGER) {
+      throw new RangeError(`The value of "timeout" is out of range. It must be >= 0 and <= ${Number.MAX_SAFE_INTEGER}. Received ${timeout}`);
+    }
+  }
 
   return {
     cwd: options.cwd,
@@ -1811,7 +1903,7 @@ function normalizeSpawnOptions(options = {}, defaults = {}) {
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
     killSignal: options.killSignal,
     maxBuffer: options.maxBuffer,
-    timeout: options.timeout,
+    timeout,
     ipc: typeof options.ipc === "function" || options.ipc === true,
   };
 }
@@ -2965,14 +3057,47 @@ if (URLSearchParams?.prototype && typeof URLSearchParams.prototype.toJSON !== "f
   });
 }
 
+// Bun prints URL objects as an expanded property list (see url.test.ts).
+if (URL?.prototype && !URL.prototype[Symbol.for("nodejs.util.inspect.custom")]) {
+  Object.defineProperty(URL.prototype, Symbol.for("nodejs.util.inspect.custom"), {
+    value: function inspect() {
+      const searchParamsText = String(
+        this.searchParams?.[Symbol.for("nodejs.util.inspect.custom")]?.() ?? this.searchParams,
+      ).replace(/\n/g, "\n  ");
+      return [
+        "URL {",
+        `  href: ${JSON.stringify(this.href)},`,
+        `  origin: ${JSON.stringify(this.origin)},`,
+        `  protocol: ${JSON.stringify(this.protocol)},`,
+        `  username: ${JSON.stringify(this.username)},`,
+        `  password: ${JSON.stringify(this.password)},`,
+        `  host: ${JSON.stringify(this.host)},`,
+        `  hostname: ${JSON.stringify(this.hostname)},`,
+        `  port: ${JSON.stringify(this.port)},`,
+        `  pathname: ${JSON.stringify(this.pathname)},`,
+        `  hash: ${JSON.stringify(this.hash)},`,
+        `  search: ${JSON.stringify(this.search)},`,
+        `  searchParams: ${searchParamsText},`,
+        "  toJSON: [Function: toJSON],",
+        "  toString: [Function: toString],",
+        "}",
+      ].join("\n");
+    },
+    writable: true,
+    configurable: true,
+  });
+}
+
 export { URL, URLSearchParams };
 
 export class Headers {
   constructor(init = undefined) {
     this._values = new Map();
     this._allValues = new Map();
-    if (init === null) {
-      throw new TypeError("Headers cannot be constructed from null");
+    if (init === undefined) return;
+    // WebIDL HeadersInit: primitives (including null and strings) throw.
+    if (init === null || (typeof init !== "object" && typeof init !== "function")) {
+      throw new TypeError("Headers can only be constructed from an object or an iterable of [name, value] pairs");
     }
     if (init instanceof Headers) {
       // Copy from the internal map to preserve original header casing.
@@ -2983,18 +3108,40 @@ export class Headers {
           this.append(entry.key, entry.value);
         }
       }
-    } else if (init != null && typeof init !== "string" && typeof init[Symbol.iterator] === "function") {
-      for (const entry of init) {
-        const pair = Array.isArray(entry)
-          ? entry
-          : (entry != null && typeof entry !== "string" && typeof entry?.[Symbol.iterator] === "function" ? Array.from(entry) : null);
-        if (pair == null || pair.length !== 2) {
+      return;
+    }
+    // Per WebIDL, Symbol.iterator is read exactly once: a defined but
+    // non-callable iterator is a TypeError, undefined selects the record path.
+    const iteratorMethod = init[Symbol.iterator];
+    if (iteratorMethod !== undefined) {
+      if (typeof iteratorMethod !== "function") {
+        throw new TypeError("Headers init is not iterable");
+      }
+      const iterator = iteratorMethod.call(init);
+      for (;;) {
+        const step = iterator.next();
+        if (step.done) break;
+        const entry = step.value;
+        if (entry === null || (typeof entry !== "object" && typeof entry !== "function")) {
+          throw new TypeError("Headers sequence must contain [name, value] pairs");
+        }
+        const pair = Array.isArray(entry) ? entry : Array.from(entry);
+        if (pair.length !== 2) {
           throw new TypeError("Headers sequence must contain [name, value] pairs");
         }
         this.append(pair[0], pair[1]);
       }
-    } else if (init && typeof init === "object") {
-      for (const key of Object.keys(init)) this.append(key, init[key]);
+      return;
+    }
+    // record<ByteString, ByteString>: own enumerable properties; symbol keys
+    // cannot convert to ByteString and throw.
+    for (const key of Reflect.ownKeys(init)) {
+      const descriptor = Object.getOwnPropertyDescriptor(init, key);
+      if (!descriptor || !descriptor.enumerable) continue;
+      if (typeof key === "symbol") {
+        throw new TypeError("Header name must be a string");
+      }
+      this.append(key, init[key]);
     }
   }
   getSetCookie() {
@@ -3004,10 +3151,12 @@ export class Headers {
     if (arguments.length < 2) {
       throw new TypeError(`Headers.append requires 2 arguments, received ${arguments.length}`);
     }
-    validateHeaderPair(key, value);
-    const normalized = String(key).toLowerCase();
+    const name = headerNameToString(key);
+    validateHeaderName(name);
+    const stringValue = normalizeHeaderValueText(headerValueToString(value, name));
+    validateHeaderValue(stringValue, name);
+    const normalized = name.toLowerCase();
     const existing = this._values.get(normalized);
-    const stringValue = String(value);
     const allValues = this._allValues.get(normalized) ?? [];
     allValues.push(stringValue);
     this._allValues.set(normalized, allValues);
@@ -3015,7 +3164,7 @@ export class Headers {
     // "; " instead of ", " when appended.
     const separator = normalized === "cookie" ? "; " : ", ";
     this._values.set(normalized, {
-      key: existing?.key ?? String(key),
+      key: existing?.key ?? name,
       value: existing ? `${existing.value}${separator}${stringValue}` : stringValue,
     });
   }
@@ -3023,23 +3172,27 @@ export class Headers {
     if (arguments.length < 2) {
       throw new TypeError(`Headers.set requires 2 arguments, received ${arguments.length}`);
     }
-    validateHeaderPair(key, value);
-    const normalized = String(key).toLowerCase();
-    const stringValue = String(value);
+    const name = headerNameToString(key);
+    validateHeaderName(name);
+    const stringValue = normalizeHeaderValueText(headerValueToString(value, name));
+    validateHeaderValue(stringValue, name);
+    const normalized = name.toLowerCase();
     this._allValues.set(normalized, [stringValue]);
-    this._values.set(normalized, { key: String(key), value: stringValue });
+    this._values.set(normalized, { key: name, value: stringValue });
   }
   get(key) {
     if (arguments.length < 1) {
       throw new TypeError("Headers.get requires 1 argument, received 0");
     }
-    return this._values.get(String(key).toLowerCase())?.value ?? null;
+    const name = headerNameToString(key);
+    validateHeaderName(name);
+    return this._values.get(name.toLowerCase())?.value ?? null;
   }
   getAll(key) {
     if (arguments.length < 1) {
       throw new TypeError("Headers.getAll requires 1 argument, received 0");
     }
-    const normalized = String(key).toLowerCase();
+    const normalized = headerNameToString(key).toLowerCase();
     if (normalized !== "set-cookie") {
       throw new TypeError('getAll() can only be used with the "Set-Cookie" header');
     }
@@ -3049,30 +3202,41 @@ export class Headers {
     if (arguments.length < 1) {
       throw new TypeError("Headers.has requires 1 argument, received 0");
     }
-    return this._values.has(String(key).toLowerCase());
+    const name = headerNameToString(key);
+    validateHeaderName(name);
+    return this._values.has(name.toLowerCase());
   }
   delete(key) {
     if (arguments.length < 1) {
       throw new TypeError("Headers.delete requires 1 argument, received 0");
     }
-    const normalized = String(key).toLowerCase();
+    const name = headerNameToString(key);
+    validateHeaderName(name);
+    const normalized = name.toLowerCase();
     this._allValues.delete(normalized);
     this._values.delete(normalized);
   }
   _sortedEntries() {
     const entries = [];
+    const setCookies = [];
     for (const [normalized, entry] of this._values) {
       if (normalized === "set-cookie") {
-        for (const value of this._allValues.get(normalized) ?? []) entries.push([normalized, value]);
+        for (const value of this._allValues.get(normalized) ?? []) setCookies.push([normalized, value]);
       } else {
         entries.push([normalized, entry.value]);
       }
     }
     entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    // Bun (WebCore FetchHeaders) iterates set-cookie entries after all other
+    // headers, in insertion order.
+    entries.push(...setCookies);
     return entries;
   }
   forEach(callback, thisArg = undefined) {
-    for (const [key, value] of this._sortedEntries()) callback.call(thisArg, value, key, this);
+    if (typeof callback !== "function") {
+      throw new TypeError("Headers.forEach requires the callback to be a function");
+    }
+    for (const [key, value] of this.entries()) callback.call(thisArg, value, key, this);
   }
   toJSON() {
     const result = {};
@@ -3082,14 +3246,20 @@ export class Headers {
     for (const [key, value] of entries) result[key] = value;
     return result;
   }
+  // Iteration is live per the fetch spec: each step re-reads the sorted and
+  // combined header list rather than iterating over a snapshot.
   *entries() {
-    yield* this._sortedEntries();
+    for (let index = 0; ; index += 1) {
+      const snapshot = this._sortedEntries();
+      if (index >= snapshot.length) return;
+      yield snapshot[index];
+    }
   }
   *keys() {
-    for (const [key] of this._sortedEntries()) yield key;
+    for (const [key] of this.entries()) yield key;
   }
   *values() {
-    for (const [, value] of this._sortedEntries()) yield value;
+    for (const [, value] of this.entries()) yield value;
   }
   get count() {
     return this._values.size;
@@ -3116,6 +3286,13 @@ export class Headers {
   }
 }
 
+Object.defineProperty(Headers.prototype, Symbol.toStringTag, {
+  value: "Headers",
+  writable: false,
+  enumerable: false,
+  configurable: true,
+});
+
 const wellKnownHeaderNames = new Set([
   "accept", "accept-charset", "accept-encoding", "accept-language", "accept-ranges",
   "access-control-allow-credentials", "access-control-allow-headers", "access-control-allow-methods",
@@ -3133,15 +3310,62 @@ const wellKnownHeaderNames = new Set([
   "x-content-type-options", "x-frame-options", "x-requested-with", "x-xss-protection",
 ]);
 
-function validateHeaderPair(name, value) {
-  const nameText = String(name);
-  if (nameText.length === 0 || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(nameText)) {
+// Header validation is deliberately regex-free: user code can sabotage
+// RegExp.prototype.exec (which `.test()` consults) and Headers must still work.
+function headerNameToString(name) {
+  if (typeof name === "symbol") throw new TypeError("Header name must be a string");
+  return String(name);
+}
+
+function headerValueToString(value, name) {
+  if (typeof value === "symbol") throw new TypeError(`Header "${name}" value must be a string`);
+  return String(value);
+}
+
+// HTTP token code points per RFC 9110.
+function isHeaderTokenCode(code) {
+  if (code >= 0x30 && code <= 0x39) return true; // 0-9
+  if (code >= 0x41 && code <= 0x5a) return true; // A-Z
+  if (code >= 0x61 && code <= 0x7a) return true; // a-z
+  switch (code) {
+    case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x2a: case 0x2b: case 0x2d: case 0x2e: case 0x5e: case 0x5f:
+    case 0x60: case 0x7c: case 0x7e:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function validateHeaderName(nameText) {
+  if (nameText.length === 0) {
     throw new TypeError(`Invalid header name: "${nameText}"`);
   }
-  const valueText = String(value);
+  for (let index = 0; index < nameText.length; index += 1) {
+    if (!isHeaderTokenCode(nameText.charCodeAt(index))) {
+      throw new TypeError(`Invalid header name: "${nameText}"`);
+    }
+  }
+}
+
+function isHeaderWhitespaceCode(code) {
+  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+// Strip leading/trailing HTTP whitespace per the fetch spec value normalize.
+function normalizeHeaderValueText(valueText) {
+  let start = 0;
+  let end = valueText.length;
+  while (start < end && isHeaderWhitespaceCode(valueText.charCodeAt(start))) start += 1;
+  while (end > start && isHeaderWhitespaceCode(valueText.charCodeAt(end - 1))) end -= 1;
+  return start === 0 && end === valueText.length ? valueText : valueText.slice(start, end);
+}
+
+function validateHeaderValue(valueText, nameText) {
   for (let index = 0; index < valueText.length; index += 1) {
-    if (valueText.charCodeAt(index) > 0xff) {
-      throw new TypeError(`Header "${nameText}" has invalid value: "${valueText}"`);
+    const code = valueText.charCodeAt(index);
+    if (code === 0x00 || code === 0x0a || code === 0x0d || code > 0xff) {
+      throw new TypeError("Header value is not valid.");
     }
   }
 }
@@ -3158,25 +3382,30 @@ export class FormData {
     this._entries = [];
   }
   append(name, value, filename = undefined) {
-    // File entries carry their own filename when none is given explicitly.
-    if (filename === undefined && value != null && typeof value === "object" &&
-        typeof value.arrayBuffer === "function" && typeof value.name === "string" && value.name !== "") {
-      filename = value.name;
+    if (arguments.length < 2) {
+      throw new TypeError(`FormData.append requires at least 2 arguments, received ${arguments.length}`);
     }
-    this._entries.push([String(name), filename === undefined ? value : { value, filename: String(filename) }]);
+    this._entries.push(makeFormDataEntry(name, value, filename));
   }
   set(name, value, filename = undefined) {
-    this.delete(name);
-    this.append(name, value, filename);
+    if (arguments.length < 2) {
+      throw new TypeError(`FormData.set requires at least 2 arguments, received ${arguments.length}`);
+    }
+    const entry = makeFormDataEntry(name, value, filename);
+    this.delete(entry[0]);
+    this._entries.push(entry);
+  }
+  get length() {
+    return this._entries.length;
   }
   get(name) {
     const key = String(name);
     const found = this._entries.find((entry) => entry[0] === key);
-    return found ? formDataEntryValue(found[1]) : null;
+    return found ? found[1] : null;
   }
   getAll(name) {
     const key = String(name);
-    return this._entries.filter((entry) => entry[0] === key).map((entry) => formDataEntryValue(entry[1]));
+    return this._entries.filter((entry) => entry[0] === key).map((entry) => entry[1]);
   }
   has(name) {
     const key = String(name);
@@ -3187,27 +3416,29 @@ export class FormData {
     this._entries = this._entries.filter((entry) => entry[0] !== key);
   }
   *entries() {
-    yield* this._entries;
+    for (const [key, value] of this._entries) yield [key, value];
   }
   *keys() {
     for (const [key] of this._entries) yield key;
   }
   *values() {
-    for (const [, value] of this._entries) yield formDataEntryValue(value);
+    for (const [, value] of this._entries) yield value;
   }
   forEach(callback, thisArg = undefined) {
-    for (const [key, value] of this._entries) callback.call(thisArg, formDataEntryValue(value), key, this);
+    if (typeof callback !== "function") {
+      throw new TypeError("FormData.forEach requires the callback to be a function");
+    }
+    for (const [key, value] of this._entries) callback.call(thisArg, value, key, this);
   }
   [Symbol.iterator]() {
     return this.entries();
   }
   toJSON() {
     const result = {};
-    for (const [key, raw] of this._entries) {
-      const value = formDataEntryValue(raw);
+    for (const [key, value] of this._entries) {
       const serialized = typeof value === "string"
         ? value
-        : { name: raw?.filename ?? value?.name ?? "", size: value?.size ?? 0 };
+        : { name: typeof value?.name === "string" ? value.name : "", size: value?.size ?? 0 };
       if (Object.hasOwn(result, key)) {
         if (!Array.isArray(result[key])) result[key] = [result[key]];
         result[key].push(serialized);
@@ -3219,6 +3450,17 @@ export class FormData {
   }
   static from(data, boundary = undefined) {
     let text;
+    const byteLength = data instanceof ArrayBuffer
+      ? data.byteLength
+      : ArrayBuffer.isView(data)
+        ? data.byteLength
+        : data?._bytes instanceof Uint8Array
+          ? data._bytes.byteLength
+          : typeof data === "string" ? data.length : 0;
+    const allocationLimit = globalThis.__cottontailSyntheticAllocationLimit ?? 0x7fffffff;
+    if (byteLength > allocationLimit) {
+      throw new RangeError(`Cannot create a string longer than ${allocationLimit} characters`);
+    }
     if (typeof data === "string") text = data;
     else if (data instanceof ArrayBuffer) text = stringLatin1FromBytes(new Uint8Array(data));
     else if (ArrayBuffer.isView(data)) text = stringLatin1FromBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
@@ -3231,20 +3473,84 @@ export class FormData {
   }
 }
 
+Object.defineProperty(FormData.prototype, Symbol.toStringTag, {
+  value: "FormData",
+  writable: false,
+  enumerable: false,
+  configurable: true,
+});
+
 function stringLatin1FromBytes(bytes) {
   let output = "";
   for (const byte of bytes) output += String.fromCharCode(byte);
   return output;
 }
 
-function formDataEntryValue(entry) {
-  return entry && typeof entry === "object" && Object.hasOwn(entry, "value") && Object.hasOwn(entry, "filename")
-    ? entry.value
-    : entry;
+function isBlobLikeFormValue(value) {
+  return value != null && typeof value === "object" &&
+    typeof value.arrayBuffer === "function" &&
+    (value instanceof Blob || typeof value.stream === "function" || typeof value.text === "function");
+}
+
+function makeFormDataEntry(name, value, filename) {
+  if (typeof name === "symbol") throw new TypeError("FormData field name must be a string");
+  const key = String(name);
+  if (!isBlobLikeFormValue(value)) {
+    if (filename !== undefined) {
+      throw new TypeError("The filename argument can only be used when the value is a Blob or File");
+    }
+    if (typeof value === "symbol") throw new TypeError("FormData field value cannot be a symbol");
+    return [key, String(value)];
+  }
+  if (filename !== undefined) {
+    return [key, formDataFileView(value, String(filename))];
+  }
+  // A Blob keeps its identity (Bun does not wrap it into a File named
+  // "blob"); lazy file refs (Bun.file) become Blob-compatible views.
+  if (value instanceof Blob) return [key, value];
+  return [key, formDataFileView(value, undefined)];
 }
 
 function formDataBoundary(formData) {
-  return formData._boundary ??= `----CottontailFormBoundary${randomBytes(12).toString("hex")}`;
+  // Lowercase so the boundary survives Blob type normalization (which
+  // lowercases MIME types) when a multipart body round-trips through blob().
+  return formData._boundary ??= `----cottontailformboundary${randomBytes(12).toString("hex")}`;
+}
+
+function isURLSearchParamsLike(value) {
+  if (value == null || typeof value !== "object") return false;
+  if (value instanceof URLSearchParams) return true;
+  const GlobalURLSearchParams = globalThis.URLSearchParams;
+  return typeof GlobalURLSearchParams === "function" && value instanceof GlobalURLSearchParams;
+}
+
+// Fill in the fetch-spec default Content-Type for bodies that imply one.
+function setDefaultBodyContentType(headers, body) {
+  if (body == null || headers.has("content-type")) return;
+  if (body instanceof FormData) {
+    headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
+  } else if (isURLSearchParamsLike(body)) {
+    headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
+  } else if (body instanceof Blob && typeof body.type === "string" && body.type !== "") {
+    headers.set("Content-Type", body.type);
+  }
+}
+
+// Bun surfaces missing Bun.file() FormData parts as a synchronous ENOENT when
+// the body is attached to a Response/Request.
+function assertFormDataFilesExist(formData) {
+  for (const [, value] of formData._entries) {
+    const source = value != null && typeof value === "object" && value._source != null ? value._source : value;
+    if (source != null && typeof source === "object" && typeof source._bunFilePath === "string" &&
+        !cottontail.existsSync(source._bunFilePath)) {
+      const error = new Error(`ENOENT: no such file or directory, open '${source._bunFilePath}'`);
+      error.code = "ENOENT";
+      error.errno = -2;
+      error.syscall = "open";
+      error.path = source._bunFilePath;
+      throw error;
+    }
+  }
 }
 
 function escapeMultipartHeader(value) {
@@ -3254,13 +3560,15 @@ function escapeMultipartHeader(value) {
 async function encodeMultipartFormData(formData) {
   const boundary = formDataBoundary(formData);
   const chunks = [];
-  for (const [name, rawEntry] of formData._entries) {
-    const wrapped = rawEntry && typeof rawEntry === "object" && Object.hasOwn(rawEntry, "filename");
-    const value = wrapped ? rawEntry.value : rawEntry;
+  for (const [name, value] of formData._entries) {
+    const isFilePart = typeof value !== "string";
     let header = `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartHeader(name)}"`;
-    if (wrapped) header += `; filename="${escapeMultipartHeader(rawEntry.filename)}"`;
+    if (isFilePart) {
+      const filename = typeof value?.name === "string" && value.name !== "" ? value.name : "blob";
+      header += `; filename="${escapeMultipartHeader(filename)}"`;
+    }
     header += "\r\n";
-    if (wrapped && value?.type) header += `Content-Type: ${value.type}\r\n`;
+    if (isFilePart && value?.type) header += `Content-Type: ${value.type}\r\n`;
     chunks.push(new TextEncoder().encode(`${header}\r\n`));
     chunks.push(await bytesFromBody(value));
     chunks.push(new TextEncoder().encode("\r\n"));
@@ -3283,29 +3591,46 @@ function utf8FromLatin1Text(text) {
 }
 
 async function parseMultipartFormData(body, contentType) {
-  if (/application\/x-www-form-urlencoded/i.test(String(contentType ?? ""))) {
+  const contentTypeText = String(contentType ?? "");
+  if (/application\/x-www-form-urlencoded/i.test(contentTypeText)) {
     const text = stripUtf8BOMText(new TextDecoder().decode(await bytesFromBody(body)));
     const result = new FormData();
     for (const [name, value] of new URLSearchParams(text)) result.append(name, value);
     return result;
   }
-  const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType))?.slice(1).find(Boolean);
-  if (!boundary) return new FormData();
+  if (!/multipart\/form-data/i.test(contentTypeText)) {
+    throw new TypeError("Body cannot be decoded as form data");
+  }
+  const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentTypeText)?.slice(1).find(Boolean);
+  if (!boundary) {
+    throw new TypeError("Missing multipart boundary");
+  }
   const source = new TextDecoder("latin1").decode(await bytesFromBody(body));
   return parseMultipartFormDataText(source, boundary);
 }
 
 function parseMultipartFormDataText(source, boundary) {
   const result = new FormData();
-  for (const rawPart of source.split(`--${boundary}`).slice(1, -1)) {
+  const delimiter = `--${boundary}`;
+  // The body must start with the dash-boundary (no preamble support) and must
+  // contain a closing delimiter; anything else is a parse error.
+  if (!source.startsWith(delimiter)) {
+    throw new TypeError("FormData parse error: missing initial boundary");
+  }
+  const closeIndex = source.indexOf(`${delimiter}--`);
+  if (closeIndex < 0) {
+    throw new TypeError("FormData parse error: missing final boundary");
+  }
+  for (const rawPart of source.slice(0, closeIndex).split(delimiter).slice(1)) {
     const part = rawPart.replace(/^\r\n/, "").replace(/\r\n$/, "");
+    if (part === "") continue;
     const separator = part.indexOf("\r\n\r\n");
-    if (separator < 0) continue;
+    if (separator < 0) throw new TypeError("FormData parse error: expected a part header");
     const headers = part.slice(0, separator);
     const value = part.slice(separator + 4);
     const dispositionLine = /content-disposition:([^\r\n]*)/i.exec(headers)?.[1] ?? "";
     const nameMatch = /\bname=(?:"([^"]*)"|([^;\r\n]+))/i.exec(dispositionLine);
-    if (!nameMatch) continue;
+    if (!nameMatch) throw new TypeError("FormData parse error: invalid Content-Disposition header");
     const fieldName = utf8FromLatin1Text((nameMatch[1] ?? nameMatch[2] ?? "").trim());
     let filename;
     const filenameStar = /\bfilename\*=?\s*(?:utf-8|iso-8859-1)?''([^;\r\n]*)/i.exec(dispositionLine);
@@ -3327,13 +3652,15 @@ function parseMultipartFormDataText(source, boundary) {
 
 export class Request {
   constructor(input, init = {}) {
+    if (init === null || init === undefined) init = {};
+    else if (typeof init !== "object" && typeof init !== "function") {
+      throw new TypeError("Failed to construct 'Request': the second argument must be an object");
+    }
     this.url = typeof input === "string" ? input : String(input?.url ?? input ?? "");
     this.method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     this.headers = new Headers(init.headers ?? input?.headers);
     this._body = init.body ?? input?._body ?? input?.body ?? null;
-    if (this._body instanceof FormData && !this.headers.has("content-type")) {
-      this.headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(this._body)}`);
-    }
+    setDefaultBodyContentType(this.headers, this._body);
     this._bodyStream = undefined;
     this._bodyUsed = false;
     this.params = init.params ?? input?.params ?? {};
@@ -3467,12 +3794,22 @@ function normalizeRequestUrl(value) {
 
 export class Response {
   constructor(body = null, init = {}) {
-    this.status = Number(init.status ?? 200);
+    if (init === null || init === undefined) init = {};
+    else if (typeof init !== "object" && typeof init !== "function") {
+      throw new TypeError("Failed to construct 'Response': the second argument must be an object");
+    }
+    let status = 200;
+    if (init.status !== undefined) {
+      status = Number(init.status);
+      if (!Number.isInteger(status) || status < 100 || status > 999) {
+        throw new RangeError(`The status provided (${init.status}) must be an integer in the range [200, 599]`);
+      }
+    }
+    this.status = status;
     this.statusText = String(init.statusText ?? "");
     this.headers = new Headers(init.headers);
-    if (body instanceof FormData && !this.headers.has("content-type")) {
-      this.headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
-    }
+    setDefaultBodyContentType(this.headers, body);
+    if (body instanceof FormData) assertFormDataFilesExist(body);
     this._body = body;
     this._bodyStream = undefined;
     this._bodyUsed = false;
@@ -3575,6 +3912,46 @@ export class Response {
   get ok() {
     return this.status >= 200 && this.status < 300;
   }
+  [Symbol.for("nodejs.util.inspect.custom")]() {
+    const indentTail = (text) => String(text).split("\n").map((line, index) => (index === 0 ? line : `  ${line}`)).join("\n");
+    const lines = [
+      `ok: ${this.ok}`,
+      `url: ${JSON.stringify(this.url)}`,
+      `status: ${this.status}`,
+      `statusText: ${JSON.stringify(this.statusText)}`,
+      `headers: ${indentTail(this.headers[Symbol.for("nodejs.util.inspect.custom")]())}`,
+      `redirected: ${this.redirected}`,
+      `bodyUsed: ${this.bodyUsed}`,
+    ];
+    const body = this._body;
+    const sizeText = inspectBodyByteSize(body);
+    const prefix = sizeText == null ? "Response" : `Response (${sizeText})`;
+    if (body != null && typeof body[Symbol.for("nodejs.util.inspect.custom")] === "function") {
+      lines.push(indentTail(body[Symbol.for("nodejs.util.inspect.custom")]()));
+    }
+    return `${prefix} {\n${lines.map((line, index) => `  ${line}${index === lines.length - 1 ? "" : ","}`).join("\n")}\n}`;
+  }
+}
+
+// Bun renders body sizes as "N bytes" below 1 KiB and with two decimals in
+// KiB-based units above it.
+function inspectBodyByteSize(body) {
+  let size = null;
+  if (body == null) return null;
+  if (typeof body === "string") size = new TextEncoder().encode(body).byteLength;
+  else if (body instanceof ArrayBuffer) size = body.byteLength;
+  else if (ArrayBuffer.isView(body)) size = body.byteLength;
+  else if (typeof body === "object" && typeof body.size === "number" && Number.isFinite(body.size)) size = body.size;
+  if (size == null) return null;
+  if (size < 1024) return `${size} bytes`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = size;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit += 1;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(2)} ${units[unit]}`;
 }
 
 const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map();
@@ -5030,7 +5407,12 @@ function runServeHandler(options, request, server) {
 
   const route = selectRoute(options.routes, request);
   if (route != null) {
-    const response = typeof route === "function" ? route(request, server) : route;
+    let response = typeof route === "function" ? route(request, server) : route;
+    if (isHtmlAssetRoute(response)) {
+      response = new Response(file(response), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
     const prepared = prepareServeResponseResult(response, request, {
       allowFileFallback: true,
       staticTextContentType: typeof route !== "function",
@@ -5098,10 +5480,17 @@ serve({
 See https://bun.com/docs/api/http for more information.`;
 }
 
+function isHtmlAssetRoute(value) {
+  // HTML imports resolve to their on-disk asset path (cottontail's
+  // representation of Bun's HTMLBundle), e.g. `import app from "./app.html"`.
+  return typeof value === "string" && /\.html?$/i.test(value) && value.includes("/");
+}
+
 function isValidRouteHandler(value) {
   return value === false ||
     typeof value === "function" ||
     value instanceof Response ||
+    isHtmlAssetRoute(value) ||
     (value && typeof value === "object" && typeof value.arrayBuffer === "function");
 }
 
@@ -5202,17 +5591,18 @@ function websocketPayloadBytes(data) {
   return asBuffer(data);
 }
 
-function encodeServerWebSocketFrame(opcode, payload) {
+function encodeServerWebSocketFrame(opcode, payload, rsv1 = false) {
   const body = websocketPayloadBytes(payload);
   const length = body.byteLength;
+  const first = 0x80 | (rsv1 ? 0x40 : 0) | (opcode & 0x0f);
   let header;
   if (length < 126) {
-    header = Buffer.from([0x80 | (opcode & 0x0f), length]);
+    header = Buffer.from([first, length]);
   } else if (length <= 0xffff) {
-    header = Buffer.from([0x80 | (opcode & 0x0f), 126, (length >> 8) & 0xff, length & 0xff]);
+    header = Buffer.from([first, 126, (length >> 8) & 0xff, length & 0xff]);
   } else {
     header = Buffer.alloc(10);
-    header[0] = 0x80 | (opcode & 0x0f);
+    header[0] = first;
     header[1] = 127;
     let big = BigInt(length);
     for (let index = 9; index >= 2; index -= 1) {
@@ -5231,6 +5621,9 @@ function decodeWebSocketFrames(buffer) {
     const first = buffer[offset++];
     const second = buffer[offset++];
     const fin = (first & 0x80) !== 0;
+    const rsv1 = (first & 0x40) !== 0;
+    const rsv2 = (first & 0x20) !== 0;
+    const rsv3 = (first & 0x10) !== 0;
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
     let length = second & 0x7f;
@@ -5255,7 +5648,7 @@ function decodeWebSocketFrames(buffer) {
     if (mask) {
       for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
     }
-    frames.push({ fin, opcode, payload });
+    frames.push({ fin, rsv1, rsv2, rsv3, opcode, payload });
   }
   return { frames, remaining: buffer.subarray(offset) };
 }
@@ -5284,11 +5677,20 @@ function assertWebSocketCompressFlag(compress, name) {
   }
 }
 
-function sendServerWebSocketFrame(state, opcode, data) {
+function sendServerWebSocketFrame(state, opcode, data, compress = false) {
   if (state.readyState !== 1) return 0;
   const socket = state.socket;
   if (!socket || socket.destroyed || !socket.writable) return 0;
-  const payload = websocketPayloadBytes(data);
+  let payload = websocketPayloadBytes(data);
+  // RFC 6455 5.5: control frame payloads are limited to 125 bytes. Bun's
+  // native server truncates instead of erroring.
+  if (opcode >= 0x8 && payload.byteLength > 125) payload = payload.subarray(0, 125);
+  const originalLength = payload.byteLength;
+  let rsv1 = false;
+  if (compress === true && state.deflate != null && opcode <= 0x2 && payload.byteLength > 0) {
+    payload = nodeHttp.websocketDeflateCompress(payload, state.deflate.serverWindowBits);
+    rsv1 = true;
+  }
   const limit = state.config.backpressureLimit;
   if (state.wantDrain) return 0;
   if (socket.writableLength > limit) {
@@ -5296,7 +5698,7 @@ function sendServerWebSocketFrame(state, opcode, data) {
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
   }
-  const frame = encodeServerWebSocketFrame(opcode, payload);
+  const frame = encodeServerWebSocketFrame(opcode, payload, rsv1);
   const ok = socket.write(frame, () => {
     if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
   });
@@ -5305,7 +5707,7 @@ function sendServerWebSocketFrame(state, opcode, data) {
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
   }
-  return payload.byteLength;
+  return originalLength;
 }
 
 function scheduleServerWebSocketDrain(state) {
@@ -5423,17 +5825,17 @@ class ServerWebSocket {
 
   send(data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "send");
-    return sendServerWebSocketFrame(this._state, typeof data === "string" ? 0x1 : 0x2, data);
+    return sendServerWebSocketFrame(this._state, typeof data === "string" ? 0x1 : 0x2, data, compress);
   }
 
   sendText(data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "sendText");
-    return sendServerWebSocketFrame(this._state, 0x1, String(data));
+    return sendServerWebSocketFrame(this._state, 0x1, String(data), compress);
   }
 
   sendBinary(data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "sendBinary");
-    return sendServerWebSocketFrame(this._state, 0x2, data);
+    return sendServerWebSocketFrame(this._state, 0x2, data, compress);
   }
 
   ping(data = undefined) {
@@ -5511,18 +5913,20 @@ class ServerWebSocket {
   unref() {}
 }
 
-function attachServerWebSocket(serverState, socket, head, data) {
+function attachServerWebSocket(serverState, socket, head, data, deflate = null) {
   const websocketOptions = serverState.getWebSocketOptions() ?? {};
   const state = {
     serverState,
     socket,
     data,
+    deflate,
     readyState: 1,
     binaryType: "nodebuffer",
     topics: new Set(),
     buffer: Buffer.alloc(0),
     fragments: [],
     fragmentOpcode: 0,
+    fragmentCompressed: false,
     wantDrain: false,
     finalized: false,
     remoteAddress: socket.remoteAddress,
@@ -5563,8 +5967,13 @@ function attachServerWebSocket(serverState, socket, head, data) {
       return;
     }
     if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+      if (frame.rsv1 && state.deflate == null) {
+        closeServerWebSocket(state, 1002, "Unexpected compressed frame");
+        return;
+      }
       state.fragmentOpcode = frame.opcode;
       state.fragments = [frame.payload];
+      state.fragmentCompressed = frame.rsv1 === true;
     } else if (frame.opcode === 0x0 && state.fragmentOpcode) {
       state.fragments.push(frame.payload);
     } else {
@@ -5576,10 +5985,21 @@ function attachServerWebSocket(serverState, socket, head, data) {
       return;
     }
     if (!frame.fin) return;
-    const payload = state.fragments.length === 1 ? state.fragments[0] : Buffer.concat(state.fragments);
+    let payload = state.fragments.length === 1 ? state.fragments[0] : Buffer.concat(state.fragments);
     const opcode = state.fragmentOpcode;
+    const compressed = state.fragmentCompressed;
     state.fragments = [];
     state.fragmentOpcode = 0;
+    state.fragmentCompressed = false;
+    if (compressed) {
+      try {
+        payload = nodeHttp.websocketDeflateDecompress(payload, state.config.maxPayloadLength);
+      } catch (error) {
+        if (error?.code === "WS_MESSAGE_TOO_BIG") closeServerWebSocket(state, 1009, "Message too big");
+        else closeServerWebSocket(state, 1007, "Invalid compressed data");
+        return;
+      }
+    }
     const message = opcode === 0x1 ? payload.toString("utf8") : convertWebSocketBinary(state, payload);
     invokeWebSocketHandler(state, "message", ws, message);
   };
@@ -5727,43 +6147,28 @@ function encodeMaskedWebSocketFrame(opcode, data) {
 
   const originalHandleFrame = proto._handleFrame;
   proto._handleFrame = function (frame) {
-    if (frame.opcode >= 0x8 && (frame.payload.byteLength > 125 || !frame.fin)) {
-      // RFC 6455 5.5: control frames must not be fragmented or exceed 125
-      // bytes; treat violations as protocol errors.
-      this._fail?.(new Error("Invalid control frame"));
-      return;
-    }
-    if (frame.opcode === 0x9) {
-      if (this.readyState === 1) {
-        try { this._socket?.write?.(encodeMaskedWebSocketFrame(0xA, frame.payload)); } catch {}
-      }
+    const validControl = frame.fin && frame.payload.byteLength <= 125 && !frame.rsv1 && !frame.rsv2 && !frame.rsv3;
+    // The base implementation performs reassembly, permessage-deflate
+    // inflation, control-frame validation, and the pong reply for pings.
+    const result = originalHandleFrame.call(this, frame);
+    if (frame.opcode === 0x9 && validControl) {
       this.dispatchEvent?.({ type: "ping", data: convertClientBinary(this, frame.payload), target: this });
-      return;
-    }
-    if (frame.opcode === 0xA) {
+    } else if (frame.opcode === 0xA && validControl) {
       this.dispatchEvent?.({ type: "pong", data: convertClientBinary(this, frame.payload), target: this });
-      return;
     }
-    if ((frame.opcode === 0x2 || (frame.opcode === 0x0 && this._fragmentOpcode === 0x2)) && frame.fin &&
-        this.binaryType !== "arraybuffer") {
-      // Deliver binary messages per Bun's binaryType semantics (the base
-      // implementation only understands "arraybuffer" vs Buffer).
-      const payload = this._fragments && this._fragments.length > 0 && frame.opcode === 0x0
-        ? Buffer.concat([...this._fragments, frame.payload])
-        : frame.payload;
-      if (frame.opcode === 0x0) {
-        this._fragments = [];
-        this._fragmentOpcode = 0;
-      }
-      const MessageEventClass = globalThis.MessageEvent ?? nodeHttp.MessageEvent;
-      this.dispatchEvent(new MessageEventClass("message", {
-        data: convertClientBinary(this, payload),
-        origin: this.url,
-        source: this,
-      }));
-      return;
-    }
-    return originalHandleFrame.call(this, frame);
+    return result;
+  };
+
+  // Deliver messages per Bun's binaryType semantics (the base implementation
+  // only understands "arraybuffer" vs Buffer).
+  proto._deliverMessage = function (opcode, payload) {
+    const MessageEventClass = globalThis.MessageEvent ?? nodeHttp.MessageEvent;
+    const data = opcode === 0x1 ? payload.toString("utf8") : convertClientBinary(this, payload);
+    this.dispatchEvent(new MessageEventClass("message", {
+      data,
+      origin: this.url,
+      source: this,
+    }));
   };
 })();
 
@@ -5784,8 +6189,16 @@ function serveTlsMaterialText(value, name) {
 }
 
 function assertValidServePem(text, name) {
+  const value = String(text ?? "");
+  if (!value.includes("-----BEGIN ")) {
+    // BoringSSL reports PEM material without a BEGIN line as NO_START_LINE;
+    // Bun surfaces that reason string directly.
+    throw new TypeError(
+      `Invalid ${name} in Bun.serve() TLS options: BoringSSL error:0900006e:PEM routines:OPENSSL_internal:NO_START_LINE`,
+    );
+  }
   const pattern = /-----BEGIN [A-Z0-9 ]+-----[A-Za-z0-9+/=\r\n]+-----END [A-Z0-9 ]+-----/;
-  if (!pattern.test(String(text ?? ""))) {
+  if (!pattern.test(value)) {
     throw new TypeError(`Invalid ${name} in Bun.serve() TLS options`);
   }
 }
@@ -5920,9 +6333,22 @@ function serveNodeBacked(options, context) {
     nodeServer = new nodeHttp.Server();
     nodeServer.on("error", () => {});
     const listenHost = hostname === "localhost" ? "127.0.0.1" : hostname;
-    nodeServer.listen(isUnix
-      ? { path: unixPath }
-      : { host: listenHost, port: defaultServePort(options), family: listenHost.includes(":") ? 6 : 4 });
+    try {
+      nodeServer.listen(isUnix
+        ? { path: unixPath }
+        : { host: listenHost, port: defaultServePort(options), family: listenHost.includes(":") ? 6 : 4 });
+    } catch (rawError) {
+      if (rawError instanceof Error) throw rawError;
+      const reason = String(rawError);
+      const error = new Error(
+        isUnix
+          ? `Failed to listen on unix socket ${unixPath}: ${reason}`
+          : `Failed to start server. ${reason}`,
+      );
+      if (/assign requested address/i.test(reason)) error.code = "EADDRNOTAVAIL";
+      else if (/in use/i.test(reason)) error.code = "EADDRINUSE";
+      throw error;
+    }
     if (!nodeServer._native?.listening) {
       const requestedPort = defaultServePort(options);
       const error = new Error(
@@ -6031,7 +6457,8 @@ function serveNodeBacked(options, context) {
       const key = request.headers.get("sec-websocket-key");
       const upgradeName = String(request.headers.get("upgrade") ?? "").toLowerCase();
       if (!key || upgradeName !== "websocket") return false;
-      if (serverState.getWebSocketOptions() == null) return false;
+      const websocketOptions = serverState.getWebSocketOptions();
+      if (websocketOptions == null) return false;
       ctx.used = true;
       const lines = [
         "HTTP/1.1 101 Switching Protocols",
@@ -6054,13 +6481,50 @@ function serveNodeBacked(options, context) {
         const requestedProtocol = request.headers.get("sec-websocket-protocol");
         if (requestedProtocol) lines.push(`Sec-WebSocket-Protocol: ${requestedProtocol.split(",")[0].trim()}`);
       }
+      // RFC 7692: negotiate permessage-deflate when enabled on the server
+      // and offered by the client. Compression state is stateless per
+      // message, so both no-context-takeover parameters are selected.
+      let deflate = null;
+      const offeredExtensions = nodeHttp.parseWebSocketExtensions(request.headers.get("sec-websocket-extensions") ?? "");
+      const clientOffer = offeredExtensions.find((extension) => extension.name === "permessage-deflate");
+      if (websocketOptions.perMessageDeflate && clientOffer != null) {
+        if (seen.has("sec-websocket-extensions")) {
+          // The caller supplied an explicit extensions response header; honor
+          // it and enable compression if it accepts permessage-deflate.
+          const explicit = [];
+          if (extraHeaders != null) {
+            const entries = typeof extraHeaders.entries === "function"
+              ? extraHeaders.entries()
+              : Object.entries(extraHeaders);
+            for (const [name, value] of entries) {
+              if (String(name).toLowerCase() === "sec-websocket-extensions") explicit.push(String(value));
+            }
+          }
+          const accepted = nodeHttp.parseWebSocketExtensions(explicit.join(", "))
+            .find((extension) => extension.name === "permessage-deflate");
+          if (accepted != null) deflate = { serverWindowBits: 15 };
+        } else {
+          const params = ["permessage-deflate", "client_no_context_takeover", "server_no_context_takeover"];
+          let serverWindowBits = 15;
+          const requestedServerBits = clientOffer.params["server_max_window_bits"];
+          if (requestedServerBits != null && requestedServerBits !== true) {
+            const bits = Number(requestedServerBits);
+            if (Number.isInteger(bits) && bits >= 8 && bits <= 15) {
+              serverWindowBits = bits;
+              params.push(`server_max_window_bits=${bits}`);
+            }
+          }
+          lines.push(`Sec-WebSocket-Extensions: ${params.join("; ")}`);
+          deflate = { serverWindowBits };
+        }
+      }
       lines.push("", "");
       try {
         ctx.socket.write(lines.join("\r\n"));
       } catch {
         return false;
       }
-      attachServerWebSocket(serverState, ctx.socket, ctx.head, upgradeOptions?.data);
+      attachServerWebSocket(serverState, ctx.socket, ctx.head, upgradeOptions?.data, deflate);
       return true;
     },
     publish(topic, data, compress = undefined) {
@@ -6234,7 +6698,21 @@ export function serve(options = {}) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs });
   }
 
-  const native = cottontail.httpServerStart(hostname, defaultServePort(options), unixPath || undefined);
+  let native;
+  try {
+    native = cottontail.httpServerStart(hostname, defaultServePort(options), unixPath || undefined);
+  } catch (rawError) {
+    if (rawError instanceof Error) throw rawError;
+    const reason = String(rawError);
+    const error = new Error(
+      unixPath
+        ? `Failed to listen on unix socket ${unixPath}: ${reason}`
+        : `Failed to start server. ${reason}`,
+    );
+    if (/assign requested address/i.test(reason)) error.code = "EADDRNOTAVAIL";
+    else if (/in use/i.test(reason)) error.code = "EADDRINUSE";
+    throw error;
+  }
   const isUnix = unixPath.length > 0;
   const nativeDisplayHostname = String(native.hostname ?? hostname).includes(":") && !String(native.hostname ?? hostname).startsWith("[")
     ? `[${native.hostname}]`
@@ -6698,6 +7176,9 @@ function guessMimeType(path) {
   if (lower.endsWith(".html")) return "text/html";
   if (lower.endsWith(".txt")) return "text/plain;charset=utf-8";
   if (lower.endsWith(".js") || lower.endsWith(".mjs")) return "text/javascript";
+  if (lower.endsWith(".ts") || lower.endsWith(".tsx") || lower.endsWith(".mts") || lower.endsWith(".cts") || lower.endsWith(".jsx")) {
+    return "text/javascript;charset=utf-8";
+  }
   if (lower.endsWith(".css")) return "text/css;charset=utf-8";
   if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "text/markdown";
   if (lower.endsWith(".json")) return "application/json";
@@ -6733,12 +7214,32 @@ export function file(path, options = undefined) {
     cachedSize = size;
     return cachedBytes;
   };
+  const readRange = (start, end) => {
+    const length = Math.max(0, end - start);
+    if (length === 0) return new Uint8Array(0);
+    const bytes = new Uint8Array(length);
+    const fd = cottontail.openFd(String(filePath), "r");
+    let totalRead = 0;
+    try {
+      while (totalRead < length) {
+        const count = Number(cottontail.fdReadAt(fd, bytes, totalRead, length - totalRead, start + totalRead));
+        if (!(count > 0)) break;
+        totalRead += count;
+      }
+    } finally {
+      cottontail.closeFd(fd);
+    }
+    return totalRead === length ? bytes : bytes.slice(0, totalRead);
+  };
   const result = {
     name: isFd ? "" : String(filePath),
     fd: isFd ? filePath : undefined,
     type: options?.type != null ? String(options.type) : (isFd ? "" : guessMimeType(filePath)),
     [Symbol.for("nodejs.util.inspect.custom")]() {
-      return isFd ? `FileRef (fd: ${filePath}) {}` : `FileRef ("${String(filePath)}") {}`;
+      const label = isFd ? `FileRef (fd: ${filePath})` : `FileRef ("${String(filePath)}")`;
+      const type = this.type;
+      if (!type) return `${label} {}`;
+      return `${label} {\n  type: ${JSON.stringify(String(type))}\n}`;
     },
     get size() {
       if (isFd) {
@@ -6848,10 +7349,9 @@ export function file(path, options = undefined) {
     },
     slice(start = 0, end = this.size, type = "") {
       if (isFd) throw new TypeError("Cannot slice Bun.file(fd)");
-      const bytes = readBytes();
       const rangeStart = Math.max(0, Number(start) || 0);
-      const rangeEnd = Math.max(rangeStart, Number(end) || 0);
-      const blob = new Blob([bytes.slice(rangeStart, rangeEnd)], { type: String(type || this.type || "") });
+      const rangeEnd = Math.min(this.size, Math.max(rangeStart, Number(end) || 0));
+      const blob = new Blob([readRange(rangeStart, rangeEnd)], { type: String(type || this.type || "") });
       Object.defineProperties(blob, {
         _bunFilePath: { value: String(filePath), configurable: true },
         _bunFileStart: { value: rangeStart, configurable: true },
@@ -6917,6 +7417,7 @@ export function file(path, options = undefined) {
       configurable: true,
     });
   }
+  Object.setPrototypeOf(result, Blob.prototype);
   return result;
 }
 
@@ -7109,10 +7610,6 @@ function normalizeCryptoHasherAlgorithm(algorithm) {
   return normalized;
 }
 
-function bunHashName(algorithm) {
-  if (algorithm === "blake2b256") return "blake2b512";
-  return algorithm;
-}
 
 function cryptoHasherBytes(data, encoding = undefined) {
   if (arguments.length === 0 || data == null) throw new TypeError("CryptoHasher update requires data");
@@ -7121,6 +7618,16 @@ function cryptoHasherBytes(data, encoding = undefined) {
 }
 
 function encodeCryptoDigest(bytes, encoding) {
+  if (encoding != null && typeof encoding === "object" && (ArrayBuffer.isView(encoding) || encoding instanceof ArrayBuffer)) {
+    const target = encoding instanceof ArrayBuffer
+      ? new Uint8Array(encoding)
+      : new Uint8Array(encoding.buffer, encoding.byteOffset, encoding.byteLength);
+    if (target.byteLength < bytes.length) {
+      throw new TypeError(`TypedArray must be at least ${bytes.length} bytes`);
+    }
+    target.set(bytes);
+    return encoding;
+  }
   if (encoding == null || encoding === "buffer") return globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes;
   if (encoding === "base64url") {
     const base64 = globalThis.Buffer?.from ? globalThis.Buffer.from(bytes).toString("base64") : btoa(String.fromCharCode(...bytes));
@@ -7130,10 +7637,9 @@ function encodeCryptoDigest(bytes, encoding) {
 }
 
 function nodeDigest(algorithm, chunks, encoding = undefined, key = undefined) {
-  const hash = key === undefined ? createHash(bunHashName(algorithm)) : createHmac(bunHashName(algorithm), key);
+  const hash = key === undefined ? createHash(algorithm) : createHmac(algorithm, key);
   for (const chunk of chunks) hash.update(chunk);
-  let output = hash.digest();
-  if (algorithm === "blake2b256") output = output.subarray(0, 32);
+  const output = hash.digest();
   return encodeCryptoDigest(output, encoding);
 }
 
@@ -7200,6 +7706,33 @@ export class CryptoHasher {
   }
 }
 
+Object.defineProperty(CryptoHasher, "algorithms", {
+  value: Object.freeze([
+    "blake2b256",
+    "blake2b512",
+    "blake2s256",
+    "md4",
+    "md5",
+    "ripemd160",
+    "sha1",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sha512-224",
+    "sha512-256",
+    "sha3-224",
+    "sha3-256",
+    "sha3-384",
+    "sha3-512",
+    "shake128",
+    "shake256",
+  ]),
+  writable: false,
+  enumerable: true,
+  configurable: true,
+});
+
 function hashClass(algorithm) {
   return class BunHash {
     constructor() {
@@ -7209,15 +7742,38 @@ function hashClass(algorithm) {
       return this._hasher.byteLength;
     }
     update(data, encoding = undefined) {
-      if (this._hasher._finished) throw new Error(`${this.constructor.name} hasher already digested, create a new instance to update`);
+      if (this._finished) throw new Error(`${this.constructor.name} hasher already digested, create a new instance to update`);
       this._hasher.update(data, encoding);
       return this;
     }
     digest(encoding = undefined) {
-      if (this._hasher._finished) throw new Error(`${this.constructor.name} hasher already digested, create a new instance to digest again`);
+      if (this._finished) throw new Error(`${this.constructor.name} hasher already digested, create a new instance to digest again`);
+      this._finished = true;
       return this._hasher.digest(encoding);
     }
     static hash(data, encoding = undefined) {
+      // Fast path for the overwhelmingly common one-shot case: hash a
+      // string/typed-array directly through the native digest without
+      // building CryptoHasher/node Hash instances.
+      if (
+        typeof cottontail?.cryptoHashSync === "function" &&
+        (typeof data === "string" || ArrayBuffer.isView(data) || data instanceof ArrayBuffer) &&
+        (encoding === undefined || encoding === "hex" || encoding === "base64")
+      ) {
+        try {
+          const bytes = typeof data === "string" ? asBuffer(data) : data;
+          if (encoding === "hex") {
+            const hex = cottontail.cryptoHashSync(algorithm, bytes, undefined, "hex");
+            if (typeof hex === "string") return hex;
+            return globalThis.Buffer.from(hex).toString("hex");
+          }
+          const digest = globalThis.Buffer.from(cottontail.cryptoHashSync(algorithm, bytes));
+          if (encoding === undefined) return digest;
+          return digest.toString(encoding);
+        } catch {
+          // fall through to the generic implementation
+        }
+      }
       return CryptoHasher.hash(algorithm, data, encoding);
     }
   };
@@ -7268,6 +7824,11 @@ export const isMainThread = cottontail.isWorker?.() !== true;
 export const version = "0.0.0-cottontail";
 export const revision = "cottontail";
 export const version_with_sha = `${version} (${revision})`;
+if (globalThis.process) {
+  globalThis.process.versions ??= {};
+  globalThis.process.versions.bun = version;
+  globalThis.process.revision = revision;
+}
 // Bun.stdin is a BunFile-like object (upstream: a lazy Blob over fd 0) with
 // stream()/text()/json()/bytes()/arrayBuffer(). process.stdin is a real node
 // Readable now, so wrap it rather than exposing it directly.
@@ -7329,7 +7890,7 @@ export const stdin = {
 };
 export const stdout = globalThis.process?.stdout;
 export const stderr = globalThis.process?.stderr;
-export const SQL = SQLiteDatabase;
+export { SQL };
 export const sql = SQLiteDatabase;
 export function jest(_source = undefined) {
   return bunTestModule.default ?? bunTestModule;
@@ -7353,7 +7914,9 @@ export function sleepSync(ms) {
 }
 
 export function nanoseconds() {
-  return globalThis.process?.hrtime?.bigint?.() ?? BigInt(Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000));
+  // Bun.nanoseconds() returns a number (not a bigint): ns since process start.
+  const bigintNs = globalThis.process?.hrtime?.bigint?.();
+  return bigintNs != null ? Number(bigintNs) : Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000);
 }
 
 function bunForceGc() {
@@ -7374,26 +7937,110 @@ function bunInspectIsPlainObject(value) {
 // two-space indent, trailing commas, and double-quoted strings; arrays of
 // short simple values stay inline. Values outside these shapes fall back to
 // util.inspect.
-function bunStyleInspect(value, options, indent, seen, depth) {
-  if (typeof value === "string") return bunInspectQuote(value);
-  if (typeof value === "bigint") return `${value}n`;
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean" || typeof value === "symbol") {
-    return String(value);
+//
+// Signature (matches real bun): Bun.inspect(value, optionsOrDepth?, colors?)
+// - a non-null object 2nd arg is an options bag ({ colors, depth, compact,
+//   sorted, ... }); the 3rd arg is ignored in that case.
+// - a numeric 2nd arg is a depth; the truthiness of the 3rd arg enables colors.
+// Depth defaults to 8; objects nested deeper print as "[Object ...]" while
+// arrays/Sets/Maps keep printing at any depth (matching real bun).
+const bunInspectIdentifierRe = /^[A-Za-z_$][\w$]*$/;
+
+function bunInspectValidateDepth(depth) {
+  if (typeof depth !== "number") return 8;
+  if (!Number.isInteger(depth) && depth !== Infinity) {
+    throw new TypeError(`expected depth to be an integer, got ${depth}`);
   }
+  if (depth < 0) {
+    throw new TypeError(`expected depth to be greater than or equal to 0, got ${depth}`);
+  }
+  return depth;
+}
+
+function bunInspectNormalizeOptions(arg2, arg3) {
+  const ctx = { colors: false, compact: false, maxDepth: 8, userOptions: null };
+  if (arg2 !== null && typeof arg2 === "object") {
+    ctx.userOptions = arg2;
+    ctx.colors = !!arg2.colors;
+    ctx.compact = arg2.compact === true;
+    ctx.maxDepth = bunInspectValidateDepth(arg2.depth);
+  } else {
+    if (typeof arg2 === "number") ctx.maxDepth = bunInspectValidateDepth(arg2);
+    ctx.colors = !!arg3;
+  }
+  return ctx;
+}
+
+function bunInspectNodeOptions(ctx, depth) {
+  const remaining = ctx.maxDepth === Infinity ? Infinity : ctx.maxDepth - depth;
+  const nodeOptions = ctx.userOptions ? { ...ctx.userOptions } : {};
+  delete nodeOptions.compact;
+  nodeOptions.colors = ctx.colors;
+  nodeOptions.depth = remaining;
+  return nodeOptions;
+}
+
+// Colors mirror real bun's escape sequences closely enough that stripping the
+// ANSI codes yields exactly the colorless output.
+function bunInspectStyle(text, code, ctx) {
+  if (!ctx.colors) return text;
+  return `[0m[${code}m${text}[0m`;
+}
+
+function bunInspectKeyPrefix(printedKey, ctx) {
+  if (!ctx.colors) return `${printedKey}: `;
+  return `[0m${printedKey}[2m:[0m `;
+}
+
+function bunInspectComma(ctx) {
+  return ctx.colors ? `[0m[2m,[0m` : ",";
+}
+
+function bunInspectCustomOptions(ctx) {
+  const options = ctx.userOptions ? { ...ctx.userOptions } : {};
+  options.colors = ctx.colors;
+  options.depth = ctx.maxDepth;
+  options.stylize = (text, style) => {
+    if (!ctx.colors) return String(text);
+    const colors = { boolean: 33, number: 33, bigint: 33, string: 32, symbol: 32 };
+    const code = colors[style];
+    return code == null ? String(text) : `[${code}m${text}[39m`;
+  };
+  return options;
+}
+
+function bunStyleInspect(value, ctx, indent, seen, depth) {
+  if (typeof value === "string") return bunInspectStyle(bunInspectQuote(value), 32, ctx);
+  if (typeof value === "bigint") return bunInspectStyle(`${value}n`, 33, ctx);
+  if (typeof value === "number" || typeof value === "boolean") {
+    return bunInspectStyle(String(value), 33, ctx);
+  }
+  if (value === null) return bunInspectStyle("null", 33, ctx);
+  if (value === undefined) return bunInspectStyle("undefined", 2, ctx);
+  if (typeof value === "symbol") return bunInspectStyle(String(value), 34, ctx);
   if (typeof value === "function") {
-    return nodeInspect(value, options);
+    return nodeInspect(value, bunInspectNodeOptions(ctx, depth));
   }
   if (seen.has(value)) return "[Circular]";
-  if (depth > 8) return nodeInspect(value, options);
+  const custom = value?.[ctInspectSymbol];
+  if (typeof custom === "function" && custom !== nodeInspect) {
+    const remaining = ctx.maxDepth === Infinity ? Infinity : ctx.maxDepth - depth;
+    const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), nodeInspect);
+    if (result !== value) {
+      return typeof result === "string" ? result : bunStyleInspect(result, ctx, indent, seen, depth);
+    }
+  }
+  const comma = bunInspectComma(ctx);
   const nested = `${indent}  `;
   if (Array.isArray(value)) {
     if (value.length === 0) return "[]";
     seen.add(value);
     try {
-      const items = value.map((item) => bunStyleInspect(item, options, nested, seen, depth + 1));
-      const inline = `[ ${items.join(", ")} ]`;
+      const items = value.map((item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
+      const inline = `[ ${items.join(`${comma} `)} ]`;
+      if (ctx.compact) return inline;
       if (!inline.includes("\n") && inline.length <= 72) return inline;
-      return `[\n${items.map((item) => `${nested}${item},`).join("\n")}\n${indent}]`;
+      return `[\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}]`;
     } finally {
       seen.delete(value);
     }
@@ -7402,8 +8049,9 @@ function bunStyleInspect(value, options, indent, seen, depth) {
     if (value.size === 0) return "Set {}";
     seen.add(value);
     try {
-      const items = [...value].map((item) => `${nested}${bunStyleInspect(item, options, nested, seen, depth + 1)},`);
-      return `Set(${value.size}) {\n${items.join("\n")}\n${indent}}`;
+      const items = [...value].map((item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
+      if (ctx.compact) return `Set(${value.size}) { ${items.join(`${comma} `)} }`;
+      return `Set(${value.size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
@@ -7412,34 +8060,64 @@ function bunStyleInspect(value, options, indent, seen, depth) {
     if (value.size === 0) return "Map {}";
     seen.add(value);
     try {
-      const items = [...value].map(([key, item]) =>
-        `${nested}${bunStyleInspect(key, options, nested, seen, depth + 1)}: ${bunStyleInspect(item, options, nested, seen, depth + 1)},`);
-      return `Map(${value.size}) {\n${items.join("\n")}\n${indent}}`;
+      const items = [...value].map(([key, item]) => {
+        const renderedKey = bunStyleInspect(key, ctx, nested, seen, depth + 1);
+        const renderedValue = bunStyleInspect(item, ctx, nested, seen, depth + 1);
+        return `${renderedKey}: ${renderedValue}`;
+      });
+      if (ctx.compact) return `Map(${value.size}) { ${items.join(`${comma} `)} }`;
+      return `Map(${value.size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
+    } finally {
+      seen.delete(value);
+    }
+  }
+  if (value instanceof Error && typeof value[ctInspectSymbol] !== "function") {
+    const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
+    if (errorKeys.length === 0) return nodeInspect(value, bunInspectNodeOptions(ctx, depth));
+    seen.add(value);
+    try {
+      const header =
+        typeof value.stack === "string" && value.stack.length > 0
+          ? value.stack
+          : `${value.name || "Error"}: ${value.message}`;
+      const entries = errorKeys.map((key) => {
+        const printedKey = bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key);
+        const rendered = bunStyleInspect(value[key], ctx, nested, seen, depth + 1);
+        return `${nested}${bunInspectKeyPrefix(printedKey, ctx)}${rendered}${comma}`;
+      });
+      return `${header} {\n${entries.join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
   }
   if (bunInspectIsPlainObject(value)) {
-    const keys = Reflect.ownKeys(value).filter((key) => typeof key === "string");
-    if (keys.length === 0 && Object.getOwnPropertySymbols(value).length === 0) return "{}";
+    if (depth > ctx.maxDepth) return "[Object ...]";
+    const keys = Reflect.ownKeys(value).filter((key) => {
+      if (!Object.prototype.propertyIsEnumerable.call(value, key)) return false;
+      return key !== ctInspectSymbol || typeof value[key] !== "function";
+    });
+    if (keys.length === 0) return "{}";
     seen.add(value);
     try {
-      const identifier = /^[A-Za-z_$][\w$]*$/;
       const entries = keys.map((key) => {
-        const rendered = bunStyleInspect(value[key], options, nested, seen, depth + 1);
-        return `${nested}${identifier.test(key) ? key : bunInspectQuote(key)}: ${rendered},`;
+        const printedKey = typeof key === "symbol"
+          ? `[${String(key)}]`
+          : (bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key));
+        const rendered = bunStyleInspect(value[key], ctx, nested, seen, depth + 1);
+        return `${bunInspectKeyPrefix(printedKey, ctx)}${rendered}`;
       });
-      if (entries.length === 0) return nodeInspect(value, options);
-      return `{\n${entries.join("\n")}\n${indent}}`;
+      if (ctx.compact) return `{ ${entries.join(`${comma} `)} }`;
+      return `{\n${entries.map((entry) => `${nested}${entry}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
   }
-  return nodeInspect(value, options);
+  return nodeInspect(value, bunInspectNodeOptions(ctx, depth));
 }
 
-export function inspect(value, options = undefined) {
-  return bunStyleInspect(value, options, "", new Set(), 0);
+export function inspect(value, options = undefined, colorsArg = undefined) {
+  const ctx = bunInspectNormalizeOptions(options, colorsArg);
+  return bunStyleInspect(value, ctx, "", new Set(), 0);
 }
 
 inspect.table = function table(value, properties = undefined, options = undefined) {
@@ -8104,18 +8782,20 @@ function resolvePackageImportsSync(specifier, from) {
 }
 
 export function resolveSync(specifier, from = cottontail.cwd()) {
-  if (String(specifier).startsWith("node:")) return String(specifier);
-  if (["fs", "path", "crypto", "http", "https", "net", "tls", "zlib", "dns"].includes(String(specifier))) {
-    return `node:${specifier}`;
-  }
-  if (String(specifier).startsWith("#")) {
-    return resolvePackageImportsSync(String(specifier), from);
-  }
-  if (String(specifier).startsWith(".") || String(specifier).startsWith("/")) {
-    const base = String(from).replace(/\/[^/]*$/, "");
-    return pathJoin(String(specifier).startsWith("/") ? "" : base, String(specifier));
-  }
-  return String(specifier);
+  if (arguments.length === 0) throw new TypeError("Bun.resolveSync expects a specifier");
+  const text = String(specifier);
+  if (text.startsWith("#")) return resolvePackageImportsSync(text, from);
+
+  let base = String(from ?? cottontail.cwd());
+  if (base.startsWith("file:")) base = nodeFileURLToPath(base);
+  try {
+    if (cottontail.statSync(base, true)?.isDirectory) base = pathJoin(base, "package.json");
+  } catch {}
+
+  const resolved = nodeResolveFilename(text, { filename: base });
+  if (resolved.startsWith("node:") || resolved.startsWith("bun:")) return resolved;
+  if (nodeIsBuiltin(resolved)) return resolved === "bun" ? resolved : `node:${resolved}`;
+  return resolved;
 }
 
 export function resolve(specifier, from = cottontail.cwd()) {
@@ -8600,7 +9280,10 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
 
 function normalizeBunSocketOptions(options) {
   if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
-  const unix = options.unix ? coerceServeOptionString(options.unix, "unix") : "";
+  let unix = options.unix ? coerceServeOptionString(options.unix, "unix") : "";
+  // Bun accepts unix:// URLs (e.g. server.url.toString()) as unix socket paths.
+  if (unix.startsWith("unix://")) unix = unix.slice("unix://".length);
+  else if (unix.startsWith("unix:")) unix = unix.slice("unix:".length);
   if (unix.includes("\0")) throw new TypeError("unix must not contain NUL bytes");
   const suppliedHostname = options.hostname ? coerceServeOptionString(options.hostname, "hostname") : "";
   if (unix && suppliedHostname) throw new TypeError("Cannot specify both unix and hostname");
@@ -10151,10 +10834,28 @@ export class HTMLRewriter {
     this._elementHandlers.push({ selector: String(selector), handlers });
     return this;
   }
-  onDocument() { return this; }
+  onDocument(handlers) {
+    if (handlers === null || typeof handlers !== "object") {
+      throw new TypeError("Expected object");
+    }
+    for (const name of ["doctype", "comments", "text", "end"]) {
+      if (handlers[name] != null && typeof handlers[name] !== "function") {
+        throw new TypeError(`${name} must be a function`);
+      }
+    }
+    this._documentHandlers.push(handlers);
+    return this;
+  }
   transform(response) {
     if (response === null || response === undefined) {
       throw new TypeError("Expected Response or Body");
+    }
+    if (typeof response === "string") return this._transformText(response);
+    if (response instanceof ArrayBuffer || ArrayBuffer.isView(response)) {
+      const bytes = response instanceof ArrayBuffer
+        ? new Uint8Array(response)
+        : new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+      return new TextEncoder().encode(this._transformText(new TextDecoder().decode(bytes))).buffer;
     }
     const source = response instanceof Response || response instanceof Blob || response?.text
       ? response
@@ -10188,6 +10889,29 @@ export class HTMLRewriter {
   _transformText(input) {
     let html = String(input);
     const liveTextStates = [];
+    for (const handlers of this._documentHandlers) {
+      if (typeof handlers.doctype === "function") {
+        html = html.replace(/<!DOCTYPE\s+([^>]+)>/i, (source, declaration) => {
+          const name = /^\s*([^\s]+)/.exec(declaration)?.[1] ?? null;
+          const publicMatch = /^\s*[^\s]+\s+PUBLIC\s+["']([^"']*)["'](?:\s+["']([^"']*)["'])?/i.exec(declaration);
+          const systemMatch = /^\s*[^\s]+\s+SYSTEM\s+["']([^"']*)["']/i.exec(declaration);
+          const state = { valid: true, removed: false };
+          const doctype = {
+            get name() { return state.valid ? name : undefined; },
+            get publicId() { return state.valid ? (publicMatch?.[1] ?? null) : undefined; },
+            get systemId() { return state.valid ? (publicMatch?.[2] ?? systemMatch?.[1] ?? null) : undefined; },
+            get removed() { return state.valid ? state.removed : undefined; },
+            remove() {
+              if (state.valid) state.removed = true;
+              return this;
+            },
+          };
+          handlers.doctype(doctype);
+          state.valid = false;
+          return state.removed ? "" : source;
+        });
+      }
+    }
     for (const { selector, handlers } of this._elementHandlers) {
       if (!/^[A-Za-z][\w:-]*$/.test(selector)) continue;
       const hasElement = typeof handlers?.element === "function";
@@ -10428,10 +11152,9 @@ function matchFileSystemRoute(record, pathname) {
 
 export class Terminal {}
 export class RedisClient {}
-export class S3Client {}
+export { S3Client, s3 };
 export const redis = null;
 export const postgres = null;
-export const s3 = null;
 function secretsError(message, code = "ERR_INVALID_ARG_TYPE") {
   const error = new TypeError(message);
   error.code = code;
@@ -11093,9 +11816,31 @@ const domExceptionCodes = {
 };
 
 class CottontailDOMException extends Error {
-  constructor(message = "", name = "Error") {
+  constructor(message = "", nameOrOptions = "Error") {
+    let name = "Error";
+    let hasCause = false;
+    let cause;
+    if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
+      if (nameOrOptions.name !== undefined) name = String(nameOrOptions.name);
+      if ("cause" in nameOrOptions) {
+        hasCause = true;
+        cause = nameOrOptions.cause;
+      }
+    } else if (nameOrOptions !== undefined) {
+      name = String(nameOrOptions);
+    }
     super(String(message));
-    this.name = String(name);
+    this.name = name;
+    if (hasCause) {
+      Object.defineProperty(this, "cause", {
+        value: cause,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    // Match WebKit/Bun: DOMException instances do not carry a stack trace.
+    this.stack = undefined;
   }
 
   get code() {
@@ -11104,6 +11849,46 @@ class CottontailDOMException extends Error {
 
   get [Symbol.toStringTag]() {
     return "DOMException";
+  }
+}
+
+{
+  const domExceptionLegacyConstants = {
+    INDEX_SIZE_ERR: 1,
+    DOMSTRING_SIZE_ERR: 2,
+    HIERARCHY_REQUEST_ERR: 3,
+    WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5,
+    NO_DATA_ALLOWED_ERR: 6,
+    NO_MODIFICATION_ALLOWED_ERR: 7,
+    NOT_FOUND_ERR: 8,
+    NOT_SUPPORTED_ERR: 9,
+    INUSE_ATTRIBUTE_ERR: 10,
+    INVALID_STATE_ERR: 11,
+    SYNTAX_ERR: 12,
+    INVALID_MODIFICATION_ERR: 13,
+    NAMESPACE_ERR: 14,
+    INVALID_ACCESS_ERR: 15,
+    VALIDATION_ERR: 16,
+    TYPE_MISMATCH_ERR: 17,
+    SECURITY_ERR: 18,
+    NETWORK_ERR: 19,
+    ABORT_ERR: 20,
+    URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22,
+    TIMEOUT_ERR: 23,
+    INVALID_NODE_TYPE_ERR: 24,
+    DATA_CLONE_ERR: 25,
+  };
+  for (const [constantName, constantValue] of Object.entries(domExceptionLegacyConstants)) {
+    const descriptor = {
+      value: constantValue,
+      writable: false,
+      enumerable: true,
+      configurable: false,
+    };
+    Object.defineProperty(CottontailDOMException, constantName, descriptor);
+    Object.defineProperty(CottontailDOMException.prototype, constantName, descriptor);
   }
 }
 
@@ -11195,17 +11980,36 @@ function markEventTrusted(event) {
   } catch {}
 }
 
+// Shared unforgeable-style isTrusted getter: the WHATWG spec installs
+// isTrusted as an own accessor on every event instance, with the same getter
+// function shared between instances (observable via getOwnPropertyDescriptor).
+function sharedIsTrustedGetter() {
+  return eventStateFor(this).isTrusted;
+}
+Object.defineProperty(sharedIsTrustedGetter, "name", { value: "isTrusted", configurable: true });
+
 class CottontailEvent {
-  constructor(type, init = {}) {
+  constructor(type, init = undefined) {
+    const options = init != null && typeof init === "object" ? init : {};
     eventState.set(this, {
       type: String(type),
-      bubbles: Boolean(init.bubbles),
-      cancelable: Boolean(init.cancelable),
-      composed: Boolean(init.composed),
+      bubbles: Boolean(options.bubbles),
+      cancelable: Boolean(options.cancelable),
+      composed: Boolean(options.composed),
       defaultPrevented: false,
       target: null,
       currentTarget: null,
       isTrusted: false,
+      cancelBubble: false,
+      stopImmediate: false,
+      eventPhase: 0,
+      returnValue: true,
+      timeStamp: typeof globalThis.performance?.now === "function" ? globalThis.performance.now() : Date.now(),
+    });
+    Object.defineProperty(this, "isTrusted", {
+      get: sharedIsTrustedGetter,
+      enumerable: true,
+      configurable: false,
     });
   }
 
@@ -11233,12 +12037,52 @@ class CottontailEvent {
     return eventStateFor(this).target;
   }
 
+  get srcElement() {
+    return eventStateFor(this).target;
+  }
+
   get currentTarget() {
     return eventStateFor(this).currentTarget;
   }
 
-  get isTrusted() {
-    return eventStateFor(this).isTrusted;
+  get eventPhase() {
+    return eventStateFor(this).eventPhase;
+  }
+
+  get timeStamp() {
+    return eventStateFor(this).timeStamp;
+  }
+
+  get cancelBubble() {
+    return eventStateFor(this).cancelBubble;
+  }
+
+  set cancelBubble(value) {
+    if (value) eventStateFor(this).cancelBubble = true;
+  }
+
+  get returnValue() {
+    return !eventStateFor(this).defaultPrevented;
+  }
+
+  set returnValue(value) {
+    const state = eventStateFor(this);
+    if (!value && state.cancelable) state.defaultPrevented = true;
+  }
+
+  composedPath() {
+    const state = eventStateFor(this);
+    return state.currentTarget == null ? [] : [state.currentTarget];
+  }
+
+  stopPropagation() {
+    eventStateFor(this).cancelBubble = true;
+  }
+
+  stopImmediatePropagation() {
+    const state = eventStateFor(this);
+    state.cancelBubble = true;
+    state.stopImmediate = true;
   }
 
   preventDefault() {
@@ -11246,9 +12090,22 @@ class CottontailEvent {
     if (state.cancelable) state.defaultPrevented = true;
   }
 
+  initEvent(type, bubbles = false, cancelable = false) {
+    const state = eventStateFor(this);
+    if (state.eventPhase !== 0) return;
+    state.type = String(type);
+    state.bubbles = Boolean(bubbles);
+    state.cancelable = Boolean(cancelable);
+  }
+
   get [Symbol.toStringTag]() {
     return "Event";
   }
+}
+
+for (const [name, value] of [["NONE", 0], ["CAPTURING_PHASE", 1], ["AT_TARGET", 2], ["BUBBLING_PHASE", 3]]) {
+  Object.defineProperty(CottontailEvent, name, { value, enumerable: true });
+  Object.defineProperty(CottontailEvent.prototype, name, { value, enumerable: true });
 }
 
 class CottontailCustomEvent extends CottontailEvent {
@@ -11306,57 +12163,186 @@ function BunFile(parts, name, options = {}) {
 }
 BunFile.prototype = CottontailFile.prototype;
 
+// A File whose contents delegate to an underlying blob-like source (an
+// in-memory Blob or a lazy Bun.file ref) without copying it eagerly. Used by
+// FormData for entries that carry an explicit filename.
+let CottontailFormDataFileClass = null;
+function formDataFileView(source, filename) {
+  CottontailFormDataFileClass ??= class File extends CottontailFile {
+    constructor(src, name) {
+      super([], name, {
+        type: typeof src?.type === "string" ? src.type : "",
+        // Deterministic default so structural equality between separately
+        // created views holds (Bun reports 0 for wrapped blobs too).
+        lastModified: Number(src?.lastModified ?? 0) || 0,
+      });
+      this._source = src;
+    }
+    get size() {
+      return Number(this._source?.size ?? 0);
+    }
+    async arrayBuffer() {
+      return await this._source.arrayBuffer();
+    }
+    async bytes() {
+      if (typeof this._source.bytes === "function") return asBuffer(await this._source.bytes());
+      return asBuffer(new Uint8Array(await this._source.arrayBuffer()));
+    }
+    async text() {
+      return await this._source.text();
+    }
+    stream() {
+      if (typeof this._source.stream === "function") return this._source.stream();
+      return super.stream();
+    }
+    slice(...args) {
+      if (typeof this._source.slice === "function") return this._source.slice(...args);
+      return super.slice(...args);
+    }
+  };
+  const name = filename !== undefined
+    ? filename
+    : (typeof source?.name === "string" && source.name !== "" ? source.name : "blob");
+  return new CottontailFormDataFileClass(source, name);
+}
+
 Object.defineProperty(CottontailCustomEvent, "name", { value: "CustomEvent", configurable: true });
 Object.defineProperty(CottontailErrorEvent, "name", { value: "ErrorEvent", configurable: true });
 Object.defineProperty(CottontailCloseEvent, "name", { value: "CloseEvent", configurable: true });
 Object.defineProperty(CottontailFile, "name", { value: "File", configurable: true });
 Object.defineProperty(BunFile, "name", { value: "File", configurable: true });
+Object.defineProperty(CottontailCustomEvent.prototype, Symbol.toStringTag, { value: "CustomEvent", configurable: true });
+Object.defineProperty(CottontailErrorEvent.prototype, Symbol.toStringTag, { value: "ErrorEvent", configurable: true });
+Object.defineProperty(CottontailCloseEvent.prototype, Symbol.toStringTag, { value: "CloseEvent", configurable: true });
+
+const eventTargetListenerMaps = new WeakMap();
+const eventHandlerAttributeOrders = new WeakMap();
+let eventListenerOrder = 0;
+
+function setEventHandlerAttributeOrder(target, type, handler) {
+  let orders = eventHandlerAttributeOrders.get(target);
+  if (!orders) {
+    orders = new Map();
+    eventHandlerAttributeOrders.set(target, orders);
+  }
+  if (typeof handler === "function") {
+    if (!orders.has(type)) orders.set(type, ++eventListenerOrder);
+  } else {
+    orders.delete(type);
+  }
+}
+
+function eventTargetListenersFor(target) {
+  const listeners = eventTargetListenerMaps.get(target);
+  if (!listeners) throw new TypeError("Can only call this method on instances of EventTarget");
+  return listeners;
+}
 
 class CottontailEventTarget {
   constructor() {
-    this.__ctEventListeners = new Map();
+    const listeners = new Map();
+    eventTargetListenerMaps.set(this, listeners);
+    Object.defineProperty(this, "__ctEventListeners", {
+      value: listeners,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
   }
 
   addEventListener(type, listener, options = undefined) {
+    const listeners = eventTargetListenersFor(this);
     if (listener == null) return;
     const name = String(type);
-    const listeners = this.__ctEventListeners.get(name) ?? [];
-    if (!listeners.some((entry) => entry.listener === listener)) {
-      listeners.push({
+    const opts = options && typeof options === "object" ? options : {};
+    const capture = options === true || Boolean(opts.capture);
+    const signal = opts.signal;
+    if (signal != null && signal.aborted) return;
+    const list = listeners.get(name) ?? [];
+    if (!list.some((entry) => entry.listener === listener && entry.capture === capture)) {
+      list.push({
         listener,
-        once: Boolean(options && typeof options === "object" && options.once),
-        weak: Boolean(options && typeof options === "object" && options[eventTargetWeakHandler]),
+        capture,
+        once: Boolean(opts.once),
+        weak: Boolean(opts[eventTargetWeakHandler]),
+        order: ++eventListenerOrder,
       });
+      if (signal != null && typeof signal.addEventListener === "function") {
+        signal.addEventListener("abort", () => {
+          this.removeEventListener(name, listener, { capture });
+        }, { once: true, [eventTargetWeakHandler]: true });
+      }
     }
-    this.__ctEventListeners.set(name, listeners);
+    listeners.set(name, list);
   }
 
-  removeEventListener(type, listener) {
+  removeEventListener(type, listener, options = undefined) {
+    const listeners = eventTargetListenersFor(this);
     const name = String(type);
-    const listeners = this.__ctEventListeners.get(name);
-    if (!listeners) return;
-    this.__ctEventListeners.set(name, listeners.filter((entry) => entry.listener !== listener));
+    const capture = options === true || Boolean(options && typeof options === "object" && options.capture);
+    const list = listeners.get(name);
+    if (list) {
+      listeners.set(name, list.filter((entry) => !(entry.listener === listener && entry.capture === capture)));
+    }
     refreshAbortSignalRetention(this);
   }
 
   dispatchEvent(event) {
+    const listeners = eventTargetListenersFor(this);
+    const state = eventState.get(event);
+    if (state) {
+      state.target = this;
+      state.currentTarget = this;
+      state.eventPhase = 2;
+      state.stopImmediate = false;
+      state.cancelBubble = false;
+      const list = [...(listeners.get(state.type) ?? [])];
+      const handler = this[`on${state.type}`];
+      if (typeof handler === "function") {
+        list.push({ listener: handler, capture: false, once: false, order: eventHandlerAttributeOrders.get(this)?.get(state.type) ?? Infinity });
+      }
+      list.sort((a, b) => a.order - b.order);
+      for (const entry of list) {
+        if (state.stopImmediate) break;
+        const listener = entry.listener;
+        if (entry.once) this.removeEventListener(state.type, listener, { capture: entry.capture });
+        if (typeof listener === "function") listener.call(this, event);
+        else if (listener && typeof listener.handleEvent === "function") listener.handleEvent(event);
+      }
+      state.eventPhase = 0;
+      state.currentTarget = null;
+      return !state.defaultPrevented;
+    }
+    // Legacy path: internal call sites dispatch plain objects that carry a
+    // type/target shape but are not real Event instances.
     const dispatched = event && typeof event === "object" ? event : new CottontailEvent(String(event));
     if (!setEventTarget(dispatched, this, this)) {
-      if (!dispatched.target) dispatched.target = this;
-      dispatched.currentTarget = this;
+      try {
+        if (!dispatched.target) dispatched.target = this;
+        dispatched.currentTarget = this;
+      } catch {}
     }
-    const listeners = [...(this.__ctEventListeners.get(String(dispatched.type)) ?? [])];
-    for (const entry of listeners) {
+    const dispatchedType = String(dispatched.type);
+    const list = [...(listeners.get(dispatchedType) ?? [])];
+    const handler = this[`on${dispatchedType}`];
+    if (typeof handler === "function") {
+      list.push({ listener: handler, capture: false, once: false, order: eventHandlerAttributeOrders.get(this)?.get(dispatchedType) ?? Infinity });
+    }
+    list.sort((a, b) => a.order - b.order);
+    for (const entry of list) {
       const listener = entry.listener;
+      if (entry.once) this.removeEventListener(dispatched.type, listener, { capture: entry.capture });
       if (typeof listener === "function") listener.call(this, dispatched);
       else if (listener && typeof listener.handleEvent === "function") listener.handleEvent(dispatched);
-      if (entry.once) this.removeEventListener(dispatched.type, listener);
     }
-    const handler = this[`on${dispatched.type}`];
-    if (typeof handler === "function") handler.call(this, dispatched);
     return !dispatched.defaultPrevented;
   }
+
+  get [Symbol.toStringTag]() {
+    return "EventTarget";
+  }
 }
+Object.defineProperty(CottontailEventTarget, "name", { value: "EventTarget", configurable: true });
 
 function makeAbortError() {
   const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
@@ -11635,16 +12621,61 @@ class CottontailAbortController {
   }
 }
 
+function makeDataCloneError(message) {
+  const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
+  return new DOMExceptionClass(message ?? "The object can not be cloned.", "DataCloneError");
+}
+
+function blobBytesSync(value) {
+  if (value?._bytes instanceof Uint8Array) return value._bytes.slice();
+  return new Uint8Array(0);
+}
+
+function cloneNativeError(value, seen) {
+  let Ctor = Error;
+  for (const candidate of [TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError]) {
+    if (value instanceof candidate) {
+      Ctor = candidate;
+      break;
+    }
+  }
+  const isAggregate = typeof AggregateError === "function" && value instanceof AggregateError;
+  if (isAggregate) Ctor = AggregateError;
+  const cloned = isAggregate ? new Ctor([], value.message) : new Ctor(value.message);
+  seen.set(value, cloned);
+  if (typeof value.name === "string" && value.name !== cloned.name) cloned.name = value.name;
+  if (typeof value.stack === "string") cloned.stack = value.stack;
+  if (Object.prototype.hasOwnProperty.call(value, "cause")) cloned.cause = structuredCloneValue(value.cause, seen);
+  if (isAggregate) cloned.errors = structuredCloneValue(value.errors ?? [], seen);
+  return cloned;
+}
+
 function structuredCloneValue(value, seen) {
+  if (typeof value === "function") throw makeDataCloneError(`${value.name || "Function"}() could not be cloned.`);
+  if (typeof value === "symbol") throw makeDataCloneError("Symbol values could not be cloned.");
   if (value === null || typeof value !== "object") return value;
   if (seen.has(value)) return seen.get(value);
-  if (value instanceof Date) return new Date(value.getTime());
-  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-  if (value instanceof ArrayBuffer) return value.slice(0);
+  const remember = (cloned) => {
+    seen.set(value, cloned);
+    return cloned;
+  };
+  if (value instanceof Date) return remember(new Date(value.getTime()));
+  if (value instanceof RegExp) return remember(new RegExp(value.source, value.flags));
+  if (value instanceof Boolean || value instanceof Number || value instanceof String) {
+    return remember(Object(value.valueOf()));
+  }
+  if (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) return remember(value);
+  if (value instanceof ArrayBuffer) {
+    if (value.detached === true) throw makeDataCloneError("Cannot clone a detached ArrayBuffer");
+    return remember(value.slice(0));
+  }
   if (ArrayBuffer.isView(value)) {
     const clonedBuffer = structuredCloneValue(value.buffer, seen);
-    if (value instanceof DataView) return new DataView(clonedBuffer, value.byteOffset, value.byteLength);
-    return new value.constructor(clonedBuffer, value.byteOffset, value.length);
+    if (value instanceof DataView) return remember(new DataView(clonedBuffer, value.byteOffset, value.byteLength));
+    if (typeof globalThis.Buffer === "function" && globalThis.Buffer.isBuffer?.(value)) {
+      return remember(new Uint8Array(clonedBuffer, value.byteOffset, value.length));
+    }
+    return remember(new value.constructor(clonedBuffer, value.byteOffset, value.length));
   }
   if (value instanceof Map) {
     const result = new Map();
@@ -11658,29 +12689,38 @@ function structuredCloneValue(value, seen) {
     for (const item of value) result.add(structuredCloneValue(item, seen));
     return result;
   }
-  const result = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
-  seen.set(value, result);
-  for (const key of Reflect.ownKeys(value)) {
-    result[key] = structuredCloneValue(value[key], seen);
+  if (value instanceof Error) return cloneNativeError(value, seen);
+  if (isBunFileLike(value)) {
+    const source = value._bunFilePath ?? (typeof value.fd === "number" ? value.fd : value.name);
+    return remember(file(source, { type: value.type }));
   }
-  return result;
-}
-
-function cottontailStructuredClone(value, options = undefined) {
-  const seen = new WeakMap();
-  const transfer = options?.transfer;
-  if (transfer != null) {
-    for (const item of transfer) {
-      if (item instanceof ArrayBuffer) {
-        if (item.detached === true) {
-          throw new TypeError("Cannot transfer a detached ArrayBuffer");
-        }
-        // Detach the source buffer; clones of it reference the moved buffer.
-        seen.set(item, typeof item.transfer === "function" ? item.transfer() : item.slice(0));
-      }
+  if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
+    const bytes = blobBytesSync(value);
+    if (typeof globalThis.File === "function" && value instanceof globalThis.File) {
+      return remember(new globalThis.File([bytes], value.name, { type: value.type, lastModified: value.lastModified }));
     }
+    return remember(new globalThis.Blob([bytes], { type: value.type }));
   }
-  return structuredCloneValue(value, seen);
+  if (value instanceof CottontailMessagePort) {
+    throw makeDataCloneError("MessagePort could not be cloned; add it to the transfer list.");
+  }
+  if (value instanceof CottontailMessageChannel) throw makeDataCloneError("The object can not be cloned.");
+  if (value instanceof Promise || value instanceof WeakMap || value instanceof WeakSet) {
+    throw makeDataCloneError("The object can not be cloned.");
+  }
+  const cloneHook = value[Symbol.for("cottontail.structuredClone")];
+  if (typeof cloneHook === "function") return remember(cloneHook.call(value));
+  if (Array.isArray(value)) {
+    const result = [];
+    seen.set(value, result);
+    for (const key of Object.keys(value)) result[key] = structuredCloneValue(value[key], seen);
+    if (result.length !== value.length) result.length = value.length;
+    return result;
+  }
+  const result = {};
+  seen.set(value, result);
+  for (const key of Object.keys(value)) result[key] = structuredCloneValue(value[key], seen);
+  return result;
 }
 
 const BunObjectTarget = globalThis.Bun ?? {};
@@ -11693,6 +12733,8 @@ const BunObject = new Proxy(BunObjectTarget, {
   },
 });
 globalThis.__cottontailBunHasNonReifiedStatic = (value) => value === BunObject && !bunObjectReified;
+// String(Bun) must be "[object Bun]".
+Object.defineProperty(BunObjectTarget, Symbol.toStringTag, { value: "Bun", configurable: true });
 BunObject.argv = cottontail.argv || ["cottontail", ...(cottontail.args || [])];
 BunObject.env = globalThis.process?.env ?? cottontail.env();
 BunObject.$ = $;
@@ -11841,6 +12883,51 @@ if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.
   };
 }
 
+// Blocking terminal prompts (alert/confirm/prompt), reading stdin one byte at
+// a time until newline/EOF like Bun's native implementations.
+{
+  const writeOut = (text) => {
+    const bytes = new TextEncoder().encode(text);
+    try {
+      cottontail.fdWriteAt(1, bytes, 0, bytes.byteLength, null);
+    } catch {}
+  };
+  const readLine = () => {
+    const chunk = new Uint8Array(1);
+    let line = "";
+    let sawAny = false;
+    for (;;) {
+      let read = 0;
+      try {
+        read = Number(cottontail.fdReadAt(0, chunk, 0, 1, null));
+      } catch {
+        break;
+      }
+      if (!(read > 0)) break;
+      sawAny = true;
+      if (chunk[0] === 10) return line.endsWith("\r") ? line.slice(0, -1) : line;
+      line += String.fromCharCode(chunk[0]);
+    }
+    if (!sawAny) return null;
+    return line.endsWith("\r") ? line.slice(0, -1) : line;
+  };
+  globalThis.alert ??= function alert(message = undefined) {
+    writeOut(message === undefined ? "Alert [Enter] " : `${message} [Enter] `);
+    readLine();
+  };
+  globalThis.confirm ??= function confirm(message = undefined) {
+    writeOut(message === undefined ? "Confirm [y/N] " : `${message} [y/N] `);
+    const line = readLine();
+    return line !== null && (line[0] === "y" || line[0] === "Y");
+  };
+  globalThis.prompt ??= function prompt(message = undefined, defaultValue = undefined) {
+    writeOut(`${message === undefined ? "Prompt" : message} `);
+    const line = readLine();
+    if (line === null || line === "") return defaultValue !== undefined ? String(defaultValue) : null;
+    return line;
+  };
+}
+
 if (globalThis.navigator == null) {
   const navigatorPlatform = cottontail.platform?.() === "darwin" ? "MacIntel" :
     cottontail.platform?.() === "win32" ? "Win32" :
@@ -11870,15 +12957,860 @@ CryptoObject.getRandomValues = function getRandomValuesCompat(view) {
   }
   return view;
 };
-CryptoObject.subtle ??= nodeWebcrypto.subtle;
+// crypto.subtle is a WebIDL readonly attribute: reads return the SubtleCrypto
+// instance and assignments are silently ignored (Node behaves the same so
+// polyfills that assign crypto.subtle keep working).
+{
+  const subtleInstance = CryptoObject.subtle ?? nodeWebcrypto.subtle;
+  Object.defineProperty(CryptoObject, "subtle", {
+    get() {
+      return subtleInstance;
+    },
+    set(_value) {},
+    enumerable: true,
+    configurable: true,
+  });
+}
 globalThis.crypto = CryptoObject;
 globalThis.CryptoKey ??= CryptoKey;
+globalThis.SubtleCrypto ??= NodeSubtleCrypto;
+// URLPattern (WHATWG URL Pattern spec) via the vendored urlpattern-polyfill.
+Object.defineProperty(CottontailURLPattern, "name", { value: "URLPattern", configurable: true });
+globalThis.URLPattern ??= CottontailURLPattern;
 globalThis.DOMException ??= CottontailDOMException;
 globalThis.Event ??= CottontailEvent;
 globalThis.EventTarget ??= CottontailEventTarget;
 globalThis.CustomEvent ??= CottontailCustomEvent;
 globalThis.ErrorEvent ??= CottontailErrorEvent;
 globalThis.CloseEvent ??= CottontailCloseEvent;
+Object.defineProperty(CottontailEvent, "name", { value: "Event", configurable: true });
+
+// ---------------------------------------------------------------------------
+// Web messaging: MessageEvent, MessagePort/MessageChannel, BroadcastChannel,
+// plus cross-thread routing over the native worker message pipe.
+// ---------------------------------------------------------------------------
+
+const messagePortConstructToken = Symbol("cottontail.MessagePort.construct");
+const webPortStates = new WeakMap();
+const webPortRegistry = new Map(); // portId -> MessagePort with cross-thread routing
+const broadcastChannelRegistry = new Map(); // name -> channels in creation order
+const broadcastChannelStates = new WeakMap();
+const WEB_WIRE_KEY = "__cottontailWebWire";
+const WEB_PORT_ENVELOPE = "__cottontailWebPortMessage";
+const WEB_BROADCAST_ENVELOPE = "__cottontailWebBroadcast";
+let webPortIdCounter = 0;
+const webContextNonce = `${Date.now().toString(36)}${Math.floor(Math.random() * 0xffffffff).toString(36)}`;
+
+function allocateWebPortId() {
+  webPortIdCounter += 1;
+  return `${webContextNonce}-${webPortIdCounter}`;
+}
+
+function webPortStateFor(port) {
+  const state = webPortStates.get(port);
+  if (!state) throw new TypeError("Can only call this method on instances of MessagePort");
+  return state;
+}
+
+function collectWebTransferables(arg, senderPort) {
+  let list;
+  if (arg == null) {
+    list = [];
+  } else if (Array.isArray(arg)) {
+    list = arg;
+  } else if (typeof arg === "object") {
+    if (arg.transfer == null) {
+      list = typeof arg[Symbol.iterator] === "function" ? [...arg] : [];
+    } else if (Array.isArray(arg.transfer)) {
+      list = arg.transfer;
+    } else if (typeof arg.transfer === "object" && typeof arg.transfer[Symbol.iterator] === "function") {
+      list = [...arg.transfer];
+    } else {
+      throw new TypeError("Transfer list must be a sequence of transferable objects");
+    }
+  } else {
+    throw new TypeError("Transfer list must be a sequence of transferable objects");
+  }
+  const seenItems = new Set();
+  const transfers = [];
+  const senderState = senderPort ? webPortStates.get(senderPort) : null;
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index];
+    if (item instanceof ArrayBuffer) {
+      if (item.detached === true) throw makeDataCloneError("Cannot transfer a detached ArrayBuffer");
+    } else if (item instanceof CottontailMessagePort) {
+      if (item === senderPort) throw makeDataCloneError("The source port cannot be transferred");
+      if (senderState && senderState.peer === item) throw makeDataCloneError("The target port cannot be transferred");
+      const itemState = webPortStates.get(item);
+      if (itemState?.detached) throw makeDataCloneError("MessagePort is already neutered");
+    } else {
+      throw makeDataCloneError("Value in the transfer list is not a transferable object");
+    }
+    if (seenItems.has(item)) throw makeDataCloneError("Transfer list contains a duplicate transferable");
+    seenItems.add(item);
+    transfers.push(item);
+  }
+  return transfers;
+}
+
+function buildWebTransferMap(transfers) {
+  const seen = new WeakMap();
+  const ports = [];
+  const buffers = [];
+  for (const item of transfers) {
+    if (item instanceof ArrayBuffer) {
+      const snapshot = item.slice(0);
+      seen.set(item, snapshot);
+      buffers.push(item);
+    } else {
+      const replacement = new CottontailMessagePort(messagePortConstructToken);
+      seen.set(item, replacement);
+      ports.push({ original: item, replacement });
+    }
+  }
+  return { seen, ports, buffers };
+}
+
+function commitWebTransfer(prepared) {
+  for (const buffer of prepared.buffers) {
+    try {
+      if (typeof buffer.transfer === "function") buffer.transfer();
+    } catch {}
+  }
+  for (const { original, replacement } of prepared.ports) {
+    const originalState = webPortStates.get(original);
+    const replacementState = webPortStates.get(replacement);
+    replacementState.queue = originalState.queue;
+    replacementState.peer = originalState.peer;
+    replacementState.remote = originalState.remote;
+    if (originalState.peer) {
+      const peerState = webPortStates.get(originalState.peer);
+      if (peerState) peerState.peer = replacement;
+    }
+    if (originalState.id != null) {
+      replacementState.id = originalState.id;
+      if (webPortRegistry.get(originalState.id) === original) webPortRegistry.set(originalState.id, replacement);
+    }
+    originalState.peer = null;
+    originalState.remote = null;
+    originalState.queue = [];
+    originalState.detached = true;
+    originalState.closed = true;
+  }
+}
+
+function cottontailStructuredClone(value, options = undefined) {
+  const transfers = collectWebTransferables(options?.transfer, null);
+  const prepared = buildWebTransferMap(transfers);
+  const result = structuredCloneValue(value, prepared.seen);
+  commitWebTransfer(prepared);
+  return result;
+}
+
+function deliverToWebPort(port, data, ports) {
+  const state = webPortStates.get(port);
+  if (!state || state.closed || state.detached) return;
+  state.queue.push({ data, ports: ports ?? [] });
+  scheduleWebPortDrain(port);
+}
+
+function scheduleWebPortDrain(port) {
+  const state = webPortStates.get(port);
+  if (!state || state.draining) return;
+  state.draining = true;
+  queueMicrotask(() => {
+    state.draining = false;
+    if (!state.started || state.closed || state.detached) return;
+    while (state.queue.length > 0 && state.started && !state.closed && !state.detached) {
+      const { data, ports } = state.queue.shift();
+      let event;
+      try {
+        event = new CottontailMessageEvent("message", { data, ports });
+      } catch {
+        event = new CottontailMessageEvent("message", { data });
+      }
+      markEventTrusted(event);
+      port.dispatchEvent(event);
+    }
+  });
+}
+
+function sendToWebRoute(route, payload) {
+  const json = JSON.stringify(payload);
+  if (route?.parent) {
+    cottontail.workerPostMessage?.(json);
+    return;
+  }
+  if (route?.workerId != null) {
+    cottontail.workerPostMessageTo?.(route.workerId, json);
+  }
+}
+
+// -- Cross-thread wire codec (JSON-safe) ------------------------------------
+
+function wireEncodePort(port, context) {
+  const existing = context.portEncodings.get(port);
+  if (existing) return existing;
+  const state = webPortStates.get(port);
+  if (state.id == null) state.id = allocateWebPortId();
+  let peerId = null;
+  if (state.peer) {
+    const peerState = webPortStates.get(state.peer);
+    if (peerState.id == null) peerState.id = allocateWebPortId();
+    peerId = peerState.id;
+    peerState.remote = { route: context.route, peerId: state.id };
+    webPortRegistry.set(peerState.id, state.peer);
+    peerState.peer = null;
+  } else if (state.remote) {
+    peerId = state.remote.peerId;
+  }
+  const encoded = {
+    t: "Port",
+    portId: state.id,
+    peerId,
+    pending: state.queue.map((entry) => ({
+      data: wireEncodeValue(entry.data, context),
+      ports: (entry.ports ?? []).map((item) => wireEncodePort(item, context)),
+    })),
+  };
+  context.portEncodings.set(port, encoded);
+  webPortRegistry.delete(state.id);
+  state.detached = true;
+  state.closed = true;
+  state.queue = [];
+  return encoded;
+}
+
+function wireDecodePort(encoded, route) {
+  let port = webPortRegistry.get(encoded.portId);
+  if (!port) {
+    port = new CottontailMessagePort(messagePortConstructToken);
+    const state = webPortStates.get(port);
+    state.id = encoded.portId;
+    if (encoded.peerId != null) state.remote = { route, peerId: encoded.peerId };
+    webPortRegistry.set(state.id, port);
+  }
+  for (const entry of encoded.pending ?? []) {
+    deliverToWebPort(port, wireDecodeValue(entry.data, route), (entry.ports ?? []).map((item) => wireDecodePort(item, route)));
+  }
+  return port;
+}
+
+function wireEncodeValue(value, context) {
+  if (value === undefined) return { t: "undefined" };
+  if (value === null) return { t: "null" };
+  const type = typeof value;
+  if (type === "boolean" || type === "string") return { t: type, v: value };
+  if (type === "number") {
+    if (Number.isNaN(value)) return { t: "number", v: "NaN" };
+    if (value === Infinity) return { t: "number", v: "Infinity" };
+    if (value === -Infinity) return { t: "number", v: "-Infinity" };
+    if (Object.is(value, -0)) return { t: "number", v: "-0" };
+    return { t: "number", v: value };
+  }
+  if (type === "bigint") return { t: "bigint", v: value.toString() };
+  if (type === "function" || type === "symbol") throw makeDataCloneError("The value can not be sent to another thread.");
+  const existingId = context.ids.get(value);
+  if (existingId != null) return { t: "Ref", id: existingId };
+  const id = (context.nextId += 1);
+  context.ids.set(value, id);
+  if (value instanceof CottontailMessagePort) {
+    const encoded = wireEncodePort(value, context);
+    return { ...encoded, id };
+  }
+  if (value instanceof Date) return { t: "Date", id, v: value.getTime() };
+  if (value instanceof RegExp) return { t: "RegExp", id, source: value.source, flags: value.flags };
+  if (value instanceof ArrayBuffer) return { t: "ArrayBuffer", id, bytes: Array.from(new Uint8Array(value)) };
+  if (ArrayBuffer.isView(value)) {
+    const name = typeof globalThis.Buffer === "function" && globalThis.Buffer.isBuffer?.(value)
+      ? "Buffer"
+      : value instanceof DataView ? "DataView" : value.constructor?.name ?? "Uint8Array";
+    return { t: "View", id, name, bytes: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+  }
+  if (value instanceof Map) {
+    return { t: "Map", id, v: [...value].map(([key, item]) => [wireEncodeValue(key, context), wireEncodeValue(item, context)]) };
+  }
+  if (value instanceof Set) return { t: "Set", id, v: [...value].map((item) => wireEncodeValue(item, context)) };
+  if (Array.isArray(value)) return { t: "Array", id, length: value.length, v: value.map((item) => wireEncodeValue(item, context)) };
+  if (value instanceof Error) return { t: "Error", id, name: value.name, message: value.message, stack: value.stack };
+  if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
+    const bytes = Array.from(blobBytesSync(value));
+    if (typeof globalThis.File === "function" && value instanceof globalThis.File) {
+      return { t: "File", id, bytes, type: value.type, name: value.name, lastModified: value.lastModified };
+    }
+    return { t: "Blob", id, bytes, type: value.type };
+  }
+  return { t: "Object", id, v: Object.keys(value).map((key) => [key, wireEncodeValue(value[key], context)]) };
+}
+
+const wireTypedArrayConstructors = {
+  Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+  Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array,
+};
+
+function wireDecodeValue(encoded, route, refs = new Map()) {
+  const remember = (value) => {
+    if (encoded?.id != null) refs.set(encoded.id, value);
+    return value;
+  };
+  switch (encoded?.t) {
+    case "Ref":
+      return refs.get(encoded.id);
+    case "undefined":
+      return undefined;
+    case "null":
+      return null;
+    case "boolean":
+    case "string":
+      return encoded.v;
+    case "number":
+      if (encoded.v === "NaN") return NaN;
+      if (encoded.v === "Infinity") return Infinity;
+      if (encoded.v === "-Infinity") return -Infinity;
+      if (encoded.v === "-0") return -0;
+      return Number(encoded.v);
+    case "bigint":
+      return BigInt(encoded.v);
+    case "Port":
+      return remember(wireDecodePort(encoded, route));
+    case "Date":
+      return remember(new Date(Number(encoded.v)));
+    case "RegExp":
+      return remember(new RegExp(encoded.source, encoded.flags));
+    case "ArrayBuffer":
+      return remember(new Uint8Array(encoded.bytes ?? []).buffer);
+    case "View": {
+      const bytes = new Uint8Array(encoded.bytes ?? []);
+      if (encoded.name === "Buffer" && typeof globalThis.Buffer === "function") return remember(globalThis.Buffer.from(bytes));
+      if (encoded.name === "DataView") return remember(new DataView(bytes.buffer));
+      const Ctor = wireTypedArrayConstructors[encoded.name] ?? Uint8Array;
+      return remember(new Ctor(bytes.buffer));
+    }
+    case "Map": {
+      const map = remember(new Map());
+      for (const [key, item] of encoded.v ?? []) map.set(wireDecodeValue(key, route, refs), wireDecodeValue(item, route, refs));
+      return map;
+    }
+    case "Set": {
+      const set = remember(new Set());
+      for (const item of encoded.v ?? []) set.add(wireDecodeValue(item, route, refs));
+      return set;
+    }
+    case "Array": {
+      const array = remember([]);
+      for (let index = 0; index < (encoded.v ?? []).length; index += 1) array[index] = wireDecodeValue(encoded.v[index], route, refs);
+      if (encoded.length != null && array.length !== encoded.length) array.length = encoded.length;
+      return array;
+    }
+    case "Error": {
+      const error = new Error(encoded.message);
+      if (encoded.name) error.name = encoded.name;
+      if (encoded.stack) error.stack = encoded.stack;
+      return remember(error);
+    }
+    case "Blob":
+      return remember(new globalThis.Blob([new Uint8Array(encoded.bytes ?? [])], { type: encoded.type ?? "" }));
+    case "File":
+      return remember(new globalThis.File([new Uint8Array(encoded.bytes ?? [])], encoded.name ?? "", {
+        type: encoded.type ?? "",
+        lastModified: encoded.lastModified,
+      }));
+    case "Object": {
+      const object = remember({});
+      for (const [key, item] of encoded.v ?? []) object[key] = wireDecodeValue(item, route, refs);
+      return object;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function makeWireContext(route) {
+  return { route, portEncodings: new Map(), ids: new WeakMap(), nextId: 0 };
+}
+
+function encodeWorkerWebMessage(message, transferOrOptions, route) {
+  const transfers = collectWebTransferables(transferOrOptions, null);
+  const prepared = buildWebTransferMap(transfers);
+  const data = structuredCloneValue(message, prepared.seen);
+  commitWebTransfer(prepared);
+  const context = makeWireContext(route);
+  const ports = prepared.ports.map((entry) => wireEncodePort(entry.replacement, context));
+  return JSON.stringify({ [WEB_WIRE_KEY]: 1, data: wireEncodeValue(data, context), ports });
+}
+
+function handleWebPortEnvelope(packet, route) {
+  const ports = (packet.ports ?? []).map((item) => wireDecodePort(item, route));
+  const data = wireDecodeValue(packet.data, route);
+  const target = webPortRegistry.get(packet.targetPortId);
+  if (!target) return;
+  deliverToWebPort(target, data, ports);
+}
+
+function handleWebBroadcastEnvelope(packet, fromWorker) {
+  const route = fromWorker ? { workerId: fromWorker.id } : { parent: true };
+  const data = wireDecodeValue(packet.data, route);
+  const recipients = [...(broadcastChannelRegistry.get(packet.name) ?? [])];
+  queueMicrotask(() => {
+    for (const channel of recipients) {
+      const state = broadcastChannelStates.get(channel);
+      if (!state || state.closed) continue;
+      const event = new CottontailMessageEvent("message", { data });
+      markEventTrusted(event);
+      channel.dispatchEvent(event);
+    }
+  });
+  if (!cottontail.isWorker?.()) {
+    broadcastToOtherThreads({ [WEB_BROADCAST_ENVELOPE]: packet }, fromWorker?.id);
+  }
+}
+
+function broadcastToOtherThreads(payload, excludeWorkerId) {
+  if (cottontail.isWorker?.()) {
+    if (typeof cottontail.workerPostMessage === "function") cottontail.workerPostMessage(JSON.stringify(payload));
+    return;
+  }
+  const workerIds = globalThis.__cottontailActiveWorkerIds?.() ?? [];
+  if (workerIds.length === 0) return;
+  const json = JSON.stringify(payload);
+  for (const workerId of workerIds) {
+    if (workerId === excludeWorkerId) continue;
+    cottontail.workerPostMessageTo?.(workerId, json);
+  }
+}
+
+// -- MessageEvent ------------------------------------------------------------
+
+function describeMessageEventSource(value) {
+  if (value === null) return "null";
+  const type = typeof value;
+  if (type === "object") return `an instance of ${value.constructor?.name ?? "Object"}`;
+  if (type === "string") return `type string ('${value}')`;
+  if (type === "function") return `type function (${value.name || "anonymous"})`;
+  return `type ${type} (${String(value)})`;
+}
+
+class CottontailMessageEvent extends CottontailEvent {
+  constructor(type, init = undefined) {
+    if (arguments.length === 0) throw new TypeError("Not enough arguments");
+    if (init != null && typeof init !== "object") throw new TypeError("MessageEvent constructor: eventInitDict could not be converted to a dictionary");
+    const options = init ?? {};
+    super(type, options);
+    const state = eventState.get(this);
+    state.data = options.data === undefined ? null : options.data;
+    state.origin = options.origin === undefined ? "" : String(options.origin);
+    state.lastEventId = options.lastEventId === undefined ? "" : String(options.lastEventId);
+    const source = options.source === undefined || options.source === null ? null : options.source;
+    if (source !== null) {
+      const isPortLike = source instanceof CottontailMessagePort
+        || (typeof source === "object" && Object.getPrototypeOf(source) !== Object.prototype && Object.getPrototypeOf(source) !== null);
+      if (!isPortLike) {
+        throw new TypeError(`The "eventInitDict.source" property must be of type MessagePort. Received ${describeMessageEventSource(source)}`);
+      }
+    }
+    state.source = source;
+    if (options.ports === undefined) {
+      state.ports = Object.freeze([]);
+    } else {
+      const ports = options.ports;
+      if (ports === null || typeof ports !== "object" || typeof ports[Symbol.iterator] !== "function") {
+        throw new TypeError("MessageEvent constructor: eventInitDict.ports is not iterable.");
+      }
+      const list = [...ports];
+      for (const item of list) {
+        if (!(item instanceof CottontailMessagePort)) {
+          throw new TypeError("MessageEvent constructor: Expected every item of eventInitDict.ports to be an instance of MessagePort.");
+        }
+      }
+      state.ports = Object.freeze(list);
+    }
+  }
+
+  get data() {
+    return eventStateFor(this).data;
+  }
+
+  get origin() {
+    return eventStateFor(this).origin;
+  }
+
+  get lastEventId() {
+    return eventStateFor(this).lastEventId;
+  }
+
+  get source() {
+    return eventStateFor(this).source;
+  }
+
+  get ports() {
+    return eventStateFor(this).ports;
+  }
+
+  initMessageEvent(type, bubbles = false, cancelable = false, data = null, origin = "", lastEventId = "", source = null, ports = []) {
+    const state = eventStateFor(this);
+    this.initEvent(type, bubbles, cancelable);
+    state.data = data;
+    state.origin = String(origin ?? "");
+    state.lastEventId = String(lastEventId ?? "");
+    state.source = source ?? null;
+    state.ports = Object.freeze([...(ports ?? [])]);
+  }
+}
+Object.defineProperty(CottontailMessageEvent, "name", { value: "MessageEvent", configurable: true });
+Object.defineProperty(CottontailMessageEvent.prototype, Symbol.toStringTag, { value: "MessageEvent", configurable: true });
+
+// -- MessagePort / MessageChannel ---------------------------------------------
+
+class CottontailMessagePort extends CottontailEventTarget {
+  constructor(token) {
+    if (token !== messagePortConstructToken) throw nodeTypeError("ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+    super();
+    webPortStates.set(this, {
+      id: null,
+      peer: null,
+      remote: null,
+      queue: [],
+      started: false,
+      closed: false,
+      detached: false,
+      draining: false,
+      onmessage: null,
+      onmessageerror: null,
+    });
+  }
+
+  get onmessage() {
+    return webPortStateFor(this).onmessage;
+  }
+
+  set onmessage(handler) {
+    const state = webPortStateFor(this);
+    state.onmessage = typeof handler === "function" ? handler : null;
+    setEventHandlerAttributeOrder(this, "message", state.onmessage);
+    if (state.onmessage) this.start();
+  }
+
+  get onmessageerror() {
+    return webPortStateFor(this).onmessageerror;
+  }
+
+  set onmessageerror(handler) {
+    const state = webPortStateFor(this);
+    state.onmessageerror = typeof handler === "function" ? handler : null;
+    setEventHandlerAttributeOrder(this, "messageerror", state.onmessageerror);
+  }
+
+  postMessage(message, transferOrOptions = undefined) {
+    const state = webPortStateFor(this);
+    const transfers = collectWebTransferables(transferOrOptions, this);
+    const prepared = buildWebTransferMap(transfers);
+    const data = structuredCloneValue(message, prepared.seen);
+    commitWebTransfer(prepared);
+    if (state.closed || state.detached) return;
+    const transferredPorts = prepared.ports.map((entry) => entry.replacement);
+    if (state.remote) {
+      const context = makeWireContext(state.remote.route);
+      const encodedPorts = transferredPorts.map((port) => wireEncodePort(port, context));
+      sendToWebRoute(state.remote.route, {
+        [WEB_PORT_ENVELOPE]: {
+          targetPortId: state.remote.peerId,
+          data: wireEncodeValue(data, context),
+          ports: encodedPorts,
+        },
+      });
+      return;
+    }
+    if (!state.peer) return;
+    deliverToWebPort(state.peer, data, transferredPorts);
+  }
+
+  start() {
+    const state = webPortStateFor(this);
+    if (state.started) return;
+    state.started = true;
+    scheduleWebPortDrain(this);
+  }
+
+  close() {
+    const state = webPortStateFor(this);
+    if (state.closed) return;
+    state.closed = true;
+    if (state.id != null && webPortRegistry.get(state.id) === this) webPortRegistry.delete(state.id);
+  }
+
+  ref() {
+    return this;
+  }
+
+  unref() {
+    return this;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "MessagePort";
+  }
+}
+Object.defineProperty(CottontailMessagePort, "name", { value: "MessagePort", configurable: true });
+
+class CottontailMessageChannel {
+  constructor() {
+    const port1 = new CottontailMessagePort(messagePortConstructToken);
+    const port2 = new CottontailMessagePort(messagePortConstructToken);
+    webPortStates.get(port1).peer = port2;
+    webPortStates.get(port2).peer = port1;
+    Object.defineProperty(this, "port1", { value: port1, enumerable: true });
+    Object.defineProperty(this, "port2", { value: port2, enumerable: true });
+  }
+
+  get [Symbol.toStringTag]() {
+    return "MessageChannel";
+  }
+}
+Object.defineProperty(CottontailMessageChannel, "name", { value: "MessageChannel", configurable: true });
+
+// -- BroadcastChannel ---------------------------------------------------------
+
+function broadcastChannelStateFor(channel) {
+  const state = broadcastChannelStates.get(channel);
+  if (!state) throw new TypeError("Can only call this method on instances of BroadcastChannel");
+  return state;
+}
+
+class CottontailBroadcastChannel extends CottontailEventTarget {
+  constructor(name) {
+    if (arguments.length === 0) throw new TypeError("BroadcastChannel constructor requires a name argument");
+    super();
+    const channelName = String(name);
+    broadcastChannelStates.set(this, {
+      name: channelName,
+      closed: false,
+      onmessage: null,
+      onmessageerror: null,
+    });
+    const channels = broadcastChannelRegistry.get(channelName) ?? [];
+    channels.push(this);
+    broadcastChannelRegistry.set(channelName, channels);
+  }
+
+  get name() {
+    return broadcastChannelStateFor(this).name;
+  }
+
+  get onmessage() {
+    return broadcastChannelStateFor(this).onmessage;
+  }
+
+  set onmessage(handler) {
+    const state = broadcastChannelStateFor(this);
+    state.onmessage = typeof handler === "function" ? handler : null;
+    setEventHandlerAttributeOrder(this, "message", state.onmessage);
+  }
+
+  get onmessageerror() {
+    return broadcastChannelStateFor(this).onmessageerror;
+  }
+
+  set onmessageerror(handler) {
+    const state = broadcastChannelStateFor(this);
+    state.onmessageerror = typeof handler === "function" ? handler : null;
+    setEventHandlerAttributeOrder(this, "messageerror", state.onmessageerror);
+  }
+
+  postMessage(message) {
+    const state = broadcastChannelStateFor(this);
+    if (arguments.length === 0) throw new TypeError("BroadcastChannel.postMessage requires a message argument");
+    if (state.closed) {
+      const DOMExceptionClass = globalThis.DOMException ?? CottontailDOMException;
+      throw new DOMExceptionClass("BroadcastChannel is closed", "InvalidStateError");
+    }
+    const data = structuredCloneValue(message, new WeakMap());
+    const recipients = (broadcastChannelRegistry.get(state.name) ?? []).filter((channel) => channel !== this);
+    queueMicrotask(() => {
+      for (const channel of recipients) {
+        const channelState = broadcastChannelStates.get(channel);
+        if (!channelState || channelState.closed) continue;
+        const event = new CottontailMessageEvent("message", { data });
+        markEventTrusted(event);
+        channel.dispatchEvent(event);
+      }
+    });
+    broadcastToOtherThreads({
+      [WEB_BROADCAST_ENVELOPE]: { name: state.name, data: wireEncodeValue(data, makeWireContext(null)) },
+    }, undefined);
+  }
+
+  close() {
+    const state = broadcastChannelStateFor(this);
+    if (state.closed) return;
+    state.closed = true;
+    const channels = broadcastChannelRegistry.get(state.name);
+    if (channels) {
+      const index = channels.indexOf(this);
+      if (index >= 0) channels.splice(index, 1);
+      if (channels.length === 0) broadcastChannelRegistry.delete(state.name);
+    }
+  }
+
+  ref() {
+    return this;
+  }
+
+  unref() {
+    return this;
+  }
+
+  [inspectCustomSymbol](depth, options, inspect) {
+    const state = broadcastChannelStates.get(this);
+    const fields = { name: state?.name, active: !(state?.closed ?? true) };
+    const render = typeof inspect === "function" ? inspect : nodeInspect;
+    return `BroadcastChannel ${render(fields, options)}`;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "BroadcastChannel";
+  }
+}
+Object.defineProperty(CottontailBroadcastChannel, "name", { value: "BroadcastChannel", configurable: true });
+
+// -- Worker integration hooks --------------------------------------------------
+
+globalThis.__cottontailWebInterceptWorkerMessage = (data, worker) => {
+  if (data == null || typeof data !== "object") return false;
+  if (data[WEB_PORT_ENVELOPE]) {
+    handleWebPortEnvelope(data[WEB_PORT_ENVELOPE], worker ? { workerId: worker.id } : { parent: true });
+    return true;
+  }
+  if (data[WEB_BROADCAST_ENVELOPE]) {
+    handleWebBroadcastEnvelope(data[WEB_BROADCAST_ENVELOPE], worker);
+    return true;
+  }
+  return false;
+};
+
+globalThis.__cottontailWebDecodeIncoming = (data, worker) => {
+  if (data != null && typeof data === "object" && data[WEB_WIRE_KEY] === 1) {
+    const route = worker ? { workerId: worker.id } : { parent: true };
+    for (const encodedPort of data.ports ?? []) wireDecodePort(encodedPort, route);
+    return wireDecodeValue(data.data, route);
+  }
+  return data;
+};
+
+globalThis.__cottontailMakeMessageEvent = (type, data) => {
+  try {
+    const event = new CottontailMessageEvent(String(type), { data });
+    markEventTrusted(event);
+    return event;
+  } catch {
+    return { type: String(type), data };
+  }
+};
+
+function webMessagingHasActiveHandles() {
+  if (broadcastChannelRegistry.size > 0) return true;
+  for (const port of webPortRegistry.values()) {
+    const state = webPortStates.get(port);
+    if (state && !state.closed && !state.detached && state.remote) return true;
+  }
+  return false;
+}
+
+if (cottontail.isWorker?.()) {
+  globalThis.__cottontailWebPollAlways = webMessagingHasActiveHandles;
+  globalThis.__cottontailWebHasActiveHandles = webMessagingHasActiveHandles;
+  globalThis.postMessage = (message, transferOrOptions = undefined) => {
+    cottontail.workerPostMessage(encodeWorkerWebMessage(message, transferOrOptions, { parent: true }));
+  };
+}
+
+if (typeof globalThis.Worker === "function" && globalThis.Worker.prototype && typeof cottontail.workerPostMessageTo === "function") {
+  const workerPrototype = globalThis.Worker.prototype;
+  workerPrototype.postMessage = function postMessage(message, transferOrOptions = undefined) {
+    cottontail.workerPostMessageTo(this.id, encodeWorkerWebMessage(message, transferOrOptions, { workerId: this.id }));
+  };
+  workerPrototype.ref = function ref() {
+    this._reffed = true;
+    return this;
+  };
+  workerPrototype.unref = function unref() {
+    this._reffed = false;
+    return this;
+  };
+}
+
+// -- Global installs ------------------------------------------------------------
+
+globalThis.MessageEvent ??= CottontailMessageEvent;
+globalThis.MessagePort ??= CottontailMessagePort;
+globalThis.MessageChannel ??= CottontailMessageChannel;
+globalThis.BroadcastChannel ??= CottontailBroadcastChannel;
+
+if (typeof globalThis.SuppressedError !== "function") {
+  const SuppressedErrorPolyfill = class SuppressedError extends Error {
+    constructor(error, suppressed, message = undefined, options = undefined) {
+      super(message, options);
+      Object.defineProperty(this, "error", { value: error, writable: true, configurable: true });
+      Object.defineProperty(this, "suppressed", { value: suppressed, writable: true, configurable: true });
+    }
+  };
+  Object.defineProperty(SuppressedErrorPolyfill.prototype, "name", {
+    value: "SuppressedError",
+    writable: true,
+    configurable: true,
+  });
+  globalThis.SuppressedError = SuppressedErrorPolyfill;
+}
+
+if (typeof globalThis.addEventListener !== "function") {
+  const globalEventTargetInstance = new CottontailEventTarget();
+  globalThis.addEventListener = (type, listener, options = undefined) =>
+    globalEventTargetInstance.addEventListener(type, listener, options);
+  globalThis.removeEventListener = (type, listener, options = undefined) =>
+    globalEventTargetInstance.removeEventListener(type, listener, options);
+  globalThis.dispatchEvent = (event) => globalEventTargetInstance.dispatchEvent(event);
+}
+globalThis.MessageEvent ??= CottontailMessageEvent;
+
+// The global scope is itself an EventTarget (addEventListener/dispatchEvent on
+// globalThis) with on<event> handler attributes like onerror/onmessage.
+{
+  const globalEventTarget = new (globalThis.EventTarget ?? CottontailEventTarget)();
+  globalThis.addEventListener ??= (...args) => globalEventTarget.addEventListener(...args);
+  globalThis.removeEventListener ??= (...args) => globalEventTarget.removeEventListener(...args);
+  globalThis.dispatchEvent ??= (...args) => globalEventTarget.dispatchEvent(...args);
+  for (const [attribute, eventName] of [["onerror", "error"], ["onmessage", "message"], ["onmessageerror", "messageerror"]]) {
+    if (Object.getOwnPropertyDescriptor(globalThis, attribute)) continue;
+    let handler = null;
+    let listener = null;
+    Object.defineProperty(globalThis, attribute, {
+      get() {
+        return handler;
+      },
+      set(value) {
+        if (listener !== null) {
+          globalEventTarget.removeEventListener(eventName, listener);
+          listener = null;
+        }
+        handler = typeof value === "function" ? value : null;
+        if (handler !== null) {
+          listener = (event) => handler.call(globalThis, event);
+          globalEventTarget.addEventListener(eventName, listener);
+        }
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  globalThis.reportError ??= function reportError(error) {
+    const event = new CottontailErrorEvent("error", {
+      message: error instanceof globalThis.Error ? String(error.message ?? "") : String(error),
+      error,
+      cancelable: true,
+    });
+    globalThis.dispatchEvent(event);
+    if (!event.defaultPrevented) console.error(error);
+  };
+}
 
 // Web Performance surface: illegal-constructor classes over the basic clock
 // installed by ffi.js, plus mark/measure entries and PerformanceObserver.
@@ -11909,6 +13841,34 @@ globalThis.CloseEvent ??= CottontailCloseEvent;
   };
   class PerformanceMark extends PerformanceEntry {}
   class PerformanceMeasure extends PerformanceEntry {}
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  class PerformanceServerTiming {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  }
+  class PerformanceTiming {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  }
+
+  const entryListRecords = new WeakMap();
+  class PerformanceObserverEntryList {
+    constructor(...args) {
+      if (args[0] !== allowConstruct) throw new TypeError("Illegal constructor");
+      entryListRecords.set(this, args[1] ?? []);
+    }
+    getEntries() {
+      return [...entryListRecords.get(this)];
+    }
+    getEntriesByName(name, type = undefined) {
+      return entryListRecords.get(this).filter((item) => item.name === String(name) && (type == null || item.entryType === type));
+    }
+    getEntriesByType(type) {
+      return entryListRecords.get(this).filter((item) => item.entryType === String(type));
+    }
+  }
 
   const notifyObservers = (entry) => {
     for (const observer of [...perfObservers]) {
@@ -11920,12 +13880,7 @@ globalThis.CloseEvent ??= CottontailCloseEvent;
         observer._pending = false;
         const records = observer._buffer.splice(0);
         if (records.length === 0) return;
-        const list = {
-          getEntries: () => [...records],
-          getEntriesByName: (name, type) => records.filter((item) => item.name === String(name) && (type == null || item.entryType === type)),
-          getEntriesByType: (type) => records.filter((item) => item.entryType === String(type)),
-        };
-        observer._callback(list, observer);
+        observer._callback(new PerformanceObserverEntryList(allowConstruct, records), observer);
       });
     }
   };
@@ -11994,10 +13949,28 @@ globalThis.CloseEvent ??= CottontailCloseEvent;
         if (perfEntries[index].entryType === "measure" && (name == null || perfEntries[index].name === String(name))) perfEntries.splice(index, 1);
       }
     }
+    clearResourceTimings() {
+      for (let index = perfEntries.length - 1; index >= 0; index -= 1) {
+        if (perfEntries[index].entryType === "resource") perfEntries.splice(index, 1);
+      }
+    }
+    setResourceTimingBufferSize(maxSize) {
+      resourceTimingBufferSize = Math.max(0, Number(maxSize) || 0);
+    }
     toJSON() {
       return { timeOrigin: perfTimeOrigin, eventCounts: {} };
     }
+    // Estimated retained bytes for bun:jsc's estimateShallowMemoryUsageOf():
+    // the buffered entries are owned by this object, so the shallow cost must
+    // grow as marks/measures accumulate (mirrors WebCore's memoryCost()).
+    get [Symbol.for("cottontail.estimatedMemoryCost")]() {
+      let cost = 256;
+      for (const entry of perfEntries) cost += 64 + entry.name.length * 2;
+      return cost;
+    }
   }
+  let resourceTimingBufferSize = 250;
+  Performance.prototype.onresourcetimingbufferfull = null;
 
   class PerformanceObserver {
     constructor(callback) {
@@ -12035,6 +14008,10 @@ globalThis.CloseEvent ??= CottontailCloseEvent;
   globalThis.PerformanceMark = PerformanceMark;
   globalThis.PerformanceMeasure = PerformanceMeasure;
   globalThis.PerformanceObserver ??= PerformanceObserver;
+  globalThis.PerformanceObserverEntryList ??= PerformanceObserverEntryList;
+  globalThis.PerformanceResourceTiming ??= PerformanceResourceTiming;
+  globalThis.PerformanceServerTiming ??= PerformanceServerTiming;
+  globalThis.PerformanceTiming ??= PerformanceTiming;
 }
 
 // The WebSocket client in node/http.js is backed by EventEmitter, and
@@ -12066,14 +14043,21 @@ if (globalThis.fetch == null) {
   Object.defineProperty(fetch, "name", { value: "fetch", configurable: true });
   globalThis.fetch = fetch;
 }
-Object.defineProperty(globalThis, "self", {
-  get() {
-    return globalThis;
-  },
-  set(_value) {},
-  enumerable: true,
-  configurable: true,
-});
+{
+  // self defaults to globalThis but stays a plain assignable property
+  // (globalThis.self = 123 must stick), exposed as a get/set accessor pair.
+  let selfValue = globalThis;
+  Object.defineProperty(globalThis, "self", {
+    get() {
+      return selfValue;
+    },
+    set(value) {
+      selfValue = value;
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
 for (const [ctor, name] of [
   [globalThis.Blob, "Blob"],
   [globalThis.TextDecoder, "TextDecoder"],
@@ -12123,7 +14107,10 @@ globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cotton
 globalThis.__cottontailImportMetaResolveSync ??= (specifier, parent = globalThis.__cottontailImportMeta?.path ?? cottontail.cwd()) =>
   resolveSync(specifier, parent);
 globalThis.__cottontailImportMetaResolve ??= (specifier, parent = globalThis.__cottontailImportMeta?.path ?? cottontail.cwd()) => {
-  const resolved = resolveSync(specifier, parent);
+  const text = String(specifier);
+  if (text.startsWith("node:") || text.startsWith("bun:") || text.startsWith("file:")) return text;
+  if (text.startsWith(".") || text.startsWith("/")) return new URL(text, pathToFileURL(parent).href).href;
+  const resolved = resolveSync(text, parent);
   return String(resolved).startsWith("/") ? pathToFileURL(resolved).href : resolved;
 };
 globalThis.test ??= bunTestModule.test;

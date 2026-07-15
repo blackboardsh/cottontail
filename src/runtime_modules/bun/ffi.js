@@ -1,3 +1,4 @@
+import "./encoding.js";
 import { createReadableStdio, createWritableStdio } from "../node/stdio.js";
 
 const g = globalThis;
@@ -11,6 +12,59 @@ if (Symbol.dispose == null) {
 }
 if (Symbol.asyncDispose == null) {
   Object.defineProperty(Symbol, "asyncDispose", { value: Symbol.for("Symbol.asyncDispose"), configurable: true });
+}
+
+// Bare `import.meta` expressions (e.g. `const { file } = import.meta;`) are
+// rewritten by the loader to `globalThis.__cottontailImportMeta`, which each
+// generated module's prelude reassigns using the GENERATED file's name
+// (script.bundle.mjs / script-entry-*.mjs / .cottontail-compat-*). The real
+// entrypoint path is published as `globalThis.__filename` before the bundle
+// is imported, so intercept the assignment and restore the original file's
+// metadata.
+if (!g.__cottontailImportMetaFixInstalled) {
+  Object.defineProperty(g, "__cottontailImportMetaFixInstalled", { value: true, configurable: true });
+  const generatedPattern = /(?:^|[\\/])(?:script\.bundle\.mjs|script-entry-[^\\/]*\.mjs|\.cottontail-compat-[0-9a-f]+(?:\.[A-Za-z0-9]+)?)$/;
+  const fileUrlFor = (path) => {
+    let url = "file://";
+    for (const segment of String(path).split("/")) {
+      if (segment === "") continue;
+      url += "/" + encodeURIComponent(segment);
+    }
+    return url === "file://" ? "file:///" : url;
+  };
+  const fixImportMeta = (meta) => {
+    if (!meta || typeof meta !== "object") return meta;
+    const original = g.__filename;
+    if (
+      typeof original === "string" &&
+      original.length > 0 &&
+      typeof meta.filename === "string" &&
+      generatedPattern.test(meta.filename) &&
+      meta.filename !== original
+    ) {
+      const slash = original.lastIndexOf("/");
+      const dir = slash > 0 ? original.slice(0, slash) : (slash === 0 ? "/" : ".");
+      meta.dirname = dir;
+      meta.dir = dir;
+      meta.filename = original;
+      meta.path = original;
+      meta.file = slash >= 0 ? original.slice(slash + 1) : original;
+      meta.url = fileUrlFor(original);
+    }
+    return meta;
+  };
+  let currentImportMeta = g.__cottontailImportMeta;
+  Object.defineProperty(g, "__cottontailImportMeta", {
+    configurable: true,
+    get() {
+      // Fix lazily: the generated prelude may assign before the entry
+      // wrapper publishes globalThis.__filename. fixImportMeta is idempotent.
+      return fixImportMeta(currentImportMeta);
+    },
+    set(value) {
+      currentImportMeta = value;
+    },
+  });
 }
 
 function platform() {
@@ -43,7 +97,8 @@ function installProcessApi(processObject) {
 
   processObject.pid ??= cottontail.pid?.() ?? 0;
   processObject.version ??= "v24.0.0";
-  processObject.title ??= "cottontail";
+  // Bun reports "bun" as the process title (upstream regression 23183).
+  processObject.title ??= "bun";
   processObject.browser ??= false;
   processObject.uptime ??= () => (Date.now() - processStartMs) / 1000;
 
@@ -303,8 +358,33 @@ const formatArrayBody = (items, indent, prefix = "") => {
   const hasNewline = items.some((item) => item.includes("\n"));
   if (!hasNewline) {
     const inline = `${prefix}[ ${items.join(", ")} ]`;
-    if (inline.length + indent <= 100) return inline;
-    return `${prefix}[\n${wrapInlineItems(items, indent)}\n${" ".repeat(indent)}]`;
+    // Bun column-groups longer arrays of short numeric items (Node-style
+    // grouping), with the opening bracket on its own line.
+    if (items.length > 6 && items.every((item) => /^-?\d+(\.\d+)?$/.test(item))) {
+      if (inline.length + indent <= 80) return inline;
+      return `${prefix}[\n${wrapInlineItems(items, indent)}\n${" ".repeat(indent)}]`;
+    }
+    // Otherwise Bun streams items onto the current line and breaks before the
+    // next item only once the line already exceeds ~80 columns, so a single
+    // oversized item never forces earlier items onto separate lines.
+    const pad = " ".repeat(indent + 2);
+    let line = `${prefix}[ ${items[0]}`;
+    let lineStart = indent;
+    let out = "";
+    let wrapped = false;
+    for (let index = 1; index < items.length; index += 1) {
+      line += ",";
+      if (lineStart + line.length > 80) {
+        out += `${line}\n`;
+        line = pad + items[index];
+        lineStart = 0;
+        wrapped = true;
+      } else {
+        line += ` ${items[index]}`;
+      }
+    }
+    if (!wrapped) return `${line} ]`;
+    return `${out}${line}\n${" ".repeat(indent)}]`;
   }
   const pad = " ".repeat(indent + 2);
   return `${prefix}[\n${pad}${items.join(", ")}\n${" ".repeat(indent)}]`;
@@ -594,111 +674,11 @@ if (typeof g.URL !== "function" || !("searchParams" in new g.URL("http://example
   };
 }
 
-function encodeUtf8(input) {
-  const out = [];
-  for (let index = 0; index < input.length; index += 1) {
-    let codePoint = input.charCodeAt(index);
-    if (codePoint >= 0xd800 && codePoint <= 0xdbff && index + 1 < input.length) {
-      const next = input.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (next - 0xdc00);
-        index += 1;
-      }
-    }
-    // WHATWG: lone surrogates encode as U+FFFD, never CESU-8.
-    if (codePoint >= 0xd800 && codePoint <= 0xdfff) codePoint = 0xfffd;
-    if (codePoint <= 0x7f) out.push(codePoint);
-    else if (codePoint <= 0x7ff) out.push(0xc0 | (codePoint >> 6), 0x80 | (codePoint & 0x3f));
-    else if (codePoint <= 0xffff) out.push(0xe0 | (codePoint >> 12), 0x80 | ((codePoint >> 6) & 0x3f), 0x80 | (codePoint & 0x3f));
-    else out.push(0xf0 | (codePoint >> 18), 0x80 | ((codePoint >> 12) & 0x3f), 0x80 | ((codePoint >> 6) & 0x3f), 0x80 | (codePoint & 0x3f));
-  }
-  return new Uint8Array(out);
-}
-
-function decodeUtf8(input) {
-  const bytes = input instanceof ArrayBuffer
-    ? new Uint8Array(input)
-    : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-  let output = "";
-  for (let index = 0; index < bytes.length;) {
-    const first = bytes[index++] || 0;
-    let codePoint = first;
-    if ((first & 0xe0) === 0xc0) {
-      codePoint = ((first & 0x1f) << 6) | ((bytes[index++] || 0) & 0x3f);
-    } else if ((first & 0xf0) === 0xe0) {
-      codePoint = ((first & 0x0f) << 12) | (((bytes[index++] || 0) & 0x3f) << 6) | ((bytes[index++] || 0) & 0x3f);
-    } else if ((first & 0xf8) === 0xf0) {
-      codePoint = ((first & 0x07) << 18) | (((bytes[index++] || 0) & 0x3f) << 12) | (((bytes[index++] || 0) & 0x3f) << 6) | ((bytes[index++] || 0) & 0x3f);
-    }
-    if (codePoint <= 0xffff) output += String.fromCharCode(codePoint);
-    else {
-      codePoint -= 0x10000;
-      output += String.fromCharCode(0xd800 + (codePoint >> 10), 0xdc00 + (codePoint & 0x3ff));
-    }
-  }
-  return output;
-}
-
-g.TextEncoder ??= class TextEncoder {
-  get encoding() {
-    return "utf-8";
-  }
-  encode(input = "") {
-    return encodeUtf8(String(input));
-  }
-  get [Symbol.toStringTag]() {
-    return "TextEncoder";
-  }
-};
-
-const windows1252HighChars = "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ";
-
-function normalizeTextDecoderLabel(label) {
-  const text = String(label).trim().toLowerCase();
-  if (["utf-8", "utf8", "unicode-1-1-utf-8"].includes(text)) return "utf-8";
-  if (["ascii", "us-ascii", "latin1", "iso-8859-1", "iso8859-1", "windows-1252", "cp1252", "x-cp1252", "iso-ir-100", "l1", "cp819", "ibm819"].includes(text)) return "windows-1252";
-  if (["utf-16le", "utf-16", "ucs-2", "unicode"].includes(text)) return "utf-16le";
-  if (["utf-16be"].includes(text)) return "utf-16be";
-  return "utf-8";
-}
-
-g.TextDecoder ??= class TextDecoder {
-  constructor(label = "utf-8", options = {}) {
-    this.encoding = normalizeTextDecoderLabel(label);
-    this.fatal = Boolean(options.fatal);
-    this.ignoreBOM = Boolean(options.ignoreBOM);
-  }
-  decode(input = new ArrayBuffer(0)) {
-    const bytes = input instanceof ArrayBuffer
-      ? new Uint8Array(input)
-      : ArrayBuffer.isView(input)
-        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-        : new Uint8Array(0);
-    if (this.encoding === "windows-1252") {
-      let output = "";
-      for (const byte of bytes) {
-        output += byte >= 0x80 && byte <= 0x9f ? windows1252HighChars[byte - 0x80] : String.fromCharCode(byte);
-      }
-      return output;
-    }
-    if (this.encoding === "utf-16le" || this.encoding === "utf-16be") {
-      let output = "";
-      const littleEndian = this.encoding === "utf-16le";
-      for (let index = 0; index + 1 < bytes.length; index += 2) {
-        output += String.fromCharCode(littleEndian ? bytes[index] | (bytes[index + 1] << 8) : (bytes[index] << 8) | bytes[index + 1]);
-      }
-      if (!this.ignoreBOM && output.charCodeAt(0) === 0xfeff) output = output.slice(1);
-      return output;
-    }
-    return decodeUtf8(bytes);
-  }
-  get [Symbol.toStringTag]() {
-    return "TextDecoder";
-  }
-};
-
+// TextEncoder/TextDecoder are installed on globalThis by ./encoding.js
+// (imported first, above). Node Buffer semantics never strip a BOM, so the
+// module-level utf-8 decoder used by Buffer.toString runs with ignoreBOM.
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const textDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 function bytesFromString(input) {
   return textEncoder.encode(String(input));
@@ -708,9 +688,19 @@ function stringFromBytes(bytes) {
   return textDecoder.decode(bytes);
 }
 
+const canonicalUtf8BlobTypes = new Set([
+  "application/javascript",
+  "application/json",
+  "text/css",
+  "text/html",
+  "text/javascript",
+  "text/plain",
+]);
+
 function normalizeBlobType(type = "") {
-  const text = String(type).toLowerCase();
-  return /[\x00-\x1f\x7f-\xff]/.test(text) ? "" : text;
+  const source = String(type);
+  if (/[^\x20-\x7e]/.test(source)) return "";
+  return canonicalUtf8BlobTypes.has(source) ? `${source};charset=utf-8` : source.toLowerCase();
 }
 
 function bytesFromBlobPart(part) {
@@ -991,7 +981,8 @@ function invalidCharacterError(message) {
   return error;
 }
 
-g.btoa ??= (input) => {
+g.btoa ??= function btoa(input) {
+  if (arguments.length === 0) throw new TypeError("btoa requires 1 argument (a string)");
   const text = String(input);
   const bytes = new Uint8Array(text.length);
   for (let index = 0; index < text.length; index += 1) {
@@ -1002,7 +993,8 @@ g.btoa ??= (input) => {
   return base64Encode(bytes);
 };
 
-g.atob ??= (input) => {
+g.atob ??= function atob(input) {
+  if (arguments.length === 0) throw new TypeError("atob requires 1 argument (a string)");
   // WHATWG forgiving-base64 decode: strip ASCII whitespace, validate
   // alphabet and padding, throw InvalidCharacterError on anything else.
   let text = String(input).replace(/[\t\n\f\r ]+/g, "");
@@ -1459,19 +1451,23 @@ function installWorkerGlobal() {
 
 function pollWorkerGlobalMessages() {
   if (!cottontail.isWorker?.()) return;
-  if (!hasWorkerMessageListener()) return;
+  if (!hasWorkerMessageListener() && !g.__cottontailWebPollAlways?.()) return;
   for (const item of cottontail.workerPollIncomingMessages()) {
     let data = item;
     try {
       data = JSON.parse(item);
     } catch {}
-    emitWorkerEvent(g, "message", { data });
+    if (g.__cottontailWebInterceptWorkerMessage?.(data, null)) continue;
+    data = g.__cottontailWebDecodeIncoming?.(data, null) ?? data;
+    const event = g.__cottontailMakeMessageEvent?.("message", data) ?? { data };
+    emitWorkerEvent(g, "message", event);
   }
 }
 
 installWorkerGlobal();
 
 const workerInstances = new Map();
+g.__cottontailActiveWorkerIds = () => [...workerInstances.keys()];
 let workerNativeEventHandlerInstalled = false;
 
 function installWorkerNativeEventHandler() {
@@ -1505,6 +1501,7 @@ function nextRunLoopDelay(now = timerNow()) {
 g.__cottontailHasActiveHandles = () => {
   if (cottontail.isWorker?.()) {
     if (hasWorkerMessageListener()) return true;
+    if (g.__cottontailWebHasActiveHandles?.()) return true;
   }
   if (workerInstances.size > 0) return true;
   for (const timer of timers.values()) {
@@ -1556,9 +1553,42 @@ function rewriteWorkerNamedImports(spec) {
     .join(", ");
 }
 
+const workerBundleCache = new Map();
+
+function workerTempDir() {
+  const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
+  return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
+}
+
 function prepareWorkerScriptPath(scriptPath) {
   const target = normalizeWorkerScriptPath(scriptPath);
   if (target.startsWith("data:")) return target;
+  const cached = workerBundleCache.get(target);
+  if (cached && cottontail.existsSync?.(cached)) return cached;
+  const tempDir = workerTempDir();
+  cottontail.mkdirSync?.(tempDir, true);
+  const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+  const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
+  const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
+  const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
+  const slashTarget = String(target).replace(/\\/g, "/");
+  const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/index.js`;
+  try {
+    cottontail.writeFile(wrapperPath, [
+      `import ${JSON.stringify(runtimeEntry)};`,
+      `import ${JSON.stringify(slashTarget)};`,
+    ].join("\n"));
+    const bundled = cottontail.bundleNative(wrapperPath, cottontail.cwd(), JSON.stringify({
+      format: "esm",
+      target: "bun",
+      includeRuntimeModules: true,
+      inlineImportMetaProperties: true,
+    }));
+    cottontail.writeFile(bundledPath, bundled);
+    workerBundleCache.set(target, bundledPath);
+    return bundledPath;
+  } catch {}
+
   let source;
   try {
     source = cottontail.readFile(target);
@@ -1579,16 +1609,13 @@ function prepareWorkerScriptPath(scriptPath) {
       (_all, names) => `const { ${rewriteWorkerNamedImports(names)} } = globalThis.Bun;`,
     );
   if (transformed === source) return target;
-  const tempDir = `${cottontail.cwd()}/.cottontail-tmp`;
-  cottontail.mkdirSync?.(tempDir, true);
-  const wrapperPath = `${tempDir}/bun-worker-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
-  cottontail.writeFile(wrapperPath, [
+  cottontail.writeFile(bundledPath, [
     "globalThis.Bun ??= { isMainThread: false };",
     "globalThis.Bun.isMainThread = false;",
     transformed,
     `\n//# sourceURL=${target}`,
   ].join("\n"));
-  return wrapperPath;
+  return bundledPath;
 }
 
 g.Worker ??= class Worker {
@@ -1621,7 +1648,10 @@ g.Worker ??= class Worker {
       try {
         data = JSON.parse(item);
       } catch {}
-      this._emit("message", { data });
+      if (g.__cottontailWebInterceptWorkerMessage?.(data, this)) continue;
+      data = g.__cottontailWebDecodeIncoming?.(data, this) ?? data;
+      const event = g.__cottontailMakeMessageEvent?.("message", data) ?? { data };
+      this._emit("message", event);
     }
   }
   postMessage(message) {
@@ -1768,24 +1798,42 @@ function readCString(pointer) {
   return stringFromBytes(bytes);
 }
 
-export class CString {
-  constructor(value) {
-    if (typeof value === "string") {
-      this.text = value;
-      this.buffer = bytesFromString(`${value}\0`);
-      this.ptr = ptr(this.buffer);
-    } else {
-      this.ptr = toNumber(value);
-      this.text = readCString(value);
-    }
+// Callable with or without `new` (bun semantics, issue #25231): without
+// `new` it returns the decoded primitive string. Optional byteOffset and
+// byteLength narrow the read window; without byteLength the string is read
+// up to the first NUL byte.
+export function CString(value, byteOffset = undefined, byteLength = undefined) {
+  if (!new.target) {
+    return String(new CString(value, byteOffset, byteLength));
   }
-  toString() {
-    return this.text;
+  if (typeof value === "string") {
+    this.text = value;
+    this.buffer = bytesFromString(`${value}\0`);
+    this.ptr = ptr(this.buffer);
+    return;
   }
-  get length() {
-    return this.text.length;
+  const offset = Number(byteOffset ?? 0) || 0;
+  const address = toNumber(value) + offset;
+  this.ptr = toNumber(value);
+  this.byteOffset = offset;
+  if (byteLength === undefined || byteLength === null) {
+    this.text = readCString(address);
+  } else {
+    const length = Number(byteLength) || 0;
+    this.byteLength = length;
+    const view = new Uint8Array(cottontail.memoryView(address, 0, length));
+    this.text = stringFromBytes(view.slice());
   }
 }
+CString.prototype.toString = function toString() {
+  return this.text;
+};
+Object.defineProperty(CString.prototype, "length", {
+  configurable: true,
+  get() {
+    return this.text.length;
+  },
+});
 
 export class JSCallback {
   constructor(fn, options = {}) {

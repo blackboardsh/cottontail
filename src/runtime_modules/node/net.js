@@ -1090,6 +1090,10 @@ export class BlockList {
     }
     return false;
   }
+
+  [Symbol.for("cottontail.structuredClone")]() {
+    return this;
+  }
 }
 
 export class SocketAddress {

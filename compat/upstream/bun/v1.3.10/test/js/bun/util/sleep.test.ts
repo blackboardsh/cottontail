@@ -18,6 +18,9 @@ test("sleep should saturate timeout values", async () => {
     "-999999999999999.999999999999999",
   ];
   const ASAN_MULTIPLIER = isASAN ? 2 : 1;
+  // COTTONTAIL-COMPAT: This test targets timer saturation, not Bun's cold-start
+  // budget. Cottontail currently bundles its runtime in each spawned process.
+  const RUNTIME_STARTUP_MULTIPLIER = process.versions.cottontail ? 3 : 1;
 
   const toKill = fixturesThatShouldTimeout.map(timeout => {
     const proc = Bun.spawn({
@@ -42,7 +45,7 @@ test("sleep should saturate timeout values", async () => {
       cwd: import.meta.dir,
     });
     expect(await proc.exited).toBe(0);
-    expect(performance.now() - start).toBeLessThan(1000 * ASAN_MULTIPLIER);
+    expect(performance.now() - start).toBeLessThan(1000 * ASAN_MULTIPLIER * RUNTIME_STARTUP_MULTIPLIER);
   });
 
   await Promise.all(toWait);

@@ -1,0 +1,38 @@
+{
+  "inputs": {
+    "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/index.js": {
+      "bytes": 47,
+      "imports": [
+        {
+          "path": "/private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/helper.js",
+          "kind": "import-statement",
+          "original": "./helper.js"
+        }
+      ],
+      "format": "esm"
+    },
+    "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/helper.js": {
+      "bytes": 43,
+      "imports": [
+      ],
+      "format": "esm"
+    }
+  },
+  "outputs": {
+    "./index.js": {
+      "bytes": 343,
+      "inputs": {
+        "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/helper.js": {
+          "bytesInOutput": 39
+        },
+        "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/index.js": {
+          "bytesInOutput": 10
+        }
+      },
+      "imports": [
+      ],
+      "exports": [],
+      "entryPoint": "../../../../../../../../../../../../private/var/folders/x3/1p_gy4213vb5pzwwtr10mk940000gp/T/metafile-object-both_1784087250923-502999/index.js"
+    }
+  }
+}

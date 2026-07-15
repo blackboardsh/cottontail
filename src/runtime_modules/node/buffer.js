@@ -71,6 +71,12 @@ if (Buffer && typeof Buffer.isEncoding !== "function") {
   };
 }
 
+if (Buffer && typeof Buffer.of !== "function") {
+  Buffer.of = function of(...items) {
+    return Buffer.from(items);
+  };
+}
+
 function bytesFrom(value) {
   if (value == null) return new Uint8Array(0);
   if (value instanceof ArrayBuffer) return new Uint8Array(value);

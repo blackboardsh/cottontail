@@ -6,7 +6,7 @@ import { Readable, Writable } from "./stream.js";
 // fs <-> fs/promises edge is evaluated. `fs.promises` must be the exact same
 // object as the fs/promises module namespace (Node/Bun behavior relied on by
 // upstream tests: require("fs/promises") === require("fs").promises).
-import * as fsPromisesNamespace from "./fs/promises.js";
+import fsPromisesDefault from "./fs/promises.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -117,9 +117,9 @@ function makeFsError(error, path, syscall = "open") {
     code = knownErrorCodes.find((candidate) => source.includes(candidate)) ?? "";
   }
   if (!code) {
-    if (source.includes("No such file or directory")) code = "ENOENT";
-    else if (source.includes("Permission denied") || source.includes("access denied")) code = "EACCES";
-    else if (source.includes("already exists") || source.includes("File exists")) code = "EEXIST";
+    if (source.includes("No such file or directory") || source.includes("FileNotFound")) code = "ENOENT";
+    else if (source.includes("Permission denied") || source.includes("access denied") || source.includes("AccessDenied")) code = "EACCES";
+    else if (source.includes("already exists") || source.includes("File exists") || source.includes("PathAlreadyExists")) code = "EEXIST";
     else if (source.includes("Not a directory") || source.includes("NotDir")) code = "ENOTDIR";
     else if (source.includes("Is a directory") || source.includes("IsDir")) code = "EISDIR";
     else if (source.includes("Directory not empty") || source.includes("DirNotEmpty")) code = "ENOTEMPTY";
@@ -1674,7 +1674,7 @@ Object.defineProperty(glob, "name", { value: "glob" });
 
 // The fs/promises module namespace itself. Node exposes fs.promises as the
 // exact same object returned by require("fs/promises").
-export const promises = fsPromisesNamespace;
+export const promises = fsPromisesDefault;
 
 export default {
   Dir,

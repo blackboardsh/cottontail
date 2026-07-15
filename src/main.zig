@@ -19,6 +19,10 @@ comptime {
 }
 
 const version = "0.1.1-beta.0";
+// Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
+// mirroring how bun reports `<version>+<git sha>`.
+const revision_suffix = "cottontail";
+const completion_commands = [_][]const u8{ "run", "test", "build", "exec", "getcompletes" };
 const help_text_template =
     \\cottontail {s}
     \\Tiny Zig-based JavaScript runtime.
@@ -425,6 +429,13 @@ fn runFakeNode(init: std.process.Init, node_args: []const [:0]const u8) !u8 {
     return 1;
 }
 
+fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+}
+
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
@@ -434,10 +445,13 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    var options: cottontail_bundler.BundleOptions = .{};
+    var options: cottontail_bundler.BundleOptions = .{ .target = .browser };
     var entries: std.ArrayList([]const u8) = .empty;
+    var external: std.ArrayList([]const u8) = .empty;
     var outdir: ?[]const u8 = null;
     var outfile: ?[]const u8 = null;
+    var metafile_json_path: ?[]const u8 = null;
+    var metafile_markdown_path: ?[]const u8 = null;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
@@ -453,6 +467,21 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             options.minify_syntax = true;
         } else if (std.mem.eql(u8, arg, "--packages=external")) {
             options.external_packages = true;
+        } else if (std.mem.eql(u8, arg, "--splitting")) {
+            options.code_splitting = true;
+        } else if (std.mem.eql(u8, arg, "--metafile")) {
+            metafile_json_path = "meta.json";
+        } else if (std.mem.startsWith(u8, arg, "--metafile=")) {
+            metafile_json_path = arg["--metafile=".len..];
+        } else if (std.mem.eql(u8, arg, "--metafile-md")) {
+            metafile_markdown_path = "meta.md";
+        } else if (std.mem.startsWith(u8, arg, "--metafile-md=")) {
+            metafile_markdown_path = arg["--metafile-md=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--external=")) {
+            try external.append(allocator, arg["--external=".len..]);
+        } else if (std.mem.eql(u8, arg, "--external") and index + 1 < args.len) {
+            index += 1;
+            try external.append(allocator, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--outdir=")) {
             outdir = arg["--outdir=".len..];
         } else if (std.mem.eql(u8, arg, "--outdir") and index + 1 < args.len) {
@@ -516,37 +545,101 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             try stderr.flush();
             return 1;
         };
+    }
 
-        var error_message: ?[*:0]u8 = null;
-        const output = cottontail_bundler.bundleEntryPointWithOptions(entry_abs, cwd_abs, options, &error_message) catch |err| {
-            if (error_message) |message| {
-                defer cottontail_bundler.ct_bundle_string_free(message);
-                try stderr.print("error: {s}\n", .{std.mem.span(message)});
-            } else {
-                try stderr.print("error: build failed: {s}\n", .{@errorName(err)});
+    options.external = external.items;
+    const MetafileRequest = struct { json: []const u8, markdown: []const u8 };
+    const MinifyRequest = struct { whitespace: bool, identifiers: bool, syntax: bool };
+    const request = .{
+        .entrypoints = entries.items,
+        .target = @tagName(options.target),
+        .format = @tagName(options.output_format),
+        .sourcemap = @tagName(options.source_map),
+        .packages = if (options.external_packages) "external" else "bundle",
+        .external = options.external,
+        .splitting = options.code_splitting,
+        .minify = MinifyRequest{
+            .whitespace = options.minify_whitespace,
+            .identifiers = options.minify_identifiers,
+            .syntax = options.minify_syntax,
+        },
+        .metafile = if (metafile_json_path != null or metafile_markdown_path != null)
+            MetafileRequest{
+                .json = metafile_json_path orelse "",
+                .markdown = metafile_markdown_path orelse "",
+            }
+        else
+            null,
+    };
+    const request_json = try std.json.Stringify.valueAlloc(allocator, request, .{});
+    var error_message: ?[*:0]u8 = null;
+    const result_json = cottontail_bundler.buildEntryPointsJson(request_json, cwd_abs, &error_message) catch |err| {
+        if (error_message) |message| {
+            defer cottontail_bundler.ct_bundle_string_free(message);
+            try stderr.print("error: {s}\n", .{std.mem.span(message)});
+        } else {
+            try stderr.print("error: build failed: {s}\n", .{@errorName(err)});
+        }
+        try stderr.flush();
+        return 1;
+    };
+    defer cottontail_bundler.ct_bundle_free(result_json.ptr, result_json.len);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    const result = parsed.value.object;
+    if (result.get("success")) |success| {
+        if (success == .bool and !success.bool) {
+            if (result.get("logs")) |logs| {
+                if (logs == .array) for (logs.array.items) |log| {
+                    if (log == .object) {
+                        if (log.object.get("message")) |message| {
+                            if (message == .string) try stderr.print("error: {s}\n", .{message.string});
+                        }
+                    }
+                };
             }
             try stderr.flush();
             return 1;
-        };
-        defer cottontail_bundler.ct_bundle_free(output.ptr, output.len);
+        }
+    }
 
-        const destination = outfile orelse if (outdir) |dir| blk: {
-            try std.Io.Dir.cwd().createDirPath(init.io, dir);
-            const base = std.fs.path.basename(entry);
-            const extension = std.fs.path.extension(base);
-            const stem = base[0 .. base.len - extension.len];
-            break :blk try std.fs.path.join(allocator, &.{ dir, try std.fmt.allocPrint(allocator, "{s}.js", .{stem}) });
-        } else null;
+    if (result.get("outputs")) |outputs| {
+        if (outputs == .array) for (outputs.array.items) |output| {
+            if (output != .object) continue;
+            const path_value = output.object.get("path") orelse continue;
+            const b64_value = output.object.get("b64") orelse continue;
+            if (path_value != .string or b64_value != .string) continue;
+            const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_value.string);
+            const decoded = try allocator.alloc(u8, decoded_len);
+            try std.base64.standard.Decoder.decode(decoded, b64_value.string);
 
-        if (destination) |path| {
-            if (std.fs.path.dirname(path)) |parent| {
-                if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(init.io, parent);
+            const output_kind = output.object.get("kind");
+            const is_entry = output_kind != null and output_kind.? == .string and std.mem.eql(u8, output_kind.?.string, "entry-point");
+            const relative_path = if (std.mem.startsWith(u8, path_value.string, "./")) path_value.string[2..] else path_value.string;
+            const destination = if (outfile != null and is_entry)
+                outfile
+            else if (outdir) |dir|
+                try std.fs.path.join(allocator, &.{ dir, relative_path })
+            else
+                null;
+            if (destination) |path| {
+                try writeBuildFile(init.io, path, decoded);
+                try stdout.print("{s}\n", .{path});
+            } else if (is_entry) {
+                try stdout.writeAll(decoded);
+                if (decoded.len == 0 or decoded[decoded.len - 1] != '\n') try stdout.writeByte('\n');
             }
-            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = output });
-            try stdout.print("{s}\n", .{path});
-        } else {
-            try stdout.writeAll(output);
-            if (output.len == 0 or output[output.len - 1] != '\n') try stdout.writeByte('\n');
+        };
+    }
+
+    if (metafile_json_path) |path| {
+        if (result.get("metafile")) |metafile| {
+            if (metafile == .string) try writeBuildFile(init.io, path, metafile.string);
+        }
+    }
+    if (metafile_markdown_path) |path| {
+        if (result.get("metafileMarkdown")) |metafile| {
+            if (metafile == .string) try writeBuildFile(init.io, path, metafile.string);
         }
     }
     try stdout.flush();
@@ -883,6 +976,40 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
         try stdout.print("{s}\n", .{version});
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "--revision")) {
+        try stdout.print("{s}+{s}\n", .{ version, revision_suffix });
+        try stdout.flush();
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "getcompletes")) {
+        // Mirrors `bun getcompletes`: emit completion candidates (builtin
+        // commands plus package.json scripts), one per line.
+        for (completion_commands) |name| {
+            try stdout.print("{s}\n", .{name});
+        }
+        if (std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            "package.json",
+            init.arena.allocator(),
+            .limited(16 * 1024 * 1024),
+        ) catch null) |source| {
+            if (std.json.parseFromSlice(std.json.Value, init.arena.allocator(), source, .{}) catch null) |parsed| {
+                if (parsed.value == .object) {
+                    if (parsed.value.object.get("scripts")) |scripts| {
+                        if (scripts == .object) {
+                            for (scripts.object.keys()) |script_name| {
+                                try stdout.print("{s}\n", .{script_name});
+                            }
+                        }
+                    }
+                }
+            }
+        }
         try stdout.flush();
         return;
     }

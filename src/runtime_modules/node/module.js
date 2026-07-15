@@ -196,9 +196,19 @@ function bunModuleMockFor(...keys) {
   return { found: false, value: undefined };
 }
 
+// Builtins whose require() result must be the module's default-export object
+// rather than the namespace wrapper. Node guarantees identities like
+// require("fs/promises") === require("fs").promises, and fs.js exports its
+// `promises` property as the fs/promises default object; storing the raw
+// namespace here would break that identity (upstream fs tests assert it).
+const kUnwrapDefaultBuiltins = new Set(["fs/promises", "node:fs/promises"]);
+
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();
-  for (const [name, value] of Object.entries(modules || {})) {
+  for (let [name, value] of Object.entries(modules || {})) {
+    if (kUnwrapDefaultBuiltins.has(name) && value && typeof value === "object" && value.default) {
+      value = value.default;
+    }
     builtinModuleMap.set(name, value);
     globalMap.set(name, value);
   }
@@ -388,7 +398,9 @@ function packageRootFor(request, startDir) {
 
 function resolveAsFile(candidate) {
   if (isFile(candidate)) return candidate;
-  for (const ext of [".js", ".json", ".cjs", ".mjs"]) {
+  // Bun also resolves TypeScript/JSX extensions (upstream regression 12034:
+  // require("./x") must find x.fixture.ts-style files).
+  for (const ext of [".js", ".json", ".cjs", ".mjs", ".ts", ".tsx", ".jsx", ".mts", ".cts"]) {
     if (isFile(`${candidate}${ext}`)) return `${candidate}${ext}`;
   }
   return null;
@@ -991,9 +1003,12 @@ function executeDynamicImportSource(resolved, source, format) {
   const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, source ?? ""));
   maybeRegisterSourceMap(resolvedPath, transformed);
   recordCompileCache(resolvedPath, transformed);
-  const run = new Function("exports", "require", "__ctImportMeta", `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`);
-  run(namespace, createRequire(resolvedPath), importMetaForModule(resolvedPath, suffix));
-  return namespace;
+  // Dynamically imported ES modules may use top-level await (e.g. Bun.build
+  // outputs re-imported via blob: URLs), which a plain Function body cannot
+  // parse; evaluate through an async wrapper and resolve to the namespace.
+  const AsyncFunction = (async () => {}).constructor;
+  const run = new AsyncFunction("exports", "require", "__ctImportMeta", `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`);
+  return run(namespace, createRequire(resolvedPath), importMetaForModule(resolvedPath, suffix)).then(() => namespace);
 }
 
 export function __importModule(specifier, referrer = undefined, options = undefined) {
@@ -1003,6 +1018,19 @@ export function __importModule(specifier, referrer = undefined, options = undefi
       return Promise.resolve(directMock.value).then(namespaceFromCommonJs);
     }
     return namespaceFromCommonJs(directMock.value);
+  }
+  // `import(URL.createObjectURL(blob))`: Bun evaluates the Blob's contents as
+  // an ES module (e.g. re-importing a Bun.build output). The object-URL
+  // registry lives on globalThis (installed by the Blob shim).
+  const specifierText = String(specifier);
+  if (specifierText.startsWith("blob:")) {
+    const blob = globalThis.__cottontailObjectURLRegistry?.get(specifierText);
+    if (blob && typeof blob.text === "function") {
+      const virtualPath = join(cottontail.cwd(), `__cottontail-blob-${specifierText.replace(/[^a-zA-Z0-9._-]/g, "_")}.mjs`);
+      return Promise.resolve(blob.text()).then((source) =>
+        executeDynamicImportSource(virtualPath, source, "module"));
+    }
+    throw moduleNotFoundError(specifierText, false);
   }
   const parent = referrer == null
     ? cottontail.cwd()
@@ -1069,7 +1097,13 @@ function loadCommonJsModule(resolved) {
   if (pathMock.found) return pathMock.value;
   const hooked = applyLoadHooks(resolvedPath);
   if (hooked !== null) return hooked;
-  if (builtinModuleMap.has(resolvedPath)) return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
+  if (builtinModuleMap.has(resolvedPath)) {
+    if (globalThis.__CT_DEBUG_FSP && resolvedPath === "fs/promises") {
+      const v = unwrapBuiltin(builtinModuleMap.get(resolvedPath));
+      console.log("[dbg] loadCommonJsModule fs/promises ownDefault:", Object.hasOwn(v, "default"));
+    }
+    return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
+  }
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
   if (resolvedPath.endsWith(".json")) return JSON.parse(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
@@ -2126,6 +2160,10 @@ const pathBuiltin = path.default ?? path;
 // require("path/posix") must be the same object as require("path").posix.
 const pathPosixBuiltin = pathBuiltin.posix ?? (pathPosix.default ?? pathPosix);
 const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
+// require("fs/promises") must be the same object as require("fs").promises
+// (Node exposes fs.promises as the exact fs/promises module object).
+const fsBuiltin = fs.default ?? fs;
+const fsPromisesBuiltin = fsBuiltin.promises ?? (fsPromises.default ?? fsPromises);
 
 __setBuiltinModules({
   assert: assertBuiltin,
@@ -2160,8 +2198,8 @@ __setBuiltinModules({
   "node:events": eventsBuiltin,
   fs,
   "node:fs": fs,
-  "fs/promises": fsPromises,
-  "node:fs/promises": fsPromises,
+  "fs/promises": fsPromisesBuiltin,
+  "node:fs/promises": fsPromisesBuiltin,
   http,
   "node:http": http,
   https,

@@ -4,6 +4,7 @@ import { Buffer } from "./buffer.js";
 import { connect as netConnect, createServer as createNetServer } from "./net.js";
 import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
+import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
 import { Headers } from "../bun/index.js";
 import { AsyncResource } from "./async_hooks.js";
 
@@ -635,7 +636,7 @@ export function _writeServerResponse(socket, response, options = {}) {
   if (!options.keepAlive) socket.end();
 }
 
-function websocketAcceptKey(key) {
+export function websocketAcceptKey(key) {
   return createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
 }
 
@@ -649,10 +650,10 @@ function readUInt64BE(bytes, offset = 0) {
   return value;
 }
 
-function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true) {
+export function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true, rsv1 = false) {
   const body = Buffer.from(bytesFromBody(payload));
   const header = [];
-  header.push(0x80 | (opcode & 0x0f));
+  header.push(0x80 | (rsv1 ? 0x40 : 0) | (opcode & 0x0f));
   if (body.byteLength < 126) {
     header.push((masked ? 0x80 : 0) | body.byteLength);
   } else if (body.byteLength <= 0xffff) {
@@ -670,7 +671,7 @@ function websocketFrame(opcode, payload = Buffer.alloc(0), masked = true) {
   return Buffer.concat([Buffer.from(header), mask, output]);
 }
 
-function parseWebSocketFrames(buffer) {
+export function parseWebSocketFrames(buffer) {
   const frames = [];
   let offset = 0;
   while (buffer.byteLength - offset >= 2) {
@@ -678,6 +679,9 @@ function parseWebSocketFrames(buffer) {
     const first = buffer[offset++];
     const second = buffer[offset++];
     const fin = (first & 0x80) !== 0;
+    const rsv1 = (first & 0x40) !== 0;
+    const rsv2 = (first & 0x20) !== 0;
+    const rsv3 = (first & 0x10) !== 0;
     const opcode = first & 0x0f;
     const masked = (second & 0x80) !== 0;
     let length = second & 0x7f;
@@ -701,9 +705,75 @@ function parseWebSocketFrames(buffer) {
     if (mask) {
       for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
     }
-    frames.push({ fin, opcode, payload });
+    frames.push({ fin, rsv1, rsv2, rsv3, opcode, payload });
   }
   return { frames, remaining: buffer.subarray(offset) };
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7692 permessage-deflate helpers (shared by the WebSocket client, the
+// Bun.serve websocket backend, and the "ws" shim).
+// ---------------------------------------------------------------------------
+
+const WEBSOCKET_DEFLATE_TRAILER = [0x00, 0x00, 0xff, 0xff];
+export const WEBSOCKET_MAX_DECOMPRESSED_LENGTH = 128 * 1024 * 1024;
+
+export function websocketDeflateCompress(payload, windowBits = 15) {
+  const bits = Math.max(9, Math.min(15, Number(windowBits) || 15));
+  let output = deflateRawSync(payload, {
+    finishFlush: zlibConstants.Z_SYNC_FLUSH,
+    windowBits: -bits,
+  });
+  // RFC 7692 7.2.1: strip the trailing 0x00 0x00 0xff 0xff emitted by an
+  // ending Z_SYNC_FLUSH; the receiver appends it back before inflating.
+  if (
+    output.byteLength >= 4 &&
+    output[output.byteLength - 4] === 0x00 &&
+    output[output.byteLength - 3] === 0x00 &&
+    output[output.byteLength - 2] === 0xff &&
+    output[output.byteLength - 1] === 0xff
+  ) {
+    output = output.subarray(0, output.byteLength - 4);
+  }
+  if (output.byteLength === 0) output = Buffer.from([0x00]);
+  return output;
+}
+
+export function websocketDeflateDecompress(payload, maxLength = WEBSOCKET_MAX_DECOMPRESSED_LENGTH) {
+  const input = Buffer.concat([Buffer.from(payload), Buffer.from(WEBSOCKET_DEFLATE_TRAILER)]);
+  const output = inflateRawSync(input, {
+    finishFlush: zlibConstants.Z_SYNC_FLUSH,
+    windowBits: -15,
+  });
+  if (maxLength != null && output.byteLength > maxLength) {
+    const error = new RangeError("Message too big");
+    error.code = "WS_MESSAGE_TOO_BIG";
+    throw error;
+  }
+  return output;
+}
+
+// Parses a Sec-WebSocket-Extensions header value into
+// [{ name, params: { [name]: value | true } }] entries.
+export function parseWebSocketExtensions(value) {
+  const extensions = [];
+  for (const part of String(value ?? "").split(",")) {
+    const tokens = part.split(";").map((token) => token.trim()).filter((token) => token.length > 0);
+    if (tokens.length === 0) continue;
+    const params = {};
+    for (const token of tokens.slice(1)) {
+      const eq = token.indexOf("=");
+      if (eq < 0) {
+        params[token.toLowerCase()] = true;
+      } else {
+        let paramValue = token.slice(eq + 1).trim();
+        if (paramValue.startsWith('"') && paramValue.endsWith('"')) paramValue = paramValue.slice(1, -1);
+        params[token.slice(0, eq).trim().toLowerCase()] = paramValue;
+      }
+    }
+    extensions.push({ name: tokens[0].toLowerCase(), params });
+  }
+  return extensions;
 }
 
 export function validateHeaderName(name, label = "Header name") {
@@ -2212,6 +2282,98 @@ export class CloseEvent {
   }
 }
 
+const WEBSOCKET_KEY_PATTERN = /^[+/0-9A-Za-z]{22}==$/;
+const WEBSOCKET_COMPRESS_THRESHOLD = 860;
+
+function normalizeWebSocketProxyOption(proxy) {
+  if (proxy == null) return null;
+  let urlValue = proxy;
+  const headers = [];
+  if (typeof proxy === "object") {
+    urlValue = proxy.url;
+    const rawHeaders = proxy.headers;
+    if (rawHeaders != null) {
+      const entries = typeof rawHeaders.entries === "function" ? rawHeaders.entries() : Object.entries(rawHeaders);
+      for (const [name, value] of entries) headers.push([String(name), String(value)]);
+    }
+  }
+  let parsed;
+  try {
+    parsed = new URL(String(urlValue));
+  } catch {
+    throw new SyntaxError(`Invalid proxy URL: ${String(urlValue)}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new SyntaxError(`Unsupported proxy protocol: ${parsed.protocol}`);
+  }
+  return { url: parsed, headers };
+}
+
+function websocketNoProxyMatches(hostname, port) {
+  const raw = process.env.NO_PROXY ?? process.env.no_proxy;
+  if (!raw) return false;
+  const target = String(hostname).toLowerCase();
+  for (const rawEntry of String(raw).split(",")) {
+    let entry = rawEntry.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry === "*") return true;
+    let entryPort = null;
+    const colon = entry.lastIndexOf(":");
+    if (colon > 0 && !entry.slice(colon).includes("]")) {
+      const maybePort = entry.slice(colon + 1);
+      if (/^\d+$/.test(maybePort)) {
+        entryPort = maybePort;
+        entry = entry.slice(0, colon);
+      }
+    }
+    if (entryPort != null && String(port) !== entryPort) continue;
+    if (entry.startsWith(".")) entry = entry.slice(1);
+    if (target === entry || target.endsWith(`.${entry}`)) return true;
+  }
+  return false;
+}
+
+// Wraps an established byte stream (e.g. an HTTP CONNECT tunnel) in a TLS
+// client session. The native TLS client only knows how to dial TCP itself,
+// so a loopback relay bridges the tunnel bytes into a native TLS connect.
+function websocketTlsOverStream(stream, options, callback, onError) {
+  const relay = createNetServer((inner) => {
+    relay.close();
+    inner.on("data", (chunk) => {
+      try { stream.write(chunk); } catch {}
+    });
+    stream.on("data", (chunk) => {
+      try { inner.write(chunk); } catch {}
+    });
+    const destroyBoth = () => {
+      try { inner.destroy(); } catch {}
+      try { stream.destroy(); } catch {}
+    };
+    inner.on("close", destroyBoth);
+    inner.on("error", () => {});
+    stream.on("close", () => { try { inner.destroy(); } catch {} });
+  });
+  relay.on("error", (error) => onError(error));
+  relay.listen(0, "127.0.0.1", () => {
+    const address = relay.address();
+    let tlsSocket;
+    try {
+      tlsSocket = tlsConnect({
+        host: "127.0.0.1",
+        port: address.port,
+        servername: options.servername,
+        rejectUnauthorized: options.rejectUnauthorized,
+        ca: options.ca,
+      });
+    } catch (error) {
+      relay.close();
+      onError(error);
+      return;
+    }
+    callback(tlsSocket);
+  });
+}
+
 export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEmitter {
   static CONNECTING = 0;
   static OPEN = 1;
@@ -2246,8 +2408,11 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
     this._fragmentOpcode = 0;
-    // Bun accepts an options object ({ headers, protocols, protocol }) in
-    // place of the protocols argument.
+    this._messageCompressed = false;
+    this._deflate = null;
+    this._aborted = false;
+    // Bun accepts an options object ({ headers, protocols, protocol, proxy,
+    // tls, perMessageDeflate }) in place of the protocols argument.
     let options = null;
     if (protocols != null && typeof protocols === "object" && !Array.isArray(protocols) &&
         typeof protocols[Symbol.iterator] !== "function") {
@@ -2258,9 +2423,22 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     const rawHeaders = options?.headers;
     if (rawHeaders != null) {
       const entries = typeof rawHeaders.entries === "function" ? rawHeaders.entries() : Object.entries(rawHeaders);
-      for (const [name, value] of entries) this._customHeaders.push([String(name), String(value)]);
+      for (const [name, value] of entries) {
+        const headerName = String(name);
+        const headerValue = String(value);
+        if (!tokenPattern.test(headerName)) {
+          throw new SyntaxError(`Header '${headerName}' has invalid name`);
+        }
+        if (/[\r\n\0]/.test(headerValue)) {
+          throw new SyntaxError(`Header '${headerName}' has invalid value`);
+        }
+        this._customHeaders.push([headerName, headerValue]);
+      }
     }
     this._protocols = Array.isArray(protocols) ? protocols.map(String) : protocols == null ? [] : [String(protocols)];
+    this._tlsOptions = options?.tls != null && typeof options.tls === "object" ? options.tls : null;
+    this._deflateOffered = !(options != null && "perMessageDeflate" in options && !options.perMessageDeflate);
+    this._proxy = normalizeWebSocketProxyOption(options?.proxy);
     this._connect(parsed);
   }
 
@@ -2275,8 +2453,19 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   dispatchEvent(event) {
     const property = `on${event.type}`;
     if (typeof this[property] === "function") this[property](event);
+    // EventEmitter throws for unhandled "error" events; WebSocket error
+    // events are droppable notifications, so only emit when listened for.
+    if (event.type === "error" && this.listenerCount("error") === 0) return true;
     this.emit(event.type, event);
     return true;
+  }
+
+  _customHeader(name) {
+    const wanted = String(name).toLowerCase();
+    for (const [headerName, headerValue] of this._customHeaders) {
+      if (headerName.toLowerCase() === wanted) return headerValue;
+    }
+    return null;
   }
 
   _connect(parsed) {
@@ -2284,43 +2473,213 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     const explicitPort = parsed.port ?? String(parsed.href).match(/^wss?:\/\/[^/:]+:(\d+)/)?.[1];
     const port = Number(explicitPort || (secure ? 443 : 80));
     const host = parsed.hostname || "localhost";
-    const key = randomBytes(16).toString("base64");
-    const socket = secure
-      ? tlsConnect({ host, port, servername: host, rejectUnauthorized: false })
-      : netConnect(port, host);
-    this._socket = socket;
-    socket.on("connect", () => {
-      const path = `${parsed.pathname || "/"}${parsed.search || ""}`;
-      const lines = [
-        `GET ${path} HTTP/1.1`,
-        `Host: ${host}${explicitPort ? `:${explicitPort}` : ""}`,
-        "Upgrade: websocket",
-        "Connection: Upgrade",
-        `Sec-WebSocket-Key: ${key}`,
-        "Sec-WebSocket-Version: 13",
-      ];
-      if (this._protocols.length > 0) lines.push(`Sec-WebSocket-Protocol: ${this._protocols.join(", ")}`);
-      const customHeaders = this._customHeaders ?? [];
-      for (const [name, value] of customHeaders) lines.push(`${name}: ${value}`);
-      // URL-embedded credentials become a Basic Authorization header unless
-      // the caller supplied an explicit Authorization header (Bun semantics).
-      const hasAuthHeader = customHeaders.some(([name]) => name.toLowerCase() === "authorization");
-      if (!hasAuthHeader && (parsed.username !== "" || parsed.password !== "")) {
-        const decode = (part) => { try { return decodeURIComponent(part); } catch { return part; } };
-        const credentials = `${decode(parsed.username)}:${decode(parsed.password)}`;
-        lines.push(`Authorization: Basic ${Buffer.from(credentials).toString("base64")}`);
+
+    const customKey = this._customHeader("sec-websocket-key");
+    this._key = customKey != null && WEBSOCKET_KEY_PATTERN.test(customKey)
+      ? customKey
+      : randomBytes(16).toString("base64");
+
+    this._target = { parsed, secure, host, port, explicitPort };
+
+    const tlsOptions = this._tlsOptions ?? {};
+    const proxy = this._proxy != null && !websocketNoProxyMatches(host, port) ? this._proxy : null;
+
+    if (!proxy) {
+      let socket;
+      try {
+        socket = secure
+          ? tlsConnect({
+              host,
+              port,
+              servername: host,
+              // Bun validates certificates when a tls option is supplied;
+              // the historical default here is permissive.
+              rejectUnauthorized: tlsOptions.rejectUnauthorized === true ||
+                (tlsOptions.rejectUnauthorized !== false && tlsOptions.ca != null),
+              ca: tlsOptions.ca,
+            })
+          : netConnect(port, host);
+      } catch (error) {
+        queueMicrotask(() => this._fail(error));
+        return;
       }
-      lines.push("", "");
-      socket.write(lines.join("\r\n"));
-    });
-    socket.on("data", (chunk) => this._handleData(Buffer.from(chunk), key));
+      this._socket = socket;
+      const readyEvent = secure ? "secureConnect" : "connect";
+      socket.on(readyEvent, () => this._startHandshake(socket));
+      this._attachTransportGuards(socket);
+      return;
+    }
+
+    this._connectViaProxy(proxy, tlsOptions);
+  }
+
+  _attachTransportGuards(socket) {
     socket.on("error", (error) => this._fail(error));
     socket.on("close", () => {
-      if (this.readyState !== WebSocket.CLOSED) this._close(1006, "", false);
+      if (this.readyState !== WebSocket.CLOSED) {
+        if (this.readyState === WebSocket.CONNECTING) this._fail(new Error("Connection closed before handshake completed"));
+        else this._close(1006, "", false);
+      }
     });
   }
 
-  _handleData(chunk, key) {
+  _connectViaProxy(proxy, tlsOptions) {
+    const { secure, host, port } = this._target;
+    const proxyUrl = proxy.url;
+    const proxySecure = proxyUrl.protocol === "https:";
+    const proxyPort = Number(proxyUrl.port || (proxySecure ? 443 : 80));
+    const proxyHost = proxyUrl.hostname || "localhost";
+
+    let socket;
+    try {
+      socket = proxySecure
+        ? tlsConnect({
+            host: proxyHost,
+            port: proxyPort,
+            servername: proxyHost,
+            rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
+            ca: tlsOptions.ca,
+          })
+        : netConnect(proxyPort, proxyHost);
+    } catch (error) {
+      queueMicrotask(() => this._fail(error));
+      return;
+    }
+    this._socket = socket;
+
+    let connectBuffer = Buffer.alloc(0);
+    let established = false;
+    const onData = (chunk) => {
+      if (established) return;
+      connectBuffer = Buffer.concat([connectBuffer, Buffer.from(chunk)]);
+      const text = connectBuffer.toString("latin1");
+      const headerEnd = text.indexOf("\r\n\r\n");
+      if (headerEnd < 0) return;
+      established = true;
+      socket.off("data", onData);
+      const statusLine = text.slice(0, text.indexOf("\r\n"));
+      const status = Number(statusLine.split(/\s+/)[1]);
+      if (status < 200 || status >= 300) {
+        this._fail(new Error(`Proxy CONNECT failed with status ${status}`));
+        try { socket.destroy(); } catch {}
+        return;
+      }
+      if (this._aborted || this.readyState !== WebSocket.CONNECTING) {
+        try { socket.destroy(); } catch {}
+        return;
+      }
+      const leftover = connectBuffer.subarray(headerEnd + 4);
+      if (!secure) {
+        this._startHandshake(socket);
+        if (leftover.byteLength > 0) this._handleData(Buffer.from(leftover));
+        return;
+      }
+      // wss:// target: negotiate TLS inside the tunnel.
+      websocketTlsOverStream(
+        socket,
+        {
+          servername: host,
+          rejectUnauthorized: tlsOptions.rejectUnauthorized === true ||
+            (tlsOptions.rejectUnauthorized !== false && tlsOptions.ca != null),
+          ca: tlsOptions.ca,
+        },
+        (tlsSocket) => {
+          this._socket = tlsSocket;
+          tlsSocket.on("secureConnect", () => this._startHandshake(tlsSocket));
+          this._attachTransportGuards(tlsSocket);
+        },
+        (error) => this._fail(error),
+      );
+    };
+    socket.on("data", onData);
+    socket.on("error", (error) => {
+      if (this.readyState !== WebSocket.CLOSED && this._socket === socket) this._fail(error);
+    });
+    socket.on("close", () => {
+      if (this._socket === socket && this.readyState === WebSocket.CONNECTING) {
+        this._fail(new Error("Proxy connection closed"));
+      }
+    });
+
+    const sendConnect = () => {
+      const lines = [
+        `CONNECT ${host}:${port} HTTP/1.1`,
+        `Host: ${host}:${port}`,
+        "Proxy-Connection: keep-alive",
+      ];
+      const decode = (part) => { try { return decodeURIComponent(part); } catch { return part; } };
+      if (proxyUrl.username !== "" || proxyUrl.password !== "") {
+        const credentials = `${decode(proxyUrl.username)}:${decode(proxyUrl.password)}`;
+        lines.push(`Proxy-Authorization: Basic ${Buffer.from(credentials).toString("base64")}`);
+      }
+      for (const [name, value] of proxy.headers) lines.push(`${name}: ${value}`);
+      lines.push("", "");
+      socket.write(lines.join("\r\n"));
+    };
+    socket.on(proxySecure ? "secureConnect" : "connect", sendConnect);
+  }
+
+  _startHandshake(socket) {
+    if (this._aborted || this.readyState !== WebSocket.CONNECTING) {
+      try { socket.destroy(); } catch {}
+      return;
+    }
+    this._socket = socket;
+    socket.on("data", (chunk) => this._handleData(Buffer.from(chunk)));
+    if (!socket.listenerCount || socket.listenerCount("error") === 0) {
+      socket.on("error", (error) => this._fail(error));
+    }
+    socket.on("close", () => {
+      if (this._socket !== socket) return;
+      if (this.readyState === WebSocket.CONNECTING) this._fail(new Error("Connection closed before handshake completed"));
+      else if (this.readyState !== WebSocket.CLOSED) this._close(1006, "", false);
+    });
+
+    const { parsed, host, explicitPort } = this._target;
+    const path = `${parsed.pathname || "/"}${parsed.search || ""}`;
+    const hostHeader = this._customHeader("host") ?? `${host}${explicitPort ? `:${explicitPort}` : ""}`;
+    const customProtocolHeader = this._customHeader("sec-websocket-protocol");
+    const protocolHeader = customProtocolHeader ?? (this._protocols.length > 0 ? this._protocols.join(", ") : null);
+    this._offeredProtocols = customProtocolHeader != null
+      ? customProtocolHeader.split(",").map((token) => token.trim()).filter((token) => token.length > 0)
+      : this._protocols;
+    const customExtensionsHeader = this._customHeader("sec-websocket-extensions");
+    const extensionsHeader = customExtensionsHeader ??
+      (this._deflateOffered
+        ? "permessage-deflate; client_no_context_takeover; server_no_context_takeover; client_max_window_bits"
+        : null);
+
+    const lines = [
+      `GET ${path} HTTP/1.1`,
+      `Host: ${hostHeader}`,
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Key: ${this._key}`,
+      "Sec-WebSocket-Version: 13",
+    ];
+    if (protocolHeader != null && protocolHeader.length > 0) lines.push(`Sec-WebSocket-Protocol: ${protocolHeader}`);
+    if (extensionsHeader != null) lines.push(`Sec-WebSocket-Extensions: ${extensionsHeader}`);
+    const managed = new Set([
+      "host", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version",
+      "sec-websocket-protocol", "sec-websocket-extensions",
+    ]);
+    for (const [name, value] of this._customHeaders) {
+      if (managed.has(name.toLowerCase())) continue;
+      lines.push(`${name}: ${value}`);
+    }
+    // URL-embedded credentials become a Basic Authorization header unless
+    // the caller supplied an explicit Authorization header (Bun semantics).
+    const hasAuthHeader = this._customHeaders.some(([name]) => name.toLowerCase() === "authorization");
+    if (!hasAuthHeader && (parsed.username !== "" || parsed.password !== "")) {
+      const decode = (part) => { try { return decodeURIComponent(part); } catch { return part; } };
+      const credentials = `${decode(parsed.username)}:${decode(parsed.password)}`;
+      lines.push(`Authorization: Basic ${Buffer.from(credentials).toString("base64")}`);
+    }
+    lines.push("", "");
+    socket.write(lines.join("\r\n"));
+  }
+
+  _handleData(chunk) {
     this._buffer = Buffer.concat([this._buffer, chunk]);
     if (this.readyState === WebSocket.CONNECTING) {
       const text = this._buffer.toString("latin1");
@@ -2329,51 +2688,165 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       const headerText = text.slice(0, headerEnd);
       const [statusLine, ...headerLines] = headerText.split("\r\n");
       const status = Number(statusLine.split(/\s+/)[1]);
-      const headers = parseHeaderLines(headerLines.join("\r\n")).headers;
+      let parsedHeaders;
+      try {
+        parsedHeaders = parseHeaderLines(headerLines.join("\r\n"));
+      } catch (error) {
+        this._fail(error);
+        return;
+      }
+      const headers = parsedHeaders.headers;
       if (status !== 101 || String(headers.upgrade ?? "").toLowerCase() !== "websocket" ||
-          String(headers["sec-websocket-accept"] ?? "") !== websocketAcceptKey(key)) {
+          String(headers["sec-websocket-accept"] ?? "") !== websocketAcceptKey(this._key)) {
         this._fail(new Error("Invalid WebSocket upgrade response"));
         return;
       }
-      this.protocol = String(headers["sec-websocket-protocol"] ?? "");
+
+      // RFC 6455 4.1: the server may select at most one of the offered
+      // subprotocols; anything else is a handshake failure.
+      let protocolHeaderCount = 0;
+      for (let index = 0; index + 1 < parsedHeaders.rawHeaders.length; index += 2) {
+        if (parsedHeaders.rawHeaders[index].toLowerCase() === "sec-websocket-protocol") protocolHeaderCount += 1;
+      }
+      let selectedProtocol = "";
+      if (protocolHeaderCount > 0) {
+        const value = protocolHeaderCount === 1 ? String(headers["sec-websocket-protocol"] ?? "").trim() : null;
+        const offered = this._offeredProtocols ?? this._protocols;
+        const valid = value != null && value.length > 0 && !value.includes(",") &&
+          tokenPattern.test(value) && offered.includes(value);
+        if (!valid) {
+          this._abortHandshake(1002, "Mismatch client protocol");
+          return;
+        }
+        selectedProtocol = value;
+      }
+      this.protocol = selectedProtocol;
+
+      // RFC 7692 extension negotiation.
+      this._deflate = null;
+      const extensionsValue = headers["sec-websocket-extensions"];
+      if (extensionsValue != null && String(extensionsValue).trim() !== "") {
+        this.extensions = String(extensionsValue);
+        const extensions = parseWebSocketExtensions(extensionsValue);
+        const pmd = extensions.find((extension) => extension.name === "permessage-deflate");
+        if (pmd != null) {
+          let clientWindowBits = 15;
+          const rawBits = pmd.params["client_max_window_bits"];
+          if (rawBits != null && rawBits !== true) {
+            const bits = Number(rawBits);
+            if (Number.isInteger(bits) && bits >= 8 && bits <= 15) clientWindowBits = bits;
+          }
+          this._deflate = { clientWindowBits };
+        }
+      } else {
+        this.extensions = "";
+      }
+
       this.readyState = WebSocket.OPEN;
       this._buffer = this._buffer.subarray(headerEnd + 4);
       this.dispatchEvent({ type: "open", target: this });
     }
 
-    const parsed = parseWebSocketFrames(this._buffer);
+    if (this.readyState === WebSocket.CLOSED) return;
+    let parsed;
+    try {
+      parsed = parseWebSocketFrames(this._buffer);
+    } catch (error) {
+      this._fail(error);
+      return;
+    }
     this._buffer = parsed.remaining;
-    for (const frame of parsed.frames) this._handleFrame(frame);
+    for (const frame of parsed.frames) {
+      if (this.readyState === WebSocket.CLOSED) return;
+      this._handleFrame(frame);
+    }
+  }
+
+  _protocolError(reason = "Protocol error") {
+    const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
+    payload.writeUInt16BE(1002, 0);
+    payload.set(Buffer.from(reason), 2);
+    try { this._socket?.write?.(websocketFrame(0x8, payload)); } catch {}
+    this._close(1002, reason, false);
+  }
+
+  _abortHandshake(code, reason) {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    try { this._socket?.destroy?.(); } catch {}
+    this.dispatchEvent(new CloseEvent("close", { code, reason, wasClean: false }));
   }
 
   _handleFrame(frame) {
-    if (frame.opcode === 0x8) {
-      const code = frame.payload.byteLength >= 2 ? readUInt16BE(frame.payload, 0) : 1000;
-      const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
-      if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0x8, frame.payload));
-      this._close(code, reason, true);
+    if (frame.opcode >= 0x8) {
+      if (!frame.fin || frame.payload.byteLength > 125 || frame.rsv1 || frame.rsv2 || frame.rsv3) {
+        this._protocolError("Invalid control frame");
+        return;
+      }
+      if (frame.opcode === 0x8) {
+        const code = frame.payload.byteLength >= 2 ? readUInt16BE(frame.payload, 0) : 1000;
+        const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
+        if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0x8, frame.payload));
+        this._close(code, reason, true);
+        return;
+      }
+      if (frame.opcode === 0x9) {
+        if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0xA, frame.payload));
+        return;
+      }
       return;
     }
-    if (frame.opcode === 0x9) {
-      if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0xA, frame.payload));
-      return;
-    }
-    if (frame.opcode === 0xA) return;
 
+    if (frame.rsv2 || frame.rsv3) {
+      this._protocolError("Invalid RSV bits");
+      return;
+    }
     if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+      if (frame.rsv1 && this._deflate == null) {
+        this._protocolError("Unexpected compressed frame");
+        return;
+      }
       this._fragmentOpcode = frame.opcode;
       this._fragments = [frame.payload];
+      this._messageCompressed = frame.rsv1 === true;
     } else if (frame.opcode === 0x0 && this._fragmentOpcode) {
+      if (frame.rsv1) {
+        this._protocolError("Invalid RSV bits");
+        return;
+      }
       this._fragments.push(frame.payload);
     } else {
       return;
     }
     if (!frame.fin) return;
 
-    const payload = Buffer.concat(this._fragments);
+    let payload = Buffer.concat(this._fragments);
     const opcode = this._fragmentOpcode;
+    const compressed = this._messageCompressed;
     this._fragments = [];
     this._fragmentOpcode = 0;
+    this._messageCompressed = false;
+    if (compressed) {
+      try {
+        payload = websocketDeflateDecompress(payload);
+      } catch (error) {
+        if (error?.code === "WS_MESSAGE_TOO_BIG") {
+          const reason = "Message too big";
+          const closePayload = Buffer.alloc(2 + Buffer.byteLength(reason));
+          closePayload.writeUInt16BE(1009, 0);
+          closePayload.set(Buffer.from(reason), 2);
+          try { this._socket?.write?.(websocketFrame(0x8, closePayload)); } catch {}
+          this._close(1009, reason, false);
+        } else {
+          this._protocolError("Invalid compressed data");
+        }
+        return;
+      }
+    }
+    this._deliverMessage(opcode, payload);
+  }
+
+  _deliverMessage(opcode, payload) {
     const data = opcode === 0x1
       ? payload.toString("utf8")
       : this.binaryType === "arraybuffer"
@@ -2383,9 +2856,12 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   }
 
   _fail(error) {
+    if (this.readyState === WebSocket.CLOSED) return;
     const connectFailure = this.readyState === WebSocket.CONNECTING;
-    const cause = connectFailure ? "Failed to connect" : (error?.message ?? String(error));
-    const message = `WebSocket connection to '${this.url}' failed: ${cause}`;
+    const cause = error?.message ?? String(error);
+    const message = connectFailure
+      ? `WebSocket connection to '${this.url}' failed: Failed to connect`
+      : `WebSocket connection to '${this.url}' failed: ${cause}`;
     const failure = new Error(message);
     const event = typeof globalThis.ErrorEvent === "function"
       ? new globalThis.ErrorEvent("error", { message, error: failure })
@@ -2404,7 +2880,18 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   send(data) {
     if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
     const opcode = typeof data === "string" ? 0x1 : 0x2;
-    const frame = websocketFrame(opcode, data);
+    let payload = data;
+    let rsv1 = false;
+    if (this._deflate != null) {
+      const bytes = Buffer.from(bytesFromBody(data));
+      if (bytes.byteLength >= WEBSOCKET_COMPRESS_THRESHOLD) {
+        payload = websocketDeflateCompress(bytes, this._deflate.clientWindowBits);
+        rsv1 = true;
+      } else {
+        payload = bytes;
+      }
+    }
+    const frame = websocketFrame(opcode, payload, true, rsv1);
     this.bufferedAmount += frame.byteLength;
     const ok = this._socket.write(frame, () => {
       this.bufferedAmount = Math.max(0, this.bufferedAmount - frame.byteLength);
@@ -2414,6 +2901,11 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
 
   close(code = 1000, reason = "") {
     if (this.readyState === WebSocket.CLOSED || this.readyState === WebSocket.CLOSING) return;
+    if (this.readyState === WebSocket.CONNECTING) {
+      this._aborted = true;
+      this._abortHandshake(1006, "");
+      return;
+    }
     this.readyState = WebSocket.CLOSING;
     const payload = Buffer.alloc(2 + Buffer.byteLength(String(reason)));
     const closeCode = Number(code) || 1000;

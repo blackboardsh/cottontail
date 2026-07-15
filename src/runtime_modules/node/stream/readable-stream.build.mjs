@@ -58,98 +58,14 @@ const shims = {
     module.exports = { AbortController: AbortControllerShim, AbortSignal: AbortSignalShim };
   `,
   events: `
-    // The runtime EventEmitter is an ES class, which cannot be invoked via
-    // EE.call(this) the way readable-stream's function constructors do.
-    // Provide a callable constructor sharing the same prototype.
-    function EventEmitter(options) {
-      this._events = new Map();
-      this._maxListeners = undefined;
-      this.captureRejections = Boolean(options && options.captureRejections);
-    }
-    // Use an intermediate prototype (instanceof runtime EventEmitter still
-    // holds) so we can pin non-virtual removeListener/off: the runtime's
-    // EventEmitter.removeListener delegates to this.off, which the stream
-    // prototypes alias back to their own removeListener -> infinite mutual
-    // recursion otherwise.
-    EventEmitter.prototype = Object.create(__ct_EventEmitter.prototype);
-    Object.defineProperty(EventEmitter.prototype, "constructor", {
-      value: EventEmitter,
-      writable: true,
-      configurable: true,
-    });
-    const base = __ct_EventEmitter.prototype;
-    EventEmitter.prototype.removeListener = function removeListener(name, handler) {
-      const hadListener =
-        this._events instanceof Map &&
-        (this._events.get(name) || []).some((item) => item === handler || item.listener === handler);
-      base.off.call(this, name, handler);
-      if (hadListener && this._events instanceof Map && this._events.has("removeListener")) {
-        this.emit("removeListener", name, handler.listener ?? handler);
-      }
-      return this;
-    };
-    EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
-    // The runtime EventEmitter invokes listeners without binding \`this\` and
-    // does not emit newListener events; Node stream internals rely on both.
-    EventEmitter.prototype.on = function on(name, handler) {
-      if (typeof handler !== "function") throw new TypeError("listener must be a function");
-      if (this._events instanceof Map && this._events.has("newListener")) {
-        this.emit("newListener", name, handler.listener ?? handler);
-      }
-      return base.on.call(this, name, handler);
-    };
-    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
-    EventEmitter.prototype.prependListener = function prependListener(name, handler) {
-      if (typeof handler !== "function") throw new TypeError("listener must be a function");
-      if (this._events instanceof Map && this._events.has("newListener")) {
-        this.emit("newListener", name, handler.listener ?? handler);
-      }
-      return base.prependListener.call(this, name, handler);
-    };
-    EventEmitter.prototype.once = function once(name, handler) {
-      if (typeof handler !== "function") throw new TypeError("listener must be a function");
-      const self = this;
-      function wrapped(...args) {
-        self.removeListener(name, wrapped);
-        handler.apply(self, args);
-      }
-      wrapped.listener = handler;
-      return this.on(name, wrapped);
-    };
-    EventEmitter.prototype.prependOnceListener = function prependOnceListener(name, handler) {
-      if (typeof handler !== "function") throw new TypeError("listener must be a function");
-      const self = this;
-      function wrapped(...args) {
-        self.removeListener(name, wrapped);
-        handler.apply(self, args);
-      }
-      wrapped.listener = handler;
-      return this.prependListener(name, wrapped);
-    };
-    EventEmitter.prototype.emit = function emit(name, ...args) {
-      const events = this._events instanceof Map ? this._events : null;
-      const handlers = events ? [...(events.get(name) || [])] : [];
-      if (name === "error") {
-        const monitors = events ? [...(events.get(__ct_errorMonitor) || [])] : [];
-        for (const monitor of monitors) monitor.apply(this, args);
-        if (handlers.length === 0) {
-          const error = args[0];
-          throw error instanceof Error ? error : new Error(String(error));
-        }
-      }
-      for (const handler of handlers) {
-        const result = handler.apply(this, args);
-        if (this.captureRejections && result && typeof result.then === "function") {
-          result.then(undefined, (error) => this.emit("error", error));
-        }
-      }
-      return handlers.length > 0;
-    };
-    Object.setPrototypeOf(EventEmitter, __ct_EventEmitter);
+    // The runtime EventEmitter is a Node-style callable function constructor
+    // (EE.call(this) works from readable-stream's function constructors), so
+    // it can be re-exported directly.
     module.exports = {
-      EventEmitter,
+      EventEmitter: __ct_EventEmitter,
       addAbortListener: __ct_addAbortListener,
       once: __ct_events_once,
+      errorMonitor: __ct_errorMonitor,
     };
   `,
   buffer: `
@@ -166,10 +82,8 @@ const banner = `// Vendored from readable-stream@4.7.0 (https://github.com/nodej
 //
 // Cottontail deltas from upstream readable-stream:
 // - events/buffer/string_decoder resolve to the runtime modules (banner
-//   imports below); the events shim adds a callable constructor, this-bound
-//   emit, newListener/removeListener events, and non-virtual
-//   removeListener/off (the runtime EventEmitter delegates removeListener to
-//   this.off, which recurses into the stream prototypes' aliases).
+//   imports below); the events shim re-exports the runtime EventEmitter,
+//   which is a Node-style callable function constructor.
 // - abort-controller/process shims resolve lazily to runtime globals.
 // - primordials' ObjectDefineProperty(ies) force accessor descriptors to be
 //   configurable so node/stream.js can install compat setters.

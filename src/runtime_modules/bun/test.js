@@ -504,6 +504,65 @@ function mockDisplayName(value) {
   return typeof value?.getMockName === "function" ? value.getMockName() : "mock function";
 }
 
+// Jest-style "- Expected / + Received" diff for spy call-argument matchers
+// (issue #10380).
+function formatArgListForDiff(args) {
+  const normalized = Array.isArray(args) ? (args.length === 1 ? args[0] : Array.from(args)) : args;
+  try {
+    const text = JSON.stringify(normalized, (key, value) => {
+      if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
+      if (typeof value === "bigint") return `${value}n`;
+      if (typeof value === "symbol") return String(value);
+      return value;
+    }, 2);
+    return text === undefined ? String(normalized) : text;
+  } catch {
+    return String(normalized);
+  }
+}
+
+function diffTextLines(expectedText, receivedText) {
+  const a = expectedText.split("\n");
+  const b = receivedText.split("\n");
+  const m = a.length;
+  const n = b.length;
+  const table = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      table[i][j] = a[i] === b[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      out.push(`  ${a[i]}`);
+      i++;
+      j++;
+    } else if (table[i + 1][j] >= table[i][j + 1]) {
+      out.push(`- ${a[i++]}`);
+    } else {
+      out.push(`+ ${b[j++]}`);
+    }
+  }
+  while (i < m) out.push(`- ${a[i++]}`);
+  while (j < n) out.push(`+ ${b[j++]}`);
+  return out.join("\n");
+}
+
+function formatCallArgsFailure(matcherName, expectedArgs, receivedCall, callCount) {
+  const expectedText = formatArgListForDiff(expectedArgs);
+  const lines = [`expect(received).${matcherName}(expected)`, "", "- Expected", "+ Received", ""];
+  if (receivedCall === undefined) {
+    lines.push(expectedText.split("\n").map((line) => `- ${line}`).join("\n"));
+  } else {
+    lines.push(diffTextLines(expectedText, formatArgListForDiff(receivedCall)));
+  }
+  lines.push("", `Number of calls: ${callCount}`);
+  return lines.join("\n");
+}
+
 function requireNoMatcherArguments(name, args) {
   if (args.length !== 0) throw new TypeError(`${name} does not accept arguments`);
 }
@@ -764,6 +823,12 @@ class Expectation {
       assertionCount += 1;
       globalThis.__cottontailTestAssertionCount += 1;
     }
+    if (typeof message === "function") {
+      // Lazy message: only pay for (potentially expensive) diff formatting
+      // when the assertion is actually going to fail.
+      const failing = this._negate ? pass : !pass;
+      message = failing ? message() : "";
+    }
     const label = this._label == null ? "" : `${String(this._label)}\n\n`;
     failMatcher(pass, this._negate, `${label}${message}`);
   }
@@ -1007,14 +1072,36 @@ class Expectation {
     return this._wrap((actual) => this._check(callRecords(actual).length === expected, `Expected ${mockDisplayName(actual)} to have ${expected} calls`));
   }
   toBeCalledTimes(count) { return this.toHaveBeenCalledTimes(count); }
-  toHaveBeenCalledWith(...args) { return this._wrap((actual) => this._check(callRecords(actual).some((call) => matchesExpected(call, args)), "Expected call arguments")); }
+  toHaveBeenCalledWith(...args) {
+    return this._wrap((actual) => {
+      const calls = callRecords(actual);
+      this._check(
+        calls.some((call) => matchesExpected(call, args)),
+        () => formatCallArgsFailure("toHaveBeenCalledWith", args, calls.at(-1), calls.length),
+      );
+    });
+  }
   toBeCalledWith(...args) { return this.toHaveBeenCalledWith(...args); }
   toHaveBeenLastCalledWith(...args) { return this.lastCalledWith(...args); }
-  lastCalledWith(...args) { return this._wrap((actual) => this._check(matchesExpected(callRecords(actual).at(-1), args), "Expected last call arguments")); }
+  lastCalledWith(...args) {
+    return this._wrap((actual) => {
+      const calls = callRecords(actual);
+      this._check(
+        matchesExpected(calls.at(-1), args),
+        () => formatCallArgsFailure("toHaveBeenLastCalledWith", args, calls.at(-1), calls.length),
+      );
+    });
+  }
   toHaveBeenNthCalledWith(index, ...args) { return this.nthCalledWith(index, ...args); }
   nthCalledWith(index, ...args) {
     const nth = requireNthCall(index, "toHaveBeenNthCalledWith");
-    return this._wrap((actual) => this._check(matchesExpected(callRecords(actual)[nth - 1], args), "Expected nth call arguments"));
+    return this._wrap((actual) => {
+      const calls = callRecords(actual);
+      this._check(
+        matchesExpected(calls[nth - 1], args),
+        () => formatCallArgsFailure("toHaveBeenNthCalledWith", args, calls[nth - 1], calls.length),
+      );
+    });
   }
 
   toHaveReturned(...args) {
@@ -1066,7 +1153,9 @@ export function expect(actual, label = undefined) {
 
 function installCustomMatchers(matchers = {}) {
   for (const [name, matcher] of Object.entries(matchers)) {
-    if (typeof matcher !== "function") continue;
+    if (typeof matcher !== "function") {
+      throw new TypeError(`expect.extend: \`${name}\` is not a valid matcher. Must be a function, is "${typeof matcher}"`);
+    }
     expect[name] = (...args) => ({ __expectMatcher: "custom", matcher, args });
     Object.defineProperty(Expectation.prototype, name, {
       configurable: true,
@@ -1608,6 +1697,8 @@ function makeBunTestFunction(base) {
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, requireCallback) : result;
     result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, requireCallback) : result;
     result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, requireCallback);
+    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, requireCallback) });
+    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, requireCallback) });
     return result;
   };
   const fn = (...args) => register(args);
@@ -1642,6 +1733,8 @@ function makeBunDescribe(base) {
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;
     result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }) : result;
     result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true });
+    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }) });
+    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }) });
     return result;
   };
   fn.only = variant({ only: true });

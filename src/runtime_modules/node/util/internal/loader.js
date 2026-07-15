@@ -219,7 +219,9 @@ function previewEntries(value, isIterator = false) {
   // iterator factory methods), so their remaining entries can be
   // reconstructed without consuming them. WeakMap/WeakSet contents are not
   // observable without native engine support.
-  const iteratorInfo = typesModule.getTrackedIteratorInfo?.(value);
+  // getTrackedIteratorInfo lives non-enumerably on the default export (the
+  // named-export surface must stay identical to Node's util/types).
+  const iteratorInfo = (typesModule.default ?? typesModule).getTrackedIteratorInfo?.(value);
   if (iteratorInfo !== undefined && !iteratorInfo.returned) {
     const { source, kind, consumed, isMap } = iteratorInfo;
     const entries = [];

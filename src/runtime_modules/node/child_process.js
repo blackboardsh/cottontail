@@ -3,7 +3,7 @@ import { Buffer } from "./buffer.js";
 import { deserialize, serialize } from "./v8.js";
 import { Server as NetServer, Socket as NetSocket } from "./net.js";
 import { Readable as ReadableStreamClass, Writable as WritableStreamClass } from "./stream.js";
-import { accessSync, statSync, constants as fsConstants } from "./fs.js";
+import { accessSync, statSync, writeSync, constants as fsConstants } from "./fs.js";
 
 export class ChildProcess extends EventEmitter {
   constructor() {
@@ -207,15 +207,56 @@ export function execFileSync(file, args = [], options = {}) {
   return result.stdout;
 }
 
+// Classify one spawnSync stdout/stderr stdio entry. The native spawner only
+// supports whole-process capture, so redirect targets (fds, streams,
+// "inherit") are serviced in JS: the captured bytes are forwarded to the
+// target fd after the child exits and the result field is null (Node
+// semantics: only "pipe" entries are captured).
+function classifySyncOutputStdio(value, parentFd) {
+  if (value === undefined || value === null || value === "pipe" || value === "overlapped") {
+    return { capture: true };
+  }
+  if (value === "ignore") return { capture: false };
+  if (value === "inherit") return { capture: false, targetFd: parentFd };
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return { capture: false, targetFd: value };
+  }
+  if (typeof value === "object") {
+    if (typeof value.fd === "number") return { capture: false, targetFd: value.fd };
+    if (typeof value.write === "function") return { capture: false, targetStream: value };
+  }
+  return { capture: true };
+}
+
+function forwardSyncOutput(target, buffer) {
+  if (!buffer || buffer.length === 0) return;
+  try {
+    if (target.targetStream) {
+      target.targetStream.write(buffer);
+    } else if (typeof target.targetFd === "number") {
+      writeSync(target.targetFd, buffer);
+    }
+  } catch {}
+}
+
 export function spawnSync(file, args = [], options = {}) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
+  const stdioOption = normalized.options.stdio;
+  const stdioArray = Array.isArray(stdioOption)
+    ? stdioOption
+    : typeof stdioOption === "string"
+      ? [stdioOption, stdioOption, stdioOption]
+      : [];
+  const stdoutTarget = classifySyncOutputStdio(stdioArray[1], 1);
+  const stderrTarget = classifySyncOutputStdio(stdioArray[2], 2);
+  const fullyInherited = stdioOption === "inherit";
   let result;
   try {
     result = cottontail.spawnSync(command.file, command.args, {
-      stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
+      stdio: fullyInherited ? "inherit" : "pipe",
       cwd: normalizeCwdOption(normalized.options.cwd),
       env: nativeOptions.env,
       clearEnv: nativeOptions.clearEnv,
@@ -224,7 +265,22 @@ export function spawnSync(file, args = [], options = {}) {
   } catch (error) {
     return makeSpawnFailureResult(file, error);
   }
-  return normalizeSyncResult(result, normalized.options);
+  const normalizedResult = normalizeSyncResult(result, normalized.options);
+  if (!stdoutTarget.capture) {
+    if (!fullyInherited) {
+      forwardSyncOutput(stdoutTarget, Buffer.from(result.stdout || ""));
+    }
+    normalizedResult.stdout = null;
+    normalizedResult.output[1] = null;
+  }
+  if (!stderrTarget.capture) {
+    if (!fullyInherited) {
+      forwardSyncOutput(stderrTarget, Buffer.from(result.stderr || ""));
+    }
+    normalizedResult.stderr = null;
+    normalizedResult.output[2] = null;
+  }
+  return normalizedResult;
 }
 
 function withoutElectrobunHostEnv(env) {
@@ -416,14 +472,28 @@ export function spawn(file, args = [], options = {}) {
     map.set(name, handlers.filter((item) => item !== handler));
   };
 
+  // Writable.prototype.writable (and Readable.prototype.readable) are
+  // accessor pairs whose setters no-op without _writableState/_readableState,
+  // so Object.assign cannot install them; shadow with own data properties.
+  // Node reports child.stdin.writable === true until end() is called (spawn
+  // callers gate `stdin.end()` on it), and child.stdout.readable === true.
+  const makeStreamShadowFlags = (fd, stream) => {
+    for (const [name, value] of [["writable", fd === 0], ["readable", fd !== 0]]) {
+      Object.defineProperty(stream, name, { value, writable: true, enumerable: true, configurable: true });
+    }
+    return stream;
+  };
+
   // The prototype makes `child.stdout instanceof stream.Readable` (and stdin
   // instanceof stream.Writable) hold, matching Node; every method these pipe
   // objects actually support is an own property assigned below.
-  const makeStream = (map, fd, writeImpl = null) => Object.assign(Object.create(fd === 0 ? WritableStreamClass.prototype : ReadableStreamClass.prototype), {
+  const makeStream = (map, fd, writeImpl = null) => makeStreamShadowFlags(fd, Object.assign(Object.create(fd === 0 ? WritableStreamClass.prototype : ReadableStreamClass.prototype), {
     fd,
     _encoding: null,
     _readableBuffer: [],
     destroyed: false,
+    writableEnded: false,
+    writableFinished: false,
     read(size = undefined) {
       if (this._readableBuffer.length === 0) return null;
       const chunks = this._readableBuffer;
@@ -477,6 +547,9 @@ export function spawn(file, args = [], options = {}) {
     end(chunk) {
       if (chunk != null && writeImpl) writeImpl(chunk);
       if (writeImpl) cottontail.spawnCloseStdin(native.id);
+      this.writable = false;
+      this.writableEnded = true;
+      this.writableFinished = true;
       emitFrom(map, "finish");
       this.destroyed = true;
       emitFrom(map, "close");
@@ -484,6 +557,8 @@ export function spawn(file, args = [], options = {}) {
     },
     destroy() {
       if (writeImpl) cottontail.spawnCloseStdin(native.id);
+      this.writable = false;
+      this.readable = false;
       this.destroyed = true;
       emitFrom(map, "close");
       return this;
@@ -501,7 +576,7 @@ export function spawn(file, args = [], options = {}) {
     resume() { return this; },
     ref() { return this; },
     unref() { return this; },
-  });
+  }));
 
   const streamChunk = (stream, bytes) => {
     const buffer = Buffer.from(bytes);

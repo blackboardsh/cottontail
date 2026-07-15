@@ -36,7 +36,13 @@ function shallowSize(value) {
   if (ArrayBuffer.isView(value)) return value.byteLength;
   if (value instanceof ArrayBuffer) return value.byteLength;
   if (Array.isArray(value)) return value.length * 8;
-  if (typeof value === "object") return Object.keys(value).length * 16;
+  if (typeof value === "object") {
+    // Objects that own out-of-line storage (e.g. Performance's entry buffer)
+    // report it through this hook, mirroring JSC's Structure::estimatedSize.
+    const reported = value[Symbol.for("cottontail.estimatedMemoryCost")];
+    if (typeof reported === "number") return reported + Object.keys(value).length * 16;
+    return Object.keys(value).length * 16;
+  }
   return 0;
 }
 
