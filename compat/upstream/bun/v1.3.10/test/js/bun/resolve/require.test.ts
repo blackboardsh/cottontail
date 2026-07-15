@@ -59,7 +59,9 @@ describe("require(specifier)", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
-    it.failing("is a Module object when a file is run directly", () => {
+    // COTTONTAIL-COMPAT: Cottontail implements the Node-correct require.main
+    // behavior that this pinned Bun test marks as a known upstream failure.
+    it("is a Module object when a file is run directly", () => {
       const file = path.join(dir, "index.js");
       const { stdout, stderr } = bunRun(file);
       expect(stderr).toBeEmpty();

@@ -90,7 +90,11 @@ function resolveTarget(path, options) {
 
 function requireCredentials(options) {
   if (!options.accessKeyId || !options.secretAccessKey) {
-    throw new Error("S3Client requires accessKeyId and secretAccessKey");
+    const error = new Error(
+      "Missing S3 credentials. 'accessKeyId', 'secretAccessKey', 'bucket', and 'endpoint' are required",
+    );
+    error.code = "ERR_S3_MISSING_CREDENTIALS";
+    throw error;
   }
 }
 
@@ -288,6 +292,10 @@ class S3File {
     return (await this.#get()).json();
   }
 
+  async formData() {
+    return (await this.#get()).formData();
+  }
+
   async arrayBuffer() {
     return (await this.#get()).arrayBuffer();
   }
@@ -432,9 +440,17 @@ export class S3Client {
   }
 }
 
-export const s3 = new Proxy(new S3Client({}), {
-  get(target, property, receiver) {
-    return Reflect.get(target, property, target);
+const defaultS3Client = new S3Client({});
+const defaultS3Methods = new Map();
+
+export const s3 = new Proxy(defaultS3Client, {
+  get(target, property) {
+    const value = Reflect.get(target, property, target);
+    if (typeof value !== "function") return value;
+    if (!defaultS3Methods.has(property)) {
+      defaultS3Methods.set(property, value.bind(target));
+    }
+    return defaultS3Methods.get(property);
   },
 });
 

@@ -25,6 +25,7 @@ const TransformConfig = struct {
     trim_unused_imports: ?bool = null,
     allow_runtime: bool = false,
     inlining: bool = false,
+    initial_indent: usize = 0,
 };
 
 const ImportResult = struct {
@@ -101,6 +102,13 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (jsonBool(object, "trimUnusedImports")) |value| config.trim_unused_imports = value;
         if (jsonBool(object, "allowBunRuntime")) |value| config.allow_runtime = value;
         if (jsonBool(object, "inline")) |value| config.inlining = value;
+        if (object.get("_cottontailInitialIndent")) |value| switch (value) {
+            .integer => |count| {
+                if (count < 0 or count > 64) return error.InvalidIndentOption;
+                config.initial_indent = @intCast(count);
+            },
+            else => return error.InvalidIndentOption,
+        };
 
         if (object.get("minify")) |value| switch (value) {
             .bool => |flag| {
@@ -265,6 +273,7 @@ fn process(
             .minify_identifiers = config.minify_identifiers,
             .minify_syntax = config.minify_syntax,
             .mangled_props = null,
+            .indent = .{ .count = config.initial_indent },
         },
         false,
     ) catch |err| {
@@ -273,6 +282,12 @@ fn process(
     };
 
     return try c_allocator.dupe(u8, printer.ctx.written);
+}
+
+pub fn scanImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.scan_imports, source_code, "", loader, &error_message);
 }
 
 export fn ct_transpiler_process(

@@ -14,6 +14,11 @@
 extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
 extern void JSContextGroupDisableSamplingProfiler(JSContextGroupRef group);
 extern JSStringRef JSContextGroupTakeSamplesFromSamplingProfiler(JSContextGroupRef group);
+extern void JSGlobalContextSetUnhandledRejectionCallback(
+    JSGlobalContextRef context,
+    JSObjectRef function,
+    JSValueRef *exception
+);
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -1387,6 +1392,20 @@ static uint32_t ct_next_sqlite_session_id = 1;
 static CtCryptoCipher *ct_crypto_ciphers = NULL;
 static uint32_t ct_next_crypto_cipher_id = 1;
 
+typedef struct CtTimer {
+    struct CtJscRuntime *runtime;
+    JSObjectRef handle;
+    uint64_t id;
+    uint64_t deadline_ns;
+    uint64_t repeat_ns;
+    size_t heap_index;
+    bool referenced;
+    bool immediate;
+    bool active;
+    bool firing;
+    bool refreshed_while_firing;
+} CtTimer;
+
 struct CtJscRuntime {
     JSGlobalContextRef context;
     JSObjectRef host_object;
@@ -1411,6 +1430,14 @@ struct CtJscRuntime {
     uint32_t next_process_id;
     uint32_t next_worker_id;
     uint32_t next_fd_watch_id;
+    CtTimer **timer_heap;
+    size_t timer_heap_len;
+    size_t timer_heap_cap;
+    CtTimer **timers_by_id;
+    size_t timers_by_id_cap;
+    uint64_t next_timer_id;
+    size_t referenced_timer_count;
+    size_t protected_timer_count;
 };
 
 static int ct_jsc_runtime_eval_internal(
@@ -2062,10 +2089,9 @@ static void ct_http_send_response(CtHttpRequest *request) {
     int status = request->status > 0 ? request->status : 200;
     const char *reason = ct_http_reason_phrase(status);
     const char *headers = request->response_headers_text != NULL ? request->response_headers_text : "";
-    char head[512];
     int head_len = snprintf(
-        head,
-        sizeof(head),
+        NULL,
+        0,
         "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\n%s\r\n",
         status,
         reason,
@@ -2074,11 +2100,25 @@ static void ct_http_send_response(CtHttpRequest *request) {
         headers
     );
     if (head_len < 0) return;
-    if ((size_t)head_len >= sizeof(head)) head_len = (int)sizeof(head) - 1;
-    ct_http_send_all(request->client_fd, head, (size_t)head_len);
-    if (request->response_body_len > 0 && request->response_body != NULL) {
-        ct_http_send_all(request->client_fd, request->response_body, request->response_body_len);
-    }
+    size_t head_size = (size_t)head_len;
+    size_t body_size = request->response_body != NULL ? request->response_body_len : 0;
+    if (body_size > SIZE_MAX - head_size - 1) return;
+    size_t response_size = head_size + body_size;
+    char *response = (char *)malloc(response_size + 1);
+    if (response == NULL) return;
+    snprintf(
+        response,
+        head_size + 1,
+        "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\n%s\r\n",
+        status,
+        reason,
+        request->response_body_len,
+        request->keep_alive ? "keep-alive" : "close",
+        headers
+    );
+    if (body_size > 0) memcpy(response + head_size, request->response_body, body_size);
+    ct_http_send_all(request->client_fd, response, response_size);
+    free(response);
 }
 
 static ssize_t ct_http_send_chunked_response_head(CtHttpRequest *request) {
@@ -7196,6 +7236,434 @@ static JSValueRef ct_console_error(JSContextRef ctx, JSObjectRef function, JSObj
     return ct_console_log_impl(ctx, argc, argv, stderr);
 }
 
+static uint64_t ct_timer_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t ct_timer_ms_to_ns(double milliseconds) {
+    if (!isfinite(milliseconds) || milliseconds <= 0) return 0;
+    if (milliseconds >= (double)(UINT64_MAX / 1000000ULL)) return UINT64_MAX;
+    return (uint64_t)ceil(milliseconds * 1000000.0);
+}
+
+static bool ct_timer_precedes(const CtTimer *left, const CtTimer *right) {
+    return left->deadline_ns < right->deadline_ns ||
+        (left->deadline_ns == right->deadline_ns && left->id < right->id);
+}
+
+static void ct_timer_heap_swap(CtJscRuntime *runtime, size_t left, size_t right) {
+    CtTimer *temporary = runtime->timer_heap[left];
+    runtime->timer_heap[left] = runtime->timer_heap[right];
+    runtime->timer_heap[right] = temporary;
+    runtime->timer_heap[left]->heap_index = left;
+    runtime->timer_heap[right]->heap_index = right;
+}
+
+static void ct_timer_heap_sift_up(CtJscRuntime *runtime, size_t index) {
+    while (index > 0) {
+        size_t parent = (index - 1) / 2;
+        if (!ct_timer_precedes(runtime->timer_heap[index], runtime->timer_heap[parent])) break;
+        ct_timer_heap_swap(runtime, index, parent);
+        index = parent;
+    }
+}
+
+static void ct_timer_heap_sift_down(CtJscRuntime *runtime, size_t index) {
+    for (;;) {
+        size_t left = index * 2 + 1;
+        size_t right = left + 1;
+        size_t smallest = index;
+        if (left < runtime->timer_heap_len &&
+            ct_timer_precedes(runtime->timer_heap[left], runtime->timer_heap[smallest])) {
+            smallest = left;
+        }
+        if (right < runtime->timer_heap_len &&
+            ct_timer_precedes(runtime->timer_heap[right], runtime->timer_heap[smallest])) {
+            smallest = right;
+        }
+        if (smallest == index) break;
+        ct_timer_heap_swap(runtime, index, smallest);
+        index = smallest;
+    }
+}
+
+static bool ct_timer_heap_reserve(CtJscRuntime *runtime, size_t required) {
+    if (required <= runtime->timer_heap_cap) return true;
+    size_t capacity = runtime->timer_heap_cap > 0 ? runtime->timer_heap_cap : 16;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2;
+    }
+    CtTimer **timers = (CtTimer **)realloc(runtime->timer_heap, capacity * sizeof(*timers));
+    if (timers == NULL) return false;
+    runtime->timer_heap = timers;
+    runtime->timer_heap_cap = capacity;
+    return true;
+}
+
+static void ct_timer_heap_push(CtJscRuntime *runtime, CtTimer *timer) {
+    size_t index = runtime->timer_heap_len++;
+    runtime->timer_heap[index] = timer;
+    timer->heap_index = index;
+    ct_timer_heap_sift_up(runtime, index);
+}
+
+static CtTimer *ct_timer_heap_remove_at(CtJscRuntime *runtime, size_t index) {
+    if (index >= runtime->timer_heap_len) return NULL;
+    CtTimer *removed = runtime->timer_heap[index];
+    size_t last = --runtime->timer_heap_len;
+    if (index != last) {
+        runtime->timer_heap[index] = runtime->timer_heap[last];
+        runtime->timer_heap[index]->heap_index = index;
+        if (index > 0 && ct_timer_precedes(runtime->timer_heap[index], runtime->timer_heap[(index - 1) / 2])) {
+            ct_timer_heap_sift_up(runtime, index);
+        } else {
+            ct_timer_heap_sift_down(runtime, index);
+        }
+    }
+    removed->heap_index = SIZE_MAX;
+    return removed;
+}
+
+static void ct_timer_heap_update(CtJscRuntime *runtime, CtTimer *timer) {
+    size_t index = timer->heap_index;
+    if (index == SIZE_MAX || index >= runtime->timer_heap_len) return;
+    if (index > 0 && ct_timer_precedes(timer, runtime->timer_heap[(index - 1) / 2])) {
+        ct_timer_heap_sift_up(runtime, index);
+    } else {
+        ct_timer_heap_sift_down(runtime, index);
+    }
+}
+
+static bool ct_timer_id_reserve(CtJscRuntime *runtime, uint64_t id) {
+    if (id > (uint64_t)(SIZE_MAX - 1)) return false;
+    size_t required = (size_t)id + 1;
+    if (required <= runtime->timers_by_id_cap) return true;
+    size_t capacity = runtime->timers_by_id_cap > 0 ? runtime->timers_by_id_cap : 32;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2;
+    }
+    CtTimer **timers = (CtTimer **)realloc(runtime->timers_by_id, capacity * sizeof(*timers));
+    if (timers == NULL) return false;
+    memset(timers + runtime->timers_by_id_cap, 0, (capacity - runtime->timers_by_id_cap) * sizeof(*timers));
+    runtime->timers_by_id = timers;
+    runtime->timers_by_id_cap = capacity;
+    return true;
+}
+
+static CtTimer *ct_timer_lookup(CtJscRuntime *runtime, uint64_t id) {
+    if (id == 0 || id >= runtime->timers_by_id_cap) return NULL;
+    return runtime->timers_by_id[id];
+}
+
+static void ct_timer_set_boolean(JSContextRef ctx, JSObjectRef handle, const char *name, bool value) {
+    JSValueRef exception = NULL;
+    ct_set_property(ctx, handle, name, JSValueMakeBoolean(ctx, value), &exception);
+}
+
+static void ct_timer_set_number(JSContextRef ctx, JSObjectRef handle, const char *name, double value) {
+    JSValueRef exception = NULL;
+    ct_set_property(ctx, handle, name, JSValueMakeNumber(ctx, value), &exception);
+}
+
+static void ct_timer_deactivate(CtTimer *timer, bool cleared) {
+    if (timer == NULL || !timer->active) return;
+    CtJscRuntime *runtime = timer->runtime;
+    if (timer->heap_index != SIZE_MAX) ct_timer_heap_remove_at(runtime, timer->heap_index);
+    timer->active = false;
+    if (timer->id < runtime->timers_by_id_cap && runtime->timers_by_id[timer->id] == timer) {
+        runtime->timers_by_id[timer->id] = NULL;
+    }
+    if (timer->referenced && runtime->referenced_timer_count > 0) runtime->referenced_timer_count -= 1;
+    if (runtime->protected_timer_count > 0) runtime->protected_timer_count -= 1;
+    ct_timer_set_boolean(runtime->context, timer->handle, "_destroyed", true);
+    if (cleared) ct_timer_set_boolean(runtime->context, timer->handle, "_cleared", true);
+    JSValueUnprotect(runtime->context, timer->handle);
+}
+
+static JSValueRef ct_timer_schedule(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 6 || !JSValueIsObject(ctx, argv[0])) {
+        ct_throw_message(ctx, exception, "timerSchedule(handle, id, delay, repeat, kind, referenced) requires six arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef handle = (JSObjectRef)argv[0];
+    double id_number = ct_value_to_number(ctx, argv[1]);
+    double delay_ms = ct_value_to_number(ctx, argv[2]);
+    double repeat_ms = ct_value_to_number(ctx, argv[3]);
+    int kind = (int)ct_value_to_number(ctx, argv[4]);
+    bool referenced = JSValueToBoolean(ctx, argv[5]);
+    uint64_t id = id_number > 0 && isfinite(id_number) ? (uint64_t)id_number : 0;
+    if (id == 0) {
+        if (runtime->next_timer_id == 0) runtime->next_timer_id = 1;
+        id = runtime->next_timer_id++;
+    }
+
+    CtTimer *timer = ct_timer_lookup(runtime, id);
+    if (timer != NULL && timer->firing && timer->repeat_ns > 0) {
+        timer->refreshed_while_firing = true;
+        return JSValueMakeNumber(ctx, (double)id);
+    }
+
+    uint64_t delay_ns = ct_timer_ms_to_ns(delay_ms);
+    uint64_t repeat_ns = ct_timer_ms_to_ns(repeat_ms);
+    uint64_t now = ct_timer_now_ns();
+    uint64_t deadline = delay_ns > UINT64_MAX - now ? UINT64_MAX : now + delay_ns;
+
+    if (timer != NULL) {
+        if (timer->referenced != referenced) {
+            if (referenced) runtime->referenced_timer_count += 1;
+            else if (runtime->referenced_timer_count > 0) runtime->referenced_timer_count -= 1;
+        }
+        timer->referenced = referenced;
+        timer->deadline_ns = deadline;
+        timer->repeat_ns = repeat_ns;
+        timer->immediate = kind == 2;
+        ct_timer_heap_update(runtime, timer);
+    } else {
+        if (!ct_timer_id_reserve(runtime, id) || !ct_timer_heap_reserve(runtime, runtime->timer_heap_len + 1)) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        timer = (CtTimer *)calloc(1, sizeof(*timer));
+        if (timer == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        timer->runtime = runtime;
+        timer->handle = handle;
+        timer->id = id;
+        timer->deadline_ns = deadline;
+        timer->repeat_ns = repeat_ns;
+        timer->heap_index = SIZE_MAX;
+        timer->referenced = referenced;
+        timer->immediate = kind == 2;
+        timer->active = true;
+        runtime->timers_by_id[id] = timer;
+        if (referenced) runtime->referenced_timer_count += 1;
+        runtime->protected_timer_count += 1;
+        JSValueProtect(ctx, handle);
+        ct_timer_heap_push(runtime, timer);
+    }
+
+    ct_timer_set_number(ctx, handle, "_id", (double)id);
+    ct_timer_set_number(ctx, handle, "_idleStart", (double)now / 1000000.0);
+    ct_timer_set_boolean(ctx, handle, "_destroyed", false);
+    ct_timer_set_boolean(ctx, handle, "_cleared", false);
+    return JSValueMakeNumber(ctx, (double)id);
+}
+
+static JSValueRef ct_timer_clear(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeUndefined(ctx);
+    double id_number = ct_value_to_number(ctx, argv[0]);
+    if (!isfinite(id_number) || id_number <= 0) return JSValueMakeUndefined(ctx);
+    CtTimer *timer = ct_timer_lookup(runtime, (uint64_t)id_number);
+    if (timer == NULL) return JSValueMakeUndefined(ctx);
+    if (argc >= 2) {
+        int expected_kind = (int)ct_value_to_number(ctx, argv[1]);
+        if ((expected_kind == 2) != timer->immediate) return JSValueMakeUndefined(ctx);
+    }
+    ct_timer_deactivate(timer, true);
+    if (!timer->firing) free(timer);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_timer_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 2) return JSValueMakeUndefined(ctx);
+    double id_number = ct_value_to_number(ctx, argv[0]);
+    CtTimer *timer = isfinite(id_number) && id_number > 0 ? ct_timer_lookup(runtime, (uint64_t)id_number) : NULL;
+    if (timer == NULL) return JSValueMakeUndefined(ctx);
+    bool referenced = JSValueToBoolean(ctx, argv[1]);
+    if (timer->referenced != referenced) {
+        if (referenced) runtime->referenced_timer_count += 1;
+        else if (runtime->referenced_timer_count > 0) runtime->referenced_timer_count -= 1;
+        timer->referenced = referenced;
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_timer_has_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+    double id_number = ct_value_to_number(ctx, argv[0]);
+    CtTimer *timer = isfinite(id_number) && id_number > 0 ? ct_timer_lookup(runtime, (uint64_t)id_number) : NULL;
+    return JSValueMakeBoolean(ctx, timer != NULL && timer->referenced);
+}
+
+static JSValueRef ct_timer_has_active(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    return JSValueMakeBoolean(ctx, runtime != NULL && runtime->referenced_timer_count > 0);
+}
+
+static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
+    if (runtime->timer_heap_len == 0) return 0;
+    uint64_t now = ct_timer_now_ns();
+    size_t due_capacity = runtime->timer_heap_len;
+    CtTimer **due = (CtTimer **)malloc(due_capacity * sizeof(*due));
+    if (due == NULL) {
+        ct_set_error_out(error_out, ct_duplicate_string("Out of memory"));
+        return -1;
+    }
+
+    size_t due_count = 0;
+    while (runtime->timer_heap_len > 0 && runtime->timer_heap[0]->deadline_ns <= now) {
+        CtTimer *timer = ct_timer_heap_remove_at(runtime, 0);
+        timer->firing = true;
+        due[due_count++] = timer;
+    }
+
+    JSContextRef ctx = runtime->context;
+    for (size_t index = 0; index < due_count; index += 1) {
+        CtTimer *timer = due[index];
+        if (!timer->active) {
+            timer->firing = false;
+            free(timer);
+            continue;
+        }
+
+        uint64_t callback_started_at = ct_timer_now_ns();
+        bool repeats = timer->repeat_ns > 0;
+        JSObjectRef handle = timer->handle;
+        JSValueProtect(ctx, handle);
+        if (!repeats) ct_timer_deactivate(timer, false);
+
+        JSValueRef exception = NULL;
+        JSValueRef callback_value = ct_get_property(ctx, handle, "__onTimeout", &exception);
+        if (exception == NULL && callback_value != NULL && JSValueIsObject(ctx, callback_value) &&
+            JSObjectIsFunction(ctx, (JSObjectRef)callback_value)) {
+            JSValueRef args_value = ct_get_property(ctx, handle, "__args", &exception);
+            JSObjectRef args_object = exception == NULL && args_value != NULL && JSValueIsObject(ctx, args_value)
+                ? (JSObjectRef)args_value
+                : NULL;
+            size_t arg_count = 0;
+            JSValueRef *args = NULL;
+            if (args_object != NULL) {
+                JSValueRef length_value = ct_get_property(ctx, args_object, "length", &exception);
+                if (exception == NULL) {
+                    double length_number = JSValueToNumber(ctx, length_value, &exception);
+                    if (exception == NULL && isfinite(length_number) && length_number > 0) {
+                        arg_count = (size_t)length_number;
+                        args = (JSValueRef *)calloc(arg_count, sizeof(*args));
+                        if (args == NULL) {
+                            exception = ct_make_string(ctx, "Out of memory");
+                        } else {
+                            for (size_t arg_index = 0; arg_index < arg_count && exception == NULL; arg_index += 1) {
+                                args[arg_index] = JSObjectGetPropertyAtIndex(ctx, args_object, (unsigned)arg_index, &exception);
+                            }
+                        }
+                    }
+                }
+            }
+            if (exception == NULL) {
+                JSObjectCallAsFunction(ctx, (JSObjectRef)callback_value, handle, arg_count, args, &exception);
+            }
+            free(args);
+        } else if (exception == NULL && repeats) {
+            ct_timer_deactivate(timer, true);
+        }
+
+        if (exception == NULL && repeats && timer->active) {
+            JSValueRef idle_timeout = ct_get_property(ctx, handle, "__idleTimeout", &exception);
+            if (exception == NULL) {
+                double idle_timeout_ms = JSValueToNumber(ctx, idle_timeout, &exception);
+                if (exception == NULL && idle_timeout_ms < 0 && !timer->refreshed_while_firing) {
+                    ct_timer_deactivate(timer, true);
+                }
+            }
+        }
+
+        if (repeats && timer->active) {
+            timer->firing = false;
+            timer->refreshed_while_firing = false;
+            uint64_t next_deadline = callback_started_at > UINT64_MAX - timer->repeat_ns
+                ? UINT64_MAX
+                : callback_started_at + timer->repeat_ns;
+            timer->deadline_ns = next_deadline;
+            ct_timer_set_number(ctx, handle, "_idleStart", (double)callback_started_at / 1000000.0);
+            ct_timer_heap_push(runtime, timer);
+        } else {
+            timer->firing = false;
+            if (!timer->active) free(timer);
+        }
+        JSValueUnprotect(ctx, handle);
+
+        if (exception != NULL) {
+            free(due);
+            ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+            return -1;
+        }
+    }
+    free(due);
+    return 0;
+}
+
+static JSValueRef ct_timer_tick_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    char *error = NULL;
+    if (runtime != NULL && ct_dispatch_timers(runtime, &error) != 0) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Timer callback failed");
+    }
+    free(error);
+    return JSValueMakeUndefined(ctx);
+}
+
+static bool ct_timer_next_delay_ms(CtJscRuntime *runtime, int *delay_out) {
+    if (runtime->timer_heap_len == 0) return false;
+    uint64_t now = ct_timer_now_ns();
+    uint64_t deadline = runtime->timer_heap[0]->deadline_ns;
+    uint64_t remaining_ns = deadline > now ? deadline - now : 0;
+    uint64_t delay = remaining_ns == 0 ? 1 : (remaining_ns + 999999ULL) / 1000000ULL;
+    if (delay > 50) delay = 50;
+    *delay_out = (int)delay;
+    return true;
+}
+
+static void ct_timer_destroy_all(CtJscRuntime *runtime) {
+    JSContextRef ctx = runtime->context;
+    for (size_t id = 1; id < runtime->timers_by_id_cap; id += 1) {
+        CtTimer *timer = runtime->timers_by_id[id];
+        if (timer == NULL) continue;
+        runtime->timers_by_id[id] = NULL;
+        if (timer->active) JSValueUnprotect(ctx, timer->handle);
+        free(timer);
+    }
+    free(runtime->timer_heap);
+    free(runtime->timers_by_id);
+    runtime->timer_heap = NULL;
+    runtime->timers_by_id = NULL;
+    runtime->timer_heap_len = 0;
+    runtime->timer_heap_cap = 0;
+    runtime->timers_by_id_cap = 0;
+    runtime->referenced_timer_count = 0;
+    runtime->protected_timer_count = 0;
+}
+
 static JSValueRef ct_nanotime(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -11741,6 +12209,19 @@ static void ct_process_close_fd(int *fd) {
     }
 }
 
+#if !defined(_WIN32)
+static int ct_process_relocate_standard_fds(int fds[2]) {
+    for (size_t index = 0; index < 2; index += 1) {
+        if (fds[index] < 0 || fds[index] > STDERR_FILENO) continue;
+        int relocated = fcntl(fds[index], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        if (relocated < 0) return -1;
+        close(fds[index]);
+        fds[index] = relocated;
+    }
+    return 0;
+}
+#endif
+
 static int ct_process_parse_stdio_value(JSContextRef ctx, JSValueRef value, CtProcessStdioMode *out, JSValueRef *exception) {
     if (JSValueIsUndefined(ctx, value)) return 0;
     if (JSValueIsNull(ctx, value)) {
@@ -13049,15 +13530,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
     int ipc_socket[2] = { -1, -1 };
-    if (stdin_mode == CT_PROCESS_STDIO_PIPE && pipe(stdin_pipe) != 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
-        free(file);
-        ct_free_string_array(args, arg_count);
-        free(cwd);
-        ct_free_env_entries(env_entries, env_count);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (stdout_mode == CT_PROCESS_STDIO_PIPE && pipe(stdout_pipe) != 0) {
+    if (stdin_mode == CT_PROCESS_STDIO_PIPE &&
+        (pipe(stdin_pipe) != 0 || ct_process_relocate_standard_fds(stdin_pipe) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_throw_message(ctx, exception, strerror(errno));
@@ -13067,7 +13541,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
-    if (stderr_mode == CT_PROCESS_STDIO_PIPE && pipe(stderr_pipe) != 0) {
+    if (stdout_mode == CT_PROCESS_STDIO_PIPE &&
+        (pipe(stdout_pipe) != 0 || ct_process_relocate_standard_fds(stdout_pipe) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
@@ -13079,8 +13554,25 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
+    if (stderr_mode == CT_PROCESS_STDIO_PIPE &&
+        (pipe(stderr_pipe) != 0 || ct_process_relocate_standard_fds(stderr_pipe) != 0)) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
 #if !defined(_WIN32)
-    if (ipc_enabled && socketpair(AF_UNIX, SOCK_STREAM, 0, ipc_socket) != 0) {
+    if (ipc_enabled &&
+        (socketpair(AF_UNIX, SOCK_STREAM, 0, ipc_socket) != 0 ||
+         ct_process_relocate_standard_fds(ipc_socket) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
@@ -13463,18 +13955,39 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     return JSValueMakeUndefined(ctx);
 }
 
-static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
-    (void)function;
+static JSValueRef ct_start_sampling_profiler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)argc;
     (void)argv;
     (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    bool enabled = runtime != NULL && runtime->context != NULL &&
+        JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context));
+    return JSValueMakeBoolean(ctx, enabled);
+}
+
+static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    JSObjectRef statistics;
 #if defined(__APPLE__)
-    JSObjectRef statistics = JSGetMemoryUsageStatistics(ctx);
-    return statistics != NULL ? statistics : ct_make_object(ctx);
+    statistics = JSGetMemoryUsageStatistics(ctx);
+    if (statistics == NULL) statistics = ct_make_object(ctx);
 #else
-    return ct_make_object(ctx);
+    statistics = ct_make_object(ctx);
 #endif
+    JSValueRef counts_value = ct_get_property(ctx, statistics, "protectedObjectTypeCounts", exception);
+    if (exception != NULL && *exception != NULL) return statistics;
+    JSObjectRef counts = counts_value != NULL && JSValueIsObject(ctx, counts_value)
+        ? (JSObjectRef)counts_value
+        : ct_make_object(ctx);
+    ct_set_property(ctx, counts, "Timeout", JSValueMakeNumber(ctx, runtime != NULL ? (double)runtime->protected_timer_count : 0), exception);
+    if (exception == NULL || *exception == NULL) {
+        ct_set_property(ctx, statistics, "protectedObjectTypeCounts", counts, exception);
+    }
+    return statistics;
 }
 
 static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
@@ -14538,6 +15051,19 @@ static JSValueRef ct_fstat_sync(JSContextRef ctx, JSObjectRef function, JSObject
     JSObjectRef result = ct_make_object(ctx);
     ct_define_stat_fields(ctx, result, &stat_value, exception);
     return result;
+}
+
+static JSValueRef ct_isatty_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1 || !JSValueIsNumber(ctx, argv[0])) return JSValueMakeBoolean(ctx, false);
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+#if defined(_WIN32)
+    return JSValueMakeBoolean(ctx, _isatty(fd) != 0);
+#else
+    return JSValueMakeBoolean(ctx, isatty(fd) != 0);
+#endif
 }
 
 static JSValueRef ct_fsync_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -15666,10 +16192,34 @@ static bool ct_install_function(JSContextRef ctx, JSObjectRef target, const char
     return ct_set_property(ctx, target, name, ct_make_function(ctx, name, callback, runtime), &exception);
 }
 
+static JSValueRef ct_unhandled_rejection(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef this_object,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)function;
+    (void)this_object;
+    if (argc >= 2) {
+        ct_set_property(ctx, JSContextGetGlobalObject(ctx), "__ctUnhandledRejection", argv[1], exception);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
 static int ct_install_host_api(CtJscRuntime *runtime) {
     JSContextRef ctx = runtime->context;
     JSValueRef exception = NULL;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
+
+    JSObjectRef unhandled_rejection_callback = ct_make_plain_function(
+        ctx,
+        "onUnhandledRejection",
+        ct_unhandled_rejection
+    );
+    JSGlobalContextSetUnhandledRejectionCallback(runtime->context, unhandled_rejection_callback, &exception);
+    if (exception != NULL) return -1;
 
     JSObjectRef console = ct_make_object(ctx);
     ct_set_property(ctx, console, "log", ct_make_plain_function(ctx, "log", ct_console_log), &exception);
@@ -15683,8 +16233,15 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
 
     ct_install_function(ctx, host, "nanotime", ct_nanotime, runtime);
     ct_install_function(ctx, host, "sleep", ct_sleep, runtime);
+    ct_install_function(ctx, host, "timerSchedule", ct_timer_schedule, runtime);
+    ct_install_function(ctx, host, "timerClear", ct_timer_clear, runtime);
+    ct_install_function(ctx, host, "timerSetRef", ct_timer_set_ref, runtime);
+    ct_install_function(ctx, host, "timerHasRef", ct_timer_has_ref, runtime);
+    ct_install_function(ctx, host, "timerHasActive", ct_timer_has_active, runtime);
+    ct_install_function(ctx, host, "timerTick", ct_timer_tick_host, runtime);
     ct_install_function(ctx, host, "drainJobs", ct_drain_jobs, runtime);
     ct_install_function(ctx, host, "gc", ct_gc, runtime);
+    ct_install_function(ctx, host, "startSamplingProfiler", ct_start_sampling_profiler, runtime);
     ct_install_function(ctx, host, "jscMemoryUsage", ct_jsc_memory_usage, runtime);
     ct_install_function(ctx, host, "importModule", ct_import_module, runtime);
     ct_install_function(ctx, host, "cwd", ct_cwd, runtime);
@@ -15703,6 +16260,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "fdReadAt", ct_fd_read_at, runtime);
     ct_install_function(ctx, host, "fdWriteAt", ct_fd_write_at, runtime);
     ct_install_function(ctx, host, "fstatSync", ct_fstat_sync, runtime);
+    ct_install_function(ctx, host, "isatty", ct_isatty_native, runtime);
     ct_install_function(ctx, host, "fsyncSync", ct_fsync_sync, runtime);
     ct_install_function(ctx, host, "fdatasyncSync", ct_fdatasync_sync, runtime);
     ct_install_function(ctx, host, "ftruncateSync", ct_ftruncate_sync, runtime);
@@ -15909,29 +16467,163 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "    Promise.resolve().then(callback);"
         "  };"
         "}"
-        "if (typeof Promise === 'function' && !Promise.__cottontailPatchedReject) {"
-        "  const reject = Promise.reject.bind(Promise);"
-        "  const then = Promise.prototype.then;"
-        "  const catchPromise = Promise.prototype.catch;"
-        "  const pending = [];"
-        "  const markHandled = function(promise){"
-        "    for (let index = 0; index < pending.length; index++) {"
-        "      const entry = pending[index];"
-        "      if (entry.promise !== promise) continue;"
-        "      entry.handled = true;"
-        "      if (globalThis.__ctUnhandledRejection === entry.reason) globalThis.__ctUnhandledRejection = undefined;"
+        "if (!globalThis.__cottontailTimersInstalled && globalThis.cottontail?.timerSchedule) {"
+        "  (function(){"
+        "  const g = globalThis;"
+        "  const customPromisify = Symbol.for('nodejs.util.promisify.custom');"
+        "  const maxDelay = 2147483647;"
+        "  const normalizeDelay = function(value, immediate){"
+        "    if (immediate) return 0;"
+        "    let delay = Number(value);"
+        "    if (!Number.isFinite(delay) || delay < 1 || delay > maxDelay) delay = 1;"
+        "    return Math.trunc(delay);"
+        "  };"
+        "  const numericTimerId = function(value){"
+        "    if (value && typeof value === 'object' && Number.isSafeInteger(value._id)) return value._id;"
+        "    if (typeof value === 'string' && !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;"
+        "    const id = Number(value);"
+        "    return Number.isSafeInteger(id) && id >= 0 ? id : null;"
+        "  };"
+        "  class Timeout {"
+        "    constructor(callback, delay, args, repeat, kind){"
+        "      this.__onTimeout = callback;"
+        "      this.__args = args;"
+        "      this.__idleTimeout = delay;"
+        "      this._repeat = repeat;"
+        "      this._kind = kind;"
+        "      this._refed = true;"
+        "      this._destroyed = false;"
+        "      this._cleared = false;"
+        "      this._id = cottontail.timerSchedule(this, 0, delay, repeat == null ? 0 : repeat, kind, true);"
         "    }"
+        "    get _idleTimeout(){ return this.__idleTimeout; }"
+        "    set _idleTimeout(value){"
+        "      this.__idleTimeout = Number(value);"
+        "    }"
+        "    get _onTimeout(){ return this.__onTimeout; }"
+        "    set _onTimeout(value){"
+        "      this.__onTimeout = value;"
+        "      if (this._id > 0 && typeof value !== 'function') this.close();"
+        "    }"
+        "    ref(){"
+        "      this._refed = true;"
+        "      cottontail.timerSetRef(this._id, true);"
+        "      return this;"
+        "    }"
+        "    unref(){"
+        "      this._refed = false;"
+        "      cottontail.timerSetRef(this._id, false);"
+        "      return this;"
+        "    }"
+        "    hasRef(){ return this._refed; }"
+        "    refresh(){"
+        "      if (this._cleared || this.__idleTimeout < 0 || typeof this.__onTimeout !== 'function') return this;"
+        "      this._destroyed = false;"
+        "      cottontail.timerSchedule(this, this._id, this.__idleTimeout, this._repeat == null ? 0 : this._repeat, this._kind, this._refed);"
+        "      return this;"
+        "    }"
+        "    close(){"
+        "      if (!this._cleared) cottontail.timerClear(this._id);"
+        "      this._cleared = true;"
+        "      this._destroyed = true;"
+        "      return this;"
+        "    }"
+        "    valueOf(){ return this._id; }"
+        "    [Symbol.toPrimitive](){ return this._id; }"
+        "  }"
+        "  function setTimeout(callback, delay = 0, ...args){"
+        "    if (typeof callback !== 'function') throw new TypeError('The \"callback\" argument must be of type function');"
+        "    const normalized = normalizeDelay(delay, false);"
+        "    return new Timeout(callback, normalized, args, null, 0);"
+        "  }"
+        "  function setInterval(callback, delay = 0, ...args){"
+        "    if (typeof callback !== 'function') throw new TypeError('The \"callback\" argument must be of type function');"
+        "    const normalized = normalizeDelay(delay, false);"
+        "    return new Timeout(callback, normalized, args, normalized, 1);"
+        "  }"
+        "  function setImmediate(callback, ...args){"
+        "    if (typeof callback !== 'function') throw new TypeError('The \"callback\" argument must be of type function');"
+        "    return new Timeout(callback, 0, args, null, 2);"
+        "  }"
+        "  function clearTimeout(value){"
+        "    const id = numericTimerId(value);"
+        "    if (id == null || (value && typeof value === 'object' && value._kind === 2)) return;"
+        "    if (value && typeof value === 'object') { value._cleared = true; value._destroyed = true; }"
+        "    cottontail.timerClear(id, 0);"
+        "  }"
+        "  function clearInterval(value){ return clearTimeout(value); }"
+        "  function clearImmediate(value){"
+        "    const id = numericTimerId(value);"
+        "    if (id == null || (value && typeof value === 'object' && value._kind !== 2)) return;"
+        "    if (value && typeof value === 'object') { value._cleared = true; value._destroyed = true; }"
+        "    cottontail.timerClear(id, 2);"
+        "  }"
+        "  const abortReason = function(signal){"
+        "    if (signal?.reason !== undefined) return signal.reason;"
+        "    const error = new Error('The operation was aborted');"
+        "    error.name = 'AbortError';"
+        "    error.code = 'ABORT_ERR';"
+        "    return error;"
         "  };"
-        "  Promise.reject = function(reason){"
-        "    const promise = reject(reason);"
-        "    const entry = { promise, reason, handled: false };"
-        "    pending.push(entry);"
-        "    queueMicrotask(function(){ if (!entry.handled) globalThis.__ctUnhandledRejection = reason; });"
-        "    return promise;"
+        "  const timeoutPromise = function(delay = 1, value = undefined, options = undefined){"
+        "    return new Promise(function(resolve, reject){"
+        "      const signal = options?.signal;"
+        "      if (signal?.aborted) { reject(abortReason(signal)); return; }"
+        "      let handle;"
+        "      const onAbort = function(){ clearTimeout(handle); reject(abortReason(signal)); };"
+        "      handle = setTimeout(function(){ signal?.removeEventListener?.('abort', onAbort); resolve(value); }, delay);"
+        "      if (options?.ref === false) handle.unref();"
+        "      signal?.addEventListener?.('abort', onAbort, { once: true });"
+        "    });"
         "  };"
-        "  Promise.prototype.then = function(onFulfilled, onRejected){ markHandled(this); return then.call(this, onFulfilled, onRejected); };"
-        "  Promise.prototype.catch = function(onRejected){ markHandled(this); return catchPromise.call(this, onRejected); };"
-        "  Promise.__cottontailPatchedReject = true;"
+        "  const immediatePromise = function(value = undefined, options = undefined){"
+        "    return new Promise(function(resolve, reject){"
+        "      const signal = options?.signal;"
+        "      if (signal?.aborted) { reject(abortReason(signal)); return; }"
+        "      let handle;"
+        "      const onAbort = function(){ clearImmediate(handle); reject(abortReason(signal)); };"
+        "      handle = setImmediate(function(){ signal?.removeEventListener?.('abort', onAbort); resolve(value); });"
+        "      if (options?.ref === false) handle.unref();"
+        "      signal?.addEventListener?.('abort', onAbort, { once: true });"
+        "    });"
+        "  };"
+        "  const intervalPromise = async function* (delay = 1, value = undefined, options = undefined){"
+        "    while (!options?.signal?.aborted) yield await timeoutPromise(delay, value, options);"
+        "  };"
+        "  Object.defineProperty(setTimeout, customPromisify, { value: timeoutPromise, configurable: true });"
+        "  Object.defineProperty(setInterval, customPromisify, { value: intervalPromise, configurable: true });"
+        "  Object.defineProperty(setImmediate, customPromisify, { value: immediatePromise, configurable: true });"
+        "  Object.defineProperties(g, {"
+        "    setTimeout: { value: setTimeout, writable: true, enumerable: true, configurable: true },"
+        "    clearTimeout: { value: clearTimeout, writable: true, enumerable: true, configurable: true },"
+        "    setInterval: { value: setInterval, writable: true, enumerable: true, configurable: true },"
+        "    clearInterval: { value: clearInterval, writable: true, enumerable: true, configurable: true },"
+        "    setImmediate: { value: setImmediate, writable: true, enumerable: true, configurable: true },"
+        "    clearImmediate: { value: clearImmediate, writable: true, enumerable: true, configurable: true },"
+        "  });"
+        "  g.requestAnimationFrame = function(callback){ return setTimeout(function(){ callback(Number(cottontail.nanotime()) / 1000000); }, 16); };"
+        "  g.cancelAnimationFrame = clearTimeout;"
+        "  let assignedRunLoopTick;"
+        "  const nativeTimerTick = function(){"
+        "    cottontail.timerTick();"
+        "    return typeof assignedRunLoopTick === 'function' ? assignedRunLoopTick() : 16;"
+        "  };"
+        "  Object.defineProperty(g, '__cottontailRunLoopTick', {"
+        "    configurable: true,"
+        "    get: function(){ return nativeTimerTick; },"
+        "    set: function(value){ if (value !== nativeTimerTick) assignedRunLoopTick = value; },"
+        "  });"
+        "  let assignedHasActiveHandles;"
+        "  const nativeTimerHasActive = function(){"
+        "    return cottontail.timerHasActive() || (typeof assignedHasActiveHandles === 'function' && assignedHasActiveHandles());"
+        "  };"
+        "  Object.defineProperty(g, '__cottontailHasActiveHandles', {"
+        "    configurable: true,"
+        "    get: function(){ return nativeTimerHasActive; },"
+        "    set: function(value){ if (value !== nativeTimerHasActive) assignedHasActiveHandles = value; },"
+        "  });"
+        "  g.__cottontailTimersInstalled = true;"
+        "  })();"
         "}"
         "if (typeof globalThis.SharedArrayBuffer !== 'function' && globalThis.cottontail?.sharedArrayBufferCreate) {"
         "  const __ctSharedBuffers = new WeakSet();"
@@ -16065,6 +16757,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
 
     JSContextRef ctx = runtime->context;
     if (ctx != NULL) {
+        ct_timer_destroy_all(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
         if (runtime->fd_event_handler != NULL) JSValueUnprotect(ctx, runtime->fd_event_handler);
         if (runtime->worker_event_handler != NULL) JSValueUnprotect(ctx, runtime->worker_event_handler);
@@ -16755,6 +17448,8 @@ static JSValueRef ct_global_value(JSContextRef ctx, const char *name) {
 static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
 
+    if (runtime->referenced_timer_count > 0) return true;
+
     pthread_mutex_lock(&runtime->callback_mutex);
     pending = runtime->callback_jobs_head != NULL;
     pthread_mutex_unlock(&runtime->callback_mutex);
@@ -16895,6 +17590,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     if (delay_ms_out != NULL) *delay_ms_out = 16;
     JSContextRef ctx = runtime->context;
     if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;
+    if (ct_dispatch_timers(runtime, error_out) != 0) return -1;
     JSStringRef source = ct_js_string(
         "(function(){"
         "let delay=16;"
@@ -16909,14 +17605,19 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
-    if (delay_ms_out != NULL && value != NULL) {
+    int js_delay_ms = 16;
+    if (value != NULL) {
         JSValueRef number_exception = NULL;
         double delay = JSValueToNumber(ctx, value, &number_exception);
         if (number_exception == NULL && delay == delay) {
             if (delay < 1) delay = 1;
             if (delay > 1000) delay = 1000;
-            *delay_ms_out = (int)delay;
+            js_delay_ms = (int)delay;
         }
+    }
+    if (delay_ms_out != NULL) {
+        int timer_delay_ms = 0;
+        *delay_ms_out = ct_timer_next_delay_ms(runtime, &timer_delay_ms) ? timer_delay_ms : js_delay_ms;
     }
     return 0;
 }

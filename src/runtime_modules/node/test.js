@@ -117,9 +117,8 @@ function isNativePromise(value) {
 }
 
 function promiseThen(value, onFulfilled, onRejected) {
-  return isNativePromise(value)
-    ? runnerPromiseThen.call(value, onFulfilled, onRejected)
-    : value.then(onFulfilled, onRejected);
+  const promise = isNativePromise(value) ? value : runnerPromiseResolve(value);
+  return runnerPromiseThen.call(promise, onFulfilled, onRejected);
 }
 
 function installUncaughtCapture() {

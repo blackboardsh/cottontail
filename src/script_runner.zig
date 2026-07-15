@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
 const native_bundler = @import("cottontail_bundler.zig");
+const native_transpiler = @import("cottontail_transpiler.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 
 const script_thread_stack_size = 128 * 1024 * 1024;
@@ -36,6 +37,7 @@ const Context = struct {
     allocator: std.mem.Allocator,
     environ_map: *std.process.Environ.Map,
     project_root: []const u8,
+    executable_stamp: []const u8,
 
     fn writeStdout(self: *const Context, comptime fmt: []const u8, args: anytype) void {
         var buffer: [2048]u8 = undefined;
@@ -80,7 +82,13 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
 
-    const runnable_path = try bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null);
+    const runnable_path = bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null) catch |err| {
+        if (err == error.SyntaxError) {
+            ctx.writeStderr("error: Syntax Error\n", .{});
+            return 1;
+        }
+        return err;
+    };
     defer cleanupRunnableDirectory(&ctx, runnable_path);
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
@@ -181,11 +189,19 @@ pub fn runStdin(
 
 fn makeContext(init: std.process.Init) !Context {
     const allocator = init.arena.allocator();
+    const process_args = try init.minimal.args.toSlice(allocator);
+    const executable_arg = if (process_args.len > 0) process_args[0] else "cottontail";
+    const executable_path = std.Io.Dir.cwd().realPathFileAlloc(init.io, executable_arg, allocator) catch executable_arg;
+    const executable_stamp = if (std.Io.Dir.cwd().statFile(init.io, executable_path, .{})) |stat|
+        try std.fmt.allocPrint(allocator, "{s}:{d}:{d}", .{ executable_path, stat.size, stat.mtime.nanoseconds })
+    else |_|
+        try allocator.dupe(u8, executable_path);
     return .{
         .io = init.io,
         .allocator = allocator,
         .environ_map = init.environ_map,
         .project_root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
+        .executable_stamp = executable_stamp,
     };
 }
 
@@ -373,9 +389,6 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
 
-    if (profiler_options.enabled() and !js_runtime.enableSamplingProfiler()) {
-        writeStderr(execution.io, "cottontail: failed to enable the JSC sampling profiler\n", .{});
-    }
     execution.exit_code = if (execution.embedded_source) |source|
         js_runtime.runSource(source, execution.runnable_path)
     else
@@ -409,6 +422,12 @@ const CpuProfileOptions = struct {
         return self.json or self.markdown;
     }
 };
+
+const cpu_profiler_start_statement =
+    \\if ((globalThis.process?.execArgv ?? []).some((arg) => arg === "--cpu-prof" || arg === "--cpu-prof-md")) {
+    \\  globalThis.cottontail?.startSamplingProfiler?.();
+    \\}
+;
 
 fn parseCpuProfileOptions(args: []const [:0]const u8) CpuProfileOptions {
     var options: CpuProfileOptions = .{};
@@ -866,6 +885,61 @@ fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias
     return aliases.toOwnedSlice(ctx.allocator);
 }
 
+fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
+    const bare = if (std.mem.startsWith(u8, specifier, "node:")) specifier["node:".len..] else specifier;
+    for (node_runtime_aliases) |alias| {
+        if (std.mem.eql(u8, bare, alias.specifier)) return true;
+    }
+    return std.mem.eql(u8, specifier, "bun") or
+        std.mem.eql(u8, specifier, "bun:ffi") or
+        std.mem.eql(u8, specifier, "bun:jsc") or
+        std.mem.eql(u8, specifier, "bun:sqlite") or
+        std.mem.eql(u8, specifier, "bun:test") or
+        std.mem.eql(u8, specifier, "bun:internal-for-testing") or
+        std.mem.eql(u8, specifier, "bun:wrap") or
+        std.mem.eql(u8, specifier, "vitest") or
+        std.mem.eql(u8, specifier, "string-width") or
+        std.mem.eql(u8, specifier, "strip-ansi") or
+        std.mem.eql(u8, specifier, "node-fetch") or
+        std.mem.eql(u8, specifier, "abort-controller");
+}
+
+fn transpilerLoaderForPath(path: []const u8) ?[]const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.mem.eql(u8, extension, ".js") or
+        std.mem.eql(u8, extension, ".mjs") or
+        std.mem.eql(u8, extension, ".cjs")) return "js";
+    if (std.mem.eql(u8, extension, ".jsx")) return "jsx";
+    if (std.mem.eql(u8, extension, ".ts") or
+        std.mem.eql(u8, extension, ".mts") or
+        std.mem.eql(u8, extension, ".cts")) return "ts";
+    if (std.mem.eql(u8, extension, ".tsx")) return "tsx";
+    return null;
+}
+
+fn entrypointImportsOnlyRuntimeAliases(ctx: *const Context, path: []const u8) !bool {
+    const loader = transpilerLoaderForPath(path) orelse return false;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return false;
+    defer std.heap.c_allocator.free(imports_json);
+
+    const ScannedImport = struct {
+        path: []const u8,
+        kind: []const u8,
+    };
+    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return false;
+    defer parsed.deinit();
+    for (parsed.value) |item| {
+        if (item.path.len == 0 or !isRuntimeAliasSpecifier(item.path)) return false;
+    }
+    return true;
+}
+
 fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
@@ -889,19 +963,38 @@ fn bundleScriptNative(
         try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir);
     defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
 
-    const preload_imports = try buildBunfigTestPreloadImports(ctx, script_abs);
+    const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args);
+    const bunfig_preload_imports = try buildBunfigTestPreloadImports(ctx, script_abs);
+    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ cli_preload_imports, bunfig_preload_imports });
+    const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
+    const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
+    const tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
+    const plain_launcher_cacheable = preload_imports.len == 0 and
+        build_options == null and
+        !has_custom_conditions and
+        tsconfig_override == null and
+        !package_json_patch.active and
+        ctx.environ_map.get("COTTONTAIL_RUNTIME_MODULES_DIR") == null and
+        ctx.environ_map.get("COTTONTAIL_KEEP_TEMP") == null and
+        ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null;
+    const bundle_common_js_entrypoint = is_common_js_entrypoint and has_custom_conditions;
+    const use_esm_bundle_cache = !is_wasm_entrypoint and
+        !is_common_js_entrypoint and
+        std.mem.eql(u8, script_entry_abs, script_abs) and
+        plain_launcher_cacheable and
+        try entrypointImportsOnlyRuntimeAliases(ctx, script_abs);
     const wrapped_entry = if (is_wasm_entrypoint)
         try writeWasiEntryWrapper(ctx, tmp_dir, script_abs)
-    else if (try shouldBundleCommonJsEntrypoint(ctx, script_abs))
+    else if (is_common_js_entrypoint)
         try writeCommonJsEntryWrapper(
             ctx,
             tmp_dir,
             script_abs,
-            hasCustomConditions(exec_args) or hasCustomConditions(script_args),
+            bundle_common_js_entrypoint,
             preload_imports,
         )
     else
-        try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs, preload_imports);
+        try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs, preload_imports, use_esm_bundle_cache);
 
     var conditions: std.ArrayList([]const u8) = .empty;
     try collectConditions(ctx.allocator, &conditions, exec_args);
@@ -913,11 +1006,33 @@ fn bundleScriptNative(
     var options = build_options orelse native_bundler.BundleOptions{};
     options.aliases = aliases;
     options.conditions = conditions.items;
-    options.tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
+    options.tsconfig_override = tsconfig_override;
     options.include_runtime_modules = true;
     options.preserve_external_require_name = true;
     options.inline_import_meta_properties = true;
     options.skip_teardown = true;
+
+    const use_common_js_launcher_cache = is_common_js_entrypoint and
+        !bundle_common_js_entrypoint and
+        plain_launcher_cacheable;
+    const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
+        "commonjs-launcher"
+    else if (use_esm_bundle_cache)
+        try std.fmt.allocPrint(ctx.allocator, "esm-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
+    else
+        null;
+    var launcher_cache = if (launcher_cache_name) |name|
+        try acquireLauncherCache(ctx, wrapped_entry, name, if (use_esm_bundle_cache) script_abs else null)
+    else
+        null;
+    defer if (launcher_cache) |*cache| cache.lock_file.close(ctx.io);
+    if (launcher_cache) |cache| {
+        if (try launcherCacheHit(ctx, &cache)) {
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+            return cache.bundle_path;
+        }
+    }
+
     const output = native_bundler.bundleEntryPointWithOptions(
         wrapped_entry,
         ctx.project_root,
@@ -926,7 +1041,12 @@ fn bundleScriptNative(
     ) catch |err| {
         if (error_message) |message| {
             defer native_bundler.ct_bundle_string_free(message);
-            ctx.writeStderr("{s}\n", .{std.mem.span(message)});
+            const text = std.mem.span(message);
+            if (std.mem.startsWith(u8, text, "error:")) {
+                ctx.writeStderr("{s}\n", .{text});
+            } else {
+                ctx.writeStderr("error: {s}\n", .{text});
+            }
             // A build/resolve error was already reported to the user. Match
             // `bun run` by exiting cleanly instead of unwinding through main,
             // which prints a (slow to symbolize) Zig error-return trace.
@@ -939,7 +1059,87 @@ fn bundleScriptNative(
     };
     defer native_bundler.ct_bundle_free(output.ptr, output.len);
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output });
+    if (launcher_cache) |cache| {
+        std.Io.Dir.cwd().deleteFile(ctx.io, cache.bundle_path) catch {};
+        std.Io.Dir.cwd().rename(bundle_path, std.Io.Dir.cwd(), cache.bundle_path, ctx.io) catch return bundle_path;
+        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cache.key_path, .data = &cache.key }) catch {};
+        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        return cache.bundle_path;
+    }
     return bundle_path;
+}
+
+const LauncherCache = struct {
+    bundle_path: []const u8,
+    key_path: []const u8,
+    key: [64]u8,
+    lock_file: std.Io.File,
+};
+
+fn acquireLauncherCache(
+    ctx: *const Context,
+    wrapped_entry: []const u8,
+    cache_name: []const u8,
+    key_material_path: ?[]const u8,
+) !?LauncherCache {
+    const wrapper_source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        wrapped_entry,
+        ctx.allocator,
+        .limited(1024 * 1024),
+    ) catch return null;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("cottontail-launcher-v1\x00");
+    hasher.update(cache_name);
+    hasher.update("\x00");
+    hasher.update(ctx.executable_stamp);
+    hasher.update("\x00");
+    hasher.update(wrapper_source);
+    if (key_material_path) |path| {
+        const key_material = std.Io.Dir.cwd().readFileAlloc(
+            ctx.io,
+            path,
+            ctx.allocator,
+            .limited(4 * 1024 * 1024),
+        ) catch return null;
+        hasher.update("\x00");
+        hasher.update(key_material);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+
+    const run_root = try ensureTempRunRoot(ctx);
+    const temp_root = std.fs.path.dirname(run_root) orelse return null;
+    const cache_root = try std.fs.path.join(ctx.allocator, &.{ temp_root, "cache" });
+    std.Io.Dir.cwd().createDirPath(ctx.io, cache_root) catch return null;
+
+    const lock_name = try std.fmt.allocPrint(ctx.allocator, "{s}.lock", .{cache_name});
+    const lock_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, lock_name });
+    const lock_file = std.Io.Dir.cwd().createFile(ctx.io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+    }) catch return null;
+    errdefer lock_file.close(ctx.io);
+
+    return .{
+        .bundle_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.mjs", .{cache_name}) }),
+        .key_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.key", .{cache_name}) }),
+        .key = std.fmt.bytesToHex(digest, .lower),
+        .lock_file = lock_file,
+    };
+}
+
+fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !bool {
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, cache.bundle_path, .{}) catch return false;
+    if (stat.kind != .file or stat.size == 0) return false;
+    const key = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        cache.key_path,
+        ctx.allocator,
+        .limited(cache.key.len + 1),
+    ) catch return false;
+    return std.mem.eql(u8, key, &cache.key);
 }
 
 fn tsconfigOverridePath(ctx: *const Context, exec_args: []const [:0]const u8) !?[]const u8 {
@@ -1316,12 +1516,63 @@ fn buildBunfigTestPreloadImports(ctx: *const Context, script_abs: []const u8) ![
     return "";
 }
 
+fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args: []const [:0]const u8) ![]const u8 {
+    var output: std.ArrayList(u8) = .empty;
+    const script_literal = try jsonStringLiteral(ctx, script_abs);
+    var index: usize = 0;
+    while (index < exec_args.len) : (index += 1) {
+        const arg = exec_args[index];
+        var specifier: ?[]const u8 = null;
+        var use_import = false;
+
+        if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--require") or std.mem.eql(u8, arg, "--preload")) {
+            if (index + 1 < exec_args.len) {
+                index += 1;
+                specifier = exec_args[index];
+            }
+        } else if (std.mem.eql(u8, arg, "--import")) {
+            if (index + 1 < exec_args.len) {
+                index += 1;
+                specifier = exec_args[index];
+                use_import = true;
+            }
+        } else inline for (.{ "--require=", "--preload=", "--import=" }) |prefix| {
+            if (std.mem.startsWith(u8, arg, prefix)) {
+                specifier = arg[prefix.len..];
+                use_import = std.mem.eql(u8, prefix, "--import=");
+                break;
+            }
+        }
+
+        if (specifier) |raw_specifier| {
+            const resolved_specifier = if (std.mem.startsWith(u8, raw_specifier, "."))
+                try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, raw_specifier })
+            else
+                raw_specifier;
+            const specifier_literal = try jsonStringLiteral(ctx, resolved_specifier);
+            if (use_import) {
+                try output.appendSlice(ctx.allocator, "await import(");
+                try output.appendSlice(ctx.allocator, specifier_literal);
+                try output.appendSlice(ctx.allocator, ");\n");
+            } else {
+                try output.appendSlice(ctx.allocator, "moduleModule.createRequire(");
+                try output.appendSlice(ctx.allocator, script_literal);
+                try output.appendSlice(ctx.allocator, ")(");
+                try output.appendSlice(ctx.allocator, specifier_literal);
+                try output.appendSlice(ctx.allocator, ");\n");
+            }
+        }
+    }
+    return try output.toOwnedSlice(ctx.allocator);
+}
+
 fn writeCottontailEntryWrapper(
     ctx: *const Context,
     tmp_dir: []const u8,
     script_import_abs: []const u8,
     script_abs: []const u8,
     preload_imports: []const u8,
+    stable_source_map_path: bool,
 ) ![]const u8 {
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const wrapper_name = try std.fmt.allocPrint(
@@ -1339,8 +1590,12 @@ fn writeCottontailEntryWrapper(
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
         "";
-    const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
-    const bundle_map_literal = try jsonStringLiteral(ctx, bundle_map_path);
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
     const source = try std.fmt.allocPrint(
         ctx.allocator,
         \\import __ctBunModule from {s};
@@ -1364,7 +1619,7 @@ fn writeCottontailEntryWrapper(
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
         \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});
-        \\globalThis.require ??= globalThis.__ctMetaRequire;
+        \\globalThis.require = globalThis.__ctMetaRequire;
         \\globalThis.__ctMetaResolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
         \\globalThis.__ctMetaResolve ??= (specifier) => {{
         \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
@@ -1372,6 +1627,7 @@ fn writeCottontailEntryWrapper(
         \\}};
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
+        \\{s}
         \\{s}await import({s});
         \\
     ,
@@ -1386,6 +1642,7 @@ fn writeCottontailEntryWrapper(
             script_literal,
             script_literal,
             test_header_signal,
+            cpu_profiler_start_statement,
             preload_imports,
             script_import_literal,
         },
@@ -1409,6 +1666,7 @@ fn writeWasiEntryWrapper(
     const source = try std.fmt.allocPrint(ctx.allocator,
         \\import {{ readFileSync }} from "node:fs";
         \\import {{ WASI }} from "node:wasi";
+        \\{s}
         \\const __ctWasi = new WASI({{ version: "preview1", args: process.argv.slice(1), env: process.env }});
         \\const __ctWasmModule = new WebAssembly.Module(readFileSync({s}));
         \\const __ctWasiImports = {{
@@ -1418,7 +1676,7 @@ fn writeWasiEntryWrapper(
         \\const __ctWasmInstance = new WebAssembly.Instance(__ctWasmModule, __ctWasiImports);
         \\__ctWasi.start(__ctWasmInstance);
         \\
-    , .{script_literal});
+    , .{ cpu_profiler_start_statement, script_literal });
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = source });
     return wrapper_path;
 }
@@ -2297,7 +2555,7 @@ fn appendDynamicTargetFactory(
     const prefix = try std.fmt.allocPrint(ctx.allocator,
         \\const __ctPath{d} = {s};
         \\const __ctURL{d} = {s};
-        \\async function __ctLoad{d}(specifier, options) {{
+        \\function __ctLoad{d}(specifier, options) {{
         \\  const __ctText = String(specifier);
         \\  const __ctMarker = __ctText.search(/[?#]/);
         \\  const __ctSuffix = __ctMarker < 0 ? "" : __ctText.slice(__ctMarker);
@@ -2305,7 +2563,7 @@ fn appendDynamicTargetFactory(
         \\  const __ctType = options?.with?.type ?? options?.assert?.type ?? options?.type ?? (__ctSuffix === "?raw" ? "text" : __ctInferredType);
         \\  const __ctKey = __ctPath{d} + __ctSuffix + (__ctType == null ? "" : "\\u0000" + __ctType);
         \\  const __ctRegistry = globalThis.Loader.registry;
-        \\  if (__ctRegistry.has(__ctKey)) return await __ctRegistry.get(__ctKey);
+        \\  if (__ctRegistry.has(__ctKey)) return __ctRegistry.get(__ctKey);
         \\  const __ctPromise = (async () => {{
         \\    const __ctImportMeta = {{ url: __ctURL{d} + __ctSuffix, dir: {s}, dirname: {s}, file: {s}, path: __ctPath{d}, filename: __ctPath{d}, main: false }};
         \\    const __ctRaw = {s};
@@ -2368,9 +2626,9 @@ fn appendDynamicTargetFactory(
         "module.exports";
     const suffix = try std.fmt.allocPrint(ctx.allocator,
         \\    return module.exports;
-        \\  }})();
+        \\  }})().catch(error => {{ __ctRegistry.delete(__ctKey); throw __ctNormalizeImportError(error); }});
         \\  __ctRegistry.set(__ctKey, __ctPromise);
-        \\  try {{ return await __ctPromise; }} catch (error) {{ __ctRegistry.delete(__ctKey); throw __ctNormalizeImportError(error); }}
+        \\  return __ctPromise;
         \\}}
         \\
     , .{});
@@ -3088,12 +3346,11 @@ fn writeCommonJsEntryWrapper(
         },
     );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
-    const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
-    const bundle_map_literal = try jsonStringLiteral(ctx, bundle_map_path);
+    const bundle_map_literal = "\"\"";
     const main_statement = if (bundle_entry)
-        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}await import({s});", .{ preload_imports, script_literal })
+        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}\n{s}await import({s});", .{ cpu_profiler_start_statement, preload_imports, script_literal })
     else
-        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}moduleModule.__runMain({s});", .{ preload_imports, script_literal });
+        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}\n{s}(moduleModule.default ?? moduleModule.Module).runMain();", .{ cpu_profiler_start_statement, preload_imports });
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};
@@ -3130,7 +3387,7 @@ fn writeCommonJsEntryWrapper(
         \\  "stream/web": streamWeb, "node:stream/web": streamWeb,
         \\  perf_hooks: perfHooks, "node:perf_hooks": perfHooks,
         \\  vm, "node:vm": vm,
-        \\  module: moduleModule, "node:module": moduleModule,
+        \\  module: moduleModule.default ?? moduleModule.Module, "node:module": moduleModule.default ?? moduleModule.Module,
         \\  net, "node:net": net,
         \\  url, "node:url": url,
         \\  constants, "node:constants": constants,

@@ -317,13 +317,17 @@ function runNodeHarness(target, entries, snapshotRoot, status, options) {
 
 function runDirect(runtime, target, entry, snapshotRoot) {
   const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
-  return spawnSync(binaryPath, [entry.path], {
+  return spawnSync(binaryPath, [entry.path, ...entryArgs(entry)], {
     cwd: snapshotRoot,
     env: makeEnv(runtime, target),
     encoding: 'utf8',
     timeout,
     maxBuffer: directTestMaxBuffer,
   });
+}
+
+function entryArgs(entry) {
+  return Array.isArray(entry.args) ? entry.args.map(String) : [];
 }
 
 
@@ -354,7 +358,7 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options) {
   const timeout = entryTimeout(entry, options);
   const runTemp = mkdtempSync(join(tempRoot, 'run-'));
   return new Promise((resolveResult) => {
-    const child = spawn(binaryPath, [entry.path], {
+    const child = spawn(binaryPath, [entry.path, ...entryArgs(entry)], {
       cwd: snapshotRoot,
       env: makeEnv(runtime, target, runTemp),
       detached: process.platform !== 'win32',

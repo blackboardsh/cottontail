@@ -33,6 +33,50 @@ const typedArrayTypes = new Set([
   "BigUint64Array",
   "DataView",
 ]);
+const storageBunFileBrand = Symbol.for("cottontail.bunJSCStorageBunFile");
+const structuredCloneHook = Symbol.for("cottontail.structuredClone");
+
+function isBunFile(value) {
+  return value?.[storageBunFileBrand] === true ||
+    (typeof value?.exists === "function" && typeof value?.writer === "function");
+}
+
+function isBlockList(value) {
+  return value?.constructor?.name === "BlockList" &&
+    typeof value?.addAddress === "function" &&
+    typeof value?.check === "function" &&
+    typeof value?.[structuredCloneHook] === "function";
+}
+
+function bunFileBytes(value) {
+  if (value?._bytes instanceof Uint8Array) return value._bytes.slice();
+  let bytes = new Uint8Array(Math.max(0, Number(value?.size) || 0));
+  if (typeof value?._bunFilePath === "string") {
+    try { bytes = new Uint8Array(cottontail.readFileBuffer(value._bunFilePath)); } catch {}
+  }
+  return bytes;
+}
+
+function storageBunFile(encoded) {
+  const bytes = bytesFromArray(encoded.bytes);
+  const type = String(encoded.mime ?? "");
+  const blob = {};
+  Object.defineProperties(blob, {
+    [storageBunFileBrand]: { value: true },
+    [Symbol.toStringTag]: { value: "Blob" },
+    _bytes: { value: bytes },
+    name: { value: String(encoded.name ?? "") },
+    type: { value: type },
+    size: { value: bytes.byteLength },
+    lastModified: { value: Number(encoded.lastModified ?? 0) },
+    arrayBuffer: { value: async () => bytes.slice().buffer },
+    bytes: { value: async () => bytes.slice() },
+    text: { value: async () => new TextDecoder().decode(bytes) },
+    slice: { value: (...args) => new globalThis.Blob([bytes], { type }).slice(...args) },
+    stream: { value: () => new globalThis.Blob([bytes], { type }).stream() },
+  });
+  return blob;
+}
 
 function viewTypeName(value) {
   if (Buffer.isBuffer?.(value)) return "Buffer";
@@ -40,7 +84,7 @@ function viewTypeName(value) {
   return typedArrayTypes.has(name) ? name : "Uint8Array";
 }
 
-function encodeValue(value, state = { ids: new WeakMap(), nextId: 1 }) {
+function encodeValue(value, state = { ids: new WeakMap(), nextId: 1, forStorage: false }) {
   if (value === undefined) return { type: "undefined" };
   if (value === null) return { type: "null" };
   if (typeof value === "number") {
@@ -72,14 +116,11 @@ function encodeValue(value, state = { ids: new WeakMap(), nextId: 1 }) {
   if (value instanceof Set) return { type: "Set", id, value: [...value].map((item) => encodeValue(item, state)) };
   if (Array.isArray(value)) return { type: "Array", id, value: value.map((item) => encodeValue(item, state)) };
   if (value instanceof Error) return { type: "Error", id, name: value.name, message: value.message, stack: value.stack };
-  const isBunFile = typeof value?.exists === "function" && typeof value?.writer === "function";
-  if (isBunFile) {
-    let bytes = new Uint8Array(Math.max(0, Number(value.size) || 0));
-    if (typeof value._bunFilePath === "string") {
-      try { bytes = new Uint8Array(cottontail.readFileBuffer(value._bunFilePath)); } catch {}
-    }
+  if (state.forStorage && isBlockList(value)) return { type: "Object", id, value: [] };
+  if (isBunFile(value)) {
+    const bytes = bunFileBytes(value);
     return {
-      type: "File",
+      type: state.forStorage ? "StorageBunFile" : "File",
       id,
       bytes: encodeBytes(bytes),
       mime: String(value.type ?? ""),
@@ -175,6 +216,8 @@ function decodeValue(encoded, refs = new Map()) {
         type: encoded.mime ?? "",
         lastModified: Number(encoded.lastModified ?? 0),
       }));
+    case "StorageBunFile":
+      return remember(refs, encoded, storageBunFile(encoded));
     case "Object": {
       const object = remember(refs, encoded, {});
       for (const [key, value] of encoded.value) object[key] = decodeValue(value, refs);
@@ -184,8 +227,13 @@ function decodeValue(encoded, refs = new Map()) {
   }
 }
 
-function payloadBuffer(value) {
-  return Buffer.from(JSON.stringify({ cottontailV8: formatVersion, value: encodeValue(value) }));
+function payloadBuffer(value, options = undefined) {
+  const state = {
+    ids: new WeakMap(),
+    nextId: 1,
+    forStorage: options?.forStorage === true,
+  };
+  return Buffer.from(JSON.stringify({ cottontailV8: formatVersion, value: encodeValue(value, state) }));
 }
 
 function parsePayload(buffer) {
@@ -284,8 +332,8 @@ export class DefaultDeserializer extends Deserializer {
   }
 }
 
-export function serialize(value) {
-  return payloadBuffer(value);
+export function serialize(value, options = undefined) {
+  return payloadBuffer(value, options);
 }
 
 export function deserialize(buffer) {

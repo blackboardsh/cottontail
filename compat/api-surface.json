@@ -7787,6 +7787,7 @@
           "setSocketOptions",
           "setSyntheticAllocationLimitForTesting",
           "shellInternals",
+          "structuredCloneAdvanced",
           "upgrade_test_helpers"
         ],
         "hasDefaultExport": true
@@ -12843,11 +12844,13 @@
           "setSocketOptions",
           "setSyntheticAllocationLimitForTesting",
           "shellInternals",
+          "structuredCloneAdvanced",
           "upgrade_test_helpers"
         ],
         "bunObjectProperties": [],
         "globalProperties": [
-          "__cottontailSyntheticAllocationLimit"
+          "__cottontailSyntheticAllocationLimit",
+          "Blob"
         ]
       },
       "src/runtime_modules/bun/jsc.js": {
@@ -18222,14 +18225,14 @@
       "version": "1.3.10",
       "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
       "snapshot": "compat/upstream/bun/v1.3.10",
-      "copiedFiles": 9721,
+      "copiedFiles": 9752,
       "discoveredRunnableFiles": 1445,
-      "enabled": 849,
+      "enabled": 857,
       "expectedFailure": 251,
       "disabled": 0,
-      "notEnabled": 345,
-      "classifiedTests": 1100,
-      "trackedTests": 1100
+      "notEnabled": 337,
+      "classifiedTests": 1108,
+      "trackedTests": 1108
     }
   },
   "behavioral": {
@@ -18661,23 +18664,23 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 11370,
+              "line": 11366,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11401,
+              "line": 11397,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11824,
+              "line": 11820,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 11840,
+              "line": 11836,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 12951,
+              "line": 12947,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],
@@ -18705,11 +18708,11 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 571,
+              "line": 572,
               "text": "throw new Error(\"socketpair is unavailable in this Cottontail build\");"
             },
             {
-              "line": 660,
+              "line": 661,
               "text": "throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);"
             }
           ],

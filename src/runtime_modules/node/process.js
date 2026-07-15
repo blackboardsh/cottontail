@@ -967,7 +967,9 @@ function stdinFdKind(fd) {
     const stats = cottontail.fstatSync?.(fd);
     if (!stats) return "pipe";
     const fileType = Number(stats.mode) & 0o170000;
-    if (fileType === 0o020000) return "tty";
+    if (fileType === 0o020000) {
+      return cottontail.isatty?.(fd) ? "tty" : "file";
+    }
     if (fileType === 0o100000) return "file";
     return "pipe";
   } catch {

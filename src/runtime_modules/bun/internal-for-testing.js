@@ -1,4 +1,5 @@
 import Module, { _resolveFilename } from "../node/module.js";
+import { BlockList } from "../node/net.js";
 
 export const jscInternals = {
   isLatin1String(value) {
@@ -798,6 +799,71 @@ export function nativeFrameForTesting(callback) {
   return [void 0].map(callback)[0];
 }
 
+function isBunFile(value) {
+  return value != null &&
+    typeof globalThis.Blob === "function" &&
+    value instanceof globalThis.Blob &&
+    typeof value.exists === "function" &&
+    typeof value.writer === "function";
+}
+
+function isCloneOnlyPlatformObject(value) {
+  return isBunFile(value) || value instanceof BlockList;
+}
+
+function replaceCloneOnlyPlatformObjects(value, seen = new WeakMap()) {
+  if (value === null || typeof value !== "object") return value;
+  if (isCloneOnlyPlatformObject(value)) return {};
+  if (seen.has(value)) return seen.get(value);
+  seen.set(value, value);
+
+  if (value instanceof Map) {
+    const entries = [...value];
+    value.clear();
+    for (const [key, entryValue] of entries) {
+      value.set(
+        replaceCloneOnlyPlatformObjects(key, seen),
+        replaceCloneOnlyPlatformObjects(entryValue, seen),
+      );
+    }
+    return value;
+  }
+
+  if (value instanceof Set) {
+    const entries = [...value];
+    value.clear();
+    for (const entry of entries) value.add(replaceCloneOnlyPlatformObjects(entry, seen));
+    return value;
+  }
+
+  for (const key of Object.keys(value)) {
+    value[key] = replaceCloneOnlyPlatformObjects(value[key], seen);
+  }
+  return value;
+}
+
+export function structuredCloneAdvanced(
+  value,
+  transferList = [],
+  isForTransfer = false,
+  isForStorage = false,
+  _context = "default",
+) {
+  const transfers = transferList == null ? [] : [...transferList];
+  if (transfers.some(isCloneOnlyPlatformObject)) {
+    const DOMExceptionClass = globalThis.DOMException ?? Error;
+    throw new DOMExceptionClass("The object can not be cloned.", "DataCloneError");
+  }
+
+  const cloned = globalThis.structuredClone(
+    value,
+    transfers.length > 0 ? { transfer: transfers } : undefined,
+  );
+  return isForTransfer || isForStorage
+    ? replaceCloneOnlyPlatformObjects(cloned)
+    : cloned;
+}
+
 export const getEventLoopStats = unimplementedInternal("getEventLoopStats");
 export const install_test_helpers = unimplementedInternal("install_test_helpers");
 export const upgrade_test_helpers = unimplementedInternal("upgrade_test_helpers");
@@ -836,5 +902,6 @@ export default {
   setSocketOptions,
   setSyntheticAllocationLimitForTesting,
   shellInternals,
+  structuredCloneAdvanced,
   upgrade_test_helpers,
 };

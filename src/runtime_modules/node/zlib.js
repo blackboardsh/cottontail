@@ -1,4 +1,5 @@
 import * as zlibConstants from "./zlib/constants.js";
+import * as bufferModule from "./buffer.js";
 import { Transform } from "./stream.js";
 
 export {
@@ -133,6 +134,18 @@ export const codes = {
   "-6": "Z_VERSION_ERROR"
 };
 
+// Node and Bun expose this CommonJS export as writable. Cottontail eagerly
+// bundles builtins, so preserve that behavior on the shared namespace object.
+const kMaxLengthDescriptor = Object.getOwnPropertyDescriptor(bufferModule, "kMaxLength");
+if (kMaxLengthDescriptor?.configurable && kMaxLengthDescriptor.writable !== true) {
+  Object.defineProperty(bufferModule, "kMaxLength", {
+    configurable: true,
+    enumerable: kMaxLengthDescriptor.enumerable,
+    value: bufferModule.kMaxLength,
+    writable: true,
+  });
+}
+
 function bytesFromData(data) {
   if (data == null) return new Uint8Array(0);
   if (typeof data === "string") return new TextEncoder().encode(data);
@@ -163,8 +176,8 @@ function transformSync(mode, data, options = undefined) {
   const output = asBuffer(result);
   const maxOutputLength = options && typeof options === "object" && options.maxOutputLength != null
     ? Number(options.maxOutputLength)
-    : undefined;
-  if (maxOutputLength !== undefined && output.length > maxOutputLength) {
+    : kMaxLengthLimit();
+  if (output.length > maxOutputLength) {
     const error = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
     error.code = "ERR_BUFFER_TOO_LARGE";
     throw error;
@@ -524,7 +537,7 @@ class ZlibTransform extends Transform {
 }
 
 function kMaxLengthLimit() {
-  const limit = globalThis.Buffer?.kMaxLength;
+  const limit = bufferModule.kMaxLength;
   return typeof limit === "number" && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
 }
 

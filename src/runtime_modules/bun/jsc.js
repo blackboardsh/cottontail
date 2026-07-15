@@ -47,7 +47,7 @@ function shallowSize(value) {
 }
 
 export function serialize(value, options = undefined) {
-  const bytes = v8Serialize(value);
+  const bytes = v8Serialize(value, { forStorage: true });
   const shared = new SharedArrayBuffer(bytes.byteLength);
   new Uint8Array(shared).set(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
   return options?.binaryType === "nodebuffer" ? Buffer.from(shared) : shared;

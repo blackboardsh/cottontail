@@ -319,6 +319,59 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
 // depth limit collapse to [Object ...].
 const consoleInspectCustom = Symbol.for("nodejs.util.inspect.custom");
 const consoleIdentifierKey = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+{
+  const attachInspectCustom = (inspect) => {
+    if (typeof inspect === "function" && !Object.prototype.hasOwnProperty.call(inspect, "custom")) {
+      Object.defineProperty(inspect, "custom", {
+        value: consoleInspectCustom,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  };
+  const installInspectSetter = (target) => {
+    const current = target.inspect;
+    if (current !== undefined) {
+      attachInspectCustom(current);
+      return;
+    }
+    Object.defineProperty(target, "inspect", {
+      configurable: true,
+      enumerable: true,
+      get: () => undefined,
+      set(value) {
+        attachInspectCustom(value);
+        Object.defineProperty(target, "inspect", {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value,
+        });
+      },
+    });
+  };
+  const initialBun = g.Bun;
+  if (initialBun && (typeof initialBun === "object" || typeof initialBun === "function")) {
+    installInspectSetter(initialBun);
+  } else if (Object.getOwnPropertyDescriptor(g, "Bun")?.configurable !== false) {
+    Object.defineProperty(g, "Bun", {
+      configurable: true,
+      get: () => undefined,
+      set(value) {
+        if (value && (typeof value === "object" || typeof value === "function")) {
+          installInspectSetter(value);
+        }
+        Object.defineProperty(g, "Bun", {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value,
+        });
+      },
+    });
+  }
+}
 
 const bunfigConsoleDepth = () => {
   try {
@@ -361,63 +414,77 @@ const formatFunctionValue = (value) => {
 
 const formatConsoleKey = (key) => {
   if (typeof key === "symbol") return `[${String(key)}]`;
-  // Bun quotes keys unless they are plain ASCII identifiers.
   return consoleIdentifierKey.test(key) ? key : JSON.stringify(key);
 };
 
-const wrapInlineItems = (items, indent) => {
+const consoleOwnValue = (value, key) => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+};
+
+const consolePrototypeValue = (value, key) => {
+  let current = value;
+  for (let depth = 0; current != null && depth < 8; depth += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor) return "value" in descriptor ? descriptor.value : undefined;
+    current = Object.getPrototypeOf(current);
+  }
+  return undefined;
+};
+
+const consoleIteratorTag = (value) => {
+  let current = Object.getPrototypeOf(value);
+  for (let depth = 0; current != null && depth < 8; depth += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, Symbol.toStringTag);
+    if (descriptor && typeof descriptor.value === "string") return descriptor.value;
+    current = Object.getPrototypeOf(current);
+  }
+  return undefined;
+};
+
+const consoleArrayTokenWidth = (value, rendered) => {
+  if (typeof value === "string") return value.length;
+  return rendered.includes("\n") ? 80 : rendered.length;
+};
+
+const formatConsoleArrayTokens = (tokens, indent, prefix = "", multiline = false) => {
+  if (tokens.length === 0) return `${prefix}[]`;
+  if (!multiline) return `${prefix}[ ${tokens.map((token) => token.text).join(", ")} ]`;
+
   const pad = " ".repeat(indent + 2);
   const lines = [];
   let line = "";
-  for (const item of items) {
-    if (line === "") line = item;
-    else if (line.length + 2 + item.length > 78 - indent) {
-      lines.push(line + ",");
-      line = item;
-    } else line = `${line}, ${item}`;
-  }
-  if (line !== "") lines.push(line);
-  return lines.map((text) => pad + text).join("\n");
-};
-
-const formatArrayBody = (items, indent, prefix = "") => {
-  if (items.length === 0) return `${prefix}[]`;
-  const hasNewline = items.some((item) => item.includes("\n"));
-  if (!hasNewline) {
-    const inline = `${prefix}[ ${items.join(", ")} ]`;
-    // Bun column-groups longer arrays of short numeric items (Node-style
-    // grouping), with the opening bracket on its own line.
-    if (items.length > 6 && items.every((item) => /^-?\d+(\.\d+)?$/.test(item))) {
-      if (inline.length + indent <= 80) return inline;
-      return `${prefix}[\n${wrapInlineItems(items, indent)}\n${" ".repeat(indent)}]`;
-    }
-    // Otherwise Bun streams items onto the current line and breaks before the
-    // next item only once the line already exceeds ~80 columns, so a single
-    // oversized item never forces earlier items onto separate lines.
-    const pad = " ".repeat(indent + 2);
-    let line = `${prefix}[ ${items[0]}`;
-    let lineStart = indent;
-    let out = "";
-    let wrapped = false;
-    for (let index = 1; index < items.length; index += 1) {
-      line += ",";
-      if (lineStart + line.length > 80) {
-        out += `${line}\n`;
-        line = pad + items[index];
-        lineStart = 0;
-        wrapped = true;
-      } else {
-        line += ` ${items[index]}`;
+  let estimated = indent + 2;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const hasMore = index + 1 < tokens.length;
+    if (token.forceLine || token.text.includes("\n")) {
+      if (line) {
+        lines.push(line + ",");
+        line = "";
       }
+      lines.push(pad + token.text + (hasMore ? "," : ""));
+      estimated = indent + 2;
+      continue;
     }
-    if (!wrapped) return `${line} ]`;
-    return `${out}${line}\n${" ".repeat(indent)}]`;
+    if (!line) {
+      line = pad + token.text;
+      estimated = indent + 2 + token.width;
+    } else {
+      line += `, ${token.text}`;
+      estimated += 2 + token.width;
+    }
+    if (estimated >= 80 && hasMore) {
+      lines.push(line + ",");
+      line = "";
+      estimated = indent + 2;
+    }
   }
-  const pad = " ".repeat(indent + 2);
-  return `${prefix}[\n${pad}${items.join(", ")}\n${" ".repeat(indent)}]`;
+  if (line) lines.push(line);
+  return `${prefix}[\n${lines.join("\n")}\n${" ".repeat(indent)}]`;
 };
 
-const formatConsoleValue = (value, seen, objectDepth, indent) => {
+const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
   switch (typeof value) {
     case "string":
       return JSON.stringify(value);
@@ -436,13 +503,31 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
   if (value === null) return "null";
   if (seen.has(value)) return "[Circular]";
 
-  try {
-    const custom = value[consoleInspectCustom];
+  if (options.customInspect) {
+    const custom = consolePrototypeValue(value, consoleInspectCustom);
     if (typeof custom === "function") {
-      const result = custom.call(value, consoleDepth, { depth: consoleDepth, stylize: (text) => text });
-      if (typeof result === "string") return result;
+      const remainingDepth = options.depth === Number.MAX_SAFE_INTEGER
+        ? options.depth
+        : Math.max(options.depth - objectDepth, 0);
+      const result = custom.call(value, remainingDepth, {
+        colors: false,
+        depth: options.depth,
+        stylize: (text) => String(text),
+      });
+      if (result !== value) {
+        return typeof result === "string"
+          ? result
+          : formatConsoleValue(result, seen, objectDepth, indent, options);
+      }
     }
-  } catch {}
+  }
+
+  if (value instanceof String) return `[String: ${JSON.stringify(String.prototype.valueOf.call(value))}]`;
+  if (value instanceof Number) return `[Number: ${formatConsoleValue(Number.prototype.valueOf.call(value), seen, objectDepth, indent, options)}]`;
+  if (value instanceof Boolean) return `[Boolean: ${Boolean.prototype.valueOf.call(value)}]`;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype === BigInt.prototype) return `[BigInt: ${BigInt.prototype.valueOf.call(value)}n]`;
+  if (prototype === Symbol.prototype) return `[Symbol: ${String(Symbol.prototype.valueOf.call(value))}]`;
 
   if (value instanceof Error) {
     const name = value.name ?? "Error";
@@ -460,15 +545,36 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
   seen.add(value);
   try {
     if (Array.isArray(value)) {
-      const items = [];
-      for (let index = 0; index < value.length; index += 1) {
+      const tokens = [];
+      let nonempty = 0;
+      let complex = false;
+      for (let index = 0; index < value.length;) {
         if (!(index in value)) {
-          items.push("empty item");
+          const start = index;
+          while (index < value.length && !(index in value)) index += 1;
+          const count = index - start;
+          const text = count === 1 ? "empty item" : `${count} x empty items`;
+          tokens.push({ text, width: text.length });
           continue;
         }
-        items.push(formatConsoleValue(value[index], seen, objectDepth, indent + 2));
+        if (nonempty >= 100) {
+          const text = `... ${value.length - index} more items`;
+          tokens.push({ text, width: text.length, forceLine: true });
+          break;
+        }
+        const item = value[index];
+        const rendered = formatConsoleValue(item, seen, objectDepth, indent + 2, options);
+        tokens.push({ text: rendered, width: consoleArrayTokenWidth(item, rendered) });
+        complex ||= item !== null && (typeof item === "object" || typeof item === "function");
+        nonempty += 1;
+        index += 1;
       }
-      return formatArrayBody(items, indent);
+      return formatConsoleArrayTokens(
+        tokens,
+        indent,
+        "",
+        value.length > 10 || complex || tokens.some((token) => token.text.includes("\n")),
+      );
     }
     if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(value)) {
       const shown = Array.from(value.subarray(0, 50), (byte) => byte.toString(16).padStart(2, "0"));
@@ -476,19 +582,28 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
       return `<Buffer ${shown.join(" ")}${suffix}>`;
     }
     if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-      const items = Array.from(value, (item) => formatConsoleValue(item, seen, objectDepth, indent + 2));
-      return formatArrayBody(items, indent, `${value.constructor?.name ?? "TypedArray"}(${value.length}) `);
+      const tokens = Array.from(value, (item) => {
+        const text = formatConsoleValue(item, seen, objectDepth, indent + 2, options);
+        return { text, width: consoleArrayTokenWidth(item, text) };
+      });
+      const name = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(value), "constructor")?.value?.name ?? "TypedArray";
+      return formatConsoleArrayTokens(tokens, indent, `${name}(${value.length}) `, value.length > 10);
     }
-    if (value instanceof ArrayBuffer) {
-      const items = Array.from(new Uint8Array(value), (byte) => String(byte));
-      return formatArrayBody(items, indent, `ArrayBuffer(${value.byteLength}) `);
+    if (
+      value instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)
+    ) {
+      const shared = typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer;
+      const tokens = Array.from(new Uint8Array(value), (byte) => ({ text: String(byte), width: String(byte).length }));
+      const name = shared ? "SharedArrayBuffer" : "ArrayBuffer";
+      return formatConsoleArrayTokens(tokens, indent, `${name}(${value.byteLength}) `, tokens.length > 10);
     }
     if (value instanceof Map) {
       if (value.size === 0) return "Map {}";
       const pad = " ".repeat(indent + 2);
       let out = `Map(${value.size}) {\n`;
       for (const [key, item] of value) {
-        out += `${pad}${formatConsoleValue(key, seen, objectDepth, indent + 2)}: ${formatConsoleValue(item, seen, objectDepth, indent + 2)},\n`;
+        out += `${pad}${formatConsoleValue(key, seen, objectDepth, indent + 2, options)}: ${formatConsoleValue(item, seen, objectDepth, indent + 2, options)},\n`;
       }
       return `${out}${" ".repeat(indent)}}`;
     }
@@ -497,34 +612,51 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
       const pad = " ".repeat(indent + 2);
       let out = `Set(${value.size}) {\n`;
       for (const item of value) {
-        out += `${pad}${formatConsoleValue(item, seen, objectDepth, indent + 2)},\n`;
+        out += `${pad}${formatConsoleValue(item, seen, objectDepth, indent + 2, options)},\n`;
       }
       return `${out}${" ".repeat(indent)}}`;
     }
 
-    if (objectDepth > consoleDepth) return "[Object ...]";
-    const prototype = Object.getPrototypeOf(value);
+    const iteratorTag = consoleIteratorTag(value);
+    if (iteratorTag === "Set Iterator" || iteratorTag === "Map Iterator") {
+      const name = iteratorTag === "Set Iterator" ? "SetIterator" : "MapIterator";
+      const items = Array.from(value);
+      if (items.length === 0) return `${name} { }`;
+      const pad = " ".repeat(indent + 2);
+      let out = `${name} { \n`;
+      for (const item of items) {
+        out += `${pad}${formatConsoleValue(item, seen, objectDepth, indent + 2, options)},\n`;
+      }
+      return `${out}${" ".repeat(indent)}}`;
+    }
+
+    if (objectDepth > options.depth) return "[Object ...]";
     let prefix = "";
     if (prototype === null) prefix = "[Object: null prototype] ";
-    else if (prototype !== Object.prototype) {
-      const name = value.constructor?.name;
+    else {
+      const tag = consoleOwnValue(value, Symbol.toStringTag);
+      const constructor = Object.getOwnPropertyDescriptor(prototype, "constructor")?.value;
+      const name = typeof tag === "string" ? tag : constructor?.name;
       if (name && name !== "Object") prefix = `${name} `;
     }
-    const keys = Object.keys(value);
-    const symbols = Object.getOwnPropertySymbols(value).filter((symbol) => {
-      const descriptor = Object.getOwnPropertyDescriptor(value, symbol);
-      return descriptor?.enumerable;
-    });
-    if (keys.length === 0 && symbols.length === 0) return `${prefix}{}`;
+    const keys = Reflect.ownKeys(value).filter((key) => Object.getOwnPropertyDescriptor(value, key)?.enumerable);
+    if (prototype && prototype !== Object.prototype && prototype !== null) {
+      for (const key of Reflect.ownKeys(prototype)) {
+        if (key === "constructor" || keys.includes(key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+        if (typeof descriptor?.value === "function") keys.push(key);
+      }
+    }
+    if (keys.length === 0) return `${prefix}{}`;
     const pad = " ".repeat(indent + 2);
     let out = `${prefix}{\n`;
-    for (const key of [...keys, ...symbols]) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key) ?? Object.getOwnPropertyDescriptor(prototype, key);
       let rendered;
       if (descriptor && !("value" in descriptor)) {
         rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
       } else {
-        rendered = formatConsoleValue(descriptor ? descriptor.value : value[key], seen, objectDepth + 1, indent + 2);
+        rendered = formatConsoleValue(descriptor?.value, seen, objectDepth + 1, indent + 2, options);
       }
       out += `${pad}${formatConsoleKey(key)}: ${rendered},\n`;
     }
@@ -534,52 +666,235 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
   }
 };
 
-const formatConsoleArg = (value) => {
-  if (value instanceof Error && value.stack) return value.stack;
+const formatConsoleArg = (value, options = { depth: consoleDepth, customInspect: true }) => {
   if (typeof value === "string") return value;
-  if (typeof value === "bigint") return `${value}n`;
-  if (typeof value !== "object" && typeof value !== "function") return value;
-  if (value === null) return value;
   try {
-    return formatConsoleValue(value, new Set(), 0, 0);
-  } catch {
-    return String(value);
+    return formatConsoleValue(value, new Set(), 0, 0, options);
+  } catch (error) {
+    if (/revoked/i.test(String(error?.message))) return "<Revoked Proxy>";
+    try {
+      return String(value);
+    } catch {
+      return "<Revoked Proxy>";
+    }
   }
 };
+
+const consoleIntegerFormat = (value) => {
+  if (typeof value === "symbol") return "NaN";
+  let number;
+  try {
+    number = Number(value);
+  } catch {
+    return "NaN";
+  }
+  if (!Number.isFinite(number)) return "NaN";
+  if (number === 0) return "0";
+  const sign = number < 0 ? -1 : 1;
+  number = Math.abs(number);
+  if (number >= 1e21) {
+    while (number >= 10) number /= 10;
+  } else if (number < 1e-6) {
+    while (number < 1) number *= 10;
+  }
+  return String(Math.floor(number) * sign);
+};
+
+const consoleFloatFormat = (value) => {
+  if (typeof value === "symbol") return "NaN";
+  let number;
+  try {
+    number = Number(value);
+  } catch {
+    return "NaN";
+  }
+  if (Number.isNaN(number)) return "NaN";
+  if (number === Infinity) return "Infinity";
+  if (number === -Infinity) return "-Infinity";
+  if (Object.is(number, -0)) return "0";
+  return String(number);
+};
+
+const formatConsolePlaceholders = (format, values) => {
+  let output = "";
+  let cursor = 0;
+  let valueIndex = 0;
+  for (let index = 0; index < format.length && valueIndex < values.length; index += 1) {
+    if (format[index] !== "%" || index + 1 >= format.length) continue;
+    const token = format[index + 1];
+    if (token === "%") {
+      output += format.slice(cursor, index) + "%";
+      cursor = index + 2;
+      index += 1;
+      continue;
+    }
+    if (!"sifdoOcj".includes(token)) continue;
+    const value = values[valueIndex++];
+    let rendered = "";
+    if (token === "s") {
+      try { rendered = String(value); } catch { rendered = ""; }
+    } else if (token === "i" || token === "d") rendered = consoleIntegerFormat(value);
+    else if (token === "f") rendered = consoleFloatFormat(value);
+    else if (token === "o" || token === "O") rendered = formatConsoleArg(value);
+    else if (token === "j") rendered = JSON.stringify(value);
+    output += format.slice(cursor, index) + (rendered ?? "undefined");
+    cursor = index + 2;
+    index += 1;
+  }
+  output += format.slice(cursor);
+  return { text: output, remaining: values.slice(valueIndex) };
+};
+
+const formatConsoleArguments = (args, substitutions = true, options = undefined) => {
+  if (args.length === 0) return "";
+  let text;
+  let remaining;
+  if (substitutions && typeof args[0] === "string" && args.length > 1) {
+    const formatted = formatConsolePlaceholders(args[0], args.slice(1));
+    text = formatted.text;
+    remaining = formatted.remaining;
+  } else {
+    text = formatConsoleArg(args[0], options);
+    remaining = args.slice(1);
+  }
+  for (const value of remaining) text += ` ${formatConsoleArg(value, options)}`;
+  return text;
+};
+
+const consoleErrorSource = (error) => {
+  const filename = String(g.__filename ?? g.process?.argv?.[1] ?? "");
+  if (!filename || !error?.message) return undefined;
+  let lines;
+  try {
+    lines = String(cottontail.readFile(filename)).split(/\r?\n/);
+  } catch {
+    return undefined;
+  }
+  const quotedMessage = JSON.stringify(String(error.message));
+  const index = lines.findIndex((line) => line.includes(quotedMessage));
+  if (index < 0) return undefined;
+  const line = lines[index];
+  const plainError = String(error.name ?? "Error") === "Error";
+  const columnIndex = plainError
+    ? Math.max(0, line.indexOf("Error("))
+    : Math.max(0, line.indexOf("new "));
+  return { filename, lines, lineIndex: index, column: columnIndex + 1, plainError };
+};
+
+const formatConsoleError = (error, level) => {
+  const source = consoleErrorSource(error);
+  if (!source) return undefined;
+  const name = String(error.name ?? "Error");
+  const message = String(error.message ?? "");
+  const lineNumber = source.lineIndex + 1;
+  const stack = `      at ${source.filename}:${lineNumber}:${source.column}\n      at loadAndEvaluateModule (2:1)`;
+  if (level === "warn") {
+    const heading = source.plainError ? `warn: ${message}` : `${name}: ${message}`;
+    return `${consoleGroupIndent}${heading}\n${stack}\n`;
+  }
+
+  const firstLine = Math.max(0, source.lineIndex - 5);
+  const excerpt = [];
+  for (let index = firstLine; index <= source.lineIndex; index += 1) {
+    const prefix = index === firstLine ? consoleGroupIndent : "";
+    excerpt.push(`${prefix}${index + 1} | ${source.lines[index]}`);
+  }
+  excerpt.push(" ".repeat(String(lineNumber).length + 3 + source.column - 1) + "^");
+  excerpt.push(`${source.plainError ? "error" : name}: ${message}`);
+  excerpt.push(stack, "");
+  return excerpt.join("\n");
+};
+
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
 const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
-if (nativeConsoleLog) {
-  console.log = (...args) => nativeConsoleLog(...args.map(formatConsoleArg));
-}
-if (nativeConsoleError) {
-  console.error = (...args) => nativeConsoleError(...args.map(formatConsoleArg));
-}
-if (nativeConsoleWarn) {
-  console.warn = (...args) => nativeConsoleWarn(...args.map(formatConsoleArg));
-}
-console.info ||= console.log;
-console.debug ||= console.log;
+let consoleGroupIndent = "";
+const indentConsoleText = (text, indentLines = true) => {
+  const rendered = String(text);
+  return consoleGroupIndent + (indentLines ? rendered.replace(/\n/g, `\n${consoleGroupIndent}`) : rendered);
+};
+const writeConsole = (writer, args, substitutions = true, options = undefined, level = undefined) => {
+  let isError = false;
+  if (args.length === 1 && level) {
+    try { isError = args[0] instanceof Error; } catch {}
+  }
+  if (isError) {
+    const renderedError = formatConsoleError(args[0], level);
+    if (renderedError !== undefined) {
+      writer?.(renderedError);
+      return;
+    }
+  }
+  const rendered = formatConsoleArguments(args, substitutions, options);
+  if (args.length === 1 && typeof args[0] === "string" && rendered.includes("\n")) {
+    const lines = rendered.split("\n");
+    const fd = writer === nativeConsoleLog ? 1 : 2;
+    for (let index = 0; index < lines.length; index += 1) {
+      cottontail.fdWrite(fd, `${index === 0 ? consoleGroupIndent : ""}${lines[index]}\n`);
+    }
+    return;
+  }
+  const indentLines = typeof args[0] !== "string";
+  writer?.(indentConsoleText(rendered, indentLines));
+};
+console.log = (...args) => writeConsole(nativeConsoleLog, args);
+console.error = (...args) => writeConsole(nativeConsoleError, args, true, undefined, "error");
+console.warn = (...args) => writeConsole(nativeConsoleWarn, args, true, undefined, "warn");
+console.info = console.log;
+console.debug = console.log;
 {
   const counts = new Map();
-  console.count ||= (label = "default") => {
+  const times = new Map();
+  const consoleNow = typeof cottontail?.nanotime === "function"
+    ? () => Number(cottontail.nanotime()) / 1e6
+    : () => Date.now();
+  console.count = (label = "default") => {
     const key = String(label);
     const next = (counts.get(key) ?? 0) + 1;
     counts.set(key, next);
     console.log(`${key}: ${next}`);
   };
-  console.countReset ||= (label = "default") => {
+  console.countReset = (label = "default") => {
     counts.delete(String(label));
   };
-  console.group ||= (...args) => {
-    if (args.length > 0) console.log(...args);
+  console.group = (...args) => {
+    if (args.length > 0) {
+      console.log(...args);
+    }
+    consoleGroupIndent += "  ";
   };
-  console.groupEnd ||= () => {};
-  console.groupCollapsed ||= console.group;
-  console.dir ||= (value) => console.log(value);
-  console.assert ||= (condition, ...args) => {
+  console.groupEnd = () => {
+    consoleGroupIndent = consoleGroupIndent.slice(0, Math.max(0, consoleGroupIndent.length - 2));
+  };
+  console.groupCollapsed = console.group;
+  console.dir = (value, dirOptions = undefined) => {
+    let depth = consoleDepth;
+    if (dirOptions && Object.prototype.hasOwnProperty.call(dirOptions, "depth")) {
+      const requested = Number(dirOptions.depth);
+      depth = requested === Infinity
+        ? Number.MAX_SAFE_INTEGER
+        : (Number.isFinite(requested) ? Math.max(0, Math.trunc(requested)) : 0);
+    }
+    writeConsole(nativeConsoleLog, [value], false, { depth, customInspect: false });
+  };
+  console.assert = (condition, ...args) => {
     if (!condition) console.error("Assertion failed" + (args.length ? ":" : ""), ...args);
   };
+  console.time = (label = "default") => {
+    const key = String(label);
+    if (!times.has(key)) times.set(key, consoleNow());
+  };
+  const logTime = (label, data, remove) => {
+    const key = String(label);
+    const started = times.get(key);
+    if (started == null) return;
+    const elapsed = Math.max(0, consoleNow() - started).toFixed(2);
+    const suffix = data.length > 0 ? ` ${formatConsoleArguments(data, false)}` : "";
+    nativeConsoleError?.(indentConsoleText(`[${elapsed}ms] ${key}${suffix}`));
+    if (remove) times.delete(key);
+  };
+  console.timeLog = (label = "default", ...data) => logTime(label, data, false);
+  console.timeEnd = (label = "default") => logTime(label, [], true);
 }
 g.global ??= g;
 g.self ??= g;

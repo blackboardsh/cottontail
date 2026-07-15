@@ -2945,6 +2945,25 @@ pub const BundleV2 = struct {
         const source = ctx.source;
         const loader = ctx.loader;
         const source_dir = source.path.sourceDir();
+        // Bun executes user CommonJS imports through its runtime loader. Keep
+        // require()/require.resolve() in application code out of Cottontail's
+        // entry bundle too, otherwise Module hooks, require.cache, custom
+        // extension loaders, and parent/child relationships are bypassed.
+        // Runtime modules and package internals still need their static
+        // dependencies linked into the standalone executable.
+        const source_path = source.path.text;
+        const is_embedded_runtime_module = source.index.isRuntime() or
+            std.mem.indexOf(u8, source_path, "/.cottontail-embedded-runtime/") != null or
+            std.mem.indexOf(u8, source_path, "\\.cottontail-embedded-runtime\\") != null or
+            std.mem.indexOf(u8, source_path, "/src/runtime_modules/") != null or
+            std.mem.indexOf(u8, source_path, "\\src\\runtime_modules\\") != null;
+        const is_package_module =
+            std.mem.indexOf(u8, source_path, "/node_modules/") != null or
+            std.mem.indexOf(u8, source_path, "\\node_modules\\") != null;
+        const externalize_user_require =
+            this.transpiler.options.externalize_runtime_require_resolve and
+            !is_embedded_runtime_module and
+            !is_package_module;
         var estimated_resolve_queue_count: usize = 0;
         for (ctx.import_records.slice()) |*import_record| {
             if (import_record.flags.is_internal) {
@@ -2984,6 +3003,14 @@ pub const BundleV2 = struct {
                 // Don't resolve pre-resolved imports
                 import_record.source_index.isValid())
             {
+                continue;
+            }
+
+            if (externalize_user_require and
+                (import_record.kind == .require or import_record.kind == .require_resolve))
+            {
+                import_record.source_index = Index.invalid;
+                import_record.flags.is_external_without_side_effects = true;
                 continue;
             }
 

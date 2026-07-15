@@ -28,6 +28,7 @@ import { S3Client, s3 } from "./s3.js";
 import { SQL } from "./sql.js";
 import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
+import * as bunInternalForTestingModule from "./internal-for-testing.js";
 import { jest as bunJest } from "./test.js";
 
 // The generated __toESM helper strictly honors the __esModule marker:
@@ -637,8 +638,8 @@ export class ShellOutput {
 
 export class ShellError extends Error {
   constructor(command = "", result = {}) {
-    super(`Shell command failed${command ? `: ${command}` : ""}`);
     const output = result instanceof ShellOutput ? result : new ShellOutput(result);
+    super(`Failed with exit code ${output.exitCode}`);
     this.name = "ShellError";
     this.command = command;
     this.exitCode = output.exitCode || 1;
@@ -711,6 +712,17 @@ function shellBasename(path) {
   return index >= 0 ? text.slice(index + 1) : text;
 }
 
+function shellDirname(path) {
+  let text = String(path);
+  if (!text) return ".";
+  if (/^[\\/]+$/.test(text)) return "/";
+  text = text.replace(/[\\/]+$/g, "");
+  const index = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
+  if (index < 0) return ".";
+  const directory = text.slice(0, index).replace(/[\\/]+$/g, "");
+  return directory || "/";
+}
+
 function shellPath(path, cwd = undefined) {
   const text = String(path);
   if (/^(?:[A-Za-z]:)?[\\/]/.test(text)) return text;
@@ -755,11 +767,88 @@ function runShellMv(words, options = {}) {
   return { exitCode: 0, stdout: "", stderr: "" };
 }
 
+function runShellSeq(words) {
+  const usage = "usage: seq [-w] [-f format] [-s string] [-t string] [first [incr]] last\n";
+  let separator = "\n";
+  let terminator = "";
+  let index = 1;
+
+  while (index < words.length) {
+    const argument = words[index];
+    if (argument === "-s" || argument === "--separator") {
+      if (index + 1 >= words.length) {
+        return { exitCode: 1, stdout: "", stderr: "seq: option requires an argument -- s\n" };
+      }
+      separator = words[index + 1];
+      index += 2;
+      continue;
+    }
+    if (argument.startsWith("-s")) {
+      separator = argument.slice(2);
+      index += 1;
+      continue;
+    }
+    if (argument === "-t" || argument === "--terminator") {
+      if (index + 1 >= words.length) {
+        return { exitCode: 1, stdout: "", stderr: "seq: option requires an argument -- t\n" };
+      }
+      terminator = words[index + 1];
+      index += 2;
+      continue;
+    }
+    if (argument.startsWith("-t")) {
+      terminator = argument.slice(2);
+      index += 1;
+      continue;
+    }
+    if (argument === "-w" || argument === "--fixed-width") {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+
+  const numericArguments = words.slice(index);
+  if (numericArguments.length === 0) return { exitCode: 1, stdout: "", stderr: usage };
+  const values = numericArguments.slice(0, 3).map((argument) => Math.fround(Number(argument)));
+  if (values.some((value) => !Number.isFinite(value))) {
+    return { exitCode: 1, stdout: "", stderr: "seq: invalid argument\n" };
+  }
+
+  let start = 1;
+  let increment = 1;
+  let end = values[0];
+  if (values.length === 1) {
+    if (start > end) increment = -1;
+  } else if (values.length === 2) {
+    [start, end] = values;
+    if (start < end) increment = 1;
+    if (start > end) increment = -1;
+  } else {
+    [start, increment, end] = values;
+    if (increment === 0) return { exitCode: 1, stdout: "", stderr: "seq: zero increment\n" };
+    if (start > end && increment > 0) {
+      return { exitCode: 1, stdout: "", stderr: "seq: needs negative decrement\n" };
+    }
+    if (start < end && increment < 0) {
+      return { exitCode: 1, stdout: "", stderr: "seq: needs positive increment\n" };
+    }
+  }
+
+  let stdout = "";
+  for (let current = start; increment > 0 ? current <= end : current >= end; current = Math.fround(current + increment)) {
+    stdout += `${current}${separator}`;
+  }
+  return { exitCode: 0, stdout: stdout + terminator, stderr: "" };
+}
+
 function normalizeShellStderr(command, stderr) {
   let text = String(stderr ?? "");
   if (String(command).includes("mv ")) {
     text = text.replace(/^mv: rename .*? to ([^:]+): Not a directory$/gm, "mv: $1: Not a directory");
     text = text.replace(/^mv: ([^:]+) is not a directory$/gm, "mv: $1: No such file or directory");
+  } else {
+    text = text.replace(/^.*?: ([^\n]+): Not a directory$/gm, "bun: Not a directory: $1");
   }
   if (/\bbasename\s*(?:[|;&]|$)/.test(String(command))) {
     text = text.replace(
@@ -816,6 +905,87 @@ function normalizeAssignmentPipelines(command) {
   return parts.join("");
 }
 
+function normalizeCombinedAppendRedirect(command) {
+  const source = String(command);
+  let output = "";
+  let quote = "";
+  let escaped = false;
+  let index = 0;
+
+  while (index < source.length) {
+    const char = source[index];
+    if (escaped) {
+      output += char;
+      escaped = false;
+      index += 1;
+      continue;
+    }
+    if (char === "\\") {
+      output += char;
+      escaped = true;
+      index += 1;
+      continue;
+    }
+    if (quote) {
+      output += char;
+      if (char === quote) quote = "";
+      index += 1;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      output += char;
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (!source.startsWith("&>>", index)) {
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    output += ">>";
+    index += 3;
+    while (index < source.length && /\s/.test(source[index])) output += source[index++];
+
+    const targetStart = index;
+    let targetQuote = "";
+    let targetEscaped = false;
+    let substitutionDepth = 0;
+    while (index < source.length) {
+      const targetChar = source[index];
+      if (targetEscaped) {
+        targetEscaped = false;
+        index += 1;
+        continue;
+      }
+      if (targetChar === "\\") {
+        targetEscaped = true;
+        index += 1;
+        continue;
+      }
+      if (targetQuote) {
+        if (targetChar === targetQuote) targetQuote = "";
+        index += 1;
+        continue;
+      }
+      if (targetChar === "\"" || targetChar === "'") {
+        targetQuote = targetChar;
+        index += 1;
+        continue;
+      }
+      if (targetChar === "(" && source[index - 1] === "$") substitutionDepth += 1;
+      else if (targetChar === ")" && substitutionDepth > 0) substitutionDepth -= 1;
+      else if (substitutionDepth === 0 && (/\s/.test(targetChar) || /[;&|<>]/.test(targetChar))) break;
+      index += 1;
+    }
+    output += source.slice(targetStart, index);
+    if (index > targetStart) output += " 2>&1";
+  }
+
+  return output;
+}
+
 function writeOutputBuffer(buffer, data) {
   const view = binaryOutputView(buffer);
   if (!view) return;
@@ -862,10 +1032,27 @@ function runShellBuiltin(command, options = {}) {
       stderr: "",
     };
   }
-  if (words[0] === "seq") {
-    const invalid = words.slice(1).find((word) => word !== "--" && /^(?:[+-]?(?:inf(?:inity)?|nan))$/i.test(word));
-    if (invalid) return { exitCode: 1, stdout: "", stderr: `seq: invalid argument '${invalid}'\n` };
+  if (words[0] === "dirname") {
+    if (words.length === 1) return { exitCode: 1, stdout: "", stderr: "usage: dirname string\n" };
+    return {
+      exitCode: 0,
+      stdout: `${words.slice(1).map(shellDirname).join("\n")}\n`,
+      stderr: "",
+    };
   }
+  if (words[0] === "exit") {
+    if (words.length === 1) return { exitCode: 0, stdout: "", stderr: "" };
+    if (words.length > 2) return { exitCode: 1, stdout: "", stderr: "exit: too many arguments\n" };
+    if (!/^\+?\d+$/.test(words[1])) {
+      return { exitCode: 1, stdout: "", stderr: "exit: numeric argument required\n" };
+    }
+    const value = BigInt(words[1]);
+    if (value > 18446744073709551615n) {
+      return { exitCode: 1, stdout: "", stderr: "exit: numeric argument required\n" };
+    }
+    return { exitCode: Number(value % 256n), stdout: "", stderr: "" };
+  }
+  if (words[0] === "seq") return runShellSeq(words);
   if (words[0] === "mv") return runShellMv(words, options);
   return null;
 }
@@ -880,10 +1067,11 @@ function runShell(command, options = {}) {
     return output;
   }
   const isWin = cottontail.platform() === "win32";
+  const hostCommand = isWin ? command : normalizeCombinedAppendRedirect(command);
   const shellExecutable = isWin ? "cmd" : cottontail.platform() === "darwin" ? "/bin/bash" : "sh";
   const shellArgs = isWin
     ? ["/d", "/s", "/c", command]
-    : ["-c", command, ...(globalThis.process?.argv ?? [])];
+    : ["-c", hostCommand, ...(globalThis.process?.argv ?? [])];
   const result = cottontail.spawnSync(shellExecutable, shellArgs, {
     stdio: "pipe",
     cwd: options.cwd,
@@ -4001,6 +4189,7 @@ function inspectBodyByteSize(body) {
 }
 
 const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map();
+const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= new WeakMap();
 
 function activeServerForFetchUrl(urlText) {
   try {
@@ -4993,7 +5182,11 @@ async function fetchFromActiveServer(activeServer, request, redirectMode, depth,
     });
     dispatchRequest._body = request._body;
   }
-  const response = await raceWithAbortSignal(activeServer.fetch(dispatchRequest), request.signal);
+  const dispatch = activeServeDispatches.get(activeServer);
+  const response = await raceWithAbortSignal(
+    dispatch ? dispatch(dispatchRequest) : activeServer.fetch(dispatchRequest),
+    request.signal,
+  );
   throwIfAborted(request.signal);
   response.url = request.url;
   response.redirected = Boolean(redirected || response.redirected);
@@ -5400,6 +5593,20 @@ function normalizedServeDispatchRequest(request) {
   });
   normalized._body = request._body;
   return normalized;
+}
+
+async function dispatchServeFetch(options, server, input, init = {}) {
+  const request = input instanceof Request ? input : new Request(String(input), init);
+  const dispatchRequest = normalizedServeDispatchRequest(request);
+  let response;
+  try {
+    response = await runServeHandler(options, dispatchRequest, server);
+  } catch (error) {
+    if (typeof options.error !== "function") throw error;
+    response = await serveErrorResponse(options, error);
+  }
+  response.url = request.url;
+  return response;
 }
 
 function serveErrorResponse(options, error) {
@@ -6462,17 +6669,10 @@ function serveNodeBacked(options, context) {
       return server;
     },
     async fetch(input, init = {}) {
-      const request = input instanceof Request ? input : new Request(String(input), init);
-      const dispatchRequest = normalizedServeDispatchRequest(request);
-      let response;
-      try {
-        response = await runServeHandler(activeOptions, dispatchRequest, server);
-      } catch (error) {
-        if (typeof activeOptions.error !== "function") throw error;
-        response = await serveErrorResponse(activeOptions, error);
+      if (typeof activeOptions.fetch !== "function") {
+        throw new Error("fetch() requires the server to have a fetch handler");
       }
-      response.url = request.url;
-      return response;
+      return dispatchServeFetch(activeOptions, server, input, init);
     },
     ref() {
       nodeServer.ref?.();
@@ -6583,6 +6783,7 @@ function serveNodeBacked(options, context) {
     },
   };
   serverState.server = server;
+  activeServeDispatches.set(server, (input, init) => dispatchServeFetch(activeOptions, server, input, init));
 
   for (const origin of originKeys) activeServeOrigins.set(origin, server);
 
@@ -6804,17 +7005,10 @@ export function serve(options = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
     },
     async fetch(input, init = {}) {
-      const request = input instanceof Request ? input : new Request(String(input), init);
-      const dispatchRequest = normalizedServeDispatchRequest(request);
-      let response;
-      try {
-        response = await runServeHandler(activeOptions, dispatchRequest, server);
-      } catch (error) {
-        if (typeof activeOptions.error !== "function") throw error;
-        response = await serveErrorResponse(activeOptions, error);
+      if (typeof activeOptions.fetch !== "function") {
+        throw new Error("fetch() requires the server to have a fetch handler");
       }
-      response.url = request.url;
-      return response;
+      return dispatchServeFetch(activeOptions, server, input, init);
     },
     ref() {
       return server;
@@ -6837,6 +7031,7 @@ export function serve(options = {}) {
     },
   };
 
+  activeServeDispatches.set(server, (input, init) => dispatchServeFetch(activeOptions, server, input, init));
   for (const origin of originKeys) activeServeOrigins.set(origin, server);
 
   const respond = (item, status, headersText, body) => {
@@ -7972,7 +8167,7 @@ export function jest(_source = undefined) {
 Object.assign(jest, bunJest);
 
 export function sleep(ms) {
-  const duration = Number(ms);
+  const duration = ms instanceof Date ? ms.getTime() - Date.now() : Number(ms);
   const maxTimeout = 2 ** 31 - 1;
   // Real bun schedules a timer even for sleep(0): resolution is a macrotask
   // that runs after pending microtasks (tests depend on this ordering).
@@ -8799,12 +8994,7 @@ export function fileURLToPath(value) {
 }
 
 export function pathToFileURL(value) {
-  const absolute = nodePathResolve(String(value));
-  const encoded = absolute
-    .split("/")
-    .map((part) => encodeURIComponent(part).replace(/~/g, "%7E"))
-    .join("/");
-  return new URL(`file://${encoded.startsWith("/") ? "" : "/"}${encoded}`);
+  return nodePathToFileURL(String(value));
 }
 
 function packageImportsTargetForConditions(target) {
@@ -14194,6 +14384,7 @@ nodeSetBuiltinModules({
   "bun:jsc": bunJscModule.default ?? bunJscModule,
   "bun:ffi": FFI.default ?? FFI,
   "bun:sqlite": { Database: SQLiteDatabase, default: SQLiteDatabase },
+  "bun:internal-for-testing": bunInternalForTestingModule,
 });
 globalThis.HTMLRewriter ??= HTMLRewriter;
 globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cottontail.cwd());

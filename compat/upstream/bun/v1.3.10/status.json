@@ -432,7 +432,11 @@
     },
     "test/cli/run/cpu-prof.test.ts": {
       "status": "enabled",
-      "reason": "Vanilla JSC sampling data is emitted as Chrome CPU profiles and relationship-aware markdown with names, paths, timings, custom output names, and directories (9 bun:test cases, 3840 assertions)."
+      "reason": "Vanilla JSC sampling data is emitted as Chrome CPU profiles and relationship-aware markdown with names, paths, timings, custom output names, and directories. The copied stress file runs alone at eight-way concurrency because every profiled child parses Cottontail's full JavaScript runtime launcher; the public Bun-compatible default remains 20.",
+      "serial": true,
+      "args": [
+        "--max-concurrency=8"
+      ]
     },
     "test/cli/run/empty-file.test.ts": {
       "status": "enabled",
@@ -1901,6 +1905,14 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
     },
+    "test/js/node/module/node-module-module.test.js": {
+      "status": "enabled",
+      "reason": "Node Module construction, resolution overrides, extension hooks, caches, runMain, preloads, builtin handling, and parent/child graphs pass the copied upstream file (28 bun:test cases, 102 assertions)."
+    },
+    "test/js/node/module/require-extensions.test.ts": {
+      "status": "enabled",
+      "reason": "Live require.extensions registration, custom loader dispatch, TypeScript loader overrides, cache invalidation, wrapped _compile hooks, synchronous ESM, and protected Next/Meteor mutation behavior pass upstream coverage (10 bun:test cases, 46 assertions)."
+    },
     "test/js/node/module/sourcemap.test.js": {
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (12 bun:test cases, 18 assertions)."
@@ -2509,6 +2521,10 @@
       "status": "enabled",
       "reason": "MessageChannel local and cross-worker transfer, host-object cloning, validation, and lifecycle pass upstream coverage."
     },
+    "test/js/web/workers/structuredClone-classes.test.ts": {
+      "status": "enabled",
+      "reason": "Structured cloning preserves supported Web, Bun, and Node class behavior and rejects unsupported host classes across 57 copied upstream cases (137 assertions)."
+    },
     "test/js/web/workers/structured-clone.test.ts": {
       "status": "enabled",
       "reason": "Structured cloning and bun:jsc serialization pass primitive, collection, Blob/File, BlockList, transfer, and cross-process coverage."
@@ -2521,9 +2537,17 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 3 assertions)."
     },
+    "test/js/web/console/console-log.test.ts": {
+      "status": "enabled",
+      "reason": "Bun-compatible placeholder, inspection, grouping, and output formatting pass the copied upstream file (4 bun:test cases, 10 assertions)."
+    },
     "test/js/web/console/console-recursive.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
+    },
+    "test/js/web/console/console-timeLog.test.ts": {
+      "status": "enabled",
+      "reason": "Console timing labels and timeLog output pass the copied upstream file (1 bun:test case, 2 assertions)."
     },
     "test/js/web/encoding/encode-bad-chunks.test.ts": {
       "status": "enabled",
@@ -2677,6 +2701,14 @@
     "test/js/web/timers/setImmediate2.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/web/timers/setInterval.test.js": {
+      "status": "enabled",
+      "reason": "Native interval scheduling, cancellation, refresh, ref lifecycle, cadence, and cleanup pass the copied upstream file under concurrent load (8 bun:test cases, 17 assertions)."
+    },
+    "test/js/web/timers/setTimeout.test.js": {
+      "status": "enabled",
+      "reason": "Native timeout/immediate ordering, cancellation, ref lifecycle, Bun.sleep, Date deadlines, and timers/promises pass the copied upstream file (24 bun:test cases, 69 assertions)."
     },
     "test/js/web/url/url.windows.test.js": {
       "status": "enabled",
@@ -3433,6 +3465,10 @@
     "test/regression/issue/pe-codesigning-integrity.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/require-extensions-override.test.ts": {
+      "status": "enabled",
+      "reason": "Live require.extensions overrides and restoration pass the copied upstream regression (8 bun:test cases, 29 assertions)."
     },
     "test/regression/issue/server-stop-with-pending-requests.test.ts": {
       "status": "enabled",

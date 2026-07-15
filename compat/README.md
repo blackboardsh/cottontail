@@ -44,6 +44,9 @@ Each snapshot has:
 default, then use per-test `disabled` or `skip` entries to quarantine failures
 as they are discovered. Explicit `--test <relative-path>` runs the selected
 test even if it is currently disabled, which keeps reproduction easy.
+Per-test `args` are appended to the Cottontail invocation. A `serial: true`
+entry runs outside the Bun harness's parallel file workers for load-sensitive
+tests; both adaptations must include their rationale in the entry's `reason`.
 
 List imported upstream test status:
 

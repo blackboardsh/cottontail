@@ -1800,7 +1800,9 @@ pub const BundleOptions = struct {
     supports_multiple_outputs: bool = true,
 
     /// Cottontail: when bundling for the Bun runtime (`bun run` / `bun test`
-    /// emulation, which produces a single in-memory output), a
+    /// emulation, which produces a single in-memory output), user
+    /// `require()` and `require.resolve()` calls stay external for Node's
+    /// runtime loader semantics. In addition, a
     /// `require.resolve(...)` whose target would otherwise be copied into the
     /// output directory as an asset (loader `.file`, etc.) is instead left as
     /// a runtime `require.resolve("<resolved absolute path>")` call. Upstream
