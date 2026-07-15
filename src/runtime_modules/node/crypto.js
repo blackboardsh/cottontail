@@ -3855,6 +3855,10 @@ export function randomUUID() {
 }
 
 export function timingSafeEqual(left, right) {
+  const isBufferSource = (value) => value instanceof ArrayBuffer || ArrayBuffer.isView(value);
+  if (!isBufferSource(left) || !isBufferSource(right)) {
+    throw new TypeError("The input must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView");
+  }
   const leftBytes = bytesFromData(left);
   const rightBytes = bytesFromData(right);
   if (leftBytes.byteLength !== rightBytes.byteLength) {

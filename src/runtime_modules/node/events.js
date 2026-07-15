@@ -1,3 +1,5 @@
+import { AsyncResource } from "./async_hooks.js";
+
 export const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 export const errorMonitor = Symbol("events.errorMonitor");
 export const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
@@ -411,9 +413,17 @@ EventEmitter.prototype.eventNames = function eventNames() {
 export class EventEmitterAsyncResource extends EventEmitter {
   constructor(options = {}) {
     super(options);
-    this.asyncResource = options.asyncResource;
-    this.asyncId = typeof this.asyncResource?.asyncId === "function" ? this.asyncResource.asyncId() : 0;
-    this.triggerAsyncId = typeof this.asyncResource?.triggerAsyncId === "function" ? this.asyncResource.triggerAsyncId() : 0;
+    const resourceOptions = typeof options === "string" ? { name: options } : options;
+    this.asyncResource = resourceOptions.asyncResource ?? new AsyncResource(
+      resourceOptions.name ?? "EventEmitterAsyncResource",
+      resourceOptions,
+    );
+    this.asyncId = this.asyncResource.asyncId();
+    this.triggerAsyncId = this.asyncResource.triggerAsyncId();
+  }
+
+  emit(eventName, ...args) {
+    return this.asyncResource.runInAsyncScope(EventEmitter.prototype.emit, this, eventName, ...args);
   }
 
   emitDestroy() {

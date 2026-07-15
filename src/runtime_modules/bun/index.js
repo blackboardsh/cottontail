@@ -1979,6 +1979,33 @@ if (nodeHttp.IncomingMessage?.prototype &&
 (function patchBlobPrototype() {
   const proto = globalThis.Blob?.prototype;
   if (!proto) return;
+  const blobNames = new WeakMap();
+  if (!Object.getOwnPropertyDescriptor(proto, "name")) {
+    Object.defineProperty(proto, "name", {
+      get() { return blobNames.get(this); },
+      set(value) { if (typeof value === "string") blobNames.set(this, value); },
+      configurable: true,
+    });
+  }
+  if (typeof proto.slice === "function" && !proto.slice.__cottontailBunSlice) {
+    const originalSlice = proto.slice;
+    const slice = function slice(start = undefined, end = undefined, type = "") {
+      if (typeof start === "string") {
+        type = start;
+        start = 0;
+        end = this.size;
+      } else if (typeof end === "string") {
+        type = end;
+        end = this.size;
+      }
+      if (typeof start !== "number" || Number.isNaN(start)) start = 0;
+      if (typeof end !== "number") end = this.size;
+      else if (Number.isNaN(end)) end = 0;
+      return originalSlice.call(this, start, end, type);
+    };
+    slice.__cottontailBunSlice = true;
+    Object.defineProperty(proto, "slice", { value: slice, writable: true, configurable: true });
+  }
   if (typeof proto.text === "function" && !proto.text.__cottontailBOM) {
     const originalText = proto.text;
     const wrapped = async function text() {
@@ -2001,6 +2028,25 @@ if (nodeHttp.IncomingMessage?.prototype &&
       value: async function formData() {
         return parseMultipartFormData(this, this.type);
       },
+      writable: true,
+      configurable: true,
+    });
+  }
+  const readOnlyBlob = function readOnlyBlob() {
+    throw new TypeError("Cannot write to a Blob backed by bytes, which are always read-only");
+  };
+  for (const name of ["write", "unlink", "delete", "writer"]) {
+    if (typeof proto[name] !== "function") {
+      Object.defineProperty(proto, name, {
+        value: readOnlyBlob,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  if (typeof proto.stat !== "function") {
+    Object.defineProperty(proto, "stat", {
+      value: async function stat() {},
       writable: true,
       configurable: true,
     });
@@ -7272,6 +7318,20 @@ export function file(path, options = undefined) {
         throw makeBunWriteError(error, filePath, "stat");
       }
     },
+    write(data, writeOptions = undefined) {
+      let bytes = null;
+      if (data?._bytes instanceof Uint8Array) bytes = data._bytes;
+      else if (typeof data === "string" || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) bytes = asBuffer(data);
+      if (bytes == null) return write(result, data, writeOptions);
+      if (!isFd) {
+        try { cottontail.mkdirSync(pathDirname(String(filePath)), true); } catch {}
+        cottontail.writeFile(String(filePath), bytes);
+      } else {
+        cottontail.fdWrite(filePath, bytes);
+      }
+      invalidateCache();
+      return Promise.resolve(bytes.byteLength);
+    },
     async delete() {
       if (isFd) throw new TypeError("Cannot delete a file descriptor");
       try {
@@ -7279,6 +7339,9 @@ export function file(path, options = undefined) {
       } catch (error) {
         throw makeBunWriteError(error, filePath, "unlink");
       }
+    },
+    unlink() {
+      return this.delete();
     },
     async text() {
       if (isFd) throw new TypeError("Cannot read Bun.file(fd) as text");
@@ -7349,8 +7412,19 @@ export function file(path, options = undefined) {
     },
     slice(start = 0, end = this.size, type = "") {
       if (isFd) throw new TypeError("Cannot slice Bun.file(fd)");
-      const rangeStart = Math.max(0, Number(start) || 0);
-      const rangeEnd = Math.min(this.size, Math.max(rangeStart, Number(end) || 0));
+      if (typeof start === "string") {
+        type = start;
+        start = 0;
+        end = this.size;
+      } else if (typeof end === "string") {
+        type = end;
+        end = this.size;
+      }
+      if (typeof start !== "number" || Number.isNaN(start)) start = 0;
+      if (typeof end !== "number") end = this.size;
+      else if (Number.isNaN(end)) end = 0;
+      const rangeStart = start < 0 ? Math.max(this.size + start, 0) : Math.min(start, this.size);
+      const rangeEnd = end < 0 ? Math.max(this.size + end, 0) : Math.min(end, this.size);
       const blob = new Blob([readRange(rangeStart, rangeEnd)], { type: String(type || this.type || "") });
       Object.defineProperties(blob, {
         _bunFilePath: { value: String(filePath), configurable: true },
@@ -7468,7 +7542,7 @@ async function bytesFromBunWriteSource(data) {
 }
 
 function writeBytesToProcessStream(stream, bytes) {
-  if (stream && typeof stream.write === "function") {
+  if (stream && !isBunFileLike(stream) && typeof stream.write === "function") {
     stream.write(bytes);
     return bytes.byteLength;
   }
@@ -8009,6 +8083,20 @@ function bunInspectCustomOptions(ctx) {
   return options;
 }
 
+const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
+
+function bunInspectDynamicErrorSource(error, rendered) {
+  const metadata = error?.[dynamicErrorSourceSymbol];
+  if (!metadata || typeof metadata.source !== "string") return rendered;
+  const functionName = String(error.stack ?? "").match(/^([^@\n]+)@/)?.[1];
+  if (!functionName) return rendered;
+  const escapedName = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const lines = metadata.source.split(/\r?\n/);
+  const lineIndex = lines.findIndex((line) => new RegExp(`\\bfunction\\s+${escapedName}\\s*\\(`).test(line));
+  if (lineIndex < 0) return rendered;
+  return `${lineIndex + 1} | ${lines[lineIndex].trimEnd()}\n${rendered}`;
+}
+
 function bunStyleInspect(value, ctx, indent, seen, depth) {
   if (typeof value === "string") return bunInspectStyle(bunInspectQuote(value), 32, ctx);
   if (typeof value === "bigint") return bunInspectStyle(`${value}n`, 33, ctx);
@@ -8073,7 +8161,9 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   }
   if (value instanceof Error && typeof value[ctInspectSymbol] !== "function") {
     const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
-    if (errorKeys.length === 0) return nodeInspect(value, bunInspectNodeOptions(ctx, depth));
+    if (errorKeys.length === 0) {
+      return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
+    }
     seen.add(value);
     try {
       const header =
@@ -8710,7 +8800,10 @@ export function fileURLToPath(value) {
 
 export function pathToFileURL(value) {
   const absolute = nodePathResolve(String(value));
-  const encoded = absolute.split("/").map((part) => encodeURIComponent(part)).join("/");
+  const encoded = absolute
+    .split("/")
+    .map((part) => encodeURIComponent(part).replace(/~/g, "%7E"))
+    .join("/");
   return new URL(`file://${encoded.startsWith("/") ? "" : "/"}${encoded}`);
 }
 
@@ -13788,13 +13881,13 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
       },
       set(value) {
         if (listener !== null) {
-          globalEventTarget.removeEventListener(eventName, listener);
+          globalThis.removeEventListener(eventName, listener);
           listener = null;
         }
         handler = typeof value === "function" ? value : null;
         if (handler !== null) {
           listener = (event) => handler.call(globalThis, event);
-          globalEventTarget.addEventListener(eventName, listener);
+          globalThis.addEventListener(eventName, listener);
         }
       },
       enumerable: true,

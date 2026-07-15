@@ -549,7 +549,7 @@ pub const BundleV2 = struct {
 
         // Check the FileMap first for in-memory files
         if (this.file_map) |file_map| {
-            const specifier = transpiler.resolver.runtimeAlias(import_record.specifier) orelse import_record.specifier;
+            const specifier = transpiler.resolver.runtimeAliasForImport(import_record.specifier, import_record.kind) orelse import_record.specifier;
             if (file_map.resolve(import_record.source_file, specifier)) |_file_map_result| {
                 var file_map_result = _file_map_result;
                 var path_primary = file_map_result.path_pair.primary;
@@ -974,6 +974,7 @@ pub const BundleV2 = struct {
         this.linker.options.minify_syntax = transpiler.options.minify_syntax;
         this.linker.options.minify_identifiers = transpiler.options.minify_identifiers;
         this.linker.options.minify_whitespace = transpiler.options.minify_whitespace;
+        this.linker.options.preserve_external_require_name = transpiler.options.preserve_external_require_name;
         this.linker.options.emit_dce_annotations = transpiler.options.emit_dce_annotations;
         this.linker.options.ignore_dce_annotations = transpiler.options.ignore_dce_annotations;
         this.linker.options.banner = transpiler.options.banner;
@@ -3109,7 +3110,7 @@ pub const BundleV2 = struct {
 
             // Check the FileMap first for in-memory files
             if (this.file_map) |file_map| {
-                const specifier = transpiler.resolver.runtimeAlias(import_record.path.text) orelse import_record.path.text;
+                const specifier = transpiler.resolver.runtimeAliasForImport(import_record.path.text, import_record.kind) orelse import_record.path.text;
                 if (file_map.resolve(source.path.text, specifier)) |_file_map_result| {
                     var file_map_result = _file_map_result;
                     var path_primary = file_map_result.path_pair.primary;

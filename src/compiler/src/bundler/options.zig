@@ -1810,6 +1810,11 @@ pub const BundleOptions = struct {
     /// outputs have nowhere to go).
     externalize_runtime_require_resolve: bool = false,
 
+    /// Cottontail runtime bundles install a global Node-style `require` before
+    /// executing user modules. Preserve that identifier for external calls so
+    /// serialized function source does not reference a linker-private helper.
+    preserve_external_require_name: bool = false,
+
     /// Cottontail: lower `using` / `await using` declarations even when
     /// targeting Bun. Upstream Bun's JSC build implements explicit resource
     /// management natively, but the JSC vendored by Cottontail does not, so

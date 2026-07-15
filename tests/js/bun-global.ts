@@ -21,6 +21,22 @@ if (!(randomValues instanceof Uint8Array) || randomValues.length !== 8) {
   throw new Error("crypto.getRandomValues did not return the input typed array");
 }
 
+const nodeCrypto = require("node:crypto");
+try {
+  nodeCrypto.timingSafeEqual(new Uint8Array([1]), "1");
+  throw new Error("crypto.timingSafeEqual should reject strings");
+} catch (error) {
+  if (!(error instanceof TypeError)) throw error;
+}
+
+let globalMessage = "";
+globalThis.onmessage = (event) => { globalMessage = event.data; };
+globalThis.dispatchEvent(new MessageEvent("message", { data: "global-message" }));
+globalThis.onmessage = null;
+if (globalMessage !== "global-message") {
+  throw new Error("global onmessage handler was not dispatched");
+}
+
 const result = Bun.spawnSync(["sh", "-c", "printf bun-global"]);
 if (!result.success || result.stdout.toString() !== "bun-global") {
   throw new Error("Bun.spawnSync global call failed");
@@ -56,8 +72,24 @@ if (typeof Blob !== "function" || typeof File !== "function" || typeof URL.creat
   throw new Error("Blob/File object URL globals were not installed");
 }
 const globalBlob = new Blob(["global-blob"], { type: "text/plain" });
-if (globalBlob.size !== 11 || globalBlob.type !== "text/plain" || await globalBlob.text() !== "global-blob") {
+if (globalBlob.size !== 11 || globalBlob.type !== "text/plain;charset=utf-8" || await globalBlob.text() !== "global-blob") {
   throw new Error("Blob global behavior mismatch");
+}
+const directTypedArrayBlob = new Blob(Buffer.from("1234"));
+if (await directTypedArrayBlob.text() !== "1234") {
+  throw new Error("direct typed-array Blob construction mismatch");
+}
+if (await new Blob(["BunFoo"]).slice(-3, 4).text() !== "F") {
+  throw new Error("Blob negative slice mismatch");
+}
+const typedModuleBlob = new Blob([
+  "export function typedBlob(value: any): boolean { return Bun.inspect(new Error()).includes('typedBlob(value: any): boolean'); }",
+], { type: "application/typescript" });
+const typedModuleURL = URL.createObjectURL(typedModuleBlob);
+const typedModule = await import(typedModuleURL);
+URL.revokeObjectURL(typedModuleURL);
+if (typedModule.typedBlob() !== true) {
+  throw new Error("TypeScript Blob module stack-source mismatch");
 }
 const globalFile = new File(["file"], "sample.txt", { type: "text/plain", lastModified: 1 });
 if (globalFile.name !== "sample.txt" || globalFile.lastModified !== 1 || await globalFile.text() !== "file") {

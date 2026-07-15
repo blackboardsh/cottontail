@@ -565,6 +565,24 @@ pub const Resolver = struct {
         return null;
     }
 
+    /// Keep Node builtin require calls as runtime calls. Bun resolves these
+    /// through its module loader, and preserving the call also keeps function
+    /// source valid when it is passed to Function.prototype.toString(). ESM
+    /// imports still use Cottontail's embedded runtime aliases.
+    pub fn runtimeAliasForImport(r: *const Resolver, specifier: []const u8, kind: ast.ImportKind) ?[]const u8 {
+        if (r.opts.mark_builtins_as_external and kind.isCommonJS()) {
+            if (strings.hasPrefixComptime(specifier, "node:")) return null;
+            if (bun.jsc.ModuleLoader.HardcodedModule.Alias.get(
+                specifier,
+                r.opts.target,
+                .{ .rewrite_jest_for_tests = r.opts.rewrite_jest_for_tests },
+            )) |alias| {
+                if (alias.node_builtin) return null;
+            }
+        }
+        return r.runtimeAlias(specifier);
+    }
+
     pub inline fn usePackageManager(self: *const ThisResolver) bool {
         if (comptime !bun.enable_package_manager) return false;
         // TODO(@paperclover): make this configurable. the rationale for disabling
@@ -727,7 +745,7 @@ pub const Resolver = struct {
 
         if (import_path.len == 0) return .{ .not_found = {} };
 
-        if (r.runtimeAlias(import_path)) |alias_path| {
+        if (r.runtimeAliasForImport(import_path, kind)) |alias_path| {
             return r.resolveAndAutoInstall(source_dir, alias_path, kind, global_cache);
         }
 

@@ -320,6 +320,33 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
 const consoleInspectCustom = Symbol.for("nodejs.util.inspect.custom");
 const consoleIdentifierKey = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
+const bunfigConsoleDepth = () => {
+  try {
+    const source = String(cottontail.readFile("bunfig.toml"));
+    let inConsoleSection = false;
+    for (const rawLine of source.split(/\r?\n/)) {
+      const line = rawLine.replace(/\s+#.*$/, "").trim();
+      const section = line.match(/^\[([^\]]+)\]$/);
+      if (section) {
+        inConsoleSection = section[1].trim() === "console";
+        continue;
+      }
+      if (!inConsoleSection) continue;
+      const depth = line.match(/^depth\s*=\s*(\d+)\s*$/);
+      if (depth) return Number(depth[1]);
+    }
+  } catch {}
+  return undefined;
+};
+
+const consoleDepth = (() => {
+  const cliValue = g.process?.env?.COTTONTAIL_CONSOLE_DEPTH;
+  const configured = cliValue !== undefined && /^\d+$/.test(cliValue)
+    ? Number(cliValue)
+    : bunfigConsoleDepth();
+  return configured === 0 ? Number.MAX_SAFE_INTEGER : (configured ?? 2);
+})();
+
 const formatFunctionValue = (value) => {
   let kind = "Function";
   try {
@@ -412,7 +439,7 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
   try {
     const custom = value[consoleInspectCustom];
     if (typeof custom === "function") {
-      const result = custom.call(value, 2, { depth: 2, stylize: (text) => text });
+      const result = custom.call(value, consoleDepth, { depth: consoleDepth, stylize: (text) => text });
       if (typeof result === "string") return result;
     }
   } catch {}
@@ -475,7 +502,7 @@ const formatConsoleValue = (value, seen, objectDepth, indent) => {
       return `${out}${" ".repeat(indent)}}`;
     }
 
-    if (objectDepth > 2) return "[Object ...]";
+    if (objectDepth > consoleDepth) return "[Object ...]";
     const prototype = Object.getPrototypeOf(value);
     let prefix = "";
     if (prototype === null) prefix = "[Object: null prototype] ";
@@ -521,13 +548,16 @@ const formatConsoleArg = (value) => {
 };
 const nativeConsoleLog = console.log?.bind(console);
 const nativeConsoleError = console.error?.bind(console);
+const nativeConsoleWarn = console.warn?.bind(console) ?? nativeConsoleError;
 if (nativeConsoleLog) {
   console.log = (...args) => nativeConsoleLog(...args.map(formatConsoleArg));
 }
 if (nativeConsoleError) {
   console.error = (...args) => nativeConsoleError(...args.map(formatConsoleArg));
 }
-console.warn ||= console.error;
+if (nativeConsoleWarn) {
+  console.warn = (...args) => nativeConsoleWarn(...args.map(formatConsoleArg));
+}
 console.info ||= console.log;
 console.debug ||= console.log;
 {
@@ -723,7 +753,10 @@ function installBlobGlobals() {
   if (typeof g.Blob !== "function") {
     class CottontailBlob {
       constructor(parts = [], options = {}) {
-        const chunks = Array.from(parts ?? [], bytesFromBlobPart);
+        if (typeof parts === "string" || parts == null) throw new TypeError("Blob parts must be an iterable object");
+        const sourceParts = parts instanceof ArrayBuffer || ArrayBuffer.isView(parts) ? [parts] : parts;
+        if (typeof sourceParts[Symbol.iterator] !== "function") throw new TypeError("Blob parts must be iterable");
+        const chunks = Array.from(sourceParts, bytesFromBlobPart);
         const size = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
         this._bytes = new Uint8Array(size);
         let offset = 0;
@@ -785,7 +818,7 @@ function installBlobGlobals() {
     class CottontailFile extends g.Blob {
       constructor(parts, name, options = {}) {
         if (arguments.length < 2) throw new TypeError("File constructor requires file bits and name");
-        if (parts == null || typeof parts[Symbol.iterator] !== "function") throw new TypeError("File bits must be iterable");
+        if (typeof parts === "string" || parts == null) throw new TypeError("File bits must be an iterable object");
         super(parts, options);
         this.name = String(name);
         this.lastModified = Number(options?.lastModified ?? Date.now());
@@ -1263,7 +1296,7 @@ function timerNow() {
 }
 
 function makeTimerHandle(id) {
-  return {
+  const handle = {
     [Symbol.toPrimitive]: () => id,
     valueOf: () => id,
     // Node's Timeout exposes _idleStart (ms since process start when the timer
@@ -1284,12 +1317,14 @@ function makeTimerHandle(id) {
     },
     close() {
       cancelledTimers.add(id);
+      if (this._entry) this._entry.destroyed = true;
       timers.delete(id);
       return this;
     },
     refresh() {
       const timer = timers.get(id) ?? this._entry;
       if (timer) {
+        timer.destroyed = false;
         timer.deadline = timerNow() + (timer.interval ?? timer.duration ?? 0);
         cancelledTimers.delete(id);
         timers.set(id, timer);
@@ -1297,35 +1332,84 @@ function makeTimerHandle(id) {
       return this;
     },
   };
+  Object.defineProperty(handle, "_destroyed", {
+    get() { return this._entry?.destroyed === true; },
+    configurable: true,
+  });
+  return handle;
+}
+
+function timerId(value) {
+  if (typeof value === "string" && !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id >= 0 ? id : null;
 }
 
 function installTimers() {
   if (g.__cottontailTimersInstalled) return;
   g.__cottontailTimersInstalled = true;
   g.setTimeout = (callback, ms = 0, ...args) => {
+    if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
     const id = nextTimerId++;
     cancelledTimers.delete(id);
     const handle = makeTimerHandle(id);
     const duration = Math.max(0, Number(ms) || 0);
-    const entry = { id, deadline: timerNow() + duration, duration, callback, args, interval: null, ref: true, handle };
+    const entry = { id, deadline: timerNow() + duration, duration, callback, args, interval: null, ref: true, handle, destroyed: false };
     handle._entry = entry;
     timers.set(id, entry);
     return handle;
   };
   g.clearTimeout = (id) => {
-    const key = Number(id);
+    const key = timerId(id);
+    if (key == null) return;
+    const entry = id?._entry ?? timers.get(key);
+    if (entry?.kind === "immediate") return;
     cancelledTimers.add(key);
+    if (entry) entry.destroyed = true;
     timers.delete(key);
   };
   g.setInterval = (callback, ms = 0, ...args) => {
+    if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
     const id = nextTimerId++;
     const interval = Math.max(1, Number(ms) || 0);
     cancelledTimers.delete(id);
     const handle = makeTimerHandle(id);
-    timers.set(id, { id, deadline: timerNow() + interval, callback, args, interval, ref: true, handle });
+    const entry = { id, deadline: timerNow() + interval, callback, args, interval, ref: true, handle, destroyed: false };
+    handle._entry = entry;
+    timers.set(id, entry);
     return handle;
   };
   g.clearInterval = g.clearTimeout;
+  g.setImmediate = (callback, ...args) => {
+    if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
+    const id = nextTimerId++;
+    cancelledTimers.delete(id);
+    const handle = makeTimerHandle(id);
+    const entry = {
+      id,
+      deadline: timerNow(),
+      duration: 0,
+      callback,
+      args,
+      interval: null,
+      ref: true,
+      handle,
+      destroyed: false,
+      kind: "immediate",
+    };
+    handle._entry = entry;
+    timers.set(id, entry);
+    return handle;
+  };
+  g.clearImmediate = (id) => {
+    const key = timerId(id);
+    if (key == null) return;
+    const entry = id?._entry ?? timers.get(key);
+    if (entry?.kind !== "immediate") return;
+    cancelledTimers.add(key);
+    entry.destroyed = true;
+    timers.delete(key);
+  };
   g.requestAnimationFrame ??= (callback) => g.setTimeout(() => callback(timerNow()), 16);
   g.cancelAnimationFrame ??= g.clearTimeout;
   Object.defineProperty(g.setTimeout, promisifyCustom, {
@@ -1340,6 +1424,14 @@ function installTimers() {
         reject(options.signal.reason ?? new Error("AbortError"));
       }, { once: true });
     }),
+    configurable: true,
+  });
+  Object.defineProperty(g.setInterval, promisifyCustom, {
+    value: async function* (ms = 1, value = undefined, options = undefined) {
+      while (!options?.signal?.aborted) {
+        yield await g.setTimeout[promisifyCustom](ms, value, options);
+      }
+    },
     configurable: true,
   });
   Object.defineProperty(g.setImmediate, promisifyCustom, {
@@ -1528,6 +1620,7 @@ g.__cottontailRunLoopTick = () => {
       timers.set(timer.id, timer);
     } else {
       cancelledTimers.delete(timer.id);
+      if (!timers.has(timer.id)) timer.destroyed = true;
     }
   }
   cottontail.drainJobs?.();

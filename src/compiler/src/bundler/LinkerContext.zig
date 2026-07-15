@@ -65,6 +65,7 @@ pub const LinkerContext = struct {
         minify_whitespace: bool = false,
         minify_syntax: bool = false,
         minify_identifiers: bool = false,
+        preserve_external_require_name: bool = false,
         banner: []const u8 = "",
         footer: []const u8 = "",
         css_chunking: bool = false,
@@ -1350,7 +1351,9 @@ pub const LinkerContext = struct {
                 alloc,
             .to_esm_ref = to_esm_ref,
             .to_commonjs_ref = to_commonjs_ref,
-            .require_ref = switch (c.options.output_format) {
+            .require_ref = if (c.options.preserve_external_require_name)
+                null
+            else switch (c.options.output_format) {
                 .cjs => null, // use unbounded global
                 else => runtime_require_ref,
             },

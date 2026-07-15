@@ -1,6 +1,7 @@
 #ifndef COTTONTAIL_JSC_RUNNER_H
 #define COTTONTAIL_JSC_RUNNER_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -26,6 +27,8 @@ int ct_jsc_runtime_eval(
     char **error_out
 );
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out);
+bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime);
+char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime);
 void ct_jsc_string_free(char *value);
 
 #endif

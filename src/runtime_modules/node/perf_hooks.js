@@ -189,10 +189,35 @@ export class Performance {
   constructor() {
     this.timeOrigin = origin;
     this._resourceTimingBufferSize = 250;
+    this.nodeTiming = {
+      name: "node",
+      entryType: "node",
+      startTime: 0,
+      duration: 0,
+      nodeStart: 0,
+      v8Start: 0,
+      bootstrapComplete: 0,
+      environment: 0,
+      loopStart: -1,
+      loopExit: -1,
+      idleTime: 0,
+    };
   }
 
   now() {
     return nowMs();
+  }
+
+  eventLoopUtilization(previous = undefined) {
+    const active = Math.max(0, nowMs());
+    const result = { idle: 0, active, utilization: active > 0 ? 1 : 0 };
+    if (previous && typeof previous === "object") {
+      result.idle -= Number(previous.idle ?? 0);
+      result.active -= Number(previous.active ?? 0);
+      const total = result.idle + result.active;
+      result.utilization = total > 0 ? result.active / total : 0;
+    }
+    return result;
   }
 
   mark(name, options = {}) {
@@ -480,6 +505,10 @@ export const constants = {
 };
 
 export const performance = new Performance();
+
+if (globalThis.performance && typeof globalThis.performance.markResourceTiming !== "function") {
+  globalThis.performance.markResourceTiming = performance.markResourceTiming.bind(performance);
+}
 
 // COTTONTAIL-COMPAT: node:perf_hooks native entries - user marks/measures, explicit resource timings, observers, timerify, and histograms are implemented; automatic GC/resource entries need JSC instrumentation.
 

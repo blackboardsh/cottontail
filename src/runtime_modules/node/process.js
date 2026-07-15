@@ -1423,6 +1423,9 @@ export const _linkedBinding = processObject._linkedBinding = (name) => {
 };
 
 export const dlopen = processObject.dlopen = (module, filename = undefined) => {
+  if (processObject.execArgv?.includes("--no-addons")) {
+    throw bindingError("\nerror: Cannot load native addon because loading addons is disabled.", "ERR_DLOPEN_DISABLED");
+  }
   const target = filename ?? module?.filename ?? module?.id ?? "";
   throw bindingError(`dlopen(${String(target)}, 0x0001): native add-on loading is pending for Cottontail`, "ERR_DLOPEN_FAILED");
 };

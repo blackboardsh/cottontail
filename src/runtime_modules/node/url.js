@@ -1016,6 +1016,7 @@ const backslashRegEx = /\\/g;
 const newlineRegEx = /\n/g;
 const carriageReturnRegEx = /\r/g;
 const tabRegEx = /\t/g;
+const tildeRegEx = /~/g;
 
 function encodePathChars(filepath) {
   if (filepath.indexOf("%") !== -1) filepath = filepath.replace(percentRegEx, "%25");
@@ -1024,6 +1025,9 @@ function encodePathChars(filepath) {
   if (filepath.indexOf("\n") !== -1) filepath = filepath.replace(newlineRegEx, "%0A");
   if (filepath.indexOf("\r") !== -1) filepath = filepath.replace(carriageReturnRegEx, "%0D");
   if (filepath.indexOf("\t") !== -1) filepath = filepath.replace(tabRegEx, "%09");
+  // Bun.pathToFileURL escapes tilde even though the WHATWG URL pathname
+  // setter leaves it unescaped.
+  if (filepath.indexOf("~") !== -1) filepath = filepath.replace(tildeRegEx, "%7E");
   return filepath;
 }
 

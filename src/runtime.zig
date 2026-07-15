@@ -93,6 +93,10 @@ pub const Runtime = struct {
             return 1;
         };
 
+        return self.runSource(source, script_path);
+    }
+
+    pub fn runSource(self: *Runtime, source: []const u8, filename: [:0]const u8) u8 {
         const source_z = self.allocator.alloc(u8, source.len + 1) catch {
             self.writeStderrLine("cottontail: out of memory preparing script source");
             return 1;
@@ -102,7 +106,7 @@ pub const Runtime = struct {
 
         var eval_error: [*c]u8 = null;
 
-        const eval_status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, script_path.ptr, &eval_error);
+        const eval_status = c.ct_jsc_runtime_eval(self.handle, source_z.ptr, source.len, filename.ptr, &eval_error);
         if (eval_status != 0) {
             defer if (eval_error != null) {
                 c.ct_jsc_string_free(eval_error);
@@ -194,6 +198,17 @@ pub const Runtime = struct {
 
             return error.TickFailed;
         }
+    }
+
+    pub fn enableSamplingProfiler(self: *Runtime) bool {
+        return c.ct_jsc_runtime_enable_sampling_profiler(self.handle);
+    }
+
+    pub fn takeSamplingProfile(self: *Runtime) !?[]u8 {
+        const profile = c.ct_jsc_runtime_take_sampling_profiler(self.handle);
+        if (profile == null) return null;
+        defer c.ct_jsc_string_free(profile);
+        return try self.allocator.dupe(u8, std.mem.span(profile));
     }
 
     fn writeLoadError(self: *Runtime, script_path: []const u8, err: anyerror) void {

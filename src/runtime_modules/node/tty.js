@@ -60,8 +60,16 @@ export class WriteStream extends EventEmitter {
     return ok;
   }
 
-  getColorDepth() {
-    return this.isTTY ? 8 : 1;
+  getColorDepth(env = globalThis.process?.env ?? {}) {
+    if (globalThis.process?.platform === "win32") return 24;
+    if (env.COLORTERM === "truecolor" || env.COLORTERM === "24bit") return 24;
+    if (env.TERM_PROGRAM === "iTerm.app") {
+      const version = Number.parseInt(String(env.TERM_PROGRAM_VERSION ?? ""), 10);
+      return Number.isFinite(version) && version >= 3 ? 24 : 8;
+    }
+    if (env.TERM_PROGRAM === "Hyper" || env.TERM_PROGRAM === "MacTerm") return 24;
+    if (env.TERM_PROGRAM === "Apple_Terminal" || /-256(?:color)?$/i.test(String(env.TERM ?? ""))) return 8;
+    return 1;
   }
 
   hasColors(count = 16) {

@@ -76,6 +76,101 @@ fn argAfterPrefix(allocator: std.mem.Allocator, arg: [:0]const u8, prefix: []con
     return try allocator.dupeZ(u8, arg[prefix.len..]);
 }
 
+fn appendBunOptionsEnv(
+    allocator: std.mem.Allocator,
+    options: []const u8,
+    args: *std.array_list.Managed([:0]const u8),
+) !void {
+    var index: usize = 0;
+    while (index < options.len) {
+        while (index < options.len and std.ascii.isWhitespace(options[index])) : (index += 1) {}
+        if (index >= options.len) break;
+
+        const start = index;
+        var end = index;
+        const is_option = end + 2 <= options.len and options[end] == '-' and options[end + 1] == '-';
+        if (is_option) {
+            while (end < options.len and !std.ascii.isWhitespace(options[end]) and options[end] != '=') : (end += 1) {}
+            const end_of_flag = end;
+            var has_equals = false;
+            if (end < options.len and options[end] == '=') {
+                has_equals = true;
+                end += 1;
+            } else if (end < options.len and std.ascii.isWhitespace(options[end])) {
+                end += 1;
+                while (end < options.len and std.ascii.isWhitespace(options[end])) : (end += 1) {}
+            }
+
+            if (end < options.len and (options[end] == '\'' or options[end] == '"')) {
+                const quote = options[end];
+                end += 1;
+                while (end < options.len and options[end] != quote) : (end += 1) {}
+                if (end < options.len) end += 1;
+            } else if (has_equals) {
+                while (end < options.len and !std.ascii.isWhitespace(options[end])) : (end += 1) {}
+            } else {
+                end = end_of_flag;
+            }
+
+            try args.append(try allocator.dupeZ(u8, options[start..end]));
+            index = end;
+            continue;
+        }
+
+        var token: std.ArrayList(u8) = .empty;
+        var in_single = false;
+        var in_double = false;
+        var escaped = false;
+        while (index < options.len) : (index += 1) {
+            const byte = options[index];
+            if (escaped) {
+                try token.append(allocator, byte);
+                escaped = false;
+                continue;
+            }
+            if (byte == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (in_single) {
+                if (byte == '\'') in_single = false else try token.append(allocator, byte);
+                continue;
+            }
+            if (in_double) {
+                if (byte == '"') in_double = false else try token.append(allocator, byte);
+                continue;
+            }
+            if (byte == '\'') {
+                in_single = true;
+            } else if (byte == '"') {
+                in_double = true;
+            } else if (std.ascii.isWhitespace(byte)) {
+                break;
+            } else {
+                try token.append(allocator, byte);
+            }
+        }
+        try token.append(allocator, 0);
+        const owned = try token.toOwnedSlice(allocator);
+        try args.append(owned[0 .. owned.len - 1 :0]);
+    }
+}
+
+fn argsWithBunOptions(
+    allocator: std.mem.Allocator,
+    process_args: []const [:0]const u8,
+    environ_map: *std.process.Environ.Map,
+) ![]const [:0]const u8 {
+    const options = environ_map.get("BUN_OPTIONS") orelse return process_args;
+    if (options.len == 0) return process_args;
+
+    var args = try std.array_list.Managed([:0]const u8).initCapacity(allocator, process_args.len + 4);
+    try args.append(process_args[0]);
+    try appendBunOptionsEnv(allocator, options, &args);
+    try args.appendSlice(process_args[1..]);
+    return try args.toOwnedSlice();
+}
+
 fn runCommandFlagTakesValue(arg: []const u8) bool {
     if (runtimeFlagTakesValue(arg)) return true;
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
@@ -103,6 +198,10 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
         "--loader",
         "--experimental-loader",
         "--conditions",
+        "--console-depth",
+        "--cpu-prof-dir",
+        "--cpu-prof-name",
+        "--cpu-prof-interval",
         "--input-type",
         "--experimental-default-type",
         "--inspect-publish-uid",
@@ -436,6 +535,89 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
+const standalone_magic = "COTTONTAIL-STAND";
+const standalone_trailer_len = @sizeOf(u64) + standalone_magic.len;
+
+fn loadStandaloneSource(init: std.process.Init) !?[]const u8 {
+    const allocator = init.arena.allocator();
+    const executable_path = try std.process.executablePathAlloc(init.io, allocator);
+    const executable = try std.Io.Dir.cwd().openFile(init.io, executable_path, .{});
+    defer executable.close(init.io);
+    const executable_len = try executable.length(init.io);
+    if (executable_len < standalone_trailer_len) return null;
+
+    var trailer: [standalone_trailer_len]u8 = undefined;
+    const trailer_offset = executable_len - standalone_trailer_len;
+    if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) != trailer.len) return null;
+    if (!std.mem.eql(u8, trailer[@sizeOf(u64)..], standalone_magic)) return null;
+
+    const source_len = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
+    if (source_len > trailer_offset or source_len > 512 * 1024 * 1024) return error.InvalidStandaloneExecutable;
+    const source = try allocator.alloc(u8, @intCast(source_len));
+    const source_offset = trailer_offset - source_len;
+    if (try executable.readPositionalAll(init.io, source, source_offset) != source.len) return error.InvalidStandaloneExecutable;
+    return source;
+}
+
+fn writeStandaloneExecutable(init: std.process.Init, output_path: []const u8, source: []const u8) !void {
+    const executable_path = try std.process.executablePathAlloc(init.io, init.arena.allocator());
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        executable_path,
+        std.Io.Dir.cwd(),
+        output_path,
+        init.io,
+        .{ .make_path = true },
+    );
+
+    const output = try std.Io.Dir.cwd().openFile(init.io, output_path, .{ .mode = .read_write });
+    defer output.close(init.io);
+    const executable_len = try output.length(init.io);
+    try output.writePositionalAll(init.io, source, executable_len);
+    var trailer: [standalone_trailer_len]u8 = undefined;
+    std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(source.len), .little);
+    @memcpy(trailer[@sizeOf(u64)..], standalone_magic);
+    try output.writePositionalAll(init.io, &trailer, executable_len + source.len);
+}
+
+fn runStandaloneIfPresent(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+) !?u8 {
+    const source = (try loadStandaloneSource(init)) orelse return null;
+    const allocator = init.arena.allocator();
+    var exec_args = try allocator.alloc([:0]const u8, args.len);
+    var exec_len: usize = 0;
+    var script_start = args.len;
+    var index: usize = 1;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--")) {
+            script_start = index + 1;
+            break;
+        }
+        if (!isRuntimeFlag(arg)) {
+            script_start = index;
+            break;
+        }
+        exec_args[exec_len] = arg;
+        exec_len += 1;
+        if (runtimeFlagTakesValue(arg) and index + 1 < args.len) {
+            index += 1;
+            exec_args[exec_len] = args[index];
+            exec_len += 1;
+        }
+        index += 1;
+    }
+    return try script_runner.runEmbedded(
+        init,
+        args[0],
+        source,
+        args[script_start..],
+        exec_args[0..exec_len],
+    );
+}
+
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
@@ -452,10 +634,13 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var outfile: ?[]const u8 = null;
     var metafile_json_path: ?[]const u8 = null;
     var metafile_markdown_path: ?[]const u8 = null;
+    var compile = false;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
-        if (std.mem.eql(u8, arg, "--minify")) {
+        if (std.mem.eql(u8, arg, "--compile")) {
+            compile = true;
+        } else if (std.mem.eql(u8, arg, "--minify")) {
             options.minify_whitespace = true;
             options.minify_identifiers = true;
             options.minify_syntax = true;
@@ -537,6 +722,33 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         return 1;
     }
 
+    options.external = external.items;
+    if (compile) {
+        if (entries.items.len != 1) {
+            try stderr.print("error: --compile requires exactly one entrypoint\n", .{});
+            try stderr.flush();
+            return 1;
+        }
+        options.target = .bun;
+        options.output_format = .esm;
+        const entry_z = try allocator.dupeZ(u8, entries.items[0]);
+        const source = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
+            try stderr.print("error: standalone build failed: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return 1;
+        };
+        const default_basename = std.fs.path.stem(entries.items[0]);
+        const default_name = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}.exe", .{default_basename})
+        else
+            default_basename;
+        const destination = outfile orelse default_name;
+        try writeStandaloneExecutable(init, destination, source);
+        try stdout.print("{s}\n", .{destination});
+        try stdout.flush();
+        return 0;
+    }
+
     const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
     for (entries.items) |entry| {
         const entry_abs = if (std.fs.path.isAbsolute(entry)) entry else try std.fs.path.join(allocator, &.{ cwd_abs, entry });
@@ -547,7 +759,6 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         };
     }
 
-    options.external = external.items;
     const MetafileRequest = struct { json: []const u8, markdown: []const u8 };
     const MinifyRequest = struct { whitespace: bool, identifiers: bool, syntax: bool };
     const request = .{
@@ -950,7 +1161,14 @@ fn defaultTestEntrypoint(io: std.Io, allocator: std.mem.Allocator) ![:0]const u8
 }
 
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const allocator = init.arena.allocator();
+    const process_args = try init.minimal.args.toSlice(allocator);
+    const args = try argsWithBunOptions(allocator, process_args, init.environ_map);
+
+    if (try runStandaloneIfPresent(init, args)) |exit_code| {
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -1026,7 +1244,6 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
-        const allocator = init.arena.allocator();
         const command_parts = try allocator.alloc([]const u8, args.len - 2);
         for (command_parts, 0..) |*part, index| {
             part.* = args[index + 2];

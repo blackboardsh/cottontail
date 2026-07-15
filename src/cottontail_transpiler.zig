@@ -184,6 +184,10 @@ fn process(
     parser_options.tree_shaking = config.tree_shaking;
     parser_options.features.allow_runtime = operation != .transform or config.allow_runtime;
     parser_options.features.top_level_await = true;
+    // Vanilla JavaScriptCore does not parse TC39 decorators. Bun's parser
+    // already contains the complete lowering pass, so transform JavaScript
+    // decorators instead of relying on engine-specific syntax support.
+    parser_options.features.standard_decorators = !config.loader.isTypeScript();
     parser_options.features.dead_code_elimination = config.dead_code_elimination;
     parser_options.features.trim_unused_imports = config.trim_unused_imports orelse config.loader.isTypeScript();
     parser_options.features.inlining = config.inlining or config.minify_syntax;

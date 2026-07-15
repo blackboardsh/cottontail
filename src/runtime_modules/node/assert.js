@@ -480,9 +480,19 @@ export function notDeepEqual(actual, expected, message) {
 function expectedMatches(error, expected) {
   if (expected == null) return true;
   if (typeof expected === "function") return safeInstanceOf(error, expected) || expected(error) === true;
-  if (expected instanceof RegExp) return expected.test(String(error?.message ?? error));
+  if (expected instanceof RegExp) {
+    expected.lastIndex = 0;
+    return expected.test(String(error));
+  }
   if (typeof expected === "object") {
-    return Object.keys(expected).every((key) => deepEqualValue(error?.[key], expected[key], true));
+    return Object.keys(expected).every((key) => {
+      const wanted = expected[key];
+      if (wanted instanceof RegExp) {
+        wanted.lastIndex = 0;
+        return wanted.test(String(error?.[key]));
+      }
+      return deepEqualValue(error?.[key], wanted, true);
+    });
   }
   return false;
 }

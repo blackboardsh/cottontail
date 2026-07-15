@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { setImmediate as setImmediateTimer, clearImmediate } from "node:timers";
+import { setImmediate as setImmediateTimer, clearImmediate, promises as timerPromises } from "node:timers";
 import { setTimeout as sleep, setImmediate as immediate, scheduler } from "node:timers/promises";
 import querystring from "node:querystring";
 import { StringDecoder } from "node:string_decoder";
@@ -37,8 +37,9 @@ const euro = new Uint8Array([0xe2, 0x82, 0xac]);
 assert(decoder.write(euro.subarray(0, 2)) === "", "StringDecoder should buffer incomplete UTF-8");
 assert(decoder.write(euro.subarray(2)) === "€", "StringDecoder should complete UTF-8");
 assert(decoder.end() === "", "StringDecoder end mismatch");
-const calledDecoder = StringDecoder("utf8");
-assert(calledDecoder instanceof StringDecoder, "StringDecoder should be callable without new");
+const calledDecoder: { encoding?: string } = {};
+StringDecoder.call(calledDecoder, "utf8");
+assert(calledDecoder.encoding === "utf8", "StringDecoder.call should initialize its receiver");
 
 const stackError = new TypeError("stack header");
 assert(stackError.stack?.startsWith("TypeError: stack header\n"), "Error stack should include Node-style name and message");
@@ -152,7 +153,26 @@ assert(storage.getStore() === undefined, "AsyncLocalStorage disable mismatch");
 await sleep(1);
 assert(await immediate("immediate-value") === "immediate-value", "timers/promises setImmediate mismatch");
 await scheduler.yield();
+const dynamicTimerPromises = await import("node:timers/promises");
+assert(dynamicTimerPromises.default === timerPromises, "dynamic timers/promises default identity mismatch");
 const handle = setImmediateTimer(() => {});
 clearImmediate(handle);
+
+try {
+  require("cottontail-package-that-does-not-exist");
+  throw new Error("missing package require should throw");
+} catch (error) {
+  assert((error as Error).constructor.name === "ResolveMessage", "missing package error type mismatch");
+}
+
+const malformedModuleURL = URL.createObjectURL(new Blob(["export const = 1"]));
+try {
+  require(malformedModuleURL);
+  throw new Error("malformed blob module require should throw");
+} catch (error) {
+  assert((error as Error).constructor.name === "BuildMessage", "malformed blob module error type mismatch");
+} finally {
+  URL.revokeObjectURL(malformedModuleURL);
+}
 
 console.log("node misc modules surface passed");

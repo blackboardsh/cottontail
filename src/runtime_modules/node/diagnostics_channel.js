@@ -2,7 +2,8 @@ const channels = globalThis.__cottontailDiagnosticsChannels ??= new Map();
 
 export class Channel {
   constructor(name) {
-    this.name = String(name);
+    validateChannelName(name);
+    this.name = name;
     this._subscribers = new Set();
   }
 
@@ -16,7 +17,7 @@ export class Channel {
   }
 
   unsubscribe(callback) {
-    this._subscribers.delete(callback);
+    return this._subscribers.delete(callback);
   }
 
   publish(message) {
@@ -37,13 +38,19 @@ export class Channel {
 }
 
 export function channel(name) {
-  const key = String(name);
-  let current = channels.get(key);
+  validateChannelName(name);
+  let current = channels.get(name);
   if (!current) {
-    current = new Channel(key);
-    channels.set(key, current);
+    current = new Channel(name);
+    channels.set(name, current);
   }
   return current;
+}
+
+function validateChannelName(name) {
+  if (typeof name !== "string" && typeof name !== "symbol") {
+    throw new TypeError('The "channel" argument must be of type string or symbol');
+  }
 }
 
 export function hasSubscribers(name) {
@@ -51,11 +58,16 @@ export function hasSubscribers(name) {
 }
 
 export function subscribe(name, callback) {
+  validateChannelName(name);
+  if (typeof callback !== "function") {
+    throw new TypeError('The "subscription" argument must be of type function');
+  }
   channel(name).subscribe(callback);
 }
 
 export function unsubscribe(name, callback) {
-  channel(name).unsubscribe(callback);
+  validateChannelName(name);
+  return channel(name).unsubscribe(callback);
 }
 
 export function tracingChannel(nameOrChannels) {

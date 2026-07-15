@@ -16,6 +16,10 @@ pub const BundleOptions = struct {
     loader: ?[]const u8 = null,
     external_packages: bool = false,
     include_runtime_modules: bool = false,
+    /// Runtime bundles execute with a global Node-style `require`. Keeping the
+    /// original identifier makes Function.prototype.toString() output usable
+    /// with `new Function("require", ...)`, matching Bun's module transpiler.
+    preserve_external_require_name: bool = false,
     inline_import_meta_properties: bool = false,
     minify_whitespace: bool = false,
     minify_identifiers: bool = false,
@@ -201,6 +205,7 @@ pub fn bundleEntryPointWithOptions(
     // of becoming an additional output file (which single-output in-memory
     // bundles cannot emit).
     transpiler.options.externalize_runtime_require_resolve = true;
+    transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
     transpiler.options.force_lower_using = true;
@@ -208,6 +213,14 @@ pub fn bundleEntryPointWithOptions(
     // modules with an explicit "use strict" must keep the directive inside
     // their wrapper closures (including the entry point).
     transpiler.options.preserve_strict_directives_in_wrappers = true;
+    // Runtime execution loads dotenv through process.js after CLI flags and
+    // bunfig policy are available. Keep env values available to resolution,
+    // but do not replace process.env reads in generated code before
+    // --no-env-file / --env-file can take effect. This is the mode Bun uses
+    // for its run and test transpilers.
+    if (options.include_runtime_modules) {
+        transpiler.options.env.behavior = .load_all_without_inlining;
+    }
     // Linker configuration must run before defines: configureLinker() seeds
     // options.jsx wholesale from the root tsconfig (development=true for
     // "react-jsx"/"react-jsxdev"), and configureDefines() then applies the

@@ -12,6 +12,9 @@ strictEqual(sys.format("ok %s", "sys"), "ok sys", "sys default should expose uti
 throws(() => {
   throw new TypeError("strict boom");
 }, TypeError);
+throws(() => {
+  throw new TypeError("verify must be function");
+}, /TypeError: verify must be function/);
 await rejects(async () => {
   throw new Error("async boom");
 }, /async boom/);

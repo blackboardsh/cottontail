@@ -4,6 +4,8 @@ const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
 const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const nativeClearInterval = globalThis.clearInterval.bind(globalThis);
+const nativeSetImmediate = globalThis.setImmediate.bind(globalThis);
+const nativeClearImmediate = globalThis.clearImmediate.bind(globalThis);
 const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
 
 export function setTimeout(callback, delay = 0, ...args) {
@@ -26,14 +28,14 @@ export function clearInterval(handle) {
 
 export function setImmediate(callback, ...args) {
   if (typeof callback !== "function") throw new TypeError("callback must be a function");
-  return setTimeout(callback, 0, ...args);
+  return nativeSetImmediate(_wrapAsyncCallback(callback), ...args);
 }
 
 export function clearImmediate(handle) {
-  return clearTimeout(handle);
+  return nativeClearImmediate(handle);
 }
 
-export const promises = {
+export const promises = globalThis.__cottontailTimerPromises ??= {
   setTimeout(delay = 1, value = undefined, options = undefined) {
     return new Promise((resolve, reject) => {
       if (options?.signal?.aborted) {
@@ -71,6 +73,10 @@ Object.defineProperty(setTimeout, promisifyCustom, {
 });
 Object.defineProperty(setImmediate, promisifyCustom, {
   value: promises.setImmediate,
+  configurable: true,
+});
+Object.defineProperty(setInterval, promisifyCustom, {
+  value: promises.setInterval,
   configurable: true,
 });
 

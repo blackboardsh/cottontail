@@ -151,6 +151,7 @@ export const builtinModules = [
 
 const commonJsCache = new Map();
 const builtinModuleMap = new Map();
+const modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
 const sourceMapCache = new Map();
@@ -555,6 +556,16 @@ function moduleNotFoundError(request, resolveMessage = false) {
   return error;
 }
 
+class ResolveMessage extends Error {}
+class BuildMessage extends SyntaxError {}
+
+function packageNotFoundError(request, basePath) {
+  const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+  const error = new ResolveMessage(`Cannot find package '${request}' from '${startDir}'`);
+  error.code = "MODULE_NOT_FOUND";
+  return error;
+}
+
 function importMetaForModule(filename, suffix = "") {
   const dir = dirname(filename);
   const meta = {
@@ -630,7 +641,7 @@ function resolveRequestCore(request, basePath) {
   if (tsMapped) return withSpecifierSuffix(tsMapped, suffix);
 
   const root = packageRootFor(text, startDir);
-  if (!root) throw moduleNotFoundError(originalText, Boolean(suffix));
+  if (!root) throw packageNotFoundError(originalText, basePath);
   const packageSuffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
   const packageJson = readPackageJson(join(root, "package.json"));
   if (packageJson?.exports != null) {
@@ -661,7 +672,12 @@ function resolveRequest(request, basePath, useHooks = true) {
     return text;
   }
   if (!useHooks || !moduleHooks.some((hook) => typeof hook.resolve === "function")) {
-    return resolveRequestCore(request, basePath);
+    const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+    const cacheKey = `${String(request)}\0${startDir}`;
+    if (Object.prototype.hasOwnProperty.call(modulePathCache, cacheKey)) return modulePathCache[cacheKey];
+    const resolved = resolveRequestCore(request, basePath);
+    modulePathCache[cacheKey] = resolved;
+    return resolved;
   }
 
   const baseContext = {
@@ -710,14 +726,38 @@ const esmSyntaxPattern = /^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:defaul
 // type syntax removed first; new Function() only parses JavaScript.
 const typeScriptExtensionPattern = /\.(?:ts|mts|cts|tsx)$/i;
 
+function hasBunTranspiledPragma(source) {
+  const firstLine = String(source).split("\n", 1)[0].trimEnd();
+  return /^\/\/\s*@bun(?:\s|$)/.test(firstLine);
+}
+
 function maybeStripTypeScript(filename, source) {
   if (!typeScriptExtensionPattern.test(String(filename))) return source;
+  // `// @bun` declares already-transpiled output. Parsing TypeScript below it
+  // must fail instead of silently stripping types from an invalid artifact.
+  if (hasBunTranspiledPragma(source)) return source;
   if (typeof cottontail.stripTypeScriptTypes !== "function") return source;
   try {
     return String(cottontail.stripTypeScriptTypes(String(source), 1));
   } catch {
     return source;
   }
+}
+
+function maybeTransformRuntimeSyntax(filename, source) {
+  const path = String(filename);
+  const needsTransform = /(?:^|[\n;{}])\s*@[A-Za-z_$([]/m.test(source);
+  if (!needsTransform || typeof cottontail.transpilerTransform !== "function") return source;
+  const extension = path.toLowerCase().match(/\.([^.]+)$/)?.[1];
+  const loader = extension === "tsx" ? "tsx"
+    : extension === "ts" || extension === "mts" || extension === "cts" ? "ts"
+    : extension === "jsx" ? "jsx"
+    : "js";
+  return String(cottontail.transpilerTransform(
+    String(source),
+    '{"target":"bun","deadCodeElimination":false}',
+    loader,
+  ));
 }
 
 // new Function("a", "b", body) prepends "function anonymous(a,b\n) {\n"
@@ -745,7 +785,10 @@ function compileModuleWrapper(args, source, filename) {
 }
 
 function executeCommonJsModule(module, filename) {
-  const source = maybeStripTypeScript(filename, cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
+  const source = maybeTransformRuntimeSyntax(
+    filename,
+    maybeStripTypeScript(filename, cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "")),
+  );
   if (esmSyntaxPattern.test(source)) {
     const transformed = transformEsmSourceForDynamicImport(source);
     maybeRegisterSourceMap(filename, transformed);
@@ -855,6 +898,14 @@ function namespaceFromCommonJs(value) {
     }
   }
   return namespace;
+}
+
+function namespaceFromBuiltin(value) {
+  const unwrapped = unwrapBuiltin(value);
+  // Builtins registered from ESM sources are already namespace objects. Do
+  // not apply CommonJS's extra default layer to dynamic import() results.
+  if (unwrapped && typeof unwrapped === "object" && Object.hasOwn(unwrapped, "default")) return unwrapped;
+  return namespaceFromCommonJs(unwrapped);
 }
 
 function rewriteImportBindings(names) {
@@ -980,12 +1031,37 @@ function transformEsmSourceForDynamicImport(source) {
   return `${staticImportHelperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
 }
 
+const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
+
+function dynamicModuleErrorConstructor(filename, source) {
+  const NativeError = globalThis.Error;
+  const annotate = (error) => {
+    try {
+      if (typeof error.stack === "string") {
+        error.stack = error.stack.replace(/@(?=\n|$)/g, `@${filename}`);
+      }
+      Object.defineProperty(error, dynamicErrorSourceSymbol, {
+        value: { filename, source: String(source) },
+        configurable: true,
+      });
+    } catch {}
+    return error;
+  };
+  return new Proxy(NativeError, {
+    construct(target, args, newTarget) {
+      return annotate(Reflect.construct(target, args, newTarget ?? target));
+    },
+    apply(target, thisArg, args) {
+      return annotate(Reflect.apply(target, thisArg, args));
+    },
+  });
+}
+
 function executeDynamicImportSource(resolved, source, format) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const effectiveFormat = format ?? formatForResolved(resolvedPath);
   if (effectiveFormat === "builtin") {
-    const value = unwrapBuiltin(builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, "")));
-    return namespaceFromCommonJs(value);
+    return namespaceFromBuiltin(builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, "")));
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
     const jsonSource = String(source ?? "");
@@ -1000,15 +1076,35 @@ function executeDynamicImportSource(resolved, source, format) {
     return namespaceFromCommonJs(executeHookSource(resolvedPath, String(source ?? "").replace(/\bimport\.meta\b/g, "__ctImportMeta"), "commonjs"));
   }
   const namespace = {};
-  const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, source ?? ""));
+  const originalSource = String(source ?? "");
+  const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
   maybeRegisterSourceMap(resolvedPath, transformed);
   recordCompileCache(resolvedPath, transformed);
-  // Dynamically imported ES modules may use top-level await (e.g. Bun.build
-  // outputs re-imported via blob: URLs), which a plain Function body cannot
-  // parse; evaluate through an async wrapper and resolve to the namespace.
-  const AsyncFunction = (async () => {}).constructor;
-  const run = new AsyncFunction("exports", "require", "__ctImportMeta", `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`);
-  return run(namespace, createRequire(resolvedPath), importMetaForModule(resolvedPath, suffix)).then(() => namespace);
+  const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
+  let run;
+  try {
+    run = new Function("exports", "require", "__ctImportMeta", "Error", body);
+  } catch (error) {
+    // Dynamically imported ES modules may use top-level await (e.g. Bun.build
+    // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
+    // ordinary modules and only retry syntax containing await asynchronously.
+    if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
+    const AsyncFunction = (async () => {}).constructor;
+    const run = new AsyncFunction("exports", "require", "__ctImportMeta", "Error", body);
+    return run(
+      namespace,
+      createRequire(resolvedPath),
+      importMetaForModule(resolvedPath, suffix),
+      dynamicModuleErrorConstructor(resolvedPath, originalSource),
+    ).then(() => namespace);
+  }
+  run(
+    namespace,
+    createRequire(resolvedPath),
+    importMetaForModule(resolvedPath, suffix),
+    dynamicModuleErrorConstructor(resolvedPath, originalSource),
+  );
+  return namespace;
 }
 
 export function __importModule(specifier, referrer = undefined, options = undefined) {
@@ -1023,10 +1119,35 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   // an ES module (e.g. re-importing a Bun.build output). The object-URL
   // registry lives on globalThis (installed by the Blob shim).
   const specifierText = String(specifier);
+  if (specifierText.startsWith("data:")) {
+    const comma = specifierText.indexOf(",");
+    const metadata = comma < 0 ? "" : specifierText.slice(5, comma);
+    if (comma < 0 || !/(?:^|;)text\/javascript(?:;|$)|^(?:application\/javascript)(?:;|$)/i.test(metadata)) {
+      throw moduleNotFoundError(specifierText, false);
+    }
+    const payload = specifierText.slice(comma + 1);
+    let source;
+    if (/(?:^|;)base64(?:;|$)/i.test(metadata)) {
+      try {
+        if (payload.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(payload)) throw new Error();
+        source = atob(payload);
+      } catch {
+        throw new Error("Base64DecodeError");
+      }
+    } else {
+      try {
+        source = decodeURIComponent(payload);
+      } catch {
+        throw new SyntaxError("Invalid percent-encoding in data URL");
+      }
+    }
+    return executeDynamicImportSource(`${cottontail.cwd()}/__cottontail-data-module.mjs`, source, "module");
+  }
   if (specifierText.startsWith("blob:")) {
     const blob = globalThis.__cottontailObjectURLRegistry?.get(specifierText);
     if (blob && typeof blob.text === "function") {
-      const virtualPath = join(cottontail.cwd(), `__cottontail-blob-${specifierText.replace(/[^a-zA-Z0-9._-]/g, "_")}.mjs`);
+      const extension = /typescript/i.test(String(blob.type ?? "")) ? "ts" : "mjs";
+      const virtualPath = join(cottontail.cwd(), `__cottontail-blob-${specifierText.replace(/[^a-zA-Z0-9._-]/g, "_")}.${extension}`);
       return Promise.resolve(blob.text()).then((source) =>
         executeDynamicImportSource(virtualPath, source, "module"));
     }
@@ -1049,7 +1170,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   if (loadResult !== undefined) {
     return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
   }
-  if (builtinModuleMap.has(resolved)) return namespaceFromCommonJs(unwrapBuiltin(builtinModuleMap.get(resolved)));
+  if (builtinModuleMap.has(resolved)) return namespaceFromBuiltin(builtinModuleMap.get(resolved));
   if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
   return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
 }
@@ -1105,7 +1226,7 @@ function loadCommonJsModule(resolved) {
     return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
   }
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
-  if (resolvedPath.endsWith(".json")) return JSON.parse(cottontail.readFile(resolvedPath));
+  if (resolvedPath.endsWith(".json")) return parseJSONC(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".toml")) return parseTOML(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".txt")) return { default: cottontail.readFile(resolvedPath) };
@@ -1115,7 +1236,12 @@ function loadCommonJsModule(resolved) {
 
   const module = makeModule(resolvedPath);
   commonJsCache.set(resolved, module);
-  return suffix ? executeQueriedModule(module, resolvedPath, suffix) : executeCommonJsModule(module, resolvedPath);
+  try {
+    return suffix ? executeQueriedModule(module, resolvedPath, suffix) : executeCommonJsModule(module, resolvedPath);
+  } catch (error) {
+    if (commonJsCache.get(resolved) === module) commonJsCache.delete(resolved);
+    throw error;
+  }
 }
 
 export function createRequire(basePath = cottontail.cwd()) {
@@ -1134,6 +1260,19 @@ export function createRequire(basePath = cottontail.cwd()) {
   const require = (request) => {
     const directMock = bunModuleMockFor(request);
     if (directMock.found) return directMock.value;
+    const requestText = String(request);
+    if (requestText.startsWith("blob:")) {
+      const blob = globalThis.__cottontailObjectURLRegistry?.get(requestText);
+      if (blob?._bytes instanceof Uint8Array) {
+        try {
+          return executeDynamicImportSource(requestText, Buffer.from(blob._bytes).toString("utf8"), "module");
+        } catch (error) {
+          const buildError = new BuildMessage(error?.message ?? String(error));
+          buildError.cause = error;
+          throw buildError;
+        }
+      }
+    }
     const resolved = resolveRequest(request, normalizedBasePath);
     const resolvedMock = bunModuleMockFor(resolved);
     if (resolvedMock.found) return resolvedMock.value;
@@ -1145,7 +1284,11 @@ export function createRequire(basePath = cottontail.cwd()) {
       // options.paths semantics both apply (matches Node).
       return Module._resolveFilename(String(request), { filename: normalizedBasePath }, false, options);
     }
-    return resolveRequest(request, normalizedBasePath);
+    const text = String(request);
+    if (text.startsWith("node:") && !builtinModuleMap.has(text) && !builtinModuleMap.has(text.slice(5))) {
+      throw packageNotFoundError(text, normalizedBasePath);
+    }
+    return resolveRequest(text, normalizedBasePath);
   };
   require.resolve.paths = (request) => {
     const text = String(request);
@@ -1532,7 +1675,7 @@ function maybeRegisterSourceMap(filename, source) {
 }
 
 export const _cache = commonJsCacheObject;
-export const _pathCache = Object.create(null);
+export const _pathCache = modulePathCache;
 export const wrapper = [
   "(function (exports, require, module, __filename, __dirname) { ",
   "\n});",

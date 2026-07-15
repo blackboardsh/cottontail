@@ -1,0 +1,1 @@
+import {setTimeout,setInterval,clearTimeout,clearInterval} from "node:timers";\nconst a=setTimeout(()=>console.log("timeout not cleared"),1);\nconst b=setInterval(()=>console.log("interval not cleared"),1);\nclearInterval(a); clearTimeout(b);\nconsole.log(a._destroyed,b._destroyed);\nglobalThis.setTimeout(()=>console.log("done"),5);

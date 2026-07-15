@@ -8,6 +8,12 @@
 #include "jsc_runner.h"
 
 #include <JavaScriptCore/JavaScript.h>
+
+/* These stable C APIs are exported by JSCOnly but are not installed in its
+ * public headers. Keep the bridge here instead of depending on JSC internals. */
+extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
+extern void JSContextGroupDisableSamplingProfiler(JSContextGroupRef group);
+extern JSStringRef JSContextGroupTakeSamplesFromSamplingProfiler(JSContextGroupRef group);
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -16917,6 +16923,25 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
 
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out) {
     return ct_jsc_runtime_tick_with_delay(runtime, NULL, error_out);
+}
+
+bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->context == NULL) return false;
+    return JSContextGroupEnableSamplingProfiler(JSContextGetGroup(runtime->context));
+}
+
+char *ct_jsc_runtime_take_sampling_profiler(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->context == NULL) return NULL;
+    JSContextGroupRef group = JSContextGetGroup(runtime->context);
+    JSContextGroupDisableSamplingProfiler(group);
+    JSStringRef samples = JSContextGroupTakeSamplesFromSamplingProfiler(group);
+    if (samples == NULL) return NULL;
+
+    size_t capacity = JSStringGetMaximumUTF8CStringSize(samples);
+    char *result = (char *)malloc(capacity);
+    if (result != NULL) JSStringGetUTF8CString(samples, result, capacity);
+    JSStringRelease(samples);
+    return result;
 }
 
 void ct_jsc_string_free(char *value) {

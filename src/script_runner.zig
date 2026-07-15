@@ -27,6 +27,7 @@ const ScriptExecution = struct {
     process_args: []const [:0]const u8,
     process_user_arg_offset: usize,
     exec_args: []const [:0]const u8,
+    embedded_source: ?[]const u8 = null,
     exit_code: u8 = 1,
 };
 
@@ -79,7 +80,7 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
 
-    const runnable_path = try bundleScriptNative(&ctx, script_path, exec_args, script_args, null);
+    const runnable_path = try bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null);
     defer cleanupRunnableDirectory(&ctx, runnable_path);
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
@@ -89,7 +90,7 @@ pub fn runWithExecArgvDisplay(
         process_args[index + 1] = arg;
     }
 
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null);
 }
 
 pub fn runEval(
@@ -104,14 +105,53 @@ pub fn runEval(
     const eval_path = try writeEvalEntrypoint(&ctx, ctx.project_root, source, print_result, module_input);
     var eval_path_active = true;
     defer if (eval_path_active) std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
-    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root);
+    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root, null);
     if (!std.mem.eql(u8, runnable_path, eval_path)) {
         std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
         eval_path_active = false;
     }
     defer cleanupRunnableDirectory(&ctx, runnable_path);
     const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
-    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args);
+    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null);
+}
+
+pub fn runEmbedded(
+    init: std.process.Init,
+    executable_path: [:0]const u8,
+    source: []const u8,
+    script_args: []const [:0]const u8,
+    exec_args: []const [:0]const u8,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const ctx = try makeContext(init);
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = executable_path;
+    for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
+    return try runPrepared(init, &ctx, executable_path, process_args, 1, exec_args, source);
+}
+
+pub fn compileStandaloneSource(
+    init: std.process.Init,
+    script_path: [:0]const u8,
+    build_options: native_bundler.BundleOptions,
+) ![]const u8 {
+    const ctx = try makeContext(init);
+    const empty_args: [0][:0]const u8 = .{};
+    const runnable_path = try bundleScriptNative(
+        &ctx,
+        script_path,
+        empty_args[0..],
+        empty_args[0..],
+        null,
+        build_options,
+    );
+    defer cleanupRunnableDirectory(&ctx, runnable_path);
+    return try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        runnable_path,
+        init.arena.allocator(),
+        .limited(512 * 1024 * 1024),
+    );
 }
 
 pub fn runStdin(
@@ -151,7 +191,7 @@ fn makeContext(init: std.process.Init) !Context {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-fn applyRuntimeEnvFlags(allocator: std.mem.Allocator, exec_args: []const [:0]const u8) void {
+fn applyRuntimeEnvFlags(io: std.Io, allocator: std.mem.Allocator, exec_args: []const [:0]const u8) bool {
     for (exec_args, 0..) |arg, index| {
         var value: ?[]const u8 = null;
         if (std.mem.startsWith(u8, arg, "--max-http-header-size=")) {
@@ -160,10 +200,32 @@ fn applyRuntimeEnvFlags(allocator: std.mem.Allocator, exec_args: []const [:0]con
             value = exec_args[index + 1];
         }
         if (value) |size_text| {
-            const value_z = allocator.dupeZ(u8, size_text) catch return;
+            const value_z = allocator.dupeZ(u8, size_text) catch return false;
             _ = setenv("BUN_HTTP_MAX_HEADER_SIZE", value_z.ptr, 1);
         }
+
+        var console_depth: ?[]const u8 = null;
+        if (std.mem.startsWith(u8, arg, "--console-depth=")) {
+            console_depth = arg["--console-depth=".len..];
+        } else if (std.mem.eql(u8, arg, "--console-depth") and index + 1 < exec_args.len) {
+            console_depth = exec_args[index + 1];
+        }
+        if (console_depth) |depth_text| {
+            _ = std.fmt.parseUnsigned(u16, depth_text, 10) catch {
+                var buffer: [512]u8 = undefined;
+                var writer = std.Io.File.stderr().writer(io, &buffer);
+                writer.interface.print(
+                    "error: Invalid value for --console-depth: \"{s}\". Must be a positive integer\n",
+                    .{depth_text},
+                ) catch {};
+                writer.interface.flush() catch {};
+                return false;
+            };
+            const value_z = allocator.dupeZ(u8, depth_text) catch return false;
+            _ = setenv("COTTONTAIL_CONSOLE_DEPTH", value_z.ptr, 1);
+        }
     }
+    return true;
 }
 
 fn runPrepared(
@@ -173,9 +235,10 @@ fn runPrepared(
     process_args: []const [:0]const u8,
     process_user_arg_offset: usize,
     exec_args: []const [:0]const u8,
+    embedded_source: ?[]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
-    applyRuntimeEnvFlags(allocator, exec_args);
+    if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
     var execution = ScriptExecution{
         .io = init.io,
         .allocator = allocator,
@@ -183,6 +246,7 @@ fn runPrepared(
         .process_args = process_args,
         .process_user_arg_offset = process_user_arg_offset,
         .exec_args = exec_args,
+        .embedded_source = embedded_source,
     };
     const thread = try std.Thread.spawn(
         .{ .stack_size = script_thread_stack_size },
@@ -287,6 +351,7 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
 }
 
 fn runScriptExecution(execution: *ScriptExecution) void {
+    const profiler_options = parseCpuProfileOptions(execution.exec_args);
     var js_runtime = runtime.Runtime.initWithStackSize(
         execution.io,
         execution.allocator,
@@ -308,7 +373,354 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
 
-    execution.exit_code = js_runtime.runFile(execution.runnable_path);
+    if (profiler_options.enabled() and !js_runtime.enableSamplingProfiler()) {
+        writeStderr(execution.io, "cottontail: failed to enable the JSC sampling profiler\n", .{});
+    }
+    execution.exit_code = if (execution.embedded_source) |source|
+        js_runtime.runSource(source, execution.runnable_path)
+    else
+        js_runtime.runFile(execution.runnable_path);
+    if (profiler_options.enabled()) {
+        const raw_profile = js_runtime.takeSamplingProfile() catch |err| {
+            writeStderr(execution.io, "cottontail: failed to collect CPU profile: {s}\n", .{@errorName(err)});
+            execution.exit_code = 1;
+            return;
+        };
+        if (raw_profile) |profile| {
+            writeCpuProfiles(execution, profiler_options, profile) catch |err| {
+                writeStderr(execution.io, "cottontail: failed to write CPU profile: {s}\n", .{@errorName(err)});
+                execution.exit_code = 1;
+            };
+        } else {
+            writeStderr(execution.io, "cottontail: JSC returned no CPU profile\n", .{});
+            execution.exit_code = 1;
+        }
+    }
+}
+
+const CpuProfileOptions = struct {
+    json: bool = false,
+    markdown: bool = false,
+    dir: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    interval_us: u64 = 1000,
+
+    fn enabled(self: CpuProfileOptions) bool {
+        return self.json or self.markdown;
+    }
+};
+
+fn parseCpuProfileOptions(args: []const [:0]const u8) CpuProfileOptions {
+    var options: CpuProfileOptions = .{};
+    for (args, 0..) |arg_z, index| {
+        const arg: []const u8 = arg_z;
+        if (std.mem.eql(u8, arg, "--cpu-prof")) {
+            options.json = true;
+        } else if (std.mem.eql(u8, arg, "--cpu-prof-md")) {
+            options.markdown = true;
+        } else if (std.mem.startsWith(u8, arg, "--cpu-prof-dir=")) {
+            options.dir = arg["--cpu-prof-dir=".len..];
+        } else if (std.mem.eql(u8, arg, "--cpu-prof-dir") and index + 1 < args.len) {
+            options.dir = args[index + 1];
+        } else if (std.mem.startsWith(u8, arg, "--cpu-prof-name=")) {
+            options.name = arg["--cpu-prof-name=".len..];
+        } else if (std.mem.eql(u8, arg, "--cpu-prof-name") and index + 1 < args.len) {
+            options.name = args[index + 1];
+        } else if (std.mem.startsWith(u8, arg, "--cpu-prof-interval=")) {
+            options.interval_us = std.fmt.parseUnsigned(u64, arg["--cpu-prof-interval=".len..], 10) catch options.interval_us;
+        } else if (std.mem.eql(u8, arg, "--cpu-prof-interval") and index + 1 < args.len) {
+            options.interval_us = std.fmt.parseUnsigned(u64, args[index + 1], 10) catch options.interval_us;
+        }
+    }
+    if (options.interval_us == 0) options.interval_us = 1000;
+    return options;
+}
+
+const CpuCallFrame = struct {
+    functionName: []const u8,
+    scriptId: []const u8,
+    url: []const u8,
+    lineNumber: i64,
+    columnNumber: i64,
+};
+
+const CpuProfileNode = struct {
+    id: u32,
+    callFrame: CpuCallFrame,
+    hitCount: u32,
+    children: []const u32,
+};
+
+const MutableCpuProfileNode = struct {
+    id: u32,
+    call_frame: CpuCallFrame,
+    parent_id: u32,
+    hit_count: u32 = 0,
+    total_samples: u32 = 0,
+    children: std.ArrayList(u32) = .empty,
+};
+
+const ChromeCpuProfile = struct {
+    nodes: []const CpuProfileNode,
+    startTime: u64,
+    endTime: u64,
+    samples: []const u32,
+    timeDeltas: []const u64,
+};
+
+const BuiltCpuProfile = struct {
+    chrome: ChromeCpuProfile,
+    mutable_nodes: []const MutableCpuProfileNode,
+    interval_us: u64,
+};
+
+fn jsonNumber(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
+        else => null,
+    };
+}
+
+fn jsonUnsigned(value: std.json.Value) ?u64 {
+    const number = jsonNumber(value) orelse return null;
+    if (number < 0 or number > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return null;
+    return @intFromFloat(number);
+}
+
+fn chromePosition(value: ?std.json.Value) i64 {
+    const position = jsonUnsigned(value orelse return -1) orelse return -1;
+    if (position == 0 or position >= std.math.maxInt(u32)) return -1;
+    return @intCast(position - 1);
+}
+
+fn cpuSourceUrl(
+    allocator: std.mem.Allocator,
+    sources: *const std.AutoHashMapUnmanaged(u64, []const u8),
+    source_id: u64,
+) ![]const u8 {
+    const url = sources.get(source_id) orelse return "";
+    if (!std.fs.path.isAbsolute(url)) return url;
+    if (builtin.os.tag == .windows) return try std.fmt.allocPrint(allocator, "file:///{s}", .{url});
+    return try std.fmt.allocPrint(allocator, "file://{s}", .{url});
+}
+
+fn buildCpuProfile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    raw_profile: []const u8,
+    configured_interval_us: u64,
+) !BuiltCpuProfile {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_profile, .{});
+    if (parsed.value != .object) return error.InvalidCpuProfile;
+    const raw_object = parsed.value.object;
+
+    var source_urls: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
+    if (raw_object.get("sources")) |sources| {
+        if (sources == .array) for (sources.array.items) |source| {
+            if (source != .object) continue;
+            const source_id = jsonUnsigned(source.object.get("sourceID") orelse continue) orelse continue;
+            const url_value = source.object.get("url") orelse continue;
+            if (url_value != .string) continue;
+            try source_urls.put(allocator, source_id, url_value.string);
+        };
+    }
+
+    var nodes: std.ArrayList(MutableCpuProfileNode) = .empty;
+    try nodes.append(allocator, .{
+        .id = 1,
+        .parent_id = 0,
+        .call_frame = .{
+            .functionName = "(root)",
+            .scriptId = "0",
+            .url = "",
+            .lineNumber = -1,
+            .columnNumber = -1,
+        },
+    });
+    var node_ids: std.StringHashMapUnmanaged(u32) = .empty;
+    var samples: std.ArrayList(u32) = .empty;
+    var time_deltas: std.ArrayList(u64) = .empty;
+
+    const raw_interval_seconds = if (raw_object.get("interval")) |value| jsonNumber(value) orelse 0.001 else 0.001;
+    const interval_us: u64 = if (configured_interval_us != 1000)
+        configured_interval_us
+    else
+        @max(1, @as(u64, @intFromFloat(@max(0.000001, raw_interval_seconds) * 1_000_000.0)));
+    var first_timestamp: ?f64 = null;
+    var last_timestamp: ?f64 = null;
+
+    if (raw_object.get("traces")) |traces| {
+        if (traces == .array) for (traces.array.items) |trace| {
+            if (trace != .object) continue;
+            const timestamp = jsonNumber(trace.object.get("timestamp") orelse continue) orelse continue;
+            const frames = trace.object.get("frames") orelse continue;
+            if (frames != .array) continue;
+
+            const previous_timestamp = last_timestamp;
+            if (first_timestamp == null) first_timestamp = timestamp;
+            last_timestamp = timestamp;
+            const delta_us = if (previous_timestamp) |previous|
+                @as(u64, @intFromFloat(@max(0.0, timestamp - previous) * 1_000_000.0))
+            else
+                interval_us;
+            try time_deltas.append(allocator, delta_us);
+
+            var parent_id: u32 = 1;
+            nodes.items[0].total_samples += 1;
+            var frame_index = frames.array.items.len;
+            while (frame_index > 0) {
+                frame_index -= 1;
+                const frame = frames.array.items[frame_index];
+                if (frame != .object) continue;
+                const source_id = jsonUnsigned(frame.object.get("sourceID") orelse .{ .integer = 0 }) orelse 0;
+                const raw_name = frame.object.get("name") orelse std.json.Value{ .string = "" };
+                const function_name = if (raw_name == .string and raw_name.string.len > 0) raw_name.string else "(anonymous)";
+                const line_number = chromePosition(frame.object.get("line"));
+                const column_number = chromePosition(frame.object.get("column"));
+                const key = try std.fmt.allocPrint(
+                    allocator,
+                    "{d}\x00{d}\x00{d}\x00{d}\x00{s}",
+                    .{ parent_id, source_id, line_number, column_number, function_name },
+                );
+
+                var node_id = node_ids.get(key);
+                if (node_id == null) {
+                    const new_id: u32 = @intCast(nodes.items.len + 1);
+                    try node_ids.put(allocator, key, new_id);
+                    try nodes.append(allocator, .{
+                        .id = new_id,
+                        .parent_id = parent_id,
+                        .call_frame = .{
+                            .functionName = function_name,
+                            .scriptId = try std.fmt.allocPrint(allocator, "{d}", .{source_id}),
+                            .url = try cpuSourceUrl(allocator, &source_urls, source_id),
+                            .lineNumber = line_number,
+                            .columnNumber = column_number,
+                        },
+                    });
+                    try nodes.items[parent_id - 1].children.append(allocator, new_id);
+                    node_id = new_id;
+                }
+                parent_id = node_id.?;
+                nodes.items[parent_id - 1].total_samples += 1;
+            }
+            nodes.items[parent_id - 1].hit_count += 1;
+            try samples.append(allocator, parent_id);
+        };
+    }
+
+    const now_ns = std.Io.Clock.real.now(io).nanoseconds;
+    const end_time: u64 = @intCast(@max(0, @divTrunc(now_ns, 1000)));
+    const duration_us: u64 = if (first_timestamp != null and last_timestamp != null)
+        @intFromFloat(@max(0.0, last_timestamp.? - first_timestamp.?) * 1_000_000.0)
+    else
+        0;
+    const start_time = end_time -| duration_us;
+
+    const chrome_nodes = try allocator.alloc(CpuProfileNode, nodes.items.len);
+    for (nodes.items, 0..) |node, index| {
+        chrome_nodes[index] = .{
+            .id = node.id,
+            .callFrame = node.call_frame,
+            .hitCount = node.hit_count,
+            .children = node.children.items,
+        };
+    }
+    return .{
+        .chrome = .{
+            .nodes = chrome_nodes,
+            .startTime = start_time,
+            .endTime = end_time,
+            .samples = samples.items,
+            .timeDeltas = time_deltas.items,
+        },
+        .mutable_nodes = nodes.items,
+        .interval_us = interval_us,
+    };
+}
+
+fn cpuProfileMarkdown(allocator: std.mem.Allocator, profile: BuiltCpuProfile) ![]const u8 {
+    var output = std.array_list.Managed(u8).init(allocator);
+    const duration_us = profile.chrome.endTime -| profile.chrome.startTime;
+    try output.print(
+        "# CPU Profile\n\n| Duration | Samples | Interval | Functions |\n|----------|---------|----------|-----------|\n| {d:.3} ms | {d} | {d} us | {d} |\n\n",
+        .{ @as(f64, @floatFromInt(duration_us)) / 1000.0, profile.chrome.samples.len, profile.interval_us, profile.mutable_nodes.len -| 1 },
+    );
+
+    try output.appendSlice("## Hot Functions (Self Time)\n\n| Function | Self Time | Samples |\n|----------|-----------|---------|\n");
+    for (profile.mutable_nodes[1..]) |node| {
+        if (node.hit_count == 0) continue;
+        try output.print("| `{s}` | {d} us | {d} |\n", .{ node.call_frame.functionName, @as(u64, node.hit_count) * profile.interval_us, node.hit_count });
+    }
+
+    try output.appendSlice("\n## Call Tree (Total Time)\n\n| Function | Total Time | Samples |\n|----------|------------|---------|\n");
+    for (profile.mutable_nodes[1..]) |node| {
+        try output.print("| `{s}` | {d} us | {d} |\n", .{ node.call_frame.functionName, @as(u64, node.total_samples) * profile.interval_us, node.total_samples });
+    }
+
+    try output.appendSlice("\n## Function Details\n\n");
+    for (profile.mutable_nodes[1..]) |node| {
+        const parent = profile.mutable_nodes[node.parent_id - 1];
+        try output.print("### `{s}`\n\n", .{node.call_frame.functionName});
+        if (node.call_frame.url.len > 0) {
+            try output.print("- **Location:** `{s}:{d}:{d}`\n", .{ node.call_frame.url, node.call_frame.lineNumber + 1, node.call_frame.columnNumber + 1 });
+        }
+        try output.print("- **Called by:** `{s}`\n", .{parent.call_frame.functionName});
+        try output.appendSlice("- **Calls:** ");
+        if (node.children.items.len == 0) {
+            try output.appendSlice("None\n\n");
+        } else {
+            for (node.children.items, 0..) |child_id, index| {
+                if (index > 0) try output.appendSlice(", ");
+                try output.print("`{s}`", .{profile.mutable_nodes[child_id - 1].call_frame.functionName});
+            }
+            try output.appendSlice("\n\n");
+        }
+    }
+
+    try output.appendSlice("## Files\n\n");
+    var files: std.StringHashMapUnmanaged(void) = .empty;
+    for (profile.mutable_nodes[1..]) |node| {
+        const url = node.call_frame.url;
+        if (url.len == 0 or files.contains(url)) continue;
+        try files.put(allocator, url, {});
+        try output.print("- `{s}`\n", .{url});
+    }
+    return output.items;
+}
+
+fn cpuProfilePath(
+    allocator: std.mem.Allocator,
+    options: CpuProfileOptions,
+    default_name: []const u8,
+    use_custom_name: bool,
+) ![]const u8 {
+    const name = if (use_custom_name) options.name orelse default_name else default_name;
+    if (options.dir) |dir| return try std.fs.path.join(allocator, &.{ dir, name });
+    return name;
+}
+
+fn writeCpuProfiles(execution: *ScriptExecution, options: CpuProfileOptions, raw_profile: []const u8) !void {
+    const profile = try buildCpuProfile(execution.io, execution.allocator, raw_profile, options.interval_us);
+    if (options.dir) |dir| try std.Io.Dir.cwd().createDirPath(execution.io, dir);
+
+    const suffix = try std.fmt.allocPrint(execution.allocator, "{d}", .{profile.chrome.endTime});
+    if (options.json) {
+        const default_name = try std.fmt.allocPrint(execution.allocator, "CPU.{s}.cpuprofile", .{suffix});
+        const use_custom_name = options.name != null and (!options.markdown or std.mem.endsWith(u8, options.name.?, ".cpuprofile"));
+        const path = try cpuProfilePath(execution.allocator, options, default_name, use_custom_name);
+        const json = try std.json.Stringify.valueAlloc(execution.allocator, profile.chrome, .{});
+        try std.Io.Dir.cwd().writeFile(execution.io, .{ .sub_path = path, .data = json });
+    }
+    if (options.markdown) {
+        const default_name = try std.fmt.allocPrint(execution.allocator, "CPU.{s}.md", .{suffix});
+        const use_custom_name = options.name != null and (!options.json or std.mem.endsWith(u8, options.name.?, ".md"));
+        const path = try cpuProfilePath(execution.allocator, options, default_name, use_custom_name);
+        const markdown = try cpuProfileMarkdown(execution.allocator, profile);
+        try std.Io.Dir.cwd().writeFile(execution.io, .{ .sub_path = path, .data = markdown });
+    }
 }
 
 fn writeStderr(io: std.Io, comptime fmt: []const u8, args: anytype) void {
@@ -434,6 +846,7 @@ fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias
     try appendRuntimeAlias(ctx, &aliases, "bun:sqlite", "bun/sqlite.js");
     try appendRuntimeAlias(ctx, &aliases, "bun:test", "bun/test.js");
     try appendRuntimeAlias(ctx, &aliases, "bun:internal-for-testing", "bun/internal-for-testing.js");
+    try appendRuntimeAlias(ctx, &aliases, "bun:wrap", "bun/wrap.js");
     try appendRuntimeAlias(ctx, &aliases, "vitest", "bun/test.js");
     try appendRuntimeAlias(ctx, &aliases, "string-width", "bun/string-width.js");
     try appendRuntimeAlias(ctx, &aliases, "strip-ansi", "bun/strip-ansi.js");
@@ -459,6 +872,7 @@ fn bundleScriptNative(
     exec_args: []const [:0]const u8,
     script_args: []const [:0]const u8,
     source_base_dir: ?[]const u8,
+    build_options: ?native_bundler.BundleOptions,
 ) ![]const u8 {
     const tmp_dir = try ensureTempDir(ctx);
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
@@ -496,17 +910,18 @@ fn bundleScriptNative(
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
 
     var error_message: ?[*:0]u8 = null;
+    var options = build_options orelse native_bundler.BundleOptions{};
+    options.aliases = aliases;
+    options.conditions = conditions.items;
+    options.tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
+    options.include_runtime_modules = true;
+    options.preserve_external_require_name = true;
+    options.inline_import_meta_properties = true;
+    options.skip_teardown = true;
     const output = native_bundler.bundleEntryPointWithOptions(
         wrapped_entry,
         ctx.project_root,
-        .{
-            .aliases = aliases,
-            .conditions = conditions.items,
-            .tsconfig_override = try tsconfigOverridePath(ctx, exec_args),
-            .include_runtime_modules = true,
-            .inline_import_meta_properties = true,
-            .skip_teardown = true,
-        },
+        options,
         &error_message,
     ) catch |err| {
         if (error_message) |message| {
@@ -515,6 +930,8 @@ fn bundleScriptNative(
             // A build/resolve error was already reported to the user. Match
             // `bun run` by exiting cleanly instead of unwinding through main,
             // which prints a (slow to symbolize) Zig error-return trace.
+            cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
             std.process.exit(1);
         }
         ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
@@ -947,6 +1364,7 @@ fn writeCottontailEntryWrapper(
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
         \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});
+        \\globalThis.require ??= globalThis.__ctMetaRequire;
         \\globalThis.__ctMetaResolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
         \\globalThis.__ctMetaResolve ??= (specifier) => {{
         \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
@@ -988,8 +1406,7 @@ fn writeWasiEntryWrapper(
     );
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const script_literal = try jsonStringLiteral(ctx, script_abs);
-    const source = try std.fmt.allocPrint(
-        ctx.allocator,
+    const source = try std.fmt.allocPrint(ctx.allocator,
         \\import {{ readFileSync }} from "node:fs";
         \\import {{ WASI }} from "node:wasi";
         \\const __ctWasi = new WASI({{ version: "preview1", args: process.argv.slice(1), env: process.env }});
@@ -1066,6 +1483,11 @@ fn writeBunCompatTransformedSource(
     ) catch return script_abs;
     var transformed_source: []const u8 = source;
     var changed = false;
+    const has_bun_transpiled_pragma = hasBunTranspiledPragma(source);
+    // A `// @bun` artifact is already JavaScript even when its filename ends
+    // in `.ts`. Give the compiler a generated `.js` path so type syntax is
+    // rejected instead of silently stripped.
+    if (has_bun_transpiled_pragma) changed = true;
     if (std.mem.indexOf(u8, source, ".__esModule") != null) {
         if (try rewriteNamespaceEsModuleAssignments(ctx.allocator, source)) |transformed| {
             transformed_source = transformed;
@@ -1106,16 +1528,31 @@ fn writeBunCompatTransformedSource(
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const ext = blk: {
         const value = std.fs.path.extension(script_abs);
-        break :blk if (value.len == 0) ".ts" else value;
+        break :blk if (has_bun_transpiled_pragma) ".js" else if (value.len == 0) ".ts" else value;
     };
+    var invocation_bytes: [8]u8 = undefined;
+    ctx.io.random(&invocation_bytes);
     const generated_name = try std.fmt.allocPrint(
         ctx.allocator,
-        ".cottontail-compat-{x}{s}",
-        .{ std.hash.Wyhash.hash(0, source), ext },
+        ".cottontail-compat-{x}-{x}{s}",
+        .{ std.hash.Wyhash.hash(0, source), std.hash.Wyhash.hash(0, &invocation_bytes), ext },
     );
     const generated_path = try std.fs.path.join(ctx.allocator, &.{ script_dir, generated_name });
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = transformed_source }) catch return script_abs;
     return generated_path;
+}
+
+fn hasBunTranspiledPragma(source: []const u8) bool {
+    var line_start: usize = 0;
+    if (std.mem.startsWith(u8, source, "#!")) {
+        line_start = if (std.mem.indexOfScalar(u8, source, '\n')) |newline| newline + 1 else return false;
+    }
+    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+    const line = std.mem.trim(u8, source[line_start..line_end], " \t\r");
+    if (!std.mem.startsWith(u8, line, "//")) return false;
+    const comment = std.mem.trimStart(u8, line[2..], " \t");
+    if (!std.mem.startsWith(u8, comment, "@bun")) return false;
+    return comment.len == "@bun".len or std.ascii.isWhitespace(comment["@bun".len]);
 }
 
 /// Replace `import.meta.url`, `import.meta.path`, `import.meta.filename` and
@@ -1902,7 +2339,8 @@ fn appendDynamicTargetFactory(
     if (cjs_source) |transpiled| {
         if (use_runtime_factory) {
             const factory_source = if (target.mutable_namespace)
-                try std.fmt.allocPrint(ctx.allocator,
+                try std.fmt.allocPrint(
+                    ctx.allocator,
                     "{s}\nconst __ctUpdateLexicalBindings = (value) => {{ for (const name of Object.keys(value ?? {{}})) {{ if (!Object.hasOwn(module.exports, name)) continue; try {{ eval(name + \" = value[name]\"); }} catch {{}} }} }}; globalThis.__cottontailRegisterModuleBindings?.({s}, __ctUpdateLexicalBindings); globalThis.__cottontailRegisterModuleBindings?.({s}, __ctUpdateLexicalBindings);",
                     .{ transpiled, mock_key_literal, path_literal },
                 )
@@ -1921,7 +2359,8 @@ fn appendDynamicTargetFactory(
     const return_expression = if (is_cjs_target)
         try std.fmt.allocPrint(ctx.allocator, "__ctCommonJSNamespace(module.exports, {s})", .{if (package_type_module) "true" else "false"})
     else if (target.mutable_namespace)
-        try std.fmt.allocPrint(ctx.allocator,
+        try std.fmt.allocPrint(
+            ctx.allocator,
             "(() => {{ const namespace = __ctMutableNamespace(module.exports); const update = value => Object.assign(namespace, value ?? {{}}); globalThis.__cottontailRegisterModuleBindings({s}, update); globalThis.__cottontailRegisterModuleBindings({s}, update); return namespace; }})()",
             .{ path_literal, mock_key_literal },
         )
@@ -2445,6 +2884,7 @@ fn writeCommonJsEntryWrapper(
 
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
     const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
+    const bun_wrap_module = try runtimeModulePath(ctx, &.{ "bun", "wrap.js" });
     const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
     const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
     const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
@@ -2629,6 +3069,7 @@ fn writeCommonJsEntryWrapper(
         \\import * as tls from {s};
         \\import * as sqlite from {s};
         \\import * as bunInternalForTesting from {s};
+        \\import * as bunWrap from {s};
         \\
     ,
         .{
@@ -2643,6 +3084,7 @@ fn writeCommonJsEntryWrapper(
             try jsonStringLiteral(ctx, tls_module),
             try jsonStringLiteral(ctx, sqlite_module),
             try jsonStringLiteral(ctx, bun_internal_for_testing_module),
+            try jsonStringLiteral(ctx, bun_wrap_module),
         },
     );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
@@ -2723,7 +3165,8 @@ fn writeCommonJsEntryWrapper(
         \\  "dns/promises": dnsPromises, "node:dns/promises": dnsPromises,
         \\  tls, "node:tls": tls,
         \\  "bun:internal-for-testing": bunInternalForTesting,
-        \\  "internal-for-testing": bunInternalForTesting
+        \\  "internal-for-testing": bunInternalForTesting,
+        \\  "bun:wrap": bunWrap
         \\}});
         \\{s}
         \\

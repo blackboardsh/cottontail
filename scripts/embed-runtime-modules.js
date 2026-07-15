@@ -6,6 +6,7 @@ import { join, relative, resolve, sep } from 'node:path';
 const rootDir = resolve(import.meta.dirname, '..');
 const outputPath = process.argv[2];
 const sourceDir = resolve(process.argv[3] ?? join(rootDir, 'src', 'runtime_modules'));
+const compilerRuntimePath = resolve(process.argv[4] ?? join(rootDir, 'src', 'compiler', 'src', 'runtime.js'));
 
 if (!outputPath) {
   console.error('usage: node scripts/embed-runtime-modules.js <output>');
@@ -21,15 +22,18 @@ function collectFiles(directory, files = []) {
   return files;
 }
 
-const files = collectFiles(sourceDir).sort((a, b) => a.localeCompare(b));
+const files = collectFiles(sourceDir)
+  .map(file => ({ file, path: relative(sourceDir, file).split(sep).join('/') }));
+files.push({ file: compilerRuntimePath, path: 'bun/wrap.js' });
+files.sort((a, b) => a.path.localeCompare(b.path));
 const header = Buffer.allocUnsafe(8);
 header.write('CTRM', 0, 4, 'ascii');
 header.writeUInt32LE(files.length, 4);
 const chunks = [header];
 
-for (const file of files) {
-  const path = Buffer.from(relative(sourceDir, file).split(sep).join('/'));
-  const contents = readFileSync(file);
+for (const entry of files) {
+  const path = Buffer.from(entry.path);
+  const contents = readFileSync(entry.file);
   const record = Buffer.allocUnsafe(8);
   record.writeUInt32LE(path.length, 0);
   record.writeUInt32LE(contents.length, 4);
