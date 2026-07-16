@@ -17,7 +17,7 @@ if (!type || !["beta", "patch", "minor", "major", "stable"].includes(type)) {
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(scriptDir, "..");
 const packageJsonPath = join(repoRoot, "package.json");
-const mainZigPath = join(repoRoot, "src", "main.zig");
+const versionZigPath = join(repoRoot, "src", "version.zig");
 
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
 const currentVersion = packageJson.version;
@@ -44,17 +44,17 @@ const tagName = `v${newVersion}`;
 
 console.log(`New version: ${newVersion}`);
 
-let mainZig = readFileSync(mainZigPath, "utf-8");
-mainZig = mainZig.replace(
-	/const version = ".*";/,
-	`const version = "${newVersion}";`,
+let versionZig = readFileSync(versionZigPath, "utf-8");
+versionZig = versionZig.replace(
+	/pub const version = ".*";/,
+	`pub const version = "${newVersion}";`,
 );
-writeFileSync(mainZigPath, mainZig);
-console.log(`Updated src/main.zig version to ${newVersion}`);
+writeFileSync(versionZigPath, versionZig);
+console.log(`Updated src/version.zig version to ${newVersion}`);
 
 console.log(`Creating commit and tag: ${tagName}`);
 
-execSync(`git add package.json src/main.zig`, {
+execSync(`git add package.json src/version.zig`, {
 	cwd: repoRoot,
 	stdio: "inherit",
 });

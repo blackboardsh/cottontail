@@ -32,6 +32,7 @@
     "electrobun:window": "bun run run -- electrobun examples/electrobun-window.js",
     "test": "bun run test:zig && bun run test:js",
     "test:blocking": "bun run test && bun run test:electrobun && bun run test:electrobun:cli",
+    "release": "bun scripts/tag-release.js",
     "push:beta": "bun run test:blocking && bun scripts/push-version.js beta",
     "push:patch": "bun run test:blocking && bun scripts/push-version.js patch",
     "push:minor": "bun run test:blocking && bun scripts/push-version.js minor",

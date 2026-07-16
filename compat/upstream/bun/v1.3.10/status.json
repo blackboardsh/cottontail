@@ -3,6 +3,76 @@
   "defaultStatus": "not-enabled",
   "patterns": [
     {
+      "pattern": "^test/regression/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: the remaining 64 regression files fail under Cottontail across package-manager, transpiler-diagnostic, process, networking, module, and error-format behavior; eight hit either the harness or file timeout. More specific passing regression patterns below override this strict-xfail fallback."
+    },
+    {
+      "pattern": "^test/bundler/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: the remaining 11 bundler files fail in compile/defer/feature-flag, native-plugin, standalone, CLI, or runtime-transpiler coverage. Explicit passing bundler entries below override this strict-xfail fallback."
+    },
+    {
+      "pattern": "^test/cli/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: 34 of the remaining 35 CLI files fail in package-manager, nested run/test, coverage, watch, profile, workspace, or lifecycle behavior; run-unicode is enabled by an exact override below."
+    },
+    {
+      "pattern": "^test/config/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: the remaining bunfig preload coverage fails under Cottontail. Explicit passing config entries override this strict-xfail fallback."
+    },
+    {
+      "pattern": "^test/internal/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: Bun's remaining repository-policy and bindgen-internal files fail because their Bun source/build infrastructure is not present in Cottontail."
+    },
+    {
+      "pattern": "^test/integration/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: all nine remaining framework/tool integration files fail in dependency installation, native-addon, dev-server, or package-manager setup before completing their application assertions."
+    },
+    {
+      "pattern": "^test/v8/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: Bun's remaining V8-compatibility aggregate fails under Cottontail's stock JavaScriptCore runtime."
+    },
+    {
+      "pattern": "^test/js/node/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: 46 of the remaining 48 Node files fail across full/stress suites for child_process, crypto, DNS, fs, HTTP/2, inspector, net, process, TLS, streams, workers, watch, and zlib; seven time out. Existing passing entries and two exact pass overrides below take precedence."
+    },
+    {
+      "pattern": "^test/js/(?:first_party|junit-reporter|web|workerd)/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: all 29 remaining first-party/web files fail across Undici/ws, fetch and streaming stress, WebSocket, worker, leak, JUnit, and workerd HTMLRewriter coverage; twelve hit the 12-second discovery timeout."
+    },
+    {
+      "pattern": "^test/js/third_party/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: 35 of the remaining 38 third-party files fail through native-addon, package-manager, framework, protocol, or runtime behavior; three grpc-js files are enabled by an exact override below. Existing passing package entries also take precedence."
+    },
+    {
+      "pattern": "^test/js/sql/",
+      "status": "expected-failure",
+      "reason": "Measured unclassified baseline: all four remaining Bun.SQL adapter precedence, override, SQLite query, and SQLite URL parsing files fail under Cottontail."
+    },
+    {
+      "pattern": "^test/cli/run/run-unicode\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
+    },
+    {
+      "pattern": "^test/js/node/(?:cluster\\.test\\.ts|util/node-inspect-tests/parallel/util-inspect-getters-accessing-this\\.test\\.js)$",
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: Node cluster compatibility and util.inspect getter receiver behavior pass four copied upstream cases."
+    },
+    {
+      "pattern": "^test/js/third_party/grpc-js/test-(?:call-propagation|deadline|server-deadlines)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Serially confirmed after unclassified discovery: grpc-js propagation and client/server deadline behavior pass 13 copied upstream cases."
+    },
+    {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
       "status": "enabled",
       "reason": "First Bun upstream tier: direct Bun JavaScript API tests under test/js/bun."
@@ -194,6 +264,14 @@
     }
   ],
   "tests": {
+    "test/bundler/bun-build-api.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.build options, artifacts, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, and macros pass the copied upstream file (35 cases, 1 upstream todo, 156 assertions). The bytecode-only case is excluded because stock JSCOnly exposes no cached-bytecode serializer.",
+      "args": [
+        "--test-name-pattern=^(?!.*bytecode works).*"
+      ],
+      "timeoutMs": 120000
+    },
     "test/bundler/bundler_edgecase.test.ts": {
       "status": "enabled",
       "reason": "The copied bundler edge-case corpus completes successfully on Cottontail's native bundler pipeline at the normal upstream-test timeout."
@@ -230,6 +308,11 @@
     "test/bundler/transpiler/jsx-production.test.ts": {
       "status": "enabled",
       "reason": "Production JSX transform modes and generated output behavior pass upstream coverage under Cottontail."
+    },
+    "test/bundler/transpiler/macro-test.test.ts": {
+      "status": "enabled",
+      "reason": "Bundle-time macros pass Bun builtin, Latin-1/UTF-16/control-string, collection, alias, default/namespace import, type-coercion, and async return coverage using Cottontail's isolated stock-JSC evaluator (10 cases, 72 assertions).",
+      "timeoutMs": 120000
     },
     "test/js/deno/event/custom-event.test.ts": {
       "status": "enabled",
@@ -285,11 +368,15 @@
     },
     "test/bundler/bundler_banner.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "Banner placement passes across browser/Bun targets, ESM/CJS formats, minification, and source/banner hashbangs (8 bun:test cases, 11 assertions). Three bytecode-only cases are excluded because stock JSCOnly exposes no cached-bytecode serializer; Cottontail rejects bytecode builds explicitly instead of emitting unusable artifacts.",
+      "args": [
+        "--test-name-pattern=^(?!.*Bytecode).*"
+      ]
     },
     "test/bundler/bundler_barrel.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 45 literal itBundled cases pass through Bun's per-case filter. The owned runner isolates them because registering the whole fixture matrix in one JSC process retains tens of gigabytes of test data.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_browser.test.ts": {
       "status": "enabled",
@@ -297,15 +384,21 @@
     },
     "test/bundler/bundler_bun.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "Nine Bun-target cases pass with 13 assertions, including sqlite assets, source-map diagnostics, package conditions, and CLI defines. The owned runner isolates the generated matrix to bound retained fixture memory.",
+      "splitBundlerTests": true,
+      "expectedFailureBundlerTests": {
+        "bun/import-bun-format-cjs": "Bun's --bytecode format requires private JavaScriptCore cached-bytecode APIs that stock JSC does not expose; Cottontail intentionally uses unmodified JSC."
+      }
     },
     "test/bundler/bundler_cjs.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 23 generated CommonJS/ESM interop cases pass with 23 assertions. The owned runner isolates them instead of accepting the old zero-test result.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_cjs2esm.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 16 generated CJS-to-ESM optimization cases pass with 23 assertions. The owned runner isolates them instead of accepting the old zero-test result.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_comments.test.ts": {
       "status": "enabled",
@@ -345,11 +438,19 @@
     },
     "test/bundler/bundler_jsx.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "Twenty-nine generated JSX cases pass with 40 assertions across automatic/classic runtimes, custom factories and import sources, production mode, externals, tsconfig, and side-effect annotations. Four cases retain Bun's own todo status because their fixture expectations are internally inconsistent.",
+      "splitBundlerTests": true,
+      "expectedFailureBundlerTests": {
+        "jsx/AutomaticFragmentDev": "Upstream marks this case todo and expects only the final fragment even though its fixture prints two preceding JSX values.",
+        "jsx/AutomaticFragmentProd": "Upstream marks this case todo and expects only the final fragment even though its fixture prints two preceding JSX values.",
+        "jsx/ImportSourceProd": "Upstream marks production todo but expects the development fragment symbol from the production custom JSX runtime.",
+        "jsx/PragmaMultipleProd": "Upstream marks this case todo and expects React production element semantics that its copied local react/jsx-runtime fixture does not implement."
+      }
     },
     "test/bundler/bundler_loader.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 27 generated itBundled cases pass with 20 assertions across Bun, Node, and browser targets, covering import attributes, text/YAML/JSON/TOML/Wasm/file loaders, plugin-loaded entry assets, empty files, and literal '#' path segments. The owned runner isolates cases to bound retained fixture memory.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_minify.test.ts": {
       "status": "enabled",
@@ -369,11 +470,13 @@
     },
     "test/bundler/bundler_plugin.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 56 generated itBundled cases pass with 122 assertions, covering resolve/load callbacks, namespaces, thrown errors and source positions, entry points, initialOptions, file assets, callback stress, and onEnd behavior. The owned runner isolates cases to bound retained fixture memory.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_plugin_chain.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 13 generated itBundled cases pass with 29 assertions, covering callback continuation/stopping, entry-point chains, and null, object, and primitive callback results. The owned runner isolates cases to bound retained fixture memory.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_promiseall_deadcode.test.ts": {
       "status": "enabled",
@@ -385,7 +488,8 @@
     },
     "test/bundler/bundler_splitting.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "The owned runner exposes and isolates all 10 generated JavaScript/CSS code-splitting cases instead of accepting the old zero-test result.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_string.test.ts": {
       "status": "enabled",
@@ -2948,6 +3052,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
+    "test/js/web/fetch/response.test.ts": {
+      "status": "enabled",
+      "reason": "Response construction, redirect/json helpers, stack-overflow handling, and body cloning pass the copied upstream file (14 bun:test cases, 41 assertions)."
+    },
     "test/js/web/fetch/server-response-stream-leak.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
@@ -3093,8 +3201,8 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
     "test/regression/issue/03830.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires bundle-time macro execution (`import ... assert { type: 'macro' }` runs user JS inside the bundler via JSC and converts the result back to AST). Cottontail's bundler treats the macro as a regular import: `cottontail build --minify` exits 0 and inlines fn() instead of failing with the snapshotted 'Cannot convert argument type to JS' macro error (verified twice)."
+      "status": "enabled",
+      "reason": "Macro argument conversion rejects unsupported call expressions with Bun's expected build error instead of executing arbitrary code or crashing (1 case, 2 assertions)."
     },
     "test/regression/issue/03844/03844.test.ts": {
       "status": "enabled",
@@ -3601,6 +3709,10 @@
     "test/regression/issue/26358.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 10 assertions)."
+    },
+    "test/regression/issue/26360.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.build called from a bundle-time macro throws instead of recursively hanging, while ordinary Bun.build remains usable (3 cases, 6 assertions)."
     },
     "test/regression/issue/26377.test.ts": {
       "status": "enabled",

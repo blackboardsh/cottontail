@@ -638,6 +638,19 @@ fn getAST(
         .file, .wasm => {
             bun.assert(loader.shouldCopyForBundling());
 
+            if (loader == .file and transpiler.options.runtime_file_loader_paths) {
+                const root = Expr.init(E.String, .{ .data = source.path.text }, .{ .start = 0 });
+                return JSAst.init((try js_parser.newLazyExportAST(
+                    allocator,
+                    transpiler.options.define,
+                    opts,
+                    log,
+                    root,
+                    source,
+                    "",
+                )).?);
+            }
+
             // Put a unique key in the AST to implement the URL loader. At the end
             // of the bundle, the key is replaced with the actual URL.
             const content_hash = ContentHasher.run(source.contents);

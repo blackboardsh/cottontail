@@ -421,7 +421,11 @@ pub fn VisitExpr(
                     if (comptime allow_macros) {
                         const ref = switch (e_.tag.?.data) {
                             .e_import_identifier => |ident| ident.ref,
-                            .e_dot => |dot| if (dot.target.data == .e_identifier) dot.target.data.e_identifier.ref else null,
+                            .e_dot => |dot| switch (dot.target.data) {
+                                .e_identifier => |identifier| identifier.ref,
+                                .e_import_identifier => |identifier| identifier.ref,
+                                else => null,
+                            },
                             else => null,
                         };
 
@@ -1285,10 +1289,11 @@ pub fn VisitExpr(
                 const is_macro_ref: bool = if (comptime allow_macros) brk: {
                     const possible_macro_ref = switch (e_.target.data) {
                         .e_import_identifier => |ident| ident.ref,
-                        .e_dot => |dot| if (dot.target.data == .e_identifier)
-                            dot.target.data.e_identifier.ref
-                        else
-                            null,
+                        .e_dot => |dot| switch (dot.target.data) {
+                            .e_identifier => |identifier| identifier.ref,
+                            .e_import_identifier => |identifier| identifier.ref,
+                            else => null,
+                        },
                         else => null,
                     };
 
@@ -1452,7 +1457,11 @@ pub fn VisitExpr(
                     if (is_macro_ref and !p.options.features.is_macro_runtime) {
                         const ref = switch (e_.target.data) {
                             .e_import_identifier => |ident| ident.ref,
-                            .e_dot => |dot| dot.target.data.e_identifier.ref,
+                            .e_dot => |dot| switch (dot.target.data) {
+                                .e_identifier => |identifier| identifier.ref,
+                                .e_import_identifier => |identifier| identifier.ref,
+                                else => unreachable,
+                            },
                             else => unreachable,
                         };
 

@@ -612,6 +612,12 @@ function splitSpecifierSuffix(value) {
   const text = String(value);
   const index = specifierSuffixIndex(text);
   if (index < 0) return { bare: text, suffix: "" };
+  const lastSeparator = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
+  if (index < lastSeparator && (text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text))) {
+    try {
+      if (cottontail.existsSync(text)) return { bare: text, suffix: "" };
+    } catch {}
+  }
   return { bare: text.slice(0, index), suffix: text.slice(index) };
 }
 
@@ -698,6 +704,20 @@ function isBuiltinHiddenByCompatProfile(id) {
 
 function resolveRequestCore(request, basePath) {
   const originalText = String(request);
+  const suffixIndex = specifierSuffixIndex(originalText);
+  const lastSeparator = Math.max(originalText.lastIndexOf("/"), originalText.lastIndexOf("\\"));
+  if (suffixIndex >= 0 && suffixIndex < lastSeparator && (
+    originalText.startsWith(".") ||
+    originalText.startsWith("/") ||
+    /^[A-Za-z]:[\\/]/.test(originalText)
+  )) {
+    const exactStartDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+    const exactCandidate = originalText.startsWith("/") || /^[A-Za-z]:[\\/]/.test(originalText)
+      ? originalText
+      : resolve(exactStartDir, originalText);
+    const exact = resolveAsFile(exactCandidate) || resolveAsDirectory(exactCandidate);
+    if (exact) return exact;
+  }
   const { bare: text, suffix } = splitSpecifierSuffix(originalText);
   if (builtinModuleMap.has(text)) {
     if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
@@ -875,10 +895,14 @@ function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_W
 }
 
 function compileModuleWrapper(args, source, filename) {
+  const useNativeCompiler = typeof cottontail.compileFunction === "function";
   try {
+    if (useNativeCompiler) {
+      return cottontail.compileFunction(`(function(${args.join(",")}) {\n${source}\n})`, filename);
+    }
     return new Function(...args, `${source}\n//# sourceURL=${filename}`);
   } catch (error) {
-    throw markModuleCompileError(error, filename, source);
+    throw markModuleCompileError(error, filename, source, useNativeCompiler ? 1 : FUNCTION_WRAPPER_LINE_OFFSET);
   }
 }
 
@@ -888,7 +912,11 @@ function executeCommonJsSource(module, filename, source) {
     maybeRegisterSourceMap(filename, transformed);
     recordCompileCache(filename, transformed);
     const run = compileModuleWrapper(["exports", "require", "module", "__ctImportMeta"], transformed, filename);
-    run(module.exports, module.require, module, importMetaForModule(filename));
+    try {
+      run(module.exports, module.require, module, importMetaForModule(filename));
+    } catch (error) {
+      throw remapThrownModuleError(error);
+    }
     module.loaded = true;
     return module.exports;
   }
@@ -910,7 +938,11 @@ function executeCommonJsSource(module, filename, source) {
     filename,
   );
   const moduleDirname = dirname(filename);
-  wrapper(module.exports, module.require, module, filename, moduleDirname, filename, moduleDirname);
+  try {
+    wrapper(module.exports, module.require, module, filename, moduleDirname, filename, moduleDirname);
+  } catch (error) {
+    throw remapThrownModuleError(error);
+  }
   module.loaded = true;
   return module.exports;
 }
@@ -1870,6 +1902,116 @@ function maybeRegisterSourceMap(filename, source) {
     if (payload) sourceMapCache.set(String(filename), new SourceMap(payload));
   } catch {}
 }
+
+function remapRegisteredSourceMapStack(stack) {
+  return String(stack ?? "").replace(/([^\s()]+):(\d+):(\d+)/g, (frame, file, lineText, columnText) => {
+    let sourceMap = sourceMapCache.get(file);
+    if (!sourceMap) {
+      try {
+        maybeRegisterSourceMap(file, cottontail.readFile(file));
+        sourceMap = sourceMapCache.get(file);
+      } catch {}
+    }
+    if (!sourceMap) return frame;
+    const entry = sourceMap.findEntry(Number(lineText) - 1, Number(columnText) - 1);
+    if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return frame;
+    const source = String(entry.originalSource);
+    const resolvedSource = source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
+      ? source
+      : resolve(dirname(file), source);
+    return `${resolvedSource}:${entry.originalLine + 1}:${entry.originalColumn + 1}`;
+  });
+}
+
+function remapThrownModuleError(error) {
+  try {
+    const filename = typeof error?.sourceURL === "string" ? error.sourceURL : undefined;
+    if (filename) {
+      const generatedSource = cottontail.readFile(filename);
+      let sourceMap = sourceMapCache.get(filename);
+      if (!sourceMap) {
+        maybeRegisterSourceMap(filename, generatedSource);
+        sourceMap = sourceMapCache.get(filename);
+      }
+      Object.defineProperty(error, "__ctModuleErrorMetadata", {
+        value: { filename, generatedSource, sourceMap },
+        configurable: true,
+      });
+    }
+    if (error && typeof error.stack === "string") {
+      error.stack = remapRegisteredSourceMapStack(error.stack);
+    }
+  } catch {}
+  return error;
+}
+
+globalThis.__cottontailRemapModuleStackString ??= remapRegisteredSourceMapStack;
+
+function originalErrorLocation(error, metadata) {
+  const sourceMap = metadata?.sourceMap;
+  const generatedLine = Number(error?.line);
+  const generatedColumn = Number(error?.column);
+  if (!sourceMap || !Number.isFinite(generatedLine) || !Number.isFinite(generatedColumn)) return null;
+
+  let mapColumn = Math.max(0, generatedColumn - 1);
+  const generatedLineText = String(metadata.generatedSource).split(/\r?\n/)[generatedLine - 1] ?? "";
+  const constructorName = String(error?.name || "Error").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const constructorPattern = new RegExp(`\\bnew\\s+${constructorName}\\b`, "g");
+  for (const match of generatedLineText.matchAll(constructorPattern)) {
+    if (match.index <= mapColumn && match.index + match[0].length >= mapColumn) {
+      mapColumn = match.index;
+      break;
+    }
+  }
+
+  const entry = sourceMap.findEntry(generatedLine - 1, mapColumn);
+  if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return null;
+  const source = String(entry.originalSource);
+  const filename = source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
+    ? source
+    : resolve(dirname(metadata.filename), source);
+  const payload = sourceMap.payload;
+  const sourceRoot = payload?.sourceRoot ? String(payload.sourceRoot) : "";
+  const sourceIndex = Array.from(payload?.sources ?? [], String)
+    .findIndex(candidate => `${sourceRoot}${candidate}` === source);
+  return {
+    filename,
+    line: entry.originalLine + 1,
+    column: entry.originalColumn + 1,
+    source: sourceIndex >= 0 ? payload?.sourcesContent?.[sourceIndex] : undefined,
+  };
+}
+
+function bunUncaughtCodeFrame(location, message) {
+  if (typeof location?.source !== "string") return null;
+  const lines = location.source.split(/\r?\n/);
+  const start = Math.max(1, location.line - 5);
+  const frame = [];
+  for (let line = start; line <= location.line && line <= lines.length; line += 1) {
+    frame.push(`${line} | ${lines[line - 1]}`);
+  }
+  frame.push(`${" ".repeat(String(location.line).length + 3 + Math.max(0, location.column - 1))}^`);
+  frame.push(`error: ${String(message ?? "")}`);
+  return frame.join("\n");
+}
+
+globalThis.__cottontailFormatUncaughtModuleError ??= error => {
+  try {
+    const metadata = error?.__ctModuleErrorMetadata;
+    if (!metadata) return;
+    const location = originalErrorLocation(error, metadata);
+    const codeFrame = bunUncaughtCodeFrame(location, error?.message);
+    if (codeFrame && location) {
+      const frames = String(error.stack ?? "").split(/\r?\n/).slice(1).join("\n");
+      error.stack = `${codeFrame}\n    at ${location.filename}:${location.line}:${location.column}${frames ? `\n${frames}` : ""}`;
+      Object.defineProperty(error, "__cottontailFormattedStack", { value: true, configurable: true });
+      return;
+    }
+    if (!metadata.sourceMap && String(metadata.generatedSource).startsWith("// @bun")) {
+      error.stack = `${String(error.stack ?? error)}\nnote: missing sourcemaps for ${metadata.filename}\nnote: consider bundling with '--sourcemap' to get unminified traces`;
+    }
+  } catch {}
+};
 
 export const _cache = commonJsCacheObject;
 export const _pathCache = modulePathCache;

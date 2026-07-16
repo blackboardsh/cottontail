@@ -1607,6 +1607,14 @@ pub const BundleV2 = struct {
             .init(),
         );
         if (bundle_out) |out| out.* = this;
+        // The releasable embedder frees this bundle's arena after an error.
+        // Drain every task that can still hold graph/linker pointers first,
+        // mirroring BundleThread's error path below.
+        errdefer {
+            this.waitForParse();
+            this.linker.source_maps.line_offset_wait_group.wait();
+            this.linker.source_maps.quoted_contents_wait_group.wait();
+        }
         this.file_map = file_map;
         this.unique_key = generateUniqueKey();
 

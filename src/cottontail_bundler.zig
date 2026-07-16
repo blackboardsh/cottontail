@@ -13,7 +13,12 @@ pub const BundleOptions = struct {
     source_map: compiler.schema.api.SourceMapMode = .none,
     output_format: compiler.options.Format = .esm,
     target: compiler.schema.api.Target = .bun,
+    banner: []const u8 = "",
+    footer: []const u8 = "",
+    bytecode: bool = false,
     loader: ?[]const u8 = null,
+    loader_extensions: []const []const u8 = &.{},
+    loader_values: []const compiler.schema.api.Loader = &.{},
     external_packages: bool = false,
     include_runtime_modules: bool = false,
     /// Runtime bundles execute with a global Node-style `require`. Keeping the
@@ -24,6 +29,8 @@ pub const BundleOptions = struct {
     minify_whitespace: bool = false,
     minify_identifiers: bool = false,
     minify_syntax: bool = false,
+    ignore_dce_annotations: bool = false,
+    emit_dce_annotations: ?bool = null,
     production: bool = false,
     /// Compile-time defines (parallel key/value arrays), e.g. mapping
     /// `import.meta.url` to a runtime identifier for dynamic-import target
@@ -37,12 +44,18 @@ pub const BundleOptions = struct {
     jsx_factory: ?[]const u8 = null,
     jsx_fragment: ?[]const u8 = null,
     jsx_runtime: ?compiler.schema.api.JsxRuntime = null,
+    jsx_import_source: ?[]const u8 = null,
+    jsx_development: ?bool = null,
+    jsx_side_effects: ?bool = null,
     metafile: bool = false,
     metafile_json_path: []const u8 = "",
     metafile_markdown_path: []const u8 = "",
     code_splitting: bool = false,
     /// `Bun.build({ external: [...] })`: import specifiers left unresolved.
     external: []const []const u8 = &.{},
+    /// Package names whose pure barrel modules should only load the exports
+    /// requested by the importing graph.
+    optimize_imports: []const []const u8 = &.{},
     /// `Bun.build({ naming: ... })` templates (Bun's defaults when unset).
     entry_naming: []const u8 = "[dir]/[name].[ext]",
     chunk_naming: []const u8 = "./chunk-[hash].[ext]",
@@ -140,6 +153,13 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     options: BundleOptions,
     error_out: *?[*:0]u8,
 ) !EntryPointOutput {
+    // COTTONTAIL-COMPAT: Bun build bytecode - stock JSCOnly does not expose
+    // cached-bytecode serialization. Reject it instead of emitting a fake
+    // artifact or entering Bun's bytecode path with the compiler JSC stubs.
+    if (options.bytecode) {
+        setError(error_out, "Bun build bytecode requires a JavaScriptCore cached-bytecode API", .{});
+        return error.UnsupportedBytecode;
+    }
     const allocator = compiler.default_allocator;
     compiler.cli.start_time = compiler.nanoTimestamp();
     const working_dir_z = try allocator.dupeZ(u8, working_dir);
@@ -155,8 +175,25 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transform_options.conditions = options.conditions;
     transform_options.tsconfig_override = options.tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
+    transform_options.external = options.external;
     transform_options.disable_hmr = true;
     transform_options.main_fields = &.{ "main", "module" };
+    if (options.jsx_factory != null or
+        options.jsx_fragment != null or
+        options.jsx_runtime != null or
+        options.jsx_import_source != null or
+        options.jsx_development != null or
+        options.jsx_side_effects != null)
+    {
+        transform_options.jsx = .{
+            .factory = options.jsx_factory orelse "",
+            .runtime = options.jsx_runtime orelse .automatic,
+            .fragment = options.jsx_fragment orelse "",
+            .development = options.jsx_development orelse !options.production,
+            .import_source = options.jsx_import_source orelse "",
+            .side_effects = options.jsx_side_effects orelse false,
+        };
+    }
     if (options.define_keys.len > 0) {
         transform_options.define = .{
             .keys = options.define_keys,
@@ -201,10 +238,15 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
+    transpiler.options.banner = options.banner;
+    transpiler.options.footer = options.footer;
+    transpiler.options.bytecode = options.bytecode;
     transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
+    transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
     // Runtime execution bundles modules into one linker scope. Preserve each
     // module's observable function/class names when the linker renames a
     // colliding binding, matching direct ESM/CJS evaluation semantics.
@@ -217,6 +259,7 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     // of becoming an additional output file (which single-output in-memory
     // bundles cannot emit).
     transpiler.options.externalize_runtime_require_resolve = true;
+    transpiler.options.runtime_file_loader_paths = options.include_runtime_modules;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
@@ -239,10 +282,42 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     // NODE_ENV production/development override on top (matching upstream
     // bun's configureLinker -> configureDefines ordering).
     transpiler.configureLinker();
+    if (options.jsx_factory) |factory| {
+        transpiler.options.jsx.factory = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            allocator,
+            transpiler.options.jsx.factory,
+            factory,
+        );
+    }
+    if (options.jsx_fragment) |fragment| {
+        transpiler.options.jsx.fragment = try compiler.options.JSX.Pragma.memberListToComponentsIfDifferent(
+            allocator,
+            transpiler.options.jsx.fragment,
+            fragment,
+        );
+    }
+    if (options.jsx_runtime) |runtime| transpiler.options.jsx.runtime = runtime;
+    if (options.jsx_import_source) |import_source| {
+        transpiler.options.jsx.package_name = import_source;
+        transpiler.options.jsx.classic_import_source = import_source;
+        transpiler.options.jsx.setImportSource(allocator);
+    }
+    if (options.jsx_development) |development| {
+        transpiler.options.jsx.development = development;
+        transpiler.options.force_node_env = .unspecified;
+    }
+    if (options.jsx_side_effects) |side_effects| transpiler.options.jsx.side_effects = side_effects;
     transpiler.configureDefines() catch |err| {
         setBuildError(error_out, &log, err);
         return err;
     };
+    if (options.jsx_development) |development| {
+        transpiler.options.jsx.development = development;
+        transpiler.options.force_node_env = .unspecified;
+    }
+    if (!transpiler.options.production) {
+        try transpiler.options.conditions.appendSlice(&.{"development"});
+    }
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
 
@@ -415,8 +490,39 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                 return error.InvalidTarget;
         }
     }
+    if (object.get("banner")) |value| {
+        if (value == .string) options.banner = value.string;
+    }
+    if (object.get("footer")) |value| {
+        if (value == .string) options.footer = value.string;
+    }
+    if (object.get("bytecode")) |value| {
+        if (value == .bool) options.bytecode = value.bool;
+    }
+    if (object.get("loader")) |value| switch (value) {
+        .string => |loader_name| options.loader = loader_name,
+        .object => |loader_map| {
+            var extensions: std.ArrayList([]const u8) = .empty;
+            var loaders: std.ArrayList(compiler.schema.api.Loader) = .empty;
+            var iterator = loader_map.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                const loader = compiler.options.Loader.fromString(entry.value_ptr.string) orelse return error.InvalidLoader;
+                try extensions.append(allocator, entry.key_ptr.*);
+                try loaders.append(allocator, loader.toAPI());
+            }
+            options.loader_extensions = extensions.items;
+            options.loader_values = loaders.items;
+        },
+        else => {},
+    };
     if (object.get("sourcemap")) |value| switch (value) {
-        .bool => |enabled| options.source_map = if (enabled) .linked else .none,
+        .bool => |enabled| options.source_map = if (!enabled)
+            .none
+        else if (object.get("outdir") != null)
+            .linked
+        else
+            .@"inline",
         .string => |mode| options.source_map = if (std.ascii.eqlIgnoreCase(mode, "inline"))
             .@"inline"
         else if (std.ascii.eqlIgnoreCase(mode, "external"))
@@ -460,8 +566,16 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
         },
         else => {},
     };
+    if (object.get("ignoreDCEAnnotations")) |value| {
+        if (value == .bool) options.ignore_dce_annotations = value.bool;
+    }
+    if (object.get("emitDCEAnnotations")) |value| {
+        if (value == .bool) options.emit_dce_annotations = value.bool;
+    }
     if (object.get("production")) |value| {
         if (value == .bool) options.production = value.bool;
+    } else if (std.c.getenv("NODE_ENV")) |node_env| {
+        options.production = std.ascii.eqlIgnoreCase(std.mem.span(node_env), "production");
     }
     if (object.get("reactFastRefresh")) |value| {
         if (value == .bool) options.react_fast_refresh = value.bool;
@@ -483,6 +597,15 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                     else
                         return error.InvalidJSXRuntime;
                 }
+            }
+            if (value.object.get("importSource")) |item| {
+                if (item == .string) options.jsx_import_source = item.string;
+            }
+            if (value.object.get("development")) |item| {
+                if (item == .bool) options.jsx_development = item.bool;
+            }
+            if (value.object.get("sideEffects")) |item| {
+                if (item == .bool) options.jsx_side_effects = item.bool;
             }
         }
     }
@@ -519,6 +642,15 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                 if (item == .string) try external.append(allocator, item.string);
             }
             options.external = external.items;
+        }
+    }
+    if (object.get("optimizeImports")) |value| {
+        if (value == .array) {
+            var optimize_imports: std.ArrayList([]const u8) = .empty;
+            for (value.array.items) |item| {
+                if (item == .string) try optimize_imports.append(allocator, item.string);
+            }
+            options.optimize_imports = optimize_imports.items;
         }
     }
     if (object.get("define")) |value| {
@@ -688,6 +820,13 @@ pub fn buildEntryPointsJson(
         setError(error_out, "Invalid Bun.build options: {s}", .{@errorName(err)});
         return err;
     };
+    // COTTONTAIL-COMPAT: Bun build bytecode - see the runtime-bundle guard
+    // above. This remains an explicit unsupported result until portable JSC
+    // exposes a cache serializer Cottontail can also consume at runtime.
+    if (options.bytecode) {
+        setError(error_out, "Bun.build bytecode requires a JavaScriptCore cached-bytecode API", .{});
+        return error.UnsupportedBytecode;
+    }
     // Bun.build defaults to target "browser" (the runtime bundler defaults to
     // "bun"); an explicit target was already applied by parseBuildOptions.
     if (request_object.get("target") == null) options.target = .browser;
@@ -708,14 +847,28 @@ pub fn buildEntryPointsJson(
     transform_options.tsconfig_override = options.tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
+    if (options.loader_extensions.len > 0) {
+        transform_options.loaders = .{
+            .extensions = options.loader_extensions,
+            .loaders = options.loader_values,
+        };
+    }
     transform_options.disable_hmr = true;
     transform_options.main_fields = &.{ "main", "module" };
-    if (options.jsx_factory != null or options.jsx_fragment != null or options.jsx_runtime != null) {
+    if (options.jsx_factory != null or
+        options.jsx_fragment != null or
+        options.jsx_runtime != null or
+        options.jsx_import_source != null or
+        options.jsx_development != null or
+        options.jsx_side_effects != null)
+    {
         transform_options.jsx = .{
             .factory = options.jsx_factory orelse "",
             .runtime = options.jsx_runtime orelse .automatic,
             .fragment = options.jsx_fragment orelse "",
-            .import_source = "",
+            .development = options.jsx_development orelse !options.production,
+            .import_source = options.jsx_import_source orelse "",
+            .side_effects = options.jsx_side_effects orelse false,
         };
     }
     if (options.define_keys.len > 0) {
@@ -740,9 +893,14 @@ pub fn buildEntryPointsJson(
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
+    transpiler.options.banner = options.banner;
+    transpiler.options.footer = options.footer;
+    transpiler.options.bytecode = options.bytecode;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
+    transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
     transpiler.options.setProduction(options.production);
     if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
     // Match Bun's root-dir default: the directory of a single entry point, or
@@ -766,6 +924,9 @@ pub fn buildEntryPointsJson(
     transpiler.options.metafile_markdown_path = options.metafile_markdown_path;
     transpiler.options.code_splitting = options.code_splitting;
     transpiler.options.supports_multiple_outputs = true;
+    var optimize_imports = compiler.StringSet.init(arena_allocator);
+    for (options.optimize_imports) |package_name| try optimize_imports.insert(package_name);
+    if (!optimize_imports.isEmpty()) transpiler.options.optimize_imports = &optimize_imports;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them so Bun.build outputs can run on this runtime.
     transpiler.options.force_lower_using = true;
@@ -790,9 +951,33 @@ pub fn buildEntryPointsJson(
         );
     }
     if (options.jsx_runtime) |runtime| transpiler.options.jsx.runtime = runtime;
+    if (options.jsx_import_source) |import_source| {
+        transpiler.options.jsx.package_name = import_source;
+        transpiler.options.jsx.classic_import_source = import_source;
+        transpiler.options.jsx.setImportSource(arena_allocator);
+    }
+    if (options.jsx_development) |development| transpiler.options.jsx.development = development;
+    if (options.jsx_side_effects) |side_effects| transpiler.options.jsx.side_effects = side_effects;
     transpiler.configureDefines() catch |err| {
         return try buildFailureJson(arena_allocator, &log, err);
     };
+    // An explicit Bun.build jsx.development option wins over NODE_ENV.
+    if (options.jsx_development) |development| {
+        transpiler.options.jsx.development = development;
+        transpiler.options.force_node_env = .unspecified;
+    }
+    if (std.c.getenv("COTTONTAIL_DEBUG_JSX") != null) {
+        std.debug.print("dbg build jsx: requested={any} production={} jsx.development={} side_effects={} source={s}\n", .{
+            options.jsx_development,
+            transpiler.options.production,
+            transpiler.options.jsx.development,
+            transpiler.options.jsx.side_effects,
+            transpiler.options.jsx.importSource(),
+        });
+    }
+    if (!transpiler.options.production) {
+        try transpiler.options.conditions.appendSlice(&.{"development"});
+    }
     transpiler.resolver.opts = transpiler.options;
     transpiler.resolver.env_loader = transpiler.env;
 
@@ -848,14 +1033,18 @@ pub fn buildEntryPointsJson(
         const bytes = output_file.value.asSlice();
         const encoded = try arena_allocator.alloc(u8, base64.calcSize(bytes.len));
         _ = base64.encode(encoded, bytes);
-        const hash: ?[]const u8 = if (output_file.hash != 0)
-            try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(output_file.hash)})
+        const hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(output_file.hash)});
+        // HTML entries produce associated JavaScript and CSS artifacts. Bun
+        // reports those artifacts' generated loaders while preserving the
+        // input loader for ordinary JS-family entry points (for example JSX).
+        const artifact_loader = if (output_file.input_loader == .html and output_file.loader != .html)
+            output_file.loader
         else
-            null;
+            output_file.input_loader;
         try outputs.append(arena_allocator, .{
             .path = try arena_allocator.dupe(u8, output_file.dest_path),
             .kind = @tagName(output_file.output_kind),
-            .loader = @tagName(output_file.input_loader),
+            .loader = @tagName(artifact_loader),
             .hash = hash,
             .sourcemapIndex = if (output_file.source_map_index != std.math.maxInt(u32))
                 output_file.source_map_index

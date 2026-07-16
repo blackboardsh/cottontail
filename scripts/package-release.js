@@ -54,6 +54,9 @@ rmSync(packageRoot, { recursive: true, force: true });
 mkdirSync(join(packageRoot, 'bin'), { recursive: true });
 
 cpSync(executablePath, join(packageRoot, 'bin', executableName));
+cpSync(join(rootDir, 'src', 'runtime_modules'), join(packageRoot, 'runtime_modules'), {
+  recursive: true,
+});
 if (process.platform !== 'win32') {
   chmodSync(join(packageRoot, 'bin', executableName), 0o755);
 }
@@ -65,6 +68,7 @@ const manifest = {
   platform,
   revision: gitRevision(),
   executable: `bin/${executableName}`,
+  runtimeModules: 'runtime_modules',
 };
 writeFileSync(join(packageRoot, 'cottontail-release.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 

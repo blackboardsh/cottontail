@@ -75,9 +75,7 @@ fn jsonBool(object: std.json.ObjectMap, name: []const u8) ?bool {
 }
 
 fn parseLoader(name: []const u8) !compiler.options.Loader {
-    const loader = compiler.options.Loader.fromString(name) orelse return error.InvalidLoader;
-    if (!loader.isJavaScriptLike()) return error.InvalidLoader;
-    return loader;
+    return compiler.options.Loader.fromString(name) orelse return error.InvalidLoader;
 }
 
 fn parseTarget(name: []const u8) !compiler.options.Target {
@@ -192,6 +190,32 @@ fn process(
     defer log.deinit();
 
     const source = compiler.logger.Source.initPathString(config.loader.stdinName(), source_code);
+
+    if (config.loader == .html and operation == .scan_imports) {
+        var scanner = compiler.bundle_v2.HTMLScanner.init(temporary_allocator, &log, &source);
+        defer scanner.deinit();
+        scanner.scan(source_code) catch |err| {
+            setLogError(error_out, &log, err);
+            return err;
+        };
+        if (log.errors > 0) {
+            setLogError(error_out, &log, error.SyntaxError);
+            return error.SyntaxError;
+        }
+
+        var imports = std.ArrayList(ImportResult).empty;
+        for (scanner.import_records.slice()) |record| {
+            try imports.append(temporary_allocator, .{ .path = record.path.text, .kind = record.kind.label() });
+        }
+        const json = try std.json.Stringify.valueAlloc(temporary_allocator, imports.items, .{});
+        return try c_allocator.dupe(u8, json);
+    }
+
+    if (!config.loader.isJavaScriptLike()) {
+        setError(error_out, "Loader \"{s}\" is not supported by this transpiler operation", .{@tagName(config.loader)});
+        return error.InvalidLoader;
+    }
+
     const define = createDefines(parsed_config.parsed, &log, allocator) catch |err| {
         setLogError(error_out, &log, err);
         return err;
@@ -199,9 +223,14 @@ fn process(
     defer define.deinit();
 
     var parser_options = compiler.js_parser.Parser.Options.init(.{}, config.loader);
+    var macro_context = compiler.ast.Macro.MacroContext.initStandalone();
+    parser_options.macro_context = &macro_context;
     parser_options.transform_only = operation == .transform and !config.allow_runtime;
     parser_options.tree_shaking = config.tree_shaking;
     parser_options.features.allow_runtime = operation != .transform or config.allow_runtime;
+    // Scanning reports macro imports but must not execute them. Unlike the
+    // bundler, the standalone scanner has no project resolver/macro context.
+    parser_options.features.is_macro_runtime = operation != .transform;
     parser_options.features.top_level_await = true;
     // Vanilla JavaScriptCore does not parse TC39 decorators. Bun's parser
     // already contains the complete lowering pass, so transform JavaScript

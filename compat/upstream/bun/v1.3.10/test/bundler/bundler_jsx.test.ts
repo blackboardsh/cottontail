@@ -115,9 +115,12 @@ function itBundledDevAndProd(
     prodTodo?: boolean;
   },
 ) {
-  const { devStdout, prodStdout, ...rest } = opts;
+  // COTTONTAIL-COMPAT: Preserve the upstream helper's per-mode todo metadata
+  // without leaking helper-only keys into expectBundled's option validation.
+  const { devStdout, prodStdout, devTodo, prodTodo, ...rest } = opts;
   itBundled(id + "Dev", {
     ...rest,
+    todo: devTodo ?? rest.todo,
     env: {
       NODE_ENV: "development",
     },
@@ -130,6 +133,7 @@ function itBundledDevAndProd(
   });
   itBundled(id + "Prod", {
     ...rest,
+    todo: prodTodo ?? rest.todo,
     env: {
       NODE_ENV: "production",
     },

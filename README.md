@@ -79,6 +79,7 @@ cross-platform working loop, see [`docs/cross-platform-bringup.md`](docs/cross-p
 The schema 2 archive layout contains a standalone executable for Dash CLI consumption:
 
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
+- `runtime_modules/` for downstream bundlers that need physical module paths
 - `cottontail-release.json`
 
 The current C host bridge uses POSIX APIs directly for process, socket, DNS,
@@ -95,10 +96,23 @@ release to Cloudflare R2. Configure these CircleCI project environment variables
 - `COTTONTAIL_R2_SECRET_ACCESS_KEY`: secret for that access key.
 - `COTTONTAIL_R2_PUBLIC_BASE_URL`: public custom-domain or `r2.dev` origin for the bucket, without a trailing slash.
 
-The target bucket is `electrobun-artifacts`. Preview archives use
-content-addressed keys under
-`cottontail/preview/builds/<git-sha>/<sha256>/`. Consumers discover the complete
-platform matrix through one manifest:
+The target bucket is `electrobun-artifacts`. Continuous preview archives use
+immutable revision paths:
+
+- `cottontail/preview/builds/<git-sha>/<platform>/cottontail.tar.gz`
+
+Consumers discover the newest complete preview matrix through
+`cottontail/preview/latest.json`. The checksum remains in the manifest and the
+adjacent `.sha256` object; it is not part of the object path.
+
+Commits tagged `v<version>` also publish an immutable, derivable version release:
+
+- `cottontail/releases/<version>/<platform>/cottontail.tar.gz`
+- `cottontail/releases/<version>/manifest.json`
+
+For example, version `0.1.1-beta.0` on macOS ARM64 is always located at
+`cottontail/releases/0.1.1-beta.0/macos-arm64/cottontail.tar.gz`. The preview
+channel pointers are:
 
 - `cottontail/preview/latest.json`
 - `cottontail/preview/versions/<version>.json`

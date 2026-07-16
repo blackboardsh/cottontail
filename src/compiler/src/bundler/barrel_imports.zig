@@ -356,9 +356,9 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
     // Handle import records without named bindings (not in named_imports).
     // - `import "x"` (bare statement): tree-shakeable with sideEffects: false — skip.
     // - `require("x")`: synchronous, needs full module — always mark as .all.
-    // - `import("x")`: returns the full module namespace at runtime — consumer
-    //   can destructure or access any export. Must mark as .all. We cannot
-    //   safely assume which exports will be used.
+    // - `import("x")`: mark as .all only when this is the sole reference. A
+    //   secondary (often circular) dynamic import must not discard an export
+    //   set already established by a static import.
     for (file_import_records.slice(), 0..) |ir, idx| {
         const target = if (ir.source_index.isValid())
             ir.source_index.get()
@@ -373,9 +373,9 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
             const gop = try this.requested_exports.getOrPut(this.allocator(), target);
             gop.value_ptr.* = .all;
         } else if (ir.kind == .dynamic) {
-            // import() returns the full module namespace — must preserve all exports.
-            const gop = try this.requested_exports.getOrPut(this.allocator(), target);
-            gop.value_ptr.* = .all;
+            if (!this.requested_exports.contains(target)) {
+                try this.requested_exports.put(this.allocator(), target, .all);
+            }
         }
     }
 
@@ -411,8 +411,8 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
         }
     }
 
-    // Add bare require/dynamic-import targets to BFS as star imports — both
-    // always need the full namespace.
+    // Add bare require/dynamic-import targets to BFS as star imports, matching
+    // the seeding rule above.
     for (file_import_records.slice(), 0..) |ir, idx| {
         const target = if (ir.source_index.isValid())
             ir.source_index.get()
@@ -423,7 +423,8 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
         if (ir.flags.is_internal) continue;
         if (named_ir_indices.contains(@intCast(idx))) continue;
         if (ir.flags.was_originally_bare_import) continue;
-        const should_add = ir.kind == .require or ir.kind == .dynamic;
+        const is_all = if (this.requested_exports.get(target)) |requested| requested == .all else false;
+        const should_add = ir.kind == .require or (ir.kind == .dynamic and is_all);
         if (should_add) {
             try queue.append(queue_alloc, .{ .barrel_source_index = target, .alias = "", .is_star = true });
         }

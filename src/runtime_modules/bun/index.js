@@ -12,7 +12,7 @@ import {
   createRequire as nodeCreateRequire,
   isBuiltin as nodeIsBuiltin,
 } from "../node/module.js";
-import { resolve as nodePathResolve } from "../node/path.js";
+import { relative as nodePathRelative, resolve as nodePathResolve } from "../node/path.js";
 import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
@@ -35,6 +35,13 @@ import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
 import { jest as bunJest } from "./test.js";
+
+function ctRemapStackString(stack) {
+  let remapped = remapBundleStack(stack);
+  const moduleRemapper = globalThis.__cottontailRemapModuleStackString;
+  if (typeof moduleRemapper === "function") remapped = moduleRemapper(remapped);
+  return remapped;
+}
 
 // The generated __toESM helper strictly honors the __esModule marker:
 // `import x from "cjs"`
@@ -138,7 +145,7 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
     Error.prepareStackTrace = undefined;
     try {
       nativeCaptureStackTrace(target, constructorOpt);
-      const rawStack = remapBundleStack(target.stack);
+      const rawStack = ctRemapStackString(target.stack);
       const callSites = parseCallSites(rawStack);
       if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
         target.stack = prepare(target, callSites);
@@ -180,11 +187,11 @@ function installNodeStyleErrorConstructor(name) {
             const prepare = Error.prepareStackTrace;
             if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
               try {
-                cached = prepare(error, parseCallSites(remapBundleStack(rawStack)));
+                cached = prepare(error, parseCallSites(ctRemapStackString(rawStack)));
                 return cached;
               } catch {}
             }
-            const callSites = parseCallSites(remapBundleStack(rawStack));
+            const callSites = parseCallSites(ctRemapStackString(rawStack));
             const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
             const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
             cached = `${error.name || name}${message}${frames ? `\n${frames}` : ""}`;
@@ -235,7 +242,7 @@ if (Error.prepareStackTrace === undefined) {
 
 // Shared hooks so other runtime modules (uncaught-error printing, test
 // reporters) can remap bundle stack positions without importing this module.
-globalThis.__cottontailRemapStackString ??= remapBundleStack;
+globalThis.__cottontailRemapStackString ??= ctRemapStackString;
 globalThis.__cottontailRemapPosition ??= remapBundlePosition;
 
 if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
@@ -245,7 +252,7 @@ if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
       return nativeJSONParse(text, reviver);
     } catch (error) {
       if (error && typeof error.stack === "string") {
-        let stack = remapBundleStack(error.stack);
+        let stack = ctRemapStackString(error.stack);
         if (error.message && !stack.includes(String(error.message))) {
           stack = `${error.name || "SyntaxError"}: ${error.message}\n${stack}`;
         }
@@ -1538,11 +1545,25 @@ function finalizeDriverResult(parsed, options) {
   };
 }
 
+async function finalizePluginDriverResult(parsed, options, onEndCallbacks) {
+  const result = finalizeDriverResult(parsed, { ...options, throw: false });
+  await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
+  if (!result.success && options?.throw !== false) {
+    const errors = result.logs.filter((log) => (log?.level ?? "error") === "error");
+    const error = new AggregateError(errors.length > 0 ? errors : result.logs, parsed.message || "Bundle failed");
+    if (parsed.name) error.name = parsed.name;
+    throw error;
+  }
+  return result;
+}
+
 const bundleLoaderExtensions = {
   js: ".js",
   jsx: ".jsx",
   ts: ".ts",
   tsx: ".tsx",
+  css: ".css",
+  html: ".html",
   json: ".json",
   toml: ".toml",
   text: ".txt",
@@ -1580,13 +1601,18 @@ function ctBuildVirtualFile(options, path) {
 function bundleLoaderForPath(path) {
   const match = /\.([a-zA-Z0-9]+)$/.exec(String(path));
   switch ((match?.[1] ?? "").toLowerCase()) {
+    case "js": case "mjs": case "cjs": return "js";
     case "ts": case "mts": case "cts": return "ts";
     case "tsx": return "tsx";
     case "jsx": return "jsx";
+    case "css": return "css";
+    case "html": case "htm": return "html";
     case "json": return "json";
     case "toml": return "toml";
+    case "yaml": case "yml": return "yaml";
     case "txt": return "text";
-    default: return "js";
+    case "wasm": return "wasm";
+    default: return "file";
   }
 }
 
@@ -1604,6 +1630,52 @@ function scanBundleImports(source) {
   return [...found].map(([specifier, kind]) => ({ specifier, kind }));
 }
 
+function scanBundleImportsForLoader(source, loader) {
+  if (loader === "html") {
+    return JSON.parse(cottontail.transpilerScanImports(String(source), "{}", "html"))
+      .map(({ path, kind }) => ({ specifier: path, kind }));
+  }
+  return scanBundleImports(source);
+}
+
+function ctBuildPluginInitialOptions(options) {
+  const minify = options?.minify;
+  const minifyOptions = minify && typeof minify === "object" ? minify : null;
+  const minifyIdentifiers = minifyOptions?.identifiers === true ? true : undefined;
+  const minifySyntax = minifyOptions?.syntax === true ? true : undefined;
+  const minifyWhitespace = minifyOptions?.whitespace === true ? true : undefined;
+  return {
+    bundle: true,
+    entryPoints: [...(options?.entrypoints ?? [])],
+    external: options?.external,
+    format: options?.format ?? "esm",
+    minify: minify === true || (
+      minifyIdentifiers === true &&
+      minifySyntax === true &&
+      minifyWhitespace === true
+    ),
+    minifyIdentifiers,
+    minifySyntax,
+    minifyWhitespace,
+    outdir: options?.outdir,
+    platform: options?.target ?? "browser",
+    sourcemap: options?.sourcemap,
+  };
+}
+
+function ctPluginBuildMessage(error, path, namespace = "file") {
+  return new BuildMessage({
+    message: error?.message ?? String(error),
+    position: path ? { file: String(path), namespace: namespace || "file" } : null,
+  });
+}
+
+function ctBuildSourceExtension(path) {
+  const base = String(path).replace(/\\/g, "/").split("/").pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot) : "";
+}
+
 // Runs Bun.build plugins (onResolve/onLoad) in-process, materializes the
 // resolved module graph into a shadow directory, and delegates the actual
 // bundling of the materialized files to the plugin-free build pipeline.
@@ -1616,7 +1688,7 @@ async function buildWithPlugins(options, plugins) {
   const toFilter = (value) => (value instanceof RegExp ? value : new RegExp(String(value ?? ".*")));
   const builder = {
     config: options,
-    initialOptions: options,
+    initialOptions: ctBuildPluginInitialOptions(options),
     target: options?.target ?? "browser",
     onResolve(constraints, callback) {
       onResolveRules.push({ filter: toFilter(constraints?.filter), namespace: constraints?.namespace, callback });
@@ -1648,20 +1720,22 @@ async function buildWithPlugins(options, plugins) {
   for (const callback of onStartCallbacks) await callback();
 
   if (onResolveRules.length === 0 && onLoadRules.length === 0) {
-    const result = finalizeDriverResult(
+    return finalizePluginDriverResult(
       runBuildDriver({ ...options, plugins: undefined }),
       options,
+      onEndCallbacks,
     );
-    await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
-    return result;
   }
 
   const errors = [];
   const moduleRecords = new Map();
+  const packageMetadata = new Map();
+  const materializedLoaders = {};
   const usedShadowNames = new Set();
   let depCounter = 0;
-  const shadowRoot = pathJoin(tmpRoot("bun-build"), `plugin-${Date.now()}-${Math.floor(Math.random() * 1000000)}`);
-  cottontail.mkdirSync(shadowRoot, true);
+  const shadowRootPath = pathJoin(tmpRoot("bun-build"), `plugin-${Date.now()}-${Math.floor(Math.random() * 1000000)}`);
+  cottontail.mkdirSync(shadowRootPath, true);
+  const shadowRoot = cottontail.realpathSync(shadowRootPath);
 
   const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
     for (const rule of onResolveRules) {
@@ -1700,8 +1774,8 @@ async function buildWithPlugins(options, plugins) {
     }
     const base = specifier.startsWith("/") ? specifier : nodePathResolve(pathDirname(importerRecord.path), specifier);
     const candidates = [base];
-    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".json"]) candidates.push(base + ext);
-    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".json"]) candidates.push(`${base}/index${ext}`);
+    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(base + ext);
+    for (const ext of [".tsx", ".ts", ".jsx", ".mjs", ".js", ".cjs", ".css", ".html", ".json"]) candidates.push(`${base}/index${ext}`);
     for (const candidate of candidates) {
       if (ctBuildVirtualFile(options, candidate) !== undefined) return { path: candidate, namespace: "file" };
       try {
@@ -1726,25 +1800,71 @@ async function buildWithPlugins(options, plugins) {
       const contents = typeof result.contents === "string"
         ? result.contents
         : new TextDecoder().decode(result.contents);
-      return { contents, loader: result.loader ? String(result.loader) : undefined };
+      // Bun treats an onLoad result without an explicit loader as JavaScript,
+      // independently of the source path's extension.
+      return { contents, loader: result.loader ? String(result.loader) : "js" };
     }
     if (record.namespace === "file") {
       const virtual = ctBuildVirtualFile(options, record.path);
-      if (virtual !== undefined) return { contents: virtual, loader: undefined };
-      return { contents: cottontail.readFile(record.path), loader: undefined };
+      const loader = bundleLoaderForPath(record.path);
+      if (virtual !== undefined) return { contents: virtual, loader };
+      return { contents: cottontail.readFile(record.path), loader };
     }
     throw new Error(`Could not load: "${record.namespace}:${record.path}" (no onLoad plugin returned contents)`);
   };
 
-  const shadowName = (sourcePath, loader, entryName) => {
+  const packageLocation = sourcePath => {
+    const normalized = String(sourcePath).replace(/\\/g, "/");
+    const firstNodeModules = normalized.indexOf("/node_modules/");
+    const packageNodeModules = normalized.lastIndexOf("/node_modules/");
+    if (firstNodeModules < 0 || packageNodeModules < 0) return null;
+    const packageStart = packageNodeModules + "/node_modules/".length;
+    const firstSlash = normalized.indexOf("/", packageStart);
+    if (firstSlash < 0) return null;
+    const packageEnd = normalized[packageStart] === "@"
+      ? normalized.indexOf("/", firstSlash + 1)
+      : firstSlash;
+    const end = packageEnd < 0 ? normalized.length : packageEnd;
+    const packageName = normalized.slice(packageStart, end);
+    if (!packageName) return null;
+    return {
+      name: packageName,
+      sourceRoot: normalized.slice(0, end),
+      shadowRoot: pathJoin(shadowRoot, normalized.slice(firstNodeModules + 1, end)),
+      relativePath: normalized.slice(firstNodeModules + 1),
+    };
+  };
+
+  const preservePackageMetadata = sourcePath => {
+    const location = packageLocation(sourcePath);
+    if (!location) return;
+    const shadowPackageJson = pathJoin(location.shadowRoot, "package.json");
+    if (packageMetadata.has(shadowPackageJson)) return;
+    const sourcePackageJson = pathJoin(location.sourceRoot, "package.json");
+    let contents = ctBuildVirtualFile(options, sourcePackageJson);
+    if (contents === undefined) {
+      try { contents = cottontail.readFile(sourcePackageJson); } catch {}
+    }
+    if (contents !== undefined) packageMetadata.set(shadowPackageJson, String(contents));
+  };
+
+  const shadowName = (sourcePath, loader, entryName, namespace = "file") => {
     const base = String(entryName ?? sourcePath).replace(/\\/g, "/").split("/").pop() || "module";
-    const known = /\.(tsx|ts|jsx|mjs|cjs|js|json|toml|txt)$/i.exec(base);
+    const known = /\.(tsx|ts|jsx|mjs|cjs|js|css|html|json|toml|txt|wasm)$/i.exec(base);
     const stem = known ? base.slice(0, -known[0].length) : base;
-    const ext = bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js");
-    const prefix = entryName == null ? `dep-${depCounter++}-` : "";
-    let name = `${prefix}${stem}${ext}`;
+    const sourceExtension = ctBuildSourceExtension(base);
+    const ext = loader === "file"
+      ? (sourceExtension || ".bin")
+      : (bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js"));
+    const location = namespace === "file" ? packageLocation(sourcePath) : null;
+    let name = location
+      ? `${location.relativePath.slice(0, location.relativePath.length - base.length)}${stem}${ext}`
+      : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
     let counter = 1;
-    while (usedShadowNames.has(name)) name = `${prefix}${stem}-${counter++}${ext}`;
+    const originalName = name;
+    while (usedShadowNames.has(name)) {
+      name = `${originalName.slice(0, -ext.length)}-${counter++}${ext}`;
+    }
     usedShadowNames.add(name);
     return pathJoin(shadowRoot, name);
   };
@@ -1752,28 +1872,34 @@ async function buildWithPlugins(options, plugins) {
   const addModule = async (resolved, entryName = undefined) => {
     const key = `${resolved.namespace} ${resolved.path}`;
     if (moduleRecords.has(key)) return moduleRecords.get(key);
-    const record = { path: resolved.path, namespace: resolved.namespace, shadowPath: null, contents: "", edges: [] };
+    const record = { path: resolved.path, namespace: resolved.namespace, shadowPath: null, contents: "", loader: "js", edges: [] };
     moduleRecords.set(key, record);
     let loaded;
     try {
       loaded = await loadWithPlugins(record);
     } catch (error) {
-      errors.push(new BuildMessage({ message: error?.message ?? String(error) }));
-      record.shadowPath = shadowName(record.path, "js", entryName);
+      errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
+      record.shadowPath = shadowName(record.path, "js", entryName, record.namespace);
       return record;
     }
     record.contents = String(loaded.contents);
     const loader = loaded.loader ?? bundleLoaderForPath(record.path);
-    record.shadowPath = shadowName(record.path, loader, entryName);
-    if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx") {
-      for (const { specifier, kind } of scanBundleImports(record.contents)) {
+    record.loader = loader;
+    record.shadowPath = shadowName(record.path, loader, entryName, record.namespace);
+    if (loader === "file") {
+      const extension = ctBuildSourceExtension(record.shadowPath);
+      if (extension) materializedLoaders[extension] = "file";
+    }
+    if (record.namespace === "file") preservePackageMetadata(record.path);
+    if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html") {
+      for (const { specifier, kind } of scanBundleImportsForLoader(record.contents, loader)) {
         const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
         let target;
         try {
           target = await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
             ?? defaultResolveImport(specifier, record);
         } catch (error) {
-          errors.push(new BuildMessage({ message: error?.message ?? String(error) }));
+          errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
           continue;
         }
         if (!target || target.external) continue;
@@ -1794,9 +1920,9 @@ async function buildWithPlugins(options, plugins) {
   for (const entry of (options?.entrypoints ?? []).map(String)) {
     let resolved;
     try {
-      resolved = await resolveWithPlugins(entry, "", "file", cottontail.cwd(), "entry-point-build");
+      resolved = await resolveWithPlugins(entry, "", "", cottontail.cwd(), "entry-point-build");
     } catch (error) {
-      errors.push(new BuildMessage({ message: error?.message ?? String(error) }));
+      errors.push(ctPluginBuildMessage(error, entry.startsWith("/") ? entry : nodePathResolve(entry), "file"));
       continue;
     }
     if (resolved?.external) continue;
@@ -1812,15 +1938,22 @@ async function buildWithPlugins(options, plugins) {
     shadowEntries.push(record.shadowPath);
   }
 
+  for (const [path, contents] of packageMetadata) {
+    cottontail.mkdirSync(pathDirname(path), true);
+    cottontail.writeFile(path, contents);
+  }
   for (const record of moduleRecords.values()) {
     let contents = record.contents;
     for (const edge of record.edges) {
       if (!edge.target?.shadowPath) continue;
-      const replacement = JSON.stringify(edge.target.shadowPath);
+      let relativeTarget = nodePathRelative(pathDirname(record.shadowPath), edge.target.shadowPath).replace(/\\/g, "/");
+      if (!relativeTarget.startsWith(".")) relativeTarget = `./${relativeTarget}`;
+      const replacement = JSON.stringify(relativeTarget);
       for (const quote of ['"', "'", "`"]) {
         contents = contents.split(`${quote}${edge.specifier}${quote}`).join(replacement);
       }
     }
+    cottontail.mkdirSync(pathDirname(record.shadowPath), true);
     cottontail.writeFile(record.shadowPath, contents);
   }
 
@@ -1829,14 +1962,23 @@ async function buildWithPlugins(options, plugins) {
     throw new AggregateError(errors, "Bundle failed");
   }
 
-  const parsed = runBuildDriver({ ...options, plugins: undefined, entrypoints: shadowEntries });
-  const result = finalizeDriverResult(parsed, options);
-  await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
-  if (!result.success && options?.throw !== false) {
-    const failures = result.logs.filter((log) => (log?.level ?? "error") === "error");
-    throw new AggregateError(failures.length > 0 ? failures : result.logs, "Bundle failed");
-  }
-  return result;
+  return finalizePluginDriverResult(
+    runBuildDriver({
+      ...options,
+      files: undefined,
+      plugins: undefined,
+      root: shadowRoot,
+      loader: Object.keys(materializedLoaders).length > 0
+        ? {
+            ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
+            ...materializedLoaders,
+          }
+        : options?.loader,
+      entrypoints: shadowEntries,
+    }),
+    options,
+    onEndCallbacks,
+  );
 }
 
 // Bun.build artifacts and plugin callbacks are implemented in-process. Plugin
@@ -1887,9 +2029,33 @@ const CTResolveMessage = class ResolveMessage {
 if (typeof globalThis.BuildMessage !== "function") globalThis.BuildMessage = CTBuildMessage;
 if (typeof globalThis.ResolveMessage !== "function") globalThis.ResolveMessage = CTResolveMessage;
 
+function ctBuildArtifactMime(meta) {
+  if (meta.type != null) return String(meta.type);
+  if (meta.kind === "sourcemap") return "application/json;charset=utf-8";
+  switch (meta.loader) {
+    case "js":
+    case "jsx":
+    case "ts":
+    case "tsx":
+      return "text/javascript;charset=utf-8";
+    case "css":
+      return "text/css;charset=utf-8";
+    case "html":
+      return "text/html;charset=utf-8";
+    case "json":
+    case "toml":
+      return "application/json;charset=utf-8";
+    case "wasm":
+      return "application/wasm";
+    default:
+      return "";
+  }
+}
+
 const CTBuildArtifact = class BuildArtifact extends Blob {
   constructor(bytes, meta = {}) {
-    super([bytes], meta.type ? { type: meta.type } : {});
+    const type = ctBuildArtifactMime(meta);
+    super([bytes], type ? { type } : {});
     this.path = meta.path ?? "";
     this.loader = meta.loader ?? "file";
     this.hash = meta.hash ?? null;
@@ -2046,13 +2212,11 @@ async function ctRunBuild(options, state) {
       log.name === "ResolveMessage" ? new CTResolveMessage(log) : new CTBuildMessage(log)
     ));
     if (logs.length === 0) logs.push(new CTBuildMessage({ message: raw.fatal.message ?? "Bundle failed" }));
-    if (options.throw === false) {
-      const result = { success: false, outputs: [], logs };
-      await ctRunOnEnd(state, result);
-      return result;
-    }
-    const errors = logs.filter((log) => (log?.level ?? "error") === "error");
-    const error = new AggregateError(errors.length > 0 ? errors : logs, raw.fatal.message ?? "Bundle failed");
+    const result = { success: false, outputs: [], logs };
+    await ctRunOnEnd(state, result);
+    if (options.throw === false) return result;
+    const errors = result.logs.filter((log) => (log?.level ?? "error") === "error");
+    const error = new AggregateError(errors.length > 0 ? errors : result.logs, raw.fatal.message ?? "Bundle failed");
     if (raw.fatal.name) error.name = raw.fatal.name;
     throw error;
   }
@@ -2067,6 +2231,11 @@ async function ctRunBuild(options, state) {
 }
 
 export function build(options) {
+  if (globalThis[Symbol.for("cottontail.macroMode")] === true ||
+      globalThis.process?.execArgv?.includes("--cottontail-macro-mode") ||
+      globalThis.process?.env?.COTTONTAIL_MACRO_MODE === "1") {
+    throw new Error("Bun.build cannot be called from within a macro");
+  }
   if (options == null || typeof options !== "object") {
     throw new TypeError("Expected a config object to be passed to Bun.build");
   }
@@ -2092,6 +2261,11 @@ export function build(options) {
   if (options.plugins != null) {
     if (!Array.isArray(options.plugins)) {
       throw new TypeError("Expected plugins to be an array of objects");
+    }
+    for (const plugin of options.plugins) {
+      if (plugin === null || typeof plugin !== "object") {
+        throw new TypeError("Expected plugin to be an object");
+      }
     }
     return buildWithPlugins(options, options.plugins);
   }
@@ -3990,9 +4164,12 @@ export class Request {
     else if (typeof init !== "object" && typeof init !== "function") {
       throw new TypeError("Failed to construct 'Request': the second argument must be an object");
     }
+    // WebIDL converts the request input before reading RequestInit. In
+    // particular, a throwing input.toString() must win over init.headers.
+    const url = typeof input === "string" ? input : String(input?.url ?? input ?? "");
     const headers = new Headers(init.headers ?? input?.headers);
     requestState.set(this, {
-      url: typeof input === "string" ? input : String(input?.url ?? input ?? ""),
+      url,
       method: String(init.method ?? input?.method ?? "GET").toUpperCase(),
       headers,
       params: init.params ?? input?.params ?? {},
@@ -4868,9 +5045,16 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
       } else {
         bodyMode = "eof";
       }
+      // The stream constructor may run jobs while an already-queued EOF is
+      // waiting. Mark the header phase complete before that reentrant turn.
+      phase = "body";
       const stream = new globalThis.ReadableStream({
         start(controller) {
           streamController = controller;
+          if (finished && !streamDone) {
+            streamDone = true;
+            controller.close();
+          }
         },
         pull() {
           if (!finished && !socket.destroyed) socket.resume?.();
@@ -4888,7 +5072,6 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         url: request.url,
         redirected,
       }));
-      phase = "body";
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
           // Ignore pipelined data.
@@ -5022,7 +5205,11 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         }
         const headers = parseHeadersText(headerTextLines.join("\n"));
         headBuffer = Buffer.alloc(0);
-        startBody(headers, status, match[2] ?? "", rest);
+        try {
+          startBody(headers, status, match[2] ?? "", rest);
+        } catch (error) {
+          failure(error);
+        }
         return;
       }
       consumeBody(chunk);
@@ -5030,11 +5217,12 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
 
     const connectionLost = (rawError) => {
       if (finished) return;
-      if (settled && bodyMode === "eof" && phase === "body") {
-        finishBody();
-        return;
-      }
-      if (settled && bodyMode === "chunked" && chunkState?.trailer) {
+      if (phase === "body" && (
+        bodyMode === "eof" ||
+        bodyMode === "none" ||
+        (bodyMode === "length" && bodyRemaining === 0) ||
+        (bodyMode === "chunked" && chunkState?.trailer)
+      )) {
         finishBody();
         return;
       }
@@ -8710,7 +8898,9 @@ function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
 function bunInspectDynamicErrorSource(error, rendered) {
   const metadata = error?.[dynamicErrorSourceSymbol];
   if (!metadata || typeof metadata.source !== "string") return rendered;
-  const functionName = String(error.stack ?? "").match(/^([^@\n]+)@/)?.[1];
+  const functionName = String(error.stack ?? "")
+    .match(/(?:^|\n)\s*(?:at\s+)?([^@\n]+)@/)?.[1]
+    ?.trim();
   if (!functionName) return rendered;
   const escapedName = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const lines = metadata.source.split(/\r?\n/);

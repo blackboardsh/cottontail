@@ -1812,6 +1812,12 @@ pub const BundleOptions = struct {
     /// outputs have nowhere to go).
     externalize_runtime_require_resolve: bool = false,
 
+    /// Cottontail runtime execution bundles do not have an output directory
+    /// for copied assets. A `file` loader import therefore evaluates to the
+    /// existing absolute source path, matching Bun's runtime loader. Bun.build
+    /// leaves this disabled and continues emitting a separate asset.
+    runtime_file_loader_paths: bool = false,
+
     /// Cottontail runtime bundles install a global Node-style `require` before
     /// executing user modules. Preserve that identifier for external calls so
     /// serialized function source does not reference a linker-private helper.

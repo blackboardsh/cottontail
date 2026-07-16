@@ -1492,7 +1492,11 @@ export const _fatalException = processObject._fatalException = (error, fromPromi
   return processObject.emit("uncaughtException", error, fromPromise ? "unhandledRejection" : "uncaughtException");
 };
 
-globalThis.__cottontailHandleUncaughtException = (error) => processObject._fatalException(error, false);
+globalThis.__cottontailHandleUncaughtException = error => {
+  const handled = processObject._fatalException(error, false);
+  if (!handled) globalThis.__cottontailFormatUncaughtModuleError?.(error);
+  return handled;
+};
 
 export const setUncaughtExceptionCaptureCallback = processObject.setUncaughtExceptionCaptureCallback = (callback) => {
   if (callback != null && typeof callback !== "function") {

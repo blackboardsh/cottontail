@@ -111,6 +111,10 @@ const DEBUG = process.env.BUN_BUNDLER_TEST_DEBUG;
 const FILTER = process.env.BUN_BUNDLER_TEST_FILTER;
 /** Set this to hide skips */
 const HIDE_SKIP = process.env.BUN_BUNDLER_TEST_HIDE_SKIP;
+// COTTONTAIL-COMPAT: The owned runner discovers generated itBundled IDs in a
+// lightweight registration pass before running memory-heavy fixtures alone.
+const COTTONTAIL_DISCOVER = process.env.COTTONTAIL_BUNDLER_TEST_DISCOVER === "1";
+const COTTONTAIL_DISCOVERY_PREFIX = "COTTONTAIL_BUNDLER_TEST_ID:";
 /** Path to the bun. */
 const BUN_EXE = (process.env.BUN_EXE && Bun.which(process.env.BUN_EXE)) ?? bunExe();
 export const RUN_UNCHECKED_TESTS = false;
@@ -482,6 +486,7 @@ function expectBundled(
     sourceMap,
     splitting,
     target,
+    timeoutScale: _timeoutScale,
     todo: notImplemented,
     treeShaking,
     unsupportedCSSFeatures,
@@ -760,7 +765,7 @@ function expectBundled(
               jsx.factory && ["--jsx-factory", jsx.factory],
               jsx.fragment && ["--jsx-fragment", jsx.fragment],
               jsx.importSource && ["--jsx-import-source", jsx.importSource],
-              jsx.side_effects && ["--jsx-side-effects"],
+              jsx.sideEffects && ["--jsx-side-effects"],
               dotenv && ["--env", dotenv],
               // metafile && `--manifest=${metafile}`,
               sourceMap && `--sourcemap=${sourceMap}`,
@@ -1774,6 +1779,10 @@ export function itBundled(
   id: string,
   opts: BundlerTestInput | ((metadata: BundlerTestWrappedAPI) => BundlerTestInput),
 ): BundlerTestRef {
+  if (COTTONTAIL_DISCOVER) {
+    console.log(`${COTTONTAIL_DISCOVERY_PREFIX}${JSON.stringify(id)}`);
+    return testRef(id, {} as BundlerTestInput);
+  }
   if (typeof opts === "function") {
     const fn = opts;
     opts = opts({ root: path.join(tempDirectory, id), getConfigRef });
@@ -1806,12 +1815,20 @@ export function itBundled(
   return ref;
 }
 itBundled.concurrent = (id: string, opts: BundlerTestInput) => {
+  if (COTTONTAIL_DISCOVER) {
+    console.log(`${COTTONTAIL_DISCOVERY_PREFIX}${JSON.stringify(id)}`);
+    return testRef(id, {} as BundlerTestInput);
+  }
   const { it } = testForFile(currentFile ?? callerSourceOrigin());
   it.concurrent(id, () => expectBundled(id, opts as any));
   return testRef(id, opts);
 };
 
 itBundled.only = (id: string, opts: BundlerTestInput) => {
+  if (COTTONTAIL_DISCOVER) {
+    console.log(`${COTTONTAIL_DISCOVERY_PREFIX}${JSON.stringify(id)}`);
+    return testRef(id, {} as BundlerTestInput);
+  }
   const { it } = testForFile(currentFile ?? callerSourceOrigin());
 
   it.only(

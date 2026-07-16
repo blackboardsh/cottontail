@@ -636,8 +636,14 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const stderr = &stderr_writer.interface;
 
     var options: cottontail_bundler.BundleOptions = .{ .target = .browser };
+    if (init.environ_map.get("NODE_ENV")) |node_env| {
+        options.production = std.ascii.eqlIgnoreCase(node_env, "production");
+    }
     var entries: std.ArrayList([]const u8) = .empty;
     var external: std.ArrayList([]const u8) = .empty;
+    var conditions: std.ArrayList([]const u8) = .empty;
+    var define_keys: std.ArrayList([]const u8) = .empty;
+    var define_values: std.ArrayList([]const u8) = .empty;
     var outdir: ?[]const u8 = null;
     var outfile: ?[]const u8 = null;
     var metafile_json_path: ?[]const u8 = null;
@@ -648,6 +654,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         const arg: []const u8 = args[index];
         if (std.mem.eql(u8, arg, "--compile")) {
             compile = true;
+        } else if (std.mem.eql(u8, arg, "--bytecode")) {
+            options.bytecode = true;
         } else if (std.mem.eql(u8, arg, "--production")) {
             options.production = true;
             options.minify_whitespace = true;
@@ -663,8 +671,85 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             options.minify_identifiers = true;
         } else if (std.mem.eql(u8, arg, "--minify-syntax")) {
             options.minify_syntax = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-dce-annotations")) {
+            options.ignore_dce_annotations = true;
+        } else if (std.mem.eql(u8, arg, "--emit-dce-annotations")) {
+            options.emit_dce_annotations = true;
+        } else if (std.mem.startsWith(u8, arg, "--jsx-runtime=")) {
+            const runtime = arg["--jsx-runtime=".len..];
+            options.jsx_runtime = if (std.ascii.eqlIgnoreCase(runtime, "classic"))
+                .classic
+            else if (std.ascii.eqlIgnoreCase(runtime, "automatic"))
+                .automatic
+            else {
+                try stderr.print("error: invalid JSX runtime \"{s}\"\n", .{runtime});
+                try stderr.flush();
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "--jsx-runtime") and index + 1 < args.len) {
+            index += 1;
+            const runtime: []const u8 = args[index];
+            options.jsx_runtime = if (std.ascii.eqlIgnoreCase(runtime, "classic"))
+                .classic
+            else if (std.ascii.eqlIgnoreCase(runtime, "automatic"))
+                .automatic
+            else {
+                try stderr.print("error: invalid JSX runtime \"{s}\"\n", .{runtime});
+                try stderr.flush();
+                return 1;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--jsx-factory=")) {
+            options.jsx_factory = arg["--jsx-factory=".len..];
+        } else if (std.mem.eql(u8, arg, "--jsx-factory") and index + 1 < args.len) {
+            index += 1;
+            options.jsx_factory = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--jsx-fragment=")) {
+            options.jsx_fragment = arg["--jsx-fragment=".len..];
+        } else if (std.mem.eql(u8, arg, "--jsx-fragment") and index + 1 < args.len) {
+            index += 1;
+            options.jsx_fragment = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--jsx-import-source=")) {
+            options.jsx_import_source = arg["--jsx-import-source=".len..];
+        } else if (std.mem.eql(u8, arg, "--jsx-import-source") and index + 1 < args.len) {
+            index += 1;
+            options.jsx_import_source = args[index];
+        } else if (std.mem.eql(u8, arg, "--jsx-side-effects")) {
+            options.jsx_side_effects = true;
+        } else if (std.mem.eql(u8, arg, "--jsx-dev")) {
+            options.jsx_development = true;
         } else if (std.mem.eql(u8, arg, "--packages=external")) {
             options.external_packages = true;
+        } else if (std.mem.eql(u8, arg, "--packages") and index + 1 < args.len) {
+            index += 1;
+            options.external_packages = std.mem.eql(u8, args[index], "external");
+        } else if (std.mem.startsWith(u8, arg, "--conditions=")) {
+            var iterator = std.mem.splitScalar(u8, arg["--conditions=".len..], ',');
+            while (iterator.next()) |condition| {
+                if (condition.len > 0) try conditions.append(allocator, condition);
+            }
+        } else if (std.mem.eql(u8, arg, "--conditions") and index + 1 < args.len) {
+            index += 1;
+            try conditions.append(allocator, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--define=") or std.mem.startsWith(u8, arg, "--define:")) {
+            const prefix_len = if (std.mem.startsWith(u8, arg, "--define=")) "--define=".len else "--define:".len;
+            const define = arg[prefix_len..];
+            const equals = std.mem.indexOfScalar(u8, define, '=') orelse {
+                try stderr.print("error: invalid define \"{s}\", expected key=value\n", .{define});
+                try stderr.flush();
+                return 1;
+            };
+            try define_keys.append(allocator, define[0..equals]);
+            try define_values.append(allocator, define[equals + 1 ..]);
+        } else if (std.mem.eql(u8, arg, "--define") and index + 1 < args.len) {
+            index += 1;
+            const define: []const u8 = args[index];
+            const equals = std.mem.indexOfScalar(u8, define, '=') orelse {
+                try stderr.print("error: invalid define \"{s}\", expected key=value\n", .{define});
+                try stderr.flush();
+                return 1;
+            };
+            try define_keys.append(allocator, define[0..equals]);
+            try define_values.append(allocator, define[equals + 1 ..]);
         } else if (std.mem.eql(u8, arg, "--splitting")) {
             options.code_splitting = true;
         } else if (std.mem.eql(u8, arg, "--metafile")) {
@@ -690,6 +775,16 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         } else if (std.mem.eql(u8, arg, "--outfile") and index + 1 < args.len) {
             index += 1;
             outfile = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--banner=")) {
+            options.banner = arg["--banner=".len..];
+        } else if (std.mem.eql(u8, arg, "--banner") and index + 1 < args.len) {
+            index += 1;
+            options.banner = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--footer=")) {
+            options.footer = arg["--footer=".len..];
+        } else if (std.mem.eql(u8, arg, "--footer") and index + 1 < args.len) {
+            index += 1;
+            options.footer = args[index];
         } else if (std.mem.startsWith(u8, arg, "--format=")) {
             options.output_format = cottontail_compiler.options.Format.fromString(arg["--format=".len..]) orelse {
                 try stderr.print("error: invalid build format \"{s}\"\n", .{arg["--format=".len..]});
@@ -736,6 +831,14 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     }
 
     options.external = external.items;
+    options.conditions = conditions.items;
+    options.define_keys = define_keys.items;
+    options.define_values = define_values.items;
+    if (options.bytecode) {
+        try stderr.writeAll("error: Bun build bytecode requires a JavaScriptCore cached-bytecode API\n");
+        try stderr.flush();
+        return 1;
+    }
     if (compile) {
         if (entries.items.len != 1) {
             try stderr.print("error: --compile requires exactly one entrypoint\n", .{});
@@ -774,6 +877,18 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
     const MetafileRequest = struct { json: []const u8, markdown: []const u8 };
     const MinifyRequest = struct { whitespace: bool, identifiers: bool, syntax: bool };
+    const JsxRequest = struct {
+        runtime: ?[]const u8,
+        factory: ?[]const u8,
+        fragment: ?[]const u8,
+        importSource: ?[]const u8,
+        development: ?bool,
+        sideEffects: ?bool,
+    };
+    var define_object: std.json.ObjectMap = .{};
+    for (options.define_keys, options.define_values) |key, value| {
+        try define_object.put(allocator, key, .{ .string = value });
+    }
     const request = .{
         .entrypoints = entries.items,
         .target = @tagName(options.target),
@@ -781,13 +896,28 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         .sourcemap = @tagName(options.source_map),
         .packages = if (options.external_packages) "external" else "bundle",
         .external = options.external,
+        .conditions = options.conditions,
+        .define = std.json.Value{ .object = define_object },
         .splitting = options.code_splitting,
+        .banner = options.banner,
+        .footer = options.footer,
+        .bytecode = options.bytecode,
+        .ignoreDCEAnnotations = options.ignore_dce_annotations,
+        .emitDCEAnnotations = options.emit_dce_annotations,
         .minify = MinifyRequest{
             .whitespace = options.minify_whitespace,
             .identifiers = options.minify_identifiers,
             .syntax = options.minify_syntax,
         },
         .production = options.production,
+        .jsx = JsxRequest{
+            .runtime = if (options.jsx_runtime) |runtime| @tagName(runtime) else null,
+            .factory = options.jsx_factory,
+            .fragment = options.jsx_fragment,
+            .importSource = options.jsx_import_source,
+            .development = options.jsx_development,
+            .sideEffects = options.jsx_side_effects,
+        },
         .metafile = if (metafile_json_path != null or metafile_markdown_path != null)
             MetafileRequest{
                 .json = metafile_json_path orelse "",
@@ -1314,10 +1444,55 @@ fn consumeSpawnGate(allocator: std.mem.Allocator, process_args: []const [:0]cons
     return visible_args;
 }
 
+fn runMacroEvaluator(init: std.process.Init, args: []const [:0]const u8) !u8 {
+    if (args.len != 5) return 1;
+    const allocator = init.arena.allocator();
+    const module_literal = try std.json.Stringify.valueAlloc(allocator, args[2], .{});
+    const export_literal = try std.json.Stringify.valueAlloc(allocator, args[3], .{});
+    const source = try std.fmt.allocPrintSentinel(
+        allocator,
+        \\import * as __ctModule from {s};
+        \\Object.defineProperty(globalThis, Symbol.for("cottontail.macroMode"), {{ value: true, configurable: true }});
+        \\const __ctExportName = {s};
+        \\const __ctMacro = __ctModule[__ctExportName];
+        \\if (typeof __ctMacro !== "function") throw new TypeError(`Macro export ${{JSON.stringify(__ctExportName)}} is not a function`);
+        \\const __ctEncode = (value, stack = new Set()) => {{
+        \\  if (value === undefined) return {{ t: "undefined" }};
+        \\  if (value === null) return {{ t: "null" }};
+        \\  const type = typeof value;
+        \\  if (type === "boolean") return {{ t: "boolean", v: value }};
+        \\  if (type === "number") return {{ t: "number", v: Object.is(value, -0) ? "-0" : String(value) }};
+        \\  if (type === "string") return {{ t: "string", v: value }};
+        \\  if (type !== "object") throw new TypeError(`Cannot serialize macro result of type ${{type}}`);
+        \\  if (typeof value.toJSON === "function") value = value.toJSON();
+        \\  if (stack.has(value)) throw new TypeError("Cannot serialize a circular macro result");
+        \\  stack.add(value);
+        \\  try {{
+        \\    if (Array.isArray(value)) return {{ t: "array", v: value.map(item => __ctEncode(item, stack)) }};
+        \\    return {{ t: "object", v: Object.keys(value).map(key => [key, __ctEncode(value[key], stack)]) }};
+        \\  }} finally {{
+        \\    stack.delete(value);
+        \\  }}
+        \\}};
+        \\const __ctResult = await __ctMacro(...({s}));
+        \\console.log("\x1eCOTTONTAIL_MACRO_RESULT:" + JSON.stringify(__ctEncode(__ctResult)));
+        \\
+    ,
+        .{ module_literal, export_literal, args[4] },
+        0,
+    );
+    return try script_runner.runEval(init, source, &.{}, &.{"--cottontail-macro-mode"}, false);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var process_args = try init.minimal.args.toSlice(allocator);
     process_args = try consumeSpawnGate(allocator, process_args);
+    if (process_args.len > 1 and std.mem.eql(u8, process_args[1], "--cottontail-macro-eval")) {
+        const exit_code = try runMacroEvaluator(init, process_args);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
     const args = try argsWithBunOptions(allocator, process_args, init.environ_map);
 
     if (try runStandaloneIfPresent(init, args)) |exit_code| {

@@ -23,7 +23,9 @@ pub const watch_directories = true;
 // This feature flag exists so when you have defines inside package.json, you can use single quotes in nested strings.
 pub const allow_json_single_quotes = true;
 
-pub const is_macro_enabled = false;
+// COTTONTAIL-COMPAT: Macro execution uses Cottontail's isolated evaluator in
+// js_parser_jsc/Macro.zig and does not depend on Bun's JavaScriptCore fork.
+pub const is_macro_enabled = true;
 
 pub const disable_compression_in_http_client = false;
 

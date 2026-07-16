@@ -1151,7 +1151,6 @@ fn bundleScriptNative(
     options.include_runtime_modules = true;
     options.preserve_external_require_name = true;
     options.inline_import_meta_properties = true;
-    options.skip_teardown = true;
 
     const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
         "commonjs-launcher"
@@ -2264,6 +2263,13 @@ fn isTomlSpecifier(specifier: []const u8) bool {
     return std.mem.eql(u8, std.fs.path.extension(bare), ".toml");
 }
 
+fn hasMacroImportAttribute(attributes: []const u8) bool {
+    const type_index = std.mem.indexOf(u8, attributes, "type") orelse return false;
+    const value = attributes[type_index + "type".len ..];
+    return std.mem.indexOf(u8, value, "\"macro\"") != null or
+        std.mem.indexOf(u8, value, "'macro'") != null;
+}
+
 fn loaderOptionsLiteral(ctx: *const Context, loader: []const u8) ![]const u8 {
     const loader_literal = try jsonStringLiteral(ctx, loader);
     return try std.fmt.allocPrint(ctx.allocator, "{{ with: {{ type: {s} }} }}", .{loader_literal});
@@ -2449,6 +2455,12 @@ fn scanDynamicImports(
             const after_specifier = std.mem.trim(u8, source[specifier_end..semicolon], " \t\r\n");
             const has_attributes = std.mem.startsWith(u8, after_specifier, "with") or
                 std.mem.startsWith(u8, after_specifier, "assert");
+            // Macro imports belong to the compiler's macro pass. Rewriting a
+            // namespace import into a runtime dynamic load bypasses expansion.
+            if (has_attributes and hasMacroImportAttribute(after_specifier)) {
+                cursor = semicolon + 1;
+                continue;
+            }
             const has_query = std.mem.indexOfAny(u8, prefix, "?#") != null;
             const assumes_jsonc = isJsoncLikeSpecifier(prefix);
             const assumes_json5 = isJson5Specifier(prefix);
@@ -2575,6 +2587,10 @@ fn transpileDynamicTarget(
             .target = .node,
             .loader = loader_override,
             .external_packages = external_packages,
+            // Dynamic target factories share createRequire()'s module cache.
+            // Keep JavaScript dependencies external instead of embedding a
+            // private copy in every target; assets such as CSS remain bundled.
+            .external = &.{ "*.js", "*.mjs", "*.cjs" },
             // The factory wrapper (`appendDynamicTargetFactory`) evaluates
             // this output inside `new Function(..., "__ctImportMeta", ...)`
             // and computes the true URL — including any `?query`/`#fragment`

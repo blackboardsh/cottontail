@@ -46,7 +46,30 @@ as they are discovered. Explicit `--test <relative-path>` runs the selected
 test even if it is currently disabled, which keeps reproduction easy.
 Per-test `args` are appended to the Cottontail invocation. A `serial: true`
 entry runs outside the Bun harness's parallel file workers for load-sensitive
-tests; both adaptations must include their rationale in the entry's `reason`.
+tests. A `splitBundlerTests: true` entry runs every discovered `itBundled` case
+in its own process through Bun's `BUN_BUNDLER_TEST_FILTER`, bounding retained
+fixture memory. The owned `expectBundled.ts` helper provides a registration-only
+discovery pass, so generated case IDs are included and skipped/commented cases
+are not. These adaptations must include their rationale in the entry's `reason`.
+An enabled split entry may use `expectedFailureBundlerTests` to map individual
+case IDs to documented reasons. Those cases remain in every run as strict
+expected failures, so a newly passing case is reported as an XPASS.
+
+The Bun runner uses up to four workers by default. Independent failures from
+the parallel phase are retried serially before being reported. Use `--jobs 1`
+for deterministic debugging, or select one generated case without registering
+the rest of a matrix:
+
+```sh
+node scripts/run-upstream-tests.js bun \
+  --test test/bundler/bundler_plugin.test.ts \
+  --case 'plugin/FileLoaderMultipleAssets'
+```
+
+Use `--no-serial-retry` when probing unclassified files in bulk. It preserves
+the normal timeout and result reporting but avoids spending a second full test
+budget confirming every discovery failure; enabled-suite and focused repair
+runs should retain the default serial retry.
 
 List imported upstream test status:
 

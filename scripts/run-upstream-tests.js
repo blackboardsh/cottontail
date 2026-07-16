@@ -14,6 +14,8 @@ const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
 const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
+const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
+const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
 const bunSnapshotArtifactNames = new Set(['app', 'app.exe', 'a.txt', 'b.txt', 'append_output.txt']);
@@ -24,14 +26,32 @@ function removeTemp(path) {
 }
 
 function removeSnapshotArtifacts(snapshotRoot, runtime) {
-  try {
-    for (const name of readdirSync(snapshotRoot)) {
-      const generated = name.startsWith('.cottontail-eval-') ||
+  const installedDependencies = join(snapshotRoot, 'test', 'node_modules');
+  const stack = [snapshotRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let names;
+    try { names = readdirSync(current); } catch { continue; }
+    for (const name of names) {
+      const path = join(current, name);
+      const generated = name === '.cottontail-tmp' ||
+        name === '.cottontail-compile-cache' ||
+        name.startsWith('.cottontail-eval-') ||
+        name.startsWith('.cottontail-compat-') ||
         name.startsWith('fstest') ||
-        (runtime === 'bun' && bunSnapshotArtifactNames.has(name));
-      if (generated) rmSync(join(snapshotRoot, name), { recursive: true, force: true });
+        /^Heap\.\d+\.heapsnapshot$/.test(name) ||
+        (current === snapshotRoot && runtime === 'bun' && bunSnapshotArtifactNames.has(name));
+      if (generated) {
+        try { rmSync(path, { recursive: true, force: true }); } catch {}
+        continue;
+      }
+      if (path === installedDependencies) continue;
+      try {
+        const stat = lstatSync(path);
+        if (stat.isDirectory() && !stat.isSymbolicLink()) stack.push(path);
+      } catch {}
     }
-  } catch {}
+  }
 }
 
 function removeAllSnapshotArtifacts() {
@@ -73,10 +93,13 @@ function usage() {
     '',
     'Options:',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
+    '  --case <regexp>              Select generated itBundled case IDs within a split file.',
+    '  --jobs <n>                   Run independent Bun files/cases concurrently (default: up to 4).',
     '  --list                       Print status counts without running tests.',
     '  --max-failures <n>           Stop after this many unexpected results.',
     '  --max-tests <n>              Run at most this many selected tests.',
     '  --match <regexp>             Select tests whose relative path matches.',
+    '  --no-serial-retry            Do not retry parallel failures serially (useful for discovery).',
     '  --only-status <status>       Select enabled, expected-failure, or not-enabled tests.',
     '  --test <relative-path>        Run one copied upstream test path.',
   ].join('\n'));
@@ -92,10 +115,12 @@ function parseArgs(argv) {
     includeExpectedFailures: false,
     list: false,
     maxFailures: Infinity,
-    jobs: 1,
+    jobs: defaultBunJobs,
     fastXfail: false,
     maxTests: Infinity,
     match: null,
+    caseMatch: null,
+    serialRetry: true,
     onlyStatus: null,
     test: null,
   };
@@ -103,6 +128,13 @@ function parseArgs(argv) {
     const arg = args.shift();
     if (arg === '--include-expected-failures') {
       options.includeExpectedFailures = true;
+    } else if (arg === '--case') {
+      const value = args.shift() ?? fail('--case requires a regular expression');
+      try {
+        options.caseMatch = new RegExp(value);
+      } catch (error) {
+        fail(`invalid --case regular expression: ${error.message}`);
+      }
     } else if (arg === '--list') {
       options.list = true;
     } else if (arg === '--max-failures') {
@@ -126,6 +158,8 @@ function parseArgs(argv) {
       } catch (error) {
         fail(`invalid --match regular expression: ${error.message}`);
       }
+    } else if (arg === '--no-serial-retry') {
+      options.serialRetry = false;
     } else if (arg === '--only-status') {
       const value = args.shift() ?? fail('--only-status requires a status');
       if (!['enabled', 'expected-failure', 'not-enabled'].includes(value)) {
@@ -293,14 +327,83 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
   return entries;
 }
 
-function makeEnv(runtime, target, runTemp = tempRoot) {
+function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
   return {
     ...process.env,
     ...(runtime === 'bun' ? { TZ: process.env.COTTONTAIL_UPSTREAM_TZ ?? 'Etc/UTC' } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
     COTTONTAIL_UPSTREAM_RUNTIME: runtime,
     COTTONTAIL_UPSTREAM_VERSION: target.version,
+    ...(overrides ?? {}),
   };
+}
+
+function entryLabel(entry) {
+  return entry.variant ? `${entry.path} [${entry.variant}]` : entry.path;
+}
+
+function discoverBundlerTestIds(entry, snapshotRoot, target) {
+  const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
+  const result = spawnSync(binaryPath, [entry.path, ...entryArgs(entry)], {
+    cwd: snapshotRoot,
+    env: makeEnv('bun', target, tempRoot, {
+      ...(entry.env ?? {}),
+      BUN_BUNDLER_TEST_FILTER: '',
+      COTTONTAIL_BUNDLER_TEST_DISCOVER: '1',
+    }),
+    encoding: 'utf8',
+    timeout,
+    maxBuffer: directTestMaxBuffer,
+  });
+  if (result.error || result.status !== 0) {
+    const details = [result.error?.message, result.stdout, result.stderr].filter(Boolean).join('\n');
+    fail(`Could not discover itBundled cases in ${entry.path}${details ? `:\n${details}` : ''}`);
+  }
+  const ids = [];
+  for (const line of String(result.stdout ?? '').split(/\r?\n/)) {
+    if (!line.startsWith(bundlerTestDiscoveryPrefix)) continue;
+    try {
+      const id = JSON.parse(line.slice(bundlerTestDiscoveryPrefix.length));
+      if (typeof id === 'string' && !ids.includes(id)) ids.push(id);
+    } catch {
+      fail(`Invalid itBundled discovery record in ${entry.path}: ${line}`);
+    }
+  }
+  if (ids.length === 0) fail(`No itBundled cases discovered in split upstream test: ${entry.path}`);
+  return ids;
+}
+
+function expandBunEntries(entries, snapshotRoot, target, options) {
+  const expanded = [];
+  for (const entry of entries) {
+    if (entry.splitBundlerTests !== true) {
+      if (options.caseMatch) continue;
+      expanded.push(entry);
+      continue;
+    }
+    const ids = discoverBundlerTestIds(entry, snapshotRoot, target)
+      .filter(id => !options.caseMatch || options.caseMatch.test(id));
+    for (const id of ids) {
+      const expectedFailureReason = entry.expectedFailureBundlerTests?.[id];
+      expanded.push({
+        ...entry,
+        variant: id,
+        ...(expectedFailureReason ? {
+          status: 'expected-failure',
+          reason: String(expectedFailureReason),
+        } : {}),
+        env: {
+          ...(entry.env ?? {}),
+          BUN_BUNDLER_TEST_FILTER: id,
+          BUN_BUNDLER_TEST_HIDE_SKIP: '1',
+        },
+      });
+    }
+  }
+  if (options.caseMatch && expanded.length === 0) {
+    fail(`No generated itBundled case IDs matched ${options.caseMatch}`);
+  }
+  return expanded;
 }
 
 function nodeTestSelector(entryPath) {
@@ -341,7 +444,7 @@ function runDirect(runtime, target, entry, snapshotRoot) {
   const timeout = Number(entry.timeoutMs ?? directTestTimeoutMs);
   return spawnSync(binaryPath, [entry.path, ...entryArgs(entry)], {
     cwd: snapshotRoot,
-    env: makeEnv(runtime, target),
+    env: makeEnv(runtime, target, tempRoot, entry.env),
     encoding: 'utf8',
     timeout,
     maxBuffer: directTestMaxBuffer,
@@ -382,7 +485,7 @@ function runDirectAsync(runtime, target, entry, snapshotRoot, options) {
   return new Promise((resolveResult) => {
     const child = spawn(binaryPath, [entry.path, ...entryArgs(entry)], {
       cwd: snapshotRoot,
-      env: makeEnv(runtime, target, runTemp),
+      env: makeEnv(runtime, target, runTemp, entry.env),
       detached: process.platform !== 'win32',
     });
     activeChildren.add(child);
@@ -437,7 +540,7 @@ function classifyResult(runtime, entry, result, options) {
       entry,
       ok: shouldFail,
       unexpected: !shouldFail,
-      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entry.path} timed out after ${timeout}ms`,
+      message: `${shouldFail ? 'xfail' : 'FAIL'} ${runtime} ${entryLabel(entry)} timed out after ${timeout}ms`,
     };
   }
   const spawnError = formatSpawnError(runtime, entry, result);
@@ -452,9 +555,9 @@ function classifyResult(runtime, entry, result, options) {
     ? ` (${execution.tests} tests, ${execution.assertions} assertions)`
     : '';
   const message = ok
-    ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entry.path}${executionLabel}`
-    : [
-        `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${entry.path} exited ${exitCode}`,
+      ? `${shouldFail ? 'xfail' : 'ok'} ${runtime} ${entryLabel(entry)}${executionLabel}`
+      : [
+        `${shouldFail ? 'XPASS' : 'FAIL'} ${runtime} ${entryLabel(entry)} exited ${exitCode}`,
         result.stdout ? `stdout:\n${result.stdout}` : '',
         result.stderr ? `stderr:\n${result.stderr}` : '',
       ].filter(Boolean).join('\n');
@@ -463,6 +566,7 @@ function classifyResult(runtime, entry, result, options) {
 
 async function runBunEntries(runtime, target, entries, options) {
   const snapshotRoot = resolve(rootDir, target.snapshot);
+  entries = expandBunEntries(entries, snapshotRoot, target, options);
   if (options.jobs <= 1) {
     const results = [];
     for (const entry of entries) results.push(await runOneAsync(runtime, target, entry, snapshotRoot, options));
@@ -493,10 +597,12 @@ async function runBunEntries(runtime, target, entries, options) {
   await Promise.all(Array.from({ length: Math.min(options.jobs, queue.length) || 1 }, worker));
   // Anything unexpected in the parallel phase gets one serial retry so load
   // artifacts can never masquerade as real failures.
-  for (let index = 0; index < entries.length; index += 1) {
-    if (serialIndexes.has(index)) continue;
-    if (results[index]?.unexpected) {
-      results[index] = await runOneAsync(runtime, target, entries[index], snapshotRoot, options);
+  if (options.serialRetry) {
+    for (let index = 0; index < entries.length; index += 1) {
+      if (serialIndexes.has(index)) continue;
+      if (results[index]?.unexpected) {
+        results[index] = await runOneAsync(runtime, target, entries[index], snapshotRoot, options);
+      }
     }
   }
   for (let index = 0; index < entries.length; index += 1) {
@@ -522,7 +628,7 @@ async function runOneAsync(runtime, target, entry, snapshotRoot, options) {
 
 function formatSpawnError(runtime, entry, result) {
   if (!result.error) return null;
-  return `${runtime} ${entry.path} failed to start: ${result.error.message}`;
+  return `${runtime} ${entryLabel(entry)} failed to start: ${result.error.message}`;
 }
 
 function parseBunTestExecution(stderr) {
@@ -615,7 +721,10 @@ function runtimeTargets(runtime, targets) {
 
 const { runtime, options } = parseArgs(process.argv.slice(2));
 if (!existsSync(targetsPath)) fail(`Missing ${targetsPath}`);
-if (!options.list && !existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
+if (!options.list) {
+  if (!existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
+  if (statSync(binaryPath).size === 0) fail(`Built cottontail binary is empty at ${binaryPath}. Rebuild after clearing the Zig cache.`);
+}
 
 const targets = readJson(targetsPath);
 let unexpected = 0;

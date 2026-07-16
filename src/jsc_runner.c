@@ -2428,6 +2428,7 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
     JSStringRef source = ct_js_string(
         "(function(e){"
         "try{"
+        "if(e&&e.__cottontailFormattedStack&&e.stack)return String(e.stack);"
         "var head='';"
         "if(e&&e.message)head=(e.name?String(e.name):'Error')+': '+String(e.message);"
         "if(e&&e.stack){var stack=String(e.stack);return head&&stack.indexOf(head)<0?head+'\\n'+stack:stack;}"
@@ -16612,6 +16613,42 @@ static JSValueRef ct_bundle_native(JSContextRef ctx, JSObjectRef function, JSObj
     return result;
 }
 
+static JSValueRef ct_compile_function_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "compileFunction(source, filename) requires two arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t source_len = 0;
+    char *source_bytes = ct_value_to_utf8_copy(ctx, argv[0], &source_len);
+    char *filename = ct_value_to_string_copy(ctx, argv[1]);
+    if (source_bytes == NULL || filename == NULL) {
+        free(source_bytes);
+        free(filename);
+        ct_throw_message(ctx, exception, "Out of memory compiling function");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSStringRef source = ct_js_string(source_bytes);
+    JSStringRef source_url = ct_js_string(filename);
+    JSValueRef eval_exception = NULL;
+    JSValueRef result = JSEvaluateScript(ctx, source, NULL, source_url, 1, &eval_exception);
+    JSStringRelease(source);
+    JSStringRelease(source_url);
+    free(source_bytes);
+    free(filename);
+    if (eval_exception != NULL) {
+        if (exception != NULL) *exception = eval_exception;
+        return JSValueMakeUndefined(ctx);
+    }
+    if (result == NULL || !JSValueIsObject(ctx, result) || !JSObjectIsFunction(ctx, (JSObjectRef)result)) {
+        ct_throw_message(ctx, exception, "compileFunction source did not evaluate to a function");
+        return JSValueMakeUndefined(ctx);
+    }
+    return result;
+}
+
 static JSValueRef ct_build_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -16879,6 +16916,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "transpilerScanImports", ct_transpiler_scan_imports_native, runtime);
     ct_install_function(ctx, host, "bundleNative", ct_bundle_native, runtime);
     ct_install_function(ctx, host, "buildNative", ct_build_native, runtime);
+    ct_install_function(ctx, host, "compileFunction", ct_compile_function_native, runtime);
     ct_install_function(ctx, host, "markdownHtml", ct_markdown_html_native, runtime);
     ct_install_function(ctx, host, "markdownEvents", ct_markdown_events_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
@@ -18025,7 +18063,8 @@ static char *ct_prepare_wrapped_source(const uint8_t *source, size_t source_len,
         "(()=>{const __ctTopLevelPromise=(async()=>{\n",
         "\n})();try{globalThis.__cottontailSuppressAsyncHookPromise=true;"
         "__ctTopLevelPromise.then(()=>{globalThis.__ctDone=true;},"
-        "e=>{globalThis.__ctError=e;globalThis.__ctDone=true;});}"
+        "e=>{globalThis.__cottontailFormatUncaughtModuleError?.(e);"
+        "globalThis.__ctError=e;globalThis.__ctDone=true;});}"
         "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();"
     );
 }

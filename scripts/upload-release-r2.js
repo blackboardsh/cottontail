@@ -9,8 +9,10 @@ const rootDir = process.cwd();
 const packageJson = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
 const dryRun = process.argv.includes('--dry-run') || process.env.COTTONTAIL_R2_DRY_RUN === '1';
 const publishAll = process.argv.includes('--all');
+const forceVersionRelease = process.argv.includes('--release');
 const bucket = 'electrobun-artifacts';
-const prefix = 'cottontail/preview';
+const rootPrefix = 'cottontail';
+const previewPrefix = `${rootPrefix}/preview`;
 const releasePlatforms = ['macos-arm64', 'linux-x64', 'linux-arm64', 'windows-x64'];
 
 function fail(message) {
@@ -34,6 +36,18 @@ function gitRevision() {
     return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: rootDir, encoding: 'utf8' }).trim();
   } catch {
     return fail('Unable to determine the release revision');
+  }
+}
+
+function isVersionTag(version) {
+  try {
+    const tags = execFileSync('git', ['tag', '--points-at', 'HEAD'], {
+      cwd: rootDir,
+      encoding: 'utf8',
+    }).trim().split(/\s+/);
+    return tags.includes(`v${version}`);
+  } catch {
+    return false;
   }
 }
 
@@ -146,34 +160,52 @@ function readArtifact(platform) {
   const recordedChecksum = checksumFile.toString('utf8').trim().split(/\s+/, 1)[0];
   if (checksum !== recordedChecksum) fail(`Release checksum mismatch for ${basename(archivePath)}`);
 
-  const archiveKey = `${prefix}/builds/${revision}/${checksum}/${archiveName}`;
   return {
     platform,
     archivePath,
     checksumFile,
-    archiveKey,
-    record: {
-      archive: {
-        url: `${publicBaseUrl}/${archiveKey}`,
-        sha256: checksum,
-        size: statSync(archivePath).size,
-      },
-    },
+    checksum,
+    size: statSync(archivePath).size,
   };
 }
 
 const platforms = publishAll ? releasePlatforms : [platformKey()];
 const artifacts = platforms.map(readArtifact);
 const publishedAt = new Date().toISOString();
-const manifest = Buffer.from(`${JSON.stringify({
-  schema: 2,
-  channel: 'preview',
-  name: packageJson.name,
-  version,
-  revision,
-  publishedAt,
-  platforms: Object.fromEntries(artifacts.map(({ platform, record }) => [platform, record])),
-}, null, 2)}\n`);
+const taggedVersionRelease = isVersionTag(version);
+if (!dryRun && forceVersionRelease && !taggedVersionRelease) {
+  fail(`Refusing to publish releases/${version}: HEAD is not tagged v${version}`);
+}
+const publishVersionRelease = taggedVersionRelease || (dryRun && forceVersionRelease);
+
+function snapshotArchiveKey(platform) {
+  return `${previewPrefix}/builds/${revision}/${platform}/cottontail.tar.gz`;
+}
+
+function versionArchiveKey(platform) {
+  return `${rootPrefix}/releases/${version}/${platform}/cottontail.tar.gz`;
+}
+
+function createManifest(channel, archiveKeyForPlatform) {
+  return Buffer.from(`${JSON.stringify({
+    schema: 2,
+    channel,
+    name: packageJson.name,
+    version,
+    revision,
+    publishedAt,
+    platforms: Object.fromEntries(artifacts.map((artifact) => [artifact.platform, {
+      archive: {
+        url: `${publicBaseUrl}/${archiveKeyForPlatform(artifact.platform)}`,
+        sha256: artifact.checksum,
+        size: artifact.size,
+      },
+    }])),
+  }, null, 2)}\n`);
+}
+
+const previewManifest = createManifest('preview', snapshotArchiveKey);
+const versionManifest = createManifest('release', versionArchiveKey);
 
 const config = {
   accountId: process.env.COTTONTAIL_R2_ACCOUNT_ID ?? 'dry-run-account',
@@ -185,14 +217,15 @@ const immutable = 'public, max-age=31536000, immutable';
 const mutable = 'no-cache, no-store, must-revalidate';
 
 for (const artifact of artifacts) {
+  const archiveKey = snapshotArchiveKey(artifact.platform);
   await putObject(config, {
-    key: artifact.archiveKey,
+    key: archiveKey,
     body: readFileSync(artifact.archivePath),
     contentType: 'application/gzip',
     cacheControl: immutable,
   });
   await putObject(config, {
-    key: `${artifact.archiveKey}.sha256`,
+    key: `${archiveKey}.sha256`,
     body: artifact.checksumFile,
     contentType: 'text/plain; charset=utf-8',
     cacheControl: immutable,
@@ -200,22 +233,48 @@ for (const artifact of artifacts) {
 }
 
 await putObject(config, {
-  key: `${prefix}/builds/${revision}/manifest.json`,
-  body: manifest,
+  key: `${previewPrefix}/builds/${revision}/manifest.json`,
+  body: previewManifest,
+  contentType: 'application/json; charset=utf-8',
+  cacheControl: immutable,
+});
+await putObject(config, {
+  // Compatibility channel pointer. New version consumers should use
+  // cottontail/releases/<version>/manifest.json instead.
+  key: `${previewPrefix}/versions/${version}.json`,
+  body: previewManifest,
   contentType: 'application/json; charset=utf-8',
   cacheControl: mutable,
 });
 await putObject(config, {
-  key: `${prefix}/versions/${version}.json`,
-  body: manifest,
-  contentType: 'application/json; charset=utf-8',
-  cacheControl: mutable,
-});
-await putObject(config, {
-  key: `${prefix}/latest.json`,
-  body: manifest,
+  key: `${previewPrefix}/latest.json`,
+  body: previewManifest,
   contentType: 'application/json; charset=utf-8',
   cacheControl: mutable,
 });
 
-console.log(JSON.stringify({ version, revision, platforms }, null, 2));
+if (publishVersionRelease) {
+  for (const artifact of artifacts) {
+    const archiveKey = versionArchiveKey(artifact.platform);
+    await putObject(config, {
+      key: archiveKey,
+      body: readFileSync(artifact.archivePath),
+      contentType: 'application/gzip',
+      cacheControl: immutable,
+    });
+    await putObject(config, {
+      key: `${archiveKey}.sha256`,
+      body: artifact.checksumFile,
+      contentType: 'text/plain; charset=utf-8',
+      cacheControl: immutable,
+    });
+  }
+  await putObject(config, {
+    key: `${rootPrefix}/releases/${version}/manifest.json`,
+    body: versionManifest,
+    contentType: 'application/json; charset=utf-8',
+    cacheControl: immutable,
+  });
+}
+
+console.log(JSON.stringify({ version, revision, platforms, publishVersionRelease }, null, 2));

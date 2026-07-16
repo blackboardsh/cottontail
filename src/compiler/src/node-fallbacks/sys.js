@@ -1,7 +1,1 @@
-/**
- * Browser polyfill for the `"sys"` module.
- *
- * Imported on usage in `bun build --target=browser`
- */
-export * from "util";
-export * as default from "util";
+export*from"util";import*as default2 from"util";export{default2 as default};
