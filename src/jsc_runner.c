@@ -20,6 +20,7 @@ extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
 extern void ct_jsc_microtask_delay_end(void *opaque_scope);
 extern int ct_jsc_promise_status(JSValueRef value);
 extern JSValueRef ct_jsc_promise_result(JSValueRef value);
+extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
 
@@ -42,12 +43,8 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #else
 #include <arpa/inet.h>
 #endif
-#if defined(__APPLE__) || defined(__MACH__)
-#include <compression.h>
-#else
 #include <brotli/decode.h>
 #include <brotli/encode.h>
-#endif
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -62,6 +59,9 @@ extern void JSGlobalContextSetUnhandledRejectionCallback(
 #include <ifaddrs.h>
 #endif
 #include <limits.h>
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
 #include <math.h>
 #if !defined(_WIN32)
 #include <netdb.h>
@@ -857,6 +857,9 @@ extern uint8_t *ct_markdown_render_html(const uint8_t *source_ptr, size_t source
 extern uint8_t *ct_markdown_parse_events(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
 extern void ct_markdown_free(uint8_t *ptr, size_t len);
 extern void ct_markdown_string_free(char *ptr);
+extern uint8_t *ct_diff_format(const uint8_t *received_ptr, size_t received_len, const uint8_t *expected_ptr, size_t expected_len, bool not, bool enable_ansi_colors, size_t *output_len, char **error_out);
+extern void ct_diff_free(uint8_t *ptr, size_t len);
+extern void ct_diff_string_free(char *ptr);
 extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 
 #if defined(__APPLE__)
@@ -1415,6 +1418,12 @@ static uint32_t ct_next_sqlite_session_id = 1;
 static CtCryptoCipher *ct_crypto_ciphers = NULL;
 static uint32_t ct_next_crypto_cipher_id = 1;
 
+typedef struct CtBrotliEncoderHandle {
+    uint32_t id;
+    BrotliEncoderState *state;
+    struct CtBrotliEncoderHandle *next;
+} CtBrotliEncoderHandle;
+
 typedef struct CtTimer {
     struct CtJscRuntime *runtime;
     JSObjectRef handle;
@@ -1464,6 +1473,8 @@ struct CtJscRuntime {
     uint64_t next_timer_id;
     size_t referenced_timer_count;
     size_t protected_timer_count;
+    CtBrotliEncoderHandle *brotli_encoders;
+    uint32_t next_brotli_encoder_id;
     bool next_tick_pending;
     bool next_tick_priority_armed;
 };
@@ -2369,11 +2380,88 @@ static JSValueRef ct_make_string(JSContextRef ctx, const char *value) {
     return result;
 }
 
+static JSStringRef ct_js_string_from_utf8_len(const char *value, size_t len) {
+    if (value == NULL || len == 0) return JSStringCreateWithUTF8CString("");
+    if (len > SIZE_MAX / sizeof(JSChar)) return NULL;
+
+    JSChar *characters = (JSChar *)malloc(len * sizeof(JSChar));
+    if (characters == NULL) return NULL;
+
+    size_t input = 0;
+    size_t output = 0;
+    while (input < len) {
+        const uint8_t first = (uint8_t)value[input];
+        uint32_t code_point = 0;
+        size_t sequence_length = 1;
+        bool valid = true;
+
+        if (first < 0x80) {
+            code_point = first;
+        } else if (first >= 0xc2 && first <= 0xdf && input + 1 < len) {
+            const uint8_t second = (uint8_t)value[input + 1];
+            valid = (second & 0xc0) == 0x80;
+            if (valid) {
+                code_point = ((uint32_t)(first & 0x1f) << 6) | (uint32_t)(second & 0x3f);
+                sequence_length = 2;
+            }
+        } else if (first >= 0xe0 && first <= 0xef && input + 2 < len) {
+            const uint8_t second = (uint8_t)value[input + 1];
+            const uint8_t third = (uint8_t)value[input + 2];
+            valid = (second & 0xc0) == 0x80 && (third & 0xc0) == 0x80 &&
+                !(first == 0xe0 && second < 0xa0) &&
+                !(first == 0xed && second >= 0xa0);
+            if (valid) {
+                code_point = ((uint32_t)(first & 0x0f) << 12) |
+                    ((uint32_t)(second & 0x3f) << 6) |
+                    (uint32_t)(third & 0x3f);
+                sequence_length = 3;
+            }
+        } else if (first >= 0xf0 && first <= 0xf4 && input + 3 < len) {
+            const uint8_t second = (uint8_t)value[input + 1];
+            const uint8_t third = (uint8_t)value[input + 2];
+            const uint8_t fourth = (uint8_t)value[input + 3];
+            valid = (second & 0xc0) == 0x80 &&
+                (third & 0xc0) == 0x80 &&
+                (fourth & 0xc0) == 0x80 &&
+                !(first == 0xf0 && second < 0x90) &&
+                !(first == 0xf4 && second >= 0x90);
+            if (valid) {
+                code_point = ((uint32_t)(first & 0x07) << 18) |
+                    ((uint32_t)(second & 0x3f) << 12) |
+                    ((uint32_t)(third & 0x3f) << 6) |
+                    (uint32_t)(fourth & 0x3f);
+                sequence_length = 4;
+            }
+        } else {
+            valid = false;
+        }
+
+        if (!valid) {
+            characters[output++] = 0xfffd;
+            input += 1;
+            continue;
+        }
+
+        if (code_point <= 0xffff) {
+            characters[output++] = (JSChar)code_point;
+        } else {
+            code_point -= 0x10000;
+            characters[output++] = (JSChar)(0xd800 + (code_point >> 10));
+            characters[output++] = (JSChar)(0xdc00 + (code_point & 0x3ff));
+        }
+        input += sequence_length;
+    }
+
+    JSStringRef string = JSStringCreateWithCharacters(characters, output);
+    free(characters);
+    return string;
+}
+
 static JSValueRef ct_make_string_len(JSContextRef ctx, const char *value, size_t len) {
-    char *copy = ct_duplicate_bytes(value != NULL ? value : "", value != NULL ? len : 0);
-    if (copy == NULL) return JSValueMakeUndefined(ctx);
-    JSValueRef result = ct_make_string(ctx, copy);
-    free(copy);
+    JSStringRef string = ct_js_string_from_utf8_len(value, value != NULL ? len : 0);
+    if (string == NULL) return JSValueMakeUndefined(ctx);
+    JSValueRef result = JSValueMakeString(ctx, string);
+    JSStringRelease(string);
     return result;
 }
 
@@ -2494,6 +2582,50 @@ static double ct_value_to_number(JSContextRef ctx, JSValueRef value) {
     return exception == NULL ? number : 0;
 }
 
+static bool ct_value_to_int_checked(
+    JSContextRef ctx,
+    JSValueRef value,
+    int minimum,
+    int maximum,
+    int *result,
+    JSValueRef *exception,
+    const char *message
+) {
+    JSValueRef conversion_exception = NULL;
+    double number = JSValueToNumber(ctx, value, &conversion_exception);
+    if (conversion_exception != NULL) {
+        if (exception != NULL) *exception = conversion_exception;
+        return false;
+    }
+    if (!isfinite(number) || number < minimum || number > maximum) {
+        ct_throw_message(ctx, exception, message);
+        return false;
+    }
+    *result = (int)number;
+    return true;
+}
+
+static bool ct_value_to_uint32_checked(
+    JSContextRef ctx,
+    JSValueRef value,
+    uint32_t *result,
+    JSValueRef *exception,
+    const char *message
+) {
+    JSValueRef conversion_exception = NULL;
+    double number = JSValueToNumber(ctx, value, &conversion_exception);
+    if (conversion_exception != NULL) {
+        if (exception != NULL) *exception = conversion_exception;
+        return false;
+    }
+    if (!isfinite(number) || number < 0 || number > UINT32_MAX) {
+        ct_throw_message(ctx, exception, message);
+        return false;
+    }
+    *result = (uint32_t)number;
+    return true;
+}
+
 static char *ct_value_to_optional_string(JSContextRef ctx, JSValueRef value) {
     if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return NULL;
     return ct_value_to_string_copy(ctx, value);
@@ -2535,6 +2667,30 @@ static JSValueRef ct_array_buffer_from_copy(JSContextRef ctx, const char *bytes,
     }
     if (len > 0) memcpy(copy, bytes, len);
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, copy, len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_uint8_array_from_owned_bytes(JSContextRef ctx, uint8_t *bytes, size_t len, JSValueRef *exception) {
+    JSObjectRef result = JSObjectMakeTypedArray(ctx, kJSTypedArrayTypeUint8Array, len, exception);
+    if (result == NULL || (exception != NULL && *exception != NULL)) {
+        free(bytes);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (len > 0) {
+        JSValueRef pointer_exception = NULL;
+        void *destination = JSObjectGetTypedArrayBytesPtr(ctx, result, &pointer_exception);
+        if (pointer_exception != NULL || destination == NULL) {
+            free(bytes);
+            if (pointer_exception != NULL) {
+                if (exception != NULL) *exception = pointer_exception;
+            } else {
+                ct_throw_message(ctx, exception, "Failed to allocate typed-array storage");
+            }
+            return JSValueMakeUndefined(ctx);
+        }
+        memcpy(destination, bytes, len);
+    }
+    free(bytes);
+    return result;
 }
 
 static int ct_fill_random_bytes(uint8_t *buffer, size_t len) {
@@ -2675,17 +2831,318 @@ static int ct_zlib_window_bits(CtZlibMode mode) {
     return MAX_WBITS;
 }
 
-static JSValueRef ct_brotli_transform_sync(JSContextRef ctx, CtZlibMode mode, const uint8_t *input, size_t input_len, JSValueRef *exception) {
-#if defined(__APPLE__) || defined(__MACH__)
-    size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
-        ? input_len + (input_len / 4) + 1024
-        : input_len * 4 + 1024;
-#else
+static bool ct_brotli_apply_encoder_params(JSContextRef ctx, BrotliEncoderState *state, JSObjectRef options, JSValueRef *exception) {
+    if (options == NULL) return true;
+    JSValueRef params_value = ct_get_property(ctx, options, "params", exception);
+    if (exception != NULL && *exception != NULL) return false;
+    if (JSValueIsUndefined(ctx, params_value) || JSValueIsNull(ctx, params_value)) return true;
+    if (!JSValueIsObject(ctx, params_value)) {
+        ct_throw_message(ctx, exception, "options.params must be an object");
+        return false;
+    }
+
+    JSObjectRef params = (JSObjectRef)params_value;
+    for (unsigned int key = 0; key <= 9; key += 1) {
+        char property[16];
+        snprintf(property, sizeof(property), "%u", key);
+        JSValueRef value = ct_get_property(ctx, params, property, exception);
+        if (exception != NULL && *exception != NULL) return false;
+        if (JSValueIsUndefined(ctx, value)) continue;
+        double number = ct_value_to_number(ctx, value);
+        if (!isfinite(number) || number < 0 || number > UINT32_MAX || floor(number) != number ||
+            BrotliEncoderSetParameter(state, (BrotliEncoderParameter)key, (uint32_t)number) == BROTLI_FALSE) {
+            ct_throw_message(ctx, exception, "Setting Brotli parameter failed");
+            return false;
+        }
+    }
+    return true;
+}
+
+static CtBrotliEncoderHandle *ct_brotli_encoder_lookup(CtJscRuntime *runtime, uint32_t id) {
+    for (CtBrotliEncoderHandle *handle = runtime != NULL ? runtime->brotli_encoders : NULL;
+         handle != NULL;
+         handle = handle->next) {
+        if (handle->id == id) return handle;
+    }
+    return NULL;
+}
+
+static void ct_brotli_encoder_close_handle(CtJscRuntime *runtime, uint32_t id) {
+    if (runtime == NULL) return;
+    CtBrotliEncoderHandle **cursor = &runtime->brotli_encoders;
+    while (*cursor != NULL) {
+        CtBrotliEncoderHandle *handle = *cursor;
+        if (handle->id != id) {
+            cursor = &handle->next;
+            continue;
+        }
+        *cursor = handle->next;
+        BrotliEncoderDestroyInstance(handle->state);
+        free(handle);
+        return;
+    }
+}
+
+static void ct_brotli_encoder_destroy_all(CtJscRuntime *runtime) {
+    if (runtime == NULL) return;
+    while (runtime->brotli_encoders != NULL) {
+        CtBrotliEncoderHandle *handle = runtime->brotli_encoders;
+        runtime->brotli_encoders = handle->next;
+        BrotliEncoderDestroyInstance(handle->state);
+        free(handle);
+    }
+}
+
+static JSValueRef ct_brotli_encoder_create(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
+    if (runtime == NULL) {
+        ct_throw_message(ctx, exception, "Brotli runtime is unavailable");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef options = NULL;
+    if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
+        if (!JSValueIsObject(ctx, argv[0])) {
+            ct_throw_message(ctx, exception, "Brotli options must be an object");
+            return JSValueMakeUndefined(ctx);
+        }
+        options = (JSObjectRef)argv[0];
+    }
+
+    BrotliEncoderState *state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
+    if (state == NULL) {
+        ct_throw_message(ctx, exception, "Failed to initialize Brotli encoder");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (!ct_brotli_apply_encoder_params(ctx, state, options, exception)) {
+        BrotliEncoderDestroyInstance(state);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtBrotliEncoderHandle *handle = (CtBrotliEncoderHandle *)calloc(1, sizeof(CtBrotliEncoderHandle));
+    if (handle == NULL) {
+        BrotliEncoderDestroyInstance(state);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint32_t id = ++runtime->next_brotli_encoder_id;
+    if (id == 0) id = ++runtime->next_brotli_encoder_id;
+    handle->id = id;
+    handle->state = state;
+    handle->next = runtime->brotli_encoders;
+    runtime->brotli_encoders = handle;
+    return JSValueMakeNumber(ctx, (double)id);
+}
+
+static JSValueRef ct_brotli_encoder_write(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "brotliEncoderWrite(id, data, operation) requires three arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtJscRuntime *runtime = (CtJscRuntime *)JSObjectGetPrivate(function);
+    uint32_t id = 0;
+    uint32_t operation_number = 0;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, exception, "invalid Brotli encoder id") ||
+        !ct_value_to_uint32_checked(ctx, argv[2], &operation_number, exception, "invalid Brotli operation")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    if (operation_number > (uint32_t)BROTLI_OPERATION_FINISH) {
+        ct_throw_message(ctx, exception, "invalid Brotli operation");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtBrotliEncoderHandle *handle = ct_brotli_encoder_lookup(runtime, id);
+    if (handle == NULL) {
+        ct_throw_message(ctx, exception, "Brotli encoder is closed");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint8_t *input = NULL;
+    size_t input_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &input, &input_len) != 0) {
+        ct_throw_message(ctx, exception, "Brotli input must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t output_capacity = input_len > 65536 ? input_len : 65536;
+    uint8_t *output = (uint8_t *)malloc(output_capacity);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    BrotliEncoderOperation operation = (BrotliEncoderOperation)operation_number;
+    const uint8_t *next_in = input;
+    size_t available_in = input_len;
+    uint8_t *next_out = output;
+    size_t available_out = output_capacity;
+    while (true) {
+        size_t before_in = available_in;
+        size_t before_used = (size_t)(next_out - output);
+        if (BrotliEncoderCompressStream(
+                handle->state,
+                operation,
+                &available_in,
+                &next_in,
+                &available_out,
+                &next_out,
+                NULL
+            ) == BROTLI_FALSE) {
+            free(output);
+            ct_throw_message(ctx, exception, "Brotli compression failed");
+            return JSValueMakeUndefined(ctx);
+        }
+
+        bool complete = operation == BROTLI_OPERATION_FINISH
+            ? BrotliEncoderIsFinished(handle->state) == BROTLI_TRUE
+            : available_in == 0 && BrotliEncoderHasMoreOutput(handle->state) == BROTLI_FALSE;
+        if (complete) break;
+
+        if (available_out == 0) {
+            size_t used = (size_t)(next_out - output);
+            if (output_capacity > (size_t)512 * 1024 * 1024) {
+                free(output);
+                ct_throw_message(ctx, exception, "Brotli output is too large");
+                return JSValueMakeUndefined(ctx);
+            }
+            size_t next_capacity = output_capacity * 2;
+            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
+            if (next_output == NULL) {
+                free(output);
+                ct_throw_message(ctx, exception, "Out of memory");
+                return JSValueMakeUndefined(ctx);
+            }
+            output = next_output;
+            output_capacity = next_capacity;
+            next_out = output + used;
+            available_out = output_capacity - used;
+            continue;
+        }
+
+        if (before_in == available_in && before_used == (size_t)(next_out - output)) {
+            free(output);
+            ct_throw_message(ctx, exception, "Brotli encoder made no progress");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
+    size_t output_len = (size_t)(next_out - output);
+    uint8_t *trimmed = (uint8_t *)realloc(output, output_len > 0 ? output_len : 1);
+    if (trimmed != NULL) output = trimmed;
+    return ct_uint8_array_from_owned_bytes(ctx, output, output_len, exception);
+}
+
+static JSValueRef ct_brotli_encoder_close(
+    JSContextRef ctx,
+    JSObjectRef function,
+    JSObjectRef thisObject,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef *exception
+) {
+    (void)thisObject;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    uint32_t id = 0;
+    if (!ct_value_to_uint32_checked(ctx, argv[0], &id, exception, "invalid Brotli encoder id")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_brotli_encoder_close_handle((CtJscRuntime *)JSObjectGetPrivate(function), id);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_brotli_transform_sync(
+    JSContextRef ctx,
+    CtZlibMode mode,
+    const uint8_t *input,
+    size_t input_len,
+    JSObjectRef options,
+    JSValueRef *exception
+) {
     size_t output_capacity = mode == CT_ZLIB_BROTLI_COMPRESS
         ? BrotliEncoderMaxCompressedSize(input_len)
         : input_len * 4 + 1024;
-#endif
     if (output_capacity < 1024) output_capacity = 1024;
+
+    if (mode == CT_ZLIB_BROTLI_COMPRESS) {
+        BrotliEncoderState *state = BrotliEncoderCreateInstance(NULL, NULL, NULL);
+        if (state == NULL) {
+            ct_throw_message(ctx, exception, "Failed to initialize Brotli encoder");
+            return JSValueMakeUndefined(ctx);
+        }
+        if (!ct_brotli_apply_encoder_params(ctx, state, options, exception)) {
+            BrotliEncoderDestroyInstance(state);
+            return JSValueMakeUndefined(ctx);
+        }
+
+        uint8_t *output = (uint8_t *)malloc(output_capacity);
+        if (output == NULL) {
+            BrotliEncoderDestroyInstance(state);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        const uint8_t *next_in = input;
+        size_t available_in = input_len;
+        uint8_t *next_out = output;
+        size_t available_out = output_capacity;
+        while (true) {
+            if (BrotliEncoderCompressStream(
+                    state,
+                    BROTLI_OPERATION_FINISH,
+                    &available_in,
+                    &next_in,
+                    &available_out,
+                    &next_out,
+                    NULL
+                ) == BROTLI_FALSE) {
+                free(output);
+                BrotliEncoderDestroyInstance(state);
+                ct_throw_message(ctx, exception, "Brotli compression failed");
+                return JSValueMakeUndefined(ctx);
+            }
+            if (BrotliEncoderIsFinished(state) == BROTLI_TRUE) {
+                size_t output_len = (size_t)(next_out - output);
+                BrotliEncoderDestroyInstance(state);
+                return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+            }
+            if (available_out > 0) continue;
+            size_t used = (size_t)(next_out - output);
+            if (output_capacity > (size_t)512 * 1024 * 1024) {
+                free(output);
+                BrotliEncoderDestroyInstance(state);
+                ct_throw_message(ctx, exception, "Brotli output is too large");
+                return JSValueMakeUndefined(ctx);
+            }
+            size_t next_capacity = output_capacity * 2;
+            uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
+            if (next_output == NULL) {
+                free(output);
+                BrotliEncoderDestroyInstance(state);
+                ct_throw_message(ctx, exception, "Out of memory");
+                return JSValueMakeUndefined(ctx);
+            }
+            output = next_output;
+            output_capacity = next_capacity;
+            next_out = output + used;
+            available_out = output_capacity - used;
+        }
+    }
 
     for (int attempt = 0; attempt < 12; attempt += 1) {
         uint8_t *output = (uint8_t *)malloc(output_capacity);
@@ -2694,24 +3151,7 @@ static JSValueRef ct_brotli_transform_sync(JSContextRef ctx, CtZlibMode mode, co
             return JSValueMakeUndefined(ctx);
         }
         size_t output_len = output_capacity;
-#if defined(__APPLE__) || defined(__MACH__)
-        output_len = mode == CT_ZLIB_BROTLI_COMPRESS
-            ? compression_encode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI)
-            : compression_decode_buffer(output, output_capacity, input, input_len, NULL, COMPRESSION_BROTLI);
-        bool succeeded = output_len > 0 || input_len == 0;
-#else
-        bool succeeded = mode == CT_ZLIB_BROTLI_COMPRESS
-            ? BrotliEncoderCompress(
-                BROTLI_DEFAULT_QUALITY,
-                BROTLI_DEFAULT_WINDOW,
-                BROTLI_MODE_GENERIC,
-                input_len,
-                input,
-                &output_len,
-                output
-            ) == BROTLI_TRUE
-            : BrotliDecoderDecompress(input_len, input, &output_len, output) == BROTLI_DECODER_RESULT_SUCCESS;
-#endif
+        bool succeeded = BrotliDecoderDecompress(input_len, input, &output_len, output) == BROTLI_DECODER_RESULT_SUCCESS;
         if (succeeded) {
             return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
         }
@@ -2872,11 +3312,13 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     int mem_level = MAX_MEM_LEVEL;
     int strategy = Z_DEFAULT_STRATEGY;
     int finish_flush = Z_FINISH;
+    JSObjectRef options_object = NULL;
     uint8_t *dictionary = NULL;
     size_t dictionary_len = 0;
     if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])) {
         if (JSValueIsObject(ctx, argv[2])) {
             JSObjectRef options = (JSObjectRef)argv[2];
+            options_object = options;
             JSValueRef level_value = ct_get_property(ctx, options, "level", exception);
             if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
             if (!JSValueIsUndefined(ctx, level_value) && !JSValueIsNull(ctx, level_value)) level = (int)ct_value_to_number(ctx, level_value);
@@ -2906,7 +3348,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     }
 
     if (mode == CT_ZLIB_BROTLI_COMPRESS || mode == CT_ZLIB_BROTLI_DECOMPRESS) {
-        return ct_brotli_transform_sync(ctx, mode, input, input_len, exception);
+        return ct_brotli_transform_sync(ctx, mode, input, input_len, options_object, exception);
     }
 
     if (mode == CT_ZLIB_ZSTD_COMPRESS || mode == CT_ZLIB_ZSTD_DECOMPRESS) {
@@ -3002,7 +3444,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
 
-    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception);
+    return ct_uint8_array_from_owned_bytes(ctx, output, output_len, exception);
 }
 
 typedef struct {
@@ -5839,33 +6281,52 @@ static JSObjectRef ct_sqlite_row_array(JSContextRef ctx, sqlite3_stmt *stmt, boo
     return row;
 }
 
+static int ct_sqlite_bind_string_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
+    JSStringRef string = JSValueToStringCopy(ctx, value, exception);
+    if (string == NULL) return SQLITE_MISUSE;
+
+    const size_t length = JSStringGetLength(string);
+    const JSChar *characters = JSStringGetCharactersPtr(string);
+    for (size_t offset = 0; offset < length; offset += 1) {
+        // COTTONTAIL-COMPAT: Bun treats the byte-order-mark inverse as an
+        // invalid text conversion and binds an empty string, like lone surrogates.
+        if (characters != NULL && characters[offset] == 0xfffe) {
+            JSStringRelease(string);
+            return sqlite3_bind_text(stmt, index, "", 0, SQLITE_TRANSIENT);
+        }
+    }
+
+    const size_t capacity = JSStringGetMaximumUTF8CStringSize(string);
+    char *text = (char *)malloc(capacity > 0 ? capacity : 1);
+    if (text == NULL) {
+        JSStringRelease(string);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return SQLITE_NOMEM;
+    }
+    const size_t written = JSStringGetUTF8CString(string, text, capacity);
+    JSStringRelease(string);
+    const size_t text_length = written > 0 ? written - 1 : 0;
+    if (text_length > INT_MAX) {
+        free(text);
+        ct_throw_message(ctx, exception, "SQLite bind parameter is too large");
+        return SQLITE_TOOBIG;
+    }
+    const int status = sqlite3_bind_text(stmt, index, text, (int)text_length, SQLITE_TRANSIENT);
+    free(text);
+    return status;
+}
+
 static int ct_sqlite_bind_value(JSContextRef ctx, sqlite3_stmt *stmt, int index, JSValueRef value, JSValueRef *exception) {
     if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return sqlite3_bind_null(stmt, index);
     if (JSValueIsBoolean(ctx, value)) return sqlite3_bind_int(stmt, index, ct_value_to_bool(ctx, value) ? 1 : 0);
     if (JSValueIsNumber(ctx, value)) return sqlite3_bind_double(stmt, index, ct_value_to_number(ctx, value));
-    if (JSValueIsString(ctx, value)) {
-        char *text = ct_value_to_string_copy(ctx, value);
-        if (text == NULL) {
-            ct_throw_message(ctx, exception, "Out of memory");
-            return SQLITE_NOMEM;
-        }
-        int status = sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
-        free(text);
-        return status;
-    }
+    if (JSValueIsString(ctx, value)) return ct_sqlite_bind_string_value(ctx, stmt, index, value, exception);
     uint8_t *bytes = NULL;
     size_t bytes_len = 0;
     if (ct_get_bytes(ctx, value, &bytes, &bytes_len) == 0) {
         return sqlite3_bind_blob(stmt, index, bytes, (int)bytes_len, SQLITE_TRANSIENT);
     }
-    char *text = ct_value_to_string_copy(ctx, value);
-    if (text == NULL) {
-        ct_throw_message(ctx, exception, "Unsupported SQLite bind parameter");
-        return SQLITE_MISUSE;
-    }
-    int status = sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
-    free(text);
-    return status;
+    return ct_sqlite_bind_string_value(ctx, stmt, index, value, exception);
 }
 
 static int ct_sqlite_bind_params(JSContextRef ctx, sqlite3_stmt *stmt, JSValueRef params, JSValueRef *exception) {
@@ -7003,7 +7464,11 @@ static JSValueRef ct_sqlite_file_control(JSContextRef ctx, JSObjectRef function,
         }
     }
 
-    int op = (int)ct_value_to_number(ctx, argv[2]);
+    int op;
+    if (!ct_value_to_int_checked(ctx, argv[2], INT_MIN, INT_MAX, &op, exception, "invalid SQLite file-control operation")) {
+        free(file_name);
+        return JSValueMakeUndefined(ctx);
+    }
     int result_int = -1;
     void *result_ptr = NULL;
     uint8_t *bytes = NULL;
@@ -7012,7 +7477,10 @@ static JSValueRef ct_sqlite_file_control(JSContextRef ctx, JSObjectRef function,
         if (ct_get_bytes(ctx, argv[3], &bytes, &bytes_len) == 0) {
             result_ptr = bytes;
         } else if (JSValueIsNumber(ctx, argv[3])) {
-            result_int = (int)ct_value_to_number(ctx, argv[3]);
+            if (!ct_value_to_int_checked(ctx, argv[3], INT_MIN, INT_MAX, &result_int, exception, "invalid SQLite file-control argument")) {
+                free(file_name);
+                return JSValueMakeUndefined(ctx);
+            }
             result_ptr = &result_int;
         } else {
             free(file_name);
@@ -8480,8 +8948,7 @@ static JSObjectRef ct_udp_make_address(JSContextRef ctx, const struct sockaddr *
 }
 
 static int ct_udp_family_from_arg(JSContextRef ctx, JSValueRef value) {
-    int family = (int)ct_value_to_number(ctx, value);
-    return family == 6 ? AF_INET6 : AF_INET;
+    return ct_value_to_number(ctx, value) == 6.0 ? AF_INET6 : AF_INET;
 }
 
 static int ct_udp_resolve_address(JSContextRef ctx, const char *address, int port, int family, struct sockaddr_storage *storage, socklen_t *storage_len, JSValueRef *exception) {
@@ -8543,8 +9010,10 @@ static JSValueRef ct_udp_socket_bind(JSContextRef ctx, JSObjectRef function, JSO
         ct_throw_message(ctx, exception, "udpSocketBind(fd, port, address, family) requires fd, port, and address");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    int port = (int)ct_value_to_number(ctx, argv[1]);
+    int fd;
+    int port;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_int_checked(ctx, argv[1], 0, 65535, &port, exception, "Invalid UDP port")) return JSValueMakeUndefined(ctx);
     char *address = ct_value_to_optional_string(ctx, argv[2]);
     int family = argc >= 4 ? ct_udp_family_from_arg(ctx, argv[3]) : AF_INET;
     struct sockaddr_storage storage;
@@ -8576,7 +9045,8 @@ static JSValueRef ct_udp_socket_address(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "udpSocketAddress(fd) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     struct sockaddr_storage address;
     socklen_t address_len = sizeof(address);
     if (getsockname(fd, (struct sockaddr *)&address, &address_len) != 0) {
@@ -8594,14 +9064,16 @@ static JSValueRef ct_udp_socket_send(JSContextRef ctx, JSObjectRef function, JSO
         ct_throw_message(ctx, exception, "udpSocketSend(fd, data, port, address, family) requires fd, data, port, address, and family");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    int port;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     uint8_t *data = NULL;
     size_t data_len = 0;
     if (ct_get_bytes(ctx, argv[1], &data, &data_len) != 0) {
         ct_throw_message(ctx, exception, "UDP data must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
-    int port = (int)ct_value_to_number(ctx, argv[2]);
+    if (!ct_value_to_int_checked(ctx, argv[2], 0, 65535, &port, exception, "Invalid UDP port")) return JSValueMakeUndefined(ctx);
     char *address = ct_value_to_optional_string(ctx, argv[3]);
     int family = ct_udp_family_from_arg(ctx, argv[4]);
     struct sockaddr_storage storage;
@@ -8629,8 +9101,10 @@ static JSValueRef ct_udp_socket_connect(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "udpSocketConnect(fd, port, address, family) requires fd, port, address, and family");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    int port = (int)ct_value_to_number(ctx, argv[1]);
+    int fd;
+    int port;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_int_checked(ctx, argv[1], 0, 65535, &port, exception, "Invalid UDP port")) return JSValueMakeUndefined(ctx);
     char *address = ct_value_to_optional_string(ctx, argv[2]);
     int family = ct_udp_family_from_arg(ctx, argv[3]);
     struct sockaddr_storage storage;
@@ -8654,8 +9128,13 @@ static JSValueRef ct_udp_socket_receive(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "udpSocketReceive(fd[, maxBytes]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    size_t max_bytes = argc >= 2 ? (size_t)ct_value_to_number(ctx, argv[1]) : 65536;
+    int fd;
+    int max_bytes_value = 65536;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &max_bytes_value, exception, "Invalid maximum byte count")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t max_bytes = (size_t)max_bytes_value;
     if (max_bytes == 0) max_bytes = 65536;
     if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
 
@@ -8716,7 +9195,8 @@ static JSValueRef ct_udp_socket_close(JSContextRef ctx, JSObjectRef function, JS
         ct_throw_message(ctx, exception, "udpSocketClose(fd) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     if (fd >= 0 && close(fd) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -8731,7 +9211,8 @@ static JSValueRef ct_udp_socket_set_broadcast(JSContextRef ctx, JSObjectRef func
         ct_throw_message(ctx, exception, "udpSocketSetBroadcast(fd[, enabled]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
     if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -8747,8 +9228,10 @@ static JSValueRef ct_udp_socket_set_ttl(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "udpSocketSetTTL(fd, ttl[, family]) requires a file descriptor and ttl");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    int ttl = (int)ct_value_to_number(ctx, argv[1]);
+    int fd;
+    int ttl;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_int_checked(ctx, argv[1], 1, 255, &ttl, exception, "Invalid TTL")) return JSValueMakeUndefined(ctx);
     int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
     int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
 #if defined(IPV6_UNICAST_HOPS)
@@ -8770,8 +9253,10 @@ static JSValueRef ct_udp_socket_set_multicast_ttl(JSContextRef ctx, JSObjectRef 
         ct_throw_message(ctx, exception, "udpSocketSetMulticastTTL(fd, ttl[, family]) requires a file descriptor and ttl");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    int ttl = (int)ct_value_to_number(ctx, argv[1]);
+    int fd;
+    int ttl;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_int_checked(ctx, argv[1], 1, 255, &ttl, exception, "Invalid TTL")) return JSValueMakeUndefined(ctx);
     int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
     if (family == AF_INET6) {
 #if defined(IPV6_MULTICAST_HOPS)
@@ -8797,7 +9282,8 @@ static JSValueRef ct_udp_socket_set_multicast_loopback(JSContextRef ctx, JSObjec
         ct_throw_message(ctx, exception, "udpSocketSetMulticastLoopback(fd[, enabled[, family]]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
     int family = argc >= 3 ? ct_udp_family_from_arg(ctx, argv[2]) : AF_INET;
     if (family == AF_INET6) {
@@ -8824,9 +9310,11 @@ static JSValueRef ct_udp_socket_set_buffer_size(JSContextRef ctx, JSObjectRef fu
         ct_throw_message(ctx, exception, "udpSocketSetBufferSize(fd, send, size) requires fd, send, and size");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    int size;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_int_checked(ctx, argv[2], 1, INT_MAX, &size, exception, "Invalid buffer size")) return JSValueMakeUndefined(ctx);
     int option = ct_value_to_bool(ctx, argv[1]) ? SO_SNDBUF : SO_RCVBUF;
-    int size = (int)ct_value_to_number(ctx, argv[2]);
     if (setsockopt(fd, SOL_SOCKET, option, &size, sizeof(size)) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -8841,7 +9329,8 @@ static JSValueRef ct_udp_socket_get_buffer_size(JSContextRef ctx, JSObjectRef fu
         ct_throw_message(ctx, exception, "udpSocketGetBufferSize(fd, send) requires fd and send");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     int option = ct_value_to_bool(ctx, argv[1]) ? SO_SNDBUF : SO_RCVBUF;
     int size = 0;
     socklen_t size_len = sizeof(size);
@@ -8859,7 +9348,8 @@ static JSValueRef ct_udp_socket_membership(JSContextRef ctx, JSObjectRef functio
         ct_throw_message(ctx, exception, "udpSocketMembership(fd, multicastAddress[, interfaceAddress[, family[, join]]]) requires fd and multicastAddress");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid UDP socket")) return JSValueMakeUndefined(ctx);
     char *multicast = ct_value_to_optional_string(ctx, argv[1]);
     char *iface = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
     int family = argc >= 4 ? ct_udp_family_from_arg(ctx, argv[3]) : AF_INET;
@@ -8904,8 +9394,7 @@ static JSValueRef ct_udp_socket_membership(JSContextRef ctx, JSObjectRef functio
 }
 
 static int ct_tcp_family_from_arg(JSContextRef ctx, JSValueRef value) {
-    int family = (int)ct_value_to_number(ctx, value);
-    return family == 6 ? AF_INET6 : AF_INET;
+    return ct_value_to_number(ctx, value) == 6.0 ? AF_INET6 : AF_INET;
 }
 
 static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int port, int family, bool passive, struct addrinfo **out_results, JSValueRef *exception) {
@@ -9018,7 +9507,8 @@ static JSValueRef ct_tcp_server_accept(JSContextRef ctx, JSObjectRef function, J
         ct_throw_message(ctx, exception, "tcpServerAccept(fd) requires a server file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int listen_fd = (int)ct_value_to_number(ctx, argv[0]);
+    int listen_fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &listen_fd, exception, "Invalid TCP server socket")) return JSValueMakeUndefined(ctx);
     struct sockaddr_storage remote_addr;
     socklen_t remote_len = sizeof(remote_addr);
     int fd = accept(listen_fd, (struct sockaddr *)&remote_addr, &remote_len);
@@ -9168,8 +9658,13 @@ static JSValueRef ct_unix_server_listen(JSContextRef ctx, JSObjectRef function, 
     strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
     unlink(path);
 
-    int backlog = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : 128;
-    if (backlog <= 0) backlog = 128;
+    int backlog = 128;
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 1, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
+        close(fd);
+        unlink(path);
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
     if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, backlog) != 0) {
         char *message = ct_duplicate_string(strerror(errno));
         close(fd);
@@ -9203,7 +9698,8 @@ static JSValueRef ct_unix_server_accept(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "unixServerAccept(fd) requires a server file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int listen_fd = (int)ct_value_to_number(ctx, argv[0]);
+    int listen_fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &listen_fd, exception, "Invalid Unix server socket")) return JSValueMakeUndefined(ctx);
     struct sockaddr_un remote_addr;
     memset(&remote_addr, 0, sizeof(remote_addr));
     socklen_t remote_len = sizeof(remote_addr);
@@ -9286,7 +9782,8 @@ static JSValueRef ct_tcp_socket_address(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "tcpSocketAddress(fd[, peer]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
     bool peer = argc >= 2 ? ct_value_to_bool(ctx, argv[1]) : false;
     JSObjectRef result = ct_tcp_address_object(ctx, fd, peer, exception);
     return result != NULL ? result : JSValueMakeUndefined(ctx);
@@ -9323,7 +9820,8 @@ static JSValueRef ct_tcp_socket_set_no_delay(JSContextRef ctx, JSObjectRef funct
         ct_throw_message(ctx, exception, "tcpSocketSetNoDelay(fd[, enabled]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
     int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 1;
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -9339,7 +9837,8 @@ static JSValueRef ct_tcp_socket_set_keep_alive(JSContextRef ctx, JSObjectRef fun
         ct_throw_message(ctx, exception, "tcpSocketSetKeepAlive(fd[, enabled[, initialDelay]]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
     int enabled = argc >= 2 ? (ct_value_to_bool(ctx, argv[1]) ? 1 : 0) : 0;
     if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
@@ -9347,7 +9846,7 @@ static JSValueRef ct_tcp_socket_set_keep_alive(JSContextRef ctx, JSObjectRef fun
     }
     if (enabled && argc >= 3) {
         double delay_ms = ct_value_to_number(ctx, argv[2]);
-        if (delay_ms > 0) {
+        if (isfinite(delay_ms) && delay_ms > 0 && delay_ms <= (double)INT_MAX * 1000.0) {
             int delay_seconds = (int)ceil(delay_ms / 1000.0);
             if (delay_seconds < 1) delay_seconds = 1;
 #if defined(TCP_KEEPALIVE)
@@ -9375,7 +9874,8 @@ static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function,
         ct_throw_message(ctx, exception, "tcpSocketShutdown(fd) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
     if (shutdown(fd, SHUT_WR) != 0 && errno != ENOTCONN) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeUndefined(ctx);
@@ -9953,7 +10453,8 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
     free(key);
 
     struct addrinfo *results = NULL;
-    if (ct_tcp_resolve_address(ctx, host, port, AF_INET, true, &results, exception) != 0) {
+    int family = host != NULL && host[0] != '\0' ? AF_UNSPEC : AF_INET;
+    if (ct_tcp_resolve_address(ctx, host, port, family, true, &results, exception) != 0) {
         SSL_CTX_free(ssl_ctx);
         free(host);
         return JSValueMakeUndefined(ctx);
@@ -10257,7 +10758,9 @@ static int ct_process_setgroups(JSContextRef ctx, JSValueRef value, JSValueRef *
     JSValueRef length_value = JSObjectGetProperty(ctx, array, length_name, exception);
     JSStringRelease(length_name);
     if (exception != NULL && *exception != NULL) return -1;
-    size_t length = (size_t)ct_value_to_number(ctx, length_value);
+    int length_value_int;
+    if (!ct_value_to_int_checked(ctx, length_value, 0, INT_MAX, &length_value_int, exception, "invalid group list length")) return -1;
+    size_t length = (size_t)length_value_int;
     gid_t *groups = (gid_t *)malloc(sizeof(gid_t) * (length > 0 ? length : 1));
     if (groups == NULL) return -1;
     for (size_t index = 0; index < length; index += 1) {
@@ -10266,7 +10769,12 @@ static int ct_process_setgroups(JSContextRef ctx, JSValueRef value, JSValueRef *
             free(groups);
             return -1;
         }
-        groups[index] = (gid_t)ct_value_to_number(ctx, item);
+        uint32_t group;
+        if (!ct_value_to_uint32_checked(ctx, item, &group, exception, "invalid group id")) {
+            free(groups);
+            return -1;
+        }
+        groups[index] = (gid_t)group;
     }
     int status = setgroups((int)length, groups);
     free(groups);
@@ -10321,26 +10829,30 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeNumber(ctx, (double)getegid());
     }
     if (strcmp(kind, "setuid") == 0) {
-        int status = argc >= 2 ? setuid((uid_t)ct_value_to_number(ctx, argv[1])) : -1;
-        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        uint32_t id;
+        int status = argc >= 2 && ct_value_to_uint32_checked(ctx, argv[1], &id, exception, "invalid user id") ? setuid((uid_t)id) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
         free(kind);
         return JSValueMakeUndefined(ctx);
     }
     if (strcmp(kind, "seteuid") == 0) {
-        int status = argc >= 2 ? seteuid((uid_t)ct_value_to_number(ctx, argv[1])) : -1;
-        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        uint32_t id;
+        int status = argc >= 2 && ct_value_to_uint32_checked(ctx, argv[1], &id, exception, "invalid effective user id") ? seteuid((uid_t)id) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
         free(kind);
         return JSValueMakeUndefined(ctx);
     }
     if (strcmp(kind, "setgid") == 0) {
-        int status = argc >= 2 ? setgid((gid_t)ct_value_to_number(ctx, argv[1])) : -1;
-        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        uint32_t id;
+        int status = argc >= 2 && ct_value_to_uint32_checked(ctx, argv[1], &id, exception, "invalid group id") ? setgid((gid_t)id) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
         free(kind);
         return JSValueMakeUndefined(ctx);
     }
     if (strcmp(kind, "setegid") == 0) {
-        int status = argc >= 2 ? setegid((gid_t)ct_value_to_number(ctx, argv[1])) : -1;
-        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        uint32_t id;
+        int status = argc >= 2 && ct_value_to_uint32_checked(ctx, argv[1], &id, exception, "invalid effective group id") ? setegid((gid_t)id) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
         free(kind);
         return JSValueMakeUndefined(ctx);
     }
@@ -10374,9 +10886,10 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
     }
     if (strcmp(kind, "initgroups") == 0) {
         char *user = argc >= 2 ? ct_value_to_string_copy(ctx, argv[1]) : NULL;
-        gid_t gid = argc >= 3 ? (gid_t)ct_value_to_number(ctx, argv[2]) : 0;
-        int status = user != NULL ? initgroups(user, gid) : -1;
-        if (status != 0) ct_throw_message(ctx, exception, strerror(errno));
+        uint32_t gid = 0;
+        bool valid_gid = argc >= 3 && ct_value_to_uint32_checked(ctx, argv[2], &gid, exception, "invalid extra group id");
+        int status = user != NULL && valid_gid ? initgroups(user, (gid_t)gid) : -1;
+        if (status != 0 && (exception == NULL || *exception == NULL)) ct_throw_message(ctx, exception, strerror(errno));
         free(user);
         free(kind);
         return JSValueMakeUndefined(ctx);
@@ -10384,7 +10897,12 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
 #endif
     if (strcmp(kind, "umask") == 0) {
         if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1])) {
-            mode_t old = umask((mode_t)ct_value_to_number(ctx, argv[1]));
+            uint32_t mask;
+            if (!ct_value_to_uint32_checked(ctx, argv[1], &mask, exception, "invalid file mode mask")) {
+                free(kind);
+                return JSValueMakeUndefined(ctx);
+            }
+            mode_t old = umask((mode_t)mask);
             free(kind);
             return JSValueMakeNumber(ctx, (double)old);
         }
@@ -12423,7 +12941,11 @@ static JSValueRef ct_chmod_sync(JSContextRef ctx, JSObjectRef function, JSObject
         return JSValueMakeUndefined(ctx);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
-    unsigned int mode = (unsigned int)ct_value_to_number(ctx, argv[1]);
+    uint32_t mode;
+    if (!ct_value_to_uint32_checked(ctx, argv[1], &mode, exception, "invalid file mode")) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
     char *error = NULL;
     if (ct_host_chmod(path, mode, &error) != 0) ct_throw_message(ctx, exception, error != NULL ? error : "chmod failed");
     if (error != NULL) ct_host_string_free(error);
@@ -12495,6 +13017,12 @@ static int ct_process_relocate_standard_fds(int fds[2]) {
         fds[index] = relocated;
     }
     return 0;
+}
+
+static void ct_process_set_close_on_exec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags >= 0) (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 #endif
 
@@ -14104,6 +14632,11 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->stderr_fd = stderr_mode == CT_PROCESS_STDIO_PIPE ? stderr_pipe[0] : -1;
     process->ipc_fd = ipc_enabled ? ipc_socket[0] : -1;
     process->start_gate_fd = defer_start ? start_gate[1] : -1;
+    ct_process_set_close_on_exec(process->stdin_fd);
+    ct_process_set_close_on_exec(process->stdout_fd);
+    ct_process_set_close_on_exec(process->stderr_fd);
+    ct_process_set_close_on_exec(process->ipc_fd);
+    ct_process_set_close_on_exec(process->start_gate_fd);
     process->wake_read_fd = -1;
     process->wake_write_fd = -1;
     int wake_pipe[2] = { -1, -1 };
@@ -14111,6 +14644,8 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         if (ct_process_relocate_standard_fds(wake_pipe) == 0) {
             process->wake_read_fd = wake_pipe[0];
             process->wake_write_fd = wake_pipe[1];
+            ct_process_set_close_on_exec(process->wake_read_fd);
+            ct_process_set_close_on_exec(process->wake_write_fd);
             fcntl(process->wake_write_fd, F_SETFL, fcntl(process->wake_write_fd, F_GETFL, 0) | O_NONBLOCK);
         } else {
             ct_process_close_fd(&wake_pipe[0]);
@@ -14422,6 +14957,7 @@ static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef this
     (void)exception;
 #if defined(__APPLE__)
     JSSynchronousGarbageCollectForDebugging(ctx);
+    malloc_zone_pressure_relief(NULL, 0);
 #else
     JSGarbageCollect(ctx);
 #endif
@@ -14620,6 +15156,13 @@ static JSValueRef ct_promise_result_host(JSContextRef ctx, JSObjectRef function,
     (void)exception;
     JSValueRef result = argc > 0 ? ct_jsc_promise_result(argv[0]) : NULL;
     return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_weak_collection_size_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    return JSValueMakeNumber(ctx, argc > 0 ? ct_jsc_weak_collection_size(argv[0]) : 0);
 }
 
 static JSValueRef ct_import_module(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -15143,7 +15686,11 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
     char *flags = argc >= 2 && !JSValueIsNumber(ctx, argv[1]) ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
     int open_flags = O_RDONLY;
     if (argc >= 2 && JSValueIsNumber(ctx, argv[1])) {
-        open_flags = (int)ct_value_to_number(ctx, argv[1]);
+        if (!ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &open_flags, exception, "invalid open flags")) {
+            free(path);
+            free(flags);
+            return JSValueMakeNumber(ctx, -1);
+        }
     } else if (flags != NULL) {
         if (strcmp(flags, "r") == 0) open_flags = O_RDONLY;
         else if (strcmp(flags, "r+") == 0) open_flags = O_RDWR;
@@ -15160,7 +15707,12 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
         else if (strcmp(flags, "as") == 0 || strcmp(flags, "sa") == 0) open_flags = O_WRONLY | O_CREAT | O_APPEND | O_SYNC;
         else if (strcmp(flags, "as+") == 0 || strcmp(flags, "sa+") == 0) open_flags = O_RDWR | O_CREAT | O_APPEND | O_SYNC;
     }
-    int mode = argc >= 3 ? (int)ct_value_to_number(ctx, argv[2]) : 0666;
+    uint32_t mode = 0666;
+    if (argc >= 3 && !ct_value_to_uint32_checked(ctx, argv[2], &mode, exception, "invalid file mode")) {
+        free(path);
+        free(flags);
+        return JSValueMakeNumber(ctx, -1);
+    }
     int fd = open(path, open_flags, (mode_t)mode);
     if (fd < 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
@@ -15234,8 +15786,11 @@ static JSValueRef ct_read_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
 static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    (void)exception;
-    if (argc >= 1) close((int)ct_value_to_number(ctx, argv[0]));
+    if (argc >= 1) {
+        int fd;
+        if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
+        close(fd);
+    }
     return JSValueMakeUndefined(ctx);
 }
 
@@ -15499,7 +16054,11 @@ static JSValueRef ct_access_sync_native(JSContextRef ctx, JSObjectRef function, 
         return JSValueMakeUndefined(ctx);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
-    int mode = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : F_OK;
+    int mode = F_OK;
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 0, INT_MAX, &mode, exception, "invalid access mode")) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
     if (path == NULL || access(path, mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
     return JSValueMakeUndefined(ctx);
@@ -15649,18 +16208,32 @@ static JSValueRef ct_ftruncate_sync(JSContextRef ctx, JSObjectRef function, JSOb
 static JSValueRef ct_fchmod_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    if (argc < 2 || fchmod((int)ct_value_to_number(ctx, argv[0]), (mode_t)ct_value_to_number(ctx, argv[1])) != 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "fchmodSync(fd, mode) requires fd and mode");
+        return JSValueMakeUndefined(ctx);
     }
+    int fd;
+    uint32_t mode;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_uint32_checked(ctx, argv[1], &mode, exception, "invalid file mode")) return JSValueMakeUndefined(ctx);
+    if (fchmod(fd, (mode_t)mode) != 0) ct_throw_message(ctx, exception, strerror(errno));
     return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_fchown_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
-    if (argc < 3 || fchown((int)ct_value_to_number(ctx, argv[0]), (uid_t)ct_value_to_number(ctx, argv[1]), (gid_t)ct_value_to_number(ctx, argv[2])) != 0) {
-        ct_throw_message(ctx, exception, strerror(errno));
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "fchownSync(fd, uid, gid) requires fd, uid, and gid");
+        return JSValueMakeUndefined(ctx);
     }
+    int fd;
+    uint32_t uid;
+    uint32_t gid;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_uint32_checked(ctx, argv[1], &uid, exception, "invalid user id")) return JSValueMakeUndefined(ctx);
+    if (!ct_value_to_uint32_checked(ctx, argv[2], &gid, exception, "invalid group id")) return JSValueMakeUndefined(ctx);
+    if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) ct_throw_message(ctx, exception, strerror(errno));
     return JSValueMakeUndefined(ctx);
 }
 
@@ -15743,10 +16316,15 @@ static JSValueRef ct_chown_native_sync(JSContextRef ctx, JSObjectRef function, J
         return JSValueMakeUndefined(ctx);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
-    uid_t uid = (uid_t)ct_value_to_number(ctx, argv[1]);
-    gid_t gid = (gid_t)ct_value_to_number(ctx, argv[2]);
+    uint32_t uid;
+    uint32_t gid;
+    if (!ct_value_to_uint32_checked(ctx, argv[1], &uid, exception, "invalid user id") ||
+        !ct_value_to_uint32_checked(ctx, argv[2], &gid, exception, "invalid group id")) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
     bool follow = argc < 4 || ct_value_to_bool(ctx, argv[3]);
-    int status = follow ? chown(path, uid, gid) : lchown(path, uid, gid);
+    int status = follow ? chown(path, (uid_t)uid, (gid_t)gid) : lchown(path, (uid_t)uid, (gid_t)gid);
     if (path == NULL || status != 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
     return JSValueMakeUndefined(ctx);
@@ -15760,8 +16338,13 @@ static JSValueRef ct_lchmod_sync(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
     char *path = ct_value_to_string_copy(ctx, argv[0]);
+    uint32_t mode;
+    if (!ct_value_to_uint32_checked(ctx, argv[1], &mode, exception, "invalid file mode")) {
+        free(path);
+        return JSValueMakeUndefined(ctx);
+    }
 #if defined(__APPLE__) || defined(__MACH__)
-    int status = lchmod(path, (mode_t)ct_value_to_number(ctx, argv[1]));
+    int status = lchmod(path, (mode_t)mode);
 #else
     errno = ENOSYS;
     int status = -1;
@@ -15940,14 +16523,13 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
         return JSValueMakeUndefined(ctx);
     }
 
-    int fd = (int)ct_value_to_number(ctx, argv[0]);
-    size_t max_bytes = argc >= 2 ? (size_t)ct_value_to_number(ctx, argv[1]) : 65536;
-    if (fd < 0) {
-        ct_throw_message(ctx, exception, "invalid file descriptor");
+    int fd;
+    int max_bytes_value = 65536;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "invalid file descriptor")) return JSValueMakeUndefined(ctx);
+    if (argc >= 2 && !ct_value_to_int_checked(ctx, argv[1], 1, 1024 * 1024, &max_bytes_value, exception, "invalid maximum byte count")) {
         return JSValueMakeUndefined(ctx);
     }
-    if (max_bytes == 0) max_bytes = 65536;
-    if (max_bytes > 1024 * 1024) max_bytes = 1024 * 1024;
+    size_t max_bytes = (size_t)max_bytes_value;
 
     CtFdWatcher *watcher = (CtFdWatcher *)calloc(1, sizeof(CtFdWatcher));
     if (watcher == NULL) {
@@ -15992,7 +16574,11 @@ static JSValueRef ct_fd_watch_stop(JSContextRef ctx, JSObjectRef function, JSObj
     (void)thisObject;
     (void)exception;
     if (argc < 1) return JSValueMakeBoolean(ctx, false);
-    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    int id_value;
+    if (!ct_value_to_int_checked(ctx, argv[0], 1, INT_MAX, &id_value, exception, "invalid file descriptor watcher id")) {
+        return JSValueMakeUndefined(ctx);
+    }
+    uint32_t id = (uint32_t)id_value;
     return JSValueMakeBoolean(ctx, ct_fd_watcher_stop_id(id));
 }
 
@@ -16754,6 +17340,53 @@ static JSValueRef ct_markdown_events_native(JSContextRef ctx, JSObjectRef functi
     return result;
 }
 
+static JSValueRef ct_diff_format_native(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "formatDiff(received, expected[, not, colors]) requires two values");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t received_len = 0;
+    char *received = ct_value_to_utf8_copy(ctx, argv[0], &received_len);
+    size_t expected_len = 0;
+    char *expected = ct_value_to_utf8_copy(ctx, argv[1], &expected_len);
+    if (received == NULL || expected == NULL) {
+        free(received);
+        free(expected);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    bool not = argc >= 3 && JSValueToBoolean(ctx, argv[2]);
+    bool colors = argc >= 4 && JSValueToBoolean(ctx, argv[3]);
+    size_t output_len = 0;
+    char *error = NULL;
+    uint8_t *output = ct_diff_format(
+        (const uint8_t *)received,
+        received_len,
+        (const uint8_t *)expected,
+        expected_len,
+        not,
+        colors,
+        &output_len,
+        &error
+    );
+    free(received);
+    free(expected);
+
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, error != NULL ? error : "Diff formatting failed");
+        if (error != NULL) ct_diff_string_free(error);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef result = ct_make_string_len(ctx, (const char *)output, output_len);
+    ct_diff_free(output, output_len);
+    return result;
+}
+
 static JSValueRef ct_exit(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     (void)exception;
@@ -16838,6 +17471,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "drainJobs", ct_drain_jobs, runtime);
     ct_install_function(ctx, host, "promiseStatus", ct_promise_status_host, runtime);
     ct_install_function(ctx, host, "promiseResult", ct_promise_result_host, runtime);
+    ct_install_function(ctx, host, "weakCollectionSize", ct_weak_collection_size_host, runtime);
     ct_install_function(ctx, host, "gc", ct_gc, runtime);
     ct_install_function(ctx, host, "startSamplingProfiler", ct_start_sampling_profiler, runtime);
     ct_install_function(ctx, host, "jscMemoryUsage", ct_jsc_memory_usage, runtime);
@@ -16919,6 +17553,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "compileFunction", ct_compile_function_native, runtime);
     ct_install_function(ctx, host, "markdownHtml", ct_markdown_html_native, runtime);
     ct_install_function(ctx, host, "markdownEvents", ct_markdown_events_native, runtime);
+    ct_install_function(ctx, host, "formatDiff", ct_diff_format_native, runtime);
     ct_install_function(ctx, host, "memoryAddress", ct_memory_address, runtime);
     ct_install_function(ctx, host, "memoryView", ct_memory_view, runtime);
     ct_install_function(ctx, host, "sharedArrayBufferCreate", ct_shared_array_buffer_create, runtime);
@@ -16953,6 +17588,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "icuDecode", ct_icu_decode, runtime);
     ct_install_function(ctx, host, "stringFromUtf16", ct_string_from_utf16, runtime);
     ct_install_function(ctx, host, "zlibTransformSync", ct_zlib_transform_sync, runtime);
+    ct_install_function(ctx, host, "brotliEncoderCreate", ct_brotli_encoder_create, runtime);
+    ct_install_function(ctx, host, "brotliEncoderWrite", ct_brotli_encoder_write, runtime);
+    ct_install_function(ctx, host, "brotliEncoderClose", ct_brotli_encoder_close, runtime);
     ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
     ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
     ct_install_function(ctx, host, "cryptoPbkdf2Sync", ct_crypto_pbkdf2_sync, runtime);
@@ -17400,6 +18038,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     JSContextRef ctx = runtime->context;
     if (ctx != NULL) {
         ct_timer_destroy_all(runtime);
+        ct_brotli_encoder_destroy_all(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
         if (runtime->fd_event_handler != NULL) JSValueUnprotect(ctx, runtime->fd_event_handler);
         if (runtime->worker_event_handler != NULL) JSValueUnprotect(ctx, runtime->worker_event_handler);

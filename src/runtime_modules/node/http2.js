@@ -10,6 +10,16 @@ export class Http2ServerResponse extends ServerResponse {}
 export const sensitiveHeaders = Symbol("sensitiveHeaders");
 
 export const constants = {
+  NGHTTP2_ERR_FRAME_SIZE_ERROR: -522,
+  NGHTTP2_SESSION_SERVER: 0,
+  NGHTTP2_SESSION_CLIENT: 1,
+  NGHTTP2_STREAM_STATE_IDLE: 1,
+  NGHTTP2_STREAM_STATE_OPEN: 2,
+  NGHTTP2_STREAM_STATE_RESERVED_LOCAL: 3,
+  NGHTTP2_STREAM_STATE_RESERVED_REMOTE: 4,
+  NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL: 5,
+  NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE: 6,
+  NGHTTP2_STREAM_STATE_CLOSED: 7,
   NGHTTP2_NO_ERROR: 0,
   NGHTTP2_PROTOCOL_ERROR: 1,
   NGHTTP2_INTERNAL_ERROR: 2,
@@ -38,33 +48,83 @@ export const constants = {
   NGHTTP2_SETTINGS_MAX_FRAME_SIZE: 5,
   NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE: 6,
   NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL: 8,
-  HTTP2_HEADER_AUTHORITY: ":authority",
-  HTTP2_HEADER_METHOD: ":method",
-  HTTP2_HEADER_PATH: ":path",
-  HTTP2_HEADER_SCHEME: ":scheme",
-  HTTP2_HEADER_STATUS: ":status",
-  HTTP2_HEADER_CONTENT_TYPE: "content-type",
-  HTTP2_HEADER_CONTENT_LENGTH: "content-length",
-  HTTP2_HEADER_CONTENT_ENCODING: "content-encoding",
-  HTTP2_HEADER_ACCEPT: "accept",
-  HTTP2_HEADER_ACCEPT_ENCODING: "accept-encoding",
-  HTTP2_HEADER_TE: "te",
-  HTTP2_HEADER_USER_AGENT: "user-agent",
-  HTTP2_HEADER_COOKIE: "cookie",
-  HTTP2_HEADER_SET_COOKIE: "set-cookie",
-  HTTP2_HEADER_DATE: "date",
-  HTTP2_HEADER_LOCATION: "location",
-  HTTP2_HEADER_HOST: "host",
-  HTTP2_METHOD_CONNECT: "CONNECT",
-  HTTP2_METHOD_DELETE: "DELETE",
-  HTTP2_METHOD_GET: "GET",
-  HTTP2_METHOD_HEAD: "HEAD",
-  HTTP2_METHOD_OPTIONS: "OPTIONS",
-  HTTP2_METHOD_PATCH: "PATCH",
-  HTTP2_METHOD_POST: "POST",
-  HTTP2_METHOD_PUT: "PUT",
-  HTTP2_METHOD_TRACE: "TRACE",
+  DEFAULT_SETTINGS_HEADER_TABLE_SIZE: 4096,
+  DEFAULT_SETTINGS_ENABLE_PUSH: 1,
+  DEFAULT_SETTINGS_MAX_CONCURRENT_STREAMS: 0xffffffff,
+  DEFAULT_SETTINGS_INITIAL_WINDOW_SIZE: 65535,
+  DEFAULT_SETTINGS_MAX_FRAME_SIZE: 16384,
+  DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: 65535,
+  DEFAULT_SETTINGS_ENABLE_CONNECT_PROTOCOL: 0,
+  MAX_MAX_FRAME_SIZE: 0xffffff,
+  MIN_MAX_FRAME_SIZE: 16384,
+  MAX_INITIAL_WINDOW_SIZE: 0x7fffffff,
+  PADDING_STRATEGY_NONE: 0,
+  PADDING_STRATEGY_ALIGNED: 1,
+  PADDING_STRATEGY_MAX: 2,
+  PADDING_STRATEGY_CALLBACK: 1,
 };
+
+const headerConstantNames = [
+  "ACCEPT", "ACCEPT_CHARSET", "ACCEPT_ENCODING", "ACCEPT_LANGUAGE", "ACCEPT_RANGES",
+  "ACCESS_CONTROL_ALLOW_CREDENTIALS", "ACCESS_CONTROL_ALLOW_HEADERS", "ACCESS_CONTROL_ALLOW_METHODS",
+  "ACCESS_CONTROL_ALLOW_ORIGIN", "ACCESS_CONTROL_EXPOSE_HEADERS", "ACCESS_CONTROL_MAX_AGE",
+  "ACCESS_CONTROL_REQUEST_HEADERS", "ACCESS_CONTROL_REQUEST_METHOD", "AGE", "ALLOW", "ALT_SVC",
+  "AUTHORIZATION", "CACHE_CONTROL", "CONNECTION", "CONTENT_DISPOSITION", "CONTENT_ENCODING",
+  "CONTENT_LANGUAGE", "CONTENT_LENGTH", "CONTENT_LOCATION", "CONTENT_MD5", "CONTENT_RANGE",
+  "CONTENT_SECURITY_POLICY", "CONTENT_TYPE", "COOKIE", "DATE", "DNT", "EARLY_DATA", "ETAG",
+  "EXPECT", "EXPECT_CT", "EXPIRES", "FORWARDED", "FROM", "HOST", "HTTP2_SETTINGS", "IF_MATCH",
+  "IF_MODIFIED_SINCE", "IF_NONE_MATCH", "IF_RANGE", "IF_UNMODIFIED_SINCE", "KEEP_ALIVE",
+  "LAST_MODIFIED", "LINK", "LOCATION", "MAX_FORWARDS", "ORIGIN", "PREFER", "PRIORITY",
+  "PROXY_AUTHENTICATE", "PROXY_AUTHORIZATION", "PROXY_CONNECTION", "PURPOSE", "RANGE", "REFERER",
+  "REFRESH", "RETRY_AFTER", "SERVER", "SET_COOKIE", "STRICT_TRANSPORT_SECURITY", "TE",
+  "TIMING_ALLOW_ORIGIN", "TK", "TRAILER", "TRANSFER_ENCODING", "UPGRADE",
+  "UPGRADE_INSECURE_REQUESTS", "USER_AGENT", "VARY", "VIA", "WARNING", "WWW_AUTHENTICATE",
+  "X_CONTENT_TYPE_OPTIONS", "X_FORWARDED_FOR", "X_FRAME_OPTIONS", "X_XSS_PROTECTION",
+];
+
+Object.assign(constants, {
+  HTTP2_HEADER_STATUS: ":status",
+  HTTP2_HEADER_METHOD: ":method",
+  HTTP2_HEADER_AUTHORITY: ":authority",
+  HTTP2_HEADER_SCHEME: ":scheme",
+  HTTP2_HEADER_PATH: ":path",
+  HTTP2_HEADER_PROTOCOL: ":protocol",
+});
+for (const name of headerConstantNames) {
+  constants[`HTTP2_HEADER_${name}`] = name.toLowerCase().replaceAll("_", "-");
+}
+
+const methodConstantNames = [
+  "ACL", "BASELINE_CONTROL", "BIND", "CHECKIN", "CHECKOUT", "CONNECT", "COPY", "DELETE", "GET",
+  "HEAD", "LABEL", "LINK", "LOCK", "MERGE", "MKACTIVITY", "MKCALENDAR", "MKCOL", "MKREDIRECTREF",
+  "MKWORKSPACE", "MOVE", "OPTIONS", "ORDERPATCH", "PATCH", "POST", "PRI", "PROPFIND", "PROPPATCH",
+  "PUT", "REBIND", "REPORT", "SEARCH", "TRACE", "UNBIND", "UNCHECKOUT", "UNLINK", "UNLOCK",
+  "UPDATE", "UPDATEREDIRECTREF", "VERSION_CONTROL",
+];
+for (const name of methodConstantNames) {
+  constants[`HTTP2_METHOD_${name}`] = name.replaceAll("_", "-");
+}
+
+const statusConstants = {
+  CONTINUE: 100, SWITCHING_PROTOCOLS: 101, PROCESSING: 102, EARLY_HINTS: 103,
+  OK: 200, CREATED: 201, ACCEPTED: 202, NON_AUTHORITATIVE_INFORMATION: 203, NO_CONTENT: 204,
+  RESET_CONTENT: 205, PARTIAL_CONTENT: 206, MULTI_STATUS: 207, ALREADY_REPORTED: 208, IM_USED: 226,
+  MULTIPLE_CHOICES: 300, MOVED_PERMANENTLY: 301, FOUND: 302, SEE_OTHER: 303, NOT_MODIFIED: 304,
+  USE_PROXY: 305, TEMPORARY_REDIRECT: 307, PERMANENT_REDIRECT: 308,
+  BAD_REQUEST: 400, UNAUTHORIZED: 401, PAYMENT_REQUIRED: 402, FORBIDDEN: 403, NOT_FOUND: 404,
+  METHOD_NOT_ALLOWED: 405, NOT_ACCEPTABLE: 406, PROXY_AUTHENTICATION_REQUIRED: 407,
+  REQUEST_TIMEOUT: 408, CONFLICT: 409, GONE: 410, LENGTH_REQUIRED: 411, PRECONDITION_FAILED: 412,
+  PAYLOAD_TOO_LARGE: 413, URI_TOO_LONG: 414, UNSUPPORTED_MEDIA_TYPE: 415, RANGE_NOT_SATISFIABLE: 416,
+  EXPECTATION_FAILED: 417, TEAPOT: 418, MISDIRECTED_REQUEST: 421, UNPROCESSABLE_ENTITY: 422,
+  LOCKED: 423, FAILED_DEPENDENCY: 424, TOO_EARLY: 425, UPGRADE_REQUIRED: 426,
+  PRECONDITION_REQUIRED: 428, TOO_MANY_REQUESTS: 429, REQUEST_HEADER_FIELDS_TOO_LARGE: 431,
+  UNAVAILABLE_FOR_LEGAL_REASONS: 451,
+  INTERNAL_SERVER_ERROR: 500, NOT_IMPLEMENTED: 501, BAD_GATEWAY: 502, SERVICE_UNAVAILABLE: 503,
+  GATEWAY_TIMEOUT: 504, HTTP_VERSION_NOT_SUPPORTED: 505, VARIANT_ALSO_NEGOTIATES: 506,
+  INSUFFICIENT_STORAGE: 507, LOOP_DETECTED: 508, BANDWIDTH_LIMIT_EXCEEDED: 509, NOT_EXTENDED: 510,
+  NETWORK_AUTHENTICATION_REQUIRED: 511,
+};
+for (const [name, code] of Object.entries(statusConstants)) constants[`HTTP_STATUS_${name}`] = code;
 
 const settingsFields = [
   ["headerTableSize", 1],
@@ -319,7 +379,7 @@ class HpackDecoder {
         const decodedValue = hpackDecodeString(block, offset);
         offset = decodedValue.offset;
         this.insert(name, decodedValue.value);
-        list.push([name, decodedValue.value]);
+        list.push([name, decodedValue.value, (first & 0x10) !== 0]);
       } else if ((first & 0x20) !== 0) {
         // Dynamic table size update
         const decoded = hpackDecodeInt(block, offset, 5);
@@ -350,6 +410,7 @@ class HpackDecoder {
 function headersToList(headers = {}) {
   const pseudo = [];
   const regular = [];
+  const sensitive = new Set(Array.isArray(headers?.[sensitiveHeaders]) ? headers[sensitiveHeaders].map(String) : []);
   for (const [rawName, rawValue] of Object.entries(headers)) {
     if (rawValue == null) continue;
     const name = String(rawName).toLowerCase();
@@ -357,7 +418,7 @@ function headersToList(headers = {}) {
     const target = name.startsWith(":") ? pseudo : regular;
     for (const value of values) {
       if (value == null) continue;
-      target.push([name, String(value)]);
+      target.push([name, String(value), sensitive.has(name)]);
     }
   }
   return pseudo.concat(regular);
@@ -368,14 +429,14 @@ function headersToList(headers = {}) {
 // is required for interoperability.
 function encodeHeaderList(list) {
   const out = [];
-  for (const [name, value] of list) {
+  for (const [name, value, isSensitive] of list) {
     const fullIndex = hpackStaticFullIndex.get(`${name} ${value}`);
-    if (fullIndex != null) {
+    if (fullIndex != null && !isSensitive) {
       hpackEncodeInt(fullIndex, 7, 0x80, out);
       continue;
     }
     const nameIndex = hpackStaticNameIndex.get(name) ?? 0;
-    hpackEncodeInt(nameIndex, 4, 0x00, out);
+    hpackEncodeInt(nameIndex, 4, isSensitive ? 0x10 : 0x00, out);
     if (nameIndex === 0) hpackEncodeString(name, out);
     hpackEncodeString(value, out);
   }
@@ -388,7 +449,9 @@ function encodeHeaders(headers = {}) {
 
 function headerListToObject(list) {
   const headers = {};
-  for (const [name, value] of list) {
+  const sensitive = [];
+  for (const [name, value, isSensitive] of list) {
+    if (isSensitive && !sensitive.includes(name)) sensitive.push(name);
     if (name === "set-cookie") {
       if (headers[name] === undefined) headers[name] = [];
       headers[name].push(value);
@@ -402,6 +465,7 @@ function headerListToObject(list) {
     }
   }
   if (headers[":status"] != null) headers[":status"] = Number(headers[":status"]);
+  if (sensitive.length > 0) headers[sensitiveHeaders] = sensitive;
   return headers;
 }
 
@@ -416,7 +480,7 @@ function decodeHeaders(block) {
 function defaultSettingsObject() {
   return {
     headerTableSize: 4096,
-    enablePush: true,
+    enablePush: false,
     initialWindowSize: 65535,
     maxFrameSize: DEFAULT_MAX_FRAME_SIZE,
     maxConcurrentStreams: 4294967295,
@@ -449,6 +513,42 @@ function readUint32BE(buffer, offset) {
 function normalizeCode(code, fallback = constants.NGHTTP2_NO_ERROR) {
   const value = Number(code ?? fallback);
   return Number.isFinite(value) ? (value >>> 0) : fallback;
+}
+
+function receivedType(value) {
+  if (value === null) return " Received null";
+  if (typeof value === "string") return ` Received type string ('${value}')`;
+  if (typeof value === "object") {
+    const name = Object.prototype.toString.call(value).slice(8, -1);
+    return ` Received an instance of ${name}`;
+  }
+  return ` Received type ${typeof value} (${String(value)})`;
+}
+
+function validateUint32(value, name) {
+  if (typeof value !== "number") {
+    const error = new TypeError(`The "${name}" argument must be of type number.${receivedType(value)}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (!Number.isInteger(value)) {
+    const error = new RangeError(`The value of "${name}" is out of range. It must be an integer. Received ${value}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  if (value < 0 || value > 0xffffffff) {
+    const error = new RangeError(`The value of "${name}" is out of range. It must be >= 0 and <= 4294967295. Received ${value}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return value;
+}
+
+function abortError() {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
 }
 
 function normalizeStreamId(streamId) {
@@ -525,6 +625,7 @@ export function getPackedSettings(settings = {}) {
     if (normalized[name] == null) continue;
     const value = typeof normalized[name] === "boolean" ? (normalized[name] ? 1 : 0) : Number(normalized[name]);
     if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new RangeError(`Invalid HTTP/2 setting value for ${name}`);
+    if (name === "enableConnectProtocol" && value === 0) continue;
     fields.push([id, value]);
   }
   const out = Buffer.alloc(fields.length * 6);
@@ -537,9 +638,14 @@ export function getPackedSettings(settings = {}) {
 }
 
 export function getUnpackedSettings(buffer) {
+  if (!Buffer.isBuffer(buffer) && !(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) {
+    throw new TypeError("Expected buf to be a Buffer, TypedArray, DataView, or ArrayBuffer");
+  }
   const bytes = Buffer.from(buffer);
-  if (bytes.byteLength % 6 !== 0) throw new RangeError("Packed HTTP/2 settings length must be a multiple of 6");
-  const out = {};
+  if (bytes.byteLength < 6 || bytes.byteLength % 6 !== 0) {
+    throw new RangeError("Expected buf to be a Buffer of at least 6 bytes and a multiple of 6 bytes");
+  }
+  const out = { enableConnectProtocol: false };
   for (let offset = 0; offset < bytes.byteLength; offset += 6) {
     const id = readUint16BE(bytes, offset);
     const value = readUint32BE(bytes, offset + 2);

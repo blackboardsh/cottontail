@@ -1,6 +1,33 @@
 import { EventEmitter } from "./events.js";
 import { Buffer } from "./buffer.js";
 
+function describeReceived(value) {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return `type string ('${value}')`;
+  if (typeof value === "bigint") return `type bigint (${value}n)`;
+  return `type ${typeof value} (${String(value)})`;
+}
+
+function validateNumber(value, name) {
+  if (typeof value !== "number") {
+    const error = new TypeError(`The "${name}" argument must be of type number. Received ${describeReceived(value)}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  return value;
+}
+
+function validateTTL(value) {
+  const ttl = validateNumber(value, "ttl");
+  if (!Number.isFinite(ttl) || ttl < 1 || ttl > 255) {
+    const error = new Error("EINVAL: invalid argument, setsockopt");
+    error.code = "EINVAL";
+    throw error;
+  }
+  return ttl;
+}
+
 function familyFromType(type = "udp4") {
   return String(type).toLowerCase() === "udp6" ? 6 : 4;
 }
@@ -195,12 +222,12 @@ export class Socket extends EventEmitter {
   }
 
   setTTL(ttl) {
-    cottontail.udpSocketSetTTL(this.fd, Number(ttl), this.family);
+    cottontail.udpSocketSetTTL(this.fd, validateTTL(ttl), this.family);
     return this;
   }
 
   setMulticastTTL(ttl) {
-    cottontail.udpSocketSetMulticastTTL(this.fd, Number(ttl), this.family);
+    cottontail.udpSocketSetMulticastTTL(this.fd, validateTTL(ttl), this.family);
     return this;
   }
 
@@ -210,12 +237,12 @@ export class Socket extends EventEmitter {
   }
 
   setRecvBufferSize(size) {
-    cottontail.udpSocketSetBufferSize(this.fd, false, Number(size));
+    cottontail.udpSocketSetBufferSize(this.fd, false, validateNumber(size, "size"));
     return this;
   }
 
   setSendBufferSize(size) {
-    cottontail.udpSocketSetBufferSize(this.fd, true, Number(size));
+    cottontail.udpSocketSetBufferSize(this.fd, true, validateNumber(size, "size"));
     return this;
   }
 

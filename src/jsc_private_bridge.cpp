@@ -388,3 +388,17 @@ extern "C" JSValueRef ct_jsc_promise_result(JSValueRef value)
     const auto* fields = reinterpret_cast<const uint64_t*>(value) + 2;
     return std::bit_cast<JSValueRef>(fields[1]);
 }
+
+extern "C" uint32_t ct_jsc_weak_collection_size(JSValueRef value)
+{
+    if (value == nullptr)
+        return 0;
+    // JSWeakMap/JSWeakSet extend JSNonFinalObject (two pointers) with a buffer
+    // pointer followed by capacity, key count, and delete count. This reads the
+    // live key count and is pinned to WebKit-7624.2.5.10.6 like the promise and
+    // CallFrame layouts above. The JS host only calls it after an instanceof
+    // WeakMap/WeakSet check.
+    const auto* fields = reinterpret_cast<const uint32_t*>(value);
+    constexpr size_t keyCountOffset = (2 * sizeof(void*) + sizeof(void*) + sizeof(uint32_t)) / sizeof(uint32_t);
+    return fields[keyCountOffset];
+}

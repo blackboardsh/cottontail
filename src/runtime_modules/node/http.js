@@ -9,6 +9,7 @@ import { Headers } from "../bun/index.js";
 import { AsyncResource } from "./async_hooks.js";
 
 const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
+const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
 
 // Module evaluation order can reach this file before bun/index.js installs the
@@ -151,20 +152,205 @@ export const STATUS_CODES = {
   511: "Network Authentication Required",
 };
 
-function initialMaxHeaderSize() {
-  const fromEnv = Number(globalThis.process?.env?.BUN_HTTP_MAX_HEADER_SIZE ?? "");
+function configuredMaxHeaderSize() {
+  let configuredEnv = globalThis.process?.env?.BUN_HTTP_MAX_HEADER_SIZE;
+  if (configuredEnv == null && typeof cottontail === "object" && typeof cottontail?.env === "function") {
+    try { configuredEnv = cottontail.env()?.BUN_HTTP_MAX_HEADER_SIZE; } catch {}
+  }
+  const fromEnv = Number(configuredEnv ?? "");
   if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
-  for (const arg of globalThis.process?.execArgv ?? []) {
+  const execArgs = globalThis.process?.execArgv ??
+    (typeof cottontail === "object" ? cottontail?.execArgv : undefined) ?? [];
+  for (const arg of execArgs) {
     const match = /^--max-http-header-size=(\d+)$/.exec(String(arg));
     if (match) return Number(match[1]);
   }
-  return 16 * 1024;
+  return null;
 }
 
 // Bun allows reassigning http.maxHeaderSize at runtime (Node's is read-only);
 // the live value drives the 431 header-overflow enforcement below.
-let currentMaxHeaderSize = initialMaxHeaderSize();
+// Runtime modules can evaluate before node:process has populated env/execArgv;
+// the host environment fallback keeps named and default imports consistent.
+let currentMaxHeaderSize = configuredMaxHeaderSize() ?? 16 * 1024;
+let maxHeaderSizeWasAssigned = false;
+
+const activeFetchHeaderLimitPatch = Symbol.for("cottontail.http.maxHeaderSize.fetch");
+
+function activeServerForUrl(value) {
+  const origins = globalThis.__cottontailActiveServeOrigins;
+  if (!(origins instanceof Map) || origins.size === 0) return null;
+  try {
+    const url = new URL(String(value));
+    const hostname = String(url.hostname);
+    const authority = `${hostname}${url.port ? `:${url.port}` : ""}`;
+    return origins.get(`${url.protocol}//${authority}`)
+      ?? (hostname === "localhost" ? origins.get(`${url.protocol}//127.0.0.1:${url.port}`) : null)
+      ?? ((hostname === "0.0.0.0" || hostname === "[::]")
+        ? origins.get(`${url.protocol}//127.0.0.1:${url.port}`) ?? origins.get(`${url.protocol}//localhost:${url.port}`)
+        : null);
+  } catch {
+    return null;
+  }
+}
+
+function outgoingHeaderLength(input, init = undefined) {
+  let url = input?.url ?? input;
+  let method = input?.method ?? "GET";
+  let source = input?.headers;
+  if (init && typeof init === "object") {
+    if (init.method != null) method = init.method;
+    if (init.headers != null) source = init.headers;
+  }
+  if (!activeServerForUrl(url)) return 0;
+  const headers = new Headers(source ?? {});
+  let length = String(method).length + String(url).length + 12;
+  headers.forEach((value, name) => {
+    length += Buffer.byteLength(String(name), "latin1") + Buffer.byteLength(String(value), "latin1") + 4;
+  });
+  return length;
+}
+
+function responseAllowsBody(status, method) {
+  return method !== "HEAD" && status !== 204 && status !== 205 && status !== 304 && !(status >= 100 && status < 200);
+}
+
+function rawFetchRequest(url, method, headers, body, signal) {
+  return new Promise((resolve, reject) => {
+    const request = new ClientRequest(url, {
+      method,
+      headers,
+      agent: false,
+      signal,
+    });
+    request.once("error", reject);
+    request.once("response", (message) => {
+      const chunks = [];
+      message.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      message.once("error", reject);
+      message.once("end", () => {
+        const responseHeaders = new Headers();
+        for (let index = 0; index + 1 < message.rawHeaders.length; index += 2) {
+          responseHeaders.append(message.rawHeaders[index], message.rawHeaders[index + 1]);
+        }
+        const bytes = chunks.length === 0 ? kEmptyBuffer : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+        const status = Number(message.statusCode) || 200;
+        const response = new Response(responseAllowsBody(status, method) ? bytes : null, {
+          status,
+          statusText: message.statusMessage,
+          headers: responseHeaders,
+        });
+        response.url = String(url);
+        resolve(response);
+      });
+    });
+    request.end(body && body.byteLength > 0 ? body : undefined);
+  });
+}
+
+async function fetchWithoutDecompression(input, init = {}) {
+  const requestInit = { ...init };
+  delete requestInit.decompress;
+  const prepared = new Request(input, requestInit);
+  const headers = {};
+  prepared.headers.forEach((value, name) => { headers[name] = value; });
+  const method = String(prepared.method || "GET").toUpperCase();
+  const body = method === "GET" || method === "HEAD"
+    ? kEmptyBuffer
+    : Buffer.from(await prepared.arrayBuffer());
+  const redirectMode = String(requestInit.redirect ?? prepared.redirect ?? "follow");
+
+  const perform = async (url, requestMethod, requestBody, depth, redirected) => {
+    if (depth > 20) throw new TypeError("redirect count exceeded");
+    const response = await rawFetchRequest(url, requestMethod, headers, requestBody, prepared.signal);
+    const status = response.status;
+    const location = response.headers.get("location");
+    const isRedirect = status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+    if (!isRedirect || location == null || redirectMode === "manual") {
+      response.redirected = redirected;
+      return response;
+    }
+    if (redirectMode === "error") throw new TypeError("fetch failed");
+    let nextMethod = requestMethod;
+    let nextBody = requestBody;
+    if (status === 303 || ((status === 301 || status === 302) && requestMethod === "POST")) {
+      nextMethod = "GET";
+      nextBody = kEmptyBuffer;
+      delete headers["content-length"];
+      delete headers["content-type"];
+      delete headers["transfer-encoding"];
+    }
+    return perform(String(new URL(location, url)), nextMethod, nextBody, depth + 1, true);
+  };
+
+  return perform(prepared.url, method, body, 0, false);
+}
+
+function ensureActiveFetchHeaderLimit() {
+  if (globalThis[activeFetchHeaderLimitPatch] || typeof globalThis.fetch !== "function") return;
+  const nativeFetch = globalThis.fetch;
+  globalThis.fetch = function fetchWithActiveServerHeaderLimit(input, init = undefined) {
+    if (init?.decompress === false) return fetchWithoutDecompression(input, init);
+    if (outgoingHeaderLength(input, init) > getCurrentMaxHeaderSize()) {
+      return Promise.resolve(new Response(null, {
+        status: 431,
+        headers: { "content-length": "0", "connection": "close" },
+      }));
+    }
+    return nativeFetch(input, init);
+  };
+  Object.defineProperty(globalThis, activeFetchHeaderLimitPatch, { value: true, configurable: true });
+}
+
+function getCurrentMaxHeaderSize() {
+  if (!maxHeaderSizeWasAssigned) {
+    const configured = configuredMaxHeaderSize();
+    if (configured != null) currentMaxHeaderSize = configured;
+  }
+  ensureActiveFetchHeaderLimit();
+  return currentMaxHeaderSize;
+}
+
+function setCurrentMaxHeaderSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size <= 0) return currentMaxHeaderSize;
+  currentMaxHeaderSize = size;
+  maxHeaderSizeWasAssigned = true;
+  ensureActiveFetchHeaderLimit();
+  return currentMaxHeaderSize;
+}
+
 export { currentMaxHeaderSize as maxHeaderSize };
+
+// Bun.serve's compact native backend is polled from JavaScript. Enforce the
+// same process-wide header limit at that boundary so assigning
+// http.maxHeaderSize applies consistently to both HTTP server backends.
+const nativeHeaderLimitPatch = Symbol.for("cottontail.http.maxHeaderSize.poll");
+if (typeof cottontail === "object" && cottontail != null &&
+    typeof cottontail.httpServerPoll === "function" && !cottontail[nativeHeaderLimitPatch]) {
+  try {
+    const nativePoll = cottontail.httpServerPoll;
+    cottontail.httpServerPoll = function httpServerPollWithHeaderLimit(serverId) {
+      for (;;) {
+        const item = nativePoll(serverId);
+        if (item == null) return item;
+        const requestLineLength = String(item.method ?? "GET").length + String(item.url ?? "/").length + 12;
+        const headerLength = Buffer.byteLength(String(item.headersText ?? ""), "latin1") + requestLineLength;
+        if (headerLength <= getCurrentMaxHeaderSize()) return item;
+        try {
+          cottontail.httpServerRespond(
+            serverId,
+            item.id,
+            431,
+            "Content-Length: 0\r\nConnection: close\r\n",
+            new ArrayBuffer(0),
+          );
+        } catch {}
+      }
+    };
+    Object.defineProperty(cottontail, nativeHeaderLimitPatch, { value: true, configurable: true });
+  } catch {}
+}
 
 const tokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
@@ -304,6 +490,14 @@ function contentLengthFromHeaders(headers) {
   return expected ?? 0;
 }
 
+function socketError(value, socket = undefined) {
+  if (value instanceof Error) return value;
+  const message = value == null
+    ? String(socket?.authorizationError ?? "socket error")
+    : String(value);
+  return new Error(message);
+}
+
 function decodeChunkedBody(buffer) {
   const chunks = [];
   let offset = 0;
@@ -360,8 +554,9 @@ function findHeaderEnd(buffer, from = 0) {
 // Incremental chunked transfer-encoding decoder that operates on bytes and
 // never re-scans previously consumed data.
 class ChunkedDecoder {
-  constructor() {
+  constructor(onChunk = null) {
     this.chunks = [];
+    this.onChunk = typeof onChunk === "function" ? onChunk : null;
     this.byteLength = 0;
     this.state = "size";
     this.lineBytes = [];
@@ -416,7 +611,9 @@ class ChunkedDecoder {
       }
       if (this.state === "data") {
         const take = Math.min(this.remaining, length - offset);
-        this.chunks.push(buffer.subarray(offset, offset + take));
+        const chunk = buffer.subarray(offset, offset + take);
+        if (this.onChunk) this.onChunk(chunk);
+        else this.chunks.push(chunk);
         this.byteLength += take;
         this.remaining -= take;
         offset += take;
@@ -791,9 +988,9 @@ export function validateHeaderValue(name, value) {
 
 export class IncomingMessage extends Readable {
   constructor(init = {}) {
-    super();
+    super({ captureRejections: true });
     this.aborted = false;
-    this.complete = true;
+    this.complete = init.deferBody !== true;
     this.headers = init.headers ?? {};
     this.rawHeaders = init.rawHeaders ?? [];
     this.httpVersion = String(init.httpVersion ?? "1.1");
@@ -809,10 +1006,46 @@ export class IncomingMessage extends Readable {
     this.trailers = init.trailers ?? {};
     this.rawTrailers = init.rawTrailers ?? [];
     this._incomingBody = bytesFromBody(init.body);
-    queueMicrotask(() => {
-      if (this._incomingBody.byteLength > 0) this.push(Buffer.from(this._incomingBody));
-      this.push(null);
-    });
+    this._incomingBodyChunks = this._incomingBody.byteLength > 0 ? [Buffer.from(this._incomingBody)] : [];
+    if (init.deferBody !== true) {
+      queueMicrotask(() => {
+        if (this._incomingBody.byteLength > 0) this.push(Buffer.from(this._incomingBody));
+        this.push(null);
+      });
+    }
+  }
+
+  _pushIncomingChunk(chunk) {
+    if (this.complete || this.aborted || chunk == null || chunk.byteLength === 0) return;
+    const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this._incomingBodyChunks.push(body);
+    this.push(body);
+  }
+
+  _completeIncoming(trailers = {}, rawTrailers = []) {
+    if (this.complete || this.aborted) return;
+    this.complete = true;
+    this.trailers = trailers;
+    this.rawTrailers = rawTrailers;
+    this._incomingBody = this._incomingBodyChunks.length === 0
+      ? kEmptyBuffer
+      : this._incomingBodyChunks.length === 1 ? this._incomingBodyChunks[0] : Buffer.concat(this._incomingBodyChunks);
+    this._incomingBodyChunks = [];
+    this.push(null);
+  }
+
+  _abortIncoming() {
+    if (this.complete || this.aborted) return;
+    this.aborted = true;
+    this.complete = false;
+    this.emit("aborted");
+    this.destroy();
+  }
+
+  [captureRejectionSymbol](error) {
+    // Stream listeners are user callbacks. A rejected async listener must
+    // remain observable through the process unhandled-rejection machinery.
+    Promise.reject(error);
   }
 
   setTimeout(_timeout, callback = undefined) {
@@ -1251,7 +1484,7 @@ export class ServerResponse extends OutgoingMessage {
   destroy(error = undefined) {
     const socket = this.socket;
     this.detachSocket(socket ?? undefined);
-    socket?.destroy?.(error);
+    if (socket) queueMicrotask(() => socket.destroy?.(error));
     this.finished = true;
     this.writableEnded = true;
     this._emitCloseOnce();
@@ -1276,6 +1509,11 @@ class AgentImpl extends EventEmitter {
     this.keepAlive = Boolean(options.keepAlive);
     this.maxSockets = options.maxSockets ?? Infinity;
     this.maxFreeSockets = options.maxFreeSockets ?? 256;
+    this.maxTotalSockets = options.maxTotalSockets ?? Infinity;
+    this.totalSocketCount = 0;
+    this.scheduling = options.scheduling ?? "lifo";
+    this._trackedSockets = new Set();
+    this._watchedSockets = new WeakSet();
   }
 
   createConnection(options = {}, callback = undefined) {
@@ -1283,6 +1521,29 @@ class AgentImpl extends EventEmitter {
     if (connectOptions.socketPath != null) connectOptions.path = connectOptions.socketPath;
     else delete connectOptions.path;
     return netConnect(connectOptions, callback);
+  }
+
+  createSocket(request, options = {}, callback = undefined) {
+    const connectOptions = { ...options, ...this.options };
+    if (connectOptions.socketPath != null) connectOptions.path = connectOptions.socketPath;
+    else delete connectOptions.path;
+    let called = false;
+    const done = (error, socket) => {
+      if (called) return;
+      called = true;
+      if (typeof callback === "function") callback(error ?? null, socket);
+    };
+    let socket;
+    try {
+      socket = this.createConnection(connectOptions, (error, connectedSocket) => {
+        done(error, connectedSocket ?? socket);
+      });
+    } catch (error) {
+      done(error);
+      return undefined;
+    }
+    if (socket != null) done(null, socket);
+    return socket;
   }
 
   getName(options = {}) {
@@ -1298,7 +1559,14 @@ class AgentImpl extends EventEmitter {
     const list = this.sockets[name] ?? [];
     if (!list.includes(socket)) list.push(socket);
     this.sockets[name] = list;
-    socket.once?.("close", () => this.removeSocket(socket, { _agentName: name }));
+    if (!this._trackedSockets.has(socket)) {
+      this._trackedSockets.add(socket);
+      this.totalSocketCount += 1;
+    }
+    if (!this._watchedSockets.has(socket)) {
+      this._watchedSockets.add(socket);
+      socket.once?.("close", () => this.removeSocket(socket, { _agentName: name }));
+    }
   }
 
   _takeSocket(options = {}) {
@@ -1316,7 +1584,24 @@ class AgentImpl extends EventEmitter {
     return null;
   }
 
+  _takeQueuedRequest(preferredName = undefined, allowOtherNames = false) {
+    const names = preferredName == null ? Object.keys(this.requests) : [preferredName];
+    if (allowOtherNames) {
+      for (const name of Object.keys(this.requests)) {
+        if (name !== preferredName) names.push(name);
+      }
+    }
+    for (const name of names) {
+      const queued = this.requests[name]?.shift();
+      if (!queued) continue;
+      if ((this.requests[name] ?? []).length === 0) delete this.requests[name];
+      return queued;
+    }
+    return null;
+  }
+
   addRequest(request, options = {}) {
+    options = { ...options, ...this.options };
     const name = options._agentName ?? this.getName(options);
     options._agentName = name;
     const socket = this._takeSocket(options);
@@ -1325,26 +1610,41 @@ class AgentImpl extends EventEmitter {
       queueMicrotask(() => request.onSocket(socket, true));
       return;
     }
-    if (this._activeCount(name) >= Number(this.maxSockets)) {
+    if (this._activeCount(name) >= Number(this.maxSockets) || this.totalSocketCount >= Number(this.maxTotalSockets)) {
       const queue = this.requests[name] ?? [];
       queue.push({ request, options: { ...options } });
       this.requests[name] = queue;
       return;
     }
-    const created = this.createConnection(options, () => {});
-    assignSocketAsyncId(created);
-    this._rememberSocket(name, created);
-    request.onSocket(created, false);
+    this.createSocket(request, options, (error, created) => {
+      if (error || created == null) {
+        const failure = error instanceof Error ? error : new Error("Agent failed to create a socket");
+        queueMicrotask(() => request.emit("error", failure));
+        request.destroy?.();
+        return;
+      }
+      assignSocketAsyncId(created);
+      this._rememberSocket(name, created);
+      request.onSocket(created, false);
+    });
   }
 
   removeSocket(socket, options = {}) {
     const name = options._agentName ?? this.getName(options);
     const active = this.sockets[name] ?? [];
-    this.sockets[name] = active.filter((item) => item !== socket);
+    const nextActive = active.filter((item) => item !== socket);
+    this.sockets[name] = nextActive;
     if (this.sockets[name].length === 0) delete this.sockets[name];
     const free = this.freeSockets[name] ?? [];
     this.freeSockets[name] = free.filter((item) => item !== socket);
     if (this.freeSockets[name].length === 0) delete this.freeSockets[name];
+    if (socket?.destroyed && this._trackedSockets.delete(socket)) {
+      this.totalSocketCount = Math.max(0, this.totalSocketCount - 1);
+      const queued = this._takeQueuedRequest(name, true);
+      if (queued) {
+        queueMicrotask(() => this.addRequest(queued.request, queued.options));
+      }
+    }
   }
 
   keepSocketAlive(socket) {
@@ -1363,9 +1663,8 @@ class AgentImpl extends EventEmitter {
     const name = options._agentName ?? this.getName(options);
     this.removeSocket(socket, { ...options, _agentName: name });
     markSocketAsyncFree(socket);
-    const queued = this.requests[name]?.shift();
+    const queued = this._takeQueuedRequest(name);
     if (queued) {
-      if ((this.requests[name] ?? []).length === 0) delete this.requests[name];
       this._rememberSocket(name, socket);
       this.reuseSocket(socket, queued.request);
       queueMicrotask(() => queued.request.onSocket(socket, true));
@@ -1810,7 +2109,7 @@ export class ClientRequest extends OutgoingMessage {
     };
     const onError = (error) => {
       cleanup();
-      this.emit("error", error);
+      this.emit("error", socketError(error, socket));
       this._emitClose();
     };
     socket.once("connect", onConnect);
@@ -1831,8 +2130,9 @@ export function _attachHttpConnection(server, socket) {
       head: null,
       chunked: null,
       contentLength: null,
-      bodyChunks: [],
       bodyBytes: 0,
+      message: null,
+      tunnelType: null,
       continueSent: false,
     };
   };
@@ -1891,6 +2191,7 @@ export function _attachHttpConnection(server, socket) {
 
   const fail = (error, statusLine = "400 Bad Request") => {
     detachParser();
+    req?.message?._abortIncoming?.();
     if (error && error.code == null) error.code = "HPE_INTERNAL";
     // Swallow any late write errors (e.g. a clientError listener responding on
     // a socket that is already closed).
@@ -1924,7 +2225,7 @@ export function _attachHttpConnection(server, socket) {
     const keepAlive = message.httpVersionMajor === 1 && message.httpVersionMinor === 0
       ? connectionTokens.includes("keep-alive")
       : !connectionTokens.includes("close");
-  const response = new ServerResponse(message);
+    const response = new ServerResponse(message);
     response._keepAlive = keepAlive;
     response.shouldKeepAlive = keepAlive;
     response.assignSocket(socket);
@@ -1933,8 +2234,8 @@ export function _attachHttpConnection(server, socket) {
       if (active !== response) return;
       active = null;
       response.detachSocket(socket);
-      if (!response._keepAlive) {
-        socket.end?.();
+      if (server._closing || !response._keepAlive) {
+        socket.destroy?.();
         return;
       }
       if (queue.length === 0 && tunnel == null && server.keepAliveTimeout > 0 && !socket.destroyed) {
@@ -1974,7 +2275,7 @@ export function _attachHttpConnection(server, socket) {
           buf = null;
           const idx = findHeaderEnd(req.headBuffer, req.searchPos);
           if (idx < 0) {
-            if (req.headBuffer.byteLength > currentMaxHeaderSize) {
+            if (req.headBuffer.byteLength > getCurrentMaxHeaderSize()) {
               const overflow = new Error("Parse Error: Header overflow");
               overflow.code = "HPE_HEADER_OVERFLOW";
               fail(overflow, "431 Request Header Fields Too Large");
@@ -1984,7 +2285,7 @@ export function _attachHttpConnection(server, socket) {
             if (req.headBuffer.byteLength > 0) refreshHeadersTimer();
             break;
           }
-          if (idx > currentMaxHeaderSize) {
+          if (idx > getCurrentMaxHeaderSize()) {
             const overflow = new Error("Parse Error: Header overflow");
             overflow.code = "HPE_HEADER_OVERFLOW";
             fail(overflow, "431 Request Header Fields Too Large");
@@ -2051,17 +2352,37 @@ export function _attachHttpConnection(server, socket) {
             socket.write("HTTP/1.1 100 Continue\r\n\r\n");
           }
           const transferEncoding = String(parsedHeaders.headers["transfer-encoding"] ?? "").toLowerCase();
+          const lowerConnection = String(req.head.headers.connection ?? "").toLowerCase();
+          req.tunnelType = String(req.head.method).toUpperCase() === "CONNECT"
+            ? "connect"
+            : (req.head.headers.upgrade != null || lowerConnection.split(",").map((item) => item.trim()).includes("upgrade"))
+              ? "upgrade"
+              : null;
+          req.message = new IncomingMessage({
+            httpVersion: `${req.head.major}.${req.head.minor}`,
+            method: req.head.method,
+            url: req.head.url,
+            headers: req.head.headers,
+            rawHeaders: req.head.rawHeaders,
+            deferBody: true,
+          });
+          req.message.socket = socket;
+          req.message.connection = socket;
           if (transferEncoding.split(",").map((item) => item.trim()).includes("chunked")) {
-            req.chunked = new ChunkedDecoder();
+            req.chunked = new ChunkedDecoder((bodyChunk) => req.message?._pushIncomingChunk(bodyChunk));
           } else {
             req.contentLength = contentLengthFromHeaders(parsedHeaders.headers);
           }
           req.phase = "body";
+          if (req.tunnelType == null) {
+            queue.push(req.message);
+            processNext();
+            if (stopped || socket.destroyed) return;
+          }
           buf = rest;
           continue;
         }
         // body phase
-        let completeBody = null;
         let trailers = {};
         let rawTrailers = [];
         let leftover = null;
@@ -2072,7 +2393,6 @@ export function _attachHttpConnection(server, socket) {
             refreshRequestTimer();
             break;
           }
-          completeBody = req.chunked.body();
           trailers = req.chunked.trailers;
           rawTrailers = req.chunked.rawTrailers;
         } else {
@@ -2080,7 +2400,7 @@ export function _attachHttpConnection(server, socket) {
           const need = expected - req.bodyBytes;
           if (need > 0 && buf != null && buf.byteLength > 0) {
             const take = Math.min(need, buf.byteLength);
-            req.bodyChunks.push(buf.subarray(0, take));
+            req.message?._pushIncomingChunk(buf.subarray(0, take));
             req.bodyBytes += take;
             leftover = buf.subarray(take);
           } else {
@@ -2091,40 +2411,20 @@ export function _attachHttpConnection(server, socket) {
             refreshRequestTimer();
             break;
           }
-          completeBody = req.bodyChunks.length === 0
-            ? kEmptyBuffer
-            : req.bodyChunks.length === 1 ? Buffer.from(req.bodyChunks[0]) : Buffer.concat(req.bodyChunks);
         }
         if (requestTimer != null) {
           clearTimeout(requestTimer);
           requestTimer = null;
         }
-        const head = req.head;
-        const message = new IncomingMessage({
-          httpVersion: `${head.major}.${head.minor}`,
-          method: head.method,
-          url: head.url,
-          headers: head.headers,
-          rawHeaders: head.rawHeaders,
-          trailers,
-          rawTrailers,
-          body: completeBody,
-        });
-        message.socket = socket;
-        message.connection = socket;
-        const lowerConnection = String(head.headers.connection ?? "").toLowerCase();
+        const message = req.message;
+        const tunnelType = req.tunnelType;
+        message?._completeIncoming(trailers, rawTrailers);
         resetReqParser();
-        if (String(head.method).toUpperCase() === "CONNECT") {
-          tunnel = { type: "connect", message };
+        if (tunnelType != null) {
+          tunnel = { type: tunnelType, message };
           if (leftover != null && leftover.byteLength > 0) tunnelChunks.push(leftover);
           break;
         }
-        if (head.headers.upgrade != null || lowerConnection.split(",").map((item) => item.trim()).includes("upgrade")) {
-          tunnel = { type: "upgrade", message };
-          if (leftover != null && leftover.byteLength > 0) tunnelChunks.push(leftover);
-          break;
-        }
-        queue.push(message);
         buf = leftover != null && leftover.byteLength > 0 ? leftover : null;
       }
     } catch (error) {
@@ -2141,6 +2441,7 @@ export function _attachHttpConnection(server, socket) {
   socket.on("error", onSocketError);
   socket.on("data", onData);
   socket.on("close", () => {
+    req?.message?._abortIncoming?.();
     clearParserTimers();
     clearKeepAliveTimer();
   });
@@ -2158,6 +2459,7 @@ export class Server extends EventEmitter {
     this._native = null;
     this._handle = null;
     this._connections = new Set();
+    this._closing = false;
     this.timeout = Number(options?.timeout ?? 0);
     this.requestTimeout = Number(options?.requestTimeout ?? 300000);
     this.headersTimeout = Number(options?.headersTimeout ?? 60000);
@@ -2166,6 +2468,8 @@ export class Server extends EventEmitter {
   }
 
   listen(...args) {
+    this._closing = false;
+    ensureActiveFetchHeaderLimit();
     const [options, callback] = normalizeListenArgs(args);
     if (typeof callback === "function") this.once("listening", callback);
     const connectionListener = (socket) => {
@@ -2190,6 +2494,7 @@ export class Server extends EventEmitter {
   }
 
   close(callback = undefined) {
+    this._closing = true;
     if (typeof callback === "function") this.once("close", callback);
     this.closeIdleConnections();
     if (!this._native) {
@@ -2945,11 +3250,8 @@ const httpDefault = {
 Object.defineProperty(httpDefault, "maxHeaderSize", {
   enumerable: true,
   configurable: true,
-  get: () => currentMaxHeaderSize,
-  set: (value) => {
-    const size = Number(value);
-    if (Number.isFinite(size) && size > 0) currentMaxHeaderSize = size;
-  },
+  get: () => getCurrentMaxHeaderSize(),
+  set: (value) => { setCurrentMaxHeaderSize(value); },
 });
 
 export default httpDefault;

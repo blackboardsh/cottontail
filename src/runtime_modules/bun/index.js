@@ -288,6 +288,7 @@ function shellEscape(value) {
   if (isBunFileLike(value) && value.name != null) value = value.name;
   const text = String(value);
   validateNoNullByte(text, "shell argument");
+  if (text.length === 0) return "";
   if (/^[A-Za-z0-9_/:.,=+@%-]+$/.test(text)) return text;
   return "'" + text.replace(/'/g, "'\\''") + "'";
 }
@@ -1717,7 +1718,7 @@ async function buildWithPlugins(options, plugins) {
     }
   }
   for (const plugin of plugins) await plugin.setup(builder);
-  for (const callback of onStartCallbacks) await callback();
+  await Promise.all(onStartCallbacks.map((callback) => callback()));
 
   if (onResolveRules.length === 0 && onLoadRules.length === 0) {
     return finalizePluginDriverResult(
@@ -1728,6 +1729,7 @@ async function buildWithPlugins(options, plugins) {
   }
 
   const errors = [];
+  const pluginResolveFailures = [];
   const moduleRecords = new Map();
   const packageMetadata = new Map();
   const materializedLoaders = {};
@@ -1736,6 +1738,56 @@ async function buildWithPlugins(options, plugins) {
   const shadowRootPath = pathJoin(tmpRoot("bun-build"), `plugin-${Date.now()}-${Math.floor(Math.random() * 1000000)}`);
   cottontail.mkdirSync(shadowRootPath, true);
   const shadowRoot = cottontail.realpathSync(shadowRootPath);
+  let activeOnLoadCallbacks = 0;
+  let deferredOnLoadCallbacks = [];
+  let deferredDrainScheduled = false;
+
+  const scheduleDeferredOnLoadDrain = () => {
+    if (activeOnLoadCallbacks !== 0 || deferredOnLoadCallbacks.length === 0 || deferredDrainScheduled) return;
+    deferredDrainScheduled = true;
+    queueMicrotask(() => {
+      deferredDrainScheduled = false;
+      if (activeOnLoadCallbacks !== 0 || deferredOnLoadCallbacks.length === 0) return;
+      const batch = deferredOnLoadCallbacks;
+      deferredOnLoadCallbacks = [];
+      for (const state of batch) {
+        if (!state.completed) {
+          state.resumed = true;
+          activeOnLoadCallbacks++;
+        }
+      }
+      for (const state of batch) state.resolve();
+    });
+  };
+
+  const invokeOnLoadCallback = async (callback, arguments_) => {
+    const state = {
+      called: false,
+      resumed: false,
+      completed: false,
+      resolve: null,
+    };
+    activeOnLoadCallbacks++;
+    const defer = () => {
+      if (state.called) throw new Error("Can't call .defer() more than once within an onLoad plugin");
+      state.called = true;
+      activeOnLoadCallbacks--;
+      const promise = new Promise((resolve) => {
+        state.resolve = resolve;
+      });
+      deferredOnLoadCallbacks.push(state);
+      scheduleDeferredOnLoadDrain();
+      return promise;
+    };
+
+    try {
+      return await callback({ ...arguments_, defer });
+    } finally {
+      state.completed = true;
+      if (!state.called || state.resumed) activeOnLoadCallbacks--;
+      scheduleDeferredOnLoadDrain();
+    }
+  };
 
   const resolveWithPlugins = async (specifier, importer, importerNamespace, resolveDir, kind) => {
     for (const rule of onResolveRules) {
@@ -1789,11 +1841,10 @@ async function buildWithPlugins(options, plugins) {
     for (const rule of onLoadRules) {
       if ((rule.namespace ?? "file") !== record.namespace) continue;
       if (!rule.filter.test(record.path)) continue;
-      const result = await rule.callback({
+      const result = await invokeOnLoadCallback(rule.callback, {
         path: record.path,
         namespace: record.namespace,
         loader: undefined,
-        defer: async () => {},
         pluginData: undefined,
       });
       if (result == null || typeof result !== "object" || result.contents == null) continue;
@@ -1872,13 +1923,22 @@ async function buildWithPlugins(options, plugins) {
   const addModule = async (resolved, entryName = undefined) => {
     const key = `${resolved.namespace} ${resolved.path}`;
     if (moduleRecords.has(key)) return moduleRecords.get(key);
-    const record = { path: resolved.path, namespace: resolved.namespace, shadowPath: null, contents: "", loader: "js", edges: [] };
+    const record = {
+      path: resolved.path,
+      namespace: resolved.namespace,
+      shadowPath: null,
+      contents: "",
+      loader: "js",
+      edges: [],
+      pluginLoadFailed: false,
+    };
     moduleRecords.set(key, record);
     let loaded;
     try {
       loaded = await loadWithPlugins(record);
     } catch (error) {
       errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
+      record.pluginLoadFailed = true;
       record.shadowPath = shadowName(record.path, "js", entryName, record.namespace);
       return record;
     }
@@ -1892,7 +1952,7 @@ async function buildWithPlugins(options, plugins) {
     }
     if (record.namespace === "file") preservePackageMetadata(record.path);
     if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html") {
-      for (const { specifier, kind } of scanBundleImportsForLoader(record.contents, loader)) {
+      const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
         const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
         let target;
         try {
@@ -1900,18 +1960,20 @@ async function buildWithPlugins(options, plugins) {
             ?? defaultResolveImport(specifier, record);
         } catch (error) {
           errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
-          continue;
+          pluginResolveFailures.push({ importer: record.path, specifier });
+          return null;
         }
-        if (!target || target.external) continue;
+        if (!target || target.external) return null;
         if (target.error) {
           // The lightweight graph scan can see import-looking text in comments
           // and template literals. Leave unresolved text untouched so the
           // native parser decides whether it is an actual dependency.
-          continue;
+          return null;
         }
         const child = await addModule(target);
-        record.edges.push({ specifier, target: child });
-      }
+        return { specifier, target: child };
+      }));
+      record.edges.push(...edges.filter(Boolean));
     }
     return record;
   };
@@ -1957,25 +2019,57 @@ async function buildWithPlugins(options, plugins) {
     cottontail.writeFile(record.shadowPath, contents);
   }
 
-  if (errors.length > 0) {
-    if (options?.throw === false) return { success: false, logs: errors, outputs: [] };
-    throw new AggregateError(errors, "Bundle failed");
+  const sourceByShadowPath = new Map();
+  for (const record of moduleRecords.values()) {
+    if (record.shadowPath) sourceByShadowPath.set(nodePathResolve(record.shadowPath), record.path);
   }
 
+  const driverResult = runBuildDriver({
+    ...options,
+    files: undefined,
+    plugins: undefined,
+    root: shadowRoot,
+    loader: Object.keys(materializedLoaders).length > 0
+      ? {
+          ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
+          ...materializedLoaders,
+        }
+      : options?.loader,
+    entrypoints: shadowEntries,
+  });
+  for (const log of driverResult.logs ?? []) {
+    const file = log?.position?.file;
+    if (!file) continue;
+    const originalPath = sourceByShadowPath.get(nodePathResolve(String(file)));
+    if (originalPath) log.position = { ...log.position, file: originalPath };
+  }
+  const failedShadowNames = new Set(
+    Array.from(moduleRecords.values())
+      .filter((record) => record.pluginLoadFailed && record.shadowPath)
+      .map((record) => String(record.shadowPath).replace(/\\/g, "/").split("/").pop()),
+  );
+  driverResult.logs = (driverResult.logs ?? []).filter((log) => {
+    const message = String(log?.message ?? "");
+    for (const shadowName of failedShadowNames) {
+      if (shadowName && message.includes(shadowName)) return false;
+    }
+    const file = log?.position?.file;
+    for (const failure of pluginResolveFailures) {
+      if (file != null && nodePathResolve(String(file)) !== nodePathResolve(failure.importer)) continue;
+      if (message.includes(failure.specifier)) return false;
+    }
+    return true;
+  });
+  if (errors.length > 0) {
+    driverResult.ok = false;
+    driverResult.success = false;
+    driverResult.name = "AggregateError";
+    driverResult.message = "Bundle failed";
+    driverResult.logs = [...errors, ...(driverResult.logs ?? [])];
+    driverResult.outputs = [];
+  }
   return finalizePluginDriverResult(
-    runBuildDriver({
-      ...options,
-      files: undefined,
-      plugins: undefined,
-      root: shadowRoot,
-      loader: Object.keys(materializedLoaders).length > 0
-        ? {
-            ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
-            ...materializedLoaders,
-          }
-        : options?.loader,
-      entrypoints: shadowEntries,
-    }),
+    driverResult,
     options,
     onEndCallbacks,
   );
@@ -5305,6 +5399,22 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
     });
   }
   const proxy = fetchProxyConfiguration(request.url, init);
+  let cachedDnsRecords = null;
+  if (!proxy.active) {
+    try {
+      const url = new URL(request.url);
+      const hostname = String(url.hostname).replace(/^\[|\]$/g, "");
+      if ((url.protocol === "http:" || url.protocol === "https:") && nodeNet.isIP(hostname) === 0) {
+        cachedDnsRecords = [];
+        const cache = globalThis[Symbol.for("cottontail.runtime.dns-cache")];
+        cachedDnsRecords = cache?.resolveForNetwork?.(
+          hostname,
+          Number(url.port || (url.protocol === "https:" ? 443 : 80)),
+          false,
+        ) ?? [];
+      }
+    } catch {}
+  }
   const activeServer = activeServerForFetchUrl(request.url);
   const redirectMode = String(init.redirect ?? request.redirect ?? "follow");
   if (proxy.explicit) {
@@ -5358,7 +5468,7 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   try {
     const url = new URL(request.url);
     const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-    const records = typeof cottontail.dnsLookup === "function" ? cottontail.dnsLookup(url.hostname, 0) : [];
+    const records = cachedDnsRecords ?? (typeof cottontail.dnsLookup === "function" ? cottontail.dnsLookup(url.hostname, 0) : []);
     const record = Array.from(records ?? []).find((item) => Number(item.family) === 4 && item.address)
       ?? Array.from(records ?? []).find((item) => item.address);
     if (record?.address) args.push("--resolve", `${url.hostname}:${port}:${record.address}`);
@@ -9044,6 +9154,10 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       seen.delete(value);
     }
   }
+  if (value instanceof Error && value.__cottontailBunExpectation &&
+      typeof globalThis.__cottontailInspectBunExpectationError === "function") {
+    return globalThis.__cottontailInspectBunExpectationError(value, ctx.colors);
+  }
   if (value instanceof Error && typeof custom !== "function") {
     const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
     if (errorKeys.length === 0) {
@@ -9114,13 +9228,25 @@ export function deepEquals(left, right) {
   return isDeepStrictEqual(left, right);
 }
 
-export function deepMatch(left, right) {
-  if (right == null || typeof right !== "object") return isDeepStrictEqual(left, right);
-  if (left == null || typeof left !== "object") return false;
-  for (const key of Object.keys(right)) {
-    if (!deepMatch(left[key], right[key])) return false;
+function deepMatchSubset(object, subset, objectSeen, subsetSeen) {
+  if (Object.is(object, subset)) return true;
+  if (object == null || subset == null || typeof object !== "object" || typeof subset !== "object") return false;
+  if (objectSeen.has(object) || subsetSeen.has(subset)) return objectSeen.has(object) && subsetSeen.has(subset);
+  objectSeen.add(object);
+  subsetSeen.add(subset);
+  if (Array.isArray(object) && Array.isArray(subset) && object.length !== subset.length) return false;
+  for (const key of Reflect.ownKeys(subset)) {
+    if (!Object.prototype.propertyIsEnumerable.call(subset, key)) continue;
+    if (!(key in object) || !deepMatchSubset(object[key], subset[key], objectSeen, subsetSeen)) return false;
   }
   return true;
+}
+
+export function deepMatch(subset, object) {
+  if (subset == null || object == null || typeof subset !== "object" || typeof object !== "object") {
+    throw new TypeError("Expected 2 objects to match");
+  }
+  return deepMatchSubset(object, subset, new WeakSet(), new WeakSet());
 }
 
 export function escapeHTML(value, attribute = false) {
@@ -10039,27 +10165,50 @@ function bunDnsFamily(family) {
   if (family == null || family === "any") return 0;
   if (family === "IPv4") return 4;
   if (family === "IPv6") return 6;
-  return Number(family) || 0;
+  if (family === 0 || family === 4 || family === 6) return family;
+  throw new Error("Invalid options passed to lookup(): InvalidFamily");
 }
 
-function bunDnsError(error, hostname = undefined) {
-  const out = new Error(error?.message || "DNS lookup failed");
+function bunDnsLookupOptions(options) {
+  // Bun treats non-object options as an empty options object rather than as
+  // Node's numeric family shorthand.
+  if (options == null || typeof options !== "object") return { family: 0, all: true };
+  const backend = options.backend;
+  if (backend != null && backend !== "system" && backend !== "libc" && backend !== "c-ares") {
+    throw new Error("Invalid options passed to lookup(): InvalidBackend");
+  }
+  return { ...options, family: bunDnsFamily(options.family), all: true };
+}
+
+function bunDnsError(error) {
+  const rawCode = String(error?.code || "ENOTFOUND").replace(/^DNS_/, "");
+  const syscall = error?.syscall ?? "getaddrinfo";
+  const out = new Error(`${syscall} ${rawCode}`);
   out.name = "DNSException";
-  const rawCode = String(error?.code || "ENOTFOUND");
-  out.code = rawCode.startsWith("DNS_") ? rawCode : `DNS_${rawCode}`;
-  out.errno = out.code;
-  if (hostname != null) out.hostname = String(hostname);
+  out.code = `DNS_${rawCode}`;
+  out.errno = ({
+    ENODATA: 1,
+    EFORMERR: 2,
+    ESERVFAIL: 3,
+    ENOTFOUND: 4,
+    ENOTIMP: 5,
+    EREFUSED: 6,
+    ETIMEOUT: 12,
+    ECONNREFUSED: 11,
+  })[rawCode] ?? error?.errno ?? 4;
+  out.syscall = syscall;
   return out;
 }
 
 function bunDnsLookup(hostname, options = {}) {
-  const lookupOptions = typeof options === "object" && options !== null
-    ? { ...options, family: bunDnsFamily(options.family), all: true }
-    : { family: bunDnsFamily(options), all: true };
+  const lookupOptions = bunDnsLookupOptions(options);
+  // COTTONTAIL-COMPAT: all accepted Bun backends currently use Cottontail's
+  // stock-JSC host resolver hook; c-ares-specific transport selection needs a
+  // distinct native hook, while result and error contracts remain identical.
   return new Promise((resolve, reject) => {
     nodeDns.lookup(hostname, lookupOptions, (error, records) => {
       if (error) {
-        reject(bunDnsError(error, hostname));
+        reject(bunDnsError(error));
         return;
       }
       resolve(Array.from(records ?? []).map((record) => ({
@@ -10080,9 +10229,14 @@ export function generateHeapSnapshot() {
   return cottontail.writeHeapSnapshot?.() ?? "";
 }
 
-export function enableANSIColors(value = true) {
-  return Boolean(value);
+function outputAnsiColorsEnabled() {
+  const env = globalThis.process?.env;
+  if (env?.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== "0";
+  if (env?.NO_COLOR !== undefined || env?.NODE_DISABLE_COLORS !== undefined) return false;
+  return Boolean(globalThis.process?.stderr?.isTTY);
 }
+
+export const enableANSIColors = outputAnsiColorsEnabled();
 
 export function color(value, _name = undefined) {
   return String(value);

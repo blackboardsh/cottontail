@@ -1,4 +1,5 @@
 import nodeAssert from "../node/assert.js";
+import { existsSync as nodeExistsSync } from "../node/fs.js";
 import {
   after as nodeAfter,
   afterEach as nodeAfterEach,
@@ -18,7 +19,9 @@ let nextInvocationCallOrder = 1;
 const moduleMocks = globalThis.__cottontailBunModuleMocks ??= new Map();
 const snapshots = new Map();
 const snapshotCounters = new Map();
-const writableSnapshotFiles = new Set();
+const snapshotFiles = new Map();
+const inlineSnapshotFiles = new Map();
+const snapshotFileHeader = "// Bun Snapshot v1, https://bun.sh/docs/test/snapshots\n";
 let fakeSystemTime = null;
 let fakeTimersEnabled = false;
 let fakeNow = Date.now();
@@ -91,13 +94,42 @@ if (nativeDateTimeFormatDescriptor?.get) {
     },
   });
 }
-let assertionCount = 0;
-let expectedAssertions = null;
-let requireAssertions = false;
+const assertionStates = new WeakMap();
+const fallbackAssertionState = { count: 0, expected: null, required: false };
 globalThis.__cottontailTestAssertionCount ??= 0;
+globalThis.__cottontailTestSnapshotCount ??= 0;
+
+function currentAssertionState() {
+  const token = globalThis.__cottontailCurrentTestToken?.();
+  if (!token || (typeof token !== "object" && typeof token !== "function")) return fallbackAssertionState;
+  let state = assertionStates.get(token);
+  if (!state) {
+    state = { count: 0, expected: null, required: false };
+    assertionStates.set(token, state);
+  }
+  return state;
+}
+
+function countAssertion() {
+  currentAssertionState().count += 1;
+  globalThis.__cottontailTestAssertionCount = Number(globalThis.__cottontailTestAssertionCount ?? 0) + 1;
+}
+
+function countSnapshotAssertion() {
+  countAssertion();
+  countSnapshot();
+}
+
+function countSnapshot() {
+  globalThis.__cottontailTestSnapshotCount = Number(globalThis.__cottontailTestSnapshotCount ?? 0) + 1;
+}
 
 function isObject(value) {
   return value !== null && typeof value === "object";
+}
+
+function isObjectLike(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function");
 }
 
 function isPromiseLike(value) {
@@ -112,6 +144,25 @@ function promiseFromActual(actual, mode) {
     });
   }
   return value;
+}
+
+function nativePromiseState(value) {
+  const host = globalThis.cottontail;
+  if (!(value instanceof Promise) || typeof host?.promiseStatus !== "function" ||
+      typeof host?.promiseResult !== "function") {
+    return null;
+  }
+  const status = host.promiseStatus(value);
+  if (status < 0 || status > 2) return null;
+  return { status, value: status === 0 ? undefined : host.promiseResult(value) };
+}
+
+function promiseModeError(mode, value) {
+  return new nodeAssert.AssertionError({
+    message: mode === "resolves"
+      ? `Received promise rejected instead of resolved: ${formatValue(value)}`
+      : "Received promise resolved instead of rejected",
+  });
 }
 
 function deepEqual(left, right) {
@@ -142,6 +193,7 @@ const binaryHashCache = new WeakMap();
 function bytesForBinaryValue(value) {
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) return new Uint8Array(value);
   return null;
 }
 
@@ -223,11 +275,52 @@ function bunDeepEqual(actual, expected, seen = new WeakMap()) {
 }
 
 function hasProperty(object, path) {
-  const parts = Array.isArray(path) ? path : String(path).split(".");
+  if (Array.isArray(path)) {
+    let cursor = object;
+    for (const part of path) {
+      if ((typeof part !== "string" && typeof part !== "number") || cursor == null || !(part in Object(cursor))) {
+        return [false, undefined];
+      }
+      cursor = cursor[part];
+    }
+    return [true, cursor];
+  }
+
+  const source = String(path);
+  if (source.length === 0) {
+    return object != null && "" in Object(object) ? [true, object[""]] : [false, undefined];
+  }
+
   let cursor = object;
-  for (const part of parts) {
-    if (cursor == null || !(part in Object(cursor))) return [false, undefined];
-    cursor = cursor[part];
+  let index = 0;
+  let tokenStart = 0;
+  let tokenEnd = 0;
+  const read = (key) => {
+    if (cursor == null || !(key in Object(cursor))) return false;
+    cursor = cursor[key];
+    return true;
+  };
+
+  if (source[0] === "." && !read("")) return [false, undefined];
+  while (index < source.length) {
+    let character = source[index];
+    while (character === "[" || character === "]" || character === ".") {
+      index++;
+      if (index === source.length) {
+        if (character === ".") return read("") ? [true, cursor] : [false, undefined];
+        return tokenEnd === 0 ? [false, undefined] : [true, cursor];
+      }
+      const previous = character;
+      character = source[index];
+      if (previous === "." && character === "." && !read("")) return [false, undefined];
+    }
+
+    tokenStart = index;
+    while (index < source.length && source[index] !== "[" && source[index] !== "]" && source[index] !== ".") {
+      index++;
+    }
+    if (!read(source.slice(tokenStart, index))) return [false, undefined];
+    tokenEnd = index;
   }
   return [true, cursor];
 }
@@ -236,33 +329,88 @@ function matcherName(expected) {
   return expected?.__expectMatcher;
 }
 
-function asymmetricMatch(actual, expected) {
+function mapMatchResult(result, callback) {
+  return isPromiseLike(result) ? Promise.resolve(result).then(callback) : callback(result);
+}
+
+function everyMatch(values, callback) {
+  const results = values.map(callback);
+  return results.some(isPromiseLike)
+    ? Promise.all(results).then((settled) => settled.every(Boolean))
+    : results.every(Boolean);
+}
+
+function someMatch(values, callback) {
+  const results = values.map(callback);
+  return results.some(isPromiseLike)
+    ? Promise.all(results).then((settled) => settled.some(Boolean))
+    : results.some(Boolean);
+}
+
+function findMatchingIndex(values, callback, start = 0) {
+  for (let index = start; index < values.length; index += 1) {
+    const result = callback(values[index]);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).then((matched) => matched ? index : findMatchingIndex(values, callback, index + 1));
+    }
+    if (result) return index;
+  }
+  return -1;
+}
+
+function matchUnordered(expectedValues, actualValues, callback, expectedIndex = 0) {
+  if (expectedIndex >= expectedValues.length) return true;
+  const matchIndex = findMatchingIndex(actualValues, (actualValue) => callback(actualValue, expectedValues[expectedIndex]));
+  return mapMatchResult(matchIndex, (index) => {
+    if (index < 0) return false;
+    const remaining = actualValues.slice();
+    remaining.splice(index, 1);
+    return matchUnordered(expectedValues, remaining, callback, expectedIndex + 1);
+  });
+}
+
+function matchesAnyConstructor(actual, type) {
+  if (type === String) return typeof actual === "string" || actual instanceof String;
+  if (type === Number) return typeof actual === "number" || actual instanceof Number;
+  if (type === Boolean) return typeof actual === "boolean" || actual instanceof Boolean;
+  if (type === BigInt) return typeof actual === "bigint" || Object.prototype.toString.call(actual) === "[object BigInt]";
+  if (type === Symbol) return typeof actual === "symbol" || Object.prototype.toString.call(actual) === "[object Symbol]";
+  if (type === Function) return typeof actual === "function";
+  if (type === Array) return Array.isArray(actual);
+  if (type === Object) return actual !== null && (typeof actual === "object" || typeof actual === "function");
+  if (type === Promise) return isPromiseLike(actual);
+  return actual instanceof type;
+}
+
+function rawAsymmetricMatch(actual, expected) {
   switch (matcherName(expected)) {
     case "any":
-      return expected.type === String ? typeof actual === "string" || actual instanceof String
-        : expected.type === Number ? typeof actual === "number" || actual instanceof Number
-        : expected.type === Boolean ? typeof actual === "boolean" || actual instanceof Boolean
-        : expected.type === BigInt ? typeof actual === "bigint"
-        : expected.type === Symbol ? typeof actual === "symbol"
-        : actual instanceof expected.type;
+      return matchesAnyConstructor(actual, expected.type);
     case "anything":
       return actual != null;
     case "arrayContaining":
-      return Array.isArray(actual) && expected.items.every((item) => actual.some((candidate) => matchesExpected(candidate, item)));
+      return Array.isArray(actual) && everyMatch(
+        expected.items,
+        (item) => someMatch(actual, (candidate) => matchesExpected(candidate, item)),
+      );
     case "objectContaining":
-      return isObject(actual) && Object.keys(expected.shape).every((key) => matchesExpected(actual[key], expected.shape[key]));
+      return isObject(actual) && everyMatch(Reflect.ownKeys(expected.shape), (key) =>
+        key in Object(actual) && matchesExpected(actual[key], expected.shape[key]));
     case "stringContaining":
-      return String(actual).includes(expected.text);
-    case "stringMatching":
-      return expected.pattern.test(String(actual));
+      return typeof actual === "string" && actual.includes(expected.text);
+    case "stringMatching": {
+      if (typeof actual !== "string") return false;
+      if (typeof expected.pattern === "string") return actual.includes(expected.pattern);
+      expected.pattern.lastIndex = 0;
+      return expected.pattern.test(actual);
+    }
     case "closeTo":
-      return Math.abs(Number(actual) - Number(expected.value)) < 10 ** -Number(expected.precision) / 2;
+      if (typeof actual !== "number") return false;
+      if (Object.is(actual, expected.value)) return true;
+      return Math.abs(expected.value - actual) < 0.5 * 10 ** -expected.precision;
     case "custom": {
       const result = invokeCustomMatcher(expected.name, expected.matcher, expected.negate, actual, expected.args);
-      const finish = (value) => {
-        const pass = customMatcherResult(expected.name, value).pass;
-        return expected.negate ? !pass : pass;
-      };
+      const finish = (value) => customMatcherResult(expected.name, value).pass;
       return isPromiseLike(result) ? Promise.resolve(result).then(finish) : finish(result);
     }
     case "not":
@@ -275,17 +423,250 @@ function asymmetricMatch(actual, expected) {
   }
 }
 
-function matchesExpected(actual, expected, seen = new WeakMap()) {
-  if (matcherName(expected)) return asymmetricMatch(actual, expected);
-  if (Object.is(actual, expected)) return true;
-  if (isBlobLike(actual) || isBlobLike(expected)) return bunDeepEqual(actual, expected);
-  if (ArrayBuffer.isView(actual) || ArrayBuffer.isView(expected) || actual instanceof ArrayBuffer || expected instanceof ArrayBuffer) {
-    return bunDeepEqual(actual, expected);
+function asymmetricMatch(actual, expected) {
+  const finish = (result, matchedValue, evaluated) => mapMatchResult(result, (pass) => {
+    if (!expected.negate) return Boolean(pass);
+    // Bun intentionally does not let `expect.not.closeTo()` match non-numbers.
+    if (evaluated && matcherName(expected) === "closeTo" && typeof matchedValue !== "number") return false;
+    return !pass;
+  });
+
+  if (expected.promiseMode) {
+    if (!isPromiseLike(actual)) return finish(false, actual, false);
+    return Promise.resolve(actual).then(
+      (value) => expected.promiseMode === "resolves"
+        ? finish(rawAsymmetricMatch(value, expected), value, true)
+        : finish(false, value, false),
+      (error) => expected.promiseMode === "rejects"
+        ? finish(rawAsymmetricMatch(error, expected), error, true)
+        : finish(false, error, false),
+    );
+  }
+
+  return finish(rawAsymmetricMatch(actual, expected), actual, true);
+}
+
+const missingArrayValue = Symbol("missing array value");
+
+function enumerableOwnKeys(value, symbolsOnly = false) {
+  return Reflect.ownKeys(value).filter((key) =>
+    (!symbolsOnly || typeof key === "symbol") &&
+    Object.prototype.propertyIsEnumerable.call(value, key));
+}
+
+function arrayDataValue(value, index) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+  return descriptor && "value" in descriptor ? descriptor.value : missingArrayValue;
+}
+
+function calculatedClassName(value) {
+  try {
+    return value?.constructor?.name ?? Object.prototype.toString.call(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+function sameEntries(left, right) {
+  const leftEntries = Array.from(left.entries());
+  const rightEntries = Array.from(right.entries());
+  if (leftEntries.length !== rightEntries.length) return false;
+  for (let index = 0; index < leftEntries.length; index++) {
+    if (leftEntries[index][0] !== rightEntries[index][0] || leftEntries[index][1] !== rightEntries[index][1]) return false;
+  }
+  return true;
+}
+
+function matchEverySequential(values, callback, index = 0) {
+  for (; index < values.length; index++) {
+    const result = callback(values[index], index);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).then(async (matched) => {
+        if (!matched) return false;
+        for (let remaining = index + 1; remaining < values.length; remaining++) {
+          if (!await callback(values[remaining], remaining)) return false;
+        }
+        return true;
+      });
+    }
+    if (!result) return false;
+  }
+  return true;
+}
+
+function finishExpectedPair(state, result) {
+  if (isPromiseLike(result)) {
+    return Promise.resolve(result).then(
+      (value) => {
+        state.pairs.pop();
+        return value;
+      },
+      (error) => {
+        state.pairs.pop();
+        throw error;
+      },
+    );
+  }
+  state.pairs.pop();
+  return result;
+}
+
+function matchesExpectedObject(actual, expected, state, strict) {
+  if (isBlobLike(actual) || isBlobLike(expected)) {
+    return isBlobLike(actual) && isBlobLike(expected) &&
+      actual.size === expected.size && actual.type === expected.type;
+  }
+
+  const actualView = ArrayBuffer.isView(actual);
+  const expectedView = ArrayBuffer.isView(expected);
+  if (actualView || expectedView) {
+    if (!actualView || !expectedView) return false;
+    if (Object.prototype.toString.call(actual) !== Object.prototype.toString.call(expected)) return false;
+    return binaryEqual(actual, expected);
+  }
+
+  const actualArrayBuffer = actual instanceof ArrayBuffer;
+  const expectedArrayBuffer = expected instanceof ArrayBuffer;
+  const actualSharedBuffer = typeof SharedArrayBuffer === "function" && actual instanceof SharedArrayBuffer;
+  const expectedSharedBuffer = typeof SharedArrayBuffer === "function" && expected instanceof SharedArrayBuffer;
+  if (actualArrayBuffer || expectedArrayBuffer || actualSharedBuffer || expectedSharedBuffer) {
+    if (actualArrayBuffer !== expectedArrayBuffer || actualSharedBuffer !== expectedSharedBuffer) return false;
+    return binaryEqual(actual, expected);
+  }
+
+  if (actual instanceof Date || expected instanceof Date) {
+    return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
+  }
+  if (actual instanceof RegExp || expected instanceof RegExp) {
+    return actual instanceof RegExp && expected instanceof RegExp &&
+      actual.source === expected.source && actual.flags === expected.flags;
   }
   if (actual instanceof Error || expected instanceof Error) {
-    return actual instanceof Error && expected instanceof Error && actual.name === expected.name && actual.message === expected.message;
+    if (!(actual instanceof Error) || !(expected instanceof Error)) return false;
+    if (actual.name !== expected.name || actual.message !== expected.message) return false;
+    if (strict && Object.hasOwn(actual, "cause") !== Object.hasOwn(expected, "cause")) return false;
+    if (!matchesExpected(actual.cause, expected.cause, state, strict)) return false;
   }
+
+  const actualURL = typeof URL === "function" && actual instanceof URL;
+  const expectedURL = typeof URL === "function" && expected instanceof URL;
+  if (actualURL && expectedURL && actual.href !== expected.href) return false;
+  if (strict && actualURL !== expectedURL) return false;
+
+  const actualSearchParams = typeof URLSearchParams === "function" && actual instanceof URLSearchParams;
+  const expectedSearchParams = typeof URLSearchParams === "function" && expected instanceof URLSearchParams;
+  if (actualSearchParams && expectedSearchParams && !sameEntries(actual, expected)) return false;
+  if (strict && actualSearchParams !== expectedSearchParams) return false;
+
+  const actualHeaders = typeof Headers === "function" && actual instanceof Headers;
+  const expectedHeaders = typeof Headers === "function" && expected instanceof Headers;
+  if (actualHeaders && expectedHeaders && !sameEntries(actual, expected)) return false;
+  if (strict && actualHeaders !== expectedHeaders) return false;
+
+  const actualTag = Object.prototype.toString.call(actual);
+  const expectedTag = Object.prototype.toString.call(expected);
+  if (actualTag === "[object String]" || expectedTag === "[object String]") {
+    return actualTag === expectedTag && calculatedClassName(actual) === calculatedClassName(expected) &&
+      String(actual) === String(expected);
+  }
+  if (actualTag === "[object Number]" || expectedTag === "[object Number]" ||
+      actualTag === "[object Boolean]" || expectedTag === "[object Boolean]") {
+    if (actualTag !== expectedTag || !Object.is(actual.valueOf(), expected.valueOf())) return false;
+  }
+
+  if (actual instanceof Map || expected instanceof Map) {
+    if (!(actual instanceof Map) || !(expected instanceof Map) || actual.size !== expected.size) return false;
+    return matchUnordered(Array.from(expected.entries()), Array.from(actual.entries()), ([actualKey, actualValue], [expectedKey, expectedValue]) => {
+      const keyMatch = matchesExpected(actualKey, expectedKey, state, strict);
+      return mapMatchResult(keyMatch, (keyMatched) => keyMatched && matchesExpected(actualValue, expectedValue, state, strict));
+    });
+  }
+  if (actual instanceof Set || expected instanceof Set) {
+    if (!(actual instanceof Set) || !(expected instanceof Set) || actual.size !== expected.size) return false;
+    return matchUnordered(Array.from(expected.values()), Array.from(actual.values()),
+      (actualValue, expectedValue) => matchesExpected(actualValue, expectedValue, state, strict));
+  }
+
+  const actualArray = Array.isArray(actual);
+  const expectedArray = Array.isArray(expected);
+  if (actualArray !== expectedArray) return false;
+  if (actualArray) {
+    if (strict && actual.length !== expected.length) return false;
+    const length = Math.max(actual.length, expected.length);
+    const indicesMatch = matchEverySequential(Array.from({ length }, (_, index) => index), (index) => {
+      const left = arrayDataValue(actual, index);
+      const right = arrayDataValue(expected, index);
+      if (strict) {
+        if (left === missingArrayValue || right === missingArrayValue) return left === right;
+      } else if ((left === missingArrayValue || right === missingArrayValue) &&
+          (left === missingArrayValue || left === undefined) &&
+          (right === missingArrayValue || right === undefined)) {
+        return true;
+      }
+      return matchesExpected(left, right, state, strict);
+    });
+    return mapMatchResult(indicesMatch, (matched) => {
+      if (!matched) return false;
+      const actualSymbols = enumerableOwnKeys(actual, true);
+      const expectedSymbols = enumerableOwnKeys(expected, true);
+      if (strict && actualSymbols.length !== expectedSymbols.length) return false;
+      const symbols = Array.from(new Set([...actualSymbols, ...expectedSymbols]));
+      return matchEverySequential(symbols, (key) => {
+        const leftHas = Object.hasOwn(actual, key);
+        const rightHas = Object.hasOwn(expected, key);
+        if (!strict && (!leftHas || !rightHas) && (!leftHas || actual[key] === undefined) && (!rightHas || expected[key] === undefined)) {
+          return true;
+        }
+        return leftHas && rightHas && matchesExpected(actual[key], expected[key], state, strict);
+      });
+    });
+  }
+
+  if (strict && calculatedClassName(actual) !== calculatedClassName(expected)) return false;
+  const actualKeys = enumerableOwnKeys(actual);
+  const expectedKeys = enumerableOwnKeys(expected);
+  if (strict && actualKeys.length !== expectedKeys.length) return false;
+  const keys = Array.from(new Set([...actualKeys, ...expectedKeys]));
+  return matchEverySequential(keys, (key) => {
+    const leftHas = Object.hasOwn(actual, key);
+    const rightHas = Object.hasOwn(expected, key);
+    const left = leftHas ? actual[key] : missingArrayValue;
+    const right = rightHas ? expected[key] : missingArrayValue;
+    if (!strict && (left === missingArrayValue || right === missingArrayValue) &&
+        (left === missingArrayValue || left === undefined) &&
+        (right === missingArrayValue || right === undefined)) {
+      return true;
+    }
+    if (!leftHas || !rightHas) return false;
+    return matchesExpected(left, right, state, strict);
+  });
+}
+
+function matchesExpected(actual, expected, state = undefined, strict = false) {
+  if (matcherName(expected)) return asymmetricMatch(actual, expected);
+  if (matcherName(actual)) return asymmetricMatch(expected, actual);
+  if (Object.is(actual, expected)) return true;
   if (!isObject(actual) || !isObject(expected)) return false;
+  state ??= { pairs: [] };
+  for (const pair of state.pairs) {
+    if (pair.actual === actual) return pair.expected === expected;
+    if (pair.expected === expected) return false;
+  }
+  state.pairs.push({ actual, expected });
+  try {
+    return finishExpectedPair(state, matchesExpectedObject(actual, expected, state, strict));
+  } catch (error) {
+    state.pairs.pop();
+    throw error;
+  }
+}
+
+function matchesObjectSubset(actual, expected, seen = new WeakMap()) {
+  if (matcherName(expected)) return asymmetricMatch(actual, expected);
+  if (matcherName(actual)) return asymmetricMatch(expected, actual);
+  if (Object.is(actual, expected)) return true;
+  if (!isObject(actual) || !isObject(expected)) return matchesExpected(actual, expected, seen);
+
   let expectedSeen = seen.get(actual);
   if (expectedSeen?.has(expected)) return true;
   if (!expectedSeen) {
@@ -296,53 +677,22 @@ function matchesExpected(actual, expected, seen = new WeakMap()) {
 
   if (Array.isArray(expected)) {
     if (!Array.isArray(actual) || actual.length !== expected.length) return false;
-    for (let index = 0; index < expected.length; index += 1) {
-      if (!matchesExpected(actual[index], expected[index], seen)) return false;
+    const actualKeys = Reflect.ownKeys(actual).filter((key) => Object.prototype.propertyIsEnumerable.call(actual, key));
+    const expectedKeys = Reflect.ownKeys(expected).filter((key) => Object.prototype.propertyIsEnumerable.call(expected, key));
+    if (actualKeys.length !== expectedKeys.length ||
+        !expectedKeys.every((key) => actualKeys.some((actualKey) => actualKey === key))) {
+      return false;
     }
-    return true;
+    return everyMatch(expectedKeys, (key) => matchesObjectSubset(actual[key], expected[key], seen));
   }
-  if (expected instanceof Map) {
-    if (!(actual instanceof Map) || actual.size !== expected.size) return false;
-    const unmatched = Array.from(actual.entries());
-    for (const [expectedKey, expectedValue] of expected) {
-      const index = unmatched.findIndex(([key, value]) =>
-        matchesExpected(key, expectedKey, seen) && matchesExpected(value, expectedValue, seen));
-      if (index < 0) return false;
-      unmatched.splice(index, 1);
-    }
-    return true;
-  }
-  if (expected instanceof Set) {
-    if (!(actual instanceof Set) || actual.size !== expected.size) return false;
-    const unmatched = Array.from(actual.values());
-    for (const expectedValue of expected) {
-      const index = unmatched.findIndex((value) => matchesExpected(value, expectedValue, seen));
-      if (index < 0) return false;
-      unmatched.splice(index, 1);
-    }
-    return true;
-  }
-  if (expected instanceof Date || expected instanceof RegExp) return deepEqual(actual, expected);
 
-  const expectedKeys = Reflect.ownKeys(expected);
-  const actualKeys = Reflect.ownKeys(actual);
-  const expectedHasProtoKey = Object.prototype.hasOwnProperty.call(expected, "__proto__");
-  const actualHasProtoKey = Object.prototype.hasOwnProperty.call(actual, "__proto__");
-  const expectedPrototype = Object.getPrototypeOf(expected);
-  const actualPrototype = Object.getPrototypeOf(actual);
-  const expectedVirtualProto = actualHasProtoKey && !expectedHasProtoKey && expectedPrototype !== Object.prototype && expectedPrototype !== null;
-  const actualVirtualProto = expectedHasProtoKey && !actualHasProtoKey && actualPrototype !== Object.prototype && actualPrototype !== null;
-  if (expectedVirtualProto) expectedKeys.push("__proto__");
-  if (actualVirtualProto) actualKeys.push("__proto__");
-  if (actualKeys.length !== expectedKeys.length) return false;
-  for (const key of expectedKeys) {
-    const virtualProtoKey = key === "__proto__";
-    if (!Object.prototype.hasOwnProperty.call(actual, key) && !(virtualProtoKey && actualVirtualProto)) return false;
-    const actualValue = virtualProtoKey && actualVirtualProto ? actualPrototype : actual[key];
-    const expectedValue = virtualProtoKey && expectedVirtualProto ? expectedPrototype : expected[key];
-    if (!matchesExpected(actualValue, expectedValue, seen)) return false;
+  if (expected instanceof Date || expected instanceof RegExp || expected instanceof Map || expected instanceof Set ||
+    ArrayBuffer.isView(expected) || expected instanceof ArrayBuffer) {
+    return matchesExpected(actual, expected);
   }
-  return true;
+
+  const keys = Reflect.ownKeys(expected).filter((key) => Object.prototype.propertyIsEnumerable.call(expected, key));
+  return everyMatch(keys, (key) => key in Object(actual) && matchesObjectSubset(actual[key], expected[key], seen));
 }
 
 function formatValue(value) {
@@ -360,17 +710,75 @@ function formatValue(value) {
 }
 
 function snapshotQuoteString(value) {
-  const text = String(value);
-  if (text.includes("\n")) return `"${text.replace(/\\/g, "\\\\")}"`;
-  return JSON.stringify(text);
+  const text = String(value).replace(/\r\n?/g, "\n");
+  return text.includes("\n") ? `\n"${text}"\n` : `"${text}"`;
 }
 
 function indentSnapshotBlock(text) {
   return String(text).split("\n").map((line) => `  ${line}`).join("\n");
 }
 
-function snapshotSerialize(value) {
+function snapshotMatcherText(value) {
+  switch (matcherName(value)) {
+    case "any":
+      return `Any<${value.type?.name || "anonymous"}>`;
+    case "anything":
+      return "Anything";
+    case "arrayContaining":
+      return `ArrayContaining ${snapshotSerialize(value.items)}`;
+    case "objectContaining":
+      return `ObjectContaining ${snapshotSerialize(value.shape)}`;
+    case "stringContaining":
+      return `StringContaining ${snapshotQuoteString(value.text)}`;
+    case "stringMatching":
+      return `StringMatching ${snapshotSerialize(value.pattern)}`;
+    case "closeTo":
+      return `CloseTo<${String(value.value)}, ${String(value.precision)}>`;
+    case "custom":
+      return typeof value.toAsymmetricMatcher === "function" ? String(value.toAsymmetricMatcher()) : String(value.name);
+    case "not":
+      return `Not<${snapshotMatcherText(value.matcher)}>`;
+    default:
+      return null;
+  }
+}
+
+function snapshotObjectEntries(value) {
+  return Reflect.ownKeys(value)
+    .filter((key) => Object.prototype.propertyIsEnumerable.call(value, key))
+    .sort((left, right) => String(left).localeCompare(String(right)));
+}
+
+function snapshotObjectKey(key) {
+  return typeof key === "symbol" ? `[${String(key)}]` : JSON.stringify(String(key));
+}
+
+function snapshotObjectBody(value, prefix, seen) {
+  const keys = snapshotObjectEntries(value);
+  if (keys.length === 0) return `${prefix}{}`;
+  return [
+    `${prefix}{`,
+    ...keys.map((key) => {
+      const item = snapshotSerialize(value[key], seen);
+      if (item.startsWith("\n") && item.endsWith("\n")) {
+        return `  ${snapshotObjectKey(key)}: ${item},`;
+      }
+      const lines = item.split("\n");
+      return [
+        `  ${snapshotObjectKey(key)}: ${lines[0]}`,
+        ...lines.slice(1).map((line) => `  ${line}`),
+      ].join("\n") + ",";
+    }),
+    "}",
+  ].join("\n");
+}
+
+function snapshotSerialize(value, seen = new Set()) {
+  const asymmetric = snapshotMatcherText(value);
+  if (asymmetric != null) return asymmetric;
   if (typeof value === "string") return snapshotQuoteString(value);
+  if (typeof value === "function") return value.name ? `[Function: ${value.name}]` : "[Function]";
+  if (typeof value === "symbol") return String(value);
   if (typeof globalThis.ErrorEvent === "function" && value instanceof globalThis.ErrorEvent) {
     const error = value.error == null
       ? String(value.error)
@@ -381,40 +789,76 @@ function snapshotSerialize(value) {
   }
   if (typeof value === "undefined") return "undefined";
   if (typeof value === "bigint") return `${value}n`;
+  if (value === null || typeof value === "boolean") return String(value);
+  if (typeof value === "number") return Object.is(value, -0) ? "-0" : String(value);
   if (value instanceof Date) return value.toISOString();
-  if (value === null || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value instanceof RegExp) return String(value);
+  if (value instanceof Error) return value.message ? `[${value.name || "Error"}: ${value.message}]` : `[${value.name || "Error"}]`;
+  if (typeof Promise === "function" && value instanceof Promise) return "Promise {}";
+  if (typeof WeakMap === "function" && value instanceof WeakMap) return "WeakMap {}";
+  if (typeof WeakSet === "function" && value instanceof WeakSet) return "WeakSet {}";
+
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    if (typeof globalThis.Buffer?.isBuffer === "function" && globalThis.Buffer.isBuffer(value)) {
+      return snapshotObjectBody({ type: "Buffer", data: Array.from(value) }, "", seen);
+    }
+    if (value instanceof ArrayBuffer) {
+      const bytes = Array.from(new Uint8Array(value));
+      return bytes.length === 0
+        ? "ArrayBuffer []"
+        : `ArrayBuffer [\n${bytes.map((item) => `  ${item},`).join("\n")}\n]`;
+    }
+    if (value instanceof DataView) {
+      const bytes = Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+      return bytes.length === 0
+        ? "DataView []"
+        : `DataView [\n${bytes.map((item) => `  ${item},`).join("\n")}\n]`;
+    }
+    if (ArrayBuffer.isView(value)) {
+      const name = value.constructor?.name || "TypedArray";
+      const items = Array.from(value);
+      return items.length === 0
+        ? `${name} []`
+        : `${name} [\n${items.map((item) => `  ${snapshotSerialize(item, seen)},`).join("\n")}\n]`;
+    }
+    if (value instanceof Map) {
+      if (value.size === 0) return "Map {}";
+      return [
+        "Map {",
+        ...Array.from(value, ([key, item]) => {
+          const rendered = `${snapshotSerialize(key, seen)} => ${snapshotSerialize(item, seen)}`;
+          return `${indentSnapshotBlock(rendered)},`;
+        }),
+        "}",
+      ].join("\n");
+    }
+    if (value instanceof Set) {
+      if (value.size === 0) return "Set {}";
+      return [
+        "Set {",
+        ...Array.from(value, (item) => `${indentSnapshotBlock(snapshotSerialize(item, seen))},`),
+        "}",
+      ].join("\n");
+    }
   if (Array.isArray(value)) {
     if (value.length === 0) return "[]";
     return [
       "[",
-      ...value.map((item) => `${indentSnapshotBlock(snapshotSerialize(item))},`),
+        ...value.map((item) => `${indentSnapshotBlock(snapshotSerialize(item, seen))},`),
       "]",
     ].join("\n");
   }
-  const entries = plainObjectEntries(value);
-  if (entries) {
-    if (entries.length === 0) return "{}";
-    entries.sort((left, right) => String(left[0]).localeCompare(String(right[0])));
-    return [
-      "{",
-      ...entries.map(([key, item]) => {
-        const serialized = snapshotSerialize(item);
-        if (typeof item === "string" && item.includes("\n")) {
-          return `  ${JSON.stringify(String(key))}: \n${serialized}\n,`;
-        }
-        if (serialized.includes("\n")) {
-          const lines = serialized.split("\n");
-          return [
-            `  ${JSON.stringify(String(key))}: ${lines[0]}`,
-            ...lines.slice(1).map((line) => `  ${line}`),
-          ].join("\n") + ",";
-        }
-        return `  ${JSON.stringify(String(key))}: ${serialized},`;
-      }),
-      "}",
-    ].join("\n");
+    const prototype = Object.getPrototypeOf(value);
+    const constructorName = value.constructor?.name;
+    const prefix = prototype === Object.prototype || prototype === null || !constructorName || constructorName === "Object"
+      ? ""
+      : `${constructorName} `;
+    return snapshotObjectBody(value, prefix, seen);
+  } finally {
+    seen.delete(value);
   }
-  return formatValue(value);
 }
 
 function iterableIsEmpty(value) {
@@ -460,7 +904,9 @@ function isEmptyObjectValue(value) {
 }
 
 function snapshotText(value) {
-  return snapshotSerialize(value);
+  const serialized = snapshotSerialize(value);
+  if (!serialized.includes("\n")) return serialized;
+  return `${serialized.startsWith("\n") ? "" : "\n"}${serialized}${serialized.endsWith("\n") ? "" : "\n"}`;
 }
 
 function normalizeSnapshotText(value) {
@@ -481,8 +927,13 @@ function inlineSnapshotMatches(received, wanted) {
 }
 
 function nextSnapshotIdentity(hint = undefined) {
-  const file = globalThis.process?.argv?.[1] ?? "<script>";
-  const testName = typeof globalThis.__cottontailCurrentTestName === "function" ? globalThis.__cottontailCurrentTestName() : "";
+  const activeFile = typeof globalThis.__cottontailCurrentTestFile === "function"
+    ? globalThis.__cottontailCurrentTestFile()
+    : "";
+  const file = activeFile || globalThis.process?.argv?.[1] || "<script>";
+  const testName = typeof globalThis.__cottontailCurrentTestName === "function"
+    ? globalThis.__cottontailCurrentTestName().replace(/ > /g, " ")
+    : "";
   const scope = testName ? `${file}:${testName}` : file;
   const base = hint != null ? `${scope}:${String(hint)}` : scope;
   const current = snapshotCounters.get(base) ?? 0;
@@ -502,23 +953,479 @@ function snapshotFilePath(testFile) {
   return `${directory}/__snapshots__/${basename}.snap`;
 }
 
-function persistSnapshot(identity, text) {
-  if (!globalThis.cottontail?.writeFile || identity.file === "<script>") return;
-  const path = snapshotFilePath(identity.file);
-  let source = "// Jest Snapshot v1, https://bun.sh/docs/test/snapshots\n";
-  try {
-    source = String(cottontail.readFile(path));
-    if (!writableSnapshotFiles.has(path)) return;
-  } catch {
-    const slash = path.lastIndexOf("/");
-    cottontail.mkdirSync(path.slice(0, slash), true);
-    writableSnapshotFiles.add(path);
-  }
-  const escapedKey = String(identity.exportKey).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
-  const escapedText = String(text).replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
-  source += `\nexports[\`${escapedKey}\`] = \`\n${escapedText}\n\`;\n`;
-  cottontail.writeFile(path, source);
+function snapshotUpdateRequested() {
+  return Array.from(globalThis.process?.argv ?? []).some((arg) =>
+    arg === "-u" || arg === "--update-snapshots" || arg === "--updateSnapshot");
 }
+
+function snapshotCreationDisabledInCI() {
+  const ci = globalThis.process?.env?.CI;
+  return ci != null && ci !== "" && !/^(?:0|false)$/i.test(String(ci));
+}
+
+function parseSnapshotFile(source, path) {
+  const parsed = Object.create(null);
+  try {
+    Function("exports", String(source))(parsed);
+  } catch (error) {
+    throw new Error(`Failed to parse snapshot file ${path}: ${error?.message ?? String(error)}`);
+  }
+  return new Map(Object.entries(parsed).map(([key, value]) => [key, String(value)]));
+}
+
+function snapshotFileState(testFile) {
+  const path = snapshotFilePath(testFile);
+  let state = snapshotFiles.get(path);
+  if (state) return state;
+  const update = snapshotUpdateRequested();
+  let values = new Map();
+  let exists = false;
+  if (!update) {
+    try {
+      const source = String(cottontail.readFile(path));
+      exists = true;
+      values = parseSnapshotFile(source, path);
+    } catch (error) {
+      if (nodeExistsSync(path)) throw error;
+    }
+  } else {
+    exists = nodeExistsSync(path);
+  }
+  state = { path, values, update, exists, dirty: false };
+  snapshotFiles.set(path, state);
+  return state;
+}
+
+function escapeSnapshotTemplate(value) {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\0/g, "\\x00")
+    .replace(/`/g, "\\`")
+    .replace(/\$\{/g, "\\${");
+}
+
+function renderSnapshotFile(values) {
+  let source = snapshotFileHeader;
+  for (const [key, value] of values) {
+    source += `\nexports[\`${escapeSnapshotTemplate(key)}\`] = \`${escapeSnapshotTemplate(value)}\`;\n`;
+  }
+  return source;
+}
+
+function skipSnapshotTrivia(source, index) {
+  while (index < source.length) {
+    if (/\s/.test(source[index])) {
+      index++;
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "/") {
+      index = source.indexOf("\n", index + 2);
+      if (index < 0) return source.length;
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "*") {
+      const end = source.indexOf("*/", index + 2);
+      return end < 0 ? source.length : skipSnapshotTrivia(source, end + 2);
+    }
+    break;
+  }
+  return index;
+}
+
+function skipSnapshotQuoted(source, index) {
+  const quote = source[index++];
+  while (index < source.length) {
+    const character = source[index++];
+    if (character === "\\") {
+      index++;
+      continue;
+    }
+    if (character === quote) return index;
+  }
+  return source.length;
+}
+
+function snapshotSourceLineColumn(source, offset) {
+  let line = 1;
+  let lineStart = 0;
+  for (let index = 0; index < offset; index++) {
+    if (source.charCodeAt(index) === 10) {
+      line++;
+      lineStart = index + 1;
+    }
+  }
+  return { line, column: offset - lineStart + 1 };
+}
+
+function trimSnapshotSourceRange(source, start, end) {
+  while (start < end && /\s/.test(source[start])) start++;
+  while (end > start && /\s/.test(source[end - 1])) end--;
+  return { start, end };
+}
+
+function parseInlineSnapshotArguments(source, open) {
+  const args = [];
+  const commas = [];
+  let segmentStart = open + 1;
+  let parens = 0;
+  let braces = 0;
+  let brackets = 0;
+  let index = open + 1;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === "'" || character === '"' || character === "`") {
+      index = skipSnapshotQuoted(source, index);
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "/") {
+      const end = source.indexOf("\n", index + 2);
+      index = end < 0 ? source.length : end;
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "*") {
+      const end = source.indexOf("*/", index + 2);
+      index = end < 0 ? source.length : end + 2;
+      continue;
+    }
+    if (character === "(") parens++;
+    else if (character === ")") {
+      if (parens === 0 && braces === 0 && brackets === 0) {
+        const range = trimSnapshotSourceRange(source, segmentStart, index);
+        if (range.start < range.end) args.push(range);
+        return {
+          args,
+          commas,
+          close: index,
+          trailingComma: commas.length > 0 && skipSnapshotTrivia(source, commas.at(-1) + 1) === index,
+        };
+      }
+      parens--;
+    } else if (character === "{") braces++;
+    else if (character === "}") braces--;
+    else if (character === "[") brackets++;
+    else if (character === "]") brackets--;
+    else if (character === "," && parens === 0 && braces === 0 && brackets === 0) {
+      const range = trimSnapshotSourceRange(source, segmentStart, index);
+      if (range.start < range.end) args.push(range);
+      commas.push(index);
+      segmentStart = index + 1;
+    }
+    index++;
+  }
+  return null;
+}
+
+function scanInlineSnapshotCalls(source) {
+  const names = ["toMatchInlineSnapshot", "toThrowErrorMatchingInlineSnapshot"];
+  const calls = [];
+  let index = 0;
+  while (index < source.length) {
+    const character = source[index];
+    if (character === "'" || character === '"' || character === "`") {
+      index = skipSnapshotQuoted(source, index);
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "/") {
+      const end = source.indexOf("\n", index + 2);
+      index = end < 0 ? source.length : end;
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "*") {
+      const end = source.indexOf("*/", index + 2);
+      index = end < 0 ? source.length : end + 2;
+      continue;
+    }
+    if (character !== ".") {
+      index++;
+      continue;
+    }
+    const identifierStart = skipSnapshotTrivia(source, index + 1);
+    const kind = names.find((name) =>
+      source.startsWith(name, identifierStart) && !/[\w$]/.test(source[identifierStart + name.length] ?? ""));
+    if (!kind) {
+      index++;
+      continue;
+    }
+    const open = skipSnapshotTrivia(source, identifierStart + kind.length);
+    if (source[open] !== "(") {
+      index++;
+      continue;
+    }
+    const parsed = parseInlineSnapshotArguments(source, open);
+    if (!parsed) {
+      index++;
+      continue;
+    }
+    const location = snapshotSourceLineColumn(source, identifierStart);
+    calls.push({ kind, identifierStart, open, ...parsed, ...location });
+    index = identifierStart + kind.length;
+  }
+  return calls;
+}
+
+function inlineSnapshotExpressionIsLiteral(source, range) {
+  const start = skipSnapshotTrivia(source, range.start);
+  const quote = source[start];
+  if (quote !== "'" && quote !== '"' && quote !== "`") return false;
+  const end = skipSnapshotQuoted(source, start);
+  if (skipSnapshotTrivia(source, end) !== range.end) return false;
+  if (quote === "`") {
+    const body = source.slice(start + 1, end - 1);
+    for (let index = 0; index + 1 < body.length; index++) {
+      if (body[index] === "\\") {
+        index++;
+      } else if (body[index] === "$" && body[index + 1] === "{") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function normalizeInlineSnapshotPath(value) {
+  let path = String(value ?? "").replace(/^file:\/\//, "");
+  try {
+    path = decodeURIComponent(path);
+  } catch {}
+  if (!/^(?:[A-Za-z]:)?[\\/]/.test(path)) path = `${cottontail.cwd()}/${path}`;
+  return path.replace(/\\/g, "/");
+}
+
+function inlineSnapshotCaller(kind) {
+  const stack = String(new Error().stack ?? "");
+  for (const line of stack.split("\n")) {
+    let location = line.trim();
+    const open = location.lastIndexOf("(");
+    if (open >= 0) location = location.slice(open + 1).replace(/\)$/, "");
+    else location = location.replace(/^at\s+(?:[^ ]+\s+)?/, "");
+    const match = /^(.*):(\d+):(\d+)$/.exec(location);
+    if (!match) continue;
+    const file = normalizeInlineSnapshotPath(match[1]);
+    if (file.includes("/.cottontail-embedded-runtime/") || file.endsWith("/runtime_modules/bun/test.js")) continue;
+    return { file, line: Number(match[2]), column: Number(match[3]), kind };
+  }
+  throw new Error(`Failed to update inline snapshot: Could not find '${kind}' here`);
+}
+
+function inlineSnapshotTestFile() {
+  return normalizeInlineSnapshotPath(
+    globalThis.__cottontailCurrentTestFile?.() ||
+    globalThis.__cottontailRegisteringTestFile ||
+    globalThis.__filename ||
+    globalThis.process?.argv?.[1] ||
+    "",
+  );
+}
+
+function inlineSnapshotFileState(path) {
+  let state = inlineSnapshotFiles.get(path);
+  if (state) return state;
+  const source = String(cottontail.readFile(path));
+  state = {
+    path,
+    source,
+    calls: scanInlineSnapshotCalls(source),
+    assignments: new Map(),
+    lastCalls: new Map(),
+    usedCalls: new Set(),
+    edits: new Map(),
+    dirty: false,
+    invalid: false,
+  };
+  inlineSnapshotFiles.set(path, state);
+  return state;
+}
+
+function resolveInlineSnapshotCall(state, caller, scope) {
+  const key = `${caller.kind}:${caller.line}:${caller.column}`;
+  const assigned = state.assignments.get(key);
+  const previous = state.lastCalls.get(scope);
+  const preferredLine = state.source.startsWith("\n") ? caller.line - 1 : caller.line;
+  const candidates = state.calls
+    .filter((call) => call.kind === caller.kind && !state.usedCalls.has(call.identifierStart))
+    .map((call) => ({
+      call,
+      score: Math.min(
+        Math.abs(call.line - preferredLine),
+        Math.abs(call.line - caller.line),
+      ) * 10000 + Math.abs(call.column - caller.column),
+    }))
+    .sort((left, right) => left.score - right.score || left.call.identifierStart - right.call.identifierStart);
+  if (assigned) {
+    if (!state.edits.has(assigned.identifierStart)) return assigned;
+    // COTTONTAIL-COMPAT: stock JSC source maps can collapse the final two
+    // calls in a generated block onto one location. Consume a neighboring
+    // unused source call before treating this as a repeated helper call.
+    const neighbor = candidates.find(({ call }) => Math.abs(call.line - preferredLine) <= 1)?.call;
+    if (!neighbor) return assigned;
+    state.usedCalls.add(neighbor.identifierStart);
+    state.lastCalls.set(scope, neighbor);
+    return neighbor;
+  }
+  const nextInTest = previous == null
+    ? null
+    : state.calls.find((call) =>
+      call.kind === caller.kind &&
+      call.identifierStart > previous.identifierStart &&
+      !state.usedCalls.has(call.identifierStart));
+  const selected = nextInTest ?? candidates[0]?.call;
+  if (!selected || (nextInTest == null &&
+      Math.min(Math.abs(selected.line - preferredLine), Math.abs(selected.line - caller.line)) > 2)) {
+    state.invalid = true;
+    throw new Error(`Failed to update inline snapshot: Could not find '${caller.kind}' here`);
+  }
+  state.assignments.set(key, selected);
+  state.usedCalls.add(selected.identifierStart);
+  state.lastCalls.set(scope, selected);
+  return selected;
+}
+
+function inlineSnapshotIndentInfo(value) {
+  if (typeof value !== "string" || !value.startsWith("\n")) return null;
+  const lines = value.split("\n");
+  if (lines[0].trim() !== "" || lines.length < 3) return null;
+  const firstContent = lines.findIndex((line, index) => index > 0 && line.trim() !== "");
+  if (firstContent < 0) return null;
+  const startIndent = lines[firstContent].match(/^[ \t]*/)?.[0] ?? "";
+  const endIndent = lines.at(-1) ?? "";
+  if (endIndent.trim() !== "") return null;
+  for (let index = firstContent; index < lines.length - 1; index++) {
+    if (lines[index].trim() !== "" && !lines[index].startsWith(startIndent)) return null;
+  }
+  return { startIndent, endIndent };
+}
+
+function reindentInlineSnapshot(value, source, call, existingValue) {
+  if (!value.startsWith("\n")) return value;
+  const existingIndent = inlineSnapshotIndentInfo(existingValue);
+  const lineStart = source.lastIndexOf("\n", call.close - 1) + 1;
+  const sourceIndent = source.slice(lineStart, call.close).match(/^[ \t]*/)?.[0] ?? "";
+  const startIndent = existingIndent?.startIndent ?? sourceIndent;
+  const endIndent = existingIndent?.endIndent ?? sourceIndent;
+  const extra = existingIndent ? "" : "  ";
+  const lines = value.slice(1).split("\n");
+  let output = "\n";
+  for (let index = 0; index < lines.length - 1; index++) {
+    const line = lines[index];
+    output += line.length === 0 ? "\n" : `${startIndent}${extra}${line}\n`;
+  }
+  return output + endIndent;
+}
+
+function inlineSnapshotTemplate(value, source, call, existingValue) {
+  const indented = reindentInlineSnapshot(value, source, call, existingValue);
+  return `\`${escapeSnapshotTemplate(indented)}\``;
+}
+
+function inlineSnapshotEdit(state, call, value, hasMatchers, existingValue) {
+  const fail = (message) => {
+    state.invalid = true;
+    throw new Error(`Failed to update inline snapshot: ${message}`);
+  };
+  if (call.args.some((arg) => state.source.slice(arg.start, arg.end).trimStart().startsWith("..."))) {
+    fail("Spread is not allowed");
+  }
+  if (call.args.length > 2) fail("Snapshot expects at most two arguments");
+  const replacement = inlineSnapshotTemplate(value, state.source, call, existingValue);
+  if (call.args.length === 0) {
+    if (hasMatchers) fail("Snapshot has matchers and yet has no arguments");
+    return { start: call.close, end: call.close, replacement };
+  }
+  if (call.args.length === 1) {
+    const first = call.args[0];
+    if (hasMatchers) {
+      if (call.trailingComma) {
+        const comma = call.commas.at(-1);
+        return { start: comma + 1, end: comma + 1, replacement: ` ${replacement}` };
+      }
+      return { start: call.close, end: call.close, replacement: `, ${replacement}` };
+    }
+    if (!inlineSnapshotExpressionIsLiteral(state.source, first)) fail("Argument must be a string literal");
+    return { start: first.start, end: first.end, replacement };
+  }
+  if (!hasMatchers) fail("Snapshot does not have matchers and yet has two arguments");
+  const second = call.args[1];
+  if (!inlineSnapshotExpressionIsLiteral(state.source, second)) fail("Argument must be a string literal");
+  return { start: second.start, end: second.end, replacement };
+}
+
+function queueInlineSnapshot(kind, value, hasMatchers, existingValue) {
+  const caller = inlineSnapshotCaller(kind);
+  const testFile = inlineSnapshotTestFile();
+  if (caller.file !== testFile) {
+    throw new Error(
+      `Inline snapshot matchers must be called from the test file: expected ${testFile}, called from ${caller.file}`,
+    );
+  }
+  const state = inlineSnapshotFileState(testFile);
+  const scope = globalThis.__cottontailCurrentTestToken?.() ?? "<module>";
+  const call = resolveInlineSnapshotCall(state, caller, scope);
+  const previous = state.edits.get(call.identifierStart);
+  if (previous) {
+    if (previous.value !== value) {
+      state.invalid = true;
+      throw new Error("Failed to update inline snapshot: Multiple inline snapshots on the same line must all have the same value");
+    }
+    return;
+  }
+  const edit = inlineSnapshotEdit(state, call, value, hasMatchers, existingValue);
+  state.edits.set(call.identifierStart, { ...edit, call, value });
+  state.dirty = true;
+  globalThis.__cottontailBunTestUsed = true;
+}
+
+function matchOrQueueInlineSnapshot(kind, actual, expected, hasMatchers) {
+  const value = snapshotText(actual);
+  const received = normalizeSnapshotText(value);
+  const wanted = normalizeSnapshotText(expected);
+  if (expected === undefined) {
+    if (snapshotCreationDisabledInCI() && !snapshotUpdateRequested()) {
+      throw new Error("Inline snapshot creation is disabled in CI environments unless --update-snapshots is used");
+    }
+    queueInlineSnapshot(kind, value, hasMatchers, expected);
+    return { pass: true, received, wanted };
+  }
+  const pass = inlineSnapshotMatches(received, wanted);
+  if (!pass && snapshotUpdateRequested()) {
+    queueInlineSnapshot(kind, value, hasMatchers, expected);
+    return { pass: true, received, wanted };
+  }
+  return { pass, received, wanted };
+}
+
+function flushSnapshotFiles() {
+  for (const state of snapshotFiles.values()) {
+    if (!state.dirty) continue;
+    const slash = state.path.lastIndexOf("/");
+    cottontail.mkdirSync(state.path.slice(0, slash), true);
+    cottontail.writeFile(state.path, renderSnapshotFile(state.values));
+    state.dirty = false;
+    state.exists = true;
+  }
+  for (const state of inlineSnapshotFiles.values()) {
+    if (!state.dirty || state.invalid) continue;
+    const edits = Array.from(state.edits.values())
+      .sort((left, right) => left.call.identifierStart - right.call.identifierStart);
+    let output = "";
+    let cursor = 0;
+    for (const edit of edits) {
+      if (edit.start < cursor) {
+        state.invalid = true;
+        throw new Error("Failed to update inline snapshot: Did not advance.");
+      }
+      output += state.source.slice(cursor, edit.start) + edit.replacement;
+      cursor = edit.end;
+    }
+    output += state.source.slice(cursor);
+    cottontail.writeFile(state.path, output);
+    state.source = output;
+    state.dirty = false;
+  }
+}
+
+globalThis.__cottontailHasPendingSnapshots = () =>
+  Array.from(snapshotFiles.values()).some((state) => state.dirty) ||
+  Array.from(inlineSnapshotFiles.values()).some((state) => state.dirty && !state.invalid);
 
 function compareSnapshot(actual, expected = undefined, hint = undefined) {
   const text = snapshotText(actual);
@@ -526,11 +1433,25 @@ function compareSnapshot(actual, expected = undefined, hint = undefined) {
     return text === normalizeSnapshotText(expected);
   }
   const identity = nextSnapshotIdentity(hint);
-  if (!snapshots.has(identity.key)) {
+  const state = snapshotFileState(identity.file);
+  const existing = state.values.get(identity.exportKey);
+  if (existing === undefined) {
+    if (snapshotCreationDisabledInCI() && !state.update) {
+      throw new Error(`Snapshot ${identity.exportKey} does not exist and snapshot creation is disabled in CI`);
+    }
+    state.values.set(identity.exportKey, text);
+    state.dirty = true;
     snapshots.set(identity.key, text);
-    persistSnapshot(identity, text);
+    return true;
   }
-  return snapshots.get(identity.key) === text;
+  if (existing !== text && state.update) {
+    state.values.set(identity.exportKey, text);
+    state.dirty = true;
+    snapshots.set(identity.key, text);
+    return true;
+  }
+  snapshots.set(identity.key, existing);
+  return existing === text;
 }
 
 function assertPropertyMatchers(actual, propertyMatchers) {
@@ -546,7 +1467,32 @@ function assertPropertyMatchers(actual, propertyMatchers) {
   if (!pass) {
     throw new nodeAssert.AssertionError({ message: `Expected ${formatValue(actual)} to match snapshot property matchers` });
   }
+  const replaceMatchers = (received, expected, seen = new WeakMap()) => {
+    if (!isObject(expected) || !isObject(received)) return;
+    let visited = seen.get(received);
+    if (visited?.has(expected)) return;
+    if (!visited) {
+      visited = new WeakSet();
+      seen.set(received, visited);
+    }
+    visited.add(expected);
+    for (const key of Reflect.ownKeys(expected)) {
+      if (!Object.prototype.propertyIsEnumerable.call(expected, key)) continue;
+      if (matcherName(expected[key])) {
+        try {
+          received[key] = expected[key];
+        } catch {
+          Object.defineProperty(received, key, { configurable: true, enumerable: true, writable: true, value: expected[key] });
+        }
+      } else {
+        replaceMatchers(received[key], expected[key], seen);
+      }
+    }
+  };
+  replaceMatchers(actual, propertyMatchers);
 }
+
+globalThis.__cottontailFlushSnapshots = flushSnapshotFiles;
 
 function callRecords(value) {
   const calls = value?.mock?.calls;
@@ -609,6 +1555,120 @@ function diffTextLines(expectedText, receivedText) {
   while (i < m) out.push(`- ${a[i++]}`);
   while (j < n) out.push(`+ ${b[j++]}`);
   return out.join("\n");
+}
+
+function snapshotDiffValue(value) {
+  let text = snapshotSerialize(value);
+  if (text.startsWith("\n")) text = text.slice(1);
+  if (text.endsWith("\n")) text = text.slice(0, -1);
+  return text;
+}
+
+function testDiffColorsEnabled() {
+  const env = globalThis.process?.env;
+  if (env?.FORCE_COLOR !== undefined) return env.FORCE_COLOR !== "0";
+  if (env?.NO_COLOR !== undefined || env?.NODE_DISABLE_COLORS !== undefined) return false;
+  return Boolean(globalThis.process?.stderr?.isTTY);
+}
+
+function styleMatcherSignature(signature, colors) {
+  if (!colors) return signature;
+  const match = /^(expect\()received(\)(?:\.not)?\.)([^\s(]+)(\()expected(\))$/.exec(signature);
+  if (!match) return signature;
+  const reset = "\x1b[0m";
+  const dim = "\x1b[2m";
+  return `${dim}${match[1]}${reset}\x1b[31mreceived${reset}${dim}${match[2]}${reset}` +
+    `${match[3]}${dim}${match[4]}${reset}\x1b[32mexpected${reset}${dim}${match[5]}${reset}`;
+}
+
+function parseExpectationStackFrame(line) {
+  const text = String(line ?? "").trim();
+  let match = /^(.*?)@(.+):(\d+):(\d+)$/.exec(text);
+  if (!match) match = /^at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
+  if (!match) return null;
+  let filePath = String(match[2]).replace(/^file:\/\//, "").replaceAll("\\", "/");
+  try { filePath = decodeURIComponent(filePath); } catch {}
+  return {
+    functionName: match[1] || "<anonymous>",
+    filePath,
+    line: Number(match[3]),
+    column: Number(match[4]),
+  };
+}
+
+function expectationCallSite(error, matcherName) {
+  let stack = String(error?.stack ?? "");
+  try { stack = globalThis.__cottontailRemapStackString?.(stack) ?? stack; } catch {}
+  let frame = null;
+  for (const line of stack.split("\n")) {
+    const candidate = parseExpectationStackFrame(line);
+    if (!candidate) continue;
+    const path = candidate.filePath;
+    if (!path || path.includes("/.cottontail-embedded-runtime/") || path.includes("/.cottontail-tmp/") ||
+        path.endsWith("/script.bundle.mjs") || path.endsWith("/runtime_modules/bun/test.js")) continue;
+    frame = candidate;
+    break;
+  }
+  if (!frame || !matcherName) return frame;
+
+  try {
+    const sourceLines = String(globalThis.cottontail.readFile(frame.filePath)).split(/\r?\n/);
+    const token = `.${matcherName}`;
+    let best = null;
+    const start = Math.max(0, frame.line - 7);
+    const end = Math.min(sourceLines.length, frame.line + 6);
+    for (let index = start; index < end; index++) {
+      const column = sourceLines[index].indexOf(token);
+      if (column < 0) continue;
+      const distance = Math.abs(index + 1 - frame.line);
+      if (!best || distance < best.distance) best = { line: index + 1, column: column + 2, distance };
+    }
+    if (best) frame = { ...frame, line: best.line, column: best.column };
+  } catch {}
+  return frame;
+}
+
+function decorateExpectationError(error, message) {
+  const plainMessage = String(message).replace(/\x1b\[[0-9;]*m/g, "");
+  const matcherName = /expect\(received\)(?:\.not)?\.([^\s(]+)\(/.exec(plainMessage)?.[1];
+  const callSite = expectationCallSite(error, matcherName);
+  Object.defineProperties(error, {
+    __cottontailBunExpectation: { value: true, configurable: true },
+    __cottontailBunCallSite: { value: callSite, configurable: true },
+  });
+  return error;
+}
+
+function inspectExpectationError(error, colors) {
+  const message = String(error?.message ?? error ?? "Test failed");
+  const frame = error?.__cottontailBunCallSite;
+  if (!frame) return colors ? `error\x1b[0m\x1b[2m:\x1b[0m \x1b[1m${message}` : `error: ${message}`;
+  const functionName = frame.functionName && frame.functionName !== "@" ? frame.functionName : "<anonymous>";
+  if (!colors) {
+    const plainMessage = message.replace(/\x1b\[[0-9;]*m/g, "");
+    const separator = plainMessage.endsWith("\n") ? "\n" : "\n\n";
+    return `error: ${plainMessage}${separator}      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})\n`;
+  }
+  const reset = "\x1b[0m";
+  const dim = "\x1b[2m";
+  const stack = `${reset}      ${dim}at ${reset}${reset}${dim}${functionName}${reset}${dim} (` +
+    `${reset}${reset}\x1b[36m${frame.filePath}${reset}${dim}:${reset}\x1b[33m${frame.line}${reset}` +
+    `${dim}:\x1b[33m${frame.column}${reset}${dim})${reset}`;
+  const separator = message.endsWith("\n") ? "" : "\n";
+  return `error${reset}${dim}:${reset} \x1b[1m${message}${separator}${reset}\n${stack}\n`;
+}
+
+globalThis.__cottontailInspectBunExpectationError = inspectExpectationError;
+
+function formatEqualityFailure(actual, expected, signature, negate, includeSignature) {
+  const colors = testDiffColorsEnabled();
+  const body = globalThis.cottontail.formatDiff(
+    snapshotDiffValue(actual),
+    snapshotDiffValue(expected),
+    negate,
+    colors,
+  );
+  return `${includeSignature ? `${styleMatcherSignature(signature, colors)}\n\n` : ""}${body}\n`;
 }
 
 function formatCallArgsFailure(matcherName, expectedArgs, receivedCall, callCount) {
@@ -824,65 +1884,75 @@ function uninstallFakeTimers() {
 }
 
 class Expectation {
-  constructor(actual, negate = false, promiseMode = null, label = undefined, rejectedValue = false) {
+  constructor(
+    actual,
+    negate = false,
+    promiseMode = null,
+    label = undefined,
+    rejectedValue = false,
+    testToken = globalThis.__cottontailCurrentTestToken?.(),
+  ) {
     this.actual = actual;
     this._negate = negate;
     this._promiseMode = promiseMode;
     this._label = label;
     this._rejectedValue = rejectedValue;
+    this._testToken = testToken;
   }
 
   get not() {
-    return new Expectation(this.actual, !this._negate, this._promiseMode, this._label, this._rejectedValue);
+    return new Expectation(this.actual, !this._negate, this._promiseMode, this._label, this._rejectedValue, this._testToken);
   }
 
   get resolves() {
-    const handled = Promise.resolve().then(() => promiseFromActual(this.actual, "resolves")).then(
-      (value) => value,
-      (error) => {
-        throw new nodeAssert.AssertionError({
-          message: `Received promise rejected instead of resolved: ${formatValue(error)}`,
-        });
-      },
-    );
-    return new Expectation(handled, this._negate, "resolves", this._label);
+    return new Expectation(this.actual, this._negate, "resolves", this._label, false, this._testToken);
   }
 
   get rejects() {
-    const handled = Promise.resolve().then(() => promiseFromActual(this.actual, "rejects")).then(
-      (promise) => promise,
-    ).then(
-      () => {
-        throw new nodeAssert.AssertionError({ message: "Received promise resolved instead of rejected" });
-      },
-      (error) => error,
-    );
-    return new Expectation(handled, this._negate, "rejects", this._label);
-  }
-
-  async _promiseActual() {
-    if (this._promiseMode === "resolves") return await this.actual;
-    if (this._promiseMode === "rejects") return await this.actual;
-    return this.actual;
+    return new Expectation(this.actual, this._negate, "rejects", this._label, false, this._testToken);
   }
 
   _check(pass, message) {
     if (this._skipAssertionCount) this._skipAssertionCount = false;
-    else {
-      assertionCount += 1;
-      globalThis.__cottontailTestAssertionCount += 1;
-    }
+    else countAssertion();
     const ok = this._negate ? !pass : pass;
     if (ok) return;
     if (typeof message === "function") message = message();
     const label = this._label == null ? "" : `${String(this._label)}\n\n`;
-    throw new nodeAssert.AssertionError({ message: `${label}${message}` });
+    const rendered = `${label}${message}`;
+    throw decorateExpectationError(new nodeAssert.AssertionError({ message: rendered }), rendered);
   }
 
   _wrap(check) {
     if (this._promiseMode) {
-      const rejectedValue = this._promiseMode === "rejects";
-      return this._promiseActual().then((actual) => check.call(new Expectation(actual, this._negate, null, this._label, rejectedValue), actual));
+      const mode = this._promiseMode;
+      const promise = promiseFromActual(this.actual, mode);
+      const runCheck = (actual) => check.call(
+        new Expectation(actual, this._negate, null, this._label, mode === "rejects", this._testToken),
+        actual,
+      );
+      const state = nativePromiseState(promise);
+      if (state?.status === 1 || state?.status === 2) {
+        if (state.status === 2) promise.catch(() => {});
+        const matchedMode = (mode === "resolves") === (state.status === 1);
+        if (!matchedMode) throw promiseModeError(mode, state.value);
+        const result = runCheck(state.value);
+        if (isPromiseLike(result)) globalThis.__cottontailRegisterTestPendingPromise?.(result);
+        return undefined;
+      }
+
+      const result = Promise.resolve(promise).then(
+        (value) => {
+          if (mode === "rejects") throw promiseModeError(mode, value);
+          return runCheck(value);
+        },
+        (error) => {
+          if (mode === "resolves") throw promiseModeError(mode, error);
+          return runCheck(error);
+        },
+      );
+      globalThis.__cottontailRegisterTestPendingPromise?.(result);
+      return undefined;
     }
     return check.call(this, this.actual);
   }
@@ -905,25 +1975,32 @@ class Expectation {
       const pass = matchesExpected(actual, expected);
       const finish = (matched) => this._check(Boolean(matched), () => {
         const signature = `expect(received)${this._negate ? ".not" : ""}.toEqual(expected)`;
-        const body = this._negate
-          ? `Expected: not ${formatValue(expected)}`
-          : `Expected: ${formatValue(expected)}\nReceived: ${formatValue(actual)}`;
-        return this._label == null ? `${signature}\n\n${body}` : body;
+        return formatEqualityFailure(actual, expected, signature, this._negate, this._label == null);
       });
       return isPromiseLike(pass) ? Promise.resolve(pass).then(finish) : finish(pass);
     });
   }
 
   toStrictEqual(expected) {
-    return this.toEqual(expected);
+    return this._wrap((actual) => {
+      const pass = matchesExpected(actual, expected, undefined, true);
+      const finish = (matched) => this._check(Boolean(matched), () => {
+        const signature = `expect(received)${this._negate ? ".not" : ""}.toStrictEqual(expected)`;
+        return formatEqualityFailure(actual, expected, signature, this._negate, this._label == null);
+      });
+      return isPromiseLike(pass) ? Promise.resolve(pass).then(finish) : finish(pass);
+    });
   }
 
   toMatchObject(expected) {
     return this._wrap((actual) => {
-      const pass = matcherName(expected)
-        ? isObject(actual)
-        : isObject(actual) && Object.keys(expected ?? {}).every((key) => matchesExpected(actual[key], expected[key]));
-      this._check(pass, `Expected ${formatValue(actual)} to match object ${formatValue(expected)}`);
+      if (!isObject(actual) || !isObject(expected)) {
+        throw new TypeError("toMatchObject() requires object values");
+      }
+      // Bun treats a top-level asymmetric matcher as an empty partial object.
+      const pass = matcherName(expected) ? true : matchesObjectSubset(actual, expected);
+      return mapMatchResult(pass, (matched) =>
+        this._check(Boolean(matched), `Expected ${formatValue(actual)} to match object ${formatValue(expected)}`));
     });
   }
 
@@ -941,7 +2018,7 @@ class Expectation {
   toBeInstanceOf(type) { return this._wrap((actual) => this._check(actual instanceof type, `Expected instance of ${type?.name ?? type}`)); }
   toBeArray() { return this._wrap((actual) => this._check(Array.isArray(actual), "Expected value to be an array")); }
   toBeArrayOfSize(size) { return this._wrap((actual) => this._check(Array.isArray(actual) && actual.length === Number(size), `Expected array size ${size}`)); }
-  toBeObject() { return this._wrap((actual) => this._check(isObject(actual) && !Array.isArray(actual), "Expected value to be an object")); }
+  toBeObject() { return this._wrap((actual) => this._check(isObjectLike(actual), "Expected value to be an object")); }
   toBeFunction() { return this._wrap((actual) => this._check(typeof actual === "function", "Expected value to be a function")); }
   toBeString() { return this._wrap((actual) => this._check(typeof actual === "string" || actual instanceof String, "Expected value to be a string")); }
   toBeNumber() { return this._wrap((actual) => this._check(typeof actual === "number", "Expected value to be a number")); }
@@ -1001,7 +2078,13 @@ class Expectation {
     });
   }
 
-  toContainEqual(expected) { return this.toContain(expected); }
+  toContainEqual(expected) {
+    return this._wrap((actual) => {
+      const pass = actual != null && typeof actual[Symbol.iterator] === "function" &&
+        Array.from(actual).some((value) => matchesExpected(value, expected));
+      this._check(pass, `Expected ${formatValue(actual)} to contain equal ${formatValue(expected)}`);
+    });
+  }
   toInclude(expected) { return this.toContain(expected); }
   toIncludeRepeated(expected, count = 1) {
     if (arguments.length < 2) throw new TypeError("toIncludeRepeated() requires 2 arguments");
@@ -1029,7 +2112,23 @@ class Expectation {
   }
   toHaveLength(length) {
     return this._wrap((actual) => {
-      const actualLength = actual?.length ?? (actual instanceof ArrayBuffer || ArrayBuffer.isView(actual) ? actual.byteLength : undefined);
+      let actualLength = actual?.length;
+      if (actualLength == null && (actual instanceof ArrayBuffer || ArrayBuffer.isView(actual))) actualLength = actual.byteLength;
+      if (actualLength == null && typeof Headers === "function" && actual instanceof Headers) actualLength = Array.from(actual.keys()).length;
+      if (actualLength == null && typeof FormData === "function" && actual instanceof FormData) actualLength = Array.from(actual.keys()).length;
+      if (actualLength == null && typeof URLSearchParams === "function" && actual instanceof URLSearchParams) actualLength = Array.from(actual.keys()).length;
+      if (actualLength == null &&
+          ((typeof WeakMap === "function" && actual instanceof WeakMap) ||
+           (typeof WeakSet === "function" && actual instanceof WeakSet)) &&
+          typeof globalThis.cottontail?.weakCollectionSize === "function") {
+        actualLength = globalThis.cottontail.weakCollectionSize(actual);
+      }
+      if (actualLength == null && typeof actual?.size === "number") {
+        if (typeof actual.exists === "function" && typeof actual.name === "string" && actual.name && !nodeExistsSync(actual.name)) {
+          throw new Error("Received file does not exist");
+        }
+        actualLength = actual.size;
+      }
       this._check(actualLength === Number(length), `Expected length ${length}`);
     });
   }
@@ -1045,19 +2144,54 @@ class Expectation {
 
   // Bun checks own properties (hasOwnProperty), which on proxies triggers the
   // getOwnPropertyDescriptor trap -- trap errors must propagate (issue #11677).
-  toContainKey(key) { return this._wrap((actual) => this._check(isObject(actual) && Object.hasOwn(actual, key), `Expected key ${String(key)}`)); }
-  toContainKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).every((key) => isObject(actual) && Object.hasOwn(actual, key)), "Expected keys")); }
-  toContainAnyKeys(keys) { return this._wrap((actual) => this._check(Array.from(keys ?? []).some((key) => isObject(actual) && Object.hasOwn(actual, key)), "Expected any key")); }
-  toContainAllKeys(keys) { return this.toContainKeys(keys); }
+  toContainKey(key) {
+    return this._wrap((actual) => {
+      if (!isObjectLike(actual)) throw new TypeError(`Expected value must be an object\nReceived: ${formatValue(actual)}`);
+      this._check(Object.hasOwn(actual, key), `Expected key ${String(key)}`);
+    });
+  }
+  toContainKeys(keys) {
+    return this._wrap((actual) => {
+      const expectedKeys = Array.from(keys ?? []);
+      const pass = !isObjectLike(actual) ? expectedKeys.length === 0 : expectedKeys.every((key) => Object.hasOwn(actual, key));
+      this._check(pass, `Expected keys\nReceived: ${formatValue(actual)}`);
+    });
+  }
+  toContainAnyKeys(keys) {
+    return this._wrap((actual) => this._check(
+      isObjectLike(actual) && Array.from(keys ?? []).some((key) => Object.hasOwn(actual, key)),
+      "Expected any key",
+    ));
+  }
+  toContainAllKeys(keys) {
+    return this._wrap((actual) => {
+      const expectedKeys = Array.from(keys ?? []);
+      const actualKeys = isObjectLike(actual) ? Object.keys(actual) : [];
+      const pass = actualKeys.length === expectedKeys.length &&
+        actualKeys.every((key) => expectedKeys.some((expected) => matchesExpected(key, expected)));
+      this._check(pass, "Expected all keys");
+    });
+  }
   toContainValue(value) { return this._wrap((actual) => this._check(Object.values(Object(actual)).some((candidate) => matchesExpected(candidate, value)), "Expected object value")); }
   toContainValues(values) { return this._wrap((actual) => this._check(Array.from(values ?? []).every((value) => Object.values(Object(actual)).some((candidate) => matchesExpected(candidate, value))), "Expected object values")); }
   toContainAnyValues(values) { return this._wrap((actual) => this._check(Array.from(values ?? []).some((value) => Object.values(Object(actual)).some((candidate) => matchesExpected(candidate, value))), "Expected any object value")); }
-  toContainAllValues(values) { return this.toContainValues(values); }
+  toContainAllValues(values) {
+    return this._wrap((actual) => {
+      const expectedValues = Array.from(values ?? []);
+      const actualValues = actual == null ? [] : Object.values(Object(actual));
+      const pass = actualValues.length === expectedValues.length && expectedValues.every((value) =>
+        actualValues.some((candidate) => matchesExpected(candidate, value)));
+      this._check(pass, "Expected all object values");
+    });
+  }
 
   toThrow(expected = undefined) {
     const rejectedValue = this._promiseMode === "rejects" || this._rejectedValue;
     return this._wrap((actual) => {
       const checkThrown = (didThrow, thrown) => {
+        if (didThrow && isPromiseLike(thrown) && typeof thrown.catch === "function") {
+          thrown.catch(() => {});
+        }
         const objectMatches = (expectedObject) => Object.entries(expectedObject).every(([key, value]) => {
           const actualValue = thrown?.[key];
           return value instanceof RegExp ? value.test(String(actualValue)) : matchesExpected(actualValue, value);
@@ -1068,9 +2202,17 @@ class Expectation {
               matcherName(expected) ? matchesExpected(thrown, expected) :
               expected && typeof expected === "object" ? objectMatches(expected) :
               String(thrown.message ?? thrown).includes(String(expected))));
-        this._check(pass, "Expected function to throw");
+        const receivedMessage = didThrow ? String(thrown?.message ?? thrown) : undefined;
+        const expectedDescription = expected instanceof RegExp ? String(expected) : formatValue(expected);
+        const message = !didThrow
+          ? "Expected function to throw"
+          : [
+              expected === undefined ? null : `Expected pattern: ${expectedDescription}`,
+              `Received message: ${JSON.stringify(receivedMessage)}`,
+            ].filter(Boolean).join("\n");
+        this._check(pass, message);
       };
-      if (typeof actual !== "function") return checkThrown(rejectedValue, actual);
+      if (typeof actual !== "function") return checkThrown(rejectedValue || actual instanceof Error, actual);
       // Call `actual` inside its own try/catch so assertion failures raised by
       // `_check` below are never mistaken for the function under test throwing.
       let didThrow = false;
@@ -1092,8 +2234,7 @@ class Expectation {
         // (issue #23865) and counts the expect() call immediately — the
         // test may time out before the promise resolves.
         if (!this._promiseMode && globalThis.__cottontailRegisterTestPendingPromise?.(settled)) {
-          assertionCount += 1;
-          globalThis.__cottontailTestAssertionCount += 1;
+          countAssertion();
           this._skipAssertionCount = true;
         }
         return settled;
@@ -1103,9 +2244,104 @@ class Expectation {
   }
 
   toThrowError(expected = undefined) { return this.toThrow(expected); }
-  toThrowErrorMatchingSnapshot() { return this.toThrow(); }
-  toThrowErrorMatchingInlineSnapshot() { return this.toThrow(); }
+  toThrowErrorMatchingSnapshot(hint = undefined) {
+    countSnapshotAssertion();
+    this._skipAssertionCount = true;
+    if (arguments.length > 0 && typeof hint !== "string") {
+      throw new TypeError("Expected snapshot hint to be a string");
+    }
+    const currentTest = globalThis.__cottontailCurrentTestToken?.();
+    if (!currentTest || currentTest !== this._testToken) {
+      throw new Error("Snapshot matchers cannot be used outside of a test");
+    }
+    return this._wrap((actual) => {
+      const checkThrown = (didThrow, thrown) => {
+        if (!didThrow) return this._check(false, "Matcher error: Received function did not throw");
+        const value = thrown instanceof Error ? thrown.message : undefined;
+        return this._check(compareSnapshot(value, undefined, hint), "Expected thrown error to match snapshot");
+      };
+      if (typeof actual !== "function") return checkThrown(this._rejectedValue || actual instanceof Error, actual);
+      let result;
+      try {
+        result = actual();
+      } catch (error) {
+        return checkThrown(true, error);
+      }
+      if (isPromiseLike(result)) {
+        const settled = result.then(
+          () => checkThrown(false, undefined),
+          (error) => checkThrown(true, error),
+        );
+        if (!this._promiseMode && globalThis.__cottontailRegisterTestPendingPromise?.(settled)) {
+          this._skipAssertionCount = true;
+        }
+        return settled;
+      }
+      return checkThrown(false, undefined);
+    });
+  }
+  toThrowErrorMatchingInlineSnapshot(inlineSnapshot = undefined) {
+    countSnapshotAssertion();
+    this._skipAssertionCount = true;
+    if (arguments.length > 0 && typeof inlineSnapshot !== "string") {
+      throw new TypeError("Expected inline snapshot to be a string");
+    }
+    const currentTest = globalThis.__cottontailCurrentTestToken?.();
+    if ((currentTest && currentTest !== this._testToken) || (!currentTest && !globalThis.__cottontailRegisteringTestFile)) {
+      throw new Error("Snapshot matchers cannot be used outside of a test");
+    }
+    nextSnapshotIdentity();
+    return this._wrap((actual) => {
+      const checkThrown = (didThrow, thrown) => {
+        if (!didThrow) {
+          return this._check(false,
+            "\u001b[2mexpect(\u001b[0m\u001b[31mreceived\u001b[0m\u001b[2m).\u001b[0m" +
+            "toThrowErrorMatchingInlineSnapshot\u001b[2m(\u001b[0m\u001b[2m)\u001b[0m\n\n" +
+            "\u001b[1mMatcher error\u001b[0m: Received function did not throw\n");
+        }
+        const value = thrown instanceof Error ? thrown.message : undefined;
+        const result = matchOrQueueInlineSnapshot(
+          "toThrowErrorMatchingInlineSnapshot",
+          value,
+          inlineSnapshot,
+          false,
+        );
+        return this._check(
+          result.pass,
+          `Expected thrown error to match inline snapshot\nExpected: ${JSON.stringify(result.wanted)}\nReceived: ${JSON.stringify(result.received)}`,
+        );
+      };
+      if (typeof actual !== "function") return checkThrown(this._rejectedValue || actual instanceof Error, actual);
+      let result;
+      try {
+        result = actual();
+      } catch (error) {
+        return checkThrown(true, error);
+      }
+      if (isPromiseLike(result)) {
+        const settled = result.then(
+          () => checkThrown(false, undefined),
+          (error) => checkThrown(true, error),
+        );
+        if (!this._promiseMode && globalThis.__cottontailRegisterTestPendingPromise?.(settled)) {
+          this._skipAssertionCount = true;
+        }
+        return settled;
+      }
+      return checkThrown(false, undefined);
+    });
+  }
   toMatchSnapshot(propertyMatchers = undefined, hint = undefined) {
+    countSnapshotAssertion();
+    this._skipAssertionCount = true;
+    const currentTest = globalThis.__cottontailCurrentTestToken?.();
+    if (!currentTest || currentTest !== this._testToken) {
+      throw new Error("Snapshot matchers cannot be used outside of a test");
+    }
+    if (globalThis.__cottontailCurrentTestIsConcurrent?.() &&
+        !globalThis.__cottontailCurrentTestHasOwnConcurrency?.()) {
+      throw new Error("Snapshot matchers are not supported in concurrent tests");
+    }
     // Bun validates argument order: with two arguments the first must be a
     // property-matcher object and the second a string hint.
     if (arguments.length >= 2) {
@@ -1125,16 +2361,38 @@ class Expectation {
     });
   }
   toMatchInlineSnapshot(propertyMatchers = undefined, inlineSnapshot = undefined) {
+    countSnapshotAssertion();
+    this._skipAssertionCount = true;
+    const currentTest = globalThis.__cottontailCurrentTestToken?.();
+    if ((currentTest && currentTest !== this._testToken) ||
+        (!currentTest && !globalThis.__cottontailRegisteringTestFile && !globalThis.__cottontailLoadingTestModules)) {
+      throw new Error("Snapshot matchers cannot be used outside of a test");
+    }
+    if (globalThis.__cottontailCurrentTestIsConcurrent?.() &&
+        !globalThis.__cottontailCurrentTestHasOwnConcurrency?.()) {
+      throw new Error("Snapshot matchers are not supported in concurrent tests");
+    }
+    if (arguments.length >= 2 && !isObject(propertyMatchers)) {
+      throw new Error("Matcher error: Expected properties must be an object");
+    }
+    if (arguments.length === 1 && typeof propertyMatchers !== "string" && !isObject(propertyMatchers)) {
+      throw new Error("Matcher error: Expected first argument to be a string or object");
+    }
+    nextSnapshotIdentity();
     return this._wrap((actual) => {
       let expected = inlineSnapshot;
+      let hasMatchers = false;
       if (typeof propertyMatchers === "string" && inlineSnapshot === undefined) {
         expected = propertyMatchers;
       } else if (propertyMatchers && typeof propertyMatchers === "object") {
+        hasMatchers = true;
         assertPropertyMatchers(actual, propertyMatchers);
       }
-      const received = snapshotText(actual);
-      const wanted = normalizeSnapshotText(expected);
-      this._check(inlineSnapshotMatches(received, wanted), `Expected value to match inline snapshot\nExpected: ${JSON.stringify(wanted)}\nReceived: ${JSON.stringify(received)}`);
+      const result = matchOrQueueInlineSnapshot("toMatchInlineSnapshot", actual, expected, hasMatchers);
+      this._check(
+        result.pass,
+        `Expected value to match inline snapshot\nExpected: ${JSON.stringify(result.wanted)}\nReceived: ${JSON.stringify(result.received)}`,
+      );
     });
   }
   pass(message = "passes by .pass() assertion") {
@@ -1198,7 +2456,7 @@ class Expectation {
     return this._wrap((actual) => {
       const calls = callRecords(actual);
       this._check(
-        calls.some((call) => matchesExpected(call, args)),
+        calls.some((call) => call.length === args.length && matchesExpected(call, args)),
         () => formatCallArgsFailure("toHaveBeenCalledWith", args, calls.at(-1), calls.length),
       );
     });
@@ -1209,7 +2467,7 @@ class Expectation {
     return this._wrap((actual) => {
       const calls = callRecords(actual);
       this._check(
-        matchesExpected(calls.at(-1), args),
+        calls.at(-1)?.length === args.length && matchesExpected(calls.at(-1), args),
         () => formatCallArgsFailure("toHaveBeenLastCalledWith", args, calls.at(-1), calls.length),
       );
     });
@@ -1220,7 +2478,7 @@ class Expectation {
     return this._wrap((actual) => {
       const calls = callRecords(actual);
       this._check(
-        matchesExpected(calls[nth - 1], args),
+        calls[nth - 1]?.length === args.length && matchesExpected(calls[nth - 1], args),
         () => formatCallArgsFailure("toHaveBeenNthCalledWith", args, calls[nth - 1], calls.length),
       );
     });
@@ -1266,10 +2524,12 @@ class Expectation {
 // Initialize the property layout and hot identity matcher before tests take
 // heap snapshots. Bun's native matcher structures are initialized up front.
 new Expectation(undefined).toBe(undefined);
-assertionCount = 0;
+fallbackAssertionState.count = 0;
 globalThis.__cottontailTestAssertionCount = 0;
+globalThis.__cottontailTestSnapshotCount = 0;
 
 export function expect(actual, label = undefined) {
+  globalThis.__cottontailBunTestUsed = true;
   return new Expectation(actual, false, null, label);
 }
 
@@ -1288,8 +2548,11 @@ function installCustomMatchers(matchers = {}) {
       const type = matcher === null ? "null" : typeof matcher;
       throw new TypeError(`expect.extend: \`${name}\` is not a valid matcher. Must be a function, is "${type}"`);
     }
-    expect[name] = (...args) => customAsymmetricMatcher(name, matcher, args, false);
-    expect.not[name] = (...args) => customAsymmetricMatcher(name, matcher, args, true);
+    customStaticMatchers.set(name, matcher);
+    expect[name] = (...args) => customAsymmetricMatcher(name, matcher, args, {});
+    for (const surface of staticMatcherSurfaces.values()) {
+      installCustomStaticMatcher(surface, name, matcher);
+    }
     Object.defineProperty(Expectation.prototype, name, {
       configurable: true,
       value: function customMatcher(...args) {
@@ -1351,8 +2614,8 @@ function customMatcherMessage(result) {
   return typeof result.message === "function" ? result.message() : result.message;
 }
 
-function customAsymmetricMatcher(name, matcher, args, negate) {
-  const result = { __expectMatcher: "custom", name, matcher, args, negate };
+function customAsymmetricMatcher(name, matcher, args, flags) {
+  const result = { __expectMatcher: "custom", name, matcher, args, ...flags };
   result.asymmetricMatch = (actual) => asymmetricMatch(actual, result);
   result.toAsymmetricMatcher = (...values) => typeof matcher.toAsymmetricMatcher === "function"
     ? matcher.toAsymmetricMatcher(...values)
@@ -1360,26 +2623,118 @@ function customAsymmetricMatcher(name, matcher, args, negate) {
   return result;
 }
 
-expect.any = (type) => ({ __expectMatcher: "any", type });
-expect.anything = () => ({ __expectMatcher: "anything" });
-expect.arrayContaining = (items) => ({ __expectMatcher: "arrayContaining", items: Array.from(items ?? []) });
-expect.objectContaining = (shape) => ({ __expectMatcher: "objectContaining", shape: shape ?? {} });
-expect.stringContaining = (text) => ({ __expectMatcher: "stringContaining", text: String(text) });
-expect.stringMatching = (pattern) => ({ __expectMatcher: "stringMatching", pattern: pattern instanceof RegExp ? pattern : new RegExp(String(pattern)) });
-expect.closeTo = (value, precision = 2) => ({ __expectMatcher: "closeTo", value, precision });
-expect.not = {
-  arrayContaining: (items) => ({ __expectMatcher: "not", matcher: expect.arrayContaining(items) }),
-  objectContaining: (shape) => ({ __expectMatcher: "not", matcher: expect.objectContaining(shape) }),
-  stringContaining: (text) => ({ __expectMatcher: "not", matcher: expect.stringContaining(text) }),
-  stringMatching: (pattern) => ({ __expectMatcher: "not", matcher: expect.stringMatching(pattern) }),
+const customStaticMatchers = new Map();
+const staticMatcherSurfaces = new Map();
+
+function createAsymmetricMatcher(name, fields, flags) {
+  const result = { __expectMatcher: name, ...fields, ...flags };
+  result.asymmetricMatch = (actual) => asymmetricMatch(actual, result);
+  return result;
+}
+
+const builtinAsymmetricFactories = {
+  any(flags, type) {
+    if (typeof type !== "function") {
+      throw new TypeError("any() expects to be passed a constructor function. Please pass one or use anything() to match any object.");
+    }
+    return createAsymmetricMatcher("any", { type }, flags);
+  },
+  anything(flags) {
+    return createAsymmetricMatcher("anything", {}, flags);
+  },
+  arrayContaining(flags, items) {
+    if (!Array.isArray(items)) throw new TypeError("You must provide an array to arrayContaining().");
+    return createAsymmetricMatcher("arrayContaining", { items }, flags);
+  },
+  objectContaining(flags, shape) {
+    if (!isObject(shape)) throw new TypeError("You must provide an object to objectContaining().");
+    return createAsymmetricMatcher("objectContaining", { shape }, flags);
+  },
+  stringContaining(flags, text) {
+    if (typeof text !== "string" && !(text instanceof String)) throw new TypeError("Expected is not a string");
+    return createAsymmetricMatcher("stringContaining", { text: String(text) }, flags);
+  },
+  stringMatching(flags, pattern) {
+    if (typeof pattern !== "string" && !(pattern instanceof RegExp)) {
+      throw new TypeError("Expected is not a String or a RegExp");
+    }
+    return createAsymmetricMatcher("stringMatching", { pattern }, flags);
+  },
+  closeTo(flags, value, precision = 2) {
+    if (typeof value !== "number") throw new TypeError("Expected is not a Number");
+    if (typeof precision !== "number") throw new TypeError("Precision is not a Number");
+    return createAsymmetricMatcher("closeTo", { value, precision }, flags);
+  },
 };
-expect.assertions = (count) => { expectedAssertions = Number(count); };
-expect.hasAssertions = () => { requireAssertions = true; };
+
+function installCustomStaticMatcher(surface, name, matcher) {
+  const flags = surface.__expectFlags;
+  Object.defineProperty(surface, name, {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: (...args) => customAsymmetricMatcher(name, matcher, args, flags),
+  });
+}
+
+function staticMatcherSurface(negate = false, promiseMode = null) {
+  const key = `${negate ? 1 : 0}:${promiseMode ?? "none"}`;
+  const cached = staticMatcherSurfaces.get(key);
+  if (cached) return cached;
+
+  const flags = Object.freeze({ negate, promiseMode });
+  const surface = {};
+  Object.defineProperty(surface, "__expectFlags", { value: flags });
+  staticMatcherSurfaces.set(key, surface);
+
+  for (const [name, factory] of Object.entries(builtinAsymmetricFactories)) {
+    surface[name] = (...args) => factory(flags, ...args);
+  }
+  for (const [name, matcher] of customStaticMatchers) installCustomStaticMatcher(surface, name, matcher);
+
+  Object.defineProperties(surface, {
+    not: {
+      configurable: true,
+      get: () => staticMatcherSurface(!negate, promiseMode),
+    },
+    resolvesTo: {
+      configurable: true,
+      get() {
+        if (promiseMode) throw new Error(`expect.resolvesTo: already called expect.${promiseMode}To on this chain`);
+        return staticMatcherSurface(negate, "resolves");
+      },
+    },
+    rejectsTo: {
+      configurable: true,
+      get() {
+        if (promiseMode) throw new Error(`expect.rejectsTo: already called expect.${promiseMode}To on this chain`);
+        return staticMatcherSurface(negate, "rejects");
+      },
+    },
+  });
+  return surface;
+}
+
+const defaultStaticMatchers = staticMatcherSurface();
+for (const name of Object.keys(builtinAsymmetricFactories)) expect[name] = defaultStaticMatchers[name];
+expect.not = staticMatcherSurface(true);
+expect.resolvesTo = staticMatcherSurface(false, "resolves");
+expect.rejectsTo = staticMatcherSurface(false, "rejects");
+expect.assertions = (count) => {
+  if (globalThis.__cottontailCurrentTestIsConcurrent?.()) {
+    throw new Error("expect.assertions() is not supported in concurrent tests");
+  }
+  currentAssertionState().expected = Number(count);
+};
+expect.hasAssertions = () => {
+  if (globalThis.__cottontailCurrentTestIsConcurrent?.()) {
+    throw new Error("expect.hasAssertions() is not supported in concurrent tests");
+  }
+  currentAssertionState().required = true;
+};
 expect.extend = installCustomMatchers;
 expect.addSnapshotSerializer = (_serializer) => undefined;
 expect.unreachable = (message = "reached unreachable code") => { throw new nodeAssert.AssertionError({ message }); };
-expect.resolvesTo = (value, expected) => expect(value).resolves.toEqual(expected);
-expect.rejectsTo = (value, expected) => expect(value).rejects.toThrow(expected);
 
 function normalizeMockImplementation(implementation, provided = true) {
   if (typeof implementation === "function") return implementation;
@@ -1700,64 +3055,85 @@ function wrapDoneCallback(callback) {
   return () => new Promise((resolve, reject) => {
     let settled = false;
     let callbackReturned = false;
-    let returnedPromise = null;
-    let returnedPromiseSettled = false;
     let doneCalled = false;
+    let doneError;
+    let returnedPromise = null;
+    let returnedPromiseSettled = true;
+    let returnedPromiseError;
+
+    const callbackFailure = (errors) => {
+      if (errors.length === 1 && errors[0] instanceof Error) return errors[0];
+      const error = new Error(String(errors[0]?.message ?? errors[0] ?? "Test callback failed"));
+      error.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
+      error.errors = errors;
+      return error;
+    };
+    const finish = () => {
+      if (settled || !callbackReturned) return;
+      const errors = [];
+      if (doneError !== undefined) errors.push(doneError);
+      if (returnedPromiseError !== undefined) errors.push(returnedPromiseError);
+      if (returnedPromiseError !== undefined || (doneCalled && returnedPromiseSettled)) {
+        settled = true;
+        if (errors.length > 0) reject(callbackFailure(errors));
+        else resolve();
+      }
+    };
     const done = (error = undefined) => {
-      if (settled) return;
-      if (error) {
-        settled = true;
-        reject(error);
-        return;
-      }
+      if (doneCalled || settled) return;
       doneCalled = true;
-      if (callbackReturned && (!returnedPromise || returnedPromiseSettled)) {
-        settled = true;
-        resolve();
-      }
+      if (error) doneError = error;
+      finish();
     };
     try {
       const result = callback(done);
       returnedPromise = result && typeof result.then === "function" ? result : null;
+      returnedPromiseSettled = returnedPromise === null;
       callbackReturned = true;
       if (returnedPromise) {
         returnedPromise.then(
           () => {
             returnedPromiseSettled = true;
-            if (!settled && doneCalled) {
-              settled = true;
-              resolve();
-            }
+            finish();
           },
           (error) => {
-            if (!settled) {
-              settled = true;
-              reject(error);
-            }
+            returnedPromiseSettled = true;
+            returnedPromiseError = error;
+            finish();
           },
         );
-      } else if (doneCalled && !settled) {
-        settled = true;
-        resolve();
       }
+      finish();
     } catch (error) {
-      done(error);
+      callbackReturned = true;
+      returnedPromiseSettled = true;
+      returnedPromiseError = error;
+      finish();
     }
   });
 }
 
 function resetAssertionState() {
-  assertionCount = 0;
-  expectedAssertions = null;
-  requireAssertions = false;
+  const state = currentAssertionState();
+  state.count = 0;
+  state.expected = null;
+  state.required = false;
 }
 
 function verifyAssertionState() {
-  if (expectedAssertions != null && assertionCount !== expectedAssertions) {
-    throw new nodeAssert.AssertionError({ message: `Expected ${expectedAssertions} assertions, received ${assertionCount}` });
+  const state = currentAssertionState();
+  if (state.expected != null && state.count !== state.expected) {
+    const error = new nodeAssert.AssertionError({
+      message: `expected ${state.expected} assertion${state.expected === 1 ? "" : "s"}, ` +
+        `but test ended with ${state.count} assertion${state.count === 1 ? "" : "s"}`,
+    });
+    error.code = "ERR_BUN_EXPECT_ASSERTIONS";
+    throw error;
   }
-  if (requireAssertions && assertionCount === 0) {
-    throw new nodeAssert.AssertionError({ message: "Expected at least one assertion" });
+  if (state.required && state.count === 0) {
+    const error = new nodeAssert.AssertionError({ message: "expected at least one assertion, but test ended with 0 assertions" });
+    error.code = "ERR_BUN_EXPECT_ASSERTIONS";
+    throw error;
   }
 }
 
@@ -1837,7 +3213,9 @@ function parseDescribeArgs(args) {
       name: "<invalid describe>",
       options,
       callback: () => {
-        throw new TypeError("describe() expects first argument to be a named class, named function, number, or string");
+        nodeTest("<invalid describe>", () => {
+          throw new TypeError("describe() expects first argument to be a named class, named function, number, or string");
+        });
       },
     };
   }
@@ -1873,7 +3251,12 @@ function makeBunTestFunction(base) {
     }
     return base(
       normalizeTestName(parsed.name),
-      { ...parsed.options, ...extraOptions },
+      {
+        ...parsed.options,
+        ...extraOptions,
+        __bunTest: true,
+        __bunUsesDoneCallback: typeof parsed.callback === "function" && parsed.callback.length > 0,
+      },
       wrapTestCallback(parsed.callback),
     );
   };
@@ -1909,7 +3292,11 @@ function makeBunDescribe(base) {
   const fn = (...args) => {
     globalThis.__cottontailBunTestUsed = true;
     const parsed = parseDescribeArgs(args);
-    return base(normalizeTestName(parsed.name), parsed.options, parsed.callback);
+    return base(
+      normalizeTestName(parsed.name),
+      { ...parsed.options, __bunDeferredDefinition: true },
+      parsed.callback,
+    );
   };
   fn.each = makeEach(fn);
   const variant = (extraOptions) => {
@@ -1917,7 +3304,11 @@ function makeBunDescribe(base) {
       globalThis.__cottontailBunTestUsed = true;
       if (extraOptions.only) assertOnlyAllowed();
       const parsed = parseDescribeArgs(args);
-      return base(normalizeTestName(parsed.name), { ...parsed.options, ...extraOptions }, parsed.callback);
+      return base(
+        normalizeTestName(parsed.name),
+        { ...parsed.options, ...extraOptions, __bunDeferredDefinition: true },
+        parsed.callback,
+      );
     };
     result.each = makeEach(result);
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;

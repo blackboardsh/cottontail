@@ -55,6 +55,7 @@ export class Server extends TlsServer {
     this.headersTimeout = Number(options?.headersTimeout ?? 60000);
     this.keepAliveTimeout = Number(options?.keepAliveTimeout ?? 5000);
     this._connections = new Set();
+    this._closing = false;
     if (typeof requestListener === "function") this.on("request", requestListener);
     this.on("secureConnection", (socket) => {
       this._connections.add(socket);
@@ -81,6 +82,7 @@ export class Server extends TlsServer {
   }
 
   close(callback = undefined) {
+    this._closing = true;
     this.closeIdleConnections();
     return super.close(callback);
   }

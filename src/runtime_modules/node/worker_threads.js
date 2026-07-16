@@ -25,6 +25,7 @@ const workerInstances = new Map();
 const broadcastChannels = new Map();
 const transferredPortPeers = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
+const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 let nextPortId = 1;
 let detachedViewAccessorsPatched = false;
 
@@ -161,9 +162,9 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
     if (value._closed) throw dataCloneError("MessagePort is closed");
     const id = state.nextId++;
     state.ids.set(value, id);
+    if (value._peer) transferredPortPeers.set(value._id, value._peer);
     if (state.transferContext?.threadId > 0) {
       value._remote = { threadId: state.transferContext.threadId, portId: value._id };
-      if (value._peer) transferredPortPeers.set(value._id, value._peer);
     }
     value._transferred = true;
     value._closed = true;
@@ -367,7 +368,20 @@ function normalizeWorkerPath(filename, evalMode = false) {
   }
   const text = String(filename);
   if (text.startsWith("file://")) return decodeURIComponent(new URL(text).pathname);
-  if (text.startsWith("data:")) throw new Error("data: workers are not supported by Cottontail worker_threads yet");
+  if (text.startsWith("data:")) {
+    const comma = text.indexOf(",");
+    if (comma < 0) throw new TypeError("Invalid data URL");
+    const metadata = text.slice(5, comma);
+    const payload = text.slice(comma + 1);
+    const source = /;base64(?:;|$)/i.test(metadata)
+      ? globalThis.atob(payload)
+      : decodeURIComponent(payload);
+    const dir = workerTempDir();
+    cottontail.mkdirSync?.(dir, true);
+    const sourcePath = `${dir}/worker-data-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
+    cottontail.writeFile(sourcePath, source);
+    return sourcePath;
+  }
   return resolve(text);
 }
 
@@ -379,7 +393,7 @@ function workerTempDir() {
 const workerWrapperCache = new Map();
 
 function makeWorkerWrapper(targetPath, options = {}) {
-  const workerDataWire = JSON.stringify(JSON.parse(encodeWireMessage(options.workerData ?? null)));
+  const workerDataWire = JSON.stringify(JSON.parse(encodeWireMessage(options.workerData ?? null, options.transferList)));
   const environmentDataWire = JSON.stringify(JSON.parse(encodeWireMessage([...environmentData])));
   const resourceLimitsWire = JSON.stringify(JSON.parse(encodeWireMessage(options.resourceLimits ?? {})));
   const cacheable = !(options.transferList?.length > 0) && !workerDataWire.includes('"t":"Port"');
@@ -399,6 +413,8 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `globalThis.__cottontailWorkerResourceLimits = __cottontailDecodeWorkerMessage(${resourceLimitsWire});`,
     `globalThis.__cottontailWorkerThreadName = ${JSON.stringify(options.name ?? "")};`,
     `globalThis.workerData = globalThis.__cottontailWorkerData;`,
+    `const __cottontailRuntimeRequire = globalThis.require;`,
+    `const __cottontailWorkerRequireBase = ${JSON.stringify(options.eval === true ? `${cottontail.cwd()}/[worker eval]` : targetPath)};`,
     `let __cottontailWorkerShouldExit = false;`,
     `const __cottontailWorkerExitSentinel = { cottontailWorkerExit: true };`,
     `const __cottontailWorkerImmediateQueue = [];`,
@@ -432,8 +448,16 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `  resourceLimits: globalThis.__cottontailWorkerResourceLimits, threadId: Number(cottontail.workerThreadId?.() ?? 1), threadName: globalThis.__cottontailWorkerThreadName, workerData: globalThis.__cottontailWorkerData`,
     `}; }`,
     `function __cottontailWorkerAsyncHooksBuiltin(){ return { createHook(callbacks = {}) { return { enable(){ return this; }, disable(){ return this; }, callbacks }; }, executionAsyncId: () => 0, triggerAsyncId: () => 0, executionAsyncResource: () => ({}), AsyncResource: class AsyncResource { constructor(type){ this.type = String(type); this.id = 0; } asyncId(){ return this.id; } triggerAsyncId(){ return 0; } runInAsyncScope(fn, thisArg, ...args){ return fn.apply(thisArg, args); } emitDestroy(){} bind(fn, thisArg){ return (...args) => this.runInAsyncScope(fn, thisArg, ...args); } } }; }`,
+    `let __cottontailBaseRequire = __cottontailRuntimeRequire;`,
+    `try {`,
+    `  const moduleBuiltin = __cottontailRuntimeRequire?.("node:module") ?? __cottontailRuntimeRequire?.("module");`,
+    `  if (typeof moduleBuiltin?.createRequire === "function") __cottontailBaseRequire = moduleBuiltin.createRequire(__cottontailWorkerRequireBase);`,
+    `} catch {}`,
     `function __cottontailWorkerRequire(specifier){`,
     `  const text = String(specifier);`,
+    `  try { if (typeof __cottontailBaseRequire === "function") return __cottontailBaseRequire(text); } catch (error) {`,
+    `    if (text !== "node:worker_threads" && text !== "worker_threads" && text !== "node:async_hooks" && text !== "async_hooks") throw error;`,
+    `  }`,
     `  if (text === "node:worker_threads" || text === "worker_threads") return __cottontailWorkerThreadsBuiltin();`,
     `  if (text === "node:async_hooks" || text === "async_hooks") return __cottontailWorkerAsyncHooksBuiltin();`,
     `  throw new Error("Cannot find module '" + text + "'");`,
@@ -453,10 +477,20 @@ function makeWorkerWrapper(targetPath, options = {}) {
     `  return out;`,
     `}`,
     `async function __cottontailRunWorkerTarget(filename){`,
-    `  const source = __cottontailTransformWorkerSource(cottontail.readFile(filename), filename);`,
-    `  const AsyncFunction = (async function(){}).constructor;`,
-    `  const run = new AsyncFunction("__cottontailWorkerRequire", source + "\\n//# sourceURL=" + filename);`,
-    `  try { await run(__cottontailWorkerRequire); } catch (error) { if (error !== __cottontailWorkerExitSentinel) throw error; }`,
+    `  try {`,
+    `    const source = __cottontailTransformWorkerSource(cottontail.readFile(filename), filename);`,
+    `    const AsyncFunction = (async function(){}).constructor;`,
+    `    const run = new AsyncFunction("__cottontailWorkerRequire", source + "\\n//# sourceURL=" + filename);`,
+    `    await run(__cottontailWorkerRequire);`,
+    `  } catch (error) {`,
+    `    if (error === __cottontailWorkerExitSentinel) return;`,
+    `    __cottontailWorkerShouldExit = true;`,
+    `    __cottontailParentPortHandlers.clear();`,
+    `    const name = typeof error?.name === "string" ? error.name : "Error";`,
+    `    const message = typeof error?.message === "string" ? error.message : String(error);`,
+    `    const stack = typeof error?.stack === "string" ? error.stack : undefined;`,
+    `    cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ ${JSON.stringify(workerControlEnvelopeKey)}: { type: "error", error: { name, message, stack } } }));`,
+    `  }`,
     `}`,
     `await __cottontailRunWorkerTarget(${JSON.stringify(targetPath)});`,
   ].join("\n");
@@ -473,6 +507,25 @@ class NullWritable extends Writable {
   }
 }
 
+function deserializeWorkerError(payload) {
+  const name = typeof payload?.name === "string" ? payload.name : "Error";
+  const message = typeof payload?.message === "string" ? payload.message : String(payload ?? "Worker error");
+  const Constructor = typeof globalThis[name] === "function" && globalThis[name].prototype instanceof Error
+    ? globalThis[name]
+    : Error;
+  const error = new Constructor(message);
+  error.name = name;
+  if (typeof payload?.stack === "string") error.stack = payload.stack;
+  return error;
+}
+
+function invalidArgumentType(name, expected, value) {
+  const actual = value === null ? "null" : `type ${typeof value} (${String(value)})`;
+  const error = new TypeError(`The "${name}" argument must be of type ${expected}. Received ${actual}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
 export class Worker extends EventEmitter {
   constructor(filename, options = {}) {
     super();
@@ -482,22 +535,42 @@ export class Worker extends EventEmitter {
     this.threadName = options.name ?? "";
     this.resourceLimits = { ...(options.resourceLimits ?? {}) };
     this.stdin = options.stdin ? new NullWritable() : null;
-    this.stdout = new Readable();
-    this.stderr = new Readable();
+    this.stdout = options.stdout ? new Readable() : null;
+    this.stderr = options.stderr ? new Readable() : null;
+    this._running = true;
+    this._exitEmitted = false;
     this._worker = new globalThis.Worker(wrapper);
     this.threadId = this._worker.id ?? this._worker.handle?.id ?? 0;
+    for (const item of options.transferList ?? []) {
+      if (item instanceof MessagePort) item._remote = { threadId: this.threadId, portId: item._id };
+    }
     workerInstances.set(this.threadId, this);
     this._worker.onmessage = (event) => {
       const message = decodeWireMessage(event.data);
       if (dispatchTransferredPortMessage(message)) return;
+      const control = message?.[workerControlEnvelopeKey];
+      if (control?.type === "error") {
+        this.emit("error", deserializeWorkerError(control.error));
+        return;
+      }
       this.emit("message", message);
     };
     this._worker.onerror = (event) => this.emit("error", event?.error ?? new Error(String(event?.message ?? event)));
     this._worker.addEventListener?.("exit", (event) => {
-      workerInstances.delete(this.threadId);
-      this.emit("exit", Number(event?.code ?? 0));
+      this._emitExit(Number(event?.code ?? 0));
     });
-    queueMicrotask(() => this.emit("online"));
+    queueMicrotask(() => {
+      globalThis.process?.emit("worker", this);
+      this.emit("online");
+    });
+  }
+
+  _emitExit(code) {
+    if (this._exitEmitted) return;
+    this._exitEmitted = true;
+    this._running = false;
+    workerInstances.delete(this.threadId);
+    this.emit("exit", Number(code) || 0);
   }
 
   postMessage(value, transferList = undefined) {
@@ -509,10 +582,14 @@ export class Worker extends EventEmitter {
   }
 
   terminate() {
+    if (!this._running) return Promise.resolve(0);
     this._worker.terminate();
-    workerInstances.delete(this.threadId);
-    this.emit("exit", 0);
-    return Promise.resolve(0);
+    return new Promise((resolve) => {
+      queueMicrotask(() => {
+        this._emitExit(0);
+        resolve(0);
+      });
+    });
   }
 
   async [Symbol.asyncDispose]() {
@@ -526,8 +603,25 @@ export class Worker extends EventEmitter {
     return Promise.resolve(globalThis.process?.memoryUsage?.() ?? {});
   }
 
-  getHeapSnapshot() {
-    return Promise.resolve(Readable.from(["{}"]));
+  getHeapSnapshot(options = undefined) {
+    if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
+      throw invalidArgumentType("options", "object", options);
+    }
+    for (const key of ["exposeInternals", "exposeNumericValues"]) {
+      if (options?.[key] !== undefined && typeof options[key] !== "boolean") {
+        throw invalidArgumentType(`options.${key}`, "boolean", options[key]);
+      }
+    }
+    if (!this._running) {
+      const error = new Error("Worker instance not running");
+      error.code = "ERR_WORKER_NOT_RUNNING";
+      return Promise.reject(error);
+    }
+    const snapshot = this._worker.getHeapSnapshot?.(options);
+    if (snapshot && typeof snapshot.then === "function") return snapshot;
+    const error = new Error("Worker heap snapshots require native worker heap inspection support");
+    error.code = "ERR_METHOD_NOT_IMPLEMENTED";
+    return Promise.reject(error);
   }
 
   cpuUsage() {

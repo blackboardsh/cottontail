@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cottontail_compiler = @import("cottontail_compiler");
 const cottontail_bundler = @import("cottontail_bundler.zig");
+const cottontail_diff = @import("cottontail_diff.zig");
 const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
@@ -11,6 +12,7 @@ const script_runner = @import("script_runner.zig");
 
 comptime {
     cottontail_bundler.forceLink();
+    cottontail_diff.forceLink();
     cottontail_hash.forceLink();
     cottontail_markdown.forceLink();
     cottontail_password.forceLink();
@@ -198,6 +200,7 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
         "--loader",
         "--experimental-loader",
         "--conditions",
+        "--feature",
         "--console-depth",
         "--cpu-prof-dir",
         "--cpu-prof-name",
@@ -235,6 +238,7 @@ fn testFlagTakesValue(arg: []const u8) bool {
         "--bail",
         "--coverage-dir",
         "--coverage-reporter",
+        "--feature",
         "--max-concurrency",
         "--preload",
         "--reporter",
@@ -642,6 +646,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var entries: std.ArrayList([]const u8) = .empty;
     var external: std.ArrayList([]const u8) = .empty;
     var drop: std.ArrayList([]const u8) = .empty;
+    var features: std.ArrayList([]const u8) = .empty;
     var conditions: std.ArrayList([]const u8) = .empty;
     var define_keys: std.ArrayList([]const u8) = .empty;
     var define_values: std.ArrayList([]const u8) = .empty;
@@ -758,6 +763,12 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         } else if (std.mem.eql(u8, arg, "--drop") and index + 1 < args.len) {
             index += 1;
             try drop.append(allocator, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--feature=")) {
+            const feature = arg["--feature=".len..];
+            if (feature.len > 0) try features.append(allocator, feature);
+        } else if (std.mem.eql(u8, arg, "--feature") and index + 1 < args.len) {
+            index += 1;
+            if (args[index].len > 0) try features.append(allocator, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--env=")) {
             const env = arg["--env=".len..];
             if (std.mem.eql(u8, env, "inline") or std.mem.eql(u8, env, "1")) {
@@ -889,6 +900,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
     options.external = external.items;
     options.drop = drop.items;
+    options.features = features.items;
     options.conditions = conditions.items;
     options.define_keys = define_keys.items;
     options.define_values = define_values.items;
@@ -962,6 +974,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         .packages = if (options.external_packages) "external" else "bundle",
         .external = options.external,
         .drop = options.drop,
+        .features = options.features,
         .publicPath = options.public_path,
         .bundle = !options.transform_only,
         .env = env_option,
@@ -1022,7 +1035,26 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
                 if (logs == .array) for (logs.array.items) |log| {
                     if (log == .object) {
                         if (log.object.get("message")) |message| {
-                            if (message == .string) try stderr.print("error: {s}\n", .{message.string});
+                            if (message == .string) {
+                                try stderr.print("error: {s}\n", .{message.string});
+                                if (log.object.get("position")) |position| {
+                                    if (position == .object) {
+                                        const file = position.object.get("file");
+                                        const line = position.object.get("line");
+                                        const column = position.object.get("column");
+                                        if (file != null and file.? == .string and
+                                            line != null and line.? == .integer and
+                                            column != null and column.? == .integer)
+                                        {
+                                            try stderr.print("    at {s}:{}:{}\n", .{
+                                                file.?.string,
+                                                line.?.integer,
+                                                column.?.integer,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 };
@@ -1096,41 +1128,83 @@ fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_a
     return childExitCode(try child.wait(init.io));
 }
 
-fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8 {
-    if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
-    const allocator = init.arena.allocator();
-    const entrypoints = try testEntrypointMask(allocator, args);
-    var test_files: std.ArrayList([:0]const u8) = .empty;
-    for (entrypoints, 0..) |is_entrypoint, index| {
-        if (is_entrypoint) try test_files.append(allocator, args[index]);
-    }
-    const explicit_entrypoint_count = test_files.items.len;
-    if (explicit_entrypoint_count == 0) {
-        var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true });
-        defer directory.close(init.io);
-        var walker = try directory.walk(allocator);
-        defer walker.deinit();
-        while (try walker.next(init.io)) |entry| {
-            if (entry.kind == .directory) {
-                if ((entry.basename.len > 0 and entry.basename[0] == '.') or
-                    std.mem.eql(u8, entry.basename, "node_modules"))
-                {
-                    walker.leave(init.io);
-                }
-                continue;
-            }
-            if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
-            try test_files.append(allocator, try allocator.dupeZ(u8, entry.path));
-        }
-        std.mem.sort([:0]const u8, test_files.items, {}, struct {
-            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
-                return std.mem.order(u8, left, right) == .lt;
-            }
-        }.lessThan);
-    }
-    const entrypoint_count = test_files.items.len;
-    if (entrypoint_count <= 1) return null;
+fn appendJavaScriptStringLiteral(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    try output.append(allocator, '"');
+    for (value) |byte| switch (byte) {
+        '"' => try output.appendSlice(allocator, "\\\""),
+        '\\' => try output.appendSlice(allocator, "\\\\"),
+        '\n' => try output.appendSlice(allocator, "\\n"),
+        '\r' => try output.appendSlice(allocator, "\\r"),
+        '\t' => try output.appendSlice(allocator, "\\t"),
+        else => try output.append(allocator, byte),
+    };
+    try output.append(allocator, '"');
+}
 
+const MultiTestEntrypoint = struct {
+    path: []const u8,
+    directory: []const u8,
+};
+
+fn writeMultiTestEntrypoint(
+    init: std.process.Init,
+    test_files: []const [:0]const u8,
+) !MultiTestEntrypoint {
+    const allocator = init.arena.allocator();
+    const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    var source: std.ArrayList(u8) = .empty;
+
+    const tmp_root = ".cottontail-tmp";
+    try std.Io.Dir.cwd().createDirPath(init.io, tmp_root);
+    var id: [8]u8 = undefined;
+    init.io.random(&id);
+    const aggregate_directory = try std.fmt.allocPrint(allocator, "{s}/test-aggregate-{x}", .{ tmp_root, id });
+    try std.Io.Dir.cwd().createDirPath(init.io, aggregate_directory);
+    errdefer std.Io.Dir.cwd().deleteTree(init.io, aggregate_directory) catch {};
+
+    for (test_files, 0..) |test_file, index| {
+        const absolute = if (std.fs.path.isAbsolute(test_file))
+            test_file
+        else
+            try std.fs.path.join(allocator, &.{ cwd_abs, test_file });
+        const test_directory = std.fs.path.dirname(absolute) orelse cwd_abs;
+        const marker_path = try std.fmt.allocPrint(allocator, "{s}/file-{d}.mjs", .{ aggregate_directory, index });
+        var marker_source: std.ArrayList(u8) = .empty;
+        try marker_source.appendSlice(allocator, "globalThis.__filename = ");
+        try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
+        try marker_source.appendSlice(allocator, ";\nglobalThis.__dirname = ");
+        try appendJavaScriptStringLiteral(allocator, &marker_source, test_directory);
+        try marker_source.appendSlice(allocator, ";\nglobalThis.__cottontailRegisteringTestFile = ");
+        try appendJavaScriptStringLiteral(allocator, &marker_source, absolute);
+        try marker_source.appendSlice(allocator, ";\n");
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = marker_path, .data = marker_source.items });
+
+        const marker_absolute = try std.fs.path.join(allocator, &.{ cwd_abs, marker_path });
+        try source.appendSlice(allocator, "import ");
+        try appendJavaScriptStringLiteral(allocator, &source, marker_absolute);
+        try source.appendSlice(allocator, ";\nimport ");
+        try appendJavaScriptStringLiteral(allocator, &source, absolute);
+        try source.appendSlice(allocator, ";\n");
+    }
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/entry.mjs", .{aggregate_directory});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = source.items });
+    return .{ .path = path, .directory = aggregate_directory };
+}
+
+fn runMultipleTestFilesWithBail(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    entrypoints: []const bool,
+    test_files: []const [:0]const u8,
+    explicit_entrypoint_count: usize,
+    bail_limit: usize,
+) !u8 {
+    const allocator = init.arena.allocator();
     var stdout_buffer: [256]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
@@ -1148,7 +1222,6 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     var exit_code: u8 = 0;
     var failed_files: usize = 0;
     var executed_files: usize = 0;
-    const bail_limit = testBailLimit(args);
     var dots_mode = false;
     for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--dots")) {
@@ -1156,7 +1229,7 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
             break;
         }
     }
-    for (test_files.items) |test_file| {
+    for (test_files) |test_file| {
         const child_args = try allocator.alloc(
             []const u8,
             if (explicit_entrypoint_count > 0) args.len - explicit_entrypoint_count + 1 else args.len + 1,
@@ -1184,9 +1257,7 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         if (code != 0) {
             exit_code = code;
             failed_files += 1;
-            if (bail_limit) |limit| {
-                if (limit > 0 and failed_files >= limit) break;
-            }
+            if (bail_limit > 0 and failed_files >= bail_limit) break;
         }
     }
 
@@ -1209,10 +1280,8 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
-    if (bail_limit) |limit| {
-        if (limit > 0 and failed_files >= limit and executed_files < entrypoint_count) {
-            try stderr.print("\nBailed out after {d} failure{s}\n", .{ limit, if (limit == 1) "" else "s" });
-        }
+    if (bail_limit > 0 and failed_files >= bail_limit and executed_files < test_files.len) {
+        try stderr.print("\nBailed out after {d} failure{s}\n", .{ bail_limit, if (bail_limit == 1) "" else "s" });
     }
     try stderr.print("{s}{d} pass\n", .{ if (dots_mode) "\n\n" else "\n ", totals[0] });
     const summary_indent = if (dots_mode) "" else " ";
@@ -1228,6 +1297,136 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     );
     try stderr.flush();
     return exit_code;
+}
+
+fn openTestDirectory(io: std.Io, path: []const u8) ?std.Io.Dir {
+    return if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch null
+    else
+        std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch null;
+}
+
+fn appendTestDirectoryFiles(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    directory_value: std.Io.Dir,
+    test_files: *std.ArrayList([:0]const u8),
+) !void {
+    var directory = directory_value;
+    defer directory.close(init.io);
+    var walker = try directory.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(init.io)) |entry| {
+        if (entry.kind == .directory) {
+            if ((entry.basename.len > 0 and entry.basename[0] == '.') or
+                std.mem.eql(u8, entry.basename, "node_modules"))
+            {
+                walker.leave(init.io);
+            }
+            continue;
+        }
+        if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
+        const path = try std.fs.path.join(allocator, &.{ root, entry.path });
+        try test_files.append(allocator, try allocator.dupeZ(u8, path));
+    }
+}
+
+fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8 {
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
+    const allocator = init.arena.allocator();
+    const entrypoints = try testEntrypointMask(allocator, args);
+    var test_files: std.ArrayList([:0]const u8) = .empty;
+    var expanded_directory = false;
+    var explicit_entrypoint_count: usize = 0;
+    for (entrypoints, 0..) |is_entrypoint, index| {
+        if (!is_entrypoint) continue;
+        explicit_entrypoint_count += 1;
+        if (openTestDirectory(init.io, args[index])) |directory| {
+            expanded_directory = true;
+            try appendTestDirectoryFiles(init, allocator, args[index], directory, &test_files);
+        } else {
+            try test_files.append(allocator, args[index]);
+        }
+    }
+    if (explicit_entrypoint_count == 0) {
+        var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true });
+        defer directory.close(init.io);
+        var walker = try directory.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(init.io)) |entry| {
+            if (entry.kind == .directory) {
+                if ((entry.basename.len > 0 and entry.basename[0] == '.') or
+                    std.mem.eql(u8, entry.basename, "node_modules"))
+                {
+                    walker.leave(init.io);
+                }
+                continue;
+            }
+            if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
+            try test_files.append(allocator, try allocator.dupeZ(u8, entry.path));
+        }
+        std.mem.sort([:0]const u8, test_files.items, {}, struct {
+            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+    }
+    std.mem.sort([:0]const u8, test_files.items, {}, struct {
+        fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+    const entrypoint_count = test_files.items.len;
+    if (entrypoint_count == 0 or (entrypoint_count == 1 and !expanded_directory)) return null;
+
+    if (testBailLimit(args)) |bail_limit| {
+        return try runMultipleTestFilesWithBail(
+            init,
+            args,
+            entrypoints,
+            test_files.items,
+            explicit_entrypoint_count,
+            bail_limit,
+        );
+    }
+
+    const aggregate = try writeMultiTestEntrypoint(init, test_files.items);
+    defer std.Io.Dir.cwd().deleteTree(init.io, aggregate.directory) catch {};
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
+    try stdout_writer.interface.flush();
+    try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+    try init.environ_map.put(
+        "COTTONTAIL_TEST_FILE_COUNT",
+        try std.fmt.allocPrint(allocator, "{d}", .{entrypoint_count}),
+    );
+
+    const child_args = try allocator.alloc(
+        []const u8,
+        if (explicit_entrypoint_count > 0) args.len - explicit_entrypoint_count + 1 else args.len + 1,
+    );
+    child_args[0] = args[0];
+    child_args[1] = args[1];
+    child_args[2] = aggregate.path;
+    var child_index: usize = 3;
+    for (args[2..], 2..) |arg, index| {
+        if (entrypoints[index]) continue;
+        child_args[child_index] = arg;
+        child_index += 1;
+    }
+    var child = try std.process.spawn(init.io, .{
+        .argv = child_args,
+        .environ_map = init.environ_map,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    });
+    defer child.kill(init.io);
+    return childExitCode(try child.wait(init.io));
 }
 
 fn testBailLimit(args: []const [:0]const u8) ?usize {

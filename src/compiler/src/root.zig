@@ -590,6 +590,7 @@ pub const LOLHTML = @import("lolhtml_sys/lol_html.zig");
 pub const css = @import("css/css_parser.zig");
 
 pub const md = @import("md/root.zig");
+pub const test_diff = @import("test_runner/diff/printDiff.zig");
 
 pub const transpiler = @import("bundler/transpiler.zig");
 pub const Transpiler = transpiler.Transpiler;

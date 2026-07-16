@@ -40,7 +40,11 @@ function removeSnapshotArtifacts(snapshotRoot, runtime) {
         name.startsWith('.cottontail-compat-') ||
         name.startsWith('fstest') ||
         /^Heap\.\d+\.heapsnapshot$/.test(name) ||
-        (current === snapshotRoot && runtime === 'bun' && bunSnapshotArtifactNames.has(name));
+        (current === snapshotRoot && runtime === 'bun' && (
+          bunSnapshotArtifactNames.has(name) ||
+          name === 'myapp.db' ||
+          /^test.*file\.db$/u.test(name)
+        ));
       if (generated) {
         try { rmSync(path, { recursive: true, force: true }); } catch {}
         continue;
@@ -332,6 +336,9 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     ...process.env,
     ...(runtime === 'bun' ? { TZ: process.env.COTTONTAIL_UPSTREAM_TZ ?? 'Etc/UTC' } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
+    TMPDIR: runTemp,
+    TMP: runTemp,
+    TEMP: runTemp,
     COTTONTAIL_UPSTREAM_RUNTIME: runtime,
     COTTONTAIL_UPSTREAM_VERSION: target.version,
     ...(overrides ?? {}),
@@ -340,6 +347,10 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
 
 function entryLabel(entry) {
   return entry.variant ? `${entry.path} [${entry.variant}]` : entry.path;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function discoverBundlerTestIds(entry, snapshotRoot, target) {
@@ -355,10 +366,6 @@ function discoverBundlerTestIds(entry, snapshotRoot, target) {
     timeout,
     maxBuffer: directTestMaxBuffer,
   });
-  if (result.error || result.status !== 0) {
-    const details = [result.error?.message, result.stdout, result.stderr].filter(Boolean).join('\n');
-    fail(`Could not discover itBundled cases in ${entry.path}${details ? `:\n${details}` : ''}`);
-  }
   const ids = [];
   for (const line of String(result.stdout ?? '').split(/\r?\n/)) {
     if (!line.startsWith(bundlerTestDiscoveryPrefix)) continue;
@@ -369,7 +376,14 @@ function discoverBundlerTestIds(entry, snapshotRoot, target) {
       fail(`Invalid itBundled discovery record in ${entry.path}: ${line}`);
     }
   }
-  if (ids.length === 0) fail(`No itBundled cases discovered in split upstream test: ${entry.path}`);
+  // Mixed files can contain ordinary bun:test cases that fail while the
+  // lightweight registration pass still discovers every itBundled ID. Keep
+  // those ordinary cases as a separate owned variant instead of making their
+  // current result block generated-case isolation.
+  if (ids.length === 0) {
+    const details = [result.error?.message, result.stdout, result.stderr].filter(Boolean).join('\n');
+    fail(`No itBundled cases discovered in ${entry.path}${details ? `:\n${details}` : ''}`);
+  }
   return ids;
 }
 
@@ -388,6 +402,10 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
       expanded.push({
         ...entry,
         variant: id,
+        args: [
+          ...(entry.args ?? []),
+          `--test-name-pattern=(?:^| > )${escapeRegExp(id)}$`,
+        ],
         ...(expectedFailureReason ? {
           status: 'expected-failure',
           reason: String(expectedFailureReason),
@@ -395,6 +413,23 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
         env: {
           ...(entry.env ?? {}),
           BUN_BUNDLER_TEST_FILTER: id,
+          BUN_BUNDLER_TEST_HIDE_SKIP: '1',
+        },
+      });
+    }
+    const directId = '$file';
+    if (entry.includeBundlerFileTests === true && (!options.caseMatch || options.caseMatch.test(directId))) {
+      const expectedFailureReason = entry.expectedFailureBundlerTests?.[directId];
+      expanded.push({
+        ...entry,
+        variant: directId,
+        ...(expectedFailureReason ? {
+          status: 'expected-failure',
+          reason: String(expectedFailureReason),
+        } : {}),
+        env: {
+          ...(entry.env ?? {}),
+          BUN_BUNDLER_TEST_FILTER: '__cottontail_no_generated_case__',
           BUN_BUNDLER_TEST_HIDE_SKIP: '1',
         },
       });
@@ -633,7 +668,7 @@ function formatSpawnError(runtime, entry, result) {
 
 function parseBunTestExecution(stderr) {
   const text = String(stderr ?? '');
-  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n(?:\s*\d+ (?:todo|skip)(?:ped)?\s*\n)*\s*(\d+) fail\s*\n(?:\s*(\d+) expect\(\) calls\s*\n)?Ran (\d+) tests? across (\d+) file(?:s)?\./g;
+  const pattern = /(?:^|\n)\s*(\d+) pass\s*\n(?:\s*\d+ (?:todo|skip)(?:ped)?\s*\n)*\s*(\d+) fail\s*\n(?:\s*\d+ error\s*\n)?(?:\s*(?:\d+ snapshots?, )?(\d+) expect\(\) calls\s*\n)?Ran (\d+) tests? across (\d+) file(?:s)?\./g;
   let execution = null;
   for (const match of text.matchAll(pattern)) {
     execution = {

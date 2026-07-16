@@ -1106,9 +1106,14 @@ fn bundleScriptNative(
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
     const tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
+    var features: std.ArrayList([]const u8) = .empty;
+    if (build_options) |provided| try features.appendSlice(ctx.allocator, provided.features);
+    try collectFeatures(ctx.allocator, &features, exec_args);
+    try collectFeatures(ctx.allocator, &features, script_args);
     const plain_launcher_cacheable = preload_imports.len == 0 and
         build_options == null and
         !has_custom_conditions and
+        features.items.len == 0 and
         tsconfig_override == null and
         !package_json_patch.active and
         ctx.environ_map.get("COTTONTAIL_RUNTIME_MODULES_DIR") == null and
@@ -1147,6 +1152,7 @@ fn bundleScriptNative(
     var options = build_options orelse native_bundler.BundleOptions{};
     options.aliases = aliases;
     options.conditions = conditions.items;
+    options.features = features.items;
     options.tsconfig_override = tsconfig_override;
     options.include_runtime_modules = true;
     options.preserve_external_require_name = true;
@@ -1340,6 +1346,25 @@ fn collectConditions(
             index += 1;
             const value: []const u8 = cli_args[index];
             if (value.len > 0) try conditions.append(allocator, value);
+        }
+    }
+}
+
+fn collectFeatures(
+    allocator: std.mem.Allocator,
+    features: *std.ArrayList([]const u8),
+    cli_args: []const [:0]const u8,
+) !void {
+    var index: usize = 0;
+    while (index < cli_args.len) : (index += 1) {
+        const arg: []const u8 = cli_args[index];
+        if (std.mem.startsWith(u8, arg, "--feature=")) {
+            const value = arg["--feature=".len..];
+            if (value.len > 0) try features.append(allocator, value);
+        } else if (std.mem.eql(u8, arg, "--feature") and index + 1 < cli_args.len) {
+            index += 1;
+            const value: []const u8 = cli_args[index];
+            if (value.len > 0) try features.append(allocator, value);
         }
     }
 }
@@ -1541,10 +1566,9 @@ fn writeEvalEntrypoint(
     else if (module_input)
         try std.fmt.allocPrint(
             ctx.allocator,
-            \\import * as __ctUtil from "node:util";
             \\const gc = globalThis.gc;
             \\const __ctPrintResult = eval({s});
-            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
+            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Bun.inspect(__ctPrintResult));
             \\
         ,
             .{source_literal},
@@ -1552,10 +1576,9 @@ fn writeEvalEntrypoint(
     else
         try std.fmt.allocPrint(
             ctx.allocator,
-            \\const __ctUtil = require("node:util");
             \\const gc = globalThis.gc;
             \\const __ctPrintResult = eval({s});
-            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : __ctUtil.inspect(__ctPrintResult));
+            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Bun.inspect(__ctPrintResult));
             \\
         ,
             .{source_literal},

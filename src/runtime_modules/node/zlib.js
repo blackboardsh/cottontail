@@ -3,6 +3,69 @@ import bufferModule from "./buffer.js";
 import { Transform } from "./stream.js";
 
 export {
+  BROTLI_DECODE,
+  BROTLI_ENCODE,
+  BROTLI_OPERATION_PROCESS,
+  BROTLI_OPERATION_FLUSH,
+  BROTLI_OPERATION_FINISH,
+  BROTLI_OPERATION_EMIT_METADATA,
+  BROTLI_PARAM_MODE,
+  BROTLI_MODE_GENERIC,
+  BROTLI_MODE_TEXT,
+  BROTLI_MODE_FONT,
+  BROTLI_DEFAULT_MODE,
+  BROTLI_PARAM_QUALITY,
+  BROTLI_MIN_QUALITY,
+  BROTLI_MAX_QUALITY,
+  BROTLI_DEFAULT_QUALITY,
+  BROTLI_PARAM_LGWIN,
+  BROTLI_MIN_WINDOW_BITS,
+  BROTLI_MAX_WINDOW_BITS,
+  BROTLI_LARGE_MAX_WINDOW_BITS,
+  BROTLI_DEFAULT_WINDOW,
+  BROTLI_PARAM_LGBLOCK,
+  BROTLI_MIN_INPUT_BLOCK_BITS,
+  BROTLI_MAX_INPUT_BLOCK_BITS,
+  BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING,
+  BROTLI_PARAM_SIZE_HINT,
+  BROTLI_PARAM_LARGE_WINDOW,
+  BROTLI_PARAM_NPOSTFIX,
+  BROTLI_PARAM_NDIRECT,
+  BROTLI_DECODER_RESULT_ERROR,
+  BROTLI_DECODER_RESULT_SUCCESS,
+  BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT,
+  BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT,
+  BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION,
+  BROTLI_DECODER_PARAM_LARGE_WINDOW,
+  BROTLI_DECODER_NO_ERROR,
+  BROTLI_DECODER_SUCCESS,
+  BROTLI_DECODER_NEEDS_MORE_INPUT,
+  BROTLI_DECODER_NEEDS_MORE_OUTPUT,
+  BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_NIBBLE,
+  BROTLI_DECODER_ERROR_FORMAT_RESERVED,
+  BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_META_NIBBLE,
+  BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET,
+  BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_SAME,
+  BROTLI_DECODER_ERROR_FORMAT_CL_SPACE,
+  BROTLI_DECODER_ERROR_FORMAT_HUFFMAN_SPACE,
+  BROTLI_DECODER_ERROR_FORMAT_CONTEXT_MAP_REPEAT,
+  BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_1,
+  BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_2,
+  BROTLI_DECODER_ERROR_FORMAT_TRANSFORM,
+  BROTLI_DECODER_ERROR_FORMAT_DICTIONARY,
+  BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS,
+  BROTLI_DECODER_ERROR_FORMAT_PADDING_1,
+  BROTLI_DECODER_ERROR_FORMAT_PADDING_2,
+  BROTLI_DECODER_ERROR_FORMAT_DISTANCE,
+  BROTLI_DECODER_ERROR_DICTIONARY_NOT_SET,
+  BROTLI_DECODER_ERROR_INVALID_ARGUMENTS,
+  BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MODES,
+  BROTLI_DECODER_ERROR_ALLOC_TREE_GROUPS,
+  BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MAP,
+  BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_1,
+  BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_2,
+  BROTLI_DECODER_ERROR_ALLOC_BLOCK_TYPE_TREES,
+  BROTLI_DECODER_ERROR_UNREACHABLE,
   DEFLATE,
   DEFLATERAW,
   GUNZIP,
@@ -154,9 +217,50 @@ function bytesFromData(data) {
   return new TextEncoder().encode(String(data));
 }
 
-function asBuffer(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  return globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes;
+function asBuffer(value) {
+  const bytes = ArrayBuffer.isView(value)
+    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    : new Uint8Array(value);
+  return globalThis.Buffer?.from
+    ? globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    : bytes;
+}
+
+function invalidOptionType(name, value) {
+  const error = new TypeError(`The "options.${name}" property must be of type number. Received type ${typeof value}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function outOfRangeOption(name, range, value) {
+  const error = new RangeError(`The value of "options.${name}" is out of range. It must be ${range}. Received ${String(value)}`);
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
+
+function validateNumericOption(options, name, minimum, maximum) {
+  const value = options[name];
+  if (value === undefined) return;
+  if (typeof value !== "number") throw invalidOptionType(name, value);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw outOfRangeOption(name, `>= ${minimum} and <= ${maximum}`, value);
+  }
+}
+
+function validateZlibOptions(options) {
+  if (options === undefined) return {};
+  if (options === null || typeof options !== "object") {
+    const error = new TypeError(`The "options" argument must be of type object. Received ${options === null ? "null" : `type ${typeof options}`}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  validateNumericOption(options, "chunkSize", constants.Z_MIN_CHUNK, kMaxLengthLimit());
+  validateNumericOption(options, "level", constants.Z_MIN_LEVEL, constants.Z_MAX_LEVEL);
+  validateNumericOption(options, "windowBits", constants.Z_MIN_WINDOWBITS, constants.Z_MAX_WINDOWBITS);
+  validateNumericOption(options, "memLevel", constants.Z_MIN_MEMLEVEL, constants.Z_MAX_MEMLEVEL);
+  validateNumericOption(options, "strategy", constants.Z_DEFAULT_STRATEGY, constants.Z_FIXED);
+  validateNumericOption(options, "maxOutputLength", 1, kMaxLengthLimit());
+  return options;
 }
 
 function levelFromOptions(options) {
@@ -168,6 +272,7 @@ function transformSync(mode, data, options = undefined) {
   if (typeof cottontail.zlibTransformSync !== "function") {
     throw new Error("native zlib support is unavailable");
   }
+  if (mode === "deflate" || mode === "deflateRaw" || mode === "gzip") validateZlibOptions(options);
   const level = levelFromOptions(options);
   const nativeOptions = options && typeof options === "object" ? options : level;
   const result = nativeOptions == null
@@ -183,6 +288,18 @@ function transformSync(mode, data, options = undefined) {
     throw error;
   }
   return output;
+}
+
+function createBrotliEncoder(options) {
+  if (typeof cottontail.brotliEncoderCreate !== "function") return null;
+  return cottontail.brotliEncoderCreate(options);
+}
+
+function writeBrotliEncoder(handle, data, operation) {
+  if (typeof cottontail.brotliEncoderWrite !== "function") {
+    throw new Error("native Brotli streaming support is unavailable");
+  }
+  return asBuffer(cottontail.brotliEncoderWrite(handle, bytesFromData(data), operation));
 }
 
 function computeConsumedSync(mode, options, input, fullOutput) {
@@ -299,6 +416,92 @@ function defaultStreamFinishFlush(mode) {
     : constants.Z_FINISH;
 }
 
+function combineBytes(parts) {
+  const totalLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    combined.set(part, offset);
+    offset += part.byteLength;
+  }
+  return combined;
+}
+
+function zstdFrameLength(input, start = 0) {
+  if (input.byteLength - start < 4) return null;
+  const magic = input[start] | (input[start + 1] << 8) | (input[start + 2] << 16) | (input[start + 3] << 24);
+  if ((magic >>> 4) === 0x0184d2a5) {
+    if (input.byteLength - start < 8) return null;
+    const size = input[start + 4] | (input[start + 5] << 8) | (input[start + 6] << 16) | (input[start + 7] << 24);
+    return input.byteLength - start >= 8 + (size >>> 0) ? 8 + (size >>> 0) : null;
+  }
+  if ((magic >>> 0) !== 0xfd2fb528) return -1;
+
+  let offset = start + 4;
+  if (offset >= input.byteLength) return null;
+  const descriptor = input[offset++];
+  if ((descriptor & 0x08) !== 0) return -1;
+  const frameContentSizeFlag = descriptor >>> 6;
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const checksum = (descriptor & 0x04) !== 0;
+  const dictionaryIdSize = [0, 1, 2, 4][descriptor & 0x03];
+  const frameContentSizeSize = frameContentSizeFlag === 0
+    ? (singleSegment ? 1 : 0)
+    : frameContentSizeFlag === 1 ? 2 : frameContentSizeFlag === 2 ? 4 : 8;
+  const remainingHeaderSize = (singleSegment ? 0 : 1) + dictionaryIdSize + frameContentSizeSize;
+  if (input.byteLength - offset < remainingHeaderSize) return null;
+  offset += remainingHeaderSize;
+
+  while (true) {
+    if (input.byteLength - offset < 3) return null;
+    const header = input[offset] | (input[offset + 1] << 8) | (input[offset + 2] << 16);
+    offset += 3;
+    const lastBlock = (header & 1) !== 0;
+    const blockType = (header >>> 1) & 0x03;
+    const blockSize = header >>> 3;
+    if (blockType === 3) return -1;
+    const payloadSize = blockType === 1 ? 1 : blockSize;
+    if (input.byteLength - offset < payloadSize) return null;
+    offset += payloadSize;
+    if (lastBlock) break;
+  }
+
+  if (checksum) {
+    if (input.byteLength - offset < 4) return null;
+    offset += 4;
+  }
+  return offset - start;
+}
+
+function decodeCompletedInput(mode, input, options) {
+  const strictOptions = { ...options, finishFlush: constants.Z_FINISH };
+  if (mode === "zstdDecompress") {
+    const parts = [];
+    let consumed = 0;
+    while (consumed < input.byteLength) {
+      const frameLength = zstdFrameLength(input, consumed);
+      if (frameLength == null) return null;
+      if (frameLength < 0) break;
+      const output = transformSync(mode, input.subarray(consumed, consumed + frameLength), strictOptions);
+      parts.push(output instanceof Uint8Array ? output : new Uint8Array(output));
+      consumed += frameLength;
+    }
+    return parts.length === 0 ? null : { bytes: combineBytes(parts), consumed };
+  }
+
+  let output;
+  try {
+    output = transformSync(mode, input, strictOptions);
+  } catch {
+    return null;
+  }
+  const bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
+  return {
+    bytes,
+    consumed: computeConsumedSync(mode, strictOptions, input, bytes),
+  };
+}
+
 const crc32Table = (() => {
   const table = new Uint32Array(256);
   for (let index = 0; index < 256; index += 1) {
@@ -321,17 +524,23 @@ export function crc32(data, value = 0) {
 
 const decompressModes = new Set(["inflate", "inflateRaw", "gunzip", "unzip", "brotliDecompress", "zstdDecompress"]);
 
-class ZlibTransform extends Transform {
+class Zlib extends Transform {
   constructor(mode, options = {}) {
     super();
     this._mode = mode;
-    this._options = options ?? {};
+    this._options = mode === "deflate" || mode === "deflateRaw" || mode === "gzip"
+      ? validateZlibOptions(options)
+      : options ?? {};
     this._chunks = [];
     this._inputBytes = 0;
     this._consumedBytes = null;
     this._finalInput = null;
     this._finalOutput = null;
     this._isDecompress = decompressModes.has(mode);
+    this._completionScheduled = false;
+    this._readableCompleted = false;
+    this._emittedMember = false;
+    this._brotliEncoder = mode === "brotliCompress" ? createBrotliEncoder(this._options) : null;
   }
 
   // Node's zlib streams expose bytesWritten as the number of input bytes the
@@ -339,12 +548,12 @@ class ZlibTransform extends Transform {
   // the end of the compressed stream, which we recover lazily by probing the
   // one-shot native transform (there is no incremental native handle yet).
   get bytesWritten() {
-    if (!this._isDecompress || this._finalInput === null) return this._inputBytes;
-    if (this._consumedBytes === null) {
-      this._consumedBytes = this._computeConsumed(this._finalInput, this._finalOutput);
-      this._finalInput = null;
-      this._finalOutput = null;
-    }
+    if (!this._isDecompress) return this._inputBytes;
+    if (this._consumedBytes !== null) return this._consumedBytes;
+    if (this._finalInput === null) return this._inputBytes;
+    this._consumedBytes = this._computeConsumed(this._finalInput, this._finalOutput);
+    this._finalInput = null;
+    this._finalOutput = null;
     return this._consumedBytes;
   }
 
@@ -385,17 +594,68 @@ class ZlibTransform extends Transform {
     return input;
   }
 
+  _peekChunks() {
+    const inputLength = this._chunks.reduce((sum, item) => sum + item.byteLength, 0);
+    const input = new Uint8Array(inputLength);
+    let offset = 0;
+    for (const chunkBytes of this._chunks) {
+      input.set(chunkBytes, offset);
+      offset += chunkBytes.byteLength;
+    }
+    return input;
+  }
+
+  _pushOutput(bytes) {
+    if (bytes.byteLength === 0) return;
+    const maxOutputLength = this._options.maxOutputLength ?? kMaxLengthLimit();
+    if (bytes.byteLength > maxOutputLength) {
+      const error = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
+      error.code = "ERR_BUFFER_TOO_LARGE";
+      throw error;
+    }
+    const chunkSize = Number(this._options.chunkSize) > 0 ? Number(this._options.chunkSize) : 16 * 1024;
+    for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+      this.push(bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize)));
+    }
+  }
+
+  _tryCompleteDecompressor() {
+    if (!this._isDecompress || this._readableCompleted || this._chunks.length === 0) return;
+    const input = this._peekChunks();
+    const completed = decodeCompletedInput(this._mode, input, this._transformOptions());
+    if (completed === null) return;
+    this._chunks = [];
+    this._consumedBytes = completed.consumed;
+    this._finalInput = null;
+    this._finalOutput = null;
+    this._pushOutput(completed.bytes);
+    this._readableCompleted = true;
+    this.push(null);
+  }
+
   _emitBuffered() {
+    if (this._readableCompleted) return false;
+    if (this._mode === "zstdCompress" && this._emittedMember && this._chunks.length === 0) return false;
     // Compressors must emit a valid (possibly empty) stream even when no
     // input was ever written; decompressors with no input emit nothing.
     if (this._chunks.length === 0 && this._isDecompress) return false;
     const input = this._consumeChunks();
-    const output = transformSync(this._mode, input, this._transformOptions());
+    let completed = null;
+    if (this._mode === "zstdDecompress") {
+      completed = decodeCompletedInput(this._mode, input, this._transformOptions());
+    }
+    const output = completed === null ? transformSync(this._mode, input, this._transformOptions()) : completed.bytes;
     let bytes = output instanceof Uint8Array ? output : new Uint8Array(output);
     if (this._isDecompress) {
-      this._finalInput = input;
-      this._finalOutput = bytes;
-      this._consumedBytes = null;
+      if (completed !== null) {
+        this._finalInput = null;
+        this._finalOutput = null;
+        this._consumedBytes = completed.consumed;
+      } else {
+        this._finalInput = input;
+        this._finalOutput = bytes;
+        this._consumedBytes = null;
+      }
       // gzip members and zstd frames concatenate; Node's decompressors keep
       // decoding subsequent members, so loop over the remaining input.
       if (this._mode === "gunzip" || this._mode === "unzip" || this._mode === "zstdDecompress") {
@@ -435,18 +695,8 @@ class ZlibTransform extends Transform {
         }
       }
     }
-    const maxOutputLength = this._options.maxOutputLength ?? kMaxLengthLimit();
-    if (bytes.byteLength > maxOutputLength) {
-      const error = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
-      error.code = "ERR_BUFFER_TOO_LARGE";
-      throw error;
-    }
-    // Node's zlib streams emit output in highWaterMark-sized chunks (16 KiB
-    // by default), never one monolithic buffer.
-    const chunkSize = Number(this._options.chunkSize) > 0 ? Number(this._options.chunkSize) : 16 * 1024;
-    for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
-      this.push(bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize)));
-    }
+    this._pushOutput(bytes);
+    if (this._mode === "zstdCompress") this._emittedMember = true;
     return true;
   }
 
@@ -456,8 +706,43 @@ class ZlibTransform extends Transform {
       encoding = undefined;
     }
     const bytes = bytesFromData(typeof chunk === "string" && encoding ? globalThis.Buffer?.from(chunk, encoding) ?? chunk : chunk);
-    this._chunks.push(bytes);
     this._inputBytes += bytes.byteLength;
+    if (this._brotliEncoder !== null) {
+      try {
+        const output = writeBrotliEncoder(this._brotliEncoder, bytes, constants.BROTLI_OPERATION_PROCESS);
+        this._pushOutput(output);
+      } catch (error) {
+        callback?.(error);
+        this.emit("error", error);
+        this.destroy();
+        return false;
+      }
+    } else if (this._mode === "zstdCompress") {
+      try {
+        const output = transformSync(this._mode, bytes, this._transformOptions());
+        this._pushOutput(output instanceof Uint8Array ? output : new Uint8Array(output));
+        this._emittedMember = true;
+      } catch (error) {
+        callback?.(error);
+        this.emit("error", error);
+        this.destroy();
+        return false;
+      }
+    } else {
+      this._chunks.push(bytes);
+    }
+    if (this._isDecompress && !this._completionScheduled && !this._readableCompleted) {
+      this._completionScheduled = true;
+      queueMicrotask(() => {
+        this._completionScheduled = false;
+        try {
+          this._tryCompleteDecompressor();
+        } catch (error) {
+          this.emit("error", error);
+          this.destroy();
+        }
+      });
+    }
     callback?.();
     return true;
   }
@@ -472,8 +757,21 @@ class ZlibTransform extends Transform {
     }
     if (chunk != null) this.write(chunk, encoding);
     try {
-      this._emitBuffered();
-      this.push(null);
+      if (this._brotliEncoder !== null) {
+        const output = writeBrotliEncoder(
+          this._brotliEncoder,
+          new Uint8Array(0),
+          constants.BROTLI_OPERATION_FINISH,
+        );
+        this._pushOutput(output);
+        this._closeBrotliEncoder();
+      } else {
+        this._emitBuffered();
+      }
+      if (!this._readableCompleted) {
+        this._readableCompleted = true;
+        this.push(null);
+      }
       // Our write()/end() bypass Writable's state machine, so mark the
       // writable side complete manually; eos()/finished() reads these flags
       // when 'close' arrives to distinguish completion from premature close.
@@ -501,6 +799,22 @@ class ZlibTransform extends Transform {
       callback = kind;
       kind = undefined;
     }
+    if (this._brotliEncoder !== null) {
+      try {
+        const operation = kind === undefined ? constants.BROTLI_OPERATION_FLUSH : Number(kind);
+        const output = writeBrotliEncoder(this._brotliEncoder, new Uint8Array(0), operation);
+        this._pushOutput(output);
+      } catch (error) {
+        if (callback) {
+          queueMicrotask(() => callback(error));
+          return;
+        }
+        this.emit("error", error);
+        return;
+      }
+      if (callback) queueMicrotask(callback);
+      return;
+    }
     void kind;
     // COTTONTAIL-COMPAT: node:zlib flush - no incremental native handle yet.
     // gzip members and zstd frames concatenate into valid streams, so those
@@ -523,16 +837,33 @@ class ZlibTransform extends Transform {
   }
 
   close(callback = undefined) {
+    this._closeBrotliEncoder();
     callback?.();
     this.emit("close");
   }
 
+  _closeBrotliEncoder() {
+    if (this._brotliEncoder === null) return;
+    cottontail.brotliEncoderClose?.(this._brotliEncoder);
+    this._brotliEncoder = null;
+  }
+
+  _destroy(error, callback) {
+    this._closeBrotliEncoder();
+    callback(error);
+  }
+
   reset() {
+    this._closeBrotliEncoder();
     this._chunks = [];
     this._inputBytes = 0;
     this._consumedBytes = null;
     this._finalInput = null;
     this._finalOutput = null;
+    this._completionScheduled = false;
+    this._readableCompleted = false;
+    this._emittedMember = false;
+    this._brotliEncoder = this._mode === "brotliCompress" ? createBrotliEncoder(this._options) : null;
   }
 }
 
@@ -541,17 +872,31 @@ function kMaxLengthLimit() {
   return typeof limit === "number" && limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
 }
 
-export class Deflate extends ZlibTransform { constructor(options = {}) { super("deflate", options); } }
-export class DeflateRaw extends ZlibTransform { constructor(options = {}) { super("deflateRaw", options); } }
-export class Gzip extends ZlibTransform { constructor(options = {}) { super("gzip", options); } }
-export class Gunzip extends ZlibTransform { constructor(options = {}) { super("gunzip", options); } }
-export class Inflate extends ZlibTransform { constructor(options = {}) { super("inflate", options); } }
-export class InflateRaw extends ZlibTransform { constructor(options = {}) { super("inflateRaw", options); } }
-export class Unzip extends ZlibTransform { constructor(options = {}) { super("unzip", options); } }
-export class BrotliCompress extends ZlibTransform { constructor(options = {}) { super("brotliCompress", options); } }
-export class BrotliDecompress extends ZlibTransform { constructor(options = {}) { super("brotliDecompress", options); } }
-export class ZstdCompress extends ZlibTransform { constructor(options = {}) { super("zstdCompress", options); } }
-export class ZstdDecompress extends ZlibTransform { constructor(options = {}) { super("zstdDecompress", options); } }
+class Brotli extends Zlib {}
+class Zstd extends Zlib {}
+
+function makeCallableZlibConstructor(name, Parent, mode) {
+  const Constructor = {
+    [name]: function(options = {}) {
+      return Reflect.construct(Parent, [mode, options], new.target ?? Constructor);
+    },
+  }[name];
+  Object.setPrototypeOf(Constructor, Parent);
+  Object.setPrototypeOf(Constructor.prototype, Parent.prototype);
+  return Constructor;
+}
+
+export const Deflate = makeCallableZlibConstructor("Deflate", Zlib, "deflate");
+export const DeflateRaw = makeCallableZlibConstructor("DeflateRaw", Zlib, "deflateRaw");
+export const Gzip = makeCallableZlibConstructor("Gzip", Zlib, "gzip");
+export const Gunzip = makeCallableZlibConstructor("Gunzip", Zlib, "gunzip");
+export const Inflate = makeCallableZlibConstructor("Inflate", Zlib, "inflate");
+export const InflateRaw = makeCallableZlibConstructor("InflateRaw", Zlib, "inflateRaw");
+export const Unzip = makeCallableZlibConstructor("Unzip", Zlib, "unzip");
+export const BrotliCompress = makeCallableZlibConstructor("BrotliCompress", Brotli, "brotliCompress");
+export const BrotliDecompress = makeCallableZlibConstructor("BrotliDecompress", Brotli, "brotliDecompress");
+export class ZstdCompress extends Zstd { constructor(options = {}) { super("zstdCompress", options); } }
+export class ZstdDecompress extends Zstd { constructor(options = {}) { super("zstdDecompress", options); } }
 
 export function createDeflate(options = {}) { return new Deflate(options); }
 export function createDeflateRaw(options = {}) { return new DeflateRaw(options); }
@@ -632,7 +977,7 @@ export const brotliDecompress = callbackifySync(brotliDecompressSync);
 export const zstdCompress = callbackifySync(zstdCompressSync);
 export const zstdDecompress = callbackifySync(zstdDecompressSync);
 
-// COTTONTAIL-COMPAT: node:zlib streaming flush - zlib/gzip/deflate/Brotli/Zstd streams, crc32, compression options, and dictionary transforms are implemented; incremental flush semantics need deeper native stream state.
+// COTTONTAIL-COMPAT: node:zlib native stream state - incremental zlib flush semantics and one-shot native allocation reuse are still required for Bun's RSS leak thresholds.
 
 export default {
   BrotliCompress,

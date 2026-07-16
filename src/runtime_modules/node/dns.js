@@ -54,19 +54,23 @@ function systemServers() {
 function effectiveServers() {
   return serversConfigured ? [...servers] : [...systemServers()];
 }
-const prefetchCache = new Map();
-const cacheStats = {
+const dnsCacheStateKey = Symbol.for("cottontail.runtime.dns-cache");
+const dnsCacheState = globalThis[dnsCacheStateKey] ??= {
+  entries: new Map(),
   cacheHitsCompleted: 0,
   cacheHitsInflight: 0,
   cacheMisses: 0,
-  cacheSize: 0,
+  errors: 0,
+  totalCount: 0,
+  resolveForNetwork: null,
 };
 
 function makeDnsError(error, syscall, hostname = undefined, code = NOTFOUND) {
   const message = error instanceof Error ? error.message : String(error);
+  const effectiveCode = typeof error?.code === "string" ? error.code : code;
   const out = new Error(message || code);
-  out.code = code;
-  out.errno = code;
+  out.code = effectiveCode;
+  out.errno = effectiveCode;
   out.syscall = syscall;
   if (hostname != null) out.hostname = String(hostname);
   return out;
@@ -136,12 +140,41 @@ function callbackifyDns(work, callback) {
 }
 
 function normalizeLookupOptions(options = {}) {
-  if (typeof options === "number") return { family: options, all: false };
-  if (typeof options === "string") return { family: Number(options) || 0, all: false };
+  if (options == null) options = {};
+  if (typeof options === "number") {
+    if (options !== 0 && options !== 4 && options !== 6) {
+      const error = new TypeError(`The argument 'family' must be one of: 0, 4, 6. Received ${options}`);
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
+    return { family: options, all: false, order: defaultResultOrder };
+  }
+  if (typeof options !== "object") {
+    const error = new TypeError(`The "options" argument must be of type object or integer. Received type ${typeof options}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  let family = options.family ?? 0;
+  if (family === "IPv4") family = 4;
+  else if (family === "IPv6") family = 6;
+  if (family !== 0 && family !== 4 && family !== 6) {
+    const error = new TypeError(`The property 'options.family' must be one of: 0, 4, 6. Received ${JSON.stringify(family)}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  let order = options.order;
+  if (order == null) {
+    order = options.verbatim == null ? defaultResultOrder : options.verbatim ? "verbatim" : "ipv4first";
+  }
+  if (order !== "verbatim" && order !== "ipv4first" && order !== "ipv6first") {
+    const error = new TypeError(`The property 'options.order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received ${JSON.stringify(order)}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
   return {
-    family: Number(options?.family ?? 0) || 0,
-    all: Boolean(options?.all),
-    order: options?.order ?? defaultResultOrder,
+    family,
+    all: Boolean(options.all),
+    order,
   };
 }
 
@@ -179,6 +212,59 @@ function lookupRecords(hostname, family = 0, order = defaultResultOrder, resolve
     throw makeDnsError(error, "getaddrinfo", hostname);
   }
 }
+
+const DNS_CACHE_MAX_ENTRIES = 256;
+
+function networkCacheTtlMs() {
+  const configured = Number(globalThis.process?.env?.BUN_CONFIG_DNS_TIME_TO_LIVE_SECONDS ?? 30);
+  return Math.max(0, Number.isFinite(configured) ? configured : 30) * 1000;
+}
+
+function pruneNetworkCache(now) {
+  const ttl = networkCacheTtlMs();
+  for (const [key, entry] of dnsCacheState.entries) {
+    if (ttl === 0 || now - entry.createdAt > ttl) dnsCacheState.entries.delete(key);
+  }
+}
+
+function resolveForNetwork(hostname, port = 0, preload = false) {
+  const host = String(hostname);
+  const now = Date.now();
+  dnsCacheState.totalCount += 1;
+  pruneNetworkCache(now);
+
+  const existing = dnsCacheState.entries.get(host);
+  if (existing) {
+    // Bun preloads an existing entry without counting it as a consumer hit.
+    if (!preload) {
+      if (existing.records) dnsCacheState.cacheHitsCompleted += 1;
+      else dnsCacheState.cacheHitsInflight += 1;
+    }
+    if (existing.records) return existing.records.map((record) => ({ ...record }));
+    if (existing.error) throw existing.error;
+    return [];
+  }
+
+  dnsCacheState.cacheMisses += 1;
+  while (dnsCacheState.entries.size >= DNS_CACHE_MAX_ENTRIES) {
+    const oldest = dnsCacheState.entries.keys().next().value;
+    if (oldest === undefined) break;
+    dnsCacheState.entries.delete(oldest);
+  }
+  const entry = { createdAt: now, port: Number(port) || 0, records: null, error: null };
+  dnsCacheState.entries.set(host, entry);
+  try {
+    entry.records = lookupRecords(host, 0, defaultResultOrder, null);
+    return entry.records.map((record) => ({ ...record }));
+  } catch (error) {
+    entry.error = error;
+    dnsCacheState.errors += 1;
+    dnsCacheState.entries.delete(host);
+    throw error;
+  }
+}
+
+dnsCacheState.resolveForNetwork = resolveForNetwork;
 
 function lookupServiceRecord(address, port, resolverState = null) {
   if (typeof cottontail.dnsLookupService !== "function") throw makeDnsError("native DNS service lookup is unavailable", "getnameinfo", address);
@@ -253,28 +339,42 @@ export function lookup(hostname, options = undefined, callback = undefined) {
   }, callback);
 }
 
-export function prefetch(hostname, port = 0) {
-  if (arguments.length === 0 || hostname == null) throw new TypeError("dns.prefetch requires a hostname");
-  const key = `${String(hostname)}:${Number(port) || 0}`;
-  if (prefetchCache.has(key)) {
-    cacheStats.cacheHitsCompleted += 1;
-    return;
+export function prefetch(hostname, port = 443) {
+  if (arguments.length === 0) {
+    const error = new TypeError("Not enough arguments to 'prefetch'. Expected 1, got 0.");
+    error.code = "ERR_MISSING_ARGS";
+    throw error;
   }
-  cacheStats.cacheHitsInflight += 1;
+  if (typeof hostname !== "string") {
+    const error = new TypeError("hostname must be a string");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (port == null) port = 443;
+  if (typeof port !== "number" || !Number.isInteger(port)) {
+    const error = new TypeError(`The "port" property must be of type number. Received ${typeof port}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (port < 0 || port > 65535) {
+    const error = new RangeError(`The value of "port" is out of range. It must be >= 0 and <= 65535. Received ${port}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
   try {
-    const records = lookupRecords(hostname, 0, defaultResultOrder, null);
-    prefetchCache.set(key, { records, port: Number(port) || 0, createdAt: Date.now() });
-    cacheStats.cacheHitsCompleted += 1;
-    cacheStats.cacheSize = prefetchCache.size;
-  } catch {
-    cacheStats.cacheMisses += 1;
-  } finally {
-    cacheStats.cacheHitsInflight = Math.max(0, cacheStats.cacheHitsInflight - 1);
-  }
+    resolveForNetwork(hostname, port, true);
+  } catch {}
 }
 
 export function getCacheStats() {
-  return { ...cacheStats, cacheSize: prefetchCache.size };
+  return {
+    cacheHitsCompleted: dnsCacheState.cacheHitsCompleted,
+    cacheHitsInflight: dnsCacheState.cacheHitsInflight,
+    cacheMisses: dnsCacheState.cacheMisses,
+    size: dnsCacheState.entries.size,
+    errors: dnsCacheState.errors,
+    totalCount: dnsCacheState.totalCount,
+  };
 }
 
 function validateLookupServiceArgs(address, port) {

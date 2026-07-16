@@ -16,6 +16,7 @@ pub const BundleOptions = struct {
     banner: []const u8 = "",
     footer: []const u8 = "",
     drop: []const []const u8 = &.{},
+    features: []const []const u8 = &.{},
     public_path: []const u8 = "",
     transform_only: bool = false,
     env_behavior: compiler.schema.api.DotEnvBehavior = .disable,
@@ -182,6 +183,7 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
     transform_options.drop = options.drop;
+    transform_options.feature_flags = options.features;
     transform_options.disable_hmr = true;
     transform_options.main_fields = &.{ "main", "module" };
     if (options.jsx_factory != null or
@@ -376,6 +378,15 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     const runtime_file_map_ptr = if (runtime_file_map.map.count() > 0) &runtime_file_map else null;
     const event_loop = compiler.jsc.AnyEventLoop.init(allocator);
     const worker_pool = sharedWorkerPool();
+    // BundleV2 temporarily retargets these allocators to its graph arena. The
+    // arena is released before Transpiler.deinit(), so restore the allocators
+    // that own long-lived option data (including bundler feature flags) after
+    // BundleV2 teardown and before the transpiler defer runs.
+    defer {
+        transpiler.allocator = allocator;
+        transpiler.resolver.allocator = allocator;
+        transpiler.linker.allocator = allocator;
+    }
     var bundle: ?*compiler.bundle_v2.BundleV2 = null;
     defer if (bundle) |value| {
         if (options.skip_teardown) {
@@ -513,6 +524,15 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                 if (item == .string) try drop.append(allocator, item.string);
             }
             options.drop = drop.items;
+        }
+    }
+    if (object.get("features")) |value| {
+        if (value == .array) {
+            var features: std.ArrayList([]const u8) = .empty;
+            for (value.array.items) |item| {
+                if (item == .string) try features.append(allocator, item.string);
+            }
+            options.features = features.items;
         }
     }
     if (object.get("publicPath")) |value| {
@@ -914,6 +934,7 @@ pub fn buildEntryPointsJson(
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
     transform_options.drop = options.drop;
+    transform_options.feature_flags = options.features;
     if (options.loader_extensions.len > 0) {
         transform_options.loaders = .{
             .extensions = options.loader_extensions,
@@ -1064,6 +1085,11 @@ pub fn buildEntryPointsJson(
     var source_code_size: u64 = 0;
     const event_loop = compiler.jsc.AnyEventLoop.init(allocator);
     const worker_pool = sharedWorkerPool();
+    defer {
+        transpiler.allocator = allocator;
+        transpiler.resolver.allocator = allocator;
+        transpiler.linker.allocator = allocator;
+    }
     var bundle: ?*compiler.bundle_v2.BundleV2 = null;
     defer if (bundle) |value| {
         if (worker_pool != null) value.deinitFromCLI(allocator) else value.deinitWithoutFreeingArena();

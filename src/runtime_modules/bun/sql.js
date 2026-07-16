@@ -4,7 +4,7 @@
 // v3 startup handshake, cleartext/md5 auth, simple-protocol queries with
 // inline-escaped parameters, and robust ErrorResponse parsing.
 
-import { Database as SQLiteDatabase } from "./sqlite.js";
+import { Database as SQLiteDatabase, SQLiteError } from "./sqlite.js";
 import * as net from "../node/net.js";
 import { createHash } from "../node/crypto.js";
 
@@ -61,6 +61,7 @@ function resolvePostgresOptions(input) {
   }
   const envv = globalThis.process?.env ?? {};
   return {
+    adapter: options.adapter ?? "postgres",
     hostname: options.hostname ?? options.host ?? envv.PGHOST ?? "localhost",
     port: Number(options.port ?? envv.PGPORT ?? 5432),
     username: options.username ?? options.user ?? envv.PGUSER ?? envv.USER ?? "postgres",
@@ -348,11 +349,781 @@ function createPostgresSQL(input) {
   return sql;
 }
 
-export function SQL(...args) {
-  const [first] = args;
-  if (isPostgresURLString(first) || looksLikePostgresOptions(first)) {
-    return createPostgresSQL(first);
+class SQLResultArray extends Array {
+  constructor(values = []) {
+    super();
+    this.push(...values);
+    Object.defineProperties(this, {
+      count: { value: null, writable: true },
+      command: { value: null, writable: true },
+      lastInsertRowid: { value: null, writable: true },
+      affectedRows: { value: null, writable: true },
+    });
   }
-  return Reflect.construct(SQLiteDatabase, args);
+
+  static get [Symbol.species]() {
+    return Array;
+  }
 }
-SQL.prototype = SQLiteDatabase.prototype;
+
+class SQLHelper {
+  constructor(value, keys = undefined) {
+    if (keys !== undefined && keys.length === 0 && value?.[0] != null && typeof value[0] === "object") {
+      keys = Object.keys(value[0]);
+    }
+
+    if (keys !== undefined) {
+      for (let key of keys) {
+        if (typeof key === "string") {
+          const asNumber = Number(key);
+          if (Number.isNaN(asNumber)) continue;
+          key = asNumber;
+        }
+
+        if (typeof key !== "string") {
+          if (Number.isSafeInteger(key) && key >= 0 && key <= 64 * 1024) continue;
+          throw new Error("Keys must be strings or numbers: " + String(key));
+        }
+      }
+    }
+
+    this.value = value;
+    this.columns = keys ?? [];
+  }
+}
+
+const SQLITE_MEMORY_VARIANTS = new Set([":memory:", "sqlite://:memory:", "sqlite:memory"]);
+const SQLITE_PROTOCOLS = [
+  ["sqlite://", 9],
+  ["sqlite:", 7],
+  ["file://", -1],
+  ["file:", 5],
+];
+const SUPPORTED_ADAPTERS = ["postgres", "sqlite", "mysql", "mariadb"];
+
+function parseDefinitelySQLiteURL(value) {
+  if (value == null) return null;
+  const string = value instanceof URL ? value.toString() : String(value);
+  if (SQLITE_MEMORY_VARIANTS.has(string)) return ":memory:";
+
+  for (const [prefix, stripLength] of SQLITE_PROTOCOLS) {
+    if (!string.startsWith(prefix)) continue;
+    if (stripLength === -1) {
+      try {
+        return globalThis.Bun.fileURLToPath(string);
+      } catch {
+        return string.slice(7);
+      }
+    }
+    return string.slice(stripLength);
+  }
+  return null;
+}
+
+function parseSQLiteOptions(filenameOrURL, options) {
+  const result = {
+    ...options,
+    adapter: "sqlite",
+    filename: ":memory:",
+  };
+
+  let filename = filenameOrURL || ":memory:";
+  let originalURL = filename;
+  if (filename instanceof URL) {
+    originalURL = filename.toString();
+    filename = originalURL;
+  }
+
+  let queryString = null;
+  if (typeof originalURL === "string") {
+    const queryIndex = originalURL.indexOf("?");
+    if (queryIndex !== -1) {
+      queryString = originalURL.slice(queryIndex + 1);
+      filename = String(filename).slice(0, queryIndex);
+    }
+  }
+
+  const parsedFilename = parseDefinitelySQLiteURL(filename);
+  if (parsedFilename !== null) filename = parsedFilename;
+  result.filename = filename || ":memory:";
+
+  if (queryString) {
+    const mode = new URLSearchParams(queryString).get("mode");
+    if (mode === "ro") {
+      result.readonly = true;
+    } else if (mode === "rw") {
+      result.readonly = false;
+    } else if (mode === "rwc") {
+      result.readonly = false;
+      result.create = true;
+    }
+  }
+
+  if ("readonly" in options) result.readonly = options.readonly;
+  if ("create" in options) result.create = options.create;
+  if ("safeIntegers" in options) result.safeIntegers = options.safeIntegers;
+  if ("strict" in options) result.strict = options.strict;
+  return result;
+}
+
+function environmentConnectionURL(adapter) {
+  const env = globalThis.Bun?.env ?? globalThis.process?.env ?? {};
+  let url = env.DATABASE_URL || env.DATABASEURL || env.TLS_DATABASE_URL || null;
+  if (url) return url;
+
+  if (!adapter || adapter === "postgres") {
+    url = env.POSTGRES_URL || env.PGURL || env.PG_URL || env.TLS_POSTGRES_DATABASE_URL || null;
+    if (url) return url;
+  }
+  if (!adapter || adapter === "mysql") {
+    url = env.MYSQL_URL || env.MYSQLURL || env.TLS_MYSQL_DATABASE_URL || null;
+    if (url) return url;
+  }
+  if (!adapter || adapter === "mariadb") {
+    url = env.MARIADB_URL || env.MARIADBURL || env.TLS_MARIADB_DATABASE_URL || null;
+    if (url) return url;
+  }
+  if (!adapter || adapter === "sqlite") {
+    url = env.SQLITE_URL || env.SQLITEURL || null;
+    if (url) return url;
+  }
+  return null;
+}
+
+function inferAdapter(value) {
+  if (parseDefinitelySQLiteURL(value) !== null) return "sqlite";
+  if (value instanceof URL) {
+    const protocol = value.protocol.replace(/:$/, "").toLowerCase();
+    if (protocol === "mysql" || protocol === "mysql2") return "mysql";
+    if (protocol === "mariadb") return "mariadb";
+    return "postgres";
+  }
+  const string = value == null ? "" : String(value);
+  const match = /^([a-z][a-z0-9+.-]*):\/\//i.exec(string);
+  if (!match) return "postgres";
+  const protocol = match[1].toLowerCase();
+  if (protocol === "sqlite" || protocol === "file") return "sqlite";
+  if (protocol === "mysql" || protocol === "mysql2") return "mysql";
+  if (protocol === "mariadb") return "mariadb";
+  return "postgres";
+}
+
+function resolveSQLConfiguration(first, second = {}) {
+  let options;
+  let resolvedURL;
+  if (typeof first === "string" || first instanceof URL) {
+    options = { ...second };
+    resolvedURL = first;
+  } else {
+    options = {
+      ...(first && typeof first === "object" ? first : {}),
+      ...(second && typeof second === "object" ? second : {}),
+    };
+    resolvedURL = environmentConnectionURL(options.adapter);
+  }
+
+  if (options.adapter != null && !SUPPORTED_ADAPTERS.includes(options.adapter)) {
+    throw new Error(
+      "Unsupported adapter: " +
+        options.adapter +
+        '. Supported adapters: "postgres", "sqlite", "mysql", "mariadb"',
+    );
+  }
+
+  if (options.adapter === "sqlite") {
+    if ("filename" in options && options.filename) resolvedURL = options.filename;
+  } else if (options.adapter) {
+    if ("url" in options && options.url) resolvedURL = options.url;
+  } else if ("filename" in options && options.filename) {
+    resolvedURL = options.filename;
+  } else if ("url" in options && options.url) {
+    resolvedURL = options.url;
+  }
+
+  const adapter = options.adapter ?? inferAdapter(resolvedURL);
+  if (adapter === "sqlite") {
+    return {
+      adapter,
+      options: parseSQLiteOptions(resolvedURL, { ...options, adapter }),
+      url: resolvedURL,
+    };
+  }
+
+  return {
+    adapter,
+    options: { ...options, adapter, url: resolvedURL },
+    url: resolvedURL,
+  };
+}
+
+function tokenizeSQL(source) {
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let lineComment = false;
+  let blockComment = false;
+
+  const flush = () => {
+    if (token) {
+      tokens.push(token.toUpperCase());
+      token = "";
+    }
+  };
+
+  for (let index = 0; index < source.length; index++) {
+    const character = source[index];
+    const next = source[index + 1];
+
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        if (source[index + 1] === quote) {
+          index++;
+        } else {
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (character === "-" && next === "-") {
+      flush();
+      lineComment = true;
+      index++;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      flush();
+      blockComment = true;
+      index++;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      flush();
+      quote = character;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(character)) {
+      token += character;
+    } else {
+      flush();
+    }
+  }
+  flush();
+  return tokens;
+}
+
+function parseSQLQuery(source) {
+  const tokens = tokenizeSQL(String(source));
+  let helperCommand = "none";
+  for (let index = tokens.length - 1; index >= 0; index--) {
+    const token = tokens[index];
+    if (token === "IN") {
+      helperCommand = "in";
+      break;
+    }
+    if (token === "SET") {
+      helperCommand = "updateSet";
+      break;
+    }
+    if (token === "WHERE") {
+      helperCommand = "where";
+      break;
+    }
+    if (token === "UPDATE") {
+      helperCommand = "update";
+      break;
+    }
+    if (token === "INSERT") {
+      helperCommand = "insert";
+      break;
+    }
+  }
+
+  const canReturnRows = tokens.some((token) =>
+    token === "SELECT" || token === "PRAGMA" || token === "WITH" || token === "EXPLAIN" || token === "RETURNING"
+  );
+  const commands = ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "PRAGMA", "SELECT", "WITH", "EXPLAIN", "VACUUM", "ANALYZE", "ATTACH", "DETACH", "REPLACE"];
+  const command = tokens.find((token) => commands.includes(token)) ?? tokens[0] ?? "";
+  return { helperCommand, canReturnRows, command };
+}
+
+function helperCommandName(command) {
+  if (command === "insert") return "INSERT";
+  if (command === "update" || command === "updateSet") return "UPDATE";
+  if (command === "in") return "IN";
+  if (command === "where") return "WHERE";
+  return "";
+}
+
+function escapeSQLiteIdentifier(value) {
+  return '"' + String(value).replaceAll('"', '""').replaceAll(".", '"."') + '"';
+}
+
+function definedColumnsAndSQL(columns, items) {
+  const definedColumns = [];
+  let sql = "(";
+  for (const column of columns) {
+    const hasDefinedValue = Array.isArray(items)
+      ? items.some((item) => item != null && typeof item[column] !== "undefined")
+      : items != null && typeof items[column] !== "undefined";
+    if (!hasDefinedValue) continue;
+    if (definedColumns.length > 0) sql += ", ";
+    sql += escapeSQLiteIdentifier(column);
+    definedColumns.push(column);
+  }
+  return { definedColumns, sql: sql + ") VALUES" };
+}
+
+function validateSQLiteBinding(value) {
+  if (value == null) return;
+  const type = typeof value;
+  if (type === "string" || type === "number" || type === "bigint" || type === "boolean") return;
+  if (ArrayBuffer.isView(value)) return;
+  throw new TypeError("Binding expected string, TypedArray, boolean, number, bigint or null");
+}
+
+function normalizeSQLiteQuery(strings, values) {
+  if (typeof strings === "string") return [strings, values ?? []];
+  if (!Array.isArray(strings)) {
+    throw new SyntaxError("Invalid query: SQL Fragment cannot be executed or was misused");
+  }
+
+  let query = "";
+  const bindings = [];
+  for (let index = 0; index < strings.length; index++) {
+    const string = strings[index];
+    if (typeof string !== "string") {
+      throw new SyntaxError("Invalid query: SQL Fragment cannot be executed or was misused");
+    }
+    query += string;
+    if (index >= values.length) continue;
+
+    const value = values[index];
+    if (value instanceof SQLiteQuery) {
+      const [fragment, fragmentBindings] = normalizeSQLiteQuery(value._strings, value._values);
+      query += fragment;
+      bindings.push(...fragmentBindings);
+      continue;
+    }
+
+    if (!(value instanceof SQLHelper)) {
+      query += "? ";
+      bindings.push(typeof value === "undefined" ? null : value);
+      continue;
+    }
+
+    const command = parseSQLQuery(query).helperCommand;
+    if (command === "none" || command === "where") {
+      throw new SyntaxError("Helpers are only allowed for INSERT, UPDATE and WHERE IN commands");
+    }
+
+    const items = value.value;
+    const columns = value.columns;
+    if (columns.length === 0 && command !== "in") {
+      throw new SyntaxError("Cannot " + helperCommandName(command) + " with no columns");
+    }
+
+    if (command === "insert") {
+      const built = definedColumnsAndSQL(columns, items);
+      if (built.definedColumns.length === 0) {
+        throw new SyntaxError("Insert needs to have at least one column with a defined value");
+      }
+      query += built.sql;
+      const rows = Array.isArray(items) ? items : [items];
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
+        query += "(";
+        for (let columnIndex = 0; columnIndex < built.definedColumns.length; columnIndex++) {
+          const column = built.definedColumns[columnIndex];
+          if (columnIndex > 0) query += ", ";
+          query += "?";
+          bindings.push(typeof row[column] === "undefined" ? null : row[column]);
+        }
+        query += rowIndex + 1 < rows.length ? ")," : ") ";
+      }
+      continue;
+    }
+
+    if (command === "in") {
+      const rows = Array.isArray(items) ? items : [items];
+      if (columns.length > 1) throw new SyntaxError("Cannot use WHERE IN helper with multiple columns");
+      query += "(";
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        if (rowIndex > 0) query += ", ";
+        query += "?";
+        const row = rows[rowIndex];
+        const binding = columns.length === 0 ? row : row?.[columns[0]];
+        bindings.push(typeof binding === "undefined" ? null : binding);
+      }
+      query += ") ";
+      continue;
+    }
+
+    const rows = Array.isArray(items) ? items : [items];
+    if (rows.length > 1) throw new SyntaxError("Cannot use array of objects for UPDATE");
+    if (command === "update") query += " SET ";
+    let added = 0;
+    for (const column of columns) {
+      const columnValue = rows[0]?.[column];
+      if (typeof columnValue === "undefined") continue;
+      if (added > 0) query += ", ";
+      query += escapeSQLiteIdentifier(column) + " = ?";
+      bindings.push(columnValue);
+      added++;
+    }
+    if (added === 0) throw new SyntaxError("Update needs to have at least one column");
+    query += " ";
+  }
+
+  for (const binding of bindings) validateSQLiteBinding(binding);
+  return [query, bindings];
+}
+
+function rawSQLiteValue(value) {
+  if (value === null) return null;
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (typeof value === "bigint") {
+    const bytes = new Uint8Array(8);
+    new DataView(bytes.buffer).setBigInt64(0, value, true);
+    return bytes;
+  }
+  if (typeof value === "number") {
+    const bytes = new Uint8Array(8);
+    const view = new DataView(bytes.buffer);
+    if (Number.isInteger(value)) view.setBigInt64(0, BigInt(value), true);
+    else view.setFloat64(0, value, true);
+    return bytes;
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  return new TextEncoder().encode(String(value));
+}
+
+function executeSQLiteQuery(client, queryObject) {
+  if (client.closed) throw new SQLiteError("Connection closed");
+  if (client.storedError) throw client.storedError;
+  if (!client.db) throw new SQLiteError("SQLite database not initialized");
+
+  const [statementSQL, bindings] = normalizeSQLiteQuery(queryObject._strings, queryObject._values);
+  const parsed = parseSQLQuery(statementSQL);
+  if (parsed.canReturnRows) {
+    const statement = client.db.prepare(statementSQL);
+    try {
+      let rows;
+      if (queryObject._mode === "values" || queryObject._mode === "raw") {
+        rows = statement.values(...bindings);
+        if (queryObject._mode === "raw") rows = rows.map((row) => row.map(rawSQLiteValue));
+      } else {
+        rows = statement.all(...bindings);
+      }
+      const result = new SQLResultArray(rows);
+      result.command = parsed.command;
+      result.count = rows.length;
+      return result;
+    } finally {
+      statement.finalize();
+    }
+  }
+
+  const changes = client.db.run(statementSQL, ...bindings);
+  const result = new SQLResultArray();
+  result.command = parsed.command;
+  result.count = changes.changes;
+  result.affectedRows = changes.changes;
+  result.lastInsertRowid = changes.lastInsertRowid;
+  return result;
+}
+
+class SQLiteQuery extends Promise {
+  constructor(client, strings, values, notTagged = false) {
+    let resolvePromise;
+    let rejectPromise;
+    super((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    this._client = client;
+    this._strings = strings;
+    this._values = values;
+    this._notTagged = notTagged;
+    this._resolvePromise = resolvePromise;
+    this._rejectPromise = rejectPromise;
+    this._mode = "objects";
+    this._started = false;
+    this._cancelled = false;
+    this.active = false;
+  }
+
+  static get [Symbol.species]() {
+    return Promise;
+  }
+
+  _start() {
+    if (this._started || this._cancelled) return;
+    this._started = true;
+    if (this._notTagged) {
+      this._rejectPromise(new SQLiteError("Query not called as a tagged template literal"));
+      return;
+    }
+    this.active = true;
+    try {
+      this._resolvePromise(executeSQLiteQuery(this._client, this));
+    } catch (error) {
+      this._rejectPromise(error);
+    } finally {
+      this.active = false;
+    }
+  }
+
+  execute() {
+    this._start();
+    return this;
+  }
+
+  async run() {
+    this._start();
+    return await this;
+  }
+
+  values() {
+    if (!this._started) this._mode = "values";
+    return this;
+  }
+
+  raw() {
+    if (!this._started) this._mode = "raw";
+    return this;
+  }
+
+  simple() {
+    return this;
+  }
+
+  cancel() {
+    if (this._started || this._cancelled) return this;
+    this._cancelled = true;
+    this._rejectPromise(new SQLiteError("Query cancelled"));
+    return this;
+  }
+
+  then(...arguments_) {
+    this._start();
+    return super.then(...arguments_);
+  }
+
+  catch(...arguments_) {
+    this._start();
+    return super.catch(...arguments_);
+  }
+
+  finally(...arguments_) {
+    this._start();
+    return super.finally(...arguments_);
+  }
+}
+
+function sqliteTransactionCommand(options) {
+  if (!options) return "BEGIN";
+  const mode = String(options).toUpperCase();
+  if (mode === "READONLY" || mode === "READ") {
+    throw new Error(
+      "SQLite doesn't support '" +
+        options +
+        "' transaction mode. Use DEFERRED, IMMEDIATE, or EXCLUSIVE.",
+    );
+  }
+  return "BEGIN " + mode;
+}
+
+function runSQLiteControl(client, statement) {
+  if (client.closed) throw new SQLiteError("Connection closed");
+  if (client.storedError) throw client.storedError;
+  return client.db.run(statement);
+}
+
+async function beginSQLiteTransaction(client, optionsOrCallback, maybeCallback) {
+  let options = optionsOrCallback;
+  let callback = maybeCallback;
+  if (typeof optionsOrCallback === "function") {
+    callback = optionsOrCallback;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw new TypeError("fn must be a function");
+
+  const begin = sqliteTransactionCommand(options);
+  runSQLiteControl(client, begin);
+  let needsRollback = true;
+  const transactionSQL = createSQLiteSQLFunction(client, true);
+  try {
+    let result = await callback(transactionSQL);
+    if (Array.isArray(result)) result = await Promise.all(result);
+    runSQLiteControl(client, "COMMIT");
+    needsRollback = false;
+    return result;
+  } catch (error) {
+    if (needsRollback) {
+      try {
+        runSQLiteControl(client, "ROLLBACK");
+      } catch {}
+    }
+    throw error;
+  }
+}
+
+async function runSQLiteSavepoint(client, callback, name = "") {
+  if (typeof callback !== "function") throw new TypeError("fn must be a function");
+  const identifier = "s" + client.nextSavepoint++ + (name ? "_" + name : "");
+  runSQLiteControl(client, "SAVEPOINT " + escapeSQLiteIdentifier(identifier));
+  const transactionSQL = createSQLiteSQLFunction(client, true);
+  try {
+    let result = await callback(transactionSQL);
+    if (Array.isArray(result)) result = await Promise.all(result);
+    runSQLiteControl(client, "RELEASE SAVEPOINT " + escapeSQLiteIdentifier(identifier));
+    return result;
+  } catch (error) {
+    try {
+      runSQLiteControl(client, "ROLLBACK TO SAVEPOINT " + escapeSQLiteIdentifier(identifier));
+      runSQLiteControl(client, "RELEASE SAVEPOINT " + escapeSQLiteIdentifier(identifier));
+    } catch {}
+    throw error;
+  }
+}
+
+function createSQLiteSQLFunction(client, inTransaction = false) {
+  function sql(strings, ...values) {
+    const isTaggedTemplate =
+      Array.isArray(strings) &&
+      (Array.isArray(strings.raw) ||
+        (strings.length === values.length + 1 && strings.every((part) => typeof part === "string")));
+    if (Array.isArray(strings) && !isTaggedTemplate) {
+      return new SQLHelper(strings, values);
+    }
+    if (
+      !Array.isArray(strings) &&
+      strings != null &&
+      typeof strings === "object" &&
+      !(strings instanceof SQLiteQuery) &&
+      !(strings instanceof SQLHelper)
+    ) {
+      return new SQLHelper([strings], values);
+    }
+    if (typeof strings === "string") {
+      return new SQLiteQuery(client, escapeSQLiteIdentifier(strings), values, true);
+    }
+    return new SQLiteQuery(client, strings, values);
+  }
+
+  sql.unsafe = (statement, arguments_ = []) => new SQLiteQuery(client, String(statement), arguments_);
+  sql.file = async (path, arguments_ = []) => {
+    const text = await globalThis.Bun.file(String(path)).text();
+    return await sql.unsafe(text, arguments_);
+  };
+  sql.connect = () => {
+    if (client.closed) return Promise.reject(new SQLiteError("Connection closed"));
+    if (client.storedError) return Promise.reject(client.storedError);
+    return Promise.resolve(sql);
+  };
+  sql.array = () => {
+    throw new Error("SQLite doesn't support arrays");
+  };
+  sql.reserve = () => Promise.reject(new Error("This adapter doesn't support connection reservation"));
+  sql.flush = () => {
+    throw new Error("SQLite doesn't support flush() - queries are executed synchronously");
+  };
+  sql.beginDistributed = () => {
+    throw new Error("This adapter doesn't support distributed transactions.");
+  };
+  sql.commitDistributed = () => {
+    throw new Error("SQLite doesn't support distributed transactions.");
+  };
+  sql.rollbackDistributed = () => {
+    throw new Error("SQLite doesn't support distributed transactions.");
+  };
+
+  if (inTransaction) {
+    sql.begin = () => {
+      throw new SQLiteError("cannot call begin inside a transaction use savepoint() instead");
+    };
+    sql.savepoint = (callback, name = "") => runSQLiteSavepoint(client, callback, name);
+    sql.close = async () => undefined;
+  } else {
+    sql.begin = (optionsOrCallback, callback) =>
+      beginSQLiteTransaction(client, optionsOrCallback, callback);
+    sql.close = async () => {
+      if (client.closed) return;
+      client.closed = true;
+      const closedError = new Error("Connection closed");
+      client.storedError = closedError;
+      if (client.db) {
+        try {
+          client.db.close();
+        } catch {}
+        client.db = null;
+      }
+      try {
+        client.options.onclose?.(closedError);
+      } catch {}
+    };
+  }
+
+  sql.transaction = sql.begin;
+  sql.distributed = sql.beginDistributed;
+  sql.end = sql.close;
+  sql.options = client.options;
+  sql[Symbol.asyncDispose] = () => sql.close();
+  return sql;
+}
+
+function createSQLiteSQL(options) {
+  const client = {
+    options,
+    db: null,
+    storedError: null,
+    closed: false,
+    nextSavepoint: 0,
+  };
+
+  try {
+    const databaseOptions = {};
+    if (options.readonly) {
+      databaseOptions.readonly = true;
+    } else {
+      databaseOptions.create = options.create !== false;
+      databaseOptions.readwrite = true;
+    }
+    if ("safeIntegers" in options) databaseOptions.safeIntegers = options.safeIntegers;
+    if ("strict" in options) databaseOptions.strict = options.strict;
+    client.db = new SQLiteDatabase(options.filename, databaseOptions);
+    try {
+      options.onconnect?.(null);
+    } catch {}
+  } catch (error) {
+    client.storedError = error;
+    try {
+      options.onconnect?.(error);
+    } catch {}
+  }
+
+  return createSQLiteSQLFunction(client);
+}
+
+export function SQL(first = undefined, second = {}) {
+  const configuration = resolveSQLConfiguration(first, second);
+  if (configuration.adapter === "sqlite") return createSQLiteSQL(configuration.options);
+  if (configuration.adapter === "postgres") return createPostgresSQL(configuration.options);
+  throw new Error("Bun.SQL " + configuration.adapter + " adapter is not available");
+}
+
+SQL.SQLiteError = SQLiteError;

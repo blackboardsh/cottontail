@@ -36,22 +36,9 @@ export class ChildProcess extends EventEmitter {
     }
     const file = String(options.file);
     const argv = Array.isArray(options?.args) ? Array.from(options.args, String) : [];
-    const inner = spawn(file, argv.length > 0 ? argv.slice(1) : [], { ...options, args: undefined, file: undefined });
-    this._inner = inner;
-    this.pid = inner.pid;
-    this.stdin = inner.stdin;
-    this.stdout = inner.stdout;
-    this.stderr = inner.stderr;
-    for (const name of ["spawn", "disconnect"]) inner.on(name, () => this.emit(name));
-    inner.on("exit", (code, signal) => {
-      this.exitCode = code;
-      this.signalCode = signal;
-      this.emit("exit", code, signal);
-    });
-    inner.on("close", (code, signal) => this.emit("close", code, signal));
-    inner.on("error", (error) => this.emit("error", error));
-    inner.on("message", (message, handle) => this.emit("message", message, handle));
-    return this;
+    const spawnOptions = { ...options, args: undefined, file: undefined, envPairs: undefined };
+    if (options.envPairs !== undefined) spawnOptions.env = envPairsToObject(options.envPairs);
+    return spawnInternal(file, argv.length > 0 ? argv.slice(1) : [], spawnOptions, this);
   }
 
   kill(signal = "SIGTERM") {
@@ -81,6 +68,17 @@ function invalidArgTypeError(name, expected, value) {
 
 function invalidFileArgError(file) {
   return invalidArgTypeError("file", "string", file);
+}
+
+function envPairsToObject(envPairs) {
+  const env = Object.create(null);
+  for (const pair of envPairs) {
+    if (typeof pair !== "string") throw invalidArgTypeError("options.envPairs", "string[]", envPairs);
+    const separator = pair.indexOf("=");
+    const name = separator < 0 ? pair : pair.slice(0, separator);
+    env[name] = separator < 0 ? "" : pair.slice(separator + 1);
+  }
+  return env;
 }
 
 const isDarwinPlatform = typeof cottontail?.platform === "function" ? cottontail.platform() === "darwin" : true;
@@ -329,11 +327,16 @@ function normalizeCwdOption(cwd) {
 }
 
 function normalizeSpawnArgs(args, options) {
-  if (!Array.isArray(args)) {
-    options = args ?? {};
+  if (args == null) {
+    args = [];
+  } else if (!Array.isArray(args)) {
+    if (typeof args !== "object") throw invalidArgTypeError("args", "Array", args);
+    options = args;
     args = [];
   }
-  return { args: Array.from(args ?? [], String), options: options ?? {} };
+  options ??= {};
+  if (typeof options !== "object") throw invalidArgTypeError("options", "object", options);
+  return { args: Array.from(args, String), options };
 }
 
 function normalizeSpawnCommand(file, args = [], options = {}) {
@@ -443,14 +446,13 @@ function normalizeSpawnError(file, spawnargs, cause) {
   return error;
 }
 
-export function spawn(file, args = [], options = {}) {
+function spawnInternal(file, args = [], options = {}, target = undefined) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   args = normalized.args;
   options = normalized.options;
   const command = normalizeSpawnCommand(file, args, options);
   let preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
-  const listeners = new Map();
   const stdoutListeners = new Map();
   const stderrListeners = new Map();
   const stdinListeners = new Map();
@@ -622,7 +624,7 @@ export function spawn(file, args = [], options = {}) {
     }
   };
 
-  const child = Object.assign(new ChildProcess(), {
+  const child = Object.assign(target ?? new ChildProcess(), {
     pid: 0,
     // Convert strings to bytes before crossing into native code: the native
     // string path measures with strlen and would truncate at embedded NULs.
@@ -636,28 +638,6 @@ export function spawn(file, args = [], options = {}) {
     stderr: stderrMode === "pipe" ? makeStream(stderrListeners, 2) : null,
     _nativeId: -1,
     _ipcFd: null,
-    on(name, handler) {
-      const handlers = listeners.get(name) ?? [];
-      handlers.push(handler);
-      listeners.set(name, handlers);
-      return child;
-    },
-    once(name, handler) {
-      const wrapped = (...values) => {
-        child.off(name, wrapped);
-        handler(...values);
-      };
-      return child.on(name, wrapped);
-    },
-    off(name, handler) {
-      const handlers = listeners.get(name) ?? [];
-      listeners.set(name, handlers.filter((item) => item !== handler));
-      return child;
-    },
-    emit(name, ...values) {
-      emitChild(name, ...values);
-      return (listeners.get(name) ?? []).length > 0;
-    },
     kill(signal = "SIGTERM") {
       const signalNumber = normalizeKillSignal(signal);
       const killed = cottontail.spawnKill?.(native.id, signalNumber) === true;
@@ -716,9 +696,7 @@ export function spawn(file, args = [], options = {}) {
     else options.signal.addEventListener?.("abort", abortHandler, { once: true });
   }
 
-  const emitChild = (name, ...values) => {
-    for (const handler of listeners.get(name) ?? []) handler(...values);
-  };
+  const emitChild = (name, ...values) => child.emit(name, ...values);
 
   if (preflightError == null) unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
     if (!event) return;
@@ -803,12 +781,34 @@ export function spawn(file, args = [], options = {}) {
     return child;
   }
 
+  // The gate only protects native events until their listener is installed.
+  // Release it before returning so a subsequent synchronous spawn cannot
+  // inherit this child's still-open gate writer and keep the child blocked.
+  releaseStart();
+
   // Node emits 'spawn' asynchronously once the process started successfully.
   queueMicrotask(() => {
-    releaseStart();
     if (!closed) emitChild("spawn");
   });
 
+  return child;
+}
+
+export function spawn(file, args = [], options = {}) {
+  if (typeof file !== "string") throw invalidFileArgError(file);
+  const normalized = normalizeSpawnArgs(args, options);
+  const stdio = normalized.options.stdio == null
+    ? undefined
+    : typeof normalized.options.stdio === "string"
+      ? [normalized.options.stdio, normalized.options.stdio, normalized.options.stdio]
+      : normalized.options.stdio;
+  const child = new ChildProcess();
+  child.spawn({
+    ...normalized.options,
+    file,
+    args: [normalized.options.argv0 != null ? String(normalized.options.argv0) : file, ...normalized.args],
+    stdio,
+  });
   return child;
 }
 
@@ -960,6 +960,22 @@ function normalizeSendArgs(sendHandleOrCallback = undefined, optionsOrCallback =
     options = undefined;
   }
   return { sendHandle, options, callback };
+}
+
+function validateIpcMessage(message, argumentCount) {
+  if (argumentCount === 0 || message === undefined) {
+    const error = new TypeError('The "message" argument must be specified');
+    error.code = "ERR_MISSING_ARGS";
+    throw error;
+  }
+  const type = typeof message;
+  if (message === null || type === "string" || type === "object" || type === "number" || type === "boolean") return;
+  const error = new TypeError(
+    'The "message" argument must be one of type string, object, number, or boolean. ' +
+      `Received ${receivedValueText(message)}`,
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
 }
 
 function ipcHandleInfo(sendHandle = undefined) {
@@ -1168,6 +1184,18 @@ function emitChildProcessError(child, error) {
 function installParentIpcChannel(child, serialization = undefined) {
   child.connected = true;
   child.serialization = serialization === "advanced" ? "advanced" : "json";
+  const channel = {
+    ref() {
+      child.ref();
+      return channel;
+    },
+    unref() {
+      child.unref();
+      return channel;
+    },
+  };
+  child.channel = channel;
+  child._channel = channel;
   child._ipcBuffer = "";
   let nativeIpcPendingFd = undefined;
 
@@ -1204,13 +1232,16 @@ function installParentIpcChannel(child, serialization = undefined) {
 
   child._ipcOnExit = () => {
     child._handleIpcEvent = null;
+    child.channel = null;
+    child._channel = null;
     if (Number.isInteger(nativeIpcPendingFd) && nativeIpcPendingFd >= 0) {
       cottontail.closeFd?.(nativeIpcPendingFd);
       nativeIpcPendingFd = undefined;
     }
   };
 
-  child.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
+  child.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
+    validateIpcMessage(message, arguments.length);
     const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
     const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
     if (!child.connected) {
@@ -1235,6 +1266,8 @@ function installParentIpcChannel(child, serialization = undefined) {
     if (!child.connected) return;
     child.connected = false;
     cottontail.spawnCloseIpc?.(child._nativeId);
+    child.channel = null;
+    child._channel = null;
     emitChildMessage(child, undefined, "disconnect");
   };
 }
@@ -1246,8 +1279,11 @@ export function fork(modulePath, args = [], options = {}) {
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
   }
-  if (!Array.isArray(args)) {
-    options = args ?? {};
+  if (args == null) {
+    args = [];
+  } else if (!Array.isArray(args)) {
+    if (typeof args !== "object") throw invalidArgTypeError("args", "Array", args);
+    options = args;
     args = [];
   }
   if (options == null) options = {};
@@ -1281,6 +1317,18 @@ export function fork(modulePath, args = [], options = {}) {
   // Fallback: no native IPC channel; multiplex IPC frames over stdio.
   child.connected = true;
   child.serialization = options.serialization === "advanced" ? "advanced" : "json";
+  const channel = {
+    ref() {
+      child.ref();
+      return channel;
+    },
+    unref() {
+      child.unref();
+      return channel;
+    },
+  };
+  child.channel = channel;
+  child._channel = channel;
   let stdoutBuffer = "";
 
   child.stdout?.on("data", (chunk) => {
@@ -1302,7 +1350,8 @@ export function fork(modulePath, args = [], options = {}) {
     }
   });
 
-  child.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
+  child.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
+    validateIpcMessage(message, arguments.length);
     const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
     const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
     if (!child.connected || !child.stdin) {
@@ -1328,6 +1377,8 @@ export function fork(modulePath, args = [], options = {}) {
     if (!child.connected) return;
     child.connected = false;
     child.stdin?.end();
+    child.channel = null;
+    child._channel = null;
     emitChildMessage(child, undefined, "disconnect");
   };
 
@@ -1360,7 +1411,8 @@ export function _forkChild(fd = 0, serializationMode = undefined) {
   processObject.connected = true;
   let stopNativeIpc = null;
 
-  processObject.send = (message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) => {
+  processObject.send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
+    validateIpcMessage(message, arguments.length);
     const normalizedSend = normalizeSendArgs(sendHandleOrCallback, optionsOrCallback, callback);
     const sendCallback = typeof normalizedSend.callback === "function" ? normalizedSend.callback : null;
     if (!processObject.connected) {

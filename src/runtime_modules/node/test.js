@@ -13,6 +13,7 @@ const runnerQueueMicrotask = globalThis.queueMicrotask;
 const runnerNextTick = globalThis.process?.nextTick?.bind(globalThis.process);
 const runnerPromiseThen = globalThis.Promise.prototype.then;
 const runnerPromiseResolve = globalThis.Promise.resolve.bind(globalThis.Promise);
+const runnerPromiseReject = globalThis.Promise.reject.bind(globalThis.Promise);
 const runnerPromiseRace = globalThis.Promise.race.bind(globalThis.Promise);
 const runnerPromiseAll = globalThis.Promise.all.bind(globalThis.Promise);
 const runnerStderrWrite = globalThis.process?.stderr?.write?.bind(globalThis.process.stderr);
@@ -40,6 +41,7 @@ let failedTests = 0;
 let skippedTests = 0;
 let todoTests = 0;
 let runnerErrors = 0;
+let nextReportOrder = 0;
 const failures = [];
 const selectedRecords = new Set();
 
@@ -47,6 +49,8 @@ const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
 const forceConcurrent = testCliArgs.includes("--concurrent");
 const runTodoTests = testCliArgs.includes("--todo");
 const dotsMode = testCliArgs.includes("--dots");
+const globalOnlyMode = testCliArgs.includes("--only");
+const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 
 function cliOption(name, fallback = undefined) {
   const equals = testCliArgs.find((arg) => String(arg).startsWith(`${name}=`));
@@ -83,10 +87,10 @@ function configuredTestNamePattern() {
 const testNamePattern = configuredTestNamePattern();
 
 let dotsLineHasMarkers = false;
-let dotsFileShown = false;
+let dotsDetailFile = "";
 
-function testFileLabel() {
-  let file = String(globalThis.process?.argv?.[1] ?? "test");
+function testFileLabel(filePath = undefined) {
+  let file = String(filePath ?? globalThis.process?.argv?.[1] ?? "test");
   const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
   if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
   return file.replace(/^\.[\\/]+/, "");
@@ -98,18 +102,15 @@ function dotsWrite(value) {
   return runnerConsoleError?.(text.replace(/\n$/, ""));
 }
 
-function prepareDotsDetail() {
+function prepareDotsDetail(filePath = undefined) {
   if (!dotsMode) return;
+  const activeFile = filePath ?? currentExecution()?.record?.filePath;
+  const label = testFileLabel(activeFile);
   if (dotsLineHasMarkers) dotsWrite("\n");
-  if (!dotsFileShown) {
-    // In aggregate mode a previous child may have left a dot line open.
-    dotsWrite(dotsLineHasMarkers
-      ? "\n"
-      : globalThis.process?.env?.COTTONTAIL_TEST_AGGREGATE_FILE
-        ? "\n\n"
-        : "");
-    dotsWrite(`${testFileLabel()}:\n`);
-    dotsFileShown = true;
+  if (label !== dotsDetailFile) {
+    dotsWrite(dotsLineHasMarkers ? "\n" : dotsDetailFile ? "\n" : "");
+    dotsWrite(`${label}:\n`);
+    dotsDetailFile = label;
   }
   dotsLineHasMarkers = false;
 }
@@ -173,7 +174,9 @@ let completedRerunCount = 0;
 const completedRuns = [];
 
 function currentExecution() {
-  return executionStorage.getStore() ?? activeExecution;
+  const stored = executionStorage.getStore();
+  if (stored?.kind !== "test" || stored.active !== false) return stored ?? activeExecution;
+  return activeExecution?.active ? activeExecution : null;
 }
 
 function isNativePromise(value) {
@@ -210,21 +213,39 @@ function installUnhandledRejectionCapture() {
       owner.failExternal(error);
       return;
     }
+    if (owner && owner.kind !== "test" && typeof owner.failExternal === "function") {
+      owner.failExternal(error);
+      return;
+    }
+    const execution = currentExecution();
+    if (execution?.kind === "test" && execution.active && typeof execution.failExternal === "function") {
+      execution.failExternal(error);
+      return;
+    }
     recordUnhandledError(error);
   });
 }
 
-function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnThrow = true) {
-  const execution = failureStorage.getStore() ?? currentExecution();
-  if (!execution || typeof callback !== "function") return callback;
+function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnThrow = true, drainCurrentTurn = false) {
+  const capturedExecution = failureStorage.getStore() ?? currentExecution();
+  if (!capturedExecution || typeof callback !== "function") return callback;
+  if (drainCurrentTurn && capturedExecution.kind === "test" && capturedExecution.active) {
+    capturedExecution.needsPostBodyDrain = true;
+  }
   return function guardedTestCallback(...args) {
+    const execution = capturedExecution.kind === "test" && !capturedExecution.active
+      ? currentExecution()
+      : capturedExecution;
     try {
       const result = callback.apply(this, args);
-      if (captureReturnedPromise && result && typeof result.then === "function") promiseThen(result, undefined, execution.failExternal);
+      if (captureReturnedPromise && result && typeof result.then === "function" && execution) {
+        promiseThen(result, undefined, execution.failExternal);
+      }
       return result;
     } catch (error) {
       if (!externalOnThrow) throw error;
-      execution.failExternal(error);
+      if (execution?.failExternal) execution.failExternal(error);
+      else recordUnhandledError(error);
       return undefined;
     }
   };
@@ -261,7 +282,7 @@ function installAsyncFailureGuards() {
     if (typeof callback !== "function") {
       throw new TypeError('The "callback" argument must be of type function.');
     }
-    const guarded = guardAsyncCallback(callback);
+    const guarded = guardAsyncCallback(callback, true, true, true);
     return runnerQueueMicrotask(function runTestMicrotask() {
       globalThis.__cottontailBeforeMicrotask?.();
       return guarded();
@@ -270,7 +291,7 @@ function installAsyncFailureGuards() {
   Object.defineProperty(globalThis.queueMicrotask, "name", { value: "queueMicrotask", configurable: true });
   if (runnerNextTick) {
     globalThis.process.nextTick = function nextTick(callback, ...args) {
-      return runnerNextTick(guardAsyncCallback(callback), ...args);
+      return runnerNextTick(guardAsyncCallback(callback, true, true, true), ...args);
     };
     Object.defineProperty(globalThis.process.nextTick, "name", { value: "nextTick", configurable: true });
   }
@@ -284,9 +305,25 @@ function installAsyncFailureGuards() {
     if (owner && result && typeof result === "object") promiseOwners.set(result, owner);
     return result;
   };
+  globalThis.Promise.reject = function testAwareReject(reason) {
+    const result = runnerPromiseReject(reason);
+    const owner = failureStorage.getStore() ?? currentExecution();
+    if (owner && result && typeof result === "object") {
+      promiseOwners.set(result, owner);
+      if (owner.kind === "test" && owner.active) owner.needsPostBodyDrain = true;
+    }
+    return result;
+  };
+  Object.defineProperty(globalThis.Promise.reject, "name", { value: "reject", configurable: true });
 }
 
 function createSuite(name, options = {}, parent = null) {
+  const filePath = parent?.filePath || String(
+    globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
+  );
+  const directoryPath = parent?.filePath
+    ? parent.directoryPath
+    : String(globalThis.__dirname ?? "");
   return {
     kind: "suite",
     name,
@@ -302,6 +339,10 @@ function createSuite(name, options = {}, parent = null) {
     beforeError: null,
     definitionError: null,
     definitionErrorReported: false,
+    definitionFn: null,
+    definitionState: parent ? "defined" : "root",
+    filePath: parent ? filePath : "",
+    directoryPath,
   };
 }
 
@@ -495,10 +536,18 @@ function invokeHook(hook, context) {
     const target = { kind: "hook", failExternal: recordUnhandledError };
     return failureStorage.run(target, () => {
       let result;
-      if (typeof hook.fn !== "function") result = undefined;
-      else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
-      else result = hook.fn(context);
-      return runnerPromiseResolve(result);
+      try {
+        if (typeof hook.fn !== "function") result = undefined;
+        else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
+        else result = hook.fn(context);
+      } catch (error) {
+        throw annotatePrimitiveError(error, context?.filePath ?? hook.filePath);
+      }
+      return promiseThen(
+        runnerPromiseResolve(result),
+        undefined,
+        (error) => { throw annotatePrimitiveError(error, context?.filePath ?? hook.filePath); },
+      );
     });
   }, hook.options);
 }
@@ -540,17 +589,31 @@ function nodeHasOnly(node) {
 
 function rebuildSelection() {
   selectedRecords.clear();
-  const visit = (suite, branchSelected) => {
-    const onlyChildren = suite.children.filter(nodeHasOnly);
-    const children = onlyChildren.length > 0
+  const visitChildren = (children, branchSelected) => {
+    const onlyChildren = children.filter(nodeHasOnly);
+    const selectedChildren = onlyChildren.length > 0
       ? onlyChildren
-      : branchSelected || !hasOnly ? suite.children : [];
-    for (const child of children) {
+      : branchSelected ? children : [];
+    for (const child of selectedChildren) {
       if (child.kind === "suite") visit(child, branchSelected || Boolean(child.options.only));
       else selectedRecords.add(child);
     }
   };
-  visit(rootSuite, !hasOnly);
+  const visit = (suite, branchSelected) => visitChildren(suite.children, branchSelected || Boolean(suite.options.only));
+
+  if (globalOnlyMode) {
+    visit(rootSuite, !hasOnly);
+  } else {
+    const byFile = new Map();
+    for (const child of rootSuite.children) {
+      const file = child.filePath ?? "";
+      if (!byFile.has(file)) byFile.set(file, []);
+      byFile.get(file).push(child);
+    }
+    for (const children of byFile.values()) {
+      visitChildren(children, !children.some(nodeHasOnly));
+    }
+  }
   selectionDirty = false;
 }
 
@@ -561,6 +624,81 @@ function selectedByOnly(record) {
 
 function recordIsRunnable(record) {
   return !record.ran && selectedByOnly(record) && !inheritedOption(record, "skip") && !inheritedOption(record, "todo");
+}
+
+function hasPendingSuiteDefinitions(suite = rootSuite) {
+  return suite.children.some((child) => child.kind === "suite" && (
+    child.definitionState === "pending" || hasPendingSuiteDefinitions(child)
+  ));
+}
+
+function discardSuiteTests(suite) {
+  for (const child of suite.children) {
+    if (child.kind === "suite") {
+      child.definitionState = child.definitionState === "pending" ? "discarded" : child.definitionState;
+      discardSuiteTests(child);
+      continue;
+    }
+    if (child.ran) continue;
+    child.ran = true;
+    child.status = "filtered";
+    child.resolve?.();
+  }
+}
+
+async function defineDeferredSuite(suite) {
+  if (suite.definitionState !== "pending") return suite.definitionError;
+  suite.definitionState = "running";
+  const previousSuite = currentSuite;
+  const previousFile = globalThis.__filename;
+  const previousDirectory = globalThis.__dirname;
+  const previousRegisteringFile = globalThis.__cottontailRegisteringTestFile;
+  currentSuite = suite;
+  if (suite.filePath) {
+    globalThis.__filename = suite.filePath;
+    globalThis.__cottontailRegisteringTestFile = suite.filePath;
+  }
+  if (suite.directoryPath) globalThis.__dirname = suite.directoryPath;
+  emit("test:suite:start", { name: suite.name });
+  try {
+    let rejectExternal;
+    const failure = new Promise((_, reject) => { rejectExternal = reject; });
+    const target = { kind: "describe", failExternal: rejectExternal };
+    const result = failureStorage.run(
+      target,
+      () => typeof suite.definitionFn === "function" ? suite.definitionFn() : undefined,
+    );
+    await runnerPromiseRace([runnerPromiseResolve(result), failure]);
+    suite.definitionState = "defined";
+  } catch (error) {
+    suite.definitionError = annotatePrimitiveError(error, suite.filePath);
+    suite.definitionState = "failed";
+    suite.definitionErrorReported = true;
+    discardSuiteTests(suite);
+    recordUnhandledError(suite.definitionError);
+  } finally {
+    emit("test:suite:finish", { name: suite.name });
+    currentSuite = previousSuite;
+    if (previousFile === undefined) delete globalThis.__filename;
+    else globalThis.__filename = previousFile;
+    if (previousDirectory === undefined) delete globalThis.__dirname;
+    else globalThis.__dirname = previousDirectory;
+    if (previousRegisteringFile === undefined) delete globalThis.__cottontailRegisteringTestFile;
+    else globalThis.__cottontailRegisteringTestFile = previousRegisteringFile;
+  }
+  if (suite.definitionState === "failed") return suite.definitionError;
+  for (let index = 0; index < suite.children.length; index += 1) {
+    const child = suite.children[index];
+    if (child.kind === "suite") await defineDeferredSuite(child);
+  }
+  return null;
+}
+
+async function defineDeferredSuites() {
+  for (let index = 0; index < rootSuite.children.length; index += 1) {
+    const child = rootSuite.children[index];
+    if (child.kind === "suite") await defineDeferredSuite(child);
+  }
 }
 
 function suiteHasRunnableTest(suite) {
@@ -608,6 +746,25 @@ function recordIsConcurrent(record) {
   return forceConcurrent || Boolean(inheritedOption(record, "concurrent"));
 }
 
+function drainPostBodyTurn(execution) {
+  if (!execution.needsPostBodyDrain) return runnerPromiseResolve();
+  execution.needsPostBodyDrain = false;
+  return new Promise((resolve) => {
+    if (typeof runnerSetImmediate === "function") runnerSetImmediate(resolve);
+    else runnerSetTimeout(resolve, 0);
+  });
+}
+
+function bunAsyncCallbackFailure(record, error) {
+  if (!record.options?.__bunTest || error instanceof Error || error?.code === "ERR_BUN_TEST_CALLBACK_FAILURES") {
+    return error;
+  }
+  const wrapped = new Error(String(error));
+  wrapped.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
+  wrapped.errors = [error];
+  return wrapped;
+}
+
 function reapDanglingProcesses(execution) {
   let killed = Number(execution.danglingKilled ?? 0);
   for (const proc of execution.subprocesses ?? []) {
@@ -631,12 +788,17 @@ async function executeAttempt(record) {
     active: true,
     record,
     afterBodyHooks: [],
+    afterEachHooks: [],
     finishHooks: [],
   };
   return executionStorage.run(execution, async () => {
     activeExecution = execution;
     const externalFailure = new Promise((_, reject) => {
-      execution.failExternal = reject;
+      execution.failExternal = (error) => {
+        const normalized = bunAsyncCallbackFailure(record, error);
+        (execution.externalErrors ??= []).push(normalized);
+        reject(normalized);
+      };
     });
 
     const chain = suiteChain(record.suite);
@@ -655,8 +817,10 @@ async function executeAttempt(record) {
       if (!setupError) {
         try {
           await runnerPromiseRace([invokeTestCallback(record, context), externalFailure]);
+          await drainPostBodyTurn(execution);
+          if (execution.externalErrors?.length) throw execution.externalErrors[0];
         } catch (error) {
-          bodyError = error;
+          bodyError = annotatePrimitiveError(error, record.filePath);
         }
         // Like bun, a timed-out test kills subprocesses it left running.
         if (bodyError?.code === "ERR_TEST_TIMEOUT") reapDanglingProcesses(execution);
@@ -665,6 +829,8 @@ async function executeAttempt(record) {
       if (!beforeAllError) {
         const afterBodyError = await runHookList(execution.afterBodyHooks, context);
         cleanupError ??= afterBodyError;
+        const dynamicAfterEachError = await runHookList(execution.afterEachHooks, context);
+        cleanupError ??= dynamicAfterEachError;
         for (const suite of Array.from(chain).reverse()) {
           const afterEachError = await runHookList(suite.afterEachHooks, context, true);
           cleanupError ??= afterEachError;
@@ -678,7 +844,7 @@ async function executeAttempt(record) {
     }
 
     if (record.options.failing && !setupError) {
-      if (bodyError && bodyError.code !== "ERR_TEST_TIMEOUT") bodyError = null;
+      if (bodyError && bodyError.code !== "ERR_TEST_TIMEOUT" && bodyError.code !== "ERR_BUN_EXPECT_ASSERTIONS") bodyError = null;
       else if (!bodyError) bodyError = failingTestPassedError();
     }
     return setupError ?? bodyError ?? cleanupError;
@@ -695,6 +861,7 @@ function attemptCount(record) {
 async function execute(record) {
   if (record.ran) return record.result;
   record.ran = true;
+  record.reportOrder = nextReportOrder++;
   globalThis.__cottontailBeginNextTickTurn?.();
   if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:start ${record.name}`);
   emit("test:start", { name: record.name });
@@ -780,7 +947,12 @@ async function execute(record) {
 }
 
 function recordHookFailure(name, error, isRunnerError = false) {
-  const record = { name, status: isRunnerError ? "error" : "fail", suite: currentSuite };
+  const record = {
+    name,
+    status: isRunnerError ? "error" : "fail",
+    suite: currentSuite,
+    reportOrder: nextReportOrder++,
+  };
   if (isRunnerError) runnerErrors += 1;
   else failedTests += 1;
   failures.push({ record, error });
@@ -794,6 +966,7 @@ function recordUnhandledError(error) {
     status: "error",
     suite: rootSuite,
     unhandledBetweenTests: true,
+    reportOrder: nextReportOrder++,
   };
   runnerErrors += 1;
   failures.push({ record, error });
@@ -812,13 +985,13 @@ function settlesBeforeNextTurn(promise) {
     let remainingMicrotasks = 32;
     const check = () => {
       if (settled) return;
-      if (remainingMicrotasks-- > 0) queueMicrotask(check);
+      if (remainingMicrotasks-- > 0) runnerQueueMicrotask(check);
       else {
         settled = true;
         resolve(false);
       }
     };
-    queueMicrotask(check);
+    runnerQueueMicrotask(check);
   });
 }
 
@@ -892,6 +1065,26 @@ function hasPendingTests() {
 
 function formatFailure(error) {
   return String(error?.message ?? error ?? "Test failed");
+}
+
+function annotatePrimitiveError(error, filePath) {
+  if (error instanceof Error || !filePath) return error;
+  const message = String(error);
+  const sourceLines = sourceLinesFor(filePath);
+  if (!sourceLines) return error;
+  let lineNumber = -1;
+  let column = 1;
+  for (let index = 0; index < sourceLines.length; index += 1) {
+    const messageIndex = sourceLines[index].indexOf(message);
+    if (messageIndex < 0 || !sourceLines[index].includes("throw")) continue;
+    lineNumber = index + 1;
+    column = Math.max(1, messageIndex);
+    break;
+  }
+  if (lineNumber < 0) return error;
+  const wrapped = new Error(message);
+  wrapped.stack = `Error: ${message}\n<anonymous>@${filePath}:${lineNumber}:${column}`;
+  return wrapped;
 }
 
 const sourceLineCache = new Map();
@@ -977,12 +1170,31 @@ function appendSourceFrame(lines, frame) {
 }
 
 function appendErrorDiagnostic(lines, error) {
-  const frames = failureStackFrames(error);
+  if (error?.code === "ERR_BUN_TEST_CALLBACK_FAILURES" && Array.isArray(error.errors)) {
+    for (const item of error.errors) {
+      appendErrorDiagnostic(lines, item);
+      if (!(item instanceof Error)) lines.push(String(item));
+    }
+    return;
+  }
+  if (error?.code === "ERR_BUN_EXPECT_ASSERTIONS") {
+    lines.push(`AssertionError: ${formatFailure(error)}`);
+    return;
+  }
+  let frames = failureStackFrames(error);
+  if (error?.__cottontailBunExpectation && error.__cottontailBunCallSite) {
+    frames = [error.__cottontailBunCallSite];
+  }
   if (frames.length > 0) appendSourceFrame(lines, frames[0]);
   lines.push(`error: ${formatFailure(error)}`);
   for (const frame of frames.slice(0, 5)) {
     const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
-    lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+    if (error?.__cottontailBunExpectation) {
+      if (!formatFailure(error).endsWith("\n")) lines.push("");
+      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+    } else {
+      lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+    }
   }
 }
 
@@ -998,6 +1210,26 @@ function fullTestName(record) {
 globalThis.__cottontailCurrentTestName = () => {
   const execution = executionStorage.getStore?.();
   return execution?.record ? fullTestName(execution.record) : "";
+};
+
+globalThis.__cottontailCurrentTestToken = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  return execution?.record;
+};
+
+globalThis.__cottontailCurrentTestFile = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  return execution?.record?.filePath ?? "";
+};
+
+globalThis.__cottontailCurrentTestIsConcurrent = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  return Boolean(execution?.record && recordIsConcurrent(execution.record));
+};
+
+globalThis.__cottontailCurrentTestHasOwnConcurrency = () => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  return Boolean(execution?.record?.options?.concurrent);
 };
 
 // Registers a promise the currently-running test must wait for before it can
@@ -1046,6 +1278,7 @@ function appendFailure(lines, record, error) {
     lines.push("-------------------------------");
     appendErrorDiagnostic(lines, error);
     lines.push("-------------------------------");
+    lines.push("");
     return;
   }
   const name = fullTestName(record);
@@ -1058,11 +1291,28 @@ function appendFailure(lines, record, error) {
     // Match `bun test` output for timeouts (no leading "error:" line).
     const duration = error.duration ?? timeoutFor(record.options ?? {});
     lines.push(`(fail) ${name}`);
-    lines.push(`  ^ this test timed out after ${duration}ms.`);
+    lines.push(record.options?.__bunUsesDoneCallback
+      ? `  ^ this test timed out after ${duration}ms, before its done callback was called. ` +
+        "If a done callback was not intended, remove the last parameter from the test callback function"
+      : `  ^ this test timed out after ${duration}ms.`);
     return;
   }
   appendErrorDiagnostic(lines, error);
   lines.push(`(fail) ${name}`);
+}
+
+function appendFailureSummary(lines, view) {
+  const name = fullTestName(view.record);
+  lines.push(`(fail) ${name}`);
+  if (view.error?.code === "ERR_TEST_FAILING_PASSED") {
+    lines.push(`  ^ ${formatFailure(view.error)}`);
+  } else if (view.error?.code === "ERR_TEST_TIMEOUT") {
+    const duration = view.error.duration ?? timeoutFor(view.record.options ?? {});
+    lines.push(view.record.options?.__bunUsesDoneCallback
+      ? `  ^ this test timed out after ${duration}ms, before its done callback was called. ` +
+        "If a done callback was not intended, remove the last parameter from the test callback function"
+      : `  ^ this test timed out after ${duration}ms.`);
+  }
 }
 
 function emitDotsRecord(record, error = record?.error) {
@@ -1073,7 +1323,7 @@ function emitDotsRecord(record, error = record?.error) {
     dotsLineHasMarkers = true;
     return;
   }
-  prepareDotsDetail();
+  prepareDotsDetail(record.filePath);
   const lines = [];
   appendFailure(lines, record, error);
   dotsWrite(`${lines.join("\n")}\n`);
@@ -1082,6 +1332,7 @@ function emitDotsRecord(record, error = record?.error) {
 function snapshotRecordView(record) {
   return {
     record,
+    reportOrder: record.reportOrder,
     status: record.status,
     error: record.error,
     todoError: record.todoError,
@@ -1090,9 +1341,22 @@ function snapshotRecordView(record) {
   };
 }
 
-function appendRunRecords(lines, views) {
+function appendRunRecords(lines, views, extraFailures = []) {
   const suppressPassing = onlyFailures || agentQuietMode;
-  for (const view of views) {
+  const entries = [
+    ...views.map((view) => ({ kind: "view", order: view.reportOrder ?? Infinity, view })),
+    ...extraFailures.map((failure) => ({
+      kind: "failure",
+      order: failure.record.reportOrder ?? Infinity,
+      failure,
+    })),
+  ].sort((left, right) => left.order - right.order);
+  for (const entry of entries) {
+    if (entry.kind === "failure") {
+      appendFailure(lines, entry.failure.record, entry.failure.error);
+      continue;
+    }
+    const view = entry.view;
     if (view.status === "pass") {
       // Failed retry attempts print their errors even though the test passed.
       for (const attemptError of view.attemptErrors ?? []) {
@@ -1131,13 +1395,14 @@ function reportResults() {
     runs.forEach((views, index) => {
       if (index > 0) lines.push("");
       lines.push(runs.length > 1 ? `${file}: (run #${index + 1})` : `${file}:`);
-      appendRunRecords(lines, views);
+      const extraFailures = index === runs.length - 1
+        ? failures.filter(({ record }) => !tests.includes(record))
+        : [];
+      appendRunRecords(lines, views, extraFailures);
     });
-    for (const { record, error } of failures) {
-      if (!tests.includes(record)) appendFailure(lines, record, error);
-    }
   }
   const assertionCount = Number(globalThis.__cottontailTestAssertionCount ?? 0);
+  const snapshotCount = Number(globalThis.__cottontailTestSnapshotCount ?? 0);
   const aggregateFile = globalThis.process?.env?.COTTONTAIL_TEST_AGGREGATE_FILE;
   if (aggregateFile) {
     appendFileSync(
@@ -1155,20 +1420,51 @@ function reportResults() {
     summary.push(`${failedTests} fail`);
     if (runnerErrors > 0) summary.push(`${runnerErrors} error`);
     const total = passedTests + skippedTests + todoTests + failedTests;
-    summary.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across 1 file.`);
+    summary.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.`);
     dotsWrite(`\n\n${summary.join("\n")}\n`);
     dotsLineHasMarkers = false;
     return;
   }
+  const orderedViews = [...currentViews].sort((left, right) =>
+    (left.reportOrder ?? Infinity) - (right.reportOrder ?? Infinity),
+  );
+  const statusSections = passedTests > 20 ? [
+    {
+      name: "skipped",
+      views: orderedViews.filter((view) => view.status === "skip"),
+      append(view) { lines.push(`(skip) ${fullTestName(view.record)}`); },
+    },
+    {
+      name: "todo",
+      views: orderedViews.filter((view) => view.status === "todo"),
+      append(view) { lines.push(`(todo) ${fullTestName(view.record)}`); },
+    },
+    {
+      name: "failed",
+      views: orderedViews.filter((view) => view.status === "fail"),
+      append(view) { appendFailureSummary(lines, view); },
+    },
+  ].filter((section) => section.views.length > 0) : [];
+  statusSections.forEach((section, index) => {
+    lines.push("");
+    if (index > 0) lines.push("");
+    const count = section.views.length;
+    lines.push(`${count} test${count === 1 ? "" : "s"} ${section.name}:`);
+    for (const view of section.views) section.append(view);
+  });
   lines.push("");
   lines.push(` ${passedTests} pass`);
   if (skippedTests > 0) lines.push(` ${skippedTests} skip`);
   if (todoTests > 0) lines.push(` ${todoTests} todo`);
   lines.push(` ${failedTests} fail`);
   if (runnerErrors > 0) lines.push(` ${runnerErrors} error`);
-  if (assertionCount > 0) lines.push(` ${assertionCount} expect() calls`);
+  if (snapshotCount > 0) {
+    lines.push(` ${snapshotCount} snapshot${snapshotCount === 1 ? "" : "s"}, ${assertionCount} expect() calls`);
+  } else if (assertionCount > 0) {
+    lines.push(` ${assertionCount} expect() calls`);
+  }
   const total = passedTests + skippedTests + todoTests + failedTests;
-  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across 1 file.`);
+  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.`);
   console.error(lines.join("\n"));
 }
 
@@ -1183,6 +1479,11 @@ async function finalizeRun(exitOnFailure = true) {
       rootSuite.afterRan = true;
       const error = await runHookList(rootSuite.afterHooks, new TestContext({ name: rootSuite.name }), true);
       if (error) recordHookFailure(rootSuite.name, error);
+    }
+    try {
+      await globalThis.__cottontailFlushSnapshots?.();
+    } catch (error) {
+      recordHookFailure("snapshot writer", error);
     }
     reportResults();
     if (exitOnFailure && (failedTests > 0 || runnerErrors > 0)) {
@@ -1209,6 +1510,7 @@ function scheduleAfterHooks() {
 }
 
 function resetForRerun() {
+  nextReportOrder = 0;
   for (const record of tests) {
     record.ran = false;
     record.status = null;
@@ -1216,6 +1518,7 @@ function resetForRerun() {
     record.todoError = null;
     record.attempts = undefined;
     record.attemptErrors = undefined;
+    record.reportOrder = undefined;
   }
   const resetSuite = (suite) => {
     suite.beforeRan = false;
@@ -1229,7 +1532,8 @@ function resetForRerun() {
 }
 
 function scheduleRun() {
-  if (tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite)) return;
+  if (tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite) &&
+      !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.()) return;
   installUncaughtCapture();
   installAsyncFailureGuards();
   if (globalThis.__cottontailLoadingTestModules) return;
@@ -1254,6 +1558,7 @@ function scheduleRun() {
           globalThis.__cottontailBunTestHeaderPrinted = true;
           console.log(`bun test ${globalThis.Bun?.version_with_sha ?? "0.0.0-cottontail (cottontail)"}`);
         }
+        await defineDeferredSuites();
         const concurrentGroup = [];
         await executeSuite(rootSuite, concurrentGroup);
         await flushConcurrent(concurrentGroup);
@@ -1305,7 +1610,7 @@ function makeTestFunction(defaultOptions = {}) {
       options: validateTestOptions({ ...defaultOptions, ...parsed.options }),
       fn: parsed.fn,
       suite: currentSuite,
-      filePath: String(globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
+      filePath: String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
       ran: false,
       result: null,
     };
@@ -1338,6 +1643,12 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   parent.children.push(child);
   if (suiteOptions.only) hasOnly = true;
   selectionDirty = true;
+  if (suiteOptions.__bunDeferredDefinition) {
+    child.definitionFn = parsed.fn;
+    child.definitionState = "pending";
+    scheduleRun();
+    return undefined;
+  }
   emit("test:suite:start", { name: parsed.name });
   currentSuite = child;
   try {
@@ -1394,12 +1705,17 @@ export function after(fn, options = {}) {
 }
 
 export function beforeEach(fn, options = {}) {
+  if (currentExecution()) {
+    throw new Error("Cannot call beforeEach() inside a test. Call it inside describe() instead.");
+  }
   currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   scheduleRun();
 }
 
 export function afterEach(fn, options = {}) {
-  currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  const execution = currentExecution();
+  if (execution) execution.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+  else currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   scheduleRun();
 }
 

@@ -160,6 +160,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DSQLITE_ENABLE_FTS5",
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+            "-DSQLITE_ENABLE_UPDATE_DELETE_LIMIT",
             "-DSQLITE_THREADSAFE=1",
         },
     });
@@ -191,12 +192,14 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             step.root_module.linkSystemLibrary("objc", .{});
             step.root_module.linkFramework("Foundation", .{});
             step.root_module.linkSystemLibrary("ffi", .{});
-            step.root_module.linkSystemLibrary("compression", .{});
             step.root_module.linkSystemLibrary("pthread", .{});
             step.root_module.linkSystemLibrary("resolv", .{});
             step.root_module.linkSystemLibrary("z", .{});
             step.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
             step.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+            inline for (&.{ "brotlicommon", "brotlidec", "brotlienc" }) |library| {
+                step.root_module.linkSystemLibrary(library, .{ .preferred_link_mode = .static });
+            }
             step.root_module.linkSystemLibrary("ssl", .{ .preferred_link_mode = .static });
             step.root_module.linkSystemLibrary("crypto", .{ .preferred_link_mode = .static });
         },

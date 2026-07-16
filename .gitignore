@@ -26,3 +26,5 @@ compat/upstream/bun/*/app.exe
 compat/upstream/bun/*/a.txt
 compat/upstream/bun/*/b.txt
 compat/upstream/bun/*/append_output.txt
+compat/upstream/bun/*/report.json
+compat/upstream/bun/*/undefined

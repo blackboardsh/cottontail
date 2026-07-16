@@ -43,7 +43,7 @@ jobs:
       - run:
           name: Install build dependencies
           command: |
-            brew install node@24 libffi
+            brew install node@24 libffi brotli
             brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"

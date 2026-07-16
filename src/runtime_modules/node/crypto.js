@@ -3977,6 +3977,37 @@ const webcryptoNamedCurves = {
 const webcryptoEcCurveNames = Object.fromEntries(Object.entries(webcryptoNamedCurves).map(([web, node]) => [node, web]));
 const webcryptoRsaAlgorithms = ["RSA-PSS", "RSASSA-PKCS1-V1_5", "RSA-OAEP"];
 const webcryptoOkpAlgorithms = ["Ed25519", "Ed448", "X25519", "X448"];
+const webcryptoOkpCanonicalNames = Object.fromEntries(webcryptoOkpAlgorithms.map((name) => [name.toUpperCase(), name]));
+const webcryptoKeyUsageNames = new Set([
+  "encrypt",
+  "decrypt",
+  "sign",
+  "verify",
+  "deriveKey",
+  "deriveBits",
+  "wrapKey",
+  "unwrapKey",
+]);
+const webcryptoGenerateKeyUsageRules = {
+  "AES-CTR": { allowed: ["encrypt", "decrypt", "wrapKey", "unwrapKey"], secret: true },
+  "AES-CBC": { allowed: ["encrypt", "decrypt", "wrapKey", "unwrapKey"], secret: true },
+  "AES-GCM": { allowed: ["encrypt", "decrypt", "wrapKey", "unwrapKey"], secret: true },
+  "AES-KW": { allowed: ["wrapKey", "unwrapKey"], secret: true },
+  HMAC: { allowed: ["sign", "verify"], secret: true },
+  "RSASSA-PKCS1-V1_5": { allowed: ["sign", "verify"], public: ["verify"], private: ["sign"] },
+  "RSA-PSS": { allowed: ["sign", "verify"], public: ["verify"], private: ["sign"] },
+  "RSA-OAEP": {
+    allowed: ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+    public: ["encrypt", "wrapKey"],
+    private: ["decrypt", "unwrapKey"],
+  },
+  ECDSA: { allowed: ["sign", "verify"], public: ["verify"], private: ["sign"] },
+  ECDH: { allowed: ["deriveKey", "deriveBits"], public: [], private: ["deriveKey", "deriveBits"] },
+  ED25519: { allowed: ["sign", "verify"], public: ["verify"], private: ["sign"] },
+  ED448: { allowed: ["sign", "verify"], public: ["verify"], private: ["sign"] },
+  X25519: { allowed: ["deriveKey", "deriveBits"], public: [], private: ["deriveKey", "deriveBits"] },
+  X448: { allowed: ["deriveKey", "deriveBits"], public: [], private: ["deriveKey", "deriveBits"] },
+};
 
 function webcryptoCanonicalRsaAlgorithmName(name) {
   return name === "RSASSA-PKCS1-V1_5" ? "RSASSA-PKCS1-v1_5" : name;
@@ -4012,7 +4043,7 @@ function webcryptoEcNamedCurveFromKey(keyObject) {
 }
 
 function webcryptoUsageList(usages = []) {
-  return Array.from(usages ?? [], (usage) => String(usage));
+  return [...new Set(Array.from(usages ?? [], (usage) => String(usage)))];
 }
 
 export class CryptoKey {
@@ -4045,7 +4076,7 @@ function webcryptoKeyObject(type, algorithm, extractable, usages, keyObject) {
 
 function webcryptoKeyObjectUsages(algorithmName, type, usages) {
   const requested = webcryptoUsageList(usages);
-  if (requested.length > 0) return requested;
+  if (usages !== undefined) return requested;
   if (algorithmName === "ECDH" || algorithmName === "X25519" || algorithmName === "X448") {
     return type === "private" ? ["deriveBits", "deriveKey"] : [];
   }
@@ -4075,14 +4106,6 @@ function webcryptoAlgorithmForKeyObject(algorithmName, keyObject, hash = undefin
   if (keyObject.asymmetricKeyType === "ed25519") return { name: "Ed25519" };
   if (rawKeyInfo[keyObject.asymmetricKeyType]) return { name: rawKeyInfo[keyObject.asymmetricKeyType].crv };
   return { name: algorithmName };
-}
-
-function webcryptoPublicExponent(value = new Uint8Array([1, 0, 1])) {
-  const bytes = bytesFromData(value);
-  if (bytes.byteLength === 0) return 65537;
-  let exponent = 0;
-  for (const byte of bytes) exponent = exponent * 256 + byte;
-  return exponent;
 }
 
 function webcryptoAesName(algorithm) {
@@ -4167,6 +4190,113 @@ function webcryptoDomException(message, name = "OperationError") {
   const error = new Error(message);
   error.name = name;
   return error;
+}
+
+function webcryptoRequiredGenerateKeyProperty(parameters, name) {
+  const value = parameters?.[name];
+  if (value === undefined) throw new TypeError(`${name} is required`);
+  return value;
+}
+
+function webcryptoGenerateKeyHash(hash) {
+  const name = typeof hash === "string" ? hash : hash?.name;
+  if (name === undefined) throw new TypeError("hash.name is required");
+  const canonical = String(name).toUpperCase();
+  if (!webcryptoHashNames[canonical]) {
+    throw webcryptoDomException(`Unsupported WebCrypto hash: ${name}`, "NotSupportedError");
+  }
+  return canonical;
+}
+
+function webcryptoGenerateKeyUsages(usages) {
+  if (usages == null || typeof usages[Symbol.iterator] !== "function") {
+    throw new TypeError("keyUsages must be a sequence");
+  }
+  const result = [];
+  const seen = new Set();
+  for (const value of usages) {
+    const usage = String(value);
+    if (!webcryptoKeyUsageNames.has(usage)) throw new TypeError(`${usage} is not a valid key usage`);
+    if (!seen.has(usage)) {
+      seen.add(usage);
+      result.push(usage);
+    }
+  }
+  return result;
+}
+
+function webcryptoNormalizeGenerateKeyAlgorithm(algorithm) {
+  const parameters = algorithm != null && typeof algorithm === "object" ? algorithm : { name: algorithm };
+  const rawName = parameters.name;
+  if (rawName === undefined) throw new TypeError("algorithm.name is required");
+  const name = String(rawName).toUpperCase();
+
+  if (name === "AES-CTR" || name === "AES-CBC" || name === "AES-GCM" || name === "AES-KW") {
+    const length = Number(webcryptoRequiredGenerateKeyProperty(parameters, "length"));
+    if (!Number.isInteger(length)) throw new TypeError("length must be an integer");
+    if (length !== 128 && length !== 192 && length !== 256) {
+      throw webcryptoDomException("AES key length must be 128, 192, or 256 bits", "OperationError");
+    }
+    return { name, length };
+  }
+
+  if (name === "HMAC") {
+    const hash = webcryptoGenerateKeyHash(webcryptoRequiredGenerateKeyProperty(parameters, "hash"));
+    const defaultLength = hash === "SHA-384" || hash === "SHA-512" ? 1024 : 512;
+    const length = parameters.length === undefined ? defaultLength : Number(parameters.length);
+    if (!Number.isInteger(length) || length < 0) throw new TypeError("length must be a non-negative integer");
+    if (length === 0) throw webcryptoDomException("HMAC key length must be greater than zero", "OperationError");
+    if (length % 8 !== 0) {
+      throw webcryptoDomException("HMAC key length must be a multiple of 8 bits", "OperationError");
+    }
+    return { name, hash, length };
+  }
+
+  if (webcryptoRsaAlgorithms.includes(name)) {
+    const hash = webcryptoGenerateKeyHash(webcryptoRequiredGenerateKeyProperty(parameters, "hash"));
+    const modulusLength = Number(webcryptoRequiredGenerateKeyProperty(parameters, "modulusLength"));
+    if (!Number.isInteger(modulusLength) || modulusLength < 0) {
+      throw new TypeError("modulusLength must be a non-negative integer");
+    }
+    const exponentData = webcryptoRequiredGenerateKeyProperty(parameters, "publicExponent");
+    if (!(exponentData instanceof ArrayBuffer) && !ArrayBuffer.isView(exponentData)) {
+      throw new TypeError("publicExponent must be a BufferSource");
+    }
+    const publicExponent = bigintFromBytes(bytesFromData(exponentData));
+    if (modulusLength < 512 || publicExponent < 3n || (publicExponent & 1n) === 0n) {
+      throw webcryptoDomException("Invalid RSA key generation parameters", "OperationError");
+    }
+    return { name, hash, modulusLength, publicExponent };
+  }
+
+  if (name === "ECDSA" || name === "ECDH") {
+    const namedCurve = String(webcryptoRequiredGenerateKeyProperty(parameters, "namedCurve"));
+    const nodeCurve = webcryptoNamedCurves[namedCurve];
+    if (!nodeCurve) throw webcryptoDomException(`Unsupported namedCurve: ${namedCurve}`, "NotSupportedError");
+    return { name, namedCurve, nodeCurve };
+  }
+
+  const okpName = webcryptoOkpCanonicalNames[name];
+  if (okpName) return { name, okpName };
+  throw webcryptoDomException(`Unsupported WebCrypto generateKey algorithm: ${rawName}`, "NotSupportedError");
+}
+
+function webcryptoValidateGenerateKeyUsages(algorithmName, usages) {
+  const rule = webcryptoGenerateKeyUsageRules[algorithmName];
+  if (usages.some((usage) => !rule.allowed.includes(usage))) {
+    throw webcryptoDomException(`Unsupported key usage for ${algorithmName}`, "SyntaxError");
+  }
+  const hasPrivateOrSecretUsage = rule.secret
+    ? usages.length > 0
+    : rule.private.some((usage) => usages.includes(usage));
+  if (!hasPrivateOrSecretUsage) {
+    throw webcryptoDomException("Usages cannot be empty when creating a key", "SyntaxError");
+  }
+  return rule;
+}
+
+function webcryptoPartitionKeyUsages(allowed, requested) {
+  return allowed.filter((usage) => requested.includes(usage));
 }
 
 const rsaPssAlgorithmIdentifierOid = new Uint8Array([
@@ -4360,50 +4490,103 @@ const subtleCrypto = {
   },
 
   async generateKey(algorithm, extractable, keyUsages) {
-    const name = webcryptoAlgorithmName(algorithm);
-    if (webcryptoAesName(algorithm)) {
-      const length = positiveInteger(algorithm.length, "length");
-      if (length !== 128 && length !== 192 && length !== 256) throw new RangeError("AES key length must be 128, 192, or 256 bits");
-      return webcryptoSecretKey({ name: webcryptoAesName(algorithm), length }, randomBytes(length / 8), extractable, keyUsages);
+    const normalized = webcryptoNormalizeGenerateKeyAlgorithm(algorithm);
+    const usages = webcryptoGenerateKeyUsages(keyUsages);
+    const usageRule = webcryptoValidateGenerateKeyUsages(normalized.name, usages);
+
+    if (normalized.name.startsWith("AES-")) {
+      return webcryptoSecretKey(
+        { name: normalized.name, length: normalized.length },
+        randomBytes(normalized.length / 8),
+        extractable,
+        usages,
+      );
     }
-    if (name === "HMAC") {
-      const hash = webcryptoHashAlgorithm(algorithm.hash ?? "SHA-256");
-      const length = positiveInteger(algorithm.length ?? ((hash === "SHA-384" || hash === "SHA-512") ? 1024 : 512), "length");
-      return webcryptoSecretKey({ name: "HMAC", length, hash: { name: hash } }, randomBytes(Math.ceil(length / 8)), extractable, keyUsages);
+    if (normalized.name === "HMAC") {
+      return webcryptoSecretKey(
+        { name: "HMAC", length: normalized.length, hash: { name: normalized.hash } },
+        randomBytes(Math.ceil(normalized.length / 8)),
+        extractable,
+        usages,
+      );
     }
-    if (name === "ECDSA" || name === "ECDH") {
-      const namedCurve = String(algorithm.namedCurve);
-      const pair = generateKeyPairSync("ec", { namedCurve: webcryptoEcNodeCurve(namedCurve) });
+    if (normalized.name === "ECDSA" || normalized.name === "ECDH") {
+      let pair;
+      try {
+        pair = generateKeyPairSync("ec", { namedCurve: normalized.nodeCurve });
+      } catch (error) {
+        throw webcryptoDomException(error?.message ?? "EC key generation failed", "OperationError");
+      }
+      const keyAlgorithm = { name: normalized.name, namedCurve: normalized.namedCurve };
       return {
-        publicKey: webcryptoKeyFromKeyObject(pair.publicKey, { name, namedCurve }, true, name === "ECDH" ? [] : ["verify"]),
-        privateKey: webcryptoKeyFromKeyObject(pair.privateKey, { name, namedCurve }, extractable, keyUsages?.length ? keyUsages : (name === "ECDH" ? ["deriveBits", "deriveKey"] : ["sign"])),
+        publicKey: webcryptoKeyFromKeyObject(
+          pair.publicKey,
+          keyAlgorithm,
+          true,
+          webcryptoPartitionKeyUsages(usageRule.public, usages),
+        ),
+        privateKey: webcryptoKeyFromKeyObject(
+          pair.privateKey,
+          keyAlgorithm,
+          extractable,
+          webcryptoPartitionKeyUsages(usageRule.private, usages),
+        ),
       };
     }
-    if (webcryptoRsaAlgorithms.includes(name)) {
-      const hash = webcryptoHashAlgorithm(algorithm.hash ?? "SHA-256");
-      const modulusLength = positiveInteger(algorithm.modulusLength, "modulusLength");
-      const publicExponent = bytesFromBigint(BigInt(webcryptoPublicExponent(algorithm.publicExponent)));
-      const pair = generateKeyPairSync("rsa", { modulusLength, publicExponent: webcryptoPublicExponent(algorithm.publicExponent) });
-      const keyAlgorithm = { name: webcryptoCanonicalRsaAlgorithmName(name), modulusLength, publicExponent, hash: { name: hash } };
-      const publicUsages = name === "RSA-OAEP" ? ["encrypt", "wrapKey"] : ["verify"];
-      const privateUsages = name === "RSA-OAEP" ? ["decrypt", "unwrapKey"] : ["sign"];
+    if (webcryptoRsaAlgorithms.includes(normalized.name)) {
+      let pair;
+      try {
+        pair = generateKeyPairSync("rsa", {
+          modulusLength: normalized.modulusLength,
+          publicExponent: normalized.publicExponent,
+        });
+      } catch (error) {
+        throw webcryptoDomException(error?.message ?? "RSA key generation failed", "OperationError");
+      }
+      const keyAlgorithm = {
+        name: webcryptoCanonicalRsaAlgorithmName(normalized.name),
+        modulusLength: normalized.modulusLength,
+        publicExponent: bytesFromBigint(normalized.publicExponent),
+        hash: { name: normalized.hash },
+      };
       return {
-        publicKey: webcryptoKeyFromKeyObject(pair.publicKey, keyAlgorithm, true, publicUsages.filter((usage) => (keyUsages ?? publicUsages).includes(usage))),
-        privateKey: webcryptoKeyFromKeyObject(pair.privateKey, keyAlgorithm, extractable, privateUsages.filter((usage) => (keyUsages ?? privateUsages).includes(usage))),
+        publicKey: webcryptoKeyFromKeyObject(
+          pair.publicKey,
+          keyAlgorithm,
+          true,
+          webcryptoPartitionKeyUsages(usageRule.public, usages),
+        ),
+        privateKey: webcryptoKeyFromKeyObject(
+          pair.privateKey,
+          keyAlgorithm,
+          extractable,
+          webcryptoPartitionKeyUsages(usageRule.private, usages),
+        ),
       };
     }
-    if (webcryptoOkpAlgorithms.includes(String(typeof algorithm === "string" ? algorithm : algorithm.name))) {
-      const type = String(typeof algorithm === "string" ? algorithm : algorithm.name).toLowerCase();
-      const pair = generateKeyPairSync(type);
-      const keyAlgorithm = { name: rawKeyInfo[type]?.crv ?? "Ed25519" };
-      const publicUsages = rawKeyInfo[type]?.dh ? [] : ["verify"];
-      const privateUsages = rawKeyInfo[type]?.dh ? ["deriveBits", "deriveKey"] : ["sign"];
-      return {
-        publicKey: webcryptoKeyFromKeyObject(pair.publicKey, keyAlgorithm, true, publicUsages),
-        privateKey: webcryptoKeyFromKeyObject(pair.privateKey, keyAlgorithm, extractable, keyUsages?.length ? keyUsages : privateUsages),
-      };
+
+    const type = normalized.okpName.toLowerCase();
+    let pair;
+    try {
+      pair = generateKeyPairSync(type);
+    } catch (error) {
+      throw webcryptoDomException(error?.message ?? `${normalized.okpName} key generation failed`, "OperationError");
     }
-    throw new TypeError(`Invalid WebCrypto generateKey algorithm: ${name}`);
+    const keyAlgorithm = { name: normalized.okpName };
+    return {
+      publicKey: webcryptoKeyFromKeyObject(
+        pair.publicKey,
+        keyAlgorithm,
+        true,
+        webcryptoPartitionKeyUsages(usageRule.public, usages),
+      ),
+      privateKey: webcryptoKeyFromKeyObject(
+        pair.privateKey,
+        keyAlgorithm,
+        extractable,
+        webcryptoPartitionKeyUsages(usageRule.private, usages),
+      ),
+    };
   },
 
   async importKey(format, keyData, algorithm, extractable, keyUsages) {
