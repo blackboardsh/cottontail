@@ -15,13 +15,33 @@ const disabledStatuses = new Set(['disabled', 'skip']);
 const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_MS ?? 30000);
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
 const activeChildren = new Set();
+const snapshotArtifactRoots = new Map();
+const bunSnapshotArtifactNames = new Set(['app', 'app.exe', 'a.txt', 'b.txt', 'append_output.txt']);
 
 function removeTemp(path) {
   if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') return;
   try { rmSync(path, { recursive: true, force: true }); } catch {}
 }
 
+function removeSnapshotArtifacts(snapshotRoot, runtime) {
+  try {
+    for (const name of readdirSync(snapshotRoot)) {
+      const generated = name.startsWith('.cottontail-eval-') ||
+        name.startsWith('fstest') ||
+        (runtime === 'bun' && bunSnapshotArtifactNames.has(name));
+      if (generated) rmSync(join(snapshotRoot, name), { recursive: true, force: true });
+    }
+  } catch {}
+}
+
+function removeAllSnapshotArtifacts() {
+  for (const [snapshotRoot, runtime] of snapshotArtifactRoots) {
+    removeSnapshotArtifacts(snapshotRoot, runtime);
+  }
+}
+
 process.on('exit', () => {
+  removeAllSnapshotArtifacts();
   if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') {
     console.error(`kept upstream temp root: ${tempRoot}`);
     return;
@@ -32,6 +52,7 @@ process.on('exit', () => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     for (const child of activeChildren) killProcessTree(child);
+    removeAllSnapshotArtifacts();
     removeTemp(tempRoot);
     process.exit(signal === 'SIGINT' ? 130 : 143);
   });
@@ -275,6 +296,7 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
 function makeEnv(runtime, target, runTemp = tempRoot) {
   return {
     ...process.env,
+    ...(runtime === 'bun' ? { TZ: process.env.COTTONTAIL_UPSTREAM_TZ ?? 'Etc/UTC' } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
     COTTONTAIL_UPSTREAM_RUNTIME: runtime,
     COTTONTAIL_UPSTREAM_VERSION: target.version,
@@ -601,6 +623,8 @@ for (const name of runtimeTargets(runtime, targets)) {
   const target = targets[name];
   if (!target) fail(`Missing upstream target: ${name}`);
   const snapshotRoot = resolve(rootDir, target.snapshot);
+  snapshotArtifactRoots.set(snapshotRoot, name);
+  removeSnapshotArtifacts(snapshotRoot, name);
   const statusPath = join(snapshotRoot, 'status.json');
   const status = readJson(statusPath);
   const counts = statusCounts(snapshotRoot, status, name);

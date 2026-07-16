@@ -16,12 +16,17 @@ import { resolve as nodePathResolve } from "../node/path.js";
 import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
+import { _patchAsyncContextGlobals, _wrapAsyncCallback } from "../node/async_hooks.js";
 import { Database as SQLiteDatabase } from "./sqlite.js";
 import { parse as parseJSON5, stringify as stringifyJSON5 } from "./json5.js";
 import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
 import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
-import { remapPosition as remapBundlePosition, remapStackString as remapBundleStack } from "../vendor/sourcemap.js";
+import {
+  remapPosition as remapBundlePosition,
+  remapStackString as remapBundleStack,
+  sourceContextForLocation as bundleSourceContextForLocation,
+} from "../vendor/sourcemap.js";
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
 import { S3Client, s3 } from "./s3.js";
@@ -179,12 +184,10 @@ function installNodeStyleErrorConstructor(name) {
                 return cached;
               } catch {}
             }
-            let stack = remapBundleStack(rawStack);
-            if (!stack.includes(String(error.message ?? ""))) {
-              const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
-              stack = `${error.name || name}${message}\n${stack}`;
-            }
-            cached = stack;
+            const callSites = parseCallSites(remapBundleStack(rawStack));
+            const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
+            const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
+            cached = `${error.name || name}${message}${frames ? `\n${frames}` : ""}`;
           }
           return cached;
         },
@@ -270,7 +273,11 @@ if (Symbol.asyncDispose == null) {
 }
 
 function shellEscape(value) {
-  if (value && typeof value === "object" && "raw" in value) value = value.raw;
+  if (value && typeof value === "object" && "raw" in value) {
+    const raw = String(value.raw);
+    validateNoNullByte(raw, "shell argument");
+    return raw;
+  }
   if (isBunFileLike(value) && value.name != null) value = value.name;
   const text = String(value);
   validateNoNullByte(text, "shell argument");
@@ -479,6 +486,7 @@ for (const name of [
     globalThis[name] = streamWeb[name];
   }
 }
+_patchAsyncContextGlobals();
 installReadableStreamConversionHelpers();
 
 function consoleInputState() {
@@ -579,11 +587,20 @@ function interpolateShellCommand(strings, values) {
   let inputBody = undefined;
   for (let index = 0; index < strings.length; index += 1) {
     let part = parts[index];
-    if (index < values.length && binaryOutputView(values[index]) && />\s*$/.test(part) && parts.slice(index + 1).every((item) => String(item).trim() === "")) {
+    const isTerminalOutputTarget = index < values.length &&
+      />\s*$/.test(part) &&
+      parts.slice(index + 1).every((item) => String(item).trim() === "");
+    if (isTerminalOutputTarget && binaryOutputView(values[index])) {
       part = part.replace(/>\s*$/, "");
       out += part;
       outputBuffer = values[index];
       continue;
+    }
+    if (isTerminalOutputTarget && values[index] != null && typeof values[index] === "object") {
+      const value = values[index];
+      if (value instanceof Blob || value instanceof Response) {
+        throw new TypeError("Shell output redirection requires a writable Buffer or TypedArray");
+      }
     }
     if (index < values.length && values[index] != null && typeof values[index] === "object" &&
         /<\s*$/.test(part) && parts.slice(index + 1).every((item) => String(item).trim() === "")) {
@@ -1003,6 +1020,51 @@ function fillOutputBuffer(buffer, pattern) {
   }
 }
 
+function decodeEchoEscapes(value) {
+  const input = String(value);
+  let output = "";
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (char !== "\\" || index + 1 >= input.length) {
+      output += char;
+      continue;
+    }
+
+    const escape = input[++index];
+    const simple = {
+      "\\": "\\",
+      a: "\x07",
+      b: "\b",
+      e: "\x1b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      v: "\v",
+    }[escape];
+    if (simple != null) {
+      output += simple;
+      continue;
+    }
+    if (escape === "c") return { output, terminated: true };
+    if (escape === "0") {
+      let digits = "";
+      while (digits.length < 3 && /[0-7]/.test(input[index + 1] ?? "")) digits += input[++index];
+      output += String.fromCharCode(Number.parseInt(digits || "0", 8));
+      continue;
+    }
+    if (escape === "x") {
+      let digits = "";
+      while (digits.length < 2 && /[0-9a-fA-F]/.test(input[index + 1] ?? "")) digits += input[++index];
+      if (digits) output += String.fromCharCode(Number.parseInt(digits, 16));
+      else output += "\\x";
+      continue;
+    }
+    output += `\\${escape}`;
+  }
+  return { output, terminated: false };
+}
+
 function runShellBuiltin(command, options = {}) {
   if (/[|&;<>()$`>]/.test(String(command))) return null;
   const words = splitShellWords(command);
@@ -1014,13 +1076,23 @@ function runShellBuiltin(command, options = {}) {
   if (words[0] === "echo") {
     let index = 1;
     let newline = true;
-    while (words[index] === "-n") {
-      newline = false;
+    let interpretEscapes = false;
+    while (/^-[nEe]+$/.test(words[index] ?? "")) {
+      for (const flag of words[index].slice(1)) {
+        if (flag === "n") newline = false;
+        else interpretEscapes = flag === "e";
+      }
       index += 1;
+    }
+    let stdout = words.slice(index).join(" ");
+    if (interpretEscapes) {
+      const decoded = decodeEchoEscapes(stdout);
+      stdout = decoded.output;
+      if (decoded.terminated) newline = false;
     }
     return {
       exitCode: 0,
-      stdout: `${words.slice(index).join(" ")}${newline ? "\n" : ""}`,
+      stdout: `${stdout}${newline ? "\n" : ""}`,
       stderr: "",
     };
   }
@@ -1527,6 +1599,7 @@ function scanBundleImports(source) {
   for (const match of text.matchAll(/(?:^|[^\w$.])import\s*(?:[\w$*{},\s]+?from\s*)?["']([^"'\n]+)["']/g)) push(match[1], "import-statement");
   for (const match of text.matchAll(/(?:^|[^\w$.])export\s*(?:\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*["']([^"'\n]+)["']/g)) push(match[1], "import-statement");
   for (const match of text.matchAll(/(?:^|[^\w$.])import\s*\(\s*["']([^"'\n]+)["']\s*[,)]/g)) push(match[1], "dynamic-import");
+  for (const match of text.matchAll(/(?:^|[^\w$])require\s*\.\s*resolve\s*\(\s*["']([^"'\n]+)["']\s*\)/g)) push(match[1], "require-resolve");
   for (const match of text.matchAll(/(?:^|[^\w$.])require\s*\(\s*["']([^"'\n]+)["']\s*\)/g)) push(match[1], "require-call");
   return [...found].map(([specifier, kind]) => ({ specifier, kind }));
 }
@@ -1574,6 +1647,15 @@ async function buildWithPlugins(options, plugins) {
   for (const plugin of plugins) await plugin.setup(builder);
   for (const callback of onStartCallbacks) await callback();
 
+  if (onResolveRules.length === 0 && onLoadRules.length === 0) {
+    const result = finalizeDriverResult(
+      runBuildDriver({ ...options, plugins: undefined }),
+      options,
+    );
+    await ctRunOnEnd({ onEnd: onEndCallbacks }, result);
+    return result;
+  }
+
   const errors = [];
   const moduleRecords = new Map();
   const usedShadowNames = new Set();
@@ -1602,7 +1684,17 @@ async function buildWithPlugins(options, plugins) {
   };
 
   const defaultResolveImport = (specifier, importerRecord) => {
-    if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) return null;
+    if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) {
+      try {
+        const resolved = resolveSync(specifier, importerRecord.path);
+        if (resolved.startsWith("node:") || resolved.startsWith("bun:") || nodeIsBuiltin(resolved)) {
+          return { external: true };
+        }
+        return { path: resolved, namespace: "file" };
+      } catch {
+        return null;
+      }
+    }
     if (importerRecord.namespace !== "file" && !specifier.startsWith("/")) {
       return { error: `Could not resolve: "${specifier}"` };
     }
@@ -1686,7 +1778,9 @@ async function buildWithPlugins(options, plugins) {
         }
         if (!target || target.external) continue;
         if (target.error) {
-          errors.push(new BuildMessage({ message: `${target.error} from "${record.path}"` }));
+          // The lightweight graph scan can see import-looking text in comments
+          // and template literals. Leave unresolved text untouched so the
+          // native parser decides whether it is an actual dependency.
           continue;
         }
         const child = await addModule(target);
@@ -2144,6 +2238,7 @@ function prepareNativeSpawnOptions(file, nativeOptions) {
 function asBuffer(value) {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   if (globalThis.Buffer?.from) return globalThis.Buffer.from(value ?? "");
   return new TextEncoder().encode(String(value ?? ""));
 }
@@ -2535,6 +2630,9 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
     globalThis.process?.stderr?.write?.(result.stderr);
   }
   const exitCode = Number(result.status ?? result.exitCode ?? 0);
+  const signalCode = result.signalCode == null
+    ? (result.signal == null ? undefined : String(result.signal))
+    : signalName(result.signalCode) ?? String(result.signalCode);
   const stdout = nativeOptions.stdout === "pipe" ? asBuffer(result.stdout ?? "") : asBuffer("");
   let stderr = nativeOptions.stderr === "pipe" ? asBuffer(result.stderr ?? "") : asBuffer("");
   if (nativeOptions.stdoutFilePath != null) {
@@ -2553,7 +2651,7 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
     stdout,
     stderr,
     exitCode,
-    signalCode: null,
+    signalCode,
     success: exitCode === 0,
     status: exitCode,
   };
@@ -3573,11 +3671,11 @@ function isHeaderTokenCode(code) {
 
 function validateHeaderName(nameText) {
   if (nameText.length === 0) {
-    throw new TypeError(`Invalid header name: "${nameText}"`);
+    throw new TypeError(`Invalid header name: '${nameText}'`);
   }
   for (let index = 0; index < nameText.length; index += 1) {
     if (!isHeaderTokenCode(nameText.charCodeAt(index))) {
-      throw new TypeError(`Invalid header name: "${nameText}"`);
+      throw new TypeError(`Invalid header name: '${nameText}'`);
     }
   }
 }
@@ -3599,7 +3697,7 @@ function validateHeaderValue(valueText, nameText) {
   for (let index = 0; index < valueText.length; index += 1) {
     const code = valueText.charCodeAt(index);
     if (code === 0x00 || code === 0x0a || code === 0x0d || code > 0xff) {
-      throw new TypeError("Header value is not valid.");
+      throw new TypeError(`Header value is not valid. Header '${nameText}' has invalid value: '${valueText}'`);
     }
   }
 }
@@ -3884,26 +3982,44 @@ function parseMultipartFormDataText(source, boundary) {
   return result;
 }
 
+const requestState = new WeakMap();
+
 export class Request {
   constructor(input, init = {}) {
     if (init === null || init === undefined) init = {};
     else if (typeof init !== "object" && typeof init !== "function") {
       throw new TypeError("Failed to construct 'Request': the second argument must be an object");
     }
-    this.url = typeof input === "string" ? input : String(input?.url ?? input ?? "");
-    this.method = String(init.method ?? input?.method ?? "GET").toUpperCase();
-    this.headers = new Headers(init.headers ?? input?.headers);
+    const headers = new Headers(init.headers ?? input?.headers);
+    requestState.set(this, {
+      url: typeof input === "string" ? input : String(input?.url ?? input ?? ""),
+      method: String(init.method ?? input?.method ?? "GET").toUpperCase(),
+      headers,
+      params: init.params ?? input?.params ?? {},
+      signal: init.signal ?? input?.signal ?? new AbortController().signal,
+      redirect: init.redirect ?? input?.redirect ?? "follow",
+      cache: init.cache ?? input?.cache ?? "default",
+      mode: init.mode ?? input?.mode ?? "cors",
+      credentials: init.credentials ?? input?.credentials ?? "include",
+    });
     this._body = init.body ?? input?._body ?? input?.body ?? null;
-    setDefaultBodyContentType(this.headers, this._body);
+    setDefaultBodyContentType(headers, this._body);
     this._bodyStream = undefined;
     this._bodyUsed = false;
-    this.params = init.params ?? input?.params ?? {};
-    this.signal = init.signal ?? input?.signal ?? null;
-    this.redirect = init.redirect ?? input?.redirect ?? "follow";
-    this.cache = init.cache ?? input?.cache ?? "default";
-    this.mode = init.mode ?? input?.mode ?? "cors";
-    this.credentials = init.credentials ?? input?.credentials ?? "include";
   }
+  get url() { return requestState.get(this)?.url; }
+  get method() { return requestState.get(this)?.method; }
+  get headers() { return requestState.get(this)?.headers; }
+  get params() { return requestState.get(this)?.params; }
+  set params(value) {
+    const state = requestState.get(this);
+    if (state) state.params = value;
+  }
+  get signal() { return requestState.get(this)?.signal; }
+  get redirect() { return requestState.get(this)?.redirect; }
+  get cache() { return requestState.get(this)?.cache; }
+  get mode() { return requestState.get(this)?.mode; }
+  get credentials() { return requestState.get(this)?.credentials; }
   get body() {
     if (!this._bodyStream) {
       this._bodyStream = bodyReadableStream(this._body);
@@ -3964,10 +4080,13 @@ export class Request {
     if (body instanceof Blob && (!type || body.type === type)) return body;
     return cachedBlobForBytes(await bytesFromBody(body), type);
   }
-  async text() {
-    const body = this._takeBody();
-    if (typeof body === "string") return stripUtf8BOMText(body);
-    return stripUtf8BOMText(cachedTextForBytes(await bytesFromBody(body)));
+  text() {
+    if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
+    const body = this._body;
+    if (body != null) this._bodyUsed = true;
+    if (body == null) return Promise.resolve("");
+    if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
+    return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
     return JSON.parse(await this.text());
@@ -3989,6 +4108,14 @@ export class Request {
       return Promise.resolve(this._body);
     }
     return parseMultipartFormData(this._body, this.headers.get("content-type"));
+  }
+  [ctInspectSymbol]() {
+    const headerInspector = bunInspectPropertyDescriptor(this.headers, ctInspectSymbol)?.value;
+    const renderedHeaders = typeof headerInspector === "function"
+      ? headerInspector.call(this.headers)
+      : nodeInspect(this.headers);
+    const size = inspectBodyByteSize(this._body) ?? "0 KB";
+    return `Request (${size}) {\n  method: ${JSON.stringify(this.method)},\n  url: ${JSON.stringify(normalizeRequestUrl(this.url))},\n  headers: ${renderedHeaders}\n}`;
   }
 }
 
@@ -4019,7 +4146,6 @@ function normalizeRequestUrl(value) {
   try {
     const url = new URL(text);
     const pathname = String(url.pathname || "/").replace(/^\/+/, "/") || "/";
-    if (pathname === url.pathname) return text;
     return `${url.origin}${pathname}${url.search}${url.hash}`;
   } catch {
     return text;
@@ -4115,10 +4241,13 @@ export class Response {
     if (body instanceof Blob && (!type || body.type === type)) return body;
     return cachedBlobForBytes(await bytesFromBody(body), type);
   }
-  async text() {
-    const body = this._takeBody();
-    if (typeof body === "string") return stripUtf8BOMText(body);
-    return stripUtf8BOMText(cachedTextForBytes(await bytesFromBody(body)));
+  text() {
+    if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
+    const body = this._body;
+    if (body != null) this._bodyUsed = true;
+    if (body == null) return Promise.resolve("");
+    if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
+    return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
     return JSON.parse(await this.text());
@@ -4160,15 +4289,18 @@ export class Response {
     const body = this._body;
     const sizeText = inspectBodyByteSize(body);
     const prefix = sizeText == null ? "Response" : `Response (${sizeText})`;
-    if (body != null && typeof body[Symbol.for("nodejs.util.inspect.custom")] === "function") {
-      lines.push(indentTail(body[Symbol.for("nodejs.util.inspect.custom")]()));
+    const bodyInspector = body == null ? undefined : bunInspectPropertyDescriptor(body, ctInspectSymbol)?.value;
+    if (typeof bodyInspector === "function") {
+      lines.push(indentTail(bodyInspector.call(body)));
+    } else if (sizeText != null) {
+      lines.push(sizeText === "0 KB" ? "[Blob detached]" : `Blob (${sizeText})`);
     }
     return `${prefix} {\n${lines.map((line, index) => `  ${line}${index === lines.length - 1 ? "" : ","}`).join("\n")}\n}`;
   }
 }
 
-// Bun renders body sizes as "N bytes" below 1 KiB and with two decimals in
-// KiB-based units above it.
+// Bun renders body sizes as "N bytes" below 1 KB and with two decimals in
+// decimal units above it.
 function inspectBodyByteSize(body) {
   let size = null;
   if (body == null) return null;
@@ -4177,14 +4309,15 @@ function inspectBodyByteSize(body) {
   else if (ArrayBuffer.isView(body)) size = body.byteLength;
   else if (typeof body === "object" && typeof body.size === "number" && Number.isFinite(body.size)) size = body.size;
   if (size == null) return null;
-  if (size < 1024) return `${size} bytes`;
+  if (size === 0) return "0 KB";
+  if (size < 1000) return `${size} bytes`;
   const units = ["KB", "MB", "GB", "TB"];
   let value = size;
   let unit = -1;
   do {
-    value /= 1024;
+    value /= 1000;
     unit += 1;
-  } while (value >= 1024 && unit < units.length - 1);
+  } while (value >= 1000 && unit < units.length - 1);
   return `${value.toFixed(2)} ${units[unit]}`;
 }
 
@@ -4919,7 +5052,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
   });
 }
 
-async function fetchImpl(input, init = {}) {
+function prepareFetchRequest(input, init = {}) {
   let requestInit = init;
   if (!(input instanceof Request) && init?.body === "") {
     const method = String(init.method ?? "GET").toUpperCase();
@@ -4936,6 +5069,10 @@ async function fetchImpl(input, init = {}) {
     }
   }
   const request = input instanceof Request ? input : new Request(input, requestInit);
+  return { request, upgradeStreamBody };
+}
+
+async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   if (
     upgradeStreamBody == null &&
     (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") &&
@@ -4981,7 +5118,7 @@ async function fetchImpl(input, init = {}) {
   }
   const proxy = fetchProxyConfiguration(request.url, init);
   const activeServer = activeServerForFetchUrl(request.url);
-  const redirectMode = String(init.redirect ?? input?.redirect ?? request.redirect ?? "follow");
+  const redirectMode = String(init.redirect ?? request.redirect ?? "follow");
   if (proxy.explicit) {
     const activeProxy = activeServerForFetchUrl(proxy.explicit);
     if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
@@ -5076,13 +5213,23 @@ async function fetchImpl(input, init = {}) {
 }
 
 export function fetch(input, init = {}) {
-  const body = input instanceof Request ? input._body : init?.body;
+  let preparedInput = input;
+  let preparedInit = init;
+  if (input instanceof Request && Object.getPrototypeOf(input) !== Request.prototype) {
+    // Fetch snapshots Request subclasses through their public getters. Doing
+    // this before entering the async implementation also keeps WebIDL/header
+    // validation synchronous, matching Bun.
+    preparedInput = new Request(input, init);
+    preparedInit = {};
+  }
+  const prepared = prepareFetchRequest(preparedInput, preparedInit);
+  const body = prepared.request._body;
   if (isBunFileLike(body) && body._bunFilePath && !cottontail.existsSync(body._bunFilePath)) {
     const error = new Error(`ENOENT: no such file or directory, open '${body._bunFilePath}'`);
     error.code = "ENOENT";
     return handledRejectedPromise(error);
   }
-  return fetchImpl(input, init);
+  return fetchImpl(prepared.request, preparedInit, prepared.upgradeStreamBody);
 }
 
 fetch.preconnect = fetchPreconnect;
@@ -5228,9 +5375,13 @@ function headersToText(headers) {
   const normalized = new Headers(headers);
   normalized.delete("content-length");
   normalized.delete("connection");
-  normalized.forEach((value, key) => {
-    out += `${key}: ${String(value).replace(/[\r\n]+/g, " ")}\r\n`;
-  });
+  for (const key of [...normalized._values.keys()].sort()) {
+    const entry = normalized._values.get(key);
+    const values = key === "set-cookie" ? normalized._allValues.get(key) ?? [] : [entry.value];
+    for (const value of values) {
+      out += `${entry.key}: ${String(value).replace(/[\r\n]+/g, " ")}\r\n`;
+    }
+  }
   return out;
 }
 
@@ -5250,7 +5401,7 @@ function appendRequestCookieHeaders(response, request) {
 
 function normalizeResponse(value, request = undefined) {
   const response = value instanceof Response ? value : new Response(value);
-  if (!response.headers.has("date")) response.headers.set("Date", cachedServeDateHeader());
+  normalizeServeDateHeader(response.headers);
   appendRequestCookieHeaders(response, request);
   return response;
 }
@@ -5269,6 +5420,13 @@ function cachedServeDateHeader() {
     cachedServeDateValue = new Date(second * 1000).toUTCString();
   }
   return cachedServeDateValue;
+}
+
+function normalizeServeDateHeader(headers) {
+  const existing = headers.get("date");
+  // `set` collapses duplicates and preserves canonical raw HTTP casing while
+  // Headers iteration remains lowercase per the Fetch API.
+  headers.set("Date", existing ?? cachedServeDateHeader());
 }
 
 function defaultServePort(options) {
@@ -6182,6 +6340,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     fragmentCompressed: false,
     wantDrain: false,
     finalized: false,
+    opened: false,
     remoteAddress: socket.remoteAddress,
     config: {
       maxPayloadLength: Number(websocketOptions.maxPayloadLength ?? 16 * 1024 * 1024),
@@ -6195,6 +6354,12 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
   state.ws = ws;
   serverState.websockets.add(state);
   serverState.server.pendingWebSockets += 1;
+
+  const invokeOpen = () => {
+    if (state.opened || state.finalized) return;
+    state.opened = true;
+    invokeWebSocketHandler(state, "open", ws);
+  };
 
   const handleFrame = (frame) => {
     if (frame.opcode === 0x8) {
@@ -6259,6 +6424,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
 
   const handleData = (chunk) => {
     if (state.finalized) return;
+    invokeOpen();
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     state.buffer = state.buffer.byteLength === 0 ? incoming : Buffer.concat([state.buffer, incoming]);
     let parsed;
@@ -6284,8 +6450,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
   socket.on("drain", () => scheduleServerWebSocketDrain(state));
 
   queueMicrotask(() => {
-    if (state.finalized) return;
-    invokeWebSocketHandler(state, "open", ws);
+    invokeOpen();
     if (head != null && head.byteLength > 0) handleData(head);
   });
   return ws;
@@ -6471,9 +6636,9 @@ function validateServeTls(tls) {
     const cert = serveTlsMaterialText(entry.cert, "cert");
     if (key != null) assertValidServePem(key, "key");
     if (cert != null) assertValidServePem(cert, "cert");
-    if (isArray) {
+    if (isArray && list.length > 1) {
       if (typeof entry.serverName !== "string" || entry.serverName.length === 0) {
-        throw new TypeError("Bun.serve tls array entries require a serverName");
+        throw new TypeError("SNI tls object must have a serverName");
       }
     }
     configs.push({
@@ -6919,6 +7084,22 @@ function serveNodeBacked(options, context) {
 }
 
 export function serve(options = {}) {
+  const wrappedWebSocket = options.websocket && typeof options.websocket === "object"
+    ? { ...options.websocket }
+    : options.websocket;
+  if (wrappedWebSocket && typeof wrappedWebSocket === "object") {
+    for (const name of ["open", "message", "close", "drain", "ping", "pong"]) {
+      if (typeof wrappedWebSocket[name] === "function") {
+        wrappedWebSocket[name] = _wrapAsyncCallback(wrappedWebSocket[name]);
+      }
+    }
+  }
+  options = {
+    ...options,
+    ...(typeof options.fetch === "function" ? { fetch: _wrapAsyncCallback(options.fetch) } : {}),
+    ...(typeof options.error === "function" ? { error: _wrapAsyncCallback(options.error) } : {}),
+    ...(wrappedWebSocket !== undefined ? { websocket: wrappedWebSocket } : {}),
+  };
   globalThis.__cottontailServeEverCalled = true;
   const hasRoutes = validateServeRoutes(options.routes);
   const hasStaticRoutes = options.static != null && typeof options.static === "object" && Object.keys(options.static).length > 0;
@@ -7056,7 +7237,7 @@ export function serve(options = {}) {
   };
 
   const sendResponse = (item, response, statusOverride = undefined) => {
-    if (!response.headers.has("date")) response.headers.set("Date", cachedServeDateHeader());
+    normalizeServeDateHeader(response.headers);
     const body = responseBody(response);
     const status = statusOverride ?? response.status;
     const headers = headersToText(response.headers);
@@ -7475,7 +7656,7 @@ export function file(path, options = undefined) {
   const result = {
     name: isFd ? "" : String(filePath),
     fd: isFd ? filePath : undefined,
-    type: options?.type != null ? String(options.type) : (isFd ? "" : guessMimeType(filePath)),
+    type: options?.type != null ? String(options.type) : (isFd ? "application/octet-stream" : guessMimeType(filePath)),
     [Symbol.for("nodejs.util.inspect.custom")]() {
       const label = isFd ? `FileRef (fd: ${filePath})` : `FileRef ("${String(filePath)}")`;
       const type = this.type;
@@ -7737,11 +7918,11 @@ async function bytesFromBunWriteSource(data) {
 }
 
 function writeBytesToProcessStream(stream, bytes) {
-  if (stream && !isBunFileLike(stream) && typeof stream.write === "function") {
+  if (stream && !isBunFileLike(stream) && typeof stream._bunFilePath !== "string" && typeof stream.write === "function") {
     stream.write(bytes);
     return bytes.byteLength;
   }
-  if (stream && typeof stream.fd === "number") {
+  if (stream && !isBunFileLike(stream) && typeof stream.fd === "number") {
     return cottontail.fdWrite(stream.fd, bytes);
   }
   return null;
@@ -7780,13 +7961,13 @@ function applyBunWriteMode(path, options) {
 
 export async function write(destination, data, options = undefined) {
   const bytes = await bytesFromBunWriteSource(data);
-  const streamWritten = writeBytesToProcessStream(destination, bytes);
-  if (streamWritten != null) return streamWritten;
   const rangeWritten = writeBytesToFileRange(destination, bytes);
   if (rangeWritten != null) {
     applyBunWriteMode(destination._bunFilePath, options);
     return rangeWritten;
   }
+  const streamWritten = writeBytesToProcessStream(destination, bytes);
+  if (streamWritten != null) return streamWritten;
 
   if (typeof destination === "number") {
     return cottontail.fdWrite(destination, bytes);
@@ -7883,7 +8064,13 @@ function normalizeCryptoHasherAlgorithm(algorithm) {
 function cryptoHasherBytes(data, encoding = undefined) {
   if (arguments.length === 0 || data == null) throw new TypeError("CryptoHasher update requires data");
   if (isBunFileLike(data)) throw new TypeError("Bun.file is not supported by CryptoHasher");
-  return encoding ? globalThis.Buffer.from(String(data), encoding) : asBuffer(data);
+  if (typeof globalThis.Blob === "function" && data instanceof globalThis.Blob) {
+    const bytes = blobBytesSync(data);
+    if (bytes.byteLength !== Number(data.size)) throw new TypeError("Unable to read Blob bytes synchronously");
+    return bytes;
+  }
+  if (typeof data === "string") return globalThis.Buffer.from(data, encoding);
+  return asBuffer(data);
 }
 
 function encodeCryptoDigest(bytes, encoding) {
@@ -8090,7 +8277,7 @@ export const cwd = cottontail.cwd();
 export const main = globalThis.process?.argv?.[1] ?? "";
 export const origin = "";
 export const isMainThread = cottontail.isWorker?.() !== true;
-export const version = "0.0.0-cottontail";
+export const version = String(cottontail.processInfo("version"));
 export const revision = "cottontail";
 export const version_with_sha = `${version} (${revision})`;
 if (globalThis.process) {
@@ -8196,10 +8383,46 @@ export { bunForceGc as gc };
 
 const bunInspectQuote = (text) => JSON.stringify(String(text));
 
+function bunInspectPropertyDescriptor(value, key) {
+  for (let current = value; current != null; current = Object.getPrototypeOf(current)) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor) return descriptor;
+  }
+  return undefined;
+}
+
+function bunInspectIsPrototypeObject(value) {
+  const descriptor = Object.getOwnPropertyDescriptor(value, "constructor");
+  return typeof descriptor?.value === "function" && descriptor.value.prototype === value;
+}
+
 function bunInspectIsPlainObject(value) {
   if (value === null || typeof value !== "object") return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+  for (let proto = Object.getPrototypeOf(value); proto != null; proto = Object.getPrototypeOf(proto)) {
+    if (proto === Object.prototype) return true;
+    const constructor = Object.getOwnPropertyDescriptor(proto, "constructor");
+    if (constructor && constructor.value !== Object) return false;
+  }
+  return Object.getPrototypeOf(value) === null;
+}
+
+function bunInspectFunction(value) {
+  let source = "";
+  try { source = Function.prototype.toString.call(value); } catch {}
+  if (/^\s*class(?:\s|{)/.test(source)) {
+    const name = value.name || "(anonymous)";
+    const parent = Object.getPrototypeOf(value);
+    const extendsName = typeof parent === "function" && parent !== Function.prototype && parent.name
+      ? ` extends ${parent.name}`
+      : "";
+    return `[class ${name}${extendsName}]`;
+  }
+  let kind = "Function";
+  if (/^\s*async\s+function\*/.test(source)) kind = "AsyncGeneratorFunction";
+  else if (/^\s*async(?:\s+function|\s*\()/.test(source) || value.constructor?.name === "AsyncFunction") kind = "AsyncFunction";
+  else if (/^\s*function\*/.test(source) || value.constructor?.name === "GeneratorFunction") kind = "GeneratorFunction";
+  else if (value.constructor?.name === "AsyncGeneratorFunction") kind = "AsyncGeneratorFunction";
+  return value.name ? `[${kind}: ${value.name}]` : `[${kind}]`;
 }
 
 // Bun's inspect style: objects/Sets/Maps print one entry per line with
@@ -8279,6 +8502,210 @@ function bunInspectCustomOptions(ctx) {
 }
 
 const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
+const bunInspectSetSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, "size")?.get;
+const bunInspectMapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, "size")?.get;
+
+function bunInspectCollectionSize(value, getter) {
+  try {
+    return Reflect.apply(getter, value, []);
+  } catch {
+    return null;
+  }
+}
+
+function bunInspectArrayIndexKey(key) {
+  if (typeof key !== "string" || !/^(?:0|[1-9]\d*)$/.test(key)) return false;
+  const index = Number(key);
+  return index >= 0 && index < 0xffffffff && Number.isInteger(index);
+}
+
+function bunInspectArrayTokens(tokens, indent) {
+  const pad = `${indent}  `;
+  const lines = [];
+  let line = "";
+  let width = pad.length;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const separator = line ? ", " : "";
+    if (line && width + separator.length + token.length >= 80) {
+      lines.push(`${line},`);
+      line = `${pad}${token}`;
+      width = pad.length + token.length;
+    } else {
+      line += `${separator}${line ? "" : pad}${token}`;
+      width += separator.length + token.length;
+    }
+  }
+  if (line) lines.push(line);
+  return `[\n${lines.join("\n")}\n${indent}]`;
+}
+
+function bunInspectJsxKind(value) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, "$$typeof");
+  if (!(descriptor && "value" in descriptor)) return false;
+  return descriptor.value === Symbol.for("react.element") ||
+    descriptor.value === Symbol.for("react.transitional.element") ||
+    descriptor.value === Symbol.for("react.fragment");
+}
+
+function bunInspectJsx(value, ctx, indent, seen, depth) {
+  const type = value.type;
+  const isFragment = type === Symbol.for("react.fragment");
+  let tagName = "";
+  if (!isFragment) {
+    if (typeof type === "string") tagName = type;
+    else if (typeof type === "function") {
+      let source = "";
+      try { source = Function.prototype.toString.call(type); } catch {}
+      tagName = source.includes("=>") ? "NoName" : (type.name || "NoName");
+    } else if (type != null && typeof type !== "symbol") {
+      tagName = type.name || String(type) || "NoName";
+    }
+  }
+
+  let opening = `<${tagName}`;
+  if (value.key != null) opening += ` key=${bunStyleInspect(value.key, ctx, `${indent}  `, seen, depth + 1)}`;
+  const props = value.props && typeof value.props === "object" ? value.props : {};
+  for (const key of Object.keys(props)) {
+    if (key === "children") continue;
+    opening += ` ${key}=${bunStyleInspect(props[key], ctx, `${indent}  `, seen, depth + 1)}`;
+  }
+
+  const children = props.children;
+  const close = `</${tagName}>`;
+  if (typeof children === "string" && children.length > 0) {
+    if (children.length < 128) return `${opening}>${children}${close}`;
+    return `${opening}>\n${indent}  ${children}\n${indent}${close}`;
+  }
+  if (bunInspectJsxKind(children)) {
+    return `${opening}>\n${indent}  ${bunInspectJsx(children, ctx, `${indent}  `, seen, depth + 1)}\n${indent}${close}`;
+  }
+  if (Array.isArray(children) && children.length > 0) {
+    const rendered = children.map((child) => {
+      if (typeof child === "string") return child;
+      if (bunInspectJsxKind(child)) return bunInspectJsx(child, ctx, `${indent}  `, seen, depth + 1);
+      return bunStyleInspect(child, ctx, `${indent}  `, seen, depth + 1);
+    });
+    return `${opening}>\n${rendered.map((child) => `${indent}  ${child}`).join("\n")}\n${indent}${close}`;
+  }
+  return `${opening} />`;
+}
+
+function bunInspectEventEntries(name, entries, ctx, indent, seen, depth) {
+  const nested = `${indent}  `;
+  const comma = bunInspectComma(ctx);
+  const rendered = entries.map(([key, entry, preRendered]) => {
+    const inspected = preRendered === undefined
+      ? bunStyleInspect(entry, ctx, nested, seen, depth + 1)
+      : preRendered;
+    return `${nested}${bunInspectKeyPrefix(key, ctx)}${inspected}${comma}`;
+  });
+  return `${name} {\n${rendered.join("\n")}\n${indent}}`;
+}
+
+function bunInspectDecodeOriginalPath(lines) {
+  const marker = lines[0]?.match(/^\/\*@cottontail-original-path-base64:([A-Za-z0-9+/=]+)\*\//);
+  if (!marker) return null;
+  try {
+    if (typeof globalThis.Buffer?.from === "function") return globalThis.Buffer.from(marker[1], "base64").toString("utf8");
+    const binary = globalThis.atob(marker[1]);
+    return new TextDecoder().decode(Uint8Array.from(binary, character => character.charCodeAt(0)));
+  } catch {
+    return null;
+  }
+}
+
+function bunInspectErrorDiagnostic(error) {
+  if (!(error instanceof Error) || typeof error.stack !== "string") return null;
+  const frame = error.stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
+  if (!frame) return null;
+  const context = bundleSourceContextForLocation(frame[1].trim(), Number(frame[2]), Number(frame[3]));
+  if (!context) return null;
+
+  let sourcePath = bunInspectDecodeOriginalPath(context.lines) ?? context.source;
+  let sourceLines = context.lines;
+  if (sourcePath !== context.source) {
+    try { sourceLines = String(cottontail.readFile(sourcePath)).split(/\r?\n/); } catch { sourcePath = context.source; }
+  }
+
+  const constructorName = error.constructor?.name || "Error";
+  const constructorText = `new ${constructorName}`;
+  const message = String(error.message ?? "");
+  const reported = Math.max(0, context.line - 1);
+  const nearby = context.lines.slice(Math.max(0, reported - 3), reported + 2);
+  const generatedLine = nearby.find(line => line.includes(constructorText) && (!message || line.includes(message)));
+  let target = generatedLine == null ? -1 : sourceLines.findIndex(line => line.trim() === generatedLine.trim());
+  if (target < 0) {
+    target = sourceLines.findIndex(line => line.includes(constructorText) && (!message || line.includes(message)));
+  }
+  if (target < 0) return null;
+
+  const start = Math.max(0, target - 5);
+  const excerpt = sourceLines.slice(start, target + 1).map((line, offset) => `${start + offset + 1} | ${line}`).join("\n");
+  const constructorColumn = Math.max(0, sourceLines[target].indexOf(constructorText));
+  const diagnosticColumn = constructorColumn + "new ".length;
+  const caret = " ".repeat(String(target + 1).length + 3 + diagnosticColumn) + "^";
+  const label = constructorName === "Error" ? "error" : constructorName;
+  return `${excerpt}\n${caret}\n${label}: ${message}\n    at <anonymous> (${sourcePath}:${target + 1}:${diagnosticColumn + 1})\n`;
+}
+
+function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
+  if (objectTag === "[object MessageEvent]") {
+    return bunInspectEventEntries("MessageEvent", [
+      ["type", value.type],
+      ["data", value.data],
+    ], ctx, indent, seen, depth);
+  }
+  if (objectTag === "[object ErrorEvent]") {
+    return bunInspectEventEntries("ErrorEvent", [
+      ["type", value.type],
+      ["message", value.message],
+      ["error", value.error, bunInspectErrorDiagnostic(value.error) ?? undefined],
+    ], ctx, indent, seen, depth);
+  }
+  const commonEntries = [
+    ["type", value.type],
+    ["target", value.target],
+    ["currentTarget", value.currentTarget],
+    ["eventPhase", value.eventPhase],
+    ["cancelBubble", value.cancelBubble],
+    ["bubbles", value.bubbles],
+    ["cancelable", value.cancelable],
+    ["defaultPrevented", value.defaultPrevented],
+    ["composed", value.composed],
+    ["timeStamp", 0],
+    ["srcElement", value.srcElement],
+    ["returnValue", value.returnValue],
+    ["composedPath", value.composedPath],
+    ["stopPropagation", value.stopPropagation],
+    ["stopImmediatePropagation", value.stopImmediatePropagation],
+    ["preventDefault", value.preventDefault],
+    ["initEvent", value.initEvent],
+    ["NONE", value.NONE],
+    ["CAPTURING_PHASE", value.CAPTURING_PHASE],
+    ["AT_TARGET", value.AT_TARGET],
+    ["BUBBLING_PHASE", value.BUBBLING_PHASE],
+  ];
+  if (objectTag === "[object CloseEvent]") {
+    return bunInspectEventEntries("CloseEvent", [
+      ["isTrusted", value.isTrusted],
+      ["wasClean", value.wasClean],
+      ["code", value.code],
+      ["reason", value.reason],
+      ...commonEntries,
+    ], ctx, indent, seen, depth);
+  }
+  if (objectTag === "[object CustomEvent]") {
+    return bunInspectEventEntries("CustomEvent", [
+      ["isTrusted", value.isTrusted],
+      ["detail", value.detail],
+      ["initCustomEvent", value.initCustomEvent],
+      ...commonEntries,
+    ], ctx, indent, seen, depth);
+  }
+  return null;
+}
 
 function bunInspectDynamicErrorSource(error, rendered) {
   const metadata = error?.[dynamicErrorSourceSymbol];
@@ -8302,10 +8729,18 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   if (value === undefined) return bunInspectStyle("undefined", 2, ctx);
   if (typeof value === "symbol") return bunInspectStyle(String(value), 34, ctx);
   if (typeof value === "function") {
-    return nodeInspect(value, bunInspectNodeOptions(ctx, depth));
+    return bunInspectFunction(value);
   }
   if (seen.has(value)) return "[Circular]";
-  const custom = value?.[ctInspectSymbol];
+  const objectTag = Object.prototype.toString.call(value);
+  const eventInspection = bunInspectIsPrototypeObject(value)
+    ? null
+    : bunInspectEvent(value, objectTag, ctx, indent, seen, depth);
+  if (eventInspection !== null) return eventInspection;
+  const customDescriptor = bunInspectIsPrototypeObject(value)
+    ? undefined
+    : bunInspectPropertyDescriptor(value, ctInspectSymbol);
+  const custom = customDescriptor && "value" in customDescriptor ? customDescriptor.value : undefined;
   if (typeof custom === "function" && custom !== nodeInspect) {
     const remaining = ctx.maxDepth === Infinity ? Infinity : ctx.maxDepth - depth;
     const result = custom.call(value, remaining, bunInspectCustomOptions(ctx), nodeInspect);
@@ -8315,10 +8750,52 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   }
   const comma = bunInspectComma(ctx);
   const nested = `${indent}  `;
+  if (bunInspectJsxKind(value)) {
+    seen.add(value);
+    try {
+      return bunInspectJsx(value, ctx, indent, seen, depth);
+    } finally {
+      seen.delete(value);
+    }
+  }
   if (Array.isArray(value)) {
     if (value.length === 0) return "[]";
     seen.add(value);
     try {
+      const hasHoles = Object.keys(value).filter(bunInspectArrayIndexKey).length < value.length;
+      const extraKeys = Reflect.ownKeys(value).filter((key) => {
+        if (key === "length" || bunInspectArrayIndexKey(key)) return false;
+        return Object.getOwnPropertyDescriptor(value, key)?.enumerable === true;
+      });
+      if (hasHoles || extraKeys.length > 0) {
+        const tokens = [];
+        for (let index = 0; index < value.length;) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+          if (!descriptor) {
+            const start = index;
+            do { index += 1; } while (index < value.length && !Object.getOwnPropertyDescriptor(value, String(index)));
+            const count = index - start;
+            tokens.push(count === 1 ? "empty item" : `${count} x empty items`);
+            continue;
+          }
+          const rendered = "value" in descriptor
+            ? bunStyleInspect(descriptor.value, ctx, nested, seen, depth + 1)
+            : (descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]");
+          tokens.push(rendered);
+          index += 1;
+        }
+        for (const key of extraKeys) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          const printedKey = typeof key === "symbol"
+            ? `[${String(key)}]`
+            : (bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key));
+          const rendered = descriptor && "value" in descriptor
+            ? bunStyleInspect(descriptor.value, ctx, nested, seen, depth + 1)
+            : (descriptor?.get && descriptor?.set ? "[Getter/Setter]" : descriptor?.get ? "[Getter]" : "[Setter]");
+          tokens.push(`${bunInspectKeyPrefix(printedKey, ctx)}${rendered}`);
+        }
+        return bunInspectArrayTokens(tokens, indent);
+      }
       const items = value.map((item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
       const inline = `[ ${items.join(`${comma} `)} ]`;
       if (ctx.compact) return inline;
@@ -8328,19 +8805,42 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       seen.delete(value);
     }
   }
-  if (value instanceof Set) {
-    if (value.size === 0) return "Set {}";
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    const items = Array.from(value, (item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
+    const name = value.constructor?.name || "TypedArray";
+    return `${name}(${value.length}) [${items.length === 0 ? "" : ` ${items.join(`${comma} `)} `}]`;
+  }
+  if (objectTag === "[object Arguments]") {
+    const items = Array.from(value, (item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
+    return `[${items.length === 0 ? "" : ` ${items.join(`${comma} `)} `}]`;
+  }
+  if (objectTag === "[object Blob]" || (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob)) {
+    const size = inspectBodyByteSize(value) ?? "0 KB";
+    if (value.constructor?.name === "File" || (typeof globalThis.File === "function" && value instanceof globalThis.File)) {
+      return `File (${size}) {\n${nested}name: ${bunInspectQuote(value.name)},\n${nested}type: ${bunInspectQuote(value.type)},\n${nested}lastModified: ${Number(value.lastModified)}\n${indent}}`;
+    }
+    const prefix = `Blob (${size})`;
+    const name = typeof value.name === "string" ? value.name : null;
+    if (name !== null) {
+      return `${prefix} {\n${nested}name: ${bunInspectQuote(name)},\n${nested}type: ${bunInspectQuote(value.type)}\n${indent}}`;
+    }
+    return value.type ? `${prefix} {\n${nested}type: ${bunInspectQuote(value.type)}\n${indent}}` : prefix;
+  }
+  if (value instanceof Set || objectTag === "[object Set]") {
+    const size = bunInspectCollectionSize(value, bunInspectSetSizeGetter);
+    if (size === 0) return "Set {}";
     seen.add(value);
     try {
       const items = [...value].map((item) => bunStyleInspect(item, ctx, nested, seen, depth + 1));
-      if (ctx.compact) return `Set(${value.size}) { ${items.join(`${comma} `)} }`;
-      return `Set(${value.size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
+      if (ctx.compact) return `Set(${size}) { ${items.join(`${comma} `)} }`;
+      return `Set(${size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
   }
-  if (value instanceof Map) {
-    if (value.size === 0) return "Map {}";
+  if (value instanceof Map || objectTag === "[object Map]") {
+    const size = bunInspectCollectionSize(value, bunInspectMapSizeGetter);
+    if (size === 0) return "Map {}";
     seen.add(value);
     try {
       const items = [...value].map(([key, item]) => {
@@ -8348,13 +8848,13 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
         const renderedValue = bunStyleInspect(item, ctx, nested, seen, depth + 1);
         return `${renderedKey}: ${renderedValue}`;
       });
-      if (ctx.compact) return `Map(${value.size}) { ${items.join(`${comma} `)} }`;
-      return `Map(${value.size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
+      if (ctx.compact) return `Map(${size}) { ${items.join(`${comma} `)} }`;
+      return `Map(${size}) {\n${items.map((item) => `${nested}${item}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
   }
-  if (value instanceof Error && typeof value[ctInspectSymbol] !== "function") {
+  if (value instanceof Error && typeof custom !== "function") {
     const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
     if (errorKeys.length === 0) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
@@ -8378,21 +8878,26 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
   if (bunInspectIsPlainObject(value)) {
     if (depth > ctx.maxDepth) return "[Object ...]";
     const keys = Reflect.ownKeys(value).filter((key) => {
-      if (!Object.prototype.propertyIsEnumerable.call(value, key)) return false;
-      return key !== ctInspectSymbol || typeof value[key] !== "function";
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable) return false;
+      return key !== ctInspectSymbol || !("value" in descriptor && typeof descriptor.value === "function");
     });
-    if (keys.length === 0) return "{}";
+    const nullPrototypePrefix = Object.getPrototypeOf(value) === null ? "[Object: null prototype] " : "";
+    if (keys.length === 0) return `${nullPrototypePrefix}{}`;
     seen.add(value);
     try {
       const entries = keys.map((key) => {
         const printedKey = typeof key === "symbol"
           ? `[${String(key)}]`
           : (bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key));
-        const rendered = bunStyleInspect(value[key], ctx, nested, seen, depth + 1);
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        const rendered = descriptor && !("value" in descriptor)
+          ? (descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]")
+          : bunStyleInspect(descriptor?.value, ctx, nested, seen, depth + 1);
         return `${bunInspectKeyPrefix(printedKey, ctx)}${rendered}`;
       });
-      if (ctx.compact) return `{ ${entries.join(`${comma} `)} }`;
-      return `{\n${entries.map((entry) => `${nested}${entry}${comma}`).join("\n")}\n${indent}}`;
+      if (ctx.compact) return `${nullPrototypePrefix}{ ${entries.join(`${comma} `)} }`;
+      return `${nullPrototypePrefix}{\n${entries.map((entry) => `${nested}${entry}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }
@@ -8971,26 +9476,7 @@ export function indexOfLine(value, offset = 0) {
 }
 
 export function fileURLToPath(value) {
-  let href;
-  if (typeof value === "string") {
-    href = value;
-  } else if (value && typeof value.href === "string") {
-    href = value.href;
-  } else {
-    throw new TypeError("The URL must be of scheme file");
-  }
-  if (!String(href).startsWith("file:")) throw new TypeError("The URL must be of scheme file");
-  let pathPart = String(href).slice("file:".length);
-  if (pathPart.startsWith("//")) {
-    pathPart = pathPart.slice(2);
-    const slash = pathPart.indexOf("/");
-    const host = slash === -1 ? pathPart : pathPart.slice(0, slash);
-    if (host && host !== "localhost") throw new TypeError("File URL host must be localhost or empty");
-    pathPart = slash === -1 ? "" : pathPart.slice(slash);
-  }
-  pathPart = pathPart.split("?")[0].split("#")[0];
-  if (!pathPart.startsWith("/")) throw new TypeError("File URL path must be an absolute path");
-  return decodeURIComponent(pathPart);
+  return nodeFileURLToPath(value);
 }
 
 export function pathToFileURL(value) {
@@ -11018,6 +11504,18 @@ function validateHTMLRewriterSelector(selector) {
   return text;
 }
 
+function runHTMLRewriterHandler(handler, ...args) {
+  const result = handler(...args);
+  if (result == null || typeof result.then !== "function") return result;
+  const status = cottontail.promiseStatus(result);
+  if (status === 2) {
+    const reason = cottontail.promiseResult(result);
+    result.catch(() => {});
+    throw reason;
+  }
+  return status === 1 ? cottontail.promiseResult(result) : result;
+}
+
 class HTMLRewriterTextChunk {
   constructor(state) {
     this._state = state;
@@ -11080,7 +11578,7 @@ function rewriteTextChunks(inner, handler, liveStates) {
         after: "",
       };
       liveStates.push(state);
-      handler(new HTMLRewriterTextChunk(state));
+      runHTMLRewriterHandler(handler, new HTMLRewriterTextChunk(state));
       const body = state.removed ? "" : state.replaced ? (state.html ? state.text : escapeHTML(state.text)) : chunkText;
       return state.before + body + state.after;
     };
@@ -11189,7 +11687,7 @@ export class HTMLRewriter {
               return this;
             },
           };
-          handlers.doctype(doctype);
+          runHTMLRewriterHandler(handlers.doctype.bind(handlers), doctype);
           state.valid = false;
           return state.removed ? "" : source;
         });
@@ -11244,7 +11742,7 @@ export class HTMLRewriter {
               return element;
             },
           };
-          handlers.element(element);
+          runHTMLRewriterHandler(handlers.element.bind(handlers), element);
         }
         let nextInner = state.replaceInner
           ? (state.html ? state.inner : escapeHTML(state.inner))
@@ -12178,63 +12676,10 @@ class CottontailDOMException extends Error {
 const eventState = new WeakMap();
 const eventTargetWeakHandler = Symbol.for("nodejs.internal.event_target.kWeakHandler");
 const NativeWeakRef = globalThis.WeakRef;
-const forcedCollectedWeakTargets = new WeakSet();
-const cottontailWeakRefs = new Set();
-
-function isForcedCollectableAbortSignal(target) {
-  const state = abortSignalState?.get?.(target);
-  if (!state) return false;
-  return !(state.timeoutTimer != null && activeTimeoutSignals.has(target));
-}
-
-class CottontailWeakRef {
-  constructor(target, options = undefined) {
-    if (target == null || (typeof target !== "object" && typeof target !== "function")) {
-      throw new TypeError("WeakRef target must be an object");
-    }
-    this._native = NativeWeakRef ? new NativeWeakRef(target) : { deref: () => target };
-    this._target = options?.internal === true ? undefined : target;
-    this._collected = false;
-    cottontailWeakRefs.add(this);
-  }
-
-  deref() {
-    if (this._collected) return undefined;
-    const target = this._native.deref();
-    if (target && forcedCollectedWeakTargets.has(target)) return undefined;
-    return target;
-  }
-}
 
 function internalWeakRef(target) {
-  return new CottontailWeakRef(target, { internal: true });
+  return new NativeWeakRef(target);
 }
-
-function runForcedWeakRefGc() {
-  for (const ref of cottontailWeakRefs) {
-    const target = ref._target;
-    if (!target) continue;
-    if (isForcedCollectableAbortSignal(target)) {
-      forcedCollectedWeakTargets.add(target);
-      ref._target = undefined;
-      ref._collected = true;
-    }
-  }
-}
-
-if (NativeWeakRef) {
-  Object.defineProperty(globalThis, "WeakRef", {
-    value: CottontailWeakRef,
-    configurable: true,
-    writable: true,
-  });
-}
-
-Object.defineProperty(globalThis, "__cottontailForcedWeakRefGc", {
-  value: runForcedWeakRefGc,
-  configurable: true,
-  writable: true,
-});
 
 function eventStateFor(event) {
   const state = eventState.get(event);
@@ -12386,6 +12831,12 @@ class CottontailEvent {
   }
 }
 
+Object.defineProperty(CottontailEvent.prototype, "isTrusted", {
+  get: sharedIsTrustedGetter,
+  enumerable: true,
+  configurable: true,
+});
+
 for (const [name, value] of [["NONE", 0], ["CAPTURING_PHASE", 1], ["AT_TARGET", 2], ["BUBBLING_PHASE", 3]]) {
   Object.defineProperty(CottontailEvent, name, { value, enumerable: true });
   Object.defineProperty(CottontailEvent.prototype, name, { value, enumerable: true });
@@ -12395,6 +12846,11 @@ class CottontailCustomEvent extends CottontailEvent {
   constructor(type, init = {}) {
     super(type, init);
     this.detail = init.detail ?? null;
+  }
+
+  initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
+    this.initEvent(type, bubbles, cancelable);
+    this.detail = detail;
   }
 }
 
@@ -12655,7 +13111,7 @@ const abortSignalConstructToken = Symbol("CottontailAbortSignalConstruct");
 const abortSignalState = new WeakMap();
 const abortControllerState = new WeakMap();
 const abortDependantSignals = Symbol("kDependantSignals");
-const activeTimeoutSignals = new Set();
+const activeAbortSignals = new Set();
 const abortQueue = [];
 let drainingAbortQueue = false;
 
@@ -12696,6 +13152,20 @@ const dependantFinalizer = typeof FinalizationRegistry === "function"
       if (!source) return;
       const state = abortSignalState.get(source);
       state?.dependants?.delete(held.ref);
+      refreshAbortSignalRetention(source);
+    })
+  : null;
+
+const sourceFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((held) => {
+      const dependantRef = held?.dependant;
+      setImmediate(() => {
+        const dependant = dependantRef?.deref?.();
+        if (!dependant) return;
+        const state = abortSignalState.get(dependant);
+        state?.sourceSignals?.delete(held.sourceRef);
+        refreshAbortSignalRetention(dependant);
+      });
     })
   : null;
 
@@ -12719,11 +13189,11 @@ function cleanupDependants(state) {
   state.dependants.prune();
 }
 
-function addDependantSignal(source, dependant) {
+function addDependantSignal(source, dependant, dependantRef, sourceRef) {
   const state = abortSignalStateFor(source);
-  const ref = internalWeakRef(dependant);
-  state.dependants.add(ref);
-  dependantFinalizer?.register(dependant, { source: internalWeakRef(source), ref }, ref);
+  state.dependants.add(dependantRef);
+  dependantFinalizer?.register(dependant, { source: sourceRef, ref: dependantRef });
+  refreshAbortSignalRetention(source);
 }
 
 function enqueueDependants(state) {
@@ -12756,7 +13226,7 @@ function abortSignal(signal, reason) {
     clearTimeout(state.timeoutTimer);
     state.timeoutTimer = null;
   }
-  activeTimeoutSignals.delete(signal);
+  activeAbortSignals.delete(signal);
   const EventClass = globalThis.Event ?? CottontailEvent;
   const event = new EventClass("abort");
   markEventTrusted(event);
@@ -12767,12 +13237,19 @@ function abortSignal(signal, reason) {
 
 function refreshAbortSignalRetention(target) {
   const state = abortSignalState.get(target);
-  if (!state?.timeoutTimer || state.aborted) return;
+  if (!state || state.aborted) {
+    activeAbortSignals.delete(target);
+    return;
+  }
   const listeners = (target.__ctEventListeners?.get?.("abort") ?? []).filter((entry) => !entry.weak);
-  if (listeners.length > 0 || typeof state.onabort === "function") {
-    activeTimeoutSignals.add(target);
+  const hasListener = listeners.length > 0 || typeof state.onabort === "function";
+  state.dependants.prune();
+  const retainTimeout = state.timeoutTimer != null && (hasListener || state.dependants.size > 0);
+  const retainComposite = state.composite && state.sourceSignals?.size > 0 && hasListener;
+  if (retainTimeout || retainComposite) {
+    activeAbortSignals.add(target);
   } else {
-    activeTimeoutSignals.delete(target);
+    activeAbortSignals.delete(target);
   }
 }
 
@@ -12790,6 +13267,8 @@ class CottontailAbortSignal extends CottontailEventTarget {
       timeoutTimer: null,
       timeoutDeadline: null,
       dependants,
+      composite: false,
+      sourceSignals: null,
     });
     Object.defineProperty(this, abortDependantSignals, {
       value: dependants,
@@ -12857,16 +13336,35 @@ class CottontailAbortSignal extends CottontailEventTarget {
       if (!isAbortSignal(list[index])) throw invalidAbortSignalArgument(`signals[${index}]`, list[index]);
     }
     const controller = new CottontailAbortController();
+    const result = controller.signal;
+    const resultState = abortSignalStateFor(result);
+    resultState.composite = true;
+    resultState.sourceSignals = new Set();
     for (const signal of list) {
       if (signal.aborted) {
         controller.abort(signal.reason);
-        return controller.signal;
+        return result;
       }
     }
+    const resultRef = internalWeakRef(result);
     for (const signal of list) {
-      addDependantSignal(signal, controller.signal);
+      const sourceState = abortSignalStateFor(signal);
+      if (sourceState.composite) {
+        for (const sourceRef of sourceState.sourceSignals ?? []) {
+          const source = sourceRef.deref();
+          if (!source || resultState.sourceSignals.has(sourceRef)) continue;
+          resultState.sourceSignals.add(sourceRef);
+          addDependantSignal(source, result, resultRef, sourceRef);
+          sourceFinalizer?.register(signal, { sourceRef, dependant: resultRef });
+        }
+        continue;
+      }
+      const sourceRef = internalWeakRef(signal);
+      resultState.sourceSignals.add(sourceRef);
+      addDependantSignal(signal, result, resultRef, sourceRef);
+      sourceFinalizer?.register(signal, { sourceRef, dependant: resultRef });
     }
-    return controller.signal;
+    return result;
   }
 
   [inspectCustomSymbol]() {
@@ -13266,6 +13764,16 @@ globalThis.EventTarget ??= CottontailEventTarget;
 globalThis.CustomEvent ??= CottontailCustomEvent;
 globalThis.ErrorEvent ??= CottontailErrorEvent;
 globalThis.CloseEvent ??= CottontailCloseEvent;
+if (typeof globalThis.CustomEvent?.prototype?.initCustomEvent !== "function") {
+  Object.defineProperty(globalThis.CustomEvent.prototype, "initCustomEvent", {
+    value: function initCustomEvent(type, bubbles = false, cancelable = false, detail = null) {
+      this.initEvent(type, bubbles, cancelable);
+      this.detail = detail;
+    },
+    writable: true,
+    configurable: true,
+  });
+}
 Object.defineProperty(CottontailEvent, "name", { value: "Event", configurable: true });
 
 // ---------------------------------------------------------------------------
@@ -13382,7 +13890,39 @@ function commitWebTransfer(prepared) {
   }
 }
 
+const structuredCloneFastPathMiss = Symbol("structuredCloneFastPathMiss");
+
+function structuredCloneFlatRecord(value) {
+  if (value === null || Object.getPrototypeOf(value) !== Object.prototype) return structuredCloneFastPathMiss;
+  const result = {};
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (Object.prototype.__lookupGetter__.call(value, key) || Object.prototype.__lookupSetter__.call(value, key)) {
+      return structuredCloneFastPathMiss;
+    }
+    const item = value[key];
+    const type = typeof item;
+    if (item !== null && (type === "object" || type === "function" || type === "symbol")) {
+      return structuredCloneFastPathMiss;
+    }
+    if (key === "__proto__") {
+      Object.defineProperty(result, key, { value: item, enumerable: true, writable: true, configurable: true });
+    } else {
+      result[key] = item;
+    }
+  }
+  return result;
+}
+
 function cottontailStructuredClone(value, options = undefined) {
+  if (options == null || options.transfer == null) {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+      if (typeof value === "symbol") throw makeDataCloneError("Symbol values could not be cloned.");
+      return value;
+    }
+    const fastResult = structuredCloneFlatRecord(value);
+    if (fastResult !== structuredCloneFastPathMiss) return fastResult;
+  }
   const transfers = collectWebTransferables(options?.transfer, null);
   const prepared = buildWebTransferMap(transfers);
   const result = structuredCloneValue(value, prepared.seen);
@@ -14318,7 +14858,9 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
     wsPrototype.dispatchEvent = dispatchEvent;
   }
 }
-globalThis.File = BunFile;
+// ffi.js installs the same public File contract early enough for node:buffer
+// to capture it. Preserve that constructor identity across both APIs.
+globalThis.File ??= BunFile;
 globalThis.AbortSignal ??= CottontailAbortSignal;
 globalThis.AbortController ??= CottontailAbortController;
 globalThis.structuredClone ??= cottontailStructuredClone;

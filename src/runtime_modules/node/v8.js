@@ -355,24 +355,28 @@ function memoryUsage() {
 
 export function getHeapStatistics() {
   const usage = memoryUsage();
+  const stats = typeof cottontail.jscMemoryUsage === "function" ? cottontail.jscMemoryUsage() : {};
   const rss = Number(usage.rss ?? 0);
-  const heapTotal = Number(usage.heapTotal ?? rss);
-  const heapUsed = Number(usage.heapUsed ?? rss);
-  const external = Number(usage.external ?? 0);
+  const heapUsed = Number(stats.heapSize ?? usage.heapUsed ?? rss);
+  const heapTotal = Number(stats.heapCapacity ?? usage.heapTotal ?? heapUsed);
+  const external = Number(stats.extraMemorySize ?? usage.external ?? 0);
+  const totalMemory = Number(globalThis.process?.constrainedMemory?.() || globalThis.process?.availableMemory?.() + rss || rss);
   return {
     total_heap_size: heapTotal,
-    total_heap_size_executable: 0,
+    total_heap_size_executable: heapUsed >> 1,
     total_physical_size: rss,
-    total_available_size: Number(globalThis.process?.availableMemory?.() ?? 0),
+    total_available_size: Math.max(0, totalMemory - heapUsed),
     used_heap_size: heapUsed,
-    heap_size_limit: Number(globalThis.process?.constrainedMemory?.() ?? heapTotal),
-    malloced_memory: external,
-    peak_malloced_memory: external,
+    heap_size_limit: Math.min(rss * 10, totalMemory),
+    malloced_memory: heapUsed,
+    peak_malloced_memory: rss,
     does_zap_garbage: 0,
-    number_of_native_contexts: 1,
+    number_of_native_contexts: Number(stats.globalObjectCount ?? 1),
     number_of_detached_contexts: 0,
-    total_global_handles_size: 0,
-    used_global_handles_size: 0,
+    // Bun uses Node's representative values because JSC does not expose
+    // byte sizes for protected handles.
+    total_global_handles_size: 8192,
+    used_global_handles_size: 2208,
     external_memory: external,
   };
 }

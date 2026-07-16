@@ -222,6 +222,14 @@ function codesToString(codes) {
   return result;
 }
 
+function codesToUtf16String(codes) {
+  if (codes.length === 0) return "";
+  if (typeof g.cottontail?.stringFromUtf16 === "function") {
+    return g.cottontail.stringFromUtf16(new Uint16Array(codes));
+  }
+  return codesToString(codes);
+}
+
 function concatChunks(chunks) {
   if (chunks.length === 1) return chunks[0];
   let total = 0;
@@ -307,7 +315,7 @@ class TextDecoder {
         return this.#finishText(state, this.#decodeUTF8(state, bytes, flush), true);
       case KIND_UTF16LE:
       case KIND_UTF16BE:
-        return this.#finishText(state, this.#decodeUTF16(state, bytes, flush, state.kind === KIND_UTF16BE), true);
+        return this.#finishText(state, this.#decodeUTF16(state, bytes, flush, state.kind === KIND_UTF16BE), true, true);
       case KIND_SINGLE_BYTE:
         return this.#decodeSingleByte(state, bytes);
       case KIND_X_USER_DEFINED:
@@ -320,7 +328,7 @@ class TextDecoder {
     return "";
   }
 
-  #finishText(state, result, checkBOM) {
+  #finishText(state, result, checkBOM, forceUtf16 = false) {
     // Fast paths return strings directly (BOM already accounted for).
     if (typeof result === "string") return result;
     if (checkBOM && !this.ignoreBOM && !state.bomSeen && result.length > 0) {
@@ -329,7 +337,7 @@ class TextDecoder {
     } else if (result.length > 0) {
       state.bomSeen = true;
     }
-    return codesToString(result);
+    return forceUtf16 ? codesToUtf16String(result) : codesToString(result);
   }
 
   #decodeUTF8(state, bytes, flush) {

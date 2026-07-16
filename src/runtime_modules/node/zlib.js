@@ -1,5 +1,5 @@
 import * as zlibConstants from "./zlib/constants.js";
-import * as bufferModule from "./buffer.js";
+import bufferModule from "./buffer.js";
 import { Transform } from "./stream.js";
 
 export {

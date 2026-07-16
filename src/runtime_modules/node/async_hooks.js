@@ -9,9 +9,21 @@ const storages = new Set();
 const asyncWrappedCallback = Symbol.for("cottontail.async_hooks.wrappedCallback");
 const promisifyCustom = Symbol.for("nodejs.util.promisify.custom");
 let drainingWrappedCallbackJobs = false;
+const nextTickJobs = [];
+let nextTickJobHead = 0;
+let drainingNextTickJobs = false;
+let nextTickDrainScheduled = false;
+let nextTickPriorityArmed = true;
 const promiseAsyncIds = new WeakMap();
 const gcTrackedAsyncResourceIds = new Set();
 const destroyedAsyncResourceIds = new Set();
+
+function syncNextTickHostState() {
+  globalThis.cottontail?.nextTickState?.(
+    nextTickJobHead < nextTickJobs.length,
+    nextTickPriorityArmed,
+  );
+}
 
 function nodeTypeError(code, message) {
   const error = new TypeError(message);
@@ -177,6 +189,89 @@ Object.defineProperty(globalThis, "__cottontailAsyncHooksOnGc", {
 });
 
 const storageStack = [];
+const deferredStorageContexts = [];
+
+function isThenable(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function") &&
+    typeof value.then === "function";
+}
+
+function isPromise(value) {
+  return typeof Promise === "function" && value instanceof Promise;
+}
+
+function registerContextDependency(context, thenable) {
+  if (!isThenable(thenable)) return false;
+  if (context.dependencies.has(thenable)) return false;
+  context.dependencies.add(thenable);
+  if (context.deferredActive) attachDeferredDependency(context, thenable);
+  return true;
+}
+
+export function _registerAsyncContextDependency(thenable) {
+  if (!isThenable(thenable)) return false;
+  if (storageStack.length > 0) {
+    return registerContextDependency(storageStack[storageStack.length - 1].context, thenable);
+  }
+  for (let i = deferredStorageContexts.length - 1; i >= 0; i--) {
+    const context = deferredStorageContexts[i];
+    if (context.frames.some((frame) => frame.storage.enabled === frame.enabled &&
+      frame.storage._store === frame.store && frame.storage._hasStore === frame.hasStore)) {
+      return registerContextDependency(context, thenable);
+    }
+  }
+  return false;
+}
+
+function finishDeferredContext(context) {
+  if (!context.deferredActive || context.deferredPending !== 0 || context.deferredAttaching) return;
+  context.deferredActive = false;
+  const index = deferredStorageContexts.lastIndexOf(context);
+  if (index >= 0) deferredStorageContexts.splice(index, 1);
+  context.onDeferredSettled();
+}
+
+function attachDeferredDependency(context, dependency) {
+  context.deferredPending += 1;
+  const settled = () => {
+    context.deferredPending -= 1;
+    finishDeferredContext(context);
+  };
+  try {
+    deferRestoreUntilSettled(dependency, settled);
+  } catch {
+    settled();
+  }
+}
+
+function activateDeferredContext(context, onSettled) {
+  context.deferredActive = true;
+  context.deferredPending = 0;
+  context.deferredAttaching = true;
+  context.onDeferredSettled = onSettled;
+  deferredStorageContexts.push(context);
+  for (const dependency of context.dependencies) attachDeferredDependency(context, dependency);
+  context.deferredAttaching = false;
+  finishDeferredContext(context);
+}
+
+function sameStorageState(left, right) {
+  return left.storage === right.storage && left.store === right.store &&
+    left.hasStore === right.hasStore && left.enabled === right.enabled &&
+    left.generation === right.generation;
+}
+
+function findParentStorageEntry(frame) {
+  for (let i = storageStack.length - 1; i >= 0; i--) {
+    if (storageStack[i].frame.storage === frame.storage) return storageStack[i];
+  }
+  for (let i = deferredStorageContexts.length - 1; i >= 0; i--) {
+    const context = deferredStorageContexts[i];
+    const parentFrame = context.frames.find((candidate) => candidate.storage === frame.storage && !candidate.restored);
+    if (parentFrame) return { context, frame: parentFrame };
+  }
+  return null;
+}
 
 // Attach a settle-time callback with the native (unpatched) promise
 // machinery: the patched Promise.prototype.then restores its captured
@@ -207,30 +302,95 @@ function runWithStorageSnapshot(snapshot, fn, thisArg, args) {
       enabled,
       store,
       hasStore,
+      generation,
       prevEnabled: storage.enabled,
       prevStore: storage._store,
       prevHasStore: storage._hasStore,
+      prevHiddenContext: storage._hiddenContext,
+      prevVisibleStore: storage.getStore(),
+      hiddenContext: null,
     });
     storage.enabled = enabled;
     storage._store = store;
     storage._hasStore = hasStore;
+    storage._hiddenContext = null;
   }
-  try {
-    return fn.apply(thisArg, args);
-  } finally {
-    for (const frame of frames) {
+  const restore = (restoreFrames, onlyIfStillOurs) => {
+    for (const frame of restoreFrames) {
+      if (frame.restored) continue;
+      frame.restored = true;
       // Only undo values this frame installed: an inner AsyncLocalStorage.run
       // with an async callback (or a nested wrapped callback) may have opened
       // a deferred context window that must survive this frame's exit; its
       // own settle handler restores it.
       const { storage } = frame;
-      if (storage._store === frame.store && storage._hasStore === frame.hasStore && storage.enabled === frame.enabled) {
+      const ownsHiddenContext = frame.hiddenContext == null
+        ? storage._hiddenContext == null
+        : storage._hiddenContext == null || storage._hiddenContext === frame.hiddenContext;
+      if (!onlyIfStillOurs || ((storage._disableGeneration ?? 0) === frame.generation &&
+        storage._store === frame.store && storage._hasStore === frame.hasStore &&
+        storage.enabled === frame.enabled && ownsHiddenContext)) {
         storage.enabled = frame.prevEnabled;
         storage._store = frame.prevStore;
         storage._hasStore = frame.prevHasStore;
+        storage._hiddenContext = frame.prevHiddenContext;
       }
     }
+  };
+  const context = { frames, dependencies: new Set() };
+  for (const frame of frames) storageStack.push({ context, frame });
+  let result;
+  try {
+    result = fn.apply(thisArg, args);
+  } catch (error) {
+    storageStack.length -= frames.length;
+    restore(frames, true);
+    throw error;
   }
+  storageStack.length -= frames.length;
+  if (isPromise(result)) registerContextDependency(context, result);
+  const dependencies = [...context.dependencies];
+  if (frames.length > 0 && dependencies.length > 0) {
+    const adoptedFrames = new Set();
+    for (const frame of frames) {
+      const parent = findParentStorageEntry(frame);
+      if (parent != null) {
+        for (const dependency of dependencies) registerContextDependency(parent.context, dependency);
+        if (sameStorageState(parent.frame, frame)) adoptedFrames.add(frame);
+      }
+    }
+    restore([...adoptedFrames], true);
+    const ownedFrames = frames.filter((frame) => !adoptedFrames.has(frame));
+    if (ownedFrames.length === 0) return result;
+    let deferredPending = true;
+    for (const frame of ownedFrames) {
+      const { storage } = frame;
+      if (storage._store !== frame.store || storage._hasStore !== frame.hasStore ||
+        storage.enabled !== frame.enabled || storage._hiddenContext != null) continue;
+      frame.hiddenContext = { active: true, value: frame.prevVisibleStore };
+      storage._hiddenContext = frame.hiddenContext;
+    }
+    (nativeQueueMicrotaskRef ?? queueMicrotask)(() => {
+      if (!deferredPending) return;
+      for (const frame of ownedFrames) {
+        if (frame.hiddenContext == null) continue;
+        frame.hiddenContext.active = false;
+        if (frame.storage._hiddenContext === frame.hiddenContext) frame.storage._hiddenContext = null;
+      }
+    });
+    activateDeferredContext(context, () => {
+      deferredPending = false;
+      for (const frame of ownedFrames) {
+        if (frame.hiddenContext != null && frame.storage._hiddenContext === frame.hiddenContext) {
+          frame.storage._hiddenContext = null;
+        }
+      }
+      restore(ownedFrames, true);
+    });
+    return result;
+  }
+  restore(frames, true);
+  return result;
 }
 
 // PromiseResolveThenableJob invokes `thenable.then` from the engine's
@@ -251,8 +411,14 @@ function isNonPromiseThenable(value) {
     !(value instanceof Promise) && typeof value.then === "function";
 }
 
-export function _wrapAsyncCallback(callback) {
-  if (typeof callback !== "function" || callback[asyncWrappedCallback]) return callback;
+export function _wrapAsyncCallback(callback, options = undefined) {
+  if (typeof callback !== "function") return callback;
+  const drainJobs = options?.drainJobs !== false;
+  const existing = callback[asyncWrappedCallback];
+  if (existing) {
+    if (existing.drainJobs === drainJobs || typeof existing.callback !== "function") return callback;
+    callback = existing.callback;
+  }
   const snapshot = captureStorageSnapshot();
   const snapshotAsyncId = currentAsyncId;
   const snapshotTriggerAsyncId = currentTriggerAsyncId;
@@ -266,15 +432,22 @@ export function _wrapAsyncCallback(callback) {
     currentResource = snapshotResource;
     continuationResource = null;
     try {
-      const result = runWithStorageSnapshot(snapshot, callback, this, args);
-      if (!drainingWrappedCallbackJobs && typeof globalThis.cottontail?.drainJobs === "function") {
-        drainingWrappedCallbackJobs = true;
-        try {
-          globalThis.cottontail.drainJobs();
-        } finally {
-          drainingWrappedCallbackJobs = false;
+      const callbackThis = this;
+      const result = runWithStorageSnapshot(snapshot, () => {
+        const callbackResult = callback.apply(callbackThis, args);
+        // JSC does not expose its async-context hooks through the public C API.
+        // Drain reactions before leaving the captured snapshot so promises
+        // resolved by a synchronous host callback inherit that callback's store.
+        if (drainJobs && !drainingWrappedCallbackJobs && typeof globalThis.cottontail?.drainJobs === "function") {
+          drainingWrappedCallbackJobs = true;
+          try {
+            globalThis.cottontail.drainJobs();
+          } finally {
+            drainingWrappedCallbackJobs = false;
+          }
         }
-      }
+        return callbackResult;
+      }, undefined, []);
       if (snapshotResource !== defaultExecutionResource) continuationResource = snapshotResource;
       return result;
     } finally {
@@ -283,18 +456,153 @@ export function _wrapAsyncCallback(callback) {
       currentResource = previousResource;
     }
   };
-  Object.defineProperty(wrapped, asyncWrappedCallback, { __proto__: null, value: true });
+  Object.defineProperty(wrapped, asyncWrappedCallback, {
+    __proto__: null,
+    value: { callback, drainJobs },
+  });
   return wrapped;
 }
 
-// process.nextTick callbacks share the native microtask queue (FIFO with
-// queueMicrotask). Matching Node/Bun's nextTick-before-microtask priority
-// would require an engine hook (e.g. JSC's onEachMicrotaskTick) - without it,
-// reordering from JS breaks code that interleaves promise reactions.
+Object.defineProperty(globalThis, "__cottontailWrapAsyncCallback", {
+  value: _wrapAsyncCallback,
+  configurable: true,
+  writable: true,
+});
+
 let nativeQueueMicrotaskRef = null;
 
+function drainNextTickJobs() {
+  if (drainingNextTickJobs || nextTickJobHead >= nextTickJobs.length) return 0;
+  drainingNextTickJobs = true;
+  nextTickDrainScheduled = false;
+  nextTickPriorityArmed = false;
+  const start = nextTickJobHead;
+  try {
+    while (nextTickJobHead < nextTickJobs.length) {
+      nextTickJobs[nextTickJobHead++]();
+    }
+    return nextTickJobHead - start;
+  } finally {
+    if (nextTickJobHead > 0) nextTickJobs.splice(0, nextTickJobHead);
+    nextTickJobHead = 0;
+    drainingNextTickJobs = false;
+    syncNextTickHostState();
+  }
+}
+
+function drainNextTicksBeforeMicrotask() {
+  if (nextTickPriorityArmed && nextTickJobHead < nextTickJobs.length) drainNextTickJobs();
+}
+
+function nextTickMicrotaskCheckpoint() {
+  nextTickDrainScheduled = false;
+  drainNextTicksBeforeMicrotask();
+}
+
 export function _enqueueNextTick(job) {
-  (nativeQueueMicrotaskRef ?? queueMicrotask)(job);
+  const wasEmpty = nextTickJobHead >= nextTickJobs.length;
+  nextTickJobs.push(job);
+  if (wasEmpty) syncNextTickHostState();
+  if (!nextTickPriorityArmed || nextTickDrainScheduled || drainingNextTickJobs) return;
+  nextTickDrainScheduled = true;
+  (nativeQueueMicrotaskRef ?? queueMicrotask)(nextTickMicrotaskCheckpoint);
+}
+
+Object.defineProperty(globalThis, "__cottontailDrainNextTicks", {
+  value(beginTurn = false) {
+    const drained = drainNextTickJobs();
+    if (beginTurn) nextTickPriorityArmed = true;
+    syncNextTickHostState();
+    return drained;
+  },
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "__cottontailBeforeMicrotask", {
+  value: drainNextTicksBeforeMicrotask,
+  configurable: true,
+  writable: true,
+});
+
+Object.defineProperty(globalThis, "__cottontailBeginNextTickTurn", {
+  value() {
+    drainNextTickJobs();
+    nextTickPriorityArmed = true;
+    syncNextTickHostState();
+  },
+  configurable: true,
+  writable: true,
+});
+
+function wrapAsyncContextCallbacks(value, callbackNames) {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const name of callbackNames) {
+    let callback;
+    try {
+      callback = value[name];
+    } catch {
+      continue;
+    }
+    if (typeof callback !== "function") continue;
+    descriptors[name] = {
+      value: _wrapAsyncCallback(function(...args) {
+        return callback.apply(value, args);
+      }),
+      writable: true,
+      enumerable: descriptors[name]?.enumerable ?? true,
+      configurable: true,
+    };
+  }
+  return Object.create(Object.getPrototypeOf(value), descriptors);
+}
+
+function patchAsyncContextConstructor(global, name, callbackGroups) {
+  const nativeConstructor = global[name];
+  if (typeof nativeConstructor !== "function" || nativeConstructor.__cottontailAsyncHooksPatched) return;
+  let wrappedConstructor;
+  wrappedConstructor = new Proxy(nativeConstructor, {
+    construct(target, args, newTarget) {
+      const wrappedArgs = Array.from(args);
+      for (const [index, callbackNames] of callbackGroups) {
+        if (index < wrappedArgs.length) {
+          wrappedArgs[index] = wrapAsyncContextCallbacks(wrappedArgs[index], callbackNames);
+        }
+      }
+      return Reflect.construct(target, wrappedArgs, newTarget === wrappedConstructor ? target : newTarget);
+    },
+  });
+  Object.defineProperty(nativeConstructor, "__cottontailAsyncHooksPatched", { value: true, configurable: true });
+  try {
+    Object.defineProperty(nativeConstructor.prototype, "constructor", {
+      value: wrappedConstructor,
+      writable: true,
+      configurable: true,
+    });
+  } catch {}
+  Object.defineProperty(global, name, {
+    value: wrappedConstructor,
+    writable: true,
+    configurable: true,
+  });
+}
+
+export function _patchAsyncContextGlobals() {
+  const global = globalThis;
+  patchAsyncContextConstructor(global, "ReadableStream", [
+    [0, ["start", "pull", "cancel"]],
+    [1, ["size"]],
+  ]);
+  patchAsyncContextConstructor(global, "WritableStream", [
+    [0, ["start", "write", "close", "abort"]],
+    [1, ["size"]],
+  ]);
+  patchAsyncContextConstructor(global, "TransformStream", [
+    [0, ["start", "transform", "flush", "cancel"]],
+    [1, ["size"]],
+    [2, ["size"]],
+  ]);
 }
 
 function patchGlobalAsyncSchedulers() {
@@ -306,7 +614,11 @@ function patchGlobalAsyncSchedulers() {
       if (typeof callback !== "function") {
         throw nodeTypeError("ERR_INVALID_ARG_TYPE", 'The "callback" argument must be of type function.');
       }
-      nativeQueueMicrotask(_wrapAsyncCallback(callback));
+      const wrapped = _wrapAsyncCallback(callback);
+      nativeQueueMicrotask(function runQueuedMicrotask() {
+        drainNextTicksBeforeMicrotask();
+        return wrapped();
+      });
     };
     // The bundler suffixes identifiers when deduplicating; pin the name.
     Object.defineProperty(global.queueMicrotask, "name", { value: "queueMicrotask", configurable: true });
@@ -412,6 +724,7 @@ function patchGlobalAsyncSchedulers() {
       let child;
       let childAsyncId = 0;
       const runPromiseCallback = (callback, value, isReject) => {
+        drainNextTicksBeforeMicrotask();
         const previousAsyncId = currentAsyncId;
         const previousTriggerAsyncId = currentTriggerAsyncId;
         const previousResource = currentResource;
@@ -468,6 +781,7 @@ function patchGlobalAsyncSchedulers() {
       global.Promise.prototype.finally.__cottontailAsyncHooksPatched = true;
     }
   }
+  _patchAsyncContextGlobals();
 }
 
 export class AsyncLocalStorage {
@@ -482,6 +796,7 @@ export class AsyncLocalStorage {
     this._hasDefaultValue = Object.prototype.hasOwnProperty.call(options, "defaultValue");
     this._store = undefined;
     this._hasStore = false;
+    this._hiddenContext = null;
     storages.add(this);
   }
 
@@ -492,14 +807,17 @@ export class AsyncLocalStorage {
     this._disableGeneration += 1;
     this._store = undefined;
     this._hasStore = false;
+    this._hiddenContext = null;
   }
 
   getStore() {
+    if (this._hiddenContext?.active) return this._hiddenContext.value;
     if (!this.enabled) return undefined;
     return this._hasStore ? this._store : (this._hasDefaultValue ? this._defaultValue : undefined);
   }
 
   enterWith(store) {
+    this._hiddenContext = null;
     this.enabled = true;
     this._store = store;
     this._hasStore = true;
@@ -510,11 +828,24 @@ export class AsyncLocalStorage {
     const previous = this._store;
     const previousHasStore = this._hasStore;
     const previousEnabled = this.enabled;
+    const previousHiddenContext = this._hiddenContext;
+    const previousVisibleStore = this.getStore();
     const generation = this._disableGeneration;
+    this._hiddenContext = null;
     this.enabled = true;
     this._store = store;
     this._hasStore = true;
-    storageStack.push(this);
+    const context = {
+      dependencies: new Set(),
+      frames: [{
+        storage: this,
+        enabled: true,
+        store,
+        hasStore: true,
+        generation,
+      }],
+    };
+    storageStack.push({ context, frame: context.frames[0] });
     let restored = false;
     const restore = (onlyIfStillOurs) => {
       if (restored) return;
@@ -527,7 +858,15 @@ export class AsyncLocalStorage {
       this._store = previous;
       this._hasStore = previousHasStore;
       this.enabled = previousEnabled;
+      this._hiddenContext = previousHiddenContext;
     };
+    let deferredPending = false;
+    const hiddenContext = { active: false, value: previousVisibleStore };
+    (nativeQueueMicrotaskRef ?? queueMicrotask)(() => {
+      if (!deferredPending) return;
+      hiddenContext.active = false;
+      if (this._hiddenContext === hiddenContext) this._hiddenContext = null;
+    });
     let result;
     try {
       result = callback(...args);
@@ -537,19 +876,23 @@ export class AsyncLocalStorage {
       throw error;
     }
     storageStack.pop();
-    // Async callback: JSC's `await` continuations bypass the patched
-    // Promise.prototype.then, so a synchronous restore would clear the store
-    // before the continuation observes it. Keep the store active until the
-    // returned promise settles (engine-level async context propagation is not
-    // reachable from the JSC C API). Attaching here - before the caller can
-    // await - guarantees the restore reaction runs before the awaiter's.
-    if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
-      try {
-        deferRestoreUntilSettled(result, () => restore(true));
-        return result;
-      } catch {
-        // fall through to synchronous restore on scheduling failure
-      }
+    // JSC's await continuations bypass Promise.prototype.then. Keep the
+    // continuation's store installed, but mask it from synchronous parent
+    // code until the microtask queued before the first continuation runs.
+    // The settle reaction is attached before the caller can await, so it
+    // restores the parent before the caller resumes.
+    if (isPromise(result)) registerContextDependency(context, result);
+    const dependencies = [...context.dependencies];
+    if (dependencies.length > 0) {
+      deferredPending = true;
+      hiddenContext.active = true;
+      this._hiddenContext = hiddenContext;
+      activateDeferredContext(context, () => {
+        deferredPending = false;
+        if (this._hiddenContext === hiddenContext) this._hiddenContext = null;
+        restore(true);
+      });
+      return result;
     }
     restore(false);
     return result;

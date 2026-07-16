@@ -5,7 +5,7 @@ import { toASCII, toUnicode } from "./punycode.js";
 // Import the vendor implementation directly: globalThis.URL is only assigned
 // by bun/index.js after this module has already been evaluated, so grabbing
 // the global here would capture the weaker ffi.js bootstrap shim instead.
-import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
+import { URL, URLSearchParams, createFileURLFromPath } from "../vendor/whatwg-url.js";
 
 export { URL, URLSearchParams };
 
@@ -1011,30 +1011,32 @@ export function resolveObject(source, relative) {
 // path <-> file: URL conversion (Node's lib/internal/url.js semantics)
 // ---------------------------------------------------------------------------
 
-const percentRegEx = /%/g;
 const backslashRegEx = /\\/g;
-const newlineRegEx = /\n/g;
-const carriageReturnRegEx = /\r/g;
-const tabRegEx = /\t/g;
+const hashRegEx = /#/g;
+const questionMarkRegEx = /\?/g;
 const tildeRegEx = /~/g;
+const pathNeedsEscapingRegEx = /[\u0000-\u0020"#%<>?\[\\\]\^`{|}~\u007F-\uFFFF]/;
 
 function encodePathChars(filepath) {
-  if (filepath.indexOf("%") !== -1) filepath = filepath.replace(percentRegEx, "%25");
-  // In posix, backslash is a valid character in paths:
-  if (filepath.indexOf("\\") !== -1) filepath = filepath.replace(backslashRegEx, "%5C");
-  if (filepath.indexOf("\n") !== -1) filepath = filepath.replace(newlineRegEx, "%0A");
-  if (filepath.indexOf("\r") !== -1) filepath = filepath.replace(carriageReturnRegEx, "%0D");
-  if (filepath.indexOf("\t") !== -1) filepath = filepath.replace(tabRegEx, "%09");
-  // Bun.pathToFileURL escapes tilde even though the WHATWG URL pathname
-  // setter leaves it unescaped.
-  if (filepath.indexOf("~") !== -1) filepath = filepath.replace(tildeRegEx, "%7E");
-  return filepath;
+  if (!pathNeedsEscapingRegEx.test(filepath)) return filepath;
+  const wellFormed = typeof filepath.toWellFormed === "function" ? filepath.toWellFormed() : filepath;
+  return encodeURI(wellFormed)
+    .replace(hashRegEx, "%23")
+    .replace(questionMarkRegEx, "%3F")
+    .replace(tildeRegEx, "%7E");
+}
+
+function resolvePathForFileURL(filepath) {
+  if (filepath.length > 0 && filepath !== "." && filepath !== ".." && filepath.indexOf("/") === -1) {
+    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+    return cwd.endsWith("/") ? `${cwd}${filepath}` : `${cwd}/${filepath}`;
+  }
+  return pathResolve(filepath);
 }
 
 export function pathToFileURL(filepath, options = undefined) {
   validateString(filepath, "path");
   const windows = options?.windows ?? globalThis.process?.platform === "win32";
-  const outURL = new URL("file://");
   if (windows && filepath.startsWith("\\\\")) {
     // UNC path format: \\server\share\resource
     const hostnameEndIndex = filepath.indexOf("\\", 2);
@@ -1043,11 +1045,11 @@ export function pathToFileURL(filepath, options = undefined) {
       err.code = "ERR_INVALID_ARG_VALUE";
       throw err;
     }
-    outURL.hostname = toASCII(filepath.slice(2, hostnameEndIndex));
-    outURL.pathname = encodePathChars(filepath.slice(hostnameEndIndex).replace(backslashRegEx, "/"));
-    return outURL;
+    const hostname = toASCII(filepath.slice(2, hostnameEndIndex));
+    const pathname = encodePathChars(filepath.slice(hostnameEndIndex).replace(backslashRegEx, "/"));
+    return createFileURLFromPath(pathname, hostname);
   }
-  let resolved = windows ? String(filepath).replace(backslashRegEx, "/") : pathResolve(filepath);
+  let resolved = windows ? String(filepath).replace(backslashRegEx, "/") : resolvePathForFileURL(filepath);
   if (!windows) {
     // path.resolve strips trailing slashes so we must add them back
     const filePathLast = filepath.charCodeAt(filepath.length - 1);
@@ -1055,8 +1057,7 @@ export function pathToFileURL(filepath, options = undefined) {
       resolved += "/";
     }
   }
-  outURL.pathname = encodePathChars(resolved);
-  return outURL;
+  return createFileURLFromPath(encodePathChars(resolved));
 }
 
 function invalidFileUrlPathError(suffix) {
@@ -1115,6 +1116,7 @@ function getPathFromURLWin32(url) {
 export function fileURLToPath(path, options = undefined) {
   const windows = options?.windows ?? globalThis.process?.platform === "win32";
   if (typeof path === "string") {
+    if (/^file:\/\/[A-Za-z]:[\\/]/.test(path)) path = `file:///${path.slice("file://".length)}`;
     path = new URL(path);
   } else if (path === null || typeof path !== "object" || typeof path.href !== "string" || typeof path.protocol !== "string") {
     throw invalidArgTypeError("path", "string or an instance of URL", path);

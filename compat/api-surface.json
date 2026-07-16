@@ -7846,7 +7846,22 @@
       "bun/node-fetch": {
         "file": "src/runtime_modules/bun/node-fetch.js",
         "exports": [
+          "AbortError",
+          "Blob",
+          "blobFrom",
+          "blobFromSync",
+          "fetch",
+          "FetchBaseError",
+          "FetchError",
+          "File",
+          "fileFrom",
+          "fileFromSync",
+          "FormData",
+          "Headers",
           "isomorphicFetch",
+          "isRedirect",
+          "Request",
+          "Response",
           "vercelFetch"
         ],
         "hasDefaultExport": true
@@ -8050,6 +8065,8 @@
         "file": "src/runtime_modules/node/async_hooks.js",
         "exports": [
           "_enqueueNextTick",
+          "_patchAsyncContextGlobals",
+          "_registerAsyncContextDependency",
           "_wrapAsyncCallback",
           "AsyncLocalStorage",
           "AsyncResource",
@@ -8065,6 +8082,8 @@
         "file": "src/runtime_modules/node/async_hooks.js",
         "exports": [
           "_enqueueNextTick",
+          "_patchAsyncContextGlobals",
+          "_registerAsyncContextDependency",
           "_wrapAsyncCallback",
           "AsyncLocalStorage",
           "AsyncResource",
@@ -12352,6 +12371,13 @@
         ],
         "hasDefaultExport": true
       },
+      "vendor/isomorphic-fetch": {
+        "file": "src/runtime_modules/vendor/isomorphic-fetch.js",
+        "exports": [
+          "fetch"
+        ],
+        "hasDefaultExport": true
+      },
       "vendor/node-fetch": {
         "file": "src/runtime_modules/vendor/node-fetch.js",
         "exports": [
@@ -12390,7 +12416,8 @@
         "file": "src/runtime_modules/vendor/sourcemap.js",
         "exports": [
           "remapPosition",
-          "remapStackString"
+          "remapStackString",
+          "sourceContextForLocation"
         ],
         "hasDefaultExport": true
       },
@@ -12401,9 +12428,15 @@
         ],
         "hasDefaultExport": false
       },
+      "vendor/vercel-fetch": {
+        "file": "src/runtime_modules/vendor/vercel-fetch.js",
+        "exports": [],
+        "hasDefaultExport": true
+      },
       "vendor/whatwg-url": {
         "file": "src/runtime_modules/vendor/whatwg-url.js",
         "exports": [
+          "createFileURLFromPath",
           "URL",
           "URLSearchParams"
         ],
@@ -12722,6 +12755,7 @@
           "zstdDecompressSync"
         ],
         "globalProperties": [
+          "__cottontailActiveServeDispatches",
           "__cottontailActiveServeOrigins",
           "__cottontailAutoServeInstalled",
           "__cottontailBunHasNonReifiedStatic",
@@ -12912,7 +12946,22 @@
         "file": "src/runtime_modules/bun/node-fetch.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "AbortError",
+          "Blob",
+          "blobFrom",
+          "blobFromSync",
+          "fetch",
+          "FetchBaseError",
+          "FetchError",
+          "File",
+          "fileFrom",
+          "fileFromSync",
+          "FormData",
+          "Headers",
           "isomorphicFetch",
+          "isRedirect",
+          "Request",
+          "Response",
           "vercelFetch"
         ],
         "bunObjectProperties": [],
@@ -13111,6 +13160,8 @@
         "hasDefaultExport": true,
         "namedExports": [
           "_enqueueNextTick",
+          "_patchAsyncContextGlobals",
+          "_registerAsyncContextDependency",
           "_wrapAsyncCallback",
           "AsyncLocalStorage",
           "AsyncResource",
@@ -13147,6 +13198,7 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
+          "Buffer",
           "resolveObjectURL"
         ]
       },
@@ -13549,7 +13601,9 @@
           "X509Certificate"
         ],
         "bunObjectProperties": [],
-        "globalProperties": []
+        "globalProperties": [
+          "DOMException"
+        ]
       },
       "src/runtime_modules/node/dgram.js": {
         "file": "src/runtime_modules/node/dgram.js",
@@ -14365,6 +14419,8 @@
           "__cottontailDotenvLoaded",
           "__cottontailFdWatchHandlerInstalled",
           "__cottontailFdWatchListeners",
+          "__cottontailHandleUncaughtException",
+          "__cottontailHandleUnhandledRejection",
           "__cottontailLoadDotenv",
           "process"
         ]
@@ -14690,6 +14746,7 @@
           "__cottontailNoteDanglingProcessKilled",
           "__cottontailRegisterTestPendingPromise",
           "__cottontailRegisterTestSubprocess",
+          "__cottontailStartTestRun",
           "queueMicrotask",
           "setImmediate",
           "setInterval",
@@ -15560,6 +15617,15 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/vendor/isomorphic-fetch.js": {
+        "file": "src/runtime_modules/vendor/isomorphic-fetch.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "fetch"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/vendor/node-fetch.js": {
         "file": "src/runtime_modules/vendor/node-fetch.js",
         "hasDefaultExport": true,
@@ -15605,7 +15671,8 @@
         "hasDefaultExport": true,
         "namedExports": [
           "remapPosition",
-          "remapStackString"
+          "remapStackString",
+          "sourceContextForLocation"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -15619,10 +15686,18 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/vendor/vercel-fetch.js": {
+        "file": "src/runtime_modules/vendor/vercel-fetch.js",
+        "hasDefaultExport": true,
+        "namedExports": [],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/vendor/whatwg-url.js": {
         "file": "src/runtime_modules/vendor/whatwg-url.js",
         "hasDefaultExport": false,
         "namedExports": [
+          "createFileURLFromPath",
           "URL",
           "URLSearchParams"
         ],
@@ -15783,6 +15858,7 @@
       "zstdDecompressSync"
     ],
     "globalProperties": [
+      "__cottontailActiveServeDispatches",
       "__cottontailActiveServeOrigins",
       "__cottontailApplyCommonJSModuleMock",
       "__cottontailAutoServeInstalled",
@@ -15804,6 +15880,8 @@
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
       "__cottontailFsConstants",
+      "__cottontailHandleUncaughtException",
+      "__cottontailHandleUnhandledRejection",
       "__cottontailHasActiveHandles",
       "__cottontailImportMetaResolve",
       "__cottontailImportMetaResolveSync",
@@ -15826,6 +15904,7 @@
       "__cottontailServeEverCalled",
       "__cottontailSharedBufferGrowState",
       "__cottontailSharedBufferRegistry",
+      "__cottontailStartTestRun",
       "__cottontailSuppressAsyncHookPromise",
       "__cottontailSyntheticAllocationLimit",
       "__cottontailTestAssertionCount",
@@ -16005,6 +16084,8 @@
         "missing": [],
         "extra": [
           "_enqueueNextTick",
+          "_patchAsyncContextGlobals",
+          "_registerAsyncContextDependency",
           "_wrapAsyncCallback"
         ]
       },
@@ -18212,7 +18293,7 @@
       "version": "24.11.1",
       "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
       "snapshot": "compat/upstream/node/v24.11.1",
-      "copiedFiles": 9979,
+      "copiedFiles": 9883,
       "discoveredRunnableFiles": 7015,
       "enabled": 7015,
       "expectedFailure": 0,
@@ -18225,14 +18306,14 @@
       "version": "1.3.10",
       "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
       "snapshot": "compat/upstream/bun/v1.3.10",
-      "copiedFiles": 9752,
+      "copiedFiles": 8573,
       "discoveredRunnableFiles": 1445,
-      "enabled": 857,
-      "expectedFailure": 251,
+      "enabled": 971,
+      "expectedFailure": 232,
       "disabled": 0,
-      "notEnabled": 337,
-      "classifiedTests": 1108,
-      "trackedTests": 1108
+      "notEnabled": 242,
+      "classifiedTests": 1203,
+      "trackedTests": 1203
     }
   },
   "behavioral": {
@@ -18249,9 +18330,9 @@
         "nodeTestFiles": 31,
         "compatMarkers": 13,
         "modulesWithCompatMarkers": 12,
-        "explicitUnsupportedMarkers": 4,
+        "explicitUnsupportedMarkers": 5,
         "nativeAvailabilityGuards": 0,
-        "modulesWithUnsupportedMarkers": 4
+        "modulesWithUnsupportedMarkers": 5
       },
       "largestGaps": [
         {
@@ -18363,6 +18444,15 @@
           "gapScore": 3
         },
         {
+          "name": "crypto",
+          "file": "src/runtime_modules/node/crypto.js",
+          "compatMarkers": 0,
+          "unsupportedMarkers": 1,
+          "nativeAvailabilityGuards": 0,
+          "tests": 3,
+          "gapScore": 2
+        },
+        {
           "name": "http",
           "file": "src/runtime_modules/node/http.js",
           "compatMarkers": 0,
@@ -18421,6 +18511,22 @@
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-cluster-surface.ts"
+          ]
+        },
+        "crypto": {
+          "file": "src/runtime_modules/node/crypto.js",
+          "compatMarkers": [],
+          "unsupportedMarkers": [
+            {
+              "line": 4453,
+              "text": "throw webcryptoDomException(\"unsupported algorithm\", \"NotSupportedError\");"
+            }
+          ],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-constants-zlib-crypto.ts",
+            "tests/js/node-crypto-kdf-dh-surface.ts",
+            "tests/js/node-crypto-webcrypto-conformance.ts"
           ]
         },
         "dns": {
@@ -18652,7 +18758,7 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 555,
+              "line": 563,
               "text": "throw new Error(`TextDecoder: the \"${this.encoding}\" encoding requires ICU converter support, which is unavailable in this build`);"
             }
           ],
@@ -18664,23 +18770,23 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 11366,
+              "line": 12052,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11397,
+              "line": 12083,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 11820,
+              "line": 12506,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 11836,
+              "line": 12522,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 12947,
+              "line": 13633,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],

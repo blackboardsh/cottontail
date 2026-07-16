@@ -7,6 +7,9 @@ const rootDir = resolve(import.meta.dirname, '..');
 const outputPath = process.argv[2];
 const sourceDir = resolve(process.argv[3] ?? join(rootDir, 'src', 'runtime_modules'));
 const compilerRuntimePath = resolve(process.argv[4] ?? join(rootDir, 'src', 'compiler', 'src', 'runtime.js'));
+const bufferFallbackPath = resolve(process.argv[5] ?? join(rootDir, 'src', 'compiler', 'src', 'node-fallbacks', 'buffer.js'));
+const base64FallbackPath = resolve(process.argv[6] ?? join(rootDir, 'src', 'compiler', 'src', 'node-fallbacks', 'vendor', 'base64-js.js'));
+const ieee754FallbackPath = resolve(process.argv[7] ?? join(rootDir, 'src', 'compiler', 'src', 'node-fallbacks', 'vendor', 'ieee754.js'));
 
 if (!outputPath) {
   console.error('usage: node scripts/embed-runtime-modules.js <output>');
@@ -25,6 +28,9 @@ function collectFiles(directory, files = []) {
 const files = collectFiles(sourceDir)
   .map(file => ({ file, path: relative(sourceDir, file).split(sep).join('/') }));
 files.push({ file: compilerRuntimePath, path: 'bun/wrap.js' });
+files.push({ file: bufferFallbackPath, path: 'node/internal/buffer-polyfill.js' });
+files.push({ file: base64FallbackPath, path: 'node/internal/vendor/base64-js.js' });
+files.push({ file: ieee754FallbackPath, path: 'node/internal/vendor/ieee754.js' });
 files.sort((a, b) => a.path.localeCompare(b.path));
 const header = Buffer.allocUnsafe(8);
 header.write('CTRM', 0, 4, 'ascii');

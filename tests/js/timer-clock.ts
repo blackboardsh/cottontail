@@ -36,4 +36,55 @@ if (intervalCount !== 1) {
   throw new Error(`clearInterval inside callback should stop future ticks, got ${intervalCount}`);
 }
 
+let destroyedDuringCallback = true;
+const lifecycleTimer = setTimeout(() => {
+  destroyedDuringCallback = lifecycleTimer._destroyed;
+}, 1);
+for (let index = 0; index < 20 && !lifecycleTimer._destroyed; index += 1) {
+  globalThis.__cottontailRunLoopTick();
+  cottontail.sleep(1);
+}
+if (destroyedDuringCallback || !lifecycleTimer._destroyed) {
+  throw new Error("one-shot timer _destroyed lifecycle does not match Node");
+}
+
+let refreshCount = 0;
+const refreshedTimer = setTimeout(() => {
+  refreshCount += 1;
+  if (refreshCount === 1) refreshedTimer.refresh();
+}, 1);
+for (let index = 0; index < 30 && refreshCount < 2; index += 1) {
+  globalThis.__cottontailRunLoopTick();
+  cottontail.sleep(1);
+}
+if (refreshCount !== 2 || !refreshedTimer._destroyed) {
+  throw new Error(`one-shot timer refresh lifecycle mismatch, got ${refreshCount} callbacks`);
+}
+
+const exceptionEvents: string[] = [];
+let exceptionPhase = 0;
+const onTimerException = (error: Error) => {
+  if (error.message !== "timer checkpoint sentinel") throw error;
+  exceptionEvents.push("caught");
+};
+process.on("uncaughtException", onTimerException);
+setImmediate(() => {
+  exceptionPhase = 1;
+  exceptionEvents.push("throw");
+  process.nextTick(() => exceptionEvents.push(`tick:${exceptionPhase}`));
+  throw new Error("timer checkpoint sentinel");
+});
+setImmediate(() => {
+  exceptionPhase = 2;
+  exceptionEvents.push("after");
+});
+for (let index = 0; index < 20 && exceptionEvents.length < 4; index += 1) {
+  globalThis.__cottontailRunLoopTick();
+  cottontail.sleep(1);
+}
+process.off("uncaughtException", onTimerException);
+if (exceptionEvents.join(",") !== "throw,caught,after,tick:2") {
+  throw new Error(`timer exception checkpoint mismatch: ${exceptionEvents.join(",")}`);
+}
+
 console.log("timer clock passed");

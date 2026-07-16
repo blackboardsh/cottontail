@@ -571,6 +571,10 @@ pub fn VisitStmt(
                     }
                 }
 
+                if (!mark_as_dead and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
+                    try stmts.append(p.keepStmtSymbolName(data.func.name.?.loc, name_ref, original_name));
+                }
+
                 if (p.options.features.react_fast_refresh) {
                     if (react_hook_data) |*hook| {
                         try stmts.append(p.getReactRefreshHookSignalDecl(hook.signature_cb));
@@ -590,6 +594,9 @@ pub fn VisitStmt(
             pub fn s_class(noalias p: *P, noalias stmts: *ListManaged(Stmt), noalias stmt: *Stmt, noalias data: *S.Class) !void {
                 const mark_as_dead = p.options.features.dead_code_elimination and data.is_export and
                     p.options.features.replace_exports.count() > 0 and p.isExportToEliminate(data.class.class_name.?.ref.?);
+                const name = data.class.class_name.?;
+                const name_ref = name.ref.?;
+                const original_name = p.symbols.items[name_ref.innerIndex()].original_name;
                 const original_is_dead = p.is_control_flow_dead;
 
                 if (mark_as_dead) {
@@ -615,12 +622,15 @@ pub fn VisitStmt(
                     // Lower class field syntax for browsers that don't support it
                     stmts.appendSlice(lowered) catch unreachable
                 else {
-                    const ref = data.class.class_name.?.ref.?;
-                    if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(ref))) |replacement| {
-                        if (p.injectReplacementExport(stmts, ref, data.class.class_name.?.loc, replacement)) {
+                    if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(name_ref))) |replacement| {
+                        if (p.injectReplacementExport(stmts, name_ref, data.class.class_name.?.loc, replacement)) {
                             p.is_control_flow_dead = original_is_dead;
                         }
                     }
+                }
+
+                if (!mark_as_dead and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
+                    try stmts.append(p.keepStmtSymbolName(name.loc, name_ref, original_name));
                 }
 
                 // Handle exporting this class from a namespace

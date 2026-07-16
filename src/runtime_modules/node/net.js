@@ -1,4 +1,5 @@
 import { EventEmitter } from "./events.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
 
 // Module evaluation order can reach this file before bun/index.js installs the
 // Symbol.dispose/asyncDispose polyfills, so ensure the shared symbol here.
@@ -483,7 +484,7 @@ export class Socket extends EventEmitter {
     const watch = cottontail.fdWatchStart(this.fd, 1024 * 1024);
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
-    fdWatchListeners.set(this._watchId, (event) => {
+    fdWatchListeners.set(this._watchId, _wrapAsyncCallback((event) => {
       if (this.destroyed) return;
       if (event.type === "data") {
         if (this._onread) {
@@ -508,7 +509,7 @@ export class Socket extends EventEmitter {
       if (event.type === "error") {
         this.destroy(new Error(event.message || "socket read failed"));
       }
-    });
+    }));
     this._unregisterWatch = () => {
       if (fdWatchListeners.get(this._watchId)) fdWatchListeners.delete(this._watchId);
     };

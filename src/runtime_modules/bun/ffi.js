@@ -210,7 +210,6 @@ if (typeof cottontail.gc === "function" &&
   Object.defineProperty(g, "gc", {
     value: exposedGc ?? ((options = undefined) => {
       const result = cottontail.gc();
-      globalThis.__cottontailForcedWeakRefGc?.();
       globalThis.__cottontailAsyncHooksOnGc?.();
       if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
       return result;
@@ -1613,6 +1612,7 @@ function timerNow() {
 function makeTimerHandle(id) {
   const handle = {
     [Symbol.toPrimitive]: () => id,
+    [consoleInspectCustom]: () => `Timeout (#${id}${timers.get(id)?.interval != null ? ", repeats" : ""})`,
     valueOf: () => id,
     // Node's Timeout exposes _idleStart (ms since process start when the timer
     // was scheduled); frameworks like Next.js read and write it.
@@ -1783,7 +1783,8 @@ function installSpawnEventHandler() {
 g.__cottontailRegisterSpawnListener = (id, listener) => {
   installSpawnEventHandler();
   const key = Number(id);
-  const entry = { listener, ref: true };
+  const wrappedListener = g.__cottontailWrapAsyncCallback?.(listener) ?? listener;
+  const entry = { listener: wrappedListener, ref: true };
   spawnEventListeners.set(key, entry);
   const unregister = () => {
     if (spawnEventListeners.get(key) === entry) {
@@ -1888,6 +1889,10 @@ function installWorkerNativeEventHandler() {
       workerInstances.delete(worker.id);
       if (worker._pollTimer != null) clearInterval(worker._pollTimer);
       worker._emit("exit", { code: 0 });
+      return;
+    }
+    if (event?.type === "open") {
+      worker._emit("open", { type: "open", target: worker });
       return;
     }
     worker._poll();
@@ -2036,7 +2041,6 @@ g.Worker ??= class Worker {
     this._listeners = new Map();
     workerInstances.set(this.id, this);
     this._pollTimer = installWorkerNativeEventHandler() ? null : setInterval(() => this._poll(), 16);
-    queueMicrotask(() => this._emit("open", { type: "open", target: this }));
   }
   _add(name, handler) {
     if (typeof handler !== "function") return this;

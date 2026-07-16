@@ -34,4 +34,20 @@ const exitCode = await proc.exited;
 assert(exitCode === 0, `Bun.spawn streaming child exited with ${exitCode}`);
 assert(rest === "second", `Bun.spawn remaining stdout mismatch: ${JSON.stringify(rest)}`);
 
+const repeatedPattern = Buffer.alloc(1024 * 1024, "zombo.com\n").toString();
+const repeated = spawn([process.execPath, "-e", `
+  let length = 0;
+  process.stdin.on("data", chunk => length += chunk.length);
+  process.stdin.pipe(process.stdout);
+`], {
+  stdin: "pipe",
+  stdout: "pipe",
+  stderr: "inherit",
+});
+for (let index = 0; index < 3; index += 1) repeated.stdin!.write(repeatedPattern);
+repeated.stdin!.end();
+const repeatedOutput = await new Response(repeated.stdout).text();
+assert(await repeated.exited === 0, "Bun.spawn repeated-stdin child failed");
+assert(repeatedOutput === repeatedPattern.repeat(3), "Bun.spawn reordered repeated stdin chunks");
+
 console.log("bun spawn streaming passed");

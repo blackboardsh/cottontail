@@ -89,6 +89,43 @@ const v8 = lazyBuiltin(() => require("./v8.js"));
 const wasi = lazyBuiltin(() => require("./wasi.js"));
 const workerThreads = lazyBuiltin(() => require("./worker_threads.js"));
 
+const runtimePackageReplacements = new Map([
+  ["abort-controller", lazyBuiltin(() => {
+    const namespace = require("../vendor/abort-controller.js");
+    return namespace.default ?? namespace;
+  })],
+  ["node-fetch", lazyBuiltin(() => {
+    const namespace = require("../bun/node-fetch.js");
+    return namespace.default ?? namespace;
+  })],
+  ["next/dist/compiled/node-fetch", lazyBuiltin(() => {
+    const namespace = require("../bun/node-fetch.js");
+    return namespace.default ?? namespace;
+  })],
+  ["isomorphic-fetch", lazyBuiltin(() => {
+    const namespace = require("../vendor/isomorphic-fetch.js");
+    return namespace.default ?? namespace;
+  })],
+  ["@vercel/fetch", lazyBuiltin(() => {
+    const namespace = require("../vendor/vercel-fetch.js");
+    return namespace.default ?? namespace;
+  })],
+]);
+
+function hasRuntimePackageReplacement(name) {
+  return runtimePackageReplacements.has(String(name));
+}
+
+function loadRuntimePackageReplacement(name) {
+  return unwrapBuiltin(runtimePackageReplacements.get(String(name)));
+}
+
+function loadBuiltinOrReplacement(name) {
+  const text = String(name);
+  if (hasRuntimePackageReplacement(text)) return loadRuntimePackageReplacement(text);
+  return unwrapBuiltin(builtinModuleMap.get(text) ?? builtinModuleMap.get(text.replace(/^node:/, "")));
+}
+
 export const builtinModules = [
   "_http_agent",
   "_http_client",
@@ -536,6 +573,7 @@ function resolvedToUrl(resolved) {
   const { bare: text, suffix } = splitSpecifierSuffix(resolved);
   if (text.startsWith("node:")) return text;
   if (builtinModuleMap.has(text)) return `node:${text.replace(/^node:/, "")}`;
+  if (hasRuntimePackageReplacement(text)) return text;
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
   return pathToFileURL(text).href + suffix;
 }
@@ -549,7 +587,7 @@ function urlToResolved(url) {
 
 function formatForResolved(resolved) {
   const { bare: text } = splitSpecifierSuffix(resolved);
-  if (text.startsWith("node:") || builtinModuleMap.has(text)) return "builtin";
+  if (text.startsWith("node:") || builtinModuleMap.has(text) || hasRuntimePackageReplacement(text)) return "builtin";
   if (text.endsWith(".json")) return "json";
   if (text.endsWith(".mjs")) return "module";
   return "commonjs";
@@ -590,6 +628,15 @@ function moduleNotFoundError(request, resolveMessage = false) {
 
 class ResolveMessage extends Error {}
 class BuildMessage extends SyntaxError {}
+
+function dynamicResolveMessage(message) {
+  const error = new ResolveMessage(message);
+  error.code = "ERR_MODULE_NOT_FOUND";
+  error.line = 0;
+  error.column = 0;
+  error.position = null;
+  return error;
+}
 
 function packageNotFoundError(request, basePath) {
   const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
@@ -660,6 +707,7 @@ function resolveRequestCore(request, basePath) {
   // Unknown "node:" specifiers can never resolve to files; both Node and Bun
   // reject them with ERR_UNKNOWN_BUILTIN_MODULE.
   if (text.startsWith("node:")) throw unknownBuiltinError(text);
+  if (hasRuntimePackageReplacement(text)) return text;
 
   const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
   if (text.startsWith(".") || text.startsWith("/")) {
@@ -921,7 +969,7 @@ function executeCommonJsModule(module, filename) {
 
 function executeHookSource(resolved, source, format) {
   const effectiveFormat = format ?? formatForResolved(resolved);
-  if (effectiveFormat === "builtin") return unwrapBuiltin(builtinModuleMap.get(resolved) ?? builtinModuleMap.get(String(resolved).replace(/^node:/, "")));
+  if (effectiveFormat === "builtin") return loadBuiltinOrReplacement(resolved);
   if (effectiveFormat === "json" || String(resolved).endsWith(".json")) return JSON.parse(String(source ?? ""));
   if (effectiveFormat === "module" || String(resolved).endsWith(".mjs")) {
     throw new Error(`Cannot require ES module '${resolved}' from CommonJS`);
@@ -1164,7 +1212,7 @@ function executeDynamicImportSource(resolved, source, format) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   const effectiveFormat = format ?? formatForResolved(resolvedPath);
   if (effectiveFormat === "builtin") {
-    return namespaceFromBuiltin(builtinModuleMap.get(resolvedPath) ?? builtinModuleMap.get(String(resolvedPath).replace(/^node:/, "")));
+    return namespaceFromBuiltin(loadBuiltinOrReplacement(resolvedPath));
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
     const jsonSource = String(source ?? "");
@@ -1222,11 +1270,14 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   // an ES module (e.g. re-importing a Bun.build output). The object-URL
   // registry lives on globalThis (installed by the Blob shim).
   const specifierText = String(specifier);
+  const parent = referrer == null
+    ? cottontail.cwd()
+    : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
   if (specifierText.startsWith("data:")) {
     const comma = specifierText.indexOf(",");
     const metadata = comma < 0 ? "" : specifierText.slice(5, comma);
     if (comma < 0 || !/(?:^|;)text\/javascript(?:;|$)|^(?:application\/javascript)(?:;|$)/i.test(metadata)) {
-      throw moduleNotFoundError(specifierText, false);
+      throw dynamicResolveMessage(`Cannot resolve invalid data URL '${specifierText}' from '${parent}'`);
     }
     const payload = specifierText.slice(comma + 1);
     let source;
@@ -1256,9 +1307,9 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     }
     throw moduleNotFoundError(specifierText, false);
   }
-  const parent = referrer == null
-    ? cottontail.cwd()
-    : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
+  if (specifierText.includes("://") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(specifierText)) {
+    throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
+  }
   const resolved = resolveRequest(String(specifier), parent);
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   if (loader === "text") {
@@ -1273,7 +1324,9 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   if (loadResult !== undefined) {
     return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
   }
-  if (builtinModuleMap.has(resolved)) return namespaceFromBuiltin(builtinModuleMap.get(resolved));
+  if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
+    return namespaceFromBuiltin(loadBuiltinOrReplacement(resolved));
+  }
   if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
   return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
 }
@@ -1342,6 +1395,9 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
       console.log("[dbg] loadCommonJsModule fs/promises ownDefault:", Object.hasOwn(v, "default"));
     }
     return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
+  }
+  if (hasRuntimePackageReplacement(resolvedPath)) {
+    return loadRuntimePackageReplacement(resolvedPath);
   }
   if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
   if (resolvedPath.endsWith(".toml")) return parseTOML(cottontail.readFile(resolvedPath));
@@ -2490,16 +2546,106 @@ const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
 // (Node exposes fs.promises as the exact fs/promises module object).
 const fsBuiltin = fs.default ?? fs;
 const fsPromisesBuiltin = fsBuiltin.promises ?? (fsPromises.default ?? fsPromises);
+// CommonJS exposes a mutable object for node:buffer. Some Node APIs, including
+// zlib's global output limit, intentionally observe mutations to that object.
+const bufferBuiltin = buffer.default ?? buffer;
+const httpAgentBuiltin = { Agent: http.Agent, globalAgent: http.globalAgent };
+const httpClientBuiltin = { ClientRequest: http.ClientRequest };
+const httpIncomingBuiltin = {
+  IncomingMessage: http.IncomingMessage,
+  readStart(socket) { if (socket?.readable && !socket._paused) socket.resume?.(); },
+  readStop(socket) { socket?.pause?.(); },
+};
+const httpOutgoingBuiltin = {
+  OutgoingMessage: http.OutgoingMessage,
+  validateHeaderName: http.validateHeaderName,
+  validateHeaderValue: http.validateHeaderValue,
+};
+const httpServerBuiltin = {
+  STATUS_CODES: http.STATUS_CODES,
+  Server: http.Server,
+  ServerResponse: http.ServerResponse,
+  _connectionListener: http._connectionListener,
+};
+const httpTokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const invalidHeaderValuePattern = /[\0-\x08\x0A-\x1F\x7F]/;
+const httpCommonBuiltin = {
+  validateHeaderName: http.validateHeaderName,
+  validateHeaderValue: http.validateHeaderValue,
+  _checkIsHttpToken(value) { return httpTokenPattern.test(String(value)); },
+  _checkInvalidHeaderChar(value) { return invalidHeaderValuePattern.test(String(value)); },
+  chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
+  continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
+  CRLF: "\r\n",
+  methods: http.METHODS,
+};
+function translatePeerCertificate(certificate) {
+  if (!certificate) return null;
+  if (certificate.issuerCertificate != null && certificate.issuerCertificate !== certificate) {
+    certificate.issuerCertificate = translatePeerCertificate(certificate.issuerCertificate);
+  }
+  if (certificate.infoAccess != null && typeof certificate.infoAccess === "string") {
+    const infoAccess = certificate.infoAccess;
+    certificate.infoAccess = Object.create(null);
+    infoAccess.replace(/([^\n:]*):([^\n]*)(?:\n|$)/g, (_all, key, rawValue) => {
+      let value = rawValue;
+      if (value.charCodeAt(0) === 0x22) value = JSON.parse(value);
+      if (key in certificate.infoAccess) certificate.infoAccess[key].push(value);
+      else certificate.infoAccess[key] = [value];
+      return "";
+    });
+  }
+  return certificate;
+}
+const tlsCommonBuiltin = {
+  SecureContext: tls.SecureContext,
+  createSecureContext: tls.createSecureContext,
+  translatePeerCertificate,
+};
+const tlsWrapBuiltin = {
+  TLSSocket: tls.TLSSocket,
+  Server: tls.Server,
+  createServer: tls.createServer,
+  connect: tls.connect,
+};
 
 __setBuiltinModules({
+  _http_agent: httpAgentBuiltin,
+  "node:_http_agent": httpAgentBuiltin,
+  _http_client: httpClientBuiltin,
+  "node:_http_client": httpClientBuiltin,
+  _http_common: httpCommonBuiltin,
+  "node:_http_common": httpCommonBuiltin,
+  _http_incoming: httpIncomingBuiltin,
+  "node:_http_incoming": httpIncomingBuiltin,
+  _http_outgoing: httpOutgoingBuiltin,
+  "node:_http_outgoing": httpOutgoingBuiltin,
+  _http_server: httpServerBuiltin,
+  "node:_http_server": httpServerBuiltin,
+  _stream_duplex: stream.Duplex,
+  "node:_stream_duplex": stream.Duplex,
+  _stream_passthrough: stream.PassThrough,
+  "node:_stream_passthrough": stream.PassThrough,
+  _stream_readable: stream.Readable,
+  "node:_stream_readable": stream.Readable,
+  _stream_transform: stream.Transform,
+  "node:_stream_transform": stream.Transform,
+  _stream_wrap: streamBuiltin,
+  "node:_stream_wrap": streamBuiltin,
+  _stream_writable: stream.Writable,
+  "node:_stream_writable": stream.Writable,
+  _tls_common: tlsCommonBuiltin,
+  "node:_tls_common": tlsCommonBuiltin,
+  _tls_wrap: tlsWrapBuiltin,
+  "node:_tls_wrap": tlsWrapBuiltin,
   assert: assertBuiltin,
   "node:assert": assertBuiltin,
   "assert/strict": assertStrictBuiltin,
   "node:assert/strict": assertStrictBuiltin,
   async_hooks: asyncHooks,
   "node:async_hooks": asyncHooks,
-  buffer,
-  "node:buffer": buffer,
+  buffer: bufferBuiltin,
+  "node:buffer": bufferBuiltin,
   child_process: childProcess,
   "node:child_process": childProcess,
   cluster,

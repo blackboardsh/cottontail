@@ -1,4 +1,5 @@
 const std = @import("std");
+const cottontail_version = @import("src/version.zig").version;
 const builtin = @import("builtin");
 
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
@@ -64,6 +65,9 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     const output = command.addOutputFileArg("runtime-modules.bin");
     command.addDirectoryArg(b.path("src/runtime_modules"));
     command.addFileArg(b.path("src/compiler/src/runtime.js"));
+    command.addFileArg(b.path("src/compiler/src/node-fallbacks/buffer.js"));
+    command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/base64-js.js"));
+    command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/ieee754.js"));
     const io = std.Io.Threaded.global_single_threaded.io();
     var directory = std.Io.Dir.cwd().openDir(io, "src/runtime_modules", .{ .iterate = true }) catch
         @panic("failed to open src/runtime_modules");
@@ -125,6 +129,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
     step.root_module.link_libc = true;
     step.root_module.addIncludePath(b.path("src"));
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
+    step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
         .flags = &[_][]const u8{
@@ -135,6 +140,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DSQLITE_ENABLE_SESSION",
             "-DSQLITE_ENABLE_PREUPDATE_HOOK",
             "-DCOTTONTAIL_VENDORED_JSC=1",
+            "-DJS_NO_EXPORT=1",
+        },
+    });
+    step.root_module.addCSourceFile(.{
+        .file = b.path("src/jsc_private_bridge.cpp"),
+        .flags = &[_][]const u8{
+            "-std=c++20",
             "-DJS_NO_EXPORT=1",
         },
     });

@@ -1811,6 +1811,28 @@ function parseX509GeneralNames(node) {
   return names.join(", ");
 }
 
+function parseX509InfoAccess(node) {
+  const lines = [];
+  const methodNames = {
+    "1.3.6.1.5.5.7.48.1": "OCSP",
+    "1.3.6.1.5.5.7.48.2": "CA Issuers",
+  };
+  for (const description of asn1Children(asn1Read(node.value))) {
+    const [methodNode, locationNode] = asn1Children(description);
+    if (methodNode == null || locationNode == null) continue;
+    const methodOid = asn1Oid(methodNode);
+    const method = methodNames[methodOid] ?? methodOid;
+    if (locationNode.tag === 0x86) {
+      lines.push(`${method} - URI:${new TextDecoder().decode(locationNode.value)}`);
+    }
+  }
+  return lines.length === 0 ? undefined : `${lines.join("\n")}\n`;
+}
+
+function parseX509ExtendedKeyUsage(node) {
+  return asn1Children(asn1Read(node.value)).map(asn1Oid);
+}
+
 function parseX509Extensions(node) {
   const result = {};
   for (const extension of asn1Children(asn1Children(node)[0])) {
@@ -1823,7 +1845,8 @@ function parseX509Extensions(node) {
       const basic = asn1Children(asn1Read(valueNode.value));
       result.ca = basic[0]?.tag === 0x01 && basic[0].value[0] !== 0;
     }
-    if (oid === "2.5.29.15") result.keyUsage = colonHex(valueNode.value);
+    if (oid === "1.3.6.1.5.5.7.1.1") result.infoAccess = parseX509InfoAccess(valueNode);
+    if (oid === "2.5.29.37") result.keyUsage = parseX509ExtendedKeyUsage(valueNode);
   }
   return result;
 }
@@ -1836,7 +1859,7 @@ function parseX509Certificate(input) {
   const tbsChildren = asn1Children(tbs);
   let index = 0;
   if ((tbsChildren[index].tag & 0xe0) === 0xa0) index += 1;
-  const serialNumber = hexFromBytes(asn1IntegerBytes(tbsChildren[index++])).toUpperCase();
+  const serialNumber = hexFromBytes(asn1IntegerBytes(tbsChildren[index++]));
   index += 1;
   const issuer = parseX509Name(tbsChildren[index++]);
   const validity = asn1Children(tbsChildren[index++]);
@@ -1863,6 +1886,7 @@ function parseX509Certificate(input) {
     publicKey: publicKeyInfo.keyObject,
     legacyPublicKey: publicKeyInfo.legacy,
     subjectAltName: extensions.subjectAltName,
+    infoAccess: extensions.infoAccess,
     keyUsage: extensions.keyUsage,
     ca: Boolean(extensions.ca),
   };
@@ -3054,7 +3078,7 @@ export class X509Certificate {
     this.issuer = parsed.issuer.text || undefined;
     this.issuerObject = parsed.issuer.object;
     this.issuerCertificate = undefined;
-    this.infoAccess = undefined;
+    this.infoAccess = parsed.infoAccess;
     this.validFromDate = parsed.validFromDate;
     this.validToDate = parsed.validToDate;
     this.validFrom = formatX509Date(parsed.validFromDate);
@@ -3248,14 +3272,57 @@ export function hkdf(digest, ikm, salt, info, keylen, callback) {
   }, callback);
 }
 
-export function pbkdf2Sync(password, salt, iterations, keylen, digest = "sha1") {
-  const count = positiveInteger(iterations, "iterations");
-  const length = positiveInteger(keylen, "keylen", true);
-  const algorithm = digest ?? "sha1";
+function validatePbkdf2Parameters(password, salt, iterations, keylen, digest) {
+  if (typeof iterations !== "number" || !Number.isFinite(iterations)) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "iterations" argument must be of type number. Received ${describeReceivedValue(iterations)}`,
+    );
+  }
+  if (!Number.isInteger(iterations) || iterations < 1 || iterations >= 2147483648) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "iterations" is out of range. It must be >= 1 and <= 2147483648. Received ${iterations}`,
+    );
+  }
+  if (typeof keylen !== "number") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "keylen" argument must be of type number. Received ${describeReceivedValue(keylen)}`,
+    );
+  }
+  if (!Number.isInteger(keylen)) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "keylen" is out of range. It must be an integer. Received ${keylen}`,
+    );
+  }
+  if (keylen < 0 || keylen > 2147483647) {
+    throw nodeCryptoError(
+      RangeError,
+      "ERR_OUT_OF_RANGE",
+      `The value of "keylen" is out of range. It must be >= 0 and <= 2147483647. Received ${keylen}`,
+    );
+  }
+  const algorithm = normalizeAlgorithm(digest ?? "sha1");
+  if (!isSupportedDigest(algorithm)) {
+    throw nodeCryptoError(TypeError, "ERR_CRYPTO_INVALID_DIGEST", `Invalid digest: ${digest}`);
+  }
   const passwordBytes = bytesFromData(password);
   const saltBytes = bytesFromData(salt);
+  return { algorithm, passwordBytes, saltBytes, iterations, keylen };
+}
+
+function derivePbkdf2({ algorithm, passwordBytes, saltBytes, iterations, keylen }) {
+  if (typeof cottontail.cryptoPbkdf2Sync === "function" && algorithm !== "md4" && algorithm !== "blake2b256") {
+    return bufferFromBytes(new Uint8Array(cottontail.cryptoPbkdf2Sync(algorithm, passwordBytes, saltBytes, iterations, keylen)));
+  }
   const hashLength = hmacBytes(algorithm, passwordBytes, new Uint8Array()).byteLength;
-  const blocks = Math.ceil(length / hashLength);
+  const blocks = Math.ceil(keylen / hashLength);
   const output = new Uint8Array(blocks * hashLength);
   for (let block = 1; block <= blocks; block += 1) {
     const blockIndex = new Uint8Array([
@@ -3266,7 +3333,7 @@ export function pbkdf2Sync(password, salt, iterations, keylen, digest = "sha1") 
     ]);
     let u = hmacBytes(algorithm, passwordBytes, concatBytes([saltBytes, blockIndex]));
     const t = new Uint8Array(u);
-    for (let index = 1; index < count; index += 1) {
+    for (let index = 1; index < iterations; index += 1) {
       u = hmacBytes(algorithm, passwordBytes, u);
       for (let byteIndex = 0; byteIndex < t.byteLength; byteIndex += 1) {
         t[byteIndex] ^= u[byteIndex];
@@ -3274,7 +3341,11 @@ export function pbkdf2Sync(password, salt, iterations, keylen, digest = "sha1") 
     }
     output.set(t, (block - 1) * hashLength);
   }
-  return bufferFromBytes(output.slice(0, length));
+  return bufferFromBytes(output.slice(0, keylen));
+}
+
+export function pbkdf2Sync(password, salt, iterations, keylen, digest = "sha1") {
+  return derivePbkdf2(validatePbkdf2Parameters(password, salt, iterations, keylen, digest));
 }
 
 export function pbkdf2(password, salt, iterations, keylen, digest, callback) {
@@ -3282,7 +3353,21 @@ export function pbkdf2(password, salt, iterations, keylen, digest, callback) {
     callback = digest;
     digest = "sha1";
   }
-  callbackify(() => pbkdf2Sync(password, salt, iterations, keylen, digest), callback);
+  const parameters = validatePbkdf2Parameters(password, salt, iterations, keylen, digest);
+  if (typeof callback !== "function") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      `The "callback" argument must be of type function. Received ${describeReceivedValue(callback)}`,
+    );
+  }
+  queueMicrotask(() => {
+    try {
+      callback(null, derivePbkdf2(parameters));
+    } catch (error) {
+      callback(error);
+    }
+  });
 }
 
 export function scryptSync(password, salt, keylen, options = {}) {
@@ -3890,8 +3975,12 @@ const webcryptoNamedCurves = {
 };
 
 const webcryptoEcCurveNames = Object.fromEntries(Object.entries(webcryptoNamedCurves).map(([web, node]) => [node, web]));
-const webcryptoRsaAlgorithms = ["RSA-PSS", "RSASSA-PKCS1-v1_5", "RSA-OAEP"];
+const webcryptoRsaAlgorithms = ["RSA-PSS", "RSASSA-PKCS1-V1_5", "RSA-OAEP"];
 const webcryptoOkpAlgorithms = ["Ed25519", "Ed448", "X25519", "X448"];
+
+function webcryptoCanonicalRsaAlgorithmName(name) {
+  return name === "RSASSA-PKCS1-V1_5" ? "RSASSA-PKCS1-v1_5" : name;
+}
 
 function webcryptoAlgorithmName(algorithm) {
   return String(typeof algorithm === "string" ? algorithm : algorithm?.name ?? "").toUpperCase();
@@ -4021,7 +4110,9 @@ function webcryptoNormalizeKeyAlgorithm(algorithm) {
   if (name === "PBKDF2") return { name: "PBKDF2" };
   if (name === "HKDF") return { name: "HKDF" };
   if (name === "ECDSA" || name === "ECDH") return { name, namedCurve: String(algorithm.namedCurve) };
-  if (webcryptoRsaAlgorithms.includes(name)) return { name, hash: { name: webcryptoHashAlgorithm(algorithm.hash ?? "SHA-256") } };
+  if (webcryptoRsaAlgorithms.includes(name)) {
+    return { name: webcryptoCanonicalRsaAlgorithmName(name), hash: { name: webcryptoHashAlgorithm(algorithm.hash ?? "SHA-256") } };
+  }
   if (webcryptoOkpAlgorithms.includes(String(typeof algorithm === "string" ? algorithm : algorithm?.name))) return { name: String(typeof algorithm === "string" ? algorithm : algorithm.name) };
   throw new TypeError(`Invalid WebCrypto algorithm: ${name}`);
 }
@@ -4069,6 +4160,28 @@ function webcryptoSecretBytes(key, usage = undefined) {
   const cryptoKey = assertCryptoKey(key, usage);
   if (cryptoKey.type !== "secret") throw new TypeError("Expected a secret CryptoKey");
   return cryptoKey.material;
+}
+
+function webcryptoDomException(message, name = "OperationError") {
+  if (typeof globalThis.DOMException === "function") return new globalThis.DOMException(message, name);
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+const rsaPssAlgorithmIdentifierOid = new Uint8Array([
+  0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a,
+]);
+
+function webcryptoContainsBytes(data, needle) {
+  const bytes = bytesFromData(data);
+  outer: for (let offset = 0; offset + needle.byteLength <= bytes.byteLength; offset += 1) {
+    for (let index = 0; index < needle.byteLength; index += 1) {
+      if (bytes[offset + index] !== needle[index]) continue outer;
+    }
+    return true;
+  }
+  return false;
 }
 
 function aesKwBlock(keyBytes, block, encrypt) {
@@ -4125,9 +4238,41 @@ function webcryptoAesKwUnwrap(key, data, usage = "decrypt") {
   return arrayBufferFromBytes(concatBytes(r));
 }
 
-function webcryptoAesEncrypt(algorithm, key, data) {
-  const keyBytes = webcryptoSecretBytes(key, "encrypt");
-  if (key.algorithm.name === "AES-KW") return webcryptoAesKwWrap(key, data);
+function webcryptoAesCtrCrypt(keyBytes, algorithm, data) {
+  const counter = bytesFromData(algorithm.counter);
+  if (counter.byteLength !== 16) throw webcryptoDomException("AES-CTR counter must be 16 bytes", "OperationError");
+  const length = positiveInteger(algorithm.length, "length");
+  if (length > 128) throw webcryptoDomException("AES-CTR length must be at most 128", "OperationError");
+  const input = bytesFromData(data);
+  const blockCount = Math.ceil(input.byteLength / 16);
+  if (BigInt(blockCount) > (1n << BigInt(length))) {
+    throw webcryptoDomException("AES-CTR input exceeds the counter length", "OperationError");
+  }
+  const current = new Uint8Array(counter);
+  const output = new Uint8Array(input.byteLength);
+  for (let offset = 0; offset < input.byteLength; offset += 16) {
+    const keystream = aesKwBlock(keyBytes, current, true);
+    const blockLength = Math.min(16, input.byteLength - offset);
+    for (let index = 0; index < blockLength; index += 1) {
+      output[offset + index] = input[offset + index] ^ keystream[index];
+    }
+    for (let bit = 0; bit < length; bit += 1) {
+      const byteIndex = 15 - Math.floor(bit / 8);
+      const mask = 1 << (bit % 8);
+      if ((current[byteIndex] & mask) === 0) {
+        current[byteIndex] |= mask;
+        break;
+      }
+      current[byteIndex] &= ~mask;
+    }
+  }
+  return arrayBufferFromBytes(output);
+}
+
+function webcryptoAesEncrypt(algorithm, key, data, usage = "encrypt") {
+  const keyBytes = webcryptoSecretBytes(key, usage);
+  if (key.algorithm.name === "AES-KW") return webcryptoAesKwWrap(key, data, usage);
+  if (key.algorithm.name === "AES-CTR") return webcryptoAesCtrCrypt(keyBytes, algorithm, data);
   const cipherName = webcryptoAesCipherName(key.algorithm.name, keyBytes);
   const iv = bytesFromData(algorithm.iv ?? algorithm.counter);
   const cipher = createCipheriv(cipherName, keyBytes, iv, { authTagLength: Math.ceil((algorithm.tagLength ?? 128) / 8) });
@@ -4137,9 +4282,10 @@ function webcryptoAesEncrypt(algorithm, key, data) {
   return arrayBufferFromBytes(concatBytes([encrypted, bytesFromData(cipher.getAuthTag())]));
 }
 
-function webcryptoAesDecrypt(algorithm, key, data) {
-  const keyBytes = webcryptoSecretBytes(key, "decrypt");
-  if (key.algorithm.name === "AES-KW") return webcryptoAesKwUnwrap(key, data);
+function webcryptoAesDecrypt(algorithm, key, data, usage = "decrypt") {
+  const keyBytes = webcryptoSecretBytes(key, usage);
+  if (key.algorithm.name === "AES-KW") return webcryptoAesKwUnwrap(key, data, usage);
+  if (key.algorithm.name === "AES-CTR") return webcryptoAesCtrCrypt(keyBytes, algorithm, data);
   const cipherName = webcryptoAesCipherName(key.algorithm.name, keyBytes);
   const iv = bytesFromData(algorithm.iv ?? algorithm.counter);
   let input = bytesFromData(data);
@@ -4174,6 +4320,38 @@ function webcryptoDecorateJwk(jwk, key) {
   };
 }
 
+function webcryptoEncryptOperation(algorithm, key, data, usage) {
+  const cryptoKey = assertCryptoKey(key, usage);
+  const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+  if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+  if (name.startsWith("AES-")) return webcryptoAesEncrypt(algorithm, cryptoKey, data, usage);
+  if (name === "RSA-OAEP") {
+    return arrayBufferFromBytes(publicEncrypt({
+      key: webcryptoKeyToNodeKey(cryptoKey),
+      padding: constantsObject.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: webcryptoHashName(cryptoKey.algorithm.hash),
+      oaepLabel: algorithm.label,
+    }, data));
+  }
+  throw new TypeError(`Invalid WebCrypto encrypt algorithm: ${name}`);
+}
+
+function webcryptoDecryptOperation(algorithm, key, data, usage) {
+  const cryptoKey = assertCryptoKey(key, usage);
+  const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
+  if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+  if (name.startsWith("AES-")) return webcryptoAesDecrypt(algorithm, cryptoKey, data, usage);
+  if (name === "RSA-OAEP") {
+    return arrayBufferFromBytes(privateDecrypt({
+      key: webcryptoKeyToNodeKey(cryptoKey),
+      padding: constantsObject.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: webcryptoHashName(cryptoKey.algorithm.hash),
+      oaepLabel: algorithm.label,
+    }, data));
+  }
+  throw new TypeError(`Invalid WebCrypto decrypt algorithm: ${name}`);
+}
+
 const subtleCrypto = {
   async digest(algorithm, data) {
     const name = typeof algorithm === "string" ? algorithm : algorithm?.name;
@@ -4206,7 +4384,7 @@ const subtleCrypto = {
       const modulusLength = positiveInteger(algorithm.modulusLength, "modulusLength");
       const publicExponent = bytesFromBigint(BigInt(webcryptoPublicExponent(algorithm.publicExponent)));
       const pair = generateKeyPairSync("rsa", { modulusLength, publicExponent: webcryptoPublicExponent(algorithm.publicExponent) });
-      const keyAlgorithm = { name, modulusLength, publicExponent, hash: { name: hash } };
+      const keyAlgorithm = { name: webcryptoCanonicalRsaAlgorithmName(name), modulusLength, publicExponent, hash: { name: hash } };
       const publicUsages = name === "RSA-OAEP" ? ["encrypt", "wrapKey"] : ["verify"];
       const privateUsages = name === "RSA-OAEP" ? ["decrypt", "unwrapKey"] : ["sign"];
       return {
@@ -4261,12 +4439,19 @@ const subtleCrypto = {
     }
     if (normalizedFormat === "jwk") {
       if (keyData?.kty === "oct") {
-        return webcryptoSecretKey(normalizedAlgorithm, bytesFromBase64Url(keyData.k), keyData.ext ?? extractable, keyData.key_ops ?? keyUsages);
+        const bytes = bytesFromBase64Url(keyData.k);
+        const keyAlgorithm = normalizedAlgorithm.name === "HMAC" || normalizedAlgorithm.name.startsWith("AES-")
+          ? { ...normalizedAlgorithm, length: bytes.byteLength * 8 }
+          : normalizedAlgorithm;
+        return webcryptoSecretKey(keyAlgorithm, bytes, keyData.ext ?? extractable, keyData.key_ops ?? keyUsages);
       }
       const keyObject = keyObjectFromJwk(keyData, keyData?.d == null ? "public" : undefined);
       return webcryptoKeyFromKeyObject(keyObject, webcryptoAlgorithmForKeyObject(normalizedAlgorithm.name, keyObject, normalizedAlgorithm.hash), extractable, keyUsages);
     }
     if (normalizedFormat === "spki" || normalizedFormat === "pkcs8") {
+      if (normalizedAlgorithm.name.startsWith("RSA") && webcryptoContainsBytes(keyData, rsaPssAlgorithmIdentifierOid)) {
+        throw webcryptoDomException("unsupported algorithm", "NotSupportedError");
+      }
       const keyObject = normalizedFormat === "spki"
         ? createPublicKey({ key: keyData, format: "der", type: "spki" })
         : createPrivateKey({ key: keyData, format: "der", type: "pkcs8" });
@@ -4367,37 +4552,11 @@ const subtleCrypto = {
   },
 
   async encrypt(algorithm, key, data) {
-    const cryptoKey = assertCryptoKey(key, "encrypt");
-    const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
-    // WebCrypto accepts any BufferSource; node primitives reject raw ArrayBuffers.
-    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
-    if (name.startsWith("AES-")) return webcryptoAesEncrypt(algorithm, cryptoKey, data);
-    if (name === "RSA-OAEP") {
-      return arrayBufferFromBytes(publicEncrypt({
-        key: webcryptoKeyToNodeKey(cryptoKey),
-        padding: constantsObject.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: webcryptoHashName(cryptoKey.algorithm.hash),
-        oaepLabel: algorithm.label,
-      }, data));
-    }
-    throw new TypeError(`Invalid WebCrypto encrypt algorithm: ${name}`);
+    return webcryptoEncryptOperation(algorithm, key, data, "encrypt");
   },
 
   async decrypt(algorithm, key, data) {
-    const cryptoKey = assertCryptoKey(key, "decrypt");
-    const name = webcryptoAlgorithmName(algorithm) || cryptoKey.algorithm.name;
-    // WebCrypto accepts any BufferSource; node primitives reject raw ArrayBuffers.
-    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
-    if (name.startsWith("AES-")) return webcryptoAesDecrypt(algorithm, cryptoKey, data);
-    if (name === "RSA-OAEP") {
-      return arrayBufferFromBytes(privateDecrypt({
-        key: webcryptoKeyToNodeKey(cryptoKey),
-        padding: constantsObject.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: webcryptoHashName(cryptoKey.algorithm.hash),
-        oaepLabel: algorithm.label,
-      }, data));
-    }
-    throw new TypeError(`Invalid WebCrypto decrypt algorithm: ${name}`);
+    return webcryptoDecryptOperation(algorithm, key, data, "decrypt");
   },
 
   async deriveBits(algorithm, baseKey, length) {
@@ -4412,6 +4571,9 @@ const subtleCrypto = {
     }
     if (name === "ECDH" || name === "X25519" || name === "X448") {
       const secret = diffieHellman({ privateKey: webcryptoKeyToNodeKey(cryptoKey), publicKey: webcryptoKeyToNodeKey(algorithm.public) });
+      if (byteLength != null && byteLength > secret.byteLength) {
+        throw webcryptoDomException("Invalid length", "OperationError");
+      }
       return arrayBufferFromBytes(byteLength == null ? secret : secret.slice(0, byteLength));
     }
     throw new TypeError(`Invalid WebCrypto deriveBits algorithm: ${name}`);
@@ -4419,7 +4581,9 @@ const subtleCrypto = {
 
   async deriveKey(algorithm, baseKey, derivedKeyAlgorithm, extractable, keyUsages) {
     const target = webcryptoNormalizeKeyAlgorithm(derivedKeyAlgorithm);
-    const length = positiveInteger(derivedKeyAlgorithm.length, "length");
+    const length = target.name === "HMAC" && derivedKeyAlgorithm.length == null
+      ? ((target.hash.name === "SHA-384" || target.hash.name === "SHA-512") ? 1024 : 512)
+      : positiveInteger(derivedKeyAlgorithm.length, "length");
     const bits = await this.deriveBits(algorithm, baseKey, length);
     if (target.name.startsWith("AES-") || target.name === "HMAC") {
       return this.importKey("raw", bits, derivedKeyAlgorithm, extractable, keyUsages);
@@ -4431,14 +4595,14 @@ const subtleCrypto = {
     const exported = await this.exportKey(format, key);
     const name = webcryptoAlgorithmName(wrapAlgorithm) || wrappingKey.algorithm?.name;
     if (name === "AES-KW") return webcryptoAesKwWrap(assertCryptoKey(wrappingKey, "wrapKey"), exported, "wrapKey");
-    return this.encrypt(wrapAlgorithm, wrappingKey, exported);
+    return webcryptoEncryptOperation(wrapAlgorithm, wrappingKey, exported, "wrapKey");
   },
 
   async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
     const name = webcryptoAlgorithmName(unwrapAlgorithm) || unwrappingKey.algorithm?.name;
     const data = name === "AES-KW"
       ? await webcryptoAesKwUnwrap(assertCryptoKey(unwrappingKey, "unwrapKey"), wrappedKey, "unwrapKey")
-      : await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+      : await webcryptoDecryptOperation(unwrapAlgorithm, unwrappingKey, wrappedKey, "unwrapKey");
     return this.importKey(format, data, unwrappedKeyAlgorithm, extractable, keyUsages);
   },
 };

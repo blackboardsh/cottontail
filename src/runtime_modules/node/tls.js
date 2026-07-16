@@ -1,4 +1,5 @@
 import { Buffer } from "./buffer.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
 import { X509Certificate, createHash, createDecipheriv } from "./crypto.js";
 import { isIP, Server as NetServer, Socket } from "./net.js";
 
@@ -352,7 +353,7 @@ export class TLSSocket extends Socket {
   _startTlsRead() {
     if (this._tlsId == null || this._tlsListenerInstalled) return this;
     const listeners = installTlsEventDispatcher();
-    listeners.set(this._tlsId, (event) => {
+    listeners.set(this._tlsId, _wrapAsyncCallback((event) => {
       if (this.destroyed) return;
       if (event.type === "data") {
         const chunk = chunkFromBytes(event.data ?? new ArrayBuffer(0), this._encoding);
@@ -373,7 +374,7 @@ export class TLSSocket extends Socket {
       if (event.type === "error") {
         this.destroy(new Error(event.message || "TLS read failed"));
       }
-    });
+    }));
     this._tlsListenerInstalled = true;
     cottontail.tlsConnectionReadStart(this._tlsId);
     return this;

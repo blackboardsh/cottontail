@@ -652,7 +652,7 @@ Buffer.prototype.toString = function toString() {
 Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
 Buffer.prototype.equals = function equals(b) {
-  if (!Buffer.isBuffer(b)) throw new TypeError("Argument must be a Buffer");
+  if (!Buffer.isBuffer(b) && !isInstance(b, Uint8Array)) throw new TypeError("Argument must be a Buffer");
   if (this === b) return true;
   return Buffer.compare(this, b) === 0;
 };

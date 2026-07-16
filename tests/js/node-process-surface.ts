@@ -6,8 +6,29 @@ function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
 }
 
+function assertThrows(callback: () => unknown, message: string) {
+  try {
+    callback();
+  } catch {
+    return;
+  }
+  throw new Error(message);
+}
+
 const tmpDir = process.env.COTTONTAIL_TMP_DIR;
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
+
+if (process.platform === "darwin") {
+  const cleanEnvironment = spawnSync(
+    process.execPath,
+    ["-e", "console.log(JSON.stringify(process.env))"],
+    { env: { COTTONTAIL_TMP_DIR: tmpDir }, encoding: "utf8" },
+  );
+  assert(cleanEnvironment.status === 0, "minimal environment child should exit successfully");
+  const parsedEnvironment = JSON.parse(cleanEnvironment.stdout.trim());
+  assert(!("__CF_USER_TEXT_ENCODING" in parsedEnvironment), "CoreFoundation environment internals should not leak");
+
+}
 
 assert(processDefault === process, "default process should be global process");
 assert(processModule.pid === process.pid, "pid export mismatch");
@@ -131,6 +152,14 @@ const configBinding = (process as any).binding("config");
 assert(configBinding.hasOpenSSL === true, "process.binding config hasOpenSSL mismatch");
 assert(configBinding.bits === 64 || configBinding.bits === 32, "process.binding config bits mismatch");
 assert(typeof configBinding.getDefaultLocale() === "string", "process.binding config getDefaultLocale mismatch");
+
+const ttyBinding = (process as any).binding("tty_wrap");
+assert(typeof ttyBinding.TTY === "function", "process.binding tty_wrap TTY mismatch");
+assert(typeof ttyBinding.TTY.prototype.getWindowSize === "function", "process.binding tty_wrap getWindowSize mismatch");
+assert(typeof ttyBinding.TTY.prototype.setRawMode === "function", "process.binding tty_wrap setRawMode mismatch");
+assert(ttyBinding.isTTY(0) === Boolean(process.stdin.isTTY), "process.binding tty_wrap stdin mismatch");
+assert(ttyBinding.isTTY(9999999) === false, "process.binding tty_wrap invalid fd mismatch");
+assertThrows(() => ttyBinding.TTY(), "process.binding tty_wrap TTY should require new");
 
 const nativesBinding = (process as any).binding("natives");
 assert(typeof nativesBinding.fs === "string" && nativesBinding.fs.includes("node:fs"), "process.binding natives fs mismatch");

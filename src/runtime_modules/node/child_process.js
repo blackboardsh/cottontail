@@ -303,7 +303,7 @@ function sanitizeEnvObject(env) {
 }
 
 function prepareNativeOptions(file, options = {}) {
-  if (options.env === undefined) {
+  if (options.env == null) {
     // Node inherits the (possibly mutated) process.env object, not the raw environ.
     return {
       ...options,
@@ -418,13 +418,38 @@ function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
   return null;
 }
 
+function normalizeSpawnError(file, spawnargs, cause) {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  const causeCode = typeof cause?.code === "string" ? cause.code.toUpperCase() : "";
+  let code;
+  let errno;
+  if (causeCode === "ENOENT" || /filenotfound|enoent|no such file/i.test(message)) {
+    code = "ENOENT";
+    errno = -2;
+  } else if (causeCode === "EACCES" || /eacces|permission denied/i.test(message)) {
+    code = "EACCES";
+    errno = -13;
+  } else {
+    code = causeCode || "UNKNOWN";
+    errno = cause?.errno;
+  }
+  const error = new Error(`spawn ${file} ${code}`);
+  error.code = code;
+  if (errno !== undefined) error.errno = errno;
+  error.syscall = `spawn ${file}`;
+  error.path = String(file);
+  error.spawnargs = Array.from(spawnargs ?? [], String);
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
 export function spawn(file, args = [], options = {}) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
   args = normalized.args;
   options = normalized.options;
   const command = normalizeSpawnCommand(file, args, options);
-  const preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
+  let preflightError = options.shell ? null : spawnPreflightError(command.file, args, file);
   const listeners = new Map();
   const stdoutListeners = new Map();
   const stderrListeners = new Map();
@@ -448,16 +473,15 @@ export function spawn(file, args = [], options = {}) {
   const ipcRequested = options.ipc === true || (Array.isArray(options.stdio) && options.stdio.some((item) => item === "ipc"));
 
   const nativeOptions = prepareNativeOptions(command.file, options);
-  const native = cottontail.spawnStart(command.file, command.args, {
-    cwd: normalizeCwdOption(options.cwd),
-    env: nativeOptions.env,
-    clearEnv: nativeOptions.clearEnv,
-    stdin: stdinMode,
-    stdout: stdoutMode,
-    stderr: stderrMode,
-    ipc: ipcRequested,
-    argv0: options.argv0 != null ? String(options.argv0) : undefined,
-  });
+  const deferStart = command.file === globalThis.process?.execPath;
+  let native = { id: -1, pid: 0, ipcFd: null };
+  let startReleased = !deferStart;
+
+  const releaseStart = () => {
+    if (startReleased || preflightError != null || native.id < 0) return;
+    startReleased = true;
+    cottontail.spawnRelease?.(native.id);
+  };
 
   const emitFrom = (map, name, ...values) => {
     for (const handler of map.get(name) ?? []) handler(...values);
@@ -555,11 +579,13 @@ export function spawn(file, args = [], options = {}) {
       emitFrom(map, "close");
       return this;
     },
-    destroy() {
+    destroy(error = undefined) {
       if (writeImpl) cottontail.spawnCloseStdin(native.id);
+      else cottontail.spawnCloseOutput?.(native.id, fd);
       this.writable = false;
       this.readable = false;
       this.destroyed = true;
+      if (error != null) emitFrom(map, "error", error);
       emitFrom(map, "close");
       return this;
     },
@@ -597,14 +623,19 @@ export function spawn(file, args = [], options = {}) {
   };
 
   const child = Object.assign(new ChildProcess(), {
-    pid: native.pid ?? 0,
+    pid: 0,
     // Convert strings to bytes before crossing into native code: the native
     // string path measures with strlen and would truncate at embedded NULs.
-    stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => cottontail.spawnWrite(native.id, Buffer.isBuffer(chunk) || ArrayBuffer.isView(chunk) ? chunk : Buffer.from(String(chunk)))) : null,
+    stdin: stdinMode === "pipe" ? makeStream(stdinListeners, 0, (chunk) => {
+      // A synchronous write can fill the pipe before the normal release
+      // microtask runs, so let the gated child start reading first.
+      releaseStart();
+      return cottontail.spawnWrite(native.id, Buffer.isBuffer(chunk) || ArrayBuffer.isView(chunk) ? chunk : Buffer.from(String(chunk)));
+    }) : null,
     stdout: stdoutMode === "pipe" ? makeStream(stdoutListeners, 1) : null,
     stderr: stderrMode === "pipe" ? makeStream(stderrListeners, 2) : null,
-    _nativeId: native.id,
-    _ipcFd: native.ipcFd == null ? null : Number(native.ipcFd),
+    _nativeId: -1,
+    _ipcFd: null,
     on(name, handler) {
       const handlers = listeners.get(name) ?? [];
       handlers.push(handler);
@@ -647,6 +678,27 @@ export function spawn(file, args = [], options = {}) {
   // tinyspawn rely on Object.assign copying stdin/stdout/stderr/stdio).
   child.stdio = [child.stdin, child.stdout, child.stderr];
 
+  if (preflightError == null) {
+    try {
+      native = cottontail.spawnStart(command.file, command.args, {
+        cwd: normalizeCwdOption(options.cwd),
+        env: nativeOptions.env,
+        clearEnv: nativeOptions.clearEnv,
+        stdin: stdinMode,
+        stdout: stdoutMode,
+        stderr: stderrMode,
+        ipc: ipcRequested,
+        argv0: options.argv0 != null ? String(options.argv0) : undefined,
+        deferStart,
+      });
+      child.pid = native.pid ?? 0;
+      child._nativeId = native.id;
+      child._ipcFd = native.ipcFd == null ? null : Number(native.ipcFd);
+    } catch (error) {
+      preflightError = normalizeSpawnError(file, args, error);
+    }
+  }
+
   if (options.timeout != null && Number(options.timeout) > 0) {
     child._timeoutTimer = setTimeout(() => {
       child.kill(options.killSignal ?? "SIGTERM");
@@ -668,7 +720,7 @@ export function spawn(file, args = [], options = {}) {
     for (const handler of listeners.get(name) ?? []) handler(...values);
   };
 
-  unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
+  if (preflightError == null) unregisterSpawnListener = globalThis.__cottontailRegisterSpawnListener?.(native.id, (event) => {
     if (!event) return;
     if (event.type === "stdout") {
       const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
@@ -753,6 +805,7 @@ export function spawn(file, args = [], options = {}) {
 
   // Node emits 'spawn' asynchronously once the process started successfully.
   queueMicrotask(() => {
+    releaseStart();
     if (!closed) emitChild("spawn");
   });
 

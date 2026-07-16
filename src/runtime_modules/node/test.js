@@ -1,6 +1,6 @@
 import * as nodeAssert from "./assert.js";
 import { AsyncLocalStorage } from "./async_hooks.js";
-import { readFileSync } from "./fs.js";
+import { appendFileSync, readFileSync } from "./fs.js";
 import { Readable } from "./stream.js";
 
 const tests = [];
@@ -15,9 +15,14 @@ const runnerPromiseThen = globalThis.Promise.prototype.then;
 const runnerPromiseResolve = globalThis.Promise.resolve.bind(globalThis.Promise);
 const runnerPromiseRace = globalThis.Promise.race.bind(globalThis.Promise);
 const runnerPromiseAll = globalThis.Promise.all.bind(globalThis.Promise);
+const runnerStderrWrite = globalThis.process?.stderr?.write?.bind(globalThis.process.stderr);
+const runnerConsoleWarn = globalThis.console?.warn?.bind(globalThis.console);
+const runnerConsoleError = globalThis.console?.error?.bind(globalThis.console);
 const executionStorage = new AsyncLocalStorage();
 const failureStorage = new AsyncLocalStorage();
+const promiseOwners = new WeakMap();
 let uncaughtCaptureInstalled = false;
+let unhandledRejectionCaptureInstalled = false;
 let asyncFailureGuardsInstalled = false;
 let currentSuite;
 let activeExecution = null;
@@ -41,6 +46,7 @@ const selectedRecords = new Set();
 const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
 const forceConcurrent = testCliArgs.includes("--concurrent");
 const runTodoTests = testCliArgs.includes("--todo");
+const dotsMode = testCliArgs.includes("--dots");
 
 function cliOption(name, fallback = undefined) {
   const equals = testCliArgs.find((arg) => String(arg).startsWith(`${name}=`));
@@ -67,6 +73,64 @@ function bunfigOnlyFailures() {
 const maxConcurrency = configuredMaxConcurrency();
 const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
 const runnerDateNow = Date.now.bind(Date);
+
+function configuredTestNamePattern() {
+  const source = cliOption("-t") ?? cliOption("--test-name-pattern");
+  if (source == null) return null;
+  return new RegExp(String(source));
+}
+
+const testNamePattern = configuredTestNamePattern();
+
+let dotsLineHasMarkers = false;
+let dotsFileShown = false;
+
+function testFileLabel() {
+  let file = String(globalThis.process?.argv?.[1] ?? "test");
+  const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
+  if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
+  return file.replace(/^\.[\\/]+/, "");
+}
+
+function dotsWrite(value) {
+  const text = String(value);
+  if (runnerStderrWrite) return runnerStderrWrite(text);
+  return runnerConsoleError?.(text.replace(/\n$/, ""));
+}
+
+function prepareDotsDetail() {
+  if (!dotsMode) return;
+  if (dotsLineHasMarkers) dotsWrite("\n");
+  if (!dotsFileShown) {
+    // In aggregate mode a previous child may have left a dot line open.
+    dotsWrite(dotsLineHasMarkers
+      ? "\n"
+      : globalThis.process?.env?.COTTONTAIL_TEST_AGGREGATE_FILE
+        ? "\n\n"
+        : "");
+    dotsWrite(`${testFileLabel()}:\n`);
+    dotsFileShown = true;
+  }
+  dotsLineHasMarkers = false;
+}
+
+function installDotsConsoleHooks() {
+  if (!dotsMode || !globalThis.console) return;
+  if (runnerConsoleWarn) {
+    globalThis.console.warn = (...args) => {
+      prepareDotsDetail();
+      return runnerConsoleWarn(...args);
+    };
+  }
+  if (runnerConsoleError) {
+    globalThis.console.error = (...args) => {
+      prepareDotsDetail();
+      return runnerConsoleError(...args);
+    };
+  }
+}
+
+installDotsConsoleHooks();
 
 function isTruthyEnvValue(value) {
   if (value == null) return false;
@@ -136,6 +200,20 @@ function installUncaughtCapture() {
   });
 }
 
+function installUnhandledRejectionCapture() {
+  if (unhandledRejectionCaptureInstalled || typeof globalThis.process?.on !== "function") return;
+  unhandledRejectionCaptureInstalled = true;
+  globalThis.process.on("unhandledRejection", (reason, promise) => {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    const owner = promise && typeof promise === "object" ? promiseOwners.get(promise) : null;
+    if (owner?.kind === "test" && owner.active && typeof owner.failExternal === "function") {
+      owner.failExternal(error);
+      return;
+    }
+    recordUnhandledError(error);
+  });
+}
+
 function guardAsyncCallback(callback, captureReturnedPromise = true, externalOnThrow = true) {
   const execution = failureStorage.getStore() ?? currentExecution();
   if (!execution || typeof callback !== "function") return callback;
@@ -164,6 +242,7 @@ function copyTimerMetadata(wrapper, original) {
 function installAsyncFailureGuards() {
   if (asyncFailureGuardsInstalled) return;
   asyncFailureGuardsInstalled = true;
+  installUnhandledRejectionCapture();
   globalThis.setTimeout = copyTimerMetadata(
     (callback, ...args) => runnerSetTimeout(guardAsyncCallback(callback), ...args),
     runnerSetTimeout,
@@ -178,12 +257,32 @@ function installAsyncFailureGuards() {
       runnerSetImmediate,
     );
   }
-  globalThis.queueMicrotask = (callback) => runnerQueueMicrotask(guardAsyncCallback(callback));
+  globalThis.queueMicrotask = function queueMicrotask(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError('The "callback" argument must be of type function.');
+    }
+    const guarded = guardAsyncCallback(callback);
+    return runnerQueueMicrotask(function runTestMicrotask() {
+      globalThis.__cottontailBeforeMicrotask?.();
+      return guarded();
+    });
+  };
+  Object.defineProperty(globalThis.queueMicrotask, "name", { value: "queueMicrotask", configurable: true });
   if (runnerNextTick) {
-    globalThis.process.nextTick = (callback, ...args) => runnerNextTick(guardAsyncCallback(callback), ...args);
+    globalThis.process.nextTick = function nextTick(callback, ...args) {
+      return runnerNextTick(guardAsyncCallback(callback), ...args);
+    };
+    Object.defineProperty(globalThis.process.nextTick, "name", { value: "nextTick", configurable: true });
   }
   globalThis.Promise.prototype.then = function testAwareThen(onFulfilled, onRejected) {
-    return runnerPromiseThen.call(this, guardAsyncCallback(onFulfilled, false, false), guardAsyncCallback(onRejected, false, false));
+    const owner = failureStorage.getStore() ?? currentExecution();
+    const result = runnerPromiseThen.call(
+      this,
+      guardAsyncCallback(onFulfilled, false, false),
+      guardAsyncCallback(onRejected, false, false),
+    );
+    if (owner && result && typeof result === "object") promiseOwners.set(result, owner);
+    return result;
   };
 }
 
@@ -231,15 +330,49 @@ function parseTestArgs(name, options, fn) {
   return { name: String(name ?? "<anonymous>"), options: options ?? {}, fn };
 }
 
+function makeTestContextAssert(record) {
+  const base = nodeAssert.default ?? nodeAssert;
+  const contextAssert = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (name === "CallTracker" || name === "AssertionError" || name === "strict") continue;
+    contextAssert[name] = value;
+  }
+  contextAssert.snapshot = (value, options = undefined) => {
+    const expectation = globalThis.Bun?.jest?.(record.filePath)?.expect?.(value);
+    if (!expectation?.toMatchSnapshot) throw new Error("Snapshot assertions require the test runner");
+    const message = typeof options === "string" ? options : options?.message;
+    return expectation.toMatchSnapshot(message);
+  };
+  contextAssert.fileSnapshot = (value, filename) => {
+    const actual = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    nodeAssert.strictEqual(actual, String(readFileSync(filename, "utf8")));
+  };
+  return contextAssert;
+}
+
+function nestedTestNotImplemented(name) {
+  const error = new Error(
+    `${name}() inside another test() is not yet implemented in Bun. ` +
+    "Track the status & thumbs up the issue: https://github.com/oven-sh/bun/issues/5090. " +
+    "Use `bun:test` in the interim.",
+  );
+  error.name = "NotImplementedError";
+  return error;
+}
+
 class TestContext {
   constructor(record) {
+    this._record = record;
     this.name = record.name;
-    this.signal = { aborted: false };
+    this.fullName = fullTestName(record);
+    this.filePath = record.filePath;
+    this._abortController = new AbortController();
+    this.signal = this._abortController.signal;
     this.mock = mock;
-    this.assert = assert;
+    this.assert = makeTestContextAssert(record);
   }
 
-  async test(name, options, fn) {
+  test(name, options, fn) {
     const previousSuite = currentSuite;
     currentSuite = this._record?.suite ?? rootSuite;
     try {
@@ -248,6 +381,12 @@ class TestContext {
       currentSuite = previousSuite;
     }
   }
+
+  describe(name, options, fn) { return describe(name, options, fn); }
+  before(fn, options = {}) { return before(fn, options); }
+  after(fn, options = {}) { return after(fn, options); }
+  beforeEach(fn, options = {}) { return beforeEach(fn, options); }
+  afterEach(fn, options = {}) { return afterEach(fn, options); }
 
   skip(reason = "skipped") {
     const error = new Error(String(reason));
@@ -353,29 +492,31 @@ function invokeTestCallback(record, context) {
 
 function invokeHook(hook, context) {
   return withTimeout(() => {
-    let rejectExternal;
-    const failure = new Promise((_, reject) => { rejectExternal = reject; });
-    const target = { failExternal: rejectExternal };
+    const target = { kind: "hook", failExternal: recordUnhandledError };
     return failureStorage.run(target, () => {
       let result;
       if (typeof hook.fn !== "function") result = undefined;
       else if (hook.fn.length >= 2) result = invokeDoneCallback(hook.fn, undefined, [context]);
       else result = hook.fn(context);
-      return runnerPromiseRace([runnerPromiseResolve(result), failure]);
+      return runnerPromiseResolve(result);
     });
   }, hook.options);
 }
 
-async function runHookList(hooks, context) {
-  let firstError = null;
-  for (const hook of hooks) {
+async function runHookList(hooks, context, reverseLayers = false) {
+  const orderedHooks = reverseLayers
+    ? hooks.map((hook, index) => ({ hook, index })).sort((left, right) =>
+      (Number(right.hook.layer ?? 0) - Number(left.hook.layer ?? 0)) || (left.index - right.index),
+    ).map(({ hook }) => hook)
+    : hooks;
+  for (const hook of orderedHooks) {
     try {
       await invokeHook(hook, context);
     } catch (error) {
-      firstError ??= error;
+      return error;
     }
   }
-  return firstError;
+  return null;
 }
 
 function suiteChain(suite) {
@@ -415,7 +556,7 @@ function rebuildSelection() {
 
 function selectedByOnly(record) {
   if (selectionDirty) rebuildSelection();
-  return selectedRecords.has(record);
+  return selectedRecords.has(record) && (!testNamePattern || testNamePattern.test(fullTestName(record)));
 }
 
 function recordIsRunnable(record) {
@@ -430,9 +571,15 @@ function suiteHasRunnableWork(suite) {
   for (let cursor = suite; cursor; cursor = cursor.parent) {
     if (cursor.options.skip || cursor.options.todo) return false;
   }
-  if (suiteHasRunnableTest(suite)) return true;
+  return suiteHasRunnableTest(suite);
+}
+
+function suiteHasLifecycleWork(suite) {
+  for (let cursor = suite; cursor; cursor = cursor.parent) {
+    if (cursor.options.skip || cursor.options.todo) return false;
+  }
   if (suite.beforeHooks.length > 0 || suite.afterHooks.length > 0) return true;
-  return suite.children.some((child) => child.kind === "suite" && suiteHasRunnableWork(child));
+  return suite.children.some((child) => child.kind === "suite" && suiteHasLifecycleWork(child));
 }
 
 function suiteBeforeError(suite) {
@@ -479,8 +626,9 @@ function reapDanglingProcesses(execution) {
 
 async function executeAttempt(record) {
   const context = new TestContext(record);
-  context._record = record;
   const execution = {
+    kind: "test",
+    active: true,
     record,
     afterBodyHooks: [],
     finishHooks: [],
@@ -492,7 +640,8 @@ async function executeAttempt(record) {
     });
 
     const chain = suiteChain(record.suite);
-    let setupError = suiteBeforeError(record.suite);
+    const beforeAllError = suiteBeforeError(record.suite);
+    let setupError = beforeAllError;
     let bodyError = null;
     let cleanupError = null;
     try {
@@ -513,15 +662,18 @@ async function executeAttempt(record) {
         if (bodyError?.code === "ERR_TEST_TIMEOUT") reapDanglingProcesses(execution);
       }
 
-      const afterBodyError = await runHookList(execution.afterBodyHooks, context);
-      cleanupError ??= afterBodyError;
-      for (const suite of Array.from(chain).reverse()) {
-        const afterEachError = await runHookList(suite.afterEachHooks, context);
-        cleanupError ??= afterEachError;
+      if (!beforeAllError) {
+        const afterBodyError = await runHookList(execution.afterBodyHooks, context);
+        cleanupError ??= afterBodyError;
+        for (const suite of Array.from(chain).reverse()) {
+          const afterEachError = await runHookList(suite.afterEachHooks, context, true);
+          cleanupError ??= afterEachError;
+        }
       }
       const finishError = await runHookList(execution.finishHooks, context);
       cleanupError ??= finishError;
     } finally {
+      execution.active = false;
       if (activeExecution === execution) activeExecution = null;
     }
 
@@ -543,9 +695,15 @@ function attemptCount(record) {
 async function execute(record) {
   if (record.ran) return record.result;
   record.ran = true;
+  globalThis.__cottontailBeginNextTickTurn?.();
   if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:start ${record.name}`);
   emit("test:start", { name: record.name });
 
+  if (!selectedByOnly(record)) {
+    record.status = "filtered";
+    record.resolve?.();
+    return undefined;
+  }
   const skipReason = inheritedOption(record, "skip");
   const todoReason = inheritedOption(record, "todo");
   if (skipReason || (todoReason && (!runTodoTests || typeof record.fn !== "function"))) {
@@ -560,15 +718,10 @@ async function execute(record) {
       skippedTests += 1;
     }
     emit("test:pass", data);
+    emitDotsRecord(record);
     record.resolve?.();
     return undefined;
   }
-  if (!selectedByOnly(record)) {
-    record.status = "filtered";
-    record.resolve?.();
-    return undefined;
-  }
-
   const started = performance?.now?.() ?? Date.now();
   let error = null;
   const totalAttempts = attemptCount(record);
@@ -590,6 +743,7 @@ async function execute(record) {
       record.status = "todo";
       record.todoError = error;
       emit("test:pass", { name: record.name, todo: todoReason === true ? "todo" : todoReason });
+      emitDotsRecord(record);
       record.resolve?.();
       return undefined;
     }
@@ -603,6 +757,7 @@ async function execute(record) {
       if (record.status === "skip") skippedTests += 1;
       else todoTests += 1;
       emit("test:pass", { name: record.name, [record.status]: error.message });
+      emitDotsRecord(record);
       record.resolve?.();
       return undefined;
     }
@@ -611,6 +766,7 @@ async function execute(record) {
     record.status = "fail";
     record.error = error;
     emit("test:fail", { name: record.name, error, duration_ms });
+    emitDotsRecord(record);
     record.reject?.(error);
     if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:fail ${record.name}: ${error?.stack || error?.message || error}`);
     return undefined;
@@ -618,6 +774,7 @@ async function execute(record) {
   passedTests += 1;
   record.status = "pass";
   emit("test:pass", { name: record.name, duration_ms });
+  emitDotsRecord(record);
   record.resolve?.();
   if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:pass ${record.name}`);
 }
@@ -628,6 +785,20 @@ function recordHookFailure(name, error, isRunnerError = false) {
   else failedTests += 1;
   failures.push({ record, error });
   emit("test:fail", { name, error });
+  emitDotsRecord(record, error);
+}
+
+function recordUnhandledError(error) {
+  const record = {
+    name: "Unhandled error between tests",
+    status: "error",
+    suite: rootSuite,
+    unhandledBetweenTests: true,
+  };
+  runnerErrors += 1;
+  failures.push({ record, error });
+  emit("test:fail", { name: record.name, error });
+  emitDotsRecord(record, error);
 }
 
 function settlesBeforeNextTurn(promise) {
@@ -688,7 +859,7 @@ async function executeSuite(suite, concurrentGroup) {
     recordHookFailure(suite.name, suite.definitionError, !(suite.definitionError instanceof TypeError));
   }
 
-  const runnable = suiteHasRunnableWork(suite);
+  const runnable = suiteHasRunnableWork(suite) || suiteHasLifecycleWork(suite);
   if (runnable && !suite.beforeRan) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
     suite.beforeRan = true;
@@ -710,7 +881,7 @@ async function executeSuite(suite, concurrentGroup) {
   if (suite !== rootSuite && suite.beforeRan && !suite.afterRan) {
     if (suite.afterHooks.length > 0) await flushConcurrent(concurrentGroup);
     suite.afterRan = true;
-    const error = await runHookList(suite.afterHooks, new TestContext({ name: suite.name }));
+    const error = await runHookList(suite.afterHooks, new TestContext({ name: suite.name }), true);
     if (error) recordHookFailure(suite.name, error);
   }
 }
@@ -721,6 +892,98 @@ function hasPendingTests() {
 
 function formatFailure(error) {
   return String(error?.message ?? error ?? "Test failed");
+}
+
+const sourceLineCache = new Map();
+
+function normalizeDiagnosticPath(value) {
+  let path = String(value ?? "").replaceAll("\\", "/");
+  if (path.startsWith("file://")) {
+    path = path.slice("file://".length);
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+  }
+  return path.replace(/[?#].*$/, "");
+}
+
+function parseStackFrame(line) {
+  const text = String(line ?? "");
+  let match = /^(.*?)@(.+):(\d+):(\d+)$/.exec(text);
+  if (match) {
+    return {
+      functionName: match[1] || "<anonymous>",
+      filePath: normalizeDiagnosticPath(match[2]),
+      line: Number(match[3]),
+      column: Number(match[4]),
+    };
+  }
+  match = /^\s*at\s+(?:(.*?)\s+\()?(.+):(\d+):(\d+)\)?$/.exec(text);
+  if (!match) return null;
+  return {
+    functionName: match[1] || "<anonymous>",
+    filePath: normalizeDiagnosticPath(match[2]),
+    line: Number(match[3]),
+    column: Number(match[4]),
+  };
+}
+
+function failureStackFrames(error) {
+  let stack;
+  try {
+    stack = typeof error?.stack === "string" ? error.stack : "";
+  } catch {
+    stack = "";
+  }
+  if (!stack) return [];
+  try {
+    stack = globalThis.__cottontailRemapStackString?.(stack) ?? stack;
+  } catch {}
+  const frames = [];
+  for (const line of String(stack).split("\n")) {
+    const frame = parseStackFrame(line);
+    if (!frame) continue;
+    const path = frame.filePath;
+    if (!path || path.includes("/.cottontail-embedded-runtime/") ||
+        path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
+    frames.push(frame);
+  }
+  return frames;
+}
+
+function sourceLinesFor(path) {
+  if (sourceLineCache.has(path)) return sourceLineCache.get(path);
+  let lines = null;
+  try {
+    lines = String(readFileSync(path, "utf8")).split(/\r?\n/);
+  } catch {}
+  sourceLineCache.set(path, lines);
+  return lines;
+}
+
+function appendSourceFrame(lines, frame) {
+  const sourceLines = sourceLinesFor(frame.filePath);
+  if (!sourceLines || frame.line < 1 || frame.line > sourceLines.length) return;
+  const start = Math.max(1, frame.line - 5);
+  const width = String(frame.line).length;
+  for (let lineNumber = start; lineNumber <= frame.line; lineNumber += 1) {
+    lines.push(`${String(lineNumber).padStart(width)} | ${sourceLines[lineNumber - 1]}`);
+  }
+  const sourceLine = sourceLines[frame.line - 1];
+  let column = Math.max(1, Math.min(Number(frame.column) || 1, sourceLine.length + 1));
+  if (/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) {
+    const closingParen = sourceLine.lastIndexOf(")");
+    if (closingParen >= 0) column = closingParen + 1;
+  }
+  lines.push(`${" ".repeat(width + 3 + column - 1)}^`);
+}
+
+function appendErrorDiagnostic(lines, error) {
+  const frames = failureStackFrames(error);
+  if (frames.length > 0) appendSourceFrame(lines, frames[0]);
+  lines.push(`error: ${formatFailure(error)}`);
+  for (const frame of frames.slice(0, 5)) {
+    const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
+    lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+  }
 }
 
 function fullTestName(record) {
@@ -777,6 +1040,14 @@ globalThis.__cottontailCurrentTestRemainingMs = () => {
 };
 
 function appendFailure(lines, record, error) {
+  if (record.unhandledBetweenTests) {
+    lines.push("");
+    lines.push("# Unhandled error between tests");
+    lines.push("-------------------------------");
+    appendErrorDiagnostic(lines, error);
+    lines.push("-------------------------------");
+    return;
+  }
   const name = fullTestName(record);
   if (error?.code === "ERR_TEST_FAILING_PASSED") {
     lines.push(`(fail) ${name}`);
@@ -790,8 +1061,22 @@ function appendFailure(lines, record, error) {
     lines.push(`  ^ this test timed out after ${duration}ms.`);
     return;
   }
-  lines.push(`error: ${formatFailure(error)}`);
+  appendErrorDiagnostic(lines, error);
   lines.push(`(fail) ${name}`);
+}
+
+function emitDotsRecord(record, error = record?.error) {
+  if (!dotsMode || !record || record.dotsReported || record.status === "filtered") return;
+  record.dotsReported = true;
+  if (record.status === "pass" || record.status === "skip" || record.status === "todo") {
+    dotsWrite(".");
+    dotsLineHasMarkers = true;
+    return;
+  }
+  prepareDotsDetail();
+  const lines = [];
+  appendFailure(lines, record, error);
+  dotsWrite(`${lines.join("\n")}\n`);
 }
 
 function snapshotRecordView(record) {
@@ -811,7 +1096,7 @@ function appendRunRecords(lines, views) {
     if (view.status === "pass") {
       // Failed retry attempts print their errors even though the test passed.
       for (const attemptError of view.attemptErrors ?? []) {
-        lines.push(`error: ${formatFailure(attemptError)}`);
+        appendErrorDiagnostic(lines, attemptError);
       }
       if (!suppressPassing) {
         const retried = (view.attempts ?? 1) > 1 && view.record.options?.repeats == null;
@@ -820,11 +1105,11 @@ function appendRunRecords(lines, views) {
       }
     } else if (view.status === "fail") {
       for (const attemptError of (view.attemptErrors ?? []).slice(0, -1)) {
-        lines.push(`error: ${formatFailure(attemptError)}`);
+        appendErrorDiagnostic(lines, attemptError);
       }
       appendFailure(lines, view.record, view.error);
     } else if (!suppressPassing) {
-      if (view.status === "todo" && view.todoError) lines.push(`error: ${formatFailure(view.todoError)}`);
+      if (view.status === "todo" && view.todoError) appendErrorDiagnostic(lines, view.todoError);
       lines.push(`(${view.status}) ${fullTestName(view.record)}`);
     }
   }
@@ -853,6 +1138,28 @@ function reportResults() {
     }
   }
   const assertionCount = Number(globalThis.__cottontailTestAssertionCount ?? 0);
+  const aggregateFile = globalThis.process?.env?.COTTONTAIL_TEST_AGGREGATE_FILE;
+  if (aggregateFile) {
+    appendFileSync(
+      aggregateFile,
+      `${passedTests}\t${skippedTests}\t${todoTests}\t${failedTests}\t${runnerErrors}\t${assertionCount}\n`,
+    );
+    if (dotsMode) return;
+    console.error(lines.join("\n"));
+    return;
+  }
+  if (dotsMode) {
+    const summary = [`${passedTests} pass`];
+    if (skippedTests > 0) summary.push(`${skippedTests} skip`);
+    if (todoTests > 0) summary.push(`${todoTests} todo`);
+    summary.push(`${failedTests} fail`);
+    if (runnerErrors > 0) summary.push(`${runnerErrors} error`);
+    const total = passedTests + skippedTests + todoTests + failedTests;
+    summary.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across 1 file.`);
+    dotsWrite(`\n\n${summary.join("\n")}\n`);
+    dotsLineHasMarkers = false;
+    return;
+  }
   lines.push("");
   lines.push(` ${passedTests} pass`);
   if (skippedTests > 0) lines.push(` ${skippedTests} skip`);
@@ -860,7 +1167,7 @@ function reportResults() {
   lines.push(` ${failedTests} fail`);
   if (runnerErrors > 0) lines.push(` ${runnerErrors} error`);
   if (assertionCount > 0) lines.push(` ${assertionCount} expect() calls`);
-  const total = passedTests + skippedTests + todoTests + failedTests + runnerErrors;
+  const total = passedTests + skippedTests + todoTests + failedTests;
   lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across 1 file.`);
   console.error(lines.join("\n"));
 }
@@ -874,7 +1181,7 @@ async function finalizeRun(exitOnFailure = true) {
     }
     if (rootSuite.beforeRan && !rootSuite.afterRan) {
       rootSuite.afterRan = true;
-      const error = await runHookList(rootSuite.afterHooks, new TestContext({ name: rootSuite.name }));
+      const error = await runHookList(rootSuite.afterHooks, new TestContext({ name: rootSuite.name }), true);
       if (error) recordHookFailure(rootSuite.name, error);
     }
     reportResults();
@@ -922,8 +1229,10 @@ function resetForRerun() {
 }
 
 function scheduleRun() {
+  if (tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite)) return;
   installUncaughtCapture();
   installAsyncFailureGuards();
+  if (globalThis.__cottontailLoadingTestModules) return;
   if (runnerActive) {
     runAgain = true;
     return;
@@ -969,6 +1278,8 @@ function scheduleRun() {
   });
 }
 
+globalThis.__cottontailStartTestRun = scheduleRun;
+
 function normalizeCountOption(value, name) {
   const count = Number(value);
   if (!Number.isInteger(count) || count < 0) throw new TypeError(`${name} must be a non-negative integer`);
@@ -987,12 +1298,14 @@ function validateTestOptions(options) {
 
 function makeTestFunction(defaultOptions = {}) {
   const fn = function nodeTest(name, options, callback) {
+    if (currentExecution()) throw nestedTestNotImplemented("test");
     const parsed = parseTestArgs(name, options, callback);
     const record = {
       name: parsed.name,
       options: validateTestOptions({ ...defaultOptions, ...parsed.options }),
       fn: parsed.fn,
       suite: currentSuite,
+      filePath: String(globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
       ran: false,
       result: null,
     };
@@ -1016,6 +1329,7 @@ export const test = makeTestFunction();
 export const it = test;
 
 function suiteFunction(name, options, callback, defaultOptions = {}) {
+  if (currentExecution()) throw nestedTestNotImplemented("describe");
   installAsyncFailureGuards();
   const parsed = parseTestArgs(name, options, callback);
   const suiteOptions = { ...defaultOptions, ...parsed.options };
@@ -1029,7 +1343,7 @@ function suiteFunction(name, options, callback, defaultOptions = {}) {
   try {
     let rejectExternal;
     const failure = new Promise((_, reject) => { rejectExternal = reject; });
-    const target = { failExternal: rejectExternal };
+    const target = { kind: "describe", failExternal: rejectExternal };
     const result = failureStorage.run(target, () => typeof parsed.fn === "function" ? parsed.fn() : undefined);
     const completion = runnerPromiseRace([runnerPromiseResolve(result), failure]);
     promiseThen(completion, undefined, (error) => {
@@ -1061,9 +1375,9 @@ export const todo = makeTestFunction({ todo: true });
 
 export function before(fn, options = {}) {
   const execution = currentExecution();
-  if (execution) execution.afterBodyHooks.unshift({ fn, options });
+  if (execution) execution.afterBodyHooks.unshift({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
-    currentSuite.beforeHooks.push({ fn, options });
+    currentSuite.beforeHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
     currentSuite.beforeRan = false;
     scheduleRun();
   }
@@ -1071,21 +1385,21 @@ export function before(fn, options = {}) {
 
 export function after(fn, options = {}) {
   const execution = currentExecution();
-  if (execution) execution.afterBodyHooks.push({ fn, options });
+  if (execution) execution.afterBodyHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
-    currentSuite.afterHooks.push({ fn, options });
+    currentSuite.afterHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
     currentSuite.afterRan = false;
     scheduleRun();
   }
 }
 
 export function beforeEach(fn, options = {}) {
-  currentSuite.beforeEachHooks.push({ fn, options });
+  currentSuite.beforeEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   scheduleRun();
 }
 
 export function afterEach(fn, options = {}) {
-  currentSuite.afterEachHooks.push({ fn, options });
+  currentSuite.afterEachHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   scheduleRun();
 }
 

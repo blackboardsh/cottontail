@@ -31,9 +31,11 @@ import {
   Url,
   domainToASCII,
   domainToUnicode,
+  fileURLToPath,
   fileURLToPathBuffer,
   format,
   parse,
+  pathToFileURL,
   resolve as resolveUrl,
   resolveObject,
   urlToHttpOptions,
@@ -130,6 +132,9 @@ assert(resolveObject("http://example.com/a/b", "../c").pathname === "/c", "url r
 assert(domainToASCII("mañana.com") === "xn--maana-pta.com", "domainToASCII mismatch");
 assert(domainToUnicode("xn--maana-pta.com") === "mañana.com", "domainToUnicode mismatch");
 assert(fileURLToPathBuffer("file:///tmp/cottontail").toString().endsWith("/tmp/cottontail"), "fileURLToPathBuffer mismatch");
+assert(pathToFileURL("[").href.includes("%5B"), "pathToFileURL should escape square brackets");
+const expectedDrivePath = process.platform === "win32" ? "C:\\firebase-gen-{{ firebase.gen }}" : "/C:/firebase-gen-{{ firebase.gen }}";
+assert(fileURLToPath("file://C:/firebase-gen-%7B%7B%20firebase.gen%20%7D%7D") === expectedDrivePath, "drive-letter file URL mismatch");
 assert(urlToHttpOptions(new URL("https://u:p@example.com/a?b=1")).auth === "u:p", "urlToHttpOptions auth mismatch");
 assert(new URLPattern({ pathname: "/ok" }).test({ pathname: "/ok", baseURL: "http://example.com" }), "URLPattern test mismatch");
 const routePattern = new URLPattern({ protocol: "https", hostname: "*.example.com", pathname: "/users/:id", search: "q=:query", hash: ":section" });

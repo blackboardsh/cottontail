@@ -48,6 +48,20 @@ function chunkByteLength(chunk) {
   return new TextEncoder().encode(String(chunk)).byteLength;
 }
 
+function writeError(errno) {
+  const normalized = Number(errno) || 5;
+  const code = normalized === 32 ? "EPIPE"
+    : normalized === 9 ? "EBADF"
+      : normalized === 22 ? "EINVAL"
+        : normalized === 28 ? "ENOSPC"
+          : "EIO";
+  const error = new Error(`${code}: write`);
+  error.errno = -normalized;
+  error.code = code;
+  error.syscall = "write";
+  return error;
+}
+
 export function createReadableStdio(fd = 0) {
   const listeners = new Map();
   const stream = {
@@ -258,10 +272,17 @@ export function createWritableStdio(fd = 1) {
       callback = encoding;
       encoding = undefined;
     }
-    const ok = cottontail.fdWrite?.(fd, chunk) === true;
-    if (typeof callback === "function") callback(ok ? undefined : new Error("write failed"));
-    if (!ok) emit(listeners, "error", new Error("write failed"));
-    return ok;
+    const status = typeof cottontail.fdWriteStatus === "function"
+      ? Number(cottontail.fdWriteStatus(fd, chunk))
+      : cottontail.fdWrite?.(fd, chunk) === true ? 0 : 32;
+    if (status === 0) {
+      if (typeof callback === "function") callback(undefined);
+      return true;
+    }
+    const error = writeError(status);
+    if (typeof callback === "function") callback(error);
+    if (!emit(listeners, "error", error)) throw error;
+    return false;
   };
   stream.end = function end(chunk = undefined, encoding = undefined, callback = undefined) {
     if (chunk != null) stream.write(chunk, encoding);

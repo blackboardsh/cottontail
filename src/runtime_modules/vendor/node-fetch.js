@@ -16,6 +16,8 @@ const nativeFetch = globalThis.fetch;
 class Headers extends WebHeaders {
   raw() {
     const obj = typeof this.toJSON === "function" ? this.toJSON() : Object.fromEntries(this.entries());
+    const setCookies = this.getSetCookie?.() ?? [];
+    if (setCookies.length > 0) obj["set-cookie"] = setCookies;
     for (const key in obj) {
       const val = obj[key];
       if (!Array.isArray(val)) obj[key] = [val];
@@ -32,7 +34,7 @@ const HeadersPrototype = Headers.prototype;
 
 const kHeaders = Symbol("kHeaders");
 const kBody = Symbol("kBody");
-const kUrl = Symbol("kUrl");
+const requestUrls = new WeakMap();
 
 class Response extends WebResponse {
   constructor(body, init) {
@@ -75,14 +77,18 @@ class Request extends WebRequest {
     // node-fetch is relaxed with the URL: "/" is accepted (bun issue #4947).
     if (typeof input === "string" && !URL.canParse(input)) {
       super(new URL(input, "http://localhost/"), init);
-      this[kUrl] = input;
+      requestUrls.set(this, input);
     } else {
       super(input, init);
     }
   }
 
   get url() {
-    return this[kUrl] ?? super.url;
+    return requestUrls.get(this) ?? super.url;
+  }
+
+  set url(value) {
+    requestUrls.set(this, String(value));
   }
 }
 

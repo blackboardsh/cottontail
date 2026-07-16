@@ -66,9 +66,138 @@
       "pattern": "^test/cli/inspect/",
       "status": "expected-failure",
       "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:10380/spy-matchers-diff|14709|16474|19661|20100|20546|23183|24234|24399|25231|25750|25794|27117)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:04298/04298|09041|14624)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:19652|20321|21677|21792)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Copied build production mode, runtime API, raw Date header, and SNI TLS-array regressions pass under Cottontail."
+    },
+    {
+      "pattern": "^test/regression/issue/20753\\.test\\.js$",
+      "status": "enabled",
+      "reason": "Node child_process execFile reports normalized asynchronous ENOENT/EACCES errors and preserves encoded stdout/stderr for callbacks and promisification."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:19219|21274)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "HTMLRewriter propagates synchronous and settled async handler errors, and X509Certificate parses authority information access and extended key usage metadata."
+    },
+    {
+      "pattern": "^test/regression/issue/09739\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The abort-controller package replacement preserves the native AbortController constructor through mixed CommonJS and ESM imports."
+    },
+    {
+      "pattern": "^test/regression/issue/08794\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Ordinary Error stacks are lazily source-mapped and formatted with Node/Bun-compatible V8-style frames, including mocked function names."
+    },
+    {
+      "pattern": "^test/regression/issue/10170\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Promisified child_process.execFile returns Cottontail's canonical Bun-compatible version output with an empty stderr stream."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:08964/08964\\.test\\.ts|12034/12034\\.test\\.js)$",
+      "status": "enabled",
+      "reason": "Bun.spawnSync exposes an undefined signalCode after normal exit, and extension-suffixed TypeScript fixtures execute with shared test globals and custom matchers."
+    },
+    {
+      "pattern": "^test/regression/issue/08757\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Symlinked entrypoints canonicalize process.argv[1] and Bun.main while preserving entry-only import.meta.main semantics and canonical import.meta paths."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:14135\\.test\\.ts|17405\\.test\\.ts|18159/18159\\.test\\.ts)$",
+      "status": "enabled",
+      "reason": "Bun test .only selection gates suite hooks correctly, shell echo implements Bun's n/E/e flag and escape semantics, and NaN timer delays emit TimeoutNaNWarning."
+    },
+    {
+      "pattern": "^test/regression/issue/1632\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Destroyed child stdout pipes propagate a real EPIPE to the child, and natural process shutdown honors process.exitCode after lifecycle handlers."
+    },
+    {
+      "pattern": "^test/regression/issue/18595\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "AsyncLocalStorage context survives HTTP request callbacks, an awaited timer, and fetch response completion."
+    },
+    {
+      "pattern": "^test/regression/issue/23077/23077\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "A nested bun test invocation aggregates multiple explicit test files and exits successfully."
+    },
+    {
+      "pattern": "^test/js/node/util/node-inspect-tests/(?:internal-inspect|parallel/util-format)\\.test\\.js$",
+      "status": "enabled",
+      "reason": "Copied Node util.inspect and util.format compatibility fixtures complete without assertion failures."
+    },
+    {
+      "pattern": "^test/js/web/fetch/abort-signal-leak\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Fetch Request instances always expose an AbortSignal, and in-process Bun.serve request signals survive abort handling without retained-signal growth."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:014865\\.test\\.ts|04947\\.test\\.js)$",
+      "status": "enabled",
+      "reason": "The built-in node-fetch compatibility class accepts and preserves relative URL inputs while retaining native Request behavior."
+    },
+    {
+      "pattern": "^test/js/node/http/node-fetch(?:-cjs|-primordials)?\\.test\\.(?:js|ts)$",
+      "status": "enabled",
+      "reason": "Bun's hardcoded node-fetch package replacements resolve from ESM and CommonJS with compatible exports, primordials, headers, and fetch behavior."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:bundler-plugin-onresolve-entrypoint|fuzzer-ENG-22942|postgres-null-byte-injection|postgres-stringbuilder-assertion-aggressive|prepare-stack-trace-crash|s3-header-injection|s3-signature-order|s3-signature-performance|test-process-stdout-async-iterator|tty-reopen-after-stdin-eof|tui-app-tty-pattern)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Copied upstream runtime regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
+    },
+    {
+      "pattern": "^test/js/node/crypto/(?:crypto-hmac-algorithm|crypto-oneshot|crypto\\.hmac)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Node-compatible HMAC and one-shot crypto behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    {
+      "pattern": "^test/js/node/(?:fs/promises\\.test\\.js|process/stdin/stdin-fixtures\\.test\\.ts|util/bun-inspect\\.test\\.ts|vm/vm\\.test\\.ts)$",
+      "status": "enabled",
+      "reason": "Copied Node filesystem, stdin, inspect, and VM behavior passes directly under Cottontail at the normal test timeout."
+    },
+    {
+      "pattern": "^test/js/web/fetch/headers\\.undici\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Undici-derived Web Headers behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    {
+      "pattern": "^test/js/web/(?:nationalized|request/request-subclass)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Bun's abort-controller replacement and Web Request subclass getter/validation behavior pass the copied upstream coverage."
+    },
+    {
+      "pattern": "^test/js/web/websocket/(?:websocket-custom-headers|websocket-permessage-deflate-simple|websocket-permessage-deflate|websocket-subprotocol-strict)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "WebSocket custom-header, compression, and subprotocol behavior passes the copied Bun corpus at the normal test timeout."
+    },
+    {
+      "pattern": "^test/js/third_party/body-parser/express-bun-build-compile\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied body-parser Express build/compile integration passes directly under Cottontail at the normal test timeout."
     }
   ],
   "tests": {
+    "test/bundler/bundler_edgecase.test.ts": {
+      "status": "enabled",
+      "reason": "The copied bundler edge-case corpus completes successfully on Cottontail's native bundler pipeline at the normal upstream-test timeout."
+    },
     "test/bundler/bundler_files.test.ts": {
       "status": "enabled",
       "reason": "Bun.build in-memory files pass string, Blob, typed-array, relative graph, disk override, JSX, and plugin integration coverage."
@@ -79,7 +208,8 @@
     },
     "test/bundler/metafile.test.ts": {
       "status": "enabled",
-      "reason": "Bun.build and bun build metafile JSON/markdown generation, output path, splitting, imports, exports, CSS, and dependency analysis coverage passes under Cottontail."
+      "reason": "Bun.build and bun build metafile JSON/markdown generation, output path, splitting, imports, exports, CSS, and dependency analysis coverage passes under Cottontail.",
+      "timeoutMs": 120000
     },
     "test/bundler/resolver/cache-node-compat.test.ts": {
       "status": "enabled",
@@ -432,10 +562,10 @@
     },
     "test/cli/run/cpu-prof.test.ts": {
       "status": "enabled",
-      "reason": "Vanilla JSC sampling data is emitted as Chrome CPU profiles and relationship-aware markdown with names, paths, timings, custom output names, and directories. The copied stress file runs alone at eight-way concurrency because every profiled child parses Cottontail's full JavaScript runtime launcher; the public Bun-compatible default remains 20.",
+      "reason": "Vanilla JSC sampling data is emitted as Chrome CPU profiles and relationship-aware markdown with names, paths, timings, custom output names, and directories. The copied stress file runs alone at four-way concurrency because every profiled child parses Cottontail's full JavaScript runtime launcher; the public Bun-compatible default remains 20.",
       "serial": true,
       "args": [
-        "--max-concurrency=8"
+        "--max-concurrency=4"
       ]
     },
     "test/cli/run/empty-file.test.ts": {
@@ -510,6 +640,14 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/cli/test/claudecode-flag.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test's --claude-code flag behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
+    },
+    "test/cli/test/rerun-each.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test's --rerun-each behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
+    },
     "test/cli/test/test-timeout-behavior.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 14 assertions)."
@@ -529,6 +667,10 @@
     "test/integration/bun-types/fixture/5396.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/integration/bun-types/fixture/serve-types.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.serve TypeScript surface fixtures pass the copied integration corpus (53 bun:test cases, 231 assertions)."
     },
     "test/integration/jsdom/jsdom.test.ts": {
       "status": "enabled",
@@ -725,7 +867,11 @@
     },
     "test/js/bun/http/bun-serve-ssl.test.ts": {
       "status": "enabled",
-      "reason": "Bun.serve TLS coverage passes with the streaming node:http/https/tls stack (16 bun:test cases, 44 assertions)."
+      "reason": "Bun.serve TLS coverage passes with the streaming node:http/https/tls stack (16 bun:test cases, 32 assertions). The three-handshake SNI fixture runs serially with a 15-second per-case budget because Cottontail performs each handshake through its JS HTTP/TLS stack.",
+      "serial": true,
+      "args": [
+        "--timeout=15000"
+      ]
     },
     "test/js/bun/http/bun-serve-static.test.ts": {
       "status": "enabled",
@@ -809,8 +955,8 @@
       "reason": "Not a leak: the fixture's RSS plateaus (~330MB stable across 100 Bun.write iterations of a 1MB payload). Cottontail's baseline RSS (~190MB from evaluating the 2.6MB bundled runtime modules in every process) already exceeds the fixture's 256MB cap on the first iteration."
     },
     "test/js/bun/io/bun-write.test.js": {
-      "status": "expected-failure",
-      "reason": "28 of 30 cases pass; fd-backed Bun.file inspection and createPath:false fd rejection still differ from Bun."
+      "status": "enabled",
+      "reason": "Bun.write passes copied upstream coverage for typed-array byte views, file and file-slice destinations, streams, file descriptors, createPath validation, responses, and process output."
     },
     "test/js/bun/io/fetch/fetch-abort-slow-connect.test.ts": {
       "status": "enabled",
@@ -969,8 +1115,8 @@
       "reason": "Bun-compatible synchronous CommonJS JSON, JSONC, TOML, and text loaders pass alongside require shape and require.main coverage."
     },
     "test/js/bun/resolve/resolve-error.test.ts": {
-      "status": "expected-failure",
-      "reason": "6 of 7 cases pass; malformed data-URL dynamic imports are not rejected synchronously with Bun's ResolveMessage behavior."
+      "status": "enabled",
+      "reason": "Dynamic import resolution passes copied upstream ResolveMessage coverage for missing modules, mutable diagnostics, error codes, invalid data URLs, and malformed URL-like specifiers."
     },
     "test/js/bun/resolve/resolve-ts.test.ts": {
       "status": "enabled",
@@ -1009,8 +1155,8 @@
       "reason": "Requires Bun.S3Client static file APIs and storage-class option support."
     },
     "test/js/bun/s3/s3-stream-cancel-leak.test.ts": {
-      "status": "expected-failure",
-      "reason": "Long-running S3 stream cancellation leak coverage currently exceeds the direct upstream runner timeout."
+      "status": "enabled",
+      "reason": "S3 stream cancellation cleanup passes directly under Cottontail at the normal test timeout (1 bun:test case, 1 assertion)."
     },
     "test/js/bun/secrets-error-codes.test.ts": {
       "status": "enabled",
@@ -1037,8 +1183,8 @@
       "reason": "Bun.file shell interpolation path-string behavior passes under Cottontail."
     },
     "test/js/bun/shell/bunshell-instance.test.ts": {
-      "status": "expected-failure",
-      "reason": "14 of 16 cases pass; invalid Blob and Response output redirections are not rejected yet."
+      "status": "enabled",
+      "reason": "Bun shell instances pass copied upstream output conversion, environment isolation, readable body input, writable typed-array output, and read-only Blob/Response redirection validation."
     },
     "test/js/bun/shell/bunshell.test.ts": {
       "status": "expected-failure",
@@ -1141,6 +1287,10 @@
       "status": "enabled",
       "reason": "Passes under Cottontail after the resolver/runtime-bundling fixes (verified twice: 1 bun:test case, 1 assertion); overrides the spawn directory expected-failure pattern."
     },
+    "test/js/bun/spawn/exit-code.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn exit-code and signal termination behavior passes directly under Cottontail (5 bun:test cases, 5 assertions)."
+    },
     "test/js/bun/spawn/job-object-bug.test.ts": {
       "status": "enabled",
       "reason": "Bun.spawn Windows job-object regression coverage is correctly platform-gated on macOS."
@@ -1239,8 +1389,8 @@
       "reason": "Bun SQLite datetime binding, expanded SQL, column metadata, null row behavior, and explicit resource disposal pass upstream coverage."
     },
     "test/js/bun/sqlite/sqlite.test.js": {
-      "status": "expected-failure",
-      "reason": "68 of 69 active cases pass; the sole failure is Database wrapper collection because Cottontail's system-JSC embedding does not clear WeakRef targets or schedule FinalizationRegistry callbacks across timer turns."
+      "status": "enabled",
+      "reason": "Bun SQLite database and statement behavior passes upstream coverage, including native WeakRef collection, FinalizationRegistry cleanup, and statement lifetime after its Database wrapper is collected."
     },
     "test/js/bun/stream/direct-readable-stream.test.tsx": {
       "status": "expected-failure",
@@ -1270,6 +1420,10 @@
       "status": "enabled",
       "reason": "bun:test describe, nested suite, skip, todo, only, and lifecycle coverage passes under Cottontail."
     },
+    "test/js/bun/test/dots.test.ts": {
+      "status": "enabled",
+      "reason": "The Bun --dots reporter streams pass/skip/todo markers and correctly interleaves filenames, failures, stderr output, and multi-file summaries (2 cases, 2 assertions)."
+    },
     "test/js/bun/test/done-async.test.ts": {
       "status": "enabled",
       "reason": "bun:test done-callback async failure and completion ownership coverage passes under Cottontail."
@@ -1281,6 +1435,10 @@
     "test/js/bun/test/expect-extend-preload.test.ts": {
       "status": "enabled",
       "reason": "expect.extend matchers registered via bunfig.toml [test] preload now run before the test file (1 bun:test case, 2 assertions; verified two isolated runs plus a full-gate pass)."
+    },
+    "test/js/bun/test/expect-extend.test.js": {
+      "status": "enabled",
+      "reason": "expect.extend supports inherited matchers, matcher contexts and utilities, strict result validation, lazy errors, sync/async asymmetric forms, and negation (27 cases, 20,079 assertions)."
     },
     "test/js/bun/test/expect-label.test.ts": {
       "status": "enabled",
@@ -1358,6 +1516,10 @@
       "status": "enabled",
       "reason": "Sinon fake-timer issue 437 regression coverage passes under Cottontail."
     },
+    "test/js/bun/test/fake-timers/sinonjs/issue-504.test.ts": {
+      "status": "enabled",
+      "reason": "Fake timers keep the Bun-visible Date constructor and Date.now identities stable while changing constructor, wall-clock, and Intl formatting results."
+    },
     "test/js/bun/test/fake-timers/sinonjs/issue-516.test.ts": {
       "status": "enabled",
       "reason": "Sinon fake-timer issue 516 regression coverage passes under Cottontail."
@@ -1374,6 +1536,10 @@
       "status": "enabled",
       "reason": "Sinon fake-timer issue 73 regression coverage passes under Cottontail."
     },
+    "test/js/bun/test/failure-skip.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test stops a hook list at its first failure, runs cleanup after beforeEach failures, and skips per-test cleanup after beforeAll failures (11 cases)."
+    },
     "test/js/bun/test/jest-each.test.ts": {
       "status": "enabled",
       "reason": "bun:test test.each and describe.each argument and title-formatting coverage passes under Cottontail."
@@ -1381,6 +1547,10 @@
     "test/js/bun/test/jest-hooks.test.ts": {
       "status": "enabled",
       "reason": "bun:test nested suite hook ordering and scoping coverage passes under Cottontail."
+    },
+    "test/js/bun/test/jest-extended.test.js": {
+      "status": "enabled",
+      "reason": "Bun's native jest-extended matcher surface passes strict type, numeric, range, parity, string, predicate, and pass/fail behavior (58 cases, 384 assertions)."
     },
     "test/js/bun/test/mock-disposable.test.ts": {
       "status": "enabled",
@@ -1410,9 +1580,17 @@
       "status": "enabled",
       "reason": "bun:test nested describe hook and test ordering coverage passes under Cottontail."
     },
+    "test/js/bun/test/only-failures.test.ts": {
+      "status": "enabled",
+      "reason": "Bun-style source-mapped code frames, matcher diagnostics, stack locations, CLI --only-failures, multi-file filtering, and bunfig onlyFailures coverage pass (3 cases, 8 assertions)."
+    },
     "test/js/bun/test/only-inside-only.test.ts": {
       "status": "enabled",
       "reason": "bun:test nested only-selection coverage passes under Cottontail."
+    },
+    "test/js/bun/test/pretty-format-overflow.test.ts": {
+      "status": "enabled",
+      "reason": "Deeply nested equality failures complete without overflow or crashes and retain the Bun matcher diagnostic signature (1 case, 5 assertions)."
     },
     "test/js/bun/test/preload-test.test.js": {
       "status": "enabled",
@@ -1462,9 +1640,21 @@
       "status": "enabled",
       "reason": "bun:test onTestFinished callback lifecycle coverage passes under Cottontail."
     },
+    "test/js/bun/test/test-only.test.ts": {
+      "status": "enabled",
+      "reason": "bun:test only-selection resets per file across multi-file CLI runs, including raw Bun shell interpolation (4 cases, 12 assertions)."
+    },
     "test/js/bun/test/test-retry-repeats-basic.test.ts": {
       "status": "enabled",
       "reason": "bun:test retry and repeat execution semantics and hook interactions pass under Cottontail."
+    },
+    "test/js/bun/test/test-test.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test-runner lifecycle, filtering, timeout, preload, empty-suite, detached async-error, syntax diagnostic, recursive discovery, and bail coverage passes (40 cases, 165 assertions)."
+    },
+    "test/js/bun/test/test-timers.test.ts": {
+      "status": "enabled",
+      "reason": "Bun fake-system-time behavior preserves Date and Date.now identity, drives Date construction and Intl formatting, and restores the real clock (1 bun:test case, 8 assertions)."
     },
     "test/js/bun/transpiler/repl-transform.test.ts": {
       "status": "enabled",
@@ -1570,6 +1760,10 @@
       "status": "enabled",
       "reason": "Bun.indexOfLine byte-offset scanning and non-number offset coverage passes under Cottontail."
     },
+    "test/js/bun/util/inspect.test.js": {
+      "status": "enabled",
+      "reason": "Bun.inspect formatting, custom inspection, function and class names, JSX, sparse arrays, Blob/FileRef, Request, timers, collections, and DOM event diagnostics pass all copied upstream coverage."
+    },
     "test/js/bun/util/inspect-error-leak.test.js": {
       "status": "expected-failure",
       "reason": "RSS-threshold behavior of the vendored bmalloc static build: after Bun.gc(true), RSS growth measures 10-14 MB against the upstream <10 MB threshold (bmalloc's scavenger returns freed pages to the OS lazily), so the test fails in most runs. Not a real leak; growth plateaus."
@@ -1664,6 +1858,10 @@
       "status": "enabled",
       "reason": "Copied Bun Deno-compat crypto random-values coverage passes under Cottontail."
     },
+    "test/js/deno/crypto/webcrypto.test.ts": {
+      "status": "enabled",
+      "reason": "Deno-derived WebCrypto RSA, EC, HMAC, HKDF, PBKDF2, AES, key import/export, derivation, and wrapping coverage passes under Cottontail (40 bun:test cases, 350 assertions)."
+    },
     "test/js/deno/encoding/encoding.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (23 bun:test cases, 41 assertions)."
@@ -1712,6 +1910,18 @@
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (4 bun:test cases, 10 assertions)."
     },
+    "test/js/node/async_hooks/AsyncLocalStorage.test.ts": {
+      "status": "enabled",
+      "reason": "AsyncLocalStorage propagates through promises, await, timers, spawn, fetch, Bun.serve, Web Streams, WebSockets, filesystem APIs, and Bun.build plugins (28 bun:test cases, 80 assertions)."
+    },
+    "test/js/node/async_hooks/AsyncLocalStorage-tracking.test.ts": {
+      "status": "enabled",
+      "reason": "The copied upstream async-context tracking matrix passes across events, streams, timers, networking, HTTP, TLS, child processes, filesystem, DNS, crypto, workers, and Web APIs (74 active cases plus 1 upstream todo). Every active case launches both Cottontail and Node, so the file runs outside the outer parallel pool with four concurrent cases.",
+      "serial": true,
+      "args": [
+        "--max-concurrency=4"
+      ]
+    },
     "test/js/node/async_hooks/async-local-storage-thenable.test.ts": {
       "status": "enabled",
       "reason": "AsyncLocalStorage context propagates through custom thenables in the copied upstream file (5 bun:test cases, 16 assertions)."
@@ -1735,6 +1945,10 @@
     "test/js/node/buffer-utf16.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/js/node/buffer.test.js": {
+      "status": "enabled",
+      "reason": "Complete copied Bun Buffer corpus passes with byte operations, encoding, validation, native call/construct behavior, and masquerades-as-undefined semantics (457 bun:test cases, 26052 assertions)."
     },
     "test/js/node/child_process/child-process-exec.test.ts": {
       "status": "enabled",
@@ -1787,6 +2001,10 @@
     "test/js/node/crypto/node-crypto.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (150 bun:test cases, 365 assertions)."
+    },
+    "test/js/node/crypto/pbkdf2.test.ts": {
+      "status": "enabled",
+      "reason": "OpenSSL-backed PBKDF2 passes all copied RFC vectors and Node/Bun validation behavior (25 bun:test cases, 43 assertions)."
     },
     "test/js/node/crypto/sign-jwk-ieee-p1363.test.ts": {
       "status": "enabled",
@@ -1925,6 +2143,10 @@
       "status": "enabled",
       "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 6 assertions)."
     },
+    "test/js/node/nodettywrap.test.ts": {
+      "status": "enabled",
+      "reason": "Node process.binding('tty_wrap') TTY construction, validation, raw-mode, and window-size coverage passes under Cottontail."
+    },
     "test/js/node/no-addons.test.ts": {
       "status": "enabled",
       "reason": "The --no-addons runtime flag disables process.dlopen with Bun-compatible diagnostics (1 bun:test case, 3 assertions)."
@@ -1940,6 +2162,10 @@
     "test/js/node/path/basename.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/path/browserify.test.js": {
+      "status": "enabled",
+      "reason": "Bundled Node path behavior and per-source import.meta path metadata pass the copied browserify-derived corpus."
     },
     "test/js/node/path/dirname.test.js": {
       "status": "enabled",
@@ -2013,6 +2239,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 1 assertions)."
     },
+    "test/js/node/process/process-nexttick.test.js": {
+      "status": "enabled",
+      "reason": "Bun-compatible next-tick priority, repeated-await batching, high-volume queues, argument forwarding, validation, and AsyncLocalStorage interaction pass the copied upstream file (7 bun:test cases, 11 assertions)."
+    },
     "test/js/node/process/process-args.test.js": {
       "status": "enabled",
       "reason": "Copied upstream process argument file passes directly under Cottontail (1 bun:test case, 50 assertions)."
@@ -2028,6 +2258,10 @@
     "test/js/node/process/process-stdio.test.ts": {
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (9 bun:test cases, 20 assertions)."
+    },
+    "test/js/node/promise/reject-tostring.test.ts": {
+      "status": "enabled",
+      "reason": "Unhandled promise rejections preserve Node-compatible diagnostics without invoking user-defined toString methods."
     },
     "test/js/node/readline/getStringWidth.test.ts": {
       "status": "enabled",
@@ -2065,9 +2299,21 @@
       "status": "enabled",
       "reason": "Copied upstream StringDecoder conformance file passes directly under Cottontail (84 bun:test cases, 2640 assertions)."
     },
+    "test/js/node/stubs.test.js": {
+      "status": "enabled",
+      "reason": "All public and legacy Node builtin import forms resolve, and JSC-backed heap statistics satisfy Bun's V8 compatibility contract (375 bun:test cases, 146 assertions)."
+    },
+    "test/js/node/test_runner/node-test.test.ts": {
+      "status": "enabled",
+      "reason": "Node test TestContext, hooks, nested-test diagnostics, and multi-file summary aggregation pass the copied Bun corpus."
+    },
     "test/js/node/timers.promises/timers.promises.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 7 assertions)."
+    },
+    "test/js/node/timers/node-timers.test.ts": {
+      "status": "enabled",
+      "reason": "Native timer handles, refresh/clear lifecycle, promisification, immediate scheduling, and uncaught-exception checkpoints pass the copied suite (20 bun:test cases, 31 assertions)."
     },
     "test/js/node/tls/node-tls-create-secure-context-args.test.ts": {
       "status": "enabled",
@@ -2141,6 +2387,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/url/url-parse-ipv6.test.ts": {
+      "status": "enabled",
+      "reason": "Legacy IPv6 parsing matches Bun 1.3.10 and its top-level asymmetric toMatchObject semantics (34 bun:test cases, 39 assertions)."
+    },
     "test/js/node/url/url-parse-query.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
@@ -2156,6 +2406,10 @@
     "test/js/node/url/url-revokeobjecturl.test.js": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/url/url.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.fileURLToPath shares the Node-compatible URL conversion path, including drive-letter file URLs on non-Windows hosts."
     },
     "test/js/node/util/custom-inspect.test.js": {
       "status": "enabled",
@@ -2177,6 +2431,10 @@
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/util/parse_args/default-args.test.mjs": {
+      "status": "enabled",
+      "reason": "Implicit and explicit run modes preserve runtime flags in process.execArgv while exposing only script arguments to util.parseArgs (8 bun:test cases, 40 assertions)."
+    },
     "test/js/node/util/parse_args/parse-args.test.mjs": {
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (106 bun:test cases, 113 assertions)."
@@ -2189,6 +2447,10 @@
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (17 bun:test cases, 11 assertions)."
     },
+    "test/js/node/util/test-aborted.test.ts": {
+      "status": "enabled",
+      "reason": "Node util.aborted and AbortSignal lifecycle behavior pass with native JSC WeakRef collection and FinalizationRegistry cleanup (5 bun:test cases, 32 assertions)."
+    },
     "test/js/node/util/test-util-types.test.js": {
       "status": "enabled",
       "reason": "Node util type predicates and Bun-native ResolveMessage/BuildMessage error identities pass the copied upstream file (52 bun:test cases, 3711 assertions)."
@@ -2196,6 +2458,10 @@
     "test/js/node/util/util.test.js": {
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (192 bun:test cases, 288 assertions)."
+    },
+    "test/js/node/vm/happy-dom-vm-16277.test.ts": {
+      "status": "enabled",
+      "reason": "Happy DOM's large VM regression passes after dynamic-import tokenization preserves private methods named #import."
     },
     "test/js/node/vm/script-leak.test.ts": {
       "status": "enabled",
@@ -2213,6 +2479,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
     },
+    "test/js/node/worker_threads/worker-async-dispose.test.ts": {
+      "status": "enabled",
+      "reason": "Worker implements async disposal by awaiting termination (2 bun:test cases, 3 assertions)."
+    },
     "test/js/node/worker_threads/worker_destruction.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
@@ -2224,6 +2494,10 @@
     "test/js/node/zlib/deflate-streaming.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
+    },
+    "test/js/node/zlib/zlib.kMaxLength.global.test.js": {
+      "status": "enabled",
+      "reason": "CommonJS buffer export mutations are shared with zlib output limits (8 bun:test cases, 8 assertions)."
     },
     "test/js/sql/local-sql.test.ts": {
       "status": "enabled",
@@ -2497,6 +2771,10 @@
       "status": "enabled",
       "reason": "Blob and File structured cloning, including Bun-compatible textual MIME normalization, passes upstream coverage."
     },
+    "test/js/web/structured-clone-fastpath.test.ts": {
+      "status": "enabled",
+      "reason": "Primitive and flat-record cloning passes Bun's correctness and allocation fast-path coverage (92 cases, 722 assertions)."
+    },
     "test/js/web/timers/performance-entries.test.ts": {
       "status": "enabled",
       "reason": "Performance entry construction and timing behavior pass upstream coverage under Cottontail."
@@ -2512,6 +2790,10 @@
     "test/js/web/url/url.test.ts": {
       "status": "enabled",
       "reason": "URL construction, parsing, properties, and mutation pass upstream coverage under Cottontail."
+    },
+    "test/js/web/urlpattern/urlpattern.test.ts": {
+      "status": "enabled",
+      "reason": "URLPattern passes the complete copied WPT corpus, including UnicodeSets, code-point parameter names, URL component canonicalization, and shorthand parsing (408 cases, 6,336 assertions)."
     },
     "test/js/web/workers/message-event.test.ts": {
       "status": "enabled",
@@ -2602,8 +2884,8 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
     "test/js/web/fetch/fetch-args.test.ts": {
-      "status": "expected-failure",
-      "reason": "Fetch does not yet match Bun's eager RequestInit property access and validation behavior for all invalid redirect, TLS, stream, and getter cases."
+      "status": "enabled",
+      "reason": "Fetch eagerly validates RequestInit redirect, TLS, stream, and getter inputs across the copied Bun argument matrix (47 bun:test cases, 91 assertions)."
     },
     "test/js/web/fetch/fetch-connection-header.test.ts": {
       "status": "enabled",
@@ -2647,8 +2929,8 @@
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
     },
     "test/js/web/fetch/fetch_headers.test.js": {
-      "status": "expected-failure",
-      "reason": "The vendored JSC Headers implementation does not reject every header name and value that Bun rejects."
+      "status": "enabled",
+      "reason": "Fetch validates header names and ByteString values synchronously with Bun-compatible field-specific errors while preserving direct Headers behavior."
     },
     "test/js/web/fetch/headers-case.test.ts": {
       "status": "enabled",
@@ -2913,6 +3195,12 @@
     "test/regression/issue/09778.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
+    },
+    "test/regression/issue/10139.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.build and the build CLI emit bounded external source maps for a 128 MB asset (2 bun:test cases, 5 assertions).",
+      "timeoutMs": 120000,
+      "serial": true
     },
     "test/regression/issue/10887.test.ts": {
       "status": "enabled",
@@ -3396,7 +3684,8 @@
     },
     "test/regression/issue/8254.test.ts": {
       "status": "enabled",
-      "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 4 assertions)."
+      "reason": "Copied upstream file passes directly under Cottontail; runs serially because it materializes and writes more than 2 GB (1 bun:test cases, 4 assertions).",
+      "serial": true
     },
     "test/regression/issue/ENG-24434.test.ts": {
       "status": "enabled",

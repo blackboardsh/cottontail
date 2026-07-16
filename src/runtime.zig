@@ -122,7 +122,9 @@ pub const Runtime = struct {
             return 1;
         }
 
-        return self.emitProcessShutdown();
+        const shutdown_status = self.emitProcessShutdown();
+        if (shutdown_status != 0) return shutdown_status;
+        return @intCast(c.ct_jsc_runtime_exit_code(self.handle));
     }
 
     fn emitProcessShutdown(self: *Runtime) u8 {
@@ -159,8 +161,9 @@ pub const Runtime = struct {
             \\  }
             \\  const process = globalThis.process;
             \\  if (!process || typeof process.emit !== "function" || process.__cottontailShutdownEmitted) return;
-            \\  const code = Number(process.exitCode ?? 0) || 0;
+            \\  let code = Number(process.exitCode ?? 0) || 0;
             \\  process.emit("beforeExit", code);
+            \\  code = Number(process.exitCode ?? 0) || 0;
             \\  process._exiting = true;
             \\  process.__cottontailShutdownEmitted = true;
             \\  process.emit("exit", code);

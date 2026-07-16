@@ -30,6 +30,11 @@ expect(jestFn).not.toHaveBeenCalled();
 expect({ user: { name: "Ada", roles: ["admin"] } }).toMatchObject({
   user: expect.objectContaining({ name: "Ada" }),
 });
+expect({ user: { name: "Ada", roles: ["admin"] } }).toMatchObject(
+  expect.objectContaining({ user: expect.objectContaining({ name: "Ada" }) }),
+);
+// COTTONTAIL-COMPAT: Bun 1.3.10 treats a top-level asymmetric matcher as an empty partial object.
+expect({ user: { name: "Ada" } }).toMatchObject(expect.objectContaining({ missing: true }));
 expect(["a", "b"]).toContain("b");
 expect("cottontail").toMatch(/tail$/);
 await expect(Promise.resolve(42)).resolves.toBe(42);

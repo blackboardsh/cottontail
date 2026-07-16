@@ -1,4 +1,4 @@
-import { ok, strictEqual } from "node:assert/strict";
+import { ok, strictEqual, throws } from "node:assert/strict";
 import constantsDefault, { EACCES } from "node:constants";
 import * as constants from "node:constants";
 import { createRequire } from "node:module";
@@ -18,6 +18,7 @@ const require = createRequire(import.meta.url);
 const requiredConstants = require("constants");
 const requiredCrypto = require("node:crypto");
 const requiredZlib = require("zlib");
+const requiredBuffer = require("node:buffer");
 const decoder = new TextDecoder();
 
 function textFromBytes(bytes: Uint8Array): string {
@@ -35,6 +36,16 @@ strictEqual(textFromBytes(inflateSync(deflateSync(payload, { level: zlibConstant
 strictEqual(textFromBytes(inflateRawSync(deflateRawSync(payload))), payload, "deflateRaw roundtrip mismatch");
 strictEqual(zlibConstants.Z_OK, 0, "zlib constants mismatch");
 strictEqual(textFromBytes(requiredZlib.gunzipSync(requiredZlib.gzipSync(payload))), payload, "required zlib mismatch");
+
+const oversizedCompressed = gzipSync("a".repeat(128));
+const originalMaxLength = requiredBuffer.kMaxLength;
+try {
+  requiredBuffer.kMaxLength = 64;
+  strictEqual(require("buffer").kMaxLength, 64, "buffer CommonJS aliases should share mutable exports");
+  throws(() => gunzipSync(oversizedCompressed), RangeError, "zlib should observe the mutable buffer output limit");
+} finally {
+  requiredBuffer.kMaxLength = originalMaxLength;
+}
 
 await new Promise<void>((resolve, reject) => {
   deflate(payload, (error, compressed) => {

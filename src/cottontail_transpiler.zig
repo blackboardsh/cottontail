@@ -26,6 +26,7 @@ const TransformConfig = struct {
     allow_runtime: bool = false,
     inlining: bool = false,
     initial_indent: usize = 0,
+    import_meta_main: ?bool = null,
 };
 
 const ImportResult = struct {
@@ -49,7 +50,16 @@ fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void 
 fn setLogError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback: anyerror) void {
     for (log.msgs.items) |message| {
         if (message.kind == .err) {
-            setError(error_out, "{s}", .{message.data.text});
+            if (message.data.location) |location| {
+                setError(error_out, "{s}:{}:{}: {s}", .{
+                    location.file,
+                    location.line,
+                    location.column,
+                    message.data.text,
+                });
+            } else {
+                setError(error_out, "{s}", .{message.data.text});
+            }
             return;
         }
     }
@@ -102,6 +112,7 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (jsonBool(object, "trimUnusedImports")) |value| config.trim_unused_imports = value;
         if (jsonBool(object, "allowBunRuntime")) |value| config.allow_runtime = value;
         if (jsonBool(object, "inline")) |value| config.inlining = value;
+        if (jsonBool(object, "_cottontailImportMetaMain")) |value| config.import_meta_main = value;
         if (object.get("_cottontailInitialIndent")) |value| switch (value) {
             .integer => |count| {
                 if (count < 0 or count > 64) return error.InvalidIndentOption;
@@ -202,6 +213,7 @@ fn process(
     parser_options.features.minify_syntax = config.minify_syntax;
     parser_options.features.minify_identifiers = config.minify_identifiers;
     parser_options.features.minify_whitespace = config.minify_whitespace;
+    parser_options.import_meta_main_value = config.import_meta_main;
 
     var parser = compiler.js_parser.Parser.init(parser_options, &log, &source, define, allocator) catch |err| {
         setLogError(error_out, &log, err);
@@ -290,6 +302,20 @@ pub fn scanImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
     return process(.scan_imports, source_code, "", loader, &error_message);
 }
 
+pub fn scanImportsJsonWithError(
+    source_code: []const u8,
+    loader: []const u8,
+    error_out: *?[*:0]u8,
+) ![]u8 {
+    return process(.scan_imports, source_code, "", loader, error_out);
+}
+
+pub fn transformEntrypointImportMetaMain(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.transform, source_code, "{\"_cottontailImportMetaMain\":true}", loader, &error_message);
+}
+
 export fn ct_transpiler_process(
     operation_value: c_int,
     source_ptr: ?[*]const u8,
@@ -346,7 +372,7 @@ export fn ct_transpiler_free(ptr: ?[*]u8, len: usize) void {
     if (ptr) |value| c_allocator.free(value[0..len]);
 }
 
-export fn ct_transpiler_string_free(ptr: ?[*:0]u8) void {
+pub export fn ct_transpiler_string_free(ptr: ?[*:0]u8) void {
     if (ptr) |value| c_allocator.free(std.mem.span(value));
 }
 

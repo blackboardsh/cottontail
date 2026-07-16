@@ -24,6 +24,7 @@ pub const BundleOptions = struct {
     minify_whitespace: bool = false,
     minify_identifiers: bool = false,
     minify_syntax: bool = false,
+    production: bool = false,
     /// Compile-time defines (parallel key/value arrays), e.g. mapping
     /// `import.meta.url` to a runtime identifier for dynamic-import target
     /// factories where the true URL (including `?query` suffixes) is only
@@ -115,8 +116,8 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
             if (message.data.location) |location| {
                 setError(error_out, "{s}:{}:{}: {s}", .{
                     location.file,
-                    location.line + 1,
-                    location.column + 1,
+                    location.line,
+                    location.column,
                     message.data.text,
                 });
             } else {
@@ -128,12 +129,17 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
     setError(error_out, "JavaScript bundle failed: {s}", .{@errorName(fallback)});
 }
 
-pub fn bundleEntryPointWithOptions(
+pub const EntryPointOutput = struct {
+    code: []u8,
+    source_map: ?[]u8 = null,
+};
+
+pub fn bundleEntryPointWithOptionsAndSourceMap(
     entry_path: []const u8,
     working_dir: []const u8,
     options: BundleOptions,
     error_out: *?[*:0]u8,
-) ![]u8 {
+) !EntryPointOutput {
     const allocator = compiler.default_allocator;
     compiler.cli.start_time = compiler.nanoTimestamp();
     const working_dir_z = try allocator.dupeZ(u8, working_dir);
@@ -199,6 +205,12 @@ pub fn bundleEntryPointWithOptions(
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    // Runtime execution bundles modules into one linker scope. Preserve each
+    // module's observable function/class names when the linker renames a
+    // colliding binding, matching direct ESM/CJS evaluation semantics.
+    transpiler.options.keep_names = options.include_runtime_modules;
+    transpiler.options.setProduction(options.production);
+    if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
     transpiler.options.supports_multiple_outputs = false;
     // Runtime bundling (bun run / bun test emulation): require.resolve() of
     // asset files must stay a runtime call returning the on-disk path instead
@@ -316,16 +328,39 @@ pub fn bundleEntryPointWithOptions(
         if (output_file.output_kind != .@"entry-point" and output_file.output_kind != .chunk) continue;
         saw_entry_point = true;
         const bytes = output_file.value.asSlice();
-        if (bytes.len > 0) return try c_allocator.dupe(u8, bytes);
+        if (bytes.len > 0) {
+            const code = try c_allocator.dupe(u8, bytes);
+            errdefer c_allocator.free(code);
+            const source_map = if (output_file.source_map_index != std.math.maxInt(u32) and
+                output_file.source_map_index < result.output_files.items.len)
+                try c_allocator.dupe(
+                    u8,
+                    result.output_files.items[output_file.source_map_index].value.asSlice(),
+                )
+            else
+                null;
+            return .{ .code = code, .source_map = source_map };
+        }
     }
 
     // An empty (or comment/whitespace-only) module legitimately bundles to
     // zero bytes, e.g. `import "./empty.js"` — treat it as an empty module
     // instead of failing the bundle.
-    if (saw_entry_point) return try c_allocator.dupe(u8, "");
+    if (saw_entry_point) return .{ .code = try c_allocator.dupe(u8, "") };
 
     setError(error_out, "JavaScript bundle produced no entry point", .{});
     return error.NoEntryPointOutput;
+}
+
+pub fn bundleEntryPointWithOptions(
+    entry_path: []const u8,
+    working_dir: []const u8,
+    options: BundleOptions,
+    error_out: *?[*:0]u8,
+) ![]u8 {
+    const output = try bundleEntryPointWithOptionsAndSourceMap(entry_path, working_dir, options, error_out);
+    if (output.source_map) |source_map| c_allocator.free(source_map);
+    return output.code;
 }
 
 pub fn bundleEntryPoint(entry_path: []const u8, working_dir: []const u8, error_out: *?[*:0]u8) ![]u8 {
@@ -425,6 +460,9 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
         },
         else => {},
     };
+    if (object.get("production")) |value| {
+        if (value == .bool) options.production = value.bool;
+    }
     if (object.get("reactFastRefresh")) |value| {
         if (value == .bool) options.react_fast_refresh = value.bool;
     }
@@ -705,6 +743,8 @@ pub fn buildEntryPointsJson(
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    transpiler.options.setProduction(options.production);
+    if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
     // Match Bun's root-dir default: the directory of a single entry point, or
     // the longest common path of multiple entry points, so `[dir]` in naming
     // templates resolves entry-relative rather than cwd-relative.

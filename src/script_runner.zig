@@ -83,6 +83,7 @@ pub fn runWithExecArgvDisplay(
     if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
 
     const runnable_path = bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null) catch |err| {
+        if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
             return 1;
@@ -93,12 +94,137 @@ pub fn runWithExecArgvDisplay(
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    process_args[0] = display_path orelse script_path;
+    const canonical_script_path = try resolvePathForCwd(ctx.io, allocator, script_path);
+    process_args[0] = display_path orelse try allocator.dupeZ(u8, canonical_script_path);
     for (script_args, 0..) |arg, index| {
         process_args[index + 1] = arg;
     }
 
     return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null);
+}
+
+const BundleDiagnostic = struct {
+    file: []const u8,
+    line: usize,
+    column: usize,
+    message: []const u8,
+};
+
+fn parseBundleDiagnostic(text: []const u8, fallback_file: []const u8) BundleDiagnostic {
+    const message_separator = std.mem.lastIndexOf(u8, text, ": ") orelse return .{
+        .file = fallback_file,
+        .line = 1,
+        .column = 1,
+        .message = text,
+    };
+    const location = text[0..message_separator];
+    const column_separator = std.mem.lastIndexOfScalar(u8, location, ':') orelse return .{
+        .file = fallback_file,
+        .line = 1,
+        .column = 1,
+        .message = text,
+    };
+    const line_separator = std.mem.lastIndexOfScalar(u8, location[0..column_separator], ':') orelse return .{
+        .file = fallback_file,
+        .line = 1,
+        .column = 1,
+        .message = text,
+    };
+    const line = std.fmt.parseUnsigned(usize, location[line_separator + 1 .. column_separator], 10) catch 1;
+    const column = std.fmt.parseUnsigned(usize, location[column_separator + 1 ..], 10) catch 1;
+    return .{
+        .file = if (line_separator > 0) location[0..line_separator] else fallback_file,
+        .line = @max(line, 1),
+        .column = @max(column, 1),
+        .message = text[message_separator + 2 ..],
+    };
+}
+
+fn appendTestAggregate(ctx: *const Context, path: []const u8, summary: []const u8) void {
+    const file = std.Io.Dir.cwd().openFile(ctx.io, path, .{ .mode = .write_only }) catch return;
+    defer file.close(ctx.io);
+    const stat = file.stat(ctx.io) catch return;
+    var buffer: [128]u8 = undefined;
+    var writer = file.writer(ctx.io, &buffer);
+    writer.seekTo(stat.size) catch return;
+    writer.interface.writeAll(summary) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn reportTestBundleError(ctx: *const Context, script_abs: []const u8, text: []const u8) void {
+    const diagnostic = parseBundleDiagnostic(text, script_abs);
+    const diagnostic_file = blk: {
+        if (std.fs.path.isAbsolute(diagnostic.file)) {
+            std.Io.Dir.accessAbsolute(ctx.io, diagnostic.file, .{}) catch break :blk script_abs;
+        } else {
+            std.Io.Dir.cwd().access(ctx.io, diagnostic.file, .{}) catch break :blk script_abs;
+        }
+        break :blk diagnostic.file;
+    };
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        diagnostic_file,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch "";
+    var source_lines = std.mem.splitScalar(u8, source, '\n');
+    var source_line: []const u8 = "";
+    var line_number: usize = 1;
+    while (source_lines.next()) |line| : (line_number += 1) {
+        if (line_number == diagnostic.line) {
+            source_line = std.mem.trimEnd(u8, line, "\r");
+            break;
+        }
+    }
+    const display_path = if (std.mem.startsWith(u8, diagnostic_file, ctx.project_root) and
+        diagnostic_file.len > ctx.project_root.len and
+        (diagnostic_file[ctx.project_root.len] == '/' or diagnostic_file[ctx.project_root.len] == '\\'))
+        diagnostic_file[ctx.project_root.len + 1 ..]
+    else
+        std.fs.path.basename(diagnostic_file);
+    const line_width = std.fmt.count("{}", .{diagnostic.line});
+    const caret_padding = line_width + 3 + diagnostic.column - 1;
+    const caret_spaces = ctx.allocator.alloc(u8, caret_padding) catch return;
+    @memset(caret_spaces, ' ');
+    ctx.writeStderr(
+        "\n{s}:\n\n# Unhandled error between tests\n-------------------------------\n{} | {s}\n{s}^\nerror: {s}\n    at {s}:{}:{}\n-------------------------------\n",
+        .{
+            display_path,
+            diagnostic.line,
+            source_line,
+            caret_spaces,
+            diagnostic.message,
+            diagnostic_file,
+            diagnostic.line,
+            diagnostic.column,
+        },
+    );
+
+    if (ctx.environ_map.get("COTTONTAIL_TEST_AGGREGATE_FILE")) |aggregate_path| {
+        appendTestAggregate(ctx, aggregate_path, "0\t0\t0\t1\t1\t0\n");
+    } else {
+        ctx.writeStderr("\n\n 0 pass\n 1 fail\n 1 error\nRan 1 test across 1 file. [0.00ms]\n", .{});
+    }
+}
+
+fn validateCommonJsTestSyntax(ctx: *const Context, script_abs: []const u8) !void {
+    if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null) return;
+    const loader = transpilerLoaderForPath(script_abs) orelse return;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return;
+    var error_message: ?[*:0]u8 = null;
+    const imports = native_transpiler.scanImportsJsonWithError(source, loader, &error_message) catch {
+        if (error_message) |message| {
+            defer native_transpiler.ct_transpiler_string_free(message);
+            reportTestBundleError(ctx, script_abs, std.mem.span(message));
+        }
+        return error.TestBundleFailed;
+    };
+    std.heap.c_allocator.free(imports);
 }
 
 pub fn runEval(
@@ -870,7 +996,10 @@ fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias
     try appendRuntimeAlias(ctx, &aliases, "string-width", "bun/string-width.js");
     try appendRuntimeAlias(ctx, &aliases, "strip-ansi", "bun/strip-ansi.js");
     // Bun ships built-in overrides for these npm packages.
-    try appendRuntimeAlias(ctx, &aliases, "node-fetch", "vendor/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, "node-fetch", "bun/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, "next/dist/compiled/node-fetch", "bun/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, "isomorphic-fetch", "vendor/isomorphic-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, "@vercel/fetch", "vendor/vercel-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, "abort-controller", "vendor/abort-controller.js");
 
     for (node_runtime_aliases) |alias| {
@@ -901,6 +1030,9 @@ fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
         std.mem.eql(u8, specifier, "string-width") or
         std.mem.eql(u8, specifier, "strip-ansi") or
         std.mem.eql(u8, specifier, "node-fetch") or
+        std.mem.eql(u8, specifier, "next/dist/compiled/node-fetch") or
+        std.mem.eql(u8, specifier, "isomorphic-fetch") or
+        std.mem.eql(u8, specifier, "@vercel/fetch") or
         std.mem.eql(u8, specifier, "abort-controller");
 }
 
@@ -964,9 +1096,14 @@ fn bundleScriptNative(
     defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
 
     const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args);
+    const test_preload_imports = if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null)
+        try buildCliPreloadImports(ctx, script_abs, script_args)
+    else
+        "";
     const bunfig_preload_imports = try buildBunfigTestPreloadImports(ctx, script_abs);
-    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ cli_preload_imports, bunfig_preload_imports });
+    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ cli_preload_imports, test_preload_imports, bunfig_preload_imports });
     const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
+    if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
     const tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
     const plain_launcher_cacheable = preload_imports.len == 0 and
@@ -983,6 +1120,9 @@ fn bundleScriptNative(
         std.mem.eql(u8, script_entry_abs, script_abs) and
         plain_launcher_cacheable and
         try entrypointImportsOnlyRuntimeAliases(ctx, script_abs);
+    const use_common_js_launcher_cache = is_common_js_entrypoint and
+        !bundle_common_js_entrypoint and
+        plain_launcher_cacheable;
     const wrapped_entry = if (is_wasm_entrypoint)
         try writeWasiEntryWrapper(ctx, tmp_dir, script_abs)
     else if (is_common_js_entrypoint)
@@ -992,6 +1132,7 @@ fn bundleScriptNative(
             script_abs,
             bundle_common_js_entrypoint,
             preload_imports,
+            use_common_js_launcher_cache,
         )
     else
         try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs, preload_imports, use_esm_bundle_cache);
@@ -1012,15 +1153,16 @@ fn bundleScriptNative(
     options.inline_import_meta_properties = true;
     options.skip_teardown = true;
 
-    const use_common_js_launcher_cache = is_common_js_entrypoint and
-        !bundle_common_js_entrypoint and
-        plain_launcher_cacheable;
     const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
         "commonjs-launcher"
     else if (use_esm_bundle_cache)
         try std.fmt.allocPrint(ctx.allocator, "esm-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
     else
         null;
+    // Non-cached runtime bundles advertise an adjacent source map to the JS
+    // stack remapper. Emit the map together with the bundle so failures can
+    // resolve back to the user's source instead of script.bundle.mjs.
+    if (build_options == null and launcher_cache_name == null) options.source_map = .external;
     var launcher_cache = if (launcher_cache_name) |name|
         try acquireLauncherCache(ctx, wrapped_entry, name, if (use_esm_bundle_cache) script_abs else null)
     else
@@ -1033,7 +1175,7 @@ fn bundleScriptNative(
         }
     }
 
-    const output = native_bundler.bundleEntryPointWithOptions(
+    const output = native_bundler.bundleEntryPointWithOptionsAndSourceMap(
         wrapped_entry,
         ctx.project_root,
         options,
@@ -1042,6 +1184,12 @@ fn bundleScriptNative(
         if (error_message) |message| {
             defer native_bundler.ct_bundle_string_free(message);
             const text = std.mem.span(message);
+            if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
+                reportTestBundleError(ctx, script_abs, text);
+                cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+                std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+                return error.TestBundleFailed;
+            }
             if (std.mem.startsWith(u8, text, "error:")) {
                 ctx.writeStderr("{s}\n", .{text});
             } else {
@@ -1057,8 +1205,13 @@ fn bundleScriptNative(
         ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
         return error.NativeBundleFailed;
     };
-    defer native_bundler.ct_bundle_free(output.ptr, output.len);
-    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output });
+    defer native_bundler.ct_bundle_free(output.code.ptr, output.code.len);
+    defer if (output.source_map) |source_map| native_bundler.ct_bundle_free(source_map.ptr, source_map.len);
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output.code });
+    if (output.source_map) |source_map| {
+        const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map });
+    }
     if (launcher_cache) |cache| {
         std.Io.Dir.cwd().deleteFile(ctx.io, cache.bundle_path) catch {};
         std.Io.Dir.cwd().rename(bundle_path, std.Io.Dir.cwd(), cache.bundle_path, ctx.io) catch return bundle_path;
@@ -1507,6 +1660,7 @@ fn buildBunfigTestPreloadImports(ctx: *const Context, script_abs: []const u8) ![
                 try imports.appendSlice(ctx.allocator, "); globalThis.process?.exit?.(1);\n");
                 continue;
             }
+            try imports.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
             try imports.appendSlice(ctx.allocator, "await import(");
             try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload_abs));
             try imports.appendSlice(ctx.allocator, ");\n");
@@ -1529,6 +1683,7 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
             if (index + 1 < exec_args.len) {
                 index += 1;
                 specifier = exec_args[index];
+                use_import = std.mem.eql(u8, arg, "--preload");
             }
         } else if (std.mem.eql(u8, arg, "--import")) {
             if (index + 1 < exec_args.len) {
@@ -1539,7 +1694,7 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
         } else inline for (.{ "--require=", "--preload=", "--import=" }) |prefix| {
             if (std.mem.startsWith(u8, arg, prefix)) {
                 specifier = arg[prefix.len..];
-                use_import = std.mem.eql(u8, prefix, "--import=");
+                use_import = std.mem.eql(u8, prefix, "--import=") or std.mem.eql(u8, prefix, "--preload=");
                 break;
             }
         }
@@ -1550,6 +1705,7 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
             else
                 raw_specifier;
             const specifier_literal = try jsonStringLiteral(ctx, resolved_specifier);
+            try output.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
             if (use_import) {
                 try output.appendSlice(ctx.allocator, "await import(");
                 try output.appendSlice(ctx.allocator, specifier_literal);
@@ -1596,11 +1752,13 @@ fn writeCottontailEntryWrapper(
         const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
+    const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
     const source = try std.fmt.allocPrint(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ createRequire as __ctCreateRequire }} from "node:module";
         \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
@@ -1627,13 +1785,21 @@ fn writeCottontailEntryWrapper(
         \\}};
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
         \\{s}
-        \\{s}await import({s});
+        \\{s}  globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\  await import({s});
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis.__cottontailStartTestRun?.();
+        \\}}
         \\
     ,
         .{
             bun_literal,
             bundle_map_literal,
+            bundle_source_root_literal,
             script_literal,
             script_dir_literal,
             script_literal,
@@ -1753,22 +1919,21 @@ fn writeBunCompatTransformedSource(
         }
     }
 
-    // Pre-inline `import.meta.url`/`.path`/`.file(name)` with the original
-    // file's values BEFORE the dynamic-import rewrite embeds module sources
-    // as string literals. If no other transform fires, the original file is
-    // used untouched and the bundler inlines the correct values itself; when
-    // a `.cottontail-compat-*` sibling is written, this keeps its
-    // `import.meta` from leaking the generated file's name.
-    const meta_inlined = try rewriteImportMetaToOriginalPath(ctx, transformed_source, script_abs);
+    var import_meta_main_source: ?[]u8 = null;
+    defer if (import_meta_main_source) |value| std.heap.c_allocator.free(value);
+    if (std.mem.indexOf(u8, transformed_source, "import.meta.main") != null) {
+        if (transpilerLoaderForPath(script_abs)) |loader| {
+            const transformed = try native_transpiler.transformEntrypointImportMetaMain(transformed_source, loader);
+            import_meta_main_source = transformed;
+            transformed_source = transformed;
+            changed = true;
+        }
+    }
 
     const resolution_dir = source_base_dir orelse std.fs.path.dirname(script_abs) orelse ctx.project_root;
-    if (try rewriteQueryImports(ctx, meta_inlined, resolution_dir)) |transformed| {
+    if (try rewriteQueryImports(ctx, transformed_source, resolution_dir)) |transformed| {
         transformed_source = transformed;
         changed = true;
-    } else {
-        // Harmless if unchanged: when no transform fires below, the original
-        // file is returned and this buffer is discarded.
-        transformed_source = meta_inlined;
     }
     // Bun treats extensionless entrypoints as TypeScript, so rewrite them into
     // a generated .ts file before invoking the compiler.
@@ -1796,7 +1961,16 @@ fn writeBunCompatTransformedSource(
         .{ std.hash.Wyhash.hash(0, source), std.hash.Wyhash.hash(0, &invocation_bytes), ext },
     );
     const generated_path = try std.fs.path.join(ctx.allocator, &.{ script_dir, generated_name });
-    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = transformed_source }) catch return script_abs;
+    const encoder = std.base64.standard.Encoder;
+    const encoded_path = try ctx.allocator.alloc(u8, encoder.calcSize(script_abs.len));
+    const encoded = encoder.encode(encoded_path, script_abs);
+    const generated_source = try std.mem.concat(ctx.allocator, u8, &.{
+        "/*@cottontail-original-path-base64:",
+        encoded,
+        "*/",
+        transformed_source,
+    });
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = generated_source }) catch return script_abs;
     return generated_path;
 }
 
@@ -1811,55 +1985,6 @@ fn hasBunTranspiledPragma(source: []const u8) bool {
     const comment = std.mem.trimStart(u8, line[2..], " \t");
     if (!std.mem.startsWith(u8, comment, "@bun")) return false;
     return comment.len == "@bun".len or std.ascii.isWhitespace(comment["@bun".len]);
-}
-
-/// Replace `import.meta.url`, `import.meta.path`, `import.meta.filename` and
-/// `import.meta.file` with string literals for `original_path`. Used when a
-/// source is rewritten into a generated `.cottontail-compat-*` sibling file so
-/// that the bundler's later inlining doesn't leak the generated file's name.
-fn rewriteImportMetaToOriginalPath(
-    ctx: *const Context,
-    source: []const u8,
-    original_path: []const u8,
-) ![]const u8 {
-    const needle = "import.meta.";
-    if (std.mem.indexOf(u8, source, needle) == null) return source;
-
-    const url_value = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{original_path});
-    const url_literal = try jsonStringLiteral(ctx, url_value);
-    const path_literal = try jsonStringLiteral(ctx, original_path);
-    const file_literal = try jsonStringLiteral(ctx, std.fs.path.basename(original_path));
-
-    const Replacement = struct { property: []const u8, literal: []const u8 };
-    var output: std.ArrayList(u8) = .empty;
-    var copied_until: usize = 0;
-    var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, source, cursor, needle)) |found| {
-        cursor = found + needle.len;
-        // Reject matches like `x.import.meta.url` or `reimport.meta.url`.
-        if (found > 0 and (isIdentifierPart(source[found - 1]) or source[found - 1] == '.')) continue;
-        // Order matters: longer property names first.
-        const replacements = [_]Replacement{
-            .{ .property = "filename", .literal = path_literal },
-            .{ .property = "file", .literal = file_literal },
-            .{ .property = "path", .literal = path_literal },
-            .{ .property = "url", .literal = url_literal },
-        };
-        for (replacements) |replacement| {
-            const property_end = cursor + replacement.property.len;
-            if (property_end > source.len) continue;
-            if (!std.mem.eql(u8, source[cursor..property_end], replacement.property)) continue;
-            if (property_end < source.len and isIdentifierPart(source[property_end])) continue;
-            try output.appendSlice(ctx.allocator, source[copied_until..found]);
-            try output.appendSlice(ctx.allocator, replacement.literal);
-            copied_until = property_end;
-            cursor = property_end;
-            break;
-        }
-    }
-    if (copied_until == 0) return source;
-    try output.appendSlice(ctx.allocator, source[copied_until..]);
-    return try output.toOwnedSlice(ctx.allocator);
 }
 
 fn isIdentifierStart(byte: u8) bool {
@@ -2071,7 +2196,13 @@ fn resolveDynamicImportTarget(
         return null;
 
     if (realPathIfFile(ctx, candidate)) |resolved| return resolved;
-    if (std.fs.path.extension(candidate).len != 0) return null;
+    // Bun resolves JavaScript extensions after application-specific suffixes
+    // such as `fixture` (`./case.fixture` -> `./case.fixture.ts`). Known data
+    // and JavaScript extensions remain exact-path requests.
+    if (std.fs.path.extension(candidate).len != 0) {
+        const loader = inferredLoaderForTarget(candidate);
+        if (loader == null or !std.mem.eql(u8, loader.?, "file")) return null;
+    }
     for ([_][]const u8{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json" }) |extension| {
         const with_extension = try std.mem.concat(ctx.allocator, u8, &.{ candidate, extension });
         if (realPathIfFile(ctx, with_extension)) |resolved| return resolved;
@@ -2281,7 +2412,7 @@ fn scanDynamicImports(
             }
         }
         if (!std.mem.startsWith(u8, source[cursor..], "import") or
-            (cursor > 0 and isIdentifierPart(source[cursor - 1])) or
+            (cursor > 0 and (isIdentifierPart(source[cursor - 1]) or source[cursor - 1] == '#' or source[cursor - 1] == '.')) or
             (cursor + "import".len < source.len and isIdentifierPart(source[cursor + "import".len])))
         {
             cursor += 1;
@@ -2322,13 +2453,20 @@ fn scanDynamicImports(
             const assumes_jsonc = isJsoncLikeSpecifier(prefix);
             const assumes_json5 = isJson5Specifier(prefix);
             const assumes_toml = isTomlSpecifier(prefix);
-            const inferred_loader = if (!has_attributes and !has_query) inferredLoaderForTarget(prefix) else null;
+            const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
+            const prefix_loader = if (!has_attributes and !has_query) inferredLoaderForTarget(prefix) else null;
+            const inferred_loader = if (!has_attributes and !has_query)
+                inferredLoaderForTarget(target_path orelse prefix)
+            else
+                null;
+            const needs_compat_resolution = target_path != null and prefix_loader != null and
+                std.mem.eql(u8, prefix_loader.?, "file") and inferred_loader == null;
             const import_clause = source[cursor + "import".len .. specifier_start];
             const force_spy_namespace = std.mem.indexOf(u8, source, "spyOn(") != null and
                 std.mem.indexOfScalar(u8, import_clause, '*') != null;
             const force_mock_bindings = uses_module_mock and std.mem.startsWith(u8, prefix, ".") and
                 std.mem.indexOfScalar(u8, import_clause, '{') != null;
-            if (!force_spy_namespace and !force_mock_bindings and !has_attributes and !has_query and !assumes_jsonc and !assumes_json5 and !assumes_toml and inferred_loader == null) {
+            if (!force_spy_namespace and !force_mock_bindings and !has_attributes and !has_query and !assumes_jsonc and !assumes_json5 and !assumes_toml and inferred_loader == null and !needs_compat_resolution) {
                 cursor = semicolon + 1;
                 continue;
             }
@@ -2354,7 +2492,6 @@ fn scanDynamicImports(
                 try loaderOptionsLiteral(ctx, loader)
             else
                 "undefined";
-            const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
             const target_index = if (target_path) |path|
                 try dynamicTargetIndex(ctx.allocator, targets, path, force_spy_namespace or force_mock_bindings)
             else
@@ -3132,6 +3269,7 @@ fn writeCommonJsEntryWrapper(
     script_abs: []const u8,
     bundle_entry: bool,
     preload_imports: []const u8,
+    stable_source_map_path: bool,
 ) ![]const u8 {
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
@@ -3346,14 +3484,38 @@ fn writeCommonJsEntryWrapper(
         },
     );
     const script_literal = try jsonStringLiteral(ctx, script_abs);
-    const bundle_map_literal = "\"\"";
-    const main_statement = if (bundle_entry)
-        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}\n{s}await import({s});", .{ cpu_profiler_start_statement, preload_imports, script_literal })
+    const bundle_map_literal = if (stable_source_map_path)
+        "\"\""
+    else blk: {
+        const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
+        break :blk try jsonStringLiteral(ctx, bundle_map_path);
+    };
+    const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
+    const test_header_signal = if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null)
+        "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
-        try std.fmt.allocPrint(ctx.allocator, "globalThis.__cottontailLoadDotenv?.();\n{s}\n{s}(moduleModule.default ?? moduleModule.Module).runMain();", .{ cpu_profiler_start_statement, preload_imports });
+        "";
+    const main_action = if (bundle_entry)
+        try std.fmt.allocPrint(ctx.allocator, "await import({s});", .{script_literal})
+    else
+        "(moduleModule.default ?? moduleModule.Module).runMain();";
+    const main_statement = try std.fmt.allocPrint(ctx.allocator,
+        \\globalThis.__cottontailLoadDotenv?.();
+        \\{s}
+        \\globalThis.__cottontailLoadingTestModules = true;
+        \\try {{
+        \\{s}
+        \\{s}globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;
+        \\{s}
+        \\}} finally {{
+        \\  globalThis.__cottontailLoadingTestModules = false;
+        \\  globalThis.__cottontailStartTestRun?.();
+        \\}}
+    , .{ test_header_signal, cpu_profiler_start_statement, preload_imports, main_action });
     const bootstrap = try std.fmt.allocPrint(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};
+        \\globalThis.__cottontailBundleSourceRoot ??= {s};
         \\const eventsBuiltin = events.default ?? events;
         \\const assertBuiltin = assert.default ?? assert;
         \\const assertStrictBuiltin = assertStrict.default ?? assertStrict;
@@ -3430,6 +3592,7 @@ fn writeCommonJsEntryWrapper(
     ,
         .{
             bundle_map_literal,
+            bundle_source_root_literal,
             main_statement,
         },
     );
@@ -3531,7 +3694,6 @@ fn osTempBase(ctx: *const Context) []const u8 {
 }
 
 fn resolvePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    if (std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
     return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
 }
 

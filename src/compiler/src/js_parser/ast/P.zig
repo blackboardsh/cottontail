@@ -3980,19 +3980,34 @@ pub fn NewParser_(
             }
         }
 
-        pub fn keepExprSymbolName(_: *P, _value: Expr, _: string) Expr {
-            return _value;
-            // var start = p.expr_list.items.len;
-            // p.expr_list.ensureUnusedCapacity(2) catch unreachable;
-            // p.expr_list.appendAssumeCapacity(_value);
-            // p.expr_list.appendAssumeCapacity(p.newExpr(E.String{
-            //     .utf8 = name,
-            // }, _value.loc));
+        pub fn pathForImportMeta(p: *P) fs.Path {
+            const generated_prefix = ".cottontail-compat-";
+            const marker = "/*@cottontail-original-path-base64:";
+            if (!std.mem.startsWith(u8, p.source.path.name.filename, generated_prefix) or
+                !std.mem.startsWith(u8, p.source.contents, marker))
+            {
+                return p.source.path;
+            }
 
-            // var value = p.callRuntime(_value.loc, "ℹ", p.expr_list.items[start..p.expr_list.items.len]);
-            // // Make sure tree shaking removes this if the function is never used
-            // value.getCall().can_be_unwrapped_if_unused = true;
-            // return value;
+            const encoded_start = marker.len;
+            const encoded_end = std.mem.indexOfPos(u8, p.source.contents, encoded_start, "*/") orelse return p.source.path;
+            const encoded = p.source.contents[encoded_start..encoded_end];
+            const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return p.source.path;
+            const decoded = p.allocator.alloc(u8, decoded_len) catch unreachable;
+            std.base64.standard.Decoder.decode(decoded, encoded) catch return p.source.path;
+            return fs.Path.init(decoded);
+        }
+
+        pub fn keepExprSymbolName(p: *P, original_value: Expr, name: string) Expr {
+            if (!p.options.features.minify_keep_names or p.source.index.isRuntime()) return original_value;
+
+            const args = p.allocator.alloc(Expr, 2) catch unreachable;
+            args[0] = original_value;
+            args[1] = p.newExpr(E.String{ .data = name }, original_value.loc);
+
+            const value = p.callRuntime(original_value.loc, "__name", args);
+            value.data.e_call.can_be_unwrapped_if_unused = .if_unused;
+            return value;
         }
 
         pub fn isSimpleParameterList(args: []G.Arg, has_rest_arg: bool) bool {
@@ -5635,13 +5650,16 @@ pub fn NewParser_(
             return res;
         }
 
-        fn keepStmtSymbolName(p: *P, loc: logger.Loc, ref: Ref, name: string) Stmt {
-            _ = p;
-            _ = loc;
-            _ = ref;
-            _ = name;
-            // TODO:
-            @compileError("not implemented");
+        pub fn keepStmtSymbolName(p: *P, loc: logger.Loc, ref: Ref, name: string) Stmt {
+            const args = p.allocator.alloc(Expr, 2) catch unreachable;
+            p.recordUsage(ref);
+            args[0] = p.newExpr(E.Identifier{ .ref = ref }, loc);
+            args[1] = p.newExpr(E.String{ .data = name }, loc);
+
+            return p.s(S.SExpr{
+                .value = p.callRuntime(loc, "__name", args),
+                .does_not_affect_tree_shaking = true,
+            }, loc);
         }
 
         fn runtimeIdentifierRef(p: *P, loc: logger.Loc, comptime name: string) Ref {

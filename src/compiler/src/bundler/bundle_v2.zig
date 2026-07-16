@@ -160,6 +160,11 @@ pub const BundleV2 = struct {
     /// deduplication is free.
     requested_exports: std.AutoArrayHashMapUnmanaged(u32, barrel_imports.RequestedExports) = .{},
 
+    /// Import records explicitly deferred by barrel optimization. The parser
+    /// also uses `is_unused` for erased TypeScript imports, so barrel BFS must
+    /// not infer ownership from that shared flag alone.
+    barrel_deferred_import_records: std.AutoArrayHashMapUnmanaged(u64, void) = .{},
+
     const barrel_imports = @import("./barrel_imports.zig");
 
     const BakeOptions = struct {

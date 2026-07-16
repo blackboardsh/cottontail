@@ -124,10 +124,17 @@ function buildState(mapPath) {
     if (!map || typeof map !== "object" || typeof map.mappings !== "string" || !Array.isArray(map.sources)) return null;
     const slash = mapPath.lastIndexOf("/");
     const mapDir = slash > 0 ? mapPath.slice(0, slash) : "/";
-    const sources = map.sources.map((source) => resolveSource(mapDir, map.sourceRoot, source));
+    const configuredRoot = globalThis.__cottontailBundleSourceRoot;
+    const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
+    const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
+    const sourceLines = map.sources.map((_, index) => {
+      const contents = Array.isArray(map.sourcesContent) ? map.sourcesContent[index] : null;
+      return typeof contents === "string" ? contents.split(/\r?\n/) : null;
+    });
     const bundlePath = mapPath.endsWith(".map") ? mapPath.slice(0, -".map".length) : null;
     return {
       sources,
+      sourceLines,
       lines: decodeMappings(map.mappings),
       bundlePath,
       bundleRegExp: bundlePath ? new RegExp(`${escapeRegExp(bundlePath)}:(\\d+):(\\d+)`, "g") : null,
@@ -167,13 +174,38 @@ function lookup(state, line, column) {
   const [, sourceIndex, sourceLine, sourceColumn] = segments[found];
   const source = state.sources[sourceIndex];
   if (source == null) return null;
-  return { source, line: sourceLine + 1, column: sourceColumn + 1 };
+  return { source, line: sourceLine + 1, column: sourceColumn + 1, sourceIndex };
 }
 
 export function remapPosition(line, column) {
   const state = getState();
   if (!state) return null;
-  return lookup(state, Number(line), Number(column));
+  const mapped = lookup(state, Number(line), Number(column));
+  return mapped && { source: mapped.source, line: mapped.line, column: mapped.column };
+}
+
+export function sourceContextForLocation(source, line, column) {
+  const state = getState();
+  if (!state || typeof source !== "string") return null;
+  const normalized = normalizePath(source.startsWith("file://") ? source.slice("file://".length) : source);
+  const sourceIndex = state.sources.findIndex(candidate => normalizePath(candidate) === normalized);
+  if (sourceIndex < 0 || !state.sourceLines[sourceIndex]) return null;
+  return {
+    source: state.sources[sourceIndex],
+    line: Number(line),
+    column: Number(column),
+    lines: state.sourceLines[sourceIndex],
+  };
+}
+
+function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, mapped) {
+  const sourceLines = state.sourceLines[mapped.sourceIndex];
+  const currentSource = sourceLines?.[mapped.line - 1] ?? "";
+  if (!/^\s*[}\])]+(?:\s*,[^;]*)?;?\s*$/.test(currentSource)) return mapped;
+  const previous = lookup(state, generatedLine - 1, generatedColumn);
+  if (!previous || previous.sourceIndex !== mapped.sourceIndex || previous.line >= mapped.line) return mapped;
+  const previousSource = sourceLines?.[previous.line - 1] ?? "";
+  return previousSource.trim() === "" ? mapped : previous;
 }
 
 export function remapStackString(stack) {
@@ -188,9 +220,12 @@ export function remapStackString(stack) {
   if (!state || !state.bundleRegExp || !stack.includes(state.bundlePath)) return stack;
   state.bundleRegExp.lastIndex = 0;
   return stack.replace(state.bundleRegExp, (match, lineText, columnText) => {
-    const mapped = lookup(state, Number(lineText), Number(columnText));
+    const line = Number(lineText);
+    const column = Number(columnText);
+    const initial = lookup(state, line, column);
+    const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
     return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
   });
 }
 
-export default { remapPosition, remapStackString };
+export default { remapPosition, remapStackString, sourceContextForLocation };

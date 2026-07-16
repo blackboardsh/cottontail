@@ -1,6 +1,7 @@
 import { createWritableStdio } from "./stdio.js";
 import { Readable } from "./stream.js";
 import { Buffer } from "./buffer.js";
+import { isatty as ttyIsatty } from "./tty.js";
 import constantsObject from "./constants.js";
 import * as utilTypes from "./util/types.js";
 import * as zlibConstants from "./zlib/constants.js";
@@ -629,6 +630,45 @@ const uvBinding = (() => {
 
 const processBindingCache = new Map();
 
+class TTYWrap {
+  constructor(fd) {
+    const normalized = Number(fd);
+    if (!Number.isInteger(normalized) || !ttyIsatty(normalized)) {
+      const error = new Error(`TTY initialization failed for file descriptor ${fd}`);
+      error.code = "ERR_TTY_INIT_FAILED";
+      throw error;
+    }
+    this.fd = normalized;
+  }
+
+  getWindowSize(output) {
+    if (!(this instanceof TTYWrap)) throw new TypeError("Illegal invocation");
+    if (output == null || (typeof output !== "object" && typeof output !== "function")) {
+      throw new TypeError("The window size output must be an array-like object");
+    }
+    const stream = this.fd === 2 ? processObject.stderr : processObject.stdout;
+    const columns = Number(stream?.columns ?? env.COLUMNS);
+    const rows = Number(stream?.rows ?? env.LINES);
+    if (!Number.isFinite(columns) || columns < 0 || !Number.isFinite(rows) || rows < 0) return false;
+    output[0] = columns;
+    output[1] = rows;
+    return true;
+  }
+
+  setRawMode(mode) {
+    if (!(this instanceof TTYWrap)) throw new TypeError("Illegal invocation");
+    if (this.fd === 0 && typeof processObject.stdin?.setRawMode === "function") {
+      processObject.stdin.setRawMode(Boolean(mode));
+    }
+    return 0;
+  }
+}
+
+const ttyWrapBinding = Object.freeze({
+  TTY: TTYWrap,
+  isTTY: ttyIsatty,
+});
+
 function makeProcessBinding(name) {
   switch (name) {
     case "natives":
@@ -661,6 +701,8 @@ function makeProcessBinding(name) {
       return uvBinding;
     case "util":
       return utilBinding;
+    case "tty_wrap":
+      return ttyWrapBinding;
     case "config":
       return Object.freeze({
         isDebugBuild: false,
@@ -775,6 +817,63 @@ processObject.debugPort ??= 9229;
 processObject.domain ??= null;
 processObject._exiting ??= false;
 processObject.exitCode ??= undefined;
+
+function unhandledRejectionMode() {
+  const args = processObject.execArgv ?? [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = String(args[index]);
+    if (argument.startsWith("--unhandled-rejections=")) return argument.slice("--unhandled-rejections=".length);
+    if (argument === "--unhandled-rejections" && args[index + 1] != null) return String(args[index + 1]);
+  }
+  return "throw";
+}
+
+function formatUnhandledRejectionReason(reason) {
+  if (reason === null) return "null";
+  switch (typeof reason) {
+    case "undefined": return "undefined";
+    case "string": return reason;
+    case "boolean":
+    case "number":
+    case "bigint": return `${reason}`;
+    case "symbol": return Symbol.prototype.toString.call(reason);
+    default:
+      try {
+        return Object.prototype.toString.call(reason);
+      } catch {
+        return "[object Object]";
+      }
+  }
+}
+
+function makeUnhandledRejectionError(reason) {
+  if (reason instanceof Error) return reason;
+  const detail = formatUnhandledRejectionReason(reason);
+  const error = new Error(
+    "This error originated either by throwing inside of an async function without a catch block, " +
+    "or by rejecting a promise which was not handled with .catch(). " +
+    `The promise rejected with the reason "${detail}".`,
+  );
+  error.name = "UnhandledPromiseRejection";
+  error.code = "ERR_UNHANDLED_REJECTION";
+  return error;
+}
+
+globalThis.__cottontailHandleUnhandledRejection = (reason, promise) => {
+  const mode = unhandledRejectionMode();
+  const hasRejectionHandler = processObject.emit("unhandledRejection", reason, promise);
+  if (hasRejectionHandler || mode === "none") return undefined;
+
+  const error = makeUnhandledRejectionError(reason);
+  if (mode === "warn" || mode === "warn-with-error-code") {
+    const warning = `${error.name}: ${error.message}\n`;
+    if (!processObject.emit("warning", error)) cottontail.fdWrite?.(2, warning);
+    if (mode === "warn-with-error-code") processObject.exitCode = 1;
+    return undefined;
+  }
+  if (processObject._fatalException?.(error, true)) return undefined;
+  return error;
+};
 
 try {
   // The generated bundle's banner declares `var __ctMetaEnv` (the target of the
@@ -1385,13 +1484,15 @@ export const _rawDebug = processObject._rawDebug = (...args) => {
   cottontail.fdWrite?.(2, `${args.map(String).join(" ")}\n`);
 };
 
-export const _fatalException = processObject._fatalException = (error) => {
+export const _fatalException = processObject._fatalException = (error, fromPromise = false) => {
   if (typeof uncaughtExceptionCaptureCallback === "function") {
     uncaughtExceptionCaptureCallback(error);
     return true;
   }
-  return processObject.emit("uncaughtException", error);
+  return processObject.emit("uncaughtException", error, fromPromise ? "unhandledRejection" : "uncaughtException");
 };
+
+globalThis.__cottontailHandleUncaughtException = (error) => processObject._fatalException(error, false);
 
 export const setUncaughtExceptionCaptureCallback = processObject.setUncaughtExceptionCaptureCallback = (callback) => {
   if (callback != null && typeof callback !== "function") {
@@ -1410,7 +1511,8 @@ export const setSourceMapsEnabled = processObject.setSourceMapsEnabled = (enable
 
 export const _tickCallback = processObject._tickCallback = () => cottontail.drainJobs?.();
 export const _debugEnd = processObject._debugEnd = () => {};
-export const _debugProcess = processObject._debugProcess = (targetPid) => cottontail.kill(Number(targetPid), signalNumber("SIGUSR1"));
+export const _debugProcess = processObject._debugProcess = (targetPid) =>
+  targetPid == null ? undefined : cottontail.kill(Number(targetPid), signalNumber("SIGUSR1"));
 export const _startProfilerIdleNotifier = processObject._startProfilerIdleNotifier = () => {};
 export const _stopProfilerIdleNotifier = processObject._stopProfilerIdleNotifier = () => {};
 

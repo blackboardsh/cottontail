@@ -131,6 +131,17 @@ strictEqual(
   "65acafe9655d154ebe7ca04e8b7ebdbc",
   "pbkdf2Sync mismatch",
 );
+strictEqual(
+  crypto.pbkdf2Sync("password", "salt", 4096, 20, "sha256").toString("hex"),
+  "c5e478d59288c841aa530db6845c4c8d962893a0",
+  "pbkdf2Sync RFC vector mismatch",
+);
+try {
+  crypto.pbkdf2("pass", "salt", "bad" as any, 8, "sha256", () => {});
+  throw new Error("pbkdf2 should reject a non-number iteration count");
+} catch (error) {
+  strictEqual((error as Error & { code?: string }).code, "ERR_INVALID_ARG_TYPE", "pbkdf2 iteration error code mismatch");
+}
 
 await new Promise<void>((resolve, reject) => {
   crypto.pbkdf2("pass", "salt", 1, 16, "sha256", (error, key) => {
@@ -606,7 +617,7 @@ try {
 const cert = new crypto.X509Certificate(fixtureCertificate);
 strictEqual(cert.subject, "CN=localhost\nO=Cottontail", "X509 subject mismatch");
 strictEqual(cert.issuer, "CN=localhost\nO=Cottontail", "X509 issuer mismatch");
-strictEqual(cert.serialNumber, "D02634654FA849A7", "X509 serial mismatch");
+strictEqual(cert.serialNumber, "d02634654fa849a7", "X509 serial mismatch");
 strictEqual(cert.signatureAlgorithm, "sha256WithRSAEncryption", "X509 signature algorithm mismatch");
 strictEqual(cert.publicKey.asymmetricKeyType, "rsa", "X509 public key type mismatch");
 strictEqual(cert.checkHost("localhost"), "localhost", "X509 checkHost CN mismatch");

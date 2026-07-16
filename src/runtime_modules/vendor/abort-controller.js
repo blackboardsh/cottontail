@@ -5,5 +5,17 @@
 const AbortController = globalThis.AbortController;
 const AbortSignal = globalThis.AbortSignal;
 
+// Bun's package replacement is the global constructor itself for require(),
+// while still exposing the package's named and default export properties.
+Object.defineProperties(AbortController, {
+  AbortController: { value: AbortController, enumerable: true, configurable: true },
+  AbortSignal: { value: AbortSignal, enumerable: true, configurable: true },
+  default: {
+    value: { AbortController, AbortSignal },
+    enumerable: true,
+    configurable: true,
+  },
+});
+
 export { AbortController, AbortSignal };
 export default AbortController;

@@ -7,6 +7,7 @@ vendors/zig.zip
 vendors/zig-temp/
 vendors/esbuild/
 .cottontail-tmp/
+.cottontail-eval-*
 fixtures/electrobun-cli/build/
 fixtures/electrobun-cli/.cottontail-tmp/
 vendors/jsc/
@@ -18,5 +19,10 @@ vm-*-release.log
 # test-run artifacts inside the upstream snapshot
 compat/upstream/**/Heap.*.heapsnapshot
 compat/upstream/**/.cottontail-compat-*
-compat/upstream/**/.cottontail-eval-*
 compat/upstream/**/.cottontail-compile-cache/
+compat/upstream/**/fstest*/
+compat/upstream/bun/*/app
+compat/upstream/bun/*/app.exe
+compat/upstream/bun/*/a.txt
+compat/upstream/bun/*/b.txt
+compat/upstream/bun/*/append_output.txt

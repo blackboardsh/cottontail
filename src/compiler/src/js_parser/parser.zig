@@ -445,6 +445,8 @@ pub const ExprIn = struct {
     is_immediately_assigned_to_decl: bool = false,
 
     property_access_for_method_call_maybe_should_replace_with_undefined: bool = false,
+
+    is_property_access_target: bool = false,
 };
 
 // This function exists to tie all of these checks together in one place

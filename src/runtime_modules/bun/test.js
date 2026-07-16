@@ -40,6 +40,57 @@ const realTimers = {
   setTimeout: globalThis.setTimeout,
   performanceNow: globalThis.performance?.now?.bind(globalThis.performance),
 };
+const nativeDateNow = realTimers.Date.now.bind(realTimers.Date);
+const nativeDateTimeFormatDescriptor = globalThis.Intl?.DateTimeFormat?.prototype
+  ? Object.getOwnPropertyDescriptor(globalThis.Intl.DateTimeFormat.prototype, "format")
+  : undefined;
+
+function testDateNow() {
+  return fakeTimersEnabled ? timerClock() : nativeDateNow();
+}
+
+let testDateConstructor;
+testDateConstructor = new Proxy(realTimers.Date, {
+  apply(target, thisArg, args) {
+    if (fakeTimersEnabled && args.length === 0) return new target(timerClock()).toString();
+    return Reflect.apply(target, thisArg, args);
+  },
+  construct(target, args, newTarget) {
+    const actualArgs = fakeTimersEnabled && args.length === 0 ? [timerClock()] : args;
+    return Reflect.construct(target, actualArgs, newTarget === testDateConstructor ? target : newTarget);
+  },
+});
+Object.defineProperty(realTimers.Date, "now", {
+  configurable: true,
+  enumerable: false,
+  writable: true,
+  value: testDateNow,
+});
+Object.defineProperty(realTimers.Date.prototype, "constructor", {
+  configurable: true,
+  enumerable: false,
+  writable: true,
+  value: testDateConstructor,
+});
+globalThis.Date = testDateConstructor;
+
+if (nativeDateTimeFormatDescriptor?.get) {
+  const formatWrappers = new WeakMap();
+  Object.defineProperty(globalThis.Intl.DateTimeFormat.prototype, "format", {
+    ...nativeDateTimeFormatDescriptor,
+    get() {
+      let wrapped = formatWrappers.get(this);
+      if (wrapped) return wrapped;
+      const nativeFormat = nativeDateTimeFormatDescriptor.get.call(this);
+      wrapped = function format(value) {
+        if (arguments.length === 0 && fakeTimersEnabled) return nativeFormat(timerClock());
+        return arguments.length === 0 ? nativeFormat() : nativeFormat(value);
+      };
+      formatWrappers.set(this, wrapped);
+      return wrapped;
+    },
+  });
+}
 let assertionCount = 0;
 let expectedAssertions = null;
 let requireAssertions = false;
@@ -206,10 +257,19 @@ function asymmetricMatch(actual, expected) {
       return expected.pattern.test(String(actual));
     case "closeTo":
       return Math.abs(Number(actual) - Number(expected.value)) < 10 ** -Number(expected.precision) / 2;
-    case "custom":
-      return Boolean(expected.matcher(actual, ...expected.args)?.pass);
+    case "custom": {
+      const result = invokeCustomMatcher(expected.name, expected.matcher, expected.negate, actual, expected.args);
+      const finish = (value) => {
+        const pass = customMatcherResult(expected.name, value).pass;
+        return expected.negate ? !pass : pass;
+      };
+      return isPromiseLike(result) ? Promise.resolve(result).then(finish) : finish(result);
+    }
     case "not":
-      return !asymmetricMatch(actual, expected.matcher);
+      {
+        const result = asymmetricMatch(actual, expected.matcher);
+        return isPromiseLike(result) ? Promise.resolve(result).then((pass) => !pass) : !result;
+      }
     default:
       return false;
   }
@@ -288,7 +348,12 @@ function matchesExpected(actual, expected, seen = new WeakMap()) {
 function formatValue(value) {
   try {
     const serialized = JSON.stringify(value);
-    return serialized === undefined ? String(value) : serialized;
+    const formatted = serialized === undefined ? String(value) : serialized;
+    const maxLength = 20_000;
+    if (formatted.length <= maxLength) return formatted;
+    const edgeLength = Math.floor(maxLength / 2);
+    const omitted = formatted.length - edgeLength * 2;
+    return `${formatted.slice(0, edgeLength)}... (${omitted} characters truncated) ...${formatted.slice(-edgeLength)}`;
   } catch {
     return String(value);
   }
@@ -483,11 +548,6 @@ function assertPropertyMatchers(actual, propertyMatchers) {
   }
 }
 
-function failMatcher(pass, negate, message) {
-  const ok = negate ? !pass : pass;
-  if (!ok) throw new nodeAssert.AssertionError({ message });
-}
-
 function callRecords(value) {
   const calls = value?.mock?.calls;
   if (!Array.isArray(calls)) throw new nodeAssert.AssertionError({ message: "Expected a mock function" });
@@ -597,7 +657,7 @@ function syncFakeDateClock() {
 
 function setFakeNow(value) {
   let next = value instanceof realTimers.Date ? value.getTime() : Number(value);
-  if (!Number.isFinite(next)) next = realTimers.Date.now();
+  if (!Number.isFinite(next)) next = nativeDateNow();
   fakeDateNanoseconds = millisecondsToNanoseconds(next);
   syncFakeDateClock();
 }
@@ -723,19 +783,9 @@ function installFakeTimers(options = undefined) {
     return;
   }
   fakeTimersEnabled = true;
-  setFakeNow(hasCustomNow ? options.now : realTimers.Date.now());
+  setFakeNow(hasCustomNow ? options.now : nativeDateNow());
   fakeHrtimeNanoseconds = 0n;
   fakePerformanceOrigin = fakeNow;
-  class FakeDate extends realTimers.Date {
-    constructor(...args) {
-      super(...(args.length === 0 ? [timerClock()] : args));
-    }
-
-    static now() {
-      return timerClock();
-    }
-  }
-  globalThis.Date = FakeDate;
   // testing-library and user-event detect fake timers via an own `clock`
   // property on globalThis.setTimeout (issue #25869 / #26284).
   Object.defineProperty(fakeSetTimeout, "clock", { configurable: true, enumerable: false, writable: true, value: true });
@@ -759,7 +809,6 @@ function uninstallFakeTimers() {
   // The `clock` marker must be deleted (not set to false) so that
   // hasOwnProperty checks report real timers (issue #26284).
   delete fakeSetTimeout.clock;
-  globalThis.Date = realTimers.Date;
   globalThis.setTimeout = realTimers.setTimeout;
   globalThis.clearTimeout = realTimers.clearTimeout;
   globalThis.setInterval = realTimers.setInterval;
@@ -823,14 +872,11 @@ class Expectation {
       assertionCount += 1;
       globalThis.__cottontailTestAssertionCount += 1;
     }
-    if (typeof message === "function") {
-      // Lazy message: only pay for (potentially expensive) diff formatting
-      // when the assertion is actually going to fail.
-      const failing = this._negate ? pass : !pass;
-      message = failing ? message() : "";
-    }
+    const ok = this._negate ? !pass : pass;
+    if (ok) return;
+    if (typeof message === "function") message = message();
     const label = this._label == null ? "" : `${String(this._label)}\n\n`;
-    failMatcher(pass, this._negate, `${label}${message}`);
+    throw new nodeAssert.AssertionError({ message: `${label}${message}` });
   }
 
   _wrap(check) {
@@ -844,14 +890,27 @@ class Expectation {
   toBe(expected) {
     return this._wrap((actual) => {
       const pass = Object.is(actual, expected);
-      this._check(pass, pass ? "" : `Expected ${formatValue(expected)}\nReceived ${formatValue(actual)}`);
+      this._check(pass, () => {
+        const signature = `expect(received)${this._negate ? ".not" : ""}.toBe(expected)`;
+        const body = this._negate
+          ? `Expected: not ${formatValue(expected)}`
+          : `Expected: ${formatValue(expected)}\nReceived: ${formatValue(actual)}`;
+        return this._label == null ? `${signature}\n\n${body}` : body;
+      });
     });
   }
 
   toEqual(expected) {
     return this._wrap((actual) => {
       const pass = matchesExpected(actual, expected);
-      this._check(pass, pass ? "" : `Expected ${formatValue(actual)} to equal ${formatValue(expected)}`);
+      const finish = (matched) => this._check(Boolean(matched), () => {
+        const signature = `expect(received)${this._negate ? ".not" : ""}.toEqual(expected)`;
+        const body = this._negate
+          ? `Expected: not ${formatValue(expected)}`
+          : `Expected: ${formatValue(expected)}\nReceived: ${formatValue(actual)}`;
+        return this._label == null ? `${signature}\n\n${body}` : body;
+      });
+      return isPromiseLike(pass) ? Promise.resolve(pass).then(finish) : finish(pass);
     });
   }
 
@@ -861,7 +920,9 @@ class Expectation {
 
   toMatchObject(expected) {
     return this._wrap((actual) => {
-      const pass = isObject(actual) && Object.keys(expected ?? {}).every((key) => matchesExpected(actual[key], expected[key]));
+      const pass = matcherName(expected)
+        ? isObject(actual)
+        : isObject(actual) && Object.keys(expected ?? {}).every((key) => matchesExpected(actual[key], expected[key]));
       this._check(pass, `Expected ${formatValue(actual)} to match object ${formatValue(expected)}`);
     });
   }
@@ -882,23 +943,55 @@ class Expectation {
   toBeArrayOfSize(size) { return this._wrap((actual) => this._check(Array.isArray(actual) && actual.length === Number(size), `Expected array size ${size}`)); }
   toBeObject() { return this._wrap((actual) => this._check(isObject(actual) && !Array.isArray(actual), "Expected value to be an object")); }
   toBeFunction() { return this._wrap((actual) => this._check(typeof actual === "function", "Expected value to be a function")); }
-  toBeString() { return this._wrap((actual) => this._check(typeof actual === "string", "Expected value to be a string")); }
+  toBeString() { return this._wrap((actual) => this._check(typeof actual === "string" || actual instanceof String, "Expected value to be a string")); }
   toBeNumber() { return this._wrap((actual) => this._check(typeof actual === "number", "Expected value to be a number")); }
   toBeBoolean() { return this._wrap((actual) => this._check(typeof actual === "boolean", "Expected value to be a boolean")); }
   toBeSymbol() { return this._wrap((actual) => this._check(typeof actual === "symbol", "Expected value to be a symbol")); }
   toBeDate() { return this._wrap((actual) => this._check(actual instanceof Date, "Expected value to be a Date")); }
   toBeValidDate() { return this._wrap((actual) => this._check(actual instanceof Date && !Number.isNaN(actual.getTime()), "Expected valid Date")); }
   toBeInteger() { return this._wrap((actual) => this._check(Number.isInteger(actual), "Expected integer")); }
-  toBeEven() { return this._wrap((actual) => this._check(Number(actual) % 2 === 0, "Expected even number")); }
-  toBeOdd() { return this._wrap((actual) => this._check(Math.abs(Number(actual) % 2) === 1, "Expected odd number")); }
-  toBePositive() { return this._wrap((actual) => this._check(Number(actual) > 0, "Expected positive number")); }
-  toBeNegative() { return this._wrap((actual) => this._check(Number(actual) < 0, "Expected negative number")); }
+  toBeEven() {
+    return this._wrap((actual) => {
+      const pass = typeof actual === "bigint"
+        ? actual % 2n === 0n
+        : typeof actual === "number" && Number.isInteger(actual) && actual % 2 === 0;
+      this._check(pass, "Expected even number");
+    });
+  }
+  toBeOdd() {
+    return this._wrap((actual) => {
+      const pass = typeof actual === "bigint"
+        ? actual % 2n !== 0n
+        : typeof actual === "number" && Number.isInteger(actual) && Math.abs(actual % 2) === 1;
+      this._check(pass, "Expected odd number");
+    });
+  }
+  toBePositive() {
+    return this._wrap((actual) => this._check(
+      typeof actual === "number" && Number.isFinite(actual) && Math.round(actual) > 0,
+      "Expected positive number",
+    ));
+  }
+  toBeNegative() {
+    return this._wrap((actual) => this._check(
+      typeof actual === "number" && Number.isFinite(actual) && Math.round(actual) < 0,
+      "Expected negative number",
+    ));
+  }
   toBeGreaterThan(expected) { return this._wrap((actual) => this._check(actual > expected, `Expected > ${expected}`)); }
   toBeGreaterThanOrEqual(expected) { return this._wrap((actual) => this._check(actual >= expected, `Expected >= ${expected}`)); }
   toBeLessThan(expected) { return this._wrap((actual) => this._check(actual < expected, `Expected < ${expected}`)); }
   toBeLessThanOrEqual(expected) { return this._wrap((actual) => this._check(actual <= expected, `Expected <= ${expected}`)); }
   toBeCloseTo(expected, precision = 2) { return this._wrap((actual) => this._check(Math.abs(Number(actual) - Number(expected)) < 10 ** -Number(precision) / 2, `Expected close to ${expected}`)); }
-  toBeWithin(min, max) { return this._wrap((actual) => this._check(Number(actual) >= Number(min) && Number(actual) <= Number(max), `Expected within ${min}..${max}`)); }
+  toBeWithin(min, max) {
+    if (arguments.length < 2) throw new TypeError("toBeWithin() requires 2 arguments");
+    if (typeof min !== "number") throw new TypeError("toBeWithin() requires the first argument to be a number");
+    if (typeof max !== "number") throw new TypeError("toBeWithin() requires the second argument to be a number");
+    return this._wrap((actual) => this._check(
+      typeof actual === "number" && actual >= min && actual < max,
+      `Expected within ${min}..${max}`,
+    ));
+  }
   toBeOneOf(values) { return this._wrap((actual) => this._check(Array.from(values ?? []).some((value) => Object.is(value, actual)), "Expected one of values")); }
 
   toContain(expected) {
@@ -911,17 +1004,29 @@ class Expectation {
   toContainEqual(expected) { return this.toContain(expected); }
   toInclude(expected) { return this.toContain(expected); }
   toIncludeRepeated(expected, count = 1) {
+    if (arguments.length < 2) throw new TypeError("toIncludeRepeated() requires 2 arguments");
+    if (typeof expected !== "string") throw new TypeError("toIncludeRepeated() requires the first argument to be a string");
+    if (!Number.isInteger(count) || count < 0 || count > 0xffffffff || Object.is(count, -0)) {
+      throw new TypeError("toIncludeRepeated() requires the second argument to be a number");
+    }
+    if (expected.length === 0) throw new TypeError("toIncludeRepeated() requires the first argument to be a non-empty string");
     return this._wrap((actual) => {
-      const text = String(actual);
-      const needle = String(expected);
-      const occurrences = needle === "" ? 0 : text.split(needle).length - 1;
-      this._check(occurrences === Number(count), `Expected ${needle} to occur ${count} times`);
+      if (typeof actual !== "string") throw new TypeError("toIncludeRepeated() requires the expect(value) to be a string");
+      const occurrences = actual.split(expected).length - 1;
+      this._check(occurrences === count, `Expected ${expected} to occur ${count} times`);
     });
   }
   toStartWith(expected) { return this._wrap((actual) => this._check(String(actual).startsWith(String(expected)), `Expected to start with ${expected}`)); }
   toEndWith(expected) { return this._wrap((actual) => this._check(String(actual).endsWith(String(expected)), `Expected to end with ${expected}`)); }
   toMatch(expected) { return this._wrap((actual) => this._check(expected instanceof RegExp ? expected.test(String(actual)) : String(actual).includes(String(expected)), `Expected to match ${expected}`)); }
-  toEqualIgnoringWhitespace(expected) { return this._wrap((actual) => this._check(String(actual).replace(/\s+/g, "") === String(expected).replace(/\s+/g, ""), "Expected equal ignoring whitespace")); }
+  toEqualIgnoringWhitespace(expected) {
+    if (arguments.length < 1) throw new TypeError("toEqualIgnoringWhitespace() requires 1 argument");
+    if (typeof expected !== "string") throw new TypeError("toEqualIgnoringWhitespace() requires argument to be a string");
+    return this._wrap((actual) => {
+      if (typeof actual !== "string") throw new TypeError("toEqualIgnoringWhitespace() requires argument to be a string");
+      this._check(actual.replace(/\s+/g, "") === expected.replace(/\s+/g, ""), "Expected equal ignoring whitespace");
+    });
+  }
   toHaveLength(length) {
     return this._wrap((actual) => {
       const actualLength = actual?.length ?? (actual instanceof ArrayBuffer || ArrayBuffer.isView(actual) ? actual.byteLength : undefined);
@@ -1032,9 +1137,26 @@ class Expectation {
       this._check(inlineSnapshotMatches(received, wanted), `Expected value to match inline snapshot\nExpected: ${JSON.stringify(wanted)}\nReceived: ${JSON.stringify(received)}`);
     });
   }
-  pass() { return this._check(true, ""); }
-  fail(message = "Explicit failure") { return this._check(false, String(message)); }
-  toSatisfy(predicate) { return this._wrap((actual) => this._check(predicate(actual) === true, "Expected predicate to pass")); }
+  pass(message = "passes by .pass() assertion") {
+    if (arguments.length > 0 && typeof message !== "string") throw new TypeError("Expected message to be a string for 'pass'.");
+    return this._check(true, message);
+  }
+  fail(message = "fails by .fail() assertion") {
+    if (arguments.length > 0 && typeof message !== "string") throw new TypeError("Expected message to be a string for 'fail'.");
+    return this._check(false, message);
+  }
+  toSatisfy(predicate) {
+    if (typeof predicate !== "function") throw new TypeError("toSatisfy() argument must be a function");
+    return this._wrap((actual) => {
+      let result;
+      try {
+        result = predicate(actual);
+      } catch (error) {
+        throw new AggregateError([error], "toSatisfy() predicate threw an exception");
+      }
+      this._check(result === true, "Expected predicate to pass");
+    });
+  }
 
   // Bun's upstream test/harness.ts registers toRun via expect.extend from a
   // bunfig preload; Cottontail provides it natively: spawn our own binary
@@ -1152,26 +1274,90 @@ export function expect(actual, label = undefined) {
 }
 
 function installCustomMatchers(matchers = {}) {
-  for (const [name, matcher] of Object.entries(matchers)) {
-    if (typeof matcher !== "function") {
-      throw new TypeError(`expect.extend: \`${name}\` is not a valid matcher. Must be a function, is "${typeof matcher}"`);
+  const entries = [];
+  const seen = new Set();
+  for (let object = matchers; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
+    for (const name of Reflect.ownKeys(object)) {
+      if (typeof name !== "string" || name === "constructor" || seen.has(name)) continue;
+      seen.add(name);
+      entries.push([name, matchers[name]]);
     }
-    expect[name] = (...args) => ({ __expectMatcher: "custom", matcher, args });
+  }
+  for (const [name, matcher] of entries) {
+    if (typeof matcher !== "function") {
+      const type = matcher === null ? "null" : typeof matcher;
+      throw new TypeError(`expect.extend: \`${name}\` is not a valid matcher. Must be a function, is "${type}"`);
+    }
+    expect[name] = (...args) => customAsymmetricMatcher(name, matcher, args, false);
+    expect.not[name] = (...args) => customAsymmetricMatcher(name, matcher, args, true);
     Object.defineProperty(Expectation.prototype, name, {
       configurable: true,
       value: function customMatcher(...args) {
         return this._wrap((actual) => {
           const finish = (result) => {
-            const pass = Boolean(result?.pass);
-            const message = typeof result?.message === "function" ? result.message() : `Expected custom matcher ${name} to pass`;
-            this._check(pass, message);
+            const parsed = customMatcherResult(name, result);
+            this._check(parsed.pass, () => customMatcherMessage(parsed));
+            return this;
           };
-          const result = matcher.call({ isNot: this._negate, equals: deepEqual }, actual, ...args);
-          return isPromiseLike(result) ? result.then(finish) : finish(result);
+          const result = invokeCustomMatcher(name, matcher, this._negate, actual, args, this._promiseMode);
+          return isPromiseLike(result) ? Promise.resolve(result).then(finish) : finish(result);
         });
       },
     });
   }
+}
+
+const matcherUtils = {
+  stringify: (value) => formatValue(value),
+  printExpected: (value) => formatValue(value),
+  printReceived: (value) => formatValue(value),
+  EXPECTED_COLOR: (value) => String(value),
+  RECEIVED_COLOR: (value) => String(value),
+  matcherHint: (name, received = "received", expected = "expected", options = {}) =>
+    `expect(${received})${options?.isNot ? ".not" : ""}.${String(name)}(${expected})`,
+};
+
+function customMatcherContext(isNot, promiseMode = null) {
+  return {
+    equals: (actual, expected) => matchesExpected(actual, expected),
+    expand: false,
+    isNot: Boolean(isNot),
+    promise: promiseMode ?? "",
+    utils: matcherUtils,
+  };
+}
+
+function invokeCustomMatcher(_name, matcher, isNot, actual, args, promiseMode = null) {
+  return matcher.call(customMatcherContext(isNot, promiseMode), actual, ...args);
+}
+
+function customMatcherResult(name, result) {
+  const validObject = result !== null && typeof result === "object";
+  const hasPass = validObject && "pass" in result;
+  const message = validObject ? result.message : undefined;
+  if (!hasPass || (message !== undefined && typeof message !== "string" && typeof message !== "function")) {
+    throw new Error(
+      `Unexpected return from matcher function \`${name}\`.\n` +
+      "Matcher functions should return an object in the following format:\n" +
+      "  {message?: string | function, pass: boolean}\n" +
+      `'${formatValue(result)}' was returned`,
+    );
+  }
+  return { pass: Boolean(result.pass), message };
+}
+
+function customMatcherMessage(result) {
+  if (result.message === undefined) return "No message was specified for this matcher.";
+  return typeof result.message === "function" ? result.message() : result.message;
+}
+
+function customAsymmetricMatcher(name, matcher, args, negate) {
+  const result = { __expectMatcher: "custom", name, matcher, args, negate };
+  result.asymmetricMatch = (actual) => asymmetricMatch(actual, result);
+  result.toAsymmetricMatcher = (...values) => typeof matcher.toAsymmetricMatcher === "function"
+    ? matcher.toAsymmetricMatcher(...values)
+    : name;
+  return result;
 }
 
 expect.any = (type) => ({ __expectMatcher: "any", type });
@@ -1697,6 +1883,10 @@ function makeBunTestFunction(base) {
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, requireCallback) : result;
     result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, requireCallback) : result;
     result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, requireCallback);
+    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, requireCallback) });
+    Object.defineProperty(result, "failing", { get: () => variant({ ...extraOptions, failing: true }, true) });
+    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, requireCallback) });
+    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, requireCallback) });
     Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, requireCallback) });
     Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, requireCallback) });
     return result;
@@ -1733,6 +1923,9 @@ function makeBunDescribe(base) {
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;
     result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }) : result;
     result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true });
+    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }) });
+    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }) });
+    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }) });
     Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }) });
     Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }) });
     return result;

@@ -1,5 +1,6 @@
 import {
   describe as jscDescribe,
+  jscDescribe as describeJscValue,
   describeArray,
   drainMicrotasks,
   estimateShallowMemoryUsageOf,
@@ -38,6 +39,13 @@ assert(memoryUsage().current > 0 && memoryUsage().peak > 0, "bun:jsc memoryUsage
 assert(percentAvailableMemoryInUse() >= 0, "bun:jsc percentAvailableMemoryInUse mismatch");
 assert(estimateShallowMemoryUsageOf(new Uint8Array(4)) === 4, "bun:jsc shallow size mismatch");
 assert(jscDescribe({ a: 1 }).includes("a"), "bun:jsc describe mismatch");
+const utf16Data = new DataView(new ArrayBuffer(6));
+utf16Data.setUint16(0, 49, true);
+utf16Data.setUint16(2, 50, true);
+utf16Data.setUint16(4, 51, true);
+const utf16String = new TextDecoder("utf-16le").decode(utf16Data);
+assert(describeJscValue("123").includes("8Bit:(1)"), "bun:jsc 8-bit string description mismatch");
+assert(describeJscValue(utf16String).includes("8Bit:(0)"), "bun:jsc 16-bit string description mismatch");
 assert(describeArray([1, "a"]).length === 2, "bun:jsc describeArray mismatch");
 setRandomSeed(123);
 assert(getRandomSeed() === 123, "bun:jsc random seed mismatch");

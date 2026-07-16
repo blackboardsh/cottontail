@@ -25,6 +25,8 @@ const File = globalThis.File;
 class Headers extends WebHeaders {
   raw() {
     const obj = this.toJSON();
+    const setCookies = this.getSetCookie?.() ?? [];
+    if (setCookies.length > 0) obj["set-cookie"] = setCookies;
     for (const key in obj) {
       const val = obj[key];
       if (!Array.isArray(val)) {
@@ -111,21 +113,25 @@ function retagHeaders(response) {
   return response;
 }
 
-const kUrl = Symbol("kUrl");
+const requestUrls = new WeakMap();
 
 class Request extends WebRequest {
   constructor(input, init) {
     // node-fetch is relaxed with the URL: it allows "/" as a valid URL.
     if (typeof input === "string" && !URL.canParse(input)) {
       super(new URL(input, "http://localhost/"), init);
-      this[kUrl] = input;
+      requestUrls.set(this, input);
     } else {
       super(input, init);
     }
   }
 
   get url() {
-    return this[kUrl] ?? super.url;
+    return requestUrls.get(this) ?? super.url;
+  }
+
+  set url(value) {
+    requestUrls.set(this, String(value));
   }
 }
 
@@ -193,6 +199,23 @@ const nodeFetch = Object.assign(fetch, {
   default: fetch,
 });
 
+export {
+  AbortError,
+  Blob,
+  FetchBaseError,
+  FetchError,
+  File,
+  BunFormData as FormData,
+  Headers,
+  Request,
+  Response,
+  blobFrom,
+  blobFromSync,
+  fetch,
+  fileFrom,
+  fileFromSync,
+  isRedirect,
+};
 export default nodeFetch;
 
 // --- isomorphic-fetch ---------------------------------------------------

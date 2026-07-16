@@ -279,6 +279,7 @@ const waitResult = await waitResultPromise;
 assert(waitResult.result === "ok", "worker Atomics.wait should return ok after notify");
 assert(Atomics.notify(waitView, 0, 1) === 0, "Atomics.notify should not count completed waiters");
 
+assert(typeof worker[Symbol.asyncDispose] === "function", "Worker asyncDispose mismatch");
 assert(await worker.terminate() === 0, "Worker terminate mismatch");
 
 console.log("node worker_threads surface passed");

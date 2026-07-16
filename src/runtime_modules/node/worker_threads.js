@@ -515,6 +515,10 @@ export class Worker extends EventEmitter {
     return Promise.resolve(0);
   }
 
+  async [Symbol.asyncDispose]() {
+    await this.terminate();
+  }
+
   ref() { return this; }
   unref() { return this; }
 

@@ -3391,6 +3391,7 @@ fn NewPrinter(
                                 if (func.func.flags.contains(.is_async)) {
                                     p.printSpaceBeforeIdentifier();
                                     p.print("async");
+                                    if (!func.func.flags.contains(.is_generator)) p.printSpace();
                                 }
 
                                 if (func.func.flags.contains(.is_generator)) {

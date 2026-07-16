@@ -76,6 +76,41 @@ pub fn VisitExpr(
                     }
                 }
 
+                if (p.options.inline_import_meta_properties and in.assign_target == .none and !in.is_property_access_target) {
+                    const properties = bun.handleOom(p.allocator.alloc(G.Property, 7));
+                    const global_this = p.newExpr(E.Identifier{
+                        .ref = (p.findSymbol(expr.loc, "globalThis") catch unreachable).ref,
+                    }, expr.loc);
+                    properties[0] = .{
+                        .kind = .spread,
+                        .value = p.newExpr(E.Dot{
+                            .target = global_this,
+                            .name = "__cottontailImportMeta",
+                            .name_loc = expr.loc,
+                        }, expr.loc),
+                    };
+
+                    const import_meta_path = p.pathForImportMeta();
+                    const dir = import_meta_path.name.dir;
+                    const file = import_meta_path.name.filename;
+                    const path = import_meta_path.text;
+                    const path_string = bun.String.fromBytes(path);
+                    defer path_string.deref();
+                    const url = std.fmt.allocPrint(p.allocator, "{f}", .{jsc.URL.fileURLFromString(path_string)}) catch unreachable;
+
+                    const names = [_][]const u8{ "dir", "dirname", "file", "path", "filename", "url" };
+                    const values = [_][]const u8{ dir, dir, file, path, path, url };
+                    for (names, values, 1..) |name, value, index| {
+                        properties[index] = .{
+                            .key = p.newExpr(E.String.init(name), expr.loc),
+                            .value = p.newExpr(E.String.init(value), expr.loc),
+                        };
+                    }
+                    return p.newExpr(E.Object{
+                        .properties = G.Property.List.fromOwnedSlice(properties),
+                    }, expr.loc);
+                }
+
                 return expr;
             }
             pub fn e_spread(p: *P, expr: Expr, _: ExprIn) Expr {
@@ -547,6 +582,7 @@ pub fn VisitExpr(
 
                 const target_visited = p.visitExprInOut(e_.target, ExprIn{
                     .has_chain_parent = e_.optional_chain == .continuation,
+                    .is_property_access_target = true,
                 });
                 e_.target = target_visited;
 
@@ -875,6 +911,7 @@ pub fn VisitExpr(
 
                 e_.target = p.visitExprInOut(e_.target, .{
                     .property_access_for_method_call_maybe_should_replace_with_undefined = in.property_access_for_method_call_maybe_should_replace_with_undefined,
+                    .is_property_access_target = true,
                 });
 
                 // 'require.resolve' -> .e_require_resolve_call_target
@@ -1688,6 +1725,12 @@ pub fn VisitExpr(
                     e_.class_name = null;
                 }
 
+                if (e_.class_name) |name| {
+                    if (name.ref) |ref| {
+                        return p.keepExprSymbolName(expr, p.symbols.items[ref.innerIndex()].original_name);
+                    }
+                }
+
                 return expr;
             }
 
@@ -1759,6 +1802,7 @@ var jsxChildrenKeyData = Expr.Data{ .e_string = &Prefill.String.Children };
 const string = []const u8;
 
 const bun = @import("bun");
+const jsc = bun.jsc;
 const Environment = bun.Environment;
 const Output = bun.Output;
 const assert = bun.assert;

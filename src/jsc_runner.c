@@ -9,6 +9,20 @@
 
 #include <JavaScriptCore/JavaScript.h>
 
+#ifndef COTTONTAIL_VERSION
+#define COTTONTAIL_VERSION "0.0.0-cottontail"
+#endif
+
+extern bool ct_jsc_string_is_8_bit(JSStringRef string);
+extern void ct_jsc_run_loop_cycle(void);
+extern void ct_jsc_drain_microtasks(JSContextRef context);
+extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
+extern void ct_jsc_microtask_delay_end(void *opaque_scope);
+extern int ct_jsc_promise_status(JSValueRef value);
+extern JSValueRef ct_jsc_promise_result(JSValueRef value);
+extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
+extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
+
 /* These stable C APIs are exported by JSCOnly but are not installed in its
  * public headers. Keep the bridge here instead of depending on JSC internals. */
 extern bool JSContextGroupEnableSamplingProfiler(JSContextGroupRef group);
@@ -843,6 +857,7 @@ extern uint8_t *ct_markdown_render_html(const uint8_t *source_ptr, size_t source
 extern uint8_t *ct_markdown_parse_events(const uint8_t *source_ptr, size_t source_len, uint64_t flags, size_t *output_len, char **error_out);
 extern void ct_markdown_free(uint8_t *ptr, size_t len);
 extern void ct_markdown_string_free(char *ptr);
+extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
@@ -850,7 +865,6 @@ extern void ct_markdown_string_free(char *ptr);
 #include <CommonCrypto/CommonHMAC.h>
 #include <mach-o/dyld.h>
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
-extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 #endif
 
 #if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>) && __has_include(<openssl/ssl.h>) && __has_include(<openssl/err.h>)
@@ -1168,10 +1182,19 @@ typedef struct CtAsyncProcess {
     int stdout_fd;
     int stderr_fd;
     int ipc_fd;
+    bool close_stdout_requested;
+    bool close_stderr_requested;
     CtJscRuntime *runtime;
     pthread_t thread;
+    bool thread_started;
 #if defined(_WIN32)
     HANDLE process_handle;
+    HANDLE wake_event;
+    HANDLE start_thread;
+#else
+    int wake_read_fd;
+    int wake_write_fd;
+    int start_gate_fd;
 #endif
     struct CtAsyncProcess *next;
 } CtAsyncProcess;
@@ -1412,6 +1435,9 @@ struct CtJscRuntime {
     JSObjectRef spawn_event_handler;
     JSObjectRef fd_event_handler;
     JSObjectRef worker_event_handler;
+    pthread_mutex_t wake_mutex;
+    pthread_cond_t wake_cond;
+    bool wake_pending;
     pthread_mutex_t spawn_event_mutex;
     CtSpawnEvent *spawn_events_head;
     CtSpawnEvent *spawn_events_tail;
@@ -1438,7 +1464,35 @@ struct CtJscRuntime {
     uint64_t next_timer_id;
     size_t referenced_timer_count;
     size_t protected_timer_count;
+    bool next_tick_pending;
+    bool next_tick_priority_armed;
 };
+
+static void ct_runtime_wake(CtJscRuntime *runtime) {
+    if (runtime == NULL) return;
+    pthread_mutex_lock(&runtime->wake_mutex);
+    runtime->wake_pending = true;
+    pthread_cond_signal(&runtime->wake_cond);
+    pthread_mutex_unlock(&runtime->wake_mutex);
+}
+
+static void ct_runtime_wait(CtJscRuntime *runtime, int delay_ms) {
+    if (runtime == NULL || delay_ms <= 0) return;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += delay_ms / 1000;
+    deadline.tv_nsec += (long)(delay_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+    pthread_mutex_lock(&runtime->wake_mutex);
+    if (!runtime->wake_pending) {
+        (void)pthread_cond_timedwait(&runtime->wake_cond, &runtime->wake_mutex, &deadline);
+    }
+    runtime->wake_pending = false;
+    pthread_mutex_unlock(&runtime->wake_mutex);
+}
 
 static int ct_jsc_runtime_eval_internal(
     CtJscRuntime *runtime,
@@ -2377,7 +2431,12 @@ static char *ct_copy_exception(JSContextRef ctx, JSValueRef exception) {
         "var head='';"
         "if(e&&e.message)head=(e.name?String(e.name):'Error')+': '+String(e.message);"
         "if(e&&e.stack){var stack=String(e.stack);return head&&stack.indexOf(head)<0?head+'\\n'+stack:stack;}"
-        "if(head)return head;"
+        "if(head){"
+        "var source=e&&(e.sourceURL||e.fileName);"
+        "var line=e&&(e.line||e.lineNumber);"
+        "var column=e&&(e.column||e.columnNumber);"
+        "if(source||line)return head+'\\n at '+(source?String(source):'<script>')+(line?':'+String(line):'')+(column?':'+String(column):'');"
+        "return head;}"
         "return String(e);}"
         "catch(_){return 'Unknown JavaScript exception';}"
         "})"
@@ -3167,6 +3226,76 @@ static JSValueRef ct_crypto_hmac_sync(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeUndefined(ctx);
 #endif
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, algorithm->output_len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_crypto_pbkdf2_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 5) {
+        ct_throw_message(ctx, exception, "cottontail.cryptoPbkdf2Sync(algorithm, password, salt, iterations, keyLength) requires five arguments");
+        return JSValueMakeUndefined(ctx);
+    }
+
+#if CT_HAS_OPENSSL
+    char *algorithm_name = ct_value_to_string_copy(ctx, argv[0]);
+    uint8_t *password = NULL;
+    size_t password_len = 0;
+    uint8_t *salt = NULL;
+    size_t salt_len = 0;
+    if (algorithm_name == NULL ||
+        ct_get_bytes(ctx, argv[1], &password, &password_len) != 0 ||
+        ct_get_bytes(ctx, argv[2], &salt, &salt_len) != 0) {
+        free(algorithm_name);
+        ct_throw_message(ctx, exception, "PBKDF2 password and salt must be ArrayBuffers or typed arrays");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (password_len > INT_MAX || salt_len > INT_MAX) {
+        free(algorithm_name);
+        ct_throw_message(ctx, exception, "PBKDF2 input is too large");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const double iterations_number = ct_value_to_number(ctx, argv[3]);
+    const double output_len_number = ct_value_to_number(ctx, argv[4]);
+    if (iterations_number < 1 || iterations_number > INT_MAX || output_len_number < 0 || output_len_number > INT_MAX) {
+        free(algorithm_name);
+        ct_throw_message(ctx, exception, "PBKDF2 parameters are out of range");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const EVP_MD *md = EVP_get_digestbyname(algorithm_name);
+    free(algorithm_name);
+    if (md == NULL || EVP_MD_get_size(md) <= 0 || (EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
+        ct_throw_message(ctx, exception, "PBKDF2 digest is not available");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    const int output_len = (int)output_len_number;
+    uint8_t *output = (uint8_t *)malloc(output_len > 0 ? (size_t)output_len : 1);
+    if (output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    const int ok = PKCS5_PBKDF2_HMAC(
+        (const char *)password,
+        (int)password_len,
+        salt,
+        (int)salt_len,
+        (int)iterations_number,
+        md,
+        output_len,
+        output
+    );
+    if (ok != 1) {
+        free(output);
+        ct_throw_message(ctx, exception, "PBKDF2 operation failed");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, (size_t)output_len, ct_array_buffer_free, NULL, exception);
+#else
+    ct_throw_message(ctx, exception, "Native PBKDF2 is not available on this platform");
+    return JSValueMakeUndefined(ctx);
+#endif
 }
 
 static JSValueRef ct_crypto_argon2_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -5023,6 +5152,27 @@ static JSValueRef ct_icu_decode(JSContextRef ctx, JSObjectRef function, JSObject
     JSStringRelease(text);
     return result;
 #endif
+}
+
+// Preserve UTF-16 storage even when every code unit fits in Latin-1. Bun's
+// TextDecoder exposes that distinction through bun:jsc.jscDescribe().
+static JSValueRef ct_string_from_utf16(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.stringFromUtf16 requires a Uint16Array");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *bytes = NULL;
+    size_t byte_len = 0;
+    if (ct_get_bytes(ctx, argv[0], &bytes, &byte_len) != 0 || byte_len % sizeof(uint16_t) != 0) {
+        ct_throw_message(ctx, exception, "cottontail.stringFromUtf16 requires a Uint16Array");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSStringRef text = JSStringCreateWithCharacters((const JSChar *)bytes, byte_len / sizeof(uint16_t));
+    JSValueRef result = JSValueMakeString(ctx, text);
+    JSStringRelease(text);
+    return result;
 }
 
 #if defined(__APPLE__)
@@ -7410,17 +7560,12 @@ static JSValueRef ct_timer_schedule(JSContextRef ctx, JSObjectRef function, JSOb
         id = runtime->next_timer_id++;
     }
 
-    CtTimer *timer = ct_timer_lookup(runtime, id);
-    if (timer != NULL && timer->firing && timer->repeat_ns > 0) {
-        timer->refreshed_while_firing = true;
-        return JSValueMakeNumber(ctx, (double)id);
-    }
-
     uint64_t delay_ns = ct_timer_ms_to_ns(delay_ms);
     uint64_t repeat_ns = ct_timer_ms_to_ns(repeat_ms);
     uint64_t now = ct_timer_now_ns();
     uint64_t deadline = delay_ns > UINT64_MAX - now ? UINT64_MAX : now + delay_ns;
 
+    CtTimer *timer = ct_timer_lookup(runtime, id);
     if (timer != NULL) {
         if (timer->referenced != referenced) {
             if (referenced) runtime->referenced_timer_count += 1;
@@ -7430,6 +7575,7 @@ static JSValueRef ct_timer_schedule(JSContextRef ctx, JSObjectRef function, JSOb
         timer->deadline_ns = deadline;
         timer->repeat_ns = repeat_ns;
         timer->immediate = kind == 2;
+        if (timer->firing) timer->refreshed_while_firing = true;
         ct_timer_heap_update(runtime, timer);
     } else {
         if (!ct_timer_id_reserve(runtime, id) || !ct_timer_heap_reserve(runtime, runtime->timer_heap_len + 1)) {
@@ -7518,6 +7664,61 @@ static JSValueRef ct_timer_has_active(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeBoolean(ctx, runtime != NULL && runtime->referenced_timer_count > 0);
 }
 
+static bool ct_handle_uncaught_exception(JSContextRef ctx, JSValueRef thrown, JSValueRef *exception_out) {
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef lookup_exception = NULL;
+    JSValueRef handler = ct_get_property(ctx, global, "__cottontailHandleUncaughtException", &lookup_exception);
+    if (lookup_exception != NULL) {
+        *exception_out = lookup_exception;
+        return false;
+    }
+    if (handler == NULL || !JSValueIsObject(ctx, handler) || !JSObjectIsFunction(ctx, (JSObjectRef)handler)) {
+        *exception_out = thrown;
+        return false;
+    }
+    JSValueRef call_exception = NULL;
+    JSValueRef result = JSObjectCallAsFunction(ctx, (JSObjectRef)handler, global, 1, &thrown, &call_exception);
+    if (call_exception != NULL) {
+        *exception_out = call_exception;
+        return false;
+    }
+    *exception_out = NULL;
+    return result != NULL && JSValueToBoolean(ctx, result);
+}
+
+static int ct_drain_next_ticks(CtJscRuntime *runtime, bool begin_turn, char **error_out) {
+    if (!runtime->next_tick_pending && (!begin_turn || runtime->next_tick_priority_armed)) return 0;
+    JSContextRef ctx = runtime->context;
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef exception = NULL;
+    JSValueRef callback = ct_get_property(ctx, global, "__cottontailDrainNextTicks", &exception);
+    if (exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+        return -1;
+    }
+    if (callback == NULL || !JSValueIsObject(ctx, callback) || !JSObjectIsFunction(ctx, (JSObjectRef)callback)) return 0;
+
+    JSValueRef argument = JSValueMakeBoolean(ctx, begin_turn);
+    JSObjectCallAsFunction(ctx, (JSObjectRef)callback, global, 1, &argument, &exception);
+    if (exception == NULL) return 0;
+
+    JSValueRef thrown = exception;
+    if (ct_handle_uncaught_exception(ctx, thrown, &exception)) return 0;
+    ct_set_error_out(error_out, ct_copy_exception(ctx, exception != NULL ? exception : thrown));
+    return -1;
+}
+
+static JSValueRef ct_next_tick_state(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)exception;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime != NULL) {
+        runtime->next_tick_pending = argc > 0 && JSValueToBoolean(ctx, argv[0]);
+        runtime->next_tick_priority_armed = argc > 1 && JSValueToBoolean(ctx, argv[1]);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
 static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
     if (runtime->timer_heap_len == 0) return 0;
     uint64_t now = ct_timer_now_ns();
@@ -7536,6 +7737,7 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
     }
 
     JSContextRef ctx = runtime->context;
+    void *microtask_delay_scope = NULL;
     for (size_t index = 0; index < due_count; index += 1) {
         CtTimer *timer = due[index];
         if (!timer->active) {
@@ -7548,10 +7750,12 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
         bool repeats = timer->repeat_ns > 0;
         JSObjectRef handle = timer->handle;
         JSValueProtect(ctx, handle);
-        if (!repeats) ct_timer_deactivate(timer, false);
+        if (microtask_delay_scope == NULL) {
+            microtask_delay_scope = ct_jsc_microtask_delay_begin(JSContextGetGroup(ctx));
+        }
 
         JSValueRef exception = NULL;
-        JSValueRef callback_value = ct_get_property(ctx, handle, "__onTimeout", &exception);
+        JSValueRef callback_value = ct_get_property(ctx, handle, "__invokeTimeout", &exception);
         if (exception == NULL && callback_value != NULL && JSValueIsObject(ctx, callback_value) &&
             JSObjectIsFunction(ctx, (JSObjectRef)callback_value)) {
             JSValueRef args_value = ct_get_property(ctx, handle, "__args", &exception);
@@ -7595,27 +7799,51 @@ static int ct_dispatch_timers(CtJscRuntime *runtime, char **error_out) {
             }
         }
 
-        if (repeats && timer->active) {
+        if (timer->active && (repeats || timer->refreshed_while_firing)) {
             timer->firing = false;
+            bool refreshed = timer->refreshed_while_firing;
             timer->refreshed_while_firing = false;
-            uint64_t next_deadline = callback_started_at > UINT64_MAX - timer->repeat_ns
-                ? UINT64_MAX
-                : callback_started_at + timer->repeat_ns;
-            timer->deadline_ns = next_deadline;
-            ct_timer_set_number(ctx, handle, "_idleStart", (double)callback_started_at / 1000000.0);
+            if (!refreshed) {
+                uint64_t next_deadline = callback_started_at > UINT64_MAX - timer->repeat_ns
+                    ? UINT64_MAX
+                    : callback_started_at + timer->repeat_ns;
+                timer->deadline_ns = next_deadline;
+                ct_timer_set_number(ctx, handle, "_idleStart", (double)callback_started_at / 1000000.0);
+            }
             ct_timer_heap_push(runtime, timer);
         } else {
+            if (timer->active) ct_timer_deactivate(timer, false);
             timer->firing = false;
-            if (!timer->active) free(timer);
+            free(timer);
         }
         JSValueUnprotect(ctx, handle);
 
         if (exception != NULL) {
+            JSValueRef thrown = exception;
+            if (ct_handle_uncaught_exception(ctx, thrown, &exception)) continue;
+            char *message = ct_copy_exception(ctx, exception != NULL ? exception : thrown);
+            if (microtask_delay_scope != NULL) {
+                ct_jsc_microtask_delay_end(microtask_delay_scope);
+                microtask_delay_scope = NULL;
+            }
             free(due);
-            ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+            ct_set_error_out(error_out, message);
             return -1;
         }
+        if (ct_drain_next_ticks(runtime, true, error_out) != 0) {
+            if (microtask_delay_scope != NULL) {
+                ct_jsc_microtask_delay_end(microtask_delay_scope);
+                microtask_delay_scope = NULL;
+            }
+            free(due);
+            return -1;
+        }
+        if (microtask_delay_scope != NULL) {
+            ct_jsc_microtask_delay_end(microtask_delay_scope);
+            microtask_delay_scope = NULL;
+        }
     }
+    if (microtask_delay_scope != NULL) ct_jsc_microtask_delay_end(microtask_delay_scope);
     free(due);
     return 0;
 }
@@ -7638,7 +7866,7 @@ static bool ct_timer_next_delay_ms(CtJscRuntime *runtime, int *delay_out) {
     uint64_t now = ct_timer_now_ns();
     uint64_t deadline = runtime->timer_heap[0]->deadline_ns;
     uint64_t remaining_ns = deadline > now ? deadline - now : 0;
-    uint64_t delay = remaining_ns == 0 ? 1 : (remaining_ns + 999999ULL) / 1000000ULL;
+    uint64_t delay = remaining_ns == 0 ? 0 : (remaining_ns + 999999ULL) / 1000000ULL;
     if (delay > 50) delay = 50;
     *delay_out = (int)delay;
     return true;
@@ -7716,8 +7944,18 @@ static JSValueRef ct_kill_process(JSContextRef ctx, JSObjectRef function, JSObje
         ct_throw_message(ctx, exception, "cottontail.kill(pid[, signal]) requires a process id");
         return JSValueMakeBoolean(ctx, false);
     }
-    pid_t pid = (pid_t)ct_value_to_number(ctx, argv[0]);
-    int signal_number = argc >= 2 ? (int)ct_value_to_number(ctx, argv[1]) : SIGTERM;
+    double pid_number = ct_value_to_number(ctx, argv[0]);
+    double signal_value = argc >= 2 ? ct_value_to_number(ctx, argv[1]) : SIGTERM;
+    if (!isfinite(pid_number) || trunc(pid_number) != pid_number || pid_number < INT_MIN || pid_number > INT_MAX) {
+        ct_throw_message(ctx, exception, "Invalid process id");
+        return JSValueMakeBoolean(ctx, false);
+    }
+    if (!isfinite(signal_value) || trunc(signal_value) != signal_value || signal_value < 0 || signal_value > INT_MAX) {
+        ct_throw_message(ctx, exception, "Invalid signal");
+        return JSValueMakeBoolean(ctx, false);
+    }
+    pid_t pid = (pid_t)pid_number;
+    int signal_number = (int)signal_value;
     if (kill(pid, signal_number) != 0) {
         ct_throw_message(ctx, exception, strerror(errno));
         return JSValueMakeBoolean(ctx, false);
@@ -10048,6 +10286,11 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
         return JSValueMakeUndefined(ctx);
     }
 
+    if (strcmp(kind, "version") == 0) {
+        free(kind);
+        return ct_make_string(ctx, COTTONTAIL_VERSION);
+    }
+
     if (strcmp(kind, "chdir") == 0) {
         char *path = argc >= 2 ? ct_value_to_string_copy(ctx, argv[1]) : NULL;
         if (path == NULL || chdir(path) != 0) ct_throw_message(ctx, exception, strerror(errno));
@@ -10152,10 +10395,22 @@ static JSValueRef ct_process_info(JSContextRef ctx, JSObjectRef function, JSObje
     if (strcmp(kind, "memoryUsage") == 0) {
         JSObjectRef result = ct_make_object(ctx);
         double rss = ct_current_rss_bytes();
+        double heap_total = 0;
+        double heap_used = 0;
+        double external = 0;
+        JSObjectRef statistics = JSGetMemoryUsageStatistics(ctx);
+        if (statistics != NULL) {
+            JSValueRef heap_capacity = ct_get_property(ctx, statistics, "heapCapacity", NULL);
+            JSValueRef heap_size = ct_get_property(ctx, statistics, "heapSize", NULL);
+            JSValueRef extra_memory = ct_get_property(ctx, statistics, "extraMemorySize", NULL);
+            if (heap_capacity != NULL && JSValueIsNumber(ctx, heap_capacity)) heap_total = JSValueToNumber(ctx, heap_capacity, NULL);
+            if (heap_size != NULL && JSValueIsNumber(ctx, heap_size)) heap_used = JSValueToNumber(ctx, heap_size, NULL);
+            if (extra_memory != NULL && JSValueIsNumber(ctx, extra_memory)) external = JSValueToNumber(ctx, extra_memory, NULL);
+        }
         ct_set_property(ctx, result, "rss", JSValueMakeNumber(ctx, rss), exception);
-        ct_set_property(ctx, result, "heapTotal", JSValueMakeNumber(ctx, 0), exception);
-        ct_set_property(ctx, result, "heapUsed", JSValueMakeNumber(ctx, 0), exception);
-        ct_set_property(ctx, result, "external", JSValueMakeNumber(ctx, 0), exception);
+        ct_set_property(ctx, result, "heapTotal", JSValueMakeNumber(ctx, heap_total), exception);
+        ct_set_property(ctx, result, "heapUsed", JSValueMakeNumber(ctx, heap_used), exception);
+        ct_set_property(ctx, result, "external", JSValueMakeNumber(ctx, external), exception);
         ct_set_property(ctx, result, "arrayBuffers", JSValueMakeNumber(ctx, 0), exception);
         free(kind);
         return result;
@@ -10884,6 +11139,7 @@ static void ct_enqueue_callback_job(CtJscRuntime *runtime, CtFfiCallbackJob *job
     }
     runtime->callback_jobs_tail = job;
     pthread_mutex_unlock(&runtime->callback_mutex);
+    ct_runtime_wake(runtime);
 }
 
 static bool ct_runtime_has_live_callbacks(CtJscRuntime *runtime) {
@@ -11912,12 +12168,27 @@ static JSValueRef ct_write_file(JSContextRef ctx, JSObjectRef function, JSObject
     return JSValueMakeUndefined(ctx);
 }
 
+static bool ct_env_is_synthesized_cf_user_text_encoding(const char *name, const char *value) {
+#if defined(__APPLE__) || defined(__MACH__)
+    if (name == NULL || value == NULL || strcmp(name, "__CF_USER_TEXT_ENCODING") != 0) return false;
+    if (value[0] != '0' || (value[1] != 'x' && value[1] != 'X')) return false;
+    char *end = NULL;
+    unsigned long encoded_uid = strtoul(value + 2, &end, 16);
+    return end != value + 2 && end != NULL && *end == ':' && encoded_uid == (unsigned long)getuid();
+#else
+    (void)name;
+    (void)value;
+    return false;
+#endif
+}
+
 static JSValueRef ct_env(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
     if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0])) {
         char *name = ct_value_to_string_copy(ctx, argv[0]);
         const char *value = name != NULL ? getenv(name) : NULL;
+        if (ct_env_is_synthesized_cf_user_text_encoding(name, value)) value = NULL;
         free(name);
         return value != NULL ? ct_make_string(ctx, value) : JSValueMakeUndefined(ctx);
     }
@@ -11927,6 +12198,10 @@ static JSValueRef ct_env(JSContextRef ctx, JSObjectRef function, JSObjectRef thi
         if (equals == NULL) continue;
         char *name = ct_duplicate_bytes(*entry, (size_t)(equals - *entry));
         if (name == NULL) continue;
+        if (ct_env_is_synthesized_cf_user_text_encoding(name, equals + 1)) {
+            free(name);
+            continue;
+        }
         ct_set_property(ctx, env, name, ct_make_string(ctx, equals + 1), exception);
         free(name);
         if (exception != NULL && *exception != NULL) return env;
@@ -12411,6 +12686,7 @@ static void ct_queue_spawn_event(CtJscRuntime *runtime, CtSpawnEvent *event) {
     }
     runtime->spawn_events_tail = event;
     pthread_mutex_unlock(&runtime->spawn_event_mutex);
+    ct_runtime_wake(runtime);
 }
 
 static void ct_queue_spawn_text(CtJscRuntime *runtime, uint32_t id, const char *type, const char *data, size_t data_len) {
@@ -12455,6 +12731,7 @@ static void ct_queue_fd_event(CtJscRuntime *runtime, CtFdEvent *event) {
     }
     runtime->fd_events_tail = event;
     pthread_mutex_unlock(&runtime->fd_event_mutex);
+    ct_runtime_wake(runtime);
 }
 
 static void ct_queue_worker_event(CtJscRuntime *runtime, uint32_t worker_id, const char *type) {
@@ -12471,6 +12748,7 @@ static void ct_queue_worker_event(CtJscRuntime *runtime, uint32_t worker_id, con
     }
     runtime->worker_events_tail = event;
     pthread_mutex_unlock(&runtime->worker_event_mutex);
+    ct_runtime_wake(runtime);
 }
 
 static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len) {
@@ -12931,13 +13209,16 @@ static bool ct_windows_spawn_process(
     CtProcessStdioMode stdout_mode,
     CtProcessStdioMode stderr_mode,
     bool detached,
+    bool suspended,
     HANDLE *process_out,
+    HANDLE *thread_out,
     DWORD *pid_out,
     int *stdin_fd_out,
     int *stdout_fd_out,
     int *stderr_fd_out
 ) {
     *process_out = NULL;
+    *thread_out = NULL;
     *pid_out = 0;
     *stdin_fd_out = -1;
     *stdout_fd_out = -1;
@@ -12980,7 +13261,9 @@ static bool ct_windows_spawn_process(
     startup.hStdInput = child_stdin;
     startup.hStdOutput = child_stdout;
     startup.hStdError = child_stderr;
-    DWORD flags = CREATE_UNICODE_ENVIRONMENT | (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : CREATE_NO_WINDOW);
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT |
+        (detached ? CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS : CREATE_NO_WINDOW) |
+        (suspended ? CREATE_SUSPENDED : 0);
     BOOL created = CreateProcessW(file_wide, command_wide, NULL, NULL, TRUE, flags, environment, cwd_wide, &startup, &process_info);
 
     if (stdin_mode != CT_PROCESS_STDIO_INHERIT && child_stdin != NULL) CloseHandle(child_stdin);
@@ -12993,7 +13276,8 @@ static bool ct_windows_spawn_process(
         if (parent_stderr != NULL) CloseHandle(parent_stderr);
         return false;
     }
-    CloseHandle(process_info.hThread);
+    if (suspended) *thread_out = process_info.hThread;
+    else CloseHandle(process_info.hThread);
     *process_out = process_info.hProcess;
     *pid_out = process_info.dwProcessId;
     *stdin_fd_out = ct_windows_handle_to_fd(parent_stdin, _O_WRONLY);
@@ -13059,12 +13343,28 @@ static void ct_windows_rusage_for_process(HANDLE process, struct rusage *usage) 
 }
 #endif
 
+static void ct_async_process_apply_output_close_requests(CtAsyncProcess *process) {
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    if (process->close_stdout_requested) {
+        if (process->stdout_fd >= 0) close(process->stdout_fd);
+        process->stdout_fd = -1;
+        process->close_stdout_requested = false;
+    }
+    if (process->close_stderr_requested) {
+        if (process->stderr_fd >= 0) close(process->stderr_fd);
+        process->stderr_fd = -1;
+        process->close_stderr_requested = false;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+}
+
 static void *ct_async_process_thread(void *opaque) {
     CtAsyncProcess *process = (CtAsyncProcess *)opaque;
 #if defined(_WIN32)
     bool exited = false;
     DWORD exit_code = 1;
     while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0) {
+        ct_async_process_apply_output_close_requests(process);
         bool read_data = false;
         read_data |= ct_windows_drain_process_pipe(process, &process->stdout_fd, "stdout");
         read_data |= ct_windows_drain_process_pipe(process, &process->stderr_fd, "stderr");
@@ -13078,7 +13378,14 @@ static void *ct_async_process_thread(void *opaque) {
             if (process->stdout_fd >= 0) { close(process->stdout_fd); process->stdout_fd = -1; }
             if (process->stderr_fd >= 0) { close(process->stderr_fd); process->stderr_fd = -1; }
         }
-        if (!read_data && !exited) Sleep(10);
+        if (!read_data && !exited) {
+            if (process->wake_event != NULL) {
+                WaitForSingleObject(process->wake_event, 10);
+                ResetEvent(process->wake_event);
+            } else {
+                Sleep(10);
+            }
+        }
     }
     struct rusage resource_usage;
     ct_windows_rusage_for_process(process->process_handle, &resource_usage);
@@ -13092,6 +13399,8 @@ static void *ct_async_process_thread(void *opaque) {
         ct_queue_spawn_event(process->runtime, exit_event);
     }
     if (process->stdin_fd >= 0) close(process->stdin_fd);
+    if (process->start_thread != NULL) CloseHandle(process->start_thread);
+    if (process->wake_event != NULL) CloseHandle(process->wake_event);
     CloseHandle(process->process_handle);
     ct_async_process_remove(process);
     free(process);
@@ -13105,10 +13414,12 @@ static void *ct_async_process_thread(void *opaque) {
     if (process->stdout_fd >= 0) fcntl(process->stdout_fd, F_SETFL, fcntl(process->stdout_fd, F_GETFL, 0) | O_NONBLOCK);
     if (process->stderr_fd >= 0) fcntl(process->stderr_fd, F_SETFL, fcntl(process->stderr_fd, F_GETFL, 0) | O_NONBLOCK);
     if (process->ipc_fd >= 0) fcntl(process->ipc_fd, F_SETFL, fcntl(process->ipc_fd, F_GETFL, 0) | O_NONBLOCK);
+    if (process->wake_read_fd >= 0) fcntl(process->wake_read_fd, F_SETFL, fcntl(process->wake_read_fd, F_GETFL, 0) | O_NONBLOCK);
 
     while (!exited || process->stdout_fd >= 0 || process->stderr_fd >= 0 || process->ipc_fd >= 0) {
-        struct pollfd fds[3];
-        const char *types[3];
+        ct_async_process_apply_output_close_requests(process);
+        struct pollfd fds[4];
+        const char *types[4];
         int count = 0;
         if (process->stdout_fd >= 0) {
             fds[count].fd = process->stdout_fd;
@@ -13131,11 +13442,24 @@ static void *ct_async_process_thread(void *opaque) {
             types[count] = "ipc";
             count += 1;
         }
+        if (process->wake_read_fd >= 0) {
+            fds[count].fd = process->wake_read_fd;
+            fds[count].events = POLLIN | POLLHUP | POLLERR;
+            fds[count].revents = 0;
+            types[count] = "wake";
+            count += 1;
+        }
 
         int ready = count > 0 ? poll(fds, (nfds_t)count, 50) : 0;
         if (ready > 0) {
             for (int index = 0; index < count; index += 1) {
                 if ((fds[index].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) continue;
+                if (strcmp(types[index], "wake") == 0) {
+                    char wake_buffer[64];
+                    while (read(fds[index].fd, wake_buffer, sizeof(wake_buffer)) > 0) {}
+                    ct_async_process_apply_output_close_requests(process);
+                    continue;
+                }
                 if (strcmp(types[index], "ipc") == 0) {
                     if ((fds[index].revents & POLLNVAL) != 0) {
                         process->ipc_fd = -1;
@@ -13251,6 +13575,9 @@ static void *ct_async_process_thread(void *opaque) {
     }
     if (process->stdin_fd >= 0) close(process->stdin_fd);
     if (process->ipc_fd >= 0) close(process->ipc_fd);
+    if (process->wake_read_fd >= 0) close(process->wake_read_fd);
+    if (process->wake_write_fd >= 0) close(process->wake_write_fd);
+    if (process->start_gate_fd >= 0) close(process->start_gate_fd);
     ct_async_process_remove(process);
     free(process);
     return NULL;
@@ -13404,6 +13731,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     bool clear_env = false;
     bool capture_output = true;
     bool ipc_enabled = false;
+    bool defer_start = false;
     CtProcessStdioMode stdin_mode = CT_PROCESS_STDIO_IGNORE;
     CtProcessStdioMode stdout_mode = CT_PROCESS_STDIO_PIPE;
     CtProcessStdioMode stderr_mode = CT_PROCESS_STDIO_INHERIT;
@@ -13422,6 +13750,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         JSValueRef stdio_value = ct_get_property(ctx, options, "stdio", exception);
         JSValueRef ipc_value = ct_get_property(ctx, options, "ipc", exception);
         JSValueRef argv0_value = ct_get_property(ctx, options, "argv0", exception);
+        JSValueRef defer_start_value = ct_get_property(ctx, options, "deferStart", exception);
         if (exception != NULL && *exception != NULL) {
             free(file);
             ct_free_string_array(args, arg_count);
@@ -13430,6 +13759,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
             return JSValueMakeUndefined(ctx);
         }
         ipc_enabled = JSValueToBoolean(ctx, ipc_value);
+        defer_start = JSValueToBoolean(ctx, defer_start_value);
         argv0 = ct_value_to_optional_string(ctx, argv0_value);
 
         if (!JSValueIsUndefined(ctx, stdio_value)) {
@@ -13472,12 +13802,13 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
     HANDLE process_handle = NULL;
+    HANDLE start_thread = NULL;
     DWORD pid = 0;
     int stdin_fd = -1;
     int stdout_fd = -1;
     int stderr_fd = -1;
     if (!ct_windows_spawn_process(file, args, arg_count, argv0, cwd, env_entries, env_count, clear_env,
-                                  stdin_mode, stdout_mode, stderr_mode, false, &process_handle, &pid,
+                                  stdin_mode, stdout_mode, stderr_mode, false, defer_start, &process_handle, &start_thread, &pid,
                                   &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         free(file);
@@ -13490,6 +13821,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     CtAsyncProcess *process = (CtAsyncProcess *)calloc(1, sizeof(CtAsyncProcess));
     if (process == NULL) {
         TerminateProcess(process_handle, 1);
+        if (start_thread != NULL) CloseHandle(start_thread);
         CloseHandle(process_handle);
         if (stdin_fd >= 0) close(stdin_fd);
         if (stdout_fd >= 0) close(stdout_fd);
@@ -13510,11 +13842,16 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->ipc_fd = -1;
     process->runtime = runtime;
     process->process_handle = process_handle;
+    process->wake_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    process->start_thread = start_thread;
     pthread_mutex_lock(&ct_async_processes_mutex);
     process->next = ct_async_processes;
     ct_async_processes = process;
     pthread_mutex_unlock(&ct_async_processes_mutex);
-    if (pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) pthread_detach(process->thread);
+    if (!defer_start && pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) {
+        process->thread_started = true;
+        pthread_detach(process->thread);
+    }
 
     JSObjectRef response = ct_make_object(ctx);
     ct_set_property(ctx, response, "id", JSValueMakeNumber(ctx, id), exception);
@@ -13530,6 +13867,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
     int ipc_socket[2] = { -1, -1 };
+    int start_gate[2] = { -1, -1 };
     if (stdin_mode == CT_PROCESS_STDIO_PIPE &&
         (pipe(stdin_pipe) != 0 || ct_process_relocate_standard_fds(stdin_pipe) != 0)) {
         ct_process_close_fd(&stdin_pipe[0]);
@@ -13603,6 +13941,23 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     }
 #endif
 
+    if (defer_start && pipe(start_gate) != 0) {
+        ct_process_close_fd(&stdin_pipe[0]);
+        ct_process_close_fd(&stdin_pipe[1]);
+        ct_process_close_fd(&stdout_pipe[0]);
+        ct_process_close_fd(&stdout_pipe[1]);
+        ct_process_close_fd(&stderr_pipe[0]);
+        ct_process_close_fd(&stderr_pipe[1]);
+        ct_process_close_fd(&ipc_socket[0]);
+        ct_process_close_fd(&ipc_socket[1]);
+        ct_throw_message(ctx, exception, strerror(errno));
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
+
     // Spawn with posix_spawn instead of fork()+execvp(): this parent is a
     // large, heavily multithreaded process (JSC + bundler worker threads),
     // and code between fork() and exec() may only use async-signal-safe
@@ -13610,7 +13965,9 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     // a malloc/environ lock held by another thread at fork time and deadlock
     // the child forever (observed as "dangling processes" whenever many
     // subprocesses were spawned concurrently).
-    char **argv_exec = (char **)calloc(arg_count + 2, sizeof(char *));
+    size_t gate_arg_count = defer_start ? 1 : 0;
+    char **argv_exec = (char **)calloc(arg_count + gate_arg_count + 2, sizeof(char *));
+    char gate_arg[64] = { 0 };
     char **envp_exec = ct_build_spawn_envp(env_entries, env_count, clear_env, ipc_enabled);
     posix_spawn_file_actions_t spawn_actions;
     bool spawn_actions_ok = posix_spawn_file_actions_init(&spawn_actions) == 0;
@@ -13619,8 +13976,12 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         errno = ENOMEM;
     } else {
         argv_exec[0] = argv0 != NULL && argv0[0] != '\0' ? argv0 : file;
-        for (size_t index = 0; index < arg_count; index += 1) argv_exec[index + 1] = args[index];
-        argv_exec[arg_count + 1] = NULL;
+        if (defer_start) {
+            snprintf(gate_arg, sizeof(gate_arg), "--cottontail-spawn-gate=%d", start_gate[0]);
+            argv_exec[1] = gate_arg;
+        }
+        for (size_t index = 0; index < arg_count; index += 1) argv_exec[index + gate_arg_count + 1] = args[index];
+        argv_exec[arg_count + gate_arg_count + 1] = NULL;
 
         if (cwd != NULL) posix_spawn_file_actions_addchdir_np(&spawn_actions, cwd);
         if (stdin_mode == CT_PROCESS_STDIO_PIPE && stdin_pipe[0] >= 0) {
@@ -13648,6 +14009,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         if (stdin_pipe[0] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stdin_pipe[0]);
         if (stdout_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stdout_pipe[1]);
         if (stderr_pipe[1] > STDERR_FILENO) posix_spawn_file_actions_addclose(&spawn_actions, stderr_pipe[1]);
+        if (start_gate[1] >= 0) posix_spawn_file_actions_addclose(&spawn_actions, start_gate[1]);
         if (ipc_enabled) {
             if (ipc_socket[0] >= 0 && ipc_socket[0] != ipc_socket[1]) {
                 posix_spawn_file_actions_addclose(&spawn_actions, ipc_socket[0]);
@@ -13705,11 +14067,13 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     ct_process_close_fd(&stdout_pipe[1]);
     ct_process_close_fd(&stderr_pipe[1]);
     if (ipc_enabled) ct_process_close_fd(&ipc_socket[1]);
+    ct_process_close_fd(&start_gate[0]);
     if (pid < 0) {
         ct_process_close_fd(&stdin_pipe[1]);
         ct_process_close_fd(&stdout_pipe[0]);
         ct_process_close_fd(&stderr_pipe[0]);
         ct_process_close_fd(&ipc_socket[0]);
+        ct_process_close_fd(&start_gate[1]);
         ct_throw_message(ctx, exception, strerror(errno));
         free(file);
         ct_free_string_array(args, arg_count);
@@ -13724,6 +14088,7 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
         ct_process_close_fd(&stdout_pipe[0]);
         ct_process_close_fd(&stderr_pipe[0]);
         ct_process_close_fd(&ipc_socket[0]);
+        ct_process_close_fd(&start_gate[1]);
         ct_throw_message(ctx, exception, "Out of memory");
         free(file);
         ct_free_string_array(args, arg_count);
@@ -13737,12 +14102,27 @@ static JSValueRef ct_spawn_start(JSContextRef ctx, JSObjectRef function, JSObjec
     process->stdout_fd = stdout_mode == CT_PROCESS_STDIO_PIPE ? stdout_pipe[0] : -1;
     process->stderr_fd = stderr_mode == CT_PROCESS_STDIO_PIPE ? stderr_pipe[0] : -1;
     process->ipc_fd = ipc_enabled ? ipc_socket[0] : -1;
+    process->start_gate_fd = defer_start ? start_gate[1] : -1;
+    process->wake_read_fd = -1;
+    process->wake_write_fd = -1;
+    int wake_pipe[2] = { -1, -1 };
+    if (pipe(wake_pipe) == 0) {
+        if (ct_process_relocate_standard_fds(wake_pipe) == 0) {
+            process->wake_read_fd = wake_pipe[0];
+            process->wake_write_fd = wake_pipe[1];
+            fcntl(process->wake_write_fd, F_SETFL, fcntl(process->wake_write_fd, F_GETFL, 0) | O_NONBLOCK);
+        } else {
+            ct_process_close_fd(&wake_pipe[0]);
+            ct_process_close_fd(&wake_pipe[1]);
+        }
+    }
     process->runtime = runtime;
     pthread_mutex_lock(&ct_async_processes_mutex);
     process->next = ct_async_processes;
     ct_async_processes = process;
     pthread_mutex_unlock(&ct_async_processes_mutex);
-    if (pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) {
+    if (!defer_start && pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) {
+        process->thread_started = true;
         pthread_detach(process->thread);
     }
 
@@ -13778,7 +14158,21 @@ static JSValueRef ct_spawn_write(JSContextRef ctx, JSObjectRef function, JSObjec
     CtAsyncProcess *process = ct_async_processes;
     while (process != NULL && process->id != id) process = process->next;
     if (process != NULL && process->stdin_fd >= 0) {
-        ok = len == 0 || write(process->stdin_fd, bytes, len) >= 0;
+        ok = true;
+        size_t written_total = 0;
+        while (written_total < len) {
+            ssize_t written = write(process->stdin_fd, bytes + written_total, len - written_total);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                ok = false;
+                break;
+            }
+            if (written == 0) {
+                ok = false;
+                break;
+            }
+            written_total += (size_t)written;
+        }
     }
     pthread_mutex_unlock(&ct_async_processes_mutex);
     free(text);
@@ -13800,6 +14194,82 @@ static JSValueRef ct_spawn_close_stdin(JSContextRef ctx, JSObjectRef function, J
     }
     pthread_mutex_unlock(&ct_async_processes_mutex);
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_spawn_close_output(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    int fd = (int)ct_value_to_number(ctx, argv[1]);
+    bool found = false;
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    CtAsyncProcess *process = ct_async_processes;
+    while (process != NULL && process->id != id) process = process->next;
+    if (process != NULL && (fd == STDOUT_FILENO || fd == STDERR_FILENO)) {
+        if (fd == STDOUT_FILENO) process->close_stdout_requested = true;
+        else process->close_stderr_requested = true;
+#if defined(_WIN32)
+        if (process->wake_event != NULL) SetEvent(process->wake_event);
+#else
+        int *output_fd = fd == STDOUT_FILENO ? &process->stdout_fd : &process->stderr_fd;
+        if (*output_fd >= 0) close(*output_fd);
+        *output_fd = -1;
+        if (fd == STDOUT_FILENO) process->close_stdout_requested = false;
+        else process->close_stderr_requested = false;
+        if (process->wake_write_fd >= 0) {
+            const char wake = 1;
+            (void)write(process->wake_write_fd, &wake, 1);
+        }
+#endif
+        found = true;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    return JSValueMakeBoolean(ctx, found);
+}
+
+static JSValueRef ct_spawn_release(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool found = false;
+    pthread_mutex_lock(&ct_async_processes_mutex);
+    CtAsyncProcess *process = ct_async_processes;
+    while (process != NULL && process->id != id) process = process->next;
+    if (process != NULL) {
+        if (process->close_stdout_requested) {
+            if (process->stdout_fd >= 0) close(process->stdout_fd);
+            process->stdout_fd = -1;
+            process->close_stdout_requested = false;
+        }
+        if (process->close_stderr_requested) {
+            if (process->stderr_fd >= 0) close(process->stderr_fd);
+            process->stderr_fd = -1;
+            process->close_stderr_requested = false;
+        }
+        if (!process->thread_started && pthread_create(&process->thread, NULL, ct_async_process_thread, process) == 0) {
+            process->thread_started = true;
+            pthread_detach(process->thread);
+        }
+#if defined(_WIN32)
+        if (process->start_thread != NULL) {
+            ResumeThread(process->start_thread);
+            CloseHandle(process->start_thread);
+            process->start_thread = NULL;
+        }
+#else
+        if (process->start_gate_fd >= 0) {
+            close(process->start_gate_fd);
+            process->start_gate_fd = -1;
+        }
+#endif
+        found = true;
+    }
+    pthread_mutex_unlock(&ct_async_processes_mutex);
+    return JSValueMakeBoolean(ctx, found);
 }
 
 static JSValueRef ct_spawn_close_ipc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -13861,15 +14331,17 @@ static JSValueRef ct_spawn_detached(JSContextRef ctx, JSObjectRef function, JSOb
 
 #if defined(_WIN32)
     HANDLE process_handle = NULL;
+    HANDLE start_thread = NULL;
     DWORD pid = 0;
     int stdin_fd = -1, stdout_fd = -1, stderr_fd = -1;
     if (!ct_windows_spawn_process(file, args, arg_count, NULL, cwd, env_entries, env_count, clear_env,
                                   CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE, CT_PROCESS_STDIO_IGNORE,
-                                  true, &process_handle, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
+                                  true, false, &process_handle, &start_thread, &pid, &stdin_fd, &stdout_fd, &stderr_fd)) {
         ct_throw_message(ctx, exception, "CreateProcessW failed");
         pid = 0;
     }
     if (process_handle != NULL) CloseHandle(process_handle);
+    if (start_thread != NULL) CloseHandle(start_thread);
     if (stdin_fd >= 0) close(stdin_fd);
     if (stdout_fd >= 0) close(stdout_fd);
     if (stderr_fd >= 0) close(stderr_fd);
@@ -13971,13 +14443,8 @@ static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JS
     (void)argc;
     (void)argv;
     CtJscRuntime *runtime = ct_callback_runtime(function);
-    JSObjectRef statistics;
-#if defined(__APPLE__)
-    statistics = JSGetMemoryUsageStatistics(ctx);
+    JSObjectRef statistics = JSGetMemoryUsageStatistics(ctx);
     if (statistics == NULL) statistics = ct_make_object(ctx);
-#else
-    statistics = ct_make_object(ctx);
-#endif
     JSValueRef counts_value = ct_get_property(ctx, statistics, "protectedObjectTypeCounts", exception);
     if (exception != NULL && *exception != NULL) return statistics;
     JSObjectRef counts = counts_value != NULL && JSValueIsObject(ctx, counts_value)
@@ -13988,6 +14455,35 @@ static JSValueRef ct_jsc_memory_usage(JSContextRef ctx, JSObjectRef function, JS
         ct_set_property(ctx, statistics, "protectedObjectTypeCounts", counts, exception);
     }
     return statistics;
+}
+
+static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsString(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    JSStringRef string = JSValueToStringCopy(ctx, argv[0], exception);
+    if (string == NULL || (exception != NULL && *exception != NULL)) return JSValueMakeUndefined(ctx);
+    bool is_8_bit = ct_jsc_string_is_8_bit(string);
+    JSStringRelease(string);
+    return JSValueMakeBoolean(ctx, is_8_bit);
+}
+
+static JSValueRef ct_create_buffer_is_ascii(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return ct_jsc_create_buffer_is_ascii(ctx);
+}
+
+static JSValueRef ct_create_buffer_transcode(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    (void)exception;
+    return ct_jsc_create_buffer_transcode(ctx);
 }
 
 static JSValueRef ct_dispatch_spawn_events(JSContextRef ctx, CtJscRuntime *runtime, JSValueRef *exception) {
@@ -14059,6 +14555,10 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime,
         if (event->message != NULL) {
             ct_set_property(ctx, item, "message", ct_make_string(ctx, event->message), exception);
         }
+        if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
+            fprintf(stderr, "[cottontail:fd] dispatch %s id=%u\n", event->type != NULL ? event->type : "", event->watch_id);
+            fflush(stderr);
+        }
         JSValueRef arg = item;
         JSObjectCallAsFunction(ctx, runtime->fd_event_handler, NULL, 1, &arg, exception);
         free(event->type);
@@ -14104,6 +14604,21 @@ static JSValueRef ct_drain_jobs(JSContextRef ctx, JSObjectRef function, JSObject
     ct_dispatch_fd_events(ctx, runtime, exception);
     if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
     return ct_dispatch_worker_events(ctx, runtime, exception);
+}
+
+static JSValueRef ct_promise_status_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    return JSValueMakeNumber(ctx, argc > 0 ? ct_jsc_promise_status(argv[0]) : -1);
+}
+
+static JSValueRef ct_promise_result_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    JSValueRef result = argc > 0 ? ct_jsc_promise_result(argv[0]) : NULL;
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_import_module(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -14481,6 +14996,8 @@ static void *ct_worker_entry(void *opaque) {
         return NULL;
     }
 
+    ct_queue_worker_event(start->worker->parent_runtime, start->worker->id, "open");
+
     if (ct_read_file_bytes(start->script_path, &source, &source_len) != 0) {
         fprintf(stderr, "cottontail: failed to load worker script %s\n", start->script_path);
         ct_jsc_runtime_destroy(runtime);
@@ -14520,7 +15037,7 @@ static void *ct_worker_entry(void *opaque) {
             break;
         }
         if (!has_active_handles) break;
-        usleep((useconds_t)delay_ms * 1000);
+        ct_runtime_wait(runtime, delay_ms);
     }
 
     ct_jsc_runtime_destroy(runtime);
@@ -14721,6 +15238,21 @@ static JSValueRef ct_close_fd(JSContextRef ctx, JSObjectRef function, JSObjectRe
     return JSValueMakeUndefined(ctx);
 }
 
+static int ct_fd_write_bytes(int fd, const uint8_t *bytes, size_t len) {
+    if (fd < 0) return EBADF;
+    size_t written_total = 0;
+    while (written_total < len) {
+        ssize_t written = write(fd, bytes + written_total, len - written_total);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        if (written == 0) return EIO;
+        written_total += (size_t)written;
+    }
+    return 0;
+}
+
 static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -14739,20 +15271,32 @@ static JSValueRef ct_fd_write(JSContextRef ctx, JSObjectRef function, JSObjectRe
         len = text != NULL ? strlen(text) : 0;
     }
 
-    bool ok = fd >= 0;
-    size_t written_total = 0;
-    while (ok && written_total < len) {
-        ssize_t written = write(fd, bytes + written_total, len - written_total);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            ok = false;
-            break;
-        }
-        written_total += (size_t)written;
+    int write_error = ct_fd_write_bytes(fd, bytes, len);
+    free(text);
+    return JSValueMakeBoolean(ctx, write_error == 0);
+}
+
+static JSValueRef ct_fd_write_status(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "cottontail.fdWriteStatus(fd, data) requires a file descriptor and data");
+        return JSValueMakeNumber(ctx, EINVAL);
     }
 
+    int fd = (int)ct_value_to_number(ctx, argv[0]);
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    char *text = NULL;
+    if (ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        text = ct_value_to_string_copy(ctx, argv[1]);
+        bytes = (uint8_t *)text;
+        len = text != NULL ? strlen(text) : 0;
+    }
+
+    int write_error = ct_fd_write_bytes(fd, bytes, len);
     free(text);
-    return JSValueMakeBoolean(ctx, ok);
+    return JSValueMakeNumber(ctx, write_error);
 }
 
 static JSValueRef ct_fd_write_some(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -16203,7 +16747,21 @@ static JSValueRef ct_unhandled_rejection(
     (void)function;
     (void)this_object;
     if (argc >= 2) {
-        ct_set_property(ctx, JSContextGetGlobalObject(ctx), "__ctUnhandledRejection", argv[1], exception);
+        JSObjectRef global = JSContextGetGlobalObject(ctx);
+        JSValueRef handler_value = ct_get_property(ctx, global, "__cottontailHandleUnhandledRejection", exception);
+        if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        if (JSValueIsObject(ctx, handler_value) && JSObjectIsFunction(ctx, (JSObjectRef)handler_value)) {
+            JSValueRef args[2] = { argv[1], argv[0] };
+            JSValueRef call_exception = NULL;
+            JSValueRef result = JSObjectCallAsFunction(ctx, (JSObjectRef)handler_value, NULL, 2, args, &call_exception);
+            if (call_exception != NULL) {
+                ct_set_property(ctx, global, "__ctUnhandledRejection", call_exception, exception);
+            } else if (!JSValueIsUndefined(ctx, result) && !JSValueIsNull(ctx, result)) {
+                ct_set_property(ctx, global, "__ctUnhandledRejection", result, exception);
+            }
+        } else {
+            ct_set_property(ctx, global, "__ctUnhandledRejection", argv[1], exception);
+        }
     }
     return JSValueMakeUndefined(ctx);
 }
@@ -16213,7 +16771,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSValueRef exception = NULL;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
 
-    JSObjectRef unhandled_rejection_callback = ct_make_plain_function(
+    JSObjectRef unhandled_rejection_callback = (JSObjectRef)ct_make_plain_function(
         ctx,
         "onUnhandledRejection",
         ct_unhandled_rejection
@@ -16239,10 +16797,16 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "timerHasRef", ct_timer_has_ref, runtime);
     ct_install_function(ctx, host, "timerHasActive", ct_timer_has_active, runtime);
     ct_install_function(ctx, host, "timerTick", ct_timer_tick_host, runtime);
+    ct_install_function(ctx, host, "nextTickState", ct_next_tick_state, runtime);
     ct_install_function(ctx, host, "drainJobs", ct_drain_jobs, runtime);
+    ct_install_function(ctx, host, "promiseStatus", ct_promise_status_host, runtime);
+    ct_install_function(ctx, host, "promiseResult", ct_promise_result_host, runtime);
     ct_install_function(ctx, host, "gc", ct_gc, runtime);
     ct_install_function(ctx, host, "startSamplingProfiler", ct_start_sampling_profiler, runtime);
     ct_install_function(ctx, host, "jscMemoryUsage", ct_jsc_memory_usage, runtime);
+    ct_install_function(ctx, host, "jscStringIs8Bit", ct_jsc_string_is_8_bit_host, runtime);
+    ct_install_function(ctx, host, "createBufferIsAscii", ct_create_buffer_is_ascii, runtime);
+    ct_install_function(ctx, host, "createBufferTranscode", ct_create_buffer_transcode, runtime);
     ct_install_function(ctx, host, "importModule", ct_import_module, runtime);
     ct_install_function(ctx, host, "cwd", ct_cwd, runtime);
     ct_install_function(ctx, host, "readFile", ct_read_file, runtime);
@@ -16253,6 +16817,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "readFd", ct_read_fd, runtime);
     ct_install_function(ctx, host, "closeFd", ct_close_fd, runtime);
     ct_install_function(ctx, host, "fdWrite", ct_fd_write, runtime);
+    ct_install_function(ctx, host, "fdWriteStatus", ct_fd_write_status, runtime);
     ct_install_function(ctx, host, "fdWriteSome", ct_fd_write_some, runtime);
     ct_install_function(ctx, host, "ipcSend", ct_ipc_send, runtime);
     ct_install_function(ctx, host, "ipcRecv", ct_ipc_recv, runtime);
@@ -16294,6 +16859,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "spawnStart", ct_spawn_start, runtime);
     ct_install_function(ctx, host, "spawnWrite", ct_spawn_write, runtime);
     ct_install_function(ctx, host, "spawnCloseStdin", ct_spawn_close_stdin, runtime);
+    ct_install_function(ctx, host, "spawnCloseOutput", ct_spawn_close_output, runtime);
+    ct_install_function(ctx, host, "spawnRelease", ct_spawn_release, runtime);
     ct_install_function(ctx, host, "spawnCloseIpc", ct_spawn_close_ipc, runtime);
     ct_install_function(ctx, host, "spawnKill", ct_spawn_kill, runtime);
     ct_install_function(ctx, host, "spawnDispose", ct_undefined, runtime);
@@ -16346,9 +16913,11 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "osSetPriority", ct_os_set_priority, runtime);
     ct_install_function(ctx, host, "randomBytes", ct_random_bytes, runtime);
     ct_install_function(ctx, host, "icuDecode", ct_icu_decode, runtime);
+    ct_install_function(ctx, host, "stringFromUtf16", ct_string_from_utf16, runtime);
     ct_install_function(ctx, host, "zlibTransformSync", ct_zlib_transform_sync, runtime);
     ct_install_function(ctx, host, "cryptoHashSync", ct_crypto_hash_sync, runtime);
     ct_install_function(ctx, host, "cryptoHmacSync", ct_crypto_hmac_sync, runtime);
+    ct_install_function(ctx, host, "cryptoPbkdf2Sync", ct_crypto_pbkdf2_sync, runtime);
     ct_install_function(ctx, host, "cryptoArgon2Sync", ct_crypto_argon2_sync, runtime);
     ct_install_function(ctx, host, "passwordHashSync", ct_password_hash_sync_native, runtime);
     ct_install_function(ctx, host, "passwordVerifySync", ct_password_verify_sync_native, runtime);
@@ -16475,6 +17044,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "  const normalizeDelay = function(value, immediate){"
         "    if (immediate) return 0;"
         "    let delay = Number(value);"
+        "    if (Number.isNaN(delay)) g.process?.emitWarning?.('NaN is not a number.', 'TimeoutNaNWarning');"
         "    if (!Number.isFinite(delay) || delay < 1 || delay > maxDelay) delay = 1;"
         "    return Math.trunc(delay);"
         "  };"
@@ -16494,7 +17064,20 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "      this._refed = true;"
         "      this._destroyed = false;"
         "      this._cleared = false;"
+        "      this.__firing = false;"
+        "      this.__refreshedWhileFiring = false;"
         "      this._id = cottontail.timerSchedule(this, 0, delay, repeat == null ? 0 : repeat, kind, true);"
+        "    }"
+        "    __invokeTimeout(...callbackArgs){"
+        "      this.__firing = true;"
+        "      this.__refreshedWhileFiring = false;"
+        "      try {"
+        "        const callback = this.__onTimeout;"
+        "        if (typeof callback === 'function') return callback.apply(this, callbackArgs);"
+        "      } finally {"
+        "        this.__firing = false;"
+        "        if (this._repeat == null && !this.__refreshedWhileFiring && !this._cleared) this._destroyed = true;"
+        "      }"
         "    }"
         "    get _idleTimeout(){ return this.__idleTimeout; }"
         "    set _idleTimeout(value){"
@@ -16518,6 +17101,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "    hasRef(){ return this._refed; }"
         "    refresh(){"
         "      if (this._cleared || this.__idleTimeout < 0 || typeof this.__onTimeout !== 'function') return this;"
+        "      if (this.__firing) this.__refreshedWhileFiring = true;"
         "      this._destroyed = false;"
         "      cottontail.timerSchedule(this, this._id, this.__idleTimeout, this._repeat == null ? 0 : this._repeat, this._kind, this._refed);"
         "      return this;"
@@ -16528,6 +17112,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
         "      this._destroyed = true;"
         "      return this;"
         "    }"
+        "    [Symbol.for('nodejs.util.inspect.custom')](){ return 'Timeout (#' + this._id + (this._repeat != null ? ', repeats' : '') + ')'; }"
         "    valueOf(){ return this._id; }"
         "    [Symbol.toPrimitive](){ return this._id; }"
         "  }"
@@ -16692,9 +17277,14 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;
+    runtime->next_tick_priority_armed = true;
     /* Expose the native SuppressedError global (explicit resource management).
      * JSC latches options from the environment at first VM creation. */
-    if (getenv("JSC_useExplicitResourceManagement") == NULL) {
+    const char *explicit_resource_option = getenv("JSC_useExplicitResourceManagement");
+    char *previous_explicit_resource_option = explicit_resource_option != NULL ? strdup(explicit_resource_option) : NULL;
+    const char *cf_user_text_encoding = getenv("__CF_USER_TEXT_ENCODING");
+    char *previous_cf_user_text_encoding = cf_user_text_encoding != NULL ? strdup(cf_user_text_encoding) : NULL;
+    if (explicit_resource_option == NULL) {
         setenv("JSC_useExplicitResourceManagement", "true", 1);
     }
     /* Use JSGlobalContextCreateInGroup(NULL, ...) rather than JSGlobalContextCreate(NULL):
@@ -16725,10 +17315,24 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
         unsetenv("JSC_useShadowRealm");
     }
 #endif
+    if (previous_explicit_resource_option != NULL) {
+        setenv("JSC_useExplicitResourceManagement", previous_explicit_resource_option, 1);
+        free(previous_explicit_resource_option);
+    } else {
+        unsetenv("JSC_useExplicitResourceManagement");
+    }
+    if (previous_cf_user_text_encoding != NULL) {
+        setenv("__CF_USER_TEXT_ENCODING", previous_cf_user_text_encoding, 1);
+        free(previous_cf_user_text_encoding);
+    } else {
+        unsetenv("__CF_USER_TEXT_ENCODING");
+    }
     if (runtime->context == NULL) {
         free(runtime);
         return NULL;
     }
+    pthread_mutex_init(&runtime->wake_mutex, NULL);
+    pthread_cond_init(&runtime->wake_cond, NULL);
     pthread_mutex_init(&runtime->spawn_event_mutex, NULL);
     pthread_mutex_init(&runtime->fd_event_mutex, NULL);
     pthread_mutex_init(&runtime->worker_event_mutex, NULL);
@@ -16801,6 +17405,8 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     pthread_mutex_destroy(&runtime->fd_event_mutex);
     pthread_mutex_destroy(&runtime->worker_event_mutex);
     pthread_mutex_destroy(&runtime->callback_mutex);
+    pthread_cond_destroy(&runtime->wake_cond);
+    pthread_mutex_destroy(&runtime->wake_mutex);
     free(runtime);
 }
 
@@ -17015,7 +17621,7 @@ static bool ct_append_rewritten_dynamic_imports(
             }
             if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
             if (strncmp(scan, "import", 6) != 0) continue;
-            if (scan > line && ct_is_js_identifier_char(scan[-1])) continue;
+            if (scan > line && (ct_is_js_identifier_char(scan[-1]) || scan[-1] == '#' || scan[-1] == '.')) continue;
             if (scan + 6 < end && ct_is_js_identifier_char(scan[6])) continue;
             const char *after_import = scan + 6;
             while (after_import < end && (*after_import == ' ' || *after_import == '\t')) after_import += 1;
@@ -17448,7 +18054,21 @@ static JSValueRef ct_global_value(JSContextRef ctx, const char *name) {
 static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     bool pending = false;
 
+    if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
+
+#if CT_HAS_OPENSSL
+    pthread_mutex_lock(&ct_tls_mutex);
+    for (CtTlsConnection *connection = ct_tls_connections; connection != NULL; connection = connection->next) {
+        if (connection->runtime != runtime) continue;
+        pthread_mutex_lock(&connection->mutex);
+        pending = connection->active;
+        pthread_mutex_unlock(&connection->mutex);
+        if (pending) break;
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+    if (pending) return true;
+#endif
 
     pthread_mutex_lock(&runtime->callback_mutex);
     pending = runtime->callback_jobs_head != NULL;
@@ -17532,9 +18152,15 @@ static int ct_jsc_runtime_eval_internal(
         if (wait_for_active_handles && !ct_global_bool(ctx, "__ctDone")) {
             bool has_active_handles = false;
             if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
-            if (!has_active_handles) return -13;
+            if (!has_active_handles) {
+                if (ct_debug_flag("COTTONTAIL_TICK_DEBUG")) {
+                    fprintf(stderr, "[cottontail:tick] unsettled top-level await pending=%d armed=%d\n", runtime->next_tick_pending, runtime->next_tick_priority_armed);
+                    fflush(stderr);
+                }
+                return -13;
+            }
         }
-        usleep(1000);
+        ct_runtime_wait(runtime, 1);
     }
     if (!ct_global_bool(ctx, "__ctDone")) return -13;
     JSValueRef error_value = ct_global_value(ctx, "__ctError");
@@ -17565,7 +18191,7 @@ static int ct_jsc_runtime_eval_internal(
         if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, error_out) != 0) return -1;
         if (!has_active_handles) break;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, error_out) != 0) return -1;
-        usleep((useconds_t)delay_ms * 1000);
+        ct_runtime_wait(runtime, delay_ms);
     }
 
     error_value = ct_global_value(ctx, "__ctError");
@@ -17585,10 +18211,34 @@ int ct_jsc_runtime_eval(CtJscRuntime *runtime, const uint8_t *source, size_t sou
     return ct_jsc_runtime_eval_internal(runtime, source, source_len, filename, true, error_out);
 }
 
+int ct_jsc_runtime_exit_code(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->context == NULL) return 0;
+
+    JSContextRef ctx = runtime->context;
+    JSValueRef process_value = ct_global_value(ctx, "process");
+    if (process_value == NULL || !JSValueIsObject(ctx, process_value)) return 0;
+
+    JSValueRef exception = NULL;
+    JSObjectRef process = JSValueToObject(ctx, process_value, &exception);
+    if (exception != NULL || process == NULL) return 0;
+
+    JSValueRef value = ct_get_property(ctx, process, "exitCode", &exception);
+    if (exception != NULL || value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
+
+    double number = JSValueToNumber(ctx, value, &exception);
+    if (exception != NULL || !isfinite(number)) return 0;
+
+    double normalized = fmod(trunc(number), 256.0);
+    if (normalized < 0) normalized += 256.0;
+    return (int)normalized;
+}
+
 static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_out, char **error_out) {
     if (error_out != NULL) *error_out = NULL;
     if (delay_ms_out != NULL) *delay_ms_out = 16;
     JSContextRef ctx = runtime->context;
+    ct_jsc_run_loop_cycle();
+    if (ct_drain_next_ticks(runtime, true, error_out) != 0) return -1;
     if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;
     if (ct_dispatch_timers(runtime, error_out) != 0) return -1;
     JSStringRef source = ct_js_string(
@@ -17605,6 +18255,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
+    ct_jsc_drain_microtasks(ctx);
     int js_delay_ms = 16;
     if (value != NULL) {
         JSValueRef number_exception = NULL;
@@ -17617,7 +18268,9 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     }
     if (delay_ms_out != NULL) {
         int timer_delay_ms = 0;
-        *delay_ms_out = ct_timer_next_delay_ms(runtime, &timer_delay_ms) ? timer_delay_ms : js_delay_ms;
+        *delay_ms_out = ct_timer_next_delay_ms(runtime, &timer_delay_ms) && timer_delay_ms < js_delay_ms
+            ? timer_delay_ms
+            : js_delay_ms;
     }
     return 0;
 }

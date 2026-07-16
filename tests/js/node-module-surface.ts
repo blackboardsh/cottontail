@@ -57,6 +57,10 @@ assert(_load("node:fs", { filename: `${root}/entry.js` }) === requiredFs, "_load
 const modulePath = join(root, "sample.cjs");
 writeFileSync(modulePath, "module.exports = { value: 42 };\n");
 const localRequire = createRequire(`${root}/entry.js`);
+assert(localRequire("_stream_duplex") === localRequire("node:stream").Duplex, "legacy stream builtin identity mismatch");
+assert(localRequire("_http_agent").Agent === localRequire("node:http").Agent, "legacy HTTP builtin identity mismatch");
+assert(localRequire("_tls_wrap").TLSSocket === localRequire("node:tls").TLSSocket, "legacy TLS builtin identity mismatch");
+assert((await import("_stream_writable")).default === localRequire("node:stream").Writable, "legacy builtin dynamic import mismatch");
 assert(localRequire("./sample.cjs").value === 42, "createRequire local module mismatch");
 // Node's Module._cache is a plain object keyed by resolved path.
 assert(modulePath in _cache, "_cache should contain required module");

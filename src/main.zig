@@ -18,7 +18,7 @@ comptime {
     host.forceLink();
 }
 
-const version = "0.1.1-beta.0";
+const version = @import("version.zig").version;
 // Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
@@ -231,9 +231,17 @@ fn isRuntimeFlag(arg: []const u8) bool {
 fn testFlagTakesValue(arg: []const u8) bool {
     if (std.mem.indexOfScalar(u8, arg, '=') != null) return false;
     const value_flags = [_][]const u8{
+        "-t",
         "--bail",
+        "--coverage-dir",
+        "--coverage-reporter",
         "--max-concurrency",
         "--preload",
+        "--reporter",
+        "--reporter-outfile",
+        "--rerun-each",
+        "--seed",
+        "--test-name-pattern",
         "--timeout",
     };
     for (value_flags) |candidate| {
@@ -640,6 +648,11 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         const arg: []const u8 = args[index];
         if (std.mem.eql(u8, arg, "--compile")) {
             compile = true;
+        } else if (std.mem.eql(u8, arg, "--production")) {
+            options.production = true;
+            options.minify_whitespace = true;
+            options.minify_identifiers = true;
+            options.minify_syntax = true;
         } else if (std.mem.eql(u8, arg, "--minify")) {
             options.minify_whitespace = true;
             options.minify_identifiers = true;
@@ -774,6 +787,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             .identifiers = options.minify_identifiers,
             .syntax = options.minify_syntax,
         },
+        .production = options.production,
         .metafile = if (metafile_json_path != null or metafile_markdown_path != null)
             MetafileRequest{
                 .json = metafile_json_path orelse "",
@@ -877,27 +891,82 @@ fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_a
 }
 
 fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8 {
-    if (args.len < 4 or !std.mem.eql(u8, args[1], "test")) return null;
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
     const allocator = init.arena.allocator();
     const entrypoints = try testEntrypointMask(allocator, args);
-    var entrypoint_count: usize = 0;
-    for (entrypoints) |is_entrypoint| entrypoint_count += @intFromBool(is_entrypoint);
+    var test_files: std.ArrayList([:0]const u8) = .empty;
+    for (entrypoints, 0..) |is_entrypoint, index| {
+        if (is_entrypoint) try test_files.append(allocator, args[index]);
+    }
+    const explicit_entrypoint_count = test_files.items.len;
+    if (explicit_entrypoint_count == 0) {
+        var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true });
+        defer directory.close(init.io);
+        var walker = try directory.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(init.io)) |entry| {
+            if (entry.kind == .directory) {
+                if ((entry.basename.len > 0 and entry.basename[0] == '.') or
+                    std.mem.eql(u8, entry.basename, "node_modules"))
+                {
+                    walker.leave(init.io);
+                }
+                continue;
+            }
+            if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
+            try test_files.append(allocator, try allocator.dupeZ(u8, entry.path));
+        }
+        std.mem.sort([:0]const u8, test_files.items, {}, struct {
+            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+    }
+    const entrypoint_count = test_files.items.len;
     if (entrypoint_count <= 1) return null;
 
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
+    try stdout_writer.interface.flush();
+    try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
+
+    var summary_id: [8]u8 = undefined;
+    init.io.random(&summary_id);
+    const summary_path = try std.fmt.allocPrint(allocator, ".cottontail-test-summary-{x}", .{summary_id});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = summary_path, .data = "" });
+    defer std.Io.Dir.cwd().deleteFile(init.io, summary_path) catch {};
+    try init.environ_map.put("COTTONTAIL_TEST_AGGREGATE_FILE", summary_path);
+    defer _ = init.environ_map.swapRemove("COTTONTAIL_TEST_AGGREGATE_FILE");
+
     var exit_code: u8 = 0;
-    for (entrypoints, 0..) |is_entrypoint, entrypoint_index| {
-        if (!is_entrypoint) continue;
-        const child_args = try allocator.alloc([]const u8, args.len - entrypoint_count + 1);
+    var failed_files: usize = 0;
+    var executed_files: usize = 0;
+    const bail_limit = testBailLimit(args);
+    var dots_mode = false;
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--dots")) {
+            dots_mode = true;
+            break;
+        }
+    }
+    for (test_files.items) |test_file| {
+        const child_args = try allocator.alloc(
+            []const u8,
+            if (explicit_entrypoint_count > 0) args.len - explicit_entrypoint_count + 1 else args.len + 1,
+        );
         child_args[0] = args[0];
         child_args[1] = args[1];
-        var child_index: usize = 2;
+        child_args[2] = test_file;
+        var child_index: usize = 3;
         for (args[2..], 2..) |arg, index| {
-            if (entrypoints[index] and index != entrypoint_index) continue;
+            if (entrypoints[index]) continue;
             child_args[child_index] = arg;
             child_index += 1;
         }
         var child = try std.process.spawn(init.io, .{
             .argv = child_args,
+            .environ_map = init.environ_map,
             .stdin = .inherit,
             .stdout = .inherit,
             .stderr = .inherit,
@@ -905,9 +974,69 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         });
         defer child.kill(init.io);
         const code = childExitCode(try child.wait(init.io));
-        if (code != 0) exit_code = code;
+        executed_files += 1;
+        if (code != 0) {
+            exit_code = code;
+            failed_files += 1;
+            if (bail_limit) |limit| {
+                if (limit > 0 and failed_files >= limit) break;
+            }
+        }
     }
+
+    const summaries = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        summary_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    var totals = [_]u64{0} ** 6;
+    var lines = std.mem.splitScalar(u8, summaries, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        for (&totals) |*total| {
+            const field = fields.next() orelse break;
+            total.* += std.fmt.parseUnsigned(u64, field, 10) catch 0;
+        }
+    }
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    if (bail_limit) |limit| {
+        if (limit > 0 and failed_files >= limit and executed_files < entrypoint_count) {
+            try stderr.print("\nBailed out after {d} failure{s}\n", .{ limit, if (limit == 1) "" else "s" });
+        }
+    }
+    try stderr.print("{s}{d} pass\n", .{ if (dots_mode) "\n\n" else "\n ", totals[0] });
+    const summary_indent = if (dots_mode) "" else " ";
+    if (totals[1] > 0) try stderr.print("{s}{d} skip\n", .{ summary_indent, totals[1] });
+    if (totals[2] > 0) try stderr.print("{s}{d} todo\n", .{ summary_indent, totals[2] });
+    try stderr.print("{s}{d} fail\n", .{ summary_indent, totals[3] });
+    if (totals[4] > 0) try stderr.print("{s}{d} error\n", .{ summary_indent, totals[4] });
+    if (!dots_mode and totals[5] > 0) try stderr.print(" {d} expect() calls\n", .{totals[5]});
+    const total_tests = totals[0] + totals[1] + totals[2] + totals[3];
+    try stderr.print(
+        "Ran {d} {s} across {d} files.\n",
+        .{ total_tests, if (total_tests == 1) "test" else "tests", executed_files },
+    );
+    try stderr.flush();
     return exit_code;
+}
+
+fn testBailLimit(args: []const [:0]const u8) ?usize {
+    for (args[2..], 2..) |arg, index| {
+        if (std.mem.startsWith(u8, arg, "--bail=")) {
+            return std.fmt.parseUnsigned(usize, arg["--bail=".len..], 10) catch null;
+        }
+        if (std.mem.eql(u8, arg, "--bail")) {
+            if (index + 1 < args.len and !std.mem.startsWith(u8, args[index + 1], "-")) {
+                return std.fmt.parseUnsigned(usize, args[index + 1], 10) catch 1;
+            }
+            return 1;
+        }
+    }
+    return null;
 }
 
 fn parseRunInvocation(
@@ -937,6 +1066,7 @@ fn parseRunInvocation(
             continue;
         }
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
+            appendExecArg(exec_args_storage, exec_len, arg);
             index += 1;
             continue;
         }
@@ -1070,6 +1200,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
         }
 
         if (std.mem.eql(u8, arg, "--bun") or std.mem.eql(u8, arg, "-b")) {
+            appendExecArg(exec_args_storage, &exec_len, arg);
             index += 1;
             continue;
         }
@@ -1124,9 +1255,16 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
 
 fn isTestEntrypoint(name: []const u8) bool {
     const extensions = [_][]const u8{ ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts" };
-    if (std.mem.indexOf(u8, name, ".test.") == null) return false;
-    for (extensions) |extension| {
-        if (std.mem.endsWith(u8, name, extension)) return true;
+    const extension = std.fs.path.extension(name);
+    if (extension.len == 0) return false;
+    const stem = name[0 .. name.len - extension.len];
+    const has_test_suffix = std.mem.endsWith(u8, stem, ".test") or
+        std.mem.endsWith(u8, stem, "_test") or
+        std.mem.endsWith(u8, stem, ".spec") or
+        std.mem.endsWith(u8, stem, "_spec");
+    if (!has_test_suffix) return false;
+    for (extensions) |candidate_extension| {
+        if (std.mem.eql(u8, extension, candidate_extension)) return true;
     }
     return false;
 }
@@ -1160,9 +1298,26 @@ fn defaultTestEntrypoint(io: std.Io, allocator: std.mem.Allocator) ![:0]const u8
     return CliParseError.MissingEntrypoint;
 }
 
+fn consumeSpawnGate(allocator: std.mem.Allocator, process_args: []const [:0]const u8) ![]const [:0]const u8 {
+    if (comptime builtin.os.tag == .windows) return process_args;
+    const prefix = "--cottontail-spawn-gate=";
+    if (process_args.len < 2 or !std.mem.startsWith(u8, process_args[1], prefix)) return process_args;
+
+    const fd = std.fmt.parseInt(std.posix.fd_t, process_args[1][prefix.len..], 10) catch return process_args;
+    var byte: [1]u8 = undefined;
+    _ = std.posix.read(fd, byte[0..]) catch 0;
+    _ = std.c.close(fd);
+
+    const visible_args = try allocator.alloc([:0]const u8, process_args.len - 1);
+    visible_args[0] = process_args[0];
+    @memcpy(visible_args[1..], process_args[2..]);
+    return visible_args;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const process_args = try init.minimal.args.toSlice(allocator);
+    var process_args = try init.minimal.args.toSlice(allocator);
+    process_args = try consumeSpawnGate(allocator, process_args);
     const args = try argsWithBunOptions(allocator, process_args, init.environ_map);
 
     if (try runStandaloneIfPresent(init, args)) |exit_code| {
@@ -1270,8 +1425,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, arg, "test")) {
-        try stdout.print("bun test 0.0.0-cottontail (cottontail)\n", .{});
-        try stdout.flush();
+        if (init.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null) {
+            try stdout.print("bun test {s} (cottontail)\n", .{version});
+            try stdout.flush();
+        }
         try init.environ_map.put("COTTONTAIL_TEST_CLI_HEADER_PRINTED", "1");
     }
 
@@ -1356,6 +1513,25 @@ test "test flags can precede the entrypoint" {
     const args = [_][:0]const u8{ "cottontail", "test", "--max-concurrency", "3", "suite.test.ts" };
     try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&args));
     try std.testing.expectEqual(@as(?usize, null), testEntrypointIndex(args[0..4]));
+}
+
+test "test flag values are not treated as additional entrypoints" {
+    const args = [_][:0]const u8{
+        "cottontail",
+        "test",
+        "first.test.ts",
+        "second.test.ts",
+        "--dots",
+        "-t",
+        "filterin",
+    };
+    const mask = try testEntrypointMask(std.testing.allocator, &args);
+    defer std.testing.allocator.free(mask);
+    try std.testing.expect(mask[2]);
+    try std.testing.expect(mask[3]);
+    try std.testing.expect(!mask[4]);
+    try std.testing.expect(!mask[5]);
+    try std.testing.expect(!mask[6]);
 }
 
 test {

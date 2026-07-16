@@ -1,4 +1,4 @@
-import { AsyncResource } from "./async_hooks.js";
+import { AsyncResource, _registerAsyncContextDependency, _wrapAsyncCallback } from "./async_hooks.js";
 
 export const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 export const errorMonitor = Symbol("events.errorMonitor");
@@ -173,13 +173,13 @@ EventEmitter.prototype.emit = function emit(type, ...args) {
   if (handler === undefined) return false;
 
   if (typeof handler === "function") {
-    const result = handler.apply(this, args);
+    const result = _wrapAsyncCallback(handler, { drainJobs: false }).apply(this, args);
     if (result !== undefined && result !== null) addCatch(this, result, type, args);
   } else {
     const len = handler.length;
     const listeners = handler.slice();
     for (let i = 0; i < len; ++i) {
-      const result = listeners[i].apply(this, args);
+      const result = _wrapAsyncCallback(listeners[i], { drainJobs: false }).apply(this, args);
       if (result !== undefined && result !== null) addCatch(this, result, type, args);
     }
   }
@@ -524,6 +524,11 @@ export function on(emitter, name, options = undefined) {
   const unconsumedPromises = [];
   let error = null;
   let finished = false;
+  let releaseContext;
+  const contextLifetime = new Promise((resolve) => {
+    releaseContext = resolve;
+  });
+  _registerAsyncContextDependency(contextLifetime);
   const removers = [];
 
   function addListener(target, event, handler) {
@@ -551,6 +556,7 @@ export function on(emitter, name, options = undefined) {
   function closeHandler() {
     if (!finished) {
       finished = true;
+      releaseContext();
       for (const remove of removers.splice(0)) remove();
       if (signal) signal.removeEventListener?.("abort", abortListener);
     }

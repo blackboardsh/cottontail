@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { EventEmitter, on as eventsOn } from "node:events";
 import { setImmediate as setImmediateTimer, clearImmediate, promises as timerPromises } from "node:timers";
 import { setTimeout as sleep, setImmediate as immediate, scheduler } from "node:timers/promises";
 import querystring from "node:querystring";
@@ -25,6 +26,24 @@ function assert(value: unknown, message: string): asserts value {
 }
 
 const require = createRequire(import.meta.url);
+
+const {
+  file: importMetaFile,
+  path: importMetaPath,
+  dir: importMetaDir,
+  url: importMetaURL,
+} = import.meta;
+const normalizedImportMetaPath = importMetaPath.replaceAll("\\", "/");
+assert(importMetaFile === "node-misc-modules-surface.ts", "destructured import.meta.file mismatch");
+assert(normalizedImportMetaPath.endsWith("/tests/js/node-misc-modules-surface.ts"), "destructured import.meta.path mismatch");
+assert(importMetaDir.replaceAll("\\", "/").endsWith("/tests/js"), "destructured import.meta.dir mismatch");
+assert(importMetaURL.endsWith("/tests/js/node-misc-modules-surface.ts"), "destructured import.meta.url mismatch");
+
+class AsyncPrivateMethod {
+  async #import() { return 42; }
+  read() { return this.#import(); }
+}
+assert(await new AsyncPrivateMethod().read() === 42, "async private method output mismatch");
 
 const parsed = querystring.parse("a=1&a=2&b=hello+world");
 assert(Array.isArray(parsed.a) && parsed.a[1] === "2", "querystring repeated key mismatch");
@@ -82,6 +101,18 @@ assert(hookInit, "async_hooks init mismatch");
 assert(scoped, "AsyncResource scope mismatch");
 assert(triggerAsyncId() >= 0, "triggerAsyncId mismatch");
 
+const emissionOrder: string[] = [];
+const orderingEmitter = new EventEmitter();
+orderingEmitter.on("ordered", () => {
+  emissionOrder.push("first");
+  queueMicrotask(() => emissionOrder.push("microtask"));
+});
+orderingEmitter.on("ordered", () => emissionOrder.push("second"));
+orderingEmitter.emit("ordered");
+assert(emissionOrder.join(",") === "first,second", "EventEmitter drained jobs between listeners");
+await Promise.resolve();
+assert(emissionOrder.join(",") === "first,second,microtask", "EventEmitter microtask order mismatch");
+
 const storage = new AsyncLocalStorage();
 assert(storage.run({ value: 7 }, () => storage.getStore()?.value) === 7, "AsyncLocalStorage run mismatch");
 let timerStoreValue = 0;
@@ -127,6 +158,66 @@ await storage.run({ value: 16 }, () => {
   });
 });
 assert(promiseFinallyStoreValue === 16, "AsyncLocalStorage promise finally propagation mismatch");
+let awaitedStoreValue = 0;
+const awaitedScope = storage.run({ value: 17 }, async () => {
+  await Promise.resolve();
+  awaitedStoreValue = storage.getStore()?.value ?? 0;
+});
+assert(storage.getStore() === undefined, "AsyncLocalStorage async run parent restoration mismatch");
+await awaitedScope;
+assert(awaitedStoreValue === 17, "AsyncLocalStorage await propagation mismatch");
+let streamStoreValue = 0;
+const contextualStream = storage.run({ value: 18 }, () => new ReadableStream({
+  pull(controller) {
+    streamStoreValue = storage.getStore()?.value ?? 0;
+    controller.close();
+  },
+}));
+await contextualStream.getReader().read();
+assert(streamStoreValue === 18, "AsyncLocalStorage ReadableStream propagation mismatch");
+let eventStoreValue = 0;
+const eventStorage = new AsyncLocalStorage();
+await new Promise<void>((resolve) => {
+  eventStorage.run({ value: 19 }, () => {
+    const emitter = new EventEmitter();
+    emitter.once("async", async () => {
+      await immediate();
+      eventStoreValue = eventStorage.getStore()?.value ?? 0;
+      resolve();
+    });
+    emitter.emit("async");
+  });
+});
+await immediate();
+assert(eventStoreValue === 19, "AsyncLocalStorage async EventEmitter propagation mismatch");
+assert(eventStorage.getStore() === undefined, "AsyncLocalStorage EventEmitter restoration mismatch");
+let iteratorStoreValue = 0;
+const iteratorStorage = new AsyncLocalStorage();
+const iteratorEmitter = new EventEmitter();
+await iteratorStorage.run({ value: 20 }, async () => {
+  const values = eventsOn(iteratorEmitter, "data");
+  setImmediateTimer(() => iteratorEmitter.emit("data", "done"));
+  for await (const [value] of values) {
+    iteratorStoreValue = iteratorStorage.getStore()?.value ?? 0;
+    if (value === "done") break;
+  }
+});
+assert(iteratorStoreValue === 20, "AsyncLocalStorage events.on propagation mismatch");
+assert(iteratorStorage.getStore() === undefined, "AsyncLocalStorage events.on restoration mismatch");
+let repeatedPulls = 0;
+const repeatedStreamStorage = new AsyncLocalStorage();
+const repeatedStream = repeatedStreamStorage.run({ value: 21 }, () => new ReadableStream({
+  async pull(controller) {
+    controller.enqueue(repeatedStreamStorage.getStore()?.value);
+    repeatedPulls += 1;
+    if (repeatedPulls === 3) controller.close();
+    else await sleep(1);
+  },
+}));
+assert(repeatedStreamStorage.getStore() === undefined, "AsyncLocalStorage repeated stream parent restoration mismatch");
+const repeatedReader = repeatedStream.getReader();
+while (!(await repeatedReader.read()).done) {}
+assert(repeatedStreamStorage.getStore() === undefined, "AsyncLocalStorage repeated stream final restoration mismatch");
 let immediateStoreValue = 0;
 await new Promise<void>((resolve) => {
   storage.run({ value: 12 }, () => {

@@ -413,18 +413,19 @@ pub fn AstMaybe(
                     // Inline import.meta properties for Bake, CommonJS, or a
                     // host that evaluates bundled ESM through a script API.
                     if (p.options.inline_import_meta_properties or p.options.framework != null or (p.options.bundle and p.options.output_format == .cjs)) {
+                        const import_meta_path = p.pathForImportMeta();
                         if (strings.eqlComptime(name, "dir") or strings.eqlComptime(name, "dirname")) {
                             // Inline import.meta.dir
-                            return p.newExpr(E.String.init(p.source.path.name.dir), name_loc);
+                            return p.newExpr(E.String.init(import_meta_path.name.dir), name_loc);
                         } else if (strings.eqlComptime(name, "file")) {
                             // Inline import.meta.file (filename only)
-                            return p.newExpr(E.String.init(p.source.path.name.filename), name_loc);
+                            return p.newExpr(E.String.init(import_meta_path.name.filename), name_loc);
                         } else if (strings.eqlComptime(name, "path") or strings.eqlComptime(name, "filename")) {
                             // Inline import.meta.path / import.meta.filename (full path)
-                            return p.newExpr(E.String.init(p.source.path.text), name_loc);
+                            return p.newExpr(E.String.init(import_meta_path.text), name_loc);
                         } else if (strings.eqlComptime(name, "url")) {
                             // Inline import.meta.url as file:// URL
-                            const bunstr = bun.String.fromBytes(p.source.path.text);
+                            const bunstr = bun.String.fromBytes(import_meta_path.text);
                             defer bunstr.deref();
                             const url = std.fmt.allocPrint(p.allocator, "{f}", .{jsc.URL.fileURLFromString(bunstr)}) catch unreachable;
                             return p.newExpr(E.String.init(url), name_loc);

@@ -23,6 +23,21 @@ const BarrelExportResolution = struct {
     alias_is_star: bool,
 };
 
+fn deferredRecordKey(source_index: u32, import_record_index: u32) u64 {
+    return (@as(u64, source_index) << 32) | import_record_index;
+}
+
+fn clearDeferredRecordsForSource(this: *BundleV2, source_index: u32) void {
+    var index: usize = 0;
+    while (index < this.barrel_deferred_import_records.count()) {
+        if (@as(u32, @truncate(this.barrel_deferred_import_records.keys()[index] >> 32)) == source_index) {
+            this.barrel_deferred_import_records.swapRemoveAt(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 /// Look up an export name → import_record_index by chasing
 /// named_exports[alias].ref through named_imports.
 /// Also returns the original alias from the source module for BFS propagation.
@@ -49,6 +64,10 @@ fn applyBarrelOptimizationImpl(this: *BundleV2, parse_result: *ParseTask.Result)
     const result = &parse_result.value.success;
     const ast = &result.ast;
     const source_index = result.source.index.get();
+
+    // Source indices are stable across incremental reparses. Discard markers
+    // from the previous AST before deciding which records this parse defers.
+    clearDeferredRecordsForSource(this, source_index);
 
     const is_explicit = if (this.transpiler.options.optimize_imports) |oi| oi.map.contains(result.package_name) else false;
     const is_side_effects_false = result.side_effects == .no_side_effects__package_json;
@@ -160,6 +179,11 @@ fn applyBarrelOptimizationImpl(this: *BundleV2, parse_result: *ParseTask.Result)
             if (!needed_records.contains(imp.import_record_index)) {
                 if (imp.import_record_index < ast.import_records.len) {
                     ast.import_records.slice()[imp.import_record_index].flags.is_unused = true;
+                    try this.barrel_deferred_import_records.put(
+                        this.allocator(),
+                        deferredRecordKey(source_index, imp.import_record_index),
+                        {},
+                    );
                     has_deferrals = true;
                 }
             }
@@ -194,8 +218,9 @@ fn applyBarrelOptimizationImpl(this: *BundleV2, parse_result: *ParseTask.Result)
 }
 
 /// Clear is_unused on a deferred barrel record. Returns true if the record was un-deferred.
-fn unDeferRecord(import_records: *ImportRecord.List, record_idx: u32) bool {
+fn unDeferRecord(this: *BundleV2, source_index: u32, import_records: *ImportRecord.List, record_idx: u32) bool {
     if (record_idx >= import_records.len) return false;
+    if (!this.barrel_deferred_import_records.swapRemove(deferredRecordKey(source_index, record_idx))) return false;
     const rec = &import_records.slice()[record_idx];
     if (rec.flags.is_internal or !rec.flags.is_unused) return false;
     rec.flags.is_unused = false;
@@ -471,7 +496,7 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
         if (item.is_star) {
             for (barrel_ir.slice(), 0..) |rec, idx| {
                 if (rec.flags.is_unused and !rec.flags.is_internal) {
-                    if (unDeferRecord(barrel_ir, @intCast(idx))) {
+                    if (unDeferRecord(this, barrel_idx, barrel_ir, @intCast(idx))) {
                         try barrels_to_resolve.put(barrels_to_resolve_alloc, barrel_idx, {});
                     }
                 }
@@ -485,7 +510,7 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
             // Name not in named re-exports — might come from export *.
             for (graph_ast_snapshot.items(.export_star_import_records)[barrel_idx]) |star_idx| {
                 if (star_idx >= barrel_ir.len) continue;
-                if (unDeferRecord(barrel_ir, star_idx)) {
+                if (unDeferRecord(this, barrel_idx, barrel_ir, star_idx)) {
                     try barrels_to_resolve.put(barrels_to_resolve_alloc, barrel_idx, {});
                 }
                 var star_rec = barrel_ir.slice()[star_idx];
@@ -503,7 +528,7 @@ pub fn scheduleBarrelDeferredImports(this: *BundleV2, result: *ParseTask.Result.
             continue;
         };
 
-        if (unDeferRecord(barrel_ir, resolution.import_record_index)) {
+        if (unDeferRecord(this, barrel_idx, barrel_ir, resolution.import_record_index)) {
             try barrels_to_resolve.put(barrels_to_resolve_alloc, barrel_idx, {});
         }
 
