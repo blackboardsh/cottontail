@@ -2138,7 +2138,7 @@ function installTestSubprocessTracking() {
 
   const deadlineCommand = (cmd, remainingMs) => {
     const seconds = Math.max(Number(remainingMs), 5) / 1000;
-    const script = `"$@" & CT_CHILD=$!; ( sleep ${seconds}; kill -9 $CT_CHILD 2>/dev/null ) >/dev/null 2>&1 & CT_WATCH=$!; ` +
+    const script = `"$@" & CT_CHILD=$!; ( /bin/sleep ${seconds}; kill -9 $CT_CHILD 2>/dev/null ) >/dev/null 2>&1 & CT_WATCH=$!; ` +
       "{ wait $CT_CHILD; } 2>/dev/null; CT_STATUS=$?; kill $CT_WATCH 2>/dev/null; exit $CT_STATUS";
     return ["/bin/sh", "-c", script, "sh", ...cmd.map(String)];
   };

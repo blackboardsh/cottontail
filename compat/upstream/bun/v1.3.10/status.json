@@ -418,15 +418,18 @@
     },
     "test/bundler/bundler_drop.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All 14 generated drop-option cases pass with 14 assertions, including dropped calls, debugger statements, side effects, nested member expressions, assignment/delete targets, and bare identifiers.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_env.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All seven API/CLI environment-injection variants pass with seven assertions, covering inline, disabled, prefix-filtered, nested literal references, and a runtime PATH intentionally replaced with an unusable value.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_footer.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "Both generated single-line and multiline footer cases pass with two assertions.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_html.test.ts": {
       "status": "enabled",
@@ -458,7 +461,8 @@
     },
     "test/bundler/bundler_minify_symbol_for.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All nine generated Symbol.for minification and tree-shaking cases pass with 38 assertions, including transform-only mode and runtime overrides.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_naming.test.ts": {
       "status": "enabled",
@@ -466,7 +470,12 @@
     },
     "test/bundler/bundler_npm.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "The owned runner exposes both npm-backed bundler cases; each remains a strict expected failure at the package-install prerequisite instead of being hidden by the old zero-test result.",
+      "splitBundlerTests": true,
+      "expectedFailureBundlerTests": {
+        "npm/ReactSSR": "Requires a functional `cottontail install` package-manager path to materialize React before the bundler behavior can run.",
+        "npm/LodashES": "Requires a functional `cottontail install` package-manager path to materialize lodash-es before the bundler behavior can run."
+      }
     },
     "test/bundler/bundler_plugin.test.ts": {
       "status": "enabled",
@@ -480,15 +489,17 @@
     },
     "test/bundler/bundler_promiseall_deadcode.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All three generated Promise helper and circular-ESM dead-code cases pass with 23 assertions and exact deterministic source-map/debug-ID snapshots.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_regressions.test.ts": {
       "status": "enabled",
-      "reason": "Passes via the official runner on the native-bundler pipeline (file registers no tests in this environment, matching Bun CI)."
+      "reason": "All eight generated regression cases pass with three assertions, covering public paths, identifier filenames, declaration merging, local reassignment, string decoding, path normalization, NODE_PATH, and namespace tracking.",
+      "splitBundlerTests": true
     },
     "test/bundler/bundler_splitting.test.ts": {
       "status": "enabled",
-      "reason": "The owned runner exposes and isolates all 10 generated JavaScript/CSS code-splitting cases instead of accepting the old zero-test result.",
+      "reason": "All 10 generated JavaScript/CSS code-splitting cases pass with 11 assertions, including nested and circular dynamic imports with shared CSS and module identity.",
       "splitBundlerTests": true
     },
     "test/bundler/bundler_string.test.ts": {

@@ -15,6 +15,11 @@ pub const BundleOptions = struct {
     target: compiler.schema.api.Target = .bun,
     banner: []const u8 = "",
     footer: []const u8 = "",
+    drop: []const []const u8 = &.{},
+    public_path: []const u8 = "",
+    transform_only: bool = false,
+    env_behavior: compiler.schema.api.DotEnvBehavior = .disable,
+    env_prefix: []const u8 = "",
     bytecode: bool = false,
     loader: ?[]const u8 = null,
     loader_extensions: []const []const u8 = &.{},
@@ -176,6 +181,7 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transform_options.tsconfig_override = options.tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
+    transform_options.drop = options.drop;
     transform_options.disable_hmr = true;
     transform_options.main_fields = &.{ "main", "module" };
     if (options.jsx_factory != null or
@@ -240,6 +246,10 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
     transpiler.options.banner = options.banner;
     transpiler.options.footer = options.footer;
+    transpiler.options.public_path = options.public_path;
+    transpiler.options.transform_only = options.transform_only;
+    transpiler.options.env.behavior = options.env_behavior;
+    transpiler.options.env.prefix = options.env_prefix;
     transpiler.options.bytecode = options.bytecode;
     transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
     transpiler.options.minify_whitespace = options.minify_whitespace;
@@ -496,6 +506,50 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     if (object.get("footer")) |value| {
         if (value == .string) options.footer = value.string;
     }
+    if (object.get("drop")) |value| {
+        if (value == .array) {
+            var drop: std.ArrayList([]const u8) = .empty;
+            for (value.array.items) |item| {
+                if (item == .string) try drop.append(allocator, item.string);
+            }
+            options.drop = drop.items;
+        }
+    }
+    if (object.get("publicPath")) |value| {
+        if (value == .string) options.public_path = value.string;
+    }
+    if (object.get("bundle")) |value| {
+        if (value == .bool) options.transform_only = !value.bool;
+    }
+    if (object.get("env")) |value| switch (value) {
+        .null => {},
+        .bool => |enabled| options.env_behavior = if (enabled) .load_all else .disable,
+        .integer => |number| options.env_behavior = if (number == 1)
+            .load_all
+        else if (number == 0)
+            .disable
+        else
+            return error.InvalidEnvironment,
+        .float => |number| options.env_behavior = if (number == 1)
+            .load_all
+        else if (number == 0)
+            .disable
+        else
+            return error.InvalidEnvironment,
+        .string => |env| {
+            if (std.mem.eql(u8, env, "inline")) {
+                options.env_behavior = .load_all;
+            } else if (std.mem.eql(u8, env, "disable")) {
+                options.env_behavior = .disable;
+            } else if (std.mem.indexOfScalar(u8, env, '*')) |asterisk| {
+                options.env_behavior = if (asterisk == 0) .load_all else .prefix;
+                options.env_prefix = env[0..asterisk];
+            } else {
+                return error.InvalidEnvironment;
+            }
+        },
+        else => return error.InvalidEnvironment,
+    };
     if (object.get("bytecode")) |value| {
         if (value == .bool) options.bytecode = value.bool;
     }
@@ -833,11 +887,23 @@ pub fn buildEntryPointsJson(
 
     const allocator = compiler.default_allocator;
     compiler.cli.start_time = compiler.nanoTimestamp();
-    const working_dir_z = try allocator.dupeZ(u8, working_dir);
-    defer allocator.free(working_dir_z);
+    const default_root = if (entry_points.items.len == 1)
+        (std.fs.path.dirname(entry_points.items[0]) orelse ".")
+    else
+        compiler.path.getIfExistsLongestCommonPath(entry_points.items) orelse ".";
+    const requested_root = if (request_object.get("root")) |value|
+        if (value == .string and value.string.len > 0) value.string else default_root
+    else
+        default_root;
+    const build_root = if (std.fs.path.isAbsolute(requested_root))
+        requested_root
+    else
+        try std.fs.path.resolve(arena_allocator, &.{ working_dir, requested_root });
+    const build_root_z = try allocator.dupeZ(u8, build_root);
+    defer allocator.free(build_root_z);
 
     var transform_options = std.mem.zeroes(compiler.schema.api.TransformOptions);
-    transform_options.absolute_working_dir = working_dir_z;
+    transform_options.absolute_working_dir = build_root_z;
     transform_options.entry_points = entry_points.items;
     transform_options.target = options.target;
     transform_options.write = false;
@@ -847,6 +913,7 @@ pub fn buildEntryPointsJson(
     transform_options.tsconfig_override = options.tsconfig_override;
     transform_options.packages = if (options.external_packages) .external else .bundle;
     transform_options.external = options.external;
+    transform_options.drop = options.drop;
     if (options.loader_extensions.len > 0) {
         transform_options.loaders = .{
             .extensions = options.loader_extensions,
@@ -889,12 +956,16 @@ pub fn buildEntryPointsJson(
         return json;
     };
     defer transpiler.deinitPreservingFileSystem();
-    try transpiler.fs.setTopLevelDir(working_dir_z);
+    try transpiler.fs.setTopLevelDir(build_root_z);
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
     transpiler.options.banner = options.banner;
     transpiler.options.footer = options.footer;
+    transpiler.options.public_path = options.public_path;
+    transpiler.options.transform_only = options.transform_only;
+    transpiler.options.env.behavior = options.env_behavior;
+    transpiler.options.env.prefix = options.env_prefix;
     transpiler.options.bytecode = options.bytecode;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
@@ -903,18 +974,9 @@ pub fn buildEntryPointsJson(
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
     transpiler.options.setProduction(options.production);
     if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
-    // Match Bun's root-dir default: the directory of a single entry point, or
-    // the longest common path of multiple entry points, so `[dir]` in naming
-    // templates resolves entry-relative rather than cwd-relative.
-    if (request_object.get("root")) |value| {
-        if (value == .string) transpiler.options.root_dir = value.string;
-    }
-    if (transpiler.options.root_dir.len == 0) {
-        transpiler.options.root_dir = if (entry_points.items.len == 1)
-            (std.fs.path.dirname(entry_points.items[0]) orelse ".")
-        else
-            compiler.path.getIfExistsLongestCommonPath(entry_points.items) orelse ".";
-    }
+    // The filesystem root must be selected before resolving inputs because it
+    // also determines source-map source paths and their deterministic debug ID.
+    transpiler.options.root_dir = build_root;
     transpiler.options.react_fast_refresh = options.react_fast_refresh;
     transpiler.options.entry_naming = options.entry_naming;
     transpiler.options.chunk_naming = options.chunk_naming;

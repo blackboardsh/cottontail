@@ -2571,6 +2571,41 @@ fn scanDynamicImports(
     return has_custom_signal;
 }
 
+fn rewriteTranspiledDynamicImports(
+    ctx: *const Context,
+    source: []const u8,
+    resolution_dir: []const u8,
+) ![]const u8 {
+    var occurrences: std.ArrayList(DynamicImportOccurrence) = .empty;
+    defer occurrences.deinit(ctx.allocator);
+    var targets: std.ArrayList(DynamicImportTarget) = .empty;
+    defer targets.deinit(ctx.allocator);
+    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets);
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(ctx.allocator);
+    var copied_until: usize = 0;
+    var changed = false;
+    for (occurrences.items) |occurrence| {
+        if (occurrence.is_static or occurrence.runtime_require or occurrence.runtime_require_resolve or
+            !std.mem.startsWith(u8, source[occurrence.start..], "import")) continue;
+        try output.appendSlice(ctx.allocator, source[copied_until..occurrence.start]);
+        try output.appendSlice(ctx.allocator, "__ctDynamicImport(");
+        try output.appendSlice(ctx.allocator, occurrence.expression);
+        try output.appendSlice(ctx.allocator, ", ");
+        try output.appendSlice(ctx.allocator, occurrence.options);
+        try output.append(ctx.allocator, ')');
+        copied_until = occurrence.end;
+        changed = true;
+    }
+    if (!changed) {
+        output.deinit(ctx.allocator);
+        return source;
+    }
+    try output.appendSlice(ctx.allocator, source[copied_until..]);
+    return try output.toOwnedSlice(ctx.allocator);
+}
+
 fn transpileDynamicTarget(
     ctx: *const Context,
     target_path: []const u8,
@@ -2610,7 +2645,8 @@ fn transpileDynamicTarget(
         return null;
     };
     defer native_bundler.ct_bundle_free(output.ptr, output.len);
-    return try ctx.allocator.dupe(u8, output);
+    const copied = try ctx.allocator.dupe(u8, output);
+    return try rewriteTranspiledDynamicImports(ctx, copied, std.fs.path.dirname(target_path) orelse ctx.project_root);
 }
 
 fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
@@ -2758,11 +2794,16 @@ fn appendDynamicTargetFactory(
             else
                 transpiled;
             const transpiled_literal = try jsonStringLiteral(ctx, factory_source);
-            try output.appendSlice(ctx.allocator, "    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", ");
+            try output.appendSlice(ctx.allocator, "    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", ");
             try output.appendSlice(ctx.allocator, transpiled_literal);
             try output.appendSlice(ctx.allocator, ")(module, exports, __ctCreateRequire(__ctPath");
             try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
-            try output.appendSlice(ctx.allocator, "), __ctImportMeta);\n");
+            // The target promise's normalization catch adds one reaction of
+            // its own. Two empty reactions keep nested evaluation behind both
+            // that propagation and the outer import's fulfillment handler.
+            try output.appendSlice(ctx.allocator, "), __ctImportMeta, (specifier, importOptions) => Promise.resolve().then(() => {}).then(() => {}).then(() => globalThis.__cottontailImportModule(String(specifier), __ctPath");
+            try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
+            try output.appendSlice(ctx.allocator, ", importOptions)));\n");
         } else {
             try output.appendSlice(ctx.allocator, transpiled);
         }

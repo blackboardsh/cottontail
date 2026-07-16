@@ -1713,7 +1713,15 @@ for (const [key, blob] of build.outputs) {
           if (run.exitCode) {
             expect([exitCode, signalCode]).toEqual([run.exitCode, undefined]);
           } else {
-            throw new Error(prefix + "Runtime failed\n" + stdout!.toUnixString() + "\n" + stderr!.toUnixString());
+            // COTTONTAIL-COMPAT: Preserve the child status in copied upstream
+            // failures; empty stdout/stderr otherwise hides native spawn bugs.
+            throw new Error(
+              prefix +
+                `Runtime failed (exitCode=${exitCode}, signalCode=${signalCode}, cmd=${JSON.stringify(args)})\n` +
+                stdout!.toUnixString() +
+                "\n" +
+                stderr!.toUnixString(),
+            );
           }
         }
 

@@ -641,6 +641,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     }
     var entries: std.ArrayList([]const u8) = .empty;
     var external: std.ArrayList([]const u8) = .empty;
+    var drop: std.ArrayList([]const u8) = .empty;
     var conditions: std.ArrayList([]const u8) = .empty;
     var define_keys: std.ArrayList([]const u8) = .empty;
     var define_values: std.ArrayList([]const u8) = .empty;
@@ -654,6 +655,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         const arg: []const u8 = args[index];
         if (std.mem.eql(u8, arg, "--compile")) {
             compile = true;
+        } else if (std.mem.eql(u8, arg, "--no-bundle")) {
+            options.transform_only = true;
         } else if (std.mem.eql(u8, arg, "--bytecode")) {
             options.bytecode = true;
         } else if (std.mem.eql(u8, arg, "--production")) {
@@ -750,6 +753,40 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             };
             try define_keys.append(allocator, define[0..equals]);
             try define_values.append(allocator, define[equals + 1 ..]);
+        } else if (std.mem.startsWith(u8, arg, "--drop=")) {
+            try drop.append(allocator, arg["--drop=".len..]);
+        } else if (std.mem.eql(u8, arg, "--drop") and index + 1 < args.len) {
+            index += 1;
+            try drop.append(allocator, args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--env=")) {
+            const env = arg["--env=".len..];
+            if (std.mem.eql(u8, env, "inline") or std.mem.eql(u8, env, "1")) {
+                options.env_behavior = .load_all;
+            } else if (std.mem.eql(u8, env, "disable") or std.mem.eql(u8, env, "0")) {
+                options.env_behavior = .load_all_without_inlining;
+            } else if (std.mem.indexOfScalar(u8, env, '*')) |asterisk| {
+                options.env_behavior = if (asterisk == 0) .load_all else .prefix;
+                options.env_prefix = env[0..asterisk];
+            } else {
+                try stderr.writeAll("error: --env must be 'inline', 'disable', or a prefix ending in '*\n");
+                try stderr.flush();
+                return 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--env") and index + 1 < args.len) {
+            index += 1;
+            const env: []const u8 = args[index];
+            if (std.mem.eql(u8, env, "inline") or std.mem.eql(u8, env, "1")) {
+                options.env_behavior = .load_all;
+            } else if (std.mem.eql(u8, env, "disable") or std.mem.eql(u8, env, "0")) {
+                options.env_behavior = .load_all_without_inlining;
+            } else if (std.mem.indexOfScalar(u8, env, '*')) |asterisk| {
+                options.env_behavior = if (asterisk == 0) .load_all else .prefix;
+                options.env_prefix = env[0..asterisk];
+            } else {
+                try stderr.writeAll("error: --env must be 'inline', 'disable', or a prefix ending in '*\n");
+                try stderr.flush();
+                return 1;
+            }
         } else if (std.mem.eql(u8, arg, "--splitting")) {
             options.code_splitting = true;
         } else if (std.mem.eql(u8, arg, "--metafile")) {
@@ -785,6 +822,26 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         } else if (std.mem.eql(u8, arg, "--footer") and index + 1 < args.len) {
             index += 1;
             options.footer = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--public-path=")) {
+            options.public_path = arg["--public-path=".len..];
+        } else if (std.mem.eql(u8, arg, "--public-path") and index + 1 < args.len) {
+            index += 1;
+            options.public_path = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--entry-naming=")) {
+            options.entry_naming = arg["--entry-naming=".len..];
+        } else if (std.mem.eql(u8, arg, "--entry-naming") and index + 1 < args.len) {
+            index += 1;
+            options.entry_naming = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--chunk-naming=")) {
+            options.chunk_naming = arg["--chunk-naming=".len..];
+        } else if (std.mem.eql(u8, arg, "--chunk-naming") and index + 1 < args.len) {
+            index += 1;
+            options.chunk_naming = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--asset-naming=")) {
+            options.asset_naming = arg["--asset-naming=".len..];
+        } else if (std.mem.eql(u8, arg, "--asset-naming") and index + 1 < args.len) {
+            index += 1;
+            options.asset_naming = args[index];
         } else if (std.mem.startsWith(u8, arg, "--format=")) {
             options.output_format = cottontail_compiler.options.Format.fromString(arg["--format=".len..]) orelse {
                 try stderr.print("error: invalid build format \"{s}\"\n", .{arg["--format=".len..]});
@@ -831,6 +888,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     }
 
     options.external = external.items;
+    options.drop = drop.items;
     options.conditions = conditions.items;
     options.define_keys = define_keys.items;
     options.define_values = define_values.items;
@@ -885,6 +943,13 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         development: ?bool,
         sideEffects: ?bool,
     };
+    const NamingRequest = struct { entry: []const u8, chunk: []const u8, asset: []const u8 };
+    const env_option: ?[]const u8 = switch (options.env_behavior) {
+        .load_all => "inline",
+        .load_all_without_inlining => "disable",
+        .prefix => try std.mem.concat(allocator, u8, &.{ options.env_prefix, "*" }),
+        else => null,
+    };
     var define_object: std.json.ObjectMap = .{};
     for (options.define_keys, options.define_values) |key, value| {
         try define_object.put(allocator, key, .{ .string = value });
@@ -896,6 +961,15 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         .sourcemap = @tagName(options.source_map),
         .packages = if (options.external_packages) "external" else "bundle",
         .external = options.external,
+        .drop = options.drop,
+        .publicPath = options.public_path,
+        .bundle = !options.transform_only,
+        .env = env_option,
+        .naming = NamingRequest{
+            .entry = if (outfile) |path| std.fs.path.basename(path) else options.entry_naming,
+            .chunk = options.chunk_naming,
+            .asset = options.asset_naming,
+        },
         .conditions = options.conditions,
         .define = std.json.Value{ .object = define_object },
         .splitting = options.code_splitting,
@@ -975,6 +1049,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
                 outfile
             else if (outdir) |dir|
                 try std.fs.path.join(allocator, &.{ dir, relative_path })
+            else if (outfile) |path|
+                try std.fs.path.join(allocator, &.{ std.fs.path.dirname(path) orelse ".", relative_path })
             else
                 null;
             if (destination) |path| {
