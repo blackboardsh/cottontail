@@ -196,52 +196,43 @@ function makeSpawnFailureResult(file, cause, args = []) {
 }
 
 export function execSync(command, options = {}) {
-  const isWin = cottontail.platform() === "win32";
-  const shell = typeof options.shell === "string" && options.shell !== "" ? options.shell : (isWin ? "cmd" : "sh");
-  const nativeOptions = prepareNativeOptions(shell, options);
-  const result = normalizeSyncResult(cottontail.spawnSync(shell, isWin ? ["/d", "/s", "/c", String(command)] : ["-c", String(command)], {
-    stdio: options.stdio === "inherit" ? "inherit" : "pipe",
-    cwd: normalizeCwdOption(options.cwd),
-    env: nativeOptions.env,
-    clearEnv: nativeOptions.clearEnv,
-  }), options);
-  if (result.status !== 0) {
-    const error = new Error(result.stderr?.toString?.() || result.stdout?.toString?.() || `Command failed: ${command}`);
-    error.status = result.status;
-    error.stdout = result.stdout;
-    error.stderr = result.stderr;
-    throw error;
-  }
-  return options.encoding ? result.stdout : result.stdout;
+  if (typeof command !== "string") throw invalidArgTypeError("command", "string", command);
+  if (options == null) options = {};
+  if (typeof options !== "object") throw invalidArgTypeError("options", "object", options);
+  const normalizedOptions = {
+    ...options,
+    shell: typeof options.shell === "string" ? options.shell : true,
+  };
+  const result = spawnSync(command, normalizedOptions);
+  if (!options.stdio && result.stderr) globalThis.process?.stderr?.write?.(result.stderr);
+  const error = checkExecSyncResult(result, undefined, command);
+  if (error) throw error;
+  return result.stdout;
 }
 
 export function execFileSync(file, args = [], options = {}) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
-  const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
-  const nativeOptions = prepareNativeOptions(command.file, normalized.options);
-  let nativeResult;
-  try {
-    nativeResult = cottontail.spawnSync(command.file, command.args, {
-      stdio: normalized.options.stdio === "inherit" ? "inherit" : "pipe",
-      cwd: normalizeCwdOption(normalized.options.cwd),
-      env: nativeOptions.env,
-      clearEnv: nativeOptions.clearEnv,
-      input: prepareSyncInput(normalized.options.input, normalized.options.encoding),
-    });
-  } catch (error) {
-    throw makeSpawnFailureResult(file, error).error;
-  }
-  const result = normalizeSyncResult(nativeResult, normalized.options);
-  if (result.status !== 0) {
-    const error = new Error(result.stderr?.toString?.() || result.stdout?.toString?.() || `Command failed: ${file}`);
-    error.status = result.status;
-    error.stdout = result.stdout;
-    error.stderr = result.stderr;
-    throw error;
-  }
-  if (normalized.options.stdio === "inherit") return null;
+  const result = spawnSync(file, normalized.args, normalized.options);
+  if (!normalized.options.stdio && result.stderr) globalThis.process?.stderr?.write?.(result.stderr);
+  const error = checkExecSyncResult(result, [normalized.options.argv0 || file, ...normalized.args]);
+  if (error) throw error;
   return result.stdout;
+}
+
+function checkExecSyncResult(result, args = undefined, command = undefined) {
+  let error;
+  if (result.error) {
+    error = result.error;
+  } else if (result.status !== 0) {
+    let message = `Command failed: ${command ?? (args ?? []).join(" ")}`;
+    if (result.stderr?.length > 0) message += `\n${result.stderr.toString()}`;
+    error = new Error(message);
+  }
+  if (!error) return undefined;
+  Object.assign(error, result);
+  delete error.error;
+  return error;
 }
 
 // Classify one spawnSync stdout/stderr stdio entry. Arbitrary descriptors and
