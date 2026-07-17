@@ -2,6 +2,11 @@ import * as nodeAssert from "./assert.js";
 import { AsyncLocalStorage } from "./async_hooks.js";
 import { appendFileSync, readFileSync } from "./fs.js";
 import { Readable } from "./stream.js";
+import {
+  captureTestRegistrationLine,
+  junitReporterOptions,
+  writeJunitReport,
+} from "../internal/bun-test-junit.js";
 
 const tests = [];
 const events = [];
@@ -51,6 +56,7 @@ const runTodoTests = testCliArgs.includes("--todo");
 const dotsMode = testCliArgs.includes("--dots");
 const globalOnlyMode = testCliArgs.includes("--only") || testCliArgs.includes("--test-only");
 const passWithNoTests = testCliArgs.includes("--pass-with-no-tests");
+const junitOptions = junitReporterOptions(testCliArgs);
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 
 function cliOption(name, fallback = undefined) {
@@ -350,6 +356,7 @@ function createSuite(name, options = {}, parent = null) {
     definitionState: parent ? "defined" : "root",
     filePath: parent ? filePath : "",
     directoryPath,
+    registrationLine: Number(options.__bunRegistrationLine) || captureTestRegistrationLine(filePath),
   };
 }
 
@@ -865,6 +872,12 @@ async function executeAttempt(record) {
   });
 }
 
+globalThis.__cottontailRecordTestAssertionCount = (count) => {
+  const execution = executionStorage.getStore?.() ?? activeExecution;
+  if (!execution?.record) return;
+  (execution.record.attemptAssertionCounts ??= []).push(Math.max(0, Number(count) || 0));
+};
+
 function attemptCount(record) {
   if (record.options.repeats != null) return Number(record.options.repeats) + 1;
   if (record.options.retry != null) return Number(record.options.retry) + 1;
@@ -908,7 +921,9 @@ async function execute(record) {
   const totalAttempts = attemptCount(record);
   const retryMode = record.options.repeats == null;
   for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+    const attemptStarted = performance?.now?.() ?? Date.now();
     error = await executeAttempt(record);
+    (record.attemptDurationsMs ??= []).push((performance?.now?.() ?? Date.now()) - attemptStarted);
     record.attempts = attempt + 1;
     if (retryMode && error) (record.attemptErrors ??= []).push(error);
     if (record.options.repeats != null) {
@@ -932,6 +947,7 @@ async function execute(record) {
   }
 
   const duration_ms = (performance?.now?.() ?? Date.now()) - started;
+  record.durationMs = duration_ms;
   if (error) {
     if (error.code === "ERR_TEST_SKIP" || error.code === "ERR_TEST_TODO") {
       record.status = error.code === "ERR_TEST_SKIP" ? "skip" : "todo";
@@ -1512,6 +1528,11 @@ async function finalizeRun(exitOnFailure = true) {
     } catch (error) {
       recordHookFailure("snapshot writer", error);
     }
+    try {
+      writeJunitReport(tests, rootSuite, junitOptions);
+    } catch (error) {
+      recordHookFailure("JUnit reporter", error);
+    }
     reportResults();
     const labelFilterMatchedNoTests = Boolean(testNamePattern) &&
       tests.length > 0 && tests.every((record) => record.status === "filtered");
@@ -1548,6 +1569,9 @@ function resetForRerun() {
     record.todoError = null;
     record.attempts = undefined;
     record.attemptErrors = undefined;
+    record.attemptAssertionCounts = undefined;
+    record.attemptDurationsMs = undefined;
+    record.durationMs = undefined;
     record.reportOrder = undefined;
   }
   const resetSuite = (suite) => {
@@ -1640,6 +1664,9 @@ function makeTestFunction(defaultOptions = {}) {
       fn: parsed.fn,
       suite: currentSuite,
       filePath: String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
+      registrationLine: Number(parsed.options.__bunRegistrationLine) || captureTestRegistrationLine(
+        String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? globalThis.process?.argv?.[1] ?? ""),
+      ),
       ran: false,
       result: null,
     };

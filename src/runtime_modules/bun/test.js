@@ -2,6 +2,7 @@ import nodeAssert from "../node/assert.js";
 import { existsSync as nodeExistsSync } from "../node/fs.js";
 import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
+import { captureTestRegistrationLine } from "../internal/bun-test-junit.js";
 import {
   bunTestFilterIsActive,
   bunTestNameMatches,
@@ -3164,6 +3165,7 @@ function wrapTestCallback(callback) {
       await wrapped();
       verifyAssertionState();
     } finally {
+      globalThis.__cottontailRecordTestAssertionCount?.(currentAssertionState().count);
       resetAssertionState();
     }
   };
@@ -3343,11 +3345,16 @@ function makeBunTestFunction(base) {
     }
     const options = validateBunTestOptions({ ...parsed.options, ...extraOptions });
     const name = normalizeTestName(parsed.name);
+    let registrationLine = captureTestRegistrationLine(
+      globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
+    );
+    if (options.todo && typeof parsed.callback !== "function") registrationLine = Math.max(0, registrationLine - 1);
     noteBunTestSelection(name);
     return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
       name,
       applyBunFileConcurrency({
         ...options,
+        __bunRegistrationLine: registrationLine,
         __bunTest: true,
         __bunUsesDoneCallback: typeof parsed.callback === "function" && parsed.callback.length > 0,
       }),
@@ -3387,6 +3394,9 @@ function makeBunDescribe(base) {
     globalThis.__cottontailBunTestUsed = true;
     const parsed = parseDescribeArgs(args);
     const name = normalizeTestName(parsed.name);
+    const registrationLine = captureTestRegistrationLine(
+      globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
+    );
     const suite = {
       name,
       parent: currentBunSuite,
@@ -3396,7 +3406,7 @@ function makeBunDescribe(base) {
     };
     return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
       name,
-      applyBunFileConcurrency({ ...parsed.options, __bunDeferredDefinition: true, __bunTest: true }),
+      applyBunFileConcurrency({ ...parsed.options, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
       wrapBunDescribeCallback(parsed.callback, suite),
     ));
   };
@@ -3407,6 +3417,9 @@ function makeBunDescribe(base) {
       if (extraOptions.only) assertOnlyAllowed();
       const parsed = parseDescribeArgs(args);
       const name = normalizeTestName(parsed.name);
+      const registrationLine = captureTestRegistrationLine(
+        globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
+      );
       const suite = {
         name,
         parent: currentBunSuite,
@@ -3416,7 +3429,7 @@ function makeBunDescribe(base) {
       };
       return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
         name,
-        applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunDeferredDefinition: true, __bunTest: true }),
+        applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
         wrapBunDescribeCallback(parsed.callback, suite),
       ));
     };
