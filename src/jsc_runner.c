@@ -10279,14 +10279,14 @@ static int ct_tls_configure_ctx(
         free(message);
         return -1;
     }
-    if (ca != NULL && ca[0] != '\0') {
+    if (ca != NULL) {
         X509_STORE *store = X509_STORE_new();
         if (store == NULL) {
             ct_throw_message(ctx, exception, "Failed to initialize TLS certificate store");
             return -1;
         }
         SSL_CTX_set_cert_store(ssl_ctx, store);
-        if (ct_tls_load_ca_pem(ssl_ctx, ca) != 0) {
+        if (ca[0] != '\0' && ct_tls_load_ca_pem(ssl_ctx, ca) != 0) {
             ct_throw_message(ctx, exception, "Failed to parse TLS CA certificates");
             return -1;
         }
@@ -10359,6 +10359,34 @@ static JSValueRef ct_tls_x509_der(JSContextRef ctx, X509 *cert, JSValueRef *exce
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)len, ct_array_buffer_free, NULL, exception);
 }
 
+static JSObjectRef ct_tls_peer_chain_der(JSContextRef ctx, SSL *ssl, X509 *peer_cert, JSValueRef *exception) {
+    STACK_OF(X509) *chain = NULL;
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    chain = SSL_get0_verified_chain(ssl);
+#endif
+    if (chain == NULL || sk_X509_num(chain) == 0) chain = SSL_get_peer_cert_chain(ssl);
+
+    int chain_count = chain != NULL ? sk_X509_num(chain) : 0;
+    bool prepend_peer = peer_cert != NULL &&
+        (chain_count == 0 || X509_cmp(peer_cert, sk_X509_value(chain, 0)) != 0);
+    size_t count = (size_t)chain_count + (prepend_peer ? 1u : 0u);
+    if (count == 0) return ct_make_array(ctx, 0, NULL, exception);
+
+    JSValueRef *values = (JSValueRef *)calloc(count, sizeof(JSValueRef));
+    if (values == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return NULL;
+    }
+    size_t output_index = 0;
+    if (prepend_peer) values[output_index++] = ct_tls_x509_der(ctx, peer_cert, exception);
+    for (int chain_index = 0; chain_index < chain_count; chain_index += 1) {
+        values[output_index++] = ct_tls_x509_der(ctx, sk_X509_value(chain, chain_index), exception);
+    }
+    JSObjectRef result = ct_make_array(ctx, count, values, exception);
+    free(values);
+    return result;
+}
+
 static JSValueRef ct_tls_session_der(JSContextRef ctx, SSL *ssl, JSValueRef *exception) {
     if (ssl == NULL) return JSValueMakeNull(ctx);
     SSL_SESSION *session = SSL_get1_session(ssl);
@@ -10420,6 +10448,8 @@ static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *c
     ct_set_property(ctx, result, "localCertificate", ct_tls_x509_der(ctx, local_cert, exception), exception);
     X509 *peer_cert = SSL_get_peer_certificate(connection->ssl);
     ct_set_property(ctx, result, "peerCertificate", ct_tls_x509_der(ctx, peer_cert, exception), exception);
+    JSObjectRef peer_chain = ct_tls_peer_chain_der(ctx, connection->ssl, peer_cert, exception);
+    if (peer_chain != NULL) ct_set_property(ctx, result, "peerCertificateChain", peer_chain, exception);
     if (peer_cert != NULL) X509_free(peer_cert);
     const char *servername = SSL_get_servername(connection->ssl, TLSEXT_NAMETYPE_host_name);
     ct_set_property(ctx, result, "servername", servername != NULL ? ct_make_string(ctx, servername) : JSValueMakeNull(ctx), exception);

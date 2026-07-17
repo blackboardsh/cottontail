@@ -535,7 +535,9 @@ function parseX509Name(node) {
       const oid = asn1Oid(pair[0]);
       const name = x509NameOids[oid] ?? oid;
       const value = asn1String(pair[1]);
-      object[name] = object[name] == null ? value : `${object[name]}, ${value}`;
+      if (object[name] == null) object[name] = value;
+      else if (Array.isArray(object[name])) object[name].push(value);
+      else object[name] = [object[name], value];
       lines.push(`${name}=${value}`);
     }
   }
@@ -3194,7 +3196,7 @@ export class X509Certificate {
       fingerprint: this.fingerprint,
       fingerprint256: this.fingerprint256,
       fingerprint512: this.fingerprint512,
-      ext_key_usage: undefined,
+      ext_key_usage: this.keyUsage,
       serialNumber: this.serialNumber,
       raw: this.raw,
       asn1Curve: this._parsed.legacyPublicKey.asn1Curve,

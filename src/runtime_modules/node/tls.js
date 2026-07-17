@@ -58,21 +58,25 @@ function normalizeCertificateLabels(value) {
     .replace(/-----END (?:X509 |TRUSTED )CERTIFICATE-----/g, "-----END CERTIFICATE-----");
 }
 
-function parsePemCertificates(text) {
+function parsePemCertificates(text, trailingNewline = false) {
   const matches = normalizeCertificateLabels(text).match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-  return matches ? matches.map((cert) => cert.trim()) : [];
+  return matches ? matches.map((cert) => `${cert.trim()}${trailingNewline ? "\n" : ""}`) : [];
+}
+
+function uniqueCertificates(certificates) {
+  return Array.from(new Set(certificates));
 }
 
 function systemRootCertificates() {
   for (const path of certificatePaths) {
     try {
       const certs = parsePemCertificates(cottontail.readFile(path));
-      if (certs.length > 0) return certs;
+      if (certs.length > 0) return uniqueCertificates(certs);
     } catch {}
   }
   try {
     const result = cottontail.spawnSync("security", ["find-certificate", "-a", "-p", "/System/Library/Keychains/SystemRootCertificates.keychain"], { stdio: "pipe" });
-    if (result.status === 0) return parsePemCertificates(result.stdout);
+    if (result.status === 0) return uniqueCertificates(parsePemCertificates(result.stdout));
   } catch {}
   return [];
 }
@@ -211,12 +215,10 @@ function tlsCredentialOptions(options) {
     : ArrayBuffer.isView(passphraseOption) || passphraseOption instanceof ArrayBuffer
       ? Buffer.from(passphraseOption).toString()
       : String(passphraseOption);
-  let ca = flattenPem(options?.ca ?? context.ca);
-  if (!ca && process.env.NODE_EXTRA_CA_CERTS) {
-    try {
-      const extra = cottontail.readFile(String(process.env.NODE_EXTRA_CA_CERTS));
-      ca = flattenPem([...rootCertificates, extra]);
-    } catch {}
+  const caOption = options?.ca ?? context.ca;
+  let ca = caOption == null ? undefined : flattenPem(caOption);
+  if (caOption == null && (defaultCACertificatesWasSet || extraCACertificates.length > 0)) {
+    ca = flattenPem(defaultCACertificates);
   }
   return {
     ca,
@@ -258,6 +260,48 @@ function legacyCertificateFromBytes(bytes) {
   } catch {
     return { raw };
   }
+}
+
+function peerX509CertificateChain(info) {
+  const chain = Array.isArray(info?.peerCertificateChain) && info.peerCertificateChain.length > 0
+    ? info.peerCertificateChain
+    : info?.peerCertificate == null
+      ? []
+      : [info.peerCertificate];
+  const certificates = [];
+  for (const bytes of chain) {
+    const raw = bufferFromNativeBytes(bytes);
+    if (raw == null || raw.byteLength === 0) continue;
+    try {
+      certificates.push(new X509Certificate(raw));
+    } catch {}
+  }
+  return certificates;
+}
+
+function isSelfIssuedCertificate(certificate) {
+  if (!(certificate instanceof X509Certificate) || certificate.subject !== certificate.issuer) return false;
+  try {
+    return certificate.verify(certificate.publicKey);
+  } catch {
+    return false;
+  }
+}
+
+function legacyPeerCertificate(info, detailed = false) {
+  const certificates = peerX509CertificateChain(info);
+  if (certificates.length === 0) return {};
+  if (!detailed) return certificates[0].toLegacyObject();
+
+  const legacy = certificates.map((certificate) => certificate.toLegacyObject());
+  for (let index = 0; index + 1 < legacy.length; index += 1) {
+    legacy[index].issuerCertificate = legacy[index + 1];
+  }
+  const lastIndex = legacy.length - 1;
+  if (isSelfIssuedCertificate(certificates[lastIndex])) {
+    legacy[lastIndex].issuerCertificate = legacy[lastIndex];
+  }
+  return legacy[0];
 }
 
 function defaultCipherList() {
@@ -550,7 +594,7 @@ export class TLSSocket extends Socket {
       ? tlsError(info.verifyErrorMessage || info.verifyErrorCode, info.verifyErrorCode)
       : null;
     if (!this.isServer && !authorizationError && typeof this._checkServerIdentity === "function") {
-      const certificate = legacyCertificateFromBytes(info.peerCertificate);
+      const certificate = legacyPeerCertificate(info);
       if (certificate?.raw) {
         try {
           authorizationError = this._checkServerIdentity(this.servername || this._host || "localhost", certificate) || null;
@@ -765,12 +809,14 @@ export class TLSSocket extends Socket {
     return Array.isArray(value) ? [...value] : [];
   }
   getFinished() { return undefined; }
-  getPeerCertificate() {
-    return legacyCertificateFromBytes(this._currentTlsInfo()?.peerCertificate);
+  getPeerCertificate(detailed = false) {
+    return legacyPeerCertificate(this._currentTlsInfo(), Boolean(detailed));
   }
   getPeerX509Certificate() {
-    const raw = bufferFromNativeBytes(this._currentTlsInfo()?.peerCertificate);
-    return raw == null || raw.byteLength === 0 ? undefined : new X509Certificate(raw);
+    const certificates = peerX509CertificateChain(this._currentTlsInfo());
+    if (certificates.length === 0) return undefined;
+    if (certificates.length > 1) certificates[0].issuerCertificate = certificates[1];
+    return certificates[0];
   }
   getX509Certificate() {
     const raw = bufferFromNativeBytes(this._currentTlsInfo()?.localCertificate);
@@ -1166,31 +1212,105 @@ function prepareALPNProtocols(protocols) {
 }
 
 function immutableCertificateArray(certificates) {
-  const target = Object.freeze([...certificates]);
-  const readonly = () => {
-    throw new TypeError("Attempted to assign to readonly property.");
-  };
+  const target = Object.freeze(uniqueCertificates(certificates));
   return new Proxy(target, {
-    set: readonly,
-    defineProperty: readonly,
-    deleteProperty: readonly,
-    setPrototypeOf: readonly,
+    set: readonlyRootCertificates,
+    defineProperty: readonlyRootCertificates,
+    deleteProperty: readonlyRootCertificates,
+    setPrototypeOf: readonlyRootCertificates,
   });
 }
 
+function readonlyRootCertificates() {
+  throw new TypeError("Attempted to assign to readonly property.");
+}
+
+function invalidCAArgument(name, value, expected) {
+  const error = new TypeError(`The "${name}" argument must be ${expected}. Received ${value === null ? "null" : typeof value}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function validatedCACertificates(certs) {
+  if (!Array.isArray(certs)) throw invalidCAArgument("certs", certs, "an instance of Array");
+  const certificates = [];
+  for (let index = 0; index < certs.length; index += 1) {
+    const value = certs[index];
+    if (typeof value !== "string" && !ArrayBuffer.isView(value)) {
+      throw invalidCAArgument(`certs[${index}]`, value, "of type string or an instance of ArrayBufferView");
+    }
+    const text = typeof value === "string" ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+    const parsed = parsePemCertificates(text, true);
+    for (const certificate of parsed) {
+      try {
+        new X509Certificate(certificate);
+      } catch (cause) {
+        const error = new Error(cause?.message || "Failed to parse CA certificate");
+        error.code = cause?.code || "ERR_OSSL_PEM_BAD_BASE64_DECODE";
+        throw error;
+      }
+      certificates.push(certificate);
+    }
+  }
+  if (certs.length > 0 && certificates.length === 0) {
+    const error = new Error("No valid certificates found in the provided array");
+    error.code = "ERR_CRYPTO_OPERATION_FAILED";
+    throw error;
+  }
+  return uniqueCertificates(certificates);
+}
+
+function warnExtraCA(path, reason) {
+  process._rawDebug?.(`Warning: ignoring extra certs from \`${path}\`, load failed: ${reason}`);
+}
+
+function loadExtraCACertificates() {
+  const path = String(process.env.NODE_EXTRA_CA_CERTS ?? "");
+  if (!path) return [];
+  let text;
+  try {
+    text = cottontail.readFile(path);
+  } catch (error) {
+    warnExtraCA(path, error?.message || String(error));
+    return [];
+  }
+
+  const parsed = parsePemCertificates(text, true);
+  if (parsed.length === 0) {
+    warnExtraCA(path, "no certificate or CRL found");
+    return [];
+  }
+  const certificates = [];
+  for (const certificate of parsed) {
+    try {
+      new X509Certificate(certificate);
+      certificates.push(certificate);
+    } catch (error) {
+      warnExtraCA(path, error?.message || String(error));
+      break;
+    }
+  }
+  return uniqueCertificates(certificates);
+}
+
 export const rootCertificates = immutableCertificateArray(systemRootCertificates());
-let defaultCACertificates = [...rootCertificates];
+const systemCACertificates = immutableCertificateArray(rootCertificates);
+const extraCACertificates = immutableCertificateArray(loadExtraCACertificates());
+let defaultCACertificates = immutableCertificateArray([...rootCertificates, ...extraCACertificates]);
+let defaultCACertificatesWasSet = false;
 
 export function getCACertificates(type = "default") {
   const normalized = String(type ?? "default");
-  if (normalized === "default") return [...defaultCACertificates];
-  if (normalized === "system" || normalized === "bundled") return [...rootCertificates];
-  if (normalized === "extra") return [];
+  if (normalized === "default") return defaultCACertificates;
+  if (normalized === "bundled") return rootCertificates;
+  if (normalized === "system") return systemCACertificates;
+  if (normalized === "extra") return extraCACertificates;
   throw new TypeError(`Unknown CA certificate type: ${type}`);
 }
 
 export function setDefaultCACertificates(certs) {
-  defaultCACertificates = normalizeCertificates(certs);
+  defaultCACertificates = immutableCertificateArray(validatedCACertificates(certs));
+  defaultCACertificatesWasSet = true;
 }
 
 const defaultCipherNames = defaultCipherList();
@@ -1223,10 +1343,51 @@ const tlsDefault = {
 
 // Node exposes rootCertificates as a frozen array behind a read-only property.
 Object.defineProperty(tlsDefault, "rootCertificates", {
-  value: rootCertificates,
-  writable: false,
+  get: () => rootCertificates,
+  set: readonlyRootCertificates,
   configurable: false,
   enumerable: true,
 });
+
+function lockRootCertificatesExport(namespace) {
+  if (namespace == null || (typeof namespace !== "object" && typeof namespace !== "function")) return false;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(namespace, "rootCertificates");
+    if (descriptor?.configurable === false) return namespace.rootCertificates === rootCertificates;
+    Object.defineProperty(namespace, "rootCertificates", {
+      get: () => rootCertificates,
+      set: readonlyRootCertificates,
+      configurable: false,
+      enumerable: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installRootCertificatesExportLock() {
+  const modules = globalThis.__cottontailBuiltinModules ??= new Map();
+  if (lockRootCertificatesExport(modules.get("tls") ?? modules.get("node:tls"))) return;
+
+  // Embedded modules are initialized before the builtin registry is filled.
+  // Lock the generated namespace at the point where the registry receives it.
+  const previousOwnDescriptor = Object.getOwnPropertyDescriptor(modules, "set");
+  const originalSet = modules.set;
+  Object.defineProperty(modules, "set", {
+    configurable: true,
+    writable: true,
+    value(name, namespace) {
+      const result = Reflect.apply(originalSet, this, [name, namespace]);
+      if ((name === "tls" || name === "node:tls") && lockRootCertificatesExport(namespace)) {
+        if (previousOwnDescriptor) Object.defineProperty(this, "set", previousOwnDescriptor);
+        else delete this.set;
+      }
+      return result;
+    },
+  });
+}
+
+installRootCertificatesExportLock();
 
 export default tlsDefault;
