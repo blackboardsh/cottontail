@@ -1,5 +1,6 @@
 import nodeAssert from "../node/assert.js";
 import { existsSync as nodeExistsSync } from "../node/fs.js";
+import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import {
   after as nodeAfter,
   afterEach as nodeAfterEach,
@@ -3082,7 +3083,7 @@ function wrapDoneCallback(callback) {
     const done = (error = undefined) => {
       if (doneCalled || settled) return;
       doneCalled = true;
-      if (error) doneError = error;
+      if (error !== undefined && error !== null) doneError = error;
       finish();
     };
     try {
@@ -3169,18 +3170,6 @@ export function expectTypeOf(value) {
   return chain;
 }
 
-function formatEachName(name, values, index) {
-  let valueIndex = 0;
-  return String(name).replace(/%[#psdifjo]/g, (token) => {
-    if (token === "%#") return String(index);
-    const value = values[valueIndex++];
-    if (token === "%s") return String(value);
-    if (token === "%d" || token === "%i") return String(Number(value));
-    if (token === "%f") return String(Number(value));
-    return formatValue(value);
-  });
-}
-
 function normalizeEachValues(row) {
   return Array.isArray(row) ? row : [row];
 }
@@ -3228,16 +3217,19 @@ function normalizeTestName(name) {
 }
 
 function makeEach(base) {
-  return (table) => (name, options, callback) => {
-    const parsed = parseCallbackArgs([name, options, callback]);
-    Array.from(table ?? []).forEach((row, index) => {
-      const values = normalizeEachValues(row);
-      const testCallback = parsed.callback?.length > values.length
-        ? (done) => parsed.callback?.(...values, done)
-        : () => parsed.callback?.(...values);
-      base(formatEachName(parsed.name, values, index), parsed.options, testCallback);
-    });
-    return undefined;
+  return (table) => {
+    const rows = validateBunEachTable(table);
+    return (name, options, callback) => {
+      const parsed = parseCallbackArgs([name, options, callback]);
+      rows.forEach((row, index) => {
+        const values = normalizeEachValues(row);
+        const testCallback = parsed.callback?.length > values.length
+          ? (done) => parsed.callback?.call(row, ...values, done)
+          : () => parsed.callback?.apply(row, values);
+        base(formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback);
+      });
+      return undefined;
+    };
   };
 }
 
