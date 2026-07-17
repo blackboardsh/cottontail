@@ -124,6 +124,23 @@ assert(configuredOutput.includes('"cottontail"'), "Bun.Transpiler define mismatc
 assert(!configuredOutput.includes("process.env.RUNTIME"), "Bun.Transpiler define should replace source expression");
 const loaderOverride = new Bun.Transpiler({ loader: "js" }).transformSync("const count: number = 2;", "ts");
 assert(loaderOverride.includes("const count = 2"), "Bun.Transpiler loader override mismatch");
+let malformedTransformError: unknown;
+try {
+  new Bun.Transpiler().transformSync("const =");
+} catch (error) {
+  malformedTransformError = error;
+}
+assert(malformedTransformError != null, "Bun.Transpiler should throw malformed-source diagnostics");
+let nestedTransformError: unknown;
+try {
+  new Bun.Transpiler().transformSync(`${"for (;;) ".repeat(1500)};`);
+} catch (error) {
+  nestedTransformError = error;
+}
+assert(
+  String((nestedTransformError as any)?.message ?? nestedTransformError).includes("Maximum call stack size exceeded"),
+  "Bun.Transpiler should report parser recursion limits without crashing",
+);
 const replTranspiler = new Bun.Transpiler({ loader: "tsx", replMode: true });
 const replContext = vm.createContext({ Promise });
 await vm.runInContext(replTranspiler.transformSync("const replValue = await Promise.resolve(21)"), replContext);

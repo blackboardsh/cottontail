@@ -239,6 +239,7 @@ pub fn NewParser_(
         has_commonjs_export_names: bool = false,
 
         stack_check: bun.StackCheck,
+        parse_statement_depth: u16 = 0,
 
         /// When this flag is enabled, we attempt to fold all expressions that
         /// TypeScript would consider to be "constant expressions". This flag is

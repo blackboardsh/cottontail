@@ -22,12 +22,86 @@ const TransformConfig = struct {
     minify_syntax: bool = false,
     dead_code_elimination: bool = true,
     tree_shaking: bool = false,
-    trim_unused_imports: ?bool = null,
+    trim_unused_imports: bool = false,
+    replace_exports: compiler.js_parser.RuntimeFeatures.ReplaceableExport.Map = .{},
     allow_runtime: bool = false,
     inlining: bool = false,
     initial_indent: usize = 0,
     import_meta_main: ?bool = null,
+    structured_errors: bool = false,
+    log_level: compiler.logger.Log.Level = .warn,
 };
+
+const structured_diagnostics_prefix = "COTTONTAIL_DIAGNOSTICS:";
+
+const DiagnosticPosition = struct {
+    file: []const u8,
+    namespace: []const u8,
+    line: i32,
+    column: i32,
+    length: usize,
+    offset: usize,
+    lineText: ?[]const u8,
+};
+
+const DiagnosticNote = struct {
+    message: []const u8,
+    position: ?DiagnosticPosition,
+};
+
+const StructuredDiagnostic = struct {
+    message: []const u8,
+    level: []const u8,
+    position: ?DiagnosticPosition,
+    notes: []const DiagnosticNote,
+};
+
+fn diagnosticPosition(location: ?compiler.logger.Location) ?DiagnosticPosition {
+    const value = location orelse return null;
+    return .{
+        .file = value.file,
+        .namespace = value.namespace,
+        .line = value.line,
+        .column = value.column,
+        .length = value.length,
+        .offset = value.offset,
+        .lineText = value.line_text,
+    };
+}
+
+fn exportReplacementValue(
+    value: std.json.Value,
+    allocator: std.mem.Allocator,
+) !?compiler.ast.Expr {
+    const loc = compiler.logger.Loc.Empty;
+    return switch (value) {
+        .bool => |flag| compiler.ast.Expr{
+            .data = .{ .e_boolean = .{ .value = flag } },
+            .loc = loc,
+        },
+        .integer => |number| compiler.ast.Expr{
+            .data = .{ .e_number = .{ .value = @floatFromInt(number) } },
+            .loc = loc,
+        },
+        .float => |number| compiler.ast.Expr{
+            .data = .{ .e_number = .{ .value = number } },
+            .loc = loc,
+        },
+        .null => compiler.ast.Expr{
+            .data = .{ .e_null = .{} },
+            .loc = loc,
+        },
+        .string => |string| blk: {
+            const string_expr = try allocator.create(compiler.ast.E.String);
+            string_expr.* = .{ .data = string };
+            break :blk compiler.ast.Expr{
+                .data = .{ .e_string = string_expr },
+                .loc = loc,
+            };
+        },
+        else => null,
+    };
+}
 
 const ImportResult = struct {
     path: []const u8,
@@ -47,9 +121,50 @@ fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void 
     error_out.* = message.ptr;
 }
 
-fn setLogError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback: anyerror) void {
+fn setStructuredLogError(
+    error_out: *?[*:0]u8,
+    log: *const compiler.logger.Log,
+    allocator: std.mem.Allocator,
+) !void {
+    var diagnostics = std.ArrayList(StructuredDiagnostic).empty;
+
     for (log.msgs.items) |message| {
-        if (message.kind == .err) {
+        if (message.kind != .err and message.kind != .warn) continue;
+
+        const notes = try allocator.alloc(DiagnosticNote, message.notes.len);
+        for (message.notes, notes) |note, *output| {
+            output.* = .{
+                .message = note.text,
+                .position = diagnosticPosition(note.location),
+            };
+        }
+        try diagnostics.append(allocator, .{
+            .message = message.data.text,
+            .level = message.kind.string(),
+            .position = diagnosticPosition(message.data.location),
+            .notes = notes,
+        });
+    }
+
+    if (diagnostics.items.len == 0) return error.NoStructuredDiagnostics;
+    const envelope = .{ .errors = diagnostics.items };
+    const json = try std.json.Stringify.valueAlloc(allocator, envelope, .{});
+    setError(error_out, "{s}{s}", .{ structured_diagnostics_prefix, json });
+}
+
+fn setLogError(
+    error_out: *?[*:0]u8,
+    log: *const compiler.logger.Log,
+    fallback: anyerror,
+    structured: bool,
+    allocator: std.mem.Allocator,
+) void {
+    if (structured) {
+        setStructuredLogError(error_out, log, allocator) catch {};
+        if (error_out.* != null) return;
+    }
+    for (log.msgs.items) |message| {
+        if (message.kind == .err or message.kind == .warn) {
             if (message.data.location) |location| {
                 setError(error_out, "{s}:{}:{}: {s}", .{
                     location.file,
@@ -86,6 +201,15 @@ fn parseTarget(name: []const u8) !compiler.options.Target {
     return error.InvalidTarget;
 }
 
+fn parseLogLevel(name: []const u8) !compiler.logger.Log.Level {
+    if (std.mem.eql(u8, name, "verbose")) return .verbose;
+    if (std.mem.eql(u8, name, "debug")) return .debug;
+    if (std.mem.eql(u8, name, "info")) return .info;
+    if (std.mem.eql(u8, name, "warn")) return .warn;
+    if (std.mem.eql(u8, name, "error")) return .err;
+    return error.InvalidLogLevel;
+}
+
 fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std.mem.Allocator) !struct {
     config: TransformConfig,
     parsed: ?std.json.Parsed(std.json.Value),
@@ -104,13 +228,19 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (object.get("target")) |value| if (value == .string) {
             config.target = try parseTarget(value.string);
         };
+        if (object.get("logLevel")) |value| if (value == .string) {
+            config.log_level = try parseLogLevel(value.string);
+        };
         if (jsonBool(object, "minifyWhitespace")) |value| config.minify_whitespace = value;
         if (jsonBool(object, "deadCodeElimination")) |value| config.dead_code_elimination = value;
-        if (jsonBool(object, "treeShaking")) |value| config.tree_shaking = value;
-        if (jsonBool(object, "trimUnusedImports")) |value| config.trim_unused_imports = value;
+        const tree_shaking_option = jsonBool(object, "treeShaking");
+        if (tree_shaking_option) |value| config.tree_shaking = value;
+        const trim_unused_imports_option = jsonBool(object, "trimUnusedImports");
+        if (trim_unused_imports_option) |value| config.trim_unused_imports = value;
         if (jsonBool(object, "allowBunRuntime")) |value| config.allow_runtime = value;
         if (jsonBool(object, "inline")) |value| config.inlining = value;
         if (jsonBool(object, "_cottontailImportMetaMain")) |value| config.import_meta_main = value;
+        if (jsonBool(object, "_cottontailStructuredErrors")) |value| config.structured_errors = value;
         if (object.get("_cottontailInitialIndent")) |value| switch (value) {
             .integer => |count| {
                 if (count < 0 or count > 64) return error.InvalidIndentOption;
@@ -132,6 +262,62 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
             },
             else => return error.InvalidMinifyOption,
         };
+
+        if (object.get("exports")) |exports_value| {
+            if (exports_value != .object) return error.InvalidExportsOption;
+            const exports = exports_value.object;
+
+            const eliminate_count = if (exports.get("eliminate")) |eliminate|
+                if (eliminate == .array) eliminate.array.items.len else return error.InvalidExportsEliminate
+            else
+                0;
+            const replace_count = if (exports.get("replace")) |replace|
+                if (replace == .object) replace.object.count() else return error.InvalidExportsReplace
+            else
+                0;
+            try config.replace_exports.ensureUnusedCapacity(arena, eliminate_count + replace_count);
+
+            if (exports.get("eliminate")) |eliminate| {
+                for (eliminate.array.items) |name_value| {
+                    if (name_value != .string or name_value.string.len == 0) continue;
+                    config.replace_exports.putAssumeCapacity(name_value.string, .{ .delete = {} });
+                }
+            }
+
+            if (exports.get("replace")) |replace| {
+                var iterator = replace.object.iterator();
+                while (iterator.next()) |entry| {
+                    if (!compiler.js_lexer.isIdentifier(entry.key_ptr.*)) return error.InvalidExportIdentifier;
+                    const map_entry = config.replace_exports.getOrPutAssumeCapacity(entry.key_ptr.*);
+                    if (try exportReplacementValue(entry.value_ptr.*, arena)) |replacement| {
+                        map_entry.value_ptr.* = .{ .replace = replacement };
+                        continue;
+                    }
+
+                    if (entry.value_ptr.* == .array and entry.value_ptr.array.items.len == 2) {
+                        const pair = entry.value_ptr.array.items;
+                        if (pair[0] == .string and compiler.js_lexer.isIdentifier(pair[0].string)) {
+                            if (try exportReplacementValue(pair[1], arena)) |replacement| {
+                                map_entry.value_ptr.* = .{ .inject = .{
+                                    .name = pair[0].string,
+                                    .value = replacement,
+                                } };
+                                continue;
+                            }
+                        }
+                    }
+                    return error.InvalidExportReplacement;
+                }
+            }
+
+            if (tree_shaking_option == null and config.replace_exports.count() > 0) {
+                config.tree_shaking = true;
+            }
+        }
+
+        // Bun resolves an omitted trimUnusedImports option after export
+        // replacement has had a chance to enable tree shaking.
+        if (trim_unused_imports_option == null) config.trim_unused_imports = config.tree_shaking;
     }
 
     if (loader_override.len > 0) config.loader = try parseLoader(loader_override);
@@ -188,6 +374,7 @@ fn process(
 
     var log = compiler.logger.Log.init(allocator);
     defer log.deinit();
+    log.level = config.log_level;
 
     const source = compiler.logger.Source.initPathString(config.loader.stdinName(), source_code);
 
@@ -195,11 +382,11 @@ fn process(
         var scanner = compiler.bundle_v2.HTMLScanner.init(temporary_allocator, &log, &source);
         defer scanner.deinit();
         scanner.scan(source_code) catch |err| {
-            setLogError(error_out, &log, err);
+            setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
             return err;
         };
-        if (log.errors > 0) {
-            setLogError(error_out, &log, error.SyntaxError);
+        if (log.errors + log.warnings > 0) {
+            setLogError(error_out, &log, error.SyntaxError, config.structured_errors, temporary_allocator);
             return error.SyntaxError;
         }
 
@@ -217,7 +404,7 @@ fn process(
     }
 
     const define = createDefines(parsed_config.parsed, &log, allocator) catch |err| {
-        setLogError(error_out, &log, err);
+        setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
         return err;
     };
     defer define.deinit();
@@ -237,7 +424,8 @@ fn process(
     // decorators instead of relying on engine-specific syntax support.
     parser_options.features.standard_decorators = !config.loader.isTypeScript();
     parser_options.features.dead_code_elimination = config.dead_code_elimination;
-    parser_options.features.trim_unused_imports = config.trim_unused_imports orelse config.loader.isTypeScript();
+    parser_options.features.trim_unused_imports = config.trim_unused_imports;
+    parser_options.features.replace_exports = config.replace_exports;
     parser_options.features.inlining = config.inlining or config.minify_syntax;
     parser_options.features.minify_syntax = config.minify_syntax;
     parser_options.features.minify_identifiers = config.minify_identifiers;
@@ -245,13 +433,20 @@ fn process(
     parser_options.import_meta_main_value = config.import_meta_main;
 
     var parser = compiler.js_parser.Parser.init(parser_options, &log, &source, define, allocator) catch |err| {
-        setLogError(error_out, &log, err);
+        setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
         return err;
     };
     const result = parser.parse() catch |err| {
-        setLogError(error_out, &log, err);
+        setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
         return err;
     };
+    // Error recovery can still produce a result tag. Inspect diagnostics before
+    // honoring early-return tags such as `already_bundled`, or malformed input
+    // can be returned unchanged instead of throwing from Bun.Transpiler.
+    if (log.errors + log.warnings > 0) {
+        setLogError(error_out, &log, error.SyntaxError, config.structured_errors, temporary_allocator);
+        return error.SyntaxError;
+    }
     var ast = switch (result) {
         .ast => |ast| ast,
         .already_bundled => {
@@ -266,16 +461,11 @@ fn process(
     };
     defer ast.deinit();
 
-    if (log.errors > 0) {
-        setLogError(error_out, &log, error.SyntaxError);
-        return error.SyntaxError;
-    }
-
     if (operation != .transform) {
         var imports = std.ArrayList(ImportResult).empty;
         for (ast.import_records.slice()) |record| {
             if (record.flags.is_internal) continue;
-            if ((config.trim_unused_imports orelse false) and record.flags.is_unused) continue;
+            if (config.trim_unused_imports and record.flags.is_unused) continue;
             try imports.append(temporary_allocator, .{ .path = record.path.text, .kind = record.kind.label() });
         }
 
@@ -284,9 +474,15 @@ fn process(
             return try c_allocator.dupe(u8, json);
         }
 
+        const named_exports = try temporary_allocator.dupe([]const u8, ast.named_exports.keys());
+        std.mem.sortUnstable([]const u8, named_exports, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.lessThan);
         const scan_result = ScanResult{
             .imports = imports.items,
-            .exports = ast.named_exports.keys(),
+            .exports = named_exports,
         };
         const json = try std.json.Stringify.valueAlloc(temporary_allocator, scan_result, .{});
         return try c_allocator.dupe(u8, json);
@@ -299,26 +495,41 @@ fn process(
     const symbol_list = compiler.ast.Symbol.List.fromBorrowedSliceDangerous(ast.symbols.slice());
     const nested_symbols = compiler.ast.Symbol.NestedList.fromBorrowedSliceDangerous(&.{symbol_list});
     const symbol_map = compiler.ast.Symbol.Map.initList(nested_symbols);
-    _ = compiler.js_printer.printAst(
-        *compiler.js_printer.BufferPrinter,
-        &printer,
-        ast,
-        symbol_map,
-        &source,
-        true,
-        .{
-            .allocator = allocator,
-            .target = config.target,
-            .transform_only = !config.allow_runtime,
-            .minify_whitespace = config.minify_whitespace,
-            .minify_identifiers = config.minify_identifiers,
-            .minify_syntax = config.minify_syntax,
-            .mangled_props = null,
-            .indent = .{ .count = config.initial_indent },
-        },
-        false,
-    ) catch |err| {
-        setLogError(error_out, &log, err);
+    const print_options = compiler.js_printer.Options{
+        .allocator = allocator,
+        .target = config.target,
+        .transform_only = !config.allow_runtime,
+        .minify_whitespace = config.minify_whitespace,
+        .minify_identifiers = config.minify_identifiers,
+        .minify_syntax = config.minify_syntax,
+        .print_dce_annotations = false,
+        .mangled_props = null,
+        .indent = .{ .count = config.initial_indent },
+    };
+    const print_result = if (config.target.isBun())
+        compiler.js_printer.printAst(
+            *compiler.js_printer.BufferPrinter,
+            &printer,
+            ast,
+            symbol_map,
+            &source,
+            true,
+            print_options,
+            false,
+        )
+    else
+        compiler.js_printer.printAst(
+            *compiler.js_printer.BufferPrinter,
+            &printer,
+            ast,
+            symbol_map,
+            &source,
+            false,
+            print_options,
+            false,
+        );
+    _ = print_result catch |err| {
+        setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
         return err;
     };
 

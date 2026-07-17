@@ -1333,6 +1333,15 @@ pub fn ParseStmt(
         }
 
         pub fn parseStmt(p: *P, opts: *ParseStatementOptions) anyerror!Stmt {
+            // COTTONTAIL-COMPAT: Bun's older Zig compiler exhausts native stack
+            // around this AST depth. Zig 0.16's parser frames are smaller but its
+            // visitor frames are larger, so a deterministic ceiling preserves
+            // Bun's observable error and protects the subsequent visit pass.
+            p.parse_statement_depth += 1;
+            defer p.parse_statement_depth -= 1;
+            if (p.parse_statement_depth >= 1500) {
+                try bun.throwStackOverflow();
+            }
             if (!p.stack_check.isSafeToRecurse()) {
                 try bun.throwStackOverflow();
             }

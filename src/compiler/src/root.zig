@@ -1349,16 +1349,54 @@ pub const MimallocArena = allocators.MimallocArena;
 pub const StackCheck = struct {
     cached_stack_end: usize = 0,
 
+    const linux = struct {
+        extern "c" fn pthread_getattr_np(thread: std.c.pthread_t, attr: *std.c.pthread_attr_t) c_int;
+        extern "c" fn pthread_attr_getstack(attr: *const std.c.pthread_attr_t, stack_addr: *?*anyopaque, stack_size: *usize) c_int;
+    };
+
+    const darwin = struct {
+        extern "c" fn pthread_get_stackaddr_np(thread: std.c.pthread_t) ?*anyopaque;
+        extern "c" fn pthread_get_stacksize_np(thread: std.c.pthread_t) usize;
+    };
+
+    fn getStackEnd() usize {
+        return switch (@import("builtin").os.tag) {
+            .windows => @intFromPtr(std.os.windows.teb().NtTib.StackLimit),
+            .macos => blk: {
+                const thread = std.c.pthread_self();
+                const stack_top = darwin.pthread_get_stackaddr_np(thread) orelse break :blk 0;
+                break :blk @intFromPtr(stack_top) -| darwin.pthread_get_stacksize_np(thread);
+            },
+            .linux => blk: {
+                var attr: std.c.pthread_attr_t = undefined;
+                if (linux.pthread_getattr_np(std.c.pthread_self(), &attr) != 0) break :blk 0;
+                defer _ = std.c.pthread_attr_destroy(&attr);
+
+                var stack_addr: ?*anyopaque = null;
+                var stack_size: usize = 0;
+                if (linux.pthread_attr_getstack(&attr, &stack_addr, &stack_size) != 0) break :blk 0;
+                break :blk if (stack_addr) |address| @intFromPtr(address) else 0;
+            },
+            else => 0,
+        };
+    }
+
     pub fn configureThread() void {}
 
     pub fn init() StackCheck {
-        return .{};
+        return .{ .cached_stack_end = getStackEnd() };
     }
 
-    pub fn update(_: *StackCheck) void {}
+    pub fn update(this: *StackCheck) void {
+        this.cached_stack_end = getStackEnd();
+    }
 
-    pub fn isSafeToRecurse(_: StackCheck) bool {
-        return true;
+    /// Match Bun's parser guard: preserve enough native stack to report the
+    /// JavaScript exception instead of crashing while unwinding the parser.
+    pub fn isSafeToRecurse(this: StackCheck) bool {
+        if (this.cached_stack_end == 0) return true;
+        const remaining_stack = @frameAddress() -| this.cached_stack_end;
+        return remaining_stack > 1024 * if (Environment.isWindows) 256 else 128;
     }
 };
 
