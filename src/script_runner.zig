@@ -1158,7 +1158,11 @@ fn bundleScriptNative(
         ctx.environ_map.get("COTTONTAIL_RUNTIME_MODULES_DIR") == null and
         ctx.environ_map.get("COTTONTAIL_KEEP_TEMP") == null and
         ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null;
-    const bundle_common_js_entrypoint = is_common_js_entrypoint and has_custom_conditions;
+    // Standalone executables cannot fall back to Module.runMain() loading the
+    // original entrypoint from disk. Make the CommonJS entry an explicit
+    // graph edge whenever build options are present so its source and
+    // transitive dependencies are embedded in the generated bundle.
+    const bundle_common_js_entrypoint = is_common_js_entrypoint and (has_custom_conditions or build_options != null);
     const use_esm_bundle_cache = !is_wasm_entrypoint and
         !is_common_js_entrypoint and
         std.mem.eql(u8, script_entry_abs, script_abs) and
