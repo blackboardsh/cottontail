@@ -1741,10 +1741,12 @@ extern "C" napi_status napi_has_named_property(napi_env opaque_env, napi_value o
     napi_status status = require_object(env, object, &target);
     if (status != napi_ok || !name || !result)
         return status != napi_ok ? status : invalid(env);
-    JSStringRef key = property_name(name);
-    *result = JSObjectHasProperty(env->context, target, key);
-    JSStringRelease(key);
-    return finish(env, napi_ok);
+    JSStringRef key_string = property_name(name);
+    JSValueRef key = JSValueMakeString(env->context, key_string);
+    JSValueRef exception = nullptr;
+    *result = JSObjectHasPropertyForKey(env->context, target, key, &exception);
+    JSStringRelease(key_string);
+    return exception ? caught(env, exception) : finish(env, napi_ok);
 }
 
 extern "C" napi_status napi_get_named_property(napi_env opaque_env, napi_value object, const char* name, napi_value* result)
@@ -1804,20 +1806,14 @@ extern "C" napi_status napi_delete_element(napi_env opaque_env, napi_value objec
 
 extern "C" napi_status napi_get_property_names(napi_env opaque_env, napi_value object, napi_value* result)
 {
-    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
-    if (status != napi_ok || !result)
-        return status != napi_ok ? status : invalid(env);
-    JSPropertyNameArrayRef names = JSObjectCopyPropertyNames(env->context, target);
-    size_t count = JSPropertyNameArrayGetCount(names);
-    std::vector<JSValueRef> values(count);
-    for (size_t index = 0; index < count; ++index)
-        values[index] = JSValueMakeString(env->context, JSPropertyNameArrayGetNameAtIndex(names, index));
-    JSValueRef exception = nullptr;
-    JSObjectRef array = JSObjectMakeArray(env->context, values.size(), values.data(), &exception);
-    JSPropertyNameArrayRelease(names);
-    return exception ? caught(env, exception) : output(env, result, array);
+    return napi_get_all_property_names(
+        opaque_env,
+        object,
+        napi_key_include_prototypes,
+        static_cast<napi_key_filter>(napi_key_enumerable | napi_key_skip_symbols),
+        napi_key_numbers_to_strings,
+        result
+    );
 }
 
 extern "C" napi_status napi_is_array(napi_env opaque_env, napi_value value, bool* result)
@@ -2724,7 +2720,7 @@ extern "C" napi_status napi_create_arraybuffer(napi_env opaque_env, size_t byte_
     if (exception)
         return caught(env, exception);
     if (data)
-        *data = bytes;
+        *data = byte_length ? bytes : nullptr;
     return output(env, result, array_buffer);
 }
 
@@ -2738,7 +2734,7 @@ extern "C" napi_status napi_create_external_arraybuffer(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !external_data || !result)
+    if (!env || (!external_data && byte_length) || !result)
         return invalid(env);
     auto* finalizer = new (std::nothrow) NapiBufferFinalizer { env, external_data, finalize_hint, finalize_callback, false, false };
     if (!finalizer)
@@ -2771,12 +2767,14 @@ extern "C" napi_status napi_get_arraybuffer_info(napi_env opaque_env, napi_value
     if (!is_array_buffer(env, value, &exception))
         return exception ? caught(env, exception) : finish(env, napi_arraybuffer_expected);
     JSObjectRef object = as_object(env, value);
-    void* bytes = JSObjectGetArrayBufferBytesPtr(env->context, object, &exception);
-    size_t length = exception ? 0 : JSObjectGetArrayBufferByteLength(env->context, object, &exception);
+    size_t length = JSObjectGetArrayBufferByteLength(env->context, object, &exception);
+    void* bytes = data && length && !exception
+        ? JSObjectGetArrayBufferBytesPtr(env->context, object, &exception)
+        : nullptr;
     if (exception)
         return caught(env, exception);
     if (data)
-        *data = bytes;
+        *data = length ? bytes : nullptr;
     if (byte_length)
         *byte_length = length;
     return finish(env, napi_ok);
@@ -2872,10 +2870,15 @@ extern "C" napi_status napi_get_typedarray_info(
     if (!from_jsc_typed_array(jsc_type, &napi_type))
         return finish(env, napi_invalid_arg);
     JSObjectRef view = as_object(env, value);
-    void* bytes = JSObjectGetTypedArrayBytesPtr(env->context, view, &exception);
-    size_t view_length = exception ? 0 : JSObjectGetTypedArrayLength(env->context, view, &exception);
-    size_t offset = exception ? 0 : JSObjectGetTypedArrayByteOffset(env->context, view, &exception);
-    JSObjectRef buffer = exception ? nullptr : JSObjectGetTypedArrayBuffer(env->context, view, &exception);
+    // JSC pins a backing store when its data pointer is requested. Preserve
+    // detachability unless the N-API caller actually asks for that pointer.
+    size_t view_length = length ? JSObjectGetTypedArrayLength(env->context, view, &exception) : 0;
+    size_t byte_length = data && !exception ? JSObjectGetTypedArrayByteLength(env->context, view, &exception) : 0;
+    size_t offset = (data || byte_offset) && !exception ? JSObjectGetTypedArrayByteOffset(env->context, view, &exception) : 0;
+    void* bytes = data && byte_length && !exception
+        ? JSObjectGetTypedArrayBytesPtr(env->context, view, &exception)
+        : nullptr;
+    JSObjectRef buffer = arraybuffer && !exception ? JSObjectGetTypedArrayBuffer(env->context, view, &exception) : nullptr;
     if (exception)
         return caught(env, exception);
     if (type)
@@ -2883,7 +2886,7 @@ extern "C" napi_status napi_get_typedarray_info(
     if (length)
         *length = view_length;
     if (data)
-        *data = bytes;
+        *data = bytes ? static_cast<unsigned char*>(bytes) + offset : nullptr;
     if (arraybuffer) {
         track(env, buffer);
         *arraybuffer = to_napi(buffer);
@@ -2949,13 +2952,15 @@ extern "C" napi_status napi_get_dataview_info(
     JSObjectRef buffer = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(buffer_value));
     size_t offset = static_cast<size_t>(JSValueToNumber(env->context, offset_value, &exception));
     size_t length = static_cast<size_t>(JSValueToNumber(env->context, length_value, &exception));
-    void* bytes = JSObjectGetArrayBufferBytesPtr(env->context, buffer, &exception);
+    void* bytes = data && length
+        ? JSObjectGetArrayBufferBytesPtr(env->context, buffer, &exception)
+        : nullptr;
     if (exception)
         return caught(env, exception);
     if (byte_length)
         *byte_length = length;
     if (data)
-        *data = static_cast<unsigned char*>(bytes) + offset;
+        *data = bytes ? static_cast<unsigned char*>(bytes) + offset : nullptr;
     if (arraybuffer) {
         track(env, buffer_value);
         *arraybuffer = to_napi(buffer_value);
@@ -3048,12 +3053,15 @@ extern "C" napi_status napi_get_buffer_info(napi_env opaque_env, napi_value valu
     if (!is_buffer_value(env, value, &exception))
         return exception ? caught(env, exception) : finish(env, napi_invalid_arg);
     JSObjectRef buffer = as_object(env, value);
-    void* bytes = JSObjectGetTypedArrayBytesPtr(env->context, buffer, &exception);
-    size_t size = exception ? 0 : JSObjectGetTypedArrayByteLength(env->context, buffer, &exception);
+    size_t size = JSObjectGetTypedArrayByteLength(env->context, buffer, &exception);
+    size_t offset = data && !exception ? JSObjectGetTypedArrayByteOffset(env->context, buffer, &exception) : 0;
+    void* bytes = data && size && !exception
+        ? JSObjectGetTypedArrayBytesPtr(env->context, buffer, &exception)
+        : nullptr;
     if (exception)
         return caught(env, exception);
     if (data)
-        *data = bytes;
+        *data = bytes ? static_cast<unsigned char*>(bytes) + offset : nullptr;
     if (length)
         *length = size;
     return finish(env, napi_ok);
@@ -3821,8 +3829,15 @@ extern "C" napi_status napi_detach_arraybuffer(napi_env opaque_env, napi_value v
     JSValueRef exception = nullptr;
     if (!is_array_buffer(env, value, &exception))
         return exception ? caught(env, exception) : finish(env, napi_arraybuffer_expected);
-    // COTTONTAIL-COMPAT: Stock JSC's public C API has no detach operation. Use
-    // the standard structuredClone transfer path when the runtime exposes it.
+    JSObjectRef array_buffer = as_object(env, value);
+    JSValueRef transferred = call_method(env, array_buffer, "transfer", 0, nullptr, &exception);
+    if (exception)
+        return caught(env, exception);
+    if (transferred)
+        return finish(env, napi_ok);
+
+    // COTTONTAIL-COMPAT: Stock JSC's public C API has no direct detach entry
+    // point. Older JSC builds are adapted through the standard transfer list.
     JSObjectRef clone = global_constructor(env, "structuredClone", &exception);
     if (exception || !clone || !JSObjectIsFunction(env->context, clone))
         return finish(env, napi_detachable_arraybuffer_expected);
@@ -3845,6 +3860,15 @@ extern "C" napi_status napi_is_detached_arraybuffer(napi_env opaque_env, napi_va
     JSValueRef exception = nullptr;
     if (!is_array_buffer(env, value, &exception))
         return exception ? caught(env, exception) : finish(env, napi_arraybuffer_expected);
+    JSObjectRef array_buffer = as_object(env, value);
+    JSValueRef detached = get_property(env, array_buffer, "detached", &exception);
+    if (exception)
+        return caught(env, exception);
+    if (detached && JSValueIsBoolean(env->context, detached)) {
+        *result = JSValueToBoolean(env->context, detached);
+        return finish(env, napi_ok);
+    }
+
     JSObjectRef constructor = global_constructor(env, "Uint8Array", &exception);
     JSValueRef argument = to_js(value);
     JSObjectRef view = exception || !constructor ? nullptr : JSObjectCallAsConstructor(env->context, constructor, 1, &argument, &exception);
