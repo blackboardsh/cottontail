@@ -2650,44 +2650,19 @@ function websocketNoProxyMatches(hostname, port) {
 }
 
 // Wraps an established byte stream (e.g. an HTTP CONNECT tunnel) in a TLS
-// client session. The native TLS client only knows how to dial TCP itself,
-// so a loopback relay bridges the tunnel bytes into a native TLS connect.
+// client session using the shared memory-BIO Duplex transport.
 function websocketTlsOverStream(stream, options, callback, onError) {
-  const relay = createNetServer((inner) => {
-    relay.close();
-    inner.on("data", (chunk) => {
-      try { stream.write(chunk); } catch {}
+  try {
+    const tlsSocket = tlsConnect({
+      socket: stream,
+      servername: options.servername,
+      rejectUnauthorized: options.rejectUnauthorized,
+      ca: options.ca,
     });
-    stream.on("data", (chunk) => {
-      try { inner.write(chunk); } catch {}
-    });
-    const destroyBoth = () => {
-      try { inner.destroy(); } catch {}
-      try { stream.destroy(); } catch {}
-    };
-    inner.on("close", destroyBoth);
-    inner.on("error", () => {});
-    stream.on("close", () => { try { inner.destroy(); } catch {} });
-  });
-  relay.on("error", (error) => onError(error));
-  relay.listen(0, "127.0.0.1", () => {
-    const address = relay.address();
-    let tlsSocket;
-    try {
-      tlsSocket = tlsConnect({
-        host: "127.0.0.1",
-        port: address.port,
-        servername: options.servername,
-        rejectUnauthorized: options.rejectUnauthorized,
-        ca: options.ca,
-      });
-    } catch (error) {
-      relay.close();
-      onError(error);
-      return;
-    }
     callback(tlsSocket);
-  });
+  } catch (error) {
+    onError(error);
+  }
 }
 
 export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEmitter {

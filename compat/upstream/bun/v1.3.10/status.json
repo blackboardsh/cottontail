@@ -3329,6 +3329,10 @@
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 1 assertions)."
     },
+    "test/js/web/websocket/websocket-proxy.test.ts": {
+      "status": "enabled",
+      "reason": "HTTP CONNECT and HTTPS proxy tunneling, authentication, custom headers, NO_PROXY matching, and nested wss TLS pass the copied upstream coverage through the shared memory-BIO TLS transport (27 bun:test cases, 25 assertions)."
+    },
     "test/js/web/websocket/websocket-upgrade.test.ts": {
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
