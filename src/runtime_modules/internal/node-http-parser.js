@@ -683,9 +683,13 @@ HTTPParserState.prototype._detachConsumedSource = function _detachConsumedSource
 function consume() {
   const parser = requireParser(this, "consume");
   if (parser._closed || !parser._initialized) return undefined;
-  const source = arguments[0];
+  let source = arguments[0];
   parser._detachConsumedSource();
   if (source == null || (typeof source !== "object" && typeof source !== "function")) return undefined;
+  if (typeof source.on !== "function") {
+    const owner = source.owner;
+    if (owner && typeof owner.on === "function") source = owner;
+  }
 
   const onData = chunk => {
     const result = execute.call(parser.owner, chunk);

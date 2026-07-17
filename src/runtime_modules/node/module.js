@@ -21,6 +21,7 @@ import * as https from "./https.js";
 import * as internalAssertMyersDiff from "./internal/assert/myers_diff.js";
 import * as internalAsyncHooks from "./internal/async_hooks.js";
 import * as internalEventTarget from "./internal/event_target.js";
+import { createHttpCommonBuiltin } from "./internal/http_common.js";
 import * as internalTestBinding from "./internal/test/binding.js";
 import * as net from "./net.js";
 import * as os from "./os.js";
@@ -3038,6 +3039,13 @@ const processBuiltin = processModule.default ?? processModule;
 const streamBuiltin = stream.default ?? stream;
 const sysBuiltin = sys.default ?? sys;
 const pathBuiltin = path.default ?? path;
+const internalTestBindingBuiltin = {
+  ...internalTestBinding,
+  internalBinding(name) {
+    if (String(name) === "http_parser") return processBuiltin.binding("http_parser");
+    return internalTestBinding.internalBinding(name);
+  },
+};
 // require("path/posix") must be the same object as require("path").posix.
 const pathPosixBuiltin = pathBuiltin.posix ?? (pathPosix.default ?? pathPosix);
 const pathWin32Builtin = pathBuiltin.win32 ?? (pathWin32.default ?? pathWin32);
@@ -3066,18 +3074,11 @@ const httpServerBuiltin = {
   ServerResponse: http.ServerResponse,
   _connectionListener: http._connectionListener,
 };
-const httpTokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const invalidHeaderValuePattern = /[\0-\x08\x0A-\x1F\x7F]/;
-const httpCommonBuiltin = {
-  validateHeaderName: http.validateHeaderName,
-  validateHeaderValue: http.validateHeaderValue,
-  _checkIsHttpToken(value) { return httpTokenPattern.test(String(value)); },
-  _checkInvalidHeaderChar(value) { return invalidHeaderValuePattern.test(String(value)); },
-  chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
-  continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
-  CRLF: "\r\n",
-  methods: http.METHODS,
-};
+const httpCommonBuiltin = lazyBuiltin(() => createHttpCommonBuiltin({
+  http,
+  incoming: httpIncomingBuiltin,
+  processObject: processBuiltin,
+}));
 function translatePeerCertificate(certificate) {
   if (!certificate) return null;
   if (certificate.issuerCertificate != null && certificate.issuerCertificate !== certificate) {
@@ -3184,7 +3185,7 @@ __setBuiltinModules({
   "internal/assert/myers_diff": internalAssertMyersDiff,
   "internal/async_hooks": internalAsyncHooks,
   "internal/event_target": internalEventTarget,
-  "internal/test/binding": internalTestBinding,
+  "internal/test/binding": internalTestBindingBuiltin,
   module: Module,
   "node:module": Module,
   net,
