@@ -87,24 +87,46 @@ function echo(args) {
   return result(0, output + (newline ? "\n" : ""));
 }
 
+function printfEscapes(value) {
+  let terminated = false;
+  const output = String(value).replace(/\\([0-7]{1,3}|.)/g, (_, escape) => {
+    if (escape === "c") { terminated = true; return ""; }
+    if (/^[0-7]/.test(escape)) return String.fromCharCode(Number.parseInt(escape, 8));
+    return ({ a: "\x07", b: "\b", e: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\" })[escape] ?? escape;
+  });
+  return { output, terminated };
+}
+
 function printf(args) {
   if (args.length === 0) return result();
+  const format = String(args[0]);
   let position = 1;
-  let output = String(args[0]).replace(/%([%sdboxXc])/g, (_, specifier) => {
-    if (specifier === "%") return "%";
-    const value = args[position++] ?? "";
-    if (specifier === "s") return String(value);
-    if (specifier === "c") return String(value)[0] ?? "";
-    const number = Number(value) || 0;
-    if (specifier === "d") return String(Math.trunc(number));
-    if (specifier === "b") return Math.trunc(number).toString(2);
-    if (specifier === "o") return Math.trunc(number).toString(8);
-    return Math.trunc(number).toString(16)[specifier === "X" ? "toUpperCase" : "toLowerCase"]();
-  });
-  output = output.replace(/\\([0-7]{1,3}|.)/g, (_, escape) => {
-    if (/^[0-7]/.test(escape)) return String.fromCharCode(Number.parseInt(escape, 8));
-    return ({ n: "\n", r: "\r", t: "\t", "\\": "\\" })[escape] ?? escape;
-  });
+  let output = "";
+  let terminated = false;
+  const conversions = (format.match(/%(?!%)[sdiuoxXcb]/g) ?? []).length;
+
+  do {
+    let iteration = format.replace(/%([%sdiuoxXcb])/g, (_, specifier) => {
+      if (specifier === "%") return "%";
+      const value = args[position++] ?? "";
+      if (specifier === "s") return String(value);
+      if (specifier === "c") return String(value)[0] ?? "";
+      if (specifier === "b") {
+        const escaped = printfEscapes(value);
+        terminated ||= escaped.terminated;
+        return escaped.output;
+      }
+      const number = Number(value) || 0;
+      if (specifier === "d" || specifier === "i" || specifier === "u") return String(Math.trunc(number));
+      if (specifier === "o") return Math.trunc(number).toString(8);
+      const hexadecimal = Math.trunc(number).toString(16);
+      return specifier === "X" ? hexadecimal.toUpperCase() : hexadecimal;
+    });
+    const escaped = printfEscapes(iteration);
+    output += escaped.output;
+    terminated ||= escaped.terminated;
+  } while (!terminated && conversions > 0 && position < args.length);
+
   return result(0, output);
 }
 
@@ -437,7 +459,7 @@ export function createShellBuiltins(host) {
       }
       case "export": {
         if (args.length === 0) {
-          const output = Object.keys(context.exported).sort().map(key => `declare -x ${key}=${JSON.stringify(context.env[key] ?? "")}\n`).join("");
+          const output = Object.keys(context.exported).sort().map(key => `${key}=${context.env[key] ?? ""}\n`).join("");
           return result(0, output);
         }
         for (const assignment of args) {
@@ -452,11 +474,22 @@ export function createShellBuiltins(host) {
         for (const key of args) { delete context.env[key]; delete context.exported[key]; delete context.externalEnv[key]; }
         return result();
       case "exit": {
-        if (args.length === 0) return result();
+        if (args.length === 0) return { ...result(), shellExit: true };
         if (args.length > 1) return result(1, "", "exit: too many arguments\n");
         if (!/^[+-]?\d+$/.test(args[0])) return result(1, "", "exit: numeric argument required\n");
         const value = BigInt(args[0]);
-        return result(Number(((value % 256n) + 256n) % 256n));
+        return { ...result(Number(((value % 256n) + 256n) % 256n)), shellExit: true };
+      }
+      case "wait": {
+        if (args.length > 0) return result(127, "", `wait: ${args[0]}: no such job\n`);
+        const pending = context.background.splice(0);
+        if (pending.length === 0) return result();
+        const completed = await Promise.all(pending);
+        return {
+          exitCode: completed.at(-1)?.exitCode ?? 0,
+          stdout: context.concat(completed.map(item => item.stdout)),
+          stderr: context.concat(completed.map(item => item.stderr)),
+        };
       }
       case "basename":
         return args.length ? result(0, `${args.map(value => basename(value)).join("\n")}\n`) : result(1, "", "usage: basename string\n");

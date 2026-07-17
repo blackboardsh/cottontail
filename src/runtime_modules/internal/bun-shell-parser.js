@@ -83,12 +83,15 @@ function readBacktick(source, start) {
 
 function operatorAt(source, index, atWordStart) {
   const rest = source.slice(index);
-  for (const operator of ["2>&1", "1>&2", "&>>", "&>", "2>>", "1>>", ">>", "2>", "1>", "<<", "&&", "||", ";;", "|&"]) {
+  for (const operator of ["2>&1", "1>&2", ">&2", ">&1", "0<<", "0<", "&>>", "&>", "2>>", "1>>", ">>", "2>", "1>", "<<", "&&", "||", ";;", "|&"]) {
     if (rest.startsWith(operator)) return operator;
   }
   const char = source[index];
   if (";|()<>&".includes(char)) return char;
   if (char === "\n") return ";";
+  if (atWordStart && char === "!" && " \t\r\n({[".includes(source[index + 1] ?? " ")) return "!";
+  if (atWordStart && char === "{" && /\s/.test(source[index + 1] ?? " ")) return "{";
+  if (atWordStart && char === "}" && /(?:\s|[;&|<>])/.test(source[index + 1] ?? " ")) return "}";
   if (atWordStart && /[012]/.test(char) && source[index + 1] === ">") return `${char}>`;
   return null;
 }
@@ -97,15 +100,16 @@ export function lexShell(source) {
   source = String(source);
   const tokens = [];
   let index = 0;
-  let commandStart = true;
+  let wordStart = true;
 
   while (index < source.length) {
     const char = source[index];
     if (char === " " || char === "\t" || char === "\r") {
       index += 1;
+      wordStart = true;
       continue;
     }
-    if (char === "#" && commandStart) {
+    if (char === "#" && wordStart) {
       while (index < source.length && source[index] !== "\n") index += 1;
       continue;
     }
@@ -113,7 +117,7 @@ export function lexShell(source) {
     if (operator) {
       tokens.push({ type: "op", value: operator, position: index });
       index += char === "\n" ? 1 : operator.length;
-      commandStart = operator === ";" || operator === "&&" || operator === "||" || operator === "|" || operator === "(";
+      wordStart = true;
       continue;
     }
 
@@ -146,9 +150,20 @@ export function lexShell(source) {
         const quoteStart = index++;
         raw += quote;
         let text = "";
+        let emitted = false;
+        const flushQuotedText = () => {
+          if (text === "") return;
+          appendPart(parts, text, quoteName, quoteName !== "single");
+          text = "";
+          emitted = true;
+        };
         while (index < source.length && source[index] !== quote) {
           if (quote === '"' && source[index] === "\\" && /[$`"\\\n]/.test(source[index + 1] ?? "")) {
-            if (source[index + 1] !== "\n") text += source[index + 1];
+            flushQuotedText();
+            if (source[index + 1] !== "\n") {
+              appendPart(parts, source[index + 1], quoteName, false);
+              emitted = true;
+            }
             raw += source.slice(index, index + 2);
             index += 2;
             continue;
@@ -172,7 +187,8 @@ export function lexShell(source) {
         }
         if (index >= source.length) throw syntax(`Unterminated ${quoteName} quote`, quoteStart);
         raw += source[index++];
-        appendPart(parts, text, quoteName, quoteName !== "single");
+        flushQuotedText();
+        if (!emitted) appendPart(parts, "", quoteName, quoteName !== "single");
         continue;
       }
       if (current === "$" && source[index + 1] === "'") {
@@ -216,14 +232,14 @@ export function lexShell(source) {
       throw syntax(`Unexpected token: \`${source[index]}\``, index);
     }
     tokens.push({ type: "word", parts, raw, position });
-    commandStart = false;
+    wordStart = false;
   }
 
   tokens.push({ type: "eof", value: "", position: source.length });
   return tokens;
 }
 
-const REDIRECTS = new Set(["<", "<<", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2"]);
+const REDIRECTS = new Set(["<", "<<", "0<", "0<<", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
 
 class Parser {
   constructor(tokens) {
@@ -238,13 +254,20 @@ class Parser {
   consumeWord(value) { if (!this.isWord(value)) return false; this.index += 1; return true; }
   skipSeparators() { while (this.consumeOp(";")) {} }
 
-  parse(stopWords = new Set()) {
+  parse(stopWords = new Set(), stopOperators = new Set([")"])) {
     const items = [];
     this.skipSeparators();
-    while (this.peek().type !== "eof" && !this.isOp(")") && !(this.peek().type === "word" && stopWords.has(this.peek().raw))) {
-      items.push(this.parseAndOr());
+    while (!this.isStop(stopWords, stopOperators)) {
+      let item = this.parseAndOr();
+      const background = this.consumeOp("&");
+      if (background) item = { type: "async", command: item };
+      items.push(item);
+      if (background) {
+        this.skipSeparators();
+        continue;
+      }
       if (!this.consumeOp(";")) {
-        if (this.peek().type !== "eof" && !this.isOp(")") && !(this.peek().type === "word" && stopWords.has(this.peek().raw))) {
+        if (!this.isStop(stopWords, stopOperators)) {
           throw syntax(`Unexpected token: \`${this.peek().raw ?? this.peek().value}\``, this.peek().position);
         }
       }
@@ -253,23 +276,42 @@ class Parser {
     return { type: "script", items };
   }
 
+  isStop(stopWords, stopOperators) {
+    const token = this.peek();
+    return token.type === "eof"
+      || (token.type === "op" && stopOperators.has(token.value))
+      || (token.type === "word" && stopWords.has(token.raw));
+  }
+
   parseAndOr() {
     let node = this.parsePipeline();
     while (this.isOp("&&") || this.isOp("||")) {
       const operator = this.take().value;
+      this.skipSeparators();
       node = { type: "binary", operator, left: node, right: this.parsePipeline() };
     }
     return node;
   }
 
   parsePipeline() {
-    const items = [this.parseCommand()];
+    const items = [this.parseNegated()];
     while (this.isOp("|") || this.isOp("|&")) {
       if (this.isOp("|&")) throw new Error("Piping stdout and stderr (`|&`) is not supported yet. Please file an issue on GitHub.");
       this.take();
-      items.push(this.parseCommand());
+      this.skipSeparators();
+      items.push(this.parseNegated());
     }
     return items.length === 1 ? items[0] : { type: "pipeline", items };
+  }
+
+  parseNegated() {
+    let inverted = false;
+    while (this.consumeOp("!")) {
+      inverted = !inverted;
+      this.skipSeparators();
+    }
+    const command = this.parseCommand();
+    return inverted ? { type: "negate", command } : command;
   }
 
   parseCommand() {
@@ -284,13 +326,22 @@ class Parser {
     this.index = assignmentStart;
 
     if (this.consumeOp("(")) {
-      const script = this.parse();
+      const script = this.parse(new Set(), new Set([")"]));
       if (!this.consumeOp(")")) throw syntax("Expected `)`", this.peek().position);
       const redirects = this.parseRedirects();
       return { type: "subshell", script, redirects };
     }
+    if (this.consumeOp("{")) {
+      const script = this.parse(new Set(), new Set(["}"]));
+      if (!this.consumeOp("}")) throw syntax("Expected `}`", this.peek().position);
+      return { type: "group", script, redirects: this.parseRedirects() };
+    }
     if (this.consumeWord("if")) return this.parseIf();
-    if (this.consumeWord("[[")) return this.parseConditional();
+    if (this.consumeWord("[[")) {
+      const conditional = this.parseConditional();
+      conditional.redirects = this.parseRedirects();
+      return conditional;
+    }
     return this.parseSimple();
   }
 
@@ -323,7 +374,7 @@ class Parser {
     const redirects = [];
     while (this.peek().type === "op" && REDIRECTS.has(this.peek().value)) {
       const operator = this.take();
-      if (operator.value === "2>&1" || operator.value === "1>&2") {
+      if (["2>&1", "1>&2", ">&2", ">&1"].includes(operator.value)) {
         redirects.push({ operator: operator.value, target: null });
         continue;
       }
