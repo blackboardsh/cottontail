@@ -595,6 +595,47 @@ static JSValueRef call_method(
     return JSObjectCallAsFunction(env->context, method, receiver, argc, argv, exception);
 }
 
+static JSObjectRef load_builtin_module(NapiEnv* env, const char* name, JSValueRef* exception)
+{
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+    JSValueRef process_value = get_property(env, global, "process", exception);
+    if (*exception || !process_value || !JSValueIsObject(env->context, process_value))
+        return nullptr;
+    JSObjectRef process = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(process_value));
+    JSStringRef name_string = make_utf8_string(name, NAPI_AUTO_LENGTH);
+    if (!name_string)
+        return nullptr;
+    JSValueRef argument = JSValueMakeString(env->context, name_string);
+    JSStringRelease(name_string);
+    JSValueRef module_value = call_method(env, process, "getBuiltinModule", 1, &argument, exception);
+    if (*exception || !module_value || !JSValueIsObject(env->context, module_value))
+        return nullptr;
+    return const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(module_value));
+}
+
+static bool process_is_exiting(NapiEnv* env, JSValueRef* exception)
+{
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+    JSValueRef process_value = get_property(env, global, "process", exception);
+    if (*exception || !process_value || !JSValueIsObject(env->context, process_value))
+        return false;
+    JSObjectRef process = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(process_value));
+    JSValueRef exiting = get_property(env, process, "_exiting", exception);
+    return !*exception && exiting && JSValueToBoolean(env->context, exiting);
+}
+
+static bool mark_array_buffer_untransferable(NapiEnv* env, JSObjectRef array_buffer, JSValueRef* exception)
+{
+    JSObjectRef worker_threads = load_builtin_module(env, "worker_threads", exception);
+    if (*exception)
+        return false;
+    if (!worker_threads)
+        return true;
+    JSValueRef argument = array_buffer;
+    call_method(env, worker_threads, "markAsUntransferable", 1, &argument, exception);
+    return !*exception;
+}
+
 static void scope_open(NapiEnv* env, napi_handle_scope__* scope, bool escapable)
 {
     scope->env = env;
@@ -1234,7 +1275,7 @@ extern "C" JSValueRef ct_napi_load_addon(
     loading_env = env;
     loading_module = nullptr;
     dlerror();
-    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    void* handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
     const char* open_error = handle ? nullptr : dlerror();
     loading_env = nullptr;
     if (!handle) {
@@ -1982,6 +2023,10 @@ extern "C" napi_status napi_call_function(
     JSValueRef returned = exception || !reflect ? nullptr : call_method(env, reflect, "apply", 3, apply_arguments, &exception);
     if (exception)
         return caught(env, exception);
+    if (process_is_exiting(env, &exception))
+        return finish(env, napi_pending_exception);
+    if (exception)
+        return caught(env, exception);
     if (result)
         return output(env, result, returned);
     return finish(env, napi_ok);
@@ -2309,16 +2354,44 @@ extern "C" napi_status napi_get_and_clear_last_exception(napi_env opaque_env, na
 
 extern "C" napi_status napi_fatal_exception(napi_env opaque_env, napi_value error)
 {
-    return napi_throw(opaque_env, error);
+    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    if (!env || !error)
+        return invalid(env);
+
+    JSValueRef exception = nullptr;
+    if (!is_instance_of_global(env, error, "Error", &exception))
+        return exception ? caught(env, exception) : finish(env, napi_invalid_arg);
+
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+    JSValueRef handler_value = get_property(env, global, "__cottontailHandleUncaughtException", &exception);
+    if (exception)
+        return caught(env, exception);
+    if (handler_value && JSValueIsObject(env->context, handler_value)) {
+        JSObjectRef handler = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(handler_value));
+        if (JSObjectIsFunction(env->context, handler)) {
+            JSValueRef argument = to_js(error);
+            JSValueRef handled = JSObjectCallAsFunction(env->context, handler, global, 1, &argument, &exception);
+            if (exception) {
+                protect_pending(env, exception);
+                return finish(env, napi_ok);
+            }
+            if (handled && JSValueToBoolean(env->context, handled))
+                return finish(env, napi_ok);
+        }
+    }
+
+    protect_pending(env, to_js(error));
+    return finish(env, napi_ok);
 }
 
 extern "C" void napi_fatal_error(const char* location, size_t location_length, const char* message, size_t message_length)
 {
+    std::fputs("FATAL ERROR: ", stderr);
     if (location) {
         if (location_length == NAPI_AUTO_LENGTH)
             location_length = std::strlen(location);
         std::fwrite(location, 1, location_length, stderr);
-        std::fputs(": ", stderr);
+        std::fputc(' ', stderr);
     }
     if (message) {
         if (message_length == NAPI_AUTO_LENGTH)
@@ -2847,6 +2920,8 @@ extern "C" napi_status napi_create_external_arraybuffer(
     }
     JSValueRef exception = nullptr;
     JSObjectRef array_buffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, external_data, byte_length, buffer_deallocator, finalizer, &exception);
+    if (!exception)
+        mark_array_buffer_untransferable(env, array_buffer, &exception);
     return exception ? caught(env, exception) : output(env, result, array_buffer);
 }
 
@@ -3113,6 +3188,11 @@ extern "C" napi_status napi_create_external_buffer(
     if (exception)
         return caught(env, exception);
     apply_buffer_prototype(env, buffer, &exception);
+    JSValueRef array_buffer = exception ? nullptr : get_property(env, buffer, "buffer", &exception);
+    if (!exception && array_buffer && JSValueIsObject(env->context, array_buffer)) {
+        auto object = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(array_buffer));
+        mark_array_buffer_untransferable(env, object, &exception);
+    }
     return exception ? caught(env, exception) : output(env, result, buffer);
 }
 
@@ -3322,7 +3402,7 @@ extern "C" napi_status napi_get_version(napi_env opaque_env, uint32_t* result)
 
 extern "C" napi_status napi_get_node_version(napi_env opaque_env, const napi_node_version** result)
 {
-    static const napi_node_version version { 24, 0, 0, "node" };
+    static const napi_node_version version { 24, 0, 0, "cottontail" };
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);
