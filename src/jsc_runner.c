@@ -953,19 +953,32 @@ typedef struct {
     const CtHostEnvEntry *env_entries;
     size_t env_count;
     bool clear_env;
-    bool capture_output;
+    int stdin_mode;
+    int stdout_mode;
+    int stderr_mode;
     bool input_present;
     const uint8_t *input_ptr;
     size_t input_len;
+    bool timeout_enabled;
+    uint64_t timeout_ms;
+    bool max_buffer_enabled;
+    uint64_t max_buffer;
+    int kill_signal;
+    bool abort_requested;
 } CtHostSpawnOptions;
 
 typedef struct {
     int exit_code;
     int signal_code;
+    uint64_t pid;
     char *stdout_ptr;
     size_t stdout_len;
+    bool stdout_present;
     char *stderr_ptr;
     size_t stderr_len;
+    bool stderr_present;
+    bool exited_due_to_timeout;
+    bool exited_due_to_max_buffer;
 } CtHostSpawnResult;
 
 extern void ct_host_string_free(char *value);
@@ -14347,8 +14360,19 @@ static JSValueRef ct_spawn_result_to_js(JSContextRef ctx, const CtHostSpawnResul
     ct_set_property(ctx, response, "signalCode",
                     result->signal_code > 0 ? JSValueMakeNumber(ctx, result->signal_code) : JSValueMakeNull(ctx),
                     exception);
-    ct_set_property(ctx, response, "stdout", ct_make_string_len(ctx, result->stdout_ptr != NULL ? result->stdout_ptr : "", result->stdout_len), exception);
-    ct_set_property(ctx, response, "stderr", ct_make_string_len(ctx, result->stderr_ptr != NULL ? result->stderr_ptr : "", result->stderr_len), exception);
+    ct_set_property(ctx, response, "pid", JSValueMakeNumber(ctx, (double)result->pid), exception);
+    ct_set_property(ctx, response, "stdout",
+                    result->stdout_present
+                        ? ct_make_string_len(ctx, result->stdout_ptr != NULL ? result->stdout_ptr : "", result->stdout_len)
+                        : JSValueMakeUndefined(ctx),
+                    exception);
+    ct_set_property(ctx, response, "stderr",
+                    result->stderr_present
+                        ? ct_make_string_len(ctx, result->stderr_ptr != NULL ? result->stderr_ptr : "", result->stderr_len)
+                        : JSValueMakeUndefined(ctx),
+                    exception);
+    ct_set_property(ctx, response, "exitedDueToTimeout", JSValueMakeBoolean(ctx, result->exited_due_to_timeout), exception);
+    ct_set_property(ctx, response, "exitedDueToMaxBuffer", JSValueMakeBoolean(ctx, result->exited_due_to_max_buffer), exception);
     return response;
 }
 
@@ -14384,6 +14408,174 @@ static int ct_parse_spawn_options(JSContextRef ctx, JSValueRef value, char **cwd
             return -1;
         }
         *input_present = true;
+    }
+    return 0;
+}
+
+static int ct_spawn_sync_parse_stdio_value(
+    JSContextRef ctx,
+    JSValueRef value,
+    int *mode,
+    JSValueRef *exception
+) {
+    if (value == NULL || JSValueIsUndefined(ctx, value)) return 0;
+    if (JSValueIsNull(ctx, value)) {
+        *mode = CT_PROCESS_STDIO_IGNORE;
+        return 0;
+    }
+    if (JSValueIsNumber(ctx, value)) {
+        *mode = CT_PROCESS_STDIO_INHERIT;
+        return 0;
+    }
+
+    char *text = ct_value_to_string_copy(ctx, value);
+    if (text == NULL) {
+        ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
+        return -1;
+    }
+    if (strcmp(text, "pipe") == 0 || strcmp(text, "overlapped") == 0) {
+        *mode = CT_PROCESS_STDIO_PIPE;
+    } else if (strcmp(text, "inherit") == 0) {
+        *mode = CT_PROCESS_STDIO_INHERIT;
+    } else if (strcmp(text, "ignore") == 0) {
+        *mode = CT_PROCESS_STDIO_IGNORE;
+    } else {
+        free(text);
+        ct_throw_message(ctx, exception, "spawn stdio must be 'pipe', 'inherit', or 'ignore'");
+        return -1;
+    }
+    free(text);
+    return 0;
+}
+
+static int ct_spawn_sync_signal_number(JSContextRef ctx, JSValueRef value, int *signal_number, JSValueRef *exception) {
+    *signal_number = SIGTERM;
+    if (value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
+    if (JSValueIsNumber(ctx, value)) {
+        double number = ct_value_to_number(ctx, value);
+        if (!isfinite(number) || floor(number) != number || number < 0 || number > 31) {
+            ct_throw_message(ctx, exception, "Invalid signal: expected an integer between 0 and 31");
+            return -1;
+        }
+        *signal_number = (int)number;
+        return 0;
+    }
+
+    char *name = ct_value_to_string_copy(ctx, value);
+    if (name == NULL) {
+        ct_throw_message(ctx, exception, "Invalid signal: expected a string or integer");
+        return -1;
+    }
+    static const char *names[] = {
+        NULL, "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS",
+        "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM",
+        "SIG16", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG",
+        "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS",
+    };
+    for (int index = 1; index <= 31; index += 1) {
+        if (strcasecmp(name, names[index]) == 0) {
+            *signal_number = index;
+            free(name);
+            return 0;
+        }
+    }
+    free(name);
+    ct_throw_message(ctx, exception, "Unknown signal");
+    return -1;
+}
+
+static int ct_parse_spawn_sync_native_options(
+    JSContextRef ctx,
+    JSValueRef value,
+    bool capture_output,
+    bool input_present,
+    CtHostSpawnOptions *options,
+    JSValueRef *exception
+) {
+    options->stdin_mode = capture_output ? CT_PROCESS_STDIO_IGNORE : CT_PROCESS_STDIO_INHERIT;
+    options->stdout_mode = capture_output ? CT_PROCESS_STDIO_PIPE : CT_PROCESS_STDIO_INHERIT;
+    options->stderr_mode = capture_output ? CT_PROCESS_STDIO_PIPE : CT_PROCESS_STDIO_INHERIT;
+    options->timeout_enabled = false;
+    options->timeout_ms = 0;
+    options->max_buffer_enabled = false;
+    options->max_buffer = 0;
+    options->kill_signal = SIGTERM;
+    options->abort_requested = false;
+
+    if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value) && JSValueIsObject(ctx, value)) {
+        JSObjectRef object = (JSObjectRef)value;
+        JSValueRef stdio_value = ct_get_property(ctx, object, "stdio", exception);
+        if (exception != NULL && *exception != NULL) return -1;
+
+        if (!JSValueIsUndefined(ctx, stdio_value) && !JSValueIsNull(ctx, stdio_value)) {
+            if (JSValueIsObject(ctx, stdio_value) && !JSValueIsString(ctx, stdio_value)) {
+                JSObjectRef stdio_array = (JSObjectRef)stdio_value;
+                int *modes[] = { &options->stdin_mode, &options->stdout_mode, &options->stderr_mode };
+                for (unsigned index = 0; index < 3; index += 1) {
+                    JSValueRef entry = JSObjectGetPropertyAtIndex(ctx, stdio_array, index, exception);
+                    if (exception != NULL && *exception != NULL) return -1;
+                    if (ct_spawn_sync_parse_stdio_value(ctx, entry, modes[index], exception) != 0) return -1;
+                }
+            } else {
+                int mode = CT_PROCESS_STDIO_PIPE;
+                if (ct_spawn_sync_parse_stdio_value(ctx, stdio_value, &mode, exception) != 0) return -1;
+                options->stdin_mode = mode;
+                options->stdout_mode = mode;
+                options->stderr_mode = mode;
+            }
+        } else {
+            JSValueRef stdin_value = ct_get_property(ctx, object, "stdin", exception);
+            JSValueRef stdout_value = ct_get_property(ctx, object, "stdout", exception);
+            JSValueRef stderr_value = ct_get_property(ctx, object, "stderr", exception);
+            if (exception != NULL && *exception != NULL) return -1;
+            if (ct_spawn_sync_parse_stdio_value(ctx, stdin_value, &options->stdin_mode, exception) != 0 ||
+                ct_spawn_sync_parse_stdio_value(ctx, stdout_value, &options->stdout_mode, exception) != 0 ||
+                ct_spawn_sync_parse_stdio_value(ctx, stderr_value, &options->stderr_mode, exception) != 0) {
+                return -1;
+            }
+        }
+
+        JSValueRef timeout_value = ct_get_property(ctx, object, "timeout", exception);
+        JSValueRef max_buffer_value = ct_get_property(ctx, object, "maxBuffer", exception);
+        JSValueRef kill_signal_value = ct_get_property(ctx, object, "killSignal", exception);
+        JSValueRef abort_signal_value = ct_get_property(ctx, object, "signal", exception);
+        if (exception != NULL && *exception != NULL) return -1;
+
+        if (!JSValueIsUndefined(ctx, timeout_value) && !JSValueIsNull(ctx, timeout_value)) {
+            double timeout = ct_value_to_number(ctx, timeout_value);
+            if (isfinite(timeout)) {
+                if (floor(timeout) != timeout || timeout < 0 || timeout > 9007199254740991.0) {
+                    ct_throw_message(ctx, exception, "spawn timeout must be a non-negative safe integer");
+                    return -1;
+                }
+                if (timeout > 0) {
+                    options->timeout_enabled = true;
+                    options->timeout_ms = (uint64_t)timeout;
+                }
+            }
+        }
+
+        if (!JSValueIsUndefined(ctx, max_buffer_value) && !JSValueIsNull(ctx, max_buffer_value)) {
+            double max_buffer = ct_value_to_number(ctx, max_buffer_value);
+            if (isfinite(max_buffer) && max_buffer > 0) {
+                options->max_buffer_enabled = true;
+                options->max_buffer = (uint64_t)max_buffer;
+            }
+        }
+
+        if (ct_spawn_sync_signal_number(ctx, kill_signal_value, &options->kill_signal, exception) != 0) return -1;
+
+        if (!JSValueIsUndefined(ctx, abort_signal_value) && !JSValueIsNull(ctx, abort_signal_value) && JSValueIsObject(ctx, abort_signal_value)) {
+            JSValueRef aborted_value = ct_get_property(ctx, (JSObjectRef)abort_signal_value, "aborted", exception);
+            if (exception != NULL && *exception != NULL) return -1;
+            options->abort_requested = JSValueToBoolean(ctx, aborted_value);
+        }
+    }
+
+    if (input_present) options->stdin_mode = CT_PROCESS_STDIO_PIPE;
+    if (options->stdin_mode == CT_PROCESS_STDIO_PIPE && !input_present) {
+        /* Bun closes an empty synchronous stdin pipe immediately. */
+        options->stdin_mode = CT_PROCESS_STDIO_IGNORE;
     }
     return 0;
 }
@@ -14519,21 +14711,44 @@ static JSValueRef ct_spawn_sync(JSContextRef ctx, JSObjectRef function, JSObject
         ct_free_env_entries(env_entries, env_count);
         return JSValueMakeUndefined(ctx);
     }
+    CtHostSpawnOptions host_options = {
+        .cwd = cwd,
+        .env_entries = env_entries,
+        .env_count = env_count,
+        .clear_env = clear_env,
+        .input_present = input_present,
+        .input_ptr = input_ptr,
+        .input_len = input_len,
+    };
+    if (ct_parse_spawn_sync_native_options(
+            ctx,
+            argc >= 3 ? argv[2] : NULL,
+            capture_output,
+            input_present,
+            &host_options,
+            exception) != 0) {
+        free(file);
+        ct_free_string_array(args, arg_count);
+        free(cwd);
+        ct_free_env_entries(env_entries, env_count);
+        return JSValueMakeUndefined(ctx);
+    }
     CtHostSpawnResult result = {0};
     char *error = NULL;
-    if (ct_host_spawn_sync(file, (const char *const *)args, arg_count, (CtHostSpawnOptions){
-            .cwd = cwd,
-            .env_entries = env_entries,
-            .env_count = env_count,
-            .clear_env = clear_env,
-            .capture_output = capture_output,
-            .input_present = input_present,
-            .input_ptr = input_ptr,
-            .input_len = input_len,
-        }, &result, &error) != 0) {
+    bool spawn_failed = ct_host_spawn_sync(
+        file,
+        (const char *const *)args,
+        arg_count,
+        host_options,
+        &result,
+        &error
+    ) != 0;
+    if (spawn_failed) {
         ct_throw_message(ctx, exception, error != NULL ? error : "spawn failed");
     }
-    JSValueRef response = ct_spawn_result_to_js(ctx, &result, exception);
+    JSValueRef response = spawn_failed
+        ? JSValueMakeUndefined(ctx)
+        : ct_spawn_result_to_js(ctx, &result, exception);
     if (error != NULL) ct_host_string_free(error);
     if (result.stdout_ptr != NULL) ct_host_buffer_free(result.stdout_ptr);
     if (result.stderr_ptr != NULL) ct_host_buffer_free(result.stderr_ptr);

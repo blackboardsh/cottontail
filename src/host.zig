@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cInclude("stdlib.h");
 });
@@ -13,19 +14,46 @@ pub const CtHostSpawnOptions = extern struct {
     env_entries: ?[*]const CtHostEnvEntry,
     env_count: usize,
     clear_env: bool,
-    capture_output: bool,
+    stdin_mode: c_int,
+    stdout_mode: c_int,
+    stderr_mode: c_int,
     input_present: bool,
     input_ptr: ?[*]const u8,
     input_len: usize,
+    timeout_enabled: bool,
+    timeout_ms: u64,
+    max_buffer_enabled: bool,
+    max_buffer: u64,
+    kill_signal: c_int,
+    abort_requested: bool,
 };
 
 pub const CtHostSpawnResult = extern struct {
     exit_code: c_int,
     signal_code: c_int,
+    pid: u64,
     stdout_ptr: ?[*]u8,
     stdout_len: usize,
+    stdout_present: bool,
     stderr_ptr: ?[*]u8,
     stderr_len: usize,
+    stderr_present: bool,
+    exited_due_to_timeout: bool,
+    exited_due_to_max_buffer: bool,
+};
+
+const SpawnStdio = enum(c_int) {
+    pipe = 0,
+    inherit = 1,
+    ignore = 2,
+};
+
+const SpawnTerminationReason = enum {
+    none,
+    timeout,
+    max_buffer,
+    abort_signal,
+    io_error,
 };
 
 var host_io: ?std.Io = null;
@@ -93,6 +121,239 @@ fn cwdOption(path: ?[*:0]const u8) std.process.Child.Cwd {
         .{ .path = std.mem.span(cwd_path) }
     else
         .inherit;
+}
+
+fn spawnStdioOption(mode: c_int) std.process.SpawnOptions.StdIo {
+    return switch (@as(SpawnStdio, @enumFromInt(mode))) {
+        .pipe => .pipe,
+        .inherit => .inherit,
+        .ignore => .ignore,
+    };
+}
+
+fn processId(id: std.process.Child.Id) u64 {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        var info: windows.PROCESS.BASIC_INFORMATION = undefined;
+        return switch (windows.ntdll.NtQueryInformationProcess(
+            id,
+            .BasicInformation,
+            &info,
+            @sizeOf(windows.PROCESS.BASIC_INFORMATION),
+            null,
+        )) {
+            .SUCCESS => @intCast(info.UniqueProcessId),
+            else => 0,
+        };
+    }
+
+    return @intCast(id);
+}
+
+fn rawTerminateProcess(id: std.process.Child.Id, signal_code: c_int) void {
+    if (signal_code == 0) return;
+
+    if (comptime builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        _ = windows.ntdll.NtTerminateProcess(
+            id,
+            @enumFromInt(@as(windows.UINT, @intCast(signal_code))),
+        );
+        return;
+    }
+
+    const signal: std.posix.SIG = @enumFromInt(@as(std.meta.Tag(std.posix.SIG), @intCast(signal_code)));
+    std.posix.kill(id, signal) catch {};
+}
+
+const SpawnControl = struct {
+    io: std.Io,
+    id: std.process.Child.Id,
+    mutex: std.Io.Mutex = .init,
+    alive: bool = true,
+    kill_signal: c_int,
+    termination_reason: SpawnTerminationReason = .none,
+    termination_requested_while_alive: bool = false,
+    max_buffer_exceeded: bool = false,
+
+    fn requestTermination(self: *SpawnControl, reason: SpawnTerminationReason) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (reason == .max_buffer) self.max_buffer_exceeded = true;
+        if (self.termination_reason != .none) return;
+        self.termination_reason = reason;
+        if (!self.alive) return;
+        self.termination_requested_while_alive = true;
+
+        const signal_code = if (reason == .io_error and self.kill_signal == 0) 15 else self.kill_signal;
+        rawTerminateProcess(self.id, signal_code);
+    }
+
+    fn markExited(self: *SpawnControl) void {
+        self.mutex.lockUncancelable(self.io);
+        self.alive = false;
+        self.mutex.unlock(self.io);
+    }
+};
+
+const SpawnReadContext = struct {
+    io: std.Io,
+    file: std.Io.File = undefined,
+    control: *SpawnControl,
+    max_buffer_enabled: bool,
+    max_buffer: u64,
+    output: std.ArrayList(u8) = .empty,
+    error_name: ?[]const u8 = null,
+
+    fn run(self: *SpawnReadContext) void {
+        defer self.file.close(self.io);
+
+        const gpa = std.heap.c_allocator;
+        var buffer: [16 * 1024]u8 = undefined;
+        while (true) {
+            const count = self.file.readStreaming(self.io, &.{buffer[0..]}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    self.error_name = @errorName(err);
+                    self.control.requestTermination(.io_error);
+                    break;
+                },
+            };
+            if (count == 0) continue;
+
+            self.output.appendSlice(gpa, buffer[0..count]) catch {
+                self.error_name = "OutOfMemory";
+                self.control.requestTermination(.io_error);
+                break;
+            };
+            if (self.max_buffer_enabled and self.output.items.len > self.max_buffer) {
+                self.control.requestTermination(.max_buffer);
+            }
+        }
+    }
+};
+
+const SpawnWriteContext = struct {
+    io: std.Io,
+    file: std.Io.File = undefined,
+    control: *SpawnControl,
+    input: []const u8,
+    error_name: ?[]const u8 = null,
+
+    fn run(self: *SpawnWriteContext) void {
+        defer self.file.close(self.io);
+        self.file.writeStreamingAll(self.io, self.input) catch |err| switch (err) {
+            error.BrokenPipe => {},
+            else => {
+                self.error_name = @errorName(err);
+                self.control.requestTermination(.io_error);
+            },
+        };
+    }
+};
+
+fn spawnReadThread(context: *SpawnReadContext) std.Thread.SpawnError!std.Thread {
+    return std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SpawnReadContext.run, .{context});
+}
+
+fn spawnWriteThread(context: *SpawnWriteContext) std.Thread.SpawnError!std.Thread {
+    return std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SpawnWriteContext.run, .{context});
+}
+
+fn joinThread(thread: ?std.Thread) void {
+    if (thread) |value| value.join();
+}
+
+fn closeChildPipes(child: *std.process.Child, io: std.Io) void {
+    if (child.stdin) |file| file.close(io);
+    if (child.stdout) |file| file.close(io);
+    if (child.stderr) |file| file.close(io);
+    child.stdin = null;
+    child.stdout = null;
+    child.stderr = null;
+}
+
+fn statusToTerm(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
+}
+
+fn pollPosixChild(child: *std.process.Child, control: *SpawnControl) !?std.process.Child.Term {
+    control.mutex.lockUncancelable(control.io);
+    defer control.mutex.unlock(control.io);
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.wait4(
+            child.id.?,
+            &status,
+            @intCast(std.posix.W.NOHANG),
+            null,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return null;
+                control.alive = false;
+                child.id = null;
+                return statusToTerm(@bitCast(status));
+            },
+            .INTR => continue,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn pollWindowsChild(child: *std.process.Child, control: *SpawnControl) !bool {
+    const windows = std.os.windows;
+    control.mutex.lockUncancelable(control.io);
+    defer control.mutex.unlock(control.io);
+
+    var timeout: windows.LARGE_INTEGER = 0;
+    return switch (windows.ntdll.NtWaitForSingleObject(child.id.?, .FALSE, &timeout)) {
+        windows.NTSTATUS.WAIT_0 => result: {
+            control.alive = false;
+            break :result true;
+        },
+        .TIMEOUT => false,
+        else => |status| windows.unexpectedStatus(status),
+    };
+}
+
+fn waitForConstrainedChild(
+    child: *std.process.Child,
+    control: *SpawnControl,
+    timeout_enabled: bool,
+    timeout_ms: u64,
+    abort_requested: bool,
+) !std.process.Child.Term {
+    const started_at = std.Io.Clock.awake.now(control.io);
+    const timeout_duration = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms));
+    const deadline = started_at.addDuration(timeout_duration);
+    var abort_sent = false;
+
+    while (true) {
+        if (comptime builtin.os.tag == .windows) {
+            if (try pollWindowsChild(child, control)) return child.wait(control.io);
+        } else {
+            if (try pollPosixChild(child, control)) |term| return term;
+        }
+
+        if (abort_requested and !abort_sent) {
+            abort_sent = true;
+            control.requestTermination(.abort_signal);
+        } else if (timeout_enabled and std.Io.Clock.awake.now(control.io).nanoseconds >= deadline.nanoseconds) {
+            control.requestTermination(.timeout);
+        }
+
+        std.Io.sleep(control.io, .fromMilliseconds(1), .awake) catch {};
+    }
 }
 
 export fn ct_host_string_free(value: ?[*:0]u8) void {
@@ -213,10 +474,15 @@ export fn ct_host_spawn_sync(
     result_out.* = .{
         .exit_code = 0,
         .signal_code = 0,
+        .pid = 0,
         .stdout_ptr = null,
         .stdout_len = 0,
+        .stdout_present = false,
         .stderr_ptr = null,
         .stderr_len = 0,
+        .stderr_present = false,
+        .exited_due_to_timeout = false,
+        .exited_due_to_max_buffer = false,
     };
 
     const gpa = std.heap.c_allocator;
@@ -261,138 +527,155 @@ export fn ct_host_spawn_sync(
     const env_map_ptr = if (env_map) |*map| map else null;
     const child_cwd = cwdOption(options.cwd);
 
-    if (options.capture_output and options.input_present) {
-        var child = std.process.spawn(io, .{
-            .argv = argv.items,
-            .cwd = child_cwd,
-            .environ_map = env_map_ptr,
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .pipe,
-            .create_no_window = true,
-        }) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        defer child.kill(io);
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = child_cwd,
+        .environ_map = env_map_ptr,
+        .stdin = spawnStdioOption(options.stdin_mode),
+        .stdout = spawnStdioOption(options.stdout_mode),
+        .stderr = spawnStdioOption(options.stderr_mode),
+        .request_resource_usage_statistics = true,
+        .create_no_window = true,
+    }) catch |err| {
+        setErrorOut(error_out, @errorName(err));
+        return -1;
+    };
+    defer child.kill(io);
 
+    result_out.pid = processId(child.id.?);
+    var control = SpawnControl{
+        .io = io,
+        .id = child.id.?,
+        .kill_signal = options.kill_signal,
+    };
+
+    const input: []const u8 = if (options.input_ptr) |ptr| ptr[0..options.input_len] else &.{};
+    var stdin_context = SpawnWriteContext{
+        .io = io,
+        .control = &control,
+        .input = input,
+    };
+    var stdout_context = SpawnReadContext{
+        .io = io,
+        .control = &control,
+        .max_buffer_enabled = options.max_buffer_enabled,
+        .max_buffer = options.max_buffer,
+    };
+    defer stdout_context.output.deinit(gpa);
+    var stderr_context = SpawnReadContext{
+        .io = io,
+        .control = &control,
+        .max_buffer_enabled = options.max_buffer_enabled,
+        .max_buffer = options.max_buffer,
+    };
+    defer stderr_context.output.deinit(gpa);
+
+    var stdin_thread: ?std.Thread = null;
+    var stdout_thread: ?std.Thread = null;
+    var stderr_thread: ?std.Thread = null;
+
+    const setup_error: ?anyerror = setup: {
+        if (child.stdout) |stdout_file| {
+            stdout_context.file = stdout_file;
+            child.stdout = null;
+            stdout_thread = spawnReadThread(&stdout_context) catch |err| {
+                stdout_file.close(io);
+                break :setup err;
+            };
+        }
+        if (child.stderr) |stderr_file| {
+            stderr_context.file = stderr_file;
+            child.stderr = null;
+            stderr_thread = spawnReadThread(&stderr_context) catch |err| {
+                stderr_file.close(io);
+                break :setup err;
+            };
+        }
         if (child.stdin) |stdin_file| {
-            const input: []const u8 = if (options.input_ptr) |ptr| ptr[0..options.input_len] else &.{};
-            var stdin_buffer: [8192]u8 = undefined;
-            var stdin_writer = stdin_file.writer(io, &stdin_buffer);
-            stdin_writer.interface.writeAll(input) catch |err| {
-                setErrorOut(error_out, @errorName(err));
-                return -1;
-            };
-            stdin_writer.interface.flush() catch |err| {
-                setErrorOut(error_out, @errorName(err));
-                return -1;
-            };
-            stdin_file.close(io);
+            stdin_context.file = stdin_file;
             child.stdin = null;
+            stdin_thread = spawnWriteThread(&stdin_context) catch |err| {
+                stdin_file.close(io);
+                break :setup err;
+            };
         }
+        break :setup null;
+    };
 
-        var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-        var multi_reader: std.Io.File.MultiReader = undefined;
-        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-        defer multi_reader.deinit();
-
-        while (multi_reader.fill(64, .none)) |_| {
-        } else |err| switch (err) {
-            error.EndOfStream => {},
-            else => |e| {
-                setErrorOut(error_out, @errorName(e));
-                return -1;
-            },
+    if (setup_error) |err| {
+        closeChildPipes(&child, io);
+        control.requestTermination(.io_error);
+        if (child.id != null) {
+            _ = waitForConstrainedChild(&child, &control, false, 0, false) catch {
+                if (child.id != null) child.kill(io);
+            };
         }
-        multi_reader.checkAnyError() catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
+        control.markExited();
+        joinThread(stdin_thread);
+        joinThread(stdout_thread);
+        joinThread(stderr_thread);
+        setErrorOut(error_out, @errorName(err));
+        return -1;
+    }
 
-        const term = child.wait(io) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        result_out.exit_code = termToExitCode(term);
-        result_out.signal_code = termToSignalCode(term);
+    const constrained = options.timeout_enabled or options.max_buffer_enabled or options.abort_requested or
+        stdin_thread != null or stdout_thread != null or stderr_thread != null;
+    const term = (if (constrained)
+        waitForConstrainedChild(&child, &control, options.timeout_enabled, options.timeout_ms, options.abort_requested)
+    else
+        child.wait(io)) catch |err| {
+        control.requestTermination(.io_error);
+        if (child.id != null) child.kill(io);
+        control.markExited();
+        joinThread(stdin_thread);
+        joinThread(stdout_thread);
+        joinThread(stderr_thread);
+        setErrorOut(error_out, @errorName(err));
+        return -1;
+    };
+    control.markExited();
 
-        const stdout_slice = multi_reader.toOwnedSlice(0) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        defer gpa.free(stdout_slice);
-        const stderr_slice = multi_reader.toOwnedSlice(1) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        defer gpa.free(stderr_slice);
+    joinThread(stdin_thread);
+    joinThread(stdout_thread);
+    joinThread(stderr_thread);
 
-        result_out.stdout_ptr = allocBuffer(stdout_slice) orelse {
+    if (stdin_context.error_name orelse stdout_context.error_name orelse stderr_context.error_name) |error_name| {
+        setErrorOut(error_out, error_name);
+        return -1;
+    }
+
+    result_out.exit_code = termToExitCode(term);
+    result_out.signal_code = termToSignalCode(term);
+    if (comptime builtin.os.tag == .windows) {
+        if (control.termination_requested_while_alive and
+            control.termination_reason != .io_error)
+        {
+            result_out.signal_code = options.kill_signal;
+            result_out.exit_code = 128 + options.kill_signal;
+        }
+    }
+    result_out.exited_due_to_timeout = control.termination_reason == .timeout;
+    result_out.exited_due_to_max_buffer = control.max_buffer_exceeded;
+
+    if (options.stdout_mode == @intFromEnum(SpawnStdio.pipe)) {
+        result_out.stdout_ptr = allocBuffer(stdout_context.output.items) orelse {
             setErrorOut(error_out, "OutOfMemory");
             return -1;
         };
-        result_out.stdout_len = stdout_slice.len;
-        result_out.stderr_ptr = allocBuffer(stderr_slice) orelse {
+        result_out.stdout_len = stdout_context.output.items.len;
+        result_out.stdout_present = true;
+    }
+    if (options.stderr_mode == @intFromEnum(SpawnStdio.pipe)) {
+        result_out.stderr_ptr = allocBuffer(stderr_context.output.items) orelse {
             if (result_out.stdout_ptr) |stdout_ptr| ct_host_buffer_free(stdout_ptr);
             result_out.stdout_ptr = null;
             result_out.stdout_len = 0;
+            result_out.stdout_present = false;
             setErrorOut(error_out, "OutOfMemory");
             return -1;
         };
-        result_out.stderr_len = stderr_slice.len;
-    } else if (options.capture_output) {
-        const run_result = std.process.run(gpa, io, .{
-            .argv = argv.items,
-            .cwd = child_cwd,
-            .environ_map = env_map_ptr,
-            .create_no_window = true,
-        }) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        defer gpa.free(run_result.stdout);
-        defer gpa.free(run_result.stderr);
-
-        result_out.exit_code = termToExitCode(run_result.term);
-        result_out.signal_code = termToSignalCode(run_result.term);
-
-        result_out.stdout_ptr = allocBuffer(run_result.stdout) orelse {
-            setErrorOut(error_out, "OutOfMemory");
-            return -1;
-        };
-        result_out.stdout_len = run_result.stdout.len;
-
-        result_out.stderr_ptr = allocBuffer(run_result.stderr) orelse {
-            if (result_out.stdout_ptr) |stdout_ptr| ct_host_buffer_free(stdout_ptr);
-            result_out.stdout_ptr = null;
-            result_out.stdout_len = 0;
-            setErrorOut(error_out, "OutOfMemory");
-            return -1;
-        };
-        result_out.stderr_len = run_result.stderr.len;
-    } else {
-        var child = std.process.spawn(io, .{
-            .argv = argv.items,
-            .cwd = child_cwd,
-            .environ_map = env_map_ptr,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-            .create_no_window = true,
-        }) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-        defer child.kill(io);
-
-        const term = child.wait(io) catch |err| {
-            setErrorOut(error_out, @errorName(err));
-            return -1;
-        };
-
-        result_out.exit_code = termToExitCode(term);
-        result_out.signal_code = termToSignalCode(term);
+        result_out.stderr_len = stderr_context.output.items.len;
+        result_out.stderr_present = true;
     }
 
     return 0;
