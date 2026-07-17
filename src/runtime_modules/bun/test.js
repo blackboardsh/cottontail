@@ -3294,7 +3294,7 @@ function makeBunDescribe(base) {
     const parsed = parseDescribeArgs(args);
     return base(
       normalizeTestName(parsed.name),
-      { ...parsed.options, __bunDeferredDefinition: true },
+      { ...parsed.options, __bunDeferredDefinition: true, __bunTest: true },
       parsed.callback,
     );
   };
@@ -3306,7 +3306,7 @@ function makeBunDescribe(base) {
       const parsed = parseDescribeArgs(args);
       return base(
         normalizeTestName(parsed.name),
-        { ...parsed.options, ...extraOptions, __bunDeferredDefinition: true },
+        { ...parsed.options, ...extraOptions, __bunDeferredDefinition: true, __bunTest: true },
         parsed.callback,
       );
     };

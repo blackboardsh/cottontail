@@ -1,13 +1,13 @@
 // Jest Snapshot v1, https://bun.sh/docs/test/snapshots
 
-exports[`: named-object 1`] = `
+exports[`snapshot matchers: named-object 1`] = `
 {
   "id": 1,
   "name": "Ada",
 }
 `;
 
-exports[`: named-object 2`] = `
+exports[`snapshot matchers: named-object 2`] = `
 {
   "id": 1,
   "name": "Ada",

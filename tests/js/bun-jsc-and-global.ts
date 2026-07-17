@@ -66,7 +66,7 @@ gcAndSweep();
 assert(Bun.cwd === process.cwd(), "Bun.cwd mismatch");
 assert(Bun.isMainThread === true, "Bun.isMainThread mismatch");
 assert(Bun.deepEquals({ a: 1 }, { a: 1 }), "Bun.deepEquals mismatch");
-assert(Bun.deepMatch({ a: { b: 1, c: 2 } }, { a: { b: 1 } }), "Bun.deepMatch mismatch");
+assert(Bun.deepMatch({ a: { b: 1 } }, { a: { b: 1, c: 2 } }), "Bun.deepMatch mismatch");
 assert(Bun.escapeHTML("<>&") === "&lt;&gt;&amp;", "Bun.escapeHTML mismatch");
 assert(Bun.stripANSI("\u001b[31mred\u001b[0m") === "red", "Bun.stripANSI mismatch");
 assert(Bun.stringWidth("abc") === 3, "Bun.stringWidth mismatch");

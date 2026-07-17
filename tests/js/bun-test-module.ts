@@ -1,4 +1,4 @@
-import { expect, jest, mock, spyOn, vi } from "bun:test";
+import { expect, jest, mock, spyOn, test, vi } from "bun:test";
 import { createRequire } from "node:module";
 import { fn as liveFn, iCallFn, rexported, variable as liveVariable } from "./fixtures/mock-live-fixture";
 import { trimWithLodash } from "./fixtures/mock-package-consumer";
@@ -40,15 +40,17 @@ expect("cottontail").toMatch(/tail$/);
 await expect(Promise.resolve(42)).resolves.toBe(42);
 await expect(new Promise((_resolve, reject) => setTimeout(() => reject(new Error("boom")), 0))).rejects.toThrow("boom");
 
-expect("inline snapshot").toMatchInlineSnapshot('"inline snapshot"');
-expect({ id: 1, name: "Ada" }).toMatchInlineSnapshot({ id: expect.any(Number) }, `
+test("snapshot matchers", () => {
+  expect("inline snapshot").toMatchInlineSnapshot('"inline snapshot"');
+  expect({ id: 1, name: "Ada" }).toMatchInlineSnapshot({ id: expect.any(Number) }, `
 {
-  "id": 1,
+  "id": Any<Number>,
   "name": "Ada",
 }
 `);
-expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
-expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
+  expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
+  expect({ id: 1, name: "Ada" }).toMatchSnapshot("named-object");
+});
 
 jest.useFakeTimers();
 const calls: string[] = [];

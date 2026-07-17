@@ -49,7 +49,7 @@ const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
 const forceConcurrent = testCliArgs.includes("--concurrent");
 const runTodoTests = testCliArgs.includes("--todo");
 const dotsMode = testCliArgs.includes("--dots");
-const globalOnlyMode = testCliArgs.includes("--only");
+const globalOnlyMode = testCliArgs.includes("--only") || testCliArgs.includes("--test-only");
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 
 function cliOption(name, fallback = undefined) {
@@ -65,6 +65,11 @@ function configuredMaxConcurrency() {
   return value === 0 ? Infinity : Math.max(1, Math.trunc(value));
 }
 
+function configuredDefaultTimeout() {
+  const value = Number(cliOption("--timeout", 5000));
+  return Number.isFinite(value) && value >= 0 ? value : 5000;
+}
+
 function bunfigOnlyFailures() {
   try {
     const source = String(readFileSync(`${globalThis.process?.cwd?.() ?? "."}/bunfig.toml`, "utf8"));
@@ -75,6 +80,7 @@ function bunfigOnlyFailures() {
 }
 
 const maxConcurrency = configuredMaxConcurrency();
+defaultTimeout = configuredDefaultTimeout();
 const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
 const runnerDateNow = Date.now.bind(Date);
 
@@ -587,22 +593,28 @@ function nodeHasOnly(node) {
   return node.kind === "suite" && node.children.some(nodeHasOnly);
 }
 
+function nodeHasBunOnly(node) {
+  if (node.options?.only && node.options?.__bunTest) return true;
+  return node.kind === "suite" && node.children.some(nodeHasBunOnly);
+}
+
 function rebuildSelection() {
   selectedRecords.clear();
-  const visitChildren = (children, branchSelected) => {
-    const onlyChildren = children.filter(nodeHasOnly);
+  const visitChildren = (children, branchSelected, respectOnly) => {
+    const onlyChildren = respectOnly ? children.filter(nodeHasOnly) : [];
     const selectedChildren = onlyChildren.length > 0
       ? onlyChildren
       : branchSelected ? children : [];
     for (const child of selectedChildren) {
-      if (child.kind === "suite") visit(child, branchSelected || Boolean(child.options.only));
+      if (child.kind === "suite") visit(child, branchSelected || Boolean(child.options.only), respectOnly);
       else selectedRecords.add(child);
     }
   };
-  const visit = (suite, branchSelected) => visitChildren(suite.children, branchSelected || Boolean(suite.options.only));
+  const visit = (suite, branchSelected, respectOnly) =>
+    visitChildren(suite.children, branchSelected || Boolean(suite.options.only), respectOnly);
 
   if (globalOnlyMode) {
-    visit(rootSuite, !hasOnly);
+    visit(rootSuite, !hasOnly, true);
   } else {
     const byFile = new Map();
     for (const child of rootSuite.children) {
@@ -611,7 +623,8 @@ function rebuildSelection() {
       byFile.get(file).push(child);
     }
     for (const children of byFile.values()) {
-      visitChildren(children, !children.some(nodeHasOnly));
+      const respectOnly = children.some(nodeHasBunOnly);
+      visitChildren(children, !respectOnly, respectOnly);
     }
   }
   selectionDirty = false;
@@ -1536,7 +1549,6 @@ function scheduleRun() {
       !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.()) return;
   installUncaughtCapture();
   installAsyncFailureGuards();
-  if (globalThis.__cottontailLoadingTestModules) return;
   if (runnerActive) {
     runAgain = true;
     return;

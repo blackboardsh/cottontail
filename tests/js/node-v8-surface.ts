@@ -110,13 +110,19 @@ assert(getHeapSpaceStatistics()[0].space_name === "jsc_heap", "getHeapSpaceStati
 assert(typeof getHeapCodeStatistics().code_and_metadata_size === "number", "getHeapCodeStatistics mismatch");
 assert(typeof getCppHeapStatistics().used_size_bytes === "number", "getCppHeapStatistics mismatch");
 
+function assertHeapSnapshotContents(source: string, label: string) {
+  const snapshot = JSON.parse(source);
+  assert(snapshot.snapshot?.meta && Array.isArray(snapshot.nodes), `${label} metadata mismatch`);
+  assert(Array.isArray(snapshot.edges) && Array.isArray(snapshot.strings), `${label} graph mismatch`);
+}
+
 const snapshotText = await text(getHeapSnapshot());
-assert(snapshotText.includes("heapStatistics"), "getHeapSnapshot content mismatch");
+assertHeapSnapshotContents(snapshotText, "getHeapSnapshot");
 const snapshotPath = `${tmpDir}/cottontail.heapsnapshot`;
 rmSync(snapshotPath, { force: true });
 assert(writeHeapSnapshot(snapshotPath) === snapshotPath, "writeHeapSnapshot path mismatch");
 assert(existsSync(snapshotPath), "writeHeapSnapshot file missing");
-assert(readFileSync(snapshotPath, "utf8").includes("heapStatistics"), "writeHeapSnapshot content mismatch");
+assertHeapSnapshotContents(readFileSync(snapshotPath, "utf8"), "writeHeapSnapshot");
 
 assert(isStringOneByteRepresentation("é"), "one-byte latin1 string mismatch");
 assert(!isStringOneByteRepresentation("€"), "two-byte string mismatch");
