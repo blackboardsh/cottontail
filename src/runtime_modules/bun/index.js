@@ -60,6 +60,7 @@ import {
   installInheritedNodeIpc,
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
+import { createBunShellRuntime } from "../internal/bun-shell-runtime.js";
 
 installInheritedNodeIpc(cottontail);
 
@@ -652,6 +653,9 @@ function appendShellInterpolation(out, value, state) {
   if (state.quote === '"') {
     return { out: out + texts.join(" ").replace(/[$`"\\]/g, "\\$&"), scan: "" };
   }
+  if (out.endsWith("$")) {
+    return { out: out.slice(0, -1) + texts.map(text => quotePosixShellValue(`$${text}`)).join(" "), scan: "" };
+  }
   return { out: out + texts.map(quotePosixShellValue).join(" "), scan: "" };
 }
 
@@ -691,23 +695,25 @@ function interpolateShellCommand(strings, values) {
   let out = "";
   let outputBuffer = undefined;
   let outputFd = 1;
+  const outputTargets = new Map();
   let inputBody = undefined;
   const state = { quote: null, escaped: false };
   for (let index = 0; index < strings.length; index += 1) {
     let part = parts[index];
     const terminalTarget = index < values.length &&
       parts.slice(index + 1).every((item) => String(item).trim() === "");
-    const outputRedirect = terminalTarget ? trailingRedirect(part, ">") : null;
+    const outputRedirect = index < values.length ? trailingRedirect(part, ">") : null;
     if (outputRedirect && binaryOutputView(values[index])) {
-      part = part.slice(0, outputRedirect.start) + part.slice(outputRedirect.end);
+      const target = `__cottontail_output_${index}_${outputTargets.size}__`;
       out += part;
-      outputBuffer = values[index];
-      outputFd = outputRedirect.fd;
+      scanShellQuoteState(state, part);
+      out += quotePosixShellValue(target);
+      outputTargets.set(target, values[index]);
       continue;
     }
     if (outputRedirect && values[index] != null && typeof values[index] === "object") {
       const value = values[index];
-      if (value instanceof Blob || value instanceof Response) {
+      if (!isBunFileLike(value) && (value instanceof Blob || value instanceof Response)) {
         throw new TypeError("Shell output redirection requires a writable Buffer or TypedArray");
       }
     }
@@ -727,7 +733,7 @@ function interpolateShellCommand(strings, values) {
       if (appended.scan) scanShellQuoteState(state, appended.scan);
     }
   }
-  return { command: out.trimEnd(), outputBuffer, outputFd, inputBody };
+  return { command: out.trimEnd(), outputBuffer, outputFd, outputTargets, inputBody };
 }
 
 const shellDefaults = {
@@ -766,15 +772,30 @@ export class ShellOutput {
 }
 
 export class ShellError extends Error {
-  constructor(command = "", result = {}) {
-    const output = result instanceof ShellOutput ? result : new ShellOutput(result);
-    super(`Failed with exit code ${output.exitCode}`);
+  constructor(command = "", result = undefined) {
+    super("");
     this.name = "ShellError";
+    if (result !== undefined) this.initialize(command, result);
+  }
+  initialize(command, result) {
+    const output = result instanceof ShellOutput ? result : new ShellOutput(result);
+    this.message = `Failed with exit code ${output.exitCode}`;
     this.command = command;
     this.exitCode = output.exitCode || 1;
     this.status = this.exitCode;
     this.stdout = output.stdout;
     this.stderr = output.stderr;
+    Object.defineProperty(this, "info", {
+      value: { exitCode: this.exitCode, stdout: this.stdout, stderr: this.stderr },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    if (typeof this.stack === "string") {
+      const firstFrame = this.stack.indexOf("\n");
+      this.stack = `ShellError: ${this.message}${firstFrame < 0 ? "" : this.stack.slice(firstFrame)}`;
+    }
+    return this;
   }
   text(encoding = "utf-8") {
     return this.stdout.toString(encoding);
@@ -1539,24 +1560,27 @@ async function runHostShell(command, options) {
   }
 }
 
+const runBunShellRuntime = createBunShellRuntime({
+  spawn,
+  which(command, options = {}) {
+    const value = String(command ?? "");
+    if ((value.includes("/") || value.includes("\\")) && !/^(?:[A-Za-z]:)?[\\/]/.test(value)) {
+      const candidate = nodePathResolve(String(options.cwd ?? cottontail.cwd()), value);
+      return isExecutableFile(candidate) ? candidate : null;
+    }
+    return which(value, options);
+  },
+  execPath: String(globalThis.process?.execPath ?? cottontail.execPath?.() ?? "cottontail"),
+  cwd: () => globalThis.process?.cwd?.() ?? cottontail.cwd(),
+  env: currentProcessEnv,
+  argv: () => globalThis.process?.argv ?? [],
+});
+
 async function runShell(command, options = {}) {
   validateNoNullByte(command, "command");
-  command = normalizeAssignmentPipelines(command);
-  const builtin = runShellBuiltin(command, options);
-  let result;
-  if (builtin) {
-    result = {
-      status: Number(builtin.exitCode ?? builtin.status ?? 0),
-      stdout: asBuffer(builtin.stdout ?? ""),
-      stderr: asBuffer(builtin.stderr ?? ""),
-    };
-  } else {
-    const isWin = cottontail.platform() === "win32";
-    const hostCommand = isWin ? command : normalizeCombinedAppendRedirect(command);
-    result = await runShellCommandList(hostCommand, options) ?? await runHostShell(hostCommand, options);
-  }
+  const result = await runBunShellRuntime(command, options);
   let stdout = result.stdout || asBuffer("");
-  let stderr = asBuffer(normalizeShellStderr(command, result.stderr || ""));
+  let stderr = asBuffer(result.stderr || "");
   if (options.outputBuffer != null) {
     if (options.outputFd === 2) {
       writeOutputBuffer(options.outputBuffer, stderr);
@@ -1590,38 +1614,54 @@ function getRandomValues(view) {
   return view;
 }
 
-class ShellCommand extends ShellExpression {
+export class ShellPromise extends Promise {
   constructor(command, options = {}) {
-    super();
+    let resolvePromise;
+    let rejectPromise;
+    super((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
     this.command = command;
     this.options = { ...shellDefaults, ...options };
-    this.promise = null;
+    this.started = false;
+    this.resolvePromise = resolvePromise;
+    this.rejectPromise = rejectPromise;
+    this.potentialError = new ShellError();
+    if (typeof Error.captureStackTrace === "function") Error.captureStackTrace(this.potentialError, ShellPromise);
+  }
+  static get [Symbol.species]() {
+    return Promise;
+  }
+  throwIfRunning() {
+    if (this.started) throw new Error("Shell is already running");
   }
   quiet(_value = true) {
+    this.throwIfRunning();
     this.options.quiet = Boolean(_value);
     return this;
   }
   throws(value = true) {
     this.options.throws = Boolean(value);
-    this.promise = null;
     return this;
   }
   nothrow() {
     return this.throws(false);
   }
   cwd(value) {
+    this.throwIfRunning();
     this.options.cwd = String(value);
-    this.promise = null;
     return this;
   }
   env(value) {
+    this.throwIfRunning();
     this.options.env = { ...(value ?? {}) };
-    this.promise = null;
     return this;
   }
-  run() {
-    if (!this.promise) {
-      this.promise = Promise.resolve().then(async () => {
+  start() {
+    if (!this.started) {
+      this.started = true;
+      Promise.resolve().then(async () => {
         if (this.options.inputBody !== undefined) {
           this.options.input = await bytesFromBody(this.options.inputBody);
         }
@@ -1631,42 +1671,51 @@ class ShellCommand extends ShellExpression {
           if (result.stderr.byteLength > 0) globalThis.process?.stderr?.write?.(result.stderr);
         }
         return result;
+      }).then(this.resolvePromise, (error) => {
+        if (error instanceof ShellError) {
+          this.rejectPromise(this.potentialError.initialize(this.command, error));
+        } else {
+          this.rejectPromise(error);
+        }
       });
     }
-    return this.promise;
+  }
+  run() {
+    this.start();
+    return this;
   }
   text() {
-    this.options.quiet = true;
-    return this.run().then((result) => result.text());
+    this.quiet(true);
+    return this.then((result) => result.text());
   }
   json() {
-    this.options.quiet = true;
-    return this.run().then((result) => result.json());
+    this.quiet(true);
+    return this.then((result) => result.json());
   }
   lines() {
-    this.options.quiet = true;
+    this.quiet(true);
     const command = this;
     return (async function* iterateLines() {
-      for (const line of (await command.text()).split("\n")) yield line;
+      const output = await command;
+      const separator = globalThis.process?.platform === "win32" ? /\r?\n/ : "\n";
+      for (const line of output.text().split(separator)) yield line;
     })();
   }
   bytes() {
-    this.options.quiet = true;
-    return this.run().then((result) => new Uint8Array(result.bytes()));
+    this.quiet(true);
+    return this.then((result) => new Uint8Array(result.bytes()));
   }
   arrayBuffer() {
-    this.options.quiet = true;
-    return this.run().then((result) => result.arrayBuffer());
+    this.quiet(true);
+    return this.then((result) => result.arrayBuffer());
   }
   blob() {
-    this.options.quiet = true;
-    return this.run().then((result) => new Blob([result.bytes()]));
+    this.quiet(true);
+    return this.then((result) => new Blob([result.bytes()]));
   }
   then(resolve, reject) {
-    return this.run().then(resolve, reject);
-  }
-  catch(reject) {
-    return this.run().catch(reject);
+    this.start();
+    return super.then(resolve, reject);
   }
 }
 
@@ -1711,10 +1760,11 @@ Object.setPrototypeOf(Shell.prototype, Function.prototype);
 
 export function $(strings, ...values) {
   const interpolation = interpolateShellCommand(strings, values);
-  return new ShellCommand(interpolation.command, {
+  return new ShellPromise(interpolation.command, {
     ...shellDefaults,
     outputBuffer: interpolation.outputBuffer,
     outputFd: interpolation.outputFd,
+    outputTargets: interpolation.outputTargets,
     inputBody: interpolation.inputBody,
   });
 }
@@ -1803,6 +1853,7 @@ $.braces = (value) => {
 $.ShellError = ShellError;
 $.ShellExpression = ShellExpression;
 $.ShellOutput = ShellOutput;
+$.ShellPromise = ShellPromise;
 $.Shell = Shell;
 $.escape = shellEscape;
 $.throws = (value = true) => {
@@ -1868,11 +1919,12 @@ function which(command, options = undefined) {
 }
 
 class BuildMessage {
-  constructor({ name = "BuildMessage", message = "", level = "error", position = null, rendered = null } = {}) {
+  constructor({ name = "BuildMessage", message = "", level = "error", position = null, notes = [], rendered = null } = {}) {
     this.name = name;
     this.message = String(message);
     this.level = level;
     this.position = position;
+    this.notes = Array.isArray(notes) ? notes : [];
     Object.defineProperty(this, "rendered", { value: rendered, enumerable: false, configurable: true, writable: true });
   }
   toString() {
@@ -2533,6 +2585,7 @@ const CTBuildMessage = class BuildMessage {
     this.message = fields.message != null ? String(fields.message) : "";
     this.position = fields.position ?? null;
     this.level = fields.level ?? "error";
+    this.notes = Array.isArray(fields.notes) ? fields.notes : [];
     if (fields.rendered != null) {
       Object.defineProperty(this, "__rendered", { value: fields.rendered, configurable: true, writable: true });
     }
@@ -12632,35 +12685,76 @@ function transpilerSourceText(source) {
   return String(source);
 }
 
+function callNativeTranspiler(callback) {
+  try {
+    return callback();
+  } catch (error) {
+    if (typeof error === "string") {
+      const prefix = "COTTONTAIL_DIAGNOSTICS:";
+      if (error.startsWith(prefix)) {
+        try {
+          const envelope = JSON.parse(error.slice(prefix.length));
+          if (Array.isArray(envelope?.errors) && envelope.errors.length > 0) {
+            const Message = typeof globalThis.BuildMessage === "function" ? globalThis.BuildMessage : CTBuildMessage;
+            const errors = envelope.errors.map(diagnostic => new Message({
+              name: "BuildMessage",
+              message: diagnostic.message,
+              position: diagnostic.position ?? null,
+              notes: Array.isArray(diagnostic.notes)
+                ? diagnostic.notes.map(note => ({ message: note.message, position: note.position ?? null }))
+                : [],
+              level: diagnostic.level ?? "error",
+            }));
+            if (errors.length === 1) throw errors[0];
+            throw new AggregateError(errors, "Parse error");
+          }
+        } catch (diagnosticError) {
+          if (diagnosticError instanceof AggregateError || diagnosticError?.name === "BuildMessage") throw diagnosticError;
+        }
+      }
+      throw new Error(error);
+    }
+    throw error;
+  }
+}
+
+const transpilerLogLevels = new Set(["verbose", "debug", "info", "warn", "error"]);
+
 export class Transpiler {
   constructor(options = {}) {
     if (options == null || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError("Expected an object");
     }
+    if (options.logLevel !== undefined && !transpilerLogLevels.has(options.logLevel)) {
+      throw new TypeError(`Invalid logLevel: ${String(options.logLevel)}`);
+    }
+    if (options.macro !== undefined && typeof options.macro !== "boolean" && (options.macro === null || typeof options.macro !== "object")) {
+      throw new TypeError(`Unexpected ${String(options.macro)}`);
+    }
     this.options = options;
-    this.optionsJson = JSON.stringify(options);
+    this.optionsJson = JSON.stringify({ ...options, _cottontailStructuredErrors: true });
   }
   transformSync(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return cottontail.transpilerTransform(
+    return callNativeTranspiler(() => cottontail.transpilerTransform(
       transpilerSourceText(source),
       this.optionsJson,
       typeof loader === "string" ? loader : "",
-    );
+    ));
   }
   async transform(source, loader = undefined) {
     if (this.options.replMode) return transformReplSource(source);
-    return cottontail.transpilerTransform(
+    return callNativeTranspiler(() => cottontail.transpilerTransform(
       transpilerSourceText(source),
       this.optionsJson,
       typeof loader === "string" ? loader : "",
-    );
+    ));
   }
   scan(source) {
-    return JSON.parse(cottontail.transpilerScan(transpilerSourceText(source), this.optionsJson, ""));
+    return JSON.parse(callNativeTranspiler(() => cottontail.transpilerScan(transpilerSourceText(source), this.optionsJson, "")));
   }
   scanImports(source) {
-    return JSON.parse(cottontail.transpilerScanImports(transpilerSourceText(source), this.optionsJson, ""));
+    return JSON.parse(callNativeTranspiler(() => cottontail.transpilerScanImports(transpilerSourceText(source), this.optionsJson, "")));
   }
 }
 
@@ -14722,6 +14816,7 @@ BunObject.SHA512 = SHA512;
 BunObject.SHA512_256 = SHA512_256;
 BunObject.ShellError = ShellError;
 BunObject.ShellOutput = ShellOutput;
+BunObject.ShellPromise = ShellPromise;
 BunObject.SQL = SQL;
 BunObject.TOML = TOML;
 BunObject.Terminal = Terminal;
