@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compiler = @import("cottontail_compiler");
 const runtime = @import("runtime.zig");
 const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
@@ -110,25 +111,18 @@ const BundleDiagnostic = struct {
     message: []const u8,
 };
 
-fn parseBundleDiagnostic(text: []const u8, fallback_file: []const u8) BundleDiagnostic {
-    const message_separator = std.mem.lastIndexOf(u8, text, ": ") orelse return .{
-        .file = fallback_file,
-        .line = 1,
-        .column = 1,
-        .message = text,
-    };
-    const location = text[0..message_separator];
+fn parseBundleDiagnosticLocation(location: []const u8, message: []const u8, fallback_file: []const u8) BundleDiagnostic {
     const column_separator = std.mem.lastIndexOfScalar(u8, location, ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
-        .message = text,
+        .message = message,
     };
     const line_separator = std.mem.lastIndexOfScalar(u8, location[0..column_separator], ':') orelse return .{
         .file = fallback_file,
         .line = 1,
         .column = 1,
-        .message = text,
+        .message = message,
     };
     const line = std.fmt.parseUnsigned(usize, location[line_separator + 1 .. column_separator], 10) catch 1;
     const column = std.fmt.parseUnsigned(usize, location[column_separator + 1 ..], 10) catch 1;
@@ -136,8 +130,53 @@ fn parseBundleDiagnostic(text: []const u8, fallback_file: []const u8) BundleDiag
         .file = if (line_separator > 0) location[0..line_separator] else fallback_file,
         .line = @max(line, 1),
         .column = @max(column, 1),
-        .message = text[message_separator + 2 ..],
+        .message = message,
     };
+}
+
+fn parseBundleDiagnostic(text: []const u8, fallback_file: []const u8) BundleDiagnostic {
+    const bun_location_marker = "\n    at ";
+    if (std.mem.lastIndexOf(u8, text, bun_location_marker)) |marker| {
+        return parseBundleDiagnosticLocation(
+            text[marker + bun_location_marker.len ..],
+            text[0..marker],
+            fallback_file,
+        );
+    }
+
+    // Accept the original Cottontail bridge representation for cached output
+    // and for diagnostics produced by older embedded compiler builds.
+    const message_separator = std.mem.lastIndexOf(u8, text, ": ") orelse return .{
+        .file = fallback_file,
+        .line = 1,
+        .column = 1,
+        .message = text,
+    };
+    return parseBundleDiagnosticLocation(
+        text[0..message_separator],
+        text[message_separator + 2 ..],
+        fallback_file,
+    );
+}
+
+test "parse Bun and legacy compiler diagnostics" {
+    const bun_style = parseBundleDiagnostic(
+        "No matching export\n    at /tmp/source.ts:4:9",
+        "fallback.ts",
+    );
+    try std.testing.expectEqualStrings("No matching export", bun_style.message);
+    try std.testing.expectEqualStrings("/tmp/source.ts", bun_style.file);
+    try std.testing.expectEqual(@as(usize, 4), bun_style.line);
+    try std.testing.expectEqual(@as(usize, 9), bun_style.column);
+
+    const legacy = parseBundleDiagnostic(
+        "C:\\project\\source.ts:2:7: Could not resolve",
+        "fallback.ts",
+    );
+    try std.testing.expectEqualStrings("Could not resolve", legacy.message);
+    try std.testing.expectEqualStrings("C:\\project\\source.ts", legacy.file);
+    try std.testing.expectEqual(@as(usize, 2), legacy.line);
+    try std.testing.expectEqual(@as(usize, 7), legacy.column);
 }
 
 fn appendTestAggregate(ctx: *const Context, path: []const u8, summary: []const u8) void {
@@ -2207,7 +2246,9 @@ fn resolveDynamicImportTarget(
     specifier_prefix: []const u8,
 ) !?[]const u8 {
     var bare = pathWithoutQueryOrFragment(specifier_prefix);
-    if (std.mem.startsWith(u8, bare, "file://")) bare = bare["file://".len..];
+    if (compiler.resolver.FileURL.isFileURL(bare)) {
+        bare = compiler.resolver.FileURL.pathFromURLAlloc(ctx.allocator, bare) catch return null;
+    }
     if (bare.len == 0) return null;
 
     const candidate = if (std.fs.path.isAbsolute(bare))
@@ -2651,13 +2692,11 @@ fn transpileDynamicTarget(
             .external = &.{ "*.js", "*.mjs", "*.cjs" },
             // The factory wrapper (`appendDynamicTargetFactory`) evaluates
             // this output inside `new Function(..., "__ctImportMeta", ...)`
-            // and computes the true URL — including any `?query`/`#fragment`
-            // suffix from the dynamic import specifier — at runtime. Without
-            // this define, the cjs conversion inlines `import.meta.url` as a
-            // literal file URL and the suffix is lost (upstream Bun keeps the
-            // suffix; see test/js/bun/resolve/import-query.test.ts).
-            .define_keys = &.{"import.meta.url"},
-            .define_values = &.{"__ctImportMeta.url"},
+            // and computes the complete metadata object — including any
+            // `?query`/`#fragment` suffix — at runtime. Replacing the whole
+            // object also keeps bare `import.meta` valid in the CJS factory.
+            .define_keys = &.{"import.meta"},
+            .define_values = &.{"__ctImportMeta"},
         },
         &error_message,
     ) catch {
@@ -2887,7 +2926,12 @@ fn appendDynamicDispatcher(
     const fallback = try std.fmt.allocPrint(ctx.allocator,
         \\  if (typeof globalThis.__cottontailImportModule === "function") {{
         \\    try {{ return await globalThis.__cottontailImportModule(__ctText, {s}, options); }}
-        \\    catch (error) {{ throw __ctNormalizeImportError(error); }}
+        \\    catch (error) {{
+        \\      if (__ctBare.toLowerCase().startsWith("file:") && error && (error.code === "MODULE_NOT_FOUND" || error.code === "ERR_MODULE_NOT_FOUND")) {{
+        \\        error.message = `Cannot find module '${{__ctText}}'`;
+        \\      }}
+        \\      throw __ctNormalizeImportError(error);
+        \\    }}
         \\  }}
         \\  throw new Error(`Cannot find module '${{__ctText}}'`);
         \\}}

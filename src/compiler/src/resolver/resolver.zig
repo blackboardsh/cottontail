@@ -1,4 +1,5 @@
 pub const DataURL = @import("./data_url.zig").DataURL;
+pub const FileURL = @import("./file_url.zig");
 pub const DirInfo = @import("./dir_info.zig");
 
 const debuglog = Output.scoped(.Resolver, .hidden);
@@ -745,6 +746,21 @@ pub const Resolver = struct {
 
         if (import_path.len == 0) return .{ .not_found = {} };
 
+        // A path with a null byte cannot exist on the filesystem. Check this
+        // before parsing file URLs so the normal unresolved-import diagnostic
+        // retains the original specifier.
+        if (bun.strings.containsChar(import_path, 0)) return .{ .not_found = {} };
+
+        // File URLs are filesystem specifiers, not package names. Normalize
+        // them once here so every resolver consumer (ESM, require, and build)
+        // follows the same extension, tsconfig, and package-json code paths.
+        if (FileURL.isFileURL(import_path)) {
+            const file_path = FileURL.pathFromURLAlloc(r.allocator, import_path) catch |err| {
+                return .{ .failure = err };
+            };
+            return r.resolveAndAutoInstall(source_dir, file_path, kind, global_cache);
+        }
+
         if (r.runtimeAliasForImport(import_path, kind)) |alias_path| {
             return r.resolveAndAutoInstall(source_dir, alias_path, kind, global_cache);
         }
@@ -953,13 +969,6 @@ pub const Resolver = struct {
         // r.mutex.lock();
         // defer r.mutex.unlock();
         errdefer (r.flushDebugLogs(.fail) catch {});
-
-        // A path with a null byte cannot exist on the filesystem. Continuing
-        // anyways would cause assertion failures.
-        if (bun.strings.containsChar(import_path, 0)) {
-            r.flushDebugLogs(.fail) catch {};
-            return .{ .not_found = {} };
-        }
 
         var tmp = r.resolveWithoutSymlinks(source_dir_normalized, import_path, kind, global_cache);
 

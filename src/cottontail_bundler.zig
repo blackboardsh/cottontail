@@ -133,11 +133,14 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
     for (log.msgs.items) |message| {
         if (message.kind == .err) {
             if (message.data.location) |location| {
-                setError(error_out, "{s}:{}:{}: {s}", .{
+                // Bun's CLI diagnostics lead with the error text and put the
+                // source location on the following line. Keep this C bridge
+                // message-first too; callers add the leading "error: ".
+                setError(error_out, "{s}\n    at {s}:{}:{}", .{
+                    message.data.text,
                     location.file,
                     location.line,
                     location.column,
-                    message.data.text,
                 });
             } else {
                 setError(error_out, "{s}", .{message.data.text});
@@ -241,6 +244,10 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
         return err;
     };
     defer transpiler.deinitPreservingFileSystem();
+    // Bun's run/build commands populate the compiler environment before
+    // resolution. The resolver consumes NODE_PATH and condition-related env
+    // values even when runtime process.env reads are intentionally not inlined.
+    try transpiler.env.loadProcess();
     try transpiler.fs.setTopLevelDir(working_dir_z);
     transpiler.resolver.runtime_aliases = options.aliases;
 
@@ -977,6 +984,9 @@ pub fn buildEntryPointsJson(
         return json;
     };
     defer transpiler.deinitPreservingFileSystem();
+    // Match Bun's compiler lifecycle so package resolution sees NODE_PATH and
+    // the rest of the inherited process environment.
+    try transpiler.env.loadProcess();
     try transpiler.fs.setTopLevelDir(build_root_z);
 
     transpiler.options.output_format = options.output_format;
