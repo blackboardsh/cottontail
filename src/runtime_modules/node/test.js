@@ -7,6 +7,12 @@ import {
   junitReporterOptions,
   writeJunitReport,
 } from "../internal/bun-test-junit.js";
+import {
+  appendGithubGroup,
+  githubActionsEnabled,
+  githubErrorAnnotation,
+  githubTimeoutAnnotation,
+} from "../internal/bun-test-github.js";
 
 const tests = [];
 const events = [];
@@ -51,6 +57,10 @@ const failures = [];
 const selectedRecords = new Set();
 
 const testCliArgs = Array.from(globalThis.process?.argv ?? []).slice(2);
+function testCliModeEnabled() {
+  return globalThis.process?.env?.COTTONTAIL_TEST_CLI_HEADER_PRINTED === "1" ||
+    globalThis.__cottontailBunTestHeaderPrinted === true;
+}
 const forceConcurrent = testCliArgs.includes("--concurrent");
 const runTodoTests = testCliArgs.includes("--todo");
 const dotsMode = testCliArgs.includes("--dots");
@@ -90,6 +100,34 @@ const maxConcurrency = configuredMaxConcurrency();
 defaultTimeout = configuredDefaultTimeout();
 const onlyFailures = testCliArgs.includes("--only-failures") || bunfigOnlyFailures();
 const runnerDateNow = Date.now.bind(Date);
+
+function configuredBailLimit() {
+  const equals = testCliArgs.find((argument) => String(argument).startsWith("--bail="));
+  if (equals != null) {
+    return Math.max(1, Math.trunc(Number(String(equals).slice("--bail=".length)) || 1));
+  }
+  const index = testCliArgs.indexOf("--bail");
+  if (index < 0) return Infinity;
+  const value = Number(testCliArgs[index + 1]);
+  return Number.isInteger(value) && value > 0 ? value : 1;
+}
+
+const bailLimit = configuredBailLimit();
+let bailReported = false;
+
+function bailReached() {
+  return failedTests + runnerErrors >= bailLimit;
+}
+
+function stopPendingTestsForBail() {
+  if (!bailReached()) return;
+  for (const record of tests) {
+    if (record.ran) continue;
+    record.ran = true;
+    record.status = "filtered";
+    record.resolve?.();
+  }
+}
 
 function configuredTestNamePattern() {
   const source = cliOption("-t") ?? cliOption("--test-name-pattern");
@@ -208,6 +246,11 @@ function installUncaughtCapture() {
     const execution = executionStorage.getStore();
     if (execution?.failExternal) {
       execution.failExternal(error);
+      return;
+    }
+    if (testCliModeEnabled()) {
+      recordUnhandledError(error);
+      scheduleAfterHooks();
       return;
     }
     globalThis.process.setUncaughtExceptionCaptureCallback(null);
@@ -737,7 +780,8 @@ function suiteHasLifecycleWork(suite) {
   for (let cursor = suite; cursor; cursor = cursor.parent) {
     if (cursor.options.skip || cursor.options.todo) return false;
   }
-  if (suite.beforeHooks.length > 0 || suite.afterHooks.length > 0) return true;
+  if (suite.beforeHooks.length > 0 || suite.afterHooks.length > 0 ||
+      suite.beforeEachHooks.length > 0 || suite.afterEachHooks.length > 0) return true;
   return suite.children.some((child) => child.kind === "suite" && suiteHasLifecycleWork(child));
 }
 
@@ -1004,6 +1048,13 @@ function recordUnhandledError(error) {
   emitDotsRecord(record, error);
 }
 
+// Bun installs its test-runner rejection handlers before loading each test
+// entrypoint, so module-scope failures use the same reporter as test failures.
+if (testCliModeEnabled()) {
+  installUncaughtCapture();
+  installUnhandledRejectionCapture();
+}
+
 function settlesBeforeNextTurn(promise) {
   return new Promise((resolve) => {
     let settled = false;
@@ -1027,7 +1078,7 @@ function settlesBeforeNextTurn(promise) {
 
 async function runConcurrentRecords(records) {
   let cursor = 0;
-  while (cursor < records.length) {
+  while (cursor < records.length && !bailReached()) {
     const first = execute(records[cursor++]);
     if (await settlesBeforeNextTurn(first)) continue;
     if (maxConcurrency === 1) {
@@ -1036,7 +1087,7 @@ async function runConcurrentRecords(records) {
     }
     const workers = [];
     const worker = async () => {
-      while (cursor < records.length) {
+      while (cursor < records.length && !bailReached()) {
         const record = records[cursor++];
         await execute(record);
       }
@@ -1056,6 +1107,7 @@ async function flushConcurrent(group) {
 }
 
 async function executeSuite(suite, concurrentGroup) {
+  if (bailReached()) return;
   if (suite.definitionError && !suite.definitionErrorReported) {
     await flushConcurrent(concurrentGroup);
     suite.definitionErrorReported = true;
@@ -1070,6 +1122,7 @@ async function executeSuite(suite, concurrentGroup) {
   }
 
   for (const child of suite.children) {
+    if (bailReached()) break;
     if (child.kind === "suite") {
       await executeSuite(child, concurrentGroup);
     } else if (!child.ran) {
@@ -1216,6 +1269,8 @@ function appendErrorDiagnostic(lines, error) {
     frames = [error.__cottontailBunCallSite];
   }
   if (frames.length > 0) appendSourceFrame(lines, frames[0]);
+  const annotation = githubErrorAnnotation(error, frames, formatFailure(error));
+  if (annotation) lines.push(annotation);
   lines.push(`error: ${formatFailure(error)}`);
   for (const frame of frames.slice(0, 5)) {
     const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
@@ -1320,6 +1375,8 @@ function appendFailure(lines, record, error) {
   if (error?.code === "ERR_TEST_TIMEOUT") {
     // Match `bun test` output for timeouts (no leading "error:" line).
     const duration = error.duration ?? timeoutFor(record.options ?? {});
+    const annotation = githubTimeoutAnnotation(name, duration);
+    if (annotation) lines.push(annotation);
     lines.push(`(fail) ${name}`);
     lines.push(record.options?.__bunUsesDoneCallback
       ? `  ^ this test timed out after ${duration}ms, before its done callback was called. ` +
@@ -1338,6 +1395,8 @@ function appendFailureSummary(lines, view) {
     lines.push(`  ^ ${formatFailure(view.error)}`);
   } else if (view.error?.code === "ERR_TEST_TIMEOUT") {
     const duration = view.error.duration ?? timeoutFor(view.record.options ?? {});
+    const annotation = githubTimeoutAnnotation(name, duration);
+    if (annotation) lines.push(annotation);
     lines.push(view.record.options?.__bunUsesDoneCallback
       ? `  ^ this test timed out after ${duration}ms, before its done callback was called. ` +
         "If a done callback was not intended, remove the last parameter from the test callback function"
@@ -1409,8 +1468,59 @@ function appendRunRecords(lines, views, extraFailures = []) {
   }
 }
 
+function displayTestFile(filePath = undefined) {
+  let file = String(filePath ?? globalThis.process?.argv?.[1] ?? "test").replaceAll("\\", "/");
+  const cwd = String(globalThis.process?.cwd?.() ?? ".").replaceAll("\\", "/").replace(/[\/]+$/, "");
+  if (file.startsWith(`${cwd}/`)) file = file.slice(cwd.length + 1);
+  return file.replace(/^\.\//, "");
+}
+
+function appendRunFileGroups(lines, views, extraFailures, runIndex, runCount) {
+  const groups = new Map();
+  const knownFiles = Array.isArray(globalThis.__cottontailTestFiles)
+    ? globalThis.__cottontailTestFiles.map(displayTestFile)
+    : [];
+  const knownFileOrder = new Map(knownFiles.map((file, index) => [file, index]));
+  const groupFor = (record) => {
+    const file = displayTestFile(record?.filePath);
+    let group = groups.get(file);
+    if (!group) {
+      group = {
+        file,
+        views: [],
+        failures: [],
+        order: knownFileOrder.get(file) ?? record?.reportOrder ?? Infinity,
+      };
+      groups.set(file, group);
+    }
+    group.order = Math.min(group.order, knownFileOrder.get(file) ?? record?.reportOrder ?? Infinity);
+    return group;
+  };
+
+  for (const view of views) groupFor(view.record).views.push(view);
+  for (const failure of extraFailures) groupFor(failure.record).failures.push(failure);
+  knownFiles.forEach((file, index) => groupFor({ filePath: file, reportOrder: index }));
+  if (groups.size === 0) {
+    for (const record of tests) groupFor(record);
+  }
+
+  const ordered = [...groups.values()].sort((left, right) => left.order - right.order);
+  if (ordered.length === 0) {
+    ordered.push({ file: displayTestFile(), views: [], failures: [], order: Infinity });
+  }
+  for (const group of ordered) {
+    if (lines.length > 1) lines.push("");
+    const label = runCount > 1 ? `${group.file}: (run #${runIndex + 1})` : `${group.file}:`;
+    const body = [];
+    appendRunRecords(body, group.views, group.failures);
+    appendGithubGroup(lines, label, body);
+  }
+}
+
 function reportResults() {
-  if (resultsReported || (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed)) return;
+  const reportEmptyGithubFile = testCliModeEnabled() && githubActionsEnabled();
+  if (resultsReported ||
+      (tests.length === 0 && failures.length === 0 && !globalThis.__cottontailBunTestUsed && !reportEmptyGithubFile)) return;
   resultsReported = true;
   const lines = [""];
   const currentViews = tests
@@ -1422,18 +1532,12 @@ function reportResults() {
   const hasVisibleRunOutput = runs.some((views) => agentQuietMode
     ? views.some((view) => view.status === "fail")
     : views.length > 0);
-  if (hasVisibleRunOutput || failures.length > 0 || labelFilterMatchedNoTests) {
-    let file = String(globalThis.process?.argv?.[1] ?? "test");
-    const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
-    if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
-    file = file.replace(/^\.[\\/]+/, "");
+  if (hasVisibleRunOutput || failures.length > 0 || labelFilterMatchedNoTests || reportEmptyGithubFile) {
     runs.forEach((views, index) => {
-      if (index > 0) lines.push("");
-      lines.push(runs.length > 1 ? `${file}: (run #${index + 1})` : `${file}:`);
       const extraFailures = index === runs.length - 1
         ? failures.filter(({ record }) => !tests.includes(record))
         : [];
-      appendRunRecords(lines, views, extraFailures);
+      appendRunFileGroups(lines, views, extraFailures, index, runs.length);
     });
   }
   if (labelFilterMatchedNoTests) {
@@ -1496,6 +1600,11 @@ function reportResults() {
     for (const view of section.views) section.append(view);
   });
   lines.push("");
+  if (bailReached() && !bailReported) {
+    bailReported = true;
+    lines.push(`Bailed out after ${bailLimit} failure${bailLimit === 1 ? "" : "s"}`);
+    lines.push("");
+  }
   lines.push(` ${passedTests} pass`);
   if (skippedTests > 0) lines.push(` ${skippedTests} skip`);
   if (todoTests > 0) lines.push(` ${todoTests} todo`);
@@ -1586,8 +1695,13 @@ function resetForRerun() {
 }
 
 function scheduleRun() {
-  if (tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite) &&
-      !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.()) return;
+  const reportEmptyGithubFile = testCliModeEnabled() && githubActionsEnabled();
+  const noRegisteredWork = tests.length === 0 && failures.length === 0 && !suiteHasLifecycleWork(rootSuite) &&
+    !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.();
+  if (noRegisteredWork) {
+    if (reportEmptyGithubFile && globalThis.__cottontailTestEntrypointLoaded) reportResults();
+    return;
+  }
   installUncaughtCapture();
   installAsyncFailureGuards();
   if (runnerActive) {
@@ -1615,6 +1729,7 @@ function scheduleRun() {
         const concurrentGroup = [];
         await executeSuite(rootSuite, concurrentGroup);
         await flushConcurrent(concurrentGroup);
+        stopPendingTestsForBail();
         // --rerun-each=N runs every test N times (bun re-evaluates the file;
         // module state persists there too, so re-running records matches).
         if (!runAgain && !hasPendingTests() && completedRerunCount + 1 < rerunEach) {

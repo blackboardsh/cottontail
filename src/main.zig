@@ -257,12 +257,24 @@ fn testFlagTakesValue(arg: []const u8) bool {
     return false;
 }
 
+fn testFlagSpan(args: []const [:0]const u8, index: usize) usize {
+    const arg = args[index];
+    if (!testFlagTakesValue(arg) or index + 1 >= args.len) return 1;
+    // `--bail` has an optional numeric value. A following path/filter belongs
+    // to test discovery, while `--bail 3` consumes the number.
+    if (std.mem.eql(u8, arg, "--bail")) {
+        const value = args[index + 1];
+        _ = std.fmt.parseUnsigned(usize, value, 10) catch return 1;
+    }
+    return 2;
+}
+
 fn testEntrypointIndex(args: []const [:0]const u8) ?usize {
     var index: usize = 2;
     while (index < args.len) {
         const arg = args[index];
         if (!std.mem.startsWith(u8, arg, "-")) return index;
-        index += if (testFlagTakesValue(arg) and index + 1 < args.len) 2 else 1;
+        index += testFlagSpan(args, index);
     }
     return null;
 }
@@ -303,7 +315,7 @@ fn testEntrypointMask(allocator: std.mem.Allocator, args: []const [:0]const u8) 
     while (index < args.len) {
         const arg = args[index];
         if (std.mem.startsWith(u8, arg, "-")) {
-            index += if (testFlagTakesValue(arg) and index + 1 < args.len) 2 else 1;
+            index += testFlagSpan(args, index);
             continue;
         }
         mask[index] = true;
@@ -1328,6 +1340,24 @@ fn writeMultiTestEntrypoint(
         try source.appendSlice(allocator, ";\n");
     }
 
+    try source.appendSlice(allocator, "globalThis.__cottontailTestFiles = [");
+    for (test_files, 0..) |test_file, index| {
+        if (index > 0) try source.append(allocator, ',');
+        const absolute = if (std.fs.path.isAbsolute(test_file))
+            test_file
+        else
+            try std.fs.path.join(allocator, &.{ cwd_abs, test_file });
+        try appendJavaScriptStringLiteral(allocator, &source, absolute);
+    }
+    try source.appendSlice(
+        allocator,
+        "];\nglobalThis.__cottontailTestEntrypointLoaded = true;\n" ++
+            "if (typeof globalThis.__cottontailStartTestRun !== \"function\") {\n" ++
+            "  globalThis.__cottontailNodeTestRuntime = await import(\"node:test\");\n" ++
+            "  globalThis.__cottontailStartTestRun?.();\n" ++
+            "}\n",
+    );
+
     const path = try std.fmt.allocPrint(allocator, "{s}/entry.mjs", .{aggregate_directory});
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = source.items });
     return .{ .path = path, .directory = aggregate_directory };
@@ -1469,6 +1499,106 @@ fn appendTestDirectoryFiles(
     }
 }
 
+fn isExplicitTestPath(path: []const u8) bool {
+    return std.fs.path.isAbsolute(path) or
+        std.mem.startsWith(u8, path, "./") or
+        std.mem.startsWith(u8, path, "../") or
+        std.mem.startsWith(u8, path, ".cottontail-tmp/") or
+        std.mem.startsWith(u8, path, ".cottontail-tmp\\") or
+        (builtin.os.tag == .windows and
+            (std.mem.startsWith(u8, path, ".\\") or std.mem.startsWith(u8, path, "..\\")));
+}
+
+fn isGeneratedTestEntrypoint(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, ".cottontail-tmp/test-aggregate-") or
+        std.mem.startsWith(u8, path, ".cottontail-tmp\\test-aggregate-");
+}
+
+fn testPathMatchesFilters(path: []const u8, filters: []const [:0]const u8) bool {
+    if (filters.len == 0) return true;
+    for (filters) |filter| {
+        if (std.mem.indexOf(u8, path, filter) != null) return true;
+    }
+    return false;
+}
+
+fn appendDiscoveredTestFiles(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    filters: []const [:0]const u8,
+    test_files: *std.ArrayList([:0]const u8),
+) !void {
+    var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true });
+    defer directory.close(init.io);
+    var walker = try directory.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(init.io)) |entry| {
+        if (entry.kind == .directory) {
+            if ((entry.basename.len > 0 and entry.basename[0] == '.') or
+                std.mem.eql(u8, entry.basename, "node_modules"))
+            {
+                walker.leave(init.io);
+            }
+            continue;
+        }
+        if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
+        if (!testPathMatchesFilters(entry.path, filters)) continue;
+        try test_files.append(allocator, try allocator.dupeZ(u8, entry.path));
+    }
+}
+
+fn writeNoTestsDiagnostic(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    filters: []const [:0]const u8,
+) !u8 {
+    var stdout_buffer: [128]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
+    try stdout_writer.interface.flush();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    if (filters.len == 0) {
+        if (isTestAIAgent(init.environ_map)) {
+            const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", init.arena.allocator());
+            try stderr.print(
+                "error: 0 test files matching **{{.test,.spec,_test_,_spec_}}.{{js,ts,jsx,tsx}} in --cwd=\"{s}\"\n\n",
+                .{cwd},
+            );
+        } else {
+            try stderr.writeAll(
+                "No tests found!\n\n" ++
+                    "Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")\n\n" ++
+                    "Learn more about bun test: https://bun.com/docs/cli/test\n",
+            );
+        }
+    } else {
+        try stderr.writeAll("The following filters did not match any test files:\n");
+        var file_like: ?[]const u8 = null;
+        for (filters) |filter| {
+            try stderr.print(" {s}", .{filter});
+            const extension = std.fs.path.extension(filter);
+            if (file_like == null and
+                (std.mem.eql(u8, extension, ".ts") or std.mem.eql(u8, extension, ".tsx") or
+                    std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".jsx")))
+            {
+                file_like = filter;
+            }
+        }
+        try stderr.writeAll(
+            "\n\nnote: Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")\n",
+        );
+        if (file_like) |file| {
+            try stderr.print("note: To treat the \"{s}\" filter as a path, run \"bun test ./{s}\"\n", .{ file, file });
+        }
+        try stderr.writeAll("\nLearn more about bun test: https://bun.com/docs/cli/test\n");
+    }
+    try stderr.flush();
+    return if (testPassWithNoTests(args)) 0 else 1;
+}
+
 fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8 {
     if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
     const allocator = init.arena.allocator();
@@ -1476,38 +1606,29 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     var test_files: std.ArrayList([:0]const u8) = .empty;
     var expanded_directory = false;
     var explicit_entrypoint_count: usize = 0;
+    var positionals: std.ArrayList([:0]const u8) = .empty;
     for (entrypoints, 0..) |is_entrypoint, index| {
         if (!is_entrypoint) continue;
-        explicit_entrypoint_count += 1;
-        if (openTestDirectory(init.io, args[index])) |directory| {
-            expanded_directory = true;
-            try appendTestDirectoryFiles(init, allocator, args[index], directory, &test_files);
-        } else {
-            try test_files.append(allocator, args[index]);
-        }
+        try positionals.append(allocator, args[index]);
     }
-    if (explicit_entrypoint_count == 0) {
-        var directory = try std.Io.Dir.cwd().openDir(init.io, ".", .{ .iterate = true });
-        defer directory.close(init.io);
-        var walker = try directory.walk(allocator);
-        defer walker.deinit();
-        while (try walker.next(init.io)) |entry| {
-            if (entry.kind == .directory) {
-                if ((entry.basename.len > 0 and entry.basename[0] == '.') or
-                    std.mem.eql(u8, entry.basename, "node_modules"))
-                {
-                    walker.leave(init.io);
-                }
-                continue;
+
+    explicit_entrypoint_count = positionals.items.len;
+    const path_mode = for (positionals.items) |path| {
+        if (isExplicitTestPath(path)) break true;
+    } else false;
+
+    if (positionals.items.len == 0 or !path_mode) {
+        expanded_directory = true;
+        try appendDiscoveredTestFiles(init, allocator, positionals.items, &test_files);
+    } else {
+        for (positionals.items) |path| {
+            if (openTestDirectory(init.io, path)) |directory| {
+                expanded_directory = true;
+                try appendTestDirectoryFiles(init, allocator, path, directory, &test_files);
+            } else {
+                try test_files.append(allocator, path);
             }
-            if (entry.kind != .file or !isTestEntrypoint(entry.basename)) continue;
-            try test_files.append(allocator, try allocator.dupeZ(u8, entry.path));
         }
-        std.mem.sort([:0]const u8, test_files.items, {}, struct {
-            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
-                return std.mem.order(u8, left, right) == .lt;
-            }
-        }.lessThan);
     }
     std.mem.sort([:0]const u8, test_files.items, {}, struct {
         fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
@@ -1516,40 +1637,23 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     }.lessThan);
     const entrypoint_count = test_files.items.len;
     if (entrypoint_count == 0) {
-        var stdout_buffer: [128]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-        try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
-        try stdout_writer.interface.flush();
+        return try writeNoTestsDiagnostic(init, args, positionals.items);
+    }
+    const generated_entrypoint = positionals.items.len == 1 and isGeneratedTestEntrypoint(positionals.items[0]);
+    if (entrypoint_count == 1 and !expanded_directory and
+        (generated_entrypoint or !isGithubTestReporting(init.environ_map))) return null;
 
-        var stderr_buffer: [512]u8 = undefined;
-        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-        if (isTestAIAgent(init.environ_map)) {
-            const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
-            try stderr_writer.interface.print(
-                "error: 0 test files matching **{{.test,.spec,_test_,_spec_}}.{{js,ts,jsx,tsx}} in --cwd=\"{s}\"\n\n",
-                .{cwd},
-            );
-        } else {
-            try stderr_writer.interface.writeAll(
-                "No tests found!\n\n" ++
-                    "Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")\n\n" ++
-                    "Learn more about bun test: https://bun.com/docs/cli/test\n",
+    if (entrypoint_count > 1) {
+        if (testBailLimit(args)) |bail_limit| {
+            return try runMultipleTestFilesWithBail(
+                init,
+                args,
+                entrypoints,
+                test_files.items,
+                explicit_entrypoint_count,
+                bail_limit,
             );
         }
-        try stderr_writer.interface.flush();
-        return if (testPassWithNoTests(args)) 0 else 1;
-    }
-    if (entrypoint_count == 1 and !expanded_directory) return null;
-
-    if (testBailLimit(args)) |bail_limit| {
-        return try runMultipleTestFilesWithBail(
-            init,
-            args,
-            entrypoints,
-            test_files.items,
-            explicit_entrypoint_count,
-            bail_limit,
-        );
     }
 
     const aggregate = try writeMultiTestEntrypoint(init, test_files.items);
@@ -1605,6 +1709,39 @@ fn testBailLimit(args: []const [:0]const u8) ?usize {
     return null;
 }
 
+const TestCliValidationError = enum {
+    invalid_bail,
+    invalid_timeout,
+};
+
+fn validateTestCliOptions(args: []const [:0]const u8) ?TestCliValidationError {
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
+    var index: usize = 2;
+    while (index < args.len) {
+        const arg = args[index];
+        if (std.mem.startsWith(u8, arg, "--bail=")) {
+            const value = std.fmt.parseUnsigned(usize, arg["--bail=".len..], 10) catch
+                return .invalid_bail;
+            if (value == 0) return .invalid_bail;
+        } else if (std.mem.eql(u8, arg, "--bail") and index + 1 < args.len) {
+            if (std.fmt.parseUnsigned(usize, args[index + 1], 10)) |value| {
+                if (value == 0) return .invalid_bail;
+                index += 1;
+            } else |_| {}
+        } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
+            _ = std.fmt.parseUnsigned(u32, arg["--timeout=".len..], 10) catch
+                return .invalid_timeout;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            if (index + 1 >= args.len) return .invalid_timeout;
+            _ = std.fmt.parseUnsigned(u32, args[index + 1], 10) catch
+                return .invalid_timeout;
+            index += 1;
+        }
+        index += 1;
+    }
+    return null;
+}
+
 fn testPassWithNoTests(args: []const [:0]const u8) bool {
     for (args[2..]) |arg| {
         if (std.mem.eql(u8, arg, "--pass-with-no-tests")) return true;
@@ -1624,6 +1761,110 @@ fn isTestAIAgent(environ_map: *const std.process.Environ.Map) bool {
         if (truthyAgentEnvironmentValue(claude)) return true;
     }
     return environ_map.get("REPL_ID") != null;
+}
+
+fn isGithubTestReporting(environ_map: *const std.process.Environ.Map) bool {
+    const github_actions = environ_map.get("GITHUB_ACTIONS") orelse return false;
+    return truthyAgentEnvironmentValue(github_actions) and !isTestAIAgent(environ_map);
+}
+
+const GithubStackLocation = struct {
+    file: []const u8,
+    line: usize,
+    column: usize,
+};
+
+fn githubStackLocation(output: []const u8) ?GithubStackLocation {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, raw_line, " \t\r");
+        if (!std.mem.startsWith(u8, line, "at ")) continue;
+        line = std.mem.trim(u8, line["at ".len..], " \t");
+        if (std.mem.endsWith(u8, line, ")")) {
+            const open = std.mem.lastIndexOfScalar(u8, line, '(') orelse continue;
+            line = line[open + 1 .. line.len - 1];
+        }
+        const column_separator = std.mem.lastIndexOfScalar(u8, line, ':') orelse continue;
+        const column = std.fmt.parseUnsigned(usize, line[column_separator + 1 ..], 10) catch continue;
+        const before_column = line[0..column_separator];
+        const line_separator = std.mem.lastIndexOfScalar(u8, before_column, ':') orelse continue;
+        const line_number = std.fmt.parseUnsigned(usize, before_column[line_separator + 1 ..], 10) catch continue;
+        var file = before_column[0..line_separator];
+        if (std.mem.startsWith(u8, file, "file://")) file = file["file://".len..];
+        if (file.len == 0) continue;
+        return .{ .file = file, .line = line_number, .column = column };
+    }
+    return null;
+}
+
+fn writeGithubEscaped(writer: *std.Io.Writer, value: []const u8, property: bool) !void {
+    for (value) |byte| switch (byte) {
+        '%' => try writer.writeAll("%25"),
+        '\r' => try writer.writeAll("%0D"),
+        '\n' => try writer.writeAll("%0A"),
+        ':' => if (property) try writer.writeAll("%3A") else try writer.writeByte(byte),
+        ',' => if (property) try writer.writeAll("%2C") else try writer.writeByte(byte),
+        else => try writer.writeByte(byte),
+    };
+}
+
+fn writeGithubExceptionAnnotation(writer: *std.Io.Writer, output: []const u8) !bool {
+    const location = githubStackLocation(output) orelse return false;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var headline: []const u8 = "Error";
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) {
+            headline = trimmed;
+            break;
+        }
+    }
+
+    try writer.writeAll("::error file=");
+    try writeGithubEscaped(writer, location.file, true);
+    try writer.print(",line={d},col={d},title=", .{ location.line, location.column });
+    if (std.mem.eql(u8, headline, "Error")) {
+        try writer.writeAll("error");
+    } else if (std.mem.startsWith(u8, headline, "Error:")) {
+        try writer.writeAll("error");
+        try writeGithubEscaped(writer, headline["Error".len..], false);
+    } else {
+        try writeGithubEscaped(writer, headline, false);
+    }
+    try writer.writeAll("::\n");
+    return true;
+}
+
+fn runGithubTestCapture(
+    init: std.process.Init,
+    args: []const [:0]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !?u8 {
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "test")) return null;
+    if (init.environ_map.get("COTTONTAIL_TEST_GITHUB_CAPTURE") != null) return null;
+    if (!isGithubTestReporting(init.environ_map)) return null;
+
+    try init.environ_map.put("COTTONTAIL_TEST_GITHUB_CAPTURE", "1");
+    defer _ = init.environ_map.swapRemove("COTTONTAIL_TEST_GITHUB_CAPTURE");
+    const allocator = init.arena.allocator();
+    const argv = try allocator.alloc([]const u8, args.len);
+    for (args, 0..) |arg, index| argv[index] = arg;
+    const result = try std.process.run(allocator, init.io, .{
+        .argv = argv,
+        .environ_map = init.environ_map,
+        .stdout_limit = .limited(256 * 1024 * 1024),
+        .stderr_limit = .limited(256 * 1024 * 1024),
+    });
+    const exit_code = childExitCode(result.term);
+    try stdout.writeAll(result.stdout);
+    try stdout.flush();
+    if (exit_code != 0 and std.mem.indexOf(u8, result.stderr, "::error") == null) {
+        _ = try writeGithubExceptionAnnotation(stderr, result.stderr);
+    }
+    try stderr.writeAll(result.stderr);
+    try stderr.flush();
+    return exit_code;
 }
 
 fn parseRunInvocation(
@@ -2057,6 +2298,20 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (validateTestCliOptions(args)) |validation_error| {
+        switch (validation_error) {
+            .invalid_bail => try stderr.writeAll("error: --bail expects a number greater than 0\n"),
+            .invalid_timeout => try stderr.writeAll("error: Invalid timeout\n"),
+        }
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    if (try runGithubTestCapture(init, args, stdout, stderr)) |exit_code| {
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (try runMultipleTestFiles(init, args)) |exit_code| {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
@@ -2174,6 +2429,46 @@ test "test flag values are not treated as additional entrypoints" {
     try std.testing.expect(!mask[6]);
     try std.testing.expect(!mask[7]);
     try std.testing.expect(!mask[8]);
+}
+
+test "bare bail keeps a following test filter positional" {
+    const args = [_][:0]const u8{ "cottontail", "test", "--bail", "suite.test.ts" };
+    try std.testing.expectEqual(@as(?usize, 3), testEntrypointIndex(&args));
+    const numeric = [_][:0]const u8{ "cottontail", "test", "--bail", "3", "suite.test.ts" };
+    try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&numeric));
+}
+
+test "test CLI validation rejects invalid bail and timeout values" {
+    const bail_text = [_][:0]const u8{ "cottontail", "test", "--bail=wat" };
+    const bail_zero = [_][:0]const u8{ "cottontail", "test", "--bail=0" };
+    const timeout_text = [_][:0]const u8{ "cottontail", "test", "--timeout", "wat" };
+    const valid = [_][:0]const u8{ "cottontail", "test", "--bail", "3", "--timeout=50" };
+    try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_text).?);
+    try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_zero).?);
+    try std.testing.expectEqual(TestCliValidationError.invalid_timeout, validateTestCliOptions(&timeout_text).?);
+    try std.testing.expectEqual(@as(?TestCliValidationError, null), validateTestCliOptions(&valid));
+}
+
+test "Bun test positionals distinguish path mode from substring filters" {
+    try std.testing.expect(isExplicitTestPath("./index.ts"));
+    try std.testing.expect(isExplicitTestPath("../tests"));
+    try std.testing.expect(!isExplicitTestPath("index.ts"));
+    const filters = [_][:0]const u8{ "unit", "network" };
+    try std.testing.expect(testPathMatchesFilters("src/unit/math.test.ts", &filters));
+    try std.testing.expect(testPathMatchesFilters("test/network/socket.test.ts", &filters));
+    try std.testing.expect(!testPathMatchesFilters("test/compiler/parser.test.ts", &filters));
+    try std.testing.expect(isGeneratedTestEntrypoint(".cottontail-tmp/test-aggregate-abcd/entry.mjs"));
+}
+
+test "GitHub test capture locates source frames from host exception output" {
+    const output =
+        "Error\n" ++
+        "    at /tmp/project/example.test.ts:3:14\n" ++
+        "    at /tmp/project/.cottontail-tmp/entry.mjs:1:1\n";
+    const location = githubStackLocation(output).?;
+    try std.testing.expectEqualStrings("/tmp/project/example.test.ts", location.file);
+    try std.testing.expectEqual(@as(usize, 3), location.line);
+    try std.testing.expectEqual(@as(usize, 14), location.column);
 }
 
 test "pass-with-no-tests controls empty test discovery exit policy" {
