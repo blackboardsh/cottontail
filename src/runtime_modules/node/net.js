@@ -321,10 +321,44 @@ export class Socket extends EventEmitter {
     }
   }
 
+  _detachFdForTls() {
+    if (this.fd == null || this.destroyed || this.connecting) {
+      const error = new Error("Socket is not connected");
+      error.code = "ERR_SOCKET_CLOSED";
+      throw error;
+    }
+    this._flushOutboundWrites();
+    if (this._pendingWrites.length > 0 || this._outboundWrites.length > 0) {
+      const error = new Error("Socket still has pending writes");
+      error.code = "ERR_SOCKET_CLOSED";
+      throw error;
+    }
+    if (this._pendingData.length > 0) {
+      const error = new Error("Socket has unread data and cannot be upgraded to TLS");
+      error.code = "ERR_SSL_INTERNAL_ERROR";
+      throw error;
+    }
+
+    this._stopRead();
+    this._clearTimeoutTimer();
+    if (this._writeRetryTimer != null) {
+      clearTimeout(this._writeRetryTimer);
+      this._writeRetryTimer = null;
+    }
+    const fd = this.fd;
+    this.fd = null;
+    this.readable = false;
+    this.writable = false;
+    this.destroyed = true;
+    this._tlsDetached = true;
+    return fd;
+  }
+
   _emitData(chunk) {
-    if (this._paused || this._pendingData.length > 0) {
+    if (this._paused || this._pendingData.length > 0 || this.listenerCount("readable") > 0) {
       this._pendingData.push(chunk);
-      if (!this._paused) queueMicrotask(() => this._flushPendingData());
+      if (this.listenerCount("readable") > 0) this.emit("readable");
+      if (!this._paused && this.listenerCount("data") > 0) queueMicrotask(() => this._flushPendingData());
       return;
     }
     this.emit("data", chunk);

@@ -1835,6 +1835,8 @@ export class ClientRequest extends OutgoingMessage {
     const defaultPort = secure ? 443 : 80;
     const requestOptions = {
       ...this._options,
+      protocol: this.protocol,
+      secureEndpoint: secure,
       host: this.url.hostname || "localhost",
       hostname: this.url.hostname || "localhost",
       port: Number(this._options._port || defaultPort),

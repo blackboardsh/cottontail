@@ -1,5 +1,6 @@
 import { Buffer } from "./buffer.js";
 import { Readable } from "./stream.js";
+import { captureV8HeapSnapshot } from "./internal/heap_snapshot.js";
 
 const formatVersion = 1;
 let flags = "";
@@ -415,33 +416,14 @@ export function getCppHeapStatistics(detailLevel = "brief") {
   };
 }
 
-function heapSnapshotPayload() {
-  return JSON.stringify({
-    snapshot: {
-      meta: { node_fields: [], node_types: [], edge_fields: [], edge_types: [], trace_function_info_fields: [], trace_node_fields: [], sample_fields: [], location_fields: [] },
-      node_count: 0,
-      edge_count: 0,
-      trace_function_count: 0,
-    },
-    nodes: [],
-    edges: [],
-    strings: [],
-    cottontail: {
-      heapStatistics: getHeapStatistics(),
-      flags,
-      heapSnapshotNearHeapLimit,
-    },
-  });
-}
-
 export function getHeapSnapshot(_options = {}) {
-  return Readable.from([heapSnapshotPayload()]);
+  return Readable.from([captureV8HeapSnapshot()]);
 }
 
 export function writeHeapSnapshot(filename = undefined, options = {}) {
   void options;
   const path = filename ?? `${globalThis.process?.cwd?.() ?? cottontail.cwd?.() ?? "."}/Heap.${Date.now()}.heapsnapshot`;
-  cottontail.writeFile(String(path), heapSnapshotPayload());
+  cottontail.writeFile(String(path), captureV8HeapSnapshot());
   return String(path);
 }
 

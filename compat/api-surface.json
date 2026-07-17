@@ -9799,6 +9799,22 @@
         ],
         "hasDefaultExport": true
       },
+      "internal/heap_snapshot": {
+        "file": "src/runtime_modules/node/internal/heap_snapshot.js",
+        "exports": [
+          "captureV8HeapSnapshot",
+          "jscHeapSnapshotToV8"
+        ],
+        "hasDefaultExport": false
+      },
+      "node:internal/heap_snapshot": {
+        "file": "src/runtime_modules/node/internal/heap_snapshot.js",
+        "exports": [
+          "captureV8HeapSnapshot",
+          "jscHeapSnapshotToV8"
+        ],
+        "hasDefaultExport": false
+      },
       "internal/test/binding": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "exports": [
@@ -14354,6 +14370,16 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/internal/heap_snapshot.js": {
+        "file": "src/runtime_modules/node/internal/heap_snapshot.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "captureV8HeapSnapshot",
+          "jscHeapSnapshotToV8"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/internal/test/binding.js": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "hasDefaultExport": true,
@@ -15587,6 +15613,7 @@
           "__cottontailWorkerData",
           "__cottontailWorkerResourceLimits",
           "__cottontailWorkerThreadName",
+          "__cottontailWorkerThreadParentPortActive",
           "clearImmediate",
           "MessageChannel",
           "MessagePort",
@@ -16322,6 +16349,7 @@
       "__cottontailWorkerData",
       "__cottontailWorkerResourceLimits",
       "__cottontailWorkerThreadName",
+      "__cottontailWorkerThreadParentPortActive",
       "__ctError",
       "__dirname",
       "__filename",
@@ -18777,10 +18805,10 @@
       "version": "1.3.10",
       "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
       "snapshot": "compat/upstream/bun/v1.3.10",
-      "copiedFiles": 8366,
+      "copiedFiles": 8369,
       "discoveredRunnableFiles": 1445,
-      "enabled": 1001,
-      "expectedFailure": 444,
+      "enabled": 1002,
+      "expectedFailure": 443,
       "disabled": 0,
       "notEnabled": 0,
       "classifiedTests": 1445,
@@ -18798,7 +18826,7 @@
       },
       "signals": {
         "publicNodeModules": 58,
-        "nodeTestFiles": 37,
+        "nodeTestFiles": 42,
         "compatMarkers": 13,
         "modulesWithCompatMarkers": 12,
         "explicitUnsupportedMarkers": 9,
@@ -18857,7 +18885,7 @@
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 1,
+          "tests": 5,
           "gapScore": 3
         },
         {
@@ -18929,7 +18957,7 @@
           "compatMarkers": 0,
           "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
-          "tests": 3,
+          "tests": 7,
           "gapScore": 2
         },
         {
@@ -19034,7 +19062,7 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 2612,
+              "line": 2614,
               "text": "throw new SyntaxError(`Unsupported proxy protocol: ${parsed.protocol}`);"
             }
           ],
@@ -19042,17 +19070,25 @@
           "tests": [
             "tests/js/node-http-agent-streaming.ts",
             "tests/js/node-http-https-surface.ts",
+            "tests/js/node-http2-close-lifecycle.test.ts",
+            "tests/js/node-http2-core.test.ts",
+            "tests/js/node-http2-session.test.ts",
+            "tests/js/node-http2-url-formats.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
         },
         "http2": {
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": [
-            "node:http2 sessions - socket-backed client/server sessions with RFC 7541 HPACK (full static table, dynamic table, Huffman decoding, proper integer coding), SETTINGS negotiation (including custom client/server settings options), DATA frame splitting at the peer's SETTINGS_MAX_FRAME_SIZE, HEADERS+CONTINUATION reassembly and splitting, padding handling, automatic WINDOW_UPDATE replenishment, write/end callbacks with encodings, server setTimeout, PING, GOAWAY, RST_STREAM, PRIORITY, PUSH_PROMISE, and stream pause/resume are implemented; outbound flow-control enforcement, Huffman encoding, trailers via waitForTrailers, ALTSVC/ORIGIN, and HTTP/1-compat request/response bridging need deeper protocol work. TLS ALPN negotiation (\"h2\") requires native support in ct_tls_client_connect and is passed through but currently unavailable."
+            "node:http2 native TLS boundary - socket-backed h2c and TLS sessions, ALPN negotiation, HPACK, CONTINUATION, trailers, SETTINGS, flow-window replenishment, validation, and request/response compatibility are implemented. Nonblocking direct TLS handshakes and upgrading an externally accepted TCP socket to server-side TLS require shared node:tls and native host support; outbound flow-control scheduling, Huffman encoding, ALTSVC/ORIGIN, and HTTP/1 fallback still need deeper protocol work."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
           "tests": [
+            "tests/js/node-http2-close-lifecycle.test.ts",
+            "tests/js/node-http2-core.test.ts",
+            "tests/js/node-http2-session.test.ts",
+            "tests/js/node-http2-url-formats.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
         },

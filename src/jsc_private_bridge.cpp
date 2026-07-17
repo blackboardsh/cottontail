@@ -13,7 +13,11 @@
 
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <cstdio>
 #include <cstdint>
+#include <cstddef>
+#include <vector>
 #include <wtf/ThreadSafeRefCounted.h>
 #include <wtf/PtrTag.h>
 #include <wtf/text/StringImpl.h>
@@ -73,6 +77,8 @@ public:
             m_impl->deref();
     }
 
+    StringImpl* impl() const { return m_impl; }
+
 private:
     StringImpl* m_impl { nullptr };
 };
@@ -104,6 +110,7 @@ using EncodedJSValue = int64_t;
 
 class CallFrame;
 class Exception;
+class HeapAnalyzer;
 class JSGlobalObject;
 class JSObject;
 class VM;
@@ -167,6 +174,33 @@ public:
     Exception* throwException(JSGlobalObject*, JSObject*);
 };
 
+// Heap profiling is a stock JSC facility, but JSCOnly does not install its
+// private headers. These opaque declarations are pinned to the vendored
+// WebKit release, just like the CallFrame and OpaqueJSString ABI bridges in
+// this file. The storage deliberately exceeds the private class layouts.
+class HeapProfiler {
+public:
+    explicit HeapProfiler(VM&);
+    ~HeapProfiler();
+    void setActiveHeapAnalyzer(HeapAnalyzer*);
+
+private:
+    alignas(std::max_align_t) unsigned char m_storage[256];
+};
+
+class HeapSnapshotBuilder {
+public:
+    enum SnapshotType { InspectorSnapshot, GCDebuggingSnapshot };
+
+    HeapSnapshotBuilder(HeapProfiler&, SnapshotType = InspectorSnapshot);
+    ~HeapSnapshotBuilder();
+    void buildSnapshot();
+    WTF::String json();
+
+private:
+    alignas(std::max_align_t) unsigned char m_storage[4096];
+};
+
 class JSLockHolder {
 public:
     JSLockHolder(VM&);
@@ -194,6 +228,117 @@ extern "C" void ct_jsc_drain_microtasks(JSContextRef context)
     auto* vm = ct_jsc_vm(context);
     JSC::JSLockHolder lock(*vm);
     vm->drainMicrotasks();
+}
+
+static char* ct_jsc_copy_utf8(const WTF::String& value)
+{
+    auto* impl = value.impl();
+    if (impl == nullptr)
+        return nullptr;
+
+    JSStringRef string = nullptr;
+    if (impl->is8Bit()) {
+        auto source = impl->span8();
+        std::vector<JSChar> characters(source.size());
+        for (size_t index = 0; index < source.size(); ++index)
+            characters[index] = static_cast<JSChar>(source[index]);
+        string = JSStringCreateWithCharacters(characters.data(), characters.size());
+    } else {
+        auto source = impl->span16();
+        static_assert(sizeof(char16_t) == sizeof(JSChar));
+        string = JSStringCreateWithCharacters(
+            reinterpret_cast<const JSChar*>(source.data()), source.size());
+    }
+    if (string == nullptr)
+        return nullptr;
+
+    size_t capacity = JSStringGetMaximumUTF8CStringSize(string);
+    char* result = static_cast<char*>(std::malloc(capacity));
+    if (result == nullptr) {
+        JSStringRelease(string);
+        return nullptr;
+    }
+    size_t written = JSStringGetUTF8CString(string, result, capacity);
+    JSStringRelease(string);
+    if (written == 0) {
+        std::free(result);
+        return nullptr;
+    }
+    return result;
+}
+
+extern "C" char* ct_jsc_heap_snapshot(JSContextRef context)
+{
+    if (context == nullptr)
+        return nullptr;
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+
+    // VM::ensureHeapProfiler() is inline in a private header omitted by the
+    // JSCOnly artifact. Locate m_activeHeapAnalyzer with a temporary sentinel,
+    // then use the pinned field delta to reach the adjacent LazyUniqueRef. The
+    // tagged slot itself supplies JSC's real initializer function, so ownership
+    // and destruction remain with the VM. Fail closed if the layout changes.
+    JSC::HeapProfiler probe(*vm);
+    alignas(std::max_align_t) unsigned char sentinel;
+    probe.setActiveHeapAnalyzer(reinterpret_cast<JSC::HeapAnalyzer*>(&sentinel));
+    constexpr size_t vm_scan_size = 128 * 1024;
+    constexpr ptrdiff_t heap_profiler_delta = 184;
+    uintptr_t* active_slot = nullptr;
+    auto* vm_bytes = reinterpret_cast<unsigned char*>(vm);
+    for (size_t offset = 0; offset + sizeof(void*) <= vm_scan_size; offset += alignof(void*)) {
+        auto* candidate = reinterpret_cast<uintptr_t*>(vm_bytes + offset);
+        if (*candidate == reinterpret_cast<uintptr_t>(&sentinel)) {
+            active_slot = candidate;
+            break;
+        }
+    }
+    probe.setActiveHeapAnalyzer(nullptr);
+    if (active_slot == nullptr)
+        return nullptr;
+
+    auto* lazy_slot = reinterpret_cast<uintptr_t*>(
+        reinterpret_cast<unsigned char*>(active_slot) + heap_profiler_delta);
+    uintptr_t tagged_pointer = *lazy_slot;
+    bool debug = std::getenv("COTTONTAIL_JSC_DEBUG") != nullptr;
+    if (debug) {
+        std::fprintf(
+            stderr,
+            "cottontail: JSC heap profiler active_offset=%td lazy_offset=%td tagged=%p\n",
+            reinterpret_cast<unsigned char*>(active_slot) - vm_bytes,
+            reinterpret_cast<unsigned char*>(lazy_slot) - vm_bytes,
+            reinterpret_cast<void*>(tagged_pointer));
+    }
+    if (tagged_pointer == 0)
+        return nullptr;
+
+    JSC::HeapProfiler* profiler = nullptr;
+    if (tagged_pointer & 1) {
+        if ((tagged_pointer & 3) != 1)
+            return nullptr;
+        using LazyInitializer = JSC::HeapProfiler* (*)(JSC::VM&, void*);
+        auto* initializer_slot = reinterpret_cast<LazyInitializer*>(tagged_pointer & ~uintptr_t(3));
+        LazyInitializer initializer = *initializer_slot;
+        if (initializer == nullptr)
+            return nullptr;
+        profiler = initializer(*vm, lazy_slot);
+    } else
+        profiler = reinterpret_cast<JSC::HeapProfiler*>(tagged_pointer);
+    if (debug) {
+        std::fprintf(
+            stderr,
+            "cottontail: JSC heap profiler initialized=%p slot=%p\n",
+            static_cast<void*>(profiler),
+            reinterpret_cast<void*>(*lazy_slot));
+    }
+    if (profiler == nullptr || *reinterpret_cast<JSC::VM**>(profiler) != vm)
+        return nullptr;
+
+    JSC::HeapSnapshotBuilder builder(
+        *profiler, JSC::HeapSnapshotBuilder::InspectorSnapshot);
+    builder.buildSnapshot();
+    auto json = builder.json();
+    return ct_jsc_copy_utf8(json);
 }
 
 static JSC::JSGlobalObject* ct_jsc_global_object(JSContextRef context)

@@ -1801,6 +1801,7 @@ g.__cottontailRegisterSpawnListener = (id, listener) => {
 };
 
 const workerMessageListeners = new Map();
+const workerTransportListenerBrand = Symbol.for("cottontail.worker_threads.transportListener");
 function addWorkerListener(target, name, handler) {
   if (typeof handler !== "function") return target;
   const key = String(name);
@@ -1827,7 +1828,7 @@ function emitWorkerEvent(target, name, event) {
 
 function hasWorkerMessageListener() {
   if (typeof g.onmessage === "function") return true;
-  return (workerMessageListeners.get("message") ?? []).length > 0;
+  return (workerMessageListeners.get("message") ?? []).some((listener) => !listener?.[workerTransportListenerBrand]);
 }
 
 function serializeWorkerMessage(message) {
@@ -1889,6 +1890,16 @@ function installWorkerNativeEventHandler() {
       workerInstances.delete(worker.id);
       if (worker._pollTimer != null) clearInterval(worker._pollTimer);
       worker._emit("exit", { code: 0 });
+      return;
+    }
+    if (event?.type === "error") {
+      const message = String(event?.message ?? "Worker execution failed");
+      worker._emit("error", {
+        type: "error",
+        message,
+        error: null,
+        target: worker,
+      });
       return;
     }
     if (event?.type === "open") {
@@ -1974,13 +1985,25 @@ function workerTempDir() {
 }
 
 function prepareWorkerScriptPath(scriptPath) {
-  const target = normalizeWorkerScriptPath(scriptPath);
-  if (target.startsWith("data:")) return target;
-  const cached = workerBundleCache.get(target);
+  const cacheKey = normalizeWorkerScriptPath(scriptPath);
+  let target = cacheKey;
+  const cached = workerBundleCache.get(cacheKey);
   if (cached && cottontail.existsSync?.(cached)) return cached;
   const tempDir = workerTempDir();
   cottontail.mkdirSync?.(tempDir, true);
   const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+  if (target.startsWith("data:")) {
+    const comma = target.indexOf(",");
+    if (comma < 0) throw new TypeError("Invalid worker data URL");
+    const metadata = target.slice(5, comma);
+    const payload = target.slice(comma + 1);
+    const source = /;base64(?:;|$)/i.test(metadata)
+      ? Buffer.from(payload, "base64").toString("utf8")
+      : decodeURIComponent(payload);
+    const dataPath = `${tempDir}/bun-worker-data-${nonce}.js`;
+    cottontail.writeFile(dataPath, source);
+    target = dataPath;
+  }
   const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
   const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
   const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
@@ -1998,7 +2021,7 @@ function prepareWorkerScriptPath(scriptPath) {
       inlineImportMetaProperties: true,
     }));
     cottontail.writeFile(bundledPath, bundled);
-    workerBundleCache.set(target, bundledPath);
+    workerBundleCache.set(cacheKey, bundledPath);
     return bundledPath;
   } catch {}
 
@@ -2021,13 +2044,17 @@ function prepareWorkerScriptPath(scriptPath) {
       /^\s*import\s+\{([^}]*)\}\s+from\s+(['"])bun\2\s*;?\s*$/mg,
       (_all, names) => `const { ${rewriteWorkerNamedImports(names)} } = globalThis.Bun;`,
     );
-  if (transformed === source) return target;
+  if (transformed === source) {
+    workerBundleCache.set(cacheKey, target);
+    return target;
+  }
   cottontail.writeFile(bundledPath, [
     "globalThis.Bun ??= { isMainThread: false };",
     "globalThis.Bun.isMainThread = false;",
     transformed,
     `\n//# sourceURL=${target}`,
   ].join("\n"));
+  workerBundleCache.set(cacheKey, bundledPath);
   return bundledPath;
 }
 

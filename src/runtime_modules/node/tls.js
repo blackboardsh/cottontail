@@ -156,12 +156,25 @@ function prepareTlsKey(keyOption, passphrase) {
       err.code = "ERR_MISSING_PASSPHRASE";
       throw err;
     }
-    // PKCS#8 encrypted keys need native decryption support.
-    const err = new Error("error:1E08010C:DECODER routines::unsupported");
-    err.code = "ERR_OSSL_UNSUPPORTED";
-    throw err;
+    return pem;
   }
   return pem;
+}
+
+function tlsCredentialOptions(options) {
+  const context = options?.secureContext?.context ?? {};
+  const passphraseOption = options?.passphrase ?? context.passphrase;
+  const passphrase = passphraseOption == null
+    ? undefined
+    : ArrayBuffer.isView(passphraseOption) || passphraseOption instanceof ArrayBuffer
+      ? Buffer.from(passphraseOption).toString()
+      : String(passphraseOption);
+  return {
+    ca: flattenPem(options?.ca ?? context.ca),
+    cert: flattenPem(options?.cert ?? context.cert),
+    key: prepareTlsKey(options?.key ?? context.key, passphrase),
+    passphrase,
+  };
 }
 
 function bytesFrom(chunk, encoding = undefined) {
@@ -315,6 +328,7 @@ export class TLSSocket extends Socket {
     this._tlsInfo = null;
     this._encoding = null;
     this._tlsListenerInstalled = false;
+    this._tlsHandshakeTimer = null;
     this._session = bufferFromNativeBytes(options?.session);
     this._renegotiationDisabled = false;
     // Node's TLSSocket always disables half-open, ignoring the option.
@@ -329,17 +343,56 @@ export class TLSSocket extends Socket {
     this.destroyed = false;
     this.readable = true;
     this.writable = true;
-    this.connecting = false;
     this._setAddressInfo(native.local, native.remote);
+    if (native.pending === true) {
+      this.connecting = true;
+      this.authorized = false;
+      this._continueTlsHandshake(connectedEvent);
+      return this;
+    }
+    this._finishTlsConnect(connectedEvent);
+    return this;
+  }
+
+  _finishTlsConnect(connectedEvent) {
+    this.connecting = false;
     this.authorized = true;
     this.authorizationError = null;
+    this.alpnProtocol = this._tlsInfo?.alpnProtocol || false;
     queueMicrotask(() => {
+      if (this.destroyed) return;
       this._flushPendingWrites?.();
       this.emit("connect");
       this.emit(connectedEvent);
       this._startTlsRead();
     });
-    return this;
+  }
+
+  _continueTlsHandshake(connectedEvent) {
+    const startedAt = Date.now();
+    const step = () => {
+      this._tlsHandshakeTimer = null;
+      if (this.destroyed || this._tlsId == null) return;
+      try {
+        if (cottontail.tlsClientHandshake(this._tlsId) === true) {
+          this._tlsInfo = cottontail.tlsConnectionInfo?.(this._tlsId) ?? this._tlsInfo;
+          this._finishTlsConnect(connectedEvent);
+          return;
+        }
+        if (Date.now() - startedAt >= 10000) {
+          const error = new Error("TLS handshake timed out");
+          error.code = "ETIMEDOUT";
+          throw error;
+        }
+        this._tlsHandshakeTimer = setTimeout(step, 1);
+      } catch (error) {
+        this.authorized = false;
+        this.authorizationError = error?.message ?? String(error);
+        this.connecting = false;
+        this.destroy(error);
+      }
+    };
+    this._tlsHandshakeTimer = setTimeout(step, 0);
   }
 
   _currentTlsInfo() {
@@ -433,6 +486,10 @@ export class TLSSocket extends Socket {
     this.readable = false;
     this.writable = false;
     this._clearTimeoutTimer?.();
+    if (this._tlsHandshakeTimer != null) {
+      clearTimeout(this._tlsHandshakeTimer);
+      this._tlsHandshakeTimer = null;
+    }
     const listeners = globalThis.__cottontailTlsListeners;
     if (this._tlsId != null) {
       listeners?.delete?.(this._tlsId);
@@ -543,11 +600,14 @@ export class Server extends NetServer {
           throw err;
         }
         const key = prepareTlsKey(this._tlsOptions.key, this._tlsOptions.passphrase);
+        const alpnProtocols = prepareALPNProtocols(this._tlsOptions.ALPNProtocols);
         const native = cottontail.tlsServerListen(
           Number(listenOptions.port ?? 0) || 0,
           listenOptions.host ?? listenOptions.hostname ?? "127.0.0.1",
           flattenPem(this._tlsOptions.cert),
           key,
+          this._tlsOptions.passphrase == null ? undefined : String(this._tlsOptions.passphrase),
+          alpnProtocols,
         );
         this._tlsServerId = Number(native.id);
         this._tlsAddress = native.address ?? null;
@@ -604,17 +664,45 @@ export class Server extends NetServer {
 
 export function connect(...args) {
   const [options, callback] = normalizeConnectArgs(args);
-  const socket = new TLSSocket(undefined, options);
+  const parentSocket = options.socket;
+  const socket = new TLSSocket(parentSocket, options);
   if (typeof callback === "function") socket.once("secureConnect", callback);
   queueMicrotask(() => {
     try {
-      const native = cottontail.tlsClientConnect(
-        Number(options.port ?? 443),
-        options.host ?? options.hostname ?? "localhost",
-        options.servername ?? options.host ?? options.hostname ?? "localhost",
-        options.rejectUnauthorized !== false,
-        flattenPem(options.ca),
-      );
+      const credentials = tlsCredentialOptions(options);
+      const servername = options.servername ?? options.host ?? options.hostname ?? "localhost";
+      const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
+      let native;
+      if (parentSocket != null) {
+        if (typeof parentSocket._detachFdForTls !== "function" || typeof cottontail.tlsClientConnectFd !== "function") {
+          const error = new TypeError('The "options.socket" property must be a Cottontail net.Socket');
+          error.code = "ERR_INVALID_ARG_TYPE";
+          throw error;
+        }
+        const fd = parentSocket._detachFdForTls();
+        native = cottontail.tlsClientConnectFd(
+          fd,
+          servername,
+          options.rejectUnauthorized !== false,
+          credentials.ca,
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          alpnProtocols,
+        );
+      } else {
+        native = cottontail.tlsClientConnect(
+          Number(options.port ?? 443),
+          options.host ?? options.hostname ?? "localhost",
+          servername,
+          options.rejectUnauthorized !== false,
+          credentials.ca,
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          alpnProtocols,
+        );
+      }
       socket._attachNative(native, "secureConnect");
     } catch (error) {
       socket.authorized = false;
@@ -646,6 +734,13 @@ export function convertALPNProtocols(protocols, out = {}) {
     bytes = Buffer.concat(chunks);
   }
   out.ALPNProtocols = bytes;
+}
+
+function prepareALPNProtocols(protocols) {
+  if (protocols == null) return undefined;
+  const out = {};
+  convertALPNProtocols(protocols, out);
+  return out.ALPNProtocols;
 }
 
 export const rootCertificates = Object.freeze(systemRootCertificates());

@@ -2260,8 +2260,8 @@
       "reason": "Passes on the native-bundler pipeline after stabilization (10 bun:test cases, 17 assertions)."
     },
     "test/js/node/http/node-http-agent-tls-options.test.mts": {
-      "status": "expected-failure",
-      "reason": "10/15 active cases pass. Proxy tunneling still needs TLS wrapping of an existing connected socket, and encrypted PKCS#8 keys need native passphrase support."
+      "status": "enabled",
+      "reason": "Passes all 15 active cases, including existing-socket TLS upgrades through https-proxy-agent and encrypted PKCS#8 credentials."
     },
     "test/js/node/http/node-http-maxHeaderSize.test.ts": {
       "status": "enabled",
@@ -2674,6 +2674,10 @@
     "test/js/node/worker_threads/worker_destruction.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
+    },
+    "test/js/node/worker_threads/worker_threads.test.ts": {
+      "status": "expected-failure",
+      "reason": "21/27 active cases pass. Remaining coverage requires native per-worker performance metrics, asynchronous worker-owned JSC heap snapshots, global Web Worker data-URL loading/error delivery, plus two Bun-1.3.10-specific legacy error expectations that conflict with the implemented Node behavior."
     },
     "test/js/node/zlib/bytesWritten.test.ts": {
       "status": "enabled",
