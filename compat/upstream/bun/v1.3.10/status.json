@@ -689,6 +689,11 @@
       "status": "enabled",
       "reason": "Package tarball SHA-512 generation, lockfile persistence, frozen reinstall verification, corruption rejection, and missing-integrity restoration pass the copied upstream coverage (9 bun:test cases, 47 assertions)."
     },
+    "test/cli/install/bun-patch.test.ts": {
+      "status": "enabled",
+      "reason": "Bun patch preparation and commit workflows, workspace and nested package selection, patch generation, patched dependency reinstalls, aliases, and executable links pass the copied upstream file (26 bun:test cases).",
+      "timeoutMs": 120000
+    },
     "test/cli/install/overrides.test.ts": {
       "status": "enabled",
       "reason": "Root and transitive overrides, npm aliases, lockfile updates, frozen installs, removal, and workspace exemption pass the copied upstream coverage (7 bun:test cases, 20 assertions).",
