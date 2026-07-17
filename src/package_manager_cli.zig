@@ -297,6 +297,9 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.dry_run = true;
         } else if (std.mem.eql(u8, arg, "--silent") or std.mem.eql(u8, arg, "--quiet")) {
             options.silent = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            // bunx forwards this to `add`; the current package manager has no
+            // additional verbose-only diagnostics, but accepts the Bun flag.
         } else if (std.mem.eql(u8, arg, "--no-summary")) {
             options.no_summary = true;
         } else if (std.mem.eql(u8, arg, "--dev") or std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--development")) {
@@ -4732,18 +4735,117 @@ fn extractTarballArchive(
     var compressed_reader: std.Io.Reader = .fixed(archive);
     var decompression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &decompression_buffer);
+    var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var sanitized_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var file_contents_buffer: [16 * 1024]u8 = undefined;
     var diagnostics: std.tar.Diagnostics = .{ .allocator = allocator };
     defer diagnostics.deinit();
-    try std.tar.extract(io, destination, &decompressor.reader, .{
-        .strip_components = 1,
+    var symlink_paths = std.StringHashMap(void).init(allocator);
+    defer symlink_paths.deinit();
+
+    var iterator: std.tar.Iterator = .init(&decompressor.reader, .{
+        .file_name_buffer = &file_name_buffer,
+        .link_name_buffer = &link_name_buffer,
         .diagnostics = &diagnostics,
     });
+    while (try iterator.next()) |entry| {
+        const path_len = sanitizeTarPath(&sanitized_path_buffer, entry.name, 1) catch continue;
+        if (path_len == 0 and entry.kind != .directory) continue;
+        const path = sanitized_path_buffer[0..path_len];
+        var links = symlink_paths.keyIterator();
+        while (links.next()) |link| {
+            if (!std.mem.eql(u8, path, link.*) and pathHasPrefix(path, link.*)) return error.TarPathThroughSymlink;
+        }
+        _ = symlink_paths.remove(path);
+
+        switch (entry.kind) {
+            .directory => if (path.len > 0) try ensureTarDirectory(io, destination, path),
+            .file => {
+                try removeTarDestination(io, destination, path);
+                if (std.fs.path.dirname(path)) |parent| try destination.createDirPath(io, parent);
+                const permissions: std.Io.File.Permissions = if (std.Io.File.Permissions.has_executable_bit and (entry.mode & 0o100) != 0) .executable_file else .default_file;
+                var file = try destination.createFile(io, path, .{ .truncate = true, .permissions = permissions });
+                defer file.close(io);
+                var file_writer = file.writer(io, &file_contents_buffer);
+                try iterator.streamRemaining(entry, &file_writer.interface);
+                try file_writer.interface.flush();
+            },
+            .sym_link => {
+                try removeTarDestination(io, destination, path);
+                if (std.fs.path.dirname(path)) |parent| try destination.createDirPath(io, parent);
+                try destination.symLink(io, entry.link_name, path, .{});
+                try symlink_paths.put(try allocator.dupe(u8, path), {});
+            },
+        }
+    }
+
     for (diagnostics.errors.items) |problem| switch (problem) {
         .components_outside_stripped_prefix => {},
         .unable_to_create_file => |info| return info.code,
         .unable_to_create_sym_link => |info| return info.code,
         .unsupported_file_type => return error.TarUnsupportedHeader,
     };
+}
+
+fn ensureTarDirectory(io: std.Io, directory: std.Io.Dir, path: []const u8) !void {
+    const stat = directory.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try directory.createDirPath(io, path);
+            return;
+        },
+        else => return err,
+    };
+    if (stat.kind == .directory) return;
+    try removeTarDestination(io, directory, path);
+    try directory.createDirPath(io, path);
+}
+
+fn removeTarDestination(io: std.Io, directory: std.Io.Dir, path: []const u8) !void {
+    const stat = directory.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .directory) {
+        try directory.deleteTree(io, path);
+    } else {
+        try directory.deleteFile(io, path);
+    }
+}
+
+fn sanitizeTarPath(buffer: []u8, path: []const u8, strip_components: u32) error{Invalid}!usize {
+    if (path.len == 0 or path[0] == '/') return error.Invalid;
+    if (builtin.os.tag == .windows and std.mem.indexOfAny(u8, path, "\\:") != null) return error.Invalid;
+
+    var output_len: usize = 0;
+    var components_to_strip = strip_components;
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (output_len == 0) return error.Invalid;
+            while (true) {
+                const ends_with_slash = buffer[output_len - 1] == '/';
+                output_len -= 1;
+                if (ends_with_slash or output_len == 0) break;
+            }
+            continue;
+        }
+        if (components_to_strip > 0) {
+            components_to_strip -= 1;
+            continue;
+        }
+        const separator_len: usize = if (output_len > 0) 1 else 0;
+        if (output_len + separator_len + component.len > buffer.len) return error.Invalid;
+        if (separator_len == 1) {
+            buffer[output_len] = '/';
+            output_len += 1;
+        }
+        @memcpy(buffer[output_len..][0..component.len], component);
+        output_len += component.len;
+    }
+    if (components_to_strip > 0) return error.Invalid;
+    return output_len;
 }
 
 fn jsonString(value: *const Value, key: []const u8) ?[]const u8 {
@@ -5084,9 +5186,12 @@ fn packageJSONHasWorkspaces(package_json: *const Value) bool {
 }
 
 fn deletePath(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(io, path) catch {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return;
+    if (stat.kind == .directory) {
+        std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    } else {
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    };
+    }
 }
 
 fn clonePackagePath(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8) anyerror!void {

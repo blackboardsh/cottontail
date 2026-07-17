@@ -6,6 +6,7 @@ const cottontail_diff = @import("cottontail_diff.zig");
 const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
+const package_manager_bunx = @import("package_manager_bunx.zig");
 const package_manager_cli = @import("package_manager_cli.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
@@ -25,7 +26,7 @@ const version = @import("version.zig").version;
 // Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
-const completion_commands = [_][]const u8{ "run", "test", "build", "exec", "getcompletes" };
+const completion_commands = [_][]const u8{ "run", "test", "build", "x", "exec", "getcompletes" };
 const help_text_template =
     \\cottontail {s}
     \\Tiny Zig-based JavaScript runtime.
@@ -35,6 +36,7 @@ const help_text_template =
     \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail test [args...]
     \\  cottontail install|add|remove|update [packages...] [flags]
+    \\  cottontail x [--package <package>] <package-or-bin> [args...]
     \\  cottontail -e|--eval <script> [args...]
     \\  cottontail -p|--print <expression> [args...]
     \\  cottontail --help
@@ -2205,6 +2207,12 @@ pub fn main(init: std.process.Init) !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
+
+    if (package_manager_bunx.detectInvocation(args)) |invocation| {
+        const exit_code = try package_manager_bunx.run(init, args, invocation, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
 
     if (args.len <= 1) {
         try printHelp(stdout);
