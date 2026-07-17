@@ -7,6 +7,7 @@ import * as utilTypes from "./util/types.js";
 import * as zlibConstants from "./zlib/constants.js";
 import { _enqueueNextTick, _wrapAsyncCallback } from "./async_hooks.js";
 import { uvErrorMap } from "./util/internal/loader.js";
+import { fileURLToPath } from "./url.js";
 
 const processStartNs = typeof cottontail.nanotime === "function" ? BigInt(Math.floor(cottontail.nanotime())) : 0n;
 const processStartMs = Date.now();
@@ -1530,12 +1531,32 @@ export const _linkedBinding = processObject._linkedBinding = (name) => {
   throw bindingError(`No such binding was linked: ${String(name)}`, "ERR_INVALID_MODULE");
 };
 
-export const dlopen = processObject.dlopen = (module, filename = undefined) => {
+export const dlopen = processObject.dlopen = (module, filename = undefined, _flags = undefined) => {
   if (processObject.execArgv?.includes("--no-addons")) {
     throw bindingError("\nerror: Cannot load native addon because loading addons is disabled.", "ERR_DLOPEN_DISABLED");
   }
-  const target = filename ?? module?.filename ?? module?.id ?? "";
-  throw bindingError(`dlopen(${String(target)}, 0x0001): native add-on loading is pending for Cottontail`, "ERR_DLOPEN_FAILED");
+  const targetValue = filename ?? module?.filename ?? module?.id ?? "";
+  let target;
+  try {
+    const text = String(targetValue);
+    target = text.startsWith("file:") ? fileURLToPath(text) : text;
+  } catch {
+    throw bindingError("invalid file: URL passed to dlopen", "ERR_DLOPEN_FAILED");
+  }
+  if (typeof cottontail.nativeAddonLoad !== "function") {
+    throw bindingError(`dlopen(${target}, 0x0001): native add-on loading is unavailable`, "ERR_DLOPEN_FAILED");
+  }
+  try {
+    const exports = cottontail.nativeAddonLoad(target, module?.exports);
+    if (module != null && (typeof module === "object" || typeof module === "function")) {
+      module.exports = exports;
+    }
+  } catch (error) {
+    if (error && (typeof error === "object" || typeof error === "function") && error.code == null) {
+      try { error.code = "ERR_DLOPEN_FAILED"; } catch {}
+    }
+    throw error;
+  }
 };
 
 export const execve = processObject.execve = (file, args, execEnv) => {

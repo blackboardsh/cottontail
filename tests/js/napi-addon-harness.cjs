@@ -1,6 +1,5 @@
 "use strict";
 
-const Module = require("node:module");
 const { resolve } = require("node:path");
 
 if (!process.argv[2]) throw new Error("usage: napi-addon-harness.cjs <test-file>");
@@ -12,10 +11,5 @@ for (const name of [
 ]) {
   if (!(name in globalThis)) globalThis[name] = undefined;
 }
-
-Module._extensions[".node"] = (module, filename) => {
-  module.exports = cottontail.nativeAddonLoad(filename, module.exports);
-  module.loaded = true;
-};
 
 require(resolve(process.argv[2]));
