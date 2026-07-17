@@ -3281,6 +3281,10 @@
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (3 bun:test cases, 4 assertions)."
     },
+    "test/js/web/websocket/websocket-client-short-read.test.ts": {
+      "status": "enabled",
+      "reason": "Node HTTP preserves caller header casing for npm ws handshakes, and the WebSocket frame parser handles a split extended payload length (1 bun:test case, 1 assertion)."
+    },
     "test/js/web/websocket/websocket-client.test.ts": {
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (29 bun:test cases, 42 assertions)."

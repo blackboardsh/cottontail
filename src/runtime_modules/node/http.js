@@ -1957,7 +1957,7 @@ export class ClientRequest extends OutgoingMessage {
       }
       if (!this.hasHeader("connection")) this.setHeader("Connection", this.agent?.keepAlive ? "keep-alive" : "close");
       const lines = [`${this.method} ${this.path} HTTP/1.1`];
-      for (const [name, value] of Object.entries(this.getHeaders())) {
+      for (const [name, value] of headerEntries(this)) {
         if (Array.isArray(value)) {
           for (const item of value) lines.push(`${name}: ${item}`);
         } else {
