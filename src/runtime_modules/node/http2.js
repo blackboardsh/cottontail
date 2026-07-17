@@ -2,26 +2,116 @@ import { Buffer } from "./buffer.js";
 import { EventEmitter } from "./events.js";
 import { IncomingMessage, ServerResponse } from "./http.js";
 import { connect as netConnect, createServer as createNetServer } from "./net.js";
+import { Duplex } from "./stream.js";
 import { _upgradeServerSocket, connect as tlsConnect, createServer as createTlsServer } from "./tls.js";
+import * as fs from "./fs.js";
+
+let statusMessageWarned = false;
+let connectionHeaderWarned = false;
+
+function warnStatusMessage() {
+  if (statusMessageWarned) return;
+  statusMessageWarned = true;
+  globalThis.process?.emitWarning?.(
+    "Status message is not supported by HTTP/2",
+    "UnsupportedWarning",
+  );
+}
+
+function warnConnectionHeader() {
+  if (connectionHeaderWarned) return;
+  connectionHeaderWarned = true;
+  globalThis.process?.emitWarning?.(
+    "The provided connection header is not valid, the value will be dropped from the header and will never be in use.",
+    "UnsupportedWarning",
+  );
+}
+
+const compatSocketCache = new WeakMap();
+
+function compatSocketForStream(stream) {
+  const cached = compatSocketCache.get(stream);
+  if (cached) return cached;
+  const prohibited = new Set(["write", "read", "pause", "resume"]);
+  const streamMethods = new Set(["on", "once", "end", "emit", "destroy"]);
+  const proxy = new Proxy(stream, {
+    has(target, property) {
+      const socket = target.session?._socket;
+      return property in target || (socket != null && property in socket);
+    },
+    get(target, property) {
+      if (prohibited.has(property)) {
+        throw codedError("ERR_HTTP2_NO_SOCKET_MANIPULATION", "HTTP/2 sockets should not be directly manipulated");
+      }
+      if (streamMethods.has(property)) return target[property].bind(target);
+      if (property === "setTimeout") return target.setTimeout.bind(target);
+      if (property === "writable" || property === "destroyed" || property === "readable") return target[property];
+      const socket = target.session?._socket;
+      const value = socket?.[property];
+      return typeof value === "function" ? value.bind(socket) : value;
+    },
+    set(target, property, value) {
+      if (prohibited.has(property)) {
+        throw codedError("ERR_HTTP2_NO_SOCKET_MANIPULATION", "HTTP/2 sockets should not be directly manipulated");
+      }
+      if (streamMethods.has(property) || property === "setTimeout" || property === "writable" ||
+          property === "destroyed" || property === "readable") {
+        target[property] = value;
+        return true;
+      }
+      const socket = target.session?._socket;
+      if (socket) socket[property] = value;
+      else target[property] = value;
+      return true;
+    },
+    getPrototypeOf(target) {
+      return Reflect.getPrototypeOf(target.session?._socket ?? target);
+    },
+  });
+  compatSocketCache.set(stream, proxy);
+  return proxy;
+}
 
 export class Http2ServerRequest extends IncomingMessage {
-  constructor(stream, headers, rawHeaders = []) {
+  constructor(stream, headers, options = undefined, rawHeaders = undefined) {
+    if (Array.isArray(options) && rawHeaders === undefined) {
+      rawHeaders = options;
+      options = undefined;
+    }
+    rawHeaders ??= [];
     super({
+      ...(options ?? {}),
       deferBody: true,
       headers,
       rawHeaders,
       httpVersion: "2.0",
       method: headers[":method"],
       url: headers[":path"],
-      socket: stream.session.socket,
+      socket: compatSocketForStream(stream),
     });
     this.stream = stream;
-    this.authority = headers[":authority"];
+    this.authority = headers[":authority"] ?? headers.host;
     this.scheme = headers[":scheme"];
     stream.on("data", chunk => this._pushIncomingChunk(chunk));
-    stream.on("trailers", (trailers) => this._completeIncoming(trailers, Object.entries(trailers).flat()));
+    stream.on("trailers", (trailers, _flags, rawTrailers) => {
+      this.trailers = trailers;
+      this.rawTrailers = rawTrailers ?? Object.entries(trailers).flat();
+    });
     stream.on("end", () => this._completeIncoming());
     stream.on("aborted", () => this._abortIncoming());
+    stream.on("timeout", () => this.emit("timeout"));
+    stream.on("close", () => {
+      if (!this.complete && !this.aborted) this._completeIncoming(this.trailers, this.rawTrailers);
+      this.emit("close");
+    });
+    stream.on("error", error => {
+      if (this.listenerCount("error") > 0) this.emit("error", error);
+    });
+  }
+
+  setTimeout(msecs, callback = undefined) {
+    this.stream?.setTimeout(msecs, callback);
+    return this;
   }
 }
 
@@ -29,15 +119,77 @@ export class Http2ServerResponse extends ServerResponse {
   constructor(stream, request) {
     super(request);
     this.stream = stream;
-    this.socket = stream.session.socket;
+    this.socket = compatSocketForStream(stream);
     this.connection = this.socket;
+    this._trailerHeaders = {};
+    this._closed = false;
+    stream.on("drain", () => this.emit("drain"));
+    stream.on("timeout", () => this.emit("timeout"));
+    stream.on("aborted", () => this.emit("aborted"));
+    stream.on("wantTrailers", () => {
+      if (!stream.sentTrailers && !stream.closed) stream.sendTrailers(this._trailerHeaders);
+    });
+    stream.on("finish", () => {
+      if (!this._finishEmitted) {
+        this._finishEmitted = true;
+        this.emit("finish");
+      }
+    });
+    stream.on("close", () => {
+      this._closed = true;
+      this.socket = undefined;
+      this.connection = undefined;
+      if (!this._closeEmitted) {
+        this._closeEmitted = true;
+        this.emit("close");
+      }
+    });
+  }
+
+  get _header() { return this.headersSent; }
+
+  get statusCode() { return this._statusCode ?? 200; }
+  set statusCode(value) {
+    const status = Number(value);
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      throw codedError("ERR_HTTP2_STATUS_INVALID", `Invalid status code: ${String(value)}`, RangeError);
+    }
+    if (status >= 100 && status < 200) {
+      throw codedError("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED", `Informational status code ${status} is not allowed here`);
+    }
+    this._statusCode = status;
+  }
+
+  get statusMessage() {
+    warnStatusMessage();
+    return "";
+  }
+  set statusMessage(value) {
+    if (value === undefined || this._suppressStatusMessageWarning) return;
+    warnStatusMessage();
   }
 
   _sendHead() {
     if (this.headersSent) return;
     const headers = { ":status": this.statusCode, ...this.getHeaders() };
-    this.stream.respond(headers);
+    this.stream.respond(headers, { waitForTrailers: true, sendDate: this.sendDate });
     this.headersSent = true;
+  }
+
+  setHeader(name, value) {
+    if (String(name).toLowerCase() === "connection") {
+      warnConnectionHeader();
+      return this;
+    }
+    return super.setHeader(name, value);
+  }
+
+  appendHeader(name, value) {
+    if (String(name).toLowerCase() === "connection") {
+      warnConnectionHeader();
+      return this;
+    }
+    return super.appendHeader(name, value);
   }
 
   writeHead(statusCode, statusMessage = undefined, headers = undefined) {
@@ -45,9 +197,21 @@ export class Http2ServerResponse extends ServerResponse {
       headers = statusMessage;
       statusMessage = undefined;
     }
-    this.statusCode = Number(statusCode);
+    this.statusCode = statusCode;
     if (headers) {
-      for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
+      if (Array.isArray(headers)) {
+        const tuples = headers.length > 0 && Array.isArray(headers[0]);
+        if (!tuples && headers.length % 2 !== 0) {
+          throw codedError("ERR_INVALID_ARG_VALUE", "The headers array must contain name/value pairs", TypeError);
+        }
+        if (tuples) {
+          for (const [name, value] of headers) this.appendHeader(name, value);
+        } else {
+          for (let index = 0; index < headers.length; index += 2) this.appendHeader(headers[index], headers[index + 1]);
+        }
+      } else {
+        for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
+      }
     }
     this._sendHead();
     return this;
@@ -58,7 +222,17 @@ export class Http2ServerResponse extends ServerResponse {
       callback = encoding;
       encoding = undefined;
     }
+    if (this.writableEnded) {
+      const error = codedError("ERR_STREAM_WRITE_AFTER_END", "write after end");
+      if (callback) queueMicrotask(() => callback(error));
+      else this.destroy(error);
+      return false;
+    }
     this._sendHead();
+    if (payloadForbidden(this.statusCode, this.req?.method === "HEAD")) {
+      if (callback) queueMicrotask(callback);
+      return true;
+    }
     return this.stream.write(chunk, encoding, callback);
   }
 
@@ -74,11 +248,15 @@ export class Http2ServerResponse extends ServerResponse {
       if (typeof callback === "function") queueMicrotask(callback);
       return this;
     }
-    this._sendHead();
+    if (chunk !== undefined && chunk !== null && !payloadForbidden(this.statusCode, this.req?.method === "HEAD")) {
+      this.write(chunk, encoding);
+    } else {
+      this._sendHead();
+    }
     this.writableEnded = true;
     this.finished = true;
-    this.stream.end(chunk, encoding, callback);
-    this.emit("finish");
+    if (typeof callback === "function") this.once("finish", callback);
+    this.stream.end();
     return this;
   }
 
@@ -88,9 +266,65 @@ export class Http2ServerResponse extends ServerResponse {
     this.finished = true;
     return this;
   }
+
+  setTrailer(name, value) {
+    const normalized = normalizeHeaders({ [name]: value }, { allowPseudo: false, trailers: true });
+    Object.assign(this._trailerHeaders, normalized);
+  }
+
+  addTrailers(headers = {}) {
+    Object.assign(this._trailerHeaders, normalizeHeaders(headers, { allowPseudo: false, trailers: true }));
+  }
+
+  flushHeaders() {
+    if (!this._closed) this._sendHead();
+  }
+
+  cork() { this.stream.cork(); }
+  uncork() { this.stream.uncork(); }
+
+  setTimeout(msecs, callback = undefined) {
+    this.stream?.setTimeout(msecs, callback);
+    return this;
+  }
+
+  createPushResponse(headers, callback) {
+    if (typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
+    if (this._closed) {
+      queueMicrotask(() => callback(codedError("ERR_HTTP2_INVALID_STREAM", "The HTTP/2 stream has been destroyed")));
+      return;
+    }
+    this.stream.pushStream(headers, {}, (error, pushStream) => {
+      callback(error, error ? undefined : new Http2ServerResponse(pushStream, undefined));
+    });
+  }
+
+  writeContinue(callback = undefined) {
+    if (this.headersSent || this._closed) return false;
+    this.stream.additionalHeaders({ ":status": 100 });
+    if (typeof callback === "function") queueMicrotask(callback);
+    return true;
+  }
+
+  writeEarlyHints(hints, callback = undefined) {
+    validateObject(hints, "hints");
+    const link = hints.link;
+    if (link === undefined || link === null) return false;
+    const values = Array.isArray(link) ? link : [link];
+    if (values.some(value => typeof value !== "string")) {
+      throw codedError("ERR_INVALID_ARG_VALUE", "The hints.link value must be a string or string array", TypeError);
+    }
+    if (this.headersSent || this._closed || values.length === 0) return false;
+    const headers = { ...hints, link: values.join(", "), ":status": 103 };
+    this.stream.additionalHeaders(headers);
+    if (typeof callback === "function") queueMicrotask(callback);
+    return true;
+  }
 }
 
-export const sensitiveHeaders = Symbol("sensitiveHeaders");
+export const sensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
 
 export const constants = {
   NGHTTP2_ERR_FRAME_SIZE_ERROR: -522,
@@ -231,6 +465,8 @@ const frameTypes = {
   GOAWAY: 7,
   WINDOW_UPDATE: 8,
   CONTINUATION: 9,
+  ALTSVC: 10,
+  ORIGIN: 12,
 };
 const flags = { END_STREAM: 0x1, END_HEADERS: 0x4, ACK: 0x1, PADDED: 0x8, PRIORITY: 0x20 };
 const DEFAULT_MAX_FRAME_SIZE = 16384;
@@ -539,7 +775,7 @@ function encodeHeaders(headers = {}) {
 }
 
 function headerListToObject(list) {
-  const headers = {};
+  const headers = Object.create(null);
   const sensitive = [];
   for (const [name, value, isSensitive] of list) {
     if (isSensitive && !sensitive.includes(name)) sensitive.push(name);
@@ -636,6 +872,155 @@ function validateUint32(value, name) {
   return value;
 }
 
+function codedError(code, message, ErrorCtor = Error) {
+  const error = new ErrorCtor(message);
+  error.code = code;
+  return error;
+}
+
+function validateObject(value, name, { optional = false } = {}) {
+  if (optional && value === undefined) return;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw codedError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "${name}" argument must be of type object.${receivedType(value)}`,
+      TypeError,
+    );
+  }
+}
+
+function invalidSetting(name, value, type = false) {
+  const message = `Invalid value for setting "${name}": ${String(value)}`;
+  throw codedError("ERR_HTTP2_INVALID_SETTING_VALUE", message, type ? TypeError : RangeError);
+}
+
+const MAX_ADDITIONAL_SETTINGS = 10;
+
+function validateSettings(settings, name = "settings") {
+  if (settings === null || typeof settings !== "object" || Array.isArray(settings)) {
+    const noun = name.includes(".") ? "property" : "argument";
+    throw codedError(
+      "ERR_INVALID_ARG_TYPE",
+      `The "${name}" ${noun} must be of type Object.${receivedType(settings)}`,
+      TypeError,
+    );
+  }
+  const uint32Settings = [
+    "headerTableSize",
+    "maxConcurrentStreams",
+    "initialWindowSize",
+    "maxHeaderListSize",
+    "maxHeaderSize",
+  ];
+  for (const name of uint32Settings) {
+    const value = settings[name];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      invalidSetting(name, value);
+    }
+  }
+  for (const name of ["enablePush", "enableConnectProtocol"]) {
+    const value = settings[name];
+    if (value !== undefined && typeof value !== "boolean") invalidSetting(name, value, true);
+  }
+  if (settings.maxFrameSize !== undefined) {
+    const value = settings.maxFrameSize;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 16384 || value > 16777215) {
+      invalidSetting("maxFrameSize", value);
+    }
+  }
+  if (settings.customSettings !== undefined) {
+    validateObject(settings.customSettings, "settings.customSettings");
+    const entries = Object.entries(settings.customSettings);
+    if (entries.length > MAX_ADDITIONAL_SETTINGS) {
+      throw codedError(
+        "ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS",
+        `The number of custom settings must not exceed ${MAX_ADDITIONAL_SETTINGS}`,
+        RangeError,
+      );
+    }
+    for (const [rawId, value] of entries) {
+      const id = Number(rawId);
+      if (!Number.isInteger(id) || id < 0 || id > 0xffff) invalidSetting(rawId, value);
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+        invalidSetting(rawId, value);
+      }
+    }
+  }
+  return settings;
+}
+
+const validHeaderToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const invalidHeaderValue = /[\u0000-\u0008\u000a-\u001f\u007f]/;
+const validPseudoHeaders = new Set([":status", ":method", ":authority", ":scheme", ":path", ":protocol"]);
+const connectionHeaders = new Set(["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]);
+const singleValueHeaders = new Set([
+  "age", "authorization", "content-length", "content-location", "content-md5", "content-range",
+  "content-type", "date", "etag", "expires", "from", "host", "if-match", "if-modified-since",
+  "if-none-match", "if-range", "if-unmodified-since", "last-modified", "location", "max-forwards",
+  "proxy-authorization", "range", "referer", "retry-after", "server", "user-agent",
+]);
+
+function assertHeaderName(name, { allowPseudo = true } = {}) {
+  if (typeof name !== "string" || name.length === 0) {
+    throw codedError("ERR_INVALID_HTTP_TOKEN", `Header name must be a valid HTTP token [${String(name)}]`, TypeError);
+  }
+  if (name.startsWith(":")) {
+    if (!allowPseudo) throw codedError("ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED", "HTTP/2 pseudo-headers are not allowed here");
+    if (!validPseudoHeaders.has(name)) {
+      throw codedError("ERR_HTTP2_INVALID_PSEUDOHEADER", `Invalid HTTP/2 pseudo-header "${name}"`);
+    }
+    return name;
+  }
+  if (!validHeaderToken.test(name)) {
+    throw codedError("ERR_INVALID_HTTP_TOKEN", `Header name must be a valid HTTP token [${name}]`, TypeError);
+  }
+  return name;
+}
+
+function assertHeaderValue(name, value) {
+  if (value === undefined || value === null) {
+    throw codedError("ERR_HTTP2_INVALID_HEADER_VALUE", `Invalid value "${value}" for header "${name}"`, TypeError);
+  }
+  const values = Array.isArray(value) ? value : [value];
+  for (const entry of values) {
+    if (invalidHeaderValue.test(String(entry))) {
+      throw codedError("ERR_INVALID_CHAR", `Invalid character in header content ["${name}"]`, TypeError);
+    }
+  }
+}
+
+function normalizeHeaders(headers, { allowPseudo = true, trailers = false } = {}) {
+  if (headers === undefined) return {};
+  validateObject(headers, "headers");
+  const normalized = {};
+  const sensitive = headers[sensitiveHeaders];
+  if (sensitive !== undefined && !Array.isArray(sensitive)) {
+    throw codedError(
+      "ERR_INVALID_ARG_VALUE",
+      "The property 'headers[http2.sensitiveHeaders]' must be an array",
+      TypeError,
+    );
+  }
+  for (const [rawName, value] of Object.entries(headers)) {
+    const name = String(rawName).toLowerCase();
+    assertHeaderName(name, { allowPseudo: allowPseudo && !trailers });
+    assertHeaderValue(name, value);
+    if (connectionHeaders.has(name) || (name === "te" && String(value).toLowerCase() !== "trailers")) {
+      throw codedError(
+        "ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+        `HTTP/1 connection specific headers are forbidden: "${name}"`,
+      );
+    }
+    if (singleValueHeaders.has(name) && Array.isArray(value) && value.length > 1) {
+      throw codedError("ERR_HTTP2_HEADER_SINGLE_VALUE", `Header field "${name}" must only have a single value`);
+    }
+    normalized[name] = value;
+  }
+  if (sensitive !== undefined) normalized[sensitiveHeaders] = sensitive.map(name => String(name).toLowerCase());
+  return normalized;
+}
+
 function abortError() {
   const error = new Error("The operation was aborted");
   error.name = "AbortError";
@@ -729,6 +1114,7 @@ export function getDefaultSettings() {
 }
 
 export function getPackedSettings(settings = {}) {
+  validateSettings(settings);
   const fields = [];
   const normalized = { ...settings };
   if (normalized.maxHeaderListSize == null && normalized.maxHeaderSize != null) {
@@ -737,9 +1123,14 @@ export function getPackedSettings(settings = {}) {
   for (const [name, id] of settingsFields) {
     if (normalized[name] == null) continue;
     const value = typeof normalized[name] === "boolean" ? (normalized[name] ? 1 : 0) : Number(normalized[name]);
-    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) throw new RangeError(`Invalid HTTP/2 setting value for ${name}`);
     if (name === "enableConnectProtocol" && value === 0) continue;
     fields.push([id, value]);
+  }
+  if (normalized.customSettings) {
+    const custom = Object.entries(normalized.customSettings)
+      .map(([id, value]) => [Number(id), value])
+      .sort((a, b) => a[0] - b[0]);
+    fields.push(...custom);
   }
   const out = Buffer.alloc(fields.length * 6);
   fields.forEach(([id, value], index) => {
@@ -750,15 +1141,24 @@ export function getPackedSettings(settings = {}) {
   return out;
 }
 
-export function getUnpackedSettings(buffer) {
+export function getUnpackedSettings(buffer, options = undefined) {
   if (!Buffer.isBuffer(buffer) && !(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) {
-    throw new TypeError("Expected buf to be a Buffer, TypedArray, DataView, or ArrayBuffer");
+    throw codedError(
+      "ERR_INVALID_ARG_TYPE",
+      "Expected buf to be a Buffer, TypedArray, DataView, or ArrayBuffer",
+      TypeError,
+    );
   }
   const bytes = Buffer.from(buffer);
-  if (bytes.byteLength < 6 || bytes.byteLength % 6 !== 0) {
-    throw new RangeError("Expected buf to be a Buffer of at least 6 bytes and a multiple of 6 bytes");
+  if (bytes.byteLength % 6 !== 0) {
+    throw codedError(
+      "ERR_HTTP2_INVALID_PACKED_SETTINGS_LENGTH",
+      "Expected buf to be a Buffer of at least 6 bytes and a multiple of 6 bytes",
+      RangeError,
+    );
   }
   const out = { enableConnectProtocol: false };
+  const customSettings = {};
   for (let offset = 0; offset < bytes.byteLength; offset += 6) {
     const id = readUint16BE(bytes, offset);
     const value = readUint32BE(bytes, offset + 2);
@@ -773,8 +1173,11 @@ export function getUnpackedSettings(buffer) {
         out.maxHeaderListSize = value;
         break;
       case 8: out.enableConnectProtocol = value !== 0; break;
+      default: customSettings[id] = value; break;
     }
   }
+  if (Object.keys(customSettings).length > 0) out.customSettings = customSettings;
+  if (options?.validate === true) validateSettings(out);
   return out;
 }
 
@@ -782,181 +1185,264 @@ export function getUnpackedSettings(buffer) {
 // Streams and sessions
 // ---------------------------------------------------------------------------
 
-export class Http2Stream extends EventEmitter {
+function validateResponseStatus(status) {
+  const code = Number(status);
+  if (!Number.isInteger(code) || code < 100 || code > 599) {
+    throw codedError("ERR_HTTP2_STATUS_INVALID", `Invalid status code: ${String(status)}`, RangeError);
+  }
+  return code;
+}
+
+function payloadForbidden(status, headRequest = false) {
+  return headRequest || status === 204 || status === 205 || status === 304;
+}
+
+function validateFileOptions(options = undefined) {
+  if (options === undefined) return {};
+  validateObject(options, "options");
+  const copy = { ...options };
+  for (const name of ["offset", "length"]) {
+    if (copy[name] !== undefined && (typeof copy[name] !== "number" || !Number.isFinite(copy[name]))) {
+      throw codedError("ERR_INVALID_ARG_VALUE", `The property 'options.${name}' is invalid`, TypeError);
+    }
+  }
+  if (copy.statCheck !== undefined && typeof copy.statCheck !== "function") {
+    throw codedError("ERR_INVALID_ARG_VALUE", "The property 'options.statCheck' must be a function", TypeError);
+  }
+  if (copy.onError !== undefined && typeof copy.onError !== "function") {
+    throw codedError("ERR_INVALID_ARG_VALUE", "The property 'options.onError' must be a function", TypeError);
+  }
+  return copy;
+}
+
+export class Http2Stream extends Duplex {
   constructor(session, id, headers = {}) {
-    super();
+    super({ decodeStrings: false, autoDestroy: false, emitClose: false, allowHalfOpen: true });
     this.session = session;
     this.id = id;
     this.headers = headers;
     this.closed = false;
-    this.destroyed = false;
     this.aborted = false;
     this.rstCode = constants.NGHTTP2_NO_ERROR;
     this.closeCode = constants.NGHTTP2_NO_ERROR;
     this.sentHeaders = undefined;
     this.sentTrailers = undefined;
     this.sentInfoHeaders = [];
-    this.pending = false;
-    this.scheme = headers[":scheme"];
-    this._encoding = null;
-    this._paused = false;
-    this._recvQueue = [];
+    this.headersSent = false;
+    this._headRequest = String(headers?.[":method"] ?? "").toUpperCase() === "HEAD";
     this._endStreamSent = false;
     this._endStreamReceived = false;
     this._responseEmitted = false;
-    this._writableEnded = false;
     this._waitForTrailers = false;
+    this._trailersReady = false;
     this._closeEmitted = false;
-    this._closeCallbacks = [];
     this._abortCleanup = null;
+    this._sendQueue = [];
+    this._remoteWindowSize = Number(session.remoteSettings?.initialWindowSize ?? 65535);
     this.state = {
-      state: 0,
+      state: constants.NGHTTP2_STREAM_STATE_OPEN,
       weight: constants.NGHTTP2_DEFAULT_WEIGHT,
       sumDependencyWeight: 0,
       localClose: 0,
       remoteClose: 0,
-      localWindowSize: 65535,
+      localWindowSize: Number(session.localSettings?.initialWindowSize ?? 65535),
     };
   }
 
-  get writableEnded() { return this._writableEnded; }
-  get readableEnded() { return this._endStreamReceived; }
+  get pending() { return !Number.isInteger(this.id) || this.id <= 0; }
+  get bufferSize() {
+    return this._sendQueue.reduce((size, item) => size + item.data.byteLength - item.offset, 0) +
+      Number(this.session?._socket?.writableLength ?? 0);
+  }
+  get scheme() { return this.headers?.[":scheme"] ?? (this.session?.encrypted ? "https" : "http"); }
+  get headRequest() { return this._headRequest; }
+  get endAfterHeaders() { return this._endStreamSent && this.headersSent; }
+  get pushAllowed() {
+    return this.session?.isServer === true && this.session._remoteEnablePushExplicit !== false && !this.closed;
+  }
+
+  _assertUsable() {
+    if (!this.session || this.destroyed || this.closed) {
+      throw codedError("ERR_HTTP2_INVALID_STREAM", "The HTTP/2 stream has been destroyed");
+    }
+    return this.session;
+  }
 
   respond(headers = {}, options = {}) {
-    const endStream = options?.endStream === true;
-    const outgoing = { ":status": headers[":status"] ?? headers.status ?? 200, ...headers };
-    delete outgoing.status;
-    if (outgoing.date == null) outgoing.date = new Date().toUTCString();
-    this._waitForTrailers = options?.waitForTrailers === true;
-    this.session._sendHeaders(this.id, outgoing, endStream);
-    this.sentHeaders = outgoing;
+    const session = this._assertUsable();
+    if (!session.isServer) throw codedError("ERR_HTTP2_INVALID_STREAM", "Client streams cannot send response headers");
+    if (this.headersSent) throw codedError("ERR_HTTP2_HEADERS_SENT", "Response has already been initiated");
+    if (this.sentTrailers) throw codedError("ERR_HTTP2_TRAILERS_ALREADY_SENT", "Trailers have already been sent");
+    validateObject(options ?? {}, "options");
+    const normalized = normalizeHeaders(headers);
+    for (const name of Object.keys(normalized)) {
+      if (name.startsWith(":") && name !== ":status") {
+        throw codedError("ERR_HTTP2_INVALID_PSEUDOHEADER", `Invalid response pseudo-header "${name}"`);
+      }
+    }
+    const status = validateResponseStatus(normalized[":status"] ?? normalized.status ?? 200);
+    if (status >= 100 && status < 200) {
+      throw codedError("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED", `Informational status code ${status} is not allowed here`);
+    }
+    delete normalized.status;
+    normalized[":status"] = status;
+    let endStream = options?.endStream === true || payloadForbidden(status, this.headRequest);
+    if (options?.sendDate !== false && normalized.date == null) normalized.date = new Date().toUTCString();
+    this._waitForTrailers = options?.waitForTrailers === true && !endStream;
+    session._sendHeaders(this.id, normalized, endStream);
+    this.sentHeaders = normalized;
+    this.headersSent = true;
     if (endStream) {
       this._endStreamSent = true;
-      this._writableEnded = true;
       this.state.localClose = 1;
+      this.state.state = constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL;
       this._maybeClose();
     }
     return this;
   }
 
-  write(chunk, encoding = undefined, callback = undefined) {
-    if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
+  additionalHeaders(headers = {}) {
+    const session = this._assertUsable();
+    if (!session.isServer) throw codedError("ERR_HTTP2_INVALID_STREAM", "Informational headers require a server stream");
+    if (this.headersSent) throw codedError("ERR_HTTP2_HEADERS_AFTER_RESPOND", "Cannot send informational headers after respond()");
+    const normalized = normalizeHeaders(headers);
+    const status = validateResponseStatus(normalized[":status"] ?? 200);
+    if (status === 101) throw codedError("ERR_HTTP2_STATUS_101", "HTTP/2 does not support status code 101");
+    if (status < 100 || status >= 200) {
+      throw codedError("ERR_HTTP2_INVALID_INFO_STATUS", `Invalid informational status code: ${status}`, RangeError);
     }
-    if (this._writableEnded || this.destroyed) {
-      const error = new Error("write after end");
-      error.code = "ERR_STREAM_WRITE_AFTER_END";
-      if (typeof callback === "function") queueMicrotask(() => callback(error));
-      else this.emit("error", error);
-      return false;
+    for (const name of Object.keys(normalized)) {
+      if (name.startsWith(":") && name !== ":status") {
+        throw codedError("ERR_HTTP2_INVALID_PSEUDOHEADER", `Invalid informational pseudo-header "${name}"`);
+      }
+    }
+    normalized[":status"] = status;
+    this.sentInfoHeaders.push(normalized);
+    session._sendHeaders(this.id, normalized, false);
+    return this;
+  }
+
+  _write(chunk, encoding, callback) {
+    if (!this.session || this.closed || this._endStreamSent) {
+      callback(this._endStreamSent
+        ? codedError("ERR_STREAM_WRITE_AFTER_END", "write after end")
+        : codedError("ERR_HTTP2_INVALID_STREAM", "The HTTP/2 stream has been destroyed"));
+      return;
     }
     this.session._sendData(this.id, toChunkBuffer(chunk, encoding), false, callback);
-    return true;
   }
 
-  end(chunk = undefined, encoding = undefined, callback = undefined) {
-    if (typeof chunk === "function") {
-      callback = chunk;
-      chunk = undefined;
-    } else if (typeof encoding === "function") {
-      callback = encoding;
-      encoding = undefined;
+  _writev(chunks, callback) {
+    const buffers = chunks.map(({ chunk, encoding }) => toChunkBuffer(chunk, encoding));
+    this._write(Buffer.concat(buffers), undefined, callback);
+  }
+
+  _final(callback) {
+    if (!this.session || this.closed) {
+      callback();
+      return;
     }
-    if (this._writableEnded) {
-      if (typeof callback === "function") queueMicrotask(callback);
-      return this;
+    if (this._endStreamSent) {
+      callback();
+      this._maybeClose();
+      return;
     }
-    this._writableEnded = true;
-    const waitForTrailers = this._waitForTrailers && !this.sentTrailers;
-    this._endStreamSent = !waitForTrailers;
-    if (!waitForTrailers) this.state.localClose = 1;
-    this.session._sendData(this.id, toChunkBuffer(chunk, encoding), !waitForTrailers, callback);
-    this.emit("finish");
-    if (waitForTrailers) queueMicrotask(() => this.emit("wantTrailers"));
-    else this._maybeClose();
-    return this;
-  }
-
-  pause() {
-    this._paused = true;
-    return this;
-  }
-
-  resume() {
-    this._paused = false;
-    this._drainRecvQueue();
-    return this;
-  }
-
-  destroy(error = undefined) {
-    if (this.destroyed) return this;
-    const code = error ? constants.NGHTTP2_INTERNAL_ERROR : constants.NGHTTP2_CANCEL;
-    if (error) {
-      this._suppressEndOnClose = true;
-      this._suppressProtocolCloseError = true;
-      queueMicrotask(() => this.emit("error", error));
+    if (this._waitForTrailers && !this.sentTrailers) {
+      this._trailersReady = true;
+      queueMicrotask(() => {
+        if (!this.session || this.closed || this.sentTrailers) return;
+        if (this.listenerCount("wantTrailers") === 0) this.sendTrailers({});
+        else this.emit("wantTrailers");
+      });
+      callback();
+      return;
     }
-    return this.close(code);
+    this.session._sendData(this.id, Buffer.alloc(0), true, (error) => {
+      if (!error) {
+        this._endStreamSent = true;
+        this.state.localClose = 1;
+        this.state.state = this._endStreamReceived
+          ? constants.NGHTTP2_STREAM_STATE_CLOSED
+          : constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL;
+        this._maybeClose();
+      }
+      callback(error);
+    });
+  }
+
+  _read() {}
+
+  _destroy(error, callback) {
+    const session = this.session;
+    let code = this.rstCode;
+    if (!code && error) code = error.code === "ABORT_ERR" ? constants.NGHTTP2_CANCEL : constants.NGHTTP2_INTERNAL_ERROR;
+    code = normalizeCode(code);
+    this.rstCode = code;
+    this.closeCode = code;
+    this.closed = true;
+    this.state.localClose = 1;
+    this.state.remoteClose = 1;
+    this.state.state = constants.NGHTTP2_STREAM_STATE_CLOSED;
+    if (!this._endStreamReceived) {
+      this._endStreamReceived = true;
+      this.push(null);
+    }
+    if (!this.writableEnded && !this.aborted) {
+      this.aborted = true;
+      this.emit("aborted");
+    }
+    this._abortCleanup?.();
+    this._abortCleanup = null;
+    if (session) {
+      session._cancelStreamWrites(this, error ?? streamError(code));
+      session._streamClosed(this);
+      if (!session.destroyed) {
+        try { session._sendRstStream(this.id, code); } catch {}
+      }
+    }
+    this.session = null;
+    callback(error ?? (code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL ? streamError(code) : null));
+    process.nextTick(() => this._emitClose());
+  }
+
+  _emitClose() {
+    if (this._closeEmitted) return;
+    this._closeEmitted = true;
+    this.emit("close");
   }
 
   close(code = constants.NGHTTP2_NO_ERROR, callback = undefined) {
     code = validateUint32(code, "code");
     if (callback !== undefined && typeof callback !== "function") {
-      const error = new TypeError(`The "callback" argument must be of type function.${receivedType(callback)}`);
-      error.code = "ERR_INVALID_ARG_TYPE";
-      throw error;
+      throw codedError(
+        "ERR_INVALID_ARG_TYPE",
+        `The "callback" argument must be of type function.${receivedType(callback)}`,
+        TypeError,
+      );
     }
     if (callback) {
       if (this._closeEmitted) queueMicrotask(callback);
-      else this._closeCallbacks.push(callback);
+      else this.once("close", callback);
     }
-    if (this.closed) return this;
-    const closeCode = code >>> 0;
+    if (this.closed || this.destroyed) return this;
+    this.rstCode = code;
+    this.closeCode = code;
     this.closed = true;
-    this.destroyed = true;
-    this.rstCode = closeCode;
-    this.closeCode = closeCode;
     this.state.localClose = 1;
-    this.session._streamClosed(this);
-    this.session._sendRstStream(this.id, closeCode);
-    this._abortCleanup?.();
-    const finishClose = () => {
-      if (!this._destroyInvoked) {
-        this._destroyInvoked = true;
-        this._destroy?.(null, () => {});
-      }
-      if (closeCode !== constants.NGHTTP2_NO_ERROR && !this._suppressProtocolCloseError) {
-        this.emit("error", streamError(closeCode));
-      }
-      if (!this._endStreamReceived && !this._suppressEndOnClose) {
-        this._endStreamReceived = true;
-        this.state.remoteClose = 1;
-        this.emit("end");
-      }
-      if (!this._closeEmitted) {
-        this._closeEmitted = true;
-        this.emit("close");
-        for (const closeCallback of this._closeCallbacks.splice(0)) closeCallback();
-      }
-    };
-    if (this.session.connecting) {
-      const ready = () => {
-        this.session.removeListener("connect", ready);
-        this.session.removeListener("error", ready);
-        queueMicrotask(finishClose);
-      };
-      this.session.once("connect", ready);
-      this.session.once("error", ready);
-    } else {
-      queueMicrotask(finishClose);
+    if (!this.aborted && !this.writableEnded) {
+      this.aborted = true;
+      this.emit("aborted");
     }
+    if (!this._endStreamReceived) {
+      this._endStreamReceived = true;
+      this.state.remoteClose = 1;
+      this.push(null);
+    }
+    const error = code !== constants.NGHTTP2_NO_ERROR && code !== constants.NGHTTP2_CANCEL ? streamError(code) : undefined;
+    queueMicrotask(() => {
+      if (!this.destroyed) Duplex.prototype.destroy.call(this, error);
+    });
     return this;
-  }
-
-  _destroy(error, callback) {
-    this.destroy(error ?? undefined);
-    if (typeof callback === "function") callback(error ?? null);
   }
 
   priority(options = {}, callback = undefined) {
@@ -964,91 +1450,225 @@ export class Http2Stream extends EventEmitter {
       callback = options;
       options = {};
     }
-    const weight = Math.max(1, Math.min(256, Number(options?.weight ?? constants.NGHTTP2_DEFAULT_WEIGHT)));
-    const parent = normalizeStreamId(options?.parent ?? options?.streamDependency ?? 0);
-    const exclusive = options?.exclusive === true;
+    validateObject(options ?? {}, "options");
+    if (options.silent === true) return false;
+    const session = this._assertUsable();
+    const weight = Math.max(1, Math.min(256, Number(options.weight ?? constants.NGHTTP2_DEFAULT_WEIGHT)));
+    const parent = normalizeStreamId(options.parent ?? options.streamDependency ?? 0);
+    const exclusive = options.exclusive === true;
     this.state.weight = weight;
     this.state.sumDependencyWeight = weight;
-    this.session._sendPriority(this.id, { parent, weight, exclusive });
+    session._sendPriority(this.id, { parent, weight, exclusive });
     if (typeof callback === "function") queueMicrotask(callback);
     return this;
   }
 
-  pushStream(headers = {}, callback = undefined) {
-    if (!this.session.isServer) {
-      const error = new Error("HTTP/2 push streams can only be created by a server session");
-      if (typeof callback === "function") queueMicrotask(() => callback(error));
+  pushStream(headers = {}, options = {}, callback = undefined) {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
+    const session = this._assertUsable();
+    if (!this.pushAllowed) {
+      const error = codedError("ERR_HTTP2_PUSH_DISABLED", "HTTP/2 server push is disabled");
+      if (callback) queueMicrotask(() => callback(error));
       else throw error;
       return undefined;
     }
-    const promisedId = this.session._nextStreamId;
-    this.session._nextStreamId += 2;
-    const stream = new Http2Stream(this.session, promisedId, headers);
-    this.session._streams.set(promisedId, stream);
-    this.session._sendPushPromise(this.id, promisedId, headers);
-    if (typeof callback === "function") queueMicrotask(() => callback(null, stream, headers));
+    const outgoing = normalizeHeaders(headers);
+    outgoing[":method"] ??= "GET";
+    outgoing[":path"] ??= "/";
+    outgoing[":scheme"] ??= this.scheme;
+    outgoing[":authority"] ??= this.headers?.[":authority"] ?? "";
+    const promisedId = session._nextStreamId;
+    session._nextStreamId += 2;
+    const stream = new Http2Stream(session, promisedId, outgoing);
+    stream.sentHeaders = outgoing;
+    stream._endStreamReceived = true;
+    stream.state.remoteClose = 1;
+    stream.state.state = constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE;
+    session._streams.set(promisedId, stream);
+    session._sendPushPromise(this.id, promisedId, outgoing);
+    if (callback) queueMicrotask(() => callback(null, stream, outgoing, options));
     return stream;
   }
 
-  setEncoding(encoding = "utf8") {
-    this._encoding = String(encoding || "utf8").toLowerCase();
-    return this;
-  }
-
   setTimeout(msecs = 0, callback = undefined) {
-    this.timeout = msecs;
+    const timeout = Number(msecs);
+    if (!Number.isFinite(timeout) || timeout < 0) {
+      throw codedError("ERR_OUT_OF_RANGE", `The value of "msecs" is out of range. Received ${msecs}`, RangeError);
+    }
     if (typeof callback === "function") this.once("timeout", callback);
+    this.session?._socket?.setTimeout?.(timeout, () => this.emit("timeout"));
     return this;
   }
 
   sendTrailers(headers = {}) {
-    this.sentTrailers = headers;
-    this.session._sendHeaders(this.id, headers, true);
+    const session = this._assertUsable();
+    if (this.sentTrailers) throw codedError("ERR_HTTP2_TRAILERS_ALREADY_SENT", "Trailers have already been sent");
+    if (!this._trailersReady) throw codedError("ERR_HTTP2_TRAILERS_NOT_READY", "Trailing headers are not ready to be sent");
+    const normalized = normalizeHeaders(headers, { allowPseudo: false, trailers: true });
+    this.sentTrailers = normalized;
+    if (Object.keys(normalized).length === 0) session._sendData(this.id, Buffer.alloc(0), true);
+    else session._sendHeaders(this.id, normalized, true);
     this._endStreamSent = true;
     this.state.localClose = 1;
+    this.state.state = this._endStreamReceived
+      ? constants.NGHTTP2_STREAM_STATE_CLOSED
+      : constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL;
     this._maybeClose();
     return this;
   }
 
-  _receiveData(payload, endStream) {
-    this._recvQueue.push({ payload: Buffer.from(payload), endStream });
-    this._drainRecvQueue();
+  respondWithFile(path, headers = {}, options = {}) {
+    this._assertUsable();
+    const responseHeaders = normalizeHeaders(headers);
+    const responseOptions = validateFileOptions(options);
+    const status = validateResponseStatus(responseHeaders[":status"] ?? 200);
+    if (payloadForbidden(status, this.headRequest)) {
+      throw codedError("ERR_HTTP2_PAYLOAD_FORBIDDEN", `Responses with status ${status} must not include a payload`);
+    }
+    fs.open(path, "r", (error, fd) => {
+      if (error) {
+        if (responseOptions.onError) responseOptions.onError(error);
+        else this.destroy(error);
+        return;
+      }
+      this._respondWithFD(fd, responseHeaders, responseOptions, true);
+    });
   }
 
-  _drainRecvQueue() {
-    while (!this._paused && this._recvQueue.length > 0) {
-      const { payload, endStream } = this._recvQueue.shift();
-      if (payload.byteLength > 0) {
-        this.emit("data", this._encoding ? payload.toString(this._encoding) : payload);
+  respondWithFD(fd, headers = {}, options = {}) {
+    this._assertUsable();
+    const numericFd = typeof fd === "object" && fd !== null ? Number(fd.fd) : Number(fd);
+    if (!Number.isInteger(numericFd) || numericFd < 0) {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The fd argument must be a valid file descriptor", TypeError);
+    }
+    this._respondWithFD(numericFd, normalizeHeaders(headers), validateFileOptions(options), false);
+  }
+
+  _respondWithFD(fd, headers, options, closeFd) {
+    if (this.headersSent) throw codedError("ERR_HTTP2_HEADERS_SENT", "Response has already been initiated");
+    const status = validateResponseStatus(headers[":status"] ?? 200);
+    if (payloadForbidden(status, this.headRequest)) {
+      throw codedError("ERR_HTTP2_PAYLOAD_FORBIDDEN", `Responses with status ${status} must not include a payload`);
+    }
+    fs.fstat(fd, (error, stat) => {
+      const fail = (reason) => {
+        if (closeFd) { try { fs.close(fd, () => {}); } catch {} }
+        if (options.onError) options.onError(reason);
+        else this.destroy(reason);
+      };
+      if (error) return fail(error);
+      if (!stat?.isFile?.()) {
+        return fail(codedError("ERR_HTTP2_SEND_FILE", "The supplied file descriptor does not refer to a regular file"));
       }
-      if (endStream) {
-        this._endStreamReceived = true;
-        this.state.remoteClose = 1;
-        this.emit("end");
-        this._maybeClose();
+      if (!this.session || this.closed) return fail(codedError("ERR_HTTP2_INVALID_STREAM", "The HTTP/2 stream has been destroyed"));
+      if (options.statCheck?.call(this, stat, headers, options) === false || this.headersSent) {
+        if (closeFd) { try { fs.close(fd, () => {}); } catch {} }
+        return;
+      }
+      const offset = Math.max(0, Number(options.offset ?? 0));
+      const available = Math.max(0, Number(stat.size) - offset);
+      const length = options.length == null || options.length < 0 ? available : Math.min(available, options.length);
+      for (const name of Object.keys(headers)) {
+        if (name.toLowerCase() === "content-length") delete headers[name];
+      }
+      headers[":status"] = status;
+      headers["content-length"] = length;
+      this.respond(headers, options);
+      if (length === 0) {
+        this.end();
+        if (closeFd) { try { fs.close(fd, () => {}); } catch {} }
+        return;
+      }
+      const source = fs.createReadStream(null, {
+        fd,
+        autoClose: closeFd,
+        start: offset,
+        end: offset + length - 1,
+        emitClose: false,
+      });
+      source.once("error", fail);
+      source.pipe(this);
+    });
+  }
+
+  _receiveData(payload, endStream) {
+    if (payload.byteLength > 0) this.push(Buffer.from(payload));
+    if (endStream && !this._endStreamReceived) {
+      this._endStreamReceived = true;
+      this.state.remoteClose = 1;
+      this.state.state = this._endStreamSent
+        ? constants.NGHTTP2_STREAM_STATE_CLOSED
+        : constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE;
+      this.push(null);
+      this._maybeClose();
+    }
+  }
+
+  _closeFromPeer(code) {
+    if (this.closed) return;
+    this.rstCode = normalizeCode(code);
+    this.closeCode = this.rstCode;
+    this.closed = true;
+    this.destroyed = true;
+    this.state.localClose = 1;
+    this.state.remoteClose = 1;
+    this.state.state = constants.NGHTTP2_STREAM_STATE_CLOSED;
+    const session = this.session;
+    session?._cancelStreamWrites(this, streamError(this.rstCode));
+    session?._streamClosed(this);
+    this._abortCleanup?.();
+    this._abortCleanup = null;
+    if (!this._endStreamReceived) {
+      this._endStreamReceived = true;
+      this.push(null);
+    }
+    if (this.rstCode !== constants.NGHTTP2_NO_ERROR) {
+      this.aborted = true;
+      this.emit("aborted");
+      if (this.rstCode !== constants.NGHTTP2_CANCEL && this.listenerCount("error") > 0) {
+        this.emit("error", streamError(this.rstCode));
       }
     }
+    this.session = null;
+    queueMicrotask(() => this._emitClose());
   }
 
   _maybeClose() {
     if (this.closed || !this._endStreamSent || !this._endStreamReceived) return;
     this.closed = true;
     this.destroyed = true;
-    this.session._streamClosed(this);
-    if (!this._closeEmitted) {
-      this._closeEmitted = true;
-      this.emit("close");
-    }
+    this.state.state = constants.NGHTTP2_STREAM_STATE_CLOSED;
+    const session = this.session;
+    session?._streamClosed(this);
+    queueMicrotask(() => this._emitClose());
   }
 }
 
 class Http2Session extends EventEmitter {
-  constructor(socket, { isServer = false, settings = undefined } = {}) {
+  constructor(socket, { isServer = false, settings = undefined, remoteCustomSettings = undefined } = {}) {
     super();
+    if (!socket || typeof socket.on !== "function" || typeof socket.write !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The socket argument must be a Duplex stream", TypeError);
+    }
+    if (settings !== undefined) validateSettings(settings);
+    if (remoteCustomSettings !== undefined) {
+      if (!Array.isArray(remoteCustomSettings)) {
+        throw codedError("ERR_INVALID_ARG_TYPE", "The remoteCustomSettings option must be an array", TypeError);
+      }
+      if (remoteCustomSettings.length > MAX_ADDITIONAL_SETTINGS) {
+        throw codedError("ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS", "Too many remote custom settings", RangeError);
+      }
+    }
     this._socket = socket;
     this._socketProxy = new Proxy(socket, {
       get(target, property) {
-        if (["destroy", "emit", "end", "pause", "read", "resume", "write"].includes(property)) {
+        if (["destroy", "emit", "end", "pause", "read", "resume", "write", "setEncoding", "setKeepAlive", "setNoDelay"].includes(property)) {
           return () => {
             const error = new Error("HTTP/2 sockets should not be directly manipulated");
             error.code = "ERR_HTTP2_NO_SOCKET_MANIPULATION";
@@ -1058,6 +1678,14 @@ class Http2Session extends EventEmitter {
         const value = Reflect.get(target, property, target);
         return typeof value === "function" ? value.bind(target) : value;
       },
+      set(target, property, value) {
+        if (["destroy", "emit", "end", "pause", "read", "resume", "write", "setEncoding", "setKeepAlive", "setNoDelay"].includes(property)) {
+          throw codedError("ERR_HTTP2_NO_SOCKET_MANIPULATION", "HTTP/2 sockets should not be directly manipulated");
+        }
+        return Reflect.set(target, property, value, target);
+      },
+      has(target, property) { return Reflect.has(target, property); },
+      getPrototypeOf(target) { return Reflect.getPrototypeOf(target); },
     });
     this.isServer = isServer;
     this.closed = false;
@@ -1076,7 +1704,11 @@ class Http2Session extends EventEmitter {
     this.remoteSettings = null;
     this._pendingSettingsCallbacks = [];
     this._pendingSettingsAck = false;
+    this._pendingSettingsCount = 0;
     this._pendingPings = new Map();
+    this._remoteCustomSettings = remoteCustomSettings ? new Set(remoteCustomSettings.map(Number)) : null;
+    this._remoteEnablePushExplicit = undefined;
+    this._originSet = this.encrypted ? new Set() : null;
     this.localWindowSize = this.localSettings.initialWindowSize;
     this.remoteWindowSize = defaultSettingsObject().initialWindowSize;
     this.goawayCode = constants.NGHTTP2_NO_ERROR;
@@ -1097,10 +1729,15 @@ class Http2Session extends EventEmitter {
       this._scheduleClose();
     });
     socket.on("close", () => this._emitClose());
+    socket.on("drain", () => this._flushAllStreamData());
+    socket.on("timeout", () => {
+      for (const stream of this._streams.values()) stream.emit("timeout");
+      this.emit("timeout");
+    });
     socket.on("error", (error) => {
       const resetDuringShutdown = error?.code === "ECONNRESET" || error?.code === "EPIPE" ||
         /connection reset|broken pipe/i.test(String(error?.message ?? ""));
-      if ((this.closed || this.destroyed || this._streams.size === 0) && resetDuringShutdown) {
+      if (this.closed || this.destroyed || (this._streams.size === 0 && resetDuringShutdown)) {
         this._emitClose();
         return;
       }
@@ -1112,12 +1749,19 @@ class Http2Session extends EventEmitter {
       if (socket.connecting) socket.once(connectedEvent, activate);
       else queueMicrotask(activate);
     }
-    this._sendSettings(settings ?? {});
+    const initialSettings = isServer ? { ...(settings ?? {}), enablePush: false } : (settings ?? {});
+    this._sendSettings(initialSettings);
   }
 
-  get socket() { return this._socketProxy; }
+  get socket() { return this.destroyed ? null : this._socketProxy; }
   get connecting() { return this._socket?.connecting === true; }
+  get connected() { return !this.destroyed && !this.connecting && this._protocolReady; }
   get encrypted() { return this._socket?.encrypted === true; }
+  get type() { return this.isServer ? constants.NGHTTP2_SESSION_SERVER : constants.NGHTTP2_SESSION_CLIENT; }
+  get originSet() { return this.encrypted ? Array.from(this._originSet ?? []) : undefined; }
+  get bufferSize() {
+    return this.state.outboundQueueSize + Number(this._socket?.writableLength ?? 0);
+  }
   get alpnProtocol() {
     if (!this.encrypted) return "h2c";
     if (this.connecting) return undefined;
@@ -1149,8 +1793,8 @@ class Http2Session extends EventEmitter {
 
   _writeBufferedFrame(buffer, callback = undefined) {
     try {
-      this._socket.write(buffer);
-      if (typeof callback === "function") queueMicrotask(callback);
+      if (typeof callback === "function") this._socket.write(buffer, callback);
+      else this._socket.write(buffer);
     } catch (error) {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else this.emit("error", error);
@@ -1171,9 +1815,13 @@ class Http2Session extends EventEmitter {
     return Number.isInteger(size) && size >= DEFAULT_MAX_FRAME_SIZE ? size : DEFAULT_MAX_FRAME_SIZE;
   }
 
-  _sendSettings(settings = undefined, ack = false) {
+  _sendSettings(settings = undefined, ack = false, callback = undefined) {
     const payload = ack ? Buffer.alloc(0) : getPackedSettings(settings ?? {});
-    if (!ack) this._pendingSettingsAck = true;
+    if (!ack) {
+      this._pendingSettingsCount += 1;
+      this._pendingSettingsAck = true;
+      this._pendingSettingsCallbacks.push({ callback, start: Date.now() });
+    }
     if (!ack && payload.byteLength > 0) {
       this.localSettings = { ...this.localSettings, ...getUnpackedSettings(payload) };
       this.localWindowSize = this.localSettings.initialWindowSize;
@@ -1209,25 +1857,78 @@ class Http2Session extends EventEmitter {
 
   _sendData(streamId, data, endStream = false, callback = undefined) {
     const body = Buffer.isBuffer(data) ? data : Buffer.from(data ?? []);
-    const max = this._maxSendFrameSize;
-    if (body.byteLength <= max) {
-      this._writeFrame(frameTypes.DATA, endStream ? flags.END_STREAM : 0, streamId, body, callback);
-      return;
+    const stream = this._streams.get(streamId);
+    if (!stream || stream.closed) {
+      const error = codedError("ERR_HTTP2_INVALID_STREAM", "The HTTP/2 stream has been destroyed");
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      else this.emit("error", error);
+      return false;
     }
-    // Split payloads larger than the peer's SETTINGS_MAX_FRAME_SIZE.
-    let offset = 0;
-    while (offset < body.byteLength) {
-      const chunk = body.subarray(offset, offset + max);
-      offset += chunk.byteLength;
-      const last = offset >= body.byteLength;
+    stream._sendQueue.push({ data: body, offset: 0, endStream: endStream === true, callback });
+    this._updateOutboundQueueSize();
+    this._flushStreamData(stream);
+    return stream._sendQueue.length === 0;
+  }
+
+  _flushStreamData(stream) {
+    if (!stream || stream.closed || this.destroyed) return;
+    while (stream._sendQueue.length > 0) {
+      const item = stream._sendQueue[0];
+      const remaining = item.data.byteLength - item.offset;
+      if (remaining === 0) {
+        stream._sendQueue.shift();
+        this._writeFrame(
+          frameTypes.DATA,
+          item.endStream ? flags.END_STREAM : 0,
+          stream.id,
+          Buffer.alloc(0),
+          item.callback,
+        );
+        continue;
+      }
+      const available = Math.min(
+        remaining,
+        this._maxSendFrameSize,
+        Math.max(0, this.remoteWindowSize),
+        Math.max(0, stream._remoteWindowSize),
+      );
+      if (available <= 0) break;
+      const chunk = item.data.subarray(item.offset, item.offset + available);
+      item.offset += available;
+      this.remoteWindowSize -= available;
+      stream._remoteWindowSize -= available;
+      this.state.remoteWindowSize = this.remoteWindowSize;
+      const last = item.offset >= item.data.byteLength;
+      if (last) stream._sendQueue.shift();
       this._writeFrame(
         frameTypes.DATA,
-        last && endStream ? flags.END_STREAM : 0,
-        streamId,
+        last && item.endStream ? flags.END_STREAM : 0,
+        stream.id,
         chunk,
-        last ? callback : undefined,
+        last ? item.callback : undefined,
       );
     }
+    this._updateOutboundQueueSize();
+  }
+
+  _flushAllStreamData() {
+    for (const stream of this._streams.values()) this._flushStreamData(stream);
+  }
+
+  _updateOutboundQueueSize() {
+    let size = this._outboundFrames.reduce((total, frame) => total + frame.buffer.byteLength, 0);
+    for (const stream of this._streams.values()) {
+      for (const item of stream._sendQueue) size += item.data.byteLength - item.offset;
+    }
+    this.state.outboundQueueSize = size;
+  }
+
+  _cancelStreamWrites(stream, error = undefined) {
+    const pending = stream?._sendQueue?.splice(0) ?? [];
+    for (const item of pending) {
+      if (typeof item.callback === "function") queueMicrotask(() => item.callback(error));
+    }
+    this._updateOutboundQueueSize();
   }
 
   _sendRstStream(streamId, code = constants.NGHTTP2_NO_ERROR) {
@@ -1245,10 +1946,28 @@ class Http2Session extends EventEmitter {
 
   _sendPushPromise(streamId, promisedId, headers = {}) {
     const headerBlock = encodeHeaders(headers);
-    const payload = Buffer.alloc(4 + headerBlock.byteLength);
+    const firstLength = Math.max(0, this._maxSendFrameSize - 4);
+    const firstBlock = headerBlock.subarray(0, firstLength);
+    const payload = Buffer.alloc(4 + firstBlock.byteLength);
     writeUint32BE(payload, 0, normalizeStreamId(promisedId));
-    payload.set(headerBlock, 4);
-    this._writeFrame(frameTypes.PUSH_PROMISE, flags.END_HEADERS, normalizeStreamId(streamId), payload);
+    payload.set(firstBlock, 4);
+    let offset = firstBlock.byteLength;
+    this._writeFrame(
+      frameTypes.PUSH_PROMISE,
+      offset >= headerBlock.byteLength ? flags.END_HEADERS : 0,
+      normalizeStreamId(streamId),
+      payload,
+    );
+    while (offset < headerBlock.byteLength) {
+      const chunk = headerBlock.subarray(offset, offset + this._maxSendFrameSize);
+      offset += chunk.byteLength;
+      this._writeFrame(
+        frameTypes.CONTINUATION,
+        offset >= headerBlock.byteLength ? flags.END_HEADERS : 0,
+        normalizeStreamId(streamId),
+        chunk,
+      );
+    }
   }
 
   _sendWindowUpdate(streamId, increment) {
@@ -1268,6 +1987,42 @@ class Http2Session extends EventEmitter {
     writeUint32BE(payload, 4, normalizeCode(code));
     payload.set(opaque, 8);
     this._writeFrame(frameTypes.GOAWAY, 0, 0, payload);
+  }
+
+  _sendAltSvc(alt, originOrStream = undefined) {
+    if (!this.isServer) throw codedError("ERR_HTTP2_ALTSVC_INVALID_ORIGIN", "Only server sessions may send ALTSVC frames");
+    if (typeof alt !== "string" || /[\u0000\r\n]/.test(alt)) {
+      throw codedError("ERR_INVALID_ARG_VALUE", "The alt argument must be a valid Alt-Svc field value", TypeError);
+    }
+    let streamId = 0;
+    let origin = "";
+    if (typeof originOrStream === "number") streamId = normalizeStreamId(originOrStream);
+    else if (originOrStream instanceof Http2Stream) streamId = normalizeStreamId(originOrStream.id);
+    else if (originOrStream !== undefined) origin = new URL(String(originOrStream)).origin;
+    const originBytes = Buffer.from(origin);
+    const altBytes = Buffer.from(alt);
+    const payload = Buffer.alloc(2 + originBytes.byteLength + altBytes.byteLength);
+    writeUint16BE(payload, 0, originBytes.byteLength);
+    payload.set(originBytes, 2);
+    payload.set(altBytes, 2 + originBytes.byteLength);
+    this._writeFrame(frameTypes.ALTSVC, 0, streamId, payload);
+  }
+
+  _sendOrigin(origins) {
+    if (!this.isServer || !this.encrypted) {
+      throw codedError("ERR_HTTP2_ORIGIN_LENGTH", "ORIGIN frames require an encrypted server session");
+    }
+    const parts = [];
+    for (const value of origins) {
+      const origin = new URL(String(value)).origin;
+      const bytes = Buffer.from(origin);
+      if (bytes.byteLength > 0xffff) throw codedError("ERR_HTTP2_ORIGIN_LENGTH", "HTTP/2 origin is too long", RangeError);
+      const part = Buffer.alloc(2 + bytes.byteLength);
+      writeUint16BE(part, 0, bytes.byteLength);
+      part.set(bytes, 2);
+      parts.push(part);
+    }
+    this._writeFrame(frameTypes.ORIGIN, 0, 0, Buffer.concat(parts));
   }
 
   _receive(chunk) {
@@ -1305,22 +2060,52 @@ class Http2Session extends EventEmitter {
         this.state.lastProcStreamID = streamId;
         this.emit("stream", stream, headers, frameFlags, rawHeaders);
       } else {
-        stream.emit("trailers", headers, frameFlags);
+        stream.emit("trailers", headers, frameFlags, rawHeaders);
       }
     } else {
       if (!stream || stream.destroyed) return;
-      if (!stream._responseEmitted) {
+      const status = Number(headers[":status"] ?? 0);
+      if (!stream._responseEmitted && status >= 100 && status < 200) {
+        if (status === constants.HTTP_STATUS_CONTINUE) stream.emit("continue");
+        stream.emit("headers", headers, frameFlags, rawHeaders);
+      } else if (!stream._responseEmitted) {
         stream._responseEmitted = true;
-        stream.emit("response", headers, frameFlags);
+        stream.emit("response", headers, frameFlags, rawHeaders);
         this.emit("stream", stream, headers, frameFlags, rawHeaders);
       } else {
-        stream.emit("trailers", headers, frameFlags);
+        stream.emit("trailers", headers, frameFlags, rawHeaders);
       }
     }
     if (endStream && stream) stream._receiveData(Buffer.alloc(0), true);
   }
 
+  _dispatchPushPromise(parentStreamId, promisedId, block, frameFlags) {
+    if (this.isServer || this._streams.has(promisedId)) {
+      this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+      return;
+    }
+    let list;
+    try {
+      list = this._hpackDecoder.decode(block);
+    } catch (error) {
+      this.destroy(error);
+      return;
+    }
+    const headers = headerListToObject(list);
+    const rawHeaders = list.flatMap(([name, value]) => [name, value]);
+    const stream = new Http2Stream(this, promisedId, headers);
+    stream._endStreamSent = true;
+    stream.state.localClose = 1;
+    stream.state.state = constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL;
+    this._streams.set(promisedId, stream);
+    this.emit("stream", stream, headers, frameFlags, rawHeaders);
+  }
+
   _handleFrame(frame) {
+    if (this._pendingHeaderBlock && frame.type !== frameTypes.CONTINUATION) {
+      this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+      return;
+    }
     if (frame.payload.byteLength > Number(this.localSettings.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE)) {
       this._sessionError(constants.NGHTTP2_FRAME_SIZE_ERROR);
       return;
@@ -1360,18 +2145,50 @@ class Http2Session extends EventEmitter {
 
     if (frame.type === frameTypes.SETTINGS) {
       if ((frame.flags & flags.ACK) !== 0) {
-        this._pendingSettingsAck = false;
-        const callback = this._pendingSettingsCallbacks.shift();
-        if (typeof callback === "function") queueMicrotask(() => callback(null, this.localSettings));
+        this._pendingSettingsCount = Math.max(0, this._pendingSettingsCount - 1);
+        this._pendingSettingsAck = this._pendingSettingsCount > 0;
+        const pending = this._pendingSettingsCallbacks.shift();
+        if (typeof pending?.callback === "function") {
+          queueMicrotask(() => pending.callback(null, this.localSettings, Date.now() - pending.start));
+        }
         this.emit("localSettings", this.localSettings);
       } else {
+        for (let offset = 0; offset < frame.payload.byteLength; offset += 6) {
+          const id = readUint16BE(frame.payload, offset);
+          const value = readUint32BE(frame.payload, offset + 2);
+          if ((id === 2 && value > 1) || (id === 5 && (value < 16384 || value > 16777215))) {
+            this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+            return;
+          }
+          if (id === 4 && value > 0x7fffffff) {
+            this._sessionError(constants.NGHTTP2_FLOW_CONTROL_ERROR);
+            return;
+          }
+        }
         const settings = frame.payload.byteLength === 0 ? {} : getUnpackedSettings(frame.payload);
+        if (!this.isServer && settings.enablePush === true) {
+          this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+          return;
+        }
+        if (settings.customSettings && this._remoteCustomSettings) {
+          settings.customSettings = Object.fromEntries(
+            Object.entries(settings.customSettings).filter(([id]) => this._remoteCustomSettings.has(Number(id))),
+          );
+          if (Object.keys(settings.customSettings).length === 0) delete settings.customSettings;
+        }
+        const previousInitialWindowSize = Number(this.remoteSettings?.initialWindowSize ?? 65535);
+        if (Object.prototype.hasOwnProperty.call(settings, "enablePush")) {
+          this._remoteEnablePushExplicit = settings.enablePush;
+        }
         this.remoteSettings = { ...defaultSettingsObject(), ...(this.remoteSettings ?? {}), ...settings };
-        this.remoteWindowSize = this.remoteSettings.initialWindowSize;
-        this.state.remoteWindowSize = this.remoteWindowSize;
+        const windowDelta = Number(this.remoteSettings.initialWindowSize) - previousInitialWindowSize;
+        if (windowDelta !== 0) {
+          for (const stream of this._streams.values()) stream._remoteWindowSize += windowDelta;
+        }
         this.state.inflateDynamicTableSize = this.remoteSettings.headerTableSize;
         this._sendSettings(undefined, true);
         this.emit("remoteSettings", this.remoteSettings);
+        this._flushAllStreamData();
       }
       return;
     }
@@ -1380,10 +2197,20 @@ class Http2Session extends EventEmitter {
       let offset = 0;
       if ((frame.flags & flags.PADDED) !== 0 && payload.byteLength > 0) {
         const padLength = payload[0];
+        if (padLength >= payload.byteLength) {
+          this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+          return;
+        }
         offset += 1;
         payload = payload.subarray(0, Math.max(offset, payload.byteLength - padLength));
       }
-      if ((frame.flags & flags.PRIORITY) !== 0) offset += 5;
+      if ((frame.flags & flags.PRIORITY) !== 0) {
+        if (payload.byteLength - offset < 5) {
+          this._sessionError(constants.NGHTTP2_FRAME_SIZE_ERROR);
+          return;
+        }
+        offset += 5;
+      }
       const block = payload.subarray(offset);
       const endStream = (frame.flags & flags.END_STREAM) !== 0;
       if ((frame.flags & flags.END_HEADERS) !== 0) {
@@ -1399,7 +2226,12 @@ class Http2Session extends EventEmitter {
       pending.chunks.push(Buffer.from(frame.payload));
       if ((frame.flags & flags.END_HEADERS) !== 0) {
         this._pendingHeaderBlock = null;
-        this._dispatchHeaders(pending.streamId, Buffer.concat(pending.chunks), pending.endStream, pending.flags);
+        const block = Buffer.concat(pending.chunks);
+        if (pending.kind === "push") {
+          this._dispatchPushPromise(pending.parentStreamId, pending.promisedId, block, pending.flags);
+        } else {
+          this._dispatchHeaders(pending.streamId, block, pending.endStream, pending.flags);
+        }
       }
       return;
     }
@@ -1407,6 +2239,10 @@ class Http2Session extends EventEmitter {
       let payload = frame.payload;
       if ((frame.flags & flags.PADDED) !== 0 && payload.byteLength > 0) {
         const padLength = payload[0];
+        if (padLength >= payload.byteLength) {
+          this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+          return;
+        }
         payload = payload.subarray(1, Math.max(1, payload.byteLength - padLength));
       }
       const endStream = (frame.flags & flags.END_STREAM) !== 0;
@@ -1431,18 +2267,7 @@ class Http2Session extends EventEmitter {
       const stream = this._streams.get(frame.streamId);
       if (!stream) return;
       const code = readUint32BE(frame.payload, 0);
-      stream.rstCode = code;
-      stream.closeCode = code;
-      stream.closed = true;
-      stream.destroyed = true;
-      stream.state.remoteClose = 1;
-      this._streamClosed(stream);
-      if (code !== constants.NGHTTP2_NO_ERROR) {
-        stream.aborted = true;
-        if (stream.listenerCount("error") > 0) stream.emit("error", streamError(code));
-        stream.emit("aborted");
-      }
-      stream.emit("close");
+      stream._closeFromPeer(code);
       return;
     }
     if (frame.type === frameTypes.PRIORITY) {
@@ -1464,16 +2289,19 @@ class Http2Session extends EventEmitter {
     if (frame.type === frameTypes.PUSH_PROMISE) {
       if (frame.payload.byteLength < 4) return;
       const promisedId = readUint32BE(frame.payload, 0) & 0x7fffffff;
-      let headers;
-      try {
-        headers = headerListToObject(this._hpackDecoder.decode(frame.payload.subarray(4)));
-      } catch (error) {
-        this.destroy(error);
-        return;
+      const block = frame.payload.subarray(4);
+      if ((frame.flags & flags.END_HEADERS) !== 0) {
+        this._dispatchPushPromise(frame.streamId, promisedId, block, frame.flags);
+      } else {
+        this._pendingHeaderBlock = {
+          kind: "push",
+          streamId: frame.streamId,
+          parentStreamId: frame.streamId,
+          promisedId,
+          flags: frame.flags,
+          chunks: [Buffer.from(block)],
+        };
       }
-      const stream = new Http2Stream(this, promisedId, headers);
-      this._streams.set(promisedId, stream);
-      this.emit("stream", stream, headers, frame.flags, []);
       return;
     }
     if (frame.type === frameTypes.PING) {
@@ -1508,17 +2336,63 @@ class Http2Session extends EventEmitter {
     if (frame.type === frameTypes.WINDOW_UPDATE) {
       if (frame.payload.byteLength < 4) return;
       const increment = readUint32BE(frame.payload, 0) & 0x7fffffff;
+      if (increment === 0) {
+        if (frame.streamId === 0) this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
+        else this._streams.get(frame.streamId)?._closeFromPeer(constants.NGHTTP2_PROTOCOL_ERROR);
+        return;
+      }
       if (frame.streamId === 0) {
+        if (this.remoteWindowSize + increment > 0x7fffffff) {
+          this._sessionError(constants.NGHTTP2_FLOW_CONTROL_ERROR);
+          return;
+        }
         this.remoteWindowSize += increment;
         this.state.remoteWindowSize = this.remoteWindowSize;
         this.emit("windowUpdate", increment);
+        this._flushAllStreamData();
       } else {
         const stream = this._streams.get(frame.streamId);
         if (stream) {
-          stream.state.localWindowSize += increment;
+          if (stream._remoteWindowSize + increment > 0x7fffffff) {
+            stream._closeFromPeer(constants.NGHTTP2_FLOW_CONTROL_ERROR);
+            return;
+          }
+          stream._remoteWindowSize += increment;
           stream.emit("windowUpdate", increment);
+          this._flushStreamData(stream);
         }
       }
+      return;
+    }
+    if (frame.type === frameTypes.ALTSVC) {
+      if (frame.payload.byteLength < 2) return;
+      const originLength = readUint16BE(frame.payload, 0);
+      if (originLength > frame.payload.byteLength - 2) {
+        this._sessionError(constants.NGHTTP2_FRAME_SIZE_ERROR);
+        return;
+      }
+      const origin = frame.payload.subarray(2, 2 + originLength).toString();
+      const value = frame.payload.subarray(2 + originLength).toString();
+      this.emit("altsvc", value, origin, frame.streamId);
+      return;
+    }
+    if (frame.type === frameTypes.ORIGIN) {
+      if (!this.encrypted || frame.streamId !== 0) return;
+      const origins = [];
+      let offset = 0;
+      while (offset + 2 <= frame.payload.byteLength) {
+        const length = readUint16BE(frame.payload, offset);
+        offset += 2;
+        if (offset + length > frame.payload.byteLength) {
+          this._sessionError(constants.NGHTTP2_FRAME_SIZE_ERROR);
+          return;
+        }
+        const origin = frame.payload.subarray(offset, offset + length).toString();
+        offset += length;
+        origins.push(origin);
+        this._originSet?.add(origin);
+      }
+      this.emit("origin", origins);
     }
   }
 
@@ -1540,19 +2414,33 @@ class Http2Session extends EventEmitter {
   }
 
   request(headers = {}, options = {}) {
+    if (this.isServer || this.destroyed || this.closed) {
+      throw codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
+    }
+    if (headers === undefined) headers = {};
+    const suppliedHeaders = normalizeHeaders(headers);
+    if (Object.prototype.hasOwnProperty.call(suppliedHeaders, ":status")) {
+      throw codedError("ERR_HTTP2_INVALID_PSEUDOHEADER", "The :status pseudo-header is not valid in a request");
+    }
+    if (options === undefined) options = {};
+    validateObject(options, "options");
+    if (this._nextStreamId <= 0 || this._nextStreamId > 0x7fffffff) {
+      const stream = new Http2Stream(this, undefined, suppliedHeaders);
+      queueMicrotask(() => stream.destroy(codedError("ERR_HTTP2_OUT_OF_STREAMS", "No stream IDs are available")));
+      return stream;
+    }
     const id = this._nextStreamId;
     this._nextStreamId += 2;
     this.state.nextStreamID = this._nextStreamId;
-    const stream = new Http2Stream(this, id, headers);
-    this._streams.set(id, stream);
     const outgoing = {
-      ":method": headers[":method"] ?? "GET",
-      ":path": headers[":path"] ?? "/",
-      ":scheme": headers[":scheme"] ?? (this._socket.encrypted ? "https" : "http"),
-      ":authority": headers[":authority"] ?? this._defaultAuthority ?? "",
-      ...headers,
+      ":method": suppliedHeaders[":method"] ?? "GET",
+      ":path": suppliedHeaders[":path"] ?? "/",
+      ":scheme": suppliedHeaders[":scheme"] ?? (this._socket.encrypted ? "https" : "http"),
+      ":authority": suppliedHeaders[":authority"] ?? suppliedHeaders.host ?? this._defaultAuthority ?? "",
+      ...suppliedHeaders,
     };
-    stream.scheme = outgoing[":scheme"];
+    const stream = new Http2Stream(this, id, outgoing);
+    this._streams.set(id, stream);
     stream.sentHeaders = outgoing;
     stream._waitForTrailers = options?.waitForTrailers === true;
 
@@ -1565,12 +2453,7 @@ class Http2Session extends EventEmitter {
     if (signal?.aborted) {
       stream.aborted = true;
       stream.rstCode = constants.NGHTTP2_CANCEL;
-      stream.closeCode = constants.NGHTTP2_CANCEL;
-      stream.closed = true;
-      stream.destroyed = true;
-      stream._suppressEndOnClose = true;
-      this._streamClosed(stream);
-      queueMicrotask(() => stream.emit("error", abortError()));
+      queueMicrotask(() => stream.destroy(abortError()));
       return stream;
     }
 
@@ -1578,50 +2461,45 @@ class Http2Session extends EventEmitter {
     const endStream = options?.endStream ?? (!stream._waitForTrailers && (method === "GET" || method === "HEAD"));
     const maxHeaderListSize = Number(this.remoteSettings?.maxHeaderListSize ?? defaultSettingsObject().maxHeaderListSize);
     if (Number.isFinite(maxHeaderListSize) && headerListSize(outgoing) > maxHeaderListSize) {
-      stream._writableEnded = true;
       queueMicrotask(() => {
         if (stream.destroyed) return;
         const code = constants.NGHTTP2_COMPRESSION_ERROR;
         stream.rstCode = code;
-        stream.closeCode = code;
-        stream.closed = true;
-        stream.destroyed = true;
-        stream.aborted = true;
-        stream.state.localClose = 1;
-        stream.state.remoteClose = 1;
-        this._streamClosed(stream);
-        stream.emit("error", streamError(code));
-        stream.emit("aborted");
-        if (!stream._closeEmitted) {
-          stream._closeEmitted = true;
-          stream.emit("close");
-        }
+        stream.destroy(streamError(code));
       });
       return stream;
     }
     this._sendHeaders(id, outgoing, endStream === true);
     if (endStream) {
       stream._endStreamSent = true;
-      stream._writableEnded = true;
       stream.state.localClose = 1;
+      stream.state.state = constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL;
+      queueMicrotask(() => {
+        if (!stream.writableEnded && !stream.destroyed) stream.end();
+      });
+    }
+    if (options.weight !== undefined || options.parent !== undefined || options.exclusive !== undefined) {
+      stream.priority(options);
     }
     if (signal) {
       const onAbort = () => {
         if (stream.destroyed) return;
         stream.aborted = true;
-        stream._suppressEndOnClose = true;
-        stream._suppressProtocolCloseError = true;
         stream.emit("aborted");
-        queueMicrotask(() => stream.emit("error", abortError()));
-        stream.close(constants.NGHTTP2_CANCEL);
+        stream.rstCode = constants.NGHTTP2_CANCEL;
+        stream.destroy(abortError());
       };
       signal.addEventListener("abort", onAbort, { once: true });
       stream._abortCleanup = () => signal.removeEventListener("abort", onAbort);
     }
+    queueMicrotask(() => {
+      if (!stream.destroyed) stream.emit("ready");
+    });
     return stream;
   }
 
   setNextStreamID(id) {
+    if (this.isServer || this.destroyed) throw codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
     if (typeof id !== "number") {
       const error = new TypeError(`The "id" argument must be of type number.${receivedType(id)}`);
       error.code = "ERR_INVALID_ARG_TYPE";
@@ -1641,8 +2519,13 @@ class Http2Session extends EventEmitter {
       callback = settings;
       settings = {};
     }
-    if (typeof callback === "function") this._pendingSettingsCallbacks.push(callback);
-    this._sendSettings(settings ?? {}, false);
+    if (this.destroyed) throw codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
+    validateSettings(settings);
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
+    const outgoing = this.isServer ? { ...settings, enablePush: false } : settings;
+    this._sendSettings(outgoing, false, callback);
     return this;
   }
 
@@ -1650,6 +2533,10 @@ class Http2Session extends EventEmitter {
     if (typeof payload === "function") {
       callback = payload;
       payload = undefined;
+    }
+    if (this.destroyed) return false;
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
     }
     if (payload !== undefined && !Buffer.isBuffer(payload) && !ArrayBuffer.isView(payload)) {
       const error = new TypeError(`The "payload" argument must be of type Buffer or TypedArray.${receivedType(payload)}`);
@@ -1669,13 +2556,14 @@ class Http2Session extends EventEmitter {
       throw error;
     }
     if (typeof callback === "function") {
-      this._pendingPings.set(body.toString("hex"), { callback, start: Date.now() });
+      this._pendingPings.set(body.toString("hex"), { callback, start: Date.now(), payload: body });
     }
     this._writeFrame(frameTypes.PING, 0, 0, body);
     return true;
   }
 
   goaway(code = constants.NGHTTP2_NO_ERROR, lastStreamID = 0, opaqueData = undefined) {
+    if (this.destroyed) throw codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
     code = validateUint32(code, "code");
     lastStreamID = validateUint32(lastStreamID, "lastStreamID");
     if (opaqueData !== undefined && !Buffer.isBuffer(opaqueData) && !ArrayBuffer.isView(opaqueData)) {
@@ -1691,10 +2579,24 @@ class Http2Session extends EventEmitter {
     return this;
   }
 
+  altsvc(alt, originOrStream = undefined) {
+    this._sendAltSvc(alt, originOrStream);
+  }
+
+  origin(...origins) {
+    if (origins.length === 0) throw codedError("ERR_MISSING_ARGS", "At least one origin is required", TypeError);
+    this._sendOrigin(origins);
+  }
+
   setLocalWindowSize(windowSize) {
+    if (this.destroyed) throw codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
     const size = Number(windowSize);
     if (!Number.isInteger(size) || size < 0 || size > 0x7fffffff) {
-      throw new RangeError("HTTP/2 local window size must be between 0 and 2147483647");
+      throw codedError(
+        "ERR_OUT_OF_RANGE",
+        "HTTP/2 local window size must be between 0 and 2147483647",
+        RangeError,
+      );
     }
     const increment = size - this.localWindowSize;
     this.localWindowSize = size;
@@ -1705,8 +2607,11 @@ class Http2Session extends EventEmitter {
   }
 
   setTimeout(msecs = 0, callback = undefined) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
     if (typeof callback === "function") this.once("timeout", callback);
-    this._socket?.setTimeout?.(msecs);
+    this._socket?.setTimeout?.(Number(msecs));
     return this;
   }
 
@@ -1725,18 +2630,19 @@ class Http2Session extends EventEmitter {
     this._closeEmitted = true;
     this.closed = true;
     this.destroyed = true;
-    for (const stream of this._streams.values()) {
-      stream.closed = true;
-      stream.destroyed = true;
-      stream.state.localClose = 1;
-      stream.state.remoteClose = 1;
-      stream._abortCleanup?.();
-      if (!stream._closeEmitted) {
-        stream._closeEmitted = true;
-        stream.emit("close");
-      }
+    const closeError = codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
+    for (const frame of this._outboundFrames.splice(0)) {
+      if (typeof frame.callback === "function") queueMicrotask(() => frame.callback(closeError));
     }
-    this._streams.clear();
+    for (const stream of [...this._streams.values()]) stream._closeFromPeer(constants.NGHTTP2_CANCEL);
+    for (const pending of this._pendingPings.values()) {
+      if (typeof pending.callback === "function") queueMicrotask(() => pending.callback(closeError, 0, pending.payload));
+    }
+    this._pendingPings.clear();
+    for (const pending of this._pendingSettingsCallbacks.splice(0)) {
+      if (typeof pending.callback === "function") queueMicrotask(() => pending.callback(closeError));
+    }
+    this._socket = null;
     this.emit("close");
   }
 
@@ -1751,6 +2657,9 @@ class Http2Session extends EventEmitter {
   }
 
   close(callback = undefined) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
     if (typeof callback === "function") {
       if (this._closeEmitted) queueMicrotask(callback);
       else this.once("close", callback);
@@ -1765,18 +2674,33 @@ class Http2Session extends EventEmitter {
 
   destroy(error = undefined) {
     if (this.destroyed) return this;
+    let code = constants.NGHTTP2_NO_ERROR;
+    if (typeof error === "number") {
+      code = normalizeCode(error);
+      error = code === constants.NGHTTP2_NO_ERROR ? undefined : codedError(
+        "ERR_HTTP2_SESSION_ERROR",
+        `Session closed with error code ${errorCodeName(code)}`,
+      );
+    } else if (error) {
+      code = normalizeCode(error.errno, constants.NGHTTP2_INTERNAL_ERROR);
+    }
     this.destroyed = true;
     this.closed = true;
-    for (const stream of this._streams.values()) {
-      stream.closed = true;
-      stream.destroyed = true;
-      stream.state.localClose = 1;
-      stream.state.remoteClose = 1;
+    if (this._protocolReady) {
+      try { this._sendGoaway(code, this.state.lastProcStreamID); } catch {}
     }
     this._scheduleClose(error);
     return this;
   }
+
+  [Symbol.asyncDispose]() {
+    return new Promise((resolve) => this.close(resolve));
+  }
 }
+
+export class ClientHttp2Session extends Http2Session {}
+
+class ServerHttp2Session extends Http2Session {}
 
 class Http2Server extends EventEmitter {
   constructor(options = {}, listener = undefined, secure = false) {
@@ -1787,8 +2711,10 @@ class Http2Server extends EventEmitter {
     this._secure = secure;
     this._server = null;
     this._sessions = new Set();
+    this._closing = false;
+    this._serverClosed = false;
+    this._closeEmitted = false;
     if (typeof listener === "function") this.on("request", listener);
-    this.on("connection", socket => this._acceptSocket(socket, false));
   }
 
   _acceptSocket(socket, alreadySecure = !this._secure) {
@@ -1808,21 +2734,69 @@ class Http2Server extends EventEmitter {
       secureSocket.once("error", (error) => this.emit("tlsClientError", error, secureSocket));
       return;
     }
-    const session = new Http2Session(socket, { isServer: true, settings: this._options.settings });
+    if (this._secure && socket?.alpnProtocol && socket.alpnProtocol !== "h2") {
+      if (!this.emit("unknownProtocol", socket)) socket?.destroy?.();
+      return;
+    }
+    const session = new ServerHttp2Session(socket, {
+      isServer: true,
+      settings: this._options.settings,
+      remoteCustomSettings: this._options.remoteCustomSettings,
+    });
     this._sessions.add(session);
-    session.once("close", () => this._sessions.delete(session));
+    session.once("close", () => {
+      this._sessions.delete(session);
+      this._maybeEmitClose();
+    });
+    if (this.timeout > 0) {
+      session.setTimeout(this.timeout, () => {
+        if (!this.emit("timeout", session)) session.destroy();
+      });
+    }
     session.on("stream", (stream, headers, streamFlags, rawHeaders) => {
       this.emit("stream", stream, headers, streamFlags, rawHeaders);
-      const request = new Http2ServerRequest(stream, headers, rawHeaders);
-      const response = new Http2ServerResponse(stream, request);
+      const RequestCtor = this._options.Http2ServerRequest ?? Http2ServerRequest;
+      const ResponseCtor = this._options.Http2ServerResponse ?? Http2ServerResponse;
+      const request = new RequestCtor(stream, headers, undefined, rawHeaders);
+      const response = new ResponseCtor(stream, request);
+      const method = String(headers[":method"] ?? "").toUpperCase();
+      if (method === "CONNECT") {
+        if (!this.emit("connect", request, response)) {
+          response.statusCode = 405;
+          response.end();
+        }
+        return;
+      }
+      if (headers.expect !== undefined) {
+        if (String(headers.expect).toLowerCase() === "100-continue") {
+          if (this.listenerCount("checkContinue") > 0) this.emit("checkContinue", request, response);
+          else {
+            response.writeContinue();
+            this.emit("request", request, response);
+          }
+        } else if (this.listenerCount("checkExpectation") > 0) {
+          this.emit("checkExpectation", request, response);
+        } else {
+          response.statusCode = 417;
+          response.end();
+        }
+        return;
+      }
       this.emit("request", request, response);
     });
     session.on("error", error => this.emit("sessionError", error, session));
     this.emit("session", session);
+    if (Array.isArray(this._options.origins) && this._options.origins.length > 0 && session.encrypted) {
+      session.origin(...this._options.origins);
+    }
   }
 
   setTimeout(msecs = 0, callback = undefined) {
-    this.timeout = msecs;
+    const timeout = Number(msecs);
+    if (!Number.isFinite(timeout) || timeout < 0) {
+      throw codedError("ERR_OUT_OF_RANGE", `The value of "msecs" is out of range. Received ${msecs}`, RangeError);
+    }
+    this.timeout = timeout;
     if (callback !== undefined) {
       if (typeof callback !== "function") {
         const error = new TypeError('The "callback" argument must be of type function');
@@ -1831,6 +2805,12 @@ class Http2Server extends EventEmitter {
       }
       this.on("timeout", callback);
     }
+    return this;
+  }
+
+  updateSettings(settings) {
+    validateSettings(settings);
+    this._options.settings = { ...(this._options.settings ?? {}), ...settings };
     return this;
   }
 
@@ -1848,6 +2828,7 @@ class Http2Server extends EventEmitter {
       ? createTlsServer(tlsOptions, connectionListener)
       : createNetServer(connectionListener);
     this._server.once("error", (error) => this.emit("error", error));
+    this._server.on?.("connection", socket => this.emit("connection", socket));
     this._server.listen(...args, () => {
       this.listening = true;
       this.emit("listening");
@@ -1856,21 +2837,51 @@ class Http2Server extends EventEmitter {
   }
 
   close(callback = undefined) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The callback argument must be a function", TypeError);
+    }
     if (callback) this.once("close", callback);
+    if (this._closing) return this;
+    this._closing = true;
     this.listening = false;
-    for (const session of [...this._sessions]) session.destroy();
+    for (const session of [...this._sessions]) session.close();
     if (this._server) {
-      this._server.once("close", () => this.emit("close"));
+      this._server.once("close", () => {
+        this._serverClosed = true;
+        this._maybeEmitClose();
+      });
       this._server.close();
     } else {
-      queueMicrotask(() => this.emit("close"));
+      this._serverClosed = true;
+      queueMicrotask(() => this._maybeEmitClose());
     }
     return this;
   }
 
+  _maybeEmitClose() {
+    if (!this._closing || !this._serverClosed || this._sessions.size > 0 || this._closeEmitted) return;
+    this._closeEmitted = true;
+    this.emit("close");
+  }
+
+  closeAllConnections() {
+    for (const session of [...this._sessions]) session.destroy();
+  }
+
+  closeIdleConnections() {
+    for (const session of [...this._sessions]) {
+      if (session._streams.size === 0) session.close();
+    }
+  }
+
+  getConnections(callback) {
+    return this._server?.getConnections?.(callback) ?? queueMicrotask(() => callback?.(null, this._sessions.size));
+  }
+
   address() { return this._server?.address?.() ?? null; }
-  ref() { return this; }
-  unref() { return this; }
+  ref() { this._server?.ref?.(); return this; }
+  unref() { this._server?.unref?.(); return this; }
+  [Symbol.asyncDispose]() { return new Promise(resolve => this.close(resolve)); }
 }
 
 function validateServerOptions(options) {
@@ -1880,22 +2891,28 @@ function validateServerOptions(options) {
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
   }
-  if (options.settings === null ||
-      (options.settings !== undefined && (typeof options.settings !== "object" || Array.isArray(options.settings)))) {
-    const error = new TypeError(`The "options.settings" property must be of type Object.${receivedType(options.settings)}`);
-    error.code = "ERR_INVALID_ARG_TYPE";
-    throw error;
+  const normalized = { ...options };
+  if (normalized.settings !== undefined) validateSettings(normalized.settings, "options.settings");
+  if (normalized.remoteCustomSettings !== undefined) {
+    if (!Array.isArray(normalized.remoteCustomSettings)) {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The options.remoteCustomSettings property must be an array", TypeError);
+    }
+    if (normalized.remoteCustomSettings.length > MAX_ADDITIONAL_SETTINGS) {
+      throw codedError("ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS", "Too many remote custom settings", RangeError);
+    }
+    normalized.remoteCustomSettings = [...normalized.remoteCustomSettings];
   }
-  for (const name of ["maxSessionInvalidFrames", "maxSessionRejectedStreams"]) {
-    if (options[name] === undefined) continue;
-    const value = Number(options[name]);
+  for (const name of ["maxSessionInvalidFrames", "maxSessionRejectedStreams", "unknownProtocolTimeout"]) {
+    if (normalized[name] === undefined) continue;
+    const value = Number(normalized[name]);
     if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
-      const error = new RangeError(`The value of "options.${name}" is out of range. It must be >= 0. Received ${options[name]}`);
+      const error = new RangeError(`The value of "options.${name}" is out of range. It must be >= 0. Received ${normalized[name]}`);
       error.code = "ERR_OUT_OF_RANGE";
       throw error;
     }
   }
-  return options;
+  normalized.unknownProtocolTimeout ??= 10000;
+  return normalized;
 }
 
 export function connect(authority, options = undefined, listener = undefined) {
@@ -1903,7 +2920,18 @@ export function connect(authority, options = undefined, listener = undefined) {
     listener = options;
     options = undefined;
   }
-  options = options ?? {};
+  if (options === undefined) options = {};
+  validateObject(options, "options");
+  options = { ...options };
+  if (options.settings !== undefined) validateSettings(options.settings, "options.settings");
+  if (options.remoteCustomSettings !== undefined) {
+    if (!Array.isArray(options.remoteCustomSettings)) {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The options.remoteCustomSettings property must be an array", TypeError);
+    }
+    if (options.remoteCustomSettings.length > MAX_ADDITIONAL_SETTINGS) {
+      throw codedError("ERR_HTTP2_TOO_MANY_CUSTOM_SETTINGS", "Too many remote custom settings", RangeError);
+    }
+  }
   let url;
   if (authority instanceof URL) {
     url = authority;
@@ -1915,7 +2943,14 @@ export function connect(authority, options = undefined, listener = undefined) {
     const port = options.port == null ? "" : `:${options.port}`;
     url = new URL(`${protocol}//${host}${port}`);
   } else {
-    url = new URL(String(authority));
+    try {
+      url = new URL(String(authority));
+    } catch {
+      throw codedError("ERR_INVALID_URL", `Invalid URL: ${String(authority)}`, TypeError);
+    }
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw codedError("ERR_HTTP2_UNSUPPORTED_PROTOCOL", `Protocol "${url.protocol}" is not supported`);
   }
   const secure = url.protocol === "https:";
   const urlHostname = networkHostname(url.hostname);
@@ -1929,6 +2964,7 @@ export function connect(authority, options = undefined, listener = undefined) {
     // options; recover the captured CA bundle so verification can succeed.
     const contextOptions = options.secureContext?.context ?? {};
     socket = tlsConnect({
+      ...options,
       host,
       port,
       servername: options.servername ?? urlHostname,
@@ -1937,13 +2973,19 @@ export function connect(authority, options = undefined, listener = undefined) {
       ALPNProtocols: options.ALPNProtocols ?? ["h2"],
     });
   } else {
-    socket = netConnect({ host, port });
+    socket = netConnect({ ...options, host, port });
   }
-  const session = new Http2Session(socket, { isServer: false, settings: options.settings });
+  const session = new ClientHttp2Session(socket, {
+    isServer: false,
+    settings: options.settings,
+    remoteCustomSettings: options.remoteCustomSettings,
+  });
   session.authority = url.href;
   session.options = options;
-  session.originSet = secure ? [url.origin] : undefined;
-  session._defaultAuthority = url.host || `${host}:${port}`;
+  if (secure) session._originSet = new Set([url.origin]);
+  const defaultPort = (secure && port === 443) || (!secure && port === 80);
+  const authorityHost = String(url.hostname || host).includes(":") ? `[${networkHostname(url.hostname || host)}]` : (url.hostname || host);
+  session._defaultAuthority = defaultPort ? authorityHost : `${authorityHost}:${port}`;
   if (typeof listener === "function") session.once("connect", listener);
   return session;
 }
@@ -1966,16 +3008,35 @@ export function createSecureServer(options = undefined, onRequestHandler = undef
   return new Http2Server(options, onRequestHandler, true);
 }
 
-export function performServerHandshake() {
-  return undefined;
+export function performServerHandshake(socket, options = {}) {
+  options = validateServerOptions(options);
+  return new ServerHttp2Session(socket, {
+    isServer: true,
+    settings: options.settings,
+    remoteCustomSettings: options.remoteCustomSettings,
+  });
 }
 
-// COTTONTAIL-COMPAT: node:http2 native TLS boundary - socket-backed h2c and TLS sessions, nonblocking client/server FD upgrades, ALPN negotiation, HPACK, CONTINUATION, trailers, SETTINGS, flow-window replenishment, validation, and request/response compatibility are implemented. Outbound flow-control scheduling, Huffman encoding, ALTSVC/ORIGIN, and HTTP/1 fallback still need deeper protocol work.
+Object.defineProperty(connect, Symbol.for("nodejs.util.promisify.custom"), {
+  value(authority, options) {
+    return new Promise((resolve, reject) => {
+      const session = connect(authority, options, () => {
+        session.removeListener("error", reject);
+        resolve(session);
+      });
+      session.once("error", reject);
+    });
+  },
+  configurable: true,
+});
+
+// COTTONTAIL-COMPAT: node:http2 native TLS boundary - h2c and TLS sessions, ALPN, HPACK decoding, CONTINUATION, settings, stream/session state, trailers, file responses, outbound flow control, and compatibility request/response APIs are implemented in the portable runtime. HTTP/1 fallback and native zero-copy sendfile remain transport-boundary work; HPACK encoding is deliberately interoperable but stateless.
 
 export default {
   Http2Stream,
   Http2ServerRequest,
   Http2ServerResponse,
+  ClientHttp2Session,
   connect,
   constants,
   createSecureServer,
