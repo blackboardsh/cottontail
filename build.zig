@@ -210,11 +210,25 @@ fn compileLinuxCppSource(
     source: []const u8,
     output_name: []const u8,
 ) std.Build.LazyPath {
+    const libgcc_path = std.mem.trim(
+        u8,
+        b.run(&.{ "g++", "-print-file-name=libgcc.a" }),
+        " \t\r\n",
+    );
+    if (!std.fs.path.isAbsolute(libgcc_path)) {
+        std.debug.print("error: g++ could not locate libgcc.a\n", .{});
+        std.process.exit(1);
+    }
+    const gcc_install_dir = std.fs.path.dirname(libgcc_path).?;
+
     // JSC's public headers use Clang annotations, while its Linux archives use
     // the GNU C++ ABI. Native clang++ supplies both the expected frontend and
     // the host libstdc++ header ordering before Zig links the resulting object.
+    // Pin the GCC installation because Clang distributions outside Ubuntu's
+    // default PATH do not always discover the host toolchain on their own.
     const command = b.addSystemCommand(&.{
         "clang++",
+        b.fmt("--gcc-install-dir={s}", .{gcc_install_dir}),
         "-std=c++20",
         "-stdlib=libstdc++",
         "-DJS_NO_EXPORT=1",
