@@ -246,6 +246,7 @@ fn testFlagTakesValue(arg: []const u8) bool {
         "--reporter",
         "--reporter-outfile",
         "--rerun-each",
+        "--retry",
         "--seed",
         "--test-name-pattern",
         "--timeout",
@@ -1514,7 +1515,14 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         }
     }.lessThan);
     const entrypoint_count = test_files.items.len;
-    if (entrypoint_count == 0 or (entrypoint_count == 1 and !expanded_directory)) return null;
+    if (entrypoint_count == 0) {
+        var stderr_buffer: [256]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+        try stderr_writer.interface.writeAll("No tests found!\n");
+        try stderr_writer.interface.flush();
+        return if (testPassWithNoTests(args)) 0 else 1;
+    }
+    if (entrypoint_count == 1 and !expanded_directory) return null;
 
     if (testBailLimit(args)) |bail_limit| {
         return try runMultipleTestFilesWithBail(
@@ -1578,6 +1586,13 @@ fn testBailLimit(args: []const [:0]const u8) ?usize {
         }
     }
     return null;
+}
+
+fn testPassWithNoTests(args: []const [:0]const u8) bool {
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--pass-with-no-tests")) return true;
+    }
+    return false;
 }
 
 fn parseRunInvocation(
@@ -2116,6 +2131,8 @@ test "test flag values are not treated as additional entrypoints" {
         "--dots",
         "-t",
         "filterin",
+        "--retry",
+        "3",
     };
     const mask = try testEntrypointMask(std.testing.allocator, &args);
     defer std.testing.allocator.free(mask);
@@ -2124,6 +2141,15 @@ test "test flag values are not treated as additional entrypoints" {
     try std.testing.expect(!mask[4]);
     try std.testing.expect(!mask[5]);
     try std.testing.expect(!mask[6]);
+    try std.testing.expect(!mask[7]);
+    try std.testing.expect(!mask[8]);
+}
+
+test "pass-with-no-tests controls empty test discovery exit policy" {
+    const enabled = [_][:0]const u8{ "cottontail", "test", "--pass-with-no-tests" };
+    const disabled = [_][:0]const u8{ "cottontail", "test" };
+    try std.testing.expect(testPassWithNoTests(&enabled));
+    try std.testing.expect(!testPassWithNoTests(&disabled));
 }
 
 test {

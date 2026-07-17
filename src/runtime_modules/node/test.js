@@ -50,6 +50,7 @@ const forceConcurrent = testCliArgs.includes("--concurrent");
 const runTodoTests = testCliArgs.includes("--todo");
 const dotsMode = testCliArgs.includes("--dots");
 const globalOnlyMode = testCliArgs.includes("--only") || testCliArgs.includes("--test-only");
+const passWithNoTests = testCliArgs.includes("--pass-with-no-tests");
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 
 function cliOption(name, fallback = undefined) {
@@ -1399,8 +1400,10 @@ function reportResults() {
   const currentViews = tests
     .filter((record) => record.status && record.status !== "filtered")
     .map(snapshotRecordView);
+  const labelFilterMatchedNoTests = Boolean(testNamePattern) && currentViews.length === 0 &&
+    failures.length === 0 && tests.length > 0;
   const runs = completedRuns.length > 0 ? [...completedRuns, currentViews] : [currentViews];
-  if (runs.some((views) => views.length > 0) || failures.length > 0) {
+  if (runs.some((views) => views.length > 0) || failures.length > 0 || labelFilterMatchedNoTests) {
     let file = String(globalThis.process?.argv?.[1] ?? "test");
     const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
     if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
@@ -1413,6 +1416,14 @@ function reportResults() {
         : [];
       appendRunRecords(lines, views, extraFailures);
     });
+  }
+  if (labelFilterMatchedNoTests) {
+    const pattern = String(cliOption("-t") ?? cliOption("--test-name-pattern") ?? "");
+    lines.push("");
+    lines.push(`error: regex ${JSON.stringify(pattern)} matched 0 tests. Searched ${testFileCount} ` +
+      `file${testFileCount === 1 ? "" : "s"} (skipping ${tests.length} test${tests.length === 1 ? "" : "s"}) [0.00ms]`);
+    console.error(lines.join("\n"));
+    return;
   }
   const assertionCount = Number(globalThis.__cottontailTestAssertionCount ?? 0);
   const snapshotCount = Number(globalThis.__cottontailTestSnapshotCount ?? 0);
@@ -1499,9 +1510,12 @@ async function finalizeRun(exitOnFailure = true) {
       recordHookFailure("snapshot writer", error);
     }
     reportResults();
-    if (exitOnFailure && (failedTests > 0 || runnerErrors > 0)) {
+    const labelFilterMatchedNoTests = Boolean(testNamePattern) &&
+      tests.length > 0 && tests.every((record) => record.status === "filtered");
+    if (exitOnFailure && (failedTests > 0 || runnerErrors > 0 || (labelFilterMatchedNoTests && !passWithNoTests))) {
       if (typeof globalThis.process?.exit === "function") globalThis.process.exit(1);
-      throw failures[0].error;
+      if (failures.length > 0) throw failures[0].error;
+      throw new Error(`No tests matched ${String(testNamePattern)}`);
     }
     // Like `bun test`, exit once the run completes even if servers/sockets
     // are still holding the event loop open.
