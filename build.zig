@@ -334,6 +334,17 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             step.root_module.addObjectFile(compileLinuxCppSource(b, vendor_dir, bridge[0], bridge[1]));
         }
     } else {
+        const cpp_flags: []const []const u8 = if (resolved_target.os.tag == .windows)
+            &.{
+                "-std=c++20",
+                "-DJS_NO_EXPORT=1",
+                "-DWIN32_LEAN_AND_MEAN=1",
+                "-DNOMINMAX=1",
+                "-DU_DISABLE_RENAMING=1",
+                "-Wno-unused-command-line-argument",
+            }
+        else
+            &.{ "-std=c++20", "-DJS_NO_EXPORT=1" };
         inline for (&.{
             "src/jsc_private_bridge.cpp",
             "src/jsc_stock_bridge.cpp",
@@ -341,7 +352,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
         }) |source| {
             step.root_module.addCSourceFile(.{
                 .file = b.path(source),
-                .flags = &.{ "-std=c++20", "-DJS_NO_EXPORT=1" },
+                .flags = cpp_flags,
             });
         }
     }
