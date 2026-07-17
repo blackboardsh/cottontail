@@ -35,6 +35,8 @@ compat/upstream/bun/*/entry
 compat/upstream/bun/*/entry.map
 compat/upstream/bun/*/nosourcemap_entry
 compat/upstream/bun/*/test*file.db
+compat/upstream/bun/*/*.db*
+compat/upstream/bun/*/sqlite:*
 
 # compile-mode diagnostics emitted at the repository root
 /chunk-*.js.map

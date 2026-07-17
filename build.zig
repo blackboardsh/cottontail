@@ -204,6 +204,28 @@ fn copyLinuxSystemLibrary(b: *std.Build, library: []const u8) std.Build.LazyPath
     return output;
 }
 
+fn addLinuxCppIncludePaths(module: *std.Build.Module, b: *std.Build) void {
+    // Zig only adds its bundled libc++ headers when link_libcpp is enabled,
+    // but vendored JSC uses the host's GNU libstdc++ ABI. Ask the same g++
+    // used to locate libstdc++ for its native header search list.
+    const output = b.run(&.{ "sh", "-c", "printf '' | g++ -E -x c++ - -v 2>&1" });
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var in_search_list = false;
+    var found = false;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (!in_search_list) {
+            if (std.mem.eql(u8, line, "#include <...> search starts here:")) in_search_list = true;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "End of search list.")) break;
+        if (line.len == 0 or std.mem.endsWith(u8, line, "(framework directory)")) continue;
+        module.addSystemIncludePath(.{ .cwd_relative = line });
+        found = true;
+    }
+    if (!found) @panic("g++ did not report its C++ include search paths");
+}
+
 fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
     const module = step.root_module;
     const target = module.resolved_target.?.result;
@@ -360,6 +382,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
         .linux => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
             requireJscLibrary(b, vendor_dir, "libcottontail_icu.a");
+            addLinuxCppIncludePaths(step.root_module, b);
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
