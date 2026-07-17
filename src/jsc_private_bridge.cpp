@@ -17,9 +17,12 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <span>
+#include <utility>
 #include <vector>
 #include <wtf/ThreadSafeRefCounted.h>
 #include <wtf/PtrTag.h>
+#include <wtf/text/ExternalStringImpl.h>
 #include <wtf/text/StringImpl.h>
 
 namespace WTF {
@@ -79,6 +82,13 @@ public:
 
     StringImpl* impl() const { return m_impl; }
 
+    static String adopt(StringImpl& impl)
+    {
+        String string;
+        string.m_impl = &impl;
+        return string;
+    }
+
 private:
     StringImpl* m_impl { nullptr };
 };
@@ -86,6 +96,7 @@ private:
 }
 
 struct OpaqueJSString : public ThreadSafeRefCounted<OpaqueJSString> {
+    static RefPtr<OpaqueJSString> tryCreate(WTF::String&&);
     bool is8Bit() { return m_string_impl == nullptr || m_string_impl->is8Bit(); }
     WTF::String string() const;
 
@@ -98,6 +109,97 @@ private:
 extern "C" bool ct_jsc_string_is_8_bit(JSStringRef string)
 {
     return string != nullptr && string->is8Bit();
+}
+
+using CtExternalStringFinalize = void (*)(void*, void*, size_t);
+
+#if defined(__linux__)
+// The Linux JSC artifact is built with libstdc++, while Zig compiles this
+// bridge with libc++. std::span has the same pinned two-word ABI in both, but
+// a different mangled namespace. Name the two GNU symbols explicitly rather
+// than introducing a second C++ runtime into Cottontail's own objects.
+template<typename Character>
+struct GnuExternalStringSpan {
+    const Character* data;
+    size_t size;
+};
+
+using ExternalStringFreeFunction = WTF::ExternalStringImplFreeFunction;
+
+extern WTF::Ref<WTF::ExternalStringImpl> create_external_latin1_gnu(
+    GnuExternalStringSpan<uint8_t>,
+    ExternalStringFreeFunction&&)
+    asm("_ZN3WTF18ExternalStringImpl6createESt4spanIKhLm18446744073709551615EEONS_8FunctionIFvPS0_PvjEEE");
+extern WTF::Ref<WTF::ExternalStringImpl> create_external_utf16_gnu(
+    GnuExternalStringSpan<char16_t>,
+    ExternalStringFreeFunction&&)
+    asm("_ZN3WTF18ExternalStringImpl6createESt4spanIKDsLm18446744073709551615EEONS_8FunctionIFvPS0_PvjEEE");
+#endif
+
+static WTF::Ref<WTF::ExternalStringImpl> create_external_impl(
+    std::span<const uint8_t> characters,
+    WTF::ExternalStringImplFreeFunction&& finalize)
+{
+#if defined(__linux__)
+    static_assert(sizeof(GnuExternalStringSpan<uint8_t>) == sizeof(char*) + sizeof(size_t));
+    return create_external_latin1_gnu(
+        { characters.data(), characters.size() },
+        std::move(finalize));
+#else
+    return WTF::ExternalStringImpl::create(characters, std::move(finalize));
+#endif
+}
+
+static WTF::Ref<WTF::ExternalStringImpl> create_external_impl(
+    std::span<const char16_t> characters,
+    WTF::ExternalStringImplFreeFunction&& finalize)
+{
+#if defined(__linux__)
+    static_assert(sizeof(GnuExternalStringSpan<char16_t>) == sizeof(char*) + sizeof(size_t));
+    return create_external_utf16_gnu(
+        { characters.data(), characters.size() },
+        std::move(finalize));
+#else
+    return WTF::ExternalStringImpl::create(characters, std::move(finalize));
+#endif
+}
+
+template<typename Character>
+static JSStringRef create_external_string(
+    const Character* characters,
+    size_t length,
+    CtExternalStringFinalize finalize,
+    void* context)
+{
+    if (characters == nullptr || length == 0 || finalize == nullptr)
+        return nullptr;
+
+    auto impl = create_external_impl(
+        std::span<const Character>(characters, length),
+        [finalize, context](WTF::ExternalStringImpl*, void* buffer, unsigned buffer_size) {
+            finalize(context, buffer, buffer_size);
+        });
+    auto string = WTF::String::adopt(impl.leakRef());
+    auto opaque = OpaqueJSString::tryCreate(std::move(string));
+    return opaque.leakRef();
+}
+
+extern "C" JSStringRef ct_jsc_string_create_external_latin1(
+    const uint8_t* characters,
+    size_t length,
+    CtExternalStringFinalize finalize,
+    void* context)
+{
+    return create_external_string(characters, length, finalize, context);
+}
+
+extern "C" JSStringRef ct_jsc_string_create_external_utf16(
+    const char16_t* characters,
+    size_t length,
+    CtExternalStringFinalize finalize,
+    void* context)
+{
+    return create_external_string(characters, length, finalize, context);
 }
 
 extern "C" void ct_jsc_run_loop_cycle()

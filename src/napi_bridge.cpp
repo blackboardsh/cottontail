@@ -25,6 +25,18 @@
 
 #include <dlfcn.h>
 
+using CtExternalStringFinalize = void (*)(void*, void*, size_t);
+extern "C" JSStringRef ct_jsc_string_create_external_latin1(
+    const uint8_t*,
+    size_t,
+    CtExternalStringFinalize,
+    void*);
+extern "C" JSStringRef ct_jsc_string_create_external_utf16(
+    const char16_t*,
+    size_t,
+    CtExternalStringFinalize,
+    void*);
+
 struct napi_handle_scope__ {
     NapiEnv* env { nullptr };
     napi_handle_scope__* parent { nullptr };
@@ -847,6 +859,11 @@ static void buffer_deallocator(void* bytes, void* opaque)
     }
 }
 
+static void external_string_deallocator(void* opaque, void*, size_t)
+{
+    buffer_deallocator(nullptr, opaque);
+}
+
 static JSObjectRef as_object(NapiEnv* env, napi_value value)
 {
     JSValueRef js_value = to_js(value);
@@ -1560,6 +1577,24 @@ static napi_status get_string(NapiEnv* env, napi_value value, JSStringRef* resul
     return exception ? caught(env, exception) : finish(env, napi_ok);
 }
 
+static size_t utf8_prefix_length(const char* bytes, size_t length, size_t capacity)
+{
+    const size_t limit = std::min(length, capacity);
+    size_t offset = 0;
+    while (offset < limit) {
+        const uint8_t lead = static_cast<uint8_t>(bytes[offset]);
+        const size_t sequence_length = lead < 0x80 ? 1
+            : (lead & 0xe0) == 0xc0 ? 2
+            : (lead & 0xf0) == 0xe0 ? 3
+            : (lead & 0xf8) == 0xf0 ? 4
+            : 1;
+        if (offset + sequence_length > limit)
+            break;
+        offset += sequence_length;
+    }
+    return offset;
+}
+
 extern "C" napi_status napi_get_value_string_utf8(napi_env opaque_env, napi_value value, char* buffer, size_t buffer_size, size_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
@@ -1579,10 +1614,12 @@ extern "C" napi_status napi_get_value_string_utf8(napi_env opaque_env, napi_valu
     size_t bytes_with_null = JSStringGetUTF8CString(string, complete.data(), complete.size());
     JSStringRelease(string);
     size_t bytes = bytes_with_null ? bytes_with_null - 1 : 0;
+    const size_t copied = buffer
+        ? utf8_prefix_length(complete.data(), bytes, buffer_size ? buffer_size - 1 : 0)
+        : bytes;
     if (result)
-        *result = buffer ? std::min(bytes, buffer_size ? buffer_size - 1 : 0) : bytes;
+        *result = copied;
     if (buffer && buffer_size) {
-        size_t copied = std::min(bytes, buffer_size - 1);
         std::memcpy(buffer, complete.data(), copied);
         buffer[copied] = '\0';
     }
@@ -3521,37 +3558,100 @@ extern "C" napi_status node_api_create_property_key_utf16(napi_env env, const ch
 }
 
 extern "C" napi_status node_api_create_external_string_latin1(
-    napi_env env,
+    napi_env opaque_env,
     char* value,
     size_t length,
-    napi_finalize,
-    void*,
+    napi_finalize finalize_callback,
+    void* finalize_hint,
     napi_value* result,
     bool* copied
 )
 {
-    // COTTONTAIL-COMPAT: Stock JSC's public C API cannot adopt external string
-    // storage. Report the spec-defined copied fallback instead of claiming
-    // zero-copy ownership while retaining caller memory.
+    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    if (!env || !value || !result || !finalize_callback)
+        return invalid(env);
+    if (length == NAPI_AUTO_LENGTH)
+        length = std::strlen(value);
+    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        return invalid(env);
+
+    auto* finalizer = new (std::nothrow) NapiBufferFinalizer {
+        env, value, finalize_hint, finalize_callback, false, false
+    };
+    if (!finalizer)
+        return finish(env, napi_generic_failure);
+    {
+        std::lock_guard lock(env->async_mutex);
+        env->buffer_finalizers.insert(finalizer);
+    }
+
+    JSStringRef string = ct_jsc_string_create_external_latin1(
+        reinterpret_cast<const uint8_t*>(value),
+        length,
+        external_string_deallocator,
+        finalizer);
+    if (!string) {
+        std::lock_guard lock(env->async_mutex);
+        env->buffer_finalizers.erase(finalizer);
+        delete finalizer;
+        return finish(env, napi_generic_failure);
+    }
+
+    napi_status status = output(env, result, JSValueMakeString(env->context, string));
+    JSStringRelease(string);
     if (copied)
-        *copied = true;
-    return napi_create_string_latin1(env, value, length, result);
+        *copied = false;
+    return status;
 }
 
 extern "C" napi_status node_api_create_external_string_utf16(
-    napi_env env,
+    napi_env opaque_env,
     char16_t* value,
     size_t length,
-    napi_finalize,
-    void*,
+    napi_finalize finalize_callback,
+    void* finalize_hint,
     napi_value* result,
     bool* copied
 )
 {
-    // COTTONTAIL-COMPAT: See node_api_create_external_string_latin1 above.
+    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    if (!env || !value || !result || !finalize_callback)
+        return invalid(env);
+    if (length == NAPI_AUTO_LENGTH) {
+        length = 0;
+        while (value[length])
+            ++length;
+    }
+    if (length == 0 || length > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        return invalid(env);
+
+    auto* finalizer = new (std::nothrow) NapiBufferFinalizer {
+        env, value, finalize_hint, finalize_callback, false, false
+    };
+    if (!finalizer)
+        return finish(env, napi_generic_failure);
+    {
+        std::lock_guard lock(env->async_mutex);
+        env->buffer_finalizers.insert(finalizer);
+    }
+
+    JSStringRef string = ct_jsc_string_create_external_utf16(
+        value,
+        length,
+        external_string_deallocator,
+        finalizer);
+    if (!string) {
+        std::lock_guard lock(env->async_mutex);
+        env->buffer_finalizers.erase(finalizer);
+        delete finalizer;
+        return finish(env, napi_generic_failure);
+    }
+
+    napi_status status = output(env, result, JSValueMakeString(env->context, string));
+    JSStringRelease(string);
     if (copied)
-        *copied = true;
-    return napi_create_string_utf16(env, value, length, result);
+        *copied = false;
+    return status;
 }
 
 extern "C" napi_status napi_async_init(napi_env opaque_env, napi_value, napi_value resource_name, napi_async_context* result)
