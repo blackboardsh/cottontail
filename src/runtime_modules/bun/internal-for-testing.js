@@ -1,5 +1,6 @@
 import Module, { _resolveFilename } from "../node/module.js";
 import { BlockList } from "../node/net.js";
+import { serializeShellLex, serializeShellParse } from "../internal/bun-shell-parser.js";
 
 export const jscInternals = {
   isLatin1String(value) {
@@ -71,8 +72,8 @@ export const shellInternals = {
   builtinDisabled() {
     return false;
   },
-  lex: internalUnavailable("shellInternals.lex"),
-  parse: internalUnavailable("shellInternals.parse"),
+  lex: serializeShellLex,
+  parse: serializeShellParse,
 };
 
 function bytesToText(value) {

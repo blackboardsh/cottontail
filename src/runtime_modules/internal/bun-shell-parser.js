@@ -484,3 +484,809 @@ export function parseShell(source) {
   }
   return script;
 }
+
+const TEST_JS_OBJECT_PREFIX = "\b__bun_";
+const TEST_JS_STRING_PREFIX = "\b__bunstr_";
+const TEST_WORD_TOKENS = new Set([
+  "Var",
+  "VarArgv",
+  "Text",
+  "SingleQuotedText",
+  "DoubleQuotedText",
+  "BraceBegin",
+  "Comma",
+  "BraceEnd",
+  "CmdSubstEnd",
+  "Asterisk",
+  "DoubleAsterisk",
+]);
+
+function testingRedirect(overrides = {}) {
+  return {
+    stdin: false,
+    stdout: false,
+    stderr: false,
+    append: false,
+    duplicate_out: false,
+    __unused: 0,
+    ...overrides,
+  };
+}
+
+function isTestingObjectReference(value) {
+  if (value == null || typeof value !== "object") return false;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+  const constructorName = value.constructor?.name;
+  return constructorName === "Blob"
+    || constructorName === "Response"
+    || constructorName === "ReadableStream";
+}
+
+function testingStringNeedsMarker(value) {
+  return value.length === 0 || /[~[\]#;\n*{},`$=()0-9|><&'" \\\b]/.test(value);
+}
+
+function buildTestingShellSource(strings, values) {
+  const raw = strings?.raw ?? strings;
+  if (!raw || typeof raw.length !== "number") {
+    throw new TypeError("shellInternals expects to be called as a template tag");
+  }
+
+  const objectRefs = [];
+  const stringRefs = [];
+  let source = "";
+
+  const appendString = value => {
+    const string = String(value);
+    if (string.includes("\0")) {
+      throw new TypeError("The shell argument must be a string without null bytes");
+    }
+    if (!testingStringNeedsMarker(string)) {
+      source += string;
+      return;
+    }
+    const index = stringRefs.push(string) - 1;
+    source += `${TEST_JS_STRING_PREFIX}${index}`;
+  };
+
+  const appendValue = value => {
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        if (index > 0) source += " ";
+        appendValue(value[index]);
+      }
+      return;
+    }
+    if (isTestingObjectReference(value)) {
+      const index = objectRefs.push(value) - 1;
+      source += `${TEST_JS_OBJECT_PREFIX}${index}`;
+      return;
+    }
+    if (value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "raw") && value.raw) {
+      const rawValue = String(value.raw);
+      if (rawValue.includes("\0")) {
+        throw new TypeError("The shell argument must be a string without null bytes");
+      }
+      source += rawValue;
+      return;
+    }
+    if (value == null || typeof value !== "object") {
+      appendString(value);
+      return;
+    }
+    if (value.toString !== Object.prototype.toString) {
+      appendString(value);
+      return;
+    }
+    throw new TypeError("Invalid JS object used in shell, you might need to call `.toString()` on it");
+  };
+
+  for (let index = 0; index < raw.length; index += 1) {
+    source += String(raw[index]);
+    if (index < values.length) appendValue(values[index]);
+  }
+  return { source, objectRefs, stringRefs };
+}
+
+class TestingShellLexer {
+  constructor(source, objectRefs, stringRefs) {
+    this.source = source;
+    this.objectRefs = objectRefs;
+    this.stringRefs = stringRefs;
+    this.tokens = [];
+    this.index = 0;
+    this.state = "normal";
+    this.text = "";
+    this.quoteTokenStart = 0;
+  }
+
+  emit(tag, value) {
+    this.tokens.push(value === undefined ? { tag } : { tag, value });
+  }
+
+  lastTag() {
+    return this.tokens.at(-1)?.tag;
+  }
+
+  appendDelimiter() {
+    if (this.lastTag() !== "Delimit") this.emit("Delimit");
+  }
+
+  breakWord(addDelimiter, boundary = false, forceEmpty = false) {
+    if (this.text.length > 0 || forceEmpty) {
+      const tag = this.state === "double"
+        ? "DoubleQuotedText"
+        : this.state === "single" ? "SingleQuotedText" : "Text";
+      this.emit(tag, this.text);
+      this.text = "";
+      if (addDelimiter) this.appendDelimiter();
+      return;
+    }
+    if (boundary && TEST_WORD_TOKENS.has(this.lastTag())) this.appendDelimiter();
+  }
+
+  readMarker(prefix, refs) {
+    if (!this.source.startsWith(prefix, this.index)) return null;
+    let end = this.index + prefix.length;
+    while (/\d/.test(this.source[end] ?? "")) end += 1;
+    if (end === this.index + prefix.length) return null;
+    const refIndex = Number(this.source.slice(this.index + prefix.length, end));
+    if (!Number.isSafeInteger(refIndex) || refIndex < 0 || refIndex >= refs.length) {
+      throw syntax(`Invalid ${prefix === TEST_JS_OBJECT_PREFIX ? "JS object" : "JS string"} ref (out of bounds)`, this.index);
+    }
+    this.index = end;
+    return refIndex;
+  }
+
+  handleMarker() {
+    const stringIndex = this.readMarker(TEST_JS_STRING_PREFIX, this.stringRefs);
+    if (stringIndex != null) {
+      this.breakWord(false);
+      const value = this.stringRefs[stringIndex];
+      if (value.length === 0) this.emit("DoubleQuotedText", "");
+      else this.text += value;
+      return true;
+    }
+    const objectIndex = this.readMarker(TEST_JS_OBJECT_PREFIX, this.objectRefs);
+    if (objectIndex == null) return false;
+    if (this.state === "double") {
+      throw syntax("JS object reference not allowed in double quotes", this.index);
+    }
+    this.breakWord(false);
+    this.emit("JSObjRef", objectIndex);
+    return true;
+  }
+
+  readVariable() {
+    const start = this.index + 1;
+    const first = this.source[start];
+    if (/\d/.test(first ?? "")) {
+      this.breakWord(false);
+      this.emit("VarArgv", Number(first));
+      this.index = start + 1;
+      return true;
+    }
+    if (!/[A-Za-z_]/.test(first ?? "")) return false;
+    let end = start + 1;
+    while (/[A-Za-z0-9_]/.test(this.source[end] ?? "")) end += 1;
+    this.breakWord(false);
+    this.emit("Var", this.source.slice(start, end));
+    this.index = end;
+    return true;
+  }
+
+  redirectAt() {
+    const rest = this.source.slice(this.index);
+    const descriptor = /^([012])>(>?)(?:&([12]))?/.exec(rest);
+    if (descriptor) {
+      const fd = descriptor[1];
+      const duplicate = descriptor[3];
+      const flags = testingRedirect({
+        stdin: fd === "0",
+        stdout: fd === "1",
+        stderr: fd === "2",
+        append: descriptor[2] === ">",
+      });
+      if (duplicate) {
+        flags.duplicate_out = true;
+        if (fd === "1" && duplicate === "2") {
+          flags.stdout = false;
+          flags.stderr = true;
+        } else if (fd === "2" && duplicate === "1") {
+          flags.stdout = true;
+          flags.stderr = false;
+        } else {
+          return null;
+        }
+      }
+      return { length: descriptor[0].length, flags };
+    }
+    if (rest.startsWith("&>>")) return { length: 3, flags: testingRedirect({ stdout: true, stderr: true, append: true }) };
+    if (rest.startsWith("&>")) return { length: 2, flags: testingRedirect({ stdout: true, stderr: true }) };
+    if (rest.startsWith(">>")) return { length: 2, flags: testingRedirect({ stdout: true, append: true }) };
+    if (rest.startsWith("<<")) return { length: 2, flags: testingRedirect({ stdin: true, append: true }) };
+    if (rest[0] === ">") return { length: 1, flags: testingRedirect({ stdout: true }) };
+    if (rest[0] === "<") return { length: 1, flags: testingRedirect({ stdin: true }) };
+    return null;
+  }
+
+  scanSubstitution(kind, quoted) {
+    this.emit("CmdSubstBegin");
+    if (quoted) this.emit("CmdSubstQuoted");
+    const outerState = this.state;
+    this.state = "normal";
+    this.scan(kind);
+    this.state = outerState;
+    this.emit("CmdSubstEnd");
+  }
+
+  closeSubstitution(kind) {
+    this.breakWord(true);
+    if (kind === "dollar" || kind === "backtick") {
+      if (!["Delimit", "Semicolon", "Newline", "Eof"].includes(this.lastTag())) this.appendDelimiter();
+    }
+  }
+
+  scan(stopKind = null) {
+    while (this.index < this.source.length) {
+      const char = this.source[this.index];
+
+      if (stopKind === "dollar" && this.state === "normal" && char === ")") {
+        this.closeSubstitution(stopKind);
+        this.index += 1;
+        return;
+      }
+      if (stopKind === "paren" && this.state === "normal" && char === ")") {
+        this.breakWord(true);
+        this.index += 1;
+        return;
+      }
+      if (stopKind === "backtick" && this.state !== "single" && char === "`") {
+        this.closeSubstitution(stopKind);
+        this.index += 1;
+        return;
+      }
+
+      if (char === "\b" && this.handleMarker()) continue;
+
+      if (char === "\\") {
+        const next = this.source[this.index + 1];
+        if (next == null) {
+          this.text += "\\";
+          this.index += 1;
+        } else if (next === "\n") {
+          this.index += 2;
+          if (this.state !== "double") this.breakWord(true, true);
+        } else {
+          this.text += next;
+          this.index += 2;
+        }
+        continue;
+      }
+
+      if (this.state === "single") {
+        if (char === "'") {
+          const empty = this.tokens.length === this.quoteTokenStart && this.text.length === 0;
+          this.breakWord(false, false, empty);
+          this.state = "normal";
+          this.index += 1;
+          if (this.index === this.source.length) this.appendDelimiter();
+        } else {
+          this.text += char;
+          this.index += 1;
+        }
+        continue;
+      }
+
+      if (this.state === "double") {
+        if (char === '"') {
+          const empty = this.tokens.length === this.quoteTokenStart && this.text.length === 0;
+          this.breakWord(false, false, empty);
+          this.state = "normal";
+          this.index += 1;
+          continue;
+        }
+        if (char === "$" && this.source[this.index + 1] === "(") {
+          this.breakWord(false);
+          this.index += 2;
+          this.scanSubstitution("dollar", true);
+          continue;
+        }
+        if (char === "`" ) {
+          this.breakWord(false);
+          this.index += 1;
+          this.scanSubstitution("backtick", true);
+          continue;
+        }
+        if (char === "$" && this.readVariable()) continue;
+        this.text += char;
+        this.index += 1;
+        continue;
+      }
+
+      if (char === " " || char === "\t" || char === "\r") {
+        this.breakWord(true, true);
+        this.index += 1;
+        continue;
+      }
+      if (char === "\n") {
+        this.breakWord(true, true);
+        this.emit("Newline");
+        this.index += 1;
+        continue;
+      }
+      if (char === "#" && (this.index === 0 || /\s/.test(this.source[this.index - 1]))) {
+        this.breakWord(true, true);
+        while (this.index < this.source.length && this.source[this.index] !== "\n") this.index += 1;
+        continue;
+      }
+      if (char === "'") {
+        this.breakWord(false);
+        this.state = "single";
+        this.quoteTokenStart = this.tokens.length;
+        this.index += 1;
+        continue;
+      }
+      if (char === '"') {
+        this.breakWord(false);
+        this.state = "double";
+        this.quoteTokenStart = this.tokens.length;
+        this.index += 1;
+        continue;
+      }
+      if (char === "$" && this.source[this.index + 1] === "(") {
+        this.breakWord(false);
+        this.index += 2;
+        this.scanSubstitution("dollar", false);
+        continue;
+      }
+      if (char === "`") {
+        this.breakWord(false);
+        this.index += 1;
+        this.scanSubstitution("backtick", false);
+        continue;
+      }
+      if (char === "$" && this.readVariable()) continue;
+
+      if (this.source.startsWith("[[", this.index) && /\s/.test(this.source[this.index + 2] ?? " ")) {
+        this.breakWord(true, true);
+        this.emit("DoubleBracketOpen");
+        this.index += 2;
+        continue;
+      }
+      if (this.source.startsWith("]]", this.index) && /(?:\s|[;&|>])/.test(this.source[this.index + 2] ?? " ")) {
+        this.breakWord(true, true);
+        this.emit("DoubleBracketClose");
+        this.index += 2;
+        continue;
+      }
+
+      const redirect = this.redirectAt();
+      if (redirect) {
+        this.breakWord(true, true);
+        this.emit("Redirect", redirect.flags);
+        this.index += redirect.length;
+        continue;
+      }
+      if (this.source.startsWith("&&", this.index)) {
+        this.breakWord(true, true);
+        this.emit("DoubleAmpersand");
+        this.index += 2;
+        continue;
+      }
+      if (this.source.startsWith("||", this.index)) {
+        this.breakWord(true, true);
+        this.emit("DoublePipe");
+        this.index += 2;
+        continue;
+      }
+      if (this.source.startsWith("|&", this.index)) {
+        throw syntax("Piping stdout and stderr (`|&`) is not supported yet. Please file an issue on GitHub.", this.index);
+      }
+      if (char === "|") {
+        this.breakWord(true, true);
+        this.emit("Pipe");
+        this.index += 1;
+        continue;
+      }
+      if (char === "&") {
+        this.breakWord(true, true);
+        this.emit("Ampersand");
+        this.index += 1;
+        continue;
+      }
+      if (char === ";") {
+        this.breakWord(true);
+        this.emit("Semicolon");
+        this.index += 1;
+        continue;
+      }
+      if (char === "(") {
+        this.breakWord(true);
+        this.emit("OpenParen");
+        this.index += 1;
+        const outerState = this.state;
+        this.state = "normal";
+        this.scan("paren");
+        this.state = outerState;
+        this.emit("CloseParen");
+        continue;
+      }
+      if (char === ")") throw syntax("Unexpected ')'", this.index);
+      if (char === "*") {
+        this.breakWord(false);
+        if (this.source[this.index + 1] === "*") {
+          this.emit("DoubleAsterisk");
+          this.index += 2;
+        } else {
+          this.emit("Asterisk");
+          this.index += 1;
+        }
+        continue;
+      }
+      if (char === "{") {
+        this.breakWord(false);
+        this.emit("BraceBegin");
+        this.index += 1;
+        continue;
+      }
+      if (char === ",") {
+        this.breakWord(false);
+        this.emit("Comma");
+        this.index += 1;
+        continue;
+      }
+      if (char === "}") {
+        this.breakWord(false);
+        this.emit("BraceEnd");
+        this.index += 1;
+        continue;
+      }
+
+      this.text += char;
+      this.index += 1;
+    }
+
+    if (this.state === "single" || this.state === "double") {
+      throw syntax(`Unterminated ${this.state} quote`, this.index);
+    }
+    if (stopKind != null) {
+      throw syntax(stopKind === "paren" ? "Unclosed subshell" : "Unclosed command substitution", this.index);
+    }
+    this.breakWord(true);
+    this.emit("Eof");
+  }
+}
+
+function lexTestingShell(strings, values) {
+  const built = buildTestingShellSource(strings, values);
+  const lexer = new TestingShellLexer(built.source, built.objectRefs, built.stringRefs);
+  lexer.scan();
+  return lexer.tokens;
+}
+
+function serializeTestingToken(token) {
+  const tag = token.tag === "SingleQuotedText" ? "Text" : token.tag;
+  return { [tag]: token.value === undefined ? {} : token.value };
+}
+
+function simpleTestingAtom(tag, value) {
+  return { [tag]: value === undefined ? {} : value };
+}
+
+function testingAtomParts(atom) {
+  return atom.simple ? [atom.simple] : [...atom.compound.atoms];
+}
+
+function testingAtomFromParts(parts) {
+  if (parts.length === 1) return { simple: parts[0] };
+  const tags = parts.map(part => Object.keys(part)[0]);
+  return {
+    compound: {
+      atoms: parts,
+      brace_expansion_hint: tags.includes("brace_begin") && tags.includes("brace_end") && tags.includes("comma"),
+      glob_hint: tags.includes("asterisk") || tags.includes("double_asterisk"),
+    },
+  };
+}
+
+function mergeTestingAtoms(left, right) {
+  return testingAtomFromParts([...testingAtomParts(left), ...testingAtomParts(right)]);
+}
+
+class TestingShellParser {
+  constructor(tokens) {
+    this.tokens = tokens;
+    this.index = 0;
+  }
+
+  peek(offset = 0) {
+    return this.tokens[this.index + offset] ?? { tag: "Eof" };
+  }
+
+  take() {
+    return this.tokens[this.index++];
+  }
+
+  is(tag) {
+    return this.peek().tag === tag;
+  }
+
+  match(tag) {
+    if (!this.is(tag)) return false;
+    this.index += 1;
+    return true;
+  }
+
+  isStandaloneWord(word) {
+    return this.peek().tag === "Text"
+      && this.peek().value === word
+      && ["Delimit", "Semicolon", "Newline", "Eof"].includes(this.peek(1).tag);
+  }
+
+  consumeStandaloneWord(word) {
+    if (!this.isStandaloneWord(word)) return false;
+    this.index += 1;
+    if (this.is("Delimit")) this.index += 1;
+    return true;
+  }
+
+  atScriptEnd(stopTags, stopWords) {
+    return stopTags.has(this.peek().tag) || [...stopWords].some(word => this.isStandaloneWord(word));
+  }
+
+  skipStatementSeparators() {
+    while (this.match("Semicolon") || this.match("Newline")) {}
+  }
+
+  parseScript(stopTags = new Set(["Eof"]), stopWords = new Set()) {
+    const stmts = [];
+    this.skipStatementSeparators();
+    while (!this.atScriptEnd(stopTags, stopWords)) {
+      const expression = this.parseBinary();
+      if (this.match("Ampersand")) {
+        throw syntax('Background commands "&" are not supported yet.', this.index);
+      }
+      stmts.push({ exprs: [expression] });
+      if (this.atScriptEnd(stopTags, stopWords)) break;
+      if (!this.is("Semicolon") && !this.is("Newline")) {
+        throw syntax(`Unexpected token: ${this.peek().tag}`, this.index);
+      }
+      this.skipStatementSeparators();
+    }
+    return { stmts };
+  }
+
+  parseBinary() {
+    let left = this.parsePipeline();
+    while (this.is("DoubleAmpersand") || this.is("DoublePipe")) {
+      const op = this.take().tag === "DoubleAmpersand" ? "And" : "Or";
+      left = { binary: { op, left, right: this.parsePipeline() } };
+    }
+    return left;
+  }
+
+  parsePipeline() {
+    const first = this.parseCompoundCommand();
+    if (!this.is("Pipe")) return first;
+    const items = [first];
+    while (this.match("Pipe")) items.push(this.parseCompoundCommand());
+    return { pipeline: { items } };
+  }
+
+  parseCompoundCommand() {
+    if (this.is("OpenParen")) return { subshell: this.parseSubshell() };
+    if (this.isStandaloneWord("if")) return { if: this.parseIf() };
+    if (this.is("DoubleBracketOpen")) return { condexpr: this.parseConditional() };
+    const command = this.parseSimpleCommand();
+    return command.assignsOnly ? { assign: command.assigns } : { cmd: command };
+  }
+
+  parseSubshell() {
+    this.take();
+    const script = this.parseScript(new Set(["CloseParen", "Eof"]));
+    if (!this.match("CloseParen")) throw syntax("Unclosed subshell", this.index);
+    const parsed = this.parseRedirect();
+    return { script, redirect: parsed.redirect, redirect_flags: parsed.flags };
+  }
+
+  parseIfBody(until) {
+    return this.parseScript(new Set(["Eof", "CmdSubstEnd", "CloseParen"]), new Set(until)).stmts;
+  }
+
+  parseIf() {
+    this.consumeStandaloneWord("if");
+    const cond = this.parseIfBody(["then"]);
+    if (!this.consumeStandaloneWord("then")) throw syntax('Expected "then"', this.index);
+    const then = this.parseIfBody(["else", "elif", "fi"]);
+    const elseParts = [];
+
+    while (this.consumeStandaloneWord("elif")) {
+      elseParts.push(this.parseIfBody(["then"]));
+      if (!this.consumeStandaloneWord("then")) throw syntax('Expected "then"', this.index);
+      elseParts.push(this.parseIfBody(["else", "elif", "fi"]));
+    }
+    if (this.consumeStandaloneWord("else")) elseParts.push(this.parseIfBody(["fi"]));
+    if (!this.consumeStandaloneWord("fi")) throw syntax('Expected "fi"', this.index);
+    return { cond, then, else_parts: elseParts };
+  }
+
+  parseConditional() {
+    this.take();
+    const atoms = [];
+    while (!this.is("DoubleBracketClose") && !this.is("Eof")) {
+      const atom = this.parseAtom();
+      if (atom) atoms.push(atom);
+      else if (this.is("Delimit")) this.take();
+      else break;
+    }
+    if (!this.match("DoubleBracketClose")) throw syntax('Expected "]]"', this.index);
+    if (atoms.length === 2) {
+      const op = Object.values(atoms[0].simple ?? {})[0];
+      return { op, args: [atoms[1]] };
+    }
+    if (atoms.length === 3) {
+      const op = Object.values(atoms[1].simple ?? {})[0];
+      return { op, args: [atoms[0], atoms[2]] };
+    }
+    throw syntax("Expected a conditional expression", this.index);
+  }
+
+  parseAssignment() {
+    const token = this.peek();
+    if (token.tag !== "Text") return null;
+    const equal = token.value.indexOf("=");
+    if (equal <= 0 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(token.value.slice(0, equal))) return null;
+    const label = token.value.slice(0, equal);
+    const value = token.value.slice(equal + 1);
+    this.take();
+
+    if (this.is("Delimit") || this.is("Semicolon") || this.is("Newline") || this.is("Eof") || this.is("CmdSubstEnd") || this.is("CloseParen")) {
+      if (this.is("Delimit")) this.take();
+      return { label, value: { simple: simpleTestingAtom("Text", value) } };
+    }
+
+    const right = this.parseAtom();
+    if (!right) throw syntax("Expected an atom", this.index);
+    if (value.length === 0) return { label, value: right };
+    return {
+      label,
+      value: mergeTestingAtoms({ simple: simpleTestingAtom("Text", value) }, right),
+    };
+  }
+
+  parseSimpleCommand() {
+    const assigns = [];
+    while (true) {
+      const assignment = this.parseAssignment();
+      if (!assignment) break;
+      assigns.push(assignment);
+    }
+
+    const name = this.parseAtom();
+    if (!name) {
+      if (assigns.length === 0) {
+        throw syntax(`expected a command or assignment but got: "${this.peek().tag}"`, this.index);
+      }
+      return { assignsOnly: true, assigns };
+    }
+
+    const nameAndArgs = [name];
+    while (true) {
+      const argument = this.parseAtom();
+      if (!argument) break;
+      nameAndArgs.push(argument);
+    }
+    const parsed = this.parseRedirect();
+    return {
+      assigns,
+      name_and_args: nameAndArgs,
+      redirect: parsed.flags,
+      redirect_file: parsed.redirect,
+    };
+  }
+
+  parseRedirect() {
+    if (!this.is("Redirect")) return { flags: testingRedirect(), redirect: null };
+    const flags = this.take().value;
+    if (this.is("JSObjRef")) return { flags, redirect: { jsbuf: { idx: this.take().value } } };
+    if (flags.duplicate_out) return { flags, redirect: null };
+    const atom = this.parseAtom();
+    if (!atom) throw syntax("Redirection with no file", this.index);
+    return { flags, redirect: { atom } };
+  }
+
+  parseAtom() {
+    const parts = [];
+    let hasBraceOpen = false;
+    let hasBraceClose = false;
+    let hasComma = false;
+    let hasGlob = false;
+
+    while (true) {
+      const token = this.peek();
+      if (token.tag === "Delimit") {
+        this.take();
+        break;
+      }
+      if ([
+        "Eof",
+        "Semicolon",
+        "Newline",
+        "Pipe",
+        "DoublePipe",
+        "Ampersand",
+        "DoubleAmpersand",
+        "Redirect",
+        "JSObjRef",
+        "CmdSubstEnd",
+        "CloseParen",
+        "DoubleBracketClose",
+      ].includes(token.tag)) break;
+
+      if (token.tag === "Text" || token.tag === "SingleQuotedText" || token.tag === "DoubleQuotedText") {
+        this.take();
+        let value = token.value;
+        if (token.tag === "Text" && value.startsWith("~")) {
+          parts.push(simpleTestingAtom("tilde"));
+          value = value.slice(1);
+        }
+        if (value.length === 0 && token.tag !== "Text") parts.push(simpleTestingAtom("quoted_empty"));
+        else if (value.length > 0 || token.tag === "Text") parts.push(simpleTestingAtom("Text", value));
+        continue;
+      }
+      if (token.tag === "Var") {
+        parts.push(simpleTestingAtom("Var", this.take().value));
+        continue;
+      }
+      if (token.tag === "VarArgv") {
+        parts.push(simpleTestingAtom("VarArgv", this.take().value));
+        continue;
+      }
+      if (token.tag === "Asterisk" || token.tag === "DoubleAsterisk") {
+        hasGlob = true;
+        parts.push(simpleTestingAtom(token.tag === "Asterisk" ? "asterisk" : "double_asterisk"));
+        this.take();
+        continue;
+      }
+      if (token.tag === "BraceBegin" || token.tag === "BraceEnd" || token.tag === "Comma") {
+        if (token.tag === "BraceBegin") hasBraceOpen = true;
+        if (token.tag === "BraceEnd") hasBraceClose = true;
+        if (token.tag === "Comma") hasComma = true;
+        parts.push(simpleTestingAtom({ BraceBegin: "brace_begin", BraceEnd: "brace_end", Comma: "comma" }[token.tag]));
+        this.take();
+        continue;
+      }
+      if (token.tag === "CmdSubstBegin") {
+        this.take();
+        const quoted = this.match("CmdSubstQuoted");
+        const script = this.parseScript(new Set(["CmdSubstEnd", "Eof"]));
+        if (!this.match("CmdSubstEnd")) throw syntax("Unclosed command substitution", this.index);
+        parts.push(simpleTestingAtom("cmd_subst", { script, quoted }));
+        continue;
+      }
+      if (token.tag === "OpenParen") throw syntax("Unexpected token: `(`", this.index);
+      throw syntax(`Unexpected token: ${token.tag}`, this.index);
+    }
+
+    if (parts.length === 0) return null;
+    if (parts.length === 1) return { simple: parts[0] };
+    return {
+      compound: {
+        atoms: parts,
+        brace_expansion_hint: hasBraceOpen && hasBraceClose && hasComma,
+        glob_hint: hasGlob,
+      },
+    };
+  }
+}
+
+export function serializeShellLex(strings, ...values) {
+  return JSON.stringify(lexTestingShell(strings, values).map(serializeTestingToken));
+}
+
+export function serializeShellParse(strings, ...values) {
+  const tokens = lexTestingShell(strings, values);
+  const parser = new TestingShellParser(tokens);
+  return JSON.stringify(parser.parseScript());
+}
