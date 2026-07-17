@@ -30,6 +30,17 @@ function result(exitCode = 0, stdout = "", stderr = "") {
   return { exitCode, stdout: bytes(stdout), stderr: bytes(stderr) };
 }
 
+function concatBytes(chunks) {
+  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
 function absolute(context, path) {
   return isAbsolute(path) ? path : resolve(context.cwd, path);
 }
@@ -59,6 +70,63 @@ function parseFlags(args, accepted) {
   return { flags, operands: args.slice(index) };
 }
 
+function appendEchoEscapes(value) {
+  const chunks = [];
+  let text = "";
+  const flush = () => {
+    if (text.length === 0) return;
+    chunks.push(bytes(text));
+    text = "";
+  };
+  const appendByte = value => {
+    flush();
+    chunks.push(Uint8Array.of(value));
+  };
+  for (let index = 0; index < value.length;) {
+    if (value[index] !== "\\" || index + 1 >= value.length) {
+      text += value[index++];
+      continue;
+    }
+    const escaped = value[index + 1];
+    index += 2;
+    if (escaped === "c") {
+      flush();
+      return { output: concatBytes(chunks), stopped: true };
+    }
+    if (escaped === "0") {
+      const match = /^[0-7]{0,3}/.exec(value.slice(index))?.[0] ?? "";
+      appendByte(Number.parseInt(match || "0", 8) & 0xff);
+      index += match.length;
+      continue;
+    }
+    if (escaped === "x") {
+      const match = /^[\da-fA-F]{1,2}/.exec(value.slice(index))?.[0];
+      if (match == null) {
+        text += "\\x";
+        continue;
+      }
+      appendByte(Number.parseInt(match, 16));
+      index += match.length;
+      continue;
+    }
+    const escapedByte = ({
+      a: 0x07, b: 0x08, e: 0x1b, E: 0x1b, f: 0x0c, n: 0x0a,
+      r: 0x0d, t: 0x09, v: 0x0b, "\\": 0x5c,
+    })[escaped];
+    if (escapedByte == null) text += `\\${escaped}`;
+    else appendByte(escapedByte);
+  }
+  flush();
+  return { output: concatBytes(chunks), stopped: false };
+}
+
+function trimRepeatedLeadingNewlines(value) {
+  if (!value.startsWith("\n")) return value;
+  let index = 1;
+  while (value[index] === "\n") index += 1;
+  return `\n${value.slice(index)}`;
+}
+
 function echo(args) {
   let newline = true;
   let escapes = false;
@@ -70,21 +138,26 @@ function echo(args) {
     }
     index += 1;
   }
-  let output = args.slice(index).join(" ");
-  if (escapes) {
-    let stopped = false;
-    output = output.replace(/\\(0[0-7]{0,3}|x[\da-fA-F]{1,2}|.)/g, (_, escape) => {
-      if (escape === "c") {
-        stopped = true;
-        return "";
-      }
-      if (escape[0] === "0") return String.fromCharCode(Number.parseInt(escape.slice(1) || "0", 8));
-      if (escape[0] === "x") return String.fromCharCode(Number.parseInt(escape.slice(1), 16));
-      return ({ a: "\x07", b: "\b", e: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\" })[escape] ?? `\\${escape}`;
-    });
-    if (stopped) newline = false;
+  const operands = args.slice(index);
+  if (!escapes) {
+    const lastEndsInNewline = operands.at(-1)?.endsWith("\n") ?? false;
+    const output = operands.map(trimRepeatedLeadingNewlines).join(" ");
+    return result(0, output + (!lastEndsInNewline && newline ? "\n" : ""));
   }
-  return result(0, output + (newline ? "\n" : ""));
+
+  const output = [];
+  let stopped = false;
+  for (let operandIndex = 0; operandIndex < operands.length; operandIndex += 1) {
+    const operand = operands[operandIndex];
+    const last = operandIndex === operands.length - 1;
+    const expanded = appendEchoEscapes(operand);
+    output.push(expanded.output);
+    stopped = expanded.stopped;
+    if (stopped) break;
+    if (!last) output.push(bytes(" "));
+  }
+  if (!stopped && newline) output.push(bytes("\n"));
+  return result(0, concatBytes(output));
 }
 
 function printfEscapes(value) {
@@ -173,22 +246,104 @@ function sequence(args) {
   return result(0, output.length ? output.join(separator) + separator + terminator : terminator);
 }
 
-function cat(args, context, input) {
-  if (args.length === 0 || (args.length === 1 && args[0] === "-")) return result(0, input);
+async function readInputBytes(input) {
+  if (input == null || typeof input.getReader !== "function") return bytes(input);
+  const reader = input.getReader();
+  const chunks = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(bytes(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+}
+
+function catArguments(args) {
+  let index = 0;
+  for (; index < args.length; index += 1) {
+    const argument = args[index];
+    if (!argument.startsWith("-")) break;
+    if (argument === "-") return { error: "cat: illegal option -- -\n" };
+    const flag = argument.slice(1);
+    if (argument.startsWith("--")) {
+      return { error: `cat: illegal option -- ${argument.slice(2)}\n` };
+    }
+    if ("benstuv".includes(flag[0])) {
+      return { error: `cat: unsupported option, please open a GitHub issue -- -${flag[0]}\n` };
+    }
+    return { error: `cat: illegal option -- ${flag}\n` };
+  }
+  return { operands: args.slice(index) };
+}
+
+async function pipeCatInput(input, output) {
+  if (input == null || typeof input.getReader !== "function") return output.write(bytes(input));
+  const reader = input.getReader();
+  let complete = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        return true;
+      }
+      if (await output.write(value)) continue;
+      await reader.cancel(new Error("Pipeline output closed"));
+      return false;
+    }
+  } finally {
+    if (!complete) {
+      try { await reader.cancel(); } catch {}
+    }
+    reader.releaseLock();
+  }
+}
+
+async function cat(args, context, input, pipelineOutput = null) {
+  const parsed = catArguments(args);
+  if (parsed.error) return result(1, "", parsed.error);
+  const operands = parsed.operands;
+  const consumesInput = operands.length === 0;
+
+  if (pipelineOutput != null) {
+    let stderr = "";
+    let open = true;
+    if (consumesInput) {
+      open = await pipeCatInput(input, pipelineOutput);
+    } else {
+      for (const path of operands) {
+        try { open = await pipelineOutput.write(readFileSync(absolute(context, path))); }
+        catch (error) { stderr = `cat: ${path}: ${errorReason(error)}\n`; }
+        if (!open || stderr) break;
+      }
+    }
+    return { ...result(stderr ? 1 : open ? 0 : 1, "", stderr), consumedInput: consumesInput, piped: true };
+  }
+
+  const stdin = consumesInput ? await readInputBytes(input) : bytes();
+  if (operands.length === 0) return { ...result(0, stdin), consumedInput: true };
   const chunks = [];
   let stderr = "";
-  for (const path of args) {
-    if (path === "-") {
-      chunks.push(input);
-      continue;
-    }
+  for (const path of operands) {
     try {
       chunks.push(bytes(readFileSync(absolute(context, path))));
     } catch (error) {
-      stderr += `cat: ${path}: ${errorReason(error)}\n`;
+      stderr = `cat: ${path}: ${errorReason(error)}\n`;
+      break;
     }
   }
-  return { exitCode: stderr ? 1 : 0, stdout: context.concat(chunks), stderr: bytes(stderr) };
+  return { exitCode: stderr ? 1 : 0, stdout: context.concat(chunks), stderr: bytes(stderr), consumedInput: consumesInput };
 }
 
 function mkdir(args, context) {
@@ -431,7 +586,7 @@ function move(args, context) {
 }
 
 export function createShellBuiltins(host) {
-  return async function runBuiltin(name, args, context, input = bytes()) {
+  return async function runBuiltin(name, args, context, input = bytes(), pipelineOutput = null) {
     switch (name) {
       case ":":
       case "true": return result();
@@ -439,7 +594,7 @@ export function createShellBuiltins(host) {
       case "echo": return echo(args);
       case "printf": return printf(args);
       case "seq": return sequence(args);
-      case "cat": return cat(args, context, input);
+      case "cat": return cat(args, context, input, pipelineOutput);
       case "pwd":
         return args.length ? result(1, "", "pwd: too many arguments\n") : result(0, `${context.cwd}\n`);
       case "cd": {
@@ -513,10 +668,15 @@ export function createShellBuiltins(host) {
         return result(failed ? 1 : 0, stdout);
       }
       case "yes": {
-        // COTTONTAIL-COMPAT: Bun shell yes streaming - the JS interpreter still
-        // materializes pipeline stages, so emit a bounded producer block until
-        // native backpressure and EPIPE can drive builtin lifecycle directly.
         const line = `${args.length ? args.join(" ") : "y"}\n`;
+        if (pipelineOutput != null) {
+          const repetitions = Math.max(1, Math.ceil(8192 / line.length));
+          const block = line.repeat(repetitions);
+          while (await pipelineOutput.write(block)) {}
+          return { ...result(1), piped: true };
+        }
+        // COTTONTAIL-COMPAT: Bun shell standalone yes cancellation - the public
+        // shell host does not yet pass an AbortSignal into this interpreter.
         return result(0, line.repeat(4096));
       }
       default: return null;

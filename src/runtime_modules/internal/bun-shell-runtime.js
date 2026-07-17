@@ -1,4 +1,4 @@
-import { appendFileSync, lstatSync, readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { closeSync, lstatSync, openSync, readFileSync, readdirSync, statSync, writeSync } from "../node/fs.js";
 import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
 import picomatch from "../vendor/picomatch.js";
 import { createShellBuiltins } from "./bun-shell-builtins.js";
@@ -6,6 +6,7 @@ import { parseShell } from "./bun-shell-parser.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const INPUT_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>"]);
 
 function bytes(value = "") {
   if (value instanceof Uint8Array) return value;
@@ -16,6 +17,8 @@ function bytes(value = "") {
 
 function concat(chunks) {
   const values = chunks.filter(Boolean).map(bytes);
+  if (values.length === 0) return bytes();
+  if (values.length === 1) return values[0];
   const length = values.reduce((total, value) => total + value.byteLength, 0);
   const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
   let offset = 0;
@@ -30,19 +33,81 @@ function result(exitCode = 0, stdout = "", stderr = "") {
   return { exitCode, stdout: bytes(stdout), stderr: bytes(stderr) };
 }
 
-function cloneContext(context) {
+function cloneContext(context, { preserveCommandEnv = false } = {}) {
   return {
     cwd: context.cwd,
     env: { ...context.env },
     exported: { ...context.exported },
-    externalEnv: { ...context.externalEnv },
+    // Bun's dupeForSubshell always starts with an empty cmd_local_env. Prefix
+    // assignments belong to one command and must not leak into substitutions,
+    // pipelines, asynchronous commands, or subshells.
+    externalEnv: preserveCommandEnv ? { ...context.externalEnv } : {},
     status: context.status,
     argv: [...context.argv],
     outputTargets: context.outputTargets,
     background: context.background,
+    openRedirects: context.openRedirects,
     pid: context.pid,
     concat,
   };
+}
+
+const PROTECTED = "\ue000";
+const PROTECTED_SYNTAX = new Map([
+  ["\\", "b"], ["{", "l"], ["}", "r"], [",", "c"],
+  ["*", "s"], ["?", "q"], ["[", "o"], ["]", "e"],
+]);
+const PROTECTED_CODES = new Map([...PROTECTED_SYNTAX].map(([character, code]) => [code, character]));
+
+function escapeProtectionMarker(value) {
+  value = String(value);
+  return value.includes(PROTECTED) ? value.replaceAll(PROTECTED, `${PROTECTED}0`) : value;
+}
+
+function protectShellSyntax(value) {
+  value = String(value);
+  const output = [];
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    const code = character === PROTECTED ? "0" : PROTECTED_SYNTAX.get(character);
+    if (code == null) continue;
+    if (start < index) output.push(value.slice(start, index));
+    output.push(`${PROTECTED}${code}`);
+    start = index + 1;
+  }
+  if (output.length === 0) return value;
+  if (start < value.length) output.push(value.slice(start));
+  return output.join("");
+}
+
+function restoreProtectedSyntax(value) {
+  if (!value.includes(PROTECTED)) return value;
+  const output = [];
+  let start = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== PROTECTED || index + 1 >= value.length) continue;
+    if (start < index) output.push(value.slice(start, index));
+    const code = value[++index];
+    output.push(code === "0" ? PROTECTED : PROTECTED_CODES.get(code) ?? code);
+    start = index + 1;
+  }
+  if (start < value.length) output.push(value.slice(start));
+  return output.join("");
+}
+
+function globMatcherPattern(value) {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== PROTECTED || index + 1 >= value.length) {
+      output += value[index];
+      continue;
+    }
+    const code = value[++index];
+    const character = code === "0" ? PROTECTED : PROTECTED_CODES.get(code) ?? code;
+    output += `\\${character}`;
+  }
+  return output;
 }
 
 function exportedEnvironment(context) {
@@ -54,8 +119,22 @@ function exportedEnvironment(context) {
   return env;
 }
 
+function unwrapNestedBraceChoice(value) {
+  if (value[0] !== "{") return value;
+  let depth = 0;
+  let comma = false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "{") depth += 1;
+    else if (value[index] === "}" && --depth === 0) {
+      if (index !== value.length - 1 || comma) return value;
+      return unwrapNestedBraceChoice(value.slice(1, -1));
+    } else if (value[index] === "," && depth === 1) comma = true;
+  }
+  return value;
+}
+
 function expandBraces(value, output = [], depth = 0) {
-  if (depth > 64 || output.length > 32768) throw new RangeError("Brace expansion is too large");
+  if (depth > 256 || output.length > 32768) throw new RangeError("Brace expansion is too large");
   let open = -1;
   let nesting = 0;
   let escaped = false;
@@ -95,7 +174,9 @@ function expandBraces(value, output = [], depth = 0) {
   if (choices.length === 1) { output.push(value); return output; }
   const prefix = value.slice(0, open);
   const suffix = value.slice(close + 1);
-  for (const choice of choices) expandBraces(prefix + choice + suffix, output, depth + 1);
+  for (const choice of choices) {
+    expandBraces(prefix + unwrapNestedBraceChoice(choice) + suffix, output, depth + 1);
+  }
   return output;
 }
 
@@ -151,13 +232,14 @@ function globCandidates(pattern, cwd) {
       continue;
     }
 
-    const magic = /[*?[\]]/.test(segment);
-    const matcher = magic ? picomatch(segment, { dot: segment.startsWith(".") }) : null;
+    const magic = hasGlobSyntax(segment);
+    const literalSegment = restoreProtectedSyntax(segment);
+    const matcher = magic ? picomatch(globMatcherPattern(segment), { dot: literalSegment.startsWith(".") }) : null;
     const next = [];
     for (const candidate of candidates) {
       const names = magic
         ? (() => { try { return readdirSync(candidate.path).map(String).sort(); } catch { return []; } })()
-        : [segment];
+        : [literalSegment];
       for (const name of names) {
         if (matcher && !matcher(name)) continue;
         const path = join(candidate.path, name);
@@ -232,8 +314,16 @@ async function expandParameter(expression, context, execute, quoted) {
   return state.value;
 }
 
+function commandSubstitutionText(value, quoted) {
+  if (quoted) return value.replace(/[ \n\t\r]+$/, "");
+  return value
+    .replace(/\n/g, " ")
+    .trim()
+    .replace(/[ \t\r]+/g, " ");
+}
+
 async function expandText(text, context, execute, quoted) {
-  let output = "";
+  const output = [];
   for (let index = 0; index < text.length;) {
     if (text.startsWith("$(", index)) {
       let cursor = index + 2;
@@ -252,7 +342,7 @@ async function expandText(text, context, execute, quoted) {
       }
       const script = text.slice(index + 2, cursor);
       const substitution = await execute(parseShell(script), cloneContext(context), bytes());
-      output += decoder.decode(substitution.stdout).replace(/\n+$/, "");
+      output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
       context.status = substitution.exitCode;
       index = cursor + 1;
@@ -269,34 +359,46 @@ async function expandText(text, context, execute, quoted) {
       }
       const script = text.slice(index + 1, cursor).replace(/\\`/g, "`");
       const substitution = await execute(parseShell(script), cloneContext(context), bytes());
-      output += decoder.decode(substitution.stdout).replace(/\n+$/, "");
+      output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
       context.status = substitution.exitCode;
       index = cursor + 1;
       continue;
     }
     if (text[index] !== "$") {
-      output += text[index++];
+      const dollar = text.indexOf("$", index);
+      const backtick = text.indexOf("`", index);
+      const next = dollar < 0 ? backtick : backtick < 0 ? dollar : Math.min(dollar, backtick);
+      const end = next < 0 ? text.length : next;
+      output.push(text.slice(index, end));
+      index = end;
       continue;
     }
     if (text[index + 1] === "{") {
       const close = closingParameterBrace(text, index + 2);
-      if (close < 0) { output += "$"; index += 1; continue; }
+      if (close < 0) { output.push("$"); index += 1; continue; }
       const expression = text.slice(index + 2, close);
-      output += await expandParameter(expression, context, execute, quoted);
+      output.push(await expandParameter(expression, context, execute, quoted));
       index = close + 1;
       continue;
     }
     const match = /^(?:[A-Za-z_][A-Za-z0-9_]*|[?*@#$!\-]|\d+)/.exec(text.slice(index + 1));
-    if (!match) { output += "$"; index += 1; continue; }
-    output += parameterValue(match[0], context);
+    if (!match) { output.push("$"); index += 1; continue; }
+    output.push(parameterValue(match[0], context));
     index += match[0].length + 1;
   }
-  return output;
+  return output.join("");
 }
 
 function hasGlobSyntax(value) {
-  return value.includes("*") || value.includes("?") || value.includes("[");
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === PROTECTED) {
+      index += 1;
+      continue;
+    }
+    if (value[index] === "*" || value[index] === "?" || value[index] === "[") return true;
+  }
+  return false;
 }
 
 function appendExpandedSegment(fields, text, split, globEligible, preserveEmpty) {
@@ -316,7 +418,7 @@ function appendExpandedSegment(fields, text, split, globEligible, preserveEmpty)
     return;
   }
   let cursor = 0;
-  for (const match of text.matchAll(/[ \t\n]+/g)) {
+  for (const match of text.matchAll(/[ \t\n\r]+/g)) {
     append(text.slice(cursor, match.index));
     const current = fields.at(-1);
     if (current?.present || current?.value) current.closed = true;
@@ -327,18 +429,21 @@ function appendExpandedSegment(fields, text, split, globEligible, preserveEmpty)
 
 async function expandWord(word, context, execute, { assignment = false, redirect = false } = {}) {
   const quoted = word.parts.some(part => part.quote !== "unquoted");
+  const braceEligible = word.parts.some(part => part.quote === "unquoted" && part.text.includes("{") && part.text.includes(","));
   const tildeEligible = word.parts[0]?.quote === "unquoted" && word.parts[0].text.startsWith("~");
   const expandedFromValue = word.parts.some(part => part.expand && (/\$(?:\(|\{|[A-Za-z_?*@#0-9])/.test(part.text) || part.text.includes("`")));
   const expandedParts = [];
   for (const part of word.parts) {
+    const value = part.expand ? await expandText(part.text, context, execute, part.quote !== "unquoted") : part.text;
     expandedParts.push({
       ...part,
-      value: part.expand ? await expandText(part.text, context, execute, part.quote !== "unquoted") : part.text,
+      value: part.quote === "unquoted" ? escapeProtectionMarker(value) : protectShellSyntax(value),
     });
   }
   const fields = [];
   if (!quoted) {
-    for (const value of expandBraces(expandedParts.map(part => part.value).join(""))) {
+    const joined = expandedParts.map(part => part.value).join("");
+    for (const value of braceEligible ? expandBraces(joined) : [joined]) {
       appendExpandedSegment(fields, value, !assignment && !redirect, true, assignment || redirect);
       if (fields.length) fields.at(-1).closed = true;
     }
@@ -355,8 +460,20 @@ async function expandWord(word, context, execute, { assignment = false, redirect
     }
   }
 
-  const values = [];
+  const braceExpandedFields = [];
   for (const field of fields) {
+    const expansions = braceEligible && field.value.includes("{") ? expandBraces(field.value) : [field.value];
+    for (const value of expansions) {
+      braceExpandedFields.push({
+        ...field,
+        value,
+        globEligible: field.globEligible || hasGlobSyntax(value),
+      });
+    }
+  }
+
+  const values = [];
+  for (const field of braceExpandedFields) {
     if (!field.present && field.value === "" && !assignment && !redirect) continue;
     let value = field.value;
     if (tildeEligible && value.startsWith("~") && (value.length === 1 || value[1] === "/")) {
@@ -366,15 +483,15 @@ async function expandWord(word, context, execute, { assignment = false, redirect
       const matches = globCandidates(value, context.cwd);
       if (matches.length === 0) {
         if (expandedFromValue) {
-          values.push(value);
+          values.push(restoreProtectedSyntax(value));
           continue;
         }
-        const error = new Error(`bun: no matches found: ${value}`);
+        const error = new Error(`bun: no matches found: ${restoreProtectedSyntax(value)}`);
         error.code = "BUN_SHELL_NO_MATCH";
         throw error;
       }
       values.push(...matches);
-    } else if (value !== "" || field.present || assignment || redirect) values.push(value);
+    } else if (value !== "" || field.present || assignment || redirect) values.push(restoreProtectedSyntax(value));
   }
   return values;
 }
@@ -415,14 +532,58 @@ async function prepareRedirects(redirects, context, execute) {
   return prepared;
 }
 
-async function redirectedInput(redirects, context, input, commandName) {
+function closePreparedRedirects(redirects) {
   for (const redirect of redirects) {
-    if (!["<", "<<", "0<", "0<<"].includes(redirect.operator)) continue;
+    if (redirect.fd == null) continue;
+    try { closeSync(redirect.fd); } catch {}
+    redirect.openRedirects?.delete(redirect.fd);
+    redirect.fd = null;
+  }
+}
+
+function writeAllSync(fd, value) {
+  let offset = 0;
+  while (offset < value.byteLength) {
+    const written = writeSync(fd, value, offset, value.byteLength - offset, null);
+    if (written <= 0) throw new Error("Unable to write redirected output");
+    offset += written;
+  }
+}
+
+async function setupRedirects(redirects, context, input, commandName) {
+  const inputPaths = new Set();
+  for (const redirect of redirects) {
     if (redirect.ambiguous) {
       return { error: result(1, "", `bun: ambiguous redirect: at \`${commandName}\`\n`), input };
     }
-    try { input = bytes(readFileSync(redirect.path)); }
-    catch (error) { return { error: result(1, "", fileReason(error, redirect.targetValue)), input }; }
+    if (INPUT_REDIRECTS.has(redirect.operator)) {
+      try {
+        if (isStreamingInput(input)) cancelPipelineInput(input);
+        input = bytes(readFileSync(redirect.path));
+        inputPaths.clear();
+        inputPaths.add(redirect.path);
+      } catch (error) {
+        closePreparedRedirects(redirects);
+        return { error: result(1, "", fileReason(error, redirect.targetValue)), input };
+      }
+      continue;
+    }
+    if (redirect.target == null) continue;
+
+    try {
+      if (redirect.outputTarget != null) {
+        if (redirect.outputTarget instanceof ArrayBuffer) new Uint8Array(redirect.outputTarget);
+        else new Uint8Array(redirect.outputTarget.buffer, redirect.outputTarget.byteOffset, redirect.outputTarget.byteLength);
+      } else {
+        redirect.fd = openSync(redirect.path, redirect.operator.endsWith(">>") ? "a" : "w", 0o666);
+        redirect.openRedirects = context.openRedirects;
+        context.openRedirects.add(redirect.fd);
+        if (!redirect.operator.endsWith(">>") && inputPaths.has(redirect.path)) input = bytes();
+      }
+    } catch (error) {
+      closePreparedRedirects(redirects);
+      return { error: result(1, "", fileReason(error, redirect.targetValue)), input };
+    }
   }
   return { input, error: null };
 }
@@ -449,7 +610,7 @@ async function applyRedirects(commandResult, redirects) {
   };
 
   for (const redirect of redirects) {
-    if (["<", "<<", "0<", "0<<"].includes(redirect.operator)) continue;
+    if (INPUT_REDIRECTS.has(redirect.operator)) continue;
     if (redirect.operator === "2>&1") {
       routes[2] = routes[1];
       continue;
@@ -472,7 +633,7 @@ async function applyRedirects(commandResult, redirects) {
   routes[2].chunks.push(bytes(commandResult.stderr));
   for (const destination of destinations) {
     const stream = concat(destination.chunks);
-    const { redirect, append } = destination;
+    const { redirect } = destination;
     try {
       const outputTarget = redirect.outputTarget;
       if (outputTarget != null) {
@@ -480,13 +641,15 @@ async function applyRedirects(commandResult, redirects) {
           ? new Uint8Array(outputTarget)
           : new Uint8Array(outputTarget.buffer, outputTarget.byteOffset, outputTarget.byteLength);
         view.set(stream.subarray(0, view.byteLength));
-      } else if (append) appendFileSync(redirect.path, stream);
-      else writeFileSync(redirect.path, stream);
+      } else if (stream.byteLength > 0) {
+        writeAllSync(redirect.fd, stream);
+      }
     } catch (error) {
       stderrCapture.chunks.push(bytes(fileReason(error, redirect.targetValue)));
       exitCode = 1;
     }
   }
+  closePreparedRedirects(redirects);
   return {
     ...commandResult,
     exitCode,
@@ -495,13 +658,111 @@ async function applyRedirects(commandResult, redirects) {
   };
 }
 
-async function collectProcess(child) {
-  const [exitCode, stdout, stderr] = await Promise.all([
+const pipelineInputChannels = new WeakMap();
+
+function createPipelineChannel() {
+  let controller;
+  let cancelled = false;
+  let closed = false;
+  const ready = [];
+  const wake = () => {
+    while (ready.length) ready.shift()();
+  };
+  const stream = new ReadableStream({
+    start(value) { controller = value; },
+    pull() { wake(); },
+    cancel() {
+      cancelled = true;
+      closed = true;
+      wake();
+    },
+  }, { highWaterMark: 1 });
+
+  const channel = {
+    stream,
+    get cancelled() { return cancelled; },
+    async waitForConsumer() {
+      for (let attempt = 0; attempt < 64 && !cancelled && !stream.locked; attempt += 1) {
+        await Promise.resolve();
+      }
+    },
+    async write(value) {
+      const chunk = bytes(value);
+      if (chunk.byteLength === 0) return !cancelled;
+      while (!cancelled && !closed && controller.desiredSize != null && controller.desiredSize <= 0) {
+        await new Promise(resolveReady => ready.push(resolveReady));
+      }
+      if (cancelled || closed) return false;
+      try {
+        controller.enqueue(chunk);
+        return true;
+      } catch {
+        cancelled = true;
+        closed = true;
+        wake();
+        return false;
+      }
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      try { controller.close(); } catch {}
+      wake();
+    },
+    cancel() {
+      if (closed) return;
+      cancelled = true;
+      closed = true;
+      try { controller.close(); } catch {}
+      wake();
+    },
+  };
+  pipelineInputChannels.set(stream, channel);
+  return channel;
+}
+
+function isStreamingInput(input) {
+  return input != null && typeof input.getReader === "function";
+}
+
+function cancelPipelineInput(input) {
+  pipelineInputChannels.get(input)?.cancel();
+}
+
+async function collectProcess(child, pipelineOutput = null) {
+  if (pipelineOutput == null) {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout?.bytes?.() ?? Promise.resolve(bytes()),
+      child.stderr?.bytes?.() ?? Promise.resolve(bytes()),
+    ]);
+    return result(exitCode == null ? 1 : Number(exitCode), stdout, stderr);
+  }
+
+  const cancelledBeforeSpawn = pipelineOutput.cancelled;
+  let pipeClosed = cancelledBeforeSpawn;
+  let sentPipeSignal = false;
+  const pumpStdout = async () => {
+    if (child.stdout == null) return;
+    for await (const chunk of child.stdout) {
+      if (!pipeClosed && await pipelineOutput.write(chunk)) continue;
+      pipeClosed = true;
+      if (!sentPipeSignal) {
+        sentPipeSignal = true;
+        child.kill?.(globalThis.process?.platform === "win32" ? "SIGTERM" : "SIGPIPE");
+      }
+    }
+  };
+  const [exitCode, , stderr] = await Promise.all([
     child.exited,
-    child.stdout?.bytes?.() ?? Promise.resolve(bytes()),
+    pumpStdout(),
     child.stderr?.bytes?.() ?? Promise.resolve(bytes()),
   ]);
-  return result(exitCode == null ? 1 : Number(exitCode), stdout, stderr);
+  return {
+    ...result(exitCode == null ? 1 : Number(exitCode), "", stderr),
+    piped: true,
+    pipeClosed,
+  };
 }
 
 function conditionalStat(value, context, symbolic = false) {
@@ -609,13 +870,33 @@ export function createBunShellRuntime(host) {
     const redirects = await prepareRedirects(node.redirects, context, execute);
     const redirectFailure = ambiguousRedirect(redirects, name);
     if (redirectFailure) return redirectFailure;
-    const redirected = await redirectedInput(redirects, context, input, name);
+    const redirected = await setupRedirects(redirects, context, input, name);
     if (redirected.error) return redirected.error;
     const commandResult = await callback(redirected.input);
     return applyRedirects(commandResult, redirects);
   }
 
-  async function execute(node, context, input = bytes()) {
+  function isAssignmentOnlyPipelineItem(node) {
+    return node.type === "command"
+      && (node.redirects?.length ?? 0) === 0
+      && node.words.length > 0
+      && node.words.every(word => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.raw));
+  }
+
+  async function executePipelineStage(node, context, input, output) {
+    try {
+      const stageResult = await execute(node, context, input, output);
+      if (isStreamingInput(input)) cancelPipelineInput(input);
+      if (output != null && !stageResult.piped) await output.write(stageResult.stdout);
+      output?.close();
+      return output == null ? stageResult : { ...stageResult, stdout: bytes() };
+    } catch (error) {
+      output?.cancel(error);
+      throw error;
+    }
+  }
+
+  async function execute(node, context, input = bytes(), pipelineOutput = null) {
     if (node.type === "script") {
       const stdout = [];
       const stderr = [];
@@ -641,19 +922,28 @@ export function createBunShellRuntime(host) {
     }
 
     if (node.type === "pipeline") {
-      let pipeInput = input;
-      let current = result();
-      const stderr = [];
-      for (const item of node.items) {
-        current = await execute(item, cloneContext(context), pipeInput);
-        pipeInput = current.stdout;
-        stderr.push(current.stderr);
+      const items = node.items.filter(item => !isAssignmentOnlyPipelineItem(item));
+      if (items.length === 0) {
+        if (isStreamingInput(input)) cancelPipelineInput(input);
+        return result();
       }
-      return { exitCode: current.exitCode, stdout: current.stdout, stderr: concat(stderr) };
+      const channels = Array.from({ length: Math.max(0, items.length - 1) }, createPipelineChannel);
+      const stages = new Array(items.length);
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const stageInput = index === 0 ? input : channels[index - 1].stream;
+        const stageOutput = index === items.length - 1 ? null : channels[index];
+        stages[index] = executePipelineStage(items[index], cloneContext(context), stageInput, stageOutput);
+        // Start consumers before producers so an input-ignoring command can
+        // close the upstream socket before the producer performs useful work.
+        if (index > 0) await channels[index - 1].waitForConsumer();
+      }
+      const completed = await Promise.all(stages);
+      const current = completed.at(-1) ?? result();
+      return { ...current, exitCode: current.exitCode, stderr: concat(completed.map(item => item.stderr)), shellExit: false };
     }
 
     if (node.type === "negate") {
-      const commandResult = await execute(node.command, context, input);
+      const commandResult = await execute(node.command, context, input, pipelineOutput);
       if (commandResult.shellExit) return commandResult;
       return { ...commandResult, exitCode: commandResult.exitCode === 0 ? 1 : 0 };
     }
@@ -728,7 +1018,7 @@ export function createBunShellRuntime(host) {
     const redirects = await prepareRedirects(node.redirects, context, execute);
     const redirectFailure = ambiguousRedirect(redirects, commandName);
     if (redirectFailure) return redirectFailure;
-    const redirected = await redirectedInput(redirects, context, input, commandName);
+    const redirected = await setupRedirects(redirects, context, input, commandName);
     if (redirected.error) return redirected.error;
     input = redirected.input;
 
@@ -757,11 +1047,13 @@ export function createBunShellRuntime(host) {
     }
     if (expanded.length === 0) {
       for (const assignment of assignments) context.env[assignment.name] = assignment.value;
-      const passthrough = input.byteLength ? input : bytes();
-      return applyRedirects(result(expansionHadCommandSubstitution ? context.status : 0, passthrough, expansionStderr), redirects);
+      if (isStreamingInput(input)) cancelPipelineInput(input);
+      return applyRedirects(result(expansionHadCommandSubstitution ? context.status : 0, "", expansionStderr), redirects);
     }
 
-    const commandContext = assignments.length ? cloneContext(context) : context;
+    const commandContext = assignments.length
+      ? cloneContext(context, { preserveCommandEnv: true })
+      : context;
     for (const assignment of assignments) {
       commandContext.env[assignment.name] = assignment.value;
       commandContext.exported[assignment.name] = true;
@@ -769,7 +1061,10 @@ export function createBunShellRuntime(host) {
       context.externalEnv[assignment.name] = assignment.value;
     }
     let [name, ...args] = expanded;
-    let commandResult = await runBuiltin(name, args, commandContext, input);
+    let commandResult = await runBuiltin(name, args, commandContext, input, pipelineOutput);
+    if (commandResult != null && isStreamingInput(input) && commandResult.consumedInput !== true) {
+      cancelPipelineInput(input);
+    }
 
     const resolvedRuntimePath = resolve(host.execPath);
     const invokesRuntime = name === "bun"
@@ -806,12 +1101,15 @@ export function createBunShellRuntime(host) {
         const child = host.spawn([name, ...args], {
           cwd: commandContext.cwd,
           env: exportedEnvironment(commandContext),
-          stdin: input.byteLength ? input : "ignore",
+          stdin: isStreamingInput(input) ? input : input.byteLength ? input : "ignore",
           stdout: "pipe",
           stderr: "pipe",
         });
-        commandResult = await collectProcess(child);
+        const streamsToPipeline = pipelineOutput != null
+          && redirects.every(redirect => INPUT_REDIRECTS.has(redirect.operator));
+        commandResult = await collectProcess(child, streamsToPipeline ? pipelineOutput : null);
       } catch (error) {
+        if (isStreamingInput(input)) cancelPipelineInput(input);
         commandResult = result(1, "", `bun: command not found: ${expanded[0]}\n`);
       }
     }
@@ -832,6 +1130,7 @@ export function createBunShellRuntime(host) {
       argv: [...host.argv()],
       outputTargets: options.outputTargets,
       background: [],
+      openRedirects: new Set(),
       pid: globalThis.process?.pid,
       concat,
     };
@@ -849,6 +1148,11 @@ export function createBunShellRuntime(host) {
       if (error?.code === "BUN_SHELL_NO_MATCH") return { status: 1, stdout: bytes(), stderr: bytes(`${error.message}\n`) };
       if (error?.code === "BUN_SHELL_PARAMETER") return { status: 1, stdout: bytes(), stderr: bytes(`${error.message}\n`) };
       throw error;
+    } finally {
+      for (const fd of context.openRedirects) {
+        try { closeSync(fd); } catch {}
+      }
+      context.openRedirects.clear();
     }
   };
 }

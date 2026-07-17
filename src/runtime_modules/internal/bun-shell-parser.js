@@ -9,13 +9,56 @@ function syntax(message, position) {
 }
 
 function decodeAnsiCString(source) {
-  return source.replace(/\\(x[\da-fA-F]{1,2}|[0-7]{1,3}|.)/gs, (_, escape) => {
-    if (escape[0] === "x") return String.fromCharCode(Number.parseInt(escape.slice(1), 16));
-    if (/^[0-7]/.test(escape)) return String.fromCharCode(Number.parseInt(escape, 8));
-    return ({
+  let output = "";
+  for (let index = 0; index < source.length;) {
+    if (source[index] !== "\\") {
+      output += source[index++];
+      continue;
+    }
+
+    const escaped = source[index + 1];
+    if (escaped == null) {
+      output += "\\";
+      break;
+    }
+    index += 2;
+    if (escaped === "x") {
+      const match = /^[\da-fA-F]{1,2}/.exec(source.slice(index));
+      if (!match) {
+        output += "\\x";
+        continue;
+      }
+      output += String.fromCharCode(Number.parseInt(match[0], 16));
+      index += match[0].length;
+      continue;
+    }
+    if (escaped === "u" || escaped === "U") {
+      const width = escaped === "u" ? 4 : 8;
+      const match = new RegExp(`^[\\da-fA-F]{${width}}`).exec(source.slice(index));
+      if (!match) {
+        output += `\\${escaped}`;
+        continue;
+      }
+      const codePoint = Number.parseInt(match[0], 16);
+      output += codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : "\ufffd";
+      index += width;
+      continue;
+    }
+    if (/[0-7]/.test(escaped)) {
+      const tail = /^[0-7]{0,2}/.exec(source.slice(index))?.[0] ?? "";
+      output += String.fromCharCode(Number.parseInt(escaped + tail, 8));
+      index += tail.length;
+      continue;
+    }
+    if (escaped === "c" && source[index] != null) {
+      output += String.fromCharCode(source.charCodeAt(index++) & 0x1f);
+      continue;
+    }
+    output += ({
       a: "\x07",
       b: "\b",
       e: "\x1b",
+      E: "\x1b",
       f: "\f",
       n: "\n",
       r: "\r",
@@ -24,8 +67,10 @@ function decodeAnsiCString(source) {
       "\\": "\\",
       "'": "'",
       '"': '"',
-    })[escape] ?? escape;
-  });
+      "?": "?",
+    })[escaped] ?? escaped;
+  }
+  return output;
 }
 
 function appendPart(parts, text, quote, expand = quote !== "single") {
@@ -65,7 +110,7 @@ function readBalancedSubstitution(source, start) {
     else if (char === ")" && --depth === 0) return index + 1;
     index += 1;
   }
-  throw syntax("Unterminated command substitution", start);
+  throw syntax("Unclosed command substitution", start);
 }
 
 function readBacktick(source, start) {
@@ -78,13 +123,12 @@ function readBacktick(source, start) {
     else if (char === "`") return index + 1;
     index += 1;
   }
-  throw syntax("Unterminated command substitution", start);
+  throw syntax("Unclosed command substitution", start);
 }
 
 function operatorAt(source, index, atWordStart) {
-  const rest = source.slice(index);
-  for (const operator of ["2>&1", "1>&2", ">&2", ">&1", "0<<", "0<", "&>>", "&>", "2>>", "1>>", ">>", "2>", "1>", "<<", "&&", "||", ";;", "|&"]) {
-    if (rest.startsWith(operator)) return operator;
+  for (const operator of ["2>&1", "1>&2", ">&2", ">&1", "0<<", "0>>", "0<", "0>", "&>>", "&>", "2>>", "1>>", ">>", "2>", "1>", "<<", "&&", "||", ";;", "|&"]) {
+    if (source.startsWith(operator, index)) return operator;
   }
   const char = source[index];
   if (";|()<>&".includes(char)) return char;
@@ -123,7 +167,7 @@ export function lexShell(source) {
 
     const position = index;
     const parts = [];
-    let raw = "";
+    const raw = [];
     while (index < source.length) {
       const current = source[index];
       if (/\s/.test(current) || operatorAt(source, index, false)) break;
@@ -135,11 +179,11 @@ export function lexShell(source) {
         const next = source[index + 1];
         if (next == null) {
           appendPart(parts, "\\", "literal", false);
-          raw += "\\";
+          raw.push("\\");
           index += 1;
         } else {
           appendPart(parts, next, "literal", false);
-          raw += source.slice(index, index + 2);
+          raw.push(source.slice(index, index + 2));
           index += 2;
         }
         continue;
@@ -148,13 +192,13 @@ export function lexShell(source) {
         const quote = current;
         const quoteName = quote === "'" ? "single" : "double";
         const quoteStart = index++;
-        raw += quote;
-        let text = "";
+        raw.push(quote);
+        const text = [];
         let emitted = false;
         const flushQuotedText = () => {
-          if (text === "") return;
-          appendPart(parts, text, quoteName, quoteName !== "single");
-          text = "";
+          if (text.length === 0) return;
+          appendPart(parts, text.join(""), quoteName, quoteName !== "single");
+          text.length = 0;
           emitted = true;
         };
         while (index < source.length && source[index] !== quote) {
@@ -164,29 +208,38 @@ export function lexShell(source) {
               appendPart(parts, source[index + 1], quoteName, false);
               emitted = true;
             }
-            raw += source.slice(index, index + 2);
+            raw.push(source.slice(index, index + 2));
             index += 2;
             continue;
           }
           if (quote === '"' && source.startsWith("$(", index)) {
             const end = readBalancedSubstitution(source, index);
-            text += source.slice(index, end);
-            raw += source.slice(index, end);
+            const chunk = source.slice(index, end);
+            text.push(chunk);
+            raw.push(chunk);
             index = end;
             continue;
           }
           if (quote === '"' && source[index] === "`") {
             const end = readBacktick(source, index);
-            text += source.slice(index, end);
-            raw += source.slice(index, end);
+            const chunk = source.slice(index, end);
+            text.push(chunk);
+            raw.push(chunk);
             index = end;
             continue;
           }
-          text += source[index];
-          raw += source[index++];
+          const chunkStart = index;
+          while (index < source.length && source[index] !== quote) {
+            if (quote === '"' && source[index] === "\\" && /[$`"\\\n]/.test(source[index + 1] ?? "")) break;
+            if (quote === '"' && (source.startsWith("$(", index) || source[index] === "`")) break;
+            index += 1;
+          }
+          const chunk = source.slice(chunkStart, index);
+          text.push(chunk);
+          raw.push(chunk);
         }
         if (index >= source.length) throw syntax(`Unterminated ${quoteName} quote`, quoteStart);
-        raw += source[index++];
+        raw.push(source[index++]);
         flushQuotedText();
         if (!emitted) appendPart(parts, "", quoteName, quoteName !== "single");
         continue;
@@ -194,44 +247,56 @@ export function lexShell(source) {
       if (current === "$" && source[index + 1] === "'") {
         const quoteStart = index;
         index += 2;
-        let text = "";
+        const text = [];
         while (index < source.length && source[index] !== "'") {
           if (source[index] === "\\" && index + 1 < source.length) {
-            text += source.slice(index, Math.min(source.length, index + 4));
-            index += 1;
-          } else {
-            text += source[index++];
+            text.push(source.slice(index, index + 2));
+            index += 2;
+            continue;
           }
+          const chunkStart = index;
+          while (index < source.length && source[index] !== "'" && source[index] !== "\\") index += 1;
+          text.push(source.slice(chunkStart, index));
         }
         if (index >= source.length) throw syntax("Unterminated ANSI-C quote", quoteStart);
         index += 1;
-        raw += source.slice(quoteStart, index);
-        appendPart(parts, decodeAnsiCString(text), "single", false);
+        raw.push(source.slice(quoteStart, index));
+        appendPart(parts, decodeAnsiCString(text.join("")), "single", false);
         continue;
       }
       if (source.startsWith("$(", index)) {
         const end = readBalancedSubstitution(source, index);
-        appendPart(parts, source.slice(index, end), "unquoted", true);
-        raw += source.slice(index, end);
+        const chunk = source.slice(index, end);
+        appendPart(parts, chunk, "unquoted", true);
+        raw.push(chunk);
         index = end;
         continue;
       }
       if (current === "`") {
         const end = readBacktick(source, index);
-        appendPart(parts, source.slice(index, end), "unquoted", true);
-        raw += source.slice(index, end);
+        const chunk = source.slice(index, end);
+        appendPart(parts, chunk, "unquoted", true);
+        raw.push(chunk);
         index = end;
         continue;
       }
-      appendPart(parts, current, "unquoted", true);
-      raw += current;
-      index += 1;
+      const chunkStart = index;
+      while (index < source.length) {
+        const chunkCharacter = source[index];
+        if (/\s/.test(chunkCharacter) || operatorAt(source, index, false)) break;
+        if (chunkCharacter === "\\" || chunkCharacter === "'" || chunkCharacter === '"' || chunkCharacter === "`") break;
+        if (chunkCharacter === "$" && (source[index + 1] === "'" || source[index + 1] === "(")) break;
+        index += 1;
+      }
+      const chunk = source.slice(chunkStart, index);
+      appendPart(parts, chunk, "unquoted", true);
+      raw.push(chunk);
     }
     if (parts.length === 0) {
       if (index > position) continue;
       throw syntax(`Unexpected token: \`${source[index]}\``, index);
     }
-    tokens.push({ type: "word", parts, raw, position });
+    tokens.push({ type: "word", parts, raw: raw.join(""), position });
     wordStart = false;
   }
 
@@ -239,7 +304,7 @@ export function lexShell(source) {
   return tokens;
 }
 
-const REDIRECTS = new Set(["<", "<<", "0<", "0<<", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
+const REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
 
 class Parser {
   constructor(tokens) {
@@ -254,7 +319,7 @@ class Parser {
   consumeWord(value) { if (!this.isWord(value)) return false; this.index += 1; return true; }
   skipSeparators() { while (this.consumeOp(";")) {} }
 
-  parse(stopWords = new Set(), stopOperators = new Set([")"])) {
+  parse(stopWords = new Set(), stopOperators = new Set()) {
     const items = [];
     this.skipSeparators();
     while (!this.isStop(stopWords, stopOperators)) {
@@ -268,6 +333,7 @@ class Parser {
       }
       if (!this.consumeOp(";")) {
         if (!this.isStop(stopWords, stopOperators)) {
+          if (this.isOp(")")) throw syntax("Unexpected ')'", this.peek().position);
           throw syntax(`Unexpected token: \`${this.peek().raw ?? this.peek().value}\``, this.peek().position);
         }
       }
@@ -327,7 +393,7 @@ class Parser {
 
     if (this.consumeOp("(")) {
       const script = this.parse(new Set(), new Set([")"]));
-      if (!this.consumeOp(")")) throw syntax("Expected `)`", this.peek().position);
+      if (!this.consumeOp(")")) throw syntax("Unclosed subshell", this.peek().position);
       const redirects = this.parseRedirects();
       return { type: "subshell", script, redirects };
     }
@@ -401,6 +467,8 @@ class Parser {
       break;
     }
     if (words.length === 0 && redirects.length === 0) {
+      if (this.peek().type === "eof") throw syntax("Unexpected EOF", this.peek().position);
+      if (this.isOp(")")) throw syntax("Unexpected ')'", this.peek().position);
       throw syntax(`Unexpected token: \`${this.peek().raw ?? this.peek().value}\``, this.peek().position);
     }
     return { type: "command", words, redirects };
@@ -410,6 +478,9 @@ class Parser {
 export function parseShell(source) {
   const parser = new Parser(lexShell(source));
   const script = parser.parse();
-  if (parser.peek().type !== "eof") throw syntax(`Unexpected token: \`${parser.peek().value}\``, parser.peek().position);
+  if (parser.peek().type !== "eof") {
+    if (parser.isOp(")")) throw syntax("Unexpected ')'", parser.peek().position);
+    throw syntax(`Unexpected token: \`${parser.peek().value}\``, parser.peek().position);
+  }
   return script;
 }
