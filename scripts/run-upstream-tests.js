@@ -7,7 +7,11 @@ import { join, relative, resolve } from 'path';
 
 const rootDir = process.cwd();
 const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
-const binaryPath = join(rootDir, 'zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail');
+let binaryPath = resolve(
+  rootDir,
+  process.env.COTTONTAIL_UPSTREAM_BINARY ??
+    join('zig-out', 'bin', process.platform === 'win32' ? 'cottontail.exe' : 'cottontail'),
+);
 const pythonPath = process.env.PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3');
 const tempBase = process.env.COTTONTAIL_UPSTREAM_TMPDIR ?? (process.platform === 'darwin' ? '/tmp' : os.tmpdir());
 const tempRoot = mkdtempSync(join(tempBase, 'cottontail-upstream-tests-'));
@@ -107,6 +111,7 @@ function usage() {
     'Usage: node scripts/run-upstream-tests.js [node|bun|all] [options]',
     '',
     'Options:',
+    '  --binary <path>              Use an immutable Cottontail executable for this run.',
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
     '  --jobs <n>                   Run independent Bun files/cases concurrently (default: up to 4).',
@@ -135,6 +140,7 @@ function parseArgs(argv) {
     maxTests: Infinity,
     match: null,
     caseMatch: null,
+    binary: null,
     serialRetry: true,
     onlyStatus: null,
     test: null,
@@ -143,6 +149,8 @@ function parseArgs(argv) {
     const arg = args.shift();
     if (arg === '--include-expected-failures') {
       options.includeExpectedFailures = true;
+    } else if (arg === '--binary') {
+      options.binary = args.shift() ?? fail('--binary requires a path');
     } else if (arg === '--case') {
       const value = args.shift() ?? fail('--case requires a regular expression');
       try {
@@ -774,6 +782,7 @@ function runtimeTargets(runtime, targets) {
 }
 
 const { runtime, options } = parseArgs(process.argv.slice(2));
+if (options.binary != null) binaryPath = resolve(rootDir, options.binary);
 if (!existsSync(targetsPath)) fail(`Missing ${targetsPath}`);
 if (!options.list) {
   if (!existsSync(binaryPath)) fail(`Built cottontail binary not found at ${binaryPath}. Run "bun run build" first.`);
