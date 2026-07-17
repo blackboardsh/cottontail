@@ -682,6 +682,16 @@ export class Socket extends EventEmitter {
   }
 
   destroy(error) {
+    if (this._tlsOwner) {
+      const tlsOwner = this._tlsOwner;
+      this._tlsOwner = null;
+      tlsOwner.destroy(error);
+      if (!this._tlsCloseEmitted) {
+        this._tlsCloseEmitted = true;
+        this.emit("close", Boolean(error));
+      }
+      return this;
+    }
     if (this.destroyed) return this;
     this.destroyed = true;
     this.readable = false;

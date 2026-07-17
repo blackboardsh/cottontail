@@ -1401,6 +1401,14 @@
       "reason": "Bun shell conditional success and failure fixtures complete without hanging and report the expected process status; load-sensitive, runs in the serial bucket.",
       "serial": true
     },
+    "test/js/bun/shell/shell-blocking-pipe.test.ts": {
+      "status": "enabled",
+      "reason": "Lazy asynchronous Bun.$ execution keeps the JavaScript event loop responsive while child pipes are active (2 copied upstream cases)."
+    },
+    "test/js/bun/shell/shell-load.test.ts": {
+      "status": "enabled",
+      "reason": "Large shell scripts spill to a temporary script instead of exceeding the platform command-argument limit (1 copied upstream case, 1 assertion)."
+    },
     "test/js/bun/shell/shell-seq-condexpr.test.ts": {
       "status": "enabled",
       "reason": "Bun shell rejects non-finite seq operands without hanging and handles empty file/directory conditional expressions."
@@ -1908,6 +1916,14 @@
       "status": "enabled",
       "reason": "Bun.hash and its Wyhash, Adler-32, CRC-32, CityHash, xxHash, Murmur, and RapidHash variants pass exact upstream vectors and 64-bit seed coverage through Zig implementations."
     },
+    "test/js/bun/util/heap-snapshot.test.ts": {
+      "status": "expected-failure",
+      "reason": "Stock JSC snapshots work, but this Bun-engine diagnostic fixture requires Bun's custom per-native-cell extra-memory accounting for FormData, Request, Response, URL, Headers, and WebSocket wrappers. Cottontail's JS-hosted wrappers do not yet attach external allocation sizes to individual JSC heap cells."
+    },
+    "test/js/bun/util/v8-heap-snapshot.test.ts": {
+      "status": "enabled",
+      "reason": "Real stock-JSC heap capture, V8 snapshot conversion, ArrayBuffer output, Node v8 streams, default and explicit-path writes, and repeated profiler cleanup pass all six copied upstream cases with 24 assertions."
+    },
     "test/js/bun/util/highlighter.test.ts": {
       "status": "enabled",
       "reason": "Bun syntax highlighter upstream coverage passes under Cottontail."
@@ -2303,6 +2319,18 @@
       "status": "enabled",
       "reason": "The main copied HTTP corpus passes request/response streaming, agents, sockets, timeouts, aborts, trailers, upgrades, headers, errors, and server lifecycle behavior (79 bun:test cases, 129 assertions)."
     },
+    "test/js/node/http2/node-http2-continuation.test.ts": {
+      "status": "enabled",
+      "reason": "Client and server HEADERS/CONTINUATION framing passes all copied coverage for large request headers, response headers, and trailers over native TLS with ALPN (8 bun:test cases)."
+    },
+    "test/js/node/http2/node-http2-upgrade.test.mts": {
+      "status": "enabled",
+      "reason": "Externally accepted net.Socket descriptors upgrade through nonblocking server-side TLS into HTTP/2 sessions with ALPN, request bodies, concurrent clients, close-order safety, and independent sessions (14 bun:test cases)."
+    },
+    "test/js/node/http2/node-http2.test.js": {
+      "status": "enabled",
+      "reason": "The complete copied HTTP/2 behavior corpus passes client/server streams, native TLS and ALPN, HPACK and CONTINUATION, settings, pings, trailers, flow control, malformed-frame errors, graceful lifecycle, and URL forms (251 bun:test cases, 12053 assertions)."
+    },
     "test/js/node/module/module-resolve-filename-paths.test.js": {
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (6 bun:test cases, 10 assertions)."
@@ -2519,6 +2547,10 @@
       "status": "enabled",
       "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 2 assertions)."
     },
+    "test/js/node/tls/node-tls-upgrade.test.ts": {
+      "status": "enabled",
+      "reason": "A paused accepted net.Socket can be upgraded to TLS while preserving backpressure through the native server-side FD bridge (1 copied upstream case, 1 assertion)."
+    },
     "test/js/node/tls/test-node-extra-ca-certs.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 6 assertions)."
@@ -2677,7 +2709,7 @@
     },
     "test/js/node/worker_threads/worker_threads.test.ts": {
       "status": "expected-failure",
-      "reason": "21/27 active cases pass. Remaining coverage requires native per-worker performance metrics, asynchronous worker-owned JSC heap snapshots, global Web Worker data-URL loading/error delivery, plus two Bun-1.3.10-specific legacy error expectations that conflict with the implemented Node behavior."
+      "reason": "24/27 active cases pass, including native per-worker event-loop metrics, worker-owned stock-JSC heap snapshots, and data-URL workers. The remaining three Bun 1.3.10 assertions conflict with implemented Node behavior: two expect supported worker APIs to throw not-implemented errors, and the others require Bun-patched-JSC module/syntax error wording rather than Node-compatible errors."
     },
     "test/js/node/zlib/bytesWritten.test.ts": {
       "status": "enabled",

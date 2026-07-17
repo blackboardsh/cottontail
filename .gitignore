@@ -18,6 +18,7 @@ vm-*-release.log
 
 # test-run artifacts inside the upstream snapshot
 compat/upstream/**/Heap.*.heapsnapshot
+compat/upstream/**/Heap-*.heapsnapshot
 compat/upstream/**/.cottontail-compat-*
 compat/upstream/**/.cottontail-compile-cache/
 compat/upstream/**/fstest*/

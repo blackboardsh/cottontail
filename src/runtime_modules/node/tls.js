@@ -1,7 +1,7 @@
 import { Buffer } from "./buffer.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
 import { X509Certificate, createHash, createDecipheriv } from "./crypto.js";
-import { isIP, Server as NetServer, Socket } from "./net.js";
+import { connect as netConnect, isIP, Server as NetServer, Socket } from "./net.js";
 
 export const CLIENT_RENEG_LIMIT = 3;
 export const CLIENT_RENEG_WINDOW = 600;
@@ -420,12 +420,23 @@ export class TLSSocket extends Socket {
       }
       if (event.type === "end") {
         this.readable = false;
-        listeners.delete(this._tlsId);
+        const tlsId = this._tlsId;
+        listeners.delete(tlsId);
         this._emitEnd();
+        // A TLS close_notify ends both application-data directions. The
+        // native reader retains its connection until this acknowledgement so
+        // queued terminal events cannot race a freed SSL object.
+        if (this._tlsId === tlsId) {
+          try { cottontail.tlsConnectionClose(tlsId); } catch {}
+          this._tlsId = null;
+        }
         return;
       }
       if (event.type === "error") {
-        this.destroy(new Error(event.message || "TLS read failed"));
+        const error = new Error(event.message || "TLS read failed");
+        if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
+        else if (/broken pipe/i.test(error.message)) error.code = "EPIPE";
+        this.destroy(error);
       }
     }));
     this._tlsListenerInstalled = true;
@@ -495,6 +506,9 @@ export class TLSSocket extends Socket {
       listeners?.delete?.(this._tlsId);
       try { cottontail.tlsConnectionClose(this._tlsId); } catch {}
       this._tlsId = null;
+    }
+    if (this._parent && !this._parent._tlsDetached) {
+      try { this._parent.destroy(); } catch {}
     }
     if (error) this.emit("error", error);
     this.emit("close", Boolean(error));
@@ -664,54 +678,87 @@ export class Server extends NetServer {
 
 export function connect(...args) {
   const [options, callback] = normalizeConnectArgs(args);
-  const parentSocket = options.socket;
+  let parentSocket = options.socket;
   const socket = new TLSSocket(parentSocket, options);
   if (typeof callback === "function") socket.once("secureConnect", callback);
-  queueMicrotask(() => {
+
+  const fail = (error) => {
+    if (socket.destroyed) return;
+    socket.authorized = false;
+    socket.authorizationError = error?.message ?? String(error);
+    socket.connecting = false;
+    socket.destroy(error instanceof Error ? error : new Error(String(error)));
+  };
+
+  const upgrade = () => {
+    parentSocket?.removeListener?.("error", fail);
     try {
       const credentials = tlsCredentialOptions(options);
       const servername = options.servername ?? options.host ?? options.hostname ?? "localhost";
       const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
-      let native;
-      if (parentSocket != null) {
-        if (typeof parentSocket._detachFdForTls !== "function" || typeof cottontail.tlsClientConnectFd !== "function") {
-          const error = new TypeError('The "options.socket" property must be a Cottontail net.Socket');
-          error.code = "ERR_INVALID_ARG_TYPE";
-          throw error;
-        }
-        const fd = parentSocket._detachFdForTls();
-        native = cottontail.tlsClientConnectFd(
-          fd,
-          servername,
-          options.rejectUnauthorized !== false,
-          credentials.ca,
-          credentials.cert,
-          credentials.key,
-          credentials.passphrase,
-          alpnProtocols,
-        );
-      } else {
-        native = cottontail.tlsClientConnect(
-          Number(options.port ?? 443),
-          options.host ?? options.hostname ?? "localhost",
-          servername,
-          options.rejectUnauthorized !== false,
-          credentials.ca,
-          credentials.cert,
-          credentials.key,
-          credentials.passphrase,
-          alpnProtocols,
-        );
+      if (typeof parentSocket?._detachFdForTls !== "function" || typeof cottontail.tlsClientConnectFd !== "function") {
+        const error = new TypeError('The "options.socket" property must be a Cottontail net.Socket');
+        error.code = "ERR_INVALID_ARG_TYPE";
+        throw error;
       }
+      const fd = parentSocket._detachFdForTls();
+      const native = cottontail.tlsClientConnectFd(
+        fd,
+        servername,
+        options.rejectUnauthorized !== false,
+        credentials.ca,
+        credentials.cert,
+        credentials.key,
+        credentials.passphrase,
+        alpnProtocols,
+      );
       socket._attachNative(native, "secureConnect");
     } catch (error) {
-      socket.authorized = false;
-      socket.authorizationError = error?.message ?? String(error);
-      socket.connecting = false;
-      socket.destroy(error);
+      fail(error);
+    }
+  };
+
+  if (parentSocket == null) {
+    parentSocket = netConnect({
+      host: options.host ?? options.hostname ?? "localhost",
+      port: Number(options.port ?? 443),
+      family: options.family,
+      localAddress: options.localAddress,
+      localPort: options.localPort,
+    });
+    socket._parent = parentSocket;
+  }
+  parentSocket.once("error", fail);
+  if (parentSocket.connecting) parentSocket.once("connect", upgrade);
+  else queueMicrotask(upgrade);
+  return socket;
+}
+
+export function _upgradeServerSocket(parentSocket, options = {}) {
+  if (typeof parentSocket?._detachFdForTls !== "function" || typeof cottontail.tlsServerUpgradeFd !== "function") {
+    const error = new TypeError("The socket must be a connected Cottontail net.Socket");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const socket = new TLSSocket(parentSocket, options);
+  const fd = parentSocket._detachFdForTls();
+  const key = prepareTlsKey(options.key, options.passphrase);
+  const native = cottontail.tlsServerUpgradeFd(
+    fd,
+    flattenPem(options.cert),
+    key,
+    options.passphrase == null ? undefined : String(options.passphrase),
+    prepareALPNProtocols(options.ALPNProtocols),
+  );
+  parentSocket._tlsOwner = socket;
+  socket.once("close", (hadError) => {
+    parentSocket._tlsOwner = null;
+    if (!parentSocket._tlsCloseEmitted) {
+      parentSocket._tlsCloseEmitted = true;
+      parentSocket.emit("close", Boolean(hadError));
     }
   });
-  return socket;
+  return socket._attachNative(native, "secureConnect");
 }
 
 export function createServer(options = {}, secureConnectionListener = undefined) {

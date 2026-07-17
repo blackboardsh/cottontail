@@ -1301,8 +1301,14 @@ typedef struct CtTlsConnection {
     pthread_mutex_t mutex;
     bool active;
     bool watcher_started;
+    bool watcher_finished;
+    bool close_requested;
+    bool free_claimed;
+    bool shutdown_started;
     bool server_side;
     bool handshake_complete;
+    unsigned char *alpn_protocols;
+    unsigned int alpn_protocols_len;
     struct CtTlsConnection *next;
 } CtTlsConnection;
 
@@ -9947,6 +9953,7 @@ static void ct_tls_connection_free(CtTlsConnection *connection) {
     if (connection->ssl != NULL) SSL_free(connection->ssl);
     if (connection->ctx != NULL) SSL_CTX_free(connection->ctx);
     if (connection->fd >= 0) close(connection->fd);
+    free(connection->alpn_protocols);
     pthread_mutex_destroy(&connection->mutex);
     free(connection);
 }
@@ -10257,6 +10264,30 @@ static int ct_tls_server_alpn_select(
     return selected == OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
 }
 
+static int ct_tls_connection_alpn_select(
+    SSL *ssl,
+    const unsigned char **out,
+    unsigned char *out_len,
+    const unsigned char *client_protocols,
+    unsigned int client_protocols_len,
+    void *opaque
+) {
+    (void)ssl;
+    CtTlsConnection *connection = (CtTlsConnection *)opaque;
+    if (connection == NULL || connection->alpn_protocols == NULL || connection->alpn_protocols_len == 0) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    int selected = SSL_select_next_proto(
+        (unsigned char **)out,
+        out_len,
+        connection->alpn_protocols,
+        connection->alpn_protocols_len,
+        client_protocols,
+        client_protocols_len
+    );
+    return selected == OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
+
 static void *ct_tls_server_thread(void *opaque) {
     CtTlsServer *server = (CtTlsServer *)opaque;
     while (!ct_tls_server_is_stopped(server)) {
@@ -10343,8 +10374,11 @@ static void *ct_tls_read_thread(void *opaque) {
         for (;;) {
             char buffer[65536];
             pthread_mutex_lock(&connection->mutex);
+            errno = 0;
             int n = connection->ssl != NULL ? SSL_read(connection->ssl, buffer, sizeof(buffer)) : -1;
+            int read_errno = errno;
             int ssl_error = n <= 0 && connection->ssl != NULL ? SSL_get_error(connection->ssl, n) : SSL_ERROR_SYSCALL;
+            bool shutdown_started = connection->shutdown_started;
             pthread_mutex_unlock(&connection->mutex);
             if (n > 0) {
                 ct_queue_fd_data(connection->runtime, connection->id, buffer, (size_t)n);
@@ -10356,7 +10390,17 @@ static void *ct_tls_read_thread(void *opaque) {
                 terminal = true;
                 break;
             }
-            if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) break;
+            if (ssl_error == SSL_ERROR_SYSCALL && (read_errno == EAGAIN || read_errno == EWOULDBLOCK || read_errno == EINTR)) break;
+            if (shutdown_started) {
+                ct_queue_fd_simple(connection->runtime, connection->id, "end", NULL);
+                terminal = true;
+                break;
+            }
+            if (ssl_error == SSL_ERROR_SYSCALL && read_errno != 0) {
+                ct_queue_fd_simple(connection->runtime, connection->id, "error", strerror(read_errno));
+                terminal = true;
+                break;
+            }
             char *message = ct_tls_error_message("TLS read failed");
             if (message != NULL && strstr(message, "unexpected eof") != NULL) {
                 free(message);
@@ -10371,8 +10415,16 @@ static void *ct_tls_read_thread(void *opaque) {
         }
         if (terminal) break;
     }
-    ct_tls_connection_set_active(connection, false);
-    ct_tls_connection_free(connection);
+    bool should_free = false;
+    pthread_mutex_lock(&connection->mutex);
+    connection->active = false;
+    connection->watcher_finished = true;
+    if (connection->close_requested && !connection->free_claimed) {
+        connection->free_claimed = true;
+        should_free = true;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    if (should_free) ct_tls_connection_free(connection);
     return NULL;
 }
 
@@ -10588,6 +10640,105 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
     return result;
 }
 
+static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "tlsServerUpgradeFd(fd, cert, key[, passphrase, ALPNProtocols]) requires fd, cert, and key");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TLS socket")) return JSValueMakeUndefined(ctx);
+    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    char *cert = ct_value_to_string_copy(ctx, argv[1]);
+    char *key = ct_value_to_string_copy(ctx, argv[2]);
+    char *passphrase = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
+    uint8_t *alpn_protocols = NULL;
+    size_t alpn_protocols_len = 0;
+    if (argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]) &&
+        (ct_get_bytes(ctx, argv[4], &alpn_protocols, &alpn_protocols_len) != 0 || alpn_protocols_len > UINT_MAX)) {
+        close(fd);
+        free(cert);
+        free(key);
+        free(passphrase);
+        ct_throw_message(ctx, exception, "TLS ALPN protocols must be a valid ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (ssl_ctx == NULL || cert == NULL || key == NULL ||
+        ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0 ||
+        ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0 ||
+        SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        if (exception != NULL && *exception == NULL) {
+            char *message = ct_tls_error_message("Failed to initialize TLS server credentials");
+            ct_throw_message(ctx, exception, message);
+            free(message);
+        }
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        close(fd);
+        free(cert);
+        free(key);
+        free(passphrase);
+        return JSValueMakeUndefined(ctx);
+    }
+    free(cert);
+    free(key);
+    free(passphrase);
+
+    CtTlsConnection *connection = (CtTlsConnection *)calloc(1, sizeof(CtTlsConnection));
+    if (connection == NULL) {
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_init(&connection->mutex, NULL);
+    connection->fd = fd;
+    connection->ctx = ssl_ctx;
+    connection->runtime = JSObjectGetPrivate(function);
+    connection->active = true;
+    connection->server_side = true;
+    connection->handshake_complete = false;
+    if (alpn_protocols_len > 0) {
+        connection->alpn_protocols = (unsigned char *)malloc(alpn_protocols_len);
+        if (connection->alpn_protocols == NULL) {
+            ct_tls_connection_free(connection);
+            ct_throw_message(ctx, exception, "Out of memory");
+            return JSValueMakeUndefined(ctx);
+        }
+        memcpy(connection->alpn_protocols, alpn_protocols, alpn_protocols_len);
+        connection->alpn_protocols_len = (unsigned int)alpn_protocols_len;
+        SSL_CTX_set_alpn_select_cb(ssl_ctx, ct_tls_connection_alpn_select, connection);
+    }
+
+    connection->ssl = SSL_new(ssl_ctx);
+    if (connection->ssl == NULL) {
+        ct_tls_connection_free(connection);
+        char *message = ct_tls_error_message("Failed to initialize TLS server connection");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    ct_set_nonblocking_fd(fd);
+    SSL_set_fd(connection->ssl, fd);
+    SSL_set_accept_state(connection->ssl);
+    pthread_mutex_lock(&ct_tls_mutex);
+    connection->id = ct_next_tls_connection_id++;
+    if (ct_next_tls_connection_id == 0) ct_next_tls_connection_id = 1;
+    pthread_mutex_unlock(&ct_tls_mutex);
+    ct_tls_connection_add(connection);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, connection->id), exception);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, connection->fd), exception);
+    JSObjectRef local = ct_tcp_address_object(ctx, connection->fd, false, exception);
+    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+    JSObjectRef remote = ct_tcp_address_object(ctx, connection->fd, true, exception);
+    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    ct_set_property(ctx, result, "pending", JSValueMakeBoolean(ctx, true), exception);
+    return result;
+}
+
 static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -10596,13 +10747,13 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
         return JSValueMakeUndefined(ctx);
     }
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
-    if (connection == NULL || connection->server_side || connection->ssl == NULL) {
+    if (connection == NULL || connection->ssl == NULL) {
         ct_throw_message(ctx, exception, "TLS connection not found");
         return JSValueMakeUndefined(ctx);
     }
 
     pthread_mutex_lock(&connection->mutex);
-    int status = SSL_connect(connection->ssl);
+    int status = connection->server_side ? SSL_accept(connection->ssl) : SSL_connect(connection->ssl);
     int ssl_error = status == 1 ? SSL_ERROR_NONE : SSL_get_error(connection->ssl, status);
     long verify_result = status == 1 ? SSL_get_verify_result(connection->ssl) : X509_V_OK;
     int verify_mode = SSL_get_verify_mode(connection->ssl);
@@ -10622,7 +10773,7 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
     if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
         return JSValueMakeBoolean(ctx, false);
     }
-    char *message = ct_tls_error_message("TLS connect failed");
+    char *message = ct_tls_error_message(connection->server_side ? "TLS accept failed" : "TLS connect failed");
     ct_throw_message(ctx, exception, message);
     free(message);
     return JSValueMakeUndefined(ctx);
@@ -10837,16 +10988,23 @@ static JSValueRef ct_tls_connection_close(JSContextRef ctx, JSObjectRef function
     if (argc < 1) return JSValueMakeUndefined(ctx);
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
     if (connection == NULL) return JSValueMakeUndefined(ctx);
-    ct_tls_connection_set_active(connection, false);
+    bool should_free = false;
     pthread_mutex_lock(&connection->mutex);
+    connection->active = false;
+    connection->close_requested = true;
+    connection->shutdown_started = true;
     if (connection->ssl != NULL && connection->handshake_complete) SSL_shutdown(connection->ssl);
     if (connection->fd >= 0) {
         shutdown(connection->fd, SHUT_RDWR);
         close(connection->fd);
         connection->fd = -1;
     }
+    if ((!connection->watcher_started || connection->watcher_finished) && !connection->free_claimed) {
+        connection->free_claimed = true;
+        should_free = true;
+    }
     pthread_mutex_unlock(&connection->mutex);
-    if (!connection->watcher_started) ct_tls_connection_free(connection);
+    if (should_free) ct_tls_connection_free(connection);
     return JSValueMakeUndefined(ctx);
 }
 
@@ -10860,6 +11018,7 @@ static JSValueRef ct_tls_connection_shutdown(JSContextRef ctx, JSObjectRef funct
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
     if (connection == NULL) return JSValueMakeUndefined(ctx);
     pthread_mutex_lock(&connection->mutex);
+    connection->shutdown_started = true;
     if (connection->ssl != NULL && connection->handshake_complete) SSL_shutdown(connection->ssl);
     pthread_mutex_unlock(&connection->mutex);
     return JSValueMakeUndefined(ctx);
@@ -10888,6 +11047,7 @@ static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSO
 #define ct_tls_client_connect ct_tls_unavailable
 #define ct_tls_client_connect_fd ct_tls_unavailable
 #define ct_tls_client_handshake ct_tls_unavailable
+#define ct_tls_server_upgrade_fd ct_tls_unavailable
 #define ct_tls_server_listen ct_tls_unavailable
 #define ct_tls_server_accept ct_tls_unavailable
 #define ct_tls_server_close ct_tls_unavailable
@@ -15256,6 +15416,11 @@ static JSValueRef ct_jsc_heap_snapshot_host(JSContextRef ctx, JSObjectRef functi
     (void)thisObject;
     (void)argc;
     (void)argv;
+#if defined(__APPLE__)
+    JSSynchronousGarbageCollectForDebugging(ctx);
+#else
+    JSGarbageCollect(ctx);
+#endif
     char *snapshot = ct_jsc_heap_snapshot(ctx);
     if (snapshot == NULL) {
         ct_throw_message(ctx, exception, "JavaScriptCore heap snapshot generation failed");
@@ -18004,6 +18169,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "tlsClientConnect", ct_tls_client_connect, runtime);
     ct_install_function(ctx, host, "tlsClientConnectFd", ct_tls_client_connect_fd, runtime);
     ct_install_function(ctx, host, "tlsClientHandshake", ct_tls_client_handshake, runtime);
+    ct_install_function(ctx, host, "tlsServerUpgradeFd", ct_tls_server_upgrade_fd, runtime);
     ct_install_function(ctx, host, "tlsServerListen", ct_tls_server_listen, runtime);
     ct_install_function(ctx, host, "tlsServerAccept", ct_tls_server_accept, runtime);
     ct_install_function(ctx, host, "tlsServerClose", ct_tls_server_close, runtime);

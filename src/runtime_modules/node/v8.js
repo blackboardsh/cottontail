@@ -417,12 +417,12 @@ export function getCppHeapStatistics(detailLevel = "brief") {
 }
 
 export function getHeapSnapshot(_options = {}) {
-  return Readable.from([captureV8HeapSnapshot()]);
+  return Readable.from([Buffer.from(captureV8HeapSnapshot())]);
 }
 
 export function writeHeapSnapshot(filename = undefined, options = {}) {
   void options;
-  const path = filename ?? `${globalThis.process?.cwd?.() ?? cottontail.cwd?.() ?? "."}/Heap.${Date.now()}.heapsnapshot`;
+  const path = filename ?? `${globalThis.process?.cwd?.() ?? cottontail.cwd?.() ?? "."}/Heap-${Date.now()}-${globalThis.process?.pid ?? 0}.heapsnapshot`;
   cottontail.writeFile(String(path), captureV8HeapSnapshot());
   return String(path);
 }

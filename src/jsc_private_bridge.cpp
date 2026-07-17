@@ -182,6 +182,7 @@ class HeapProfiler {
 public:
     explicit HeapProfiler(VM&);
     ~HeapProfiler();
+    void clearSnapshots();
     void setActiveHeapAnalyzer(HeapAnalyzer*);
 
 private:
@@ -334,6 +335,7 @@ extern "C" char* ct_jsc_heap_snapshot(JSContextRef context)
     if (profiler == nullptr || *reinterpret_cast<JSC::VM**>(profiler) != vm)
         return nullptr;
 
+    profiler->clearSnapshots();
     JSC::HeapSnapshotBuilder builder(
         *profiler, JSC::HeapSnapshotBuilder::InspectorSnapshot);
     builder.buildSnapshot();

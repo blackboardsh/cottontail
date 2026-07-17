@@ -12,7 +12,13 @@ import {
   createRequire as nodeCreateRequire,
   isBuiltin as nodeIsBuiltin,
 } from "../node/module.js";
-import { relative as nodePathRelative, resolve as nodePathResolve } from "../node/path.js";
+import { cpSync as nodeCpSync } from "../node/fs.js";
+import {
+  basename as nodePathBasename,
+  join as nodePathJoin,
+  relative as nodePathRelative,
+  resolve as nodePathResolve,
+} from "../node/path.js";
 import * as streamWeb from "../node/stream/web.js";
 import { fileURLToPath as nodeFileURLToPath, pathToFileURL as nodePathToFileURL } from "../node/url.js";
 import { inspect as nodeInspect, isDeepStrictEqual, stripVTControlCharacters } from "../node/util.js";
@@ -35,6 +41,7 @@ import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
 import { jest as bunJest } from "./test.js";
+import { captureV8HeapSnapshot } from "../node/internal/heap_snapshot.js";
 
 function ctRemapStackString(stack) {
   let remapped = remapBundleStack(stack);
@@ -280,17 +287,14 @@ if (Symbol.asyncDispose == null) {
 }
 
 function shellEscape(value) {
-  if (value && typeof value === "object" && "raw" in value) {
-    const raw = String(value.raw);
-    validateNoNullByte(raw, "shell argument");
-    return raw;
-  }
   if (isBunFileLike(value) && value.name != null) value = value.name;
   const text = String(value);
   validateNoNullByte(text, "shell argument");
-  if (text.length === 0) return "";
-  if (/^[A-Za-z0-9_/:.,=+@%-]+$/.test(text)) return text;
-  return "'" + text.replace(/'/g, "'\\''") + "'";
+  // Ported from Bun's shell.escapeBunStr/needsEscapeBunstr. Bun deliberately
+  // quotes digits and assignment punctuation because the same escaped value is
+  // also consumed by its lexer, not only by a platform shell.
+  if (!/[~[\]#;\n*{,}`$=()0-9|><&'" \\]/.test(text)) return text;
+  return `"${text.replace(/[$`"\\]/g, "\\$&")}"`;
 }
 
 function invalidNullByteError(name, value) {
@@ -569,61 +573,120 @@ if (globalThis.console && typeof globalThis.console[Symbol.asyncIterator] !== "f
   };
 }
 
-function interpolate(strings, values) {
-  let out = "";
-  const parts = Array.isArray(strings?.raw) ? strings.raw : strings;
-  for (let index = 0; index < strings.length; index += 1) {
-    out += parts[index];
-    if (index < values.length) {
-      const value = values[index];
-      out += Array.isArray(value) ? value.map(shellEscape).join(" ") : shellEscape(value);
-    }
-  }
-  return out;
-}
-
 function binaryOutputView(value) {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   return null;
 }
 
+function shellInterpolationText(value) {
+  if (isBunFileLike(value) && value.name != null) value = value.name;
+  const text = String(value);
+  validateNoNullByte(text, "shell argument");
+  return text;
+}
+
+function quotePosixShellValue(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function appendShellInterpolation(out, value, state) {
+  if (value && typeof value === "object" && "raw" in value) {
+    const raw = String(value.raw);
+    validateNoNullByte(raw, "shell argument");
+    return { out: out + raw, scan: raw };
+  }
+
+  const values = Array.isArray(value) ? value : [value];
+  const texts = values.map(shellInterpolationText);
+  if (state.escaped) {
+    out = out.slice(0, -1);
+    texts[0] = `\\${texts[0]}`;
+    state.escaped = false;
+  }
+
+  if (state.quote === "'") {
+    return { out: out + texts.join(" ").replace(/'/g, `'\\''`), scan: "" };
+  }
+  if (state.quote === '"') {
+    return { out: out + texts.join(" ").replace(/[$`"\\]/g, "\\$&"), scan: "" };
+  }
+  return { out: out + texts.map(quotePosixShellValue).join(" "), scan: "" };
+}
+
+function scanShellQuoteState(state, source) {
+  for (const char of String(source)) {
+    if (state.quote === "'") {
+      if (char === "'") state.quote = null;
+      continue;
+    }
+    if (state.escaped) {
+      state.escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      state.escaped = true;
+      continue;
+    }
+    if (state.quote === '"') {
+      if (char === '"') state.quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') state.quote = char;
+  }
+}
+
+function trailingRedirect(part, operator) {
+  let end = part.length;
+  while (end > 0 && /\s/.test(part[end - 1])) end -= 1;
+  if (part[end - 1] !== operator || part[end - 2] === operator) return null;
+  let start = end - 1;
+  if (/[012]/.test(part[start - 1] ?? "")) start -= 1;
+  return { fd: start < end - 1 ? Number(part[start]) : operator === "<" ? 0 : 1, start, end };
+}
+
 function interpolateShellCommand(strings, values) {
   const parts = Array.isArray(strings?.raw) ? strings.raw : strings;
   let out = "";
   let outputBuffer = undefined;
+  let outputFd = 1;
   let inputBody = undefined;
+  const state = { quote: null, escaped: false };
   for (let index = 0; index < strings.length; index += 1) {
     let part = parts[index];
-    const isTerminalOutputTarget = index < values.length &&
-      />\s*$/.test(part) &&
+    const terminalTarget = index < values.length &&
       parts.slice(index + 1).every((item) => String(item).trim() === "");
-    if (isTerminalOutputTarget && binaryOutputView(values[index])) {
-      part = part.replace(/>\s*$/, "");
+    const outputRedirect = terminalTarget ? trailingRedirect(part, ">") : null;
+    if (outputRedirect && binaryOutputView(values[index])) {
+      part = part.slice(0, outputRedirect.start) + part.slice(outputRedirect.end);
       out += part;
       outputBuffer = values[index];
+      outputFd = outputRedirect.fd;
       continue;
     }
-    if (isTerminalOutputTarget && values[index] != null && typeof values[index] === "object") {
+    if (outputRedirect && values[index] != null && typeof values[index] === "object") {
       const value = values[index];
       if (value instanceof Blob || value instanceof Response) {
         throw new TypeError("Shell output redirection requires a writable Buffer or TypedArray");
       }
     }
-    if (index < values.length && values[index] != null && typeof values[index] === "object" &&
-        /<\s*$/.test(part) && parts.slice(index + 1).every((item) => String(item).trim() === "")) {
-      part = part.replace(/<\s*$/, "");
+    const inputRedirect = terminalTarget ? trailingRedirect(part, "<") : null;
+    if (inputRedirect && values[index] != null && typeof values[index] === "object") {
+      part = part.slice(0, inputRedirect.start) + part.slice(inputRedirect.end);
       out += part;
       inputBody = values[index];
       continue;
     }
     out += part;
+    scanShellQuoteState(state, part);
     if (index < values.length) {
       const value = values[index];
-      out += Array.isArray(value) ? value.map(shellEscape).join(" ") : shellEscape(value);
+      const appended = appendShellInterpolation(out, value, state);
+      out = appended.out;
+      if (appended.scan) scanShellQuoteState(state, appended.scan);
     }
   }
-  return { command: out.trimEnd(), outputBuffer, inputBody };
+  return { command: out.trimEnd(), outputBuffer, outputFd, inputBody };
 }
 
 const shellDefaults = {
@@ -790,6 +853,116 @@ function runShellMv(words, options = {}) {
     }
   }
   return { exitCode: 0, stdout: "", stderr: "" };
+}
+
+function parseShellCpArguments(words) {
+  const options = { recursive: false, verbose: false };
+  let index = 1;
+  while (index < words.length) {
+    const argument = words[index];
+    if (argument === "--") {
+      index += 1;
+      break;
+    }
+    if (!argument.startsWith("-") || argument === "-") break;
+    for (const flag of argument.slice(1)) {
+      if (flag === "R" || flag === "r") options.recursive = true;
+      else if (flag === "v") options.verbose = true;
+      else if (flag === "n") continue;
+      else if ("fHiLPp".includes(flag)) {
+        return { error: `cp: unsupported option, please open a GitHub issue -- -${flag}\n` };
+      } else {
+        return { error: `cp: illegal option -- ${argument.slice(argument.indexOf(flag))}\n` };
+      }
+    }
+    index += 1;
+  }
+  return { options, operands: words.slice(index) };
+}
+
+function shellCpErrorMessage(error, path) {
+  const text = String(error?.message || error || "copy failed");
+  if (error?.code === "ENOENT" || /no such file|filenotfound/i.test(text)) return `${path}: No such file or directory`;
+  if (error?.code === "ENOTDIR" || /not a directory/i.test(text)) return `${path}: Not a directory`;
+  if (error?.code === "EACCES" || /permission denied/i.test(text)) return `${path}: Permission denied`;
+  return `${path}: ${text.replace(/^.*?:\s*/, "")}`;
+}
+
+function runShellCp(words, options = {}) {
+  const usage = "usage: cp [-R [-H | -L | -P]] [-fi | -n] [-aclpsvXx] source_file target_file\n" +
+    "       cp [-R [-H | -L | -P]] [-fi | -n] [-aclpsvXx] source_file ... target_directory\n";
+  const parsed = parseShellCpArguments(words);
+  if (parsed.error) return { exitCode: 1, stdout: "", stderr: parsed.error };
+  if (parsed.operands.length < 2) return { exitCode: 1, stdout: "", stderr: usage };
+
+  const cwd = String(options.cwd || cottontail.cwd());
+  const sources = parsed.operands.slice(0, -1);
+  const targetOperand = parsed.operands[parsed.operands.length - 1];
+  const targetAbsolute = nodePathResolve(cwd, targetOperand);
+  const targetStat = shellStat(targetOperand, cwd);
+  const targetHasTrailingSeparator = /[\\/]$/.test(targetOperand);
+  const stdout = [];
+  const stderr = [];
+
+  for (const sourceOperand of sources) {
+    const sourceAbsolute = nodePathResolve(cwd, sourceOperand);
+    const sourceStat = shellStat(sourceOperand, cwd);
+    if (!sourceStat) {
+      stderr.push(`cp: ${sourceOperand}: No such file or directory\n`);
+      continue;
+    }
+    if (sourceStat.isDirectory && !parsed.options.recursive) {
+      stderr.push(`cp: ${sourceOperand} is a directory (not copied)\n`);
+      continue;
+    }
+    if (!sourceStat.isDirectory && sourceAbsolute === targetAbsolute) {
+      stderr.push(`cp: ${sourceOperand} and ${sourceOperand} are identical (not copied)\n`);
+      continue;
+    }
+
+    let destinationAbsolute = targetAbsolute;
+    const targetIsDirectory = Boolean(targetStat?.isDirectory) || (!targetStat && targetHasTrailingSeparator);
+    if (!sourceStat.isDirectory && !targetIsDirectory && parsed.operands.length === 2) {
+      // source_file -> target_file
+    } else if (parsed.options.recursive) {
+      if (targetStat) destinationAbsolute = nodePathJoin(targetAbsolute, nodePathBasename(sourceAbsolute));
+      else if (parsed.operands.length !== 2) {
+        stderr.push(`cp: directory ${targetOperand} does not exist\n`);
+        continue;
+      }
+    } else {
+      if (!targetStat?.isDirectory) {
+        stderr.push(`cp: ${targetOperand} is not a directory\n`);
+        continue;
+      }
+      destinationAbsolute = nodePathJoin(targetAbsolute, nodePathBasename(sourceAbsolute));
+    }
+
+    if (sourceAbsolute === destinationAbsolute) {
+      stderr.push(`cp: ${sourceOperand} and ${sourceOperand} are identical (not copied)\n`);
+      continue;
+    }
+
+    try {
+      nodeCpSync(sourceAbsolute, destinationAbsolute, {
+        recursive: parsed.options.recursive,
+        force: true,
+        errorOnExist: false,
+        filter(source, destination) {
+          if (parsed.options.verbose) stdout.push(`${source} -> ${destination}\n`);
+          return true;
+        },
+      });
+    } catch (error) {
+      stderr.push(`cp: ${shellCpErrorMessage(error, sourceOperand)}\n`);
+    }
+  }
+
+  return {
+    exitCode: stderr.length === 0 ? 0 : 1,
+    stdout: stdout.join(""),
+    stderr: stderr.join(""),
+  };
 }
 
 function runShellSeq(words) {
@@ -1134,36 +1307,228 @@ function runShellBuiltin(command, options = {}) {
   }
   if (words[0] === "seq") return runShellSeq(words);
   if (words[0] === "mv") return runShellMv(words, options);
+  if (words[0] === "cp") return runShellCp(words, options);
   return null;
 }
 
-function runShell(command, options = {}) {
+function parseTopLevelShellList(command) {
+  const source = String(command);
+  const commands = [];
+  const operators = [];
+  let pendingOperator = null;
+  let start = 0;
+  let quote = null;
+  let escaped = false;
+  let parentheses = 0;
+  let braces = 0;
+
+  const append = (end) => {
+    const value = source.slice(start, end).trim();
+    if (!value) return false;
+    if (commands.length > 0) operators.push(pendingOperator || ";");
+    commands.push(value);
+    pendingOperator = null;
+    return true;
+  };
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "(") {
+      parentheses += 1;
+      continue;
+    }
+    if (char === ")" && parentheses > 0) {
+      parentheses -= 1;
+      continue;
+    }
+    if (char === "{") {
+      braces += 1;
+      continue;
+    }
+    if (char === "}" && braces > 0) {
+      braces -= 1;
+      continue;
+    }
+    if (parentheses > 0 || braces > 0) continue;
+
+    let operator = null;
+    let width = 1;
+    if (source.startsWith("&&", index)) {
+      operator = "&&";
+      width = 2;
+    } else if (source.startsWith("||", index)) {
+      operator = "||";
+      width = 2;
+    } else if (char === ";" || char === "\n") {
+      operator = ";";
+    } else if (char === "&" && source[index + 1] !== ">") {
+      return null;
+    }
+    if (!operator) continue;
+
+    const hadCommand = append(index);
+    if (!hadCommand && pendingOperator && pendingOperator !== ";") return null;
+    pendingOperator = operator;
+    index += width - 1;
+    start = index + 1;
+  }
+
+  if (quote || parentheses !== 0 || braces !== 0) return null;
+  append(source.length);
+  if (commands.length < 2 || operators.length !== commands.length - 1) return null;
+  return { commands, operators };
+}
+
+function shellCommandName(command) {
+  const words = splitShellWords(command);
+  let index = 0;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? "")) index += 1;
+  return words[index] ?? "";
+}
+
+async function runShellCommandList(command, options) {
+  if (options.input !== undefined) return null;
+  const list = parseTopLevelShellList(command);
+  if (!list) return null;
+  const names = list.commands.map(shellCommandName);
+  if (!names.includes("cp")) return null;
+  if (names.some((name) => ["cd", "export", "unset", "source", ".", "exec"].includes(name))) return null;
+
+  const stdout = [];
+  const stderr = [];
+  let exitCode = 0;
+  for (let index = 0; index < list.commands.length; index += 1) {
+    const operator = index === 0 ? ";" : list.operators[index - 1];
+    if (operator === "&&" && exitCode !== 0) continue;
+    if (operator === "||" && exitCode === 0) continue;
+
+    const segment = list.commands[index];
+    const builtin = runShellBuiltin(segment, options);
+    const result = builtin ?? await runHostShell(segment, options);
+    exitCode = Number(result.exitCode ?? result.status ?? 0);
+    if (result.stdout != null) stdout.push(asBuffer(result.stdout));
+    if (result.stderr != null) stderr.push(asBuffer(result.stderr));
+  }
+
+  return {
+    status: exitCode,
+    stdout: concatManyBuffers(stdout),
+    stderr: concatManyBuffers(stderr),
+  };
+}
+
+const shellCommandArgumentLimit = 64 * 1024;
+
+// COTTONTAIL-COMPAT: Bun.$ native interpreter - the production parser,
+// expansion engine, pipelines, and remaining builtins are vendored under
+// src/compiler/src/shell but still need a shell-specific JSC/event-loop bridge.
+async function runHostShell(command, options) {
+  const isWin = cottontail.platform() === "win32";
+  const shellExecutable = isWin ? "cmd" : cottontail.platform() === "darwin" ? "/bin/bash" : "sh";
+  let shellArgs;
+  let scriptPath;
+
+  if (asBuffer(command).byteLength > shellCommandArgumentLimit) {
+    const root = tmpRoot("shell");
+    cottontail.mkdirSync(root, true);
+    scriptPath = pathJoin(root, `script-${randomUUID()}${isWin ? ".cmd" : ".sh"}`);
+    cottontail.writeFile(scriptPath, asBuffer(`${command}\n`));
+    if (isWin) {
+      shellArgs = ["/d", "/s", "/c", `"${scriptPath}"`];
+    } else {
+      // Source the generated script after shifting it out of $@. This keeps the
+      // same $0/$1... layout as the normal `sh -c script $argv` path.
+      const argv = globalThis.process?.argv ?? [];
+      shellArgs = [
+        "-c",
+        '__cottontail_script=$1; shift; . "$__cottontail_script"',
+        argv[0] ?? "cottontail",
+        scriptPath,
+        ...argv.slice(1),
+      ];
+    }
+  } else if (isWin) {
+    shellArgs = ["/d", "/s", "/c", command];
+  } else {
+    shellArgs = ["-c", command, ...(globalThis.process?.argv ?? [])];
+  }
+
+  try {
+    const child = spawn([shellExecutable, ...shellArgs], {
+      cwd: options.cwd,
+      env: shellEnv(options),
+      stdin: options.input ?? "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      child.stdout?.bytes?.() ?? Promise.resolve(asBuffer("")),
+      child.stderr?.bytes?.() ?? Promise.resolve(asBuffer("")),
+    ]);
+    return {
+      status: exitCode == null ? 1 : Number(exitCode),
+      stdout: asBuffer(stdout),
+      stderr: asBuffer(stderr),
+    };
+  } finally {
+    if (scriptPath != null) {
+      try { cottontail.unlinkSync(scriptPath); } catch {}
+    }
+  }
+}
+
+async function runShell(command, options = {}) {
   validateNoNullByte(command, "command");
   command = normalizeAssignmentPipelines(command);
   const builtin = runShellBuiltin(command, options);
+  let result;
   if (builtin) {
-    const output = new ShellOutput(builtin);
-    if (output.exitCode !== 0 && options.throws !== false) throw new ShellError(command, output);
-    return output;
+    result = {
+      status: Number(builtin.exitCode ?? builtin.status ?? 0),
+      stdout: asBuffer(builtin.stdout ?? ""),
+      stderr: asBuffer(builtin.stderr ?? ""),
+    };
+  } else {
+    const isWin = cottontail.platform() === "win32";
+    const hostCommand = isWin ? command : normalizeCombinedAppendRedirect(command);
+    result = await runShellCommandList(hostCommand, options) ?? await runHostShell(hostCommand, options);
   }
-  const isWin = cottontail.platform() === "win32";
-  const hostCommand = isWin ? command : normalizeCombinedAppendRedirect(command);
-  const shellExecutable = isWin ? "cmd" : cottontail.platform() === "darwin" ? "/bin/bash" : "sh";
-  const shellArgs = isWin
-    ? ["/d", "/s", "/c", command]
-    : ["-c", hostCommand, ...(globalThis.process?.argv ?? [])];
-  const result = cottontail.spawnSync(shellExecutable, shellArgs, {
-    stdio: "pipe",
-    cwd: options.cwd,
-    env: shellEnv(options),
-    input: options.input,
-  });
-  if (options.outputBuffer != null) writeOutputBuffer(options.outputBuffer, result.stdout ?? "");
-  const stderr = normalizeShellStderr(command, result.stderr || "");
-  const exitCode = String(command).includes("mv ") && stderr.includes("Not a directory") ? 20 : result.status;
+  let stdout = result.stdout || asBuffer("");
+  let stderr = asBuffer(normalizeShellStderr(command, result.stderr || ""));
+  if (options.outputBuffer != null) {
+    if (options.outputFd === 2) {
+      writeOutputBuffer(options.outputBuffer, stderr);
+      stderr = asBuffer("");
+    } else {
+      writeOutputBuffer(options.outputBuffer, stdout);
+      stdout = asBuffer("");
+    }
+  }
+  const exitCode = String(command).includes("mv ") && String(stderr).includes("Not a directory") ? 20 : result.status;
   const output = new ShellOutput({
     exitCode,
-    stdout: options.outputBuffer != null ? "" : result.stdout || "",
+    stdout,
     stderr,
   });
   if (output.exitCode !== 0 && options.throws !== false) {
@@ -1219,7 +1584,7 @@ class ShellCommand extends ShellExpression {
         if (this.options.inputBody !== undefined) {
           this.options.input = await bytesFromBody(this.options.inputBody);
         }
-        const result = runShell(this.command, this.options);
+        const result = await runShell(this.command, this.options);
         if (!this.options.quiet) {
           if (result.stdout.byteLength > 0) globalThis.process?.stdout?.write?.(result.stdout);
           if (result.stderr.byteLength > 0) globalThis.process?.stderr?.write?.(result.stderr);
@@ -1264,11 +1629,51 @@ class ShellCommand extends ShellExpression {
   }
 }
 
+export class Shell {
+  constructor() {
+    const callable = (strings, ...values) => {
+      let command = $(strings, ...values).throws(callable._throws);
+      if (callable._cwd != null) command = command.cwd(callable._cwd);
+      if (callable._env != null) command = command.env(callable._env);
+      if (callable._quiet) command = command.quiet();
+      return command;
+    };
+    Object.setPrototypeOf(callable, new.target.prototype);
+    callable._cwd = undefined;
+    callable._env = undefined;
+    callable._throws = true;
+    callable._quiet = false;
+    return callable;
+  }
+  cwd(value) {
+    this._cwd = String(value);
+    return this;
+  }
+  env(value) {
+    this._env = { ...(value ?? {}) };
+    return this;
+  }
+  throws(value = true) {
+    this._throws = Boolean(value);
+    return this;
+  }
+  nothrow() {
+    return this.throws(false);
+  }
+  quiet(value = true) {
+    this._quiet = Boolean(value);
+    return this;
+  }
+}
+
+Object.setPrototypeOf(Shell.prototype, Function.prototype);
+
 export function $(strings, ...values) {
   const interpolation = interpolateShellCommand(strings, values);
   return new ShellCommand(interpolation.command, {
     ...shellDefaults,
     outputBuffer: interpolation.outputBuffer,
+    outputFd: interpolation.outputFd,
     inputBody: interpolation.inputBody,
   });
 }
@@ -1357,6 +1762,7 @@ $.braces = (value) => {
 $.ShellError = ShellError;
 $.ShellExpression = ShellExpression;
 $.ShellOutput = ShellOutput;
+$.Shell = Shell;
 $.escape = shellEscape;
 $.throws = (value = true) => {
   shellDefaults.throws = Boolean(value);
@@ -10225,8 +10631,27 @@ export const dns = {
   lookup: bunDnsLookup,
 };
 
-export function generateHeapSnapshot() {
-  return cottontail.writeHeapSnapshot?.() ?? "";
+export function generateHeapSnapshot(format = undefined, output = undefined) {
+  let useV8 = false;
+  if (typeof format === "string") {
+    if (format === "v8") useV8 = true;
+    else if (format !== "jsc") throw new TypeError("Expected 'v8' or 'jsc' or undefined");
+  }
+
+  if (useV8 && typeof output === "string" && output !== "arraybuffer") {
+    throw new TypeError("Expected 'arraybuffer' or undefined as second argument");
+  }
+
+  const snapshot = useV8
+    ? captureV8HeapSnapshot()
+    : cottontail.jscHeapSnapshot?.() ?? "";
+
+  if (useV8 && output === "arraybuffer") {
+    const bytes = new TextEncoder().encode(snapshot);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  }
+
+  return useV8 ? snapshot : JSON.parse(snapshot);
 }
 
 function outputAnsiColorsEnabled() {

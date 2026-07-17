@@ -2,7 +2,7 @@ import { Buffer } from "./buffer.js";
 import { EventEmitter } from "./events.js";
 import { IncomingMessage, ServerResponse } from "./http.js";
 import { connect as netConnect, createServer as createNetServer } from "./net.js";
-import { connect as tlsConnect, createServer as createTlsServer } from "./tls.js";
+import { _upgradeServerSocket, connect as tlsConnect, createServer as createTlsServer } from "./tls.js";
 
 export class Http2ServerRequest extends IncomingMessage {
   constructor(stream, headers, rawHeaders = []) {
@@ -507,6 +507,14 @@ function headersToList(headers = {}) {
   return pseudo.concat(regular);
 }
 
+function headerListSize(headers = {}) {
+  let size = 0;
+  for (const [name, value] of headersToList(headers)) {
+    size += Buffer.byteLength(String(name)) + Buffer.byteLength(String(value)) + 32;
+  }
+  return size;
+}
+
 // Stateless HPACK encoding: full static matches use the indexed form, all other
 // headers are emitted as literals without indexing so no shared encoder state
 // is required for interoperability.
@@ -910,7 +918,7 @@ export class Http2Stream extends EventEmitter {
     this.rstCode = closeCode;
     this.closeCode = closeCode;
     this.state.localClose = 1;
-    this.session._streams.delete(this.id);
+    this.session._streamClosed(this);
     this.session._sendRstStream(this.id, closeCode);
     this._abortCleanup?.();
     const finishClose = () => {
@@ -1025,7 +1033,8 @@ export class Http2Stream extends EventEmitter {
   _maybeClose() {
     if (this.closed || !this._endStreamSent || !this._endStreamReceived) return;
     this.closed = true;
-    this.session._streams.delete(this.id);
+    this.destroyed = true;
+    this.session._streamClosed(this);
     if (!this._closeEmitted) {
       this._closeEmitted = true;
       this.emit("close");
@@ -1059,6 +1068,8 @@ class Http2Session extends EventEmitter {
     this._streams = new Map();
     this._closeScheduled = false;
     this._closeEmitted = false;
+    this._protocolReady = isServer;
+    this._outboundFrames = [];
     this._pendingHeaderBlock = null;
     this._hpackDecoder = new HpackDecoder();
     this.localSettings = defaultSettingsObject();
@@ -1081,7 +1092,10 @@ class Http2Session extends EventEmitter {
       inflateDynamicTableSize: defaultSettingsObject().headerTableSize,
     };
     socket.on("data", (chunk) => this._receive(chunk));
-    socket.on("end", () => this.close());
+    socket.on("end", () => {
+      this.closed = true;
+      this._scheduleClose();
+    });
     socket.on("close", () => this._emitClose());
     socket.on("error", (error) => {
       const resetDuringShutdown = error?.code === "ECONNRESET" || error?.code === "EPIPE" ||
@@ -1092,20 +1106,13 @@ class Http2Session extends EventEmitter {
       }
       this.emit("error", error);
     });
-    // The connection preface and initial SETTINGS frame are written
-    // immediately; net/tls sockets buffer pre-connect writes in order, which
-    // guarantees the preface precedes any frames queued by early request()
-    // calls made before the socket finishes connecting.
-    if (!isServer) socket.write(clientPreface);
-    this._sendSettings(settings ?? {});
     if (!isServer) {
       const connectedEvent = socket.encrypted ? "secureConnect" : "connect";
-      if (socket.connecting) {
-        socket.once(connectedEvent, () => this.emit("connect", this, socket));
-      } else {
-        queueMicrotask(() => this.emit("connect", this, socket));
-      }
+      const activate = () => this._activateProtocol();
+      if (socket.connecting) socket.once(connectedEvent, activate);
+      else queueMicrotask(activate);
     }
+    this._sendSettings(settings ?? {});
   }
 
   get socket() { return this._socketProxy; }
@@ -1118,8 +1125,29 @@ class Http2Session extends EventEmitter {
   }
   get pendingSettingsAck() { return this._pendingSettingsAck; }
 
-  _writeFrame(type, frameFlags, streamId, payload = Buffer.alloc(0), callback = undefined) {
-    const buffer = frameBuffer(type, frameFlags, streamId, payload);
+  _activateProtocol() {
+    if (this._protocolReady || this.destroyed || this._closeScheduled) return;
+    if (this.encrypted && this._socket?.alpnProtocol !== "h2") {
+      const error = new Error("Protocol error: HTTP/2 was not negotiated by ALPN");
+      error.code = "ERR_HTTP2_ERROR";
+      for (const frame of this._outboundFrames.splice(0)) {
+        if (typeof frame.callback === "function") queueMicrotask(() => frame.callback(error));
+      }
+      this.destroy(error);
+      return;
+    }
+    this._protocolReady = true;
+    try {
+      this._socket.write(clientPreface);
+      for (const frame of this._outboundFrames.splice(0)) this._writeBufferedFrame(frame.buffer, frame.callback);
+    } catch (error) {
+      this.destroy(error);
+      return;
+    }
+    this.emit("connect", this, this._socket);
+  }
+
+  _writeBufferedFrame(buffer, callback = undefined) {
     try {
       this._socket.write(buffer);
       if (typeof callback === "function") queueMicrotask(callback);
@@ -1127,6 +1155,15 @@ class Http2Session extends EventEmitter {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else this.emit("error", error);
     }
+  }
+
+  _writeFrame(type, frameFlags, streamId, payload = Buffer.alloc(0), callback = undefined) {
+    const buffer = frameBuffer(type, frameFlags, streamId, payload);
+    if (!this._protocolReady) {
+      this._outboundFrames.push({ buffer, callback });
+      return;
+    }
+    this._writeBufferedFrame(buffer, callback);
   }
 
   get _maxSendFrameSize() {
@@ -1399,7 +1436,7 @@ class Http2Session extends EventEmitter {
       stream.closed = true;
       stream.destroyed = true;
       stream.state.remoteClose = 1;
-      this._streams.delete(frame.streamId);
+      this._streamClosed(stream);
       if (code !== constants.NGHTTP2_NO_ERROR) {
         stream.aborted = true;
         if (stream.listenerCount("error") > 0) stream.emit("error", streamError(code));
@@ -1465,6 +1502,7 @@ class Http2Session extends EventEmitter {
       this.closed = true;
       this.state.lastProcStreamID = lastStreamID;
       this.emit("goaway", errorCode, lastStreamID, opaqueData);
+      if (this._streams.size === 0) this._scheduleClose();
       return;
     }
     if (frame.type === frameTypes.WINDOW_UPDATE) {
@@ -1492,12 +1530,13 @@ class Http2Session extends EventEmitter {
     error.errno = code;
     this.goawayCode = code;
     try { this._sendGoaway(code, this.state.lastProcStreamID); } catch {}
-    queueMicrotask(() => {
-      this.emit("error", error);
-      this.destroyed = true;
-      this.closed = true;
-      try { this._socket.end?.(); } catch {}
-    });
+    this.closed = true;
+    this._scheduleClose(error);
+  }
+
+  _streamClosed(stream) {
+    this._streams.delete(stream.id);
+    if (this.closed && !this.destroyed && this._streams.size === 0) this._scheduleClose();
   }
 
   request(headers = {}, options = {}) {
@@ -1530,13 +1569,36 @@ class Http2Session extends EventEmitter {
       stream.closed = true;
       stream.destroyed = true;
       stream._suppressEndOnClose = true;
-      this._streams.delete(id);
+      this._streamClosed(stream);
       queueMicrotask(() => stream.emit("error", abortError()));
       return stream;
     }
 
     const method = String(outgoing[":method"]).toUpperCase();
     const endStream = options?.endStream ?? (!stream._waitForTrailers && (method === "GET" || method === "HEAD"));
+    const maxHeaderListSize = Number(this.remoteSettings?.maxHeaderListSize ?? defaultSettingsObject().maxHeaderListSize);
+    if (Number.isFinite(maxHeaderListSize) && headerListSize(outgoing) > maxHeaderListSize) {
+      stream._writableEnded = true;
+      queueMicrotask(() => {
+        if (stream.destroyed) return;
+        const code = constants.NGHTTP2_COMPRESSION_ERROR;
+        stream.rstCode = code;
+        stream.closeCode = code;
+        stream.closed = true;
+        stream.destroyed = true;
+        stream.aborted = true;
+        stream.state.localClose = 1;
+        stream.state.remoteClose = 1;
+        this._streamClosed(stream);
+        stream.emit("error", streamError(code));
+        stream.emit("aborted");
+        if (!stream._closeEmitted) {
+          stream._closeEmitted = true;
+          stream.emit("close");
+        }
+      });
+      return stream;
+    }
     this._sendHeaders(id, outgoing, endStream === true);
     if (endStream) {
       stream._endStreamSent = true;
@@ -1694,11 +1756,15 @@ class Http2Session extends EventEmitter {
       else this.once("close", callback);
     }
     this.closed = true;
-    this._scheduleClose();
+    if (this._protocolReady) {
+      try { this._sendGoaway(constants.NGHTTP2_NO_ERROR, this.state.lastProcStreamID); } catch {}
+    }
+    if (this._streams.size === 0) this._scheduleClose();
+    return this;
   }
 
   destroy(error = undefined) {
-    if (this.destroyed) return;
+    if (this.destroyed) return this;
     this.destroyed = true;
     this.closed = true;
     for (const stream of this._streams.values()) {
@@ -1708,6 +1774,7 @@ class Http2Session extends EventEmitter {
       stream.state.remoteClose = 1;
     }
     this._scheduleClose(error);
+    return this;
   }
 }
 
@@ -1726,10 +1793,19 @@ class Http2Server extends EventEmitter {
 
   _acceptSocket(socket, alreadySecure = !this._secure) {
     if (this._secure && !alreadySecure && socket?.encrypted !== true) {
-      const error = new Error("Upgrading an existing TCP socket to a server-side TLS connection requires native support");
-      error.code = "ERR_NOT_IMPLEMENTED";
-      this.emit("tlsClientError", error, socket);
-      socket?.destroy?.();
+      let secureSocket;
+      try {
+        const tlsOptions = this._options.ALPNProtocols == null
+          ? { ...this._options, ALPNProtocols: this._options.allowHTTP1 ? ["h2", "http/1.1"] : ["h2"] }
+          : this._options;
+        secureSocket = _upgradeServerSocket(socket, tlsOptions);
+      } catch (error) {
+        this.emit("tlsClientError", error, socket);
+        socket?.destroy?.();
+        return;
+      }
+      secureSocket.once("secureConnect", () => this._acceptSocket(secureSocket, true));
+      secureSocket.once("error", (error) => this.emit("tlsClientError", error, secureSocket));
       return;
     }
     const session = new Http2Session(socket, { isServer: true, settings: this._options.settings });
@@ -1894,7 +1970,7 @@ export function performServerHandshake() {
   return undefined;
 }
 
-// COTTONTAIL-COMPAT: node:http2 native TLS boundary - socket-backed h2c and TLS sessions, ALPN negotiation, HPACK, CONTINUATION, trailers, SETTINGS, flow-window replenishment, validation, and request/response compatibility are implemented. Nonblocking direct TLS handshakes and upgrading an externally accepted TCP socket to server-side TLS require shared node:tls and native host support; outbound flow-control scheduling, Huffman encoding, ALTSVC/ORIGIN, and HTTP/1 fallback still need deeper protocol work.
+// COTTONTAIL-COMPAT: node:http2 native TLS boundary - socket-backed h2c and TLS sessions, nonblocking client/server FD upgrades, ALPN negotiation, HPACK, CONTINUATION, trailers, SETTINGS, flow-window replenishment, validation, and request/response compatibility are implemented. Outbound flow-control scheduling, Huffman encoding, ALTSVC/ORIGIN, and HTTP/1 fallback still need deeper protocol work.
 
 export default {
   Http2Stream,
