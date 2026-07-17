@@ -204,31 +204,29 @@ fn copyLinuxSystemLibrary(b: *std.Build, library: []const u8) std.Build.LazyPath
     return output;
 }
 
-fn linuxCppFlags(b: *std.Build) []const []const u8 {
-    // Zig only adds its bundled libc++ headers when link_libcpp is enabled,
-    // but vendored JSC uses the host's GNU libstdc++ ABI. Ask the same g++
-    // used to locate libstdc++ for its native C++ header search list. These
-    // flags must stay scoped to C++ sources: GCC's stdatomic.h is not
-    // compatible with the Clang frontend compiling libuv's C sources.
-    var flags: std.ArrayList([]const u8) = .empty;
-    flags.appendSlice(b.allocator, &.{ "-std=c++20", "-DJS_NO_EXPORT=1" }) catch @panic("OOM");
-    const output = b.run(&.{ "sh", "-c", "printf '' | g++ -E -x c++ - -v 2>&1" });
-    var lines = std.mem.splitScalar(u8, output, '\n');
-    var in_search_list = false;
-    var found = false;
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (!in_search_list) {
-            if (std.mem.eql(u8, line, "#include <...> search starts here:")) in_search_list = true;
-            continue;
-        }
-        if (std.mem.eql(u8, line, "End of search list.")) break;
-        if (std.mem.indexOf(u8, line, "/c++/") == null) continue;
-        flags.append(b.allocator, b.fmt("-isystem{s}", .{line})) catch @panic("OOM");
-        found = true;
+fn compileLinuxCppSource(
+    b: *std.Build,
+    vendor_dir: []const u8,
+    source: []const u8,
+    output_name: []const u8,
+) std.Build.LazyPath {
+    // JSC uses the host GNU C++ ABI. Compile the small C++ bridge with the
+    // matching frontend so GCC's include_next headers retain their native
+    // search order, then let Zig link the resulting object into Cottontail.
+    const command = b.addSystemCommand(&.{ "g++", "-std=c++20", "-DJS_NO_EXPORT=1", "-fPIC", "-c" });
+    inline for (&.{
+        "src",
+        "vendors/libuv/include",
+        "vendors/libuv/src",
+    }) |include_dir| {
+        command.addArg("-I");
+        command.addDirectoryArg(b.path(include_dir));
     }
-    if (!found) @panic("g++ did not report its C++ include search paths");
-    return flags.toOwnedSlice(b.allocator) catch @panic("OOM");
+    command.addArg("-I");
+    command.addDirectoryArg(b.path(b.fmt("{s}/include", .{vendor_dir})));
+    command.addFileArg(b.path(source));
+    command.addArg("-o");
+    return command.addOutputFileArg(output_name);
 }
 
 fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
@@ -298,6 +296,15 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
     const resolved_target = step.root_module.resolved_target.?.result;
+    const platform_key = jscVendorPlatformKey(resolved_target) orelse {
+        std.debug.print(
+            "error: no vendored JavaScriptCore target for {s}-{s}\n",
+            .{ @tagName(resolved_target.os.tag), @tagName(resolved_target.cpu.arch) },
+        );
+        std.process.exit(1);
+    };
+    const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
+    step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
         .flags = &[_][]const u8{
@@ -311,16 +318,25 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DJS_NO_EXPORT=1",
         },
     });
-    const cpp_flags: []const []const u8 = if (resolved_target.os.tag == .linux)
-        linuxCppFlags(b)
-    else
-        &.{ "-std=c++20", "-DJS_NO_EXPORT=1" };
-    inline for (&.{
-        "src/jsc_private_bridge.cpp",
-        "src/jsc_stock_bridge.cpp",
-        "src/napi_bridge.cpp",
-    }) |source| {
-        step.root_module.addCSourceFile(.{ .file = b.path(source), .flags = cpp_flags });
+    if (resolved_target.os.tag == .linux) {
+        inline for (&.{
+            .{ "src/jsc_private_bridge.cpp", "jsc_private_bridge.o" },
+            .{ "src/jsc_stock_bridge.cpp", "jsc_stock_bridge.o" },
+            .{ "src/napi_bridge.cpp", "napi_bridge.o" },
+        }) |bridge| {
+            step.root_module.addObjectFile(compileLinuxCppSource(b, vendor_dir, bridge[0], bridge[1]));
+        }
+    } else {
+        inline for (&.{
+            "src/jsc_private_bridge.cpp",
+            "src/jsc_stock_bridge.cpp",
+            "src/napi_bridge.cpp",
+        }) |source| {
+            step.root_module.addCSourceFile(.{
+                .file = b.path(source),
+                .flags = &.{ "-std=c++20", "-DJS_NO_EXPORT=1" },
+            });
+        }
     }
     step.root_module.addObjectFile(lolhtml);
     step.root_module.addCSourceFile(.{
@@ -336,16 +352,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DSQLITE_THREADSAFE=1",
         },
     });
-
-    const platform_key = jscVendorPlatformKey(resolved_target) orelse {
-        std.debug.print(
-            "error: no vendored JavaScriptCore target for {s}-{s}\n",
-            .{ @tagName(resolved_target.os.tag), @tagName(resolved_target.cpu.arch) },
-        );
-        std.process.exit(1);
-    };
-    const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
-    step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
 
     switch (resolved_target.os.tag) {
         .macos => {

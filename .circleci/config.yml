@@ -135,7 +135,11 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Node.js 24.18.0 installation failed through nvm" }
             nvm use 24.18.0 64
             if ($LASTEXITCODE -ne 0) { throw "Could not select Node.js 24.18.0 x64 through nvm" }
-            choco install rustup.install -y --no-progress
+            $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
+            $rustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
+            curl.exe --proto '=https' --tlsv1.2 --fail --location --retry 3 --output $rustupInit $rustupUrl
+            if ($LASTEXITCODE -ne 0) { throw "Could not download the official x64 rustup installer" }
+            & $rustupInit -y --profile minimal --default-host x86_64-pc-windows-msvc --default-toolchain stable --no-modify-path
             if ($LASTEXITCODE -ne 0) { throw "rustup installation failed" }
             $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
             if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 x64") {
