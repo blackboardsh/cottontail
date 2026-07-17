@@ -8,8 +8,8 @@ import { connect as nodeTlsConnect } from "../node/tls.js";
 import * as zlib from "../node/zlib.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
+  _resolveForImport as nodeResolveForImport,
   __setBuiltinModules as nodeSetBuiltinModules,
-  _resolveFilename as nodeResolveFilename,
   createRequire as nodeCreateRequire,
   isBuiltin as nodeIsBuiltin,
 } from "../node/module.js";
@@ -2622,6 +2622,9 @@ const CTResolveMessage = class ResolveMessage {
 
 if (typeof globalThis.BuildMessage !== "function") globalThis.BuildMessage = CTBuildMessage;
 if (typeof globalThis.ResolveMessage !== "function") globalThis.ResolveMessage = CTResolveMessage;
+// Bun 1.3.10 exposes the legacy Error spellings as exact constructor aliases.
+globalThis.BuildError = globalThis.BuildMessage;
+globalThis.ResolveError = globalThis.ResolveMessage;
 
 function ctBuildArtifactMime(meta) {
   if (meta.type != null) return String(meta.type);
@@ -10856,77 +10859,15 @@ export function pathToFileURL(value) {
   return nodePathToFileURL(String(value));
 }
 
-function packageImportsTargetForConditions(target) {
-  if (typeof target === "string") return target;
-  if (Array.isArray(target)) {
-    for (const item of target) {
-      const resolved = packageImportsTargetForConditions(item);
-      if (resolved != null) return resolved;
-    }
-    return null;
-  }
-  if (target && typeof target === "object") {
-    for (const condition of ["bun", "node", "import", "require", "default"]) {
-      if (target[condition] !== undefined) {
-        const resolved = packageImportsTargetForConditions(target[condition]);
-        if (resolved != null) return resolved;
-      }
-    }
-  }
-  return null;
-}
-
-function resolvePackageImportsSync(specifier, from) {
-  let fromPath = String(from ?? cottontail.cwd());
-  if (fromPath.startsWith("file:")) {
-    try { fromPath = fileURLToPath(fromPath); } catch { /* keep as-is */ }
-  }
-  if (!fromPath.startsWith("/")) fromPath = nodePathResolve(String(fromPath));
-  let dir = fromPath;
-  while (dir && dir !== "/") {
-    dir = dir.replace(/\/[^/]*$/, "") || "/";
-    const packageJsonPath = dir === "/" ? "/package.json" : `${dir}/package.json`;
-    if (cottontail.existsSync(packageJsonPath)) {
-      let imports;
-      try { imports = JSON.parse(cottontail.readFile(packageJsonPath))?.imports; } catch { imports = undefined; }
-      if (imports && typeof imports === "object") {
-        let target = imports[specifier] !== undefined ? packageImportsTargetForConditions(imports[specifier]) : null;
-        if (target == null) {
-          for (const key of Object.keys(imports)) {
-            const star = key.indexOf("*");
-            if (star === -1) continue;
-            const prefix = key.slice(0, star);
-            const suffix = key.slice(star + 1);
-            if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) continue;
-            if (specifier.length < prefix.length + suffix.length) continue;
-            const wildcard = specifier.slice(prefix.length, specifier.length - suffix.length);
-            const rawTarget = packageImportsTargetForConditions(imports[key]);
-            if (rawTarget != null) {
-              target = rawTarget.replace("*", wildcard);
-              break;
-            }
-          }
-        }
-        if (target != null && !String(target).startsWith("#")) {
-          if (String(target).startsWith(".") || String(target).startsWith("/")) {
-            return nodePathResolve(dir, String(target));
-          }
-          return resolveSync(String(target), `${dir}/package.json`);
-        }
-      }
-      break;
-    }
-  }
-  const error = new Error(`Cannot find module "${specifier}" from "${String(from ?? cottontail.cwd())}"`);
-  error.name = "ResolveMessage";
-  error.code = "ERR_MODULE_NOT_FOUND";
-  throw error;
+function missingResolveArguments() {
+  const error = new TypeError("Expected a specifier and a from path");
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
 }
 
 export function resolveSync(specifier, from = cottontail.cwd()) {
-  if (arguments.length === 0) throw new TypeError("Bun.resolveSync expects a specifier");
+  if (arguments.length === 0) throw missingResolveArguments();
   const text = String(specifier);
-  if (text.startsWith("#")) return resolvePackageImportsSync(text, from);
 
   let base = String(from ?? cottontail.cwd());
   if (base.startsWith("file:")) base = nodeFileURLToPath(base);
@@ -10934,13 +10875,14 @@ export function resolveSync(specifier, from = cottontail.cwd()) {
     if (cottontail.statSync(base, true)?.isDirectory) base = pathJoin(base, "package.json");
   } catch {}
 
-  const resolved = nodeResolveFilename(text, { filename: base });
+  const resolved = nodeResolveForImport(text, base);
   if (resolved.startsWith("node:") || resolved.startsWith("bun:")) return resolved;
   if (nodeIsBuiltin(resolved)) return resolved === "bun" ? resolved : `node:${resolved}`;
   return resolved;
 }
 
 export function resolve(specifier, from = cottontail.cwd()) {
+  if (arguments.length === 0) return Promise.reject(missingResolveArguments());
   return Promise.resolve(resolveSync(specifier, from));
 }
 

@@ -512,9 +512,25 @@ function packageDirRealPath(candidate) {
   return candidate;
 }
 
-function packageRootFor(request, startDir) {
+function packageNameForRequest(request) {
   const parts = request.startsWith("@") ? request.split("/").slice(0, 2) : [request.split("/")[0]];
-  const packageName = parts.join("/");
+  return parts.join("/");
+}
+
+function packageDirectoryExists(candidate) {
+  return isDirectory(candidate) || modulePathExists(join(candidate, "package.json"));
+}
+
+function nodePathEntries() {
+  const value = globalThis.process?.env?.NODE_PATH ?? processModule.env?.NODE_PATH;
+  if (typeof value !== "string" || value.length === 0) return [];
+  return value.split(path.delimiter || (globalThis.process?.platform === "win32" ? ";" : ":"))
+    .filter(Boolean)
+    .map((entry) => resolve(entry));
+}
+
+function packageRootFor(request, startDir) {
+  const packageName = packageNameForRequest(request);
   let dir = startDir;
   while (true) {
     const selfManifest = join(dir, "package.json");
@@ -528,7 +544,7 @@ function packageRootFor(request, startDir) {
     }
 
     const nodeModulesCandidate = join(dir, "node_modules", packageName);
-    if (modulePathExists(join(nodeModulesCandidate, "package.json"))) return packageDirRealPath(nodeModulesCandidate);
+    if (packageDirectoryExists(nodeModulesCandidate)) return packageDirRealPath(nodeModulesCandidate);
 
     // A sibling directory that merely shares the package name is not a
     // package root (e.g. test fixtures at third_party/<name>/package.json);
@@ -549,6 +565,14 @@ function packageRootFor(request, startDir) {
     if (parent === dir) break;
     dir = parent;
   }
+
+  // Bun follows Node's NODE_PATH lookup after ordinary ancestor
+  // node_modules traversal. Entries point at node_modules directories, not
+  // project roots, and retain their declared order.
+  for (const entry of nodePathEntries()) {
+    const candidate = join(entry, packageName);
+    if (packageDirectoryExists(candidate)) return packageDirRealPath(candidate);
+  }
   return null;
 }
 
@@ -564,67 +588,103 @@ function resolveAsFile(candidate) {
   return null;
 }
 
-function resolveAsDirectory(candidate) {
+function resolveAsDirectory(candidate, kind = "require") {
   if (!isDirectory(candidate)) return null;
   const packagePath = join(candidate, "package.json");
   const packageJson = isFile(packagePath) ? readPackageJson(packagePath) : null;
   if (packageJson?.exports != null) {
-    const exported = resolvePackageExports(candidate, packageJson, "");
+    const exported = resolvePackageExports(candidate, packageJson, "", kind);
     if (exported) return exported;
   }
   const mainField = packageJson && typeof packageJson.main === "string" ? packageJson.main : "";
   if (mainField) {
     const mainCandidate = resolve(candidate, mainField);
-    const mainResolved = resolveAsFile(mainCandidate) || resolveAsDirectory(mainCandidate);
+    const mainResolved = resolveAsFile(mainCandidate) || resolveAsDirectory(mainCandidate, kind);
     if (mainResolved) return mainResolved;
   }
   return resolveAsFile(join(candidate, "index"));
 }
 
-function packageTargetForConditions(target) {
+const packageTargetUndefined = Symbol("packageTargetUndefined");
+const packageTargetNull = Symbol("packageTargetNull");
+
+function customResolverConditions() {
+  const conditions = [];
+  const args = globalThis.process?.execArgv ?? processModule.execArgv ?? [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index]);
+    let value;
+    if (arg.startsWith("--conditions=")) value = arg.slice("--conditions=".length);
+    else if (arg === "--conditions" && index + 1 < args.length) value = String(args[++index]);
+    else continue;
+    for (const condition of value.split(",")) {
+      if (condition) conditions.push(condition);
+    }
+  }
+  return conditions;
+}
+
+function resolverConditions(kind) {
+  return new Set(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
+}
+
+// Ported from Bun's ESModule.resolveTarget: condition objects preserve
+// package.json key order, arrays advance past null/invalid alternatives, and
+// a matched condition whose nested target is undefined may fall through to a
+// later condition.
+function packageTargetForConditions(target, conditions) {
   if (typeof target === "string") return target;
+  if (target === null) return packageTargetNull;
   if (Array.isArray(target)) {
     for (const item of target) {
-      const resolved = packageTargetForConditions(item);
-      if (resolved) return resolved;
+      const resolved = packageTargetForConditions(item, conditions);
+      if (typeof resolved === "string") return resolved;
     }
-    return null;
+    return packageTargetNull;
   }
   if (target && typeof target === "object") {
-    const activeConditions = new Set(["node", "require", "default"]);
     for (const [condition, value] of Object.entries(target)) {
-      if (activeConditions.has(condition)) {
-        const resolved = packageTargetForConditions(value);
-        if (resolved) return resolved;
-      }
+      if (!conditions.has(condition)) continue;
+      const resolved = packageTargetForConditions(value, conditions);
+      if (resolved !== packageTargetUndefined) return resolved;
     }
   }
-  return null;
+  return packageTargetUndefined;
 }
 
-function applyExportPattern(pattern, target, subpath) {
-  const starIndex = pattern.indexOf("*");
-  if (starIndex < 0) return target;
-  const before = pattern.slice(0, starIndex);
-  const after = pattern.slice(starIndex + 1);
-  if (!subpath.startsWith(before) || !subpath.endsWith(after)) return null;
-  const matched = subpath.slice(before.length, subpath.length - after.length);
-  return String(target).replace(/\*/g, matched);
-}
-
-function resolvePackageTarget(root, target) {
+function resolvePackageTarget(root, target, kind = "require") {
   if (typeof target !== "string" || !target.startsWith("./")) return null;
   const candidate = resolve(root, target);
-  return resolveAsFile(candidate) || resolveAsDirectory(candidate);
+  if (candidate !== root && !candidate.startsWith(`${root}/`) && !candidate.startsWith(`${root}\\`)) return null;
+  return resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
 }
 
-function resolvePackageExports(root, packageJson, suffix = "") {
+function packageMapPatternMatches(map, specifier) {
+  const matches = [];
+  for (const [key, target] of Object.entries(map)) {
+    const star = key.indexOf("*");
+    if (star >= 0) {
+      const prefix = key.slice(0, star);
+      const trailer = key.slice(star + 1);
+      if (!specifier.startsWith(prefix) || !specifier.endsWith(trailer)) continue;
+      if (specifier.length < prefix.length + trailer.length) continue;
+      matches.push({ key, target, subpath: specifier.slice(prefix.length, specifier.length - trailer.length), prefixLength: prefix.length });
+    } else if (key.endsWith("/") && specifier.startsWith(key)) {
+      matches.push({ key, target, subpath: specifier.slice(key.length), prefixLength: key.length });
+    }
+  }
+  matches.sort((a, b) => b.prefixLength - a.prefixLength || b.key.length - a.key.length);
+  return matches;
+}
+
+function resolvePackageExports(root, packageJson, suffix = "", kind = "require") {
   const exportsField = packageJson?.exports;
   if (exportsField == null) return null;
   const subpath = suffix ? `./${suffix}` : ".";
+  const conditions = resolverConditions(kind);
   if (typeof exportsField === "string" || Array.isArray(exportsField)) {
     if (subpath !== ".") return null;
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField));
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField, conditions), kind);
   }
   if (typeof exportsField !== "object") return null;
   // "exports" sugar: an object whose keys are all conditions (none start
@@ -632,16 +692,16 @@ function resolvePackageExports(root, packageJson, suffix = "") {
   // { "require": "./index.js", "import": "./esm/wrapper.js" }.
   if (!Object.keys(exportsField).some((key) => key.startsWith("."))) {
     if (subpath !== ".") return null;
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField));
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField, conditions), kind);
   }
   if (Object.prototype.hasOwnProperty.call(exportsField, subpath)) {
-    return resolvePackageTarget(root, packageTargetForConditions(exportsField[subpath]));
+    return resolvePackageTarget(root, packageTargetForConditions(exportsField[subpath], conditions), kind);
   }
-  for (const [pattern, target] of Object.entries(exportsField)) {
-    if (!pattern.includes("*")) continue;
-    const resolvedTarget = packageTargetForConditions(target);
-    const mapped = resolvedTarget == null ? null : applyExportPattern(pattern, resolvedTarget, subpath);
-    const resolved = mapped == null ? null : resolvePackageTarget(root, mapped);
+  for (const { key, target, subpath: matched } of packageMapPatternMatches(exportsField, subpath)) {
+    const resolvedTarget = packageTargetForConditions(target, conditions);
+    const mapped = typeof resolvedTarget !== "string" ? null
+      : key.includes("*") ? resolvedTarget.replace(/\*/g, matched) : `${resolvedTarget}${matched}`;
+    const resolved = mapped == null ? null : resolvePackageTarget(root, mapped, kind);
     if (resolved) return resolved;
   }
   return null;
@@ -723,9 +783,23 @@ function moduleNotFoundError(request, resolveMessage = false) {
 class ResolveMessage extends Error {}
 class BuildMessage extends SyntaxError {}
 
+function makeResolveMessage(message, code = "ERR_MODULE_NOT_FOUND", referrer = undefined) {
+  const Constructor = typeof globalThis.ResolveMessage === "function" ? globalThis.ResolveMessage : ResolveMessage;
+  let error;
+  try {
+    error = new Constructor({ message, code, referrer });
+    if (String(error?.message ?? "") !== message) throw new Error();
+  } catch {
+    error = new Constructor(message);
+  }
+  error.name = "ResolveMessage";
+  error.code = code;
+  if (referrer !== undefined) error.referrer = referrer;
+  return error;
+}
+
 function dynamicResolveMessage(message) {
-  const error = new ResolveMessage(message);
-  error.code = "ERR_MODULE_NOT_FOUND";
+  const error = makeResolveMessage(message);
   error.line = 0;
   error.column = 0;
   error.position = null;
@@ -733,10 +807,11 @@ function dynamicResolveMessage(message) {
 }
 
 function packageNotFoundError(request, basePath) {
-  const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
-  const error = new ResolveMessage(`Cannot find package '${request}' from '${startDir}'`);
-  error.code = "MODULE_NOT_FOUND";
-  return error;
+  let referrer = String(basePath || cottontail.cwd());
+  if (referrer.startsWith("file:")) {
+    try { referrer = fileURLToPath(referrer); } catch {}
+  }
+  return makeResolveMessage(`Cannot find package '${request}' from '${referrer}'`, "MODULE_NOT_FOUND", referrer);
 }
 
 function importMetaForModule(filename, suffix = "") {
@@ -748,11 +823,91 @@ function importMetaForModule(filename, suffix = "") {
     file: basename(filename),
     path: filename,
     filename,
-    main: false,
+    main: mainModule?.filename === filename,
   };
   meta.require = createRequire(filename);
-  meta.resolveSync = (specifier, parent = filename) => resolveRequest(specifier, parent);
+  meta.resolveSync = (specifier, parent = filename) => resolveRequest(specifier, parent, true, "import");
+  meta.resolve = (specifier, parent = filename) => {
+    const resolved = meta.resolveSync(specifier, parent);
+    return resolvedToUrl(resolved);
+  };
+  Object.defineProperty(meta, "env", {
+    configurable: true,
+    enumerable: true,
+    get: () => globalThis.process?.env,
+  });
   return meta;
+}
+
+function resolutionStartDir(basePath) {
+  let text = String(basePath || cottontail.cwd());
+  if (text.startsWith("file:")) text = fileURLToPath(text);
+  return text.endsWith("/") || text.endsWith("\\") ? resolve(text) : dirname(text);
+}
+
+function nearestPackageScope(basePath) {
+  let dir = resolutionStartDir(basePath);
+  while (true) {
+    const packageJsonPath = join(dir, "package.json");
+    if (modulePathExists(packageJsonPath)) {
+      return { dir, packageJsonPath, packageJson: readPackageJson(packageJsonPath) };
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function packageImportNotDefinedError(specifier, basePath) {
+  let referrer = String(basePath || cottontail.cwd());
+  if (referrer.startsWith("file:")) {
+    try { referrer = fileURLToPath(referrer); } catch {}
+  }
+  return makeResolveMessage(
+    `Package import specifier '${specifier}' is not defined from '${referrer}'`,
+    "ERR_PACKAGE_IMPORT_NOT_DEFINED",
+    referrer,
+  );
+}
+
+function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
+  if (specifier === "#" || specifier.startsWith("#/")) throw packageImportNotDefinedError(specifier, basePath);
+  const scope = nearestPackageScope(basePath);
+  const imports = scope?.packageJson?.imports;
+  if (!imports || typeof imports !== "object" || Array.isArray(imports)) {
+    throw packageImportNotDefinedError(specifier, basePath);
+  }
+
+  const cycleKey = `${scope.packageJsonPath}\0${specifier}\0${kind}`;
+  if (seen.has(cycleKey)) throw packageImportNotDefinedError(specifier, basePath);
+  seen.add(cycleKey);
+
+  let rawTarget = Object.prototype.hasOwnProperty.call(imports, specifier)
+    ? imports[specifier]
+    : packageTargetUndefined;
+  let matched = "";
+  let patternMatched = false;
+  if (rawTarget === packageTargetUndefined) {
+    const pattern = packageMapPatternMatches(imports, specifier)[0];
+    if (pattern) {
+      rawTarget = pattern.target;
+      matched = pattern.subpath;
+      patternMatched = true;
+    }
+  }
+  const selected = packageTargetForConditions(rawTarget, resolverConditions(kind));
+  if (typeof selected !== "string") throw packageImportNotDefinedError(specifier, basePath);
+  const target = patternMatched ? selected.replace(/\*/g, matched) : selected;
+
+  if (target.startsWith("./")) {
+    const resolved = resolvePackageTarget(scope.dir, target, kind);
+    if (resolved) return resolved;
+    throw moduleNotFoundError(target);
+  }
+  if (target.startsWith("../") || target.startsWith("/") || target.startsWith("file:")) {
+    throw packageImportNotDefinedError(specifier, basePath);
+  }
+  return resolveRequestCore(target, scope.packageJsonPath, kind, seen);
 }
 
 function normalizeResolveHookResult(result) {
@@ -790,8 +945,23 @@ function isBuiltinHiddenByCompatProfile(id) {
   }
 }
 
-function resolveRequestCore(request, basePath) {
+function resolveRequestCore(request, basePath, kind = "require", packageImportSeen = undefined) {
   const originalText = String(request);
+  if (originalText.startsWith("#")) {
+    return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new Set());
+  }
+  if (originalText.startsWith("file:")) {
+    const { bare: fileUrl, suffix } = splitSpecifierSuffix(originalText);
+    let candidate;
+    try {
+      candidate = fileURLToPath(fileUrl);
+    } catch {
+      throw moduleNotFoundError(originalText, true);
+    }
+    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
+    if (resolved) return withSpecifierSuffix(resolved, suffix);
+    throw moduleNotFoundError(originalText, Boolean(suffix));
+  }
   const suffixIndex = specifierSuffixIndex(originalText);
   const lastSeparator = Math.max(originalText.lastIndexOf("/"), originalText.lastIndexOf("\\"));
   if (suffixIndex >= 0 && suffixIndex < lastSeparator && (
@@ -799,11 +969,11 @@ function resolveRequestCore(request, basePath) {
     originalText.startsWith("/") ||
     /^[A-Za-z]:[\\/]/.test(originalText)
   )) {
-    const exactStartDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+    const exactStartDir = resolutionStartDir(basePath);
     const exactCandidate = originalText.startsWith("/") || /^[A-Za-z]:[\\/]/.test(originalText)
       ? originalText
       : resolve(exactStartDir, originalText);
-    const exact = resolveAsFile(exactCandidate) || resolveAsDirectory(exactCandidate);
+    const exact = resolveAsFile(exactCandidate) || resolveAsDirectory(exactCandidate, kind);
     if (exact) return exact;
   }
   const { bare: text, suffix } = splitSpecifierSuffix(originalText);
@@ -817,10 +987,10 @@ function resolveRequestCore(request, basePath) {
   if (text.startsWith("node:")) throw unknownBuiltinError(text);
   if (hasRuntimePackageReplacement(text)) return text;
 
-  const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+  const startDir = resolutionStartDir(basePath);
   if (text.startsWith(".") || text.startsWith("/")) {
     const candidate = text.startsWith("/") ? text : resolve(startDir, text);
-    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
+    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
     if (resolved) return withSpecifierSuffix(resolved, suffix);
     throw moduleNotFoundError(originalText, Boolean(suffix));
   }
@@ -831,9 +1001,16 @@ function resolveRequestCore(request, basePath) {
   const root = packageRootFor(text, startDir);
   if (!root) throw packageNotFoundError(originalText, basePath);
   const packageSuffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
-  const packageJson = readPackageJson(join(root, "package.json"));
+  const packageJsonPath = join(root, "package.json");
+  const packageJson = modulePathExists(packageJsonPath) ? readPackageJson(packageJsonPath) : null;
   if (packageJson?.exports != null) {
-    const exported = resolvePackageExports(root, packageJson, packageSuffix);
+    let exported = resolvePackageExports(root, packageJson, packageSuffix, kind);
+    // Bun permits package.json reads and TypeScript-style redundant .js
+    // suffixes even when the exports map omits those spellings.
+    if (!exported && packageSuffix === "package.json" && isFile(packageJsonPath)) exported = packageJsonPath;
+    if (!exported && packageSuffix.endsWith(".js")) {
+      exported = resolvePackageExports(root, packageJson, packageSuffix.slice(0, -3), kind);
+    }
     if (exported) return withSpecifierSuffix(exported, suffix);
     const error = new Error(`Package subpath '${packageSuffix ? `./${packageSuffix}` : "."}' is not defined by "exports" in ${join(root, "package.json")}`);
     error.code = "ERR_PACKAGE_PATH_NOT_EXPORTED";
@@ -841,35 +1018,35 @@ function resolveRequestCore(request, basePath) {
   }
   if (packageSuffix) {
     const candidate = join(root, packageSuffix);
-    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate);
+    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
     if (resolved) return withSpecifierSuffix(resolved, suffix);
   }
-  const resolved = resolveAsDirectory(root);
+  const resolved = resolveAsDirectory(root, kind);
   if (resolved) return withSpecifierSuffix(resolved, suffix);
   throw moduleNotFoundError(originalText, Boolean(suffix));
 }
 
-function resolveRequest(request, basePath, useHooks = true) {
+function resolveRequest(request, basePath, useHooks = true, kind = "require") {
   if (bunModuleMockFor(request).found) {
     const text = String(request).replace(/^file:(?=\.\/)/, "");
     if (text.startsWith(".") || text.startsWith("/")) {
-      const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
+      const startDir = resolutionStartDir(basePath);
       const absoluteStartDir = startDir.startsWith("/") ? startDir : resolve(cottontail.cwd(), startDir);
       return text.startsWith("/") ? text : `${absoluteStartDir}/${text}`;
     }
     return text;
   }
   if (!useHooks || !moduleHooks.some((hook) => typeof hook.resolve === "function")) {
-    const startDir = basePath && !String(basePath).endsWith("/") ? dirname(basePath) : resolve(basePath || ".");
-    const cacheKey = `${String(request)}\0${startDir}`;
+    const startDir = resolutionStartDir(basePath);
+    const cacheKey = `${kind}\0${customResolverConditions().join("\0")}\0${String(request)}\0${startDir}`;
     if (Object.prototype.hasOwnProperty.call(modulePathCache, cacheKey)) return modulePathCache[cacheKey];
-    const resolved = resolveRequestCore(request, basePath);
+    const resolved = resolveRequestCore(request, basePath, kind);
     modulePathCache[cacheKey] = resolved;
     return resolved;
   }
 
   const baseContext = {
-    conditions: ["node", "require"],
+    conditions: [...resolverConditions(kind)],
     importAttributes: {},
     parentURL: parentURLForBase(basePath),
   };
@@ -885,7 +1062,7 @@ function resolveRequest(request, basePath, useHooks = true) {
     }
 
     const parent = context?.parentURL ? fileURLToPath(context.parentURL) : basePath;
-    const resolved = resolveRequestCore(specifier, parent);
+    const resolved = resolveRequestCore(specifier, parent, kind);
     return { url: resolvedToUrl(resolved), format: formatForResolved(resolved), shortCircuit: true };
   };
 
@@ -1004,7 +1181,7 @@ function executeCommonJsSource(module, filename, source) {
     try {
       run(module.exports, module.require, module, importMetaForModule(filename));
     } catch (error) {
-      throw remapThrownModuleError(error);
+      throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
     }
     module.loaded = true;
     return module.exports;
@@ -1050,7 +1227,7 @@ function executeCommonJsSource(module, filename, source) {
       async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
     );
   } catch (error) {
-    throw remapThrownModuleError(error);
+    throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
   }
   module.loaded = true;
   return module.exports;
@@ -1063,10 +1240,15 @@ function transpileExtensionSource(filename, loader) {
     return maybeTransformRuntimeSyntax(filename, maybeStripTypeScript(filename, source));
   }
   try {
+    // Bun's parser canonicalizes `module === require.main` through its
+    // import.meta.main AST node. CJS modules must be printed with Node target
+    // semantics so that node remains the original entry Module instead of
+    // emitting import.meta into the CommonJS function wrapper.
+    const target = /\brequire\.main\b/.test(source) ? "node" : "bun";
     return String(cottontail.transpilerTransform(
       source,
       JSON.stringify({
-        target: "bun",
+        target,
         deadCodeElimination: false,
         minify: { syntax: true },
         _cottontailInitialIndent: 1,
@@ -1099,11 +1281,22 @@ function executeBundledCommonJsModule(module, filename) {
       target: "bun",
       preserveExternalRequireName: true,
       runtimeFileLoaderPaths: true,
+      // Keep JavaScript dependencies in createRequire()'s shared module
+      // cache. Bundling them into each required ESM entry creates duplicate
+      // module instances and breaks ESM live bindings across re-exports.
+      external: ["*.js", "*.mjs", "*.cjs"],
+      define: {
+        "import.meta": "__ctImportMeta",
+      },
     }),
   ));
   maybeRegisterSourceMap(filename, bundled);
   recordCompileCache(filename, bundled);
-  const factory = cottontail.compileFunction(bundled, filename);
+  const createFactory = cottontail.compileFunction(
+    `(function(__ctImportMeta) { return (\n${bundled}\n); })`,
+    filename,
+  );
+  const factory = createFactory(importMetaForModule(filename));
   if (typeof factory !== "function") {
     throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
   }
@@ -1480,7 +1673,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   if (specifierText.includes("://") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(specifierText)) {
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
-  const resolved = resolveRequest(String(specifier), parent);
+  const resolved = resolveRequest(String(specifier), parent, true, "import");
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   if (loader === "text") {
     return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
@@ -1590,7 +1783,7 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
 }
 
 export function createRequire(basePath = cottontail.cwd(), parentModule = null) {
-  let normalizedBasePath = String(basePath).startsWith("file://")
+  let normalizedBasePath = String(basePath).startsWith("file:")
     ? fileURLToPath(basePath)
     : String(basePath);
   // Only inspect the stack when the caller heuristic can actually apply
@@ -2066,9 +2259,9 @@ function remapRegisteredSourceMapStack(stack) {
   });
 }
 
-function remapThrownModuleError(error) {
+function remapThrownModuleError(error, fallbackFilename = undefined, wrapperLineOffset = 0) {
   try {
-    const filename = typeof error?.sourceURL === "string" ? error.sourceURL : undefined;
+    const filename = typeof error?.sourceURL === "string" ? error.sourceURL : fallbackFilename;
     if (filename) {
       const generatedSource = readModuleFile(filename);
       let sourceMap = sourceMapCache.get(filename);
@@ -2077,7 +2270,7 @@ function remapThrownModuleError(error) {
         sourceMap = sourceMapCache.get(filename);
       }
       Object.defineProperty(error, "__ctModuleErrorMetadata", {
-        value: { filename, generatedSource, sourceMap },
+        value: { filename, generatedSource, sourceMap, wrapperLineOffset },
         configurable: true,
       });
     }
@@ -2094,7 +2287,21 @@ function originalErrorLocation(error, metadata) {
   const sourceMap = metadata?.sourceMap;
   const generatedLine = Number(error?.line);
   const generatedColumn = Number(error?.column);
-  if (!sourceMap || !Number.isFinite(generatedLine) || !Number.isFinite(generatedColumn)) return null;
+  if (!sourceMap) {
+    if (typeof metadata?.generatedSource !== "string" || typeof metadata?.filename !== "string") return null;
+    const escapedFilename = metadata.filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const frame = String(error?.stack ?? "").match(new RegExp(`${escapedFilename}:(\\d+):(\\d+)`));
+    const stackLine = Number(frame?.[1] ?? generatedLine);
+    const stackColumn = Number(frame?.[2] ?? generatedColumn);
+    if (!Number.isFinite(stackLine) || !Number.isFinite(stackColumn)) return null;
+    return {
+      filename: metadata.filename,
+      line: Math.max(1, stackLine - Number(metadata.wrapperLineOffset || 0)),
+      column: Math.max(1, stackColumn),
+      source: metadata.generatedSource,
+    };
+  }
+  if (!Number.isFinite(generatedLine) || !Number.isFinite(generatedColumn)) return null;
 
   let mapColumn = Math.max(0, generatedColumn - 1);
   const generatedLineText = String(metadata.generatedSource).split(/\r?\n/)[generatedLine - 1] ?? "";
@@ -2330,6 +2537,13 @@ export function _resolveFilename(request, parent = undefined, isMain = false, op
   }
   const base = parent?.filename || parent?.path || cottontail.cwd();
   return resolveRequest(text, base);
+}
+
+// Shared Bun/import-meta resolver entrypoint. Keep this separate from
+// Module._resolveFilename because package condition maps distinguish ESM
+// imports from CommonJS require/require.resolve calls.
+export function _resolveForImport(request, basePath = cottontail.cwd()) {
+  return resolveRequest(String(request), basePath, true, "import");
 }
 
 export function _load(request, parent = undefined, isMain = false) {
