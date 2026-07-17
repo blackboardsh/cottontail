@@ -8,6 +8,7 @@ import * as zlibConstants from "./zlib/constants.js";
 import { _enqueueNextTick, _wrapAsyncCallback } from "./async_hooks.js";
 import { uvErrorMap } from "./util/internal/loader.js";
 import { fileURLToPath } from "./url.js";
+import { makeHttpParserBinding } from "../internal/node-http-parser.js";
 
 const processStartNs = typeof cottontail.nanotime === "function" ? BigInt(Math.floor(cottontail.nanotime())) : 0n;
 const processStartMs = Date.now();
@@ -704,6 +705,8 @@ function makeProcessBinding(name) {
       return utilBinding;
     case "tty_wrap":
       return ttyWrapBinding;
+    case "http_parser":
+      return makeHttpParserBinding();
     case "config":
       return Object.freeze({
         isDebugBuild: false,
