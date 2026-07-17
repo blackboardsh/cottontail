@@ -703,6 +703,10 @@
       "reason": "Root and transitive overrides, npm aliases, lockfile updates, frozen installs, removal, and workspace exemption pass the copied upstream coverage (7 bun:test cases, 20 assertions).",
       "timeoutMs": 120000
     },
+    "test/cli/install/migration/migrate.test.ts": {
+      "status": "enabled",
+      "reason": "npm package-lock and Yarn v1 migration semantics pass all 10 copied upstream cases with 26 assertions through Cottontail's source-ported lockfile graph."
+    },
     "test/cli/install/hosted-git-info/boundary-conditions.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
@@ -2375,8 +2379,8 @@
       "reason": "Runtime and CLI maximum-header configuration is enforced across node:http and Bun.serve in all four copied upstream cases (9 assertions)."
     },
     "test/js/node/http/node-http-parser.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires a real process.binding(\"http_parser\") HTTPParser and ConnectionsList implementation."
+      "status": "enabled",
+      "reason": "The source-ported process.binding(\"http_parser\") implementation passes all 9 copied incremental parser and ConnectionsList cases with 36 assertions."
     },
     "test/js/node/http/node-http-primoridals.test.ts": {
       "status": "enabled",
