@@ -1516,9 +1516,26 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
     }.lessThan);
     const entrypoint_count = test_files.items.len;
     if (entrypoint_count == 0) {
-        var stderr_buffer: [256]u8 = undefined;
+        var stdout_buffer: [128]u8 = undefined;
+        var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        try stdout_writer.interface.print("bun test {s} (cottontail)\n", .{version});
+        try stdout_writer.interface.flush();
+
+        var stderr_buffer: [512]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
-        try stderr_writer.interface.writeAll("No tests found!\n");
+        if (isTestAIAgent(init.environ_map)) {
+            const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+            try stderr_writer.interface.print(
+                "error: 0 test files matching **{{.test,.spec,_test_,_spec_}}.{{js,ts,jsx,tsx}} in --cwd=\"{s}\"\n\n",
+                .{cwd},
+            );
+        } else {
+            try stderr_writer.interface.writeAll(
+                "No tests found!\n\n" ++
+                    "Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")\n\n" ++
+                    "Learn more about bun test: https://bun.com/docs/cli/test\n",
+            );
+        }
         try stderr_writer.interface.flush();
         return if (testPassWithNoTests(args)) 0 else 1;
     }
@@ -1593,6 +1610,20 @@ fn testPassWithNoTests(args: []const [:0]const u8) bool {
         if (std.mem.eql(u8, arg, "--pass-with-no-tests")) return true;
     }
     return false;
+}
+
+fn truthyAgentEnvironmentValue(value: []const u8) bool {
+    return value.len > 0 and
+        !std.mem.eql(u8, value, "0") and
+        !std.ascii.eqlIgnoreCase(value, "false");
+}
+
+fn isTestAIAgent(environ_map: *const std.process.Environ.Map) bool {
+    if (environ_map.get("AGENT")) |agent| return std.mem.eql(u8, agent, "1");
+    if (environ_map.get("CLAUDECODE")) |claude| {
+        if (truthyAgentEnvironmentValue(claude)) return true;
+    }
+    return environ_map.get("REPL_ID") != null;
 }
 
 fn parseRunInvocation(
@@ -2150,6 +2181,17 @@ test "pass-with-no-tests controls empty test discovery exit policy" {
     const disabled = [_][:0]const u8{ "cottontail", "test" };
     try std.testing.expect(testPassWithNoTests(&enabled));
     try std.testing.expect(!testPassWithNoTests(&disabled));
+}
+
+test "test AI-agent detection follows Bun environment precedence" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("CLAUDECODE", "1");
+    try std.testing.expect(isTestAIAgent(&environ));
+    try environ.put("AGENT", "false");
+    try std.testing.expect(!isTestAIAgent(&environ));
+    try environ.put("AGENT", "1");
+    try std.testing.expect(isTestAIAgent(&environ));
 }
 
 test {

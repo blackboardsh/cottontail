@@ -1403,7 +1403,10 @@ function reportResults() {
   const labelFilterMatchedNoTests = Boolean(testNamePattern) && currentViews.length === 0 &&
     failures.length === 0 && tests.length > 0;
   const runs = completedRuns.length > 0 ? [...completedRuns, currentViews] : [currentViews];
-  if (runs.some((views) => views.length > 0) || failures.length > 0 || labelFilterMatchedNoTests) {
+  const hasVisibleRunOutput = runs.some((views) => agentQuietMode
+    ? views.some((view) => view.status === "fail")
+    : views.length > 0);
+  if (hasVisibleRunOutput || failures.length > 0 || labelFilterMatchedNoTests) {
     let file = String(globalThis.process?.argv?.[1] ?? "test");
     const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
     if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
