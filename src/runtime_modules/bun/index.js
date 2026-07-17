@@ -6,6 +6,7 @@ import * as nodeHttps from "../node/https.js";
 import * as nodeNet from "../node/net.js";
 import { connect as nodeTlsConnect } from "../node/tls.js";
 import * as zlib from "../node/zlib.js";
+import { createUndiciModule } from "../node/undici.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
   _resolveForImport as nodeResolveForImport,
@@ -4888,8 +4889,11 @@ export class Headers {
   }
   toJSON() {
     const result = {};
-    const entries = [...this._values.values()]
-      .map(({ key, value }) => [String(key).toLowerCase(), value])
+    const entries = [...this._values.entries()]
+      .map(([normalized, { value }]) => [
+        normalized,
+        normalized === "set-cookie" ? [...(this._allValues.get(normalized) ?? [])] : value,
+      ])
       .sort(([left], [right]) => left.localeCompare(right));
     for (const [key, value] of entries) result[key] = value;
     return result;
@@ -4910,7 +4914,8 @@ export class Headers {
     for (const [, value] of this.entries()) yield value;
   }
   get count() {
-    return this._values.size;
+    const setCookies = this._allValues.get("set-cookie")?.length ?? 0;
+    return this._values.size + Math.max(0, setCookies - 1);
   }
   [Symbol.iterator]() {
     return this.entries();
@@ -5175,7 +5180,9 @@ function isURLSearchParamsLike(value) {
 // Fill in the fetch-spec default Content-Type for bodies that imply one.
 function setDefaultBodyContentType(headers, body) {
   if (body == null || headers.has("content-type")) return;
-  if (body instanceof FormData) {
+  if (typeof body === "string") {
+    headers.set("Content-Type", "text/plain;charset=UTF-8");
+  } else if (body instanceof FormData) {
     headers.set("Content-Type", `multipart/form-data; boundary=${formDataBoundary(body)}`);
   } else if (isURLSearchParamsLike(body)) {
     headers.set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
@@ -5262,12 +5269,12 @@ function parseMultipartFormDataText(source, boundary) {
   const delimiter = `--${boundary}`;
   // The body must start with the dash-boundary (no preamble support) and must
   // contain a closing delimiter; anything else is a parse error.
-  if (!source.startsWith(delimiter)) {
-    throw new TypeError("FormData parse error: missing initial boundary");
-  }
   const closeIndex = source.indexOf(`${delimiter}--`);
   if (closeIndex < 0) {
-    throw new TypeError("FormData parse error: missing final boundary");
+    throw new TypeError("FormData parse error missing final boundary");
+  }
+  if (!source.startsWith(delimiter)) {
+    throw new TypeError("FormData parse error: missing initial boundary");
   }
   for (const rawPart of source.slice(0, closeIndex).split(delimiter).slice(1)) {
     const part = rawPart.replace(/^\r\n/, "").replace(/\r\n$/, "");
@@ -5300,6 +5307,21 @@ function parseMultipartFormDataText(source, boundary) {
 
 const requestState = new WeakMap();
 
+function canonicalFetchUrl(input) {
+  let value;
+  if (input instanceof Request) value = input.url;
+  else if (typeof input === "string") value = input;
+  else if (input != null && (typeof input === "object" || typeof input === "function") && "url" in input) value = input.url;
+  else value = String(input);
+  try {
+    return new URL(String(value)).href;
+  } catch (cause) {
+    const error = new TypeError(`Invalid URL: ${String(value)}`);
+    error.cause = cause;
+    throw error;
+  }
+}
+
 export class Request {
   constructor(input, init = {}) {
     if (init === null || init === undefined) init = {};
@@ -5308,7 +5330,7 @@ export class Request {
     }
     // WebIDL converts the request input before reading RequestInit. In
     // particular, a throwing input.toString() must win over init.headers.
-    const url = typeof input === "string" ? input : String(input?.url ?? input ?? "");
+    const url = canonicalFetchUrl(input);
     const headers = new Headers(init.headers ?? input?.headers);
     requestState.set(this, {
       url,
@@ -5320,9 +5342,18 @@ export class Request {
       cache: init.cache ?? input?.cache ?? "default",
       mode: init.mode ?? input?.mode ?? "cors",
       credentials: init.credentials ?? input?.credentials ?? "include",
+      keepalive: init.keepalive ?? input?.keepalive ?? false,
+      keepaliveExplicit: Object.prototype.hasOwnProperty.call(init, "keepalive") ||
+        (input instanceof Request && requestState.get(input)?.keepaliveExplicit === true),
     });
-    this._body = init.body ?? input?._body ?? input?.body ?? null;
+    this._body = Object.prototype.hasOwnProperty.call(init, "body")
+      ? init.body
+      : input?._body ?? input?.body ?? null;
     setDefaultBodyContentType(headers, this._body);
+    if (this._body?.locked) throw new TypeError(init.keepalive ? "keepalive" : "ReadableStream is locked");
+    if (init.keepalive === true && typeof this._body?.getReader === "function") {
+      throw new TypeError("keepalive");
+    }
     this._bodyStream = undefined;
     this._bodyUsed = false;
   }
@@ -5339,12 +5370,19 @@ export class Request {
   get cache() { return requestState.get(this)?.cache; }
   get mode() { return requestState.get(this)?.mode; }
   get credentials() { return requestState.get(this)?.credentials; }
+  get keepalive() { return requestState.get(this)?.keepalive === true; }
   get body() {
     if (!this._bodyStream) {
       this._bodyStream = bodyReadableStream(this._body);
       const getReader = this._bodyStream?.getReader?.bind(this._bodyStream);
       if (getReader) this._bodyStream.getReader = (...args) => {
-        const reader = getReader(...args);
+        let reader;
+        try {
+          reader = getReader(...args);
+        } catch (error) {
+          if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
+          throw error;
+        }
         const read = reader.read.bind(reader);
         reader.read = (...readArgs) => { this._bodyUsed = true; return read(...readArgs); };
         return reader;
@@ -5362,6 +5400,7 @@ export class Request {
     return this._bodyUsed;
   }
   clone() {
+    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
     if (this._bodyUsed) throw new TypeError("Body already used");
     const cloned = new Request(this.url, {
       method: this.method,
@@ -5372,12 +5411,14 @@ export class Request {
       cache: this.cache,
       mode: this.mode,
       credentials: this.credentials,
+      keepalive: this.keepalive,
     });
     cloned._body = teeClonedBody(this);
     if (this._cookies) cloned._cookies = cloneCookieMap(this._cookies);
     return cloned;
   }
   _takeBody() {
+    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
     if (this._bodyUsed) throw new TypeError("Body already used");
     const body = this._body;
     if (body != null) this._bodyUsed = true;
@@ -5400,6 +5441,7 @@ export class Request {
     return cachedBlobForBytes(await bytesFromBody(body), type);
   }
   text() {
+    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
     if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
     const body = this._body;
     if (body != null) this._bodyUsed = true;
@@ -5421,6 +5463,7 @@ export class Request {
       error.code = "ERR_INVALID_THIS";
       throw error;
     }
+    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
     if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
     this._bodyUsed = true;
     if (this._body instanceof FormData || (this._body && typeof this._body.get === "function" && typeof this._body.append === "function")) {
@@ -5480,38 +5523,54 @@ export class Response {
     let status = 200;
     if (init.status !== undefined) {
       status = Number(init.status);
-      if (!Number.isInteger(status) || status < 100 || status > 999) {
+      if (!Number.isInteger(status) || status < 200 || status > 599) {
         throw new RangeError(`The status provided (${init.status}) must be an integer in the range [200, 599]`);
       }
     }
     this.status = status;
     this.statusText = String(init.statusText ?? "");
     this.headers = new Headers(init.headers);
+    if (body?.locked) throw new TypeError("ReadableStream is locked");
     setDefaultBodyContentType(this.headers, body);
     if (body instanceof FormData) assertFormDataFilesExist(body);
     this._body = body;
     this._bodyStream = undefined;
     this._bodyUsed = false;
+    this._bodyConsumedBytes = 0;
     this.url = String(init.url ?? "");
     this.redirected = Boolean(init.redirected);
+    this._type = String(init.type ?? "default");
   }
   get bodyUsed() {
     return this._bodyUsed === true;
   }
   static json(value, init = {}) {
+    const omitted = arguments.length === 0;
+    if (typeof init === "number") init = { status: init };
     let body;
-    try {
-      body = JSON.stringify(value);
-    } catch (error) {
-      // Match Node's JSON.stringify BigInt message (Bun does the same).
-      if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
-      throw error;
+    if (omitted) {
+      body = "";
+    } else {
+      try {
+        body = JSON.stringify(value);
+      } catch (error) {
+        // Match Node's JSON.stringify BigInt message (Bun does the same).
+        if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
+        throw error;
+      }
+      // Top-level undefined/function/symbol serialize to undefined; Bun throws.
+      if (body === undefined) throw new TypeError("Value is not JSON serializable");
     }
-    // Top-level undefined/function/symbol serialize to undefined; Bun throws.
-    if (body === undefined) throw new TypeError("Value is not JSON serializable");
     const headers = new Headers(init.headers);
-    if (!headers.has("content-type")) headers.set("content-type", "application/json");
+    if (!headers.has("content-type")) headers.set("content-type", "application/json;charset=utf-8");
     return new Response(body, { ...init, headers });
+  }
+  static error() {
+    const response = new Response(null);
+    response.status = 0;
+    response.statusText = "";
+    response._type = "error";
+    return response;
   }
   static redirect(url, status = 302) {
     let init = {};
@@ -5530,15 +5589,19 @@ export class Response {
     return new Response(null, { ...init, status: statusCode, headers });
   }
   clone() {
+    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
+    if (this._bodyUsed) throw new TypeError("Body already used");
     return new Response(teeClonedBody(this), {
       status: this.status,
       statusText: this.statusText,
       headers: new Headers(this.headers),
       url: this.url,
       redirected: this.redirected,
+      type: this._type,
     });
   }
   _takeBody() {
+    if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
     if (this._bodyUsed) throw new TypeError("Body already used");
     const body = this._body;
     if (body != null) this._bodyUsed = true;
@@ -5561,6 +5624,7 @@ export class Response {
     return cachedBlobForBytes(await bytesFromBody(body), type);
   }
   text() {
+    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
     if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
     const body = this._body;
     if (body != null) this._bodyUsed = true;
@@ -5572,6 +5636,7 @@ export class Response {
     return JSON.parse(await this.text());
   }
   formData() {
+    if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
     if (this._bodyUsed) return handledRejectedPromise(new TypeError("Body already used"));
     if (this._body != null) this._bodyUsed = true;
     if (this._body instanceof FormData) return Promise.resolve(this._body);
@@ -5582,10 +5647,24 @@ export class Response {
       this._bodyStream = bodyReadableStream(this._body);
       const getReader = this._bodyStream?.getReader?.bind(this._bodyStream);
       if (getReader) this._bodyStream.getReader = (...args) => {
-        const reader = getReader(...args);
+        let reader;
+        try {
+          reader = getReader(...args);
+        } catch (error) {
+          if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
+          throw error;
+        }
         // Bun marks the body as used as soon as the stream is locked for
         // reading (e.g. Readable.fromWeb), not only after the first read.
         this._bodyUsed = true;
+        const read = reader.read.bind(reader);
+        reader.read = (...readArgs) => read(...readArgs).then(result => {
+          const value = result?.value;
+          if (value != null) {
+            this._bodyConsumedBytes += value.byteLength ?? value.length ?? new TextEncoder().encode(String(value)).byteLength;
+          }
+          return result;
+        });
         return reader;
       };
     }
@@ -5593,6 +5672,9 @@ export class Response {
   }
   get ok() {
     return this.status >= 200 && this.status < 300;
+  }
+  get type() {
+    return this._type;
   }
   [Symbol.for("nodejs.util.inspect.custom")]() {
     const indentTail = (text) => String(text).split("\n").map((line, index) => (index === 0 ? line : `  ${line}`)).join("\n");
@@ -5606,7 +5688,9 @@ export class Response {
       `bodyUsed: ${this.bodyUsed}`,
     ];
     const body = this._body;
-    const sizeText = inspectBodyByteSize(body);
+    const sizeText = typeof body?.getReader === "function"
+      ? formatInspectBodyByteSize(this._bodyConsumedBytes, false)
+      : inspectBodyByteSize(body);
     const prefix = sizeText == null ? "Response" : `Response (${sizeText})`;
     const bodyInspector = body == null ? undefined : bunInspectPropertyDescriptor(body, ctInspectSymbol)?.value;
     if (typeof bodyInspector === "function") {
@@ -5628,7 +5712,11 @@ function inspectBodyByteSize(body) {
   else if (ArrayBuffer.isView(body)) size = body.byteLength;
   else if (typeof body === "object" && typeof body.size === "number" && Number.isFinite(body.size)) size = body.size;
   if (size == null) return null;
-  if (size === 0) return "0 KB";
+  return formatInspectBodyByteSize(size, true);
+}
+
+function formatInspectBodyByteSize(size, emptyAsKilobytes) {
+  if (size === 0) return emptyAsKilobytes ? "0 KB" : "0 bytes";
   if (size < 1000) return `${size} bytes`;
   const units = ["KB", "MB", "GB", "TB"];
   let value = size;
@@ -5662,10 +5750,27 @@ function activeServerForFetchUrl(urlText) {
 
 function fetchProxyConfiguration(urlText, init = {}) {
   const explicit = init?.proxy;
-  if (explicit != null && String(explicit).trim() !== "") {
-    let value = String(explicit).trim();
+  if (explicit != null) {
+    const rawValue = typeof explicit === "object" && !Array.isArray(explicit)
+      ? explicit.url
+      : explicit;
+    if (rawValue == null && typeof explicit === "object") {
+      return { active: false, explicit: null, environment: null, disabled: false, headers: null };
+    }
+    let value = String(rawValue ?? "").trim();
+    if (value === "") {
+      if (typeof explicit === "object") throw new TypeError("fetch() proxy.url must be a non-empty string");
+      return { active: false, explicit: null, environment: null, disabled: true, headers: null };
+    }
     if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) value = `http://${value}`;
-    return { active: true, explicit: value, environment: null, disabled: false };
+    try { value = new URL(value).href; } catch { throw new TypeError("fetch() proxy URL is invalid"); }
+    return {
+      active: true,
+      explicit: value,
+      environment: null,
+      disabled: false,
+      headers: typeof explicit === "object" ? new Headers(explicit.headers) : null,
+    };
   }
 
   let protocol = "http:";
@@ -5678,7 +5783,7 @@ function fetchProxyConfiguration(urlText, init = {}) {
     if (!Object.prototype.hasOwnProperty.call(env, name)) continue;
     const value = String(env[name] ?? "").trim();
     if (value === "" || value === "undefined" || value === "''" || value === '\"\"') {
-      return { active: false, explicit: null, environment: null, disabled: true };
+      return { active: false, explicit: null, environment: null, disabled: true, headers: null };
     }
     const bypass = noProxyMatches(urlText, env.NO_PROXY ?? env.no_proxy ?? "");
     return {
@@ -5686,9 +5791,10 @@ function fetchProxyConfiguration(urlText, init = {}) {
       explicit: null,
       environment: bypass ? null : value,
       disabled: bypass,
+      headers: null,
     };
   }
-  return { active: false, explicit: null, environment: null, disabled: false };
+  return { active: false, explicit: null, environment: null, disabled: false, headers: null };
 }
 
 function noProxyMatches(urlText, noProxy) {
@@ -5749,22 +5855,43 @@ async function fetchFromActiveProxy(activeProxy, proxyUrl, request) {
   return response;
 }
 
+function percentDecodeDataUrlPayload(payload) {
+  const bytes = [];
+  const encoder = new TextEncoder();
+  for (let index = 0; index < payload.length;) {
+    if (payload[index] === "%" && /^[0-9A-Fa-f]{2}$/.test(payload.slice(index + 1, index + 3))) {
+      bytes.push(parseInt(payload.slice(index + 1, index + 3), 16));
+      index += 3;
+      continue;
+    }
+    const codePoint = payload.codePointAt(index);
+    const character = String.fromCodePoint(codePoint);
+    bytes.push(...encoder.encode(character));
+    index += character.length;
+  }
+  return Buffer.from(bytes);
+}
+
 function responseFromDataUrl(urlText) {
   const match = /^data:([^,]*),([\s\S]*)$/.exec(urlText);
-  if (!match) throw new TypeError("fetch failed: invalid data URL");
+  if (!match) throw new TypeError("failed to fetch the data URL");
   const meta = match[1] ?? "";
   const isBase64 = /;base64$/i.test(meta);
-  const type = meta.replace(/;base64$/i, "") || "text/plain;charset=US-ASCII";
+  let type = meta.replace(/;base64$/i, "") || "text/plain;charset=utf-8";
+  if (/^text\/plain$/i.test(type)) type = "text/plain;charset=utf-8";
   let bytes;
   if (isBase64) {
-    bytes = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+    const encoded = percentDecodeDataUrlPayload(match[2]).toString("latin1").replace(/\s+/g, "");
+    if (encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+      throw new TypeError("failed to fetch the data URL");
+    }
+    bytes = Buffer.from(encoded, "base64");
   } else {
-    let text = match[2];
-    try { text = decodeURIComponent(text); } catch {}
-    bytes = Buffer.from(text);
+    bytes = percentDecodeDataUrlPayload(match[2]);
   }
   return new Response(bytes, {
     status: 200,
+    statusText: "OK",
     headers: { "content-type": type },
     url: urlText,
   });
@@ -5827,19 +5954,43 @@ function fetchPreconnect(url) {
   return undefined;
 }
 
-function applyDefaultFetchHeaders(request) {
+function fetchUsesKeepalive(request) {
+  const state = requestState.get(request);
+  return state?.keepaliveExplicit === true ? request.keepalive : true;
+}
+
+function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(request)) {
   const headers = request.headers;
   if (!headers.has("user-agent")) {
     headers.set("User-Agent", globalThis.navigator?.userAgent ?? `Bun/${BunObject.version ?? "1.0.0"}`);
   }
   if (!headers.has("accept")) headers.set("Accept", "*/*");
-  if (!headers.has("connection")) headers.set("Connection", "keep-alive");
+  if (keepalive && !headers.has("connection")) headers.set("Connection", "keep-alive");
   if (!headers.has("accept-encoding")) headers.set("Accept-Encoding", "gzip, deflate, br, zstd");
   if (!headers.has("host")) {
     try {
       const url = new URL(request.url);
       headers.set("Host", `${url.hostname}${url.port ? `:${url.port}` : ""}`);
     } catch {}
+  }
+}
+
+function fetchPoolKey(urlText, tlsConfig = undefined) {
+  const url = new URL(urlText);
+  let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
+  if (hostname === "0.0.0.0") hostname = "127.0.0.1";
+  else if (hostname === "::") hostname = "::1";
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return `${url.protocol}//${hostname}:${port}` +
+    (tlsConfig ? `|tls:${fetchTlsSessionKey(tlsConfig)}` : "");
+}
+
+function hasPreconnectedFetchSocket(urlText, tlsConfig = undefined) {
+  try {
+    const list = preconnectedFetchSockets.get(fetchPoolKey(urlText, tlsConfig));
+    return list?.some(socket => !socket.destroyed && socket.writable !== false) === true;
+  } catch {
+    return false;
   }
 }
 
@@ -5870,20 +6021,12 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
   if (depth > 20) throw new TypeError("redirect count exceeded");
   const response = await fetchOnceFromNodeHttp(request, redirected, transport);
   if (redirectMode === "manual" || !isRedirectStatus(response.status)) return response;
-  if (redirectMode === "error") throw new TypeError("fetch failed");
+  if (redirectMode === "error") throw unexpectedRedirectError();
   const location = response.headers.get("location");
   if (!location) return response;
   try { response._body?.cancel?.(); } catch {}
-  const nextUrl = String(new URL(redirectLocationText(location), request.url));
-  const dropBody = response.status === 303 ||
-    ((response.status === 301 || response.status === 302) && request.method === "POST");
-  const nextRequest = new Request(nextUrl, {
-    method: dropBody ? "GET" : request.method,
-    headers: new Headers(request.headers),
-    signal: request.signal,
-    redirect: request.redirect,
-  });
-  if (!dropBody) nextRequest._body = request._body;
+  const nextRequest = redirectedFetchRequest(request, response, location);
+  const nextUrl = nextRequest.url;
   let nextTransport = transport;
   if (transport.socketPath) {
     try {
@@ -5896,7 +6039,7 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
   }
   if (!nextTransport.socketPath) {
     // Redirect targets that are not loopback/unix should fall back to the
-    // regular fetch dispatch (active-server fast path or curl).
+    // regular fetch dispatch (active-server fast path or node:http/https).
     const nextIsLocal = isLoopbackHttpUrl(nextUrl) || isLoopbackHttpsUrl(nextUrl) || activeServerForFetchUrl(nextUrl);
     if (!nextIsLocal) return fetchImpl(nextRequest, { redirect: redirectMode });
     const nextActive = activeServerForFetchUrl(nextUrl);
@@ -5940,6 +6083,393 @@ function decompressFetchBytes(bytes, encoding) {
 
 function isCompressedFetchEncoding(encoding) {
   return encoding === "gzip" || encoding === "x-gzip" || encoding === "deflate" || encoding === "br" || encoding === "zstd";
+}
+
+function normalizedFetchAbortReason(signal) {
+  const reason = signal?.reason;
+  const DOMExceptionClass = globalThis.DOMException ?? Error;
+  if (reason?.name === "TimeoutError") return new DOMExceptionClass("The operation timed out.", "TimeoutError");
+  if (reason?.name === "AbortError" || reason == null) return new DOMExceptionClass("The operation was aborted.", "AbortError");
+  return reason;
+}
+
+function normalizeFetchNetworkError(error) {
+  if (error?.name === "AbortError" || error?.name === "TimeoutError") return error;
+  if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"].includes(error?.code)) {
+    const normalized = new Error("Unable to connect. Is the computer able to access the url?");
+    normalized.code = "ConnectionRefused";
+    normalized.cause = error;
+    return normalized;
+  }
+  return error;
+}
+
+function nodeFetchHeaders(headers) {
+  const values = [];
+  if (headers?._values instanceof Map) {
+    for (const [normalized, entry] of headers._values) {
+      const all = normalized === "set-cookie" ? headers._allValues.get(normalized) ?? [] : [entry.value];
+      for (const value of all) values.push(entry.key, value);
+    }
+    return values;
+  }
+  headers?.forEach?.((value, name) => values.push(name, value));
+  return values;
+}
+
+function decodeInboundFetchHeader(value) {
+  const text = String(value ?? "");
+  if (!/[\x80-\xff]/.test(text) || /[Ā-￿]/.test(text)) return text;
+  const bytes = Buffer.from(text, "latin1");
+  const decoded = bytes.toString("utf8");
+  return Buffer.from(decoded, "utf8").equals(bytes) ? decoded : text;
+}
+
+function headersFromIncomingMessage(message) {
+  const headers = new Headers();
+  const raw = Array.isArray(message.rawHeaders) ? message.rawHeaders : [];
+  if (raw.length > 0) {
+    for (let index = 0; index + 1 < raw.length; index += 2) {
+      headers.append(raw[index], decodeInboundFetchHeader(raw[index + 1]));
+    }
+  } else {
+    for (const [name, value] of Object.entries(message.headers ?? {})) {
+      for (const item of Array.isArray(value) ? value : [value]) headers.append(name, decodeInboundFetchHeader(item));
+    }
+  }
+  return headers;
+}
+
+function incomingMessageBodyStream(message, signal) {
+  let controller;
+  let done = false;
+  const cleanup = () => {
+    message.off?.("data", onData);
+    message.off?.("end", onEnd);
+    message.off?.("error", onError);
+    message.off?.("aborted", onAborted);
+    signal?.removeEventListener?.("abort", onAbort);
+  };
+  const finish = callback => {
+    if (done) return;
+    done = true;
+    cleanup();
+    callback();
+  };
+  const onData = chunk => {
+    if (done) return;
+    controller.enqueue(Buffer.from(chunk));
+    if (controller.desiredSize <= 0) message.pause?.();
+  };
+  const onEnd = () => finish(() => controller.close());
+  const onError = error => finish(() => controller.error(normalizeFetchNetworkError(error)));
+  const onAborted = () => {
+    const error = new Error("The socket connection was closed unexpectedly.");
+    error.code = "ECONNRESET";
+    onError(error);
+  };
+  const onAbort = () => {
+    const reason = normalizedFetchAbortReason(signal);
+    finish(() => controller.error(reason));
+    message.on?.("error", () => {});
+    message.destroy?.(reason);
+  };
+  message.pause?.();
+  return new globalThis.ReadableStream({
+    start(streamController) {
+      controller = streamController;
+      message.on?.("data", onData);
+      message.once?.("end", onEnd);
+      message.once?.("error", onError);
+      message.once?.("aborted", onAborted);
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    },
+    pull() {
+      if (!done) message.resume?.();
+    },
+    cancel(reason) {
+      if (done) return;
+      done = true;
+      cleanup();
+      message.on?.("error", () => {});
+      message.destroy?.(reason);
+    },
+  }, new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
+}
+
+function prepareNodeFetchBody(request) {
+  const body = request._body;
+  if (body == null || request.method === "GET" || request.method === "HEAD") return { bytes: null, stream: null, length: null };
+  if (request._bodyStream?.locked || body?.locked) throw new TypeError("ReadableStream is locked");
+  request._bodyUsed = true;
+  if (body instanceof FormData) {
+    return encodeMultipartFormData(body).then(encoded => ({
+      bytes: Buffer.from(encoded.bytes),
+      stream: null,
+      length: encoded.bytes.byteLength,
+    }));
+  }
+  if (typeof body === "string" || isURLSearchParamsLike(body) || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    const bytes = Buffer.from(bytesFromData(body));
+    return { bytes, stream: null, length: bytes.byteLength };
+  }
+  const shared = sharedArrayBufferBytes(body);
+  if (shared) return { bytes: Buffer.from(shared), stream: null, length: shared.byteLength };
+  if (typeof body?.stream === "function" && typeof body?.size === "number") {
+    return { bytes: null, stream: body.stream(), length: Number(body.size) };
+  }
+  if (typeof body?.getReader === "function" || typeof body?.[Symbol.asyncIterator] === "function" || typeof body === "function") {
+    return { bytes: null, stream: body, length: null };
+  }
+  return bytesFromBody(body).then(value => {
+    const bytes = Buffer.from(value);
+    return { bytes, stream: null, length: bytes.byteLength };
+  });
+}
+
+function waitForFetchRequestDrain(request) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      request.off?.("drain", onDrain);
+      request.off?.("error", onError);
+      request.off?.("close", onClose);
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onError = error => { cleanup(); reject(error); };
+    const onClose = () => { cleanup(); reject(new Error("The socket connection was closed unexpectedly.")); };
+    request.once("drain", onDrain);
+    request.once("error", onError);
+    request.once("close", onClose);
+  });
+}
+
+async function writeNodeFetchBody(clientRequest, body) {
+  if (body.bytes) {
+    clientRequest.end(body.bytes);
+    return;
+  }
+  if (!body.stream) {
+    clientRequest.end();
+    return;
+  }
+  clientRequest.flushHeaders?.();
+  await consumeStreamingBody(body.stream, async chunk => {
+    if (clientRequest.destroyed) throw new Error("The socket connection was closed unexpectedly.");
+    if (!clientRequest.write(Buffer.from(asBuffer(chunk)))) await waitForFetchRequestDrain(clientRequest);
+  });
+  clientRequest.end();
+}
+
+function proxyAuthorization(proxyUrl) {
+  if (!proxyUrl.username && !proxyUrl.password) return null;
+  const credentials = `${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`;
+  return `Basic ${Buffer.from(credentials).toString("base64")}`;
+}
+
+function normalizedProxyUrl(value) {
+  let text = String(value ?? "").trim();
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text)) text = `http://${text}`;
+  return new URL(text);
+}
+
+function fetchTlsOptions(url, config = null) {
+  const hostname = String(url.hostname).replace(/^\[|\]$/g, "");
+  const options = { ...(config ?? {}) };
+  if (options.rejectUnauthorized == null) {
+    options.rejectUnauthorized = String(globalThis.process?.env?.NODE_TLS_REJECT_UNAUTHORIZED ?? "1") !== "0";
+  }
+  options.servername = config?.serverName ?? config?.servername ?? (nodeNet.isIP(hostname) ? "" : hostname);
+  delete options.serverName;
+  if (options.rejectUnauthorized === false) delete options.checkServerIdentity;
+  return options;
+}
+
+const reusableFetchHttpsAgents = new Map();
+
+function defaultFetchHttpsAgent(tlsOptions, keepalive) {
+  if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
+  const key = tlsOptions.rejectUnauthorized === false ? "insecure" : "verified";
+  let agent = reusableFetchHttpsAgents.get(key);
+  if (!agent) {
+    agent = new nodeHttps.Agent({ keepAlive: true, rejectUnauthorized: tlsOptions.rejectUnauthorized !== false });
+    reusableFetchHttpsAgents.set(key, agent);
+  }
+  return agent;
+}
+
+function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepalive) {
+  const agent = new nodeHttps.Agent({ ...tlsOptions, keepAlive: keepalive });
+  agent.createConnection = function createConnection(options, callback) {
+    const proxyClient = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
+    const headers = new Headers(proxyHeaders);
+    headers.set("Host", `${target.hostname}:${target.port || 443}`);
+    headers.set("Proxy-Connection", keepalive ? "Keep-Alive" : "close");
+    const authorization = proxyAuthorization(proxy);
+    if (authorization && !headers.has("proxy-authorization")) headers.set("Proxy-Authorization", authorization);
+    let completed = false;
+    const done = (error, socket) => {
+      if (completed) return;
+      completed = true;
+      callback(error ?? null, socket);
+    };
+    const tunnel = proxyClient.request({
+      protocol: proxy.protocol,
+      hostname: proxy.hostname,
+      port: Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80)),
+      method: "CONNECT",
+      path: `${target.hostname}:${target.port || 443}`,
+      headers: nodeFetchHeaders(headers),
+      agent: keepalive ? undefined : false,
+    });
+    tunnel.once("connect", (response, socket, head) => {
+      if (response.statusCode !== 200) {
+        socket.destroy?.();
+        const error = new Error(`Proxy response (${response.statusCode}) !== 200 when HTTP Tunneling`);
+        error.code = "ERR_HTTP_PROXY_CONNECT";
+        done(error);
+        return;
+      }
+      if (head?.byteLength) socket.unshift?.(head);
+      let secureSocket;
+      try {
+        secureSocket = nodeTlsConnect({ ...tlsOptions, socket, host: target.hostname, port: Number(target.port || 443) });
+        secureSocket.once("secureConnect", () => done(null, secureSocket));
+        secureSocket.once("error", done);
+      } catch (error) {
+        done(error);
+      }
+    });
+    tunnel.once("error", done);
+    tunnel.end();
+    return undefined;
+  };
+  return agent;
+}
+
+async function fetchOnceUsingNodeClient(request, redirected = false, transport = {}) {
+  const url = new URL(request.url);
+  const keepalive = fetchUsesKeepalive(request);
+  applyDefaultFetchHeaders(request, keepalive);
+  const preparedBody = prepareNodeFetchBody(request);
+  const body = preparedBody && typeof preparedBody.then === "function"
+    ? await preparedBody
+    : preparedBody;
+  if (body.length != null && !request.headers.has("content-length") && !request.headers.has("transfer-encoding")) {
+    request.headers.set("Content-Length", String(body.length));
+  }
+
+  let client = url.protocol === "https:" ? nodeHttps : nodeHttp;
+  let hostname = String(url.hostname).replace(/^\[|\]$/g, "");
+  let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  let path = `${url.pathname || "/"}${url.search || ""}`;
+  const tlsOptions = fetchTlsOptions(url, transport.tlsConfig);
+  let agent = keepalive ? undefined : false;
+  const proxyValue = transport.proxy?.explicit ?? transport.proxy?.environment;
+  if (proxyValue) {
+    const proxy = normalizedProxyUrl(proxyValue);
+    if (url.protocol === "https:") {
+      agent = httpsProxyTunnelAgent(url, proxy, transport.proxy.headers, tlsOptions, keepalive);
+    } else {
+      client = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
+      hostname = proxy.hostname;
+      port = Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80));
+      path = request.url;
+      const authorization = proxyAuthorization(proxy);
+      if (authorization && !request.headers.has("proxy-authorization")) request.headers.set("Proxy-Authorization", authorization);
+      for (const [name, value] of transport.proxy.headers ?? []) request.headers.set(name, value);
+      if (!request.headers.has("proxy-connection")) request.headers.set("Proxy-Connection", keepalive ? "Keep-Alive" : "close");
+    }
+  } else if (url.protocol === "https:") {
+    agent = transport.tlsConfig
+      ? new nodeHttps.Agent({ ...tlsOptions, keepAlive: keepalive })
+      : defaultFetchHttpsAgent(tlsOptions, keepalive);
+  }
+
+  return new Promise((resolve, reject) => {
+    let responseReceived = false;
+    let clientRequest;
+    const signal = request.signal;
+    const onAbort = () => {
+      const reason = normalizedFetchAbortReason(signal);
+      clientRequest?.destroy?.(reason);
+      if (!responseReceived) reject(reason);
+    };
+    if (signal?.aborted) {
+      reject(normalizedFetchAbortReason(signal));
+      return;
+    }
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    try {
+      clientRequest = client.request({
+        protocol: client === nodeHttps ? "https:" : "http:",
+        hostname,
+        port,
+        path,
+        method: request.method,
+        headers: nodeFetchHeaders(request.headers),
+        agent,
+        socketPath: transport.socketPath,
+        ...((client === nodeHttps || url.protocol === "https:") ? tlsOptions : {}),
+      }, incoming => {
+        responseReceived = true;
+        signal?.removeEventListener?.("abort", onAbort);
+        const headers = headersFromIncomingMessage(incoming);
+        const stream = incomingMessageBodyStream(incoming, signal);
+        const response = new Response(stream, {
+          status: Number(incoming.statusCode ?? 200),
+          statusText: incoming.statusMessage ?? "",
+          headers,
+          url: request.url,
+          redirected,
+        });
+        Object.defineProperty(response, "trailers", {
+          get: () => incoming.complete ? incoming.trailers : {},
+          configurable: true,
+        });
+        resolve(response);
+      });
+      clientRequest.once("error", error => {
+        signal?.removeEventListener?.("abort", onAbort);
+        if (!responseReceived) reject(normalizeFetchNetworkError(error));
+      });
+      writeNodeFetchBody(clientRequest, body).catch(error => {
+        if (!clientRequest.destroyed) clientRequest.destroy(error);
+        if (!responseReceived) reject(normalizeFetchNetworkError(error));
+      });
+    } catch (error) {
+      signal?.removeEventListener?.("abort", onAbort);
+      reject(normalizeFetchNetworkError(error));
+    }
+  });
+}
+
+async function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}) {
+  throwIfAborted(request.signal);
+  if (depth > 20) throw new TypeError("redirect count exceeded");
+  const response = await fetchOnceUsingNodeClient(request, redirected, transport);
+  if (redirectMode === "manual" || !isRedirectStatus(response.status)) {
+    return decodeFetchResponse(response, transport.decompress !== false);
+  }
+  if (redirectMode === "error") {
+    try { await response.body?.cancel?.(); } catch {}
+    throw unexpectedRedirectError();
+  }
+  const location = response.headers.get("location");
+  if (!location) return decodeFetchResponse(response, transport.decompress !== false);
+  try { await response.body?.cancel?.(); } catch {}
+  const nextRequest = redirectedFetchRequest(request, response, location);
+  let nextTransport = transport;
+  if (transport.socketPath) {
+    try {
+      if (new URL(nextRequest.url).origin !== new URL(request.url).origin) nextTransport = { ...transport, socketPath: undefined };
+    } catch {
+      nextTransport = { ...transport, socketPath: undefined };
+    }
+  }
+  const activeServer = !nextTransport.proxy?.active && activeServerForFetchUrl(nextRequest.url);
+  if (activeServer) return fetchFromActiveServer(activeServer, nextRequest, redirectMode, depth + 1, true, nextTransport.decompress !== false);
+  return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, nextTransport);
 }
 
 // Minimal streaming HTTP/1.1 client used for loopback and unix-socket fetch.
@@ -6398,7 +6928,8 @@ function prepareFetchRequest(input, init = {}) {
       requestInit = { ...requestInit, body: undefined };
     }
   }
-  const request = input instanceof Request ? input : new Request(input, requestInit);
+  const hasOverrides = requestInit != null && typeof requestInit === "object" && Object.keys(requestInit).length > 0;
+  const request = input instanceof Request && !hasOverrides ? input : new Request(input, requestInit);
   return { request, upgradeStreamBody };
 }
 
@@ -6410,7 +6941,29 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   ) {
     throw new TypeError("fetch() request with GET/HEAD/OPTIONS method cannot have body.");
   }
-  throwIfAborted(request.signal);
+  if (request.signal?.aborted) {
+    const reason = normalizedFetchAbortReason(request.signal);
+    if (typeof request._body?.cancel === "function" && !request._body.locked) {
+      try { await request._body.cancel(reason); } catch {}
+    }
+    throw reason;
+  }
+  const redirectMode = String(init.redirect ?? request.redirect ?? "follow");
+  if (redirectMode !== "follow" && redirectMode !== "manual" && redirectMode !== "error") {
+    throw new TypeError(`Invalid redirect mode: ${redirectMode}`);
+  }
+  const timeout = init?.timeout;
+  const verbose = init?.verbose;
+  void verbose;
+  if (timeout != null) {
+    const delay = Number(timeout);
+    if (!Number.isFinite(delay) || delay < 0) throw new TypeError("fetch() timeout must be a non-negative number");
+    if (delay > 0) {
+      const timeoutSignal = globalThis.AbortSignal.timeout(delay);
+      const state = requestState.get(request);
+      if (state) state.signal = globalThis.AbortSignal.any([request.signal, timeoutSignal]);
+    }
+  }
   // When the request body is a stream, aborting the fetch must stop pulling
   // from it; cancel any reader created for it once the signal fires.
   if (request.signal && typeof request._body?.getReader === "function") {
@@ -6437,34 +6990,35 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
       url: request.url,
     });
   }
-  const unixSocketPath = init?.unix != null && init.unix !== false ? String(init.unix) : null;
-  const rejectUnauthorized = init?.tls?.rejectUnauthorized === false ? false : undefined;
-  const customTlsConfig = init?.tls != null && typeof init.tls === "object" && !Array.isArray(init.tls) ? init.tls : null;
-  if (unixSocketPath) {
-    return await fetchFromNodeHttp(request, String(init.redirect ?? request.redirect ?? "follow"), 0, false, {
-      socketPath: unixSocketPath,
-      rejectUnauthorized,
+  if (request.url.startsWith("file:")) {
+    const body = file(nodeFileURLToPath(request.url));
+    return new Response(body, {
+      status: 200,
+      headers: body.type ? { "content-type": body.type } : {},
+      url: request.url,
     });
   }
+  const parsedUrl = new URL(request.url);
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);
+  }
+  const unixSocketPath = init?.unix != null && init.unix !== false ? String(init.unix) : null;
+  const customTlsConfig = init?.tls != null && typeof init.tls === "object" && !Array.isArray(init.tls) ? init.tls : null;
   const proxy = fetchProxyConfiguration(request.url, init);
-  let cachedDnsRecords = null;
-  if (!proxy.active) {
-    try {
-      const url = new URL(request.url);
-      const hostname = String(url.hostname).replace(/^\[|\]$/g, "");
-      if ((url.protocol === "http:" || url.protocol === "https:") && nodeNet.isIP(hostname) === 0) {
-        cachedDnsRecords = [];
-        const cache = globalThis[Symbol.for("cottontail.runtime.dns-cache")];
-        cachedDnsRecords = cache?.resolveForNetwork?.(
-          hostname,
-          Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-          false,
-        ) ?? [];
-      }
-    } catch {}
+  if (unixSocketPath && proxy.active) throw new TypeError("fetch() proxy and unix options cannot be used together");
+  if (customTlsConfig) {
+    for (const name of ["ca", "cert", "key", "pfx", "crl"]) {
+      const value = customTlsConfig[name];
+      const valid = value == null || typeof value === "string" || ArrayBuffer.isView(value) || value instanceof ArrayBuffer ||
+        Array.isArray(value) && value.every(item => typeof item === "string" || ArrayBuffer.isView(item) || item instanceof ArrayBuffer);
+      if (!valid) throw new TypeError(`fetch() tls.${name} must be a string, buffer, or array of strings/buffers`);
+    }
+    if (customTlsConfig.checkServerIdentity != null && typeof customTlsConfig.checkServerIdentity !== "function") {
+      throw new TypeError("fetch() tls.checkServerIdentity must be a function");
+    }
   }
   const activeServer = activeServerForFetchUrl(request.url);
-  const redirectMode = String(init.redirect ?? request.redirect ?? "follow");
+  const decompress = (init?.decompression ?? init?.decompress) !== false;
   if (proxy.explicit) {
     const activeProxy = activeServerForFetchUrl(proxy.explicit);
     if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
@@ -6478,120 +7032,106 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   // separation and requestIP() are observable (#27358).
   const customTlsSocketPath = customTlsConfig != null && isLoopbackHttpsUrl(request.url);
   if (activeServer && !proxy.active && !wantsUpgrade && !customTlsSocketPath) {
-    applyDefaultFetchHeaders(request);
-    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false);
+    applyDefaultFetchHeaders(request, fetchUsesKeepalive(request));
+    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress);
   }
-  if (!proxy.active && isLoopbackHttpUrl(request.url)) {
-    return await fetchFromNodeHttp(request, redirectMode, 0, false, upgradeStreamBody ? { streamBody: upgradeStreamBody } : {});
-  }
-  if (!proxy.active && (rejectUnauthorized === false || customTlsSocketPath) && isLoopbackHttpsUrl(request.url)) {
+  if (wantsUpgrade) {
     return await fetchFromNodeHttp(request, redirectMode, 0, false, {
-      rejectUnauthorized,
+      streamBody: upgradeStreamBody,
+      rejectUnauthorized: customTlsConfig?.rejectUnauthorized,
       tlsConfig: customTlsConfig ?? undefined,
-      pooled: init?.keepalive === true,
     });
   }
-
-  const args = ["-L", "-sS", "-D", "-", "-X", request.method];
-  const timeoutState = abortSignalState.get(request.signal);
-  const timeoutRemaining = timeoutState?.timeoutDeadline == null
-    ? null
-    : Math.max(1, timeoutState.timeoutDeadline - Date.now());
-  if (timeoutRemaining != null) {
-    const seconds = String(timeoutRemaining / 1000);
-    args.push("--connect-timeout", seconds, "--max-time", seconds);
+  if (!proxy.active && hasPreconnectedFetchSocket(request.url, customTlsConfig ?? undefined)) {
+    return await fetchFromNodeHttp(request, redirectMode, 0, false, {
+      tlsConfig: customTlsConfig ?? undefined,
+      rejectUnauthorized: customTlsConfig?.rejectUnauthorized,
+      pooled: fetchUsesKeepalive(request),
+    });
   }
-  if (proxy.explicit) args.push("--proxy", proxy.explicit);
-  else if (proxy.environment) args.push("--proxy", proxy.environment, "--noproxy", "");
-  else if (proxy.disabled) args.push("--proxy", "", "--noproxy", "*");
-  if (rejectUnauthorized === false) args.push("-k");
-  if (proxy.active) args.push("-H", "Proxy-Connection: Keep-Alive");
-  request.headers.forEach((value, key) => {
-    args.push("-H", `${key}: ${value}`);
+  return await fetchFromNodeClient(request, redirectMode, 0, false, {
+    socketPath: unixSocketPath ?? undefined,
+    tlsConfig: customTlsConfig ?? undefined,
+    proxy,
+    decompress,
   });
-  const body = await request.text();
-  if (body.length > 0 && request.method !== "GET" && request.method !== "HEAD") {
-    args.push("--data-binary", body);
-  }
-  try {
-    const url = new URL(request.url);
-    const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-    const records = cachedDnsRecords ?? (typeof cottontail.dnsLookup === "function" ? cottontail.dnsLookup(url.hostname, 0) : []);
-    const record = Array.from(records ?? []).find((item) => Number(item.family) === 4 && item.address)
-      ?? Array.from(records ?? []).find((item) => item.address);
-    if (record?.address) args.push("--resolve", `${url.hostname}:${port}:${record.address}`);
-  } catch {}
-  args.push("-w", "\n__COTTONTAIL_HTTP_STATUS__:%{http_code}", request.url);
-
-  const result = cottontail.spawnSync("curl", args, { stdio: "pipe" });
-  const stdout = String(result.stdout ?? "");
-  const marker = "\n__COTTONTAIL_HTTP_STATUS__:";
-  const markerIndex = stdout.lastIndexOf(marker);
-  const payload = markerIndex >= 0 ? stdout.slice(0, markerIndex) : stdout;
-  const status = markerIndex >= 0 ? Number(stdout.slice(markerIndex + marker.length).trim()) || 0 : Number(result.status) || 0;
-
-  if (result.status !== 0 && status === 0) {
-    if (timeoutRemaining != null) throw makeTimeoutError();
-    const stderrText = String(result.stderr || result.stdout || "fetch failed");
-    if (/curl: \((?:5|6|7|28)\)/.test(stderrText)) {
-      const error = new Error("Unable to connect. Is the computer able to access the url?");
-      error.code = "ConnectionRefused";
-      throw error;
-    }
-    throw new Error(stderrText);
-  }
-
-  let responseHeaders = new Headers();
-  let bodyOffset = 0;
-  while (payload.startsWith("HTTP/", bodyOffset)) {
-    const headerEnd = payload.indexOf("\r\n\r\n", bodyOffset);
-    const separatorLength = headerEnd >= 0 ? 4 : 2;
-    const effectiveEnd = headerEnd >= 0 ? headerEnd : payload.indexOf("\n\n", bodyOffset);
-    if (effectiveEnd < 0) break;
-    const block = payload.slice(bodyOffset, effectiveEnd);
-    const firstNewline = block.indexOf("\n");
-    responseHeaders = parseHeadersText(firstNewline >= 0 ? block.slice(firstNewline + 1) : "");
-    bodyOffset = effectiveEnd + separatorLength;
-    if (!payload.startsWith("HTTP/", bodyOffset)) break;
-  }
-
-  return new Response(payload.slice(bodyOffset), { status: status || 200, headers: responseHeaders });
 }
 
 export function fetch(input, init = {}) {
-  let preparedInput = input;
-  let preparedInit = init;
-  if (input instanceof Request && Object.getPrototypeOf(input) !== Request.prototype) {
-    // Fetch snapshots Request subclasses through their public getters. Doing
-    // this before entering the async implementation also keeps WebIDL/header
-    // validation synchronous, matching Bun.
-    preparedInput = new Request(input, init);
-    preparedInit = {};
-  }
-  const prepared = prepareFetchRequest(preparedInput, preparedInit);
-  const body = prepared.request._body;
-  if (isBunFileLike(body) && body._bunFilePath && !cottontail.existsSync(body._bunFilePath)) {
-    const error = new Error(`ENOENT: no such file or directory, open '${body._bunFilePath}'`);
-    error.code = "ENOENT";
+  try {
+    let preparedInput = input;
+    let preparedInit = init;
+    if (input instanceof Request && Object.getPrototypeOf(input) !== Request.prototype) {
+      // Fetch snapshots Request subclasses through their public getters before
+      // starting I/O, then reports conversion failures through its promise.
+      preparedInput = new Request(input, init);
+      preparedInit = {};
+    }
+    const prepared = prepareFetchRequest(preparedInput, preparedInit);
+    const body = prepared.request._body;
+    if (isBunFileLike(body) && body._bunFilePath && !cottontail.existsSync(body._bunFilePath)) {
+      const error = new Error(`ENOENT: no such file or directory, open '${body._bunFilePath}'`);
+      error.code = "ENOENT";
+      return handledRejectedPromise(error);
+    }
+    return fetchImpl(prepared.request, preparedInit, prepared.upgradeStreamBody);
+  } catch (error) {
     return handledRejectedPromise(error);
   }
-  return fetchImpl(prepared.request, preparedInit, prepared.upgradeStreamBody);
 }
 
 fetch.preconnect = fetchPreconnect;
 
 function abortError() {
-  const error = new Error("The operation was aborted");
-  error.name = "AbortError";
-  return error;
+  return normalizedFetchAbortReason(null);
 }
 
 function throwIfAborted(signal) {
-  if (signal?.aborted) throw abortError();
+  if (signal?.aborted) throw normalizedFetchAbortReason(signal);
 }
 
 function isRedirectStatus(status) {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function unexpectedRedirectError() {
+  const error = new TypeError("UnexpectedRedirect: redirect mode is set to error");
+  error.code = "UnexpectedRedirect";
+  return error;
+}
+
+const redirectBodyHeaderNames = [
+  "content-encoding", "content-language", "content-location", "content-type", "content-length", "transfer-encoding",
+];
+const crossOriginRedirectHeaderNames = ["authorization", "proxy-authorization", "cookie", "host"];
+
+function redirectedFetchRequest(request, response, location) {
+  const nextUrl = String(new URL(redirectLocationText(location), request.url));
+  let method = request.method;
+  let body = request._body;
+  const dropBody = response.status === 303 && method !== "GET" && method !== "HEAD" ||
+    (response.status === 301 || response.status === 302) && method === "POST";
+  const headers = new Headers(request.headers);
+  if (dropBody) {
+    method = "GET";
+    body = undefined;
+    for (const name of redirectBodyHeaderNames) headers.delete(name);
+  }
+  try {
+    if (new URL(nextUrl).origin !== new URL(request.url).origin) {
+      for (const name of crossOriginRedirectHeaderNames) headers.delete(name);
+    }
+  } catch {}
+  const state = requestState.get(request);
+  const init = {
+    method,
+    headers,
+    signal: request.signal,
+    redirect: request.redirect,
+  };
+  if (state?.keepaliveExplicit) init.keepalive = request.keepalive;
+  if (body !== undefined && method !== "GET" && method !== "HEAD") init.body = body;
+  return new Request(nextUrl, init);
 }
 
 function decompressionError(encoding, cause) {
@@ -6601,49 +7141,61 @@ function decompressionError(encoding, cause) {
       ? "ZstdDecompressionError"
       : "ZlibError";
   const error = new Error(`Decompression error: ${kind}`);
-  error.name = kind;
   error.code = kind;
   if (cause !== undefined) error.cause = cause;
   return error;
 }
 
-async function decodeFetchResponse(response) {
+function decodedFetchBodyStream(body, encoding) {
+  // COTTONTAIL-COMPAT: Streaming decompression needs incremental zlib,
+  // Brotli, and Zstd decoder handles; the current host APIs are one-shot.
+  let reader;
+  let started = false;
+  return new globalThis.ReadableStream({
+    async pull(controller) {
+      if (started) return;
+      started = true;
+      reader = body.getReader();
+      const chunks = [];
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(Buffer.from(value));
+        }
+        const raw = chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks);
+        if (raw.byteLength > 0) controller.enqueue(asBuffer(decompressFetchBytes(raw, encoding)));
+        controller.close();
+      } catch (cause) {
+        controller.error(cause?.name === "AbortError" || cause?.name === "TimeoutError" || cause?.code === "ECONNRESET"
+          ? cause
+          : decompressionError(encoding, cause));
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel?.(reason);
+    },
+  }, new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
+}
+
+function decodeFetchResponse(response, decompress = true) {
   const encoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-  if (!isCompressedFetchEncoding(encoding)) return response;
-  const raw = await response.bytes();
+  if (!decompress || !isCompressedFetchEncoding(encoding) || !response.body) return response;
   const init = {
     status: response.status,
     statusText: response.statusText,
     headers: new Headers(response.headers),
     url: response.url,
     redirected: response.redirected,
+    type: response.type,
   };
-  // A zero-byte body with a Content-Encoding header decodes to empty (Bun
-  // does not treat the missing stream trailer as an error here).
-  if (raw.byteLength === 0) return new Response(new Uint8Array(0), init);
-  let decoded;
-  try {
-    decoded = decompressFetchBytes(raw, encoding);
-  } catch (cause) {
-    // Truncated/corrupt payloads surface as typed decompression errors when
-    // the body is consumed, matching Bun (fetch itself still resolves).
-    const failure = decompressionError(encoding, cause);
-    return new Response(
-      new globalThis.ReadableStream({
-        start(controller) {
-          controller.error(failure);
-        },
-      }),
-      init,
-    );
-  }
-  return new Response(decoded, init);
+  return new Response(decodedFetchBodyStream(response.body, encoding), init);
 }
 
 function raceWithAbortSignal(promise, signal) {
   if (!signal || typeof signal.addEventListener !== "function") return promise;
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason ?? abortError());
+    const onAbort = () => reject(normalizedFetchAbortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
@@ -6658,7 +7210,7 @@ function raceWithAbortSignal(promise, signal) {
   });
 }
 
-async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected) {
+async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected, decompress = true) {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
   // Bun's HTTP server normalizes duplicate leading slashes in the request
@@ -6683,26 +7235,16 @@ async function fetchFromActiveServer(activeServer, request, redirectMode, depth,
   throwIfAborted(request.signal);
   response.url = request.url;
   response.redirected = Boolean(redirected || response.redirected);
-  if (redirectMode === "manual" || !isRedirectStatus(response.status)) return decodeFetchResponse(response);
-  if (redirectMode === "error") throw new TypeError("fetch failed");
+  if (redirectMode === "manual" || !isRedirectStatus(response.status)) return decodeFetchResponse(response, decompress);
+  if (redirectMode === "error") throw unexpectedRedirectError();
 
   const location = response.headers.get("location");
-  if (!location) return response;
-  const nextUrl = String(new URL(location, request.url));
-  const nextInit = {
-    method: request.method,
-    headers: new Headers(request.headers),
-    signal: request.signal,
-    redirect: request.redirect,
-  };
-  if (response.status === 303 && nextInit.method !== "GET" && nextInit.method !== "HEAD") {
-    nextInit.method = "GET";
-  } else if (nextInit.method !== "GET" && nextInit.method !== "HEAD") {
-    nextInit.body = request._body;
-  }
-  const nextRequest = new Request(nextUrl, nextInit);
-  const nextActiveServer = activeServerForFetchUrl(nextUrl) ?? activeServer;
-  return fetchFromActiveServer(nextActiveServer, nextRequest, redirectMode, depth + 1, true);
+  if (!location) return decodeFetchResponse(response, decompress);
+  try { await response.body?.cancel?.(); } catch {}
+  const nextRequest = redirectedFetchRequest(request, response, location);
+  const nextActiveServer = activeServerForFetchUrl(nextRequest.url);
+  if (nextActiveServer) return fetchFromActiveServer(nextActiveServer, nextRequest, redirectMode, depth + 1, true, decompress);
+  return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, { decompress });
 }
 
 function parseHeadersText(text) {
@@ -16324,6 +16866,24 @@ if (typeof globalThis.TextEncoder === "function" && typeof globalThis.TextEncode
     writable: true,
   });
 }
+const undiciBuiltin = createUndiciModule({
+  fetch,
+  Response,
+  Request,
+  Headers,
+  FormData,
+  File: globalThis.File,
+  Blob: globalThis.Blob,
+  URL,
+  URLSearchParams,
+  AbortSignal: globalThis.AbortSignal,
+  AbortController: globalThis.AbortController,
+  WebSocket: globalThis.WebSocket ?? nodeHttp.WebSocket,
+  CloseEvent: globalThis.CloseEvent,
+  ErrorEvent: globalThis.ErrorEvent,
+  MessageEvent: globalThis.MessageEvent,
+  EventTarget: globalThis.EventTarget,
+});
 nodeSetBuiltinModules({
   bun: BunObject,
   "bun:test": bunTestModule.default ?? bunTestModule,
@@ -16331,6 +16891,8 @@ nodeSetBuiltinModules({
   "bun:ffi": FFI.default ?? FFI,
   "bun:sqlite": { Database: SQLiteDatabase, default: SQLiteDatabase },
   "bun:internal-for-testing": bunInternalForTestingModule,
+  undici: undiciBuiltin,
+  "node:undici": undiciBuiltin,
 });
 globalThis.HTMLRewriter ??= HTMLRewriter;
 globalThis.require ??= nodeCreateRequire(globalThis.process?.argv?.[1] ?? cottontail.cwd());
