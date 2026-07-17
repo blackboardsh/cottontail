@@ -14557,7 +14557,7 @@ static int ct_parse_spawn_sync_native_options(
 
         if (!JSValueIsUndefined(ctx, max_buffer_value) && !JSValueIsNull(ctx, max_buffer_value)) {
             double max_buffer = ct_value_to_number(ctx, max_buffer_value);
-            if (isfinite(max_buffer) && max_buffer > 0) {
+            if (isfinite(max_buffer) && max_buffer >= 0) {
                 options->max_buffer_enabled = true;
                 options->max_buffer = (uint64_t)max_buffer;
             }

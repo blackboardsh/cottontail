@@ -134,10 +134,48 @@ function prepareSyncInput(input, encoding = undefined) {
   if (typeof input === "string") {
     return Buffer.from(input, encoding && encoding !== "buffer" ? encoding : "utf8");
   }
+  if (!ArrayBuffer.isView(input)) {
+    throw invalidArgTypeError("options.stdio[0]", "string, Buffer, TypedArray, or DataView", input);
+  }
+  if (input instanceof DataView) {
+    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
   return input;
 }
 
-function makeSpawnFailureResult(file, cause) {
+const DEFAULT_SYNC_MAX_BUFFER = 1024 * 1024;
+
+function validateSyncTimeout(timeout) {
+  if (timeout == null) return undefined;
+  if (typeof timeout !== "number" || !Number.isFinite(timeout) || !Number.isInteger(timeout) || timeout < 0) {
+    const error = new RangeError(`The value of "options.timeout" is out of range. It must be an unsigned integer. Received ${timeout}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return timeout;
+}
+
+function validateSyncMaxBuffer(maxBuffer) {
+  if (maxBuffer === Infinity) return maxBuffer;
+  if (typeof maxBuffer !== "number" || Number.isNaN(maxBuffer) || maxBuffer < 0) {
+    const error = new RangeError(`The value of "options.maxBuffer" is out of range. It must be >= 0. Received ${maxBuffer}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return maxBuffer;
+}
+
+function makeSpawnSyncLimitError(code, errno, file, args) {
+  const error = new Error(`spawnSync ${file} ${code}`);
+  error.code = code;
+  error.errno = errno;
+  error.syscall = `spawnSync ${file}`;
+  error.path = String(file);
+  error.spawnargs = Array.from(args ?? [], String);
+  return error;
+}
+
+function makeSpawnFailureResult(file, cause, args = []) {
   const message = cause instanceof Error ? cause.message : String(cause);
   const notFound = /filenotfound|enoent|no such file/i.test(message);
   const error = notFound ? new Error(`spawnSync ${file} ENOENT`) : new Error(message);
@@ -145,6 +183,7 @@ function makeSpawnFailureResult(file, cause) {
   if (notFound) error.errno = -2;
   error.syscall = `spawnSync ${file}`;
   error.path = String(file);
+  error.spawnargs = Array.from(args, String);
   return {
     status: null,
     signal: null,
@@ -205,11 +244,9 @@ export function execFileSync(file, args = [], options = {}) {
   return result.stdout;
 }
 
-// Classify one spawnSync stdout/stderr stdio entry. The native spawner only
-// supports whole-process capture, so redirect targets (fds, streams,
-// "inherit") are serviced in JS: the captured bytes are forwarded to the
-// target fd after the child exits and the result field is null (Node
-// semantics: only "pipe" entries are captured).
+// Classify one spawnSync stdout/stderr stdio entry. Arbitrary descriptors and
+// stream objects still need capture-and-forward; pipe/inherit/ignore are sent
+// directly to the native per-fd spawner.
 function classifySyncOutputStdio(value, parentFd) {
   if (value === undefined || value === null || value === "pipe" || value === "overlapped") {
     return { capture: true };
@@ -226,6 +263,13 @@ function classifySyncOutputStdio(value, parentFd) {
   return { capture: true };
 }
 
+function nativeSyncOutputMode(target, parentFd) {
+  if (target.capture) return "pipe";
+  if (target.targetFd === parentFd) return "inherit";
+  if (target.targetFd != null || target.targetStream) return "pipe";
+  return "ignore";
+}
+
 function forwardSyncOutput(target, buffer) {
   if (!buffer || buffer.length === 0) return;
   try {
@@ -240,6 +284,7 @@ function forwardSyncOutput(target, buffer) {
 export function spawnSync(file, args = [], options = {}) {
   if (typeof file !== "string") throw invalidFileArgError(file);
   const normalized = normalizeSpawnArgs(args, options);
+  validateSpawnOptions(normalized.options);
   const command = normalizeSpawnCommand(file, normalized.args, normalized.options);
   const nativeOptions = prepareNativeOptions(command.file, normalized.options);
   const stdioOption = normalized.options.stdio;
@@ -250,29 +295,37 @@ export function spawnSync(file, args = [], options = {}) {
       : [];
   const stdoutTarget = classifySyncOutputStdio(stdioArray[1], 1);
   const stderrTarget = classifySyncOutputStdio(stdioArray[2], 2);
-  const fullyInherited = stdioOption === "inherit";
+  const input = prepareSyncInput(normalized.options.input, normalized.options.encoding);
+  const timeout = validateSyncTimeout(normalized.options.timeout);
+  const maxBuffer = validateSyncMaxBuffer(normalized.options.maxBuffer ?? DEFAULT_SYNC_MAX_BUFFER);
+  const killSignal = normalizeSpawnKillSignal(normalized.options.killSignal);
   let result;
   try {
     result = cottontail.spawnSync(command.file, command.args, {
-      stdio: fullyInherited ? "inherit" : "pipe",
+      stdin: input != null ? "pipe" : (stdioArray[0] ?? "pipe"),
+      stdout: nativeSyncOutputMode(stdoutTarget, 1),
+      stderr: nativeSyncOutputMode(stderrTarget, 2),
       cwd: normalizeCwdOption(normalized.options.cwd),
       env: nativeOptions.env,
       clearEnv: nativeOptions.clearEnv,
-      input: prepareSyncInput(normalized.options.input, normalized.options.encoding),
+      input,
+      timeout,
+      maxBuffer,
+      killSignal,
     });
   } catch (error) {
-    return makeSpawnFailureResult(file, error);
+    return makeSpawnFailureResult(file, error, command.args);
   }
-  const normalizedResult = normalizeSyncResult(result, normalized.options);
+  const normalizedResult = normalizeSyncResult(result, normalized.options, command.file, command.args);
   if (!stdoutTarget.capture) {
-    if (!fullyInherited) {
+    if (result.stdout != null) {
       forwardSyncOutput(stdoutTarget, Buffer.from(result.stdout || ""));
     }
     normalizedResult.stdout = null;
     normalizedResult.output[1] = null;
   }
   if (!stderrTarget.capture) {
-    if (!fullyInherited) {
+    if (result.stderr != null) {
       forwardSyncOutput(stderrTarget, Buffer.from(result.stderr || ""));
     }
     normalizedResult.stderr = null;
@@ -323,7 +376,38 @@ function normalizeCwdOption(cwd) {
   if (typeof cwd === "object" && cwd.protocol === "file:" && typeof cwd.pathname === "string") {
     return decodeURIComponent(cwd.pathname);
   }
-  return String(cwd);
+  throw invalidArgTypeError("options.cwd", "string or an instance of URL", cwd);
+}
+
+function validateSpawnOptions(options) {
+  for (const name of ["detached", "windowsHide", "windowsVerbatimArguments"]) {
+    if (options[name] != null && typeof options[name] !== "boolean") {
+      throw invalidArgTypeError(`options.${name}`, "boolean", options[name]);
+    }
+  }
+  for (const name of ["uid", "gid"]) {
+    if (options[name] != null && (!Number.isInteger(options[name]) || options[name] < -0x80000000 || options[name] > 0x7fffffff)) {
+      throw invalidArgTypeError(`options.${name}`, "int32", options[name]);
+    }
+  }
+  if (options.shell != null && typeof options.shell !== "boolean" && typeof options.shell !== "string") {
+    throw invalidArgTypeError("options.shell", "boolean or string", options.shell);
+  }
+  if (options.argv0 != null && typeof options.argv0 !== "string") {
+    throw invalidArgTypeError("options.argv0", "string", options.argv0);
+  }
+  normalizeCwdOption(options.cwd);
+}
+
+function normalizeSpawnKillSignal(signal) {
+  if (signal == null) return signalNumbersByName.SIGTERM;
+  if (typeof signal !== "string" && typeof signal !== "number") {
+    throw invalidArgTypeError("options.killSignal", "string or number", signal);
+  }
+  if (typeof signal === "number" && (!Number.isInteger(signal) || signal === 0)) {
+    throw unknownSignalError(signal);
+  }
+  return normalizeKillSignal(signal);
 }
 
 function normalizeSpawnArgs(args, options) {
@@ -354,14 +438,14 @@ function normalizeSpawnCommand(file, args = [], options = {}) {
   return { file: shell, args: ["-c", command] };
 }
 
-function normalizeSyncResult(result, options = {}) {
+function normalizeSyncResult(result, options = {}, file = "", args = []) {
   const encoding = options.encoding === "buffer" ? null : options.encoding;
   const stdoutBuffer = Buffer.from(result.stdout || "");
   const stderrBuffer = Buffer.from(result.stderr || "");
   const stdout = encoding ? stdoutBuffer.toString(encoding) : stdoutBuffer;
   const stderr = encoding ? stderrBuffer.toString(encoding) : stderrBuffer;
   const signal = result.signal ?? signalNumberToName(result.signalCode) ?? null;
-  return {
+  const normalized = {
     // Node reports status null when the child died from a signal.
     status: signal != null ? null : Number(result.status ?? 0),
     signal,
@@ -371,6 +455,12 @@ function normalizeSyncResult(result, options = {}) {
     stdout,
     stderr,
   };
+  if (!normalized.error && result.exitedDueToTimeout === true) {
+    normalized.error = makeSpawnSyncLimitError("ETIMEDOUT", -60, file, args);
+  } else if (!normalized.error && result.exitedDueToMaxBuffer === true) {
+    normalized.error = makeSpawnSyncLimitError("ENOBUFS", -55, file, args);
+  }
+  return normalized;
 }
 
 function makeAbortError(reason = undefined) {
