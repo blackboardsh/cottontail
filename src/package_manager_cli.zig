@@ -7,6 +7,7 @@ const Scripts = @import("package_manager_scripts.zig");
 const Git = @import("package_manager_git.zig");
 const Patch = @import("package_manager_patch.zig");
 const Isolated = @import("package_manager_isolated.zig");
+const Workspaces = @import("package_manager_workspaces.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -116,12 +117,7 @@ const PackageRecord = struct {
     install_dir: []const u8 = "",
 };
 
-const Workspace = struct {
-    name: []const u8,
-    path: []const u8,
-    version: []const u8,
-    package_json: *Value,
-};
+const Workspace = Workspaces.Entry;
 
 const LockedSelection = struct {
     package: *const Lockfile.Package,
@@ -412,6 +408,7 @@ const Manager = struct {
     stderr: *std.Io.Writer,
     root_dir: []const u8 = "",
     invocation_dir: []const u8 = "",
+    invocation_package_dir: []const u8 = "",
     registry: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
     save_text_lockfile: bool = true,
@@ -422,11 +419,13 @@ const Manager = struct {
     root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
     direct_bins: std.array_list.Managed([]const u8),
+    installed_workspaces: std.StringHashMap(void),
     report_direct_installs: bool = false,
+    link_workspace_packages: bool = true,
     started_ns: i128,
     installed_count: usize = 0,
     changed: bool = false,
-    root_package_json: ?*const Value = null,
+    root_package_json: ?*Value = null,
     node_linker: Isolated.Linker = .hoisted,
     public_hoist_pattern: ?Isolated.HoistPattern = null,
     hidden_hoist_pattern: ?Isolated.HoistPattern = null,
@@ -462,6 +461,7 @@ const Manager = struct {
             .root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
+            .installed_workspaces = std.StringHashMap(void).init(allocator),
             .isolated_parent_modules = std.StringHashMap([]const u8).init(allocator),
             .isolated_parent_keys = std.StringHashMap([]const u8).init(allocator),
             .isolated_package_metadata = std.StringHashMap(*const Value).init(allocator),
@@ -477,6 +477,7 @@ const Manager = struct {
     }
 
     fn deinit(manager: *Manager) void {
+        manager.installed_workspaces.deinit();
         manager.peer_conflict_warnings.deinit();
         manager.script_queue.deinit();
         manager.isolated_public_hoists.deinit();
@@ -499,10 +500,14 @@ const Manager = struct {
             manager.options.command = .add;
         }
         manager.invocation_dir = try absolutePath(manager.init_data.io, manager.allocator, ".");
-        manager.root_dir = if (manager.options.command == .patch or manager.options.command == .patch_commit)
-            try findPatchProjectRoot(manager.init_data.io, manager.allocator, manager.invocation_dir)
-        else
-            manager.invocation_dir;
+        if (manager.options.command == .patch or manager.options.command == .patch_commit) {
+            manager.root_dir = try findPatchProjectRoot(manager.init_data.io, manager.allocator, manager.invocation_dir);
+            manager.invocation_package_dir = manager.root_dir;
+        } else {
+            const project = try findInstallProject(manager.init_data.io, manager.allocator, manager.invocation_dir);
+            manager.root_dir = project.root_dir;
+            manager.invocation_package_dir = project.package_dir;
+        }
         if (!std.mem.eql(u8, manager.invocation_dir, manager.root_dir)) {
             try std.process.setCurrentPath(manager.init_data.io, manager.root_dir);
         }
@@ -549,19 +554,40 @@ const Manager = struct {
             try manager.stdout.flush();
         }
 
+        var command_package_json = &root;
+        var command_package_json_path = package_json_path;
+        var command_package_json_had_trailing_newline = had_trailing_newline;
+        if (!std.mem.eql(u8, manager.invocation_package_dir, manager.root_dir)) {
+            const workspace = manager.workspaceForPath(manager.invocation_package_dir) orelse {
+                try manager.stderr.print("error: Workspace not found \"{s}\"\n", .{manager.invocation_package_dir});
+                return error.PackageManagerErrorReported;
+            };
+            command_package_json = workspace.package_json;
+            command_package_json_path = try std.fs.path.join(manager.allocator, &.{ workspace.path, "package.json" });
+            const command_source = try std.Io.Dir.cwd().readFileAlloc(
+                manager.init_data.io,
+                command_package_json_path,
+                manager.allocator,
+                .limited(64 * 1024 * 1024),
+            );
+            command_package_json_had_trailing_newline = command_source.len > 0 and command_source[command_source.len - 1] == '\n';
+        }
+
         try manager.prepareNodeModules();
+        try manager.reserveWorkspaceRootVersions();
 
         switch (manager.options.command) {
             .install => try manager.installRoot(&root, true),
-            .add => try manager.addPackages(&root),
-            .remove => try manager.removePackages(&root),
-            .update => try manager.updatePackages(&root),
+            .add => try manager.addPackages(command_package_json, manager.invocation_package_dir),
+            .remove => try manager.removePackages(command_package_json, manager.invocation_package_dir),
+            .update => try manager.updatePackages(command_package_json, manager.invocation_package_dir),
             .patch, .patch_commit => unreachable,
             .pm => unreachable,
         }
 
         try manager.reconcileIsolatedPeerGraph();
         try manager.finalizeIsolatedNodeModules();
+        try manager.pruneStaleHoistedWorkspaceLinks();
 
         if ((manager.options.command == .add or manager.options.command == .remove or manager.options.command == .update) and
             !manager.options.no_save and !manager.options.dry_run)
@@ -569,9 +595,9 @@ const Manager = struct {
             try writePackageJSON(
                 manager.init_data.io,
                 manager.allocator,
-                package_json_path,
-                root,
-                had_trailing_newline,
+                command_package_json_path,
+                command_package_json.*,
+                command_package_json_had_trailing_newline,
             );
         }
 
@@ -1125,6 +1151,7 @@ const Manager = struct {
             if (parseTomlBool(source, "saveTextLockfile")) |value| manager.save_text_lockfile = value;
             if (parseTomlBool(source, "exact")) |value| manager.options.exact = value;
             if (parseTomlBool(source, "frozenLockfile")) |value| manager.options.frozen_lockfile = value;
+            if (parseTomlBool(source, "linkWorkspacePackages")) |value| manager.link_workspace_packages = value;
             const public_patterns = parseTomlStringList(manager.allocator, source, "publicHoistPattern") catch |err| {
                 try manager.reportPatternConfigurationError(err);
                 return error.PackageManagerErrorReported;
@@ -1149,6 +1176,10 @@ const Manager = struct {
             .limited(1024 * 1024),
         ) catch null) |npmrc| {
             if (registry == null) registry = parseNpmrcValue(npmrc, "registry");
+            if (parseNpmrcValue(npmrc, "link-workspace-packages")) |value| {
+                if (std.ascii.eqlIgnoreCase(value, "true")) manager.link_workspace_packages = true;
+                if (std.ascii.eqlIgnoreCase(value, "false")) manager.link_workspace_packages = false;
+            }
             if (manager.registry_authorization == null) {
                 if (parseNpmrcValue(npmrc, "_authToken")) |token| {
                     manager.registry_authorization = try std.fmt.allocPrint(manager.allocator, "Bearer {s}", .{token});
@@ -1257,7 +1288,7 @@ const Manager = struct {
         try manager.relinkNativeDependencyBins(root);
     }
 
-    fn addPackages(manager: *Manager, root: *Value) !void {
+    fn addPackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
         var added_output: std.Io.Writer.Allocating = .init(manager.allocator);
 
@@ -1275,17 +1306,17 @@ const Manager = struct {
             manager.direct_bins.clearRetainingCapacity();
 
             if (isGitSpec(requested)) {
-                const git = try manager.installGit(alias, requested, manager.root_dir, true, false, null, &.{});
+                const git = try manager.installGit(alias, requested, parent_dir, true, false, null, &.{});
                 alias = git.alias;
                 resolved_version = git.version;
                 display_resolution = git.source;
             } else if (isTarballSpec(requested)) {
-                const tarball = try manager.installTarball(alias, requested, manager.root_dir, true, false, &.{});
+                const tarball = try manager.installTarball(alias, requested, parent_dir, true, false, &.{});
                 alias = tarball.alias;
                 resolved_version = tarball.version;
                 display_resolution = requested;
             } else if (isLocalSpec(requested)) {
-                const local = manager.resolveLocalPackage(requested, manager.root_dir) catch |err| {
+                const local = manager.resolveLocalPackage(requested, parent_dir) catch |err| {
                     try manager.stderr.print("note: error occurred while resolving {s}\n", .{requested});
                     return err;
                 };
@@ -1296,12 +1327,12 @@ const Manager = struct {
                 return error.InvalidPackageName;
             }
             const name = alias.?;
-            const target_section = manager.sectionForAdd(root, name);
-            const section = try ensureObjectProperty(manager.allocator, &root.object, target_section.key());
+            const target_section = manager.sectionForAdd(package_json, name);
+            const section = try ensureObjectProperty(manager.allocator, &package_json.object, target_section.key());
 
             if (manager.options.only_missing and section.get(name) != null) continue;
             if (!isTarballSpec(requested) and !isGitSpec(requested)) {
-                resolved_version = try manager.installDependency(name, requested, manager.root_dir, true, false);
+                resolved_version = try manager.installDependency(name, requested, parent_dir, true, false);
                 if (!isLocalSpec(requested)) display_resolution = resolved_version;
             }
             const saved_spec = if (isTarballSpec(requested) or isGitSpec(requested) or isLocalSpec(requested) or std.mem.startsWith(u8, requested, "workspace:"))
@@ -1312,7 +1343,7 @@ const Manager = struct {
                 resolved_version
             else
                 try std.fmt.allocPrint(manager.allocator, "^{s}", .{resolved_version});
-            manager.removeDependencyFromOtherSections(root, name, target_section);
+            manager.removeDependencyFromOtherSections(package_json, name, target_section);
             try section.put(manager.allocator, try manager.allocator.dupe(u8, name), .{ .string = try manager.allocator.dupe(u8, saved_spec) });
             manager.changed = true;
             if (!manager.options.silent) {
@@ -1325,7 +1356,7 @@ const Manager = struct {
             }
         }
         const installed_before_reconcile = manager.installed_count;
-        try manager.installRoot(root, true);
+        try manager.installRoot(manager.root_package_json.?, true);
         if (!manager.options.silent) {
             if (manager.installed_count > installed_before_reconcile and added_output.written().len > 0) {
                 try manager.stdout.writeByte('\n');
@@ -1355,35 +1386,38 @@ const Manager = struct {
         }
     }
 
-    fn removePackages(manager: *Manager, root: *Value) !void {
+    fn removePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
         var removed: usize = 0;
         for (manager.options.positionals) |name| {
             for (all_dependency_sections) |section_name| {
-                if (root.object.getPtr(section_name)) |section| {
+                if (package_json.object.getPtr(section_name)) |section| {
                     if (section.* == .object and section.object.orderedRemove(name)) {
                         removed += 1;
                         manager.changed = true;
                     }
                     if (section.* == .object and section.object.count() == 0) {
-                        _ = root.object.orderedRemove(section_name);
+                        _ = package_json.object.orderedRemove(section_name);
                     }
                 }
             }
-            const path = try packageDestination(manager.allocator, manager.root_dir, name);
+            const path = if (manager.node_linker == .isolated)
+                try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), name })
+            else
+                try packageDestination(manager.allocator, manager.root_dir, name);
             if (!manager.options.dry_run) deletePath(manager.init_data.io, path);
         }
-        try manager.installRoot(root, true);
+        try manager.installRoot(manager.root_package_json.?, true);
         if (!manager.options.silent and removed > 0) try manager.stdout.print("Removed: {d}\n", .{removed});
     }
 
-    fn updatePackages(manager: *Manager, root: *Value) !void {
+    fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         const requested = manager.options.positionals;
         const previous_force = manager.options.force;
         manager.options.force = true;
         defer manager.options.force = previous_force;
         for (mutable_dependency_sections) |section_name| {
-            const section_value = root.object.getPtr(section_name) orelse continue;
+            const section_value = package_json.object.getPtr(section_name) orelse continue;
             if (section_value.* != .object) continue;
             for (section_value.object.keys(), section_value.object.values()) |name, *spec_value| {
                 if (requested.len > 0 and !containsString(requested, name)) continue;
@@ -1391,7 +1425,7 @@ const Manager = struct {
                 const resolved = try manager.installDependency(
                     name,
                     if (manager.options.latest or requested.len > 0) "latest" else spec_value.string,
-                    manager.root_dir,
+                    parent_dir,
                     true,
                     false,
                 );
@@ -1448,7 +1482,7 @@ const Manager = struct {
         direct: bool,
         optional: bool,
     ) anyerror![]const u8 {
-        const workspace_package = std.mem.startsWith(u8, spec, "workspace:") or manager.workspaces.get(alias) != null;
+        var workspace_package = manager.isWorkspaceDependency(alias, spec);
         const effective_spec = manager.manifest_policy.?.resolveDependency(alias, spec, workspace_package) catch |err| {
             if (err == error.CatalogDependencyNotFound or err == error.InvalidCatalogDependency) {
                 try manager.stderr.print("error: {s}@{s} failed to resolve\n", .{ alias, spec });
@@ -1456,6 +1490,7 @@ const Manager = struct {
             }
             return err;
         };
+        if (!workspace_package) workspace_package = manager.isWorkspaceDependency(alias, effective_spec);
         var protocol_patch_paths: []const []const u8 = &.{};
         const resolution_spec = if (try Patch.Spec.parseProtocol(manager.allocator, alias, effective_spec)) |protocol| blk: {
             protocol_patch_paths = protocol.patch_paths;
@@ -1485,36 +1520,8 @@ const Manager = struct {
         }
 
         if (workspace_package) {
-            if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
-            const workspace = try manager.resolveWorkspaceDependency(alias, resolution_spec, parent_dir) orelse return error.WorkspaceNotFound;
-            _ = try manager.peerContextForPackage(workspace.package_json, parent_dir, true);
-            const destination = if (manager.node_linker == .isolated)
-                try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
-            else
-                try packageDestination(manager.allocator, manager.root_dir, alias);
-            if (!manager.options.lockfile_only) {
-                if (manager.node_linker == .isolated)
-                    try manager.linkRelativeDirectory(destination, workspace.path, true)
-                else
-                    try manager.linkDirectory(alias, workspace.path);
-            }
-            try manager.addRecord(.{
-                .key = if (manager.node_linker == .isolated)
-                    try manager.dependencyLockKey(parent_dir, alias)
-                else
-                    try manager.lockKeyForDestination(destination),
-                .alias = alias,
-                .name = workspace.name,
-                .version = workspace.version,
-                .local_path = workspace.path,
-                .resolution = workspace.path,
-                .kind = .workspace,
-                .metadata = workspace.package_json,
-                .install_dir = workspace.path,
-            });
-            try manager.rememberPackageMetadata(workspace.path, workspace.package_json);
-            try manager.linkPeerDependencies(workspace.package_json, workspace.path, parent_dir);
-            return workspace.version;
+            const workspace = try manager.resolveWorkspaceDependency(alias, resolution_spec, parent_dir);
+            return manager.installResolvedWorkspace(alias, workspace, parent_dir, direct, protocol_patch_paths);
         }
 
         if (isGitSpec(resolution_spec)) {
@@ -1630,7 +1637,18 @@ const Manager = struct {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
-        const resolved = try manager.resolveRegistryPackage(registry_name, registry_spec);
+        const resolved = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| {
+            if (err == error.NoMatchingVersion and
+                manager.link_workspace_packages and
+                Semver.Version.isTaggedVersionOnly(registry_spec) and
+                manager.workspaces.get(registry_name) != null)
+            {
+                const fallback_spec = try std.fmt.allocPrint(manager.allocator, "workspace:{s}@{s}", .{ registry_name, registry_spec });
+                const workspace = try manager.resolveWorkspaceDependency(alias, fallback_spec, parent_dir);
+                return manager.installResolvedWorkspace(alias, workspace, parent_dir, direct, protocol_patch_paths);
+            }
+            return err;
+        };
         const peer_context = try manager.peerContextForPackage(resolved.metadata, parent_dir, true);
         const destination = try manager.packageInstallDestinationWithPeerContext(
             alias,
@@ -1729,14 +1747,19 @@ const Manager = struct {
         spec: []const u8,
         parent_dir: []const u8,
     ) !bool {
+        const workspace_dependency = manager.isWorkspaceDependency(alias, spec);
+        if (workspace_dependency and package.kind != .workspace) return false;
         switch (package.kind) {
             .npm => {
                 const registry_name, const registry_spec = parseNpmAlias(alias, spec);
                 return std.mem.eql(u8, registry_name, package.name) and
                     semverSatisfies(manager.allocator, registry_spec, package.version);
             },
-            .workspace => return std.mem.startsWith(u8, spec, "workspace:") and
-                (std.mem.eql(u8, alias, package.name) or manager.workspaces.get(package.name) != null),
+            .workspace => {
+                if (!workspace_dependency) return false;
+                const workspace = try manager.resolveWorkspaceDependency(alias, spec, parent_dir);
+                return std.mem.eql(u8, workspace.name, package.name);
+            },
             .folder, .symlink => {
                 if (!isLocalSpec(spec)) return false;
                 const requested = try absolutePathFrom(manager.allocator, parent_dir, localSpecPath(spec));
@@ -3744,54 +3767,51 @@ const Manager = struct {
     }
 
     fn discoverWorkspaces(manager: *Manager, root: *Value) !void {
-        if (root.* != .object) return;
-        const workspace_value = root.object.get("workspaces") orelse return;
-        const patterns = switch (workspace_value) {
-            .array => |array| array.items,
-            .object => |object| if (object.get("packages")) |packages| if (packages == .array) packages.array.items else return else return,
-            else => return,
+        const discovery = Workspaces.discover(manager.init_data.io, manager.allocator, manager.root_dir, root) catch |err| switch (err) {
+            error.InvalidWorkspaces => {
+                try manager.stderr.writeAll("error: Invalid workspaces configuration; expected an array of strings\n");
+                return error.PackageManagerErrorReported;
+            },
+            error.InvalidWorkspaceGlob => {
+                try manager.stderr.writeAll("error: Invalid workspace glob\n");
+                return error.PackageManagerErrorReported;
+            },
+            else => return err,
         };
-        for (patterns) |pattern_value| {
-            if (pattern_value != .string) continue;
-            try manager.discoverWorkspacePattern(pattern_value.string);
-        }
+        var failed = false;
+        for (discovery.diagnostics) |diagnostic| switch (diagnostic) {
+            .missing_workspace => |path| {
+                try manager.stderr.print("error: Workspace not found \"{s}\"\n", .{path});
+                failed = true;
+            },
+            .missing_name => |path| {
+                try manager.stderr.print("error: Workspace at \"{s}\" is missing a package name\n", .{path});
+                failed = true;
+            },
+            .invalid_package_json => |path| {
+                try manager.stderr.print("error: Invalid package.json in workspace \"{s}\"\n", .{path});
+                failed = true;
+            },
+            .duplicate_name => |duplicate| {
+                try manager.stderr.print(
+                    "error: Workspace name \"{s}\" already exists\nnote: first declared at {s}/package.json\nnote: duplicated at {s}/package.json\n",
+                    .{ duplicate.name, duplicate.first_path, duplicate.duplicate_path },
+                );
+                failed = true;
+            },
+        };
+        if (failed) return error.PackageManagerErrorReported;
+        for (discovery.entries) |workspace| try manager.workspaces.put(workspace.name, workspace);
     }
 
-    fn discoverWorkspacePattern(manager: *Manager, pattern: []const u8) !void {
-        if (std.mem.endsWith(u8, pattern, "/*")) {
-            const base = pattern[0 .. pattern.len - 2];
-            var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, base, .{ .iterate = true }) catch return;
-            defer directory.close(manager.init_data.io);
-            var iterator = directory.iterate();
-            while (try iterator.next(manager.init_data.io)) |entry| {
-                if (entry.kind != .directory) continue;
-                const path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, base, entry.name });
-                try manager.addWorkspace(path);
+    fn workspaceForPath(manager: *Manager, path: []const u8) ?*Workspace {
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| {
+            if (pathsEquivalent(manager.init_data.io, manager.allocator, entry.value_ptr.path, path) catch false) {
+                return entry.value_ptr;
             }
-        } else if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
-            const path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, pattern });
-            try manager.addWorkspace(path);
         }
-    }
-
-    fn addWorkspace(manager: *Manager, path: []const u8) !void {
-        const package_json_path = try std.fs.path.join(manager.allocator, &.{ path, "package.json" });
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            manager.init_data.io,
-            package_json_path,
-            manager.allocator,
-            .limited(16 * 1024 * 1024),
-        ) catch return;
-        const package_json = try manager.allocator.create(Value);
-        package_json.* = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch return;
-        if (package_json.* != .object) return;
-        const name = jsonString(package_json, "name") orelse return;
-        try manager.workspaces.put(name, .{
-            .name = name,
-            .path = path,
-            .version = jsonString(package_json, "version") orelse "0.0.0",
-            .package_json = package_json,
-        });
+        return null;
     }
 
     fn resolveWorkspaceDependency(
@@ -3799,30 +3819,150 @@ const Manager = struct {
         alias: []const u8,
         spec: []const u8,
         parent_dir: []const u8,
-    ) !?Workspace {
-        if (manager.workspaces.get(alias)) |workspace| return workspace;
-        if (!std.mem.startsWith(u8, spec, "workspace:")) return null;
+    ) !Workspace {
+        const request = Workspaces.parseRequest(alias, spec);
+        const registry_name, const registry_range = parseNpmAlias(alias, spec);
+        const workspace = if (request.path) |path| path_workspace: {
+            const target_path = try absolutePathFrom(manager.allocator, parent_dir, path);
+            if (manager.workspaceForPath(target_path)) |entry| break :path_workspace entry.*;
+            if (!std.mem.eql(u8, parent_dir, manager.root_dir)) {
+                const root_target_path = try absolutePathFrom(manager.allocator, manager.root_dir, path);
+                if (manager.workspaceForPath(root_target_path)) |entry| break :path_workspace entry.*;
+            }
+            break :path_workspace null;
+        } else manager.workspaces.get(if (request.explicit) request.target_name else registry_name);
 
-        const target = spec["workspace:".len..];
-        if (target.len == 0 or target[0] != '.') return null;
-        const target_path = try absolutePathFrom(manager.allocator, parent_dir, target);
-        var workspaces = manager.workspaces.iterator();
-        while (workspaces.next()) |entry| {
-            const workspace = entry.value_ptr.*;
-            if (std.mem.eql(u8, workspace.path, target_path)) return workspace;
+        const selected = workspace orelse {
+            try manager.stderr.print("error: Workspace dependency \"{s}\" not found\n", .{alias});
+            return error.PackageManagerErrorReported;
+        };
+        if (request.explicit) {
+            if (request.range) |range| {
+                const trimmed = std.mem.trim(u8, range, " \t\r\n");
+                const version_matches = selected.has_version and
+                    Semver.Version.parseUTF8(selected.version).valid and
+                    semverSatisfies(manager.allocator, trimmed, selected.version);
+                if (!version_matches and
+                    trimmed.len > 0 and
+                    !semverRangeIsWildcard(manager.allocator, trimmed) and
+                    !Semver.Version.isTaggedVersionOnly(trimmed))
+                {
+                    try manager.stderr.print(
+                        "error: No matching version for workspace dependency \"{s}\". Version: \"{s}\"\n",
+                        .{ alias, spec },
+                    );
+                    return error.PackageManagerErrorReported;
+                }
+            }
+        } else if (!manager.workspaceMatchesRange(selected, registry_range)) {
+            return error.WorkspaceNotFound;
         }
-        return null;
+        return selected;
     }
 
-    fn installWorkspaceDependencies(manager: *Manager) !void {
+    fn installResolvedWorkspace(
+        manager: *Manager,
+        alias: []const u8,
+        workspace: Workspace,
+        parent_dir: []const u8,
+        direct: bool,
+        protocol_patch_paths: []const []const u8,
+    ) ![]const u8 {
+        if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
+        _ = try manager.peerContextForPackage(workspace.package_json, parent_dir, true);
+        const destination = if (manager.node_linker == .isolated)
+            try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
+        else
+            try manager.chooseDestination(alias, workspace.version, parent_dir, direct);
+        const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
+        if (!manager.options.lockfile_only) {
+            if (manager.node_linker == .isolated)
+                try manager.linkRelativeDirectory(destination, workspace.path, true)
+            else
+                try manager.linkDirectoryAt(destination, workspace.path);
+        }
+        try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
+        try manager.addRecord(.{
+            .key = if (manager.node_linker == .isolated)
+                try manager.dependencyLockKey(parent_dir, alias)
+            else
+                try manager.lockKeyForDestination(destination),
+            .alias = alias,
+            .name = workspace.name,
+            .version = workspace.version,
+            .local_path = workspace.path,
+            .resolution = workspace.path,
+            .kind = .workspace,
+            .metadata = workspace.package_json,
+            .install_dir = workspace.path,
+        });
+        try manager.rememberPackageMetadata(workspace.path, workspace.package_json);
+        try manager.linkPeerDependencies(workspace.package_json, workspace.path, parent_dir);
+        return workspace.version;
+    }
+
+    fn isWorkspaceDependency(manager: *Manager, alias: []const u8, spec: []const u8) bool {
+        const request = Workspaces.parseRequest(alias, spec);
+        if (request.explicit) return true;
+        if (!manager.link_workspace_packages) return false;
+        const registry_name, const registry_range = parseNpmAlias(alias, spec);
+        const workspace = manager.workspaces.get(registry_name) orelse return false;
+        return manager.workspaceMatchesRange(workspace, registry_range);
+    }
+
+    fn workspaceMatchesRange(manager: *Manager, workspace: Workspace, range: []const u8) bool {
+        if (std.mem.trim(u8, range, " \t\r\n").len == 0) return false;
+        if (Semver.Version.isTaggedVersionOnly(range)) return false;
+        const parsed_version = Semver.Version.parseUTF8(workspace.version);
+        if (workspace.has_version and parsed_version.valid) {
+            return semverSatisfies(manager.allocator, range, workspace.version);
+        }
+        return semverRangeIsWildcard(manager.allocator, range);
+    }
+
+    fn workspaceShouldLinkAtRoot(manager: *Manager, workspace: Workspace) bool {
+        const root_spec = manager.rootDependencySpec(workspace.name) orelse return true;
+        return manager.isWorkspaceDependency(workspace.name, root_spec);
+    }
+
+    fn reserveWorkspaceRootVersions(manager: *Manager) !void {
+        if (manager.node_linker != .hoisted) return;
         var iterator = manager.workspaces.iterator();
         while (iterator.next()) |entry| {
             const workspace = entry.value_ptr.*;
+            if (!manager.workspaceShouldLinkAtRoot(workspace)) continue;
+            try manager.root_versions.put(
+                try manager.allocator.dupe(u8, workspace.name),
+                try manager.allocator.dupe(u8, workspace.version),
+            );
+        }
+    }
+
+    fn countWorkspaceInstall(manager: *Manager, workspace: Workspace, newly_linked: bool) !void {
+        if (!newly_linked or manager.options.lockfile_only or manager.options.dry_run) return;
+        const entry = try manager.installed_workspaces.getOrPut(workspace.name);
+        if (!entry.found_existing) manager.installed_count += 1;
+    }
+
+    fn installWorkspaceDependencies(manager: *Manager) !void {
+        var workspaces = std.array_list.Managed(Workspace).init(manager.allocator);
+        defer workspaces.deinit();
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| try workspaces.append(entry.value_ptr.*);
+        std.mem.sort(Workspace, workspaces.items, {}, struct {
+            fn lessThan(_: void, left: Workspace, right: Workspace) bool {
+                return std.mem.order(u8, left.relative_path, right.relative_path) == .lt;
+            }
+        }.lessThan);
+
+        for (workspaces.items) |workspace| {
             try manager.rememberPackageMetadata(workspace.path, workspace.package_json);
             _ = try manager.peerContextForPackage(workspace.package_json, workspace.path, true);
-            if (manager.node_linker == .hoisted) {
-                if (!manager.options.lockfile_only) try manager.linkDirectory(workspace.name, workspace.path);
+            if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
                 const destination = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
+                const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
+                if (!manager.options.lockfile_only) try manager.linkDirectoryAt(destination, workspace.path);
+                try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
                 if (!manager.options.lockfile_only) try manager.linkBins(workspace.name, destination, workspace.package_json, true, manager.root_dir);
                 try manager.addRecord(.{
                     .key = try manager.lockKeyForDestination(destination),
@@ -3832,8 +3972,13 @@ const Manager = struct {
                     .local_path = workspace.path,
                     .resolution = workspace.path,
                     .kind = .workspace,
+                    .metadata = workspace.package_json,
+                    .install_dir = workspace.path,
                 });
             }
+        }
+
+        for (workspaces.items) |workspace| {
             try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
             if (!manager.options.omit_optional) {
                 try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, false, true);
@@ -3847,6 +3992,26 @@ const Manager = struct {
                 .kind = .workspace,
                 .optional = false,
             });
+        }
+    }
+
+    fn pruneStaleHoistedWorkspaceLinks(manager: *Manager) !void {
+        if (manager.node_linker != .hoisted or manager.options.lockfile_only or manager.options.dry_run) return;
+        const graph = if (manager.lock_graph) |*value| value else return;
+        var packages = graph.packages.iterator();
+        while (packages.next()) |entry| {
+            if (entry.value_ptr.kind != .workspace) continue;
+            var retained = false;
+            for (manager.records.items) |record| {
+                const key = if (record.key.len > 0) record.key else record.alias;
+                if (std.mem.eql(u8, key, entry.key_ptr.*)) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (retained) continue;
+            const destination = Patch.Spec.destinationForLockKey(manager.allocator, manager.root_dir, entry.key_ptr.*) catch continue;
+            deletePath(manager.init_data.io, destination);
         }
     }
 
@@ -4213,6 +4378,57 @@ fn isPatchableResolution(kind: Lockfile.Kind) bool {
     };
 }
 
+const InstallProject = struct {
+    root_dir: []const u8,
+    package_dir: []const u8,
+};
+
+fn findInstallProject(io: std.Io, allocator: std.mem.Allocator, start: []const u8) !InstallProject {
+    var current = try allocator.dupe(u8, start);
+    var maybe_package_dir: ?[]const u8 = null;
+    while (true) {
+        const package_json_path = try std.fs.path.join(allocator, &.{ current, "package.json" });
+        if (std.Io.Dir.cwd().access(io, package_json_path, .{})) |_| {
+            maybe_package_dir = current;
+            break;
+        } else |_| {}
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = try allocator.dupe(u8, parent);
+    }
+    const package_dir = maybe_package_dir orelse return .{ .root_dir = start, .package_dir = start };
+
+    current = if (std.fs.path.dirname(package_dir)) |parent|
+        try allocator.dupe(u8, parent)
+    else
+        return .{ .root_dir = package_dir, .package_dir = package_dir };
+    while (true) {
+        const package_json_path = try std.fs.path.join(allocator, &.{ current, "package.json" });
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            package_json_path,
+            allocator,
+            .limited(64 * 1024 * 1024),
+        ) catch null;
+        if (source) |contents| {
+            const manifest = std.json.parseFromSliceLeaky(Value, allocator, contents, .{}) catch null;
+            if (manifest) |value| {
+                if (value == .object) {
+                    const relative = try std.fs.path.relative(allocator, current, null, current, package_dir);
+                    if (Workspaces.matchesManifestPath(allocator, &value, relative) catch false) {
+                        return .{ .root_dir = current, .package_dir = package_dir };
+                    }
+                }
+            }
+        }
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = try allocator.dupe(u8, parent);
+    }
+    return .{ .root_dir = package_dir, .package_dir = package_dir };
+}
+
 fn findPatchProjectRoot(io: std.Io, allocator: std.mem.Allocator, start: []const u8) ![]const u8 {
     var current = try allocator.dupe(u8, start);
     while (true) {
@@ -4341,6 +4557,13 @@ fn semverSatisfies(allocator: std.mem.Allocator, range: []const u8, version_valu
     var query = Semver.Query.parse(allocator, range, sliced) catch return false;
     defer query.deinit();
     return query.satisfies(parsed_version.version.min(), range, version_value);
+}
+
+fn semverRangeIsWildcard(allocator: std.mem.Allocator, range: []const u8) bool {
+    const sliced = Semver.SlicedString.init(range, range);
+    var query = Semver.Query.parse(allocator, range, sliced) catch return false;
+    defer query.deinit();
+    return query.@"is *"();
 }
 
 fn bestMatchingVersion(
@@ -4766,4 +4989,38 @@ test "bun semver source selects the highest satisfying version" {
     try object.put(std.testing.allocator, "1.9.0", .null);
     try object.put(std.testing.allocator, "2.0.0", .null);
     try std.testing.expectEqualStrings("1.9.0", bestMatchingVersion(std.testing.allocator, &object, "^1.0.0").?);
+}
+
+test "install project selection promotes only declared workspace ancestors" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/packages/app/src");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/package.json",
+        .data = "{\"name\":\"repo\",\"workspaces\":[\"packages/*\"]}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/packages/app/package.json",
+        .data = "{\"name\":\"app\",\"version\":\"1.0.0\"}",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "repo" });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "packages", "app" });
+    const nested = try std.fs.path.join(allocator, &.{ workspace, "src" });
+    const project = try findInstallProject(io, allocator, nested);
+    try std.testing.expectEqualStrings(root, project.root_dir);
+    try std.testing.expectEqualStrings(workspace, project.package_dir);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "repo/package.json",
+        .data = "{\"name\":\"repo\",\"workspaces\":[\"other/*\"]}",
+    });
+    const standalone = try findInstallProject(io, allocator, nested);
+    try std.testing.expectEqualStrings(workspace, standalone.root_dir);
+    try std.testing.expectEqualStrings(workspace, standalone.package_dir);
 }
