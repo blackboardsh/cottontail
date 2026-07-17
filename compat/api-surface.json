@@ -7950,6 +7950,39 @@
         ],
         "hasDefaultExport": true
       },
+      "internal/bun-spawn-contract": {
+        "file": "src/runtime_modules/internal/bun-spawn-contract.js",
+        "exports": [
+          "assertBunAbortSignal",
+          "bunSignalName",
+          "bunSignalNumber",
+          "isEmptyBunSpawnOption",
+          "isReadableStreamLike",
+          "normalizeBunSpawnCommand",
+          "normalizeBunSpawnMaxBuffer",
+          "normalizeBunSpawnTimeout",
+          "validateBunSpawnCallbacks"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-spawn-ipc": {
+        "file": "src/runtime_modules/internal/bun-spawn-ipc.js",
+        "exports": [
+          "decodeBunSpawnIpc",
+          "encodeBunSpawnIpc",
+          "installInheritedNodeIpc",
+          "isCottontailIpcFrame"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/v8-date-parser": {
+        "file": "src/runtime_modules/internal/v8-date-parser.js",
+        "exports": [
+          "installV8DateParser",
+          "parseV8Date"
+        ],
+        "hasDefaultExport": false
+      },
       "assert/strict": {
         "file": "src/runtime_modules/node/assert/strict.js",
         "exports": [
@@ -13366,6 +13399,47 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/internal/bun-spawn-contract.js": {
+        "file": "src/runtime_modules/internal/bun-spawn-contract.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "assertBunAbortSignal",
+          "bunSignalName",
+          "bunSignalNumber",
+          "isEmptyBunSpawnOption",
+          "isReadableStreamLike",
+          "normalizeBunSpawnCommand",
+          "normalizeBunSpawnMaxBuffer",
+          "normalizeBunSpawnTimeout",
+          "validateBunSpawnCallbacks"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-spawn-ipc.js": {
+        "file": "src/runtime_modules/internal/bun-spawn-ipc.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "decodeBunSpawnIpc",
+          "encodeBunSpawnIpc",
+          "installInheritedNodeIpc",
+          "isCottontailIpcFrame"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/v8-date-parser.js": {
+        "file": "src/runtime_modules/internal/v8-date-parser.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "installV8DateParser",
+          "parseV8Date"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": [
+          "Date"
+        ]
+      },
       "src/runtime_modules/node/assert/strict.js": {
         "file": "src/runtime_modules/node/assert/strict.js",
         "hasDefaultExport": true,
@@ -15106,6 +15180,7 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
+          "__cottontailBuiltinModules",
           "__cottontailFdWatchHandlerInstalled",
           "__cottontailTlsListeners"
         ]
@@ -18815,8 +18890,8 @@
       "snapshot": "compat/upstream/bun/v1.3.10",
       "copiedFiles": 8366,
       "discoveredRunnableFiles": 1445,
-      "enabled": 1009,
-      "expectedFailure": 436,
+      "enabled": 1026,
+      "expectedFailure": 419,
       "disabled": 0,
       "notEnabled": 0,
       "classifiedTests": 1445,
@@ -18834,7 +18909,7 @@
       },
       "signals": {
         "publicNodeModules": 58,
-        "nodeTestFiles": 42,
+        "nodeTestFiles": 44,
         "compatMarkers": 13,
         "modulesWithCompatMarkers": 12,
         "explicitUnsupportedMarkers": 9,
@@ -18929,7 +19004,7 @@
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 1,
+          "tests": 3,
           "gapScore": 3
         },
         {
@@ -19027,23 +19102,23 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 4206,
+              "line": 4231,
               "text": "throw webcryptoDomException(`Unsupported WebCrypto hash: ${name}`, \"NotSupportedError\");"
             },
             {
-              "line": 4275,
+              "line": 4300,
               "text": "if (!nodeCurve) throw webcryptoDomException(`Unsupported namedCurve: ${namedCurve}`, \"NotSupportedError\");"
             },
             {
-              "line": 4281,
+              "line": 4306,
               "text": "throw webcryptoDomException(`Unsupported WebCrypto generateKey algorithm: ${rawName}`, \"NotSupportedError\");"
             },
             {
-              "line": 4287,
+              "line": 4312,
               "text": "throw webcryptoDomException(`Unsupported key usage for ${algorithmName}`, \"SyntaxError\");"
             },
             {
-              "line": 4636,
+              "line": 4661,
               "text": "throw webcryptoDomException(\"unsupported algorithm\", \"NotSupportedError\");"
             }
           ],
@@ -19070,7 +19145,7 @@
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 2614,
+              "line": 2623,
               "text": "throw new SyntaxError(`Unsupported proxy protocol: ${parsed.protocol}`);"
             }
           ],
@@ -19155,11 +19230,13 @@
         "tls": {
           "file": "src/runtime_modules/node/tls.js",
           "compatMarkers": [
-            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, default cipher inventory, session setters, trace toggles, and OCSP/TLS-ticket accessors are implemented; protocol-level renegotiation, OCSP stapling generation, and resumable session cache wiring need deeper bindings."
+            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, CA helpers, SNI contexts, arbitrary Duplex transports, ALPN, cipher selection, and keying-material export are implemented; active renegotiation, finished-message/OCSP/TLS-ticket extraction, and resumable session injection need deeper native bindings."
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
           "tests": [
+            "tests/js/node-tls-certificates.test.ts",
+            "tests/js/node-tls-duplex.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
         },
@@ -19245,10 +19322,10 @@
       "note": "Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.",
       "signals": {
         "publicBunModules": 5,
-        "bunTestFiles": 20,
-        "compatMarkers": 4,
+        "bunTestFiles": 21,
+        "compatMarkers": 8,
         "modulesWithCompatMarkers": 3,
-        "explicitUnsupportedMarkers": 9,
+        "explicitUnsupportedMarkers": 10,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 4
       },
@@ -19256,11 +19333,11 @@
         {
           "name": "bun",
           "file": "src/runtime_modules/bun/index.js",
-          "compatMarkers": 2,
-          "unsupportedMarkers": 5,
+          "compatMarkers": 6,
+          "unsupportedMarkers": 6,
           "nativeAvailabilityGuards": 0,
-          "tests": 20,
-          "gapScore": 16
+          "tests": 21,
+          "gapScore": 30
         },
         {
           "name": "internal-for-testing",
@@ -19316,27 +19393,35 @@
           "file": "src/runtime_modules/bun/index.js",
           "compatMarkers": [
             "Bun.$ native interpreter - the production parser,",
+            "Bun.spawn fd routing - the native spawn hooks need an",
+            "Bun.spawn terminal - PTY/ConPTY creation, resize,",
+            "spawn argv0 - Cottontail children use this internal",
+            "Bun.spawnSync native contract - the host currently",
             "all accepted Bun backends currently use Cottontail's"
           ],
           "unsupportedMarkers": [
             {
-              "line": 12827,
+              "line": 2903,
+              "text": "throw new Error(\"Bun.spawn terminal requires native PTY support\");"
+            },
+            {
+              "line": 13237,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 12858,
+              "line": 13268,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 13281,
+              "line": 13691,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 13297,
+              "line": 13707,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 14408,
+              "line": 14818,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],
@@ -19354,6 +19439,7 @@
             "tests/js/bun-serve-detached.ts",
             "tests/js/bun-serve-spawn.ts",
             "tests/js/bun-shell-runtime.test.ts",
+            "tests/js/bun-spawn-contract.ts",
             "tests/js/bun-spawn-execpath-env.ts",
             "tests/js/bun-spawn-streaming.ts",
             "tests/js/bun-sqlite.ts",
@@ -19371,11 +19457,11 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 572,
+              "line": 604,
               "text": "throw new Error(\"socketpair is unavailable in this Cottontail build\");"
             },
             {
-              "line": 661,
+              "line": 693,
               "text": "throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);"
             }
           ],

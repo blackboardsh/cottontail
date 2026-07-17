@@ -677,6 +677,10 @@
       "status": "enabled",
       "reason": "File is Docker-gated upstream (describeWithContainer/isDockerEnabled); without Docker it registers no tests and exits 0, matching Bun CI behavior."
     },
+    "test/cli/install/bun-install-tarball-integrity.test.ts": {
+      "status": "enabled",
+      "reason": "Package tarball SHA-512 generation, lockfile persistence, frozen reinstall verification, corruption rejection, and missing-integrity restoration pass the copied upstream coverage (9 bun:test cases, 47 assertions)."
+    },
     "test/cli/install/hosted-git-info/boundary-conditions.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."
@@ -2568,6 +2572,10 @@
       "status": "enabled",
       "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 270 assertions)."
     },
+    "test/js/node/tls/node-tls-rootcertificates-immutable.test.ts": {
+      "status": "enabled",
+      "reason": "Node TLS rootCertificates is a cached, frozen collection whose entries and identity cannot be mutated (1 bun:test case, 17 assertions)."
+    },
     "test/js/node/tls/node-tls-namedpipes.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
@@ -3336,6 +3344,14 @@
     "test/js/web/websocket/websocket-upgrade.test.ts": {
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
+    },
+    "test/js/web/websocket/websocket.test.js": {
+      "status": "enabled",
+      "reason": "Bun WebSocket client/server lifecycle, TLS verification, encrypted keys, handshake failures, binary and large messages, subprocess cleanup, stress cancellation, and GC coverage pass the copied upstream file (24 bun:test cases, 78 assertions).",
+      "args": [
+        "--timeout=120000"
+      ],
+      "timeoutMs": 120000
     },
     "test/package-json-lint.test.ts": {
       "status": "enabled",
