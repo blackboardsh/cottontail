@@ -549,31 +549,72 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
-const standalone_magic = "COTTONTAIL-STAND";
-const standalone_trailer_len = @sizeOf(u64) + standalone_magic.len;
+const standalone_magic_v1 = "COTTONTAIL-STAND";
+const standalone_magic = "COTTONTAIL-STAND2";
+const standalone_trailer_v1_len = @sizeOf(u64) + standalone_magic_v1.len;
+const standalone_trailer_len = @sizeOf(u64) * 2 + standalone_magic.len;
 
-fn loadStandaloneSource(init: std.process.Init) !?[]const u8 {
+const StandalonePayload = struct {
+    source: []const u8,
+    source_map: ?[]const u8 = null,
+};
+
+fn loadStandalonePayload(init: std.process.Init) !?StandalonePayload {
     const allocator = init.arena.allocator();
     const executable_path = try std.process.executablePathAlloc(init.io, allocator);
     const executable = try std.Io.Dir.cwd().openFile(init.io, executable_path, .{});
     defer executable.close(init.io);
     const executable_len = try executable.length(init.io);
-    if (executable_len < standalone_trailer_len) return null;
 
-    var trailer: [standalone_trailer_len]u8 = undefined;
-    const trailer_offset = executable_len - standalone_trailer_len;
+    if (executable_len >= standalone_trailer_len) {
+        var trailer: [standalone_trailer_len]u8 = undefined;
+        const trailer_offset = executable_len - standalone_trailer_len;
+        if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
+            std.mem.eql(u8, trailer[@sizeOf(u64) * 2 ..], standalone_magic))
+        {
+            const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
+            const map_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little);
+            const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
+            const map_len = std.math.cast(usize, map_len_u64) orelse return error.InvalidStandaloneExecutable;
+            if (source_len > 512 * 1024 * 1024 or map_len > 512 * 1024 * 1024 or
+                source_len > trailer_offset or map_len > trailer_offset - source_len)
+            {
+                return error.InvalidStandaloneExecutable;
+            }
+            const payload_offset = trailer_offset - source_len - map_len;
+            const source = try allocator.alloc(u8, source_len);
+            if (try executable.readPositionalAll(init.io, source, payload_offset) != source.len)
+                return error.InvalidStandaloneExecutable;
+            const source_map = if (map_len > 0) blk: {
+                const map = try allocator.alloc(u8, map_len);
+                if (try executable.readPositionalAll(init.io, map, payload_offset + source_len) != map.len)
+                    return error.InvalidStandaloneExecutable;
+                break :blk map;
+            } else null;
+            return .{ .source = source, .source_map = source_map };
+        }
+    }
+
+    if (executable_len < standalone_trailer_v1_len) return null;
+    var trailer: [standalone_trailer_v1_len]u8 = undefined;
+    const trailer_offset = executable_len - standalone_trailer_v1_len;
     if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) != trailer.len) return null;
-    if (!std.mem.eql(u8, trailer[@sizeOf(u64)..], standalone_magic)) return null;
-
-    const source_len = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
+    if (!std.mem.eql(u8, trailer[@sizeOf(u64)..], standalone_magic_v1)) return null;
+    const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
+    const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
     if (source_len > trailer_offset or source_len > 512 * 1024 * 1024) return error.InvalidStandaloneExecutable;
-    const source = try allocator.alloc(u8, @intCast(source_len));
+    const source = try allocator.alloc(u8, source_len);
     const source_offset = trailer_offset - source_len;
     if (try executable.readPositionalAll(init.io, source, source_offset) != source.len) return error.InvalidStandaloneExecutable;
-    return source;
+    return .{ .source = source };
 }
 
-fn writeStandaloneExecutable(init: std.process.Init, output_path: []const u8, source: []const u8) !void {
+fn writeStandaloneExecutable(
+    init: std.process.Init,
+    output_path: []const u8,
+    payload: script_runner.StandaloneSource,
+    write_external_source_map: bool,
+) !void {
     const executable_path = try std.process.executablePathAlloc(init.io, init.arena.allocator());
     try std.Io.Dir.copyFile(
         std.Io.Dir.cwd(),
@@ -587,18 +628,26 @@ fn writeStandaloneExecutable(init: std.process.Init, output_path: []const u8, so
     const output = try std.Io.Dir.cwd().openFile(init.io, output_path, .{ .mode = .read_write });
     defer output.close(init.io);
     const executable_len = try output.length(init.io);
-    try output.writePositionalAll(init.io, source, executable_len);
+    try output.writePositionalAll(init.io, payload.source, executable_len);
+    const source_map = payload.source_map orelse "";
+    try output.writePositionalAll(init.io, source_map, executable_len + payload.source.len);
     var trailer: [standalone_trailer_len]u8 = undefined;
-    std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(source.len), .little);
-    @memcpy(trailer[@sizeOf(u64)..], standalone_magic);
-    try output.writePositionalAll(init.io, &trailer, executable_len + source.len);
+    std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
+    std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
+    @memcpy(trailer[@sizeOf(u64) * 2 ..], standalone_magic);
+    try output.writePositionalAll(init.io, &trailer, executable_len + payload.source.len + source_map.len);
+
+    if (write_external_source_map and payload.source_map != null) {
+        const map_path = try std.mem.concat(init.arena.allocator(), u8, &.{ output_path, ".map" });
+        try writeBuildFile(init.io, map_path, source_map);
+    }
 }
 
 fn runStandaloneIfPresent(
     init: std.process.Init,
     args: []const [:0]const u8,
 ) !?u8 {
-    const source = (try loadStandaloneSource(init)) orelse return null;
+    const payload = (try loadStandalonePayload(init)) orelse return null;
     const allocator = init.arena.allocator();
     var exec_args = try allocator.alloc([:0]const u8, args.len);
     var exec_len: usize = 0;
@@ -626,7 +675,8 @@ fn runStandaloneIfPresent(
     return try script_runner.runEmbedded(
         init,
         args[0],
-        source,
+        payload.source,
+        payload.source_map,
         args[script_start..],
         exec_args[0..exec_len],
     );
@@ -919,8 +969,13 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         }
         options.target = .bun;
         options.output_format = .esm;
+        const requested_source_map = options.source_map;
+        // The standalone payload always embeds a normal external map. Inline
+        // mode keeps it inside the executable; external/linked modes also
+        // materialize the same compiler output next to the binary.
+        if (requested_source_map != .none) options.source_map = .external;
         const entry_z = try allocator.dupeZ(u8, entries.items[0]);
-        const source = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
+        const payload = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
             try stderr.print("error: standalone build failed: {s}\n", .{@errorName(err)});
             try stderr.flush();
             return 1;
@@ -931,7 +986,12 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         else
             default_basename;
         const destination = outfile orelse default_name;
-        try writeStandaloneExecutable(init, destination, source);
+        try writeStandaloneExecutable(
+            init,
+            destination,
+            payload,
+            requested_source_map == .external or requested_source_map == .linked,
+        );
         try stdout.print("{s}\n", .{destination});
         try stdout.flush();
         return 0;

@@ -30,7 +30,13 @@ const ScriptExecution = struct {
     process_user_arg_offset: usize,
     exec_args: []const [:0]const u8,
     embedded_source: ?[]const u8 = null,
+    embedded_source_map: ?[]const u8 = null,
     exit_code: u8 = 1,
+};
+
+pub const StandaloneSource = struct {
+    source: []const u8,
+    source_map: ?[]const u8 = null,
 };
 
 const Context = struct {
@@ -101,7 +107,7 @@ pub fn runWithExecArgvDisplay(
         process_args[index + 1] = arg;
     }
 
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null);
 }
 
 const BundleDiagnostic = struct {
@@ -285,13 +291,14 @@ pub fn runEval(
     }
     defer cleanupRunnableDirectory(&ctx, runnable_path);
     const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
-    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null);
+    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null, null);
 }
 
 pub fn runEmbedded(
     init: std.process.Init,
     executable_path: [:0]const u8,
     source: []const u8,
+    source_map: ?[]const u8,
     script_args: []const [:0]const u8,
     exec_args: []const [:0]const u8,
 ) !u8 {
@@ -300,14 +307,18 @@ pub fn runEmbedded(
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
     process_args[0] = executable_path;
     for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
-    return try runPrepared(init, &ctx, executable_path, process_args, 1, exec_args, source);
+    const virtual_path: [:0]const u8 = if (builtin.os.tag == .windows)
+        "B:/~BUN/root/index.js"
+    else
+        "/$bunfs/root/index.js";
+    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, source, source_map);
 }
 
 pub fn compileStandaloneSource(
     init: std.process.Init,
     script_path: [:0]const u8,
     build_options: native_bundler.BundleOptions,
-) ![]const u8 {
+) !StandaloneSource {
     const ctx = try makeContext(init);
     const empty_args: [0][:0]const u8 = .{};
     const runnable_path = try bundleScriptNative(
@@ -319,12 +330,20 @@ pub fn compileStandaloneSource(
         build_options,
     );
     defer cleanupRunnableDirectory(&ctx, runnable_path);
-    return try std.Io.Dir.cwd().readFileAlloc(
+    const source = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
         runnable_path,
         init.arena.allocator(),
         .limited(512 * 1024 * 1024),
     );
+    const source_map_path = try std.mem.concat(init.arena.allocator(), u8, &.{ runnable_path, ".map" });
+    const source_map = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        source_map_path,
+        init.arena.allocator(),
+        .limited(512 * 1024 * 1024),
+    ) catch null;
+    return .{ .source = source, .source_map = source_map };
 }
 
 pub fn runStdin(
@@ -417,6 +436,7 @@ fn runPrepared(
     process_user_arg_offset: usize,
     exec_args: []const [:0]const u8,
     embedded_source: ?[]const u8,
+    embedded_source_map: ?[]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
@@ -428,6 +448,7 @@ fn runPrepared(
         .process_user_arg_offset = process_user_arg_offset,
         .exec_args = exec_args,
         .embedded_source = embedded_source,
+        .embedded_source_map = embedded_source_map,
     };
     const thread = try std.Thread.spawn(
         .{ .stack_size = script_thread_stack_size },
@@ -554,8 +575,15 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
 
-    execution.exit_code = if (execution.embedded_source) |source|
-        js_runtime.runSource(source, execution.runnable_path)
+    execution.exit_code = if (execution.embedded_source) |source| blk: {
+        if (execution.embedded_source_map) |source_map| {
+            js_runtime.setEmbeddedSourceMap(source_map, execution.runnable_path) catch {
+                writeStderr(execution.io, "cottontail: failed to install standalone source map\n", .{});
+                break :blk 1;
+            };
+        }
+        break :blk js_runtime.runSource(source, execution.runnable_path);
+    }
     else
         js_runtime.runFile(execution.runnable_path);
     if (profiler_options.enabled()) {

@@ -2875,6 +2875,11 @@ function ctAppendCompileBuildOptions(args, options) {
   if (options.splitting === true) args.push("--splitting");
   if (options.ignoreDCEAnnotations === true) args.push("--ignore-dce-annotations");
   if (options.emitDCEAnnotations === true) args.push("--emit-dce-annotations");
+  if (options.sourcemap === true) {
+    args.push("--sourcemap=inline");
+  } else if (["inline", "external", "linked"].includes(options.sourcemap)) {
+    args.push(`--sourcemap=${options.sourcemap}`);
+  }
 
   if (options.minify === true) {
     args.push("--minify");
@@ -2960,14 +2965,29 @@ async function ctRunCompiledBuild(options, compile, state) {
   }
 
   const bytes = new Uint8Array(await file(outfile).arrayBuffer());
+  const executableArtifact = new CTBuildArtifact(bytes, {
+    path: outfile,
+    kind: "entry-point",
+    loader: "file",
+    hash: null,
+  });
+  const outputs = [executableArtifact];
+  if (options.sourcemap === "external" || options.sourcemap === "linked") {
+    const mapPath = `${outfile}.map`;
+    if (await file(mapPath).exists()) {
+      const mapArtifact = new CTBuildArtifact(new Uint8Array(await file(mapPath).arrayBuffer()), {
+        path: mapPath,
+        kind: "sourcemap",
+        loader: "json",
+        hash: null,
+      });
+      executableArtifact.sourcemap = mapArtifact;
+      outputs.push(mapArtifact);
+    }
+  }
   const result = {
     success: true,
-    outputs: [new CTBuildArtifact(bytes, {
-      path: outfile,
-      kind: "entry-point",
-      loader: "file",
-      hash: null,
-    })],
+    outputs,
     logs: [],
   };
   await ctRunOnEnd(state, result);

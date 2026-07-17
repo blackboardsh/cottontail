@@ -16,6 +16,8 @@ const BASE64_VALUES = new Int8Array(128).fill(-1);
 for (let i = 0; i < BASE64_CHARS.length; i += 1) BASE64_VALUES[BASE64_CHARS.charCodeAt(i)] = i;
 
 let cachedMapPath;
+let cachedMapData;
+let cachedBundlePath;
 let cachedState; // undefined = never attempted for cachedMapPath, null = load failed
 
 function normalizePath(path) {
@@ -116,14 +118,17 @@ function readMapText(mapPath) {
   return null;
 }
 
-function buildState(mapPath) {
+function buildState(mapPath, mapData, configuredBundlePath) {
   try {
-    const text = readMapText(mapPath);
+    const text = typeof mapData === "string" ? mapData : readMapText(mapPath);
     if (typeof text !== "string" || text === "") return null;
     const map = JSON.parse(text);
     if (!map || typeof map !== "object" || typeof map.mappings !== "string" || !Array.isArray(map.sources)) return null;
-    const slash = mapPath.lastIndexOf("/");
-    const mapDir = slash > 0 ? mapPath.slice(0, slash) : "/";
+    const effectiveMapPath = typeof mapPath === "string" && mapPath !== ""
+      ? mapPath
+      : `${configuredBundlePath || "/$bunfs/root/index.js"}.map`;
+    const slash = effectiveMapPath.lastIndexOf("/");
+    const mapDir = slash > 0 ? effectiveMapPath.slice(0, slash) : "/";
     const configuredRoot = globalThis.__cottontailBundleSourceRoot;
     const sourceBase = typeof configuredRoot === "string" && configuredRoot !== "" ? configuredRoot : mapDir;
     const sources = map.sources.map((source) => resolveSource(sourceBase, map.sourceRoot, source));
@@ -131,7 +136,11 @@ function buildState(mapPath) {
       const contents = Array.isArray(map.sourcesContent) ? map.sourcesContent[index] : null;
       return typeof contents === "string" ? contents.split(/\r?\n/) : null;
     });
-    const bundlePath = mapPath.endsWith(".map") ? mapPath.slice(0, -".map".length) : null;
+    const bundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
+      ? configuredBundlePath
+      : effectiveMapPath.endsWith(".map")
+        ? effectiveMapPath.slice(0, -".map".length)
+        : null;
     return {
       sources,
       sourceLines,
@@ -146,10 +155,18 @@ function buildState(mapPath) {
 
 function getState() {
   const mapPath = globalThis.__cottontailBundleSourceMap;
-  if (typeof mapPath !== "string" || mapPath === "") return null;
-  if (cachedState !== undefined && cachedMapPath === mapPath) return cachedState;
+  const mapData = globalThis.__cottontailBundleSourceMapData;
+  const bundlePath = globalThis.__cottontailBundlePath;
+  const hasMapPath = typeof mapPath === "string" && mapPath !== "";
+  const hasMapData = typeof mapData === "string" && mapData !== "";
+  if (!hasMapPath && !hasMapData) return null;
+  if (cachedState !== undefined && cachedMapPath === mapPath && cachedMapData === mapData && cachedBundlePath === bundlePath) {
+    return cachedState;
+  }
   cachedMapPath = mapPath;
-  cachedState = buildState(mapPath);
+  cachedMapData = mapData;
+  cachedBundlePath = bundlePath;
+  cachedState = buildState(hasMapPath ? mapPath : "", hasMapData ? mapData : null, bundlePath);
   return cachedState;
 }
 
@@ -214,18 +231,34 @@ export function remapStackString(stack) {
   // ".map", so stacks that never mention the bundle can skip the expensive
   // one-time decode of the multi-megabyte source map entirely.
   const mapPath = globalThis.__cottontailBundleSourceMap;
-  if (typeof mapPath !== "string" || mapPath === "") return stack;
-  if (mapPath.endsWith(".map") && !stack.includes(mapPath.slice(0, -4))) return stack;
+  const mapData = globalThis.__cottontailBundleSourceMapData;
+  const configuredBundlePath = globalThis.__cottontailBundlePath;
+  const hasMapPath = typeof mapPath === "string" && mapPath !== "";
+  const hasMapData = typeof mapData === "string" && mapData !== "";
+  if (!hasMapPath && !hasMapData) return stack;
+  const expectedBundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
+    ? configuredBundlePath
+    : hasMapPath && mapPath.endsWith(".map")
+      ? mapPath.slice(0, -4)
+      : null;
+  if (expectedBundlePath && !stack.includes(expectedBundlePath)) return stack;
   const state = getState();
   if (!state || !state.bundleRegExp || !stack.includes(state.bundlePath)) return stack;
   state.bundleRegExp.lastIndex = 0;
-  return stack.replace(state.bundleRegExp, (match, lineText, columnText) => {
+  const remapped = stack.replace(state.bundleRegExp, (match, lineText, columnText) => {
     const line = Number(lineText);
     const column = Number(columnText);
     const initial = lookup(state, line, column);
     const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
     return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
   });
+  return remapped
+    .split("\n")
+    .filter((line) => {
+      const isFrame = /^\s*at\b/.test(line) || line.includes(`@${state.bundlePath}:`);
+      return !(isFrame && line.includes(state.bundlePath));
+    })
+    .join("\n");
 }
 
 export default { remapPosition, remapStackString, sourceContextForLocation };

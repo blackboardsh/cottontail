@@ -82,6 +82,45 @@ pub const Runtime = struct {
         }
     }
 
+    pub fn setEmbeddedSourceMap(
+        self: *Runtime,
+        source_map: []const u8,
+        bundle_path: []const u8,
+    ) !void {
+        const map_literal = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            std.json.Value{ .string = source_map },
+            .{},
+        );
+        defer self.allocator.free(map_literal);
+        const path_literal = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            std.json.Value{ .string = bundle_path },
+            .{},
+        );
+        defer self.allocator.free(path_literal);
+        const setup_source = try std.fmt.allocPrint(
+            self.allocator,
+            "globalThis.__cottontailBundleSourceMapData={s};globalThis.__cottontailBundlePath={s};",
+            .{ map_literal, path_literal },
+        );
+        defer self.allocator.free(setup_source);
+
+        var eval_error: [*c]u8 = null;
+        const filename = "cottontail:standalone-source-map";
+        if (c.ct_jsc_runtime_eval(
+            self.handle,
+            setup_source.ptr,
+            setup_source.len,
+            filename,
+            &eval_error,
+        ) != 0) {
+            defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
+            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            return error.SourceMapSetupFailed;
+        }
+    }
+
     pub fn runFile(self: *Runtime, script_path: [:0]const u8) u8 {
         const source = std.Io.Dir.cwd().readFileAlloc(
             self.io,
