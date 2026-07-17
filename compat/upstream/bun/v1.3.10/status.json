@@ -3289,6 +3289,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
+    "test/js/web/websocket/websocket-permessage-deflate-edge-cases.test.ts": {
+      "status": "enabled",
+      "reason": "Node-compatible raw-deflate window handling, compressed continuation frames, size thresholds, and a native 128 MiB decompression ceiling pass the copied upstream coverage (5 bun:test cases, 7 assertions)."
+    },
     "test/js/web/websocket/websocket-pong-fragmented.test.ts": {
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 1 assertions)."

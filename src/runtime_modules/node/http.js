@@ -919,7 +919,7 @@ export function websocketDeflateCompress(payload, windowBits = 15) {
   const bits = Math.max(9, Math.min(15, Number(windowBits) || 15));
   let output = deflateRawSync(payload, {
     finishFlush: zlibConstants.Z_SYNC_FLUSH,
-    windowBits: -bits,
+    windowBits: bits,
   });
   // RFC 7692 7.2.1: strip the trailing 0x00 0x00 0xff 0xff emitted by an
   // ending Z_SYNC_FLUSH; the receiver appends it back before inflating.
@@ -938,10 +938,19 @@ export function websocketDeflateCompress(payload, windowBits = 15) {
 
 export function websocketDeflateDecompress(payload, maxLength = WEBSOCKET_MAX_DECOMPRESSED_LENGTH) {
   const input = Buffer.concat([Buffer.from(payload), Buffer.from(WEBSOCKET_DEFLATE_TRAILER)]);
-  const output = inflateRawSync(input, {
-    finishFlush: zlibConstants.Z_SYNC_FLUSH,
-    windowBits: -15,
-  });
+  let output;
+  try {
+    output = inflateRawSync(input, {
+      finishFlush: zlibConstants.Z_SYNC_FLUSH,
+      maxOutputLength: maxLength,
+      windowBits: 15,
+    });
+  } catch (error) {
+    if (error?.code !== "ERR_BUFFER_TOO_LARGE") throw error;
+    const tooLarge = new RangeError("Message too big");
+    tooLarge.code = "WS_MESSAGE_TOO_BIG";
+    throw tooLarge;
+  }
   if (maxLength != null && output.byteLength > maxLength) {
     const error = new RangeError("Message too big");
     error.code = "WS_MESSAGE_TOO_BIG";
@@ -3139,10 +3148,6 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       } catch (error) {
         if (error?.code === "WS_MESSAGE_TOO_BIG") {
           const reason = "Message too big";
-          const closePayload = Buffer.alloc(2 + Buffer.byteLength(reason));
-          closePayload.writeUInt16BE(1009, 0);
-          closePayload.set(Buffer.from(reason), 2);
-          try { this._socket?.write?.(websocketFrame(0x8, closePayload)); } catch {}
           this._close(1009, reason, false);
         } else {
           this._protocolError("Invalid compressed data");

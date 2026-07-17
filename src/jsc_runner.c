@@ -3338,6 +3338,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     int mem_level = MAX_MEM_LEVEL;
     int strategy = Z_DEFAULT_STRATEGY;
     int finish_flush = Z_FINISH;
+    size_t max_output_length = (size_t)-1;
     JSObjectRef options_object = NULL;
     uint8_t *dictionary = NULL;
     size_t dictionary_len = 0;
@@ -3360,6 +3361,14 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
             JSValueRef finish_flush_value = ct_get_property(ctx, options, "finishFlush", exception);
             if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
             if (!JSValueIsUndefined(ctx, finish_flush_value) && !JSValueIsNull(ctx, finish_flush_value)) finish_flush = (int)ct_value_to_number(ctx, finish_flush_value);
+            JSValueRef max_output_length_value = ct_get_property(ctx, options, "maxOutputLength", exception);
+            if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+            if (!JSValueIsUndefined(ctx, max_output_length_value) && !JSValueIsNull(ctx, max_output_length_value)) {
+                double requested_max_output_length = ct_value_to_number(ctx, max_output_length_value);
+                if (requested_max_output_length > 0 && requested_max_output_length < (double)((size_t)-1)) {
+                    max_output_length = (size_t)requested_max_output_length;
+                }
+            }
             JSValueRef dictionary_value = ct_get_property(ctx, options, "dictionary", exception);
             if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
             if (!JSValueIsUndefined(ctx, dictionary_value) && !JSValueIsNull(ctx, dictionary_value)) {
@@ -3383,6 +3392,15 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
 
     if (level < Z_NO_COMPRESSION || level > Z_BEST_COMPRESSION) level = Z_DEFAULT_COMPRESSION;
     if (window_bits == 0) window_bits = ct_zlib_window_bits(mode);
+    // Node's public zlib API always accepts a positive 8..15 windowBits. The
+    // selected transform mode supplies zlib's raw/gzip wrapper modifier.
+    if ((mode == CT_ZLIB_DEFLATE_RAW || mode == CT_ZLIB_INFLATE_RAW) && window_bits > 0) {
+        window_bits = -window_bits;
+    } else if ((mode == CT_ZLIB_GZIP || mode == CT_ZLIB_GUNZIP) && window_bits <= MAX_WBITS) {
+        window_bits += 16;
+    } else if (mode == CT_ZLIB_UNZIP && window_bits <= MAX_WBITS) {
+        window_bits += 32;
+    }
     if (mem_level < 1 || mem_level > MAX_MEM_LEVEL) mem_level = MAX_MEM_LEVEL;
     if (strategy < Z_DEFAULT_STRATEGY || strategy > Z_FIXED) strategy = Z_DEFAULT_STRATEGY;
     if (finish_flush < Z_NO_FLUSH || finish_flush > Z_TREES) finish_flush = Z_FINISH;
@@ -3390,6 +3408,7 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     const bool compressing = ct_zlib_mode_compresses(mode);
     size_t capacity = compressing ? (size_t)compressBound((uLong)input_len) + 64 : (input_len > 0 ? input_len * 3 : 65536);
     if (capacity < 65536) capacity = 65536;
+    if (capacity > max_output_length) capacity = max_output_length;
     uint8_t *output = (uint8_t *)malloc(capacity);
     if (output == NULL) {
         ct_throw_message(ctx, exception, "Out of memory");
@@ -3419,13 +3438,20 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
         }
     }
 
+    bool output_limit_exceeded = false;
     while (true) {
         if (stream.total_out >= capacity) {
+            if (capacity >= max_output_length) {
+                output_limit_exceeded = true;
+                status = Z_MEM_ERROR;
+                break;
+            }
             if (capacity > (size_t)512 * 1024 * 1024) {
                 status = Z_MEM_ERROR;
                 break;
             }
             size_t next_capacity = capacity * 2;
+            if (next_capacity < capacity || next_capacity > max_output_length) next_capacity = max_output_length;
             uint8_t *next_output = (uint8_t *)realloc(output, next_capacity);
             if (next_output == NULL) {
                 status = Z_MEM_ERROR;
@@ -3464,6 +3490,11 @@ static JSValueRef ct_zlib_transform_sync(JSContextRef ctx, JSObjectRef function,
     }
 
     if (status != Z_STREAM_END) {
+        if (output_limit_exceeded) {
+            free(output);
+            ct_throw_message(ctx, exception, "COTTONTAIL_ZLIB_OUTPUT_LIMIT");
+            return JSValueMakeUndefined(ctx);
+        }
         const char *message = stream.msg != NULL ? stream.msg : zError(status);
         free(output);
         ct_throw_message(ctx, exception, message != NULL ? message : "zlib transform failed");

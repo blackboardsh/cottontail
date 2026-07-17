@@ -275,9 +275,20 @@ function transformSync(mode, data, options = undefined) {
   if (mode === "deflate" || mode === "deflateRaw" || mode === "gzip") validateZlibOptions(options);
   const level = levelFromOptions(options);
   const nativeOptions = options && typeof options === "object" ? options : level;
-  const result = nativeOptions == null
-    ? cottontail.zlibTransformSync(mode, bytesFromData(data))
-    : cottontail.zlibTransformSync(mode, bytesFromData(data), nativeOptions);
+  let result;
+  try {
+    result = nativeOptions == null
+      ? cottontail.zlibTransformSync(mode, bytesFromData(data))
+      : cottontail.zlibTransformSync(mode, bytesFromData(data), nativeOptions);
+  } catch (error) {
+    if (String(error) === "COTTONTAIL_ZLIB_OUTPUT_LIMIT") {
+      const maxOutputLength = Number(options?.maxOutputLength ?? kMaxLengthLimit());
+      const rangeError = new RangeError(`Cannot create a Buffer larger than ${maxOutputLength} bytes`);
+      rangeError.code = "ERR_BUFFER_TOO_LARGE";
+      throw rangeError;
+    }
+    throw error;
+  }
   const output = asBuffer(result);
   const maxOutputLength = options && typeof options === "object" && options.maxOutputLength != null
     ? Number(options.maxOutputLength)
