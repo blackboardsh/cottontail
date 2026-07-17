@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
 
 const rootDir = process.cwd();
+const packageVersion = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')).version;
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -72,6 +73,10 @@ const nativeBuildOutDir = join(tempDir, 'native-build');
 try {
   writeFileSync(join(tempDir, 'eval-data.json'), JSON.stringify({ value: 42 }));
   writeFileSync(join(tempDir, 'plain.test.js'), 'console.log("plain-test-body");\n');
+  writeFileSync(
+    join(tempDir, 'commonjs-using.js'),
+    'let disposed = false; { using value = { [Symbol.dispose]() { disposed = true; } }; } if (!disposed) throw new Error("resource was not disposed"); console.log("commonjs using passed");\n'
+  );
   const tests = [
     {
       name: 'smoke',
@@ -122,11 +127,18 @@ try {
       stdoutIncludes: ['42'],
     },
     {
+      name: 'commonjs-explicit-resource-management',
+      cwd: tempDir,
+      scriptPath: join(tempDir, 'commonjs-using.js'),
+      expectExitCode: 0,
+      stdoutIncludes: ['commonjs using passed'],
+    },
+    {
       name: 'cli-test-banner-without-registered-tests',
       cwd: tempDir,
       argv: ['test', 'plain.test.js'],
       expectExitCode: 0,
-      stdoutIncludes: ['bun test 0.0.0-cottontail (cottontail)', 'plain-test-body'],
+      stdoutIncludes: [`bun test ${packageVersion} (cottontail)`, 'plain-test-body'],
     },
     {
       name: 'cli-wasi-entrypoint',

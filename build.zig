@@ -65,6 +65,7 @@ fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     const output = command.addOutputFileArg("runtime-modules.bin");
     command.addDirectoryArg(b.path("src/runtime_modules"));
     command.addFileArg(b.path("src/compiler/src/runtime.js"));
+    command.addFileArg(b.path("src/compiler/src/runtime.bun.js"));
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/buffer.js"));
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/base64-js.js"));
     command.addFileArg(b.path("src/compiler/src/node-fallbacks/vendor/ieee754.js"));
