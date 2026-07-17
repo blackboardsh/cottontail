@@ -5,6 +5,7 @@ const Lockfile = @import("package_manager_lockfile.zig");
 const Manifest = @import("package_manager_manifest.zig");
 const Scripts = @import("package_manager_scripts.zig");
 const Git = @import("package_manager_git.zig");
+const Patch = @import("package_manager_patch.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -25,6 +26,8 @@ const Command = enum {
     add,
     remove,
     update,
+    patch,
+    patch_commit,
     pm,
 };
 
@@ -63,6 +66,7 @@ const Options = struct {
     omit_optional: bool = false,
     omit_peer: bool = false,
     help: bool = false,
+    patches_dir: []const u8 = "patches",
     section: DependencySection = .dependencies,
 };
 
@@ -119,6 +123,13 @@ const LockedSelection = struct {
     destination: []const u8,
 };
 
+const PatchSelection = struct {
+    package: *const Lockfile.Package,
+    destination: []const u8,
+    name: []const u8,
+    version: []const u8,
+};
+
 pub fn recognizes(command: []const u8) bool {
     return commandFromString(command) != null;
 }
@@ -128,6 +139,8 @@ fn commandFromString(command: []const u8) ?Command {
     if (std.mem.eql(u8, command, "add") or std.mem.eql(u8, command, "a")) return .add;
     if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm") or std.mem.eql(u8, command, "uninstall")) return .remove;
     if (std.mem.eql(u8, command, "update") or std.mem.eql(u8, command, "up")) return .update;
+    if (std.mem.eql(u8, command, "patch")) return .patch;
+    if (std.mem.eql(u8, command, "patch-commit")) return .patch_commit;
     if (std.mem.eql(u8, command, "pm")) return .pm;
     return null;
 }
@@ -255,6 +268,20 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.latest = true;
         } else if (std.mem.eql(u8, arg, "--save-text-lockfile")) {
             options.save_text_lockfile = true;
+        } else if (std.mem.eql(u8, arg, "--commit")) {
+            if (options.command != .patch) return error.InvalidPackageManagerOption;
+            options.command = .patch_commit;
+        } else if (std.mem.eql(u8, arg, "--patches-dir")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.patches_dir = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--patches-dir=")) {
+            options.patches_dir = arg["--patches-dir=".len..];
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+        } else if (std.mem.startsWith(u8, arg, "--backend=")) {
+            if (arg.len == "--backend=".len) return error.MissingOptionValue;
         } else if (std.mem.eql(u8, arg, "--omit")) {
             index += 1;
             if (index >= args.len) return error.MissingOptionValue;
@@ -277,6 +304,9 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
         }
     }
     options.positionals = try positionals.toOwnedSlice();
+    if ((options.command == .patch or options.command == .patch_commit) and options.positionals.len == 0) {
+        return error.MissingPatchTarget;
+    }
     return options;
 }
 
@@ -305,6 +335,7 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --no-save                Do not update package.json or bun.lock
         \\  --no-verify              Skip package integrity verification
         \\  -f, --force              Re-resolve and reinstall dependencies
+        \\  --patches-dir <path>     Set the generated patch directory
         \\
     , .{@tagName(command)});
 }
@@ -346,6 +377,7 @@ const Manager = struct {
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     root_dir: []const u8 = "",
+    invocation_dir: []const u8 = "",
     registry: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
     save_text_lockfile: bool = true,
@@ -360,6 +392,7 @@ const Manager = struct {
     started_ns: i128,
     installed_count: usize = 0,
     changed: bool = false,
+    root_package_json: ?*const Value = null,
     lock_graph: ?Lockfile.Graph = null,
     manifest_policy: ?Manifest.Policy = null,
     script_queue: Scripts.Queue,
@@ -401,7 +434,14 @@ const Manager = struct {
         if (manager.options.command == .install and manager.options.positionals.len > 0) {
             manager.options.command = .add;
         }
-        manager.root_dir = try absolutePath(manager.init_data.io, manager.allocator, ".");
+        manager.invocation_dir = try absolutePath(manager.init_data.io, manager.allocator, ".");
+        manager.root_dir = if (manager.options.command == .patch or manager.options.command == .patch_commit)
+            try findPatchProjectRoot(manager.init_data.io, manager.allocator, manager.invocation_dir)
+        else
+            manager.invocation_dir;
+        if (!std.mem.eql(u8, manager.invocation_dir, manager.root_dir)) {
+            try std.process.setCurrentPath(manager.init_data.io, manager.root_dir);
+        }
         try manager.loadConfiguration();
         manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
 
@@ -426,6 +466,7 @@ const Manager = struct {
         const had_trailing_newline = package_source.len > 0 and package_source[package_source.len - 1] == '\n';
         var root = try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
         if (root != .object) return error.InvalidPackageJSON;
+        manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
 
         if (manager.options.frozen_lockfile) {
@@ -435,6 +476,10 @@ const Manager = struct {
 
         try manager.discoverWorkspaces(&root);
         try manager.validateLockfileWorkspaces();
+        if (manager.options.command == .patch) return manager.preparePatchCommand();
+        if (manager.options.command == .patch_commit) {
+            return manager.commitPatchCommand(&root, package_json_path, had_trailing_newline);
+        }
         if (!manager.options.silent) {
             try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n\n", .{ @tagName(manager.options.command), bun_compat_version, version });
             try manager.stdout.flush();
@@ -447,6 +492,7 @@ const Manager = struct {
             .add => try manager.addPackages(&root),
             .remove => try manager.removePackages(&root),
             .update => try manager.updatePackages(&root),
+            .patch, .patch_commit => unreachable,
             .pm => unreachable,
         }
 
@@ -493,6 +539,296 @@ const Manager = struct {
         try manager.stdout.flush();
         try manager.stderr.flush();
         return 0;
+    }
+
+    fn preparePatchCommand(manager: *Manager) !u8 {
+        const selection = try manager.selectPatchPackage(manager.options.positionals[0]);
+        try manager.preparePackageForEditing(selection);
+
+        const display_path = if (std.mem.eql(u8, manager.invocation_dir, manager.root_dir))
+            try manager.relativeLockPath(selection.destination)
+        else
+            try normalizePathForManifest(manager.allocator, selection.destination);
+        try manager.stdout.print(
+            "\nTo patch {s}, edit the following folder:\n\n  {s}\n\nOnce you're done with your changes, run:\n\n  bun patch --commit '{s}'\n",
+            .{ selection.name, display_path, display_path },
+        );
+        try manager.stdout.flush();
+        return 0;
+    }
+
+    fn commitPatchCommand(
+        manager: *Manager,
+        root: *Value,
+        package_json_path: []const u8,
+        had_trailing_newline: bool,
+    ) !u8 {
+        const selection = try manager.selectPatchPackage(manager.options.positionals[0]);
+        const temp_root = try manager.patchTempPath("commit", selection.package.key);
+        defer deletePath(manager.init_data.io, temp_root);
+        const pristine_dir = try std.fs.path.join(manager.allocator, &.{ temp_root, "pristine" });
+        const changed_dir = try std.fs.path.join(manager.allocator, &.{ temp_root, "changed" });
+
+        try manager.materializePristine(selection.package, pristine_dir);
+        try Patch.snapshot(manager.allocator, manager.init_data.io, selection.destination, changed_dir);
+        try Patch.stripDiffArtifacts(manager.allocator, manager.init_data.io, pristine_dir);
+        try Patch.stripDiffArtifacts(manager.allocator, manager.init_data.io, changed_dir);
+        const contents = Patch.diff(
+            manager.allocator,
+            manager.init_data.io,
+            manager.init_data.environ_map,
+            pristine_dir,
+            changed_dir,
+        ) catch |err| {
+            try manager.stderr.print("error: failed to make patch diff: {s}\n", .{@errorName(err)});
+            return error.PackageManagerErrorReported;
+        };
+        if (contents.len == 0) {
+            try manager.stdout.print("\nNo changes detected, comparing {s} to {s}\n", .{ pristine_dir, selection.destination });
+            try manager.stdout.flush();
+            return 0;
+        }
+
+        const patch_label = try std.fmt.allocPrint(manager.allocator, "{s}@{s}.patch", .{ selection.name, selection.version });
+        const patch_filename = try Patch.Spec.escapeFilename(manager.allocator, patch_label);
+        const patches_dir = try absolutePathFrom(manager.allocator, manager.root_dir, manager.options.patches_dir);
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, patches_dir);
+        const patch_path = try std.fs.path.join(manager.allocator, &.{ patches_dir, patch_filename });
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = patch_path, .data = contents });
+
+        const stored_patch_path = if (std.fs.path.isAbsolute(manager.options.patches_dir))
+            try normalizePathForManifest(manager.allocator, patch_path)
+        else
+            try normalizePathForManifest(
+                manager.allocator,
+                try std.fs.path.join(manager.allocator, &.{ manager.options.patches_dir, patch_filename }),
+            );
+        const patch_key = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ selection.name, selection.version });
+        const patched_dependencies = try ensureObjectProperty(manager.allocator, &root.object, "patchedDependencies");
+        try patched_dependencies.put(
+            manager.allocator,
+            try manager.allocator.dupe(u8, patch_key),
+            .{ .string = try manager.allocator.dupe(u8, stored_patch_path) },
+        );
+        try writePackageJSON(manager.init_data.io, manager.allocator, package_json_path, root.*, had_trailing_newline);
+
+        manager.manifest_policy.?.deinit();
+        manager.manifest_policy = try Manifest.Policy.init(manager.allocator, root);
+        manager.changed = true;
+        try manager.prepareNodeModules();
+        try manager.installRoot(root, false);
+        try manager.writeTextLockfile(root);
+        if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
+            try manager.script_queue.run(manager.init_data, manager.root_dir, manager.stderr);
+        }
+        try manager.stdout.flush();
+        try manager.stderr.flush();
+        return 0;
+    }
+
+    fn selectPatchPackage(manager: *Manager, argument: []const u8) !PatchSelection {
+        const graph = if (manager.lock_graph) |*value| value else {
+            try manager.stderr.writeAll("error: Cannot find lockfile. Install packages with `bun install` before patching them.\n");
+            return error.PackageManagerErrorReported;
+        };
+
+        if (try manager.patchArgumentPath(argument)) |requested_path| {
+            const identity = manager.readInstalledPackageJSON(requested_path) catch {
+                try manager.stderr.print("error: package {s} not found\n", .{argument});
+                return error.PackageManagerErrorReported;
+            };
+            const name = jsonString(identity, "name") orelse return error.InvalidPackageName;
+            const version_value = jsonString(identity, "version") orelse return error.InvalidPackageVersion;
+            var fallback: ?PatchSelection = null;
+            var iterator = graph.packages.iterator();
+            while (iterator.next()) |entry| {
+                const package = entry.value_ptr;
+                if (!isPatchableResolution(package.kind) or !std.mem.eql(u8, package.name, name)) continue;
+                if (package.kind == .npm and !std.mem.eql(u8, package.version, version_value)) continue;
+                const candidate = manager.patchDestinationForKey(package.key) catch continue;
+                const selection = PatchSelection{
+                    .package = package,
+                    .destination = requested_path,
+                    .name = name,
+                    .version = version_value,
+                };
+                if (try pathsEquivalent(manager.init_data.io, manager.allocator, candidate, requested_path)) return selection;
+                if (fallback == null) fallback = selection;
+            }
+            if (fallback) |selection| return selection;
+            try manager.stderr.print("error: package {s} not found\n", .{argument});
+            return error.PackageManagerErrorReported;
+        }
+
+        if (packageNameFromNodeModulesPath(argument)) |path_name| {
+            var selection = try manager.selectPatchTarget(.{ .name = path_name, .version = null }, argument);
+            selection.destination = try absolutePathFrom(manager.allocator, manager.invocation_dir, argument);
+            return selection;
+        }
+
+        return manager.selectPatchTarget(Patch.Spec.splitTarget(argument), argument);
+    }
+
+    fn selectPatchTarget(
+        manager: *Manager,
+        target: Patch.Spec.Target,
+        argument: []const u8,
+    ) !PatchSelection {
+        const graph = &manager.lock_graph.?;
+        var selected: ?PatchSelection = null;
+        var iterator = graph.packages.iterator();
+        while (iterator.next()) |entry| {
+            const package = entry.value_ptr;
+            if (!isPatchableResolution(package.kind) or !std.mem.eql(u8, package.name, target.name)) continue;
+            const destination = manager.patchDestinationForKey(package.key) catch continue;
+            const identity = manager.readInstalledPackageJSON(destination) catch continue;
+            const name = jsonString(identity, "name") orelse continue;
+            const version_value = jsonString(identity, "version") orelse continue;
+            if (!std.mem.eql(u8, name, target.name)) continue;
+            if (target.version) |wanted| if (!std.mem.eql(u8, wanted, version_value)) continue;
+
+            const selected_destination = try manager.workspaceAliasDestination(destination);
+            const candidate = PatchSelection{
+                .package = package,
+                .destination = selected_destination,
+                .name = name,
+                .version = version_value,
+            };
+            if (selected) |current| {
+                if (target.version == null and !std.mem.eql(u8, current.version, version_value)) {
+                    try manager.stderr.print("error: package {s} has multiple installed versions; specify an exact version\n", .{target.name});
+                    return error.PackageManagerErrorReported;
+                }
+                if (!std.mem.eql(u8, manager.invocation_dir, manager.root_dir) and
+                    pathHasPrefix(destination, manager.invocation_dir)) selected = candidate;
+            } else {
+                selected = candidate;
+            }
+        }
+        if (selected) |selection| return selection;
+        try manager.stderr.print("error: package {s} not found\n", .{argument});
+        return error.PackageManagerErrorReported;
+    }
+
+    fn patchArgumentPath(manager: *Manager, argument: []const u8) !?[]const u8 {
+        const invocation_path = try absolutePathFrom(manager.allocator, manager.invocation_dir, argument);
+        const invocation_manifest = try std.fs.path.join(manager.allocator, &.{ invocation_path, "package.json" });
+        if (manager.pathExists(invocation_manifest)) return invocation_path;
+        if (!std.mem.eql(u8, manager.invocation_dir, manager.root_dir)) {
+            const root_path = try absolutePathFrom(manager.allocator, manager.root_dir, argument);
+            const root_manifest = try std.fs.path.join(manager.allocator, &.{ root_path, "package.json" });
+            if (manager.pathExists(root_manifest)) return root_path;
+        }
+        return null;
+    }
+
+    fn patchDestinationForKey(manager: *Manager, key: []const u8) ![]const u8 {
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            const relative = try manager.relativeLockPath(workspace.path);
+            if (key.len > relative.len and std.mem.startsWith(u8, key, relative) and key[relative.len] == '/') {
+                return Patch.Spec.destinationForLockKey(manager.allocator, workspace.path, key[relative.len + 1 ..]);
+            }
+        }
+        return Patch.Spec.destinationForLockKey(manager.allocator, manager.root_dir, key);
+    }
+
+    fn workspaceAliasDestination(manager: *Manager, destination: []const u8) ![]const u8 {
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            if (!pathHasPrefix(destination, workspace.path) or destination.len == workspace.path.len) continue;
+            const linked_workspace = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
+            return std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ linked_workspace, destination[workspace.path.len..] });
+        }
+        return destination;
+    }
+
+    fn preparePackageForEditing(manager: *Manager, selection: PatchSelection) !void {
+        const nested_modules = try std.fs.path.join(manager.allocator, &.{ selection.destination, "node_modules" });
+        const holding_root = try manager.patchTempPath("dependencies", selection.package.key);
+        const holding_modules = try std.fs.path.join(manager.allocator, &.{ holding_root, "node_modules" });
+        deletePath(manager.init_data.io, holding_root);
+        var moved_nested = false;
+        if (manager.pathExists(nested_modules)) {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, holding_root);
+            try std.Io.Dir.cwd().rename(nested_modules, std.Io.Dir.cwd(), holding_modules, manager.init_data.io);
+            moved_nested = true;
+        }
+        errdefer if (moved_nested) {
+            std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination) catch {};
+            std.Io.Dir.cwd().rename(holding_modules, std.Io.Dir.cwd(), nested_modules, manager.init_data.io) catch {};
+        };
+
+        try manager.materializePristine(selection.package, selection.destination);
+        try manager.applyPackagePatch(selection.name, selection.version, selection.destination, &.{});
+        if (moved_nested) {
+            try std.Io.Dir.cwd().rename(holding_modules, std.Io.Dir.cwd(), nested_modules, manager.init_data.io);
+        }
+        deletePath(manager.init_data.io, holding_root);
+    }
+
+    fn materializePristine(manager: *Manager, package: *const Lockfile.Package, destination: []const u8) !void {
+        deletePath(manager.init_data.io, destination);
+        if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(manager.init_data.io, parent);
+        switch (package.kind) {
+            .npm, .local_tarball, .remote_tarball => {
+                const archive = switch (package.kind) {
+                    .npm => blk: {
+                        const url = if (package.source.len > 0)
+                            package.source
+                        else
+                            try manager.defaultTarballURL(package.name, package.version);
+                        break :blk try manager.fetchBytes(url, false, max_tarball_bytes);
+                    },
+                    .remote_tarball => try manager.fetchBytes(package.source, false, max_tarball_bytes),
+                    .local_tarball => blk: {
+                        const path = try absolutePathFrom(manager.allocator, manager.root_dir, localSpecPath(package.source));
+                        break :blk try std.Io.Dir.cwd().readFileAlloc(
+                            manager.init_data.io,
+                            path,
+                            manager.allocator,
+                            .limited(max_tarball_bytes),
+                        );
+                    },
+                    else => unreachable,
+                };
+                if (manager.options.verify_integrity) {
+                    try verifyIntegrity(archive, if (package.integrity.len > 0) package.integrity else null);
+                }
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
+                var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
+                defer destination_dir.close(manager.init_data.io);
+                try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+            },
+            .git, .github => {
+                const spec = (try Git.parse(manager.allocator, package.source)) orelse return error.InvalidGitDependency;
+                const checkout_path = try manager.patchTempPath("git", package.key);
+                const checkout = try Git.checkout(
+                    manager.allocator,
+                    manager.init_data.io,
+                    manager.init_data.environ_map,
+                    spec,
+                    checkout_path,
+                );
+                defer deletePath(manager.init_data.io, checkout.path);
+                try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, destination);
+            },
+            else => return error.UnsupportedPatchResolution,
+        }
+    }
+
+    fn patchTempPath(manager: *Manager, label: []const u8, key: []const u8) ![]const u8 {
+        const cache_dir = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
+        return std.fmt.allocPrint(manager.allocator, "{s}{c}cottontail-patch-{s}-{x}-{d}", .{
+            cache_dir,
+            std.fs.path.sep,
+            label,
+            std.hash.Wyhash.hash(0, key),
+            std.Io.Clock.awake.now(manager.init_data.io).nanoseconds,
+        });
     }
 
     fn prepareNodeModules(manager: *Manager) !void {
@@ -651,12 +987,12 @@ const Manager = struct {
             manager.direct_bins.clearRetainingCapacity();
 
             if (isGitSpec(requested)) {
-                const git = try manager.installGit(alias, requested, manager.root_dir, true, false, null);
+                const git = try manager.installGit(alias, requested, manager.root_dir, true, false, null, &.{});
                 alias = git.alias;
                 resolved_version = git.version;
                 display_resolution = git.source;
             } else if (isTarballSpec(requested)) {
-                const tarball = try manager.installTarball(alias, requested, manager.root_dir, true, false);
+                const tarball = try manager.installTarball(alias, requested, manager.root_dir, true, false, &.{});
                 alias = tarball.alias;
                 resolved_version = tarball.version;
                 display_resolution = requested;
@@ -830,20 +1166,25 @@ const Manager = struct {
             }
             return err;
         };
+        var protocol_patch_paths: []const []const u8 = &.{};
+        const resolution_spec = if (try Patch.Spec.parseProtocol(manager.allocator, alias, effective_spec)) |protocol| blk: {
+            protocol_patch_paths = protocol.patch_paths;
+            break :blk protocol.base_spec;
+        } else effective_spec;
 
         if (direct) {
             for (manager.records.items) |record| {
-                if (std.mem.eql(u8, record.alias, alias)) return record.version;
+                if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, record.key, alias)) return record.version;
             }
         }
 
         if (try manager.findLockedSelection(alias, parent_dir)) |selection| {
-            if (try manager.lockedPackageMatches(selection.package, alias, effective_spec, parent_dir)) {
+            if (try manager.lockedPackageMatches(selection.package, alias, resolution_spec, parent_dir)) {
                 const cycle_key = try std.fmt.allocPrint(manager.allocator, "lock:{s}", .{selection.package.key});
                 if (manager.resolving.contains(cycle_key)) return selection.package.version;
                 try manager.resolving.put(cycle_key, {});
                 defer _ = manager.resolving.remove(cycle_key);
-                return manager.installLockedPackage(selection, alias, direct, optional);
+                return manager.installLockedPackage(selection, alias, direct, optional, protocol_patch_paths);
             }
             if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
         } else if (manager.options.frozen_lockfile) {
@@ -851,6 +1192,7 @@ const Manager = struct {
         }
 
         if (workspace_package) {
+            if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
             const workspace = manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
             if (!manager.options.lockfile_only) try manager.linkDirectory(alias, workspace.path);
             const destination = try packageDestination(manager.allocator, manager.root_dir, alias);
@@ -866,18 +1208,19 @@ const Manager = struct {
             return workspace.version;
         }
 
-        if (isGitSpec(effective_spec)) {
-            const git = try manager.installGit(alias, effective_spec, parent_dir, direct, optional, null);
+        if (isGitSpec(resolution_spec)) {
+            const git = try manager.installGit(alias, resolution_spec, parent_dir, direct, optional, null, protocol_patch_paths);
             return git.version;
         }
 
-        if (isTarballSpec(effective_spec)) {
-            const tarball = try manager.installTarball(alias, effective_spec, parent_dir, direct, optional);
+        if (isTarballSpec(resolution_spec)) {
+            const tarball = try manager.installTarball(alias, resolution_spec, parent_dir, direct, optional, protocol_patch_paths);
             return tarball.version;
         }
 
-        if (isLocalSpec(effective_spec)) {
-            const local = try manager.resolveLocalPackage(effective_spec, parent_dir);
+        if (isLocalSpec(resolution_spec)) {
+            if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
+            const local = try manager.resolveLocalPackage(resolution_spec, parent_dir);
             const destination = try packageDestination(manager.allocator, manager.root_dir, alias);
             const newly_installed = !manager.pathExists(destination);
             if (!manager.options.lockfile_only) {
@@ -890,8 +1233,8 @@ const Manager = struct {
                 .name = local.name,
                 .version = local.version,
                 .local_path = local.path,
-                .resolution = localSpecPath(effective_spec),
-                .kind = if (std.mem.startsWith(u8, effective_spec, "link:")) .symlink else .folder,
+                .resolution = localSpecPath(resolution_spec),
+                .kind = if (std.mem.startsWith(u8, resolution_spec, "link:")) .symlink else .folder,
                 .metadata = local.package_json,
             });
             manager.installed_count += 1;
@@ -906,14 +1249,14 @@ const Manager = struct {
             return local.version;
         }
 
-        const registry_name, const registry_spec = parseNpmAlias(alias, effective_spec);
+        const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
         const cycle_key = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ registry_name, registry_spec });
         if (manager.resolving.contains(cycle_key)) return registry_spec;
         try manager.resolving.put(cycle_key, {});
         defer _ = manager.resolving.remove(cycle_key);
 
         if (!manager.options.force) {
-            if (try manager.findInstalledVersion(alias, effective_spec, parent_dir)) |installed| return installed;
+            if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, protocol_patch_paths)) |installed| return installed;
         }
 
         const resolved = try manager.resolveRegistryPackage(registry_name, registry_spec);
@@ -926,7 +1269,9 @@ const Manager = struct {
             var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
             defer destination_dir.close(manager.init_data.io);
             try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
-            try manager.linkBins(alias, destination, resolved.metadata, direct);
+            try manager.applyPackagePatch(resolved.name, resolved.version, destination, protocol_patch_paths);
+            const bin_metadata = (try manager.metadataForInstalledPackage(destination, resolved.metadata)).?;
+            try manager.linkBins(alias, destination, bin_metadata, direct);
         }
 
         try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
@@ -1018,13 +1363,17 @@ const Manager = struct {
         alias: []const u8,
         direct: bool,
         optional: bool,
+        protocol_patch_paths: []const []const u8,
     ) anyerror![]const u8 {
         const package = selection.package;
         switch (package.kind) {
             .npm => {
+                const patch_paths = try manager.packagePatchPaths(package.name, package.version, protocol_patch_paths);
                 var installed = false;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
-                    installed = !manager.options.force and try manager.installedPackageMatches(selection.destination, package.name, package.version);
+                    installed = !manager.options.force and
+                        try manager.installedPackageMatches(selection.destination, package.name, package.version) and
+                        try manager.packagePatchStateMatches(selection.destination, patch_paths);
                     if (!installed) {
                         const tarball_url = if (package.source.len > 0)
                             package.source
@@ -1039,9 +1388,12 @@ const Manager = struct {
                         var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, selection.destination, .{});
                         defer destination_dir.close(manager.init_data.io);
                         try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+                        try manager.applyPatchPaths(selection.destination, patch_paths);
                         manager.installed_count += 1;
                     }
-                    if (package.info) |info| try manager.linkBins(alias, selection.destination, info, direct);
+                    if (try manager.metadataForInstalledPackage(selection.destination, package.info)) |info| {
+                        try manager.linkBins(alias, selection.destination, info, direct);
+                    }
                 }
 
                 if (isTopLevelDestination(manager.root_dir, selection.destination, alias)) {
@@ -1061,6 +1413,7 @@ const Manager = struct {
                 return package.version;
             },
             .workspace => {
+                if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
                 const workspace = manager.workspaces.get(package.name) orelse manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     try manager.linkDirectoryAt(selection.destination, workspace.path);
@@ -1084,6 +1437,7 @@ const Manager = struct {
                 return workspace.version;
             },
             .folder, .symlink => {
+                if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
                 const spec = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{
                     if (package.kind == .symlink) "link:" else "file:",
                     package.source,
@@ -1126,18 +1480,26 @@ const Manager = struct {
                 const metadata = try manager.readTarballPackageJSON(archive);
                 const name = jsonString(metadata, "name") orelse package.name;
                 const version_value = jsonString(metadata, "version") orelse "0.0.0";
+                const patch_paths = try manager.packagePatchPaths(name, version_value, protocol_patch_paths);
                 var installed = false;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
-                    installed = !manager.options.force and try manager.installedPackageMatches(selection.destination, name, version_value);
+                    installed = !manager.options.force and
+                        try manager.installedPackageMatches(selection.destination, name, version_value) and
+                        try manager.packagePatchStateMatches(selection.destination, patch_paths);
                     if (!installed) {
                         deletePath(manager.init_data.io, selection.destination);
                         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination);
                         var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, selection.destination, .{});
                         defer destination_dir.close(manager.init_data.io);
                         try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+                        try manager.applyPatchPaths(selection.destination, patch_paths);
                         manager.installed_count += 1;
                     }
-                    try manager.linkBins(alias, selection.destination, package.info orelse metadata, direct);
+                    const bin_metadata = (try manager.metadataForInstalledPackage(
+                        selection.destination,
+                        package.info orelse metadata,
+                    )).?;
+                    try manager.linkBins(alias, selection.destination, bin_metadata, direct);
                 }
                 try manager.addRecord(.{
                     .key = package.key,
@@ -1155,7 +1517,7 @@ const Manager = struct {
                 return version_value;
             },
             .git, .github => {
-                const git = try manager.installGit(alias, package.source, manager.root_dir, direct, optional, selection);
+                const git = try manager.installGit(alias, package.source, manager.root_dir, direct, optional, selection, protocol_patch_paths);
                 return git.version;
             },
             .root => return error.InvalidLockedRootResolution,
@@ -1185,6 +1547,75 @@ const Manager = struct {
         return package_json == .object and
             std.mem.eql(u8, jsonString(&package_json, "name") orelse "", name) and
             std.mem.eql(u8, jsonString(&package_json, "version") orelse "", version_value);
+    }
+
+    fn packagePatchPaths(
+        manager: *Manager,
+        package_name: []const u8,
+        version_value: []const u8,
+        protocol_patch_paths: []const []const u8,
+    ) ![]const []const u8 {
+        const configured_path = manager.manifest_policy.?.patchPath(package_name, version_value);
+        if (configured_path == null) return protocol_patch_paths;
+        for (protocol_patch_paths) |path| {
+            if (std.mem.eql(u8, path, configured_path.?)) return protocol_patch_paths;
+        }
+
+        var paths = std.array_list.Managed([]const u8).init(manager.allocator);
+        try paths.appendSlice(protocol_patch_paths);
+        try paths.append(configured_path.?);
+        return paths.toOwnedSlice();
+    }
+
+    fn packagePatchStateMatches(
+        manager: *Manager,
+        package_dir: []const u8,
+        patch_paths: []const []const u8,
+    ) !bool {
+        return Patch.installedStateMatches(
+            manager.allocator,
+            manager.init_data.io,
+            manager.root_dir,
+            package_dir,
+            patch_paths,
+        ) catch |err| return manager.patchFailure(err, patch_paths);
+    }
+
+    fn applyPackagePatch(
+        manager: *Manager,
+        package_name: []const u8,
+        version_value: []const u8,
+        package_dir: []const u8,
+        protocol_patch_paths: []const []const u8,
+    ) !void {
+        const patch_paths = try manager.packagePatchPaths(package_name, version_value, protocol_patch_paths);
+        return manager.applyPatchPaths(package_dir, patch_paths);
+    }
+
+    fn applyPatchPaths(
+        manager: *Manager,
+        package_dir: []const u8,
+        patch_paths: []const []const u8,
+    ) !void {
+        Patch.apply(
+            manager.allocator,
+            manager.init_data.io,
+            manager.root_dir,
+            package_dir,
+            patch_paths,
+        ) catch |err| return manager.patchFailure(err, patch_paths);
+    }
+
+    fn patchFailure(manager: *Manager, err: anyerror, patch_paths: []const []const u8) anyerror {
+        const path = if (patch_paths.len > 0) patch_paths[0] else "";
+        switch (err) {
+            error.PatchFileNotFound => manager.stderr.print("error: Couldn't find patch file: '{s}'\n", .{path}) catch {},
+            error.EmptyPatchFile => manager.stderr.print("error: patchfile '{s}' is empty, please restore or delete it.\n", .{path}) catch {},
+            error.InvalidPatchFile => manager.stderr.print("error: failed to parse patchfile ({s})\n", .{path}) catch {},
+            error.PatchApplyFailed => manager.stderr.print("error: failed to apply patchfile ({s})\n", .{path}) catch {},
+            else => manager.stderr.print("error: failed to apply patchfile ({s}): {s}\n", .{ path, @errorName(err) }) catch {},
+        }
+        return error.PackageManagerErrorReported;
     }
 
     fn defaultTarballURL(manager: *Manager, name: []const u8, version_value: []const u8) ![]const u8 {
@@ -1219,6 +1650,7 @@ const Manager = struct {
         direct: bool,
         optional: bool,
         locked_selection: ?LockedSelection,
+        protocol_patch_paths: []const []const u8,
     ) !GitPackage {
         const spec = (try Git.parse(manager.allocator, requested)) orelse return error.InvalidGitDependency;
         const destination = if (locked_selection) |selection|
@@ -1240,12 +1672,13 @@ const Manager = struct {
             const package_json_path = try std.fs.path.join(manager.allocator, &.{ destination, "package.json" });
             if (manager.pathExists(package_json_path)) {
                 metadata = try manager.readInstalledPackageJSON(destination);
-                installed = true;
                 package_name = jsonString(metadata, "name") orelse alias_hint orelse locked_selection.?.package.name;
                 package_version = jsonString(metadata, "version") orelse locked_selection.?.package.version;
                 resolved_source = locked_selection.?.package.source;
                 const locked_spec = (try Git.parse(manager.allocator, resolved_source)).?;
                 commit = locked_spec.committish;
+                const patch_paths = try manager.packagePatchPaths(package_name, package_version, protocol_patch_paths);
+                installed = try manager.packagePatchStateMatches(destination, patch_paths);
             }
         }
 
@@ -1289,13 +1722,15 @@ const Manager = struct {
             if (!manager.options.lockfile_only and !manager.options.dry_run) {
                 deletePath(manager.init_data.io, final_destination);
                 try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, final_destination);
+                try manager.applyPackagePatch(package_name, package_version, final_destination, protocol_patch_paths);
             }
             manager.installed_count += 1;
         }
 
         const alias = alias_hint orelse package_name;
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
-            try manager.linkBins(alias, final_destination, metadata, direct);
+            const bin_metadata = (try manager.metadataForInstalledPackage(final_destination, metadata)).?;
+            try manager.linkBins(alias, final_destination, bin_metadata, direct);
         }
         try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package_version);
         try manager.addRecord(.{
@@ -1341,6 +1776,15 @@ const Manager = struct {
         return package_json;
     }
 
+    fn metadataForInstalledPackage(
+        manager: *Manager,
+        package_dir: []const u8,
+        fallback: ?*const Value,
+    ) !?*const Value {
+        const installed = manager.readInstalledPackageJSON(package_dir) catch return fallback;
+        return installed;
+    }
+
     fn installTarball(
         manager: *Manager,
         alias_hint: ?[]const u8,
@@ -1348,6 +1792,7 @@ const Manager = struct {
         parent_dir: []const u8,
         direct: bool,
         optional: bool,
+        protocol_patch_paths: []const []const u8,
     ) !TarballPackage {
         const archive = if (isRemoteTarballSpec(spec))
             try manager.fetchBytes(spec, false, max_tarball_bytes)
@@ -1376,7 +1821,9 @@ const Manager = struct {
             var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
             defer destination_dir.close(manager.init_data.io);
             try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
-            try manager.linkBins(alias, destination, metadata, direct);
+            try manager.applyPackagePatch(package_name, package_version, destination, protocol_patch_paths);
+            const bin_metadata = (try manager.metadataForInstalledPackage(destination, metadata)).?;
+            try manager.linkBins(alias, destination, bin_metadata, direct);
         }
 
         try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package_version);
@@ -1440,6 +1887,23 @@ const Manager = struct {
         parent_dir: []const u8,
         direct: bool,
     ) ![]const u8 {
+        if (!direct) {
+            if (manager.rootDependencySpec(alias)) |root_spec| {
+                const effective = manager.manifest_policy.?.resolveDependency(alias, root_spec, false) catch root_spec;
+                const unwrapped = if (try Patch.Spec.parseProtocol(manager.allocator, alias, effective)) |protocol|
+                    protocol.base_spec
+                else
+                    effective;
+                if (!isGitSpec(unwrapped) and !isTarballSpec(unwrapped) and !isLocalSpec(unwrapped) and
+                    !std.mem.startsWith(u8, unwrapped, "workspace:"))
+                {
+                    const root_npm = parseNpmAlias(alias, unwrapped);
+                    if (!semverSatisfies(manager.allocator, root_npm[1], version_value)) {
+                        return packageDestination(manager.allocator, parent_dir, alias);
+                    }
+                }
+            }
+        }
         if (direct or manager.root_versions.get(alias) == null) {
             return packageDestination(manager.allocator, manager.root_dir, alias);
         }
@@ -1449,11 +1913,24 @@ const Manager = struct {
         return packageDestination(manager.allocator, parent_dir, alias);
     }
 
+    fn rootDependencySpec(manager: *Manager, alias: []const u8) ?[]const u8 {
+        const root = manager.root_package_json orelse return null;
+        if (root.* != .object) return null;
+        for (all_dependency_sections) |section_name| {
+            const section = root.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            const value = section.object.get(alias) orelse continue;
+            if (value == .string) return value.string;
+        }
+        return null;
+    }
+
     fn findInstalledVersion(
         manager: *Manager,
         alias: []const u8,
         spec: []const u8,
         parent_dir: []const u8,
+        protocol_patch_paths: []const []const u8,
     ) !?[]const u8 {
         const candidates = [_][]const u8{ parent_dir, manager.root_dir };
         for (candidates) |base| {
@@ -1471,11 +1948,14 @@ const Manager = struct {
             const version_value = value.object.get("version") orelse continue;
             if (version_value != .string) continue;
             if (semverSatisfies(manager.allocator, spec, version_value.string)) {
+                const package_name = jsonString(value, "name") orelse alias;
+                const patch_paths = try manager.packagePatchPaths(package_name, version_value.string, protocol_patch_paths);
+                if (!try manager.packagePatchStateMatches(destination, patch_paths)) continue;
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), version_value.string);
                 try manager.addRecord(.{
                     .key = try manager.lockKeyForDestination(destination),
                     .alias = alias,
-                    .name = jsonString(value, "name") orelse alias,
+                    .name = package_name,
                     .version = version_value.string,
                     .metadata = value,
                 });
@@ -1838,14 +2318,14 @@ const Manager = struct {
                 .resolution = workspace.path,
                 .kind = .workspace,
             });
-            try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, true, false);
+            try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
             if (!manager.options.omit_optional) {
-                try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, true, true);
+                try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, false, true);
             }
             if (!manager.options.omit_peer) {
-                try manager.installDependencyObject(workspace.package_json, "peerDependencies", workspace.path, true, true);
+                try manager.installDependencyObject(workspace.package_json, "peerDependencies", workspace.path, false, true);
             }
-            if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, true, false);
+            if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
             try manager.script_queue.add(.{
                 .name = workspace.name,
                 .version = workspace.version,
@@ -2185,6 +2665,60 @@ fn hasUnknownURLScheme(spec: []const u8) bool {
 
 fn packageDestination(allocator: std.mem.Allocator, base: []const u8, alias: []const u8) ![]const u8 {
     return std.fs.path.join(allocator, &.{ base, "node_modules", alias });
+}
+
+fn packageNameFromNodeModulesPath(path: []const u8) ?[]const u8 {
+    var start: ?usize = null;
+    if (std.mem.startsWith(u8, path, "node_modules/") or std.mem.startsWith(u8, path, "node_modules\\")) {
+        start = "node_modules/".len;
+    }
+    if (std.mem.lastIndexOf(u8, path, "/node_modules/")) |index| start = index + "/node_modules/".len;
+    if (std.mem.lastIndexOf(u8, path, "\\node_modules\\")) |index| start = index + "\\node_modules\\".len;
+    const tail = path[start orelse return null ..];
+    if (tail.len == 0) return null;
+    if (tail[0] == '@') {
+        const scope_end = std.mem.indexOfAny(u8, tail, "/\\") orelse return null;
+        const package_end = std.mem.indexOfAnyPos(u8, tail, scope_end + 1, "/\\") orelse tail.len;
+        if (scope_end + 1 >= package_end) return null;
+        return tail[0..package_end];
+    }
+    const package_end = std.mem.indexOfAny(u8, tail, "/\\") orelse tail.len;
+    return if (package_end > 0) tail[0..package_end] else null;
+}
+
+fn isPatchableResolution(kind: Lockfile.Kind) bool {
+    return switch (kind) {
+        .npm, .local_tarball, .remote_tarball, .git, .github => true,
+        else => false,
+    };
+}
+
+fn findPatchProjectRoot(io: std.Io, allocator: std.mem.Allocator, start: []const u8) ![]const u8 {
+    var current = try allocator.dupe(u8, start);
+    while (true) {
+        const text_lock = try std.fs.path.join(allocator, &.{ current, "bun.lock" });
+        if (std.Io.Dir.cwd().access(io, text_lock, .{})) |_| return current else |_| {}
+        const binary_lock = try std.fs.path.join(allocator, &.{ current, "bun.lockb" });
+        if (std.Io.Dir.cwd().access(io, binary_lock, .{})) |_| return current else |_| {}
+        const parent = std.fs.path.dirname(current) orelse return allocator.dupe(u8, start);
+        if (std.mem.eql(u8, parent, current)) return allocator.dupe(u8, start);
+        current = try allocator.dupe(u8, parent);
+    }
+}
+
+fn normalizePathForManifest(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const normalized = try allocator.dupe(u8, path);
+    if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, normalized, '\\', '/');
+    return normalized;
+}
+
+fn pathsEquivalent(io: std.Io, allocator: std.mem.Allocator, left: []const u8, right: []const u8) !bool {
+    const resolved_left = try std.fs.path.resolve(allocator, &.{left});
+    const resolved_right = try std.fs.path.resolve(allocator, &.{right});
+    if (std.mem.eql(u8, resolved_left, resolved_right)) return true;
+    const real_left = std.Io.Dir.cwd().realPathFileAlloc(io, left, allocator) catch return false;
+    const real_right = std.Io.Dir.cwd().realPathFileAlloc(io, right, allocator) catch return false;
+    return std.mem.eql(u8, real_left, real_right);
 }
 
 fn normalizedBinName(name: []const u8) []const u8 {

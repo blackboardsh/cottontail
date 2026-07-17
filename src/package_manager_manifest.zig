@@ -11,6 +11,7 @@ pub const Policy = struct {
     allocator: std.mem.Allocator,
     root: *const Value,
     overrides: std.StringHashMap([]const u8),
+    patched_dependencies: std.StringHashMap([]const u8),
     default_catalog: std.StringHashMap([]const u8),
     catalog_groups: std.StringHashMap(std.StringHashMap([]const u8)),
     trusted_dependencies: ?std.StringHashMap(void) = null,
@@ -20,12 +21,14 @@ pub const Policy = struct {
             .allocator = allocator,
             .root = root,
             .overrides = std.StringHashMap([]const u8).init(allocator),
+            .patched_dependencies = std.StringHashMap([]const u8).init(allocator),
             .default_catalog = std.StringHashMap([]const u8).init(allocator),
             .catalog_groups = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
         };
         errdefer policy.deinit();
 
         try policy.parseOverrides();
+        try policy.parsePatchedDependencies();
         try policy.parseCatalogs();
         try policy.parseTrustedDependencies();
         return policy;
@@ -33,6 +36,7 @@ pub const Policy = struct {
 
     pub fn deinit(policy: *Policy) void {
         policy.overrides.deinit();
+        policy.patched_dependencies.deinit();
         policy.default_catalog.deinit();
         var groups = policy.catalog_groups.valueIterator();
         while (groups.next()) |group| group.deinit();
@@ -69,6 +73,12 @@ pub const Policy = struct {
         return npm_package and isDefaultTrustedDependency(package_name);
     }
 
+    pub fn patchPath(policy: *const Policy, package_name: []const u8, version: []const u8) ?[]const u8 {
+        var key_buffer: [1024]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{s}@{s}", .{ package_name, version }) catch return null;
+        return policy.patched_dependencies.get(key);
+    }
+
     pub fn wasTrustedInLock(document: *const Value, package_name: []const u8) bool {
         if (document.* != .object) return false;
         const trusted = document.object.get("trustedDependencies") orelse return false;
@@ -82,6 +92,7 @@ pub const Policy = struct {
     pub fn matchesLockDocument(policy: *const Policy, document: *const Value) bool {
         if (document.* != .object) return false;
         if (!stringMapMatchesValue(&policy.overrides, document.object.get("overrides"))) return false;
+        if (!stringMapMatchesValue(&policy.patched_dependencies, document.object.get("patchedDependencies"))) return false;
         if (!stringMapMatchesValue(&policy.default_catalog, document.object.get("catalog"))) return false;
         if (!catalogGroupsMatchValue(&policy.catalog_groups, document.object.get("catalogs"))) return false;
 
@@ -107,6 +118,9 @@ pub const Policy = struct {
                 }
                 try writer.writeAll("\n  ]");
             }
+        }
+        if (policy.patched_dependencies.count() > 0) {
+            try writeStringMapField(writer, policy.allocator, "patchedDependencies", &policy.patched_dependencies, 2);
         }
         if (policy.overrides.count() > 0) {
             try writeStringMapField(writer, policy.allocator, "overrides", &policy.overrides, 2);
@@ -154,7 +168,7 @@ pub const Policy = struct {
                     },
                     else => continue,
                 };
-                if (override.len == 0 or std.mem.startsWith(u8, override, "patch:")) continue;
+                if (override.len == 0) continue;
                 try policy.overrides.put(try policy.allocator.dupe(u8, raw_name), try policy.allocator.dupe(u8, override));
             }
             return;
@@ -165,8 +179,21 @@ pub const Policy = struct {
         for (resolutions.object.keys(), resolutions.object.values()) |raw_name, value| {
             if (value != .string) continue;
             const name = if (std.mem.startsWith(u8, raw_name, "**/")) raw_name[3..] else raw_name;
-            if (!isSinglePackageName(name) or value.string.len == 0 or std.mem.startsWith(u8, value.string, "patch:")) continue;
+            if (!isSinglePackageName(name) or value.string.len == 0) continue;
             try policy.overrides.put(try policy.allocator.dupe(u8, name), try policy.allocator.dupe(u8, value.string));
+        }
+    }
+
+    fn parsePatchedDependencies(policy: *Policy) !void {
+        if (policy.root.* != .object) return;
+        const patched = policy.root.object.get("patchedDependencies") orelse return;
+        if (patched != .object) return error.InvalidPatchedDependencies;
+        for (patched.object.keys(), patched.object.values()) |key, value| {
+            if (key.len == 0 or value != .string or value.string.len == 0) return error.InvalidPatchedDependencies;
+            try policy.patched_dependencies.put(
+                try policy.allocator.dupe(u8, key),
+                try policy.allocator.dupe(u8, value.string),
+            );
         }
     }
 
@@ -263,7 +290,7 @@ fn isValidDependencyValue(value: []const u8) bool {
     if (value.len == 0) return false;
     if (std.mem.indexOf(u8, value, "://")) |scheme| return scheme > 0;
     if (std.mem.indexOfScalar(u8, value, ':')) |colon| {
-        const known = [_][]const u8{ "npm:", "file:", "link:", "workspace:", "catalog:", "git:", "git+", "github:" };
+        const known = [_][]const u8{ "npm:", "file:", "link:", "workspace:", "catalog:", "git:", "git+", "github:", "patch:" };
         for (known) |prefix| if (std.mem.startsWith(u8, value, prefix)) return true;
         return colon == 1 and std.ascii.isAlphabetic(value[0]);
     }
@@ -327,7 +354,8 @@ test "manifest policy resolves catalogs and overrides" {
         \\  "workspaces": { "packages": ["packages/*"], "catalog": { "foo": "1.2.3" }, "catalogs": { "web": { "bar": "npm:baz@2.0.0" } } },
         \\  "dependencies": { "shared": "^3.0.0" },
         \\  "overrides": { "qux": "$shared" },
-        \\  "trustedDependencies": ["foo"]
+        \\  "trustedDependencies": ["foo"],
+        \\  "patchedDependencies": { "bar@2.0.0": "patches/bar.patch" }
         \\}
     , .{});
     var policy = try Policy.init(allocator, &root);
@@ -339,4 +367,5 @@ test "manifest policy resolves catalogs and overrides" {
     try std.testing.expectEqualStrings("latest", try policy.resolveDependency("qux", "latest", true));
     try std.testing.expect(policy.isTrusted("foo", true));
     try std.testing.expect(!policy.isTrusted("bar", true));
+    try std.testing.expectEqualStrings("patches/bar.patch", policy.patchPath("bar", "2.0.0").?);
 }
