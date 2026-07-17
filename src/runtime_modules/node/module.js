@@ -272,7 +272,86 @@ export function __setBuiltinModules(modules) {
   }
 }
 
+function normalizeStandaloneFilePath(path) {
+  let text = String(path);
+  if (text.startsWith("file:")) {
+    try { text = fileURLToPath(text); } catch {}
+  }
+  text = text.replace(/\\/g, "/");
+  const drive = text.match(/^([A-Za-z]):\//);
+  const rooted = drive != null || text.startsWith("/");
+  const prefix = drive ? `${drive[1].toUpperCase()}:/` : rooted ? "/" : "";
+  const rest = drive ? text.slice(3) : rooted ? text.slice(1) : text;
+  const parts = [];
+  for (const part of rest.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0 && parts[parts.length - 1] !== "..") parts.pop();
+      else if (!rooted) parts.push(part);
+      continue;
+    }
+    parts.push(part);
+  }
+  return `${prefix}${parts.join("/")}` || (rooted ? prefix : ".");
+}
+
+function standaloneFileEntry(path) {
+  const files = globalThis.__cottontailStandaloneFiles;
+  if (files == null) return { found: false, value: undefined };
+  const text = String(path);
+  const normalized = normalizeStandaloneFilePath(text);
+  const candidates = normalized === text ? [text] : [text, normalized];
+  if (typeof files.has === "function" && typeof files.get === "function") {
+    for (const candidate of candidates) {
+      if (files.has(candidate)) return { found: true, value: String(files.get(candidate)) };
+    }
+    return { found: false, value: undefined };
+  }
+  if (typeof files === "object") {
+    for (const candidate of candidates) {
+      if (Object.prototype.hasOwnProperty.call(files, candidate)) {
+        return { found: true, value: String(files[candidate]) };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function standaloneDirectoryExists(path) {
+  const files = globalThis.__cottontailStandaloneFiles;
+  if (files == null) return false;
+  const normalized = normalizeStandaloneFilePath(path);
+  const prefix = normalized.endsWith("/") ? normalized : `${normalized}/`;
+  const keys = typeof files.keys === "function"
+    ? files.keys()
+    : typeof files === "object" ? Object.keys(files) : [];
+  for (const key of keys) {
+    if (normalizeStandaloneFilePath(key).startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function readModuleFile(path) {
+  const embedded = standaloneFileEntry(path);
+  return embedded.found ? embedded.value : cottontail.readFile(path);
+}
+
+function modulePathExists(path) {
+  if (standaloneFileEntry(path).found || standaloneDirectoryExists(path)) return true;
+  try {
+    return cottontail.existsSync(String(path));
+  } catch {
+    return false;
+  }
+}
+
 function stat(path) {
+  if (standaloneFileEntry(path).found) {
+    return { isFile: true, isDirectory: false, isSymbolicLink: false };
+  }
+  if (standaloneDirectoryExists(path)) {
+    return { isFile: false, isDirectory: true, isSymbolicLink: false };
+  }
   try {
     return cottontail.statSync(String(path), true);
   } catch {
@@ -290,7 +369,7 @@ function isDirectory(path) {
 
 function readPackageJson(path) {
   try {
-    return JSON.parse(cottontail.readFile(path));
+    return JSON.parse(readModuleFile(path));
   } catch {
     return null;
   }
@@ -345,7 +424,7 @@ function loadTsconfigPaths(dir) {
   try {
     const file = join(dir, "tsconfig.json");
     if (isFile(file)) {
-      const parsed = parseJSONC(String(cottontail.readFile(file)));
+      const parsed = parseJSONC(String(readModuleFile(file)));
       const paths = parsed?.compilerOptions?.paths;
       const explicitBaseUrl = typeof parsed?.compilerOptions?.baseUrl === "string";
       if ((paths && typeof paths === "object") || explicitBaseUrl) {
@@ -413,6 +492,7 @@ function resolveTsconfigPathsMapping(request, startDir) {
 }
 
 function packageDirRealPath(candidate) {
+  if (standaloneDirectoryExists(candidate)) return candidate;
   try {
     // Store-based installs expose packages through node_modules symlinks. Do
     // not canonicalize ordinary package paths: on macOS that would also turn
@@ -430,7 +510,7 @@ function packageRootFor(request, startDir) {
   let dir = startDir;
   while (true) {
     const selfManifest = join(dir, "package.json");
-    if (cottontail.existsSync(selfManifest)) {
+    if (modulePathExists(selfManifest)) {
       try {
         const packageJson = readPackageJson(selfManifest);
         if (packageJson?.name === packageName && packageJson.exports != null) {
@@ -440,14 +520,14 @@ function packageRootFor(request, startDir) {
     }
 
     const nodeModulesCandidate = join(dir, "node_modules", packageName);
-    if (cottontail.existsSync(join(nodeModulesCandidate, "package.json"))) return packageDirRealPath(nodeModulesCandidate);
+    if (modulePathExists(join(nodeModulesCandidate, "package.json"))) return packageDirRealPath(nodeModulesCandidate);
 
     // A sibling directory that merely shares the package name is not a
     // package root (e.g. test fixtures at third_party/<name>/package.json);
     // only accept it when its package.json "name" actually matches.
     const directCandidate = join(dir, packageName);
     const directManifest = join(directCandidate, "package.json");
-    if (cottontail.existsSync(directManifest)) {
+    if (modulePathExists(directManifest)) {
       let manifestName;
       try {
         manifestName = readPackageJson(directManifest)?.name;
@@ -615,7 +695,7 @@ function splitSpecifierSuffix(value) {
   const lastSeparator = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
   if (index < lastSeparator && (text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text))) {
     try {
-      if (cottontail.existsSync(text)) return { bare: text, suffix: "" };
+      if (modulePathExists(text)) return { bare: text, suffix: "" };
     } catch {}
   }
   return { bare: text.slice(0, index), suffix: text.slice(index) };
@@ -948,7 +1028,7 @@ function executeCommonJsSource(module, filename, source) {
 }
 
 function transpileExtensionSource(filename, loader) {
-  const source = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  const source = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
   if (loader === "ts" && hasBunTranspiledPragma(source)) return source;
   if (typeof cottontail.transpilerTransform !== "function") {
     return maybeTransformRuntimeSyntax(filename, maybeStripTypeScript(filename, source));
@@ -1003,8 +1083,10 @@ function executeBundledCommonJsModule(module, filename) {
 }
 
 function executeDefaultExtension(module, filename, loader) {
-  const originalSource = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  if (esmSyntaxPattern.test(originalSource) && typeof cottontail.bundleNative === "function") {
+  const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  if (esmSyntaxPattern.test(originalSource) &&
+      !standaloneFileEntry(filename).found &&
+      typeof cottontail.bundleNative === "function") {
     return executeBundledCommonJsModule(module, filename);
   }
   const source = transpileExtensionSource(filename, loader);
@@ -1054,7 +1136,7 @@ function defaultLoadForHooks(url) {
   const resolved = urlToResolved(url);
   const format = formatForResolved(resolved);
   if (format === "builtin") return { format, source: null, shortCircuit: true };
-  return { format, source: cottontail.readFile(resolved), shortCircuit: true };
+  return { format, source: readModuleFile(resolved), shortCircuit: true };
 }
 
 function runLoadHooks(resolved) {
@@ -1371,7 +1453,7 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   const resolved = resolveRequest(String(specifier), parent);
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   if (loader === "text") {
-    return { default: cottontail.readFile(splitSpecifierSuffix(resolved).bare) };
+    return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
   }
   if (loader === "file") {
     return { default: splitSpecifierSuffix(resolved).bare };
@@ -1385,8 +1467,13 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
     return namespaceFromBuiltin(loadBuiltinOrReplacement(resolved));
   }
+  const resolvedPath = splitSpecifierSuffix(resolved).bare;
+  const embedded = standaloneFileEntry(resolvedPath);
+  if (embedded.found && esmSyntaxPattern.test(embedded.value)) {
+    return executeDynamicImportSource(resolved, embedded.value, "module");
+  }
   if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
-  return executeDynamicImportSource(resolved, cottontail.readFile(splitSpecifierSuffix(resolved).bare), formatForResolved(resolved));
+  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), formatForResolved(resolved));
 }
 
 // The native dynamic-import shim (cottontail.importModule) stringifies any
@@ -1406,7 +1493,7 @@ globalThis.__cottontailImportModule = (specifier, referrer, options) => {
 };
 
 function executeQueriedModule(module, filename, suffix) {
-  const source = maybeStripTypeScript(filename, cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
+  const source = maybeStripTypeScript(filename, readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, ""));
   const transformed = transformEsmSourceForDynamicImport(source);
   maybeRegisterSourceMap(filename, transformed);
   recordCompileCache(filename, transformed);
@@ -1457,9 +1544,9 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   if (hasRuntimePackageReplacement(resolvedPath)) {
     return loadRuntimePackageReplacement(resolvedPath);
   }
-  if (resolvedPath.endsWith(".jsonc")) return parseJSONC(cottontail.readFile(resolvedPath));
-  if (resolvedPath.endsWith(".toml")) return parseTOML(cottontail.readFile(resolvedPath));
-  if (resolvedPath.endsWith(".txt")) return { default: cottontail.readFile(resolvedPath) };
+  if (resolvedPath.endsWith(".jsonc")) return parseJSONC(readModuleFile(resolvedPath));
+  if (resolvedPath.endsWith(".toml")) return parseTOML(readModuleFile(resolvedPath));
+  if (resolvedPath.endsWith(".txt")) return { default: readModuleFile(resolvedPath) };
 
   const module = makeModule(resolvedPath, parent, isMain);
   attachModuleChild(parent, module);
@@ -1919,7 +2006,7 @@ function readSourceMapPayload(filename, source) {
   const mapPath = sourceMapUrl.startsWith("file:")
     ? fileURLToPath(sourceMapUrl)
     : resolve(dirname(String(filename)), sourceMapUrl);
-  return JSON.parse(cottontail.readFile(mapPath));
+  return JSON.parse(readModuleFile(mapPath));
 }
 
 function maybeRegisterSourceMap(filename, source) {
@@ -1934,7 +2021,7 @@ function remapRegisteredSourceMapStack(stack) {
     let sourceMap = sourceMapCache.get(file);
     if (!sourceMap) {
       try {
-        maybeRegisterSourceMap(file, cottontail.readFile(file));
+        maybeRegisterSourceMap(file, readModuleFile(file));
         sourceMap = sourceMapCache.get(file);
       } catch {}
     }
@@ -1953,7 +2040,7 @@ function remapThrownModuleError(error) {
   try {
     const filename = typeof error?.sourceURL === "string" ? error.sourceURL : undefined;
     if (filename) {
-      const generatedSource = cottontail.readFile(filename);
+      const generatedSource = readModuleFile(filename);
       let sourceMap = sourceMapCache.get(filename);
       if (!sourceMap) {
         maybeRegisterSourceMap(filename, generatedSource);
@@ -2102,7 +2189,7 @@ const moduleExtensionsTarget = {
     module.loaded = true;
   },
   ".json"(module, filename) {
-    const source = cottontail.readFile(filename);
+    const source = readModuleFile(filename);
     try {
       module.exports = JSON.parse(source);
     } catch (error) {
@@ -2317,7 +2404,7 @@ export function findSourceMap(path, error = undefined) {
   const key = String(path);
   if (sourceMapCache.has(key)) return sourceMapCache.get(key);
   try {
-    maybeRegisterSourceMap(key, cottontail.readFile(key));
+    maybeRegisterSourceMap(key, readModuleFile(key));
   } catch {}
   return sourceMapCache.get(key);
 }
