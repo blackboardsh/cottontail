@@ -323,14 +323,12 @@ class Parser {
     const items = [];
     this.skipSeparators();
     while (!this.isStop(stopWords, stopOperators)) {
-      let item = this.parseAndOr();
-      const background = this.consumeOp("&");
-      if (background) item = { type: "async", command: item };
-      items.push(item);
-      if (background) {
-        this.skipSeparators();
-        continue;
+      const item = this.parseAndOr();
+      if (this.isOp("&")) {
+        const background = this.take();
+        throw syntax('Background commands "&" are not supported yet.', background.position);
       }
+      items.push(item);
       if (!this.consumeOp(";")) {
         if (!this.isStop(stopWords, stopOperators)) {
           if (this.isOp(")")) throw syntax("Unexpected ')'", this.peek().position);
@@ -394,7 +392,11 @@ class Parser {
     if (this.consumeOp("(")) {
       const script = this.parse(new Set(), new Set([")"]));
       if (!this.consumeOp(")")) throw syntax("Unclosed subshell", this.peek().position);
+      const redirectPosition = this.peek().position;
       const redirects = this.parseRedirects();
+      if (redirects.length > 0) {
+        throw syntax("Subshells with redirections are currently not supported. Please open a GitHub issue.", redirectPosition);
+      }
       return { type: "subshell", script, redirects };
     }
     if (this.consumeOp("{")) {

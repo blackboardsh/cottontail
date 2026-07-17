@@ -629,11 +629,11 @@ export function createShellBuiltins(host) {
         for (const key of args) { delete context.env[key]; delete context.exported[key]; delete context.externalEnv[key]; }
         return result();
       case "exit": {
-        if (args.length === 0) return { ...result(), shellExit: true };
+        if (args.length === 0) return result();
         if (args.length > 1) return result(1, "", "exit: too many arguments\n");
         if (!/^[+-]?\d+$/.test(args[0])) return result(1, "", "exit: numeric argument required\n");
         const value = BigInt(args[0]);
-        return { ...result(Number(((value % 256n) + 256n) % 256n)), shellExit: true };
+        return result(Number(((value % 256n) + 256n) % 256n));
       }
       case "wait": {
         if (args.length > 0) return result(127, "", `wait: ${args[0]}: no such job\n`);

@@ -31,6 +31,13 @@ test.skipIf(process.platform === "win32")("preserves interpolation quote context
   expect(stdout.subarray(0, 7).toString()).toBe("answer\n");
 });
 
+test("rejects object references inside double-quoted shell words", async () => {
+  const output = Buffer.alloc(16);
+  await expect($`echo "answer > ${output}"`.quiet()).rejects.toThrow(
+    "JS object reference not allowed in double quotes",
+  );
+});
+
 test.skipIf(process.platform === "win32")("shell execution does not block the JavaScript event loop", async () => {
   let timerRan = false;
   const pending = $`sleep 0.05; echo complete`.text();

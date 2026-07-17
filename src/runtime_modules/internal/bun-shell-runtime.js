@@ -33,6 +33,45 @@ function result(exitCode = 0, stdout = "", stderr = "") {
   return { exitCode, stdout: bytes(stdout), stderr: bytes(stderr) };
 }
 
+function quoteAt(source, stop) {
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < stop; index += 1) {
+    const character = source[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+  }
+  return quote;
+}
+
+function validateOutputReferences(source, outputTargets) {
+  if (!(outputTargets instanceof Map) || outputTargets.size === 0) return;
+  for (const marker of outputTargets.keys()) {
+    let offset = 0;
+    while ((offset = source.indexOf(marker, offset)) !== -1) {
+      if (quoteAt(source, offset) === '"') {
+        throw new SyntaxError("JS object reference not allowed in double quotes");
+      }
+      offset += marker.length;
+    }
+  }
+}
+
 function cloneContext(context, { preserveCommandEnv = false } = {}) {
   return {
     cwd: context.cwd,
@@ -1118,6 +1157,7 @@ export function createBunShellRuntime(host) {
   }
 
   return async function runShell(source, options = {}) {
+    validateOutputReferences(source, options.outputTargets);
     const env = { ...host.env(), ...(options.env ?? {}) };
     const cwd = resolve(String(options.cwd ?? host.cwd()));
     env.PWD = cwd;

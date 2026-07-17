@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
@@ -26,15 +26,14 @@ test("groups share shell state while subshells isolate it", async () => {
   const output = await shell(`
     VALUE=outer
     { VALUE=grouped; echo "$VALUE"; } > group.txt
-    (VALUE=inner; echo "$VALUE"; exit 7; echo unreachable) > sub.txt
+    (VALUE=inner; echo "$VALUE"; exit 7; echo reached)
     echo "$VALUE"
-    cat group.txt sub.txt
+    cat group.txt
   `);
 
   expect(output.exitCode).toBe(0);
-  expect(output.stdout.toString()).toBe("grouped\ngrouped\ninner\n");
+  expect(output.stdout.toString()).toBe("inner\nreached\ngrouped\ngrouped\n");
   expect(readFileSync(join(root, "group.txt"), "utf8")).toBe("grouped\n");
-  expect(readFileSync(join(root, "sub.txt"), "utf8")).toBe("inner\n");
 });
 
 test("compound redirections are resolved before their bodies execute", async () => {
@@ -69,14 +68,14 @@ test("redirections preserve Bun descriptor merging and target order", async () =
   expect(readFileSync(join(root, "second.txt"), "utf8")).toBe("payload\n");
 });
 
-test("exit terminates its shell scope and preserves its status", async () => {
+test("exit is a regular builtin result in Bun 1.3.10 scripts", async () => {
   const topLevel = await shell("echo before; exit 37; echo unreachable");
-  expect(topLevel.exitCode).toBe(37);
-  expect(topLevel.stdout.toString()).toBe("before\n");
+  expect(topLevel.exitCode).toBe(0);
+  expect(topLevel.stdout.toString()).toBe("before\nunreachable\n");
 
   const nested = await shell("(echo nested; exit 19; echo unreachable); echo parent");
   expect(nested.exitCode).toBe(0);
-  expect(nested.stdout.toString()).toBe("nested\nparent\n");
+  expect(nested.stdout.toString()).toBe("nested\nunreachable\nparent\n");
 });
 
 test("parameter operators compose with quote-aware field splitting", async () => {
@@ -118,11 +117,10 @@ test("conditional expressions support logical and file operators", async () => {
   expect(output.stdout.toString()).toBe("accepted\n");
 });
 
-test("background lists are joined by wait without losing output", async () => {
-  const output = await shell("echo background & echo foreground; wait");
-  expect(output.exitCode).toBe(0);
-  expect(output.stdout.toString()).toBe("foreground\nbackground\n");
-  expect(output.stderr.toString()).toBe("");
+test("background lists preserve Bun's unsupported syntax diagnostic", async () => {
+  await expect(shell("echo background & echo foreground; wait")).rejects.toThrow(
+    'Background commands "&" are not supported yet.',
+  );
 });
 
 test("deep brace groups flatten while independently escaped braces stay literal", async () => {
@@ -170,6 +168,21 @@ test("redirections open in source order before a compound body runs", async () =
   expect(output.stderr.toString()).toContain("No such file or directory");
 });
 
+test("repeated redirections release their descriptors deterministically", async () => {
+  const probe = join(root, "descriptor-probe.txt");
+  const before = openSync(probe, "a+");
+  closeSync(before);
+
+  for (let index = 0; index < 100; index += 1) {
+    const output = await shell(`printf '%s' ${index} > repeated-output.txt`);
+    expect(output.exitCode).toBe(0);
+  }
+
+  const after = openSync(probe, "a+");
+  closeSync(after);
+  expect(after).toBeLessThanOrEqual(before + 1);
+});
+
 test("ANSI-C quotes decode complete escape sequences exactly once", async () => {
   const output = await shell("printf '%s' $'A\\n\\x42\\103'");
 
@@ -204,4 +217,8 @@ test("parser diagnostics preserve Bun's public syntax errors", () => {
   expect(() => parseShell("echo )")).toThrow("Unexpected ')'");
   expect(() => parseShell("echo $(echo hi")).toThrow("Unclosed command substitution");
   expect(() => parseShell("(echo hi")).toThrow("Unclosed subshell");
+  expect(() => parseShell("(echo hi) > output.txt")).toThrow(
+    "Subshells with redirections are currently not supported. Please open a GitHub issue.",
+  );
+  expect(() => parseShell("echo hi &")).toThrow('Background commands "&" are not supported yet.');
 });
