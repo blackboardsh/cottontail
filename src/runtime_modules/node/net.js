@@ -261,11 +261,13 @@ class SocketImpl extends EventEmitter {
     if (this.fd != null) this._attachFd(this.fd, options.local, options.remote, false);
   }
 
-  // Node exposes the libuv wrap as socket._handle with an fd property; tools
-  // and tests read socket._handle.fd. Surface a small stand-in over this.fd.
+  // Bun creates a detached socket handle as soon as connect() starts, before
+  // DNS and the native connection attempt have produced an fd. Keep the
+  // facade stable across that transition so internal consumers can attach to
+  // the socket owner while the connection is still pending.
   get _handle() {
     if (this.__handleOverride !== undefined) return this.__handleOverride;
-    if (this.fd == null) return null;
+    if (this.fd == null && !this.connecting) return null;
     if (this.__handleWrap == null) {
       const self = this;
       this.__handleWrap = {
@@ -1336,6 +1338,7 @@ class ServerImpl extends EventEmitter {
     this._address = null;
     this._path = null;
     this._isPipe = false;
+    this._ownsPipePath = false;
     this._acceptTimer = null;
     this._unref = false;
     this._usingWorkers = false;
@@ -1427,6 +1430,7 @@ class ServerImpl extends EventEmitter {
       if (options.fd != null) {
         this._fd = Number(options.fd);
         this._isPipe = options.path != null || options.pipe === true;
+        this._ownsPipePath = false;
         this._path = this._isPipe ? String(options.path ?? "") : null;
         try {
           this._address = this._isPipe ? this._path : cottontail.tcpSocketAddress?.(this._fd, false) ?? null;
@@ -1450,6 +1454,7 @@ class ServerImpl extends EventEmitter {
       if (result != null) {
         this._fd = Number(result.fd);
         this._isPipe = options.path != null;
+        this._ownsPipePath = this._isPipe;
         this._path = this._isPipe ? String(result.path ?? options.path) : null;
         this._address = this._isPipe ? this._path : result.address ?? null;
       }
@@ -1481,6 +1486,7 @@ class ServerImpl extends EventEmitter {
     const server = new Server(options);
     server._fd = Number(fd);
     server._isPipe = options.pipe === true || options.path != null;
+    server._ownsPipePath = false;
     server._path = options.path ?? null;
     try {
       server._address = server._isPipe ? server._path : cottontail.tcpSocketAddress?.(server._fd, false);
@@ -1556,6 +1562,7 @@ class ServerImpl extends EventEmitter {
   close(callback = undefined) {
     if (callback !== undefined && typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
     const wasRunning = this._fd != null || this.listening;
+    const ownedPipePath = this._ownsPipePath && this._path ? this._path : null;
     if (callback) {
       if (wasRunning) this.once("close", callback);
       else if (this._closeEmitted) queueMicrotask(() => callback(makeNodeError(Error, "Server is not running.", "ERR_SERVER_NOT_RUNNING")));
@@ -1570,6 +1577,10 @@ class ServerImpl extends EventEmitter {
       try { cottontail.closeFd?.(this._fd); } catch {}
       this._fd = null;
     }
+    if (ownedPipePath != null) {
+      try { cottontail.unlinkSync?.(ownedPipePath); } catch {}
+    }
+    this._ownsPipePath = false;
     this.listening = false;
     this._address = null;
     this._emitCloseIfDrained();

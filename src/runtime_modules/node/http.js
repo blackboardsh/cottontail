@@ -364,6 +364,9 @@ function nodeError(ErrorType, code, message) {
 }
 
 function validateIntegerOption(value, name, minimum = 0) {
+  if (typeof value !== "number") {
+    throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", `The "${name}" argument must be of type number. Received ${typeof value}`);
+  }
   if (!Number.isInteger(value) || value < minimum) {
     throw nodeError(RangeError, "ERR_OUT_OF_RANGE", `The value of "${name}" is out of range. It must be >= ${minimum}. Received ${value}`);
   }
