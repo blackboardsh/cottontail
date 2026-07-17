@@ -929,8 +929,8 @@
       "reason": "WebCrypto generateKey normalization, validation, usage partitioning, metadata, and AES/HMAC/RSA/EC/EdDSA/XDH behavior pass all 10,226 upstream cases (29,346 assertions)."
     },
     "test/js/bun/css/color.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun's real cssInternals color parser/serializer implementation from bun:internal-for-testing."
+      "status": "enabled",
+      "reason": "Bun.color uses the vendored Zig CSS parser, color-space conversions, printer, structured formats, ANSI conversion, snapshots, and full ansi256 fuzz coverage; all 917 upstream cases pass."
     },
     "test/js/bun/css/css-fuzz.test.ts": {
       "status": "expected-failure",

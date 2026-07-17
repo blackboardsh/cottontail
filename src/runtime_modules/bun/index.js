@@ -39,6 +39,7 @@ import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
 import { S3Client, s3 } from "./s3.js";
 import { SQL } from "./sql.js";
+import { color as bunColor } from "./color.js";
 import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
@@ -11798,9 +11799,7 @@ function outputAnsiColorsEnabled() {
 
 export const enableANSIColors = outputAnsiColorsEnabled();
 
-export function color(value, _name = undefined) {
-  return String(value);
-}
+export const color = bunColor;
 
 export function shrink() {
   bunForceGc();

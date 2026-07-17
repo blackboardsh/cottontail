@@ -1,5 +1,6 @@
 const std = @import("std");
 const compiler = @import("cottontail_compiler");
+const bun_color = @import("bun_color.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 
 const c_allocator = std.heap.c_allocator;
@@ -1703,6 +1704,10 @@ pub fn buildEntryPointsJson(
         return error.InvalidOptions;
     }
     const request_object = parsed_request.value.object;
+    if (request_object.get("__cottontailColor")) |color_request| {
+        const result = try bun_color.runRequest(arena_allocator, color_request);
+        return try c_allocator.dupe(u8, result);
+    }
     if (request_object.get("__cottontailCssInternals")) |css_request| {
         return runCssInternalsRequest(arena_allocator, css_request);
     }
