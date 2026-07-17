@@ -803,6 +803,14 @@
       "status": "enabled",
       "reason": "Bun test's --rerun-each behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
     },
+    "test/cli/test/test-filter-lifecycle-snapshot.test.ts": {
+      "status": "enabled",
+      "reason": "Filtered suites suppress their hooks and preserve Bun's lifecycle snapshot output (1 bun:test case, 1 snapshot, 2 assertions)."
+    },
+    "test/cli/test/test-randomize.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test randomizes test and file order deterministically and reproduces ordering from an explicit seed (2 bun:test cases, 32 assertions)."
+    },
     "test/cli/test/test-timeout-behavior.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 14 assertions)."
