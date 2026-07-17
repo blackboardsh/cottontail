@@ -6,6 +6,7 @@ const cottontail_diff = @import("cottontail_diff.zig");
 const cottontail_hash = @import("cottontail_hash.zig");
 const cottontail_markdown = @import("cottontail_markdown.zig");
 const cottontail_password = @import("cottontail_password.zig");
+const package_manager_cli = @import("package_manager_cli.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
@@ -33,6 +34,7 @@ const help_text_template =
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail run <entrypoint.js|entrypoint.ts> [args...]
     \\  cottontail test [args...]
+    \\  cottontail install|add|remove|update [packages...] [flags]
     \\  cottontail -e|--eval <script> [args...]
     \\  cottontail -p|--print <expression> [args...]
     \\  cottontail --help
@@ -1834,6 +1836,12 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         try stdout.flush();
+        return;
+    }
+
+    if (package_manager_cli.recognizes(arg)) {
+        const exit_code = try package_manager_cli.run(init, args, stdout, stderr);
+        if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
