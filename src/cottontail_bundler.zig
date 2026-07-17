@@ -160,12 +160,154 @@ pub const EntryPointOutput = struct {
     source_map: ?[]u8 = null,
 };
 
-pub fn bundleEntryPointWithOptionsAndSourceMap(
+pub const GraphOutputKind = enum {
+    @"entry-point",
+    chunk,
+    asset,
+};
+
+pub const GraphOutputSide = enum {
+    server,
+    client,
+};
+
+/// An external source map associated with one emitted graph file. Both fields
+/// are owned by this value until `takeContents` transfers the map bytes.
+pub const GraphSourceMap = struct {
+    path: []u8,
+    contents: []u8,
+    owns_contents: bool = true,
+
+    pub fn takeContents(this: *GraphSourceMap) []u8 {
+        this.owns_contents = false;
+        return this.contents;
+    }
+
+    pub fn deinit(this: *GraphSourceMap) void {
+        c_allocator.free(this.path);
+        if (this.owns_contents) c_allocator.free(this.contents);
+    }
+};
+
+/// A standalone-relevant BundleV2 output. Paths are the stable generated
+/// paths after Bun's naming templates have been applied. Source maps are
+/// attached to their owning output instead of being exposed as unrelated
+/// output-list entries.
+pub const GraphOutputFile = struct {
+    path: []u8,
+    source_path: []u8,
+    contents: []u8,
+    kind: GraphOutputKind,
+    loader: compiler.options.Loader,
+    input_loader: compiler.options.Loader,
+    side: ?GraphOutputSide,
+    entry_point_index: ?u32,
+    hash: u64,
+    is_executable: bool,
+    source_map: ?GraphSourceMap = null,
+    owns_contents: bool = true,
+
+    pub fn takeContents(this: *GraphOutputFile) []u8 {
+        this.owns_contents = false;
+        return this.contents;
+    }
+
+    pub fn takeSourceMapContents(this: *GraphOutputFile) ?[]u8 {
+        if (this.source_map) |*source_map| return source_map.takeContents();
+        return null;
+    }
+
+    pub fn deinit(this: *GraphOutputFile) void {
+        c_allocator.free(this.path);
+        c_allocator.free(this.source_path);
+        if (this.owns_contents) c_allocator.free(this.contents);
+        if (this.source_map) |*source_map| source_map.deinit();
+    }
+};
+
+/// An owned compiler output graph. `entry_point_file_index` prefers Bun's
+/// server-side entry point when a build contains both server and client sides.
+pub const BundleGraphOutput = struct {
+    files: []GraphOutputFile,
+    entry_point_file_index: ?usize,
+
+    pub fn entryPoint(this: *BundleGraphOutput) ?*GraphOutputFile {
+        const index = this.entry_point_file_index orelse return null;
+        return &this.files[index];
+    }
+
+    pub fn deinit(this: *BundleGraphOutput) void {
+        for (this.files) |*file| file.deinit();
+        c_allocator.free(this.files);
+    }
+};
+
+fn graphOutputKind(kind: compiler.jsc.API.BuildArtifact.OutputKind) ?GraphOutputKind {
+    return switch (kind) {
+        .@"entry-point" => .@"entry-point",
+        .chunk => .chunk,
+        .asset => .asset,
+        else => null,
+    };
+}
+
+fn cloneGraphSourceMap(output_file: *const compiler.options.OutputFile) !GraphSourceMap {
+    if (output_file.output_kind != .sourcemap or output_file.value != .buffer) {
+        return error.InvalidBundleSourceMap;
+    }
+
+    const path = try c_allocator.dupe(u8, output_file.dest_path);
+    errdefer c_allocator.free(path);
+    const contents = try c_allocator.dupe(u8, output_file.value.buffer.bytes);
+    errdefer c_allocator.free(contents);
+    return .{ .path = path, .contents = contents };
+}
+
+fn cloneGraphOutputFile(
+    output_file: *const compiler.options.OutputFile,
+    output_files: []const compiler.options.OutputFile,
+) !GraphOutputFile {
+    const kind = graphOutputKind(output_file.output_kind) orelse return error.UnsupportedBundleOutputKind;
+    if (output_file.value != .buffer) return error.UnsupportedBundleOutputStorage;
+
+    const path = try c_allocator.dupe(u8, output_file.dest_path);
+    errdefer c_allocator.free(path);
+    const source_path = try c_allocator.dupe(u8, output_file.src_path.text);
+    errdefer c_allocator.free(source_path);
+    const contents = try c_allocator.dupe(u8, output_file.value.buffer.bytes);
+    errdefer c_allocator.free(contents);
+
+    var source_map: ?GraphSourceMap = null;
+    errdefer if (source_map) |*map| map.deinit();
+    if (output_file.source_map_index != std.math.maxInt(u32)) {
+        if (output_file.source_map_index >= output_files.len) return error.InvalidBundleSourceMapIndex;
+        source_map = try cloneGraphSourceMap(&output_files[output_file.source_map_index]);
+    }
+
+    return .{
+        .path = path,
+        .source_path = source_path,
+        .contents = contents,
+        .kind = kind,
+        .loader = output_file.loader,
+        .input_loader = output_file.input_loader,
+        .side = if (output_file.side) |side| switch (side) {
+            .server => .server,
+            .client => .client,
+        } else null,
+        .entry_point_index = output_file.entry_point_index,
+        .hash = output_file.hash,
+        .is_executable = output_file.is_executable,
+        .source_map = source_map,
+    };
+}
+
+pub fn bundleEntryPointGraphWithOptions(
     entry_path: []const u8,
     working_dir: []const u8,
     options: BundleOptions,
     error_out: *?[*:0]u8,
-) !EntryPointOutput {
+) !BundleGraphOutput {
     // COTTONTAIL-COMPAT: Bun build bytecode - stock JSCOnly does not expose
     // cached-bytecode serialization. Reject it instead of emitting a fake
     // artifact or entering Bun's bytecode path with the compiler JSC stubs.
@@ -281,7 +423,15 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transpiler.options.keep_names = options.keep_names or options.include_runtime_modules;
     transpiler.options.setProduction(options.production);
     if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
-    transpiler.options.supports_multiple_outputs = false;
+    // Match Bun's build/standalone compiler output configuration. The output
+    // graph owns every generated file, so code splitting and file-loader
+    // assets are valid here instead of being rejected as stdout-only output.
+    transpiler.options.root_dir = working_dir;
+    transpiler.options.entry_naming = options.entry_naming;
+    transpiler.options.chunk_naming = options.chunk_naming;
+    transpiler.options.asset_naming = options.asset_naming;
+    transpiler.options.code_splitting = options.code_splitting;
+    transpiler.options.supports_multiple_outputs = true;
     // Runtime bundling (bun run / bun test emulation): require.resolve() of
     // asset files must stay a runtime call returning the on-disk path instead
     // of becoming an additional output file (which single-output in-memory
@@ -435,33 +585,71 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     };
     defer result.deinit();
 
-    var saw_entry_point = false;
-    for (result.output_files.items) |output_file| {
-        if (output_file.output_kind != .@"entry-point" and output_file.output_kind != .chunk) continue;
-        saw_entry_point = true;
-        const bytes = output_file.value.asSlice();
-        if (bytes.len > 0) {
-            const code = try c_allocator.dupe(u8, bytes);
-            errdefer c_allocator.free(code);
-            const source_map = if (output_file.source_map_index != std.math.maxInt(u32) and
-                output_file.source_map_index < result.output_files.items.len)
-                try c_allocator.dupe(
-                    u8,
-                    result.output_files.items[output_file.source_map_index].value.asSlice(),
-                )
-            else
-                null;
-            return .{ .code = code, .source_map = source_map };
+    var files: std.ArrayList(GraphOutputFile) = .empty;
+    errdefer {
+        for (files.items) |*file| file.deinit();
+        files.deinit(c_allocator);
+    }
+    var first_entry_point: ?usize = null;
+    var server_entry_point: ?usize = null;
+
+    for (result.output_files.items) |*output_file| {
+        const kind = graphOutputKind(output_file.output_kind) orelse continue;
+        var file = cloneGraphOutputFile(output_file, result.output_files.items) catch |err| {
+            setError(error_out, "Invalid compiler graph output for {s}: {s}", .{
+                output_file.dest_path,
+                @errorName(err),
+            });
+            return err;
+        };
+        const file_index = files.items.len;
+        files.append(c_allocator, file) catch |err| {
+            file.deinit();
+            return err;
+        };
+
+        if (kind == .@"entry-point") {
+            if (first_entry_point == null) first_entry_point = file_index;
+            if (server_entry_point == null and file.side != .client) {
+                server_entry_point = file_index;
+            }
         }
     }
 
-    // An empty (or comment/whitespace-only) module legitimately bundles to
-    // zero bytes, e.g. `import "./empty.js"` — treat it as an empty module
-    // instead of failing the bundle.
-    if (saw_entry_point) return .{ .code = try c_allocator.dupe(u8, "") };
+    if (files.items.len == 0) {
+        setError(error_out, "JavaScript bundle produced no standalone graph output", .{});
+        return error.NoEntryPointOutput;
+    }
 
-    setError(error_out, "JavaScript bundle produced no entry point", .{});
-    return error.NoEntryPointOutput;
+    return .{
+        .files = try files.toOwnedSlice(c_allocator),
+        .entry_point_file_index = server_entry_point orelse first_entry_point,
+    };
+}
+
+pub fn bundleEntryPointWithOptionsAndSourceMap(
+    entry_path: []const u8,
+    working_dir: []const u8,
+    options: BundleOptions,
+    error_out: *?[*:0]u8,
+) !EntryPointOutput {
+    var graph = try bundleEntryPointGraphWithOptions(entry_path, working_dir, options, error_out);
+    defer graph.deinit();
+
+    const entry_index = graph.entry_point_file_index orelse fallback: {
+        // Preserve the old helper's last-resort behavior for compiler modes
+        // that classify their only runnable output as a chunk.
+        for (graph.files, 0..) |file, index| {
+            if (file.kind == .chunk) break :fallback index;
+        }
+        setError(error_out, "JavaScript bundle produced no entry point", .{});
+        return error.NoEntryPointOutput;
+    };
+    const entry = &graph.files[entry_index];
+    return .{
+        .code = entry.takeContents(),
+        .source_map = entry.takeSourceMapContents(),
+    };
 }
 
 pub fn bundleEntryPointWithOptions(
@@ -1513,4 +1701,81 @@ pub fn forceLink() void {
     _ = &ct_bundle_build;
     _ = &ct_bundle_free;
     _ = &ct_bundle_string_free;
+}
+
+test "bundle graph retains split chunks and their source maps" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "entry.js",
+        .data =
+        \\export async function load() {
+        \\  return import("./lazy.js");
+        \\}
+        \\load();
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "lazy.js",
+        .data = "export const value = 42;\n",
+    });
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const entry_path = try std.fs.path.join(allocator, &.{ absolute_root, "entry.js" });
+    defer allocator.free(entry_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    var graph = bundleEntryPointGraphWithOptions(
+        entry_path,
+        absolute_root,
+        .{
+            .source_map = .external,
+            .code_splitting = true,
+            .entry_naming = "[name].[ext]",
+            .chunk_naming = "chunk-[hash].[ext]",
+        },
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| std.debug.print("bundle graph failed: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer graph.deinit();
+
+    const entry = graph.entryPoint() orelse return error.MissingEntryPoint;
+    try std.testing.expectEqual(GraphOutputKind.@"entry-point", entry.kind);
+
+    var entry_count: usize = 0;
+    var chunk_count: usize = 0;
+    for (graph.files) |file| {
+        switch (file.kind) {
+            .@"entry-point" => entry_count += 1,
+            .chunk => chunk_count += 1,
+            .asset => continue,
+        }
+        try std.testing.expect(file.path.len > 0);
+        try std.testing.expect(file.contents.len > 0);
+        const source_map = file.source_map orelse return error.MissingSourceMap;
+        try std.testing.expect(std.mem.endsWith(u8, source_map.path, ".map"));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, source_map.contents, .{});
+        defer parsed.deinit();
+        const version = parsed.value.object.get("version") orelse return error.InvalidSourceMap;
+        try std.testing.expectEqual(@as(i64, 3), version.integer);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entry_count);
+    try std.testing.expect(chunk_count >= 1);
+
+    // The compatibility helper uses these transfers before graph teardown.
+    // Exercise them here so an ownership regression becomes a double-free or
+    // allocator leak in the focused Zig test instead of a runtime-only fault.
+    const transferred_code = entry.takeContents();
+    defer c_allocator.free(transferred_code);
+    const transferred_source_map = entry.takeSourceMapContents() orelse return error.MissingSourceMap;
+    defer c_allocator.free(transferred_source_map);
 }
