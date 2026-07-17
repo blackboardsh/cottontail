@@ -25,6 +25,7 @@ const detachedArrayBuffers = new WeakSet();
 const workerInstances = new Map();
 const broadcastChannels = new Map();
 const transferredPortPeers = new Map();
+const receivedMessagePorts = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 const messagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
@@ -247,6 +248,10 @@ function decodeClone(encoded, refs = new Map()) {
     case "MessagePort": {
       const port = remember(refs, encoded, new MessagePort());
       port._id = Number(encoded.portId ?? port._id);
+      if (!isMainThread) {
+        port._remote = { threadId: 0, portId: port._id };
+        receivedMessagePorts.set(port._id, port);
+      }
       return port;
     }
     case "Map": {
@@ -316,6 +321,16 @@ function dispatchTransferredPortMessage(message) {
   if (!peer || peer._closed) return true;
   peer._queue.push(packet.value);
   peer._scheduleDispatch?.();
+  return true;
+}
+
+function dispatchReceivedPortMessage(message) {
+  const packet = message?.[portMessageEnvelopeKey];
+  if (!packet || packet.portId == null) return false;
+  const port = receivedMessagePorts.get(Number(packet.portId));
+  if (!port || port._closed) return true;
+  port._queue.push(packet.value);
+  port._scheduleDispatch();
   return true;
 }
 
@@ -671,11 +686,12 @@ export class Worker extends EventEmitter {
   }
 
   postMessage(value, transferList = undefined) {
+    const encoded = encodeWireMessage(value, transferList, { threadId: this.threadId });
     if (this.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
-      cottontail.workerPostMessageTo(this.threadId, encodeWireMessage(value, transferList, { threadId: this.threadId }));
+      cottontail.workerPostMessageTo(this.threadId, encoded);
       return;
     }
-    this._worker.postMessage(JSON.parse(encodeWireMessage(value, transferList, { threadId: this.threadId })));
+    this._worker.postMessage(JSON.parse(encoded));
   }
 
   terminate() {
@@ -769,9 +785,16 @@ export class MessagePort extends EventEmitter {
   postMessage(value, transferList = undefined) {
     if (this._closed) return;
     const remote = this._remote ?? this._peer?._remote;
-    if (remote?.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
-      cottontail.workerPostMessageTo(remote.threadId, encodeWireMessage(makePortMessage(remote.portId, value), transferList));
-      return;
+    if (remote) {
+      const encoded = encodeWireMessage(makePortMessage(remote.portId, value), transferList);
+      if (remote.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+        cottontail.workerPostMessageTo(remote.threadId, encoded);
+        return;
+      }
+      if (!isMainThread && typeof cottontail.workerPostMessage === "function") {
+        cottontail.workerPostMessage(encoded);
+        return;
+      }
     }
     if (!this._peer || this._peer._closed) return;
     this._peer._queue.push(cloneForMessage(value, transferList));
@@ -874,7 +897,10 @@ export class BroadcastChannel extends EventEmitter {
 export const parentPort = isMainThread ? null : new class ParentPort extends EventEmitter {
   constructor() {
     super();
-    const transportListener = (event) => this.emit("message", decodeWireMessage(event.data));
+    const transportListener = (event) => {
+      const message = decodeWireMessage(event.data);
+      if (!dispatchReceivedPortMessage(message)) this.emit("message", message);
+    };
     transportListener[Symbol.for("cottontail.worker_threads.transportListener")] = true;
     globalThis.addEventListener?.("message", transportListener);
     globalThis.__cottontailWorkerThreadParentPortActive = () => this.listenerCount("message") > 0;

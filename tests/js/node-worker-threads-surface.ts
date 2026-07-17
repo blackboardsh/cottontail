@@ -52,9 +52,15 @@ assert(channel.port1 instanceof MessagePort, "MessageChannel port1 mismatch");
 channel.port2.postMessage("queued");
 assert(receiveMessageOnPort(channel.port1)?.message === "queued", "receiveMessageOnPort mismatch");
 let portMessage = "";
-channel.port1.on("message", (value) => { portMessage = value; });
+const liveMessage = new Promise<void>((resolve) => {
+  channel.port1.once("message", (value) => {
+    portMessage = value;
+    resolve();
+  });
+});
 channel.port1.start();
 channel.port2.postMessage("live");
+await liveMessage;
 assert(portMessage === "live", "MessagePort live message mismatch");
 assert(moveMessagePortToContext(channel.port1, {}) === channel.port1, "moveMessagePortToContext mismatch");
 channel.port1.unref();
