@@ -6,30 +6,90 @@ import {
   STATUS_CODES,
   ServerResponse,
   _attachHttpConnection,
+  _configureHttpServer,
+  _httpListeningCallbackArgs,
 } from "./http.js";
 import { Server as TlsServer, connect as tlsConnect } from "./tls.js";
+import { Buffer } from "./buffer.js";
+import { isIP } from "./net.js";
 
 export { IncomingMessage, OutgoingMessage, ServerResponse, STATUS_CODES };
 
 export class Agent extends HttpAgent {
   constructor(options = {}) {
-    super({ ...options });
+    super({ ...options, defaultPort: 443, protocol: "https:" });
+    this.defaultPort = 443;
     this.protocol = "https:";
+    this.maxCachedSessions = options.maxCachedSessions ?? 100;
+    this._sessionCache = { map: Object.create(null), list: [] };
+  }
+
+  getName(options = {}) {
+    let name = super.getName(options);
+    for (const key of [
+      "ca", "cert", "clientCertEngine", "ciphers", "key", "pfx", "rejectUnauthorized",
+      "servername", "minVersion", "maxVersion", "secureProtocol", "crl", "honorCipherOrder",
+      "ecdhCurve", "dhparam", "secureOptions", "sessionIdContext",
+    ]) {
+      const value = options[key] ?? this.options[key];
+      if (value !== undefined) name += `:${key}=${tlsCacheKey(value)}`;
+    }
+    return name;
+  }
+
+  _getSession(key) {
+    return this._sessionCache.map[key];
+  }
+
+  _cacheSession(key, session) {
+    if (this.maxCachedSessions === 0 || session == null) return;
+    if (this._sessionCache.map[key] == null) {
+      if (this._sessionCache.list.length >= this.maxCachedSessions) {
+        const oldest = this._sessionCache.list.shift();
+        delete this._sessionCache.map[oldest];
+      }
+      this._sessionCache.list.push(key);
+    }
+    this._sessionCache.map[key] = session;
+  }
+
+  _evictSession(key) {
+    delete this._sessionCache.map[key];
+    const index = this._sessionCache.list.indexOf(key);
+    if (index >= 0) this._sessionCache.list.splice(index, 1);
   }
 
   createConnection(options = {}, callback = undefined) {
     const merged = { ...this.options, ...options };
     delete merged.path;
-    return tlsConnect({
+    const name = this.getName(merged);
+    if (merged.session == null) merged.session = this._getSession(name);
+    const host = merged.host ?? merged.hostname ?? "localhost";
+    const servername = merged.servername == null
+      ? (isIP(host) ? "" : host)
+      : merged.servername;
+    const socket = tlsConnect({
       ...merged,
-      host: merged.host ?? merged.hostname ?? "localhost",
-      servername: merged.servername ?? merged.host ?? merged.hostname ?? "localhost",
+      host,
+      servername,
       port: Number(merged.port ?? 443),
     }, callback);
+    socket.once?.("secureConnect", () => {
+      try { this._cacheSession(name, socket.getSession?.()); } catch {}
+    });
+    socket.once?.("error", () => this._evictSession(name));
+    return socket;
   }
 }
 
-export const globalAgent = new Agent({ protocol: "https:" });
+function tlsCacheKey(value) {
+  if (Array.isArray(value)) return value.map(tlsCacheKey).join(",");
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
+  if (value instanceof ArrayBuffer) return Buffer.from(value).toString("base64");
+  return String(value);
+}
+
+export const globalAgent = new Agent({ keepAlive: true, scheduling: "lifo", timeout: 5000 });
 
 export class ClientRequest extends HttpClientRequest {
   constructor(input, options = undefined, callback = undefined) {
@@ -47,16 +107,17 @@ export class ClientRequest extends HttpClientRequest {
   }
 }
 
-export class Server extends TlsServer {
+class ServerImpl extends TlsServer {
   constructor(options = {}, requestListener = undefined) {
+    if (typeof options === "function") {
+      requestListener = options;
+      options = {};
+    }
     super(options);
-    this.timeout = Number(options?.timeout ?? 0);
-    this.requestTimeout = Number(options?.requestTimeout ?? 300000);
-    this.headersTimeout = Number(options?.headersTimeout ?? 60000);
-    this.keepAliveTimeout = Number(options?.keepAliveTimeout ?? 5000);
     this._connections = new Set();
     this._closing = false;
-    if (typeof requestListener === "function") this.on("request", requestListener);
+    this.maxRequestsPerSocket = 0;
+    _configureHttpServer(this, options, requestListener);
     this.on("secureConnection", (socket) => {
       this._connections.add(socket);
       socket.once("close", () => this._connections.delete(socket));
@@ -65,8 +126,27 @@ export class Server extends TlsServer {
     });
   }
 
+  listen(...args) {
+    const forwarded = Array.from(args);
+    const callback = typeof forwarded[forwarded.length - 1] === "function" ? forwarded.pop() : undefined;
+    let options = {};
+    if (forwarded[0] != null && typeof forwarded[0] === "object") options = forwarded[0];
+    else if (typeof forwarded[0] === "string") options = { path: forwarded[0] };
+    else options = { port: forwarded[0], host: typeof forwarded[1] === "string" ? forwarded[1] : undefined };
+    if (callback) {
+      this.once("listening", () => callback.call(this, ..._httpListeningCallbackArgs(this, options)));
+    }
+    return super.listen(...forwarded);
+  }
+
   setTimeout(timeout = 0, callback = undefined) {
-    this.timeout = Number(timeout) || 0;
+    const value = Number(timeout);
+    if (!Number.isInteger(value) || value < 0) {
+      const error = new RangeError(`The value of "msecs" is out of range. It must be >= 0. Received ${timeout}`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    this.timeout = value;
     if (typeof callback === "function") this.on("timeout", callback);
     return this;
   }
@@ -87,6 +167,13 @@ export class Server extends TlsServer {
     return super.close(callback);
   }
 }
+
+Object.defineProperty(ServerImpl, "name", { value: "Server", configurable: true });
+export const Server = new Proxy(ServerImpl, {
+  apply(target, _thisArg, args) {
+    return new target(...args);
+  },
+});
 
 export function createServer(options = {}, requestListener = undefined) {
   return new Server(options, requestListener);

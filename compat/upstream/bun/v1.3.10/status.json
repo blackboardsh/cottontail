@@ -803,9 +803,21 @@
       "status": "enabled",
       "reason": "Bun test's --claude-code flag behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
     },
+    "test/cli/test/concurrent-test-glob.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test discovers concurrent glob inputs and reports all four copied cases with 11 assertions."
+    },
+    "test/cli/test/pass-with-no-tests.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test implements human and agent-mode empty-discovery policy with --pass-with-no-tests (5 bun:test cases, 7 assertions)."
+    },
     "test/cli/test/rerun-each.test.ts": {
       "status": "enabled",
       "reason": "Bun test's --rerun-each behavior passes the copied CLI corpus (3 bun:test cases, 17 assertions)."
+    },
+    "test/cli/test/retry-flag.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test's CLI retry count and per-test retry semantics pass the copied corpus (9 bun:test cases, 27 assertions)."
     },
     "test/cli/test/test-filter-lifecycle-snapshot.test.ts": {
       "status": "enabled",
@@ -1505,8 +1517,8 @@
       "reason": "Bun.spawn and Bun.spawnSync reject spoofed command arrays above Bun's u32 argument limit before traversal."
     },
     "test/js/bun/spawn/spawn-maxbuf.test.ts": {
-      "status": "expected-failure",
-      "reason": "All four asynchronous maxBuffer/timeout cases pass (17 assertions); the synchronous cases require maxBuffer, timeout, and killSignal enforcement inside Cottontail's blocking native spawnSync hook."
+      "status": "enabled",
+      "reason": "Native and asynchronous Bun spawn enforce maxBuffer, timeout, and killSignal while preserving partial output (8 bun:test cases, 37 assertions)."
     },
     "test/js/bun/spawn/spawn-noread-leak.test.ts": {
       "status": "enabled",
@@ -1522,8 +1534,8 @@
       "reason": "The leak workload launches 2,250 nested Cottontail processes and exceeds its 30-second per-case budget because each child still bundles/evaluates runtime modules at startup."
     },
     "test/js/bun/spawn/spawn-signal.test.ts": {
-      "status": "expected-failure",
-      "reason": "All three asynchronous AbortSignal cases pass (5 assertions); spawnSync AbortSignal.timeout requires deadline enforcement inside the blocking native spawnSync hook."
+      "status": "enabled",
+      "reason": "Bun.spawn and Bun.spawnSync honor live, pre-aborted, and timeout AbortSignals (4 bun:test cases, 7 assertions)."
     },
     "test/js/bun/spawn/spawn-stdin-readable-stream-edge-cases.test.ts": {
       "status": "enabled",
@@ -2133,6 +2145,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
     },
+    "test/js/junit-reporter/junit.test.js": {
+      "status": "enabled",
+      "reason": "Bun's nested JUnit XML reporter passes source-line, retry, skip/todo, assertion, duration, ordering, escaping, and CI-property coverage (4 bun:test cases, 97 assertions)."
+    },
     "test/js/node/assert/assert-doesNotMatch.test.cjs": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 2 assertions)."
@@ -2433,6 +2449,10 @@
     "test/js/node/net/node-net-allowHalfOpen.test.js": {
       "status": "enabled",
       "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (2 bun:test cases, 6 assertions)."
+    },
+    "test/js/node/net/node-net-server.test.ts": {
+      "status": "enabled",
+      "reason": "Node net.Server construction, listen lifecycle, address metadata, connection accounting, close behavior, and async disposal pass upstream coverage (18 bun:test cases, 38 assertions)."
     },
     "test/js/node/nodettywrap.test.ts": {
       "status": "enabled",
@@ -2825,6 +2845,50 @@
     "test/js/node/zlib/zlib.test.js": {
       "status": "enabled",
       "reason": "The complete copied zlib behavior corpus passes with callable constructors, validation, dictionaries, truncated streams, concatenated frames, Brotli params, and incremental Brotli/Zstd output (378 bun:test cases, 425 assertions)."
+    },
+    "test/js/node/test/parallel/test-child-process-execfilesync-maxbuf.js": {
+      "status": "enabled",
+      "reason": "Node execFileSync routes through the native spawnSync limit contract and reports maxBuffer failures with captured output."
+    },
+    "test/js/node/test/parallel/test-child-process-execsync-maxbuf.js": {
+      "status": "enabled",
+      "reason": "Node execSync routes through the native spawnSync limit contract and reports maxBuffer failures with captured output."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-args.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync argument normalization and child argv behavior pass the copied upstream file."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-env.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync environment inheritance, replacement, and value coercion pass the copied upstream file."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-input.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync supports string, Buffer, TypedArray, and DataView input plus pipe and inherited output semantics."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-kill-signal.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync timeout termination honors default, named, and numeric kill signals with ETIMEDOUT metadata."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-maxbuf.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync enforces explicit, infinite, and default maxBuffer limits with ENOBUFS metadata and partial output."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-shell.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync shell command construction and output behavior pass the copied upstream file."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-timeout.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync terminates timed-out children natively and returns ETIMEDOUT system-error metadata."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync-validation-errors.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync validates cwd, process flags, credentials, shell, argv0, timeout, maxBuffer, and killSignal options."
+    },
+    "test/js/node/test/parallel/test-child-process-spawnsync.js": {
+      "status": "enabled",
+      "reason": "Node spawnSync process status, ENOENT metadata, cwd, and Buffer/string output encodings pass the copied upstream file."
     },
     "test/js/sql/adapter-env-var-precedence.test.ts": {
       "status": "expected-failure",
