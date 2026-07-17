@@ -266,9 +266,9 @@
   "tests": {
     "test/bundler/bun-build-api.test.ts": {
       "status": "enabled",
-      "reason": "Twenty-nine Bun.build cases and one upstream todo pass across options, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, macros, NODE_PATH, and callbacks. The bytecode case requires private JSC cached-bytecode APIs; six BuildArtifact snapshot cases remain excluded until Cottontail's native emitter and artifact hashes match Bun's exact serialized output.",
+      "reason": "Thirty-five Bun.build cases, seven snapshots, and one upstream todo pass across exact BuildArtifact output/hashes, options, errors, plugins, HTML loading, sourcemaps, tsconfig resolution, DCE annotations, macros, NODE_PATH, and callbacks. The remaining bytecode case requires a cached-bytecode serializer unavailable in stock JSC.",
       "args": [
-        "--test-name-pattern=^(?!.*(?:bytecode works|Bun\\.write\\(BuildArtifact\\)|outdir \\+ reading out blobs works|BuildArtifact properties$|BuildArtifact properties \\+ entry\\.naming|BuildArtifact properties sourcemap|new Response\\(BuildArtifact\\) sets content type)).*"
+        "--test-name-pattern=^(?!.*bytecode works).*$"
       ],
       "timeoutMs": 120000
     },
@@ -359,12 +359,12 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 8 assertions)."
     },
     "test/bundler/bun-build-compile-wasm.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires `Bun.build({ compile: true })` standalone executables with embedded .wasm assets; compile support is unimplemented so the build fails/never produces a runnable binary (verified twice)."
+      "status": "enabled",
+      "reason": "Bun.build standalone compilation embeds and executes WebAssembly assets successfully (1 bun:test case, 6 assertions)."
     },
     "test/bundler/bun-build-compile.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires `Bun.build({ compile: ... })` standalone-executable generation (StandaloneModuleGraph embedding into a target binary), which Cottontail does not implement; the build currently ignores `compile` and emits a plain JS artifact (verified twice: outputs[0].path ends with app.js instead of app-cross, no executable is produced, and the invalid-target case does not throw)."
+      "status": "enabled",
+      "reason": "Bun.build compile target validation, outfile/outdir resolution, native executable headers, embedded CommonJS entry graphs, and executable launch behavior pass the copied upstream file (6 bun:test cases, 23 assertions)."
     },
     "test/bundler/bundler_banner.test.ts": {
       "status": "enabled",
@@ -645,9 +645,17 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (1 bun:test cases, 2 assertions)."
     },
+    "test/bundler/transpiler/runtime-transpiler.test.ts": {
+      "status": "enabled",
+      "reason": "The native runtime transpiler handles CommonJS detection, regex literals, @bun output, JSON modules, tsconfig recovery, with statements, and constant folding (13 bun:test cases, 28 assertions)."
+    },
     "test/bundler/transpiler/transpiler-stack-overflow.test.ts": {
       "status": "enabled",
       "reason": "The copied deeply nested transpiler stack-overflow regression completes without crashing and passes its upstream assertion."
+    },
+    "test/bundler/transpiler/transpiler.test.js": {
+      "status": "enabled",
+      "reason": "Bun's complete upstream Transpiler file passes through the vendored parser and printer pipeline (108 passing bun:test cases, 1 skip, 21 upstream todos, 1160 assertions)."
     },
     "test/bundler/transpiler/template-literal.test.ts": {
       "status": "enabled",
@@ -680,6 +688,11 @@
     "test/cli/install/bun-install-tarball-integrity.test.ts": {
       "status": "enabled",
       "reason": "Package tarball SHA-512 generation, lockfile persistence, frozen reinstall verification, corruption rejection, and missing-integrity restoration pass the copied upstream coverage (9 bun:test cases, 47 assertions)."
+    },
+    "test/cli/install/overrides.test.ts": {
+      "status": "enabled",
+      "reason": "Root and transitive overrides, npm aliases, lockfile updates, frozen installs, removal, and workspace exemption pass the copied upstream coverage (7 bun:test cases, 20 assertions).",
+      "timeoutMs": 120000
     },
     "test/cli/install/hosted-git-info/boundary-conditions.test.ts": {
       "status": "enabled",
@@ -1333,6 +1346,10 @@
       "status": "enabled",
       "reason": "Bun shell basename builtin now handles usage, multiple operands, slash trimming, and Windows-style paths for this upstream file."
     },
+    "test/js/bun/shell/commands/cp.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell cp option parsing, recursive copies, overwrite behavior, file metadata, and diagnostics pass the copied upstream file (30 bun:test cases)."
+    },
     "test/js/bun/shell/commands/dirname.test.ts": {
       "status": "enabled",
       "reason": "Bun shell dirname smoke test passes under Cottontail's current shell wrapper."
@@ -1348,6 +1365,10 @@
     "test/js/bun/shell/commands/false.test.ts": {
       "status": "enabled",
       "reason": "Bun shell false smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/commands/ls.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell ls flags, sorting, path handling, output formatting, and diagnostics pass the copied upstream file (27 bun:test cases)."
     },
     "test/js/bun/shell/commands/mv.test.ts": {
       "status": "enabled",
@@ -1590,6 +1611,10 @@
     "test/js/bun/test/concurrent.test.ts": {
       "status": "enabled",
       "reason": "bun:test concurrent test scheduling, max-concurrency, and serial override coverage passes under Cottontail."
+    },
+    "test/js/bun/test/concurrent-test-glob.test.ts": {
+      "status": "enabled",
+      "reason": "Bun test.concurrent file-glob selection and execution behavior passes the copied upstream file (4 bun:test cases, 11 assertions)."
     },
     "test/js/bun/test/concurrent_immediate.test.ts": {
       "status": "enabled",
