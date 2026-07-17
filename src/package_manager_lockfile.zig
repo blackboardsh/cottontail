@@ -56,6 +56,16 @@ pub const Graph = struct {
         const workspace = graph.workspaces.get(path) orelse return false;
         return workspaceValueMatches(workspace, package_json);
     }
+
+    pub fn rootDependencySpec(graph: *const Graph, name: []const u8) ?[]const u8 {
+        for (dependency_sections) |section_name| {
+            const section = graph.root_workspace.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            const value = section.object.get(name) orelse continue;
+            if (value == .string) return value.string;
+        }
+        return null;
+    }
 };
 
 const dependency_sections = [_][]const u8{
@@ -144,6 +154,7 @@ fn parsePackageEntry(key: []const u8, entry: *const Value) !Package {
         .git, .github => {
             package.source = split.resolution;
             package.info = objectAt(entry, 1);
+            package.integrity = stringAt(entry, 2) orelse "";
         },
         .root => {
             package.info = objectAt(entry, 1);
@@ -182,7 +193,11 @@ fn resolutionKind(resolution: []const u8) Kind {
     if (std.mem.startsWith(u8, resolution, "link:")) return .symlink;
     if (std.mem.startsWith(u8, resolution, "file:")) return .folder;
     if (std.mem.startsWith(u8, resolution, "github:")) return .github;
-    if (std.mem.startsWith(u8, resolution, "git+") or std.mem.startsWith(u8, resolution, "git://")) return .git;
+    if (std.mem.startsWith(u8, resolution, "git+") or
+        std.mem.startsWith(u8, resolution, "git://") or
+        std.mem.startsWith(u8, resolution, "ssh://") or
+        std.mem.startsWith(u8, resolution, "git@") or
+        isScpLikeGitResolution(resolution)) return .git;
     if (std.mem.startsWith(u8, resolution, "http://") or std.mem.startsWith(u8, resolution, "https://")) return .remote_tarball;
     if (isTarballPath(resolution)) return .local_tarball;
     return .npm;
@@ -192,6 +207,14 @@ fn isTarballPath(path: []const u8) bool {
     const without_fragment = if (std.mem.indexOfScalar(u8, path, '#')) |index| path[0..index] else path;
     const without_query = if (std.mem.indexOfScalar(u8, without_fragment, '?')) |index| without_fragment[0..index] else without_fragment;
     return std.mem.endsWith(u8, without_query, ".tgz") or std.mem.endsWith(u8, without_query, ".tar.gz");
+}
+
+fn isScpLikeGitResolution(resolution: []const u8) bool {
+    const source = if (std.mem.indexOfScalar(u8, resolution, '#')) |hash| resolution[0..hash] else resolution;
+    const colon = std.mem.indexOfScalar(u8, source, ':') orelse return false;
+    if (colon == 0 or colon + 1 >= source.len or std.mem.indexOfScalar(u8, source[0..colon], '/') != null) return false;
+    return std.mem.indexOfScalar(u8, source[0..colon], '@') != null and
+        std.mem.indexOfScalar(u8, source[colon + 1 ..], '/') != null;
 }
 
 fn optionalStringEqual(left: *const Value, right: *const Value, key: []const u8) bool {
@@ -367,7 +390,9 @@ test "parse scoped and non-registry resolutions" {
         \\{"lockfileVersion":1,"workspaces":{"":{}},"packages":{
         \\  "@scope/pkg":["@scope/pkg@workspace:packages/pkg"],
         \\  "linked":["linked@link:../linked",{}],
-        \\  "archive":["archive@./archive.tgz",{},"sha512-c"]
+        \\  "archive":["archive@./archive.tgz",{},"sha512-c"],
+        \\  "ssh-git":["ssh-git@ssh://git@example.com/owner/repo.git#abcdef012345",{},"abcdef012345"],
+        \\  "scp-git":["scp-git@git@example.com:owner/repo.git#abcdef012345",{},"abcdef012345"]
         \\}}
     );
     defer graph.deinit();
@@ -376,6 +401,8 @@ test "parse scoped and non-registry resolutions" {
     try std.testing.expectEqualStrings("packages/pkg", graph.get("@scope/pkg").?.source);
     try std.testing.expectEqual(Kind.symlink, graph.get("linked").?.kind);
     try std.testing.expectEqual(Kind.local_tarball, graph.get("archive").?.kind);
+    try std.testing.expectEqual(Kind.git, graph.get("ssh-git").?.kind);
+    try std.testing.expectEqual(Kind.git, graph.get("scp-git").?.kind);
 }
 
 test "frozen workspace comparison covers workspace dependency graphs" {
