@@ -1845,7 +1845,12 @@ function serializeWorkerMessage(message) {
 }
 
 function installWorkerGlobal() {
-  if (!cottontail.isWorker?.()) return;
+  if (!cottontail.isWorker?.()) {
+    // Bun exposes postMessage on the main global for Web-compatible shape,
+    // but without a parent worker target the operation is intentionally inert.
+    g.postMessage ??= function postMessage() {};
+    return;
+  }
   g.self = g;
   g.postMessage = g.self.postMessage = (message) => {
     cottontail.workerPostMessage(serializeWorkerMessage(message));

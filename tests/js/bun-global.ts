@@ -37,6 +37,10 @@ if (globalMessage !== "global-message") {
   throw new Error("global onmessage handler was not dispatched");
 }
 
+if (typeof globalThis.postMessage !== "function" || globalThis.postMessage("main-thread-noop") !== undefined) {
+  throw new Error("main-thread postMessage global behavior mismatch");
+}
+
 const result = Bun.spawnSync(["sh", "-c", "printf bun-global"]);
 if (!result.success || result.stdout.toString() !== "bun-global") {
   throw new Error("Bun.spawnSync global call failed");

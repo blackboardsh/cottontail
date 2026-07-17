@@ -194,6 +194,7 @@ struct NapiEnv {
     std::thread::id owner_thread;
     bool stop_workers { false };
     bool destroying { false };
+    bool in_basic_finalizer { false };
 };
 
 namespace {
@@ -454,6 +455,18 @@ static napi_status invalid(NapiEnv* env)
     return env ? finish(env, napi_invalid_arg) : napi_invalid_arg;
 }
 
+static void check_basic_finalizer_safety(NapiEnv* env)
+{
+    if (!env || !env->in_basic_finalizer || env->module_api_version != NAPI_VERSION_EXPERIMENTAL)
+        return;
+    std::fprintf(stderr, "FATAL ERROR: Finalizer is calling a function that may affect GC state.\n");
+    std::fprintf(stderr, "The finalizers are run directly from GC and must not affect GC state.\n");
+    std::fprintf(stderr, "Use `node_api_post_finalizer` from inside of the finalizer to work around this issue.\n");
+    std::fprintf(stderr, "It schedules the call as a new task in the event loop.\n");
+    std::fflush(stderr);
+    std::abort();
+}
+
 static void protect_pending(NapiEnv* env, JSValueRef exception)
 {
     if (env->pending_exception)
@@ -607,6 +620,26 @@ public:
 private:
     NapiEnv* m_env;
     napi_handle_scope__ m_scope;
+};
+
+class BasicFinalizerScope {
+public:
+    BasicFinalizerScope(NapiEnv* env, bool active)
+        : m_env(env)
+        , m_previous(env->in_basic_finalizer)
+    {
+        if (active)
+            env->in_basic_finalizer = true;
+    }
+
+    ~BasicFinalizerScope()
+    {
+        m_env->in_basic_finalizer = m_previous;
+    }
+
+private:
+    NapiEnv* m_env;
+    bool m_previous;
 };
 
 static JSObjectRef make_napi_function(
@@ -1039,15 +1072,20 @@ static void destroy_single_env(NapiEnv* env)
     }
 
     for (;;) {
+        std::deque<NapiPostedFinalizer> basic;
         std::deque<NapiPostedFinalizer> posted;
         {
             std::lock_guard lock(env->async_mutex);
-            posted.swap(env->basic_finalizers);
-            posted.insert(posted.end(), env->posted_finalizers.begin(), env->posted_finalizers.end());
-            env->posted_finalizers.clear();
+            basic.swap(env->basic_finalizers);
+            posted.swap(env->posted_finalizers);
         }
-        if (posted.empty())
+        if (basic.empty() && posted.empty())
             break;
+        for (const auto& finalizer : basic) {
+            BasicFinalizerScope finalizer_scope(env, true);
+            if (finalizer.callback)
+                finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
+        }
         for (const auto& finalizer : posted) {
             if (finalizer.callback)
                 finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
@@ -1250,6 +1288,7 @@ extern "C" napi_status napi_get_null(napi_env opaque_env, napi_value* result)
 extern "C" napi_status napi_get_global(napi_env opaque_env, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     return env ? output(env, result, JSContextGetGlobalObject(env->context)) : napi_invalid_arg;
 }
 
@@ -1262,6 +1301,7 @@ extern "C" napi_status napi_get_boolean(napi_env opaque_env, bool value, napi_va
 extern "C" napi_status napi_create_object(napi_env opaque_env, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     return env ? output(env, result, JSObjectMake(env->context, nullptr, nullptr)) : napi_invalid_arg;
 }
 
@@ -1295,6 +1335,7 @@ extern "C" napi_status napi_create_array_with_length(napi_env opaque_env, size_t
 extern "C" napi_status napi_create_double(napi_env opaque_env, double value, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     return env ? output(env, result, JSValueMakeNumber(env->context, value)) : napi_invalid_arg;
 }
 
@@ -1367,6 +1408,7 @@ extern "C" napi_status napi_create_string_utf16(napi_env opaque_env, const char1
 extern "C" napi_status napi_create_symbol(napi_env opaque_env, napi_value description, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !result)
         return invalid(env);
     JSStringRef string = nullptr;
@@ -1387,6 +1429,7 @@ extern "C" napi_status napi_create_symbol(napi_env opaque_env, napi_value descri
 extern "C" napi_status node_api_symbol_for(napi_env opaque_env, const char* description, size_t length, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !result || (!description && length != 0))
         return invalid(env);
     JSValueRef exception = nullptr;
@@ -1406,6 +1449,7 @@ extern "C" napi_status node_api_symbol_for(napi_env opaque_env, const char* desc
 extern "C" napi_status napi_typeof(napi_env opaque_env, napi_value value, napi_valuetype* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     JSValueRef js_value = to_js(value);
@@ -1435,6 +1479,7 @@ extern "C" napi_status napi_typeof(napi_env opaque_env, napi_value value, napi_v
 extern "C" napi_status napi_get_value_double(napi_env opaque_env, napi_value value, double* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     if (!JSValueIsNumber(env->context, to_js(value)))
@@ -1447,6 +1492,7 @@ extern "C" napi_status napi_get_value_double(napi_env opaque_env, napi_value val
 extern "C" napi_status napi_get_value_int32(napi_env opaque_env, napi_value value, int32_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     if (!JSValueIsNumber(env->context, to_js(value)))
@@ -1459,6 +1505,7 @@ extern "C" napi_status napi_get_value_int32(napi_env opaque_env, napi_value valu
 extern "C" napi_status napi_get_value_uint32(napi_env opaque_env, napi_value value, uint32_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     if (!JSValueIsNumber(env->context, to_js(value)))
@@ -1471,6 +1518,7 @@ extern "C" napi_status napi_get_value_uint32(napi_env opaque_env, napi_value val
 extern "C" napi_status napi_get_value_int64(napi_env opaque_env, napi_value value, int64_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     double number = 0;
@@ -1492,6 +1540,7 @@ extern "C" napi_status napi_get_value_int64(napi_env opaque_env, napi_value valu
 extern "C" napi_status napi_get_value_bool(napi_env opaque_env, napi_value value, bool* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     if (!JSValueIsBoolean(env->context, to_js(value)))
@@ -1514,6 +1563,7 @@ static napi_status get_string(NapiEnv* env, napi_value value, JSStringRef* resul
 extern "C" napi_status napi_get_value_string_utf8(napi_env opaque_env, napi_value value, char* buffer, size_t buffer_size, size_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value)
         return invalid(env);
     JSStringRef string = nullptr;
@@ -1542,6 +1592,7 @@ extern "C" napi_status napi_get_value_string_utf8(napi_env opaque_env, napi_valu
 extern "C" napi_status napi_get_value_string_utf16(napi_env opaque_env, napi_value value, char16_t* buffer, size_t buffer_size, size_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value)
         return invalid(env);
     JSStringRef string = nullptr;
@@ -1568,6 +1619,7 @@ extern "C" napi_status napi_get_value_string_utf16(napi_env opaque_env, napi_val
 extern "C" napi_status napi_get_value_string_latin1(napi_env opaque_env, napi_value value, char* buffer, size_t buffer_size, size_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value)
         return invalid(env);
     JSStringRef string = nullptr;
@@ -1971,6 +2023,7 @@ extern "C" napi_status napi_get_cb_info(
 extern "C" napi_status napi_get_new_target(napi_env opaque_env, napi_callback_info opaque_info, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     auto* info = reinterpret_cast<napi_callback_info__*>(opaque_info);
     if (!env || !info || info->env != env || !result)
         return invalid(env);
@@ -2105,6 +2158,7 @@ static napi_status create_error(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !message || !result)
         return invalid(env);
     if (!JSValueIsString(env->context, to_js(message)) || (code && !JSValueIsString(env->context, to_js(code))))
@@ -2137,6 +2191,7 @@ extern "C" napi_status node_api_create_syntax_error(napi_env env, napi_value cod
 extern "C" napi_status napi_throw(napi_env opaque_env, napi_value error)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !error)
         return invalid(env);
     protect_pending(env, to_js(error));
@@ -2192,6 +2247,7 @@ extern "C" napi_status napi_is_error(napi_env opaque_env, napi_value value, bool
 extern "C" napi_status napi_is_exception_pending(napi_env opaque_env, bool* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !result)
         return invalid(env);
     *result = env->pending_exception != nullptr;
@@ -2201,6 +2257,7 @@ extern "C" napi_status napi_is_exception_pending(napi_env opaque_env, bool* resu
 extern "C" napi_status napi_get_and_clear_last_exception(napi_env opaque_env, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !result)
         return invalid(env);
     JSValueRef value = env->pending_exception ? env->pending_exception : JSValueMakeUndefined(env->context);
@@ -2336,6 +2393,7 @@ extern "C" napi_status napi_create_external(
 extern "C" napi_status napi_get_value_external(napi_env opaque_env, napi_value value, void** result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     if (!JSValueIsObjectOfClass(env->context, to_js(value), external_class))
@@ -2467,6 +2525,7 @@ extern "C" napi_status napi_add_finalizer(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     JSObjectRef target = nullptr;
     napi_status status = require_object(env, object, &target);
     if (status != napi_ok || !finalize_callback)
@@ -2526,6 +2585,7 @@ static JSValueRef dereference_weak_ref(NapiEnv* env, JSObjectRef weak_ref, JSVal
 extern "C" napi_status napi_create_reference(napi_env opaque_env, napi_value value, uint32_t initial_count, napi_ref* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     JSValueRef js_value = to_js(value);
@@ -2577,6 +2637,7 @@ extern "C" napi_status napi_create_reference(napi_env opaque_env, napi_value val
 extern "C" napi_status napi_delete_reference(napi_env opaque_env, napi_ref opaque_reference)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     auto* reference = reinterpret_cast<napi_ref__*>(opaque_reference);
     if (!env || !reference || reference->env != env || reference->deleted)
         return invalid(env);
@@ -2597,6 +2658,7 @@ extern "C" napi_status napi_delete_reference(napi_env opaque_env, napi_ref opaqu
 extern "C" napi_status napi_reference_ref(napi_env opaque_env, napi_ref opaque_reference, uint32_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     auto* reference = reinterpret_cast<napi_ref__*>(opaque_reference);
     if (!env || !reference || reference->env != env || reference->deleted)
         return invalid(env);
@@ -2622,6 +2684,7 @@ extern "C" napi_status napi_reference_ref(napi_env opaque_env, napi_ref opaque_r
 extern "C" napi_status napi_reference_unref(napi_env opaque_env, napi_ref opaque_reference, uint32_t* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     auto* reference = reinterpret_cast<napi_ref__*>(opaque_reference);
     if (!env || !reference || reference->env != env || reference->deleted)
         return invalid(env);
@@ -2644,6 +2707,7 @@ extern "C" napi_status napi_reference_unref(napi_env opaque_env, napi_ref opaque
 extern "C" napi_status napi_get_reference_value(napi_env opaque_env, napi_ref opaque_reference, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     auto* reference = reinterpret_cast<napi_ref__*>(opaque_reference);
     if (!env || !reference || reference->env != env || reference->deleted || !result)
         return invalid(env);
@@ -2701,6 +2765,7 @@ static void apply_buffer_prototype(NapiEnv* env, JSObjectRef buffer, JSValueRef*
 extern "C" napi_status napi_create_arraybuffer(napi_env opaque_env, size_t byte_length, void** data, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !result)
         return invalid(env);
     void* bytes = std::calloc(byte_length ? byte_length : 1, 1);
@@ -3345,6 +3410,7 @@ static bool bigint_lossless(NapiEnv* env, napi_value value, const char* method, 
 extern "C" napi_status napi_get_value_bigint_int64(napi_env opaque_env, napi_value value, int64_t* result, bool* lossless)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result || !lossless)
         return invalid(env);
     if (!JSValueIsBigInt(env->context, to_js(value)))
@@ -3359,6 +3425,7 @@ extern "C" napi_status napi_get_value_bigint_int64(napi_env opaque_env, napi_val
 extern "C" napi_status napi_get_value_bigint_uint64(napi_env opaque_env, napi_value value, uint64_t* result, bool* lossless)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result || !lossless)
         return invalid(env);
     if (!JSValueIsBigInt(env->context, to_js(value)))
@@ -3379,6 +3446,7 @@ extern "C" napi_status napi_get_value_bigint_words(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !word_count)
         return invalid(env);
     if ((!sign_bit) != (!words))
@@ -3824,6 +3892,7 @@ extern "C" napi_status napi_get_all_property_names(
 extern "C" napi_status napi_detach_arraybuffer(napi_env opaque_env, napi_value value)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value)
         return invalid(env);
     JSValueRef exception = nullptr;
@@ -3855,6 +3924,7 @@ extern "C" napi_status napi_detach_arraybuffer(napi_env opaque_env, napi_value v
 extern "C" napi_status napi_is_detached_arraybuffer(napi_env opaque_env, napi_value value, bool* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    check_basic_finalizer_safety(env);
     if (!env || !value || !result)
         return invalid(env);
     JSValueRef exception = nullptr;
@@ -4084,6 +4154,7 @@ static bool drain_finalizer_queue(NapiEnv* env, bool basic, JSValueRef* exceptio
     while (!finalizers.empty()) {
         NapiPostedFinalizer finalizer = finalizers.front();
         finalizers.pop_front();
+        BasicFinalizerScope finalizer_scope(env, basic);
         AutomaticScope scope(env);
         if (finalizer.callback)
             finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
