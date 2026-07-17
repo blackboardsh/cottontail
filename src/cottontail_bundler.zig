@@ -29,6 +29,10 @@ pub const BundleOptions = struct {
     loader_values: []const compiler.schema.api.Loader = &.{},
     external_packages: bool = false,
     include_runtime_modules: bool = false,
+    /// Root used for the synthetic paths of embedded runtime modules. Runtime
+    /// launcher artifacts can set this independently of the user's working
+    /// directory so one compiled runtime graph is reusable across projects.
+    runtime_virtual_root: ?[]const u8 = null,
     runtime_file_loader_paths: bool = false,
     /// Runtime bundles execute with a global Node-style `require`. Keeping the
     /// original identifier makes Function.prototype.toString() output usable
@@ -175,6 +179,13 @@ fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback
 pub const EntryPointOutput = struct {
     code: []u8,
     source_map: ?[]u8 = null,
+    input_files: []GraphInputFile = &.{},
+
+    pub fn deinitInputFiles(this: *EntryPointOutput) void {
+        for (this.input_files) |*file| file.deinit();
+        if (this.input_files.len > 0) c_allocator.free(this.input_files);
+        this.input_files = &.{};
+    }
 };
 
 pub const GraphOutputKind = enum {
@@ -186,6 +197,17 @@ pub const GraphOutputKind = enum {
 pub const GraphOutputSide = enum {
     server,
     client,
+};
+
+/// A disk or virtual source consumed by BundleV2 while producing an output.
+/// Runtime callers use these paths to validate a reusable generated artifact
+/// without running the resolver and linker again.
+pub const GraphInputFile = struct {
+    path: []u8,
+
+    pub fn deinit(this: *GraphInputFile) void {
+        c_allocator.free(this.path);
+    }
 };
 
 /// An external source map associated with one emitted graph file. Both fields
@@ -247,17 +269,39 @@ pub const GraphOutputFile = struct {
 pub const BundleGraphOutput = struct {
     files: []GraphOutputFile,
     entry_point_file_index: ?usize,
+    input_files: []GraphInputFile,
 
     pub fn entryPoint(this: *BundleGraphOutput) ?*GraphOutputFile {
         const index = this.entry_point_file_index orelse return null;
         return &this.files[index];
     }
 
+    pub fn takeInputFiles(this: *BundleGraphOutput) []GraphInputFile {
+        const files = this.input_files;
+        this.input_files = &.{};
+        return files;
+    }
+
     pub fn deinit(this: *BundleGraphOutput) void {
         for (this.files) |*file| file.deinit();
         c_allocator.free(this.files);
+        for (this.input_files) |*file| file.deinit();
+        if (this.input_files.len > 0) c_allocator.free(this.input_files);
     }
 };
+
+fn cloneGraphInputFiles(bundle: *const compiler.bundle_v2.BundleV2) ![]GraphInputFile {
+    var files: std.ArrayList(GraphInputFile) = .empty;
+    errdefer {
+        for (files.items) |*file| file.deinit();
+        files.deinit(c_allocator);
+    }
+    for (bundle.graph.input_files.items(.source)) |source| {
+        if (source.path.text.len == 0) continue;
+        try files.append(c_allocator, .{ .path = try c_allocator.dupe(u8, source.path.text) });
+    }
+    return try files.toOwnedSlice(c_allocator);
+}
 
 fn graphOutputKind(kind: compiler.jsc.API.BuildArtifact.OutputKind) ?GraphOutputKind {
     return switch (kind) {
@@ -834,13 +878,14 @@ pub fn bundleEntryPointGraphWithOptions(
         runtime_file_keys.deinit(c_allocator);
     }
     if (options.include_runtime_modules) {
+        const runtime_virtual_root = options.runtime_virtual_root orelse working_dir;
         // Dev override: load runtime modules from a directory on disk instead
         // of the embedded blob so module edits do not require a rebuild.
         var used_override = false;
         if (std.c.getenv("COTTONTAIL_RUNTIME_MODULES_DIR")) |dir_pointer| {
             const dir_path = std.mem.span(dir_pointer);
             if (dir_path.len > 0) {
-                if (loadRuntimeModulesFromDisk(dir_path, working_dir, &runtime_file_map, &runtime_file_keys)) {
+                if (loadRuntimeModulesFromDisk(dir_path, runtime_virtual_root, &runtime_file_map, &runtime_file_keys)) {
                     used_override = true;
                 } else |_| {
                     // Fall back to the embedded blob on any error.
@@ -850,7 +895,7 @@ pub fn bundleEntryPointGraphWithOptions(
         if (!used_override) {
             var iterator = try embedded_runtime_modules.Iterator.init();
             while (try iterator.next()) |entry| {
-                const path = try embedded_runtime_modules.virtualPath(c_allocator, working_dir, entry.path);
+                const path = try embedded_runtime_modules.virtualPath(c_allocator, runtime_virtual_root, entry.path);
                 try runtime_file_keys.append(c_allocator, path);
                 try runtime_file_map.map.put(c_allocator, path, entry.contents);
             }
@@ -936,9 +981,16 @@ pub fn bundleEntryPointGraphWithOptions(
         return error.NoEntryPointOutput;
     }
 
+    const input_files = try cloneGraphInputFiles(bundle orelse return error.MissingBundleGraph);
+    errdefer {
+        for (input_files) |*file| file.deinit();
+        if (input_files.len > 0) c_allocator.free(input_files);
+    }
+
     return .{
         .files = try files.toOwnedSlice(c_allocator),
         .entry_point_file_index = server_entry_point orelse first_entry_point,
+        .input_files = input_files,
     };
 }
 
@@ -964,6 +1016,7 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     return .{
         .code = entry.takeContents(),
         .source_map = entry.takeSourceMapContents(),
+        .input_files = graph.takeInputFiles(),
     };
 }
 
@@ -973,7 +1026,8 @@ pub fn bundleEntryPointWithOptions(
     options: BundleOptions,
     error_out: *?[*:0]u8,
 ) ![]u8 {
-    const output = try bundleEntryPointWithOptionsAndSourceMap(entry_path, working_dir, options, error_out);
+    var output = try bundleEntryPointWithOptionsAndSourceMap(entry_path, working_dir, options, error_out);
+    defer output.deinitInputFiles();
     if (output.source_map) |source_map| c_allocator.free(source_map);
     return output.code;
 }

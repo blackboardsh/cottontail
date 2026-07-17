@@ -759,6 +759,31 @@ fn runScriptExecution(execution: *ScriptExecution) void {
         return;
     };
 
+    // Cached runtime artifacts keep their external map beside the immutable
+    // generated source. Install the map data before evaluation so the stack
+    // remapper does not depend on a per-invocation temporary path.
+    if (execution.embedded_source == null) {
+        const source_map_path = std.mem.concat(
+            execution.allocator,
+            u8,
+            &.{ execution.runnable_path, ".map" },
+        ) catch null;
+        if (source_map_path) |path| {
+            if (std.Io.Dir.cwd().readFileAlloc(
+                execution.io,
+                path,
+                execution.allocator,
+                .limited(64 * 1024 * 1024),
+            )) |source_map| {
+                js_runtime.setEmbeddedSourceMap(source_map, execution.runnable_path) catch {
+                    writeStderr(execution.io, "cottontail: failed to install generated source map\n", .{});
+                    execution.exit_code = 1;
+                    return;
+                };
+            } else |_| {}
+        }
+    }
+
     execution.exit_code = if (execution.embedded_source) |source| blk: {
         if (execution.embedded_files) |files| {
             js_runtime.setStandaloneFiles(files) catch {
@@ -773,9 +798,7 @@ fn runScriptExecution(execution: *ScriptExecution) void {
             };
         }
         break :blk js_runtime.runSource(source, execution.runnable_path);
-    }
-    else
-        js_runtime.runFile(execution.runnable_path);
+    } else js_runtime.runFile(execution.runnable_path);
     if (profiler_options.enabled()) {
         const raw_profile = js_runtime.takeSamplingProfile() catch |err| {
             writeStderr(execution.io, "cottontail: failed to collect CPU profile: {s}\n", .{@errorName(err)});
@@ -1224,46 +1247,57 @@ const node_runtime_aliases = [_]NodeRuntimeAlias{
     .{ .specifier = "tls", .relative_path = "node/tls.js" },
 };
 
-fn runtimeModuleRelativePath(ctx: *const Context, relative_path: []const u8) ![]const u8 {
-    return embedded_runtime_modules.virtualPath(ctx.allocator, ctx.project_root, relative_path);
+const reusable_runtime_bundle_root = if (builtin.os.tag == .windows) "C:\\" else "/";
+
+fn runtimeModuleRelativePath(
+    ctx: *const Context,
+    runtime_virtual_root: []const u8,
+    relative_path: []const u8,
+) ![]const u8 {
+    return embedded_runtime_modules.virtualPath(ctx.allocator, runtime_virtual_root, relative_path);
 }
 
 fn appendRuntimeAlias(
     ctx: *const Context,
     aliases: *std.ArrayList(native_bundler.RuntimeAlias),
+    runtime_virtual_root: []const u8,
     specifier: []const u8,
     relative_path: []const u8,
 ) !void {
     try aliases.append(ctx.allocator, .{
         .specifier = specifier,
-        .path = try runtimeModuleRelativePath(ctx, relative_path),
+        .path = try runtimeModuleRelativePath(ctx, runtime_virtual_root, relative_path),
     });
 }
 
-fn buildRuntimeAliases(ctx: *const Context) ![]const native_bundler.RuntimeAlias {
+fn buildRuntimeAliases(
+    ctx: *const Context,
+    runtime_virtual_root: []const u8,
+) ![]const native_bundler.RuntimeAlias {
     var aliases: std.ArrayList(native_bundler.RuntimeAlias) = .empty;
-    try appendRuntimeAlias(ctx, &aliases, "bun", "bun/index.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:ffi", "bun/ffi.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:jsc", "bun/jsc.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:sqlite", "bun/sqlite.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:test", "bun/test.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:internal-for-testing", "bun/internal-for-testing.js");
-    try appendRuntimeAlias(ctx, &aliases, "bun:wrap", "bun/wrap.js");
-    try appendRuntimeAlias(ctx, &aliases, "vitest", "bun/test.js");
-    try appendRuntimeAlias(ctx, &aliases, "string-width", "bun/string-width.js");
-    try appendRuntimeAlias(ctx, &aliases, "strip-ansi", "bun/strip-ansi.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun", "bun/index.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:ffi", "bun/ffi.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:jsc", "bun/jsc.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:sqlite", "bun/sqlite.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:test", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:internal-for-testing", "bun/internal-for-testing.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "bun:wrap", "bun/wrap.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "vitest", "bun/test.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "string-width", "bun/string-width.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "strip-ansi", "bun/strip-ansi.js");
     // Bun ships built-in overrides for these npm packages.
-    try appendRuntimeAlias(ctx, &aliases, "node-fetch", "bun/node-fetch.js");
-    try appendRuntimeAlias(ctx, &aliases, "next/dist/compiled/node-fetch", "bun/node-fetch.js");
-    try appendRuntimeAlias(ctx, &aliases, "isomorphic-fetch", "vendor/isomorphic-fetch.js");
-    try appendRuntimeAlias(ctx, &aliases, "@vercel/fetch", "vendor/vercel-fetch.js");
-    try appendRuntimeAlias(ctx, &aliases, "abort-controller", "vendor/abort-controller.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "node-fetch", "bun/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "next/dist/compiled/node-fetch", "bun/node-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "isomorphic-fetch", "vendor/isomorphic-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "@vercel/fetch", "vendor/vercel-fetch.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "abort-controller", "vendor/abort-controller.js");
 
     for (node_runtime_aliases) |alias| {
-        try appendRuntimeAlias(ctx, &aliases, alias.specifier, alias.relative_path);
+        try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, alias.specifier, alias.relative_path);
         try appendRuntimeAlias(
             ctx,
             &aliases,
+            runtime_virtual_root,
             try std.fmt.allocPrint(ctx.allocator, "node:{s}", .{alias.specifier}),
             alias.relative_path,
         );
@@ -1384,6 +1418,8 @@ fn bundleScriptNative(
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    const is_test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null and
+        (isTestEntrypointPath(script_abs) or isTestAggregateEntrypointPath(script_abs));
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
 
@@ -1395,7 +1431,7 @@ fn bundleScriptNative(
     defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
 
     const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args);
-    const test_preload_imports = if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null)
+    const test_preload_imports = if (is_test_cli_execution)
         try buildCliPreloadImports(ctx, script_abs, script_args)
     else
         "";
@@ -1417,7 +1453,7 @@ fn bundleScriptNative(
         !package_json_patch.active and
         ctx.environ_map.get("COTTONTAIL_RUNTIME_MODULES_DIR") == null and
         ctx.environ_map.get("COTTONTAIL_KEEP_TEMP") == null and
-        ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null;
+        !is_test_cli_execution;
     // Standalone executables cannot fall back to Module.runMain() loading the
     // original entrypoint from disk. Make the CommonJS entry an explicit
     // graph edge whenever build options are present so its source and
@@ -1425,12 +1461,14 @@ fn bundleScriptNative(
     const bundle_common_js_entrypoint = is_common_js_entrypoint and (has_custom_conditions or build_options != null);
     const use_esm_bundle_cache = !is_wasm_entrypoint and
         !is_common_js_entrypoint and
-        std.mem.eql(u8, script_entry_abs, script_abs) and
-        plain_launcher_cacheable and
-        try entrypointImportsOnlyRuntimeAliases(ctx, script_abs);
+        plain_launcher_cacheable;
     const use_common_js_launcher_cache = is_common_js_entrypoint and
         !bundle_common_js_entrypoint and
         plain_launcher_cacheable;
+    const runtime_virtual_root = if (use_common_js_launcher_cache)
+        reusable_runtime_bundle_root
+    else
+        ctx.project_root;
     const wrapped_entry = if (is_wasm_entrypoint)
         try writeWasiEntryWrapper(ctx, tmp_dir, script_abs)
     else if (is_common_js_entrypoint)
@@ -1440,15 +1478,25 @@ fn bundleScriptNative(
             script_abs,
             bundle_common_js_entrypoint,
             preload_imports,
+            is_test_cli_execution,
             use_common_js_launcher_cache,
+            runtime_virtual_root,
         )
     else
-        try writeCottontailEntryWrapper(ctx, tmp_dir, script_entry_abs, script_abs, preload_imports, use_esm_bundle_cache);
+        try writeCottontailEntryWrapper(
+            ctx,
+            tmp_dir,
+            script_entry_abs,
+            script_abs,
+            preload_imports,
+            is_test_cli_execution,
+            use_esm_bundle_cache,
+        );
 
     var conditions: std.ArrayList([]const u8) = .empty;
     try collectConditions(ctx.allocator, &conditions, exec_args);
     try collectConditions(ctx.allocator, &conditions, script_args);
-    const aliases = try buildRuntimeAliases(ctx);
+    const aliases = try buildRuntimeAliases(ctx, runtime_virtual_root);
     const bundle_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs" });
 
     var error_message: ?[*:0]u8 = null;
@@ -1458,6 +1506,7 @@ fn bundleScriptNative(
     options.features = features.items;
     options.tsconfig_override = tsconfig_override;
     options.include_runtime_modules = true;
+    options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
     options.inline_import_meta_properties = true;
     var runtime_define_keys: std.ArrayList([]const u8) = .empty;
@@ -1479,31 +1528,40 @@ fn bundleScriptNative(
     options.define_values = runtime_define_values.items;
 
     const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
-        "commonjs-launcher"
+        "commonjs-runtime"
     else if (use_esm_bundle_cache)
         try std.fmt.allocPrint(ctx.allocator, "esm-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
     else
         null;
-    // Non-cached runtime bundles advertise an adjacent source map to the JS
-    // stack remapper. Emit the map together with the bundle so failures can
-    // resolve back to the user's source instead of script.bundle.mjs.
-    if (build_options == null and launcher_cache_name == null) options.source_map = .external;
+    // Runtime bundles advertise an adjacent source map to the JS stack
+    // remapper. Cached maps move with their immutable generated artifact.
+    if (build_options == null) options.source_map = .external;
     var launcher_cache = if (launcher_cache_name) |name|
-        try acquireLauncherCache(ctx, wrapped_entry, name, if (use_esm_bundle_cache) script_abs else null)
+        try acquireLauncherCache(
+            ctx,
+            wrapped_entry,
+            name,
+            use_common_js_launcher_cache,
+            if (use_esm_bundle_cache) script_entry_abs else null,
+        )
     else
         null;
     defer if (launcher_cache) |*cache| cache.lock_file.close(ctx.io);
     if (launcher_cache) |cache| {
-        if (try launcherCacheHit(ctx, &cache)) {
+        if (try launcherCacheHit(ctx, &cache)) |cached_bundle_path| {
             std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-            return cache.bundle_path;
+            return cached_bundle_path;
         }
     }
 
+    const bundle_working_dir = if (use_common_js_launcher_cache)
+        reusable_runtime_bundle_root
+    else
+        ctx.project_root;
     if (graph_out) |graph| {
         graph.* = native_bundler.bundleEntryPointGraphWithOptions(
             wrapped_entry,
-            ctx.project_root,
+            bundle_working_dir,
             options,
             &error_message,
         ) catch |err| return nativeBundleFailure(
@@ -1524,9 +1582,9 @@ fn bundleScriptNative(
         return bundle_path;
     }
 
-    const output = native_bundler.bundleEntryPointWithOptionsAndSourceMap(
+    var output = native_bundler.bundleEntryPointWithOptionsAndSourceMap(
         wrapped_entry,
-        ctx.project_root,
+        bundle_working_dir,
         options,
         &error_message,
     ) catch |err| return nativeBundleFailure(
@@ -1537,6 +1595,7 @@ fn bundleScriptNative(
         error_message,
         err,
     );
+    defer output.deinitInputFiles();
     defer native_bundler.ct_bundle_free(output.code.ptr, output.code.len);
     defer if (output.source_map) |source_map| native_bundler.ct_bundle_free(source_map.ptr, source_map.len);
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output.code });
@@ -1545,41 +1604,74 @@ fn bundleScriptNative(
         try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map });
     }
     if (launcher_cache) |cache| {
-        std.Io.Dir.cwd().deleteFile(ctx.io, cache.bundle_path) catch {};
-        std.Io.Dir.cwd().rename(bundle_path, std.Io.Dir.cwd(), cache.bundle_path, ctx.io) catch return bundle_path;
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cache.key_path, .data = &cache.key }) catch {};
+        const cached_bundle_path = installLauncherCache(
+            ctx,
+            &cache,
+            wrapped_entry,
+            script_entry_abs,
+            if (use_esm_bundle_cache) script_abs else null,
+            output.code,
+            output.source_map,
+            output.input_files,
+        ) catch return bundle_path;
         std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-        return cache.bundle_path;
+        return cached_bundle_path;
     }
     return bundle_path;
 }
 
 const LauncherCache = struct {
-    bundle_path: []const u8,
-    key_path: []const u8,
+    cache_root: []const u8,
+    cache_name: []const u8,
+    manifest_path: []const u8,
     key: [64]u8,
     lock_file: std.Io.File,
+};
+
+const launcher_cache_magic = "CTLCACH2";
+const launcher_cache_manifest_limit = 16 * 1024 * 1024;
+
+const LauncherCacheDependencyKind = enum(u8) {
+    file = 1,
+    missing = 2,
+    directory = 3,
+};
+
+const LauncherCacheDependency = struct {
+    kind: LauncherCacheDependencyKind,
+    path: []const u8,
+    size: u64 = 0,
+    stamp: i64 = 0,
+    digest: [32]u8 = [_]u8{0} ** 32,
+};
+
+const LauncherCacheManifest = struct {
+    bytes: []u8,
+    artifact_id: [64]u8,
 };
 
 fn acquireLauncherCache(
     ctx: *const Context,
     wrapped_entry: []const u8,
     cache_name: []const u8,
+    hash_wrapper_source: bool,
     key_material_path: ?[]const u8,
 ) !?LauncherCache {
-    const wrapper_source = std.Io.Dir.cwd().readFileAlloc(
-        ctx.io,
-        wrapped_entry,
-        ctx.allocator,
-        .limited(1024 * 1024),
-    ) catch return null;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("cottontail-launcher-v1\x00");
+    hasher.update("cottontail-launcher-v2\x00");
     hasher.update(cache_name);
     hasher.update("\x00");
     hasher.update(ctx.executable_stamp);
-    hasher.update("\x00");
-    hasher.update(wrapper_source);
+    if (hash_wrapper_source) {
+        const wrapper_source = std.Io.Dir.cwd().readFileAlloc(
+            ctx.io,
+            wrapped_entry,
+            ctx.allocator,
+            .limited(1024 * 1024),
+        ) catch return null;
+        hasher.update("\x00wrapper\x00");
+        hasher.update(wrapper_source);
+    }
     if (key_material_path) |path| {
         const key_material = std.Io.Dir.cwd().readFileAlloc(
             ctx.io,
@@ -1587,15 +1679,19 @@ fn acquireLauncherCache(
             ctx.allocator,
             .limited(4 * 1024 * 1024),
         ) catch return null;
-        hasher.update("\x00");
+        hasher.update("\x00entry\x00");
         hasher.update(key_material);
+    }
+    for ([_][]const u8{ "NODE_PATH", "NODE_ENV" }) |name| {
+        hasher.update("\x00");
+        hasher.update(name);
+        hasher.update("=");
+        if (ctx.environ_map.get(name)) |value| hasher.update(value);
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
 
-    const run_root = try ensureTempRunRoot(ctx);
-    const temp_root = std.fs.path.dirname(run_root) orelse return null;
-    const cache_root = try std.fs.path.join(ctx.allocator, &.{ temp_root, "cache" });
+    const cache_root = try launcherCacheRoot(ctx);
     std.Io.Dir.cwd().createDirPath(ctx.io, cache_root) catch return null;
 
     const lock_name = try std.fmt.allocPrint(ctx.allocator, "{s}.lock", .{cache_name});
@@ -1608,23 +1704,437 @@ fn acquireLauncherCache(
     errdefer lock_file.close(ctx.io);
 
     return .{
-        .bundle_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.mjs", .{cache_name}) }),
-        .key_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.key", .{cache_name}) }),
+        .cache_root = cache_root,
+        .cache_name = cache_name,
+        .manifest_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.manifest", .{cache_name}) }),
         .key = std.fmt.bytesToHex(digest, .lower),
         .lock_file = lock_file,
     };
 }
 
-fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !bool {
-    const stat = std.Io.Dir.cwd().statFile(ctx.io, cache.bundle_path, .{}) catch return false;
-    if (stat.kind != .file or stat.size == 0) return false;
-    const key = std.Io.Dir.cwd().readFileAlloc(
+fn launcherCacheRoot(ctx: *const Context) ![]const u8 {
+    if (ctx.environ_map.get("COTTONTAIL_TMP_DIR")) |tmp_dir| {
+        if (tmp_dir.len > 0) {
+            return try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "cottontail", "cache" });
+        }
+    }
+    if (builtin.os.tag == .windows) {
+        if (ctx.environ_map.get("LOCALAPPDATA")) |local_app_data| {
+            if (local_app_data.len > 0) {
+                return try std.fs.path.join(ctx.allocator, &.{ local_app_data, "cottontail", "cache" });
+            }
+        }
+    }
+    if (ctx.environ_map.get("XDG_CACHE_HOME")) |xdg_cache_home| {
+        if (xdg_cache_home.len > 0) {
+            return try std.fs.path.join(ctx.allocator, &.{ xdg_cache_home, "cottontail", "cache" });
+        }
+    }
+    if (ctx.environ_map.get("HOME")) |home| {
+        if (home.len > 0) {
+            return try std.fs.path.join(ctx.allocator, &.{ home, ".cache", "cottontail", "cache" });
+        }
+    }
+    return try std.fs.path.join(ctx.allocator, &.{ osTempBase(ctx), "cottontail", "cache" });
+}
+
+fn launcherCacheArtifactPath(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    artifact_id: []const u8,
+) ![]const u8 {
+    const name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}.mjs", .{ cache.cache_name, artifact_id });
+    return try std.fs.path.join(ctx.allocator, &.{ cache.cache_root, name });
+}
+
+fn launcherCacheSourceMapPath(ctx: *const Context, bundle_path: []const u8) ![]const u8 {
+    return try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
+}
+
+fn hashLauncherCacheFile(ctx: *const Context, path: []const u8) ![32]u8 {
+    const file = try std.Io.Dir.cwd().openFile(ctx.io, path, .{});
+    defer file.close(ctx.io);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var reader_buffer: [16 * 1024]u8 = undefined;
+    var chunk: [64 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(ctx.io, &reader_buffer);
+    while (true) {
+        const count = try reader.interface.readSliceShort(&chunk);
+        if (count == 0) break;
+        hasher.update(chunk[0..count]);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+const LauncherCacheDirectoryEntry = struct {
+    name: []const u8,
+    kind: u8,
+};
+
+fn launcherCacheDirectoryEntryLessThan(
+    _: void,
+    left: LauncherCacheDirectoryEntry,
+    right: LauncherCacheDirectoryEntry,
+) bool {
+    return switch (std.mem.order(u8, left.name, right.name)) {
+        .lt => true,
+        .gt => false,
+        .eq => left.kind < right.kind,
+    };
+}
+
+fn isGeneratedLauncherSource(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, ".cottontail-compat-") or
+        std.mem.startsWith(u8, name, ".cottontail-eval-");
+}
+
+fn hashLauncherCacheDirectory(ctx: *const Context, path: []const u8) ![32]u8 {
+    var directory = try std.Io.Dir.cwd().openDir(ctx.io, path, .{ .iterate = true });
+    defer directory.close(ctx.io);
+
+    var entries: std.ArrayList(LauncherCacheDirectoryEntry) = .empty;
+    var iterator = directory.iterate();
+    while (try iterator.next(ctx.io)) |entry| {
+        if (isGeneratedLauncherSource(entry.name)) continue;
+        try entries.append(ctx.allocator, .{
+            .name = try ctx.allocator.dupe(u8, entry.name),
+            .kind = @intFromEnum(entry.kind),
+        });
+    }
+    std.mem.sort(LauncherCacheDirectoryEntry, entries.items, {}, launcherCacheDirectoryEntryLessThan);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (entries.items) |entry| {
+        hasher.update(entry.name);
+        hasher.update(&.{ 0, entry.kind });
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn appendLauncherCacheDependency(
+    ctx: *const Context,
+    dependencies: *std.ArrayList(LauncherCacheDependency),
+    seen: *std.StringHashMapUnmanaged(void),
+    path: []const u8,
+    include_missing: bool,
+) !bool {
+    if (path.len == 0 or seen.contains(path)) return false;
+
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch {
+        if (!include_missing) return false;
+        try seen.put(ctx.allocator, path, {});
+        try dependencies.append(ctx.allocator, .{ .kind = .missing, .path = path });
+        return false;
+    };
+    if (stat.kind != .file) return false;
+
+    try seen.put(ctx.allocator, path, {});
+    try dependencies.append(ctx.allocator, .{
+        .kind = .file,
+        .path = path,
+        .size = stat.size,
+        .digest = try hashLauncherCacheFile(ctx, path),
+    });
+    return true;
+}
+
+fn appendLauncherCacheDirectory(
+    ctx: *const Context,
+    dependencies: *std.ArrayList(LauncherCacheDependency),
+    seen: *std.StringHashMapUnmanaged(void),
+    path: []const u8,
+) !void {
+    if (path.len == 0 or seen.contains(path)) return;
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch return;
+    if (stat.kind != .directory) return;
+    try seen.put(ctx.allocator, path, {});
+    try dependencies.append(ctx.allocator, .{
+        .kind = .directory,
+        .path = path,
+        .digest = try hashLauncherCacheDirectory(ctx, path),
+    });
+}
+
+fn appendLauncherCacheConfigChain(
+    ctx: *const Context,
+    dependencies: *std.ArrayList(LauncherCacheDependency),
+    seen: *std.StringHashMapUnmanaged(void),
+    start_dir: []const u8,
+) !void {
+    var current = start_dir;
+    while (current.len > 0) {
+        for ([_][]const u8{
+            "package.json",
+            "tsconfig.json",
+            "jsconfig.json",
+            "bunfig.toml",
+            "bun.lock",
+            "bun.lockb",
+        }) |name| {
+            const path = try std.fs.path.join(ctx.allocator, &.{ current, name });
+            _ = try appendLauncherCacheDependency(ctx, dependencies, seen, path, true);
+        }
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
+}
+
+fn collectLauncherCacheDependencies(
+    ctx: *const Context,
+    wrapped_entry: []const u8,
+    generated_entry: []const u8,
+    original_entry: ?[]const u8,
+    input_files: []const native_bundler.GraphInputFile,
+) ![]LauncherCacheDependency {
+    var dependencies: std.ArrayList(LauncherCacheDependency) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(ctx.allocator);
+
+    const wrapped_entry_real = std.Io.Dir.cwd().realPathFileAlloc(
         ctx.io,
-        cache.key_path,
+        wrapped_entry,
         ctx.allocator,
-        .limited(cache.key.len + 1),
-    ) catch return false;
-    return std.mem.eql(u8, key, &cache.key);
+    ) catch wrapped_entry;
+    const generated_entry_real = std.Io.Dir.cwd().realPathFileAlloc(
+        ctx.io,
+        generated_entry,
+        ctx.allocator,
+    ) catch generated_entry;
+    const original_entry_real = if (original_entry) |path|
+        std.Io.Dir.cwd().realPathFileAlloc(ctx.io, path, ctx.allocator) catch path
+    else
+        null;
+    const has_generated_entry = if (original_entry_real) |path|
+        !std.mem.eql(u8, generated_entry_real, path)
+    else
+        false;
+
+    for (input_files) |input| {
+        const path = input.path;
+        if (std.mem.eql(u8, path, wrapped_entry_real) or
+            (has_generated_entry and std.mem.eql(u8, path, generated_entry_real)) or
+            std.mem.indexOf(u8, path, embedded_runtime_modules.virtual_directory_name) != null)
+        {
+            continue;
+        }
+        if (!try appendLauncherCacheDependency(ctx, &dependencies, &seen, path, false)) continue;
+        const parent = std.fs.path.dirname(path) orelse continue;
+        try appendLauncherCacheDirectory(ctx, &dependencies, &seen, parent);
+        try appendLauncherCacheConfigChain(ctx, &dependencies, &seen, parent);
+    }
+    if (original_entry_real) |path| {
+        if (try appendLauncherCacheDependency(ctx, &dependencies, &seen, path, false)) {
+            if (std.fs.path.dirname(path)) |parent| {
+                try appendLauncherCacheDirectory(ctx, &dependencies, &seen, parent);
+                try appendLauncherCacheConfigChain(ctx, &dependencies, &seen, parent);
+            }
+        }
+    }
+    return try dependencies.toOwnedSlice(ctx.allocator);
+}
+
+fn launcherCacheDependencyLessThan(
+    _: void,
+    left: LauncherCacheDependency,
+    right: LauncherCacheDependency,
+) bool {
+    return switch (std.mem.order(u8, left.path, right.path)) {
+        .lt => true,
+        .gt => false,
+        .eq => @intFromEnum(left.kind) < @intFromEnum(right.kind),
+    };
+}
+
+fn appendLauncherCacheInt(
+    bytes: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    value: T,
+) !void {
+    var buffer: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buffer, value, .little);
+    try bytes.appendSlice(allocator, &buffer);
+}
+
+fn readLauncherCacheInt(
+    comptime T: type,
+    bytes: []const u8,
+    cursor: *usize,
+) ?T {
+    const end = std.math.add(usize, cursor.*, @sizeOf(T)) catch return null;
+    if (end > bytes.len) return null;
+    const value = std.mem.readInt(T, bytes[cursor.*..end][0..@sizeOf(T)], .little);
+    cursor.* = end;
+    return value;
+}
+
+fn buildLauncherCacheManifest(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    dependencies: []LauncherCacheDependency,
+) !LauncherCacheManifest {
+    std.mem.sort(LauncherCacheDependency, dependencies, {}, launcherCacheDependencyLessThan);
+
+    var payload: std.ArrayList(u8) = .empty;
+    try appendLauncherCacheInt(&payload, ctx.allocator, u32, @intCast(dependencies.len));
+    for (dependencies) |dependency| {
+        try payload.append(ctx.allocator, @intFromEnum(dependency.kind));
+        try appendLauncherCacheInt(&payload, ctx.allocator, u32, @intCast(dependency.path.len));
+        try appendLauncherCacheInt(&payload, ctx.allocator, u64, dependency.size);
+        try appendLauncherCacheInt(&payload, ctx.allocator, i64, dependency.stamp);
+        try payload.appendSlice(ctx.allocator, &dependency.digest);
+        try payload.appendSlice(ctx.allocator, dependency.path);
+    }
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&cache.key);
+    hasher.update(payload.items);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const artifact_id = std.fmt.bytesToHex(digest, .lower);
+
+    var manifest: std.ArrayList(u8) = .empty;
+    try manifest.appendSlice(ctx.allocator, launcher_cache_magic);
+    try manifest.appendSlice(ctx.allocator, &cache.key);
+    try manifest.appendSlice(ctx.allocator, &artifact_id);
+    try manifest.appendSlice(ctx.allocator, payload.items);
+    return .{
+        .bytes = try manifest.toOwnedSlice(ctx.allocator),
+        .artifact_id = artifact_id,
+    };
+}
+
+fn launcherCacheHexIdValid(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isHex(byte)) return false;
+    }
+    return true;
+}
+
+fn validateLauncherCacheDependency(
+    ctx: *const Context,
+    kind: LauncherCacheDependencyKind,
+    path: []const u8,
+    size: u64,
+    stamp: i64,
+    digest: *const [32]u8,
+) bool {
+    _ = stamp;
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, path, .{}) catch {
+        return kind == .missing;
+    };
+    return switch (kind) {
+        .missing => false,
+        .directory => blk: {
+            if (stat.kind != .directory) break :blk false;
+            const actual_digest = hashLauncherCacheDirectory(ctx, path) catch break :blk false;
+            break :blk std.mem.eql(u8, &actual_digest, digest);
+        },
+        .file => blk: {
+            if (stat.kind != .file or stat.size != size) break :blk false;
+            const actual_digest = hashLauncherCacheFile(ctx, path) catch break :blk false;
+            break :blk std.mem.eql(u8, &actual_digest, digest);
+        },
+    };
+}
+
+fn launcherCacheHit(ctx: *const Context, cache: *const LauncherCache) !?[]const u8 {
+    const manifest = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        cache.manifest_path,
+        ctx.allocator,
+        .limited(launcher_cache_manifest_limit),
+    ) catch return null;
+    const header_len = launcher_cache_magic.len + cache.key.len + 64;
+    if (manifest.len < header_len + @sizeOf(u32) or
+        !std.mem.eql(u8, manifest[0..launcher_cache_magic.len], launcher_cache_magic) or
+        !std.mem.eql(u8, manifest[launcher_cache_magic.len..][0..cache.key.len], &cache.key))
+    {
+        return null;
+    }
+    const artifact_id = manifest[launcher_cache_magic.len + cache.key.len .. header_len];
+    if (!launcherCacheHexIdValid(artifact_id)) return null;
+
+    var cursor = header_len;
+    const dependency_count = readLauncherCacheInt(u32, manifest, &cursor) orelse return null;
+    for (0..@as(usize, @intCast(dependency_count))) |_| {
+        if (cursor >= manifest.len) return null;
+        const kind: LauncherCacheDependencyKind = switch (manifest[cursor]) {
+            @intFromEnum(LauncherCacheDependencyKind.file) => .file,
+            @intFromEnum(LauncherCacheDependencyKind.missing) => .missing,
+            @intFromEnum(LauncherCacheDependencyKind.directory) => .directory,
+            else => return null,
+        };
+        cursor += 1;
+        const path_len = readLauncherCacheInt(u32, manifest, &cursor) orelse return null;
+        const size = readLauncherCacheInt(u64, manifest, &cursor) orelse return null;
+        const stamp = readLauncherCacheInt(i64, manifest, &cursor) orelse return null;
+        const digest_end = std.math.add(usize, cursor, 32) catch return null;
+        if (digest_end > manifest.len) return null;
+        const digest: *const [32]u8 = @ptrCast(manifest[cursor..digest_end].ptr);
+        cursor = digest_end;
+        const path_end = std.math.add(usize, cursor, path_len) catch return null;
+        if (path_end > manifest.len) return null;
+        const path = manifest[cursor..path_end];
+        cursor = path_end;
+        if (!validateLauncherCacheDependency(ctx, kind, path, size, stamp, digest)) return null;
+    }
+    if (cursor != manifest.len) return null;
+
+    const bundle_path = try launcherCacheArtifactPath(ctx, cache, artifact_id);
+    const bundle_stat = std.Io.Dir.cwd().statFile(ctx.io, bundle_path, .{}) catch return null;
+    if (bundle_stat.kind != .file or bundle_stat.size == 0) return null;
+    const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
+    const source_map_stat = std.Io.Dir.cwd().statFile(ctx.io, source_map_path, .{}) catch return null;
+    if (source_map_stat.kind != .file or source_map_stat.size == 0) return null;
+    return bundle_path;
+}
+
+fn installLauncherCache(
+    ctx: *const Context,
+    cache: *const LauncherCache,
+    wrapped_entry: []const u8,
+    generated_entry: []const u8,
+    original_entry: ?[]const u8,
+    code: []const u8,
+    source_map: ?[]const u8,
+    input_files: []const native_bundler.GraphInputFile,
+) ![]const u8 {
+    const map = source_map orelse return error.MissingLauncherSourceMap;
+    const dependencies = try collectLauncherCacheDependencies(
+        ctx,
+        wrapped_entry,
+        generated_entry,
+        original_entry,
+        input_files,
+    );
+    const manifest = try buildLauncherCacheManifest(ctx, cache, dependencies);
+    const bundle_path = try launcherCacheArtifactPath(ctx, cache, &manifest.artifact_id);
+    const source_map_path = try launcherCacheSourceMapPath(ctx, bundle_path);
+
+    const bundle_ready = if (std.Io.Dir.cwd().statFile(ctx.io, bundle_path, .{})) |stat|
+        stat.kind == .file and stat.size == @as(u64, @intCast(code.len))
+    else |_|
+        false;
+    if (!bundle_ready) try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = code });
+
+    const map_ready = if (std.Io.Dir.cwd().statFile(ctx.io, source_map_path, .{})) |stat|
+        stat.kind == .file and stat.size == @as(u64, @intCast(map.len))
+    else |_|
+        false;
+    if (!map_ready) try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = map });
+
+    // The fixed manifest is the generation index. Publish it only after both
+    // immutable artifact files are complete.
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cache.manifest_path, .data = manifest.bytes });
+    return bundle_path;
 }
 
 fn tsconfigOverridePath(ctx: *const Context, exec_args: []const [:0]const u8) !?[]const u8 {
@@ -1925,6 +2435,11 @@ fn isTestEntrypointPath(path: []const u8) bool {
     return false;
 }
 
+fn isTestAggregateEntrypointPath(path: []const u8) bool {
+    return std.mem.eql(u8, std.fs.path.basename(path), "entry.mjs") and
+        std.mem.indexOf(u8, path, "test-aggregate-") != null;
+}
+
 /// Append every quoted ("..." or '...') segment in `text` to `list`,
 /// stopping at an unquoted `#` comment marker.
 fn appendQuotedStrings(
@@ -2077,6 +2592,7 @@ fn writeCottontailEntryWrapper(
     script_import_abs: []const u8,
     script_abs: []const u8,
     preload_imports: []const u8,
+    test_cli_execution: bool,
     stable_source_map_path: bool,
 ) ![]const u8 {
     const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
@@ -2091,7 +2607,7 @@ fn writeCottontailEntryWrapper(
     const script_literal = try jsonStringLiteral(ctx, script_abs);
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const script_dir_literal = try jsonStringLiteral(ctx, script_dir);
-    const test_header_signal = if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null)
+    const test_header_signal = if (test_cli_execution)
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
         "";
@@ -3758,7 +4274,9 @@ fn writeCommonJsEntryWrapper(
     script_abs: []const u8,
     bundle_entry: bool,
     preload_imports: []const u8,
+    test_cli_execution: bool,
     stable_source_map_path: bool,
+    runtime_virtual_root: []const u8,
 ) ![]const u8 {
     const wrapper_name = try std.fmt.allocPrint(
         ctx.allocator,
@@ -3767,67 +4285,67 @@ fn writeCommonJsEntryWrapper(
     );
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
 
-    const bun_module = try runtimeModulePath(ctx, &.{ "bun", "index.js" });
-    const bun_internal_for_testing_module = try runtimeModulePath(ctx, &.{ "bun", "internal-for-testing.js" });
-    const bun_wrap_module = try runtimeModulePath(ctx, &.{ "bun", "wrap.js" });
-    const fs_module = try runtimeModulePath(ctx, &.{ "node", "fs.js" });
-    const fs_promises_module = try runtimeModulePath(ctx, &.{ "node", "fs", "promises.js" });
-    const os_module = try runtimeModulePath(ctx, &.{ "node", "os.js" });
-    const path_module = try runtimeModulePath(ctx, &.{ "node", "path.js" });
-    const process_module = try runtimeModulePath(ctx, &.{ "node", "process.js" });
-    const readline_module = try runtimeModulePath(ctx, &.{ "node", "readline.js" });
-    const readline_promises_module = try runtimeModulePath(ctx, &.{ "node", "readline", "promises.js" });
-    const util_module = try runtimeModulePath(ctx, &.{ "node", "util.js" });
-    const util_types_module = try runtimeModulePath(ctx, &.{ "node", "util", "types.js" });
-    const events_module = try runtimeModulePath(ctx, &.{ "node", "events.js" });
-    const async_hooks_module = try runtimeModulePath(ctx, &.{ "node", "async_hooks.js" });
-    const assert_module = try runtimeModulePath(ctx, &.{ "node", "assert.js" });
-    const assert_strict_module = try runtimeModulePath(ctx, &.{ "node", "assert", "strict.js" });
-    const console_module = try runtimeModulePath(ctx, &.{ "node", "console.js" });
-    const diagnostics_channel_module = try runtimeModulePath(ctx, &.{ "node", "diagnostics_channel.js" });
-    const domain_module = try runtimeModulePath(ctx, &.{ "node", "domain.js" });
-    const tty_module = try runtimeModulePath(ctx, &.{ "node", "tty.js" });
-    const v8_module = try runtimeModulePath(ctx, &.{ "node", "v8.js" });
-    const stream_module = try runtimeModulePath(ctx, &.{ "node", "stream.js" });
-    const stream_consumers_module = try runtimeModulePath(ctx, &.{ "node", "stream", "consumers.js" });
-    const stream_promises_module = try runtimeModulePath(ctx, &.{ "node", "stream", "promises.js" });
-    const stream_web_module = try runtimeModulePath(ctx, &.{ "node", "stream", "web.js" });
-    const perf_hooks_module = try runtimeModulePath(ctx, &.{ "node", "perf_hooks.js" });
-    const vm_module = try runtimeModulePath(ctx, &.{ "node", "vm.js" });
-    const module_module = try runtimeModulePath(ctx, &.{ "node", "module.js" });
-    const net_module = try runtimeModulePath(ctx, &.{ "node", "net.js" });
-    const url_module = try runtimeModulePath(ctx, &.{ "node", "url.js" });
-    const constants_module = try runtimeModulePath(ctx, &.{ "node", "constants.js" });
-    const crypto_module = try runtimeModulePath(ctx, &.{ "node", "crypto.js" });
-    const buffer_module = try runtimeModulePath(ctx, &.{ "node", "buffer.js" });
-    const cluster_module = try runtimeModulePath(ctx, &.{ "node", "cluster.js" });
-    const punycode_module = try runtimeModulePath(ctx, &.{ "node", "punycode.js" });
-    const querystring_module = try runtimeModulePath(ctx, &.{ "node", "querystring.js" });
-    const child_process_module = try runtimeModulePath(ctx, &.{ "node", "child_process.js" });
-    const path_posix_module = try runtimeModulePath(ctx, &.{ "node", "path", "posix.cjs" });
-    const path_win32_module = try runtimeModulePath(ctx, &.{ "node", "path", "win32.cjs" });
-    const string_decoder_module = try runtimeModulePath(ctx, &.{ "node", "string_decoder.js" });
-    const sys_module = try runtimeModulePath(ctx, &.{ "node", "sys.js" });
-    const repl_module = try runtimeModulePath(ctx, &.{ "node", "repl.js" });
-    const sea_module = try runtimeModulePath(ctx, &.{ "node", "sea.js" });
-    const sqlite_module = try runtimeModulePath(ctx, &.{ "node", "sqlite.js" });
-    const node_test_module = try runtimeModulePath(ctx, &.{ "node", "test.js" });
-    const test_reporters_module = try runtimeModulePath(ctx, &.{ "node", "test", "reporters.js" });
-    const timers_module = try runtimeModulePath(ctx, &.{ "node", "timers.js" });
-    const timers_promises_module = try runtimeModulePath(ctx, &.{ "node", "timers", "promises.js" });
-    const trace_events_module = try runtimeModulePath(ctx, &.{ "node", "trace_events.js" });
-    const wasi_module = try runtimeModulePath(ctx, &.{ "node", "wasi.js" });
-    const worker_threads_module = try runtimeModulePath(ctx, &.{ "node", "worker_threads.js" });
-    const zlib_module = try runtimeModulePath(ctx, &.{ "node", "zlib.js" });
-    const http_module = try runtimeModulePath(ctx, &.{ "node", "http.js" });
-    const https_module = try runtimeModulePath(ctx, &.{ "node", "https.js" });
-    const http2_module = try runtimeModulePath(ctx, &.{ "node", "http2.js" });
-    const inspector_module = try runtimeModulePath(ctx, &.{ "node", "inspector.js" });
-    const inspector_promises_module = try runtimeModulePath(ctx, &.{ "node", "inspector", "promises.js" });
-    const dgram_module = try runtimeModulePath(ctx, &.{ "node", "dgram.js" });
-    const dns_module = try runtimeModulePath(ctx, &.{ "node", "dns.js" });
-    const dns_promises_module = try runtimeModulePath(ctx, &.{ "node", "dns", "promises.js" });
-    const tls_module = try runtimeModulePath(ctx, &.{ "node", "tls.js" });
+    const bun_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "index.js" });
+    const bun_internal_for_testing_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "internal-for-testing.js" });
+    const bun_wrap_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "bun", "wrap.js" });
+    const fs_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "fs.js" });
+    const fs_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "fs", "promises.js" });
+    const os_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "os.js" });
+    const path_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "path.js" });
+    const process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "process.js" });
+    const readline_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "readline.js" });
+    const readline_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "readline", "promises.js" });
+    const util_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "util.js" });
+    const util_types_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "util", "types.js" });
+    const events_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "events.js" });
+    const async_hooks_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "async_hooks.js" });
+    const assert_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "assert.js" });
+    const assert_strict_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "assert", "strict.js" });
+    const console_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "console.js" });
+    const diagnostics_channel_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "diagnostics_channel.js" });
+    const domain_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "domain.js" });
+    const tty_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "tty.js" });
+    const v8_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "v8.js" });
+    const stream_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "stream.js" });
+    const stream_consumers_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "stream", "consumers.js" });
+    const stream_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "stream", "promises.js" });
+    const stream_web_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "stream", "web.js" });
+    const perf_hooks_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "perf_hooks.js" });
+    const vm_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "vm.js" });
+    const module_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "module.js" });
+    const net_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "net.js" });
+    const url_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "url.js" });
+    const constants_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "constants.js" });
+    const crypto_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "crypto.js" });
+    const buffer_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "buffer.js" });
+    const cluster_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "cluster.js" });
+    const punycode_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "punycode.js" });
+    const querystring_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "querystring.js" });
+    const child_process_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "child_process.js" });
+    const path_posix_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "path", "posix.cjs" });
+    const path_win32_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "path", "win32.cjs" });
+    const string_decoder_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "string_decoder.js" });
+    const sys_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sys.js" });
+    const repl_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "repl.js" });
+    const sea_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sea.js" });
+    const sqlite_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "sqlite.js" });
+    const node_test_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test.js" });
+    const test_reporters_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "test", "reporters.js" });
+    const timers_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "timers.js" });
+    const timers_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "timers", "promises.js" });
+    const trace_events_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "trace_events.js" });
+    const wasi_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "wasi.js" });
+    const worker_threads_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "worker_threads.js" });
+    const zlib_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "zlib.js" });
+    const http_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http.js" });
+    const https_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "https.js" });
+    const http2_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "http2.js" });
+    const inspector_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector.js" });
+    const inspector_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "inspector", "promises.js" });
+    const dgram_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dgram.js" });
+    const dns_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns.js" });
+    const dns_promises_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "dns", "promises.js" });
+    const tls_module = try runtimeModulePathAtRoot(ctx, runtime_virtual_root, &.{ "node", "tls.js" });
 
     const imports_a = try std.fmt.allocPrint(
         ctx.allocator,
@@ -3979,8 +4497,8 @@ fn writeCommonJsEntryWrapper(
         const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
-    const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
-    const test_header_signal = if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null)
+    const bundle_source_root_literal = try jsonStringLiteral(ctx, runtime_virtual_root);
+    const test_header_signal = if (test_cli_execution)
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
         "";
@@ -4095,8 +4613,16 @@ fn jsonStringLiteral(ctx: *const Context, value: []const u8) ![]const u8 {
 }
 
 fn runtimeModulePath(ctx: *const Context, parts: []const []const u8) ![]const u8 {
+    return runtimeModulePathAtRoot(ctx, ctx.project_root, parts);
+}
+
+fn runtimeModulePathAtRoot(
+    ctx: *const Context,
+    runtime_virtual_root: []const u8,
+    parts: []const []const u8,
+) ![]const u8 {
     const relative_path = try std.fs.path.join(ctx.allocator, parts);
-    return embedded_runtime_modules.virtualPath(ctx.allocator, ctx.project_root, relative_path);
+    return embedded_runtime_modules.virtualPath(ctx.allocator, runtime_virtual_root, relative_path);
 }
 
 fn ensureTempDir(ctx: *const Context) ![]const u8 {
