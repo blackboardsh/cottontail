@@ -126,6 +126,67 @@ pub const HoistPattern = struct {
     }
 };
 
+pub const PeerLeakNode = struct {
+    own_peers: []const []const u8 = &.{},
+    provides: []const []const u8 = &.{},
+    children: []const usize = &.{},
+};
+
+pub const PeerLeakSet = struct {
+    names: []const []const u8,
+
+    pub fn contains(leaks: PeerLeakSet, name: []const u8) bool {
+        return containsName(leaks.names, name);
+    }
+};
+
+/// Mirrors Bun's `isolated_install.zig` leaking-peer prepass. A peer name
+/// propagates through every transitive child until a package has a concrete
+/// non-peer dependency with that name. Iterating to a fixpoint makes cycles
+/// deterministic without relying on dependency traversal order.
+pub fn computePeerLeaks(allocator: std.mem.Allocator, nodes: []const PeerLeakNode) ![]const PeerLeakSet {
+    const sets = try allocator.alloc(std.StringHashMap(void), nodes.len);
+    for (sets) |*set| set.* = std.StringHashMap(void).init(allocator);
+    defer for (sets) |*set| set.deinit();
+
+    for (nodes, sets) |node, *set| {
+        for (node.own_peers) |name| {
+            if (!containsName(node.provides, name)) try set.put(name, {});
+        }
+    }
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (nodes, sets) |node, *set| {
+            for (node.children) |child_index| {
+                if (child_index >= sets.len) return error.InvalidPeerLeakGraph;
+                var child = sets[child_index].keyIterator();
+                while (child.next()) |name| {
+                    if (containsName(node.provides, name.*) or set.contains(name.*)) continue;
+                    try set.put(name.*, {});
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    const result = try allocator.alloc(PeerLeakSet, nodes.len);
+    for (sets, result) |*set, *leaks| {
+        const names = try allocator.alloc([]const u8, set.count());
+        var index: usize = 0;
+        var iterator = set.keyIterator();
+        while (iterator.next()) |name| : (index += 1) names[index] = name.*;
+        std.sort.pdq([]const u8, names, {}, struct {
+            fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+        leaks.* = .{ .names = names };
+    }
+    return result;
+}
+
 pub fn placement(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -229,6 +290,13 @@ fn wildcardMatch(pattern: []const u8, value: []const u8) bool {
     return pattern_index == pattern.len;
 }
 
+fn containsName(names: []const []const u8, needle: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, needle)) return true;
+    }
+    return false;
+}
+
 fn normalizedLocalSource(source: []const u8) []const u8 {
     if (std.mem.startsWith(u8, source, "file:")) return source["file:".len..];
     if (std.mem.startsWith(u8, source, "link:")) return source["link:".len..];
@@ -325,4 +393,28 @@ test "hoist patterns follow pnpm include and exclude ordering" {
     try std.testing.expect(mixed.isMatch("a-dep"));
     try std.testing.expect(!mixed.isMatch("@types/is-number"));
     try std.testing.expect(mixed.isMatch("@types/private-tool"));
+}
+
+test "peer leaks propagate to a fixpoint and stop at providers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const graph = [_]PeerLeakNode{
+        .{ .children = &.{1}, .provides = &.{"provider"} },
+        .{ .children = &.{2} },
+        .{ .own_peers = &.{"provider"} },
+    };
+    const leaks = try computePeerLeaks(allocator, &graph);
+    try std.testing.expectEqual(@as(usize, 0), leaks[0].names.len);
+    try std.testing.expect(leaks[1].contains("provider"));
+    try std.testing.expect(leaks[2].contains("provider"));
+
+    const cycle = [_]PeerLeakNode{
+        .{ .children = &.{1} },
+        .{ .children = &.{0}, .own_peers = &.{"cyclic-peer"} },
+    };
+    const cycle_leaks = try computePeerLeaks(allocator, &cycle);
+    try std.testing.expect(cycle_leaks[0].contains("cyclic-peer"));
+    try std.testing.expect(cycle_leaks[1].contains("cyclic-peer"));
 }
