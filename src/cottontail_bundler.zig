@@ -4,6 +4,8 @@ const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
 
 const c_allocator = std.heap.c_allocator;
 
+pub const binary_diagnostic_prefix = "COTTONTAIL_DIAGNOSTIC_BASE64:";
+
 pub const RuntimeAlias = compiler.resolver.Resolver.RuntimeAlias;
 
 pub const BundleOptions = struct {
@@ -130,6 +132,21 @@ fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void 
         error_out.* = null;
         return;
     };
+    if (std.mem.indexOfScalar(u8, message, 0) != null) {
+        const encoder = std.base64.standard.Encoder;
+        const encoded_len = encoder.calcSize(message.len);
+        const wire = c_allocator.alloc(u8, binary_diagnostic_prefix.len + encoded_len + 1) catch {
+            c_allocator.free(message);
+            error_out.* = null;
+            return;
+        };
+        @memcpy(wire[0..binary_diagnostic_prefix.len], binary_diagnostic_prefix);
+        _ = encoder.encode(wire[binary_diagnostic_prefix.len .. binary_diagnostic_prefix.len + encoded_len], message);
+        wire[wire.len - 1] = 0;
+        c_allocator.free(message);
+        error_out.* = @ptrCast(wire.ptr);
+        return;
+    }
     error_out.* = message.ptr;
 }
 
@@ -263,9 +280,304 @@ fn cloneGraphSourceMap(output_file: *const compiler.options.OutputFile) !GraphSo
     return .{ .path = path, .contents = contents };
 }
 
+const generated_esm_initializer = "(fn, res) => () => (fn && (res = fn(fn = 0)), res)";
+const cottontail_esm_initializer = "(fn, res) => () => { if (!fn) return res; const init = fn; fn = 0; res = Promise.resolve(); try { return res = init(); } catch (error) { res = void 0; throw error; } }";
+
+const GeneratedReplacement = struct {
+    start: usize,
+    end: usize,
+    text: []const u8,
+};
+
+fn generatedIdentifierEnd(source: []const u8, start: usize) usize {
+    var end = start;
+    while (end < source.len and (std.ascii.isAlphanumeric(source[end]) or source[end] == '_' or source[end] == '$')) : (end += 1) {}
+    return end;
+}
+
+fn skipGeneratedQuoted(source: []const u8, start: usize) usize {
+    const quote = source[start];
+    var cursor = start + 1;
+    while (cursor < source.len) : (cursor += 1) {
+        if (source[cursor] == '\\') {
+            cursor += 1;
+        } else if (source[cursor] == quote) {
+            return cursor + 1;
+        }
+    }
+    return source.len;
+}
+
+fn decodeGeneratedString(allocator: std.mem.Allocator, literal: []const u8) !?[]const u8 {
+    if (literal.len < 2 or (literal[0] != '\'' and literal[0] != '"') or literal[literal.len - 1] != literal[0]) return null;
+    var output: std.ArrayList(u8) = .empty;
+    var cursor: usize = 1;
+    while (cursor + 1 < literal.len) : (cursor += 1) {
+        if (literal[cursor] != '\\') {
+            try output.append(allocator, literal[cursor]);
+            continue;
+        }
+        cursor += 1;
+        if (cursor + 1 >= literal.len) return null;
+        try output.append(allocator, switch (literal[cursor]) {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'b' => 0x08,
+            'f' => 0x0c,
+            'v' => 0x0b,
+            '0' => 0,
+            else => literal[cursor],
+        });
+    }
+    return try output.toOwnedSlice(allocator);
+}
+
+fn realGeneratedSourcePath(
+    allocator: std.mem.Allocator,
+    working_dir: []const u8,
+    source_path: []const u8,
+) ?[]const u8 {
+    const candidate = if (std.fs.path.isAbsolute(source_path))
+        allocator.dupe(u8, source_path) catch return null
+    else
+        std.fs.path.join(allocator, &.{ working_dir, source_path }) catch return null;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator) catch null;
+}
+
+fn generatedSourcePathBefore(
+    allocator: std.mem.Allocator,
+    contents: []const u8,
+    before: usize,
+    working_dir: []const u8,
+) ?[]const u8 {
+    var search_end = before;
+    while (search_end > 0) {
+        const marker = std.mem.lastIndexOf(u8, contents[0..search_end], "\n// ") orelse return null;
+        const path_start = marker + "\n// ".len;
+        const path_end = std.mem.indexOfScalarPos(u8, contents, path_start, '\n') orelse contents.len;
+        const source_path = std.mem.trim(u8, contents[path_start..path_end], " \t\r");
+        if (source_path.len > 0) {
+            if (realGeneratedSourcePath(allocator, working_dir, source_path)) |path| return path;
+        }
+        search_end = marker;
+    }
+    return null;
+}
+
+fn resolveGeneratedModuleSpecifier(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    specifier: []const u8,
+) ?[]const u8 {
+    const marker = std.mem.indexOfAny(u8, specifier, "?#") orelse specifier.len;
+    var bare = specifier[0..marker];
+    if (compiler.resolver.FileURL.isFileURL(bare)) {
+        bare = compiler.resolver.FileURL.pathFromURLAlloc(allocator, bare) catch return null;
+    }
+    const source_dir = std.fs.path.dirname(source_path) orelse return null;
+    const candidate = if (std.fs.path.isAbsolute(bare))
+        allocator.dupe(u8, bare) catch return null
+    else if (std.mem.startsWith(u8, bare, "./") or std.mem.startsWith(u8, bare, "../"))
+        std.fs.path.join(allocator, &.{ source_dir, bare }) catch return null
+    else
+        return null;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (std.Io.Dir.cwd().realPathFileAlloc(io, candidate, allocator)) |path| return path else |_| {}
+    if (std.fs.path.extension(candidate).len == 0) {
+        for ([_][]const u8{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs" }) |extension| {
+            const with_extension = std.mem.concat(allocator, u8, &.{ candidate, extension }) catch return null;
+            if (std.Io.Dir.cwd().realPathFileAlloc(io, with_extension, allocator)) |path| return path else |_| {}
+        }
+    }
+    return null;
+}
+
+fn appendGeneratedSelfRequires(
+    allocator: std.mem.Allocator,
+    replacements: *std.ArrayList(GeneratedReplacement),
+    contents: []const u8,
+    body_start: usize,
+    body_end: usize,
+    source_path: []const u8,
+    exports_name: []const u8,
+    has_to_common_js: bool,
+) !void {
+    var cursor = body_start;
+    while (cursor < body_end) {
+        if (contents[cursor] == '\'' or contents[cursor] == '"' or contents[cursor] == '`') {
+            cursor = skipGeneratedQuoted(contents, cursor);
+            continue;
+        }
+        if (contents[cursor] == '/' and cursor + 1 < body_end) {
+            if (contents[cursor + 1] == '/') {
+                cursor = std.mem.indexOfScalarPos(u8, contents, cursor + 2, '\n') orelse body_end;
+                continue;
+            }
+            if (contents[cursor + 1] == '*') {
+                const comment_end = std.mem.indexOfPos(u8, contents, cursor + 2, "*/") orelse {
+                    cursor = body_end;
+                    continue;
+                };
+                cursor = comment_end + 2;
+                continue;
+            }
+        }
+        if (!std.mem.startsWith(u8, contents[cursor..body_end], "require") or
+            (cursor > body_start and (std.ascii.isAlphanumeric(contents[cursor - 1]) or contents[cursor - 1] == '_' or contents[cursor - 1] == '$' or contents[cursor - 1] == '.')))
+        {
+            cursor += 1;
+            continue;
+        }
+        var open = cursor + "require".len;
+        while (open < body_end and std.ascii.isWhitespace(contents[open])) : (open += 1) {}
+        if (open >= body_end or contents[open] != '(') {
+            cursor += "require".len;
+            continue;
+        }
+        var literal_start = open + 1;
+        while (literal_start < body_end and std.ascii.isWhitespace(contents[literal_start])) : (literal_start += 1) {}
+        if (literal_start >= body_end or (contents[literal_start] != '\'' and contents[literal_start] != '"')) {
+            cursor = open + 1;
+            continue;
+        }
+        const literal_end = skipGeneratedQuoted(contents, literal_start);
+        if (literal_end > body_end) break;
+        var close = literal_end;
+        while (close < body_end and std.ascii.isWhitespace(contents[close])) : (close += 1) {}
+        if (close >= body_end or contents[close] != ')') {
+            cursor = literal_end;
+            continue;
+        }
+        const specifier = (try decodeGeneratedString(allocator, contents[literal_start..literal_end])) orelse {
+            cursor = close + 1;
+            continue;
+        };
+        const resolved = resolveGeneratedModuleSpecifier(allocator, source_path, specifier) orelse {
+            cursor = close + 1;
+            continue;
+        };
+        if (std.mem.eql(u8, resolved, source_path)) {
+            const replacement = if (has_to_common_js)
+                try std.fmt.allocPrint(allocator, "({s}.__esModule = true, __toCommonJS({s}))", .{ exports_name, exports_name })
+            else
+                try std.fmt.allocPrint(allocator, "({s}.__esModule = true, {s})", .{ exports_name, exports_name });
+            try replacements.append(allocator, .{ .start = cursor, .end = close + 1, .text = replacement });
+        }
+        cursor = close + 1;
+    }
+}
+
+fn patchGeneratedSelfImports(contents: []const u8, working_dir: []const u8) !?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(c_allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var replacements: std.ArrayList(GeneratedReplacement) = .empty;
+    const has_to_common_js = std.mem.indexOf(u8, contents, "var __toCommonJS =") != null;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, contents, search_from, "var init_")) |init_start| {
+        const name_start = init_start + "var ".len;
+        const name_end = generatedIdentifierEnd(contents, name_start);
+        const init_name = contents[name_start..name_end];
+        const assignment = std.mem.trimStart(u8, contents[name_end..], " \t");
+        if (!std.mem.startsWith(u8, assignment, "= __esm(")) {
+            search_from = name_end;
+            continue;
+        }
+        const body_open = std.mem.indexOfScalarPos(u8, contents, name_end, '{') orelse break;
+        const body_close = std.mem.indexOfPos(u8, contents, body_open + 1, "\n});") orelse break;
+        const self_prefix = try std.fmt.allocPrint(allocator, "{s}().then(() => ", .{init_name});
+        const self_call = std.mem.indexOfPos(u8, contents, body_open + 1, self_prefix) orelse {
+            search_from = body_close + "\n});".len;
+            continue;
+        };
+        if (self_call >= body_close) {
+            search_from = body_close + "\n});".len;
+            continue;
+        }
+        const exports_start = self_call + self_prefix.len;
+        const exports_end = generatedIdentifierEnd(contents, exports_start);
+        if (exports_end == exports_start or exports_end >= body_close or contents[exports_end] != ')') {
+            search_from = body_close + "\n});".len;
+            continue;
+        }
+        const exports_name = contents[exports_start..exports_end];
+        const declaration = try std.fmt.allocPrint(allocator, "var {s} = {{}};", .{exports_name});
+        const declaration_start = std.mem.lastIndexOf(u8, contents[0..init_start], declaration) orelse {
+            search_from = body_close + "\n});".len;
+            continue;
+        };
+        const replacement = try std.fmt.allocPrint(
+            allocator,
+            "var {s} = ((target, marker = false) => new Proxy(target, {{ get(target, key, receiver) {{ return key === \"__esModule\" && !Object.hasOwn(target, key) ? marker || void 0 : Reflect.get(target, key, receiver); }}, set(target, key, value, receiver) {{ if (key === \"__esModule\" && !Object.hasOwn(target, key)) {{ marker = value === true; return true; }} return Reflect.set(target, key, value, receiver); }} }}))({{}});",
+            .{exports_name},
+        );
+        try replacements.append(allocator, .{
+            .start = declaration_start,
+            .end = declaration_start + declaration.len,
+            .text = replacement,
+        });
+        if (generatedSourcePathBefore(allocator, contents, declaration_start, working_dir)) |source_path| {
+            try appendGeneratedSelfRequires(
+                allocator,
+                &replacements,
+                contents,
+                body_open + 1,
+                body_close,
+                source_path,
+                exports_name,
+                has_to_common_js,
+            );
+        }
+        search_from = body_close + "\n});".len;
+    }
+    if (replacements.items.len == 0) return null;
+    std.mem.sort(GeneratedReplacement, replacements.items, {}, struct {
+        fn lessThan(_: void, left: GeneratedReplacement, right: GeneratedReplacement) bool {
+            return left.start < right.start;
+        }
+    }.lessThan);
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(c_allocator);
+    var copied_until: usize = 0;
+    for (replacements.items) |replacement| {
+        if (replacement.start < copied_until) continue;
+        try output.appendSlice(c_allocator, contents[copied_until..replacement.start]);
+        try output.appendSlice(c_allocator, replacement.text);
+        copied_until = replacement.end;
+    }
+    try output.appendSlice(c_allocator, contents[copied_until..]);
+    return try output.toOwnedSlice(c_allocator);
+}
+
+fn cloneGeneratedJavaScript(contents: []const u8, working_dir: []const u8) ![]u8 {
+    const generated = if (try patchGeneratedSelfImports(contents, working_dir)) |patched|
+        patched
+    else
+        try c_allocator.dupe(u8, contents);
+    if (std.mem.indexOf(u8, generated, generated_esm_initializer) == null) {
+        return generated;
+    }
+    // A recursive dynamic self-import can enter an async ESM initializer
+    // synchronously, before Bun's compact helper assigns its cached Promise.
+    // Publish an already-resolved placeholder during that call so the linker-
+    // generated namespace continuation can run, then cache the real result.
+    const patched = try std.mem.replaceOwned(
+        u8,
+        c_allocator,
+        generated,
+        generated_esm_initializer,
+        cottontail_esm_initializer,
+    );
+    c_allocator.free(generated);
+    return patched;
+}
+
 fn cloneGraphOutputFile(
     output_file: *const compiler.options.OutputFile,
     output_files: []const compiler.options.OutputFile,
+    working_dir: []const u8,
 ) !GraphOutputFile {
     const kind = graphOutputKind(output_file.output_kind) orelse return error.UnsupportedBundleOutputKind;
     if (output_file.value != .buffer) return error.UnsupportedBundleOutputStorage;
@@ -274,7 +586,10 @@ fn cloneGraphOutputFile(
     errdefer c_allocator.free(path);
     const source_path = try c_allocator.dupe(u8, output_file.src_path.text);
     errdefer c_allocator.free(source_path);
-    const contents = try c_allocator.dupe(u8, output_file.value.buffer.bytes);
+    const contents = if (output_file.loader.isJavaScriptLike())
+        try cloneGeneratedJavaScript(output_file.value.buffer.bytes, working_dir)
+    else
+        try c_allocator.dupe(u8, output_file.value.buffer.bytes);
     errdefer c_allocator.free(contents);
 
     var source_map: ?GraphSourceMap = null;
@@ -595,7 +910,7 @@ pub fn bundleEntryPointGraphWithOptions(
 
     for (result.output_files.items) |*output_file| {
         const kind = graphOutputKind(output_file.output_kind) orelse continue;
-        var file = cloneGraphOutputFile(output_file, result.output_files.items) catch |err| {
+        var file = cloneGraphOutputFile(output_file, result.output_files.items, working_dir) catch |err| {
             setError(error_out, "Invalid compiler graph output for {s}: {s}", .{
                 output_file.dest_path,
                 @errorName(err),

@@ -1339,7 +1339,7 @@ fn nativeBundleFailure(
 ) anyerror {
     if (error_message) |message| {
         defer native_bundler.ct_bundle_string_free(message);
-        const text = std.mem.span(message);
+        const text = decodeBundleDiagnostic(ctx, std.mem.span(message));
         if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
             reportTestBundleError(ctx, script_abs, text);
             cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
@@ -1359,6 +1359,15 @@ fn nativeBundleFailure(
     }
     ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
     return error.NativeBundleFailed;
+}
+
+fn decodeBundleDiagnostic(ctx: *const Context, wire: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, wire, native_bundler.binary_diagnostic_prefix)) return wire;
+    const encoded = wire[native_bundler.binary_diagnostic_prefix.len..];
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return wire;
+    const decoded = ctx.allocator.alloc(u8, decoded_len) catch return wire;
+    std.base64.standard.Decoder.decode(decoded, encoded) catch return wire;
+    return decoded;
 }
 
 fn bundleScriptNative(
@@ -1451,6 +1460,23 @@ fn bundleScriptNative(
     options.include_runtime_modules = true;
     options.preserve_external_require_name = true;
     options.inline_import_meta_properties = true;
+    var runtime_define_keys: std.ArrayList([]const u8) = .empty;
+    var runtime_define_values: std.ArrayList([]const u8) = .empty;
+    try runtime_define_keys.appendSlice(ctx.allocator, options.define_keys);
+    try runtime_define_values.appendSlice(ctx.allocator, options.define_values);
+    for ([_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "import.meta.resolveSync", .value = "globalThis.__ctMetaResolveSync" },
+        .{ .key = "import.meta.resolve", .value = "globalThis.__ctMetaResolve" },
+    }) |runtime_define| {
+        for (runtime_define_keys.items) |key| {
+            if (std.mem.eql(u8, key, runtime_define.key)) break;
+        } else {
+            try runtime_define_keys.append(ctx.allocator, runtime_define.key);
+            try runtime_define_values.append(ctx.allocator, runtime_define.value);
+        }
+    }
+    options.define_keys = runtime_define_keys.items;
+    options.define_values = runtime_define_values.items;
 
     const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
         "commonjs-launcher"
@@ -2080,15 +2106,41 @@ fn writeCottontailEntryWrapper(
         ctx.allocator,
         \\import __ctBunModule from {s};
         \\import {{ createRequire as __ctCreateRequire }} from "node:module";
+        \\import {{ existsSync as __ctExistsSync }} from "node:fs";
+        \\import {{ dirname as __ctPathDirname, resolve as __ctPathResolve }} from "node:path";
         \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__cottontailBundleSourceRoot ??= {s};
         \\globalThis.__filename ??= {s};
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
+        \\const __ctImportMetaParentDir = (parent) => {{
+        \\  let text = String(parent);
+        \\  if (text.startsWith("file:")) text = __ctBunModule.fileURLToPath(text);
+        \\  return __ctPathDirname(text);
+        \\}};
+        \\const __ctResolveImportMetaTypeScript = (specifier, parent) => {{
+        \\  const text = String(specifier);
+        \\  if (!text.startsWith(".") && !text.startsWith("/")) return undefined;
+        \\  const extension = text.endsWith(".mjs") ? ".mjs" : text.endsWith(".jsx") ? ".jsx" : text.endsWith(".js") ? ".js" : "";
+        \\  if (!extension) return undefined;
+        \\  const absolute = __ctPathResolve(__ctImportMetaParentDir(parent), text);
+        \\  const stem = absolute.slice(0, -extension.length);
+        \\  for (const replacement of extension === ".mjs" ? [".mts"] : [".ts", ".tsx", ".mts"]) {{
+        \\    const candidate = stem + replacement;
+        \\    if (__ctExistsSync(candidate)) return candidate;
+        \\  }}
+        \\  return undefined;
+        \\}};
         \\globalThis.__cottontailImportMetaResolveSync = (specifier, parent = {s}) => {{
         \\  const text = String(specifier);
         \\  if (text.startsWith("node:") || text.startsWith("bun:")) return text;
-        \\  return __ctBunModule.resolveSync(text, parent);
+        \\  try {{ return __ctBunModule.resolveSync(text, __ctImportMetaParentDir(parent)); }}
+        \\  catch (error) {{
+        \\    const rewritten = __ctResolveImportMetaTypeScript(text, parent);
+        \\    if (rewritten !== undefined) return rewritten;
+        \\    if (error && (typeof error === "object" || typeof error === "function")) error.referrer = String(parent);
+        \\    throw error;
+        \\  }}
         \\}};
         \\globalThis.__cottontailImportMetaResolve = (specifier, parent = {s}) => {{
         \\  const text = String(specifier);
@@ -2096,16 +2148,13 @@ fn writeCottontailEntryWrapper(
         \\  if (text.startsWith(".") || text.startsWith("/")) {{
         \\    return new URL(text, __ctBunModule.pathToFileURL(parent).href).href;
         \\  }}
-        \\  const resolved = __ctBunModule.resolveSync(text, parent);
+        \\  const resolved = __ctBunModule.resolveSync(text, __ctImportMetaParentDir(parent));
         \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
         \\}};
         \\globalThis.__ctMetaRequire ??= __ctCreateRequire({s});
         \\globalThis.require = globalThis.__ctMetaRequire;
-        \\globalThis.__ctMetaResolveSync ??= (specifier, parent = {s}) => __ctBunModule.resolveSync(specifier, parent);
-        \\globalThis.__ctMetaResolve ??= (specifier) => {{
-        \\  const resolved = __ctBunModule.resolveSync(specifier, {s});
-        \\  return resolved.startsWith("/") ? __ctBunModule.pathToFileURL(resolved).href : resolved;
-        \\}};
+        \\globalThis.__ctMetaResolveSync = (specifier, parent = {s}) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
+        \\globalThis.__ctMetaResolve = (specifier, parent = {s}) => globalThis.__cottontailImportMetaResolve(specifier, parent);
         \\{s}
         \\globalThis.__cottontailLoadDotenv?.();
         \\globalThis.__cottontailLoadingTestModules = true;
@@ -2358,6 +2407,7 @@ const DynamicImportOccurrence = struct {
     needs_await: bool = false,
     runtime_require: bool = false,
     runtime_require_resolve: bool = false,
+    native_bun_identity: bool = false,
     mock_binding_clause: ?[]const u8 = null,
     mock_binding_specifier: ?[]const u8 = null,
 };
@@ -2491,6 +2541,12 @@ fn decodeJavaScriptStringPrefix(allocator: std.mem.Allocator, expression: []cons
     return null;
 }
 
+fn isExactJavaScriptStringLiteral(expression: []const u8) bool {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    if (trimmed.len < 2 or (trimmed[0] != '\'' and trimmed[0] != '"')) return false;
+    return skipQuotedJavaScript(trimmed, 0) == trimmed.len;
+}
+
 fn pathWithoutQueryOrFragment(path: []const u8) []const u8 {
     const query = std.mem.indexOfScalar(u8, path, '?') orelse path.len;
     const fragment = std.mem.indexOfScalar(u8, path, '#') orelse path.len;
@@ -2607,6 +2663,7 @@ fn scanDynamicImports(
     resolution_dir: []const u8,
     occurrences: *std.ArrayList(DynamicImportOccurrence),
     targets: *std.ArrayList(DynamicImportTarget),
+    rewrite_standard_imports: bool,
 ) !bool {
     var has_custom_signal = false;
     const uses_module_mock = std.mem.indexOf(u8, source, "mock.module(") != null or
@@ -2863,34 +2920,67 @@ fn scanDynamicImports(
         var options = std.mem.trim(u8, if (comma) |index| arguments[index + 1 ..] else "undefined", " \t\r\n");
 
         var target_index: ?usize = null;
+        var native_bun_identity = false;
+        var needs_generated_loader = rewrite_standard_imports or comma != null;
         if (try decodeJavaScriptStringPrefix(ctx.allocator, expression)) |prefix| {
-            if (std.mem.indexOfAny(u8, prefix, "?#") != null) has_custom_signal = true;
+            if (std.mem.eql(u8, prefix, "bun") and isExactJavaScriptStringLiteral(expression)) {
+                native_bun_identity = true;
+                needs_generated_loader = true;
+            }
+            if (std.mem.indexOfAny(u8, prefix, "?#") != null) {
+                has_custom_signal = true;
+                needs_generated_loader = true;
+            }
             if (comma == null and isJsoncLikeSpecifier(prefix)) {
                 options = "{ with: { type: \"jsonc\" } }";
                 has_custom_signal = true;
+                needs_generated_loader = true;
             } else if (comma == null and isJson5Specifier(prefix)) {
                 options = "{ with: { type: \"json5\" } }";
                 has_custom_signal = true;
+                needs_generated_loader = true;
             } else if (comma == null and isTomlSpecifier(prefix)) {
                 options = "{ with: { type: \"toml\" } }";
                 has_custom_signal = true;
+                needs_generated_loader = true;
             } else if (comma == null) {
                 if (inferredLoaderForTarget(prefix)) |loader| {
                     options = try loaderOptionsLiteral(ctx, loader);
                     has_custom_signal = true;
+                    needs_generated_loader = true;
                 }
             }
-            if (try resolveDynamicImportTarget(ctx, resolution_dir, prefix)) |target_path| {
-                target_index = try dynamicTargetIndex(ctx.allocator, targets, target_path, uses_module_mock);
+            if (uses_module_mock) needs_generated_loader = true;
+            const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
+            // The compiler owns ordinary local module graphs once resolution
+            // succeeds. Unresolved literals still need the runtime dispatcher
+            // so native builtins and resolution failures retain Bun semantics.
+            if (!rewrite_standard_imports and !needs_generated_loader and target_path == null) {
+                needs_generated_loader = true;
             }
+            if (needs_generated_loader) {
+                if (target_path) |path| {
+                    target_index = try dynamicTargetIndex(ctx.allocator, targets, path, uses_module_mock);
+                }
+            }
+        } else {
+            // Opaque specifiers need the runtime dispatcher. Bun's linker owns
+            // ordinary literal JavaScript imports so it can preserve graph
+            // identity, cycles, live bindings, and top-level await propagation.
+            needs_generated_loader = true;
         }
         if (comma != null) has_custom_signal = true;
+        if (!needs_generated_loader) {
+            cursor = close + 1;
+            continue;
+        }
         try occurrences.append(ctx.allocator, .{
             .start = cursor,
             .end = close + 1,
             .expression = expression,
             .options = options,
             .target_index = target_index,
+            .native_bun_identity = native_bun_identity,
         });
         cursor = close + 1;
     }
@@ -2906,7 +2996,7 @@ fn rewriteTranspiledDynamicImports(
     defer occurrences.deinit(ctx.allocator);
     var targets: std.ArrayList(DynamicImportTarget) = .empty;
     defer targets.deinit(ctx.allocator);
-    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets);
+    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets, true);
 
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(ctx.allocator);
@@ -3085,6 +3175,9 @@ fn appendDynamicTargetFactory(
         \\  if (__ctRegistry.has(__ctKey)) return __ctRegistry.get(__ctKey);
         \\  const __ctPromise = (async () => {{
         \\    const __ctImportMeta = {{ url: __ctURL{d} + __ctSuffix, dir: {s}, dirname: {s}, file: {s}, path: __ctPath{d}, filename: __ctPath{d}, main: false }};
+        \\    __ctImportMeta.require = __ctCreateRequire(__ctPath{d});
+        \\    __ctImportMeta.resolveSync = (specifier, parent = __ctPath{d}) => globalThis.__cottontailImportMetaResolveSync(specifier, parent);
+        \\    __ctImportMeta.resolve = (specifier, parent = __ctPath{d}) => globalThis.__cottontailImportMetaResolve(specifier, parent);
         \\    const __ctRaw = {s};
         \\    if (__ctType === "text") return {{ default: __ctRaw }};
         \\    if (__ctType === "file" || __ctType === "css") return {{ default: __ctPath{d} }};
@@ -3111,7 +3204,7 @@ fn appendDynamicTargetFactory(
         \\    const module = {{ exports: {{}} }};
         \\    const exports = module.exports;
         \\
-    , .{ index, path_literal, index, url_literal, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, raw_literal, index, index, index, index, loader_guard });
+    , .{ index, path_literal, index, url_literal, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index, loader_guard });
     try output.appendSlice(ctx.allocator, prefix);
     if (cjs_source) |transpiled| {
         if (use_runtime_factory) {
@@ -3172,6 +3265,8 @@ fn appendDynamicDispatcher(
     resolution_dir: []const u8,
 ) !void {
     try output.appendSlice(ctx.allocator,
+        \\function __ctImportBun() { return Promise.resolve(globalThis.Bun); }
+        \\
         \\async function __ctImportDynamic(specifier, options) {
         \\  const __ctText = String(specifier);
         \\  const __ctMarker = __ctText.search(/[?#]/);
@@ -3344,7 +3439,7 @@ fn rewriteQueryImports(
 ) !?[]u8 {
     var occurrences: std.ArrayList(DynamicImportOccurrence) = .empty;
     var targets: std.ArrayList(DynamicImportTarget) = .empty;
-    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets);
+    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets, false);
     if (occurrences.items.len == 0) return null;
 
     var output: std.ArrayList(u8) = .empty;
@@ -3549,7 +3644,9 @@ fn rewriteQueryImports(
     var copied_until: usize = 0;
     for (occurrences.items) |occurrence| {
         try output.appendSlice(ctx.allocator, source[copied_until..occurrence.start]);
-        const function_name = if (occurrence.runtime_require_resolve)
+        const function_name = if (occurrence.native_bun_identity)
+            "__ctImportBun"
+        else if (occurrence.runtime_require_resolve)
             "__ctRuntimeRequire.resolve"
         else if (occurrence.runtime_require)
             "__ctRuntimeRequire"
