@@ -28,6 +28,7 @@ const TransformConfig = struct {
     inlining: bool = false,
     initial_indent: usize = 0,
     import_meta_main: ?bool = null,
+    preserve_use_strict: bool = false,
     structured_errors: bool = false,
     log_level: compiler.logger.Log.Level = .warn,
 };
@@ -240,6 +241,7 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (jsonBool(object, "allowBunRuntime")) |value| config.allow_runtime = value;
         if (jsonBool(object, "inline")) |value| config.inlining = value;
         if (jsonBool(object, "_cottontailImportMetaMain")) |value| config.import_meta_main = value;
+        if (jsonBool(object, "_cottontailPreserveUseStrict")) |value| config.preserve_use_strict = value;
         if (jsonBool(object, "_cottontailStructuredErrors")) |value| config.structured_errors = value;
         if (object.get("_cottontailInitialIndent")) |value| switch (value) {
             .integer => |count| {
@@ -532,6 +534,16 @@ fn process(
         setLogError(error_out, &log, err, config.structured_errors, temporary_allocator);
         return err;
     };
+
+    if (config.preserve_use_strict and std.mem.eql(u8, ast.directive orelse "", "use strict")) {
+        const indent_len = config.initial_indent * 2;
+        const directive = "\"use strict\";\n";
+        const output = try c_allocator.alloc(u8, indent_len + directive.len + printer.ctx.written.len);
+        @memset(output[0..indent_len], ' ');
+        @memcpy(output[indent_len .. indent_len + directive.len], directive);
+        @memcpy(output[indent_len + directive.len ..], printer.ctx.written);
+        return output;
+    }
 
     return try c_allocator.dupe(u8, printer.ctx.written);
 }

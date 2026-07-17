@@ -134,6 +134,11 @@ try {
       stdoutIncludes: ['commonjs using passed'],
     },
     {
+      name: 'commonjs-strict-mode',
+      scriptPath: join(rootDir, 'tests', 'js', 'commonjs-strict-mode.cjs'),
+      expectExitCode: 0,
+    },
+    {
       name: 'cli-test-banner-without-registered-tests',
       cwd: tempDir,
       argv: ['test', 'plain.test.js'],

@@ -966,6 +966,7 @@ function maybeTransformRuntimeSyntax(filename, source) {
 const FUNCTION_WRAPPER_LINE_OFFSET = 2;
 const CJS_FILENAME_BINDING = "__cottontailCjsFilename_4b86f6";
 const CJS_DIRNAME_BINDING = "__cottontailCjsDirname_4b86f6";
+const CJS_DYNAMIC_IMPORT_BINDING = "__cottontailCjsDynamicImport_4b86f6";
 
 function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_WRAPPER_LINE_OFFSET) {
   if (error instanceof SyntaxError || /syntax error/i.test(String(error?.message ?? error))) {
@@ -1010,24 +1011,44 @@ function executeCommonJsSource(module, filename, source) {
   }
   // Route dynamic import() in plain CJS through the runtime module loader so
   // it resolves like Bun/Node (e.g. unknown node: builtins reject with
-  // ERR_UNKNOWN_BUILTIN_MODULE instead of an opaque engine error). The helper
-  // is prepended on the same line to keep line numbers stable.
+  // ERR_UNKNOWN_BUILTIN_MODULE instead of an opaque engine error). Pass the
+  // helper as a wrapper binding so an explicit strict-mode directive remains
+  // the first statement in the CommonJS function body.
   let effectiveSource = source;
   if (/(?<![.\w$])import\s*\(/.test(effectiveSource)) {
-    effectiveSource =
-      "const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), __filename, options); " +
-      effectiveSource.replace(/(?<![.\w$])import\s*\(/g, "__ctDynamicImport(");
+    effectiveSource = effectiveSource.replace(
+      /(?<![.\w$])import\s*\(/g,
+      `${CJS_DYNAMIC_IMPORT_BINDING}(`,
+    );
   }
   maybeRegisterSourceMap(filename, effectiveSource);
   recordCompileCache(filename, effectiveSource);
   const wrapper = compileModuleWrapper(
-    ["exports", "require", "module", "__filename", "__dirname", CJS_FILENAME_BINDING, CJS_DIRNAME_BINDING],
+    [
+      "exports",
+      "require",
+      "module",
+      "__filename",
+      "__dirname",
+      CJS_FILENAME_BINDING,
+      CJS_DIRNAME_BINDING,
+      CJS_DYNAMIC_IMPORT_BINDING,
+    ],
     effectiveSource,
     filename,
   );
   const moduleDirname = dirname(filename);
   try {
-    wrapper(module.exports, module.require, module, filename, moduleDirname, filename, moduleDirname);
+    wrapper(
+      module.exports,
+      module.require,
+      module,
+      filename,
+      moduleDirname,
+      filename,
+      moduleDirname,
+      async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
+    );
   } catch (error) {
     throw remapThrownModuleError(error);
   }
@@ -1049,6 +1070,7 @@ function transpileExtensionSource(filename, loader) {
         deadCodeElimination: false,
         minify: { syntax: true },
         _cottontailInitialIndent: 1,
+        _cottontailPreserveUseStrict: true,
         // Keep CommonJS wrapper bindings live. The standalone transpiler would
         // otherwise fold them relative to its synthetic input filename.
         define: {
