@@ -1078,7 +1078,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
             const output_kind = output.object.get("kind");
             const is_entry = output_kind != null and output_kind.? == .string and std.mem.eql(u8, output_kind.?.string, "entry-point");
-            const relative_path = if (std.mem.startsWith(u8, path_value.string, "./")) path_value.string[2..] else path_value.string;
+            var relative_path = path_value.string;
+            while (std.mem.startsWith(u8, relative_path, "./")) relative_path = relative_path[2..];
             const destination = if (outfile != null and is_entry)
                 outfile
             else if (outdir) |dir|
