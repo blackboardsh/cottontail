@@ -29,11 +29,43 @@ export function escapeRegExpForPackageNameMatching(value) {
   });
 }
 
-export const cssInternals = new Proxy({}, {
-  get(_target, property) {
-    return internalUnavailable(`cssInternals.${String(property)}`);
+function runCssInternal(operation, source, _expected, options, minify = false) {
+  if (typeof source !== "string") {
+    throw new TypeError(`${operation}: expected source to be a string`);
+  }
+  const response = JSON.parse(cottontail.buildNative(JSON.stringify({
+    __cottontailCssInternals: { operation, source, options, minify },
+  }), cottontail.cwd()));
+  if (!response.success) throw new Error(response.error || "CSS operation failed");
+  return response.result;
+}
+
+export const cssInternals = {
+  minifyTestWithOptions(source, expected, options) {
+    return runCssInternal("minifyTestWithOptions", source, expected, options);
   },
-});
+  minifyErrorTestWithOptions(source, expected, options) {
+    return runCssInternal("minifyErrorTestWithOptions", source, expected, options);
+  },
+  testWithOptions(source, expected, options) {
+    return runCssInternal("testWithOptions", source, expected, options);
+  },
+  prefixTestWithOptions(source, expected, options) {
+    return runCssInternal("prefixTestWithOptions", source, expected, options);
+  },
+  minifyTest(source, expected, browsers) {
+    return runCssInternal("minifyTest", source, expected, browsers);
+  },
+  prefixTest(source, expected, browsers) {
+    return runCssInternal("prefixTest", source, expected, browsers);
+  },
+  _test(source, expected, browsers) {
+    return runCssInternal("_test", source, expected, browsers);
+  },
+  attrTest(source, expected, minify, browsers) {
+    return runCssInternal("attrTest", source, expected, browsers, Boolean(minify));
+  },
+};
 
 export const shellInternals = {
   builtinDisabled() {

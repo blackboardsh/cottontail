@@ -809,6 +809,225 @@ const BuildResultJson = struct {
     metafileMarkdown: ?[]const u8 = null,
 };
 
+// COTTONTAIL-COMPAT: Bun CSS internals - stock JSC cannot consume Bun's
+// $newZigFunction bindings, so the existing native build bridge carries the
+// same vendored Zig parser/minifier inputs and results as structured JSON.
+const CssInternalsResponse = struct {
+    success: bool,
+    result: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+const CssInternalsKind = enum {
+    normal,
+    minify,
+    prefix,
+};
+
+fn cssInternalsResponse(
+    allocator: std.mem.Allocator,
+    success: bool,
+    result: ?[]const u8,
+    error_message: ?[]const u8,
+) ![]u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, CssInternalsResponse{
+        .success = success,
+        .result = result,
+        .@"error" = error_message,
+    }, .{});
+    return try c_allocator.dupe(u8, json);
+}
+
+fn cssInternalsError(
+    allocator: std.mem.Allocator,
+    log: *const compiler.logger.Log,
+    fallback: []const u8,
+) ![]u8 {
+    for (log.msgs.items) |message| {
+        if (message.kind == .err) {
+            return cssInternalsResponse(allocator, false, null, message.data.text);
+        }
+    }
+    return cssInternalsResponse(allocator, false, null, fallback);
+}
+
+fn cssInteger(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @intCast(number) else null,
+        .float => |number| if (number >= 0 and number <= std.math.maxInt(u32)) @intFromFloat(number) else null,
+        else => null,
+    };
+}
+
+fn cssTargetsFromJson(value: ?std.json.Value) ?compiler.css.targets.Browsers {
+    var browsers: compiler.css.targets.Browsers = .{};
+    const object = if (value) |item| switch (item) {
+        .object => |object| object,
+        else => return null,
+    } else return null;
+
+    inline for (.{
+        .{ "android", "android" },
+        .{ "chrome", "chrome" },
+        .{ "edge", "edge" },
+        .{ "firefox", "firefox" },
+        .{ "ie", "ie" },
+        .{ "ios_saf", "ios_saf" },
+        .{ "opera", "opera" },
+        .{ "safari", "safari" },
+        .{ "samsung", "samsung" },
+    }) |entry| {
+        if (object.get(entry[0])) |item| {
+            if (cssInteger(item)) |number| @field(browsers, entry[1]) = number;
+        }
+    }
+    return browsers;
+}
+
+fn applyCssParserOptions(
+    options: *compiler.css.ParserOptions,
+    value: ?std.json.Value,
+) !void {
+    const object = if (value) |item| switch (item) {
+        .object => |object| object,
+        else => return,
+    } else return;
+    const flags = object.get("flags") orelse return;
+    if (flags != .array) return error.InvalidCssParserFlags;
+    for (flags.array.items) |flag| {
+        if (flag != .string) return error.InvalidCssParserFlags;
+        if (std.mem.eql(u8, flag.string, "DEEP_SELECTOR_COMBINATOR")) {
+            options.flags.deep_selector_combinator = true;
+        } else {
+            return error.InvalidCssParserFlag;
+        }
+    }
+}
+
+fn runCssStylesheetInternals(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    kind: CssInternalsKind,
+    parser_options_value: ?std.json.Value,
+    browsers_value: ?std.json.Value,
+) ![]u8 {
+    var log = compiler.logger.Log.init(allocator);
+    defer log.deinit();
+    var parser_options = compiler.css.ParserOptions.default(allocator, &log);
+    applyCssParserOptions(&parser_options, parser_options_value) catch |err| {
+        const message = switch (err) {
+            error.InvalidCssParserFlags => "flags must be an array",
+            error.InvalidCssParserFlag => "invalid CSS parser flag",
+        };
+        return cssInternalsResponse(allocator, false, null, message);
+    };
+
+    var import_records = compiler.BabyList(compiler.ImportRecord){};
+    switch (compiler.css.StyleSheet(compiler.css.DefaultAtRule).parse(
+        allocator,
+        source,
+        parser_options,
+        &import_records,
+        compiler.bundle_v2.Index.invalid,
+    )) {
+        .result => |parsed| {
+            var stylesheet, var extra = parsed;
+            var minify_options = compiler.css.MinifyOptions.default();
+            minify_options.targets.browsers = cssTargetsFromJson(browsers_value);
+            switch (stylesheet.minify(allocator, minify_options, &extra)) {
+                .result => {},
+                .err => return cssInternalsError(allocator, &log, "CSS minification failed"),
+            }
+
+            const symbols = compiler.ast.Symbol.Map{};
+            var local_names = compiler.css.LocalsResultsMap{};
+            return switch (stylesheet.toCss(
+                allocator,
+                .{
+                    .minify = kind == .minify,
+                    .targets = .{ .browsers = minify_options.targets.browsers },
+                },
+                .initOutsideOfBundler(&import_records),
+                &local_names,
+                &symbols,
+            )) {
+                .result => |result| cssInternalsResponse(allocator, true, result.code, null),
+                .err => cssInternalsError(allocator, &log, "CSS printing failed"),
+            };
+        },
+        .err => return cssInternalsError(allocator, &log, "CSS parsing failed"),
+    }
+}
+
+fn runCssAttributeInternals(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    minify: bool,
+    browsers_value: ?std.json.Value,
+) ![]u8 {
+    var log = compiler.logger.Log.init(allocator);
+    defer log.deinit();
+    const parser_options = compiler.css.ParserOptions.default(allocator, &log);
+    var import_records = compiler.BabyList(compiler.ImportRecord){};
+    switch (compiler.css.StyleAttribute.parse(
+        allocator,
+        source,
+        parser_options,
+        &import_records,
+        compiler.bundle_v2.Index.invalid,
+    )) {
+        .result => |parsed| {
+            var stylesheet = parsed;
+            var minify_options = compiler.css.MinifyOptions.default();
+            minify_options.targets.browsers = cssTargetsFromJson(browsers_value);
+            stylesheet.minify(allocator, minify_options);
+            const printed = stylesheet.toCss(
+                allocator,
+                .{ .minify = minify, .targets = minify_options.targets },
+                .initOutsideOfBundler(&import_records),
+            ) catch return cssInternalsError(allocator, &log, "CSS attribute printing failed");
+            return cssInternalsResponse(allocator, true, printed.code, null);
+        },
+        .err => return cssInternalsError(allocator, &log, "CSS attribute parsing failed"),
+    }
+}
+
+fn runCssInternalsRequest(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    if (value != .object) return cssInternalsResponse(allocator, false, null, "Invalid CSS internals request");
+    const object = value.object;
+    const operation_value = object.get("operation") orelse
+        return cssInternalsResponse(allocator, false, null, "CSS internals operation is required");
+    const source_value = object.get("source") orelse
+        return cssInternalsResponse(allocator, false, null, "CSS source is required");
+    if (operation_value != .string or source_value != .string) {
+        return cssInternalsResponse(allocator, false, null, "CSS internals operation and source must be strings");
+    }
+    const operation = operation_value.string;
+    const source = source_value.string;
+    if (std.mem.eql(u8, operation, "attrTest")) {
+        const minify = if (object.get("minify")) |item| item == .bool and item.bool else false;
+        return runCssAttributeInternals(allocator, source, minify, object.get("options"));
+    }
+
+    const kind: CssInternalsKind = if (std.mem.startsWith(u8, operation, "minify"))
+        .minify
+    else if (std.mem.startsWith(u8, operation, "prefix"))
+        .prefix
+    else
+        .normal;
+    const with_parser_options = std.mem.endsWith(u8, operation, "WithOptions");
+    return runCssStylesheetInternals(
+        allocator,
+        source,
+        kind,
+        if (with_parser_options) object.get("options") else null,
+        if (with_parser_options) null else object.get("options"),
+    );
+}
+
 fn buildLogFromMessage(allocator: std.mem.Allocator, message: *const compiler.logger.Msg) !BuildLogJson {
     var entry = BuildLogJson{
         .name = if (message.metadata == .resolve) "ResolveMessage" else "BuildMessage",
@@ -885,6 +1104,9 @@ pub fn buildEntryPointsJson(
         return error.InvalidOptions;
     }
     const request_object = parsed_request.value.object;
+    if (request_object.get("__cottontailCssInternals")) |css_request| {
+        return runCssInternalsRequest(arena_allocator, css_request);
+    }
     var entry_points: std.ArrayList([]const u8) = .empty;
     if (request_object.get("entrypoints")) |value| {
         if (value == .array) {

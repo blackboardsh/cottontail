@@ -891,12 +891,13 @@
       "reason": "Long-running CSS fuzz coverage currently exceeds the direct upstream runner timeout under Cottontail."
     },
     "test/js/bun/css/css.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun's real cssInternals parser/minifier implementation from bun:internal-for-testing."
+      "status": "enabled",
+      "reason": "Cottontail exposes Bun's vendored Zig CSS parser/minifier through bun:internal-for-testing; all 1,028 active upstream cases pass and Bun's own 67 cases remain skipped."
     },
     "test/js/bun/css/doesnt_crash.test.ts": {
-      "status": "expected-failure",
-      "reason": "Large CSS Bun.build fixtures still fail through the delegated build driver even when its subprocess exits 0."
+      "status": "enabled",
+      "timeoutMs": 180000,
+      "reason": "All 60 large real-world CSS parser/minifier stability cases pass with 180 assertions; the extended timeout accommodates repeated multi-megabyte fixture builds."
     },
     "test/js/bun/dns/dns-prefetch.test.ts": {
       "status": "expected-failure",
