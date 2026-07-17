@@ -1,3 +1,4 @@
+import "../internal/v8-date-parser.js";
 import * as FFI from "./ffi.js";
 import * as nodeDns from "../node/dns.js";
 import * as nodeHttp from "../node/http.js";
