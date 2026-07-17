@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { once } from "node:events";
 import { createServer, type Server } from "node:http";
-import { gzipSync } from "node:zlib";
+import { Writable } from "node:stream";
+import { brotliCompressSync, deflateRawSync, gzipSync, zstdCompressSync } from "node:zlib";
 
 const servers = new Set<Server>();
 
@@ -141,6 +142,39 @@ describe("fetch source transport", () => {
     expect(await (await fetch(origin.url)).text()).toBe("ok");
     expect(connections).toBe(1);
   });
+
+  test("decodes gzip, raw deflate, Brotli, and Zstd through a backpressured body stream", async () => {
+    const content = Buffer.from("streamed decoded content\n".repeat(20_000));
+    const encodings = new Map([
+      ["/gzip", ["gzip", gzipSync(content)]],
+      ["/deflate", ["deflate", deflateRawSync(content)]],
+      ["/br", ["br", brotliCompressSync(content)]],
+      ["/zstd", ["zstd", zstdCompressSync(content)]],
+    ] as const);
+    const { url } = await listen((request, response) => {
+      const [encoding, compressed] = encodings.get(request.url ?? "")!;
+      response.writeHead(200, {
+        "content-encoding": encoding,
+        "content-length": compressed.byteLength,
+      });
+      const split = Math.max(1, Math.floor(compressed.byteLength / 3));
+      response.write(compressed.subarray(0, split));
+      response.write(compressed.subarray(split, split * 2));
+      response.end(compressed.subarray(split * 2));
+    });
+
+    for (const path of encodings.keys()) {
+      const reader = (await fetch(`${url}${path}`)).body!.getReader();
+      const chunks: Uint8Array[] = [];
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) break;
+        chunks.push(result.value);
+      }
+      expect(Buffer.concat(chunks)).toEqual(content);
+      expect(chunks.length).toBeGreaterThan(1);
+    }
+  });
 });
 
 describe("node:undici source port", () => {
@@ -244,5 +278,120 @@ describe("node:undici source port", () => {
     expect(mime.essence).toBe("text/html");
     expect(mime.parameters.get("charset")).toBe("utf-8");
     expect(undici.serializeAMimeType(mime)).toBe("text/html;charset=utf-8");
+  });
+
+  test("honors dispatcher and writable backpressure and waits for graceful close", async () => {
+    const undici = require("node:undici");
+    let releaseResponse!: () => void;
+    const responseReleased = new Promise<void>(resolve => { releaseResponse = resolve; });
+    const { url } = await listen(async (request, response) => {
+      if (request.url === "/delayed") {
+        response.writeHead(200);
+        response.write("first");
+        await responseReleased;
+        response.end("second");
+        return;
+      }
+      response.end("dispatcher-body");
+    });
+
+    const streamed: Buffer[] = [];
+    const result = await undici.stream(url, {}, () => new Writable({
+      highWaterMark: 1,
+      write(chunk, _encoding, callback) {
+        setTimeout(() => {
+          streamed.push(Buffer.from(chunk));
+          callback();
+        }, 1);
+      },
+    }));
+    expect(Buffer.concat(streamed).toString()).toBe("dispatcher-body");
+    expect(result.trailers).toBeDefined();
+
+    const client = new undici.Client(url);
+    let resume!: () => void;
+    const dispatched: Buffer[] = [];
+    await new Promise<void>((resolve, reject) => {
+      client.dispatch({ path: "/" }, {
+        onConnect() {},
+        onHeaders(_status, _headers, resumeRequest) {
+          resume = resumeRequest;
+          queueMicrotask(resume);
+          return false;
+        },
+        onData(chunk) {
+          dispatched.push(Buffer.from(chunk));
+          queueMicrotask(resume);
+          return false;
+        },
+        onComplete() { resolve(); },
+        onError(error) { reject(error); },
+      });
+    });
+    expect(Buffer.concat(dispatched).toString()).toBe("dispatcher-body");
+
+    const delayed = await client.request({ path: "/delayed" });
+    let closed = false;
+    const closing = client.close().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    releaseResponse();
+    expect(await delayed.body.text()).toBe("firstsecond");
+    await closing;
+    expect(closed).toBe(true);
+  });
+
+  test("implements duplex pipeline", async () => {
+    const undici = require("node:undici");
+    const { url } = await listen((request, response) => request.pipe(response));
+
+    const duplex = undici.pipeline(url, { method: "POST" }, ({ body }) => body);
+    duplex.end("pipeline-body");
+    const pipelineChunks: Buffer[] = [];
+    for await (const chunk of duplex) pipelineChunks.push(Buffer.from(chunk));
+    expect(Buffer.concat(pipelineChunks).toString()).toBe("pipeline-body");
+  });
+
+  test("implements CONNECT with a live socket", async () => {
+    const undici = require("node:undici");
+    const { server, url } = await listen((_request, response) => response.end());
+
+    server.once("connect", (request, socket) => {
+      expect(request.url).toBe("example.test:443");
+      socket.write("HTTP/1.1 200 Connection Established\r\n\r\nconnected");
+    });
+    const connected = await undici.connect(url, { path: "example.test:443" });
+    expect(connected.statusCode).toBe(200);
+    expect(Buffer.from((await once(connected.socket, "data"))[0]).toString()).toBe("connected");
+    connected.socket.destroy();
+  });
+
+  test("implements Upgrade with a live socket", async () => {
+    const undici = require("node:undici");
+    const { server, url } = await listen((_request, response) => response.end());
+    server.once("upgrade", (request, socket) => {
+      expect(request.headers.upgrade).toBe("cottontail");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cottontail\r\n\r\nupgraded",
+      );
+    });
+    const upgraded = await undici.upgrade(`${url}/upgrade`, { upgrade: "cottontail" });
+    expect(upgraded.statusCode).toBe(101);
+    expect(Buffer.from((await once(upgraded.socket, "data"))[0]).toString()).toBe("upgraded");
+    upgraded.socket.destroy();
+  });
+
+  test("aborts active bodies during forced dispatcher disposal", async () => {
+    const undici = require("node:undici");
+    const hanging = await listen((_request, response) => {
+      response.writeHead(200);
+      response.write("partial");
+    });
+    const agent = new undici.Agent();
+    const pending = await agent.request({ origin: hanging.url, path: "/" });
+    const consuming = pending.body.text();
+    const destroying = agent.destroy();
+    await expect(consuming).rejects.toMatchObject({ code: "UND_ERR_DESTROYED" });
+    await destroying;
   });
 });

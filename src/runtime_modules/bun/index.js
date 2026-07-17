@@ -6043,7 +6043,7 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
     // regular fetch dispatch (active-server fast path or node:http/https).
     const nextIsLocal = isLoopbackHttpUrl(nextUrl) || isLoopbackHttpsUrl(nextUrl) || activeServerForFetchUrl(nextUrl);
     if (!nextIsLocal) return fetchImpl(nextRequest, { redirect: redirectMode });
-    const nextActive = activeServerForFetchUrl(nextUrl);
+    const nextActive = new URL(nextUrl).protocol === "http:" ? activeServerForFetchUrl(nextUrl) : null;
     if (nextActive) return fetchFromActiveServer(nextActive, nextRequest, redirectMode, depth + 1, true);
   }
   return fetchFromNodeHttp(nextRequest, redirectMode, depth + 1, true, nextTransport);
@@ -6144,6 +6144,7 @@ function headersFromIncomingMessage(message) {
 function incomingMessageBodyStream(message, signal) {
   let controller;
   let done = false;
+  let paused = false;
   const cleanup = () => {
     message.off?.("data", onData);
     message.off?.("end", onEnd);
@@ -6160,7 +6161,10 @@ function incomingMessageBodyStream(message, signal) {
   const onData = chunk => {
     if (done) return;
     controller.enqueue(Buffer.from(chunk));
-    if (controller.desiredSize <= 0) message.pause?.();
+    if (controller.desiredSize <= 0) {
+      paused = true;
+      message.pause?.();
+    }
   };
   const onEnd = () => finish(() => controller.close());
   const onError = error => finish(() => controller.error(normalizeFetchNetworkError(error)));
@@ -6175,7 +6179,6 @@ function incomingMessageBodyStream(message, signal) {
     message.on?.("error", () => {});
     message.destroy?.(reason);
   };
-  message.pause?.();
   return new globalThis.ReadableStream({
     start(streamController) {
       controller = streamController;
@@ -6185,9 +6188,13 @@ function incomingMessageBodyStream(message, signal) {
       message.once?.("aborted", onAborted);
       signal?.addEventListener?.("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
+      else message.resume?.();
     },
     pull() {
-      if (!done) message.resume?.();
+      if (!done && paused) {
+        paused = false;
+        message.resume?.();
+      }
     },
     cancel(reason) {
       if (done) return;
@@ -6468,7 +6475,8 @@ async function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, 
       nextTransport = { ...transport, socketPath: undefined };
     }
   }
-  const activeServer = !nextTransport.proxy?.active && activeServerForFetchUrl(nextRequest.url);
+  const nextUrl = new URL(nextRequest.url);
+  const activeServer = nextUrl.protocol === "http:" && !nextTransport.proxy?.active && activeServerForFetchUrl(nextRequest.url);
   if (activeServer) return fetchFromActiveServer(activeServer, nextRequest, redirectMode, depth + 1, true, nextTransport.decompress !== false);
   return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, nextTransport);
 }
@@ -6652,15 +6660,9 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
     let bodyMode = "eof"; // "length" | "chunked" | "eof" | "none"
     let bodyRemaining = 0;
     let chunkState = null;
-    let compressedChunks = null;
-    let responseEncoding = "";
 
     const enqueueBody = (chunk) => {
       if (chunk.byteLength === 0) return;
-      if (compressedChunks) {
-        compressedChunks.push(Buffer.from(chunk));
-        return;
-      }
       if (streamDone || !streamController) return;
       try {
         streamController.enqueue(Buffer.from(chunk));
@@ -6674,20 +6676,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
       if (finished) return;
       finished = true;
       request.signal?.removeEventListener?.("abort", onAbort);
-      if (compressedChunks) {
-        try {
-          const decoded = decompressFetchBytes(Buffer.concat(compressedChunks), responseEncoding);
-          if (!streamDone && streamController) {
-            if (decoded.byteLength > 0) streamController.enqueue(asBuffer(decoded));
-            streamController.close();
-          }
-        } catch (error) {
-          if (!streamDone && streamController) {
-            try { streamController.error(error); } catch {}
-          }
-        }
-        streamDone = true;
-      } else if (!streamDone && streamController) {
+      if (!streamDone && streamController) {
         streamDone = true;
         try { streamController.close(); } catch {}
       }
@@ -6700,8 +6689,6 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         .toLowerCase()
         .split(",")
         .some((token) => token.trim() === "close");
-      responseEncoding = String(headers.get("content-encoding") ?? "").trim().toLowerCase();
-      if (isCompressedFetchEncoding(responseEncoding)) compressedChunks = [];
       const transferEncoding = String(headers.get("transfer-encoding") ?? "").toLowerCase();
       const method = String(request.method).toUpperCase();
       if (status === 101) {
@@ -6738,13 +6725,14 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         },
       }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
       settled = true;
-      resolve(new Response(stream, {
+      const response = new Response(stream, {
         headers,
         status,
         statusText,
         url: request.url,
         redirected,
-      }));
+      });
+      resolve(decodeFetchResponse(response, transport.decompress !== false));
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
           // Ignore pipelined data.
@@ -7032,7 +7020,7 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   // Custom TLS configs must exercise real sockets so per-config connection
   // separation and requestIP() are observable (#27358).
   const customTlsSocketPath = customTlsConfig != null && isLoopbackHttpsUrl(request.url);
-  if (activeServer && !proxy.active && !wantsUpgrade && !customTlsSocketPath) {
+  if (activeServer && parsedUrl.protocol === "http:" && !proxy.active && !wantsUpgrade && !customTlsSocketPath) {
     applyDefaultFetchHeaders(request, fetchUsesKeepalive(request));
     return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress);
   }
@@ -7147,36 +7135,113 @@ function decompressionError(encoding, cause) {
   return error;
 }
 
+function fetchDeflateHasZlibWrapper(bytes) {
+  if (bytes.byteLength < 2) return false;
+  const cmf = bytes[0];
+  const flags = bytes[1];
+  return (cmf & 0x0f) === 8 && (cmf >>> 4) <= 7 && (((cmf << 8) | flags) % 31) === 0;
+}
+
+function createFetchDecompressor(encoding, firstBytes) {
+  const options = { chunkSize: 256 * 1024 };
+  if (encoding === "gzip" || encoding === "x-gzip") return zlib.createGunzip(options);
+  if (encoding === "deflate") {
+    return fetchDeflateHasZlibWrapper(firstBytes) ? zlib.createInflate(options) : zlib.createInflateRaw(options);
+  }
+  if (encoding === "br") return zlib.createBrotliDecompress(options);
+  if (encoding === "zstd") return zlib.createZstdDecompress(options);
+  return null;
+}
+
+// COTTONTAIL-COMPAT: Fetch uses Node Transform decoder output and propagates
+// decoded-body backpressure. Compressed input is retained per member/frame
+// because the host exposes only one-shot decode calls; native zlib/Brotli/Zstd
+// decoder create/write/end handles are required to produce decoded bytes and
+// apply transport backpressure before member/frame EOF.
 function decodedFetchBodyStream(body, encoding) {
-  // COTTONTAIL-COMPAT: Streaming decompression needs incremental zlib,
-  // Brotli, and Zstd decoder handles; the current host APIs are one-shot.
   let reader;
-  let started = false;
-  return new globalThis.ReadableStream({
-    async pull(controller) {
-      if (started) return;
-      started = true;
-      reader = body.getReader();
-      const chunks = [];
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(Buffer.from(value));
-        }
-        const raw = chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks);
-        if (raw.byteLength > 0) controller.enqueue(asBuffer(decompressFetchBytes(raw, encoding)));
-        controller.close();
-      } catch (cause) {
-        controller.error(cause?.name === "AbortError" || cause?.name === "TimeoutError" || cause?.code === "ECONNRESET"
-          ? cause
-          : decompressionError(encoding, cause));
+  let decoder;
+  let controller;
+  let done = false;
+  let sourceEnded = false;
+  let decoderEnded = false;
+  let wantsOutput = false;
+
+  const closeIfComplete = () => {
+    if (done || !sourceEnded || !decoderEnded) return;
+    done = true;
+    controller.close();
+  };
+
+  const fail = cause => {
+    if (done) return;
+    done = true;
+    controller.error(cause?.name === "AbortError" || cause?.name === "TimeoutError" || cause?.code === "ECONNRESET"
+      ? cause
+      : decompressionError(encoding, cause));
+  };
+
+  const attachDecoder = firstBytes => {
+    decoder = createFetchDecompressor(encoding, firstBytes);
+    decoder.pause?.();
+    decoder.on("data", chunk => {
+      if (done) return;
+      controller.enqueue(asBuffer(chunk));
+      if (controller.desiredSize <= 0) {
+        wantsOutput = false;
+        decoder.pause?.();
       }
+    });
+    decoder.once("end", () => {
+      decoderEnded = true;
+      closeIfComplete();
+    });
+    decoder.once("error", fail);
+    if (wantsOutput) decoder.resume?.();
+  };
+
+  const pump = async () => {
+    reader = body.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) break;
+        const chunk = Buffer.from(result.value);
+        if (chunk.byteLength > 0) chunks.push(chunk);
+      }
+      sourceEnded = true;
+      if (chunks.length === 0) {
+        decoderEnded = true;
+        done = true;
+        controller.close();
+      } else {
+        const input = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+        attachDecoder(input);
+        decoder.end(input);
+      }
+      closeIfComplete();
+    } catch (cause) {
+      try { decoder?.destroy?.(); } catch {}
+      fail(cause);
+    }
+  };
+
+  return new globalThis.ReadableStream({
+    start(streamController) {
+      controller = streamController;
+      void pump();
+    },
+    pull() {
+      wantsOutput = true;
+      decoder?.resume?.();
     },
     cancel(reason) {
+      done = true;
+      try { decoder?.destroy?.(); } catch {}
       return reader?.cancel?.(reason);
     },
-  }, new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
+  }, new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }));
 }
 
 function decodeFetchResponse(response, decompress = true) {
@@ -7243,7 +7308,9 @@ async function fetchFromActiveServer(activeServer, request, redirectMode, depth,
   if (!location) return decodeFetchResponse(response, decompress);
   try { await response.body?.cancel?.(); } catch {}
   const nextRequest = redirectedFetchRequest(request, response, location);
-  const nextActiveServer = activeServerForFetchUrl(nextRequest.url);
+  const nextActiveServer = new URL(nextRequest.url).protocol === "http:"
+    ? activeServerForFetchUrl(nextRequest.url)
+    : null;
   if (nextActiveServer) return fetchFromActiveServer(nextActiveServer, nextRequest, redirectMode, depth + 1, true, decompress);
   return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, { decompress });
 }
