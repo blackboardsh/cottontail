@@ -2939,6 +2939,7 @@ async function ctRunCompiledBuild(options, compile, state) {
   const env = { ...(globalThis.process?.env ?? {}) };
   delete env.COTTONTAIL_TEST_CLI_HEADER_PRINTED;
   delete env.COTTONTAIL_TEST_AGGREGATE_FILE;
+  env.COTTONTAIL_BUILD_OUTPUT_MANIFEST = "1";
   let processResult;
   try {
     processResult = cottontail.spawnSync(globalThis.process?.execPath ?? cottontail.execPath(), args, {
@@ -2983,6 +2984,18 @@ async function ctRunCompiledBuild(options, compile, state) {
       });
       executableArtifact.sourcemap = mapArtifact;
       outputs.push(mapArtifact);
+    }
+    const buildStdout = new TextDecoder().decode(asBuffer(processResult.stdout ?? ""));
+    for (const line of buildStdout.split(/\r?\n/)) {
+      if (!line.startsWith("COTTONTAIL_SOURCEMAP\t")) continue;
+      const extraMapPath = line.slice("COTTONTAIL_SOURCEMAP\t".length);
+      if (!extraMapPath || extraMapPath === mapPath || !(await file(extraMapPath).exists())) continue;
+      outputs.push(new CTBuildArtifact(new Uint8Array(await file(extraMapPath).arrayBuffer()), {
+        path: extraMapPath,
+        kind: "sourcemap",
+        loader: "json",
+        hash: null,
+      }));
     }
   }
   const result = {

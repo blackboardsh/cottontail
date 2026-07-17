@@ -19,6 +19,12 @@ int ct_jsc_runtime_set_args(
     const char *const *exec_argv,
     char **error_out
 );
+int ct_jsc_runtime_set_standalone_files(
+    CtJscRuntime *runtime,
+    const uint8_t *data,
+    size_t data_len,
+    char **error_out
+);
 int ct_jsc_runtime_eval(
     CtJscRuntime *runtime,
     const uint8_t *source,

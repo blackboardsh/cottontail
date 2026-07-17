@@ -549,14 +549,29 @@ fn writeBuildFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
+fn standaloneExtraSourceMapPath(allocator: std.mem.Allocator, output_path: []const u8, map_path: []const u8) ![]const u8 {
+    var relative = map_path;
+    while (std.mem.startsWith(u8, relative, "./")) relative = relative[2..];
+    if (relative.len == 0 or std.fs.path.isAbsolute(relative) or
+        std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../"))
+    {
+        return error.InvalidStandaloneSourceMapPath;
+    }
+    const output_dir = std.fs.path.dirname(output_path) orelse ".";
+    return try std.fs.path.join(allocator, &.{ output_dir, relative });
+}
+
 const standalone_magic_v1 = "COTTONTAIL-STAND";
-const standalone_magic = "COTTONTAIL-STAND2";
+const standalone_magic_v2 = "COTTONTAIL-STAND2";
+const standalone_magic = "COTTONTAIL-STAND3";
 const standalone_trailer_v1_len = @sizeOf(u64) + standalone_magic_v1.len;
-const standalone_trailer_len = @sizeOf(u64) * 2 + standalone_magic.len;
+const standalone_trailer_v2_len = @sizeOf(u64) * 2 + standalone_magic_v2.len;
+const standalone_trailer_len = @sizeOf(u64) * 3 + standalone_magic.len;
 
 const StandalonePayload = struct {
     source: []const u8,
     source_map: ?[]const u8 = null,
+    files: ?[]const u8 = null,
 };
 
 fn loadStandalonePayload(init: std.process.Init) !?StandalonePayload {
@@ -570,7 +585,45 @@ fn loadStandalonePayload(init: std.process.Init) !?StandalonePayload {
         var trailer: [standalone_trailer_len]u8 = undefined;
         const trailer_offset = executable_len - standalone_trailer_len;
         if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
-            std.mem.eql(u8, trailer[@sizeOf(u64) * 2 ..], standalone_magic))
+            std.mem.eql(u8, trailer[@sizeOf(u64) * 3 ..], standalone_magic))
+        {
+            const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
+            const map_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little);
+            const files_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], .little);
+            const source_len = std.math.cast(usize, source_len_u64) orelse return error.InvalidStandaloneExecutable;
+            const map_len = std.math.cast(usize, map_len_u64) orelse return error.InvalidStandaloneExecutable;
+            const files_len = std.math.cast(usize, files_len_u64) orelse return error.InvalidStandaloneExecutable;
+            if (source_len > 512 * 1024 * 1024 or map_len > 512 * 1024 * 1024 or files_len > 512 * 1024 * 1024 or
+                source_len > trailer_offset or map_len > trailer_offset - source_len or
+                files_len > trailer_offset - source_len - map_len)
+            {
+                return error.InvalidStandaloneExecutable;
+            }
+            const payload_offset = trailer_offset - source_len - map_len - files_len;
+            const source = try allocator.alloc(u8, source_len);
+            if (try executable.readPositionalAll(init.io, source, payload_offset) != source.len)
+                return error.InvalidStandaloneExecutable;
+            const source_map = if (map_len > 0) blk: {
+                const map = try allocator.alloc(u8, map_len);
+                if (try executable.readPositionalAll(init.io, map, payload_offset + source_len) != map.len)
+                    return error.InvalidStandaloneExecutable;
+                break :blk map;
+            } else null;
+            const files = if (files_len > 0) blk: {
+                const files = try allocator.alloc(u8, files_len);
+                if (try executable.readPositionalAll(init.io, files, payload_offset + source_len + map_len) != files.len)
+                    return error.InvalidStandaloneExecutable;
+                break :blk files;
+            } else null;
+            return .{ .source = source, .source_map = source_map, .files = files };
+        }
+    }
+
+    if (executable_len >= standalone_trailer_v2_len) {
+        var trailer: [standalone_trailer_v2_len]u8 = undefined;
+        const trailer_offset = executable_len - standalone_trailer_v2_len;
+        if (try executable.readPositionalAll(init.io, &trailer, trailer_offset) == trailer.len and
+            std.mem.eql(u8, trailer[@sizeOf(u64) * 2 ..], standalone_magic_v2))
         {
             const source_len_u64 = std.mem.readInt(u64, trailer[0..@sizeOf(u64)], .little);
             const map_len_u64 = std.mem.readInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], .little);
@@ -631,15 +684,26 @@ fn writeStandaloneExecutable(
     try output.writePositionalAll(init.io, payload.source, executable_len);
     const source_map = payload.source_map orelse "";
     try output.writePositionalAll(init.io, source_map, executable_len + payload.source.len);
+    const files = payload.files orelse "";
+    try output.writePositionalAll(init.io, files, executable_len + payload.source.len + source_map.len);
     var trailer: [standalone_trailer_len]u8 = undefined;
     std.mem.writeInt(u64, trailer[0..@sizeOf(u64)], @intCast(payload.source.len), .little);
     std.mem.writeInt(u64, trailer[@sizeOf(u64) .. @sizeOf(u64) * 2], @intCast(source_map.len), .little);
-    @memcpy(trailer[@sizeOf(u64) * 2 ..], standalone_magic);
-    try output.writePositionalAll(init.io, &trailer, executable_len + payload.source.len + source_map.len);
+    std.mem.writeInt(u64, trailer[@sizeOf(u64) * 2 .. @sizeOf(u64) * 3], @intCast(files.len), .little);
+    @memcpy(trailer[@sizeOf(u64) * 3 ..], standalone_magic);
+    try output.writePositionalAll(
+        init.io,
+        &trailer,
+        executable_len + payload.source.len + source_map.len + files.len,
+    );
 
     if (write_external_source_map and payload.source_map != null) {
         const map_path = try std.mem.concat(init.arena.allocator(), u8, &.{ output_path, ".map" });
         try writeBuildFile(init.io, map_path, source_map);
+        for (payload.source_maps) |extra_map| {
+            const extra_path = try standaloneExtraSourceMapPath(init.arena.allocator(), output_path, extra_map.path);
+            try writeBuildFile(init.io, extra_path, extra_map.contents);
+        }
     }
 }
 
@@ -677,6 +741,7 @@ fn runStandaloneIfPresent(
         args[0],
         payload.source,
         payload.source_map,
+        payload.files,
         args[script_start..],
         exec_args[0..exec_len],
     );
@@ -992,6 +1057,14 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             payload,
             requested_source_map == .external or requested_source_map == .linked,
         );
+        if (init.environ_map.get("COTTONTAIL_BUILD_OUTPUT_MANIFEST") != null and
+            (requested_source_map == .external or requested_source_map == .linked))
+        {
+            for (payload.source_maps) |extra_map| {
+                const map_path = try standaloneExtraSourceMapPath(allocator, destination, extra_map.path);
+                try stdout.print("COTTONTAIL_SOURCEMAP\t{s}\n", .{map_path});
+            }
+        }
         try stdout.print("{s}\n", .{destination});
         try stdout.flush();
         return 0;

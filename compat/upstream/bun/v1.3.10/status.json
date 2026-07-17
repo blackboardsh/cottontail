@@ -362,6 +362,10 @@
       "status": "enabled",
       "reason": "Bun.build standalone compilation embeds and executes WebAssembly assets successfully (1 bun:test case, 6 assertions)."
     },
+    "test/bundler/bun-build-compile-sourcemap.test.ts": {
+      "status": "enabled",
+      "reason": "Standalone source maps pass inline, external, linked, nested-outfile, multi-source, and real split-module graph coverage. Split chunks and their unique maps are embedded, resolved from memory, materialized when requested, and execute successfully (9 bun:test cases, 79 assertions)."
+    },
     "test/bundler/bun-build-compile.test.ts": {
       "status": "enabled",
       "reason": "Bun.build compile target validation, outfile/outdir resolution, native executable headers, embedded CommonJS entry graphs, and executable launch behavior pass the copied upstream file (6 bun:test cases, 23 assertions)."

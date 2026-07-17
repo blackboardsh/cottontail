@@ -303,14 +303,14 @@ function standaloneFileEntry(path) {
   const candidates = normalized === text ? [text] : [text, normalized];
   if (typeof files.has === "function" && typeof files.get === "function") {
     for (const candidate of candidates) {
-      if (files.has(candidate)) return { found: true, value: String(files.get(candidate)) };
+      if (files.has(candidate)) return { found: true, value: files.get(candidate) };
     }
     return { found: false, value: undefined };
   }
   if (typeof files === "object") {
     for (const candidate of candidates) {
       if (Object.prototype.hasOwnProperty.call(files, candidate)) {
-        return { found: true, value: String(files[candidate]) };
+        return { found: true, value: files[candidate] };
       }
     }
   }
@@ -333,7 +333,15 @@ function standaloneDirectoryExists(path) {
 
 function readModuleFile(path) {
   const embedded = standaloneFileEntry(path);
-  return embedded.found ? embedded.value : cottontail.readFile(path);
+  if (!embedded.found) return cottontail.readFile(path);
+  if (typeof embedded.value === "string") return embedded.value;
+  if (embedded.value instanceof ArrayBuffer) return new TextDecoder().decode(embedded.value);
+  if (ArrayBuffer.isView(embedded.value)) {
+    return new TextDecoder().decode(
+      new Uint8Array(embedded.value.buffer, embedded.value.byteOffset, embedded.value.byteLength),
+    );
+  }
+  return String(embedded.value);
 }
 
 function modulePathExists(path) {

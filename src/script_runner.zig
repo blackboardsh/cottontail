@@ -31,12 +31,20 @@ const ScriptExecution = struct {
     exec_args: []const [:0]const u8,
     embedded_source: ?[]const u8 = null,
     embedded_source_map: ?[]const u8 = null,
+    embedded_files: ?[]const u8 = null,
     exit_code: u8 = 1,
 };
 
 pub const StandaloneSource = struct {
     source: []const u8,
     source_map: ?[]const u8 = null,
+    source_maps: []const StandaloneSourceMap = &.{},
+    files: ?[]const u8 = null,
+};
+
+pub const StandaloneSourceMap = struct {
+    path: []const u8,
+    contents: []const u8,
 };
 
 const Context = struct {
@@ -89,7 +97,7 @@ pub fn runWithExecArgvDisplay(
 
     if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
 
-    const runnable_path = bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null) catch |err| {
+    const runnable_path = bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null, null) catch |err| {
         if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
@@ -107,7 +115,7 @@ pub fn runWithExecArgvDisplay(
         process_args[index + 1] = arg;
     }
 
-    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
 }
 
 const BundleDiagnostic = struct {
@@ -284,14 +292,14 @@ pub fn runEval(
     const eval_path = try writeEvalEntrypoint(&ctx, ctx.project_root, source, print_result, module_input);
     var eval_path_active = true;
     defer if (eval_path_active) std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
-    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root, null);
+    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root, null, null);
     if (!std.mem.eql(u8, runnable_path, eval_path)) {
         std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
         eval_path_active = false;
     }
     defer cleanupRunnableDirectory(&ctx, runnable_path);
     const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
-    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null, null);
+    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null, null, null);
 }
 
 pub fn runEmbedded(
@@ -299,6 +307,7 @@ pub fn runEmbedded(
     executable_path: [:0]const u8,
     source: []const u8,
     source_map: ?[]const u8,
+    files: ?[]const u8,
     script_args: []const [:0]const u8,
     exec_args: []const [:0]const u8,
 ) !u8 {
@@ -311,7 +320,7 @@ pub fn runEmbedded(
         "B:/~BUN/root/index.js"
     else
         "/$bunfs/root/index.js";
-    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, source, source_map);
+    return try runPrepared(init, &ctx, virtual_path, process_args, 1, exec_args, source, source_map, files);
 }
 
 pub fn compileStandaloneSource(
@@ -321,29 +330,202 @@ pub fn compileStandaloneSource(
 ) !StandaloneSource {
     const ctx = try makeContext(init);
     const empty_args: [0][:0]const u8 = .{};
+    var standalone_options = build_options;
+    standalone_options.public_path = "";
+    standalone_options.entry_naming = "index.js";
+    if (standalone_options.source_map != .none) standalone_options.source_map = .linked;
+    var graph: native_bundler.BundleGraphOutput = undefined;
     const runnable_path = try bundleScriptNative(
         &ctx,
         script_path,
         empty_args[0..],
         empty_args[0..],
         null,
-        build_options,
+        standalone_options,
+        &graph,
     );
+    defer graph.deinit();
     defer cleanupRunnableDirectory(&ctx, runnable_path);
-    const source = try std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        runnable_path,
-        init.arena.allocator(),
-        .limited(512 * 1024 * 1024),
-    );
-    const source_map_path = try std.mem.concat(init.arena.allocator(), u8, &.{ runnable_path, ".map" });
-    const source_map = std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        source_map_path,
-        init.arena.allocator(),
-        .limited(512 * 1024 * 1024),
-    ) catch null;
-    return .{ .source = source, .source_map = source_map };
+    if (standalone_options.code_splitting) {
+        try bundleStandaloneBootstrap(&ctx, runnable_path, &graph, build_options.source_map != .none);
+    }
+    const entry = graph.entryPoint() orelse return error.MissingStandaloneEntryPoint;
+    const source = try init.arena.allocator().dupe(u8, entry.contents);
+    const source_map = if (entry.source_map) |source_map|
+        try init.arena.allocator().dupe(u8, source_map.contents)
+    else
+        null;
+    var source_maps: std.ArrayList(StandaloneSourceMap) = .empty;
+    for (graph.files, 0..) |file, index| {
+        if (index == graph.entry_point_file_index.?) continue;
+        if (file.source_map) |map| {
+            try source_maps.append(init.arena.allocator(), .{
+                .path = try init.arena.allocator().dupe(u8, map.path),
+                .contents = try init.arena.allocator().dupe(u8, map.contents),
+            });
+        }
+    }
+    const files = try serializeStandaloneGraph(&ctx, &graph);
+    return .{
+        .source = source,
+        .source_map = source_map,
+        .source_maps = try source_maps.toOwnedSlice(init.arena.allocator()),
+        .files = files,
+    };
+}
+
+fn standaloneGraphOutputPath(ctx: *const Context, output_path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(output_path)) return error.InvalidStandaloneGraphPath;
+    const normalized = try ctx.allocator.dupe(u8, output_path);
+    if (builtin.os.tag == .windows) std.mem.replaceScalar(u8, normalized, '\\', '/');
+    var trimmed: []const u8 = normalized;
+    while (std.mem.startsWith(u8, trimmed, "./")) trimmed = trimmed[2..];
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "..") or std.mem.startsWith(u8, trimmed, "../")) {
+        return error.InvalidStandaloneGraphPath;
+    }
+    return trimmed;
+}
+
+fn writeStandaloneGraphFile(ctx: *const Context, root: []const u8, path: []const u8, contents: []const u8) ![]const u8 {
+    const relative = try standaloneGraphOutputPath(ctx, path);
+    const destination = try std.fs.path.join(ctx.allocator, &.{ root, relative });
+    if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = destination, .data = contents });
+    return destination;
+}
+
+fn bundleStandaloneBootstrap(
+    ctx: *const Context,
+    runnable_path: []const u8,
+    graph: *native_bundler.BundleGraphOutput,
+    source_maps: bool,
+) !void {
+    const entry = graph.entryPoint() orelse return error.MissingStandaloneEntryPoint;
+    const runnable_dir = std.fs.path.dirname(runnable_path) orelse return error.InvalidStandaloneGraphPath;
+    const graph_root = try std.fs.path.join(ctx.allocator, &.{ runnable_dir, "standalone-graph" });
+    try std.Io.Dir.cwd().createDirPath(ctx.io, graph_root);
+
+    var disk_entry: ?[]const u8 = null;
+    for (graph.files, 0..) |file, index| {
+        const destination = try writeStandaloneGraphFile(ctx, graph_root, file.path, file.contents);
+        if (index == graph.entry_point_file_index.?) disk_entry = destination;
+        if (file.source_map) |source_map| {
+            _ = try writeStandaloneGraphFile(ctx, graph_root, source_map.path, source_map.contents);
+        }
+    }
+
+    const imports_json = try native_transpiler.scanImportsJson(entry.contents, "js");
+    defer std.heap.c_allocator.free(imports_json);
+    const ScannedImport = struct { path: []const u8, kind: []const u8 };
+    const parsed = try std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{});
+    defer parsed.deinit();
+    var dynamic_imports: std.ArrayList([]const u8) = .empty;
+    for (parsed.value) |item| {
+        if (std.mem.eql(u8, item.kind, "dynamic-import")) try dynamic_imports.append(ctx.allocator, item.path);
+    }
+
+    var options: native_bundler.BundleOptions = .{
+        .source_map = if (source_maps) .external else .none,
+        .output_format = .esm,
+        .target = .bun,
+        .external = dynamic_imports.items,
+        .entry_naming = "index.js",
+        .code_splitting = false,
+        .inline_import_meta_properties = true,
+        .preserve_external_require_name = true,
+    };
+    options.public_path = "";
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| native_bundler.ct_bundle_string_free(message);
+    var bootstrap = native_bundler.bundleEntryPointGraphWithOptions(
+        disk_entry orelse return error.MissingStandaloneEntryPoint,
+        graph_root,
+        options,
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| ctx.writeStderr("error: standalone bootstrap: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer bootstrap.deinit();
+    const bootstrap_entry = bootstrap.entryPoint() orelse return error.MissingStandaloneEntryPoint;
+
+    const replacement_contents = bootstrap_entry.takeContents();
+    if (entry.owns_contents) std.heap.c_allocator.free(entry.contents);
+    entry.contents = replacement_contents;
+    entry.owns_contents = true;
+    entry.hash = bootstrap_entry.hash;
+
+    var replacement_map: ?native_bundler.GraphSourceMap = null;
+    errdefer if (replacement_map) |*source_map| source_map.deinit();
+    if (bootstrap_entry.source_map) |source_map| {
+        replacement_map = .{
+            .path = try std.heap.c_allocator.dupe(u8, source_map.path),
+            .contents = try std.heap.c_allocator.dupe(u8, source_map.contents),
+        };
+    }
+    if (entry.source_map) |*source_map| source_map.deinit();
+    entry.source_map = replacement_map;
+}
+
+fn standaloneVirtualPath(
+    ctx: *const Context,
+    output_path: []const u8,
+) ![]const u8 {
+    const trimmed = try standaloneGraphOutputPath(ctx, output_path);
+
+    const root = if (builtin.os.tag == .windows) "B:/~BUN/root/" else "/$bunfs/root/";
+    return try std.mem.concat(ctx.allocator, u8, &.{ root, trimmed });
+}
+
+fn serializeStandaloneGraph(
+    ctx: *const Context,
+    graph: *const native_bundler.BundleGraphOutput,
+) ![]const u8 {
+    const entry_index = graph.entry_point_file_index orelse return error.MissingStandaloneEntryPoint;
+    const entry_path = graph.files[entry_index].path;
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(ctx.allocator, "CTGRAPH1");
+    try bytes.appendNTimes(ctx.allocator, 0, @sizeOf(u32));
+    var file_count: u32 = 0;
+
+    for (graph.files, 0..) |file, index| {
+        if (ctx.environ_map.get("COTTONTAIL_DEBUG_STANDALONE_GRAPH") != null) {
+            ctx.writeStderr("standalone graph: entry={s} output={s} bytes={d}\n", .{ entry_path, file.path, file.contents.len });
+        }
+        // The entry source is already the first standalone payload field. It
+        // is installed separately at the canonical virtual entry path.
+        if (index != entry_index) {
+            const path = try standaloneVirtualPath(ctx, file.path);
+            try appendStandaloneGraphFile(&bytes, ctx.allocator, path, file.contents);
+            file_count += 1;
+        }
+        if (file.source_map) |source_map| {
+            const map_path = try standaloneVirtualPath(ctx, source_map.path);
+            try appendStandaloneGraphFile(&bytes, ctx.allocator, map_path, source_map.contents);
+            file_count += 1;
+        }
+    }
+
+    var count_bytes: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &count_bytes, file_count, .little);
+    @memcpy(bytes.items["CTGRAPH1".len..][0..count_bytes.len], &count_bytes);
+    return try bytes.toOwnedSlice(ctx.allocator);
+}
+
+fn appendStandaloneGraphFile(
+    bytes: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    contents: []const u8,
+) !void {
+    if (path.len > std.math.maxInt(u32)) return error.StandaloneGraphPathTooLong;
+    var header: [1 + @sizeOf(u32) + @sizeOf(u64)]u8 = undefined;
+    header[0] = if (std.unicode.utf8ValidateSlice(contents)) 0 else 1;
+    std.mem.writeInt(u32, header[1 .. 1 + @sizeOf(u32)], @intCast(path.len), .little);
+    std.mem.writeInt(u64, header[1 + @sizeOf(u32) ..], @intCast(contents.len), .little);
+    try bytes.appendSlice(allocator, &header);
+    try bytes.appendSlice(allocator, path);
+    try bytes.appendSlice(allocator, contents);
 }
 
 pub fn runStdin(
@@ -437,6 +619,7 @@ fn runPrepared(
     exec_args: []const [:0]const u8,
     embedded_source: ?[]const u8,
     embedded_source_map: ?[]const u8,
+    embedded_files: ?[]const u8,
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
@@ -449,6 +632,7 @@ fn runPrepared(
         .exec_args = exec_args,
         .embedded_source = embedded_source,
         .embedded_source_map = embedded_source_map,
+        .embedded_files = embedded_files,
     };
     const thread = try std.Thread.spawn(
         .{ .stack_size = script_thread_stack_size },
@@ -576,6 +760,12 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     };
 
     execution.exit_code = if (execution.embedded_source) |source| blk: {
+        if (execution.embedded_files) |files| {
+            js_runtime.setStandaloneFiles(files) catch {
+                writeStderr(execution.io, "cottontail: failed to install standalone module graph\n", .{});
+                break :blk 1;
+            };
+        }
         if (execution.embedded_source_map) |source_map| {
             js_runtime.setEmbeddedSourceMap(source_map, execution.runnable_path) catch {
                 writeStderr(execution.io, "cottontail: failed to install standalone source map\n", .{});
@@ -1139,6 +1329,38 @@ fn entrypointImportsOnlyRuntimeAliases(ctx: *const Context, path: []const u8) !b
     return true;
 }
 
+fn nativeBundleFailure(
+    ctx: *const Context,
+    script_abs: []const u8,
+    script_entry_abs: []const u8,
+    tmp_dir: []const u8,
+    error_message: ?[*:0]u8,
+    err: anyerror,
+) anyerror {
+    if (error_message) |message| {
+        defer native_bundler.ct_bundle_string_free(message);
+        const text = std.mem.span(message);
+        if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
+            reportTestBundleError(ctx, script_abs, text);
+            cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+            return error.TestBundleFailed;
+        }
+        if (std.mem.startsWith(u8, text, "error:")) {
+            ctx.writeStderr("{s}\n", .{text});
+        } else {
+            ctx.writeStderr("error: {s}\n", .{text});
+        }
+        // Resolution and parse diagnostics are complete at this point. Avoid
+        // adding a Zig error-return trace to an ordinary JavaScript failure.
+        cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
+        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+        std.process.exit(1);
+    }
+    ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
+    return error.NativeBundleFailed;
+}
+
 fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
@@ -1146,6 +1368,7 @@ fn bundleScriptNative(
     script_args: []const [:0]const u8,
     source_base_dir: ?[]const u8,
     build_options: ?native_bundler.BundleOptions,
+    graph_out: ?*native_bundler.BundleGraphOutput,
 ) ![]const u8 {
     const tmp_dir = try ensureTempDir(ctx);
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
@@ -1251,36 +1474,43 @@ fn bundleScriptNative(
         }
     }
 
+    if (graph_out) |graph| {
+        graph.* = native_bundler.bundleEntryPointGraphWithOptions(
+            wrapped_entry,
+            ctx.project_root,
+            options,
+            &error_message,
+        ) catch |err| return nativeBundleFailure(
+            ctx,
+            script_abs,
+            script_entry_abs,
+            tmp_dir,
+            error_message,
+            err,
+        );
+        errdefer graph.deinit();
+        const entry = graph.entryPoint() orelse return error.MissingStandaloneEntryPoint;
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = entry.contents });
+        if (entry.source_map) |source_map| {
+            const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
+            try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map.contents });
+        }
+        return bundle_path;
+    }
+
     const output = native_bundler.bundleEntryPointWithOptionsAndSourceMap(
         wrapped_entry,
         ctx.project_root,
         options,
         &error_message,
-    ) catch |err| {
-        if (error_message) |message| {
-            defer native_bundler.ct_bundle_string_free(message);
-            const text = std.mem.span(message);
-            if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
-                reportTestBundleError(ctx, script_abs, text);
-                cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
-                std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-                return error.TestBundleFailed;
-            }
-            if (std.mem.startsWith(u8, text, "error:")) {
-                ctx.writeStderr("{s}\n", .{text});
-            } else {
-                ctx.writeStderr("error: {s}\n", .{text});
-            }
-            // A build/resolve error was already reported to the user. Match
-            // `bun run` by exiting cleanly instead of unwinding through main,
-            // which prints a (slow to symbolize) Zig error-return trace.
-            cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
-            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-            std.process.exit(1);
-        }
-        ctx.writeStderr("cottontail: native bundle failed: {s}\n", .{@errorName(err)});
-        return error.NativeBundleFailed;
-    };
+    ) catch |err| return nativeBundleFailure(
+        ctx,
+        script_abs,
+        script_entry_abs,
+        tmp_dir,
+        error_message,
+        err,
+    );
     defer native_bundler.ct_bundle_free(output.code.ptr, output.code.len);
     defer if (output.source_map) |source_map| native_bundler.ct_bundle_free(source_map.ptr, source_map.len);
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = output.code });

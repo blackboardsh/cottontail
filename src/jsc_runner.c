@@ -19668,6 +19668,98 @@ int ct_jsc_runtime_set_args(
     return 0;
 }
 
+static uint32_t ct_read_u32_le(const uint8_t *bytes) {
+    return (uint32_t)bytes[0] |
+        ((uint32_t)bytes[1] << 8) |
+        ((uint32_t)bytes[2] << 16) |
+        ((uint32_t)bytes[3] << 24);
+}
+
+static uint64_t ct_read_u64_le(const uint8_t *bytes) {
+    return (uint64_t)bytes[0] |
+        ((uint64_t)bytes[1] << 8) |
+        ((uint64_t)bytes[2] << 16) |
+        ((uint64_t)bytes[3] << 24) |
+        ((uint64_t)bytes[4] << 32) |
+        ((uint64_t)bytes[5] << 40) |
+        ((uint64_t)bytes[6] << 48) |
+        ((uint64_t)bytes[7] << 56);
+}
+
+int ct_jsc_runtime_set_standalone_files(
+    CtJscRuntime *runtime,
+    const uint8_t *data,
+    size_t data_len,
+    char **error_out
+) {
+    static const char magic[] = "CTGRAPH1";
+    if (error_out != NULL) *error_out = NULL;
+    if (runtime == NULL || runtime->context == NULL || data == NULL ||
+        data_len < sizeof(magic) - 1 + sizeof(uint32_t) ||
+        memcmp(data, magic, sizeof(magic) - 1) != 0) {
+        ct_set_error_out(error_out, ct_duplicate_bytes("Invalid standalone module graph", 31));
+        return -1;
+    }
+
+    JSContextRef ctx = runtime->context;
+    JSValueRef exception = NULL;
+    JSObjectRef files = JSObjectMake(ctx, NULL, NULL);
+    JSValueProtect(ctx, files);
+    size_t offset = sizeof(magic) - 1;
+    uint32_t file_count = ct_read_u32_le(data + offset);
+    offset += sizeof(uint32_t);
+
+    for (uint32_t index = 0; index < file_count; index += 1) {
+        const size_t header_len = 1 + sizeof(uint32_t) + sizeof(uint64_t);
+        if (offset > data_len || data_len - offset < header_len) goto invalid_graph;
+        uint8_t encoding = data[offset];
+        uint32_t path_len = ct_read_u32_le(data + offset + 1);
+        uint64_t contents_len_u64 = ct_read_u64_le(data + offset + 1 + sizeof(uint32_t));
+        offset += header_len;
+        if (contents_len_u64 > SIZE_MAX) goto invalid_graph;
+        size_t contents_len = (size_t)contents_len_u64;
+        if (path_len == 0 || offset > data_len || path_len > data_len - offset) goto invalid_graph;
+        const uint8_t *path = data + offset;
+        offset += path_len;
+        if (offset > data_len || contents_len > data_len - offset) goto invalid_graph;
+        const uint8_t *contents = data + offset;
+        offset += contents_len;
+
+        JSStringRef property = ct_js_string_from_utf8_len((const char *)path, path_len);
+        if (property == NULL) goto out_of_memory;
+        JSValueRef value = encoding == 0
+            ? ct_make_string_len(ctx, (const char *)contents, contents_len)
+            : ct_array_buffer_from_copy(ctx, (const char *)contents, contents_len, &exception);
+        if (exception == NULL) {
+            JSObjectSetProperty(ctx, files, property, value, kJSPropertyAttributeNone, &exception);
+        }
+        JSStringRelease(property);
+        if (exception != NULL) goto javascript_error;
+    }
+    if (offset != data_len) goto invalid_graph;
+
+    ct_set_property(ctx, JSContextGetGlobalObject(ctx), "__cottontailStandaloneFiles", files, &exception);
+    JSValueUnprotect(ctx, files);
+    if (exception != NULL) {
+        ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+        return -1;
+    }
+    return 0;
+
+invalid_graph:
+    JSValueUnprotect(ctx, files);
+    ct_set_error_out(error_out, ct_duplicate_bytes("Invalid standalone module graph", 31));
+    return -1;
+out_of_memory:
+    JSValueUnprotect(ctx, files);
+    ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
+    return -1;
+javascript_error:
+    JSValueUnprotect(ctx, files);
+    ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
+    return -1;
+}
+
 typedef struct {
     char *data;
     size_t len;

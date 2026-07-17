@@ -18,7 +18,17 @@ const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
-const bunSnapshotArtifactNames = new Set(['app', 'app.exe', 'a.txt', 'b.txt', 'append_output.txt']);
+const bunSnapshotArtifactNames = new Set([
+  'app',
+  'app.exe',
+  'app.map',
+  'entry',
+  'entry.map',
+  'nosourcemap_entry',
+  'a.txt',
+  'b.txt',
+  'append_output.txt',
+]);
 
 function removeTemp(path) {
   if (process.env.COTTONTAIL_UPSTREAM_KEEP_TEMP === '1') return;
@@ -42,6 +52,7 @@ function removeSnapshotArtifacts(snapshotRoot, runtime) {
         /^Heap\.\d+\.heapsnapshot$/.test(name) ||
         (current === snapshotRoot && runtime === 'bun' && (
           bunSnapshotArtifactNames.has(name) ||
+          /^chunk-[^.]+\.js\.map$/u.test(name) ||
           name === 'myapp.db' ||
           /^test.*file\.db$/u.test(name)
         ));

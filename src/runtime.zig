@@ -121,6 +121,20 @@ pub const Runtime = struct {
         }
     }
 
+    pub fn setStandaloneFiles(self: *Runtime, files: []const u8) !void {
+        var eval_error: [*c]u8 = null;
+        if (c.ct_jsc_runtime_set_standalone_files(
+            self.handle,
+            files.ptr,
+            files.len,
+            &eval_error,
+        ) != 0) {
+            defer if (eval_error != null) c.ct_jsc_string_free(eval_error);
+            if (eval_error != null) self.writeStderrLine(std.mem.span(eval_error));
+            return error.StandaloneGraphSetupFailed;
+        }
+    }
+
     pub fn runFile(self: *Runtime, script_path: [:0]const u8) u8 {
         const source = std.Io.Dir.cwd().readFileAlloc(
             self.io,
