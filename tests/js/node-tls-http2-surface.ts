@@ -134,7 +134,8 @@ strictEqual(http2.constants.HTTP2_METHOD_GET, "GET", "http2 method constant mism
 
 const defaults = http2.getDefaultSettings();
 strictEqual(defaults.headerTableSize, 4096, "http2 default headerTableSize mismatch");
-strictEqual(defaults.enablePush, true, "http2 default enablePush mismatch");
+// COTTONTAIL-COMPAT: Bun 1.3.10 disables HTTP/2 server push by default; Node 24 enables it.
+strictEqual(defaults.enablePush, false, "http2 default enablePush mismatch");
 strictEqual(defaults.maxFrameSize, 16384, "http2 default maxFrameSize mismatch");
 
 const packed = http2.getPackedSettings({
@@ -147,6 +148,7 @@ strictEqual(Buffer.from(packed).toString("hex"), "000100001000000200000000000400
 deepStrictEqual(
   http2.getUnpackedSettings(packed),
   {
+    enableConnectProtocol: false,
     headerTableSize: 4096,
     enablePush: false,
     initialWindowSize: 65535,
@@ -250,6 +252,10 @@ const pingPayload = await new Promise<Buffer>((resolve, reject) => {
 });
 strictEqual(pingPayload.toString(), "12345678", "http2 ping payload mismatch");
 const resetStream = h2ControlSession.request({ ":path": "/rst" });
+resetStream.once("error", (error) => {
+  strictEqual(error.code, "ERR_HTTP2_STREAM_ERROR", "http2 RST_STREAM error code mismatch");
+  strictEqual(error.errno, http2.constants.NGHTTP2_CANCEL, "http2 RST_STREAM errno mismatch");
+});
 resetStream.close(http2.constants.NGHTTP2_CANCEL);
 await new Promise((resolve) => setTimeout(resolve, 50));
 strictEqual(controlResetCode, http2.constants.NGHTTP2_CANCEL, "http2 RST_STREAM code mismatch");
@@ -263,9 +269,9 @@ deepStrictEqual(
 h2ControlSession.close();
 await new Promise<void>((resolve) => h2ControlServer.close(() => resolve()));
 
-const h2SecureServer = http2.createSecureServer({ cert, key }, (stream) => {
-  stream.respond({ ":status": 200 });
-  stream.end("h2s-ok");
+const h2SecureServer = http2.createSecureServer({ cert, key }, (_request, response) => {
+  response.writeHead(200);
+  response.end("h2s-ok");
 });
 await new Promise<void>((resolve, reject) => {
   h2SecureServer.once("error", reject);
