@@ -25,6 +25,9 @@ extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
 extern char *ct_jsc_heap_snapshot(JSContextRef context);
+extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
+extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
+extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
 
 /* These stable C APIs are exported by JSCOnly but are not installed in its
  * public headers. Keep the bridge here instead of depending on JSC internals. */
@@ -146,6 +149,7 @@ typedef unsigned int gid_t;
 #include <unistd.h>
 #endif
 #include <time.h>
+#include <uv.h>
 #include <zlib.h>
 
 #if defined(_WIN32)
@@ -1514,9 +1518,12 @@ struct CtJscRuntime {
     JSObjectRef spawn_event_handler;
     JSObjectRef fd_event_handler;
     JSObjectRef worker_event_handler;
-    pthread_mutex_t wake_mutex;
-    pthread_cond_t wake_cond;
-    bool wake_pending;
+    uv_loop_t uv_loop;
+    uv_async_t uv_wake;
+    uv_timer_t uv_wait_timer;
+    bool uv_loop_initialized;
+    bool uv_wake_initialized;
+    bool uv_wait_timer_initialized;
     pthread_mutex_t spawn_event_mutex;
     CtSpawnEvent *spawn_events_head;
     CtSpawnEvent *spawn_events_tail;
@@ -1550,12 +1557,17 @@ struct CtJscRuntime {
     bool next_tick_priority_armed;
 };
 
+static void ct_uv_wake_callback(uv_async_t *handle) {
+    (void)handle;
+}
+
+static void ct_uv_wait_timer_callback(uv_timer_t *handle) {
+    (void)handle;
+}
+
 static void ct_runtime_wake(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
-    pthread_mutex_lock(&runtime->wake_mutex);
-    runtime->wake_pending = true;
-    pthread_cond_signal(&runtime->wake_cond);
-    pthread_mutex_unlock(&runtime->wake_mutex);
+    if (runtime->uv_wake_initialized) (void)uv_async_send(&runtime->uv_wake);
 }
 
 static void ct_napi_wake(void *opaque) {
@@ -1563,21 +1575,74 @@ static void ct_napi_wake(void *opaque) {
 }
 
 static void ct_runtime_wait(CtJscRuntime *runtime, int delay_ms) {
-    if (runtime == NULL || delay_ms <= 0) return;
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += delay_ms / 1000;
-    deadline.tv_nsec += (long)(delay_ms % 1000) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
-        deadline.tv_nsec %= 1000000000L;
+    if (runtime == NULL || !runtime->uv_loop_initialized) return;
+    if (delay_ms <= 0) {
+        (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+        return;
     }
-    pthread_mutex_lock(&runtime->wake_mutex);
-    if (!runtime->wake_pending) {
-        (void)pthread_cond_timedwait(&runtime->wake_cond, &runtime->wake_mutex, &deadline);
+    if (!runtime->uv_wait_timer_initialized) return;
+    if (uv_timer_start(&runtime->uv_wait_timer, ct_uv_wait_timer_callback, (uint64_t)delay_ms, 0) != 0) return;
+    (void)uv_run(&runtime->uv_loop, UV_RUN_ONCE);
+    (void)uv_timer_stop(&runtime->uv_wait_timer);
+}
+
+static int ct_runtime_uv_init(CtJscRuntime *runtime) {
+    if (uv_loop_init(&runtime->uv_loop) != 0) return -1;
+    runtime->uv_loop_initialized = true;
+    uv_loop_set_data(&runtime->uv_loop, runtime);
+
+    if (uv_async_init(&runtime->uv_loop, &runtime->uv_wake, ct_uv_wake_callback) != 0) goto fail;
+    runtime->uv_wake_initialized = true;
+    uv_unref((uv_handle_t *)&runtime->uv_wake);
+
+    if (uv_timer_init(&runtime->uv_loop, &runtime->uv_wait_timer) != 0) goto fail;
+    runtime->uv_wait_timer_initialized = true;
+    return 0;
+
+fail:
+    if (runtime->uv_wake_initialized) {
+        runtime->uv_wake_initialized = false;
+        uv_close((uv_handle_t *)&runtime->uv_wake, NULL);
+        (void)uv_run(&runtime->uv_loop, UV_RUN_DEFAULT);
     }
-    runtime->wake_pending = false;
-    pthread_mutex_unlock(&runtime->wake_mutex);
+    runtime->uv_loop_initialized = false;
+    (void)uv_loop_close(&runtime->uv_loop);
+    return -1;
+}
+
+static void ct_uv_close_walk(uv_handle_t *handle, void *opaque) {
+    (void)opaque;
+    if (!uv_is_closing(handle)) uv_close(handle, NULL);
+}
+
+static void ct_runtime_uv_shutdown(CtJscRuntime *runtime) {
+    if (runtime == NULL || !runtime->uv_loop_initialized) return;
+
+    if (runtime->uv_wait_timer_initialized) {
+        runtime->uv_wait_timer_initialized = false;
+        (void)uv_timer_stop(&runtime->uv_wait_timer);
+        if (!uv_is_closing((uv_handle_t *)&runtime->uv_wait_timer)) {
+            uv_close((uv_handle_t *)&runtime->uv_wait_timer, NULL);
+        }
+    }
+    if (runtime->uv_wake_initialized) {
+        runtime->uv_wake_initialized = false;
+        if (!uv_is_closing((uv_handle_t *)&runtime->uv_wake)) {
+            uv_close((uv_handle_t *)&runtime->uv_wake, NULL);
+        }
+    }
+    (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
+
+    int close_status = uv_loop_close(&runtime->uv_loop);
+    if (close_status == UV_EBUSY) {
+        uv_walk(&runtime->uv_loop, ct_uv_close_walk, NULL);
+        (void)uv_run(&runtime->uv_loop, UV_RUN_DEFAULT);
+        close_status = uv_loop_close(&runtime->uv_loop);
+    }
+    if (close_status != 0) {
+        fprintf(stderr, "cottontail: failed to close libuv loop: %s\n", uv_strerror(close_status));
+    }
+    runtime->uv_loop_initialized = false;
 }
 
 static int ct_jsc_runtime_eval_internal(
@@ -2632,6 +2697,22 @@ static JSValueRef ct_get_property(JSContextRef ctx, JSObjectRef object, const ch
     JSValueRef result = JSObjectGetProperty(ctx, object, property, exception);
     JSStringRelease(property);
     return result;
+}
+
+static void ct_throw_type_error(JSContextRef ctx, JSValueRef *exception, const char *message) {
+    if (exception == NULL) return;
+    JSValueRef constructor_exception = NULL;
+    JSValueRef constructor_value = ct_get_property(ctx, JSContextGetGlobalObject(ctx), "TypeError", &constructor_exception);
+    if (constructor_exception == NULL && constructor_value != NULL && JSValueIsObject(ctx, constructor_value)) {
+        JSValueRef argument = ct_make_string(ctx, message);
+        JSObjectRef error = JSObjectCallAsConstructor(ctx, (JSObjectRef)constructor_value, 1, &argument, &constructor_exception);
+        if (constructor_exception == NULL && error != NULL) {
+            *exception = error;
+            return;
+        }
+    }
+    JSValueRef argument = ct_make_string(ctx, message);
+    *exception = JSObjectMakeError(ctx, 1, &argument, NULL);
 }
 
 static bool ct_value_to_bool(JSContextRef ctx, JSValueRef value) {
@@ -14682,7 +14763,7 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
     if (uses_napi && runtime->napi_env == NULL) {
-        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
         if (runtime->napi_env == NULL) {
             free(library_path);
             free(symbol_name);
@@ -14841,7 +14922,7 @@ static JSValueRef ct_native_addon_load(JSContextRef ctx, JSObjectRef function, J
         }
     }
     if (runtime->napi_env == NULL) {
-        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
         if (runtime->napi_env == NULL) {
             free(path);
             ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
@@ -14895,7 +14976,7 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
     if (uses_napi && runtime->napi_env == NULL) {
-        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        runtime->napi_env = ct_napi_env_create(runtime->context, &runtime->uv_loop, runtime, ct_napi_wake);
         if (runtime->napi_env == NULL) {
             ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
             return JSValueMakeUndefined(ctx);
@@ -17859,6 +17940,66 @@ static JSValueRef ct_jsc_string_is_8_bit_host(JSContextRef ctx, JSObjectRef func
     return JSValueMakeBoolean(ctx, is_8_bit);
 }
 
+static JSValueRef ct_jsc_value_is_rope_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    return JSValueMakeBoolean(ctx, argc > 0 && ct_jsc_value_is_rope(ctx, argv[0]));
+}
+
+static JSValueRef ct_jsc_protected_objects_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+
+    size_t count = ct_jsc_copy_protected_objects(ctx, NULL, 0);
+    if (count == SIZE_MAX || count > SIZE_MAX / sizeof(JSValueRef)) {
+        ct_throw_message(ctx, exception, "stock JSC protected-object ABI mismatch");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSValueRef *values = count > 0 ? (JSValueRef *)malloc(count * sizeof(JSValueRef)) : NULL;
+    if (count > 0 && values == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t copied_count = ct_jsc_copy_protected_objects(ctx, values, count);
+    if (copied_count != count) {
+        free(values);
+        ct_throw_message(ctx, exception, "stock JSC protected-object ABI mismatch");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef result = JSObjectMakeArray(ctx, count, values, exception);
+    free(values);
+    return result;
+}
+
+static JSValueRef ct_jsc_set_time_zone_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1 || !JSValueIsString(ctx, argv[0])) {
+        ct_throw_type_error(ctx, exception, "cottontail.jscSetTimeZone(value) requires a timezone string");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    size_t time_zone_len = 0;
+    char *time_zone = ct_value_to_utf8_copy(ctx, argv[0], &time_zone_len);
+    if (time_zone == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool accepted = strlen(time_zone) == time_zone_len && ct_jsc_set_time_zone(ctx, time_zone);
+    free(time_zone);
+    if (!accepted) {
+        ct_throw_type_error(ctx, exception, "Invalid timezone");
+        return JSValueMakeUndefined(ctx);
+    }
+    return argv[0];
+}
+
 static JSValueRef ct_create_buffer_is_ascii(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -20448,6 +20589,9 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "jscMemoryUsage", ct_jsc_memory_usage, runtime);
     ct_install_function(ctx, host, "jscHeapSnapshot", ct_jsc_heap_snapshot_host, runtime);
     ct_install_function(ctx, host, "jscStringIs8Bit", ct_jsc_string_is_8_bit_host, runtime);
+    ct_install_function(ctx, host, "jscProtectedObjects", ct_jsc_protected_objects_host, runtime);
+    ct_install_function(ctx, host, "jscValueIsRope", ct_jsc_value_is_rope_host, runtime);
+    ct_install_function(ctx, host, "jscSetTimeZone", ct_jsc_set_time_zone_host, runtime);
     ct_install_function(ctx, host, "createBufferIsAscii", ct_create_buffer_is_ascii, runtime);
     ct_install_function(ctx, host, "createBufferTranscode", ct_create_buffer_transcode, runtime);
     ct_install_function(ctx, host, "importModule", ct_import_module, runtime);
@@ -21004,13 +21148,15 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
         free(runtime);
         return NULL;
     }
-    pthread_mutex_init(&runtime->wake_mutex, NULL);
-    pthread_cond_init(&runtime->wake_cond, NULL);
     pthread_mutex_init(&runtime->spawn_event_mutex, NULL);
     pthread_mutex_init(&runtime->fd_event_mutex, NULL);
     pthread_mutex_init(&runtime->worker_event_mutex, NULL);
     pthread_mutex_init(&runtime->callback_mutex, NULL);
     runtime->owner_thread = pthread_self();
+    if (ct_runtime_uv_init(runtime) != 0) {
+        ct_jsc_runtime_destroy(runtime);
+        return NULL;
+    }
     if (ct_install_host_api(runtime) != 0) {
         ct_jsc_runtime_destroy(runtime);
         return NULL;
@@ -21043,6 +21189,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             ct_napi_env_destroy(runtime->napi_env);
             runtime->napi_env = NULL;
         }
+        ct_runtime_uv_shutdown(runtime);
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
@@ -21089,8 +21236,6 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     pthread_mutex_destroy(&runtime->fd_event_mutex);
     pthread_mutex_destroy(&runtime->worker_event_mutex);
     pthread_mutex_destroy(&runtime->callback_mutex);
-    pthread_cond_destroy(&runtime->wake_cond);
-    pthread_mutex_destroy(&runtime->wake_mutex);
     free(runtime);
 }
 
@@ -21450,6 +21595,20 @@ static bool ct_append_rewritten_dynamic_imports(
         if (argument_end >= end || *argument_end != ')') {
             if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
             cursor = open_paren + 1;
+            continue;
+        }
+
+        const char *trimmed_argument = argument_start;
+        while (trimmed_argument < argument_end &&
+            (*trimmed_argument == ' ' || *trimmed_argument == '\t' ||
+             *trimmed_argument == '\r' || *trimmed_argument == '\n')) {
+            trimmed_argument += 1;
+        }
+        const char *after_close = argument_end + 1;
+        while (after_close < end && (*after_close == ' ' || *after_close == '\t')) after_close += 1;
+        if (trimmed_argument == argument_end || (after_close < end && *after_close == '{')) {
+            if (!ct_sb_append_bytes(builder, import_start, (size_t)(argument_end + 1 - import_start))) return false;
+            cursor = argument_end + 1;
             continue;
         }
 
@@ -21834,6 +21993,7 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
     if (runtime->napi_env != NULL && ct_napi_env_has_pending_work(runtime->napi_env)) return true;
+    if (runtime->uv_loop_initialized && uv_loop_alive(&runtime->uv_loop)) return true;
 
 #if CT_HAS_OPENSSL
     pthread_mutex_lock(&ct_tls_mutex);
@@ -22017,6 +22177,7 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     if (delay_ms_out != NULL) *delay_ms_out = 16;
     JSContextRef ctx = runtime->context;
     ct_jsc_run_loop_cycle();
+    if (runtime->uv_loop_initialized) (void)uv_run(&runtime->uv_loop, UV_RUN_NOWAIT);
     if (ct_drain_next_ticks(runtime, true, error_out) != 0) return -1;
     if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;
     if (runtime->napi_env != NULL) {
@@ -22031,36 +22192,43 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
         }
     }
     if (ct_dispatch_timers(runtime, error_out) != 0) return -1;
-    JSStringRef source = ct_js_string(
-        "(function(){"
-        "let delay=16;"
-        "if(globalThis.__cottontailRunLoopTick) delay=globalThis.__cottontailRunLoopTick();"
-        "return delay == null ? 16 : Number(delay);"
-        "})()"
-    );
     JSValueRef exception = NULL;
-    JSValueRef value = JSEvaluateScript(ctx, source, NULL, NULL, 1, &exception);
-    JSStringRelease(source);
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSValueRef tick_value = ct_get_property(ctx, global, "__cottontailRunLoopTick", &exception);
+    JSValueRef value = NULL;
+    if (exception == NULL && tick_value != NULL && JSValueToBoolean(ctx, tick_value)) {
+        JSObjectRef tick = JSValueToObject(ctx, tick_value, &exception);
+        if (exception == NULL && tick != NULL) {
+            value = JSObjectCallAsFunction(ctx, tick, global, 0, NULL, &exception);
+        }
+    }
     if (exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, exception));
         return -1;
     }
     ct_jsc_drain_microtasks(ctx);
     int js_delay_ms = 16;
-    if (value != NULL) {
+    if (value != NULL && !JSValueIsUndefined(ctx, value) && !JSValueIsNull(ctx, value)) {
         JSValueRef number_exception = NULL;
         double delay = JSValueToNumber(ctx, value, &number_exception);
-        if (number_exception == NULL && delay == delay) {
-            if (delay < 1) delay = 1;
-            if (delay > 1000) delay = 1000;
-            js_delay_ms = (int)delay;
+        if (number_exception != NULL) {
+            ct_set_error_out(error_out, ct_copy_exception(ctx, number_exception));
+            return -1;
         }
+        if (delay < 1) delay = 1;
+        if (delay > 1000) delay = 1000;
+        if (delay == delay) js_delay_ms = (int)delay;
     }
     if (delay_ms_out != NULL) {
         int timer_delay_ms = 0;
-        *delay_ms_out = ct_timer_next_delay_ms(runtime, &timer_delay_ms) && timer_delay_ms < js_delay_ms
+        int delay_ms = ct_timer_next_delay_ms(runtime, &timer_delay_ms) && timer_delay_ms < js_delay_ms
             ? timer_delay_ms
             : js_delay_ms;
+        if (runtime->uv_loop_initialized) {
+            int uv_delay_ms = uv_backend_timeout(&runtime->uv_loop);
+            if (uv_delay_ms >= 0 && uv_delay_ms < delay_ms) delay_ms = uv_delay_ms;
+        }
+        *delay_ms_out = delay_ms;
     }
     return 0;
 }

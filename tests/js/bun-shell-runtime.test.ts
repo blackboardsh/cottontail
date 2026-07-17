@@ -31,11 +31,26 @@ test.skipIf(process.platform === "win32")("preserves interpolation quote context
   expect(stdout.subarray(0, 7).toString()).toBe("answer\n");
 });
 
-test("rejects object references inside double-quoted shell words", async () => {
+test.skipIf(process.platform === "win32")("preserves Blob and typed-array stdin as binary data", async () => {
+  expect(await $`cat < ${new Blob(["blob-input"])}`.text()).toBe("blob-input");
+  expect(await $`cat < ${new TextEncoder().encode("typed-input")}`.text()).toBe("typed-input");
+});
+
+test("parses structured object references eagerly", () => {
   const output = Buffer.alloc(16);
-  await expect($`echo "answer > ${output}"`.quiet()).rejects.toThrow(
+  expect(() => $`echo "answer > ${output}"`).toThrow(
     "JS object reference not allowed in double quotes",
   );
+  expect(() => $`${output} | cat`).toThrow('expected a command or assignment but got: "JSObjRef"');
+});
+
+test("constructs ShellError with Bun's lazy initialization semantics", () => {
+  const error = new $.ShellError();
+  expect(error).toBeInstanceOf(Error);
+  expect(error).toBeInstanceOf($.ShellError);
+  expect(error.name).toBe("Error");
+  expect(error.message).toBe("");
+  expect(error.exitCode).toBeUndefined();
 });
 
 test.skipIf(process.platform === "win32")("shell execution does not block the JavaScript event loop", async () => {

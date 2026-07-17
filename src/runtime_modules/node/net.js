@@ -1555,7 +1555,7 @@ class ServerImpl extends EventEmitter {
       this._incrementConnections();
       socket.once("close", () => this._decrementConnections());
       this.emit("connection", socket);
-      if (!this.pauseOnConnect) socket.resume();
+      if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
     }
   }
 

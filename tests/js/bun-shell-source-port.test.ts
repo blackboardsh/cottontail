@@ -117,8 +117,8 @@ test("conditional expressions support logical and file operators", async () => {
   expect(output.stdout.toString()).toBe("accepted\n");
 });
 
-test("background lists preserve Bun's unsupported syntax diagnostic", async () => {
-  await expect(shell("echo background & echo foreground; wait")).rejects.toThrow(
+test("background lists preserve Bun's unsupported syntax diagnostic", () => {
+  expect(() => shell("echo background & echo foreground; wait")).toThrow(
     'Background commands "&" are not supported yet.',
   );
 });

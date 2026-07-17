@@ -1291,6 +1291,8 @@ fn buildRuntimeAliases(
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "isomorphic-fetch", "vendor/isomorphic-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "@vercel/fetch", "vendor/vercel-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "abort-controller", "vendor/abort-controller.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "undici", "node/undici-public.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "node:undici", "node/undici-public.js");
 
     for (node_runtime_aliases) |alias| {
         try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, alias.specifier, alias.relative_path);
@@ -1324,7 +1326,9 @@ fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
         std.mem.eql(u8, specifier, "next/dist/compiled/node-fetch") or
         std.mem.eql(u8, specifier, "isomorphic-fetch") or
         std.mem.eql(u8, specifier, "@vercel/fetch") or
-        std.mem.eql(u8, specifier, "abort-controller");
+        std.mem.eql(u8, specifier, "abort-controller") or
+        std.mem.eql(u8, specifier, "undici") or
+        std.mem.eql(u8, specifier, "node:undici");
 }
 
 fn transpilerLoaderForPath(path: []const u8) ?[]const u8 {
@@ -2897,6 +2901,18 @@ fn skipWhitespace(source: []const u8, start: usize) usize {
     return cursor;
 }
 
+fn skipJavaScriptTrivia(source: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < source.len) {
+        cursor = skipWhitespace(source, cursor);
+        if (cursor >= source.len or source[cursor] != '/') return cursor;
+        const after_comment = skipJavaScriptComment(source, cursor);
+        if (after_comment == cursor) return cursor;
+        cursor = after_comment;
+    }
+    return cursor;
+}
+
 fn hasPriorRequireBinding(source: []const u8, end: usize) bool {
     const prefix = source[0..@min(end, source.len)];
     return std.mem.lastIndexOf(u8, prefix, "const require") != null or
@@ -3105,6 +3121,32 @@ fn resolveDynamicImportTarget(
         if (realPathIfFile(ctx, with_extension)) |resolved| return resolved;
     }
     return null;
+}
+
+fn dynamicTargetHasUnresolvedLocalImport(ctx: *const Context, target_path: []const u8) !bool {
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        target_path,
+        ctx.allocator,
+        .limited(4 * 1024 * 1024),
+    ) catch return false;
+    const loader = transpilerLoaderForPath(target_path) orelse return false;
+    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return true;
+    defer std.heap.c_allocator.free(imports_json);
+
+    const ScannedImport = struct { path: []const u8, kind: []const u8 };
+    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return true;
+    defer parsed.deinit();
+    const target_dir = std.fs.path.dirname(target_path) orelse ctx.project_root;
+    for (parsed.value) |item| {
+        if (std.mem.eql(u8, item.kind, "dynamic-import")) continue;
+        const bare = pathWithoutQueryOrFragment(item.path);
+        if (!std.fs.path.isAbsolute(bare) and
+            !std.mem.startsWith(u8, bare, "./") and
+            !std.mem.startsWith(u8, bare, "../")) continue;
+        if (try resolveDynamicImportTarget(ctx, target_dir, item.path) == null) return true;
+    }
+    return false;
 }
 
 fn dynamicTargetIndex(
@@ -3426,11 +3468,21 @@ fn scanDynamicImports(
             cursor = open + 1;
             continue;
         };
+        const arguments = source[open + 1 .. close];
+        const after_close = skipJavaScriptTrivia(source, close + 1);
+        // `import` is a valid class/object method name. Only an actual import
+        // expression reaches the rewrite path; method parameters are followed
+        // by a body and an empty import expression is invalid JavaScript.
+        if (std.mem.trim(u8, arguments, " \t\r\n").len == 0 or
+            (after_close < source.len and source[after_close] == '{'))
+        {
+            cursor = close + 1;
+            continue;
+        }
         if (isTypeScriptAsImport(source, cursor)) {
             cursor = close + 1;
             continue;
         }
-        const arguments = source[open + 1 .. close];
         const comma = findTopLevelComma(arguments);
         const expression = std.mem.trim(u8, if (comma) |index| arguments[0..index] else arguments, " \t\r\n");
         var options = std.mem.trim(u8, if (comma) |index| arguments[index + 1 ..] else "undefined", " \t\r\n");
@@ -3468,6 +3520,11 @@ fn scanDynamicImports(
             }
             if (uses_module_mock) needs_generated_loader = true;
             const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
+            if (target_path) |path| {
+                if (!needs_generated_loader and try dynamicTargetHasUnresolvedLocalImport(ctx, path)) {
+                    needs_generated_loader = true;
+                }
+            }
             // The compiler owns ordinary local module graphs once resolution
             // succeeds. Unresolved literals still need the runtime dispatcher
             // so native builtins and resolution failures retain Bun semantics.

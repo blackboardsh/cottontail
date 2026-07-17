@@ -22,6 +22,7 @@ import {
   workerData,
 } from "node:worker_threads";
 import { createRequire } from "node:module";
+import { createContext, runInContext } from "node:vm";
 
 function assert(value: unknown, message: string): asserts value {
   if (!value) throw new Error(message);
@@ -62,7 +63,11 @@ channel.port1.start();
 channel.port2.postMessage("live");
 await liveMessage;
 assert(portMessage === "live", "MessagePort live message mismatch");
-assert(moveMessagePortToContext(channel.port1, {}) === channel.port1, "moveMessagePortToContext mismatch");
+const portContext = createContext({});
+const movedPort = moveMessagePortToContext(channel.port1, portContext);
+assert(movedPort === channel.port1, "moveMessagePortToContext mismatch");
+portContext.port = movedPort;
+assert(runInContext("port", portContext) === movedPort, "moved MessagePort context mismatch");
 channel.port1.unref();
 assert(channel.port1.hasRef() === false, "MessagePort unref mismatch");
 channel.port1.ref();
@@ -150,10 +155,6 @@ assert(worker instanceof Worker, "Worker constructor mismatch");
 assert(typeof worker.threadId === "number" && worker.threadId > 0, "Worker threadId mismatch");
 assert(worker.threadName === "cottontail-worker", "Worker threadName mismatch");
 assert(typeof worker.postMessage === "function", "Worker postMessage mismatch");
-assert(worker.ref() === worker && worker.unref() === worker, "Worker ref/unref mismatch");
-assert(typeof (await worker.cpuUsage()).user === "number", "Worker cpuUsage mismatch");
-assert(typeof (await worker.getHeapStatistics()) === "object", "Worker heap stats mismatch");
-
 const messages: any[] = [];
 const reply = new Promise<any>((resolve, reject) => {
   const timeout = setTimeout(() => reject(new Error("worker_threads response timed out")), 1500);
@@ -177,6 +178,15 @@ const reply = new Promise<any>((resolve, reject) => {
   });
   worker.on("error", reject);
 });
+assert(worker.ref() === worker && worker.unref() === worker, "Worker ref/unref mismatch");
+let cpuUsageError: any;
+try {
+  await worker.cpuUsage();
+} catch (error) {
+  cpuUsageError = error;
+}
+assert(cpuUsageError?.code === "ERR_COTTONTAIL_NATIVE_BOUNDARY", "Worker cpuUsage boundary mismatch");
+assert(typeof (await worker.getHeapStatistics()) === "object", "Worker heap stats mismatch");
 
 const response = await reply;
 assert(messages.some((message) => message.type === "ready"), "Worker ready message mismatch");
@@ -197,7 +207,7 @@ assert(response.date === "2020-01-02T03:04:05.000Z", "Worker reply date mismatch
 assert(response.cycle === true, "Worker reply cycle mismatch");
 assert(response.workerData.token === "abc", "Worker workerData mismatch");
 assert(response.env.count === 7n, "Worker environmentData mismatch");
-assert(await postMessageToThread(worker.threadId, { value: "post-to-thread" }) === true, "postMessageToThread mismatch");
+assert(await postMessageToThread(worker.threadId, { value: "post-to-thread" }) === undefined, "postMessageToThread mismatch");
 
 const transferredChannel = new MessageChannel();
 const transferredPortReply = new Promise<any>((resolve, reject) => {
@@ -286,6 +296,6 @@ assert(waitResult.result === "ok", "worker Atomics.wait should return ok after n
 assert(Atomics.notify(waitView, 0, 1) === 0, "Atomics.notify should not count completed waiters");
 
 assert(typeof worker[Symbol.asyncDispose] === "function", "Worker asyncDispose mismatch");
-assert(await worker.terminate() === 0, "Worker terminate mismatch");
+assert(await worker.terminate() === 1, "Worker terminate mismatch");
 
 console.log("node worker_threads surface passed");

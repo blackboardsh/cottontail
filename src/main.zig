@@ -29,7 +29,8 @@ const revision_suffix = "cottontail";
 const completion_commands = [_][]const u8{ "run", "test", "build", "x", "exec", "getcompletes" };
 const help_text_template =
     \\cottontail {s}
-    \\Tiny Zig-based JavaScript runtime.
+    \\Bun is a fast JavaScript runtime, package manager, bundler, and test runner.
+    \\Cottontail provides a Bun-compatible Zig and JavaScriptCore implementation.
     \\
     \\Usage:
     \\  cottontail <entrypoint.js|entrypoint.ts> [args...]
@@ -175,6 +176,28 @@ fn argsWithBunOptions(
     try appendBunOptionsEnv(allocator, options, &args);
     try args.appendSlice(process_args[1..]);
     return try args.toOwnedSlice();
+}
+
+fn normalizeLeadingTestRuntimeFlags(
+    allocator: std.mem.Allocator,
+    args: []const [:0]const u8,
+) ![]const [:0]const u8 {
+    if (args.len < 3 or !isRuntimeFlag(args[1])) return args;
+
+    var command_index: usize = 1;
+    while (command_index < args.len and isRuntimeFlag(args[command_index])) {
+        const flag = args[command_index];
+        command_index += 1;
+        if (runtimeFlagTakesValue(flag) and command_index < args.len) command_index += 1;
+    }
+    if (command_index >= args.len or !std.mem.eql(u8, args[command_index], "test")) return args;
+
+    const normalized = try allocator.alloc([:0]const u8, args.len);
+    normalized[0] = args[0];
+    normalized[1] = args[command_index];
+    @memcpy(normalized[2 .. command_index + 1], args[1..command_index]);
+    @memcpy(normalized[command_index + 1 ..], args[command_index + 1 ..]);
+    return normalized;
 }
 
 fn runCommandFlagTakesValue(arg: []const u8) bool {
@@ -2193,12 +2216,13 @@ pub fn main(init: std.process.Init) !void {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
-    const args = try argsWithBunOptions(allocator, process_args, init.environ_map);
+    var args = try argsWithBunOptions(allocator, process_args, init.environ_map);
 
     if (try runStandaloneIfPresent(init, args)) |exit_code| {
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
+    args = try normalizeLeadingTestRuntimeFlags(allocator, args);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -2399,8 +2423,20 @@ pub fn main(init: std.process.Init) !void {
 
 test "help text mentions cottontail and script usage" {
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "cottontail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text_template, "Bun is a fast JavaScript runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "JavaScriptCore") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text_template, "<entrypoint.js|entrypoint.ts>") != null);
+}
+
+test "runtime flags can precede the test command" {
+    const args = [_][:0]const u8{ "cottontail", "--smol", "--conditions", "shell", "test", "suite.test.ts" };
+    const normalized = try normalizeLeadingTestRuntimeFlags(std.testing.allocator, &args);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("test", normalized[1]);
+    try std.testing.expectEqualStrings("--smol", normalized[2]);
+    try std.testing.expectEqualStrings("--conditions", normalized[3]);
+    try std.testing.expectEqualStrings("shell", normalized[4]);
+    try std.testing.expectEqualStrings("suite.test.ts", normalized[5]);
 }
 
 test "test entrypoint names use supported test extensions" {

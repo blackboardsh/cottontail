@@ -139,6 +139,12 @@ try {
       expectExitCode: 0,
     },
     {
+      name: 'dynamic-import-method-name',
+      scriptPath: join(rootDir, 'tests', 'js', 'dynamic-import-method-name.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['dynamic import method name passed'],
+    },
+    {
       name: 'cli-test-banner-without-registered-tests',
       cwd: tempDir,
       argv: ['test', 'plain.test.js'],

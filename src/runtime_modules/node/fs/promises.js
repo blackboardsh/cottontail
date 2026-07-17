@@ -49,6 +49,13 @@ import {
   writevSync,
 } from "../fs.js";
 import { ReadableStream as WebReadableStream } from "../stream/web.js";
+import {
+  abortReason,
+  encodingFromOptions,
+  invalidArgType,
+  runAbortable,
+  validateAbortSignal,
+} from "./internal.js";
 
 // fs.constants must be the exact same object as fsPromises.constants. Because
 // fs.js and fs/promises.js form an import cycle whose evaluation order depends
@@ -120,12 +127,18 @@ export const constants = globalThis.__cottontailFsConstants ??= Object.freeze(Ob
     .map((name) => [name, constantsObject[name]]),
 ));
 
+const symbolAsyncDispose = Symbol.asyncDispose ?? Symbol.for("Symbol.asyncDispose");
+if (Symbol.asyncDispose == null) {
+  Object.defineProperty(Symbol, "asyncDispose", { value: symbolAsyncDispose, configurable: true });
+}
+
 export async function access(path, mode = constants.F_OK) {
   return accessSync(path, mode);
 }
 
 export async function appendFile(path, data, options = undefined) {
-  return appendFileSync(path, data, options);
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  return runAbortable(() => appendFileSync(fileDescriptorFrom(path), data, options), signal);
 }
 
 export async function chmod(path, mode) {
@@ -138,6 +151,68 @@ export async function chown(path, uid, gid) {
 
 export async function close(fd) {
   return closeSync(fd);
+}
+
+export async function fchmod(fd, mode) {
+  return fchmodSync(fd, mode);
+}
+
+export async function fchown(fd, uid, gid) {
+  return fchownSync(fd, uid, gid);
+}
+
+export async function fstat(fd, options = undefined) {
+  return fstatSync(fd, options);
+}
+
+export async function fsync(fd) {
+  return fsyncSync(fd);
+}
+
+export async function fdatasync(fd) {
+  return fdatasyncSync(fd);
+}
+
+export async function ftruncate(fd, len = 0) {
+  return ftruncateSync(fd, len);
+}
+
+export async function futimes(fd, atime, mtime) {
+  return futimesSync(fd, atime, mtime);
+}
+
+export async function read(fd, bufferOrOptions = undefined, offset = 0, length = undefined, position = null) {
+  let buffer = bufferOrOptions;
+  if (buffer == null || (typeof buffer === "object" && !ArrayBuffer.isView(buffer) && !(buffer instanceof ArrayBuffer))) {
+    const options = buffer ?? {};
+    buffer = options.buffer ?? globalThis.Buffer?.alloc?.(16384) ?? new Uint8Array(16384);
+    offset = options.offset ?? 0;
+    length = options.length ?? buffer.byteLength - offset;
+    position = options.position ?? null;
+  }
+  const bytesRead = readSync(fd, buffer, offset, length, position);
+  return { bytesRead, buffer };
+}
+
+export async function write(fd, data, offsetOrPosition = undefined, lengthOrEncoding = undefined, position = null) {
+  if (typeof data === "string") {
+    const stringPosition = typeof offsetOrPosition === "number" || typeof offsetOrPosition === "bigint"
+      ? offsetOrPosition
+      : null;
+    const encoding = typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8";
+    return { bytesWritten: writeSync(fd, data, stringPosition, encoding), buffer: data };
+  }
+  const offset = offsetOrPosition ?? 0;
+  const bytesWritten = writeSync(fd, data, offset, lengthOrEncoding, position);
+  return { bytesWritten, buffer: data };
+}
+
+export async function readv(fd, buffers, position = null) {
+  return { bytesRead: readvSync(fd, buffers, position), buffers };
+}
+
+export async function writev(fd, buffers, position = null) {
+  return { bytesWritten: writevSync(fd, buffers, position), buffers };
 }
 
 export async function copyFile(source, destination, mode = 0) {
@@ -178,8 +253,8 @@ export async function mkdir(path, options = {}) {
   return mkdirSync(path, options);
 }
 
-export async function mkdtemp(prefix) {
-  return mkdtempSync(prefix);
+export async function mkdtemp(prefix, options = undefined) {
+  return mkdtempSync(prefix, options);
 }
 
 export async function mkdtempDisposable(prefix) {
@@ -187,6 +262,22 @@ export async function mkdtempDisposable(prefix) {
 }
 
 let nextFileHandleAsyncId = 1;
+
+function fileDescriptorFrom(value) {
+  if (value instanceof FileHandle) {
+    value._assertOpen("open");
+    return value.fd;
+  }
+  return value;
+}
+
+function badFileDescriptor(syscall) {
+  const error = new Error("Bad file descriptor");
+  error.code = "EBADF";
+  error.name = "SystemError";
+  error.syscall = syscall;
+  return error;
+}
 
 function createReadLinesInterface(stream) {
   let closed = false;
@@ -219,59 +310,137 @@ function createReadLinesInterface(stream) {
 }
 
 class FileHandle extends EventEmitter {
-  constructor(fd, path) {
+  constructor(fd, path, flags = "r") {
     super();
     this.fd = fd;
     this.path = path;
+    this.flags = flags;
     this._asyncId = nextFileHandleAsyncId++;
     this._closed = false;
+    this._closing = false;
+    this._refs = 1;
+    this._closePromise = null;
+    this._closeResolve = null;
+    this._closeReject = null;
   }
 
-  _markClosed() {
-    this.fd = -1;
-    if (!this._closed) {
-      this._closed = true;
-      this.emit("close");
-    }
+  _assertOpen(syscall) {
+    if (this.fd < 0 || this._closing) throw badFileDescriptor(syscall);
+    return this.fd;
   }
 
-  appendFile(data, options = undefined) { return appendFile(this.fd, data, options); }
-  chmod(mode) { return Promise.resolve(fchmodSync(this.fd, mode)); }
-  chown(uid, gid) { return Promise.resolve(fchownSync(this.fd, uid, gid)); }
-  close() {
+  _emitClose() {
+    if (this._closed) return;
+    this._closed = true;
+    this.emit("close");
+  }
+
+  _finishClose() {
+    if (!this._closing || this._refs !== 0 || this.fd < 0) return;
     const fd = this.fd;
     this.fd = -1;
-    if (fd != null && fd >= 0) {
-      try {
-        closeSync(fd);
-      } catch (error) {
-        this._markClosed();
-        return Promise.reject(error);
-      }
+    try {
+      closeSync(fd);
+      this._closeResolve?.();
+    } catch (error) {
+      this._closeReject?.(error);
     }
-    this._markClosed();
-    return Promise.resolve();
+  }
+
+  _unref() {
+    this._refs -= 1;
+    this._finishClose();
+  }
+
+  _withRef(syscall, operation) {
+    let result;
+    try {
+      this._assertOpen(syscall);
+      this._refs += 1;
+      result = operation();
+    } catch (error) {
+      if (this._refs > 0 && !this._closing) this._unref();
+      return Promise.reject(error);
+    }
+    return Promise.resolve(result).finally(() => this._unref());
+  }
+
+  _markClosedExternally() {
+    this.fd = -1;
+    this._closing = true;
+    this._refs = 0;
+    this._emitClose();
+    this._closeResolve?.();
+  }
+
+  appendFile(data, options = undefined) {
+    return this._withRef("writeFile", () => appendFile(this.fd, data, options));
+  }
+  chmod(mode) { return this._withRef("fchmod", () => fchmodSync(this.fd, mode)); }
+  chown(uid, gid) { return this._withRef("fchown", () => fchownSync(this.fd, uid, gid)); }
+  close() {
+    if (this.fd < 0) return this._closePromise ?? Promise.resolve();
+    if (this._closePromise) return this._closePromise;
+    this._closing = true;
+    this._refs -= 1;
+    this._closePromise = new Promise((resolve, reject) => {
+      this._closeResolve = resolve;
+      this._closeReject = reject;
+    });
+    this._emitClose();
+    this._finishClose();
+    return this._closePromise;
   }
   createReadStream(options = {}) {
-    const stream = createReadStream(this.path, { ...options, fd: this.fd });
-    if (options?.autoClose !== false) stream.once("close", () => this._markClosed());
+    const fd = this._assertOpen("createReadStream");
+    const stream = createReadStream(this.path, { highWaterMark: 64 * 1024, ...options, fd });
+    if (options?.autoClose !== false) stream.once("close", () => this._markClosedExternally());
     return stream;
   }
   createWriteStream(options = {}) {
-    const stream = createWriteStream(this.path, { ...options, fd: this.fd });
-    if (options?.autoClose !== false) stream.once("close", () => this._markClosed());
+    const fd = this._assertOpen("createWriteStream");
+    const stream = createWriteStream(this.path, { highWaterMark: 64 * 1024, ...options, fd });
+    if (options?.autoClose !== false) {
+      const markClosed = () => this._markClosedExternally();
+      stream.once("finish", markClosed);
+      stream.once("close", markClosed);
+    }
     return stream;
   }
-  datasync() { return Promise.resolve(fdatasyncSync(this.fd)); }
+  datasync() { return this._withRef("fdatasync", () => fdatasyncSync(this.fd)); }
   getAsyncId() { return this._asyncId; }
-  read(buffer, offset = 0, length = buffer.byteLength - offset, position = null) {
-    return Promise.resolve({ bytesRead: readSync(this.fd, buffer, offset, length, position), buffer });
+  read(bufferOrOptions = undefined, offset = undefined, length = undefined, position = undefined) {
+    let buffer = bufferOrOptions;
+    if (!ArrayBuffer.isView(buffer) && !(buffer instanceof ArrayBuffer)) {
+      if (buffer != null && (typeof buffer !== "object" || Array.isArray(buffer))) {
+        return Promise.reject(invalidArgType("options", "of type object", buffer));
+      }
+      const options = buffer ?? {};
+      buffer = options.buffer ?? globalThis.Buffer?.alloc?.(16384) ?? new Uint8Array(16384);
+      offset = options.offset ?? 0;
+      length = options.length ?? buffer.byteLength - offset;
+      position = options.position ?? null;
+    } else if (offset && typeof offset === "object") {
+      const options = offset;
+      offset = options.offset ?? 0;
+      length = options.length ?? buffer.byteLength - offset;
+      position = options.position ?? null;
+    } else {
+      offset ??= 0;
+      length ??= buffer.byteLength - offset;
+      position ??= null;
+    }
+    return this._withRef("read", () => ({
+      bytesRead: readSync(this.fd, buffer, offset, length, position),
+      buffer,
+    }));
   }
-  readFile(options = undefined) { return Promise.resolve(readFileSync(this.fd, options)); }
+  readFile(options = undefined) { return this._withRef("readFile", () => readFile(this.fd, options)); }
   readLines(options = {}) {
     return createReadLinesInterface(this.createReadStream({ ...options, encoding: options?.encoding ?? "utf8" }));
   }
   readableWebStream(options = {}) {
+    this._assertOpen("readableWebStream");
     const highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 64 * 1024), 1024 * 1024));
     return new WebReadableStream({
       pull: (controller) => {
@@ -290,19 +459,19 @@ class FileHandle extends EventEmitter {
     });
   }
   readv(buffers, position = null) {
-    return Promise.resolve({ bytesRead: readvSync(this.fd, buffers, position), buffers });
+    return this._withRef("readv", () => ({ bytesRead: readvSync(this.fd, buffers, position), buffers }));
   }
-  stat(options = undefined) { return Promise.resolve(fstatSync(this.fd, options)); }
-  sync() { return Promise.resolve(fsyncSync(this.fd)); }
-  truncate(len = 0) { return Promise.resolve(ftruncateSync(this.fd, len)); }
-  utimes(atime, mtime) { return Promise.resolve(futimesSync(this.fd, atime, mtime)); }
+  stat(options = undefined) { return this._withRef("fstat", () => fstatSync(this.fd, options)); }
+  sync() { return this._withRef("fsync", () => fsyncSync(this.fd)); }
+  truncate(len = 0) { return this._withRef("ftruncate", () => ftruncateSync(this.fd, len)); }
+  utimes(atime, mtime) { return this._withRef("futimes", () => futimesSync(this.fd, atime, mtime)); }
   write(data, offsetOrOptions = undefined, length = undefined, position = undefined) {
     if (typeof data === "string") {
       // write(string[, position[, encoding]]): default position null writes at
       // the current file offset (so append-mode handles keep appending).
       const stringPosition = typeof offsetOrOptions === "number" ? offsetOrOptions : null;
       const encoding = typeof length === "string" ? length : "utf8";
-      return Promise.resolve({ bytesWritten: writeSync(this.fd, data, stringPosition, encoding), buffer: data });
+      return this._withRef("write", () => ({ bytesWritten: writeSync(this.fd, data, stringPosition, encoding), buffer: data }));
     }
     let offset = offsetOrOptions;
     if (offset !== null && typeof offset === "object") {
@@ -310,19 +479,26 @@ class FileHandle extends EventEmitter {
       length = offset.length;
       offset = offset.offset ?? 0;
     }
-    return Promise.resolve({
+    return this._withRef("write", () => ({
       bytesWritten: writeSync(this.fd, data, offset ?? 0, length, position ?? null),
       buffer: data,
-    });
+    }));
   }
-  writeFile(data, options = undefined) { writeFileSync(this.fd, data, options); return Promise.resolve(); }
+  writeFile(data, options = undefined) {
+    return this._withRef("writeFile", () => writeFile(this.fd, data, {
+      ...(typeof options === "object" && options !== null ? options : {}),
+      encoding: typeof options === "string" ? options : options?.encoding,
+      flag: this.flags,
+    }));
+  }
   writev(buffers, position = null) {
-    return Promise.resolve({ bytesWritten: writevSync(this.fd, buffers, position), buffers });
+    return this._withRef("writev", () => ({ bytesWritten: writevSync(this.fd, buffers, position), buffers }));
   }
+  [symbolAsyncDispose]() { return this.close(); }
 }
 
 export async function open(path, flags = "r", mode = 0o666) {
-  return new FileHandle(openSync(path, flags, mode), String(path));
+  return new FileHandle(openSync(path, flags, mode), String(path), flags);
 }
 
 export async function opendir(path, options = {}) {
@@ -330,7 +506,8 @@ export async function opendir(path, options = {}) {
 }
 
 export async function readFile(path, options = undefined) {
-  return readFileSync(path, options);
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  return runAbortable(() => readFileSync(fileDescriptorFrom(path), options), signal);
 }
 
 export async function readdir(path, options = undefined) {
@@ -471,16 +648,23 @@ function writeChunkToFd(fd, chunk, encoding) {
 }
 
 export async function writeFile(path, data, options = undefined) {
+  const encoding = encodingFromOptions(options, "utf8");
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  if (signal?.aborted) throw abortReason(signal);
   if (isStreamLikeData(data)) {
-    const encoding = (typeof options === "string" ? options : options?.encoding) ?? "utf8";
     const flag = (typeof options === "object" && options?.flag) || "w";
     // Open before touching the iterator so path errors (e.g. EISDIR) surface
     // without consuming the input, matching Node.
-    const fileHandleFd = path !== null && typeof path === "object" && typeof path.fd === "number" ? path.fd : null;
+    const fileHandleFd = path instanceof FileHandle
+      ? path._assertOpen("writeFile")
+      : path !== null && typeof path === "object" && typeof path.fd === "number"
+        ? path.fd
+        : null;
     const fd = fileHandleFd ?? (typeof path === "number" ? path : openSync(path, flag, 0o666));
     const ownsFd = fileHandleFd == null && typeof path !== "number";
     try {
       for await (const chunk of data) {
+        if (signal?.aborted) throw abortReason(signal);
         writeChunkToFd(fd, chunk, encoding);
       }
     } finally {
@@ -488,7 +672,7 @@ export async function writeFile(path, data, options = undefined) {
     }
     return;
   }
-  return writeFileSync(path, data, options);
+  return runAbortable(() => writeFileSync(fileDescriptorFrom(path), data, options), signal);
 }
 
 // Bun extends fs.promises with exists(); it never rejects.
@@ -511,6 +695,13 @@ export default {
   constants,
   copyFile,
   cp,
+  fchmod,
+  fchown,
+  fstat,
+  fsync,
+  fdatasync,
+  ftruncate,
+  futimes,
   glob,
   lchmod,
   lchown,
@@ -522,9 +713,11 @@ export default {
   mkdtempDisposable,
   open,
   opendir,
+  read,
   readFile,
   readdir,
   readlink,
+  readv,
   realpath,
   rename,
   rm,
@@ -536,5 +729,7 @@ export default {
   unlink,
   utimes,
   watch,
+  write,
   writeFile,
+  writev,
 };

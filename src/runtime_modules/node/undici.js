@@ -40,6 +40,7 @@ const BalancedPoolMissingUpstreamError = namedError("BalancedPoolMissingUpstream
 const ResponseExceededMaxSizeError = namedError("ResponseExceededMaxSizeError", "UND_ERR_RES_EXCEEDED_MAX_SIZE", UndiciError);
 const RequestRetryError = namedError("RequestRetryError", "UND_ERR_REQ_RETRY", UndiciError);
 const SecureProxyConnectionError = namedError("SecureProxyConnectionError", "UND_ERR_PRX_TLS", UndiciError);
+const MockNotMatchedError = namedError("MockNotMatchedError", "UND_MOCK_ERR_MOCK_NOT_MATCHED", UndiciError);
 
 const errors = {
   AbortError,
@@ -65,12 +66,6 @@ const errors = {
   RequestRetryError,
   SecureProxyConnectionError,
 };
-
-// COTTONTAIL-COMPAT: Undici's mock interception and EventSource still need
-// dedicated protocol implementations.
-function unsupported(name) {
-  throw new NotSupportedError(`${name} is not implemented by Cottontail's Undici compatibility layer`);
-}
 
 function callbackifyPromise(promise, callback) {
   if (typeof callback !== "function") return promise;
@@ -170,6 +165,164 @@ export function createUndiciModule(primitives) {
     MessageEvent,
     EventTarget,
   } = primitives;
+
+  const kMockNetworkFallback = Symbol("undici.mock.networkFallback");
+
+  function matchMockValue(matcher, value) {
+    if (typeof matcher === "string") return matcher === value;
+    if (matcher instanceof RegExp) {
+      matcher.lastIndex = 0;
+      return matcher.test(value);
+    }
+    if (typeof matcher === "function") return matcher(value) === true;
+    if (Buffer.isBuffer(matcher) || matcher instanceof Uint8Array) {
+      const actual = Buffer.isBuffer(value) || value instanceof Uint8Array
+        ? Buffer.from(value)
+        : Buffer.from(String(value ?? ""));
+      return Buffer.from(matcher).equals(actual);
+    }
+    return Object.is(matcher, value);
+  }
+
+  function normalizeMockOrigin(origin) {
+    if (typeof origin !== "string" && !(origin instanceof URL)) return origin;
+    try {
+      return new URL(String(origin)).origin.toLowerCase();
+    } catch {
+      return String(origin).toLowerCase();
+    }
+  }
+
+  function normalizeMockPath(path, ignoreTrailingSlash = false) {
+    if (typeof path !== "string") return path;
+    const hash = path.indexOf("#");
+    if (hash >= 0) path = path.slice(0, hash);
+    const queryIndex = path.indexOf("?");
+    if (queryIndex >= 0) {
+      const search = new URLSearchParams(path.slice(queryIndex + 1));
+      search.sort();
+      path = `${path.slice(0, queryIndex)}?${search}`;
+    }
+    if (ignoreTrailingSlash) {
+      const split = path.indexOf("?");
+      const pathname = split < 0 ? path : path.slice(0, split);
+      const query = split < 0 ? "" : path.slice(split);
+      path = `${pathname.replace(/\/+$/, "") || "/"}${query}`;
+    }
+    return path;
+  }
+
+  function appendMockQuery(path, query) {
+    if (query == null) return path;
+    const parsed = new URL(String(path), "http://mock.invalid");
+    const entries = query instanceof URLSearchParams ? query : Object.entries(query);
+    for (const [name, rawValue] of entries) {
+      if (Array.isArray(rawValue)) {
+        for (const value of rawValue) parsed.searchParams.append(name, String(value));
+      } else {
+        parsed.searchParams.append(name, String(rawValue));
+      }
+    }
+    return `${parsed.pathname}${parsed.search}`;
+  }
+
+  function mockHeadersObject(input) {
+    const result = {};
+    if (input == null) return result;
+    if (Array.isArray(input) && (input.length === 0 || !Array.isArray(input[0]))) {
+      for (let index = 0; index + 1 < input.length; index += 2) {
+        result[String(input[index]).toLowerCase()] = String(input[index + 1]);
+      }
+      return result;
+    }
+    const headers = input instanceof Headers ? input : new Headers(input);
+    for (const [name, value] of headers) result[name.toLowerCase()] = value;
+    return result;
+  }
+
+  function matchMockHeaders(matcher, headers) {
+    if (matcher === undefined) return true;
+    if (typeof matcher === "function") return matcher(headers) === true;
+    if (!matcher || typeof matcher !== "object") return false;
+    for (const [name, valueMatcher] of Object.entries(matcher)) {
+      if (!matchMockValue(valueMatcher, headers[String(name).toLowerCase()])) return false;
+    }
+    return true;
+  }
+
+  async function materializeMockRequestBody(body) {
+    if (body == null || typeof body === "string") return { value: body, networkBody: body };
+    if (body instanceof URLSearchParams) {
+      const value = body.toString();
+      return { value, networkBody: value };
+    }
+    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+      const networkBody = Buffer.from(body);
+      return { value: networkBody.toString("utf8"), networkBody };
+    }
+    if (body instanceof ArrayBuffer) {
+      const networkBody = Buffer.from(body);
+      return { value: networkBody.toString("utf8"), networkBody };
+    }
+    const chunks = [];
+    if (typeof body.getReader === "function") {
+      const reader = body.getReader();
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) break;
+        chunks.push(Buffer.from(item.value));
+      }
+    } else if (typeof body[Symbol.asyncIterator] === "function" || typeof body[Symbol.iterator] === "function") {
+      for await (const chunk of body) chunks.push(Buffer.from(chunk));
+    } else {
+      return { value: body, networkBody: body };
+    }
+    const networkBody = chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks);
+    return { value: networkBody.toString("utf8"), networkBody };
+  }
+
+  function mockResponseData(data) {
+    if (Buffer.isBuffer(data)) return data;
+    if (data instanceof Uint8Array) return Buffer.from(data);
+    if (data instanceof ArrayBuffer) return Buffer.from(data);
+    if (typeof data === "object" && data !== null) return JSON.stringify(data);
+    return data == null ? "" : String(data);
+  }
+
+  function waitForMockDelay(delay, signal) {
+    if (!(delay > 0)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        signal?.removeEventListener?.("abort", onAbort);
+        signal?.off?.("abort", onAbort);
+      };
+      const finish = (error = undefined) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        if (error) reject(normalizeAbortError(error));
+        else resolve();
+      };
+      const onAbort = () => finish(signal.reason ?? new RequestAbortedError("The operation was aborted."));
+      const timer = setTimeout(finish, delay);
+      timer.unref?.();
+      if (signal?.aborted) onAbort();
+      else if (typeof signal?.addEventListener === "function") signal.addEventListener("abort", onAbort, { once: true });
+      else signal?.once?.("abort", onAbort);
+    });
+  }
+
+  function responseFromMockReply(reply, method = "GET") {
+    const status = Number(reply.statusCode);
+    const bodyForbidden = method === "HEAD" || status === 101 || status === 204 || status === 205 || status === 304;
+    return new Response(bodyForbidden ? null : mockResponseData(reply.data), {
+      status,
+      statusText: reply.statusText,
+      headers: reply.headers,
+    });
+  }
 
   class BodyReadable extends Readable {
     constructor(response, bodyTimeout = 0, maxSize = -1, onComplete = undefined) {
@@ -348,6 +501,8 @@ export function createUndiciModule(primitives) {
     }, headersTimeout) : null;
     headersTimer?.unref?.();
     let response;
+    let responseTrailers = kEmptyObject;
+    let responseUrl = url.href;
     try {
       const fetchOptions = {
         ...dispatcherFetch,
@@ -358,7 +513,20 @@ export function createUndiciModule(primitives) {
         redirect: options.maxRedirections === 0 ? "manual" : "follow",
       };
       if (options.reset === true) fetchOptions.keepalive = false;
-      response = await fetch(url, fetchOptions);
+      const mockReply = typeof dispatcher?._resolveMock === "function"
+        ? await dispatcher._resolveMock(url, { ...options, ...fetchOptions, signal })
+        : null;
+      if (mockReply && mockReply.fallback === kMockNetworkFallback) {
+        if (mockReply.body !== undefined) fetchOptions.body = mockReply.body;
+        response = await fetch(url, fetchOptions);
+        responseUrl = response.url || url.href;
+      } else if (mockReply) {
+        response = responseFromMockReply(mockReply, method);
+        responseTrailers = mockReply.trailers ?? kEmptyObject;
+      } else {
+        response = await fetch(url, fetchOptions);
+        responseUrl = response.url || url.href;
+      }
     } catch (error) {
       operation?.finish();
       throw normalizeAbortError(error);
@@ -385,9 +553,10 @@ export function createUndiciModule(primitives) {
       statusCode: response.status,
       headers: headersObject(response.headers),
       body,
-      trailers: response.trailers ?? kEmptyObject,
+      trailers: responseTrailers === kEmptyObject ? response.trailers ?? kEmptyObject : responseTrailers,
       opaque: options.opaque ?? kEmptyObject,
       context: options.context ?? kEmptyObject,
+      url: responseUrl,
     };
   }
 
@@ -458,7 +627,9 @@ export function createUndiciModule(primitives) {
       const controller = new primitives.AbortController();
       let release = null;
       let resumeRequested = false;
+      let protocolPaused = false;
       const resume = () => {
+        protocolPaused = false;
         if (release) {
           const resolve = release;
           release = null;
@@ -468,17 +639,31 @@ export function createUndiciModule(primitives) {
         }
       };
       const waitIfPaused = async value => {
-        if (value !== false) return;
+        if (value !== false && !protocolPaused) return;
         if (resumeRequested) {
           resumeRequested = false;
           return;
         }
         await new Promise(resolve => { release = resolve; });
       };
+      const protocolController = {
+        rawHeaders: null,
+        rawTrailers: null,
+        pause() { protocolPaused = true; },
+        resume,
+        abort(reason = new RequestAbortedError("The operation was aborted.")) {
+          controller.abort(reason);
+        },
+      };
+      const reportError = error => {
+        handler.onError?.(error);
+        handler.onResponseError?.(protocolController, error);
+      };
       try {
         handler.onConnect?.(reason => controller.abort(reason));
+        handler.onRequestStart?.(protocolController, null);
       } catch (error) {
-        queueMicrotask(() => handler.onError?.(error));
+        queueMicrotask(() => reportError(error));
         return true;
       }
       const origin = options.origin ?? this.origin;
@@ -504,21 +689,30 @@ export function createUndiciModule(primitives) {
         let result;
         try {
           result = await request(target, { ...options, dispatcher: this, signal });
-          await waitIfPaused(handler.onHeaders?.(
+          const rawHeaders = rawHeaderPairs(new Headers(result.headers));
+          protocolController.rawHeaders = rawHeaders;
+          const oldHeadersResult = handler.onHeaders?.(
             result.statusCode,
-            rawHeaderPairs(new Headers(result.headers)),
+            rawHeaders,
             resume,
             "",
-          ));
+          );
+          handler.onResponseStart?.(protocolController, result.statusCode, result.headers, "");
+          await waitIfPaused(oldHeadersResult);
           if (result.body) {
             for await (const chunk of result.body) {
-              await waitIfPaused(handler.onData?.(chunk));
+              const oldDataResult = handler.onData?.(chunk);
+              handler.onResponseData?.(protocolController, chunk);
+              await waitIfPaused(oldDataResult);
             }
           }
-          handler.onComplete?.(rawHeaderPairs(new Headers(result.trailers)));
+          const rawTrailers = rawHeaderPairs(new Headers(result.trailers));
+          protocolController.rawTrailers = rawTrailers;
+          handler.onComplete?.(rawTrailers);
+          handler.onResponseEnd?.(protocolController, result.trailers);
         } catch (error) {
           result?.body?.destroy?.(error);
-          handler.onError?.(error);
+          reportError(error);
         } finally {
           removeSourceAbort?.();
         }
@@ -671,10 +865,435 @@ export function createUndiciModule(primitives) {
   const createRedirectInterceptor = options => dispatch => (opts, handler) =>
     dispatch({ ...opts, maxRedirections: opts.maxRedirections ?? options?.maxRedirections }, handler);
 
-  class MockClient extends Client { constructor() { super("http://localhost"); unsupported("MockClient"); } }
-  class MockPool extends Pool { constructor() { super("http://localhost"); unsupported("MockPool"); } }
-  class MockAgent extends Agent { constructor() { super(); unsupported("MockAgent"); } }
-  const mockErrors = Object.freeze({ MockNotMatchedError: namedError("MockNotMatchedError", "UND_MOCK_ERR_MOCK_NOT_MATCHED", UndiciError) });
+  function validateMockCount(value, name) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new InvalidArgumentError(`${name} must be a valid integer > 0`);
+    }
+  }
+
+  function mergeMockHeaders(...sources) {
+    const result = {};
+    for (const source of sources) {
+      if (source == null) continue;
+      const values = mockHeadersObject(source);
+      for (const [name, value] of Object.entries(values)) result[name] = value;
+    }
+    return result;
+  }
+
+  class MockScope {
+    constructor(dispatch) {
+      this._dispatch = dispatch;
+    }
+
+    delay(waitInMs) {
+      validateMockCount(waitInMs, "waitInMs");
+      this._dispatch.delay = waitInMs;
+      return this;
+    }
+
+    persist() {
+      this._dispatch.persist = true;
+      return this;
+    }
+
+    times(repeatTimes) {
+      validateMockCount(repeatTimes, "repeatTimes");
+      this._dispatch.times = repeatTimes;
+      this._dispatch.pending = this._dispatch.timesInvoked < repeatTimes;
+      return this;
+    }
+  }
+
+  class MockInterceptor {
+    constructor(options, dispatches, defaults = {}) {
+      if (!options || typeof options !== "object") throw new InvalidArgumentError("opts must be an object");
+      if (options.path === undefined) throw new InvalidArgumentError("opts.path must be defined");
+      let path = options.path;
+      if (typeof path === "string") {
+        path = appendMockQuery(path, options.query);
+        if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(path)) {
+          const parsed = new URL(path);
+          path = `${parsed.pathname}${parsed.search}`;
+        }
+        path = normalizeMockPath(path, options.ignoreTrailingSlash ?? defaults.ignoreTrailingSlash);
+      }
+      this._key = {
+        path,
+        method: typeof options.method === "string" ? options.method.toUpperCase() : options.method ?? "GET",
+        body: options.body,
+        headers: options.headers,
+      };
+      this._dispatches = dispatches;
+      this._ignoreTrailingSlash = options.ignoreTrailingSlash ?? defaults.ignoreTrailingSlash ?? false;
+      this._defaultHeaders = Object.create(null);
+      this._defaultTrailers = Object.create(null);
+      this._contentLength = false;
+    }
+
+    _add(data) {
+      const dispatch = {
+        ...this._key,
+        ...data,
+        ignoreTrailingSlash: this._ignoreTrailingSlash,
+        defaultHeaders: this._defaultHeaders,
+        defaultTrailers: this._defaultTrailers,
+        contentLength: this._contentLength,
+        timesInvoked: 0,
+        times: 1,
+        persist: false,
+        consumed: false,
+        pending: true,
+        delay: 0,
+      };
+      this._dispatches.push(dispatch);
+      return new MockScope(dispatch);
+    }
+
+    reply(statusCodeOrCallback, data = "", responseOptions = {}) {
+      if (typeof statusCodeOrCallback === "function") {
+        return this._add({ replyCallback: statusCodeOrCallback });
+      }
+      if (statusCodeOrCallback === undefined) throw new InvalidArgumentError("statusCode must be defined");
+      if (!responseOptions || typeof responseOptions !== "object") {
+        throw new InvalidArgumentError("responseOptions must be an object");
+      }
+      return this._add({ statusCode: statusCodeOrCallback, data, responseOptions });
+    }
+
+    replyWithError(error) {
+      if (error === undefined) throw new InvalidArgumentError("error must be defined");
+      return this._add({ error });
+    }
+
+    defaultReplyHeaders(headers) {
+      if (headers === undefined) throw new InvalidArgumentError("headers must be defined");
+      this._defaultHeaders = headers;
+      return this;
+    }
+
+    defaultReplyTrailers(trailers) {
+      if (trailers === undefined) throw new InvalidArgumentError("trailers must be defined");
+      this._defaultTrailers = trailers;
+      return this;
+    }
+
+    replyContentLength() {
+      this._contentLength = true;
+      return this;
+    }
+  }
+
+  function initializeMockDispatcher(dispatcher, origin, options) {
+    if (!options?.agent || typeof options.agent.dispatch !== "function") {
+      throw new InvalidArgumentError("Argument opts.agent must implement Agent");
+    }
+    dispatcher._mockAgent = options.agent;
+    dispatcher._mockOriginKey = options.originKey ?? normalizeMockOrigin(origin);
+    dispatcher._mockDispatches = options.dispatches ?? [];
+    dispatcher._ignoreTrailingSlash = options.ignoreTrailingSlash ?? false;
+    dispatcher.connected = true;
+  }
+
+  function closeMockDispatcher(dispatcher, callback) {
+    const promise = Dispatcher.prototype.close.call(dispatcher).then(() => {
+      dispatcher.connected = false;
+      dispatcher._mockAgent?._deleteClient(dispatcher._mockOriginKey, dispatcher);
+    });
+    return callbackifyPromise(promise, callback);
+  }
+
+  class MockClient extends Client {
+    constructor(origin, options = {}) {
+      const actualOrigin = typeof origin === "string" || origin instanceof URL ? origin : "http://localhost:9999";
+      super(actualOrigin, options);
+      initializeMockDispatcher(this, origin, options);
+    }
+
+    intercept(options) {
+      return new MockInterceptor(options, this._mockDispatches, { ignoreTrailingSlash: this._ignoreTrailingSlash });
+    }
+
+    cleanMocks() {
+      this._mockDispatches.length = 0;
+    }
+
+    _resolveMock(target, options) {
+      return this._mockAgent._resolveMock(target, options, this);
+    }
+
+    close(callback = undefined) {
+      return closeMockDispatcher(this, callback);
+    }
+  }
+
+  class MockPool extends Pool {
+    constructor(origin, options = {}) {
+      const actualOrigin = typeof origin === "string" || origin instanceof URL ? origin : "http://localhost:9999";
+      super(actualOrigin, options);
+      initializeMockDispatcher(this, origin, options);
+    }
+
+    intercept(options) {
+      return new MockInterceptor(options, this._mockDispatches, { ignoreTrailingSlash: this._ignoreTrailingSlash });
+    }
+
+    cleanMocks() {
+      this._mockDispatches.length = 0;
+    }
+
+    _resolveMock(target, options) {
+      return this._mockAgent._resolveMock(target, options, this);
+    }
+
+    close(callback = undefined) {
+      return closeMockDispatcher(this, callback);
+    }
+  }
+
+  class MockAgent extends Dispatcher {
+    constructor(options = {}) {
+      super();
+      if (!options || typeof options !== "object") throw new InvalidArgumentError("options must be an object");
+      if (options.agent != null && typeof options.agent.dispatch !== "function") {
+        throw new InvalidArgumentError("Argument opts.agent must implement Agent");
+      }
+      for (const name of ["acceptNonStandardSearchParameters", "ignoreTrailingSlash"]) {
+        if (options[name] !== undefined && typeof options[name] !== "boolean") {
+          throw new InvalidArgumentError(`options.${name} must to be a boolean`);
+        }
+      }
+      this.options = options;
+      this._clients = new Map();
+      this._netConnect = true;
+      this._mockActive = true;
+      this._fetchOptions = options.agent?._fetchOptions ?? dispatcherFetchOptions(options);
+      this._ignoreTrailingSlash = options.ignoreTrailingSlash ?? false;
+      this._acceptNonStandardSearchParameters = options.acceptNonStandardSearchParameters ?? false;
+    }
+
+    get isMockActive() {
+      return this._mockActive;
+    }
+
+    get(origin) {
+      const key = normalizeMockOrigin(origin);
+      const existing = this._clients.get(key);
+      if (existing) return existing;
+
+      if (typeof key === "string") {
+        for (const [matcher, dispatcher] of this._clients) {
+          if (typeof matcher === "string" || !matchMockValue(matcher, key)) continue;
+          const concrete = this._createClient(key, dispatcher._mockDispatches);
+          this._clients.set(key, concrete);
+          return concrete;
+        }
+      }
+
+      const dispatcher = this._createClient(key);
+      this._clients.set(key, dispatcher);
+      return dispatcher;
+    }
+
+    _createClient(originKey, dispatches = undefined) {
+      const options = {
+        ...this.options,
+        agent: this,
+        originKey,
+        dispatches,
+        ignoreTrailingSlash: this._ignoreTrailingSlash,
+      };
+      return this.options.connections === 1
+        ? new MockClient(originKey, options)
+        : new MockPool(originKey, options);
+    }
+
+    _deleteClient(key, dispatcher) {
+      if (this._clients.get(key) === dispatcher) this._clients.delete(key);
+    }
+
+    _networkAllowed(origin) {
+      if (this._netConnect === true) return true;
+      if (!Array.isArray(this._netConnect)) return false;
+      const host = new URL(origin).host;
+      return this._netConnect.some(matcher => matchMockValue(matcher, host));
+    }
+
+    _notMatched(message, origin, networkBody = undefined) {
+      if (!this._mockActive || this._networkAllowed(origin)) {
+        return { fallback: kMockNetworkFallback, body: networkBody };
+      }
+      const clients = new Set(this._clients.values());
+      let total = 0;
+      let remaining = 0;
+      for (const client of clients) {
+        total += client._mockDispatches.length;
+        remaining += client._mockDispatches.filter(dispatch => !dispatch.consumed).length;
+      }
+      throw new MockNotMatchedError(
+        `${message}: subsequent request to origin ${origin} was not allowed ` +
+        `(net.connect ${this._netConnect === false ? "disabled" : "is not enabled for this origin"}), ` +
+        `${remaining} interceptor(s) remaining out of ${total} defined`,
+      );
+    }
+
+    async _resolveMock(target, options, explicitDispatcher = undefined) {
+      const origin = normalizeMockOrigin(target.origin);
+      if (!this._mockActive) return { fallback: kMockNetworkFallback };
+      const dispatcher = explicitDispatcher ?? this.get(origin);
+      const headers = mockHeadersObject(options.headers);
+      let path = `${target.pathname || "/"}${target.search || ""}`;
+      if (this._acceptNonStandardSearchParameters && target.search) {
+        const normalized = new URLSearchParams(target.search);
+        for (const [name, value] of [...normalized]) {
+          if (!name.endsWith("[]") && !value.includes(",")) continue;
+          normalized.delete(name);
+          const cleanName = name.replace(/\[\]$/, "");
+          for (const part of value.split(",")) normalized.append(cleanName, part);
+        }
+        path = `${target.pathname || "/"}?${normalized}`;
+      }
+      const normalizedPath = normalizeMockPath(path, dispatcher._ignoreTrailingSlash);
+      const method = String(options.method ?? "GET").toUpperCase();
+      const available = dispatcher._mockDispatches.filter(dispatch => !dispatch.consumed);
+      let matches = available.filter(dispatch => {
+        const expected = typeof dispatch.path === "string"
+          ? normalizeMockPath(dispatch.path, dispatch.ignoreTrailingSlash)
+          : dispatch.path;
+        return matchMockValue(expected, normalizeMockPath(path, dispatch.ignoreTrailingSlash));
+      });
+      if (matches.length === 0) {
+        return this._notMatched(`Mock dispatch not matched for path '${normalizedPath}'`, origin);
+      }
+      matches = matches.filter(dispatch => matchMockValue(dispatch.method, method));
+      if (matches.length === 0) {
+        return this._notMatched(`Mock dispatch not matched for method '${method}' on path '${normalizedPath}'`, origin);
+      }
+      matches = matches.filter(dispatch => matchMockHeaders(dispatch.headers, headers));
+      if (matches.length === 0) {
+        return this._notMatched(`Mock dispatch not matched for headers '${JSON.stringify(headers)}' on path '${normalizedPath}'`, origin);
+      }
+
+      let body = options.body;
+      let networkBody;
+      if (body != null && matches.some(dispatch => dispatch.body !== undefined || dispatch.replyCallback || typeof dispatch.data === "function")) {
+        const materialized = await materializeMockRequestBody(body);
+        body = materialized.value;
+        networkBody = materialized.networkBody;
+      }
+      matches = matches.filter(dispatch => dispatch.body === undefined || matchMockValue(dispatch.body, body));
+      if (matches.length === 0) {
+        return this._notMatched(`Mock dispatch not matched for body '${body}' on path '${normalizedPath}'`, origin, networkBody);
+      }
+
+      const dispatch = matches[0];
+      dispatch.timesInvoked++;
+      dispatch.consumed = !dispatch.persist && dispatch.timesInvoked >= dispatch.times;
+      dispatch.pending = dispatch.timesInvoked < dispatch.times;
+      const requestOptions = { path, method, headers, ...(body === undefined ? {} : { body }) };
+
+      if (dispatch.error !== undefined) throw dispatch.error;
+      let reply = dispatch;
+      if (dispatch.replyCallback) {
+        reply = await dispatch.replyCallback(requestOptions);
+        if (!reply || typeof reply !== "object") {
+          throw new InvalidArgumentError("reply options callback must return an object");
+        }
+        reply = { data: "", responseOptions: {}, ...reply };
+      }
+      if (reply.statusCode === undefined) throw new InvalidArgumentError("statusCode must be defined");
+      const responseOptions = reply.responseOptions ?? {};
+      if (!responseOptions || typeof responseOptions !== "object") {
+        throw new InvalidArgumentError("responseOptions must be an object");
+      }
+      let data = reply.data ?? "";
+      if (typeof data === "function") data = await data(requestOptions);
+      await waitForMockDelay(dispatch.delay, options.signal);
+      const encoded = mockResponseData(data);
+      const contentLength = dispatch.contentLength
+        ? { "content-length": Buffer.byteLength(encoded) }
+        : null;
+      return {
+        statusCode: reply.statusCode,
+        statusText: responseOptions.statusText,
+        data: encoded,
+        headers: mergeMockHeaders(dispatch.defaultHeaders, contentLength, responseOptions.headers),
+        trailers: mergeMockHeaders(dispatch.defaultTrailers, responseOptions.trailers),
+      };
+    }
+
+    activate() {
+      this._mockActive = true;
+    }
+
+    deactivate() {
+      this._mockActive = false;
+    }
+
+    enableNetConnect(matcher = undefined) {
+      if (matcher === undefined) {
+        this._netConnect = true;
+        return;
+      }
+      if (typeof matcher !== "string" && typeof matcher !== "function" && !(matcher instanceof RegExp)) {
+        throw new InvalidArgumentError("Unsupported matcher. Must be one of String|Function|RegExp.");
+      }
+      if (!Array.isArray(this._netConnect)) this._netConnect = [];
+      this._netConnect.push(matcher);
+    }
+
+    disableNetConnect() {
+      this._netConnect = false;
+    }
+
+    pendingInterceptors() {
+      const seen = new Set();
+      const pending = [];
+      for (const [origin, dispatcher] of this._clients) {
+        for (const dispatch of dispatcher._mockDispatches) {
+          if (!dispatch.pending || seen.has(dispatch)) continue;
+          seen.add(dispatch);
+          pending.push({ ...dispatch, origin });
+        }
+      }
+      return pending;
+    }
+
+    assertNoPendingInterceptors() {
+      const pending = this.pendingInterceptors();
+      if (pending.length === 0) return;
+      const lines = pending.map(item => `${String(item.method)} ${String(item.origin)}${String(item.path)}`);
+      throw new UndiciError(
+        `${pending.length} interceptor${pending.length === 1 ? " is" : "s are"} pending:\n\n${lines.join("\n")}`,
+      );
+    }
+
+    close(callback = undefined) {
+      const promise = (async () => {
+        const clients = [...new Set(this._clients.values())];
+        await Promise.all(clients.map(client => Dispatcher.prototype.close.call(client)));
+        for (const client of clients) client.connected = false;
+        this._clients.clear();
+        await Dispatcher.prototype.close.call(this);
+      })();
+      return callbackifyPromise(promise, callback);
+    }
+
+    destroy(error = undefined, callback = undefined) {
+      if (typeof error === "function") {
+        callback = error;
+        error = undefined;
+      }
+      const promise = (async () => {
+        const clients = [...new Set(this._clients.values())];
+        await Promise.all(clients.map(client => Dispatcher.prototype.destroy.call(client, error)));
+        this._clients.clear();
+        await Dispatcher.prototype.destroy.call(this, error);
+      })();
+      return callbackifyPromise(promise, callback);
+    }
+  }
+  const mockErrors = Object.freeze({ MockNotMatchedError });
 
   class FileReader extends EventTarget {
     static EMPTY = 0;
@@ -688,15 +1307,246 @@ export function createUndiciModule(primitives) {
     }
   }
 
-  class EventSource extends EventTarget {
-    static CONNECTING = 0;
-    static OPEN = 1;
-    static CLOSED = 2;
-    constructor() {
-      super();
-      unsupported("EventSource");
+  class EventSourceParser {
+    constructor(state, emit) {
+      this._state = state;
+      this._emit = emit;
+      this._decoder = new TextDecoder("utf-8");
+      this._buffer = "";
+      this._started = false;
+      this._data = [];
+      this._eventType = "";
+      this._pendingId = undefined;
+      this._pendingRetry = undefined;
+    }
+
+    push(chunk) {
+      let text = this._decoder.decode(chunk, { stream: true });
+      if (!this._started) {
+        this._started = true;
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+      }
+      this._buffer += text;
+      this._process(false);
+    }
+
+    finish() {
+      this._buffer += this._decoder.decode();
+      this._process(true);
+    }
+
+    _process(final) {
+      for (;;) {
+        let lineEnd = -1;
+        for (let index = 0; index < this._buffer.length; index++) {
+          const code = this._buffer.charCodeAt(index);
+          if (code === 0x0a || code === 0x0d) {
+            lineEnd = index;
+            break;
+          }
+        }
+        if (lineEnd < 0) break;
+        const code = this._buffer.charCodeAt(lineEnd);
+        if (!final && code === 0x0d && lineEnd + 1 === this._buffer.length) break;
+        const width = code === 0x0d && this._buffer.charCodeAt(lineEnd + 1) === 0x0a ? 2 : 1;
+        const line = this._buffer.slice(0, lineEnd);
+        this._buffer = this._buffer.slice(lineEnd + width);
+        this._line(line);
+      }
+      if (final && this._buffer.length > 0) {
+        this._line(this._buffer);
+        this._buffer = "";
+      }
+    }
+
+    _line(line) {
+      if (line === "") {
+        this._dispatch();
+        return;
+      }
+      if (line.startsWith(":")) return;
+      const colon = line.indexOf(":");
+      const field = colon < 0 ? line : line.slice(0, colon);
+      let value = colon < 0 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "data") this._data.push(value);
+      else if (field === "event") this._eventType = value;
+      else if (field === "id" && !value.includes("\0")) this._pendingId = value;
+      else if (field === "retry" && /^[0-9]+$/.test(value)) this._pendingRetry = Number(value);
+    }
+
+    _dispatch() {
+      if (this._pendingRetry !== undefined) this._state.reconnectionTime = this._pendingRetry;
+      if (this._pendingId !== undefined) this._state.lastEventId = this._pendingId;
+      if (this._data.length > 0) {
+        this._emit(this._eventType || "message", {
+          data: this._data.join("\n"),
+          lastEventId: this._state.lastEventId,
+          origin: this._state.origin,
+        });
+      }
+      this._data.length = 0;
+      this._eventType = "";
+      this._pendingId = undefined;
+      this._pendingRetry = undefined;
     }
   }
+
+  function createEventSourceEvent(type, options = undefined) {
+    return new MessageEvent(type, options ?? {});
+  }
+
+  class EventSource extends EventTarget {
+    constructor(url, init = {}) {
+      super();
+      if (arguments.length === 0) throw new TypeError("EventSource constructor requires at least 1 argument");
+      if (init == null || typeof init !== "object") throw new TypeError("eventSourceInitDict must be an object");
+      let parsed;
+      try {
+        parsed = new URL(String(url), getGlobalOrigin());
+      } catch (error) {
+        if (typeof DOMException === "function") throw new DOMException(String(error?.message ?? error), "SyntaxError");
+        const syntaxError = new TypeError(String(error?.message ?? error));
+        syntaxError.name = "SyntaxError";
+        throw syntaxError;
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        if (typeof DOMException === "function") throw new DOMException("EventSource URL must use HTTP or HTTPS", "SyntaxError");
+        throw new TypeError("EventSource URL must use HTTP or HTTPS");
+      }
+      const nodeOptions = init.node && typeof init.node === "object" ? init.node : kEmptyObject;
+      const reconnectionTime = nodeOptions.reconnectionTime === undefined ? 3000 : Number(nodeOptions.reconnectionTime) >>> 0;
+      this._url = parsed.href;
+      this._withCredentials = init.withCredentials === true;
+      this._dispatcher = nodeOptions.dispatcher ?? init.dispatcher;
+      this._readyState = EventSource.CONNECTING;
+      this._handlers = { open: null, message: null, error: null };
+      this._state = { lastEventId: "", origin: parsed.origin, reconnectionTime };
+      this._controller = null;
+      this._body = null;
+      this._reconnectTimer = null;
+      this._generation = 0;
+      void this._connect();
+    }
+
+    get readyState() { return this._readyState; }
+    get url() { return this._url; }
+    get withCredentials() { return this._withCredentials; }
+
+    get onopen() { return this._handlers.open; }
+    set onopen(value) { this._setHandler("open", value); }
+    get onmessage() { return this._handlers.message; }
+    set onmessage(value) { this._setHandler("message", value); }
+    get onerror() { return this._handlers.error; }
+    set onerror(value) { this._setHandler("error", value); }
+
+    _setHandler(type, value) {
+      this._handlers[type] = typeof value === "function" ? value : null;
+    }
+
+    async _connect() {
+      if (this._readyState === EventSource.CLOSED) return;
+      if (this._reconnectTimer != null) clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+      this._readyState = EventSource.CONNECTING;
+      const generation = ++this._generation;
+      const controller = new primitives.AbortController();
+      this._controller = controller;
+      const headers = { Accept: "text/event-stream" };
+      if (this._state.lastEventId !== "") headers["Last-Event-ID"] = this._state.lastEventId;
+      let result;
+      try {
+        result = await request(this._url, {
+          dispatcher: this._dispatcher,
+          headers,
+          signal: controller.signal,
+          maxRedirections: 20,
+        });
+        if (generation !== this._generation || this._readyState === EventSource.CLOSED) {
+          result.body?.destroy?.();
+          return;
+        }
+        const contentType = String(result.headers["content-type"] ?? "").split(";", 1)[0].trim().toLowerCase();
+        if (result.statusCode !== 200 || contentType !== "text/event-stream") {
+          result.body?.destroy?.();
+          this._fail();
+          return;
+        }
+        this._state.origin = new URL(result.url || this._url).origin;
+        this._readyState = EventSource.OPEN;
+        this.dispatchEvent(createEventSourceEvent("open"));
+        if (this._readyState === EventSource.CLOSED) return;
+        const parser = new EventSourceParser(this._state, (type, options) => {
+          if (this._readyState !== EventSource.CLOSED) {
+            this.dispatchEvent(createEventSourceEvent(type, options));
+          }
+        });
+        this._body = result.body;
+        if (result.body) {
+          for await (const chunk of result.body) {
+            if (generation !== this._generation || this._readyState === EventSource.CLOSED) break;
+            parser.push(chunk);
+          }
+          parser.finish();
+        }
+        if (generation === this._generation && this._readyState !== EventSource.CLOSED) this._reconnect();
+      } catch (error) {
+        if (generation === this._generation && this._readyState !== EventSource.CLOSED && !controller.signal.aborted) {
+          this._reconnect();
+        }
+      } finally {
+        if (generation === this._generation) {
+          this._controller = null;
+          this._body = null;
+        }
+      }
+    }
+
+    _fail() {
+      if (this._readyState === EventSource.CLOSED) return;
+      this._readyState = EventSource.CLOSED;
+      this._generation++;
+      this._controller?.abort();
+      this._controller = null;
+      this.dispatchEvent(createEventSourceEvent("error"));
+    }
+
+    _reconnect() {
+      if (this._readyState === EventSource.CLOSED) return;
+      this._readyState = EventSource.CONNECTING;
+      this.dispatchEvent(createEventSourceEvent("error"));
+      if (this._readyState === EventSource.CLOSED) return;
+      const generation = this._generation;
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        if (generation !== this._generation || this._readyState !== EventSource.CONNECTING) return;
+        void this._connect();
+      }, this._state.reconnectionTime);
+      this._reconnectTimer.unref?.();
+    }
+
+    close() {
+      if (!(this instanceof EventSource)) throw new TypeError("Illegal invocation");
+      if (this._readyState === EventSource.CLOSED) return;
+      this._readyState = EventSource.CLOSED;
+      this._generation++;
+      if (this._reconnectTimer != null) clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+      this._controller?.abort();
+      this._controller = null;
+      this._body?.destroy?.(new RequestAbortedError("The operation was aborted."));
+      this._body = null;
+    }
+  }
+
+  const eventSourceConstants = {
+    CONNECTING: { value: 0, enumerable: true },
+    OPEN: { value: 1, enumerable: true },
+    CLOSED: { value: 2, enumerable: true },
+  };
+  Object.defineProperties(EventSource, eventSourceConstants);
+  Object.defineProperties(EventSource.prototype, eventSourceConstants);
+  Object.defineProperty(EventSource.prototype, Symbol.toStringTag, { value: "EventSource", configurable: true });
 
   function parseCookieHeader(value) {
     const result = Object.create(null);
@@ -812,12 +1662,35 @@ export function createUndiciModule(primitives) {
   }
   function getGlobalOrigin() { return globalOrigin; }
 
-  function undiciFetch(input, init = {}) {
+  async function undiciFetch(input, init = {}) {
     const dispatcher = init?.dispatcher ?? globalDispatcher;
-    if (!dispatcher?._fetchOptions || Object.keys(dispatcher._fetchOptions).length === 0) return fetch(input, init);
-    const options = { ...dispatcher._fetchOptions, ...init };
+    const options = { ...(dispatcher?._fetchOptions ?? kEmptyObject), ...init };
     delete options.dispatcher;
-    return fetch(input, options);
+    if (typeof dispatcher?._resolveMock !== "function") {
+      return fetch(input, options);
+    }
+    const target = input instanceof Request
+      ? new URL(input.url)
+      : new URL(String(input), globalOrigin);
+    const method = String(options.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    const signal = options.signal ?? (input instanceof Request ? input.signal : undefined);
+    const operation = dispatcher._beginOperation?.(signal) ?? null;
+    try {
+      const reply = await dispatcher._resolveMock(target, {
+        ...options,
+        method,
+        headers: options.headers ?? (input instanceof Request ? input.headers : undefined),
+        body: options.body ?? (input instanceof Request ? input.body : undefined),
+        signal: operation?.signal ?? signal,
+      });
+      if (reply?.fallback === kMockNetworkFallback) {
+        if (reply.body !== undefined) options.body = reply.body;
+        return await fetch(reply.body === undefined ? input : target, options);
+      }
+      return responseFromMockReply(reply, method);
+    } finally {
+      operation?.finish();
+    }
   }
 
   function buildConnector(defaults = {}) {

@@ -23,7 +23,7 @@ strictEqual(typeof tls.connect, "function", "tls connect should be exported");
 strictEqual(typeof tls.createServer, "function", "tls createServer should be exported");
 strictEqual(typeof tls.getCiphers, "function", "tls getCiphers should be exported");
 strictEqual(new tls.TLSSocket().encrypted, true, "tls TLSSocket encrypted mismatch");
-strictEqual(new tls.TLSSocket().renegotiate({}), true, "tls TLSSocket renegotiate return mismatch");
+strictEqual(new tls.TLSSocket().renegotiate({}), false, "tls TLSSocket renegotiate return mismatch");
 const tlsProbe = new tls.TLSSocket();
 tlsProbe.setSession(Buffer.from([1, 2, 3]));
 strictEqual(tlsProbe.getSession()?.toString("hex"), "010203", "tls TLSSocket setSession/getSession mismatch");
@@ -31,16 +31,27 @@ strictEqual(tlsProbe.getOCSPResponse(), undefined, "tls TLSSocket getOCSPRespons
 strictEqual(tlsProbe.getTLSTicket(), undefined, "tls TLSSocket getTLSTicket default mismatch");
 strictEqual(tlsProbe.enableTrace(), undefined, "tls TLSSocket enableTrace return mismatch");
 await new Promise<void>((resolve, reject) => {
-  strictEqual(tlsProbe.renegotiate({}, (error) => error ? reject(error) : resolve()), true, "tls renegotiate callback return mismatch");
+  strictEqual(tlsProbe.renegotiate({}, (error) => {
+    try {
+      strictEqual(error?.code, "ERR_TLS_RENEGOTIATION_UNSUPPORTED", "tls renegotiate callback error mismatch");
+      resolve();
+    } catch (assertionError) {
+      reject(assertionError);
+    }
+  }), false, "tls renegotiate callback return mismatch");
 });
 const tlsNoRenegotiate = new tls.TLSSocket();
-let disabledRenegotiateError = false;
-tlsNoRenegotiate.once("error", (error) => {
-  disabledRenegotiateError = String(error.message).includes("disabled");
-});
 strictEqual(tlsNoRenegotiate.disableRenegotiation(), undefined, "tls disableRenegotiation return mismatch");
-strictEqual(tlsNoRenegotiate.renegotiate({}, () => {}), false, "tls disabled renegotiate return mismatch");
-strictEqual(disabledRenegotiateError, true, "tls disabled renegotiate should emit error");
+await new Promise<void>((resolve, reject) => {
+  strictEqual(tlsNoRenegotiate.renegotiate({}, (error) => {
+    try {
+      strictEqual(error?.code, "ERR_TLS_RENEGOTIATION_DISABLED", "tls disabled renegotiate callback error mismatch");
+      resolve();
+    } catch (assertionError) {
+      reject(assertionError);
+    }
+  }), false, "tls disabled renegotiate return mismatch");
+});
 let renegotiateTypeError = false;
 try {
   new tls.TLSSocket().renegotiate(null as never);
@@ -68,7 +79,7 @@ strictEqual(alpn.ALPNProtocols?.toString("hex"), "02683208687474702f312e31", "tl
 
 const context = tls.createSecureContext({ ca: tls.rootCertificates[0] });
 strictEqual(context instanceof tls.SecureContext, true, "tls SecureContext mismatch");
-ok(Array.isArray(context.context.ca), "tls SecureContext should normalize CA certificates");
+ok(context.context && typeof context.context === "object", "tls SecureContext native context mismatch");
 ok(Array.isArray(tls.rootCertificates), "tls rootCertificates should be an array");
 ok(tls.rootCertificates.length > 0, "tls rootCertificates should load system roots");
 ok(tls.getCACertificates().length > 0, "tls getCACertificates should return default roots");

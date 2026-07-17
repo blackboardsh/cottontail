@@ -62,6 +62,7 @@ import {
   installInheritedNodeIpc,
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
+import { parseShell } from "../internal/bun-shell-parser.js";
 import { createBunShellRuntime } from "../internal/bun-shell-runtime.js";
 
 installInheritedNodeIpc(cottontail);
@@ -625,6 +626,10 @@ function binaryOutputView(value) {
 
 function shellInterpolationText(value) {
   if (isBunFileLike(value) && value.name != null) value = value.name;
+  if (value != null && typeof value === "object" &&
+    (typeof value.toString !== "function" || value.toString === Object.prototype.toString)) {
+    throw new TypeError("Invalid JS object used in shell, you might need to call `.toString()` on it");
+  }
   const text = String(value);
   validateNoNullByte(text, "shell argument");
   return text;
@@ -634,31 +639,60 @@ function quotePosixShellValue(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+function isShellObjectReference(value) {
+  if (value == null || typeof value !== "object" || isBunFileLike(value)) return false;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+  return (typeof Blob === "function" && value instanceof Blob)
+    || (typeof Response === "function" && value instanceof Response)
+    || (typeof ReadableStream === "function" && value instanceof ReadableStream);
+}
+
 function appendShellInterpolation(out, value, state) {
-  if (value && typeof value === "object" && "raw" in value) {
-    const raw = String(value.raw);
-    validateNoNullByte(raw, "shell argument");
-    return { out: out + raw, scan: raw };
+  if (Array.isArray(value)) {
+    let first = true;
+    const appendArrayValue = item => {
+      if (Array.isArray(item)) {
+        for (const nested of item) appendArrayValue(nested);
+        return;
+      }
+      if (!first) out += " ";
+      first = false;
+      out = appendShellInterpolation(out, item, state);
+    };
+    for (const item of value) appendArrayValue(item);
+    return out;
   }
 
-  const values = Array.isArray(value) ? value : [value];
-  const texts = values.map(shellInterpolationText);
+  if (isShellObjectReference(value)) {
+    if (state.quote === '"') throw new Error("JS object reference not allowed in double quotes");
+    throw new Error('expected a command or assignment but got: "JSObjRef"');
+  }
+
+  if (value && typeof value === "object" &&
+    Object.prototype.hasOwnProperty.call(value, "raw") && value.raw) {
+    const raw = String(value.raw);
+    validateNoNullByte(raw, "shell argument");
+    scanShellQuoteState(state, raw);
+    return out + raw;
+  }
+
+  let text = shellInterpolationText(value);
   if (state.escaped) {
     out = out.slice(0, -1);
-    texts[0] = `\\${texts[0]}`;
+    text = `\\${text}`;
     state.escaped = false;
   }
 
   if (state.quote === "'") {
-    return { out: out + texts.join(" ").replace(/'/g, `'\\''`), scan: "" };
+    return out + text.replace(/'/g, `'\\''`);
   }
   if (state.quote === '"') {
-    return { out: out + texts.join(" ").replace(/[$`"\\]/g, "\\$&"), scan: "" };
+    return out + text.replace(/[$`"\\]/g, "\\$&");
   }
   if (out.endsWith("$")) {
-    return { out: out.slice(0, -1) + texts.map(text => quotePosixShellValue(`$${text}`)).join(" "), scan: "" };
+    return out.slice(0, -1) + quotePosixShellValue(`$${text}`);
   }
-  return { out: out + texts.map(quotePosixShellValue).join(" "), scan: "" };
+  return out + quotePosixShellValue(text);
 }
 
 function scanShellQuoteState(state, source) {
@@ -729,13 +763,12 @@ function interpolateShellCommand(strings, values) {
     out += part;
     scanShellQuoteState(state, part);
     if (index < values.length) {
-      const value = values[index];
-      const appended = appendShellInterpolation(out, value, state);
-      out = appended.out;
-      if (appended.scan) scanShellQuoteState(state, appended.scan);
+      out = appendShellInterpolation(out, values[index], state);
     }
   }
-  return { command: out.trimEnd(), outputBuffer, outputFd, outputTargets, inputBody };
+  const command = out.trimEnd();
+  parseShell(command);
+  return { command, outputBuffer, outputFd, outputTargets, inputBody };
 }
 
 const shellDefaults = {
@@ -747,8 +780,10 @@ const shellDefaults = {
 
 export class ShellOutput {
   constructor(result = {}) {
-    this.stdout = asBuffer(result.stdout ?? "");
-    this.stderr = asBuffer(result.stderr ?? "");
+    const stdout = asBuffer(result.stdout ?? "");
+    const stderr = asBuffer(result.stderr ?? "");
+    this.stdout = globalThis.Buffer?.from ? Buffer.from(stdout) : stdout;
+    this.stderr = globalThis.Buffer?.from ? Buffer.from(stderr) : stderr;
     this.exitCode = Number(result.exitCode ?? result.status ?? 0);
     this.status = this.exitCode;
     this.success = this.exitCode === 0;
@@ -774,17 +809,18 @@ export class ShellOutput {
 }
 
 export class ShellError extends Error {
-  constructor(command = "", result = undefined) {
+  constructor() {
     super("");
-    this.name = "ShellError";
-    if (result !== undefined) this.initialize(command, result);
+    this.info = undefined;
+    this.exitCode = undefined;
+    this.stdout = undefined;
+    this.stderr = undefined;
   }
-  initialize(command, result) {
+  initialize(result, code = result?.exitCode) {
     const output = result instanceof ShellOutput ? result : new ShellOutput(result);
-    this.message = `Failed with exit code ${output.exitCode}`;
-    this.command = command;
-    this.exitCode = output.exitCode || 1;
-    this.status = this.exitCode;
+    this.message = `Failed with exit code ${code}`;
+    this.name = "ShellError";
+    this.exitCode = Number(code);
     this.stdout = output.stdout;
     this.stderr = output.stderr;
     Object.defineProperty(this, "info", {
@@ -1599,7 +1635,7 @@ async function runShell(command, options = {}) {
     stderr,
   });
   if (output.exitCode !== 0 && options.throws !== false) {
-    throw new ShellError(command, output);
+    throw new ShellError().initialize(output, output.exitCode);
   }
   return output;
 }
@@ -1663,21 +1699,31 @@ export class ShellPromise extends Promise {
   start() {
     if (!this.started) {
       this.started = true;
+      const command = this.command;
+      const options = this.options;
+      const resolvePromise = this.resolvePromise;
+      const rejectPromise = this.rejectPromise;
+      const potentialError = this.potentialError;
+      this.command = undefined;
+      this.options = undefined;
+      this.resolvePromise = undefined;
+      this.rejectPromise = undefined;
+      this.potentialError = undefined;
       Promise.resolve().then(async () => {
-        if (this.options.inputBody !== undefined) {
-          this.options.input = await bytesFromBody(this.options.inputBody);
+        if (options.inputBody !== undefined) {
+          options.input = await bytesFromBody(options.inputBody);
         }
-        const result = await runShell(this.command, this.options);
-        if (!this.options.quiet) {
+        const result = await runShell(command, options);
+        if (!options.quiet) {
           if (result.stdout.byteLength > 0) globalThis.process?.stdout?.write?.(result.stdout);
           if (result.stderr.byteLength > 0) globalThis.process?.stderr?.write?.(result.stderr);
         }
         return result;
-      }).then(this.resolvePromise, (error) => {
+      }).then(resolvePromise, (error) => {
         if (error instanceof ShellError) {
-          this.rejectPromise(this.potentialError.initialize(this.command, error));
+          rejectPromise(potentialError.initialize(error, error.exitCode));
         } else {
-          this.rejectPromise(error);
+          rejectPromise(error);
         }
       });
     }
@@ -10390,6 +10436,8 @@ function bunInspectFunction(value) {
   else if (/^\s*async(?:\s+function|\s*\()/.test(source) || value.constructor?.name === "AsyncFunction") kind = "AsyncFunction";
   else if (/^\s*function\*/.test(source) || value.constructor?.name === "GeneratorFunction") kind = "GeneratorFunction";
   else if (value.constructor?.name === "AsyncGeneratorFunction") kind = "AsyncGeneratorFunction";
+  const parent = Object.getPrototypeOf(value);
+  if (typeof parent === "function" && parent !== Function.prototype && parent.name) kind = parent.name;
   return value.name ? `[${kind}: ${value.name}]` : `[${kind}]`;
 }
 
@@ -10506,6 +10554,46 @@ function bunInspectArrayTokens(tokens, indent) {
   }
   if (line) lines.push(line);
   return `[\n${lines.join("\n")}\n${indent}]`;
+}
+
+function bunInspectFunctionNamespace(value, ctx, indent, seen, depth) {
+  if (value === null || typeof value !== "object") return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (typeof prototype !== "function") return null;
+
+  const entries = [];
+  const included = new Set();
+  const addDescriptor = (owner, key, inherited) => {
+    if (included.has(key) || key === ctInspectSymbol || key === "arguments" || key === "caller") return;
+    const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+    if (!descriptor) return;
+    if (inherited && !descriptor.enumerable && key !== "length" && key !== "name" && key !== "prototype") return;
+    if (!inherited && !descriptor.enumerable) return;
+    included.add(key);
+    entries.push([key, descriptor]);
+  };
+
+  for (const key of Reflect.ownKeys(value)) addDescriptor(value, key, false);
+  for (const key of Reflect.ownKeys(prototype)) addDescriptor(prototype, key, true);
+  if (entries.length === 0) return "Function {}";
+
+  const comma = bunInspectComma(ctx);
+  const nested = `${indent}  `;
+  seen.add(value);
+  try {
+    const rendered = entries.map(([key, descriptor]) => {
+      const printedKey = typeof key === "symbol"
+        ? `[${String(key)}]`
+        : (bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key));
+      const inspected = "value" in descriptor
+        ? bunStyleInspect(descriptor.value, ctx, nested, seen, depth + 1)
+        : (descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]");
+      return `${nested}${bunInspectKeyPrefix(printedKey, ctx)}${inspected}${comma}`;
+    });
+    return `Function {\n${rendered.join("\n")}\n${indent}}`;
+  } finally {
+    seen.delete(value);
+  }
 }
 
 function bunInspectJsxKind(value) {
@@ -10718,6 +10806,8 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       return typeof result === "string" ? result : bunStyleInspect(result, ctx, indent, seen, depth);
     }
   }
+  const functionNamespace = bunInspectFunctionNamespace(value, ctx, indent, seen, depth);
+  if (functionNamespace !== null) return functionNamespace;
   const comma = bunInspectComma(ctx);
   const nested = `${indent}  `;
   if (bunInspectJsxKind(value)) {

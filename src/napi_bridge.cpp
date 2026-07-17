@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <uv.h>
 #include <vector>
 
 #include <dlfcn.h>
@@ -36,6 +37,8 @@ extern "C" JSStringRef ct_jsc_string_create_external_utf16(
     size_t,
     CtExternalStringFinalize,
     void*);
+extern "C" void* ct_jsc_microtask_delay_begin(JSContextGroupRef);
+extern "C" void ct_jsc_microtask_delay_end(void*);
 
 struct napi_handle_scope__ {
     NapiEnv* env { nullptr };
@@ -87,6 +90,7 @@ struct napi_callback_scope__ {
 
 struct napi_async_work__ {
     NapiEnv* env { nullptr };
+    uv_work_t request {};
     napi_async_execute_callback execute { nullptr };
     napi_async_complete_callback complete { nullptr };
     void* data { nullptr };
@@ -167,11 +171,15 @@ struct napi_threadsafe_function__ {
     bool aborting { false };
     bool referenced { true };
     bool finalized { false };
+    bool teardown_started { false };
+    bool teardown_complete { false };
 };
 
 struct NapiEnv {
     NapiEnv* runtime_root { nullptr };
     JSGlobalContextRef context { nullptr };
+    JSObjectRef function_call { nullptr };
+    uv_loop_t* event_loop { nullptr };
     void* wake_opaque { nullptr };
     CtNapiWakeCallback wake_callback { nullptr };
     napi_extended_error_info last_error {};
@@ -185,12 +193,9 @@ struct NapiEnv {
     std::vector<NapiCleanupHook> cleanup_hooks;
     std::vector<napi_async_cleanup_hook_handle__*> async_cleanup_hooks;
     std::mutex async_mutex;
-    std::condition_variable async_condition;
-    std::deque<napi_async_work__*> pending_work;
     std::deque<napi_async_work__*> completed_work;
     std::deque<NapiPostedFinalizer> basic_finalizers;
     std::deque<NapiPostedFinalizer> posted_finalizers;
-    std::vector<std::thread> worker_threads;
     std::vector<NapiEnv*> addon_envs;
     std::unordered_map<std::string, NapiEnv*> ffi_envs;
     void* instance_data { nullptr };
@@ -204,7 +209,6 @@ struct NapiEnv {
     std::string wrap_key;
     uint64_t finalizer_key { 1 };
     std::thread::id owner_thread;
-    bool stop_workers { false };
     bool destroying { false };
     bool in_basic_finalizer { false };
 };
@@ -547,6 +551,26 @@ static JSObjectRef global_constructor(NapiEnv* env, const char* name, JSValueRef
     return const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(value));
 }
 
+static JSObjectRef cached_function_call(NapiEnv* env, JSValueRef* exception)
+{
+    if (env->function_call)
+        return env->function_call;
+    JSObjectRef constructor = global_constructor(env, "Function", exception);
+    JSValueRef prototype_value = *exception || !constructor ? nullptr : get_property(env, constructor, "prototype", exception);
+    if (*exception || !prototype_value || !JSValueIsObject(env->context, prototype_value))
+        return nullptr;
+    JSObjectRef prototype = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(prototype_value));
+    JSValueRef call_value = get_property(env, prototype, "call", exception);
+    if (*exception || !call_value || !JSValueIsObject(env->context, call_value))
+        return nullptr;
+    JSObjectRef call = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(call_value));
+    if (!JSObjectIsFunction(env->context, call))
+        return nullptr;
+    env->function_call = call;
+    JSValueProtect(env->context, call);
+    return call;
+}
+
 static void define_data_property(
     NapiEnv* env,
     JSObjectRef target,
@@ -693,6 +717,23 @@ public:
 private:
     NapiEnv* m_env;
     bool m_previous;
+};
+
+class MicrotaskDelayScope {
+public:
+    explicit MicrotaskDelayScope(JSGlobalContextRef context)
+        : m_scope(context ? ct_jsc_microtask_delay_begin(JSContextGetGroup(context)) : nullptr)
+    {
+    }
+
+    ~MicrotaskDelayScope()
+    {
+        if (m_scope)
+            ct_jsc_microtask_delay_end(m_scope);
+    }
+
+private:
+    void* m_scope;
 };
 
 static JSObjectRef make_napi_function(
@@ -990,34 +1031,33 @@ static std::string path_to_file_uri(const char* path)
 
 } // namespace
 
-static void napi_worker_loop(NapiEnv* root)
+static void napi_uv_work_execute(uv_work_t* request)
 {
-    for (;;) {
-        napi_async_work__* work = nullptr;
-        {
-            std::unique_lock lock(root->async_mutex);
-            root->async_condition.wait(lock, [root] { return root->stop_workers || !root->pending_work.empty(); });
-            if (root->stop_workers && root->pending_work.empty())
-                return;
-            work = root->pending_work.front();
-            root->pending_work.pop_front();
-        }
-        int expected = 1;
-        if (work->state.compare_exchange_strong(expected, 2)) {
-            if (work->execute)
-                work->execute(reinterpret_cast<napi_env>(work->env), work->data);
-            work->state.store(3);
-        }
-        {
-            std::lock_guard lock(root->async_mutex);
-            root->completed_work.push_back(work);
-        }
-        wake(work->env);
+    auto* work = static_cast<napi_async_work__*>(request->data);
+    int expected = 1;
+    if (!work || !work->state.compare_exchange_strong(expected, 2))
+        return;
+    if (work->execute)
+        work->execute(reinterpret_cast<napi_env>(work->env), work->data);
+}
+
+static void napi_uv_work_complete(uv_work_t* request, int status)
+{
+    auto* work = static_cast<napi_async_work__*>(request->data);
+    if (!work || !work->env)
+        return;
+    work->state.store(status == UV_ECANCELED ? 4 : 3);
+    NapiEnv* root = root_env(work->env);
+    {
+        std::lock_guard lock(root->async_mutex);
+        root->completed_work.push_back(work);
     }
+    wake(work->env);
 }
 
 static NapiEnv* allocate_env(
     JSGlobalContextRef context,
+    uv_loop_t* event_loop,
     void* wake_opaque,
     CtNapiWakeCallback wake_callback,
     NapiEnv* root
@@ -1028,6 +1068,7 @@ static NapiEnv* allocate_env(
         return nullptr;
     env->runtime_root = root ? root : env;
     env->context = context;
+    env->event_loop = event_loop;
     env->wake_opaque = wake_opaque;
     env->wake_callback = wake_callback;
     env->owner_thread = std::this_thread::get_id();
@@ -1038,33 +1079,54 @@ static NapiEnv* allocate_env(
     return env;
 }
 
+static void teardown_threadsafe_function(NapiEnv* env, napi_threadsafe_function__* function)
+{
+    std::deque<NapiTsfnCall> pending_calls;
+    {
+        std::lock_guard lock(function->mutex);
+        function->teardown_started = true;
+        function->closing = true;
+        function->aborting = true;
+        function->referenced = false;
+        pending_calls.swap(function->queue);
+    }
+    function->space_available.notify_all();
+
+    if (function->call_js) {
+        while (!pending_calls.empty()) {
+            function->call_js(nullptr, nullptr, function->context, pending_calls.front().data);
+            pending_calls.pop_front();
+        }
+    }
+
+    if (!function->finalized && function->finalize_callback)
+        function->finalize_callback(reinterpret_cast<napi_env>(env), function->finalize_data, function->context);
+    if (function->callback)
+        JSValueUnprotect(env->context, function->callback);
+
+    bool delete_now = false;
+    {
+        std::lock_guard lock(function->mutex);
+        function->callback = nullptr;
+        function->finalized = true;
+        function->teardown_complete = true;
+        function->env = nullptr;
+        delete_now = function->thread_count == 0;
+    }
+    if (delete_now)
+        delete function;
+}
+
 extern "C" CtNapiEnv* ct_napi_env_create(
     JSGlobalContextRef context,
+    uv_loop_t* event_loop,
     void* wake_opaque,
     CtNapiWakeCallback wake_callback
 )
 {
-    if (!context)
+    if (!context || !event_loop)
         return nullptr;
-    auto* env = allocate_env(context, wake_opaque, wake_callback, nullptr);
-    if (!env)
-        return nullptr;
-    try {
-        for (size_t index = 0; index < 4; ++index)
-            env->worker_threads.emplace_back(napi_worker_loop, env);
-    } catch (...) {
-        {
-            std::lock_guard lock(env->async_mutex);
-            env->stop_workers = true;
-        }
-        env->async_condition.notify_all();
-        for (auto& worker : env->worker_threads) {
-            if (worker.joinable())
-                worker.join();
-        }
-        delete env;
-        return nullptr;
-    }
+    auto* env = allocate_env(context, event_loop, wake_opaque, wake_callback, nullptr);
     return env;
 }
 
@@ -1083,13 +1145,28 @@ static void destroy_single_env(NapiEnv* env)
             break;
         if (has_async && (!has_sync || (*async)->order > sync->order)) {
             auto* hook = *async;
-            env->async_cleanup_hooks.erase(async);
             hook->executing = true;
             if (!hook->removed && hook->callback)
                 hook->callback(reinterpret_cast<napi_async_cleanup_hook_handle>(hook), hook->data);
             hook->executing = false;
-            hook->removed = true;
-            delete hook;
+            if (hook->removed) {
+                auto iterator = std::find(env->async_cleanup_hooks.begin(), env->async_cleanup_hooks.end(), hook);
+                if (iterator != env->async_cleanup_hooks.end()) env->async_cleanup_hooks.erase(iterator);
+                hook->env = nullptr;
+                delete hook;
+                continue;
+            }
+
+            // Async cleanup owns the loop until the hook removes itself. This
+            // is how addons finish uv_close callbacks before object finalizers.
+            if (env->event_loop) (void)uv_run(env->event_loop, UV_RUN_DEFAULT);
+            auto iterator = std::find(env->async_cleanup_hooks.begin(), env->async_cleanup_hooks.end(), hook);
+            if (iterator != env->async_cleanup_hooks.end()) {
+                env->async_cleanup_hooks.erase(iterator);
+                hook->removed = true;
+                hook->env = nullptr;
+                delete hook;
+            }
         } else {
             NapiCleanupHook hook = *sync;
             env->cleanup_hooks.erase(sync);
@@ -1097,6 +1174,11 @@ static void destroy_single_env(NapiEnv* env)
                 hook.callback(hook.data);
         }
     }
+
+    auto thread_safe_functions = env->thread_safe_functions;
+    env->thread_safe_functions.clear();
+    for (auto* function : thread_safe_functions)
+        teardown_threadsafe_function(env, function);
 
     if (env->instance_finalizer) {
         auto callback = env->instance_finalizer;
@@ -1166,18 +1248,10 @@ static void destroy_single_env(NapiEnv* env)
         delete work;
     }
 
-    auto thread_safe_functions = env->thread_safe_functions;
-    for (auto* function : thread_safe_functions) {
-        if (function->callback)
-            JSValueUnprotect(env->context, function->callback);
-        if (!function->finalized && function->finalize_callback)
-            function->finalize_callback(reinterpret_cast<napi_env>(env), function->finalize_data, function->context);
-        delete function;
-    }
-    env->thread_safe_functions.clear();
-
     if (env->pending_exception)
         JSValueUnprotect(env->context, env->pending_exception);
+    if (env->function_call)
+        JSValueUnprotect(env->context, env->function_call);
     delete env;
 }
 
@@ -1190,7 +1264,7 @@ extern "C" CtNapiEnv* ct_napi_env_for_ffi_library(CtNapiEnv* opaque_env, const c
     if (existing != root->ffi_envs.end())
         return existing->second;
 
-    auto* env = allocate_env(root->context, root->wake_opaque, root->wake_callback, root);
+    auto* env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
     if (!env)
         return nullptr;
     env->module_api_version = 9;
@@ -1211,18 +1285,36 @@ extern "C" void ct_napi_env_destroy(CtNapiEnv* opaque_env)
     auto* root = root_env(static_cast<NapiEnv*>(opaque_env));
     if (!root)
         return;
+    MicrotaskDelayScope microtasks(root->context);
 
     root->destroying = true;
     for (auto* env : root->addon_envs)
         env->destroying = true;
-    {
-        std::lock_guard lock(root->async_mutex);
-        root->stop_workers = true;
+
+    std::vector<NapiEnv*> environments { root };
+    environments.insert(environments.end(), root->addon_envs.begin(), root->addon_envs.end());
+    for (auto* env : environments) {
+        std::lock_guard lock(env->async_mutex);
+        for (auto* work : env->async_work) {
+            if (work->state.load() == 1)
+                (void)uv_cancel(reinterpret_cast<uv_req_t*>(&work->request));
+        }
     }
-    root->async_condition.notify_all();
-    for (auto& worker : root->worker_threads) {
-        if (worker.joinable())
-            worker.join();
+    for (;;) {
+        bool pending = false;
+        for (auto* env : environments) {
+            std::lock_guard lock(env->async_mutex);
+            for (auto* work : env->async_work) {
+                const int state = work->state.load();
+                if (state == 1 || state == 2) {
+                    pending = true;
+                    break;
+                }
+            }
+            if (pending) break;
+        }
+        if (!pending || !root->event_loop) break;
+        (void)uv_run(root->event_loop, UV_RUN_ONCE);
     }
 
     for (auto iterator = root->addon_envs.rbegin(); iterator != root->addon_envs.rend(); ++iterator)
@@ -1266,7 +1358,7 @@ extern "C" JSValueRef ct_napi_load_addon(
     if (!root || !path || !exception)
         return nullptr;
 
-    auto* env = allocate_env(root->context, root->wake_opaque, root->wake_callback, root);
+    auto* env = allocate_env(root->context, root->event_loop, root->wake_opaque, root->wake_callback, root);
     if (!env) {
         *exception = make_loader_error(root, "failed to allocate a Node-API environment");
         return nullptr;
@@ -1989,7 +2081,7 @@ extern "C" napi_status napi_create_function(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !callback || !result)
+    if (!env || !callback)
         return invalid(env);
     JSValueRef exception = nullptr;
     JSObjectRef function = make_napi_function(env, name, name ? length : 0, callback, data, false, &exception);
@@ -2013,14 +2105,22 @@ extern "C" napi_status napi_call_function(
     JSObjectRef callable = as_object(env, function);
     if (!callable || !JSObjectIsFunction(env->context, callable))
         return finish(env, napi_function_expected);
-    std::vector<JSValueRef> arguments(argc);
-    for (size_t index = 0; index < argc; ++index)
-        arguments[index] = to_js(argv[index]);
     JSValueRef exception = nullptr;
-    JSObjectRef arguments_array = JSObjectMakeArray(env->context, argc, arguments.data(), &exception);
-    JSObjectRef reflect = exception ? nullptr : global_constructor(env, "Reflect", &exception);
-    JSValueRef apply_arguments[] = { callable, to_js(receiver), arguments_array };
-    JSValueRef returned = exception || !reflect ? nullptr : call_method(env, reflect, "apply", 3, apply_arguments, &exception);
+    JSObjectRef function_call = cached_function_call(env, &exception);
+    constexpr size_t inline_capacity = 8;
+    JSValueRef inline_arguments[inline_capacity + 1];
+    std::vector<JSValueRef> heap_arguments;
+    JSValueRef* arguments = inline_arguments;
+    if (argc > inline_capacity) {
+        heap_arguments.resize(argc + 1);
+        arguments = heap_arguments.data();
+    }
+    arguments[0] = to_js(receiver);
+    for (size_t index = 0; index < argc; ++index)
+        arguments[index + 1] = to_js(argv[index]);
+    JSValueRef returned = exception || !function_call
+        ? nullptr
+        : JSObjectCallAsFunction(env->context, function_call, callable, argc + 1, arguments, &exception);
     if (exception)
         return caught(env, exception);
     if (process_is_exiting(env, &exception))
@@ -3832,13 +3932,12 @@ extern "C" napi_status napi_queue_async_work(napi_env opaque_env, napi_async_wor
     int expected = 0;
     if (!work->state.compare_exchange_strong(expected, 1))
         return finish(env, napi_generic_failure);
-    NapiEnv* root = root_env(env);
-    {
-        std::lock_guard lock(root->async_mutex);
-        root->pending_work.push_back(work);
+    work->request.data = work;
+    int status = uv_queue_work(env->event_loop, &work->request, napi_uv_work_execute, napi_uv_work_complete);
+    if (status != 0) {
+        work->state.store(0);
+        return finish(env, napi_generic_failure);
     }
-    root->async_condition.notify_one();
-    wake(env);
     return finish(env, napi_ok);
 }
 
@@ -3848,11 +3947,11 @@ extern "C" napi_status napi_cancel_async_work(napi_env opaque_env, napi_async_wo
     auto* work = reinterpret_cast<napi_async_work__*>(opaque_work);
     if (!env || !work || work->env != env)
         return invalid(env);
-    int expected = 1;
-    if (!work->state.compare_exchange_strong(expected, 4))
+    if (work->state.load() != 1)
         return finish(env, napi_generic_failure);
-    root_env(env)->async_condition.notify_all();
-    return finish(env, napi_ok);
+    return finish(env, uv_cancel(reinterpret_cast<uv_req_t*>(&work->request)) == 0
+        ? napi_ok
+        : napi_generic_failure);
 }
 
 extern "C" napi_status napi_delete_async_work(napi_env opaque_env, napi_async_work opaque_work)
@@ -3878,10 +3977,8 @@ extern "C" napi_status napi_get_uv_event_loop(napi_env opaque_env, uv_loop_s** r
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);
-    // COTTONTAIL-COMPAT: Cottontail does not currently embed a libuv loop. A
-    // fabricated uv_loop_t would let addons load and then corrupt native state.
-    *result = nullptr;
-    return finish(env, napi_generic_failure);
+    *result = env->event_loop;
+    return finish(env, napi_ok);
 }
 
 extern "C" napi_status napi_add_env_cleanup_hook(napi_env opaque_env, void (*callback)(void*), void* data)
@@ -3915,7 +4012,7 @@ extern "C" napi_status napi_add_async_cleanup_hook(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !callback || !result)
+    if (!env || !callback)
         return invalid(env);
     auto* hook = new (std::nothrow) napi_async_cleanup_hook_handle__ {
         env, callback, data, env->next_cleanup_order++, false, false
@@ -3923,7 +4020,8 @@ extern "C" napi_status napi_add_async_cleanup_hook(
     if (!hook)
         return finish(env, napi_generic_failure);
     env->async_cleanup_hooks.push_back(hook);
-    *result = reinterpret_cast<napi_async_cleanup_hook_handle>(hook);
+    if (result)
+        *result = reinterpret_cast<napi_async_cleanup_hook_handle>(hook);
     return finish(env, napi_ok);
 }
 
@@ -3943,6 +4041,7 @@ extern "C" napi_status napi_remove_async_cleanup_hook(napi_async_cleanup_hook_ha
     auto iterator = std::find(env->async_cleanup_hooks.begin(), env->async_cleanup_hooks.end(), hook);
     if (iterator != env->async_cleanup_hooks.end())
         env->async_cleanup_hooks.erase(iterator);
+    hook->env = nullptr;
     delete hook;
     return finish(env, napi_ok);
 }
@@ -4176,7 +4275,7 @@ extern "C" napi_status napi_create_threadsafe_function(
 extern "C" napi_status napi_get_threadsafe_function_context(napi_threadsafe_function opaque_function, void** result)
 {
     auto* function = reinterpret_cast<napi_threadsafe_function__*>(opaque_function);
-    if (!function || !function->env || !result)
+    if (!function || !result)
         return napi_invalid_arg;
     *result = function->context;
     return napi_ok;
@@ -4189,11 +4288,22 @@ extern "C" napi_status napi_call_threadsafe_function(
 )
 {
     auto* function = reinterpret_cast<napi_threadsafe_function__*>(opaque_function);
-    if (!function || !function->env)
+    if (!function)
         return napi_invalid_arg;
     std::unique_lock lock(function->mutex);
-    if (function->closing)
+    if (function->closing) {
+        if (!function->thread_count)
+            return napi_invalid_arg;
+        --function->thread_count;
+        const bool delete_now = function->teardown_complete && function->thread_count == 0;
+        lock.unlock();
+        if (delete_now)
+            delete function;
         return napi_closing;
+    }
+    NapiEnv* env = function->env;
+    if (!env)
+        return napi_invalid_arg;
     auto full = [function] {
         return function->max_queue_size && function->queue.size() >= function->max_queue_size;
     };
@@ -4203,19 +4313,27 @@ extern "C" napi_status napi_call_threadsafe_function(
         if (std::this_thread::get_id() == function->env->owner_thread)
             return napi_would_deadlock;
         function->space_available.wait(lock, [function, full] { return function->closing || !full(); });
-        if (function->closing)
+        if (function->closing) {
+            if (!function->thread_count)
+                return napi_invalid_arg;
+            --function->thread_count;
+            const bool delete_now = function->teardown_complete && function->thread_count == 0;
+            lock.unlock();
+            if (delete_now)
+                delete function;
             return napi_closing;
+        }
     }
     function->queue.push_back({ data });
     lock.unlock();
-    wake(function->env);
+    wake(env);
     return napi_ok;
 }
 
 extern "C" napi_status napi_acquire_threadsafe_function(napi_threadsafe_function opaque_function)
 {
     auto* function = reinterpret_cast<napi_threadsafe_function__*>(opaque_function);
-    if (!function || !function->env)
+    if (!function)
         return napi_invalid_arg;
     std::lock_guard lock(function->mutex);
     if (function->closing)
@@ -4230,8 +4348,10 @@ extern "C" napi_status napi_release_threadsafe_function(
 )
 {
     auto* function = reinterpret_cast<napi_threadsafe_function__*>(opaque_function);
-    if (!function || !function->env)
+    if (!function)
         return napi_invalid_arg;
+    NapiEnv* env = nullptr;
+    bool delete_now = false;
     {
         std::lock_guard lock(function->mutex);
         if (!function->thread_count)
@@ -4243,9 +4363,14 @@ extern "C" napi_status napi_release_threadsafe_function(
         --function->thread_count;
         if (!function->thread_count)
             function->closing = true;
+        env = function->env;
+        delete_now = function->teardown_complete && function->thread_count == 0;
     }
     function->space_available.notify_all();
-    wake(function->env);
+    if (delete_now)
+        delete function;
+    else if (env)
+        wake(env);
     return napi_ok;
 }
 
@@ -4280,7 +4405,7 @@ extern "C" bool ct_napi_env_has_pending_work(CtNapiEnv* opaque_env)
         return false;
     {
         std::lock_guard lock(root->async_mutex);
-        if (!root->completed_work.empty() || !root->pending_work.empty())
+        if (!root->completed_work.empty())
             return true;
     }
 
@@ -4299,7 +4424,7 @@ extern "C" bool ct_napi_env_has_pending_work(CtNapiEnv* opaque_env)
         }
         for (auto* function : thread_safe_functions) {
             std::lock_guard lock(function->mutex);
-            if ((function->referenced && !function->finalized) || !function->queue.empty())
+            if (function->referenced && !function->finalized)
                 return true;
         }
         return false;
@@ -4386,13 +4511,31 @@ static bool drain_completed_work(NapiEnv* root, JSValueRef* exception)
 
 static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
 {
+    constexpr size_t max_dispatch_iterations = 999;
     std::vector<napi_threadsafe_function__*> thread_safe_functions;
     {
         std::lock_guard lock(env->async_mutex);
         thread_safe_functions.assign(env->thread_safe_functions.begin(), env->thread_safe_functions.end());
     }
     for (auto* function : thread_safe_functions) {
+        size_t dispatch_iterations = 0;
         for (;;) {
+            JSValueRef exit_exception = nullptr;
+            if (process_is_exiting(env, &exit_exception)) {
+                {
+                    std::lock_guard lock(function->mutex);
+                    function->closing = true;
+                    function->aborting = true;
+                    function->referenced = false;
+                }
+                function->space_available.notify_all();
+                break;
+            }
+            if (exit_exception) {
+                *exception = exit_exception;
+                return false;
+            }
+
             NapiTsfnCall call;
             bool has_call = false;
             bool should_finalize = false;
@@ -4439,6 +4582,10 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                     return false;
                 break;
             }
+            if (has_call && ++dispatch_iterations >= max_dispatch_iterations) {
+                wake(env);
+                break;
+            }
             if (!has_call)
                 break;
         }
@@ -4453,6 +4600,7 @@ extern "C" void ct_napi_env_drain(CtNapiEnv* opaque_env, JSValueRef* exception)
         *exception = nullptr;
     if (!root || !exception)
         return;
+    MicrotaskDelayScope microtasks(root->context);
 
     if (!drain_completed_work(root, exception))
         return;
@@ -4473,6 +4621,7 @@ extern "C" void ct_napi_env_drain_gc(CtNapiEnv* opaque_env, JSValueRef* exceptio
         *exception = nullptr;
     if (!root || !exception)
         return;
+    MicrotaskDelayScope microtasks(root->context);
     if (!drain_finalizer_queue(root, true, exception))
         return;
     for (auto* env : root->addon_envs) {

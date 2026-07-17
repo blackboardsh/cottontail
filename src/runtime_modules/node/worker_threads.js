@@ -3,6 +3,7 @@ import { resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
 import { format as formatValue } from "./util.js";
+import { isContext } from "./vm.js";
 import "../bun/ffi.js";
 
 const wireVersion = 1;
@@ -1605,10 +1606,12 @@ export function markAsUncloneable(object) {
 
 export function moveMessagePortToContext(port, contextifiedSandbox) {
   if (!(port instanceof MessagePort)) throw invalidArgumentType("port", "a MessagePort instance", port);
-  if (contextifiedSandbox === null || (typeof contextifiedSandbox !== "object" && typeof contextifiedSandbox !== "function")) {
+  if (!isContext(contextifiedSandbox)) {
     throw invalidArgumentType("contextifiedSandbox", "a vm.Context", contextifiedSandbox);
   }
-  throw nativeBoundaryError("worker_threads.moveMessagePortToContext vm realm transfer");
+  // node:vm contexts currently share one JSC realm, so the live port already
+  // has the prototypes and backing state visible from the target context.
+  return port;
 }
 
 export function receiveMessageOnPort(port) {
@@ -1762,7 +1765,7 @@ export const locks = {
 // COTTONTAIL-COMPAT: node:worker_threads native boundaries - hard interruption of
 // running JSC, parent-loop ref/unref, resource-limit enforcement and OS thread
 // naming, per-thread CPU/profilers, live SHARE_ENV, process-wide BroadcastChannel
-// and Web Locks, vm realm transfer, postMessageToThread acknowledgement/timeouts,
+// and Web Locks, postMessageToThread acknowledgement/timeouts,
 // natural exitCode/beforeExit propagation, and native stdio backpressure need host
 // support. The JavaScript implementation does not synthesize those measurements
 // or claim enforcement; focused boundary tests encode each remaining contract.

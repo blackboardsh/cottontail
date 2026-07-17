@@ -10,10 +10,12 @@ extern "C" {
 #endif
 
 typedef struct NapiEnv CtNapiEnv;
+typedef struct uv_loop_s uv_loop_t;
 typedef void (*CtNapiWakeCallback)(void *opaque);
 
 CtNapiEnv *ct_napi_env_create(
     JSGlobalContextRef context,
+    uv_loop_t *event_loop,
     void *wake_opaque,
     CtNapiWakeCallback wake_callback
 );

@@ -2,6 +2,88 @@ const std = @import("std");
 const cottontail_version = @import("src/version.zig").version;
 const builtin = @import("builtin");
 
+const libuv_common_sources = &.{
+    "src/fs-poll.c",
+    "src/idna.c",
+    "src/inet.c",
+    "src/random.c",
+    "src/strscpy.c",
+    "src/strtok.c",
+    "src/thread-common.c",
+    "src/threadpool.c",
+    "src/timer.c",
+    "src/uv-common.c",
+    "src/uv-data-getter-setters.c",
+    "src/version.c",
+};
+
+const libuv_unix_sources = &.{
+    "src/unix/async.c",
+    "src/unix/core.c",
+    "src/unix/dl.c",
+    "src/unix/fs.c",
+    "src/unix/getaddrinfo.c",
+    "src/unix/getnameinfo.c",
+    "src/unix/loop-watcher.c",
+    "src/unix/loop.c",
+    "src/unix/pipe.c",
+    "src/unix/poll.c",
+    "src/unix/process.c",
+    "src/unix/random-devurandom.c",
+    "src/unix/signal.c",
+    "src/unix/stream.c",
+    "src/unix/tcp.c",
+    "src/unix/thread.c",
+    "src/unix/tty.c",
+    "src/unix/udp.c",
+};
+
+const libuv_macos_sources = &.{
+    "src/unix/proctitle.c",
+    "src/unix/bsd-ifaddrs.c",
+    "src/unix/kqueue.c",
+    "src/unix/random-getentropy.c",
+    "src/unix/darwin-proctitle.c",
+    "src/unix/darwin.c",
+    "src/unix/fsevents.c",
+};
+
+const libuv_linux_sources = &.{
+    "src/unix/proctitle.c",
+    "src/unix/linux.c",
+    "src/unix/procfs-exepath.c",
+    "src/unix/random-getrandom.c",
+    "src/unix/random-sysctl-linux.c",
+};
+
+const libuv_windows_sources = &.{
+    "src/win/async.c",
+    "src/win/core.c",
+    "src/win/detect-wakeup.c",
+    "src/win/dl.c",
+    "src/win/error.c",
+    "src/win/fs.c",
+    "src/win/fs-event.c",
+    "src/win/getaddrinfo.c",
+    "src/win/getnameinfo.c",
+    "src/win/handle.c",
+    "src/win/loop-watcher.c",
+    "src/win/pipe.c",
+    "src/win/thread.c",
+    "src/win/poll.c",
+    "src/win/process.c",
+    "src/win/process-stdio.c",
+    "src/win/signal.c",
+    "src/win/snprintf.c",
+    "src/win/stream.c",
+    "src/win/tcp.c",
+    "src/win/tty.c",
+    "src/win/udp.c",
+    "src/win/util.c",
+    "src/win/winapi.c",
+    "src/win/winsock.c",
+};
+
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
 const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6";
 
@@ -122,12 +204,69 @@ fn copyLinuxSystemLibrary(b: *std.Build, library: []const u8) std.Build.LazyPath
     return output;
 }
 
+fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
+    const module = step.root_module;
+    const target = module.resolved_target.?.result;
+    const root = b.path("vendors/libuv");
+    module.addIncludePath(b.path("vendors/libuv/include"));
+    module.addIncludePath(b.path("vendors/libuv/src"));
+
+    switch (target.os.tag) {
+        .macos => {
+            const flags = &.{
+                "-std=c11",
+                "-fno-strict-aliasing",
+                "-D_FILE_OFFSET_BITS=64",
+                "-D_LARGEFILE_SOURCE",
+                "-D_DARWIN_UNLIMITED_SELECT=1",
+                "-D_DARWIN_USE_64_BIT_INODE=1",
+            };
+            module.addCSourceFiles(.{ .root = root, .files = libuv_common_sources, .flags = flags });
+            module.addCSourceFiles(.{ .root = root, .files = libuv_unix_sources, .flags = flags });
+            module.addCSourceFiles(.{ .root = root, .files = libuv_macos_sources, .flags = flags });
+            module.linkSystemLibrary("pthread", .{});
+        },
+        .linux => {
+            const flags = &.{
+                "-std=c11",
+                "-fno-strict-aliasing",
+                "-D_FILE_OFFSET_BITS=64",
+                "-D_LARGEFILE_SOURCE",
+                "-D_GNU_SOURCE",
+                "-D_POSIX_C_SOURCE=200112",
+            };
+            module.addCSourceFiles(.{ .root = root, .files = libuv_common_sources, .flags = flags });
+            module.addCSourceFiles(.{ .root = root, .files = libuv_unix_sources, .flags = flags });
+            module.addCSourceFiles(.{ .root = root, .files = libuv_linux_sources, .flags = flags });
+            inline for (&.{ "dl", "pthread", "rt" }) |library| module.linkSystemLibrary(library, .{});
+        },
+        .windows => {
+            const flags = &.{
+                "-std=c11",
+                "-fno-strict-aliasing",
+                "-DWIN32_LEAN_AND_MEAN",
+                "-D_WIN32_WINNT=0x0A00",
+                "-D_CRT_DECLARE_NONSTDC_NAMES=0",
+                // Public libuv declarations must remain visible from the final executable.
+                "-DBUILDING_UV_SHARED=1",
+            };
+            module.addCSourceFiles(.{ .root = root, .files = libuv_common_sources, .flags = flags });
+            module.addCSourceFiles(.{ .root = root, .files = libuv_windows_sources, .flags = flags });
+            inline for (&.{
+                "advapi32", "dbghelp", "iphlpapi", "ole32", "psapi", "shell32", "user32", "userenv", "ws2_32",
+            }) |library| module.linkSystemLibrary(library, .{});
+        },
+        else => unreachable,
+    }
+}
+
 fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build.LazyPath) void {
     step.rdynamic = true;
     // Static JSC uses indirectly referenced LLInt/JIT entry points that the
     // release linker otherwise discards, producing SIGBUS at runtime.
     step.link_gc_sections = false;
     step.root_module.link_libc = true;
+    configureLibuv(step, b);
     step.root_module.addIncludePath(b.path("src"));
     step.root_module.addIncludePath(b.path("src/compiler/src/jsc/bindings/sqlite"));
     step.root_module.addCMacro("COTTONTAIL_VERSION", b.fmt("\"{s}\"", .{cottontail_version}));
@@ -146,6 +285,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
     });
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_private_bridge.cpp"),
+        .flags = &[_][]const u8{
+            "-std=c++20",
+            "-DJS_NO_EXPORT=1",
+        },
+    });
+    step.root_module.addCSourceFile(.{
+        .file = b.path("src/jsc_stock_bridge.cpp"),
         .flags = &[_][]const u8{
             "-std=c++20",
             "-DJS_NO_EXPORT=1",

@@ -126,8 +126,8 @@ export function jscDescribeArray(value) {
   return describeArray(value);
 }
 
-export function isRope(_value) {
-  return false;
+export function isRope(value) {
+  return typeof value === "string" && Boolean(cottontail.jscValueIsRope(value));
 }
 
 export function getRandomSeed() {
@@ -139,8 +139,10 @@ export function setRandomSeed(value) {
 }
 
 export function setTimeZone(value) {
-  timezone = String(value ?? "");
+  if (typeof value !== "string") throw new TypeError("setTimeZone requires a timezone string");
+  timezone = cottontail.jscSetTimeZone(value);
   if (globalThis.process?.env) globalThis.process.env.TZ = timezone;
+  return timezone;
 }
 
 export function setTimezone(value) {
@@ -150,10 +152,16 @@ export function setTimezone(value) {
 export function callerSourceOrigin() {
   const stack = String(new Error().stack ?? "");
   for (const line of stack.split("\n").slice(1)) {
-    const match = line.match(/((?:file:\/\/)?[^@\s]+\.[cm]?[jt]sx?)(?::\d+){0,2}/);
-    if (!match || match[1].includes("runtime_modules/bun/jsc")) continue;
-    const path = match[1];
-    return path.startsWith("file://") ? path : `file://${path.startsWith("/") ? "" : `${cottontail.cwd()}/`}${path}`;
+    const match = line.match(/(?:\(|@|\s)((?:file:\/\/)?\/.*\.[cm]?[jt]sx?):\d+:\d+\)?$/);
+    if (
+      !match ||
+      match[1].includes("runtime_modules/bun/jsc") ||
+      match[1].includes(".cottontail-embedded-runtime/bun/jsc.js")
+    ) {
+      continue;
+    }
+    const sourcePath = match[1];
+    return sourcePath.startsWith("file://") ? sourcePath : `file://${sourcePath}`;
   }
   return "";
 }
@@ -163,7 +171,7 @@ export function codeCoverageForFile(_path = undefined) {
 }
 
 export function getProtectedObjects() {
-  return [];
+  return cottontail.jscProtectedObjects();
 }
 
 export function noFTL(fn = undefined) {

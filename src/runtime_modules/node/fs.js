@@ -2,6 +2,18 @@ import "../bun/ffi.js";
 import constantsObject from "./constants.js";
 import { dirname, join, resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
+import {
+  encodingFromOptions,
+  invalidArgType,
+  invalidArgValue,
+  outOfRange,
+  runAbortable,
+  validateAbortSignal,
+  validateBufferRange,
+  validateFd,
+  validateInteger,
+  validatePosition,
+} from "./fs/internal.js";
 // Imported last so constants/path/stream are initialized before the circular
 // fs <-> fs/promises edge is evaluated. `fs.promises` must be the exact same
 // object as the fs/promises module namespace (Node/Bun behavior relied on by
@@ -86,18 +98,32 @@ export const W_OK = constants.W_OK ?? 2;
 export const X_OK = constants.X_OK ?? 1;
 
 function normalizePath(path) {
+  if (path instanceof Uint8Array) {
+    const decoded = decoder.decode(path);
+    if (decoded.includes("\0")) throw invalidArgValue("path", decoded, "must be a string without null bytes");
+    return decoded;
+  }
   if (path && typeof path === "object" && typeof path.href === "string" && path.protocol === "file:") {
-    return normalizeFileUrlPath(path);
+    path = normalizeFileUrlPath(path);
+    if (path.includes("\0")) throw invalidArgValue("path", path, "must be a string without null bytes");
+    return path;
   }
   if (typeof path === "string" && path.startsWith("file:")) {
+    let url;
     try {
-      const url = new URL(path);
-      if (url.protocol === "file:") return normalizeFileUrlPath(url);
+      url = new URL(path);
     } catch {
       // Let the filesystem report malformed file: strings as ordinary paths.
     }
+    if (url?.protocol === "file:") {
+      path = normalizeFileUrlPath(url);
+      if (path.includes("\0")) throw invalidArgValue("path", path, "must be a string without null bytes");
+      return path;
+    }
   }
-  return String(path);
+  const normalized = String(path);
+  if (normalized.includes("\0")) throw invalidArgValue("path", normalized, "must be a string without null bytes");
+  return normalized;
 }
 
 function normalizeFileUrlPath(url) {
@@ -126,7 +152,8 @@ const messageByCode = {
 };
 
 function makeFsError(error, path, syscall = "open") {
-  const normalizedPath = normalizePath(path);
+  const hasPath = path !== undefined;
+  const normalizedPath = hasPath ? normalizePath(path) : undefined;
   const source = String(error?.message ?? error ?? "");
   let code = String(error?.code ?? "");
   if (!knownErrorCodes.includes(code)) {
@@ -144,11 +171,17 @@ function makeFsError(error, path, syscall = "open") {
     else code = "EIO";
   }
   const reason = messageByCode[code] ?? (source || code);
-  const out = new Error(`${code}: ${reason}, ${syscall} '${normalizedPath}'`);
+  const out = new Error(`${code}: ${reason}, ${syscall}${hasPath ? ` '${normalizedPath}'` : ""}`);
   out.errno = -(Number(constantsObject[code]) || 5);
   out.code = code;
   out.syscall = syscall;
-  out.path = normalizedPath;
+  if (hasPath) out.path = normalizedPath;
+  return out;
+}
+
+function makeFdError(error, fd, syscall) {
+  const out = makeFsError(error, undefined, syscall);
+  out.fd = fd;
   return out;
 }
 
@@ -184,9 +217,7 @@ function validatePathArg(path, name = "path") {
 }
 
 function normalizeEncoding(options, fallback = undefined) {
-  if (typeof options === "string") return options;
-  if (options && typeof options === "object" && options.encoding != null) return options.encoding;
-  return fallback;
+  return encodingFromOptions(options, fallback);
 }
 
 function bufferFrom(bytes) {
@@ -227,21 +258,57 @@ function bytesFromData(data, encoding = "utf8") {
   return encoder.encode(String(data));
 }
 
+function validateWriteData(data) {
+  if (typeof data === "string" || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return;
+  throw invalidArgType("data", "of type string or an instance of Buffer, TypedArray, or DataView", data);
+}
+
 function decodeBytes(bytes, encoding = "utf8") {
   if (encoding === "buffer" || encoding == null) return bufferFrom(bytes);
   if (globalThis.Buffer?.from) return globalThis.Buffer.from(bytes).toString(encoding);
   return decoder.decode(bytes);
 }
 
-function readFdToEndSync(fd, options = undefined) {
+function allocationLimitForEncoding(encoding) {
+  const configured = Number(globalThis.__cottontailSyntheticAllocationLimit);
+  if (!Number.isFinite(configured) || configured <= 0) return Number.MAX_SAFE_INTEGER;
+  const normalized = String(encoding ?? "buffer").toLowerCase();
+  if (normalized === "hex") return configured * 2;
+  if (normalized === "base64" || normalized === "base64url") return configured * 3;
+  if (normalized === "utf8" || normalized === "utf-8" || normalized === "ucs2" || normalized === "ucs-2" || normalized === "utf16le" || normalized === "utf-16le") {
+    return configured * 4;
+  }
+  return configured;
+}
+
+function makeOutOfMemoryError(path = undefined) {
+  const suffix = path == null ? "" : `, read '${normalizePath(path)}'`;
+  const error = new Error(`ENOMEM: not enough memory${suffix}`);
+  error.errno = -(Number(constantsObject.ENOMEM) || 12);
+  error.code = "ENOMEM";
+  error.syscall = "read";
+  if (path != null) error.path = normalizePath(path);
+  return error;
+}
+
+function readFdToEndSync(fd, options = undefined, path = undefined) {
   const encoding = normalizeEncoding(options);
+  validateFd(fd);
+  const allocationLimit = allocationLimitForEncoding(encoding);
+  try {
+    const stats = fstatSync(fd);
+    if (stats.isFile() && stats.size > allocationLimit) throw makeOutOfMemoryError(path);
+  } catch (error) {
+    if (error?.code === "ENOMEM") throw error;
+  }
   const chunks = [];
   let total = 0;
   for (;;) {
     const chunk = new Uint8Array(64 * 1024);
     const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, null);
     if (bytesRead <= 0) break;
-    chunks.push(chunk.subarray(0, bytesRead));
+    if (total + bytesRead > allocationLimit) throw makeOutOfMemoryError(path);
+    chunks.push(chunk.slice(0, bytesRead));
     total += bytesRead;
   }
   const out = new Uint8Array(total);
@@ -295,6 +362,33 @@ function parseMode(mode) {
   return typeof mode === "string" ? parseInt(mode, 8) : Number(mode);
 }
 
+function validateOpenInteger(value, name) {
+  if (!Number.isInteger(value)) {
+    const error = new RangeError(
+      `The value of "${name}" is out of range. It must be an integer. Received ${String(value)}`,
+    );
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  if (value < 0 || value > 0xffffffff) {
+    throw outOfRange(name, ">= 0 and <= 4294967295", value);
+  }
+  return value;
+}
+
+function normalizeOpenFlags(flags) {
+  if (typeof flags === "string") return flags;
+  if (typeof flags !== "number") throw invalidArgType("flags", "of type string or number", flags);
+  return validateOpenInteger(flags, "flags");
+}
+
+function normalizeOpenMode(mode) {
+  if (typeof mode !== "number" && typeof mode !== "string") {
+    throw invalidArgType("mode", "of type number or string", mode);
+  }
+  return validateOpenInteger(parseMode(mode), "mode");
+}
+
 function ensureParent(path) {
   const parent = dirname(path);
   if (parent && parent !== path && !existsSync(parent)) mkdirSync(parent, { recursive: true });
@@ -324,24 +418,20 @@ export class Stats {
   }
 
   _initialize(result = {}) {
-    this.dev = Number(result.dev) || 0;
-    this.ino = Number(result.ino) || 0;
-    this.mode = Number(result.mode) || 0;
-    this.nlink = Number(result.nlink) || 0;
-    this.uid = Number(result.uid) || 0;
-    this.gid = Number(result.gid) || 0;
-    this.rdev = Number(result.rdev) || 0;
-    this.size = Number(result.size) || 0;
-    this.blksize = Number(result.blksize) || 0;
-    this.blocks = Number(result.blocks) || 0;
-    this.atimeMs = Number(result.atimeMs) || 0;
-    this.mtimeMs = Number(result.mtimeMs) || 0;
-    this.ctimeMs = Number(result.ctimeMs) || 0;
-    this.birthtimeMs = Number(result.birthtimeMs) || 0;
-    this.atime = new Date(this.atimeMs);
-    this.mtime = new Date(this.mtimeMs);
-    this.ctime = new Date(this.ctimeMs);
-    this.birthtime = new Date(this.birthtimeMs);
+    this.dev = result.dev;
+    this.ino = result.ino;
+    this.mode = result.mode;
+    this.nlink = result.nlink;
+    this.uid = result.uid;
+    this.gid = result.gid;
+    this.rdev = result.rdev;
+    this.size = result.size;
+    this.blksize = result.blksize;
+    this.blocks = result.blocks;
+    this.atimeMs = result.atimeMs;
+    this.mtimeMs = result.mtimeMs;
+    this.ctimeMs = result.ctimeMs;
+    this.birthtimeMs = result.birthtimeMs;
   }
 
   isFile() { return modeMatches(this.mode, constants.S_IFREG ?? 0o100000); }
@@ -373,10 +463,6 @@ class BigIntStats {
     this.mtimeNs = msToNs(result.mtimeMs);
     this.ctimeNs = msToNs(result.ctimeMs);
     this.birthtimeNs = msToNs(result.birthtimeMs);
-    this.atime = new Date(Number(result.atimeMs) || 0);
-    this.mtime = new Date(Number(result.mtimeMs) || 0);
-    this.ctime = new Date(Number(result.ctimeMs) || 0);
-    this.birthtime = new Date(Number(result.birthtimeMs) || 0);
   }
 
   isFile() { return modeMatches(Number(this.mode), constants.S_IFREG ?? 0o100000); }
@@ -387,6 +473,42 @@ class BigIntStats {
   isFIFO() { return modeMatches(Number(this.mode), constants.S_IFIFO ?? 0o010000); }
   isSocket() { return modeMatches(Number(this.mode), constants.S_IFSOCK ?? 0o140000); }
 }
+
+function installLazyStatsDates(prototype, bigint = false) {
+  for (const [property, milliseconds] of [
+    ["atime", "atimeMs"],
+    ["mtime", "mtimeMs"],
+    ["ctime", "ctimeMs"],
+    ["birthtime", "birthtimeMs"],
+  ]) {
+    Object.defineProperty(prototype, property, {
+      get() {
+        const raw = this[milliseconds];
+        const value = new Date(bigint && typeof raw === "bigint" ? Number(raw) : raw);
+        Object.defineProperty(this, property, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+        return value;
+      },
+      set(value) {
+        Object.defineProperty(this, property, {
+          value,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+}
+
+installLazyStatsDates(Stats.prototype);
+installLazyStatsDates(BigIntStats.prototype, true);
 
 function toBigIntStat(value) {
   return BigInt(Math.trunc(Number(value) || 0));
@@ -515,7 +637,12 @@ export class Dir {
 }
 
 export function existsSync(path) {
-  return cottontail.existsSync(normalizePath(path));
+  try {
+    validatePathArg(path);
+    return cottontail.existsSync(normalizePath(path));
+  } catch {
+    return false;
+  }
 }
 
 export function accessSync(path, mode = F_OK) {
@@ -529,91 +656,146 @@ export function accessSync(path, mode = F_OK) {
 
 export function readFileSync(path, options = undefined) {
   if (typeof path === "number") return readFdToEndSync(path, options);
-  const encoding = normalizeEncoding(options);
+  validatePathArg(path);
+  normalizeEncoding(options);
   const normalizedPath = normalizePath(path);
-  let raw;
+  const flag = typeof options === "object" && options?.flag != null ? options.flag : "r";
+  let fd;
   try {
-    raw = cottontail.readFileBuffer(normalizedPath);
+    fd = openSync(normalizedPath, flag);
   } catch (error) {
-    throw makeFsError(error, normalizedPath, "open");
+    throw error?.code ? error : makeFsError(error, normalizedPath, "open");
   }
-  const bytes = makeBuffer(raw);
-  return encoding ? decodeBytes(bytes, encoding) : bytes;
+  try {
+    return readFdToEndSync(fd, options, normalizedPath);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function writeFileSync(path, data, options = undefined) {
+  normalizeEncoding(options, "utf8");
+  validateWriteData(data);
   if (typeof path === "number") {
     writeAllToFdSync(path, data, options);
     return;
   }
-  const flag = typeof options === "object" && options?.flag ? String(options.flag) : "w";
+  validatePathArg(path);
+  const flag = typeof options === "object" && options?.flag != null ? options.flag : "w";
   const encoding = normalizeEncoding(options, "utf8");
-  if (flag.includes("a")) {
+  if (typeof flag === "string" && flag.includes("a")) {
     appendFileSync(path, data, options);
     return;
   }
   const normalizedPath = normalizePath(path);
-  cottontail.writeFile(normalizedPath, bytesFromData(data, encoding));
-  const mode = typeof options === "object" && options !== null ? options.mode : undefined;
-  if (mode !== undefined && mode !== null) {
-    try {
-      cottontail.chmodSync(normalizedPath, parseMode(mode));
-    } catch {}
+  const mode = typeof options === "object" && options?.mode != null ? parseMode(options.mode) : 0o666;
+  const flush = typeof options === "object" && options?.flush != null ? options.flush : false;
+  if (typeof flush !== "boolean") throw invalidArgType("flush", "of type boolean", flush);
+  const fd = openSync(normalizedPath, flag, mode);
+  try {
+    writeAllToFdSync(fd, data, { encoding });
+    if (flush) fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
 export function appendFileSync(path, data, options = undefined) {
   const encoding = normalizeEncoding(options, "utf8");
-  const fd = typeof path === "number" ? path : openSync(path, "a");
+  validateWriteData(data);
+  const flag = typeof options === "object" && options?.flag != null ? options.flag : "a";
+  const mode = typeof options === "object" && options?.mode != null ? parseMode(options.mode) : 0o666;
+  const flush = typeof options === "object" && options?.flush != null ? options.flush : false;
+  if (typeof flush !== "boolean") throw invalidArgType("flush", "of type boolean", flush);
+  const fd = typeof path === "number" ? path : openSync(path, flag, mode);
   try {
     writeSync(fd, bytesFromData(data, encoding));
+    if (flush) fsyncSync(fd);
   } finally {
     if (typeof path !== "number") closeSync(fd);
   }
 }
 
 export function openSync(path, flags = "r", mode = 0o666) {
+  validatePathArg(path);
   const normalizedPath = normalizePath(path);
+  flags = normalizeOpenFlags(flags);
+  const normalizedMode = normalizeOpenMode(mode ?? 0o666);
   try {
-    return cottontail.openFd(normalizedPath, flags ?? "r", Number(mode ?? 0o666));
+    return cottontail.openFd(normalizedPath, flags ?? "r", normalizedMode);
   } catch (error) {
     throw makeFsError(error, normalizedPath, "open");
   }
 }
 
 export function closeSync(fd) {
-  cottontail.closeFd(Number(fd));
+  fd = validateFd(fd);
+  try {
+    // COTTONTAIL-COMPAT: the current host close primitive has no return
+    // channel, so validate first to preserve Node's EBADF contract.
+    cottontail.fstatSync(fd);
+    cottontail.closeFd(fd);
+  } catch (error) {
+    throw makeFdError(error, fd, "close");
+  }
 }
 
 export function readSync(fd, buffer, offset = 0, length = undefined, position = null) {
+  fd = validateFd(fd);
   if (buffer && typeof buffer === "object" && !ArrayBuffer.isView(buffer) && !(buffer instanceof ArrayBuffer)) {
     position = buffer.position ?? null;
     length = buffer.length;
     offset = buffer.offset ?? 0;
-    buffer = buffer.buffer;
+    buffer = buffer.buffer ?? globalThis.Buffer?.alloc?.(16384) ?? new Uint8Array(16384);
+  } else if (offset && typeof offset === "object") {
+    position = offset.position ?? null;
+    length = offset.length;
+    offset = offset.offset ?? 0;
   }
   const view = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer;
-  const byteLength = length == null ? view.byteLength - Number(offset || 0) : Number(length);
-  return Number(cottontail.fdReadAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
+  const range = validateBufferRange(view, Number(offset ?? 0), length == null ? undefined : Number(length));
+  position = validatePosition(position);
+  if (range.length === 0) return 0;
+  try {
+    return Number(cottontail.fdReadAt(fd, range.buffer, range.offset, range.length, position));
+  } catch (error) {
+    throw makeFdError(error, fd, "read");
+  }
 }
 
 export function writeSync(fd, data, offset = undefined, length = undefined, position = null) {
+  fd = validateFd(fd);
   if (typeof data === "string") {
-    const bytes = bytesFromData(data, typeof length === "string" ? length : "utf8");
-    return Number(cottontail.fdWriteAt(Number(fd), bytes, 0, bytes.byteLength, offset ?? null));
+    const encoding = normalizeEncoding(typeof length === "string" ? length : "utf8", "utf8");
+    position = validatePosition(offset ?? null);
+    const bytes = bytesFromData(data, encoding);
+    if (bytes.byteLength === 0) return 0;
+    try {
+      return Number(cottontail.fdWriteAt(fd, bytes, 0, bytes.byteLength, position));
+    } catch (error) {
+      throw makeFdError(error, fd, "write");
+    }
   }
-  if (data && typeof data === "object" && !ArrayBuffer.isView(data) && !(data instanceof ArrayBuffer)) {
-    position = data.position ?? null;
-    length = data.length;
-    offset = data.offset ?? 0;
-    data = data.buffer;
+  if (offset && typeof offset === "object") {
+    position = offset.position ?? null;
+    length = offset.length;
+    offset = offset.offset ?? 0;
   }
   const view = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-  const byteLength = length == null ? view.byteLength - Number(offset || 0) : Number(length);
-  return Number(cottontail.fdWriteAt(Number(fd), view, Number(offset || 0), byteLength, position ?? null));
+  const range = validateBufferRange(view, Number(offset ?? 0), length == null ? undefined : Number(length));
+  position = validatePosition(position);
+  if (range.length === 0) return 0;
+  try {
+    return Number(cottontail.fdWriteAt(fd, range.buffer, range.offset, range.length, position));
+  } catch (error) {
+    throw makeFdError(error, fd, "write");
+  }
 }
 
 export function readvSync(fd, buffers, position = null) {
+  fd = validateFd(fd);
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
+  position = validatePosition(position);
   let total = 0;
   let currentPosition = position;
   for (const buffer of buffers) {
@@ -626,6 +808,9 @@ export function readvSync(fd, buffers, position = null) {
 }
 
 export function writevSync(fd, buffers, position = null) {
+  fd = validateFd(fd);
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
+  position = validatePosition(position);
   let total = 0;
   let currentPosition = position;
   for (const buffer of buffers) {
@@ -738,7 +923,11 @@ function parseMkdirOptions(options) {
     throw makeInvalidArgTypeError("options", "of type object or integer", options);
   }
   if (options.recursive !== undefined && typeof options.recursive !== "boolean") {
-    throw makeInvalidArgTypeError("options.recursive", "of type boolean", options.recursive);
+    const error = new TypeError(
+      `The "recursive" property must be of type boolean, got ${typeof options.recursive}`,
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
   }
   return { recursive: Boolean(options.recursive) };
 }
@@ -747,6 +936,7 @@ export function mkdirSync(path, options = {}) {
   validatePathArg(path);
   const { recursive } = parseMkdirOptions(options);
   const target = normalizePath(path);
+  if (target.length === 0) throw makeFsError({ code: "ENOENT" }, target, "mkdir");
   if (!recursive) {
     try {
       cottontail.mkdirSync(target, false);
@@ -797,16 +987,27 @@ export function mkdirSync(path, options = {}) {
   return missing.length > 0 ? missing[missing.length - 1] : undefined;
 }
 
-export function mkdtempSync(prefix) {
+export function mkdtempSync(prefix, options = undefined) {
+  validatePathArg(prefix, "prefix");
+  const encoding = normalizeEncoding(options);
+  const normalizedPrefix = normalizePath(prefix);
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const suffix = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-    const path = `${String(prefix)}${suffix}`;
-    if (!existsSync(path)) {
-      mkdirSync(path, { recursive: true });
-      return path;
+    let suffix = "";
+    for (let index = 0; index < 6; index += 1) {
+      suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
+    }
+    const path = `${normalizedPrefix}${suffix}`;
+    try {
+      cottontail.mkdirSync(path, false);
+      return encoding === "buffer" ? bufferFrom(encoder.encode(path)) : path;
+    } catch (error) {
+      const out = makeFsError(error, path, "mkdtemp");
+      if (out.code === "EEXIST") continue;
+      throw out;
     }
   }
-  throw new Error(`mkdtempSync failed for prefix ${prefix}`);
+  throw makeFsError({ code: "EEXIST" }, normalizedPrefix, "mkdtemp");
 }
 
 export function mkdtempDisposableSync(prefix) {
@@ -822,20 +1023,44 @@ export function mkdtempDisposableSync(prefix) {
 }
 
 export function rmSync(path, options = {}) {
-  cottontail.rmSync(normalizePath(path), Boolean(options?.recursive), Boolean(options?.force));
+  const normalizedPath = normalizePath(path);
+  try {
+    cottontail.rmSync(normalizedPath, Boolean(options?.recursive), Boolean(options?.force));
+  } catch (error) {
+    if (options?.force && String(error?.message ?? error).includes("No such file")) return;
+    throw makeFsError(error, normalizedPath, "rm");
+  }
 }
 
 export function rmdirSync(path, options = {}) {
   if (options?.recursive) return rmSync(path, { recursive: true, force: false });
-  cottontail.rmdirSync(normalizePath(path));
+  const normalizedPath = normalizePath(path);
+  try {
+    cottontail.rmdirSync(normalizedPath);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "rmdir");
+  }
 }
 
 export function unlinkSync(path) {
-  cottontail.unlinkSync(normalizePath(path));
+  const normalizedPath = normalizePath(path);
+  try {
+    cottontail.unlinkSync(normalizedPath);
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "unlink");
+  }
 }
 
 export function renameSync(oldPath, newPath) {
-  cottontail.renameSync(normalizePath(oldPath), normalizePath(newPath));
+  const oldName = normalizePath(oldPath);
+  const newName = normalizePath(newPath);
+  try {
+    cottontail.renameSync(oldName, newName);
+  } catch (error) {
+    const out = makeFsError(error, oldName, "rename");
+    out.dest = newName;
+    throw out;
+  }
 }
 
 export function linkSync(existingPath, newPath) {
@@ -848,8 +1073,14 @@ export function symlinkSync(target, path, type = undefined) {
 }
 
 export function readlinkSync(path, options = undefined) {
-  const value = cottontail.readlinkSync(normalizePath(path));
-  return normalizeEncoding(options) === "buffer" ? bufferFrom(encoder.encode(value)) : value;
+  const encoding = normalizeEncoding(options);
+  const normalizedPath = normalizePath(path);
+  try {
+    const value = cottontail.readlinkSync(normalizedPath);
+    return encoding === "buffer" ? bufferFrom(encoder.encode(value)) : value;
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "readlink");
+  }
 }
 
 export function readdirSync(path, options = undefined) {
@@ -857,23 +1088,43 @@ export function readdirSync(path, options = undefined) {
   const recursive = Boolean(options?.recursive);
   const encoding = normalizeEncoding(options);
   const root = normalizePath(path);
-  const entries = cottontail.readDirSync(root).map((entry) => {
-    const name = encoding === "buffer" ? bufferFrom(encoder.encode(entry.name)) : entry.name;
-    return withFileTypes ? new Dirent(name, entry, root) : name;
-  });
-  if (!recursive) return entries;
+  const out = [];
 
-  const out = [...entries];
-  for (const entry of entries) {
-    const name = String(withFileTypes ? entry.name : entry);
-    const childPath = join(root, name);
-    if ((withFileTypes ? entry : lstatSync(childPath)).isDirectory()) {
-      for (const child of readdirSync(childPath, options)) {
-        if (withFileTypes) out.push(child);
-        else out.push(join(name, String(child)));
+  const visit = (directory, relativePrefix = "") => {
+    let sourceEntries;
+    try {
+      sourceEntries = cottontail.readDirSync(directory);
+    } catch (error) {
+      throw makeFsError(error, directory, "scandir");
+    }
+
+    const entries = sourceEntries.map((entry) => {
+      const relativeName = relativePrefix ? join(relativePrefix, entry.name) : entry.name;
+      const encodedName = encoding === "buffer" ? bufferFrom(encoder.encode(relativeName)) : relativeName;
+      return {
+        entry,
+        value: withFileTypes
+          ? new Dirent(
+            encoding === "buffer" ? bufferFrom(encoder.encode(entry.name)) : entry.name,
+            entry,
+            directory,
+          )
+          : encodedName,
+      };
+    });
+
+    for (const item of entries) out.push(item.value);
+    if (!recursive) return;
+    for (const item of entries) {
+      const dirent = withFileTypes ? item.value : new Dirent(item.entry.name, item.entry, directory);
+      if (dirent.isDirectory()) {
+        const nextRelative = relativePrefix ? join(relativePrefix, item.entry.name) : item.entry.name;
+        visit(join(directory, item.entry.name), nextRelative);
       }
     }
-  }
+  };
+
+  visit(root);
   return out;
 }
 
@@ -882,6 +1133,7 @@ export function opendirSync(path, options = {}) {
 }
 
 export function statSync(path, options = undefined) {
+  validatePathArg(path);
   const normalizedPath = normalizePath(path);
   try {
     return makeStats(cottontail.statSync(normalizedPath, true), options);
@@ -892,6 +1144,7 @@ export function statSync(path, options = undefined) {
 }
 
 export function lstatSync(path, options = undefined) {
+  validatePathArg(path);
   const normalizedPath = normalizePath(path);
   try {
     return makeStats(cottontail.statSync(normalizedPath, false), options);
@@ -902,7 +1155,12 @@ export function lstatSync(path, options = undefined) {
 }
 
 export function fstatSync(fd, options = undefined) {
-  return makeStats(cottontail.fstatSync(Number(fd)), options);
+  fd = validateFd(fd);
+  try {
+    return makeStats(cottontail.fstatSync(fd), options);
+  } catch (error) {
+    throw makeFdError(error, fd, "fstat");
+  }
 }
 
 export function statfsSync(path, options = undefined) {
@@ -910,26 +1168,38 @@ export function statfsSync(path, options = undefined) {
 }
 
 export function realpathSync(path, options = undefined) {
-  const value = cottontail.realpathSync(normalizePath(path));
-  return normalizeEncoding(options) === "buffer" ? bufferFrom(encoder.encode(value)) : value;
+  const encoding = normalizeEncoding(options);
+  const normalizedPath = normalizePath(path);
+  try {
+    const value = cottontail.realpathSync(normalizedPath);
+    return encoding === "buffer" ? bufferFrom(encoder.encode(value)) : value;
+  } catch (error) {
+    throw makeFsError(error, normalizedPath, "realpath");
+  }
 }
 
 realpathSync.native = realpathSync;
 
 export function fsyncSync(fd) {
-  cottontail.fsyncSync(Number(fd));
+  fd = validateFd(fd);
+  try { cottontail.fsyncSync(fd); } catch (error) { throw makeFdError(error, fd, "fsync"); }
 }
 
 export function fdatasyncSync(fd) {
-  cottontail.fdatasyncSync(Number(fd));
+  fd = validateFd(fd);
+  try { cottontail.fdatasyncSync(fd); } catch (error) { throw makeFdError(error, fd, "fdatasync"); }
 }
 
 export function ftruncateSync(fd, len = 0) {
-  cottontail.ftruncateSync(Number(fd), Number(len ?? 0));
+  fd = validateFd(fd);
+  len = validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
+  try { cottontail.ftruncateSync(fd, len); } catch (error) { throw makeFdError(error, fd, "ftruncate"); }
 }
 
 export function truncateSync(path, len = 0) {
-  cottontail.truncateSync(normalizePath(path), Number(len ?? 0));
+  len = validateInteger(len ?? 0, "len", 0, Number.MAX_SAFE_INTEGER);
+  const normalizedPath = normalizePath(path);
+  try { cottontail.truncateSync(normalizedPath, len); } catch (error) { throw makeFsError(error, normalizedPath, "truncate"); }
 }
 
 export function futimesSync(fd, atime, mtime) {
@@ -971,14 +1241,38 @@ function defineOwnState(target, values) {
   }
 }
 
-export class ReadStream extends Readable {
+function normalizeStreamOptions(options) {
+  if (options == null || typeof options === "function") return {};
+  if (typeof options === "string") return { encoding: normalizeEncoding(options) };
+  if (typeof options !== "object") throw invalidArgType("options", "of type string or object", options);
+  const copy = {};
+  for (const key in options) copy[key] = options[key];
+  if (copy.encoding != null) copy.encoding = normalizeEncoding(copy.encoding);
+  if (copy.signal != null) validateAbortSignal(copy.signal);
+  return copy;
+}
+
+function streamPrematureCloseError() {
+  const error = new Error("Premature close");
+  error.code = "ERR_STREAM_PREMATURE_CLOSE";
+  return error;
+}
+
+class ReadStreamImpl extends Readable {
   constructor(path, options = {}) {
+    options = normalizeStreamOptions(options);
     // Lifecycle (open/close/destroy) is managed by this class, not the engine.
-    super({ autoDestroy: false, emitClose: false });
-    const fd = Object.prototype.hasOwnProperty.call(options ?? {}, "fd") ? Number(options.fd) : null;
-    const start = options?.start == null ? null : Number(options.start);
+    super({ ...options, autoDestroy: false, emitClose: false });
+    const hasFd = Object.prototype.hasOwnProperty.call(options, "fd") && options.fd != null;
+    const fd = hasFd ? validateFd(options.fd) : null;
+    if (!hasFd) validatePathArg(path);
+    const start = options.start == null ? null : validateInteger(options.start, "start", 0, Number.MAX_SAFE_INTEGER);
+    const end = options.end == null || options.end === Infinity
+      ? null
+      : validateInteger(options.end, "end", 0, Number.MAX_SAFE_INTEGER);
+    if (start != null && end != null && start > end) throw outOfRange("start", `<= ${end}`, start);
     defineOwnState(this, {
-      path,
+      path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "r",
       mode: options?.mode ?? 0o666,
       fd,
@@ -990,7 +1284,7 @@ export class ReadStream extends Readable {
       bytesRead: 0,
       pending: true,
       start,
-      end: options?.end == null ? null : Number(options.end),
+      end,
       pos: start,
       highWaterMark: Math.max(1, Math.min(Number(options?.highWaterMark || 64 * 1024), 1024 * 1024)),
       encoding: options?.encoding,
@@ -999,8 +1293,24 @@ export class ReadStream extends Readable {
       _closed: false,
       _opened: false,
       _reading: false,
+      _abortListener: null,
     });
 
+    if (options.signal) {
+      this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
+      if (options.signal.aborted) queueMicrotask(this._abortListener);
+      else options.signal.addEventListener("abort", this._abortListener, { once: true });
+      this.once("close", () => options.signal.removeEventListener("abort", this._abortListener));
+    }
+
+    queueMicrotask(() => {
+      if (this.destroyed) return;
+      try { this._open(); } catch (error) { this.destroy(error); }
+    });
+  }
+
+  _read() {
+    if (this._paused || this.destroyed || this.readableEnded) return;
     queueMicrotask(() => this._pump());
   }
 
@@ -1075,8 +1385,16 @@ export class ReadStream extends Readable {
   }
 
   close(callback = undefined) {
-    if (callback) this.once("close", callback);
-    this.destroy();
+    const error = this.readableEnded ? undefined : streamPrematureCloseError();
+    if (callback) this.once("close", () => callback(error));
+    queueMicrotask(() => {
+      if (this._closed) return;
+      try { this._open(); } catch (openError) {
+        if (callback && error === undefined) callback(openError);
+      }
+      this.destroy();
+    });
+    return this;
   }
 
   destroy(error = undefined) {
@@ -1105,6 +1423,23 @@ export class ReadStream extends Readable {
   }
 }
 
+function abortReasonForStream(signal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  if (reason !== undefined) error.cause = reason;
+  return error;
+}
+
+export function ReadStream(path, options = {}) {
+  return new ReadStreamImpl(path, options);
+}
+ReadStream.prototype = ReadStreamImpl.prototype;
+Object.defineProperty(ReadStream.prototype, "constructor", { value: ReadStream, writable: true, configurable: true });
+Object.setPrototypeOf(ReadStream, ReadStreamImpl);
+
 export const FileReadStream = ReadStream;
 export const Utf8Stream = ReadStream;
 
@@ -1112,15 +1447,18 @@ export function createReadStream(path, options = {}) {
   return new ReadStream(path, options);
 }
 
-export class WriteStream extends Writable {
+class WriteStreamImpl extends Writable {
   constructor(path, options = {}) {
+    options = normalizeStreamOptions(options);
     // Lifecycle (open/close/destroy) is managed by this class, not the engine.
-    super({ autoDestroy: false, emitClose: false });
-    const fd = Object.prototype.hasOwnProperty.call(options ?? {}, "fd") ? Number(options.fd) : null;
-    const start = options?.start == null ? null : Number(options.start);
+    super({ ...options, autoDestroy: false, emitClose: false });
+    const hasFd = Object.prototype.hasOwnProperty.call(options, "fd") && options.fd != null;
+    const fd = hasFd ? validateFd(options.fd) : null;
+    if (!hasFd) validatePathArg(path);
+    const start = options.start == null ? null : validateInteger(options.start, "start", 0, Number.MAX_SAFE_INTEGER);
     const highWaterMark = Math.max(1, Math.min(Number(options?.highWaterMark || 16 * 1024), 1024 * 1024));
     defineOwnState(this, {
-      path,
+      path: hasFd ? path : normalizePath(path),
       flags: options?.flags || "w",
       mode: options?.mode ?? 0o666,
       fd,
@@ -1138,7 +1476,20 @@ export class WriteStream extends Writable {
       writableLength: 0,
       writableNeedDrain: false,
       _ownsFd: fd == null || Number.isNaN(fd),
+      flush: options.flush === true,
+      _abortListener: null,
+      _finalizing: false,
+      _finished: false,
     });
+    if (options.flush != null && typeof options.flush !== "boolean") {
+      throw invalidArgType("options.flush", "of type boolean", options.flush);
+    }
+    if (options.signal) {
+      this._abortListener = () => this.destroy(abortReasonForStream(options.signal));
+      if (options.signal.aborted) queueMicrotask(this._abortListener);
+      else options.signal.addEventListener("abort", this._abortListener, { once: true });
+      this.once("close", () => options.signal.removeEventListener("abort", this._abortListener));
+    }
     queueMicrotask(() => {
       try { this._open(); } catch (error) { this.destroy(error); }
     });
@@ -1200,22 +1551,49 @@ export class WriteStream extends Writable {
       callback = encoding;
       encoding = undefined;
     }
+    if (this.writableEnded) {
+      if (typeof callback === "function") {
+        if (this._finished) queueMicrotask(callback);
+        else this.once("finish", callback);
+      }
+      return this;
+    }
+    if (this.pending) {
+      try { this._open(); } catch (error) {
+        this.destroy(error);
+        if (typeof callback === "function") queueMicrotask(() => callback(error));
+        return this;
+      }
+    }
     if (chunk != null) this.write(chunk, encoding);
     this.writableEnded = true;
-    this.emit("finish");
-    if (this.autoClose) this.close(callback);
-    else if (typeof callback === "function") queueMicrotask(callback);
+    this.writable = false;
+    if (typeof callback === "function") this.once("finish", callback);
+    if (this._finalizing) return this;
+    this._finalizing = true;
+    queueMicrotask(() => {
+      if (this.destroyed || this._finished) return;
+      if (this.flush && this.fd != null) {
+        try { fsyncSync(this.fd); } catch (error) { this.destroy(error); return; }
+      }
+      this._finished = true;
+      this.emit("finish");
+      if (this.autoClose) this.destroy();
+    });
     return this;
   }
 
   close(callback = undefined) {
     if (callback) this.once("close", callback);
-    this.destroy();
+    this.end();
+    if (!this.autoClose) this.once("finish", () => this.destroy());
+    return this;
   }
 
   destroy(error = undefined) {
     if (this.destroyed) return this;
     this.destroyed = true;
+    this.writable = false;
     if (this.fd != null) {
       try { closeSync(this.fd); } catch {}
     }
@@ -1231,17 +1609,25 @@ export class WriteStream extends Writable {
   }
 }
 
+export function WriteStream(path, options = {}) {
+  return new WriteStreamImpl(path, options);
+}
+WriteStream.prototype = WriteStreamImpl.prototype;
+Object.defineProperty(WriteStream.prototype, "constructor", { value: WriteStream, writable: true, configurable: true });
+Object.setPrototypeOf(WriteStream, WriteStreamImpl);
+
 export const FileWriteStream = WriteStream;
 
 export function createWriteStream(path, options = {}) {
   return new WriteStream(path, options);
 }
 
-function callbackify(action, callbackName = "callback") {
+function callbackify(action, callbackName = "callback", validate = undefined) {
   return (...args) => {
     const callback = args[args.length - 1];
     if (typeof callback !== "function") throw makeInvalidCallbackError(callbackName, callback);
     const callArgs = args.slice(0, -1);
+    validate?.(...callArgs);
     queueMicrotask(() => {
       try { callback(null, action(...callArgs)); } catch (error) { callback(error); }
     });
@@ -1249,10 +1635,37 @@ function callbackify(action, callbackName = "callback") {
 }
 
 export const access = callbackify(accessSync);
-export const appendFile = callbackify(appendFileSync);
+export function appendFile(path, data, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  if (typeof path !== "number") validatePathArg(path);
+  validateWriteData(data);
+  normalizeEncoding(options, "utf8");
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  runAbortable(() => appendFileSync(path, data, options), signal).then(
+    () => callback(null),
+    error => callback(error),
+  );
+}
 export const chmod = callbackify(chmodSync);
 export const chown = callbackify(chownSync);
-export const close = callbackify(closeSync);
+export function close(fd, callback = undefined) {
+  fd = validateFd(fd);
+  if (callback !== undefined && typeof callback !== "function") {
+    throw makeInvalidCallbackError("callback", callback);
+  }
+  queueMicrotask(() => {
+    try {
+      closeSync(fd);
+      callback?.(null);
+    } catch (error) {
+      callback?.(error);
+    }
+  });
+}
 export const copyFile = callbackify(copyFileSync);
 // Node names fs.cp's callback argument "cb" in its validation error.
 export const cp = callbackify(cpSync, "cb");
@@ -1281,13 +1694,50 @@ export function mkdir(path, options, callback) {
     try { callback(null, mkdirSync(path, options ?? {})); } catch (error) { callback(error); }
   });
 }
-export const mkdtemp = callbackify(mkdtempSync);
-export const open = callbackify(openSync);
+export const mkdtemp = callbackify(mkdtempSync, "callback", (prefix, options) => {
+  validatePathArg(prefix, "prefix");
+  normalizeEncoding(options);
+});
+export function open(path, flags, mode, callback) {
+  if (typeof mode === "function") {
+    callback = mode;
+    mode = 0o666;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  validatePathArg(path);
+  normalizeOpenFlags(flags);
+  normalizeOpenMode(mode ?? 0o666);
+  queueMicrotask(() => {
+    try { callback(null, openSync(path, flags, mode ?? 0o666)); } catch (error) { callback(error); }
+  });
+}
 export const opendir = callbackify(opendirSync);
-export const readFile = callbackify(readFileSync);
-export const readdir = callbackify(readdirSync);
-export const readlink = callbackify(readlinkSync);
-export const realpath = callbackify(realpathSync);
+export function readFile(path, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  if (typeof path !== "number") validatePathArg(path);
+  normalizeEncoding(options);
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  runAbortable(() => readFileSync(path, options), signal).then(
+    value => callback(null, value),
+    error => callback(error),
+  );
+}
+export const readdir = callbackify(readdirSync, "callback", (path, options) => {
+  validatePathArg(path);
+  normalizeEncoding(options);
+});
+export const readlink = callbackify(readlinkSync, "callback", (path, options) => {
+  validatePathArg(path);
+  normalizeEncoding(options);
+});
+export const realpath = callbackify(realpathSync, "callback", (path, options) => {
+  validatePathArg(path);
+  normalizeEncoding(options);
+});
 export const rename = callbackify(renameSync);
 export const rm = callbackify(rmSync);
 export const rmdir = callbackify(rmdirSync);
@@ -1297,7 +1747,21 @@ export const symlink = callbackify(symlinkSync);
 export const truncate = callbackify(truncateSync);
 export const unlink = callbackify(unlinkSync);
 export const utimes = callbackify(utimesSync);
-export const writeFile = callbackify(writeFileSync);
+export function writeFile(path, data, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  if (typeof path !== "number") validatePathArg(path);
+  validateWriteData(data);
+  normalizeEncoding(options, "utf8");
+  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+  runAbortable(() => writeFileSync(path, data, options), signal).then(
+    () => callback(null),
+    error => callback(error),
+  );
+}
 
 export function exists(path, callback) {
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
@@ -1305,7 +1769,20 @@ export function exists(path, callback) {
 }
 
 export function read(fd, buffer, offset, length, position, callback) {
-  if (typeof offset === "object") {
+  if (typeof buffer === "function") {
+    callback = buffer;
+    buffer = globalThis.Buffer?.alloc?.(16384) ?? new Uint8Array(16384);
+    offset = 0;
+    length = buffer.byteLength;
+    position = null;
+  } else if (buffer && typeof buffer === "object" && !ArrayBuffer.isView(buffer) && !(buffer instanceof ArrayBuffer)) {
+    callback = offset;
+    const options = buffer;
+    buffer = options.buffer ?? globalThis.Buffer?.alloc?.(16384) ?? new Uint8Array(16384);
+    offset = options.offset ?? 0;
+    length = options.length ?? buffer.byteLength - offset;
+    position = options.position ?? null;
+  } else if (offset && typeof offset === "object") {
     callback = length;
     position = offset.position ?? null;
     length = offset.length;
@@ -1316,6 +1793,9 @@ export function read(fd, buffer, offset, length, position, callback) {
     position = null;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  validateFd(fd);
+  validateBufferRange(buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : buffer, offset ?? 0, length);
+  validatePosition(position);
   queueMicrotask(() => {
     try {
       const bytesRead = readSync(fd, buffer, offset, length, position);
@@ -1341,6 +1821,19 @@ export function write(fd, data, offset = undefined, length = undefined, position
     position = undefined;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  validateFd(fd);
+  if (typeof data === "string") {
+    validatePosition(offset ?? null);
+    normalizeEncoding(typeof length === "string" ? length : "utf8", "utf8");
+  } else {
+    const options = offset && typeof offset === "object" ? offset : null;
+    validateBufferRange(
+      data instanceof ArrayBuffer ? new Uint8Array(data) : data,
+      options?.offset ?? offset ?? 0,
+      options?.length ?? length,
+    );
+    validatePosition(options?.position ?? position ?? null);
+  }
   queueMicrotask(() => {
     try {
       const bytesWritten = writeSync(fd, data, offset, length, position);
@@ -1357,6 +1850,9 @@ export function readv(fd, buffers, position = null, callback = undefined) {
     position = null;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  validateFd(fd);
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
+  validatePosition(position);
   queueMicrotask(() => {
     try { callback(null, readvSync(fd, buffers, position), buffers); } catch (error) { callback(error); }
   });
@@ -1368,10 +1864,53 @@ export function writev(fd, buffers, position = null, callback = undefined) {
     position = null;
   }
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
+  validateFd(fd);
+  if (!Array.isArray(buffers)) throw invalidArgType("buffers", "an Array of ArrayBufferView instances", buffers);
+  validatePosition(position);
   queueMicrotask(() => {
     try { callback(null, writevSync(fd, buffers, position), buffers); } catch (error) { callback(error); }
   });
 }
+
+const customPromisify = Symbol.for("nodejs.util.promisify.custom");
+Object.defineProperty(exists, customPromisify, {
+  configurable: true,
+  value(path) {
+    return new Promise(resolve => exists(path, resolve));
+  },
+});
+Object.defineProperty(read, customPromisify, {
+  configurable: true,
+  value(...args) {
+    return new Promise((resolve, reject) => {
+      read(...args, (error, bytesRead, buffer) => error ? reject(error) : resolve({ bytesRead, buffer }));
+    });
+  },
+});
+Object.defineProperty(write, customPromisify, {
+  configurable: true,
+  value(...args) {
+    return new Promise((resolve, reject) => {
+      write(...args, (error, bytesWritten, buffer) => error ? reject(error) : resolve({ bytesWritten, buffer }));
+    });
+  },
+});
+Object.defineProperty(readv, customPromisify, {
+  configurable: true,
+  value(...args) {
+    return new Promise((resolve, reject) => {
+      readv(...args, (error, bytesRead, buffers) => error ? reject(error) : resolve({ bytesRead, buffers }));
+    });
+  },
+});
+Object.defineProperty(writev, customPromisify, {
+  configurable: true,
+  value(...args) {
+    return new Promise((resolve, reject) => {
+      writev(...args, (error, bytesWritten, buffers) => error ? reject(error) : resolve({ bytesWritten, buffers }));
+    });
+  },
+});
 
 function snapshot(path, recursive, validateRoot = false) {
   const root = normalizePath(path);
@@ -1456,6 +1995,8 @@ export function watch(path, options = {}, listener = undefined) {
     options = {};
   }
   if (typeof options === "string") options = { encoding: options };
+  normalizeEncoding(options, "utf8");
+  validateAbortSignal(options?.signal);
   const filename = normalizePath(path);
   const recursive = Boolean(options?.recursive);
   const listeners = new Map();
@@ -1565,7 +2106,7 @@ export function watch(path, options = {}, listener = undefined) {
 }
 
 function zeroStats(options = undefined) {
-  return makeStats({}, options);
+  return makeStats(Object.fromEntries(statsPositionalFields.map((field) => [field, 0])), options);
 }
 
 function statSnapshot(path, options = undefined) {

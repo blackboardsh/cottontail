@@ -1,4 +1,5 @@
 import {
+  callerSourceOrigin,
   describe as jscDescribe,
   jscDescribe as describeJscValue,
   describeArray,
@@ -6,9 +7,11 @@ import {
   estimateShallowMemoryUsageOf,
   fullGC,
   gcAndSweep,
+  getProtectedObjects,
   getRandomSeed,
   heapSize,
   heapStats,
+  isRope,
   memoryUsage,
   noFTL,
   noInline,
@@ -47,10 +50,22 @@ const utf16String = new TextDecoder("utf-16le").decode(utf16Data);
 assert(describeJscValue("123").includes("8Bit:(1)"), "bun:jsc 8-bit string description mismatch");
 assert(describeJscValue(utf16String).includes("8Bit:(0)"), "bun:jsc 16-bit string description mismatch");
 assert(describeArray([1, "a"]).length === 2, "bun:jsc describeArray mismatch");
+assert(callerSourceOrigin() === import.meta.url, "bun:jsc callerSourceOrigin mismatch");
+let ropeValuePart: number | undefined = 123;
+assert(isRope("a" + ropeValuePart + "b"), "bun:jsc isRope should detect a deferred string");
+assert(!isRope("abcdefgh"), "bun:jsc isRope should reject a flat string");
+const protectedObjects = getProtectedObjects();
+assert(protectedObjects.length > 0, "bun:jsc getProtectedObjects should expose JSC roots");
+assert(protectedObjects.includes(cottontail), "bun:jsc getProtectedObjects should include the protected host object");
 setRandomSeed(123);
 assert(getRandomSeed() === 123, "bun:jsc random seed mismatch");
-setTimeZone("UTC");
+assert(setTimeZone("UTC") === "UTC", "bun:jsc setTimeZone result mismatch");
 assert(process.env.TZ === "UTC", "bun:jsc timezone mismatch");
+assert(Intl.DateTimeFormat().resolvedOptions().timeZone === "UTC", "bun:jsc Intl timezone mismatch");
+const utcDateString = new Date(0).toString();
+assert(setTimeZone("America/Anchorage") === "America/Anchorage", "bun:jsc alternate timezone result mismatch");
+assert(new Date(0).toString() !== utcDateString, "bun:jsc setTimeZone should reset JSC's Date cache");
+setTimeZone("UTC");
 const passthrough = () => 7;
 assert(noInline(passthrough)() === 7, "bun:jsc noInline mismatch");
 assert(noFTL(passthrough)() === 7, "bun:jsc noFTL mismatch");
@@ -70,6 +85,36 @@ assert(Bun.deepMatch({ a: { b: 1 } }, { a: { b: 1, c: 2 } }), "Bun.deepMatch mis
 assert(Bun.escapeHTML("<>&") === "&lt;&gt;&amp;", "Bun.escapeHTML mismatch");
 assert(Bun.stripANSI("\u001b[31mred\u001b[0m") === "red", "Bun.stripANSI mismatch");
 assert(Bun.stringWidth("abc") === 3, "Bun.stringWidth mismatch");
+
+function InspectBase() {}
+function InspectChild() {}
+Object.setPrototypeOf(InspectChild, InspectBase);
+Object.defineProperties(InspectChild, {
+  inherited: { value: function inherited() {}, enumerable: true },
+  shadowed: { value: function shadowed() {}, enumerable: true },
+  inheritedGetter: { get() { return 1; }, enumerable: true },
+});
+const inspectNamespace = Object.create(InspectChild);
+Object.defineProperties(inspectNamespace, {
+  default: { value: InspectChild, enumerable: true },
+  length: { get() { return 0; }, enumerable: true },
+  name: { get() { return "InspectChild"; }, enumerable: true },
+  prototype: { get() { return InspectChild.prototype; }, enumerable: true },
+  shadowed: { get() { return InspectChild.shadowed; }, enumerable: true },
+});
+assert(
+  Bun.inspect(inspectNamespace) ===
+    "Function {\n" +
+    `  default: [${Object.getPrototypeOf(InspectChild).name}: ${InspectChild.name}],\n` +
+    "  length: [Getter],\n" +
+    "  name: [Getter],\n" +
+    "  prototype: [Getter],\n" +
+    "  shadowed: [Getter],\n" +
+    "  inherited: [Function: inherited],\n" +
+    "  inheritedGetter: [Getter],\n" +
+    "}",
+  "Bun.inspect function namespace mismatch",
+);
 
 const compressed = Bun.gzipSync("hello");
 assert(Bun.gunzipSync(compressed).toString() === "hello", "Bun gzip/gunzip mismatch");

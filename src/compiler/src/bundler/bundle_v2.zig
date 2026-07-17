@@ -3058,7 +3058,19 @@ pub const BundleV2 = struct {
                 continue;
             }
 
-            if (ctx.target.isBun() and this.transpiler.resolver.runtimeAlias(import_record.path.text) == null) {
+            const runtime_alias = if (ctx.target.isBun())
+                this.transpiler.resolver.runtimeAlias(import_record.path.text)
+            else
+                null;
+
+            // COTTONTAIL-COMPAT: Keep Bun's intrinsic tag while resolving the
+            // implementation from Cottontail's embedded runtime. The printer
+            // uses this tag to preserve `import("bun") === globalThis.Bun`.
+            if (runtime_alias != null and strings.eqlComptime(import_record.path.text, "bun")) {
+                import_record.tag = .bun;
+            }
+
+            if (ctx.target.isBun() and runtime_alias == null) {
                 if (jsc.ModuleLoader.HardcodedModule.Alias.get(import_record.path.text, .bun, .{ .rewrite_jest_for_tests = this.transpiler.options.rewrite_jest_for_tests })) |replacement| skip_hardcoded: {
                     // Cottontail runtime bundles: real Bun overrides some npm
                     // packages ("ws", "node-fetch", "undici", ...) with

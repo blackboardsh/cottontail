@@ -7598,6 +7598,13 @@
   "cottontail": {
     "source": "src/runtime_modules static parse",
     "modules": {
+      "bun/color": {
+        "file": "src/runtime_modules/bun/color.js",
+        "exports": [
+          "color"
+        ],
+        "hasDefaultExport": true
+      },
       "bun/encoding": {
         "file": "src/runtime_modules/bun/encoding.js",
         "exports": [
@@ -7721,6 +7728,7 @@
           "ShellError",
           "ShellExpression",
           "ShellOutput",
+          "ShellPromise",
           "shrink",
           "sleep",
           "sleepSync",
@@ -7950,6 +7958,30 @@
         ],
         "hasDefaultExport": true
       },
+      "internal/bun-shell-builtins": {
+        "file": "src/runtime_modules/internal/bun-shell-builtins.js",
+        "exports": [
+          "createShellBuiltins"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-shell-parser": {
+        "file": "src/runtime_modules/internal/bun-shell-parser.js",
+        "exports": [
+          "lexShell",
+          "parseShell",
+          "serializeShellLex",
+          "serializeShellParse"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-shell-runtime": {
+        "file": "src/runtime_modules/internal/bun-shell-runtime.js",
+        "exports": [
+          "createBunShellRuntime"
+        ],
+        "hasDefaultExport": false
+      },
       "internal/bun-spawn-contract": {
         "file": "src/runtime_modules/internal/bun-spawn-contract.js",
         "exports": [
@@ -7972,6 +8004,74 @@
           "encodeBunSpawnIpc",
           "installInheritedNodeIpc",
           "isCottontailIpcFrame"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-concurrency": {
+        "file": "src/runtime_modules/internal/bun-test-concurrency.js",
+        "exports": [
+          "applyBunFileConcurrency",
+          "bunTestFileRunsConcurrently"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-each": {
+        "file": "src/runtime_modules/internal/bun-test-each.js",
+        "exports": [
+          "formatBunEachLabel",
+          "validateBunEachTable"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-filter": {
+        "file": "src/runtime_modules/internal/bun-test-filter.js",
+        "exports": [
+          "bunTestFilterIsActive",
+          "bunTestNameMatches",
+          "installBunTestFilterReporter",
+          "restoreBunTestFilterArgument"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-github": {
+        "file": "src/runtime_modules/internal/bun-test-github.js",
+        "exports": [
+          "appendGithubGroup",
+          "githubActionsEnabled",
+          "githubErrorAnnotation",
+          "githubTimeoutAnnotation"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-junit": {
+        "file": "src/runtime_modules/internal/bun-test-junit.js",
+        "exports": [
+          "captureTestRegistrationLine",
+          "junitReporterOptions",
+          "writeJunitReport"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/bun-test-order": {
+        "file": "src/runtime_modules/internal/bun-test-order.js",
+        "exports": [
+          "beginBunTestCollection",
+          "createBunTestOrderScope",
+          "enqueueBunTestEntry",
+          "enqueueBunTestHook",
+          "flushBunTestOrderScope",
+          "reportBunTestRandomizationSeed"
+        ],
+        "hasDefaultExport": false
+      },
+      "internal/node-http-parser": {
+        "file": "src/runtime_modules/internal/node-http-parser.js",
+        "exports": [
+          "allMethods",
+          "ConnectionsList",
+          "HTTPParser",
+          "makeHttpParserBinding",
+          "methods"
         ],
         "hasDefaultExport": false
       },
@@ -9283,6 +9383,40 @@
         ],
         "hasDefaultExport": true
       },
+      "fs/internal": {
+        "file": "src/runtime_modules/node/fs/internal.js",
+        "exports": [
+          "abortReason",
+          "encodingFromOptions",
+          "invalidArgType",
+          "invalidArgValue",
+          "outOfRange",
+          "runAbortable",
+          "validateAbortSignal",
+          "validateBufferRange",
+          "validateFd",
+          "validateInteger",
+          "validatePosition"
+        ],
+        "hasDefaultExport": false
+      },
+      "node:fs/internal": {
+        "file": "src/runtime_modules/node/fs/internal.js",
+        "exports": [
+          "abortReason",
+          "encodingFromOptions",
+          "invalidArgType",
+          "invalidArgValue",
+          "outOfRange",
+          "runAbortable",
+          "validateAbortSignal",
+          "validateBufferRange",
+          "validateFd",
+          "validateInteger",
+          "validatePosition"
+        ],
+        "hasDefaultExport": false
+      },
       "fs/promises": {
         "file": "src/runtime_modules/node/fs/promises.js",
         "exports": [
@@ -9295,6 +9429,13 @@
           "copyFile",
           "cp",
           "exists",
+          "fchmod",
+          "fchown",
+          "fdatasync",
+          "fstat",
+          "fsync",
+          "ftruncate",
+          "futimes",
           "glob",
           "lchmod",
           "lchown",
@@ -9306,9 +9447,11 @@
           "mkdtempDisposable",
           "open",
           "opendir",
+          "read",
           "readdir",
           "readFile",
           "readlink",
+          "readv",
           "realpath",
           "rename",
           "rm",
@@ -9320,7 +9463,9 @@
           "unlink",
           "utimes",
           "watch",
-          "writeFile"
+          "write",
+          "writeFile",
+          "writev"
         ],
         "hasDefaultExport": true
       },
@@ -9336,6 +9481,13 @@
           "copyFile",
           "cp",
           "exists",
+          "fchmod",
+          "fchown",
+          "fdatasync",
+          "fstat",
+          "fsync",
+          "ftruncate",
+          "futimes",
           "glob",
           "lchmod",
           "lchown",
@@ -9347,9 +9499,11 @@
           "mkdtempDisposable",
           "open",
           "opendir",
+          "read",
           "readdir",
           "readFile",
           "readlink",
+          "readv",
           "realpath",
           "rename",
           "rm",
@@ -9361,7 +9515,9 @@
           "unlink",
           "utimes",
           "watch",
-          "writeFile"
+          "write",
+          "writeFile",
+          "writev"
         ],
         "hasDefaultExport": true
       },
@@ -9597,7 +9753,9 @@
         "file": "src/runtime_modules/node/http.js",
         "exports": [
           "_attachHttpConnection",
+          "_configureHttpServer",
           "_connectionListener",
+          "_httpListeningCallbackArgs",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
@@ -9633,7 +9791,9 @@
         "file": "src/runtime_modules/node/http.js",
         "exports": [
           "_attachHttpConnection",
+          "_configureHttpServer",
           "_connectionListener",
+          "_httpListeningCallbackArgs",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
@@ -9668,6 +9828,7 @@
       "http2": {
         "file": "src/runtime_modules/node/http2.js",
         "exports": [
+          "ClientHttp2Session",
           "connect",
           "constants",
           "createSecureServer",
@@ -9686,6 +9847,7 @@
       "node:http2": {
         "file": "src/runtime_modules/node/http2.js",
         "exports": [
+          "ClientHttp2Session",
           "connect",
           "constants",
           "createSecureServer",
@@ -9849,6 +10011,20 @@
         ],
         "hasDefaultExport": false
       },
+      "internal/http_common": {
+        "file": "src/runtime_modules/node/internal/http_common.js",
+        "exports": [
+          "createHttpCommonBuiltin"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:internal/http_common": {
+        "file": "src/runtime_modules/node/internal/http_common.js",
+        "exports": [
+          "createHttpCommonBuiltin"
+        ],
+        "hasDefaultExport": true
+      },
       "internal/test/binding": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "exports": [
@@ -9880,6 +10056,7 @@
           "_preloadModules",
           "_readPackage",
           "_resolveFilename",
+          "_resolveForImport",
           "_resolveLookupPaths",
           "_stat",
           "builtinModules",
@@ -9924,6 +10101,7 @@
           "_preloadModules",
           "_readPackage",
           "_resolveFilename",
+          "_resolveForImport",
           "_resolveLookupPaths",
           "_stat",
           "builtinModules",
@@ -9956,6 +10134,7 @@
         "exports": [
           "_createServerHandle",
           "_normalizeArgs",
+          "_setSimultaneousAccepts",
           "BlockList",
           "connect",
           "createConnection",
@@ -9980,6 +10159,7 @@
         "exports": [
           "_createServerHandle",
           "_normalizeArgs",
+          "_setSimultaneousAccepts",
           "BlockList",
           "connect",
           "createConnection",
@@ -11082,6 +11262,128 @@
           "isatty",
           "ReadStream",
           "WriteStream"
+        ],
+        "hasDefaultExport": true
+      },
+      "undici-public": {
+        "file": "src/runtime_modules/node/undici-public.js",
+        "exports": [
+          "Agent",
+          "BalancedPool",
+          "buildConnector",
+          "caches",
+          "Client",
+          "CloseEvent",
+          "connect",
+          "createRedirectInterceptor",
+          "DecoratorHandler",
+          "deleteCookie",
+          "Dispatcher",
+          "EnvHttpProxyAgent",
+          "ErrorEvent",
+          "errors",
+          "EventSource",
+          "fetch",
+          "File",
+          "FileReader",
+          "FormData",
+          "getCookies",
+          "getGlobalDispatcher",
+          "getGlobalOrigin",
+          "getSetCookies",
+          "Headers",
+          "interceptors",
+          "MessageEvent",
+          "MockAgent",
+          "MockClient",
+          "mockErrors",
+          "MockPool",
+          "parseMIMEType",
+          "pipeline",
+          "Pool",
+          "ProxyAgent",
+          "RedirectHandler",
+          "request",
+          "Request",
+          "Response",
+          "RetryAgent",
+          "RetryHandler",
+          "serializeAMimeType",
+          "setCookie",
+          "setGlobalDispatcher",
+          "setGlobalOrigin",
+          "stream",
+          "upgrade",
+          "util",
+          "WebSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:undici-public": {
+        "file": "src/runtime_modules/node/undici-public.js",
+        "exports": [
+          "Agent",
+          "BalancedPool",
+          "buildConnector",
+          "caches",
+          "Client",
+          "CloseEvent",
+          "connect",
+          "createRedirectInterceptor",
+          "DecoratorHandler",
+          "deleteCookie",
+          "Dispatcher",
+          "EnvHttpProxyAgent",
+          "ErrorEvent",
+          "errors",
+          "EventSource",
+          "fetch",
+          "File",
+          "FileReader",
+          "FormData",
+          "getCookies",
+          "getGlobalDispatcher",
+          "getGlobalOrigin",
+          "getSetCookies",
+          "Headers",
+          "interceptors",
+          "MessageEvent",
+          "MockAgent",
+          "MockClient",
+          "mockErrors",
+          "MockPool",
+          "parseMIMEType",
+          "pipeline",
+          "Pool",
+          "ProxyAgent",
+          "RedirectHandler",
+          "request",
+          "Request",
+          "Response",
+          "RetryAgent",
+          "RetryHandler",
+          "serializeAMimeType",
+          "setCookie",
+          "setGlobalDispatcher",
+          "setGlobalOrigin",
+          "stream",
+          "upgrade",
+          "util",
+          "WebSocket"
+        ],
+        "hasDefaultExport": true
+      },
+      "undici": {
+        "file": "src/runtime_modules/node/undici.js",
+        "exports": [
+          "createUndiciModule"
+        ],
+        "hasDefaultExport": true
+      },
+      "node:undici": {
+        "file": "src/runtime_modules/node/undici.js",
+        "exports": [
+          "createUndiciModule"
         ],
         "hasDefaultExport": true
       },
@@ -12784,6 +13086,15 @@
       }
     },
     "files": {
+      "src/runtime_modules/bun/color.js": {
+        "file": "src/runtime_modules/bun/color.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "color"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/bun/encoding.js": {
         "file": "src/runtime_modules/bun/encoding.js",
         "hasDefaultExport": false,
@@ -12915,6 +13226,7 @@
           "ShellError",
           "ShellExpression",
           "ShellOutput",
+          "ShellPromise",
           "shrink",
           "sleep",
           "sleepSync",
@@ -13031,6 +13343,7 @@
           "SHA512_256",
           "ShellError",
           "ShellOutput",
+          "ShellPromise",
           "shrink",
           "sleep",
           "sleepSync",
@@ -13088,6 +13401,7 @@
           "Blob",
           "BroadcastChannel",
           "Buffer",
+          "BuildError",
           "BuildMessage",
           "Bun",
           "CloseEvent",
@@ -13129,6 +13443,7 @@
           "reportError",
           "Request",
           "require",
+          "ResolveError",
           "ResolveMessage",
           "Response",
           "self",
@@ -13361,6 +13676,7 @@
           "__cottontailInspectBunExpectationError",
           "__cottontailModuleBindingValues",
           "__cottontailNotifyModuleBindings",
+          "__cottontailStartTestRun",
           "__cottontailTestAssertionCount",
           "__cottontailTestSnapshotCount",
           "Bun",
@@ -13399,6 +13715,36 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/internal/bun-shell-builtins.js": {
+        "file": "src/runtime_modules/internal/bun-shell-builtins.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createShellBuiltins"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-shell-parser.js": {
+        "file": "src/runtime_modules/internal/bun-shell-parser.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "lexShell",
+          "parseShell",
+          "serializeShellLex",
+          "serializeShellParse"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-shell-runtime.js": {
+        "file": "src/runtime_modules/internal/bun-shell-runtime.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "createBunShellRuntime"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/internal/bun-spawn-contract.js": {
         "file": "src/runtime_modules/internal/bun-spawn-contract.js",
         "hasDefaultExport": false,
@@ -13424,6 +13770,88 @@
           "encodeBunSpawnIpc",
           "installInheritedNodeIpc",
           "isCottontailIpcFrame"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-concurrency.js": {
+        "file": "src/runtime_modules/internal/bun-test-concurrency.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "applyBunFileConcurrency",
+          "bunTestFileRunsConcurrently"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-each.js": {
+        "file": "src/runtime_modules/internal/bun-test-each.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "formatBunEachLabel",
+          "validateBunEachTable"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-filter.js": {
+        "file": "src/runtime_modules/internal/bun-test-filter.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "bunTestFilterIsActive",
+          "bunTestNameMatches",
+          "installBunTestFilterReporter",
+          "restoreBunTestFilterArgument"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-github.js": {
+        "file": "src/runtime_modules/internal/bun-test-github.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "appendGithubGroup",
+          "githubActionsEnabled",
+          "githubErrorAnnotation",
+          "githubTimeoutAnnotation"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-junit.js": {
+        "file": "src/runtime_modules/internal/bun-test-junit.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "captureTestRegistrationLine",
+          "junitReporterOptions",
+          "writeJunitReport"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/bun-test-order.js": {
+        "file": "src/runtime_modules/internal/bun-test-order.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "beginBunTestCollection",
+          "createBunTestOrderScope",
+          "enqueueBunTestEntry",
+          "enqueueBunTestHook",
+          "flushBunTestOrderScope",
+          "reportBunTestRandomizationSeed"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/internal/node-http-parser.js": {
+        "file": "src/runtime_modules/internal/node-http-parser.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "allMethods",
+          "ConnectionsList",
+          "HTTPParser",
+          "makeHttpParserBinding",
+          "methods"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -14144,6 +14572,25 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/fs/internal.js": {
+        "file": "src/runtime_modules/node/fs/internal.js",
+        "hasDefaultExport": false,
+        "namedExports": [
+          "abortReason",
+          "encodingFromOptions",
+          "invalidArgType",
+          "invalidArgValue",
+          "outOfRange",
+          "runAbortable",
+          "validateAbortSignal",
+          "validateBufferRange",
+          "validateFd",
+          "validateInteger",
+          "validatePosition"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/fs/promises.js": {
         "file": "src/runtime_modules/node/fs/promises.js",
         "hasDefaultExport": true,
@@ -14157,6 +14604,13 @@
           "copyFile",
           "cp",
           "exists",
+          "fchmod",
+          "fchown",
+          "fdatasync",
+          "fstat",
+          "fsync",
+          "ftruncate",
+          "futimes",
           "glob",
           "lchmod",
           "lchown",
@@ -14168,9 +14622,11 @@
           "mkdtempDisposable",
           "open",
           "opendir",
+          "read",
           "readdir",
           "readFile",
           "readlink",
+          "readv",
           "realpath",
           "rename",
           "rm",
@@ -14182,7 +14638,9 @@
           "unlink",
           "utimes",
           "watch",
-          "writeFile"
+          "write",
+          "writeFile",
+          "writev"
         ],
         "bunObjectProperties": [],
         "globalProperties": [
@@ -14313,7 +14771,9 @@
         "hasDefaultExport": true,
         "namedExports": [
           "_attachHttpConnection",
+          "_configureHttpServer",
           "_connectionListener",
+          "_httpListeningCallbackArgs",
           "_writeServerResponse",
           "Agent",
           "ClientRequest",
@@ -14354,6 +14814,7 @@
         "file": "src/runtime_modules/node/http2.js",
         "hasDefaultExport": true,
         "namedExports": [
+          "ClientHttp2Session",
           "connect",
           "constants",
           "createSecureServer",
@@ -14458,6 +14919,15 @@
         "bunObjectProperties": [],
         "globalProperties": []
       },
+      "src/runtime_modules/node/internal/http_common.js": {
+        "file": "src/runtime_modules/node/internal/http_common.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "createHttpCommonBuiltin"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
       "src/runtime_modules/node/internal/test/binding.js": {
         "file": "src/runtime_modules/node/internal/test/binding.js",
         "hasDefaultExport": true,
@@ -14485,6 +14955,7 @@
           "_preloadModules",
           "_readPackage",
           "_resolveFilename",
+          "_resolveForImport",
           "_resolveLookupPaths",
           "_stat",
           "builtinModules",
@@ -14516,7 +14987,8 @@
           "__cottontailBuiltinModules",
           "__cottontailFormatUncaughtModuleError",
           "__cottontailImportModule",
-          "__cottontailRemapModuleStackString"
+          "__cottontailRemapModuleStackString",
+          "ResolveMessage"
         ]
       },
       "src/runtime_modules/node/net.js": {
@@ -14525,6 +14997,7 @@
         "namedExports": [
           "_createServerHandle",
           "_normalizeArgs",
+          "_setSimultaneousAccepts",
           "BlockList",
           "connect",
           "createConnection",
@@ -14545,7 +15018,8 @@
         "bunObjectProperties": [],
         "globalProperties": [
           "__cottontailFdWatchHandlerInstalled",
-          "__cottontailFdWatchListeners"
+          "__cottontailFdWatchListeners",
+          "__cottontailTcpConnectListeners"
         ]
       },
       "src/runtime_modules/node/os.js": {
@@ -15113,6 +15587,7 @@
           "__cottontailCurrentTestRemainingMs",
           "__cottontailCurrentTestToken",
           "__cottontailNoteDanglingProcessKilled",
+          "__cottontailRecordTestAssertionCount",
           "__cottontailRegisteringTestFile",
           "__cottontailRegisterTestPendingPromise",
           "__cottontailRegisterTestSubprocess",
@@ -15202,6 +15677,71 @@
           "isatty",
           "ReadStream",
           "WriteStream"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/undici-public.js": {
+        "file": "src/runtime_modules/node/undici-public.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "Agent",
+          "BalancedPool",
+          "buildConnector",
+          "caches",
+          "Client",
+          "CloseEvent",
+          "connect",
+          "createRedirectInterceptor",
+          "DecoratorHandler",
+          "deleteCookie",
+          "Dispatcher",
+          "EnvHttpProxyAgent",
+          "ErrorEvent",
+          "errors",
+          "EventSource",
+          "fetch",
+          "File",
+          "FileReader",
+          "FormData",
+          "getCookies",
+          "getGlobalDispatcher",
+          "getGlobalOrigin",
+          "getSetCookies",
+          "Headers",
+          "interceptors",
+          "MessageEvent",
+          "MockAgent",
+          "MockClient",
+          "mockErrors",
+          "MockPool",
+          "parseMIMEType",
+          "pipeline",
+          "Pool",
+          "ProxyAgent",
+          "RedirectHandler",
+          "request",
+          "Request",
+          "Response",
+          "RetryAgent",
+          "RetryHandler",
+          "serializeAMimeType",
+          "setCookie",
+          "setGlobalDispatcher",
+          "setGlobalOrigin",
+          "stream",
+          "upgrade",
+          "util",
+          "WebSocket"
+        ],
+        "bunObjectProperties": [],
+        "globalProperties": []
+      },
+      "src/runtime_modules/node/undici.js": {
+        "file": "src/runtime_modules/node/undici.js",
+        "hasDefaultExport": true,
+        "namedExports": [
+          "createUndiciModule"
         ],
         "bunObjectProperties": [],
         "globalProperties": []
@@ -15686,22 +16226,18 @@
         ],
         "bunObjectProperties": [],
         "globalProperties": [
-          "__cottontailDecodeWorkerMessage",
-          "__cottontailEncodeWorkerMessage",
-          "__cottontailEnvironmentData",
-          "__cottontailHasActiveHandles",
-          "__cottontailWorkerData",
-          "__cottontailWorkerResourceLimits",
-          "__cottontailWorkerThreadName",
-          "__cottontailWorkerThreadParentPortActive",
-          "clearImmediate",
+          "__cottontailConfigureWorkerStdio",
+          "__cottontailWebHasActiveHandles",
+          "__cottontailWebPollAlways",
+          "__cottontailWorkerBootstrap",
+          "__cottontailWorkerThreadsFatalCleanup",
+          "__cottontailWorkerThreadsReportError",
+          "AggregateError",
+          "BroadcastChannel",
+          "DOMException",
           "MessageChannel",
           "MessagePort",
-          "onmessage",
           "parentPort",
-          "process",
-          "require",
-          "setImmediate",
           "workerData"
         ]
       },
@@ -16330,6 +16866,7 @@
       "SHA512_256",
       "ShellError",
       "ShellOutput",
+      "ShellPromise",
       "shrink",
       "sleep",
       "sleepSync",
@@ -16369,6 +16906,7 @@
       "__cottontailBunReified",
       "__cottontailBunTestHeaderPrinted",
       "__cottontailBunTestUsed",
+      "__cottontailConfigureWorkerStdio",
       "__cottontailCurrentTestFile",
       "__cottontailCurrentTestHasOwnConcurrency",
       "__cottontailCurrentTestIsConcurrent",
@@ -16376,11 +16914,8 @@
       "__cottontailCurrentTestRemainingMs",
       "__cottontailCurrentTestToken",
       "__cottontailCustomSQLitePath",
-      "__cottontailDecodeWorkerMessage",
       "__cottontailDiagnosticsChannels",
       "__cottontailDotenvLoaded",
-      "__cottontailEncodeWorkerMessage",
-      "__cottontailEnvironmentData",
       "__cottontailFdWatchHandlerInstalled",
       "__cottontailFdWatchListeners",
       "__cottontailFileWatchers",
@@ -16389,7 +16924,6 @@
       "__cottontailFsConstants",
       "__cottontailHandleUncaughtException",
       "__cottontailHandleUnhandledRejection",
-      "__cottontailHasActiveHandles",
       "__cottontailHasPendingSnapshots",
       "__cottontailImportMetaResolve",
       "__cottontailImportMetaResolveSync",
@@ -16406,6 +16940,7 @@
       "__cottontailPromisePeekStates",
       "__cottontailProxyDetails",
       "__cottontailProxyRegistry",
+      "__cottontailRecordTestAssertionCount",
       "__cottontailRegisteringTestFile",
       "__cottontailRegisterTestPendingPromise",
       "__cottontailRegisterTestSubprocess",
@@ -16418,6 +16953,7 @@
       "__cottontailStartTestRun",
       "__cottontailSuppressAsyncHookPromise",
       "__cottontailSyntheticAllocationLimit",
+      "__cottontailTcpConnectListeners",
       "__cottontailTestAssertionCount",
       "__cottontailTestSnapshotCount",
       "__cottontailTimerPromises",
@@ -16426,10 +16962,9 @@
       "__cottontailWebHasActiveHandles",
       "__cottontailWebInterceptWorkerMessage",
       "__cottontailWebPollAlways",
-      "__cottontailWorkerData",
-      "__cottontailWorkerResourceLimits",
-      "__cottontailWorkerThreadName",
-      "__cottontailWorkerThreadParentPortActive",
+      "__cottontailWorkerBootstrap",
+      "__cottontailWorkerThreadsFatalCleanup",
+      "__cottontailWorkerThreadsReportError",
       "__ctError",
       "__dirname",
       "__filename",
@@ -16438,12 +16973,14 @@
       "addEventListener",
       "afterAll",
       "afterEach",
+      "AggregateError",
       "alert",
       "beforeAll",
       "beforeEach",
       "Blob",
       "BroadcastChannel",
       "Buffer",
+      "BuildError",
       "BuildMessage",
       "Bun",
       "cancelAnimationFrame",
@@ -16477,7 +17014,6 @@
       "MessageEvent",
       "MessagePort",
       "navigator",
-      "onmessage",
       "parentPort",
       "performance",
       "Performance",
@@ -16499,6 +17035,7 @@
       "Request",
       "requestAnimationFrame",
       "require",
+      "ResolveError",
       "ResolveMessage",
       "resolveObjectURL",
       "Response",
@@ -17350,7 +17887,18 @@
         "missing": [],
         "extra": [
           "close",
-          "exists"
+          "exists",
+          "fchmod",
+          "fchown",
+          "fdatasync",
+          "fstat",
+          "fsync",
+          "ftruncate",
+          "futimes",
+          "read",
+          "readv",
+          "write",
+          "writev"
         ]
       },
       "http": {
@@ -17381,6 +17929,8 @@
         "extra": [
           "WEBSOCKET_MAX_DECOMPRESSED_LENGTH",
           "_attachHttpConnection",
+          "_configureHttpServer",
+          "_httpListeningCallbackArgs",
           "_writeServerResponse",
           "ensureAsyncDisposeSymbol",
           "parseWebSocketExtensions",
@@ -17408,6 +17958,7 @@
         ],
         "missing": [],
         "extra": [
+          "ClientHttp2Session",
           "Http2Stream"
         ]
       },
@@ -17503,6 +18054,7 @@
           "__importModule",
           "__runMain",
           "__setBuiltinModules",
+          "_resolveForImport",
           "ns"
         ]
       },
@@ -17529,7 +18081,8 @@
         ],
         "missing": [],
         "extra": [
-          "TCP"
+          "TCP",
+          "_setSimultaneousAccepts"
         ]
       },
       "node:sea": {
@@ -18627,7 +19180,8 @@
         "extra": [
           "HTMLRewriter",
           "ShellError",
-          "ShellOutput"
+          "ShellOutput",
+          "ShellPromise"
         ]
       },
       "modules": {
@@ -18752,6 +19306,7 @@
             "ShellError",
             "ShellExpression",
             "ShellOutput",
+            "ShellPromise",
             "URL",
             "URLSearchParams",
             "cwd",
@@ -18875,7 +19430,7 @@
       "version": "24.11.1",
       "commit": "18aefb2d2b36938316d27b5cb53089e97632f0c3",
       "snapshot": "compat/upstream/node/v24.11.1",
-      "copiedFiles": 9883,
+      "copiedFiles": 9611,
       "discoveredRunnableFiles": 7015,
       "enabled": 7015,
       "expectedFailure": 0,
@@ -18888,10 +19443,10 @@
       "version": "1.3.10",
       "commit": "30e609e08073cf7114bfb278506962a5b19d0677",
       "snapshot": "compat/upstream/bun/v1.3.10",
-      "copiedFiles": 8366,
+      "copiedFiles": 8102,
       "discoveredRunnableFiles": 1445,
-      "enabled": 1026,
-      "expectedFailure": 419,
+      "enabled": 1052,
+      "expectedFailure": 393,
       "disabled": 0,
       "notEnabled": 0,
       "classifiedTests": 1445,
@@ -18902,19 +19457,19 @@
     "node": {
       "note": "Heuristic behavioral-readiness signal from inline COTTONTAIL-COMPAT comments, explicit unsupported/native markers, and Node-focused test files. This is not a conformance result.",
       "estimate": {
-        "implementedPercentLower": 83,
-        "implementedPercentUpper": 93,
-        "gapPercentLower": 7,
-        "gapPercentUpper": 17
+        "implementedPercentLower": 79,
+        "implementedPercentUpper": 89,
+        "gapPercentLower": 11,
+        "gapPercentUpper": 21
       },
       "signals": {
         "publicNodeModules": 58,
-        "nodeTestFiles": 44,
-        "compatMarkers": 13,
-        "modulesWithCompatMarkers": 12,
-        "explicitUnsupportedMarkers": 9,
+        "nodeTestFiles": 54,
+        "compatMarkers": 19,
+        "modulesWithCompatMarkers": 16,
+        "explicitUnsupportedMarkers": 11,
         "nativeAvailabilityGuards": 0,
-        "modulesWithUnsupportedMarkers": 5
+        "modulesWithUnsupportedMarkers": 7
       },
       "largestGaps": [
         {
@@ -18927,6 +19482,24 @@
           "gapScore": 10
         },
         {
+          "name": "tls",
+          "file": "src/runtime_modules/node/tls.js",
+          "compatMarkers": 2,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 4,
+          "gapScore": 6
+        },
+        {
+          "name": "worker_threads",
+          "file": "src/runtime_modules/node/worker_threads.js",
+          "compatMarkers": 2,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 2,
+          "gapScore": 6
+        },
+        {
           "name": "zlib",
           "file": "src/runtime_modules/node/zlib.js",
           "compatMarkers": 2,
@@ -18934,6 +19507,15 @@
           "nativeAvailabilityGuards": 0,
           "tests": 4,
           "gapScore": 6
+        },
+        {
+          "name": "http2",
+          "file": "src/runtime_modules/node/http2.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 1,
+          "nativeAvailabilityGuards": 0,
+          "tests": 6,
+          "gapScore": 5
         },
         {
           "name": "child_process",
@@ -18963,12 +19545,21 @@
           "gapScore": 3
         },
         {
-          "name": "http2",
-          "file": "src/runtime_modules/node/http2.js",
+          "name": "fs",
+          "file": "src/runtime_modules/node/fs.js",
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 5,
+          "tests": 3,
+          "gapScore": 3
+        },
+        {
+          "name": "fs/internal",
+          "file": "src/runtime_modules/node/fs/internal.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 3,
           "gapScore": 3
         },
         {
@@ -18978,6 +19569,15 @@
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
           "tests": 1,
+          "gapScore": 3
+        },
+        {
+          "name": "net",
+          "file": "src/runtime_modules/node/net.js",
+          "compatMarkers": 1,
+          "unsupportedMarkers": 0,
+          "nativeAvailabilityGuards": 0,
+          "tests": 2,
           "gapScore": 3
         },
         {
@@ -18999,12 +19599,12 @@
           "gapScore": 3
         },
         {
-          "name": "tls",
-          "file": "src/runtime_modules/node/tls.js",
-          "compatMarkers": 1,
-          "unsupportedMarkers": 0,
+          "name": "undici",
+          "file": "src/runtime_modules/node/undici.js",
+          "compatMarkers": 0,
+          "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
-          "tests": 3,
+          "tests": 0,
           "gapScore": 3
         },
         {
@@ -19040,7 +19640,7 @@
           "compatMarkers": 0,
           "unsupportedMarkers": 1,
           "nativeAvailabilityGuards": 0,
-          "tests": 7,
+          "tests": 13,
           "gapScore": 2
         },
         {
@@ -19140,22 +19740,54 @@
             "tests/js/node-dns-surface.ts"
           ]
         },
+        "fs/internal": {
+          "file": "src/runtime_modules/node/fs/internal.js",
+          "compatMarkers": [
+            "Bun's native fs task checks the signal before dispatch"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-fs-source-conformance.ts",
+            "tests/js/node-fs-surface.ts",
+            "tests/js/node-fs.ts"
+          ]
+        },
+        "fs": {
+          "file": "src/runtime_modules/node/fs.js",
+          "compatMarkers": [
+            "the current host close primitive has no return"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-fs-source-conformance.ts",
+            "tests/js/node-fs-surface.ts",
+            "tests/js/node-fs.ts"
+          ]
+        },
         "http": {
           "file": "src/runtime_modules/node/http.js",
           "compatMarkers": [],
           "unsupportedMarkers": [
             {
-              "line": 2623,
+              "line": 3314,
               "text": "throw new SyntaxError(`Unsupported proxy protocol: ${parsed.protocol}`);"
             }
           ],
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-http-agent-streaming.ts",
+            "tests/js/node-http-common-lazy-load.ts",
+            "tests/js/node-http-common-source-conformance.ts",
             "tests/js/node-http-https-surface.ts",
+            "tests/js/node-http-parser-incremental.test.ts",
+            "tests/js/node-http-parser-source-conformance.ts",
+            "tests/js/node-http-source-conformance.test.ts",
             "tests/js/node-http2-close-lifecycle.test.ts",
             "tests/js/node-http2-core.test.ts",
             "tests/js/node-http2-session.test.ts",
+            "tests/js/node-http2-source-conformance.test.ts",
             "tests/js/node-http2-url-formats.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
@@ -19163,14 +19795,20 @@
         "http2": {
           "file": "src/runtime_modules/node/http2.js",
           "compatMarkers": [
-            "node:http2 native TLS boundary - socket-backed h2c and TLS sessions, nonblocking client/server FD upgrades, ALPN negotiation, HPACK, CONTINUATION, trailers, SETTINGS, flow-window replenishment, validation, and request/response compatibility are implemented. Outbound flow-control scheduling, Huffman encoding, ALTSVC/ORIGIN, and HTTP/1 fallback still need deeper protocol work."
+            "node:http2 native TLS boundary - h2c and TLS sessions, ALPN, HPACK decoding, CONTINUATION, settings, stream/session state, trailers, file responses, outbound flow control, and compatibility request/response APIs are implemented in the portable runtime. HTTP/1 fallback and native zero-copy sendfile remain transport-boundary work; HPACK encoding is deliberately interoperable but stateless."
           ],
-          "unsupportedMarkers": [],
+          "unsupportedMarkers": [
+            {
+              "line": 2953,
+              "text": "throw codedError(\"ERR_HTTP2_UNSUPPORTED_PROTOCOL\", `Protocol \"${url.protocol}\" is not supported`);"
+            }
+          ],
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-http2-close-lifecycle.test.ts",
             "tests/js/node-http2-core.test.ts",
             "tests/js/node-http2-session.test.ts",
+            "tests/js/node-http2-source-conformance.test.ts",
             "tests/js/node-http2-url-formats.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
@@ -19184,6 +19822,18 @@
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/node-inspector-surface.ts"
+          ]
+        },
+        "net": {
+          "file": "src/runtime_modules/node/net.js",
+          "compatMarkers": [
+            "Dynamic platform interface enumeration and libuv-specific handle internals"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-net-tls-source-port.test.ts",
+            "tests/js/node-net.ts"
           ]
         },
         "perf_hooks": {
@@ -19230,15 +19880,29 @@
         "tls": {
           "file": "src/runtime_modules/node/tls.js",
           "compatMarkers": [
-            "node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, CA helpers, SNI contexts, arbitrary Duplex transports, ALPN, cipher selection, and keying-material export are implemented; active renegotiation, finished-message/OCSP/TLS-ticket extraction, and resumable session injection need deeper native bindings."
+            "Requires a native OpenSSL message callback.",
+            "Dynamic asynchronous SNICallback/OCSP callbacks, renegotiation, trace output,"
           ],
           "unsupportedMarkers": [],
           "nativeAvailabilityGuards": [],
           "tests": [
+            "tests/js/node-net-tls-source-port.test.ts",
             "tests/js/node-tls-certificates.test.ts",
             "tests/js/node-tls-duplex.test.ts",
             "tests/js/node-tls-http2-surface.ts"
           ]
+        },
+        "undici": {
+          "file": "src/runtime_modules/node/undici.js",
+          "compatMarkers": [],
+          "unsupportedMarkers": [
+            {
+              "line": 1239,
+              "text": "throw new InvalidArgumentError(\"Unsupported matcher. Must be one of String|Function|RegExp.\");"
+            }
+          ],
+          "nativeAvailabilityGuards": [],
+          "tests": []
         },
         "util/internal/loader": {
           "file": "src/runtime_modules/node/util/internal/loader.js",
@@ -19301,6 +19965,19 @@
             "tests/js/node-instrumentation-surface.ts"
           ]
         },
+        "worker_threads": {
+          "file": "src/runtime_modules/node/worker_threads.js",
+          "compatMarkers": [
+            "resourceLimits are observable configuration here; JSC",
+            "node:worker_threads native boundaries - hard interruption of"
+          ],
+          "unsupportedMarkers": [],
+          "nativeAvailabilityGuards": [],
+          "tests": [
+            "tests/js/node-worker-conformance.test.ts",
+            "tests/js/node-worker-threads-surface.ts"
+          ]
+        },
         "zlib": {
           "file": "src/runtime_modules/node/zlib.js",
           "compatMarkers": [
@@ -19322,10 +19999,10 @@
       "note": "Source caveat and local test-inventory signals only. These are not conformance results and do not support a Bun compatibility percentage.",
       "signals": {
         "publicBunModules": 5,
-        "bunTestFiles": 21,
+        "bunTestFiles": 26,
         "compatMarkers": 8,
         "modulesWithCompatMarkers": 3,
-        "explicitUnsupportedMarkers": 10,
+        "explicitUnsupportedMarkers": 11,
         "nativeAvailabilityGuards": 0,
         "modulesWithUnsupportedMarkers": 4
       },
@@ -19334,10 +20011,10 @@
           "name": "bun",
           "file": "src/runtime_modules/bun/index.js",
           "compatMarkers": 6,
-          "unsupportedMarkers": 6,
+          "unsupportedMarkers": 7,
           "nativeAvailabilityGuards": 0,
-          "tests": 21,
-          "gapScore": 30
+          "tests": 26,
+          "gapScore": 32
         },
         {
           "name": "internal-for-testing",
@@ -19354,7 +20031,7 @@
           "compatMarkers": 1,
           "unsupportedMarkers": 0,
           "nativeAvailabilityGuards": 0,
-          "tests": 5,
+          "tests": 6,
           "gapScore": 3
         },
         {
@@ -19396,32 +20073,36 @@
             "Bun.spawn fd routing - the native spawn hooks need an",
             "Bun.spawn terminal - PTY/ConPTY creation, resize,",
             "spawn argv0 - Cottontail children use this internal",
-            "Bun.spawnSync native contract - the host currently",
+            "Fetch uses Node Transform decoder output and propagates",
             "all accepted Bun backends currently use Cottontail's"
           ],
           "unsupportedMarkers": [
             {
-              "line": 2903,
+              "line": 3195,
               "text": "throw new Error(\"Bun.spawn terminal requires native PTY support\");"
             },
             {
-              "line": 13237,
+              "line": 7038,
+              "text": "throw new TypeError(`Unsupported URL scheme: ${parsedUrl.protocol}`);"
+            },
+            {
+              "line": 14159,
               "text": "if (!(label in passwordAlgorithmIds)) throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 13268,
+              "line": 14190,
               "text": "throw new TypeError(\"Unsupported password algorithm\");"
             },
             {
-              "line": 13691,
+              "line": 14613,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 13707,
+              "line": 14629,
               "text": "throw new TypeError(`Unsupported CSRF token encoding: ${encoding}`);"
             },
             {
-              "line": 14818,
+              "line": 15741,
               "text": "throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);"
             }
           ],
@@ -19431,19 +20112,24 @@
             "tests/js/bun-build-error.ts",
             "tests/js/bun-build-native.ts",
             "tests/js/bun-cjs-interop.ts",
+            "tests/js/bun-color-source-conformance.test.ts",
             "tests/js/bun-dns-cache.ts",
             "tests/js/bun-ffi-surface.ts",
             "tests/js/bun-global.ts",
             "tests/js/bun-jsc-and-global.ts",
+            "tests/js/bun-resolver-source-port.test.ts",
             "tests/js/bun-s3-compat.test.ts",
             "tests/js/bun-serve-detached.ts",
             "tests/js/bun-serve-spawn.ts",
             "tests/js/bun-shell-runtime.test.ts",
+            "tests/js/bun-shell-source-port.test.ts",
             "tests/js/bun-spawn-contract.ts",
             "tests/js/bun-spawn-execpath-env.ts",
             "tests/js/bun-spawn-streaming.ts",
+            "tests/js/bun-spawn-sync-native.test.ts",
             "tests/js/bun-sqlite.ts",
             "tests/js/bun-test-asymmetric.ts",
+            "tests/js/bun-test-cli-source-port.test.ts",
             "tests/js/bun-test-large-array.ts",
             "tests/js/bun-test-module.ts",
             "tests/js/bun-test-snapshot-bootstrap.test.ts",
@@ -19457,11 +20143,11 @@
           ],
           "unsupportedMarkers": [
             {
-              "line": 604,
+              "line": 605,
               "text": "throw new Error(\"socketpair is unavailable in this Cottontail build\");"
             },
             {
-              "line": 693,
+              "line": 694,
               "text": "throw new Error(`bun:internal-for-testing ${name} is not implemented in Cottontail`);"
             }
           ],
@@ -19491,6 +20177,7 @@
           "nativeAvailabilityGuards": [],
           "tests": [
             "tests/js/bun-test-asymmetric.ts",
+            "tests/js/bun-test-cli-source-port.test.ts",
             "tests/js/bun-test-large-array.ts",
             "tests/js/bun-test-module.ts",
             "tests/js/bun-test-snapshot-bootstrap.test.ts",

@@ -6,6 +6,7 @@ import {
   Worker,
   moveMessagePortToContext,
 } from "node:worker_threads";
+import { createContext, runInContext } from "node:vm";
 
 function once(target: any, event: string) {
   return new Promise<any[]>(resolve => target.once(event, (...args: any[]) => resolve(args)));
@@ -26,15 +27,15 @@ test("per-worker CPU and profiler APIs expose the native boundary instead of fak
   await worker.terminate();
 });
 
-test("moving a MessagePort into a vm realm exposes the native boundary instead of returning the original", () => {
-  const { port1 } = new MessageChannel();
-  let error: any;
-  try {
-    moveMessagePortToContext(port1, {});
-  } catch (caught) {
-    error = caught;
-  }
-  expect(error?.code).toBe("ERR_COTTONTAIL_NATIVE_BOUNDARY");
+test("moving a MessagePort into a shared-realm vm context keeps it functional", async () => {
+  const { port1, port2 } = new MessageChannel();
+  const context = createContext({});
+  context.port = moveMessagePortToContext(port1, context);
+  expect(runInContext("port", context)).toBe(port1);
+  const received = new Promise(resolve => { context.record = resolve; });
+  runInContext("port.onmessage = ({ data }) => record(data)", context);
+  port2.postMessage("moved");
+  expect(await received).toBe("moved");
 });
 
 test.todo("COTTONTAIL-COMPAT: Worker.ref/unref needs a native parent-loop keepalive hook", async () => {

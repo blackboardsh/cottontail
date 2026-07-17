@@ -115,7 +115,7 @@
     {
       "pattern": "^test/napi/",
       "status": "expected-failure",
-      "reason": "Requires a Node-API (NAPI) native addon layer that Cottontail's C host bridge does not implement yet."
+      "reason": "The aggregate native-addon corpus still includes unsupported Node-API cases and platform-specific build orchestration. Cottontail's bridge now passes focused addon loading, shared libuv loop, async work, cleanup-hook, thread-pool, and thread-safe-function teardown coverage."
     },
     {
       "pattern": "^test/cli/install/",
@@ -364,7 +364,11 @@
     },
     "test/bundler/bun-build-compile-sourcemap.test.ts": {
       "status": "enabled",
-      "reason": "Standalone source maps pass inline, external, linked, nested-outfile, multi-source, and real split-module graph coverage. Split chunks and their unique maps are embedded, resolved from memory, materialized when requested, and execute successfully (9 bun:test cases, 79 assertions)."
+      "reason": "Standalone source maps pass inline, external, linked, nested-outfile, multi-source, and real split-module graph coverage. Split chunks and their unique maps are embedded, resolved from memory, materialized when requested, and execute successfully. The owned runner allows 30 seconds per case because assembling a self-contained executable can exceed Bun's 5-second default (9 bun:test cases, 84 assertions).",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 180000
     },
     "test/bundler/bun-build-compile.test.ts": {
       "status": "enabled",
@@ -1156,8 +1160,8 @@
       "reason": "Passes under Cottontail after the resolver/runtime-bundling fixes (verified twice: 78 bun:test cases, 78 assertions)."
     },
     "test/js/bun/jsc/bun-jsc.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun's JSC introspection helpers and code coverage behavior."
+      "status": "enabled",
+      "reason": "Stock-JSC-backed caller origin, rope detection, protected-object enumeration, timezone override, heap stats, and related introspection pass all 28 copied upstream cases (49 assertions)."
     },
     "test/js/bun/jsc/domjit.test.ts": {
       "status": "enabled",
@@ -1436,8 +1440,8 @@
       "reason": "Bun shell epipe smoke test passes under Cottontail's current shell wrapper."
     },
     "test/js/bun/shell/exec.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun shell exec/process behavior that currently exceeds the direct upstream runner timeout."
+      "status": "enabled",
+      "reason": "Bun shell execution, environment, process status, pipelines, and redirection pass all 19 copied upstream cases (54 assertions)."
     },
     "test/js/bun/shell/file-io.test.ts": {
       "status": "enabled",
@@ -1446,6 +1450,14 @@
     "test/js/bun/shell/lazy.test.ts": {
       "status": "enabled",
       "reason": "Bun shell lazy smoke test passes under Cottontail's current shell wrapper."
+    },
+    "test/js/bun/shell/lex.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell lexical analysis passes all 29 copied upstream cases (47 assertions)."
+    },
+    "test/js/bun/shell/parse.test.ts": {
+      "status": "enabled",
+      "reason": "Bun shell parser behavior passes the copied upstream file (21 tests, 19 assertions, including its upstream todo cases)."
     },
     "test/js/bun/shell/pipeline_stack.test.ts": {
       "status": "enabled",
@@ -2148,6 +2160,10 @@
     "test/js/deno/v8/error.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
+    },
+    "test/js/first_party/undici/undici.test.ts": {
+      "status": "enabled",
+      "reason": "Bare ESM Undici imports and request behavior pass all 9 copied upstream cases (19 assertions) against Cottontail's shared built-in dispatcher."
     },
     "test/js/junit-reporter/junit.test.js": {
       "status": "enabled",

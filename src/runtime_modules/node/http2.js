@@ -1,7 +1,7 @@
 import { Buffer } from "./buffer.js";
 import { EventEmitter } from "./events.js";
 import { IncomingMessage, ServerResponse } from "./http.js";
-import { connect as netConnect, createServer as createNetServer } from "./net.js";
+import { connect as netConnect, createServer as createNetServer, isIP } from "./net.js";
 import { Duplex } from "./stream.js";
 import { _upgradeServerSocket, connect as tlsConnect, createServer as createTlsServer } from "./tls.js";
 import * as fs from "./fs.js";
@@ -2967,7 +2967,7 @@ export function connect(authority, options = undefined, listener = undefined) {
       ...options,
       host,
       port,
-      servername: options.servername ?? urlHostname,
+      servername: options.servername ?? (isIP(urlHostname) ? undefined : urlHostname),
       rejectUnauthorized: options.rejectUnauthorized,
       ca: options.ca ?? contextOptions.ca,
       ALPNProtocols: options.ALPNProtocols ?? ["h2"],

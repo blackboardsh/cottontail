@@ -29,3 +29,15 @@ compat/upstream/bun/*/b.txt
 compat/upstream/bun/*/append_output.txt
 compat/upstream/bun/*/report.json
 compat/upstream/bun/*/undefined
+compat/upstream/bun/*/app.map
+compat/upstream/bun/*/chunk-*.js.map
+compat/upstream/bun/*/entry
+compat/upstream/bun/*/entry.map
+compat/upstream/bun/*/nosourcemap_entry
+compat/upstream/bun/*/test*file.db
+
+# compile-mode diagnostics emitted at the repository root
+/chunk-*.js.map
+/entry
+/entry.map
+/tests/js/fixtures/debug-compile-split/
