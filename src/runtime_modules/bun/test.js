@@ -3,6 +3,20 @@ import { existsSync as nodeExistsSync } from "../node/fs.js";
 import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import {
+  bunTestFilterIsActive,
+  bunTestNameMatches,
+  installBunTestFilterReporter,
+  restoreBunTestFilterArgument,
+} from "../internal/bun-test-filter.js";
+import {
+  beginBunTestCollection,
+  createBunTestOrderScope,
+  enqueueBunTestEntry,
+  enqueueBunTestHook,
+  flushBunTestOrderScope,
+  reportBunTestRandomizationSeed,
+} from "../internal/bun-test-order.js";
+import {
   after as nodeAfter,
   afterEach as nodeAfterEach,
   before as nodeBefore,
@@ -13,6 +27,8 @@ import {
   setDefaultTimeout as nodeSetDefaultTimeout,
   test as nodeTest,
 } from "../node/test.js";
+
+restoreBunTestFilterArgument();
 
 const mocks = new Set();
 const restores = [];
@@ -3190,6 +3206,22 @@ function normalizeTestOptions(options) {
   return options && typeof options === "object" ? options : {};
 }
 
+function validateBunTestOptions(options) {
+  const normalized = { ...options };
+  if (normalized.retry != null && normalized.repeats != null) {
+    throw new TypeError("Cannot set both retry and repeats");
+  }
+  for (const name of ["retry", "repeats"]) {
+    if (normalized[name] == null) continue;
+    const count = Number(normalized[name]);
+    if (!Number.isInteger(count) || count < 0) {
+      throw new TypeError(`${name} must be a non-negative integer`);
+    }
+    normalized[name] = count;
+  }
+  return normalized;
+}
+
 function parseDescribeArgs(args) {
   const first = args[0];
   if (typeof first !== "function") return parseCallbackArgs(args);
@@ -3217,6 +3249,73 @@ function normalizeTestName(name) {
   return String(name ?? "<anonymous>");
 }
 
+const bunRootSuite = {
+  name: "",
+  parent: null,
+  matchingTestCount: 0,
+  totalTestCount: 0,
+  orderScope: createBunTestOrderScope(),
+};
+let currentBunSuite = bunRootSuite;
+
+const startNodeTestRun = globalThis.__cottontailStartTestRun;
+globalThis.__cottontailStartTestRun = () => {
+  flushBunTestOrderScope(bunRootSuite.orderScope);
+  reportBunTestRandomizationSeed();
+  return startNodeTestRun?.();
+};
+installBunTestFilterReporter(() => bunRootSuite.totalTestCount - bunRootSuite.matchingTestCount);
+
+function bunSuiteNames(suite) {
+  const names = [];
+  for (let cursor = suite; cursor && cursor !== bunRootSuite; cursor = cursor.parent) {
+    if (cursor.name) names.push(cursor.name);
+  }
+  return names.reverse();
+}
+
+function noteBunTestSelection(name) {
+  const matches = bunTestNameMatches(bunSuiteNames(currentBunSuite), name);
+  for (let suite = currentBunSuite; suite; suite = suite.parent) {
+    suite.totalTestCount += 1;
+    if (matches) suite.matchingTestCount += 1;
+  }
+}
+
+function wrapBunDescribeCallback(callback, suite) {
+  if (typeof callback !== "function") return callback;
+  return function bunDescribeDefinition(...args) {
+    const previousSuite = currentBunSuite;
+    currentBunSuite = suite;
+    beginBunTestCollection(suite.orderScope);
+    const finishCollection = () => {
+      flushBunTestOrderScope(suite.orderScope);
+      currentBunSuite = previousSuite;
+    };
+    try {
+      const result = Reflect.apply(callback, this, args);
+      if (result && typeof result.then === "function") {
+        return Promise.resolve(result).finally(finishCollection);
+      }
+      finishCollection();
+      return result;
+    } catch (error) {
+      finishCollection();
+      throw error;
+    }
+  };
+}
+
+function wrapBunLifecycleHook(callback) {
+  const wrapped = wrapDoneCallback(callback);
+  if (!bunTestFilterIsActive() || typeof wrapped !== "function") return wrapped;
+  const suite = currentBunSuite;
+  return function bunFilteredLifecycleHook(...args) {
+    if (suite.matchingTestCount === 0) return undefined;
+    return Reflect.apply(wrapped, this, args);
+  };
+}
+
 function makeEach(base) {
   return (table) => {
     const rows = validateBunEachTable(table);
@@ -3242,16 +3341,18 @@ function makeBunTestFunction(base) {
     if (requireCallback && typeof parsed.callback !== "function") {
       throw new TypeError("test.failing expects a function as the second argument");
     }
-    return base(
-      normalizeTestName(parsed.name),
+    const options = validateBunTestOptions({ ...parsed.options, ...extraOptions });
+    const name = normalizeTestName(parsed.name);
+    noteBunTestSelection(name);
+    return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+      name,
       applyBunFileConcurrency({
-        ...parsed.options,
-        ...extraOptions,
+        ...options,
         __bunTest: true,
         __bunUsesDoneCallback: typeof parsed.callback === "function" && parsed.callback.length > 0,
       }),
       wrapTestCallback(parsed.callback),
-    );
+    ));
   };
   const variant = (extraOptions, requireCallback = false) => {
     const result = (...args) => register(args, extraOptions, requireCallback);
@@ -3285,11 +3386,19 @@ function makeBunDescribe(base) {
   const fn = (...args) => {
     globalThis.__cottontailBunTestUsed = true;
     const parsed = parseDescribeArgs(args);
-    return base(
-      normalizeTestName(parsed.name),
+    const name = normalizeTestName(parsed.name);
+    const suite = {
+      name,
+      parent: currentBunSuite,
+      matchingTestCount: 0,
+      totalTestCount: 0,
+      orderScope: createBunTestOrderScope(currentBunSuite.orderScope),
+    };
+    return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+      name,
       applyBunFileConcurrency({ ...parsed.options, __bunDeferredDefinition: true, __bunTest: true }),
-      parsed.callback,
-    );
+      wrapBunDescribeCallback(parsed.callback, suite),
+    ));
   };
   fn.each = makeEach(fn);
   const variant = (extraOptions) => {
@@ -3297,11 +3406,19 @@ function makeBunDescribe(base) {
       globalThis.__cottontailBunTestUsed = true;
       if (extraOptions.only) assertOnlyAllowed();
       const parsed = parseDescribeArgs(args);
-      return base(
-        normalizeTestName(parsed.name),
+      const name = normalizeTestName(parsed.name);
+      const suite = {
+        name,
+        parent: currentBunSuite,
+        matchingTestCount: 0,
+        totalTestCount: 0,
+        orderScope: createBunTestOrderScope(currentBunSuite.orderScope),
+      };
+      return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+        name,
         applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunDeferredDefinition: true, __bunTest: true }),
-        parsed.callback,
-      );
+        wrapBunDescribeCallback(parsed.callback, suite),
+      ));
     };
     result.each = makeEach(result);
     result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;
@@ -3355,19 +3472,27 @@ function assertOnlyAllowed() {
 
 export const beforeAll = (callback, options = {}) => {
   markBunTestUsed();
-  return nodeBefore(wrapDoneCallback(callback), options);
+  const suite = currentBunSuite;
+  const hook = wrapBunLifecycleHook(callback);
+  return enqueueBunTestHook(suite.orderScope, () => nodeBefore(hook, options));
 };
 export const afterAll = (callback, options = {}) => {
   markBunTestUsed();
-  return nodeAfter(wrapDoneCallback(callback), options);
+  const suite = currentBunSuite;
+  const hook = wrapBunLifecycleHook(callback);
+  return enqueueBunTestHook(suite.orderScope, () => nodeAfter(hook, options));
 };
 export const beforeEach = (callback, options = {}) => {
   markBunTestUsed();
-  return nodeBeforeEach(wrapDoneCallback(callback), options);
+  const suite = currentBunSuite;
+  const hook = wrapBunLifecycleHook(callback);
+  return enqueueBunTestHook(suite.orderScope, () => nodeBeforeEach(hook, options));
 };
 export const afterEach = (callback, options = {}) => {
   markBunTestUsed();
-  return nodeAfterEach(wrapDoneCallback(callback), options);
+  const suite = currentBunSuite;
+  const hook = wrapBunLifecycleHook(callback);
+  return enqueueBunTestHook(suite.orderScope, () => nodeAfterEach(hook, options));
 };
 export const test = makeBunTestFunction(nodeTest);
 export const it = test;
