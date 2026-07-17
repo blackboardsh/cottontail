@@ -7835,6 +7835,7 @@ function serveNodeBacked(options, context) {
         listenHost,
         String(primary.cert ?? ""),
         String(primary.key ?? ""),
+        primary.passphrase,
       );
     } catch (rawError) {
       const error = rawError instanceof Error ? rawError : new Error(String(rawError));
@@ -7885,6 +7886,13 @@ function serveNodeBacked(options, context) {
   const displayHostname = boundHostname.includes(":") ? `[${boundHostname}]` : boundHostname;
   const fallbackHost = isUnix ? "localhost" : `${displayHostname}:${boundPort}`;
   const requestOrigin = isUnix ? `${protocol}//localhost` : `${protocol}//${displayHostname}:${boundPort}`;
+  const listenerAddress = isUnix
+    ? unixPath
+    : (useTls ? nodeServer._tlsAddress : nodeServer.address()) ?? {
+        address: boundHostname,
+        family: boundHostname.includes(":") ? "IPv6" : "IPv4",
+        port: boundPort,
+      };
   const originKeys = isUnix ? [] : [
     requestOrigin,
     ...(boundHostname === "0.0.0.0" || boundHostname === "::"
@@ -7904,7 +7912,7 @@ function serveNodeBacked(options, context) {
     id: options.id ?? `bun-serve-${boundPort || unixPath}`,
     hostname: isUnix ? undefined : boundHostname,
     port: isUnix ? undefined : boundPort,
-    address: isUnix ? unixPath : undefined,
+    address: listenerAddress,
     development: options.development ?? false,
     pendingRequests: 0,
     pendingWebSockets: 0,
@@ -7916,20 +7924,21 @@ function serveNodeBacked(options, context) {
       if (stopped) return Promise.resolve();
       stopped = true;
       for (const origin of originKeys) activeServeOrigins.delete(origin);
-      for (const state of Array.from(serverState.websockets)) {
-        if (force) terminateServerWebSocket(state);
-        else closeServerWebSocket(state, 1001, "Server is shutting down");
-        serverState.websockets.delete(state);
+      if (force) {
+        for (const state of Array.from(serverState.websockets)) {
+          terminateServerWebSocket(state);
+          serverState.websockets.delete(state);
+        }
       }
       nodeServer.close();
       if (force) nodeServer.closeAllConnections?.();
       return Promise.resolve();
     },
     [Symbol.dispose]() {
-      return server.stop();
+      return server.stop(true);
     },
     [Symbol.asyncDispose]() {
-      return server.stop();
+      return server.stop(true);
     },
     reload(nextOptions = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
@@ -8137,6 +8146,9 @@ function serveNodeBacked(options, context) {
   });
 
   nodeServer.on("upgrade", (message, socket, head) => {
+    // Bun.stop() closes the listener without cutting off an upgrade request
+    // whose fetch handler still needs to write its response.
+    socket._cottontailBunServeUpgradeActive = true;
     const { request } = requestFromNodeIncoming(message, protocol, fallbackHost, true);
     serveUpgradeContexts.set(request, { socket, head, used: false });
     serveRequestSockets.set(request, socket);

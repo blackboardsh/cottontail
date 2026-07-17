@@ -2525,7 +2525,7 @@ export class Server extends EventEmitter {
 
   closeIdleConnections() {
     for (const socket of Array.from(this._connections)) {
-      if (socket._httpMessage == null) socket.destroy?.();
+      if (socket._httpMessage == null && socket._cottontailBunServeUpgradeActive !== true) socket.destroy?.();
     }
   }
 
@@ -2665,6 +2665,13 @@ function websocketTlsOverStream(stream, options, callback, onError) {
   }
 }
 
+function isWebSocketTlsHandshakeError(error) {
+  const code = String(error?.code ?? "");
+  const message = String(error?.message ?? error ?? "");
+  return /(?:CERT|SSL|TLS|SELF_SIGNED|UNABLE_TO_VERIFY|WRONG_VERSION|UNKNOWN_CA)/i.test(code) ||
+    /(?:certificate|self[- ]signed|tls handshake|ssl routines|unknown ca)/i.test(message);
+}
+
 export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEmitter {
   static CONNECTING = 0;
   static OPEN = 1;
@@ -2783,10 +2790,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
               host,
               port,
               servername: host,
-              // Bun validates certificates when a tls option is supplied;
-              // the historical default here is permissive.
-              rejectUnauthorized: tlsOptions.rejectUnauthorized === true ||
-                (tlsOptions.rejectUnauthorized !== false && tlsOptions.ca != null),
+              rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
               ca: tlsOptions.ca,
             })
           : netConnect(port, host);
@@ -2870,8 +2874,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
         socket,
         {
           servername: host,
-          rejectUnauthorized: tlsOptions.rejectUnauthorized === true ||
-            (tlsOptions.rejectUnauthorized !== false && tlsOptions.ca != null),
+          rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
           ca: tlsOptions.ca,
         },
         (tlsSocket) => {
@@ -2987,9 +2990,44 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
         return;
       }
       const headers = parsedHeaders.headers;
-      if (status !== 101 || String(headers.upgrade ?? "").toLowerCase() !== "websocket" ||
-          String(headers["sec-websocket-accept"] ?? "") !== websocketAcceptKey(this._key)) {
-        this._fail(new Error("Invalid WebSocket upgrade response"));
+      if (status !== 101) {
+        this._failWithClose(new Error("Expected 101 status code"), 1002, "Expected 101 status code");
+        return;
+      }
+      const upgradeHeader = headers.upgrade;
+      if (upgradeHeader == null) {
+        this._failWithClose(new Error("Missing upgrade header"), 1002, "Missing upgrade header");
+        return;
+      }
+      if (String(upgradeHeader).toLowerCase() !== "websocket") {
+        this._failWithClose(new Error("Invalid upgrade header"), 1002, "Invalid upgrade header");
+        return;
+      }
+      const connectionHeader = headers.connection;
+      if (connectionHeader == null) {
+        this._failWithClose(new Error("Missing connection header"), 1002, "Missing connection header");
+        return;
+      }
+      const connectionTokens = String(connectionHeader).split(",").map((token) => token.trim().toLowerCase());
+      if (!connectionTokens.includes("upgrade")) {
+        this._failWithClose(new Error("Invalid connection header"), 1002, "Invalid connection header");
+        return;
+      }
+      const acceptHeader = headers["sec-websocket-accept"];
+      if (acceptHeader == null) {
+        this._failWithClose(
+          new Error("Missing websocket accept header"),
+          1002,
+          "Missing websocket accept header",
+        );
+        return;
+      }
+      if (String(acceptHeader) !== websocketAcceptKey(this._key)) {
+        this._failWithClose(
+          new Error("Mismatch websocket accept header"),
+          1002,
+          "Mismatch websocket accept header",
+        );
         return;
       }
 
@@ -3144,6 +3182,15 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
 
   _fail(error) {
     if (this.readyState === WebSocket.CLOSED) return;
+    if (this.readyState === WebSocket.CONNECTING && isWebSocketTlsHandshakeError(error)) {
+      this._failWithClose(error, 1015, "TLS handshake failed");
+      return;
+    }
+    this._failWithClose(error, 1006, "");
+  }
+
+  _failWithClose(error, code, reason, wasClean = false) {
+    if (this.readyState === WebSocket.CLOSED) return;
     const connectFailure = this.readyState === WebSocket.CONNECTING;
     const cause = error?.message ?? String(error);
     const message = connectFailure
@@ -3154,7 +3201,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       ? new globalThis.ErrorEvent("error", { message, error: failure })
       : { type: "error", message, error: failure, target: this };
     this.dispatchEvent(event);
-    this._close(1006, "", false);
+    this._close(code, reason, wasClean);
   }
 
   _close(code = 1000, reason = "", wasClean = true) {
