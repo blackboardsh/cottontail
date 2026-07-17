@@ -2696,6 +2696,14 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 3 assertions)."
     },
+    "test/js/node/watch/fs.watch.test.ts": {
+      "status": "enabled",
+      "reason": "Node and Bun filesystem watcher behavior passes across callback and async-iterator APIs, lifecycle references, aborts, encodings, URLs, permissions, recursion, and symlinks (32 bun:test cases, 65 assertions)."
+    },
+    "test/js/node/watch/fs.watchFile.test.ts": {
+      "status": "enabled",
+      "reason": "Stat watching passes missing-file, bigint, URL, Unicode, and 1,000-watcher scheduler coverage (7 bun:test cases, 21 assertions)."
+    },
     "test/js/node/worker_threads/15787.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 1 assertions)."

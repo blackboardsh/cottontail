@@ -87,9 +87,25 @@ export const X_OK = constants.X_OK ?? 1;
 
 function normalizePath(path) {
   if (path && typeof path === "object" && typeof path.href === "string" && path.protocol === "file:") {
-    return decodeURIComponent(path.pathname);
+    return normalizeFileUrlPath(path);
+  }
+  if (typeof path === "string" && path.startsWith("file:")) {
+    try {
+      const url = new URL(path);
+      if (url.protocol === "file:") return normalizeFileUrlPath(url);
+    } catch {
+      // Let the filesystem report malformed file: strings as ordinary paths.
+    }
   }
   return String(path);
+}
+
+function normalizeFileUrlPath(url) {
+  let pathname = decodeURIComponent(url.pathname);
+  if (globalThis.process?.platform === "win32" && /^\/[A-Za-z]:/.test(pathname)) {
+    pathname = pathname.slice(1).replaceAll("/", "\\");
+  }
+  return pathname;
 }
 
 const knownErrorCodes = [
@@ -1357,25 +1373,48 @@ export function writev(fd, buffers, position = null, callback = undefined) {
   });
 }
 
-function snapshot(path, recursive) {
+function snapshot(path, recursive, validateRoot = false) {
   const root = normalizePath(path);
-  const stats = lstatSync(root);
+  const linkStats = lstatSync(root);
+  const stats = linkStats.isSymbolicLink() ? statSync(root) : linkStats;
+  if (validateRoot && (Number(stats.mode) & 0o444) === 0) {
+    const error = new Error("Permission denied");
+    error.code = "EACCES";
+    throw makeFsError(error, root, "watch");
+  }
   const entries = new Map();
   const add = (relative, fullPath, entryStats = lstatSync(fullPath)) => {
-    entries.set(relative, `${entryStats.mode}:${entryStats.size}:${entryStats.mtimeMs}:${entryStats.ctimeMs}:${entryStats.birthtimeMs}`);
+    entries.set(relative, {
+      identity: `${entryStats.dev}:${entryStats.ino}`,
+      metadata: `${entryStats.mode}:${entryStats.size}:${entryStats.mtimeMs}:${entryStats.ctimeMs}:${entryStats.birthtimeMs}`,
+    });
   };
   if (!stats.isDirectory()) {
     add(String(root).split("/").pop() || "", root, stats);
     return entries;
   }
   const walk = (dir, prefix = "") => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    let children;
+    try {
+      children = readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      if (prefix) return;
+      throw error;
+    }
+    for (const entry of children) {
       const name = String(entry.name);
       const relative = prefix ? `${prefix}/${name}` : name;
       const fullPath = join(dir, name);
-      const entryStats = lstatSync(fullPath);
+      let entryStats;
+      try {
+        entryStats = lstatSync(fullPath);
+      } catch {
+        continue;
+      }
       add(relative, fullPath, entryStats);
-      if (recursive && entryStats.isDirectory()) walk(fullPath, relative);
+      if (recursive && entryStats.isDirectory()) {
+        walk(fullPath, relative);
+      }
     }
   };
   walk(root);
@@ -1384,14 +1423,26 @@ function snapshot(path, recursive) {
 
 function watchFilename(name, options) {
   const encoding = normalizeEncoding(options, "utf8");
-  return encoding === "buffer" ? bufferFrom(encoder.encode(name)) : name;
+  const bytes = bufferFrom(encoder.encode(name));
+  return encoding === "buffer" ? bytes : bytes.toString(encoding);
+}
+
+function watchAbortError(signal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error && reason.name !== "AbortError") return reason;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  if (reason !== undefined) error.cause = reason;
+  return error;
 }
 
 function diffSnapshots(previous, current) {
   const events = [];
   for (const [name, signature] of current) {
     if (!previous.has(name)) events.push(["rename", name]);
-    else if (previous.get(name) !== signature) events.push(["change", name]);
+    else if (previous.get(name).identity !== signature.identity) events.push(["rename", name]);
+    else if (previous.get(name).metadata !== signature.metadata) events.push(["change", name]);
   }
   for (const name of previous.keys()) {
     if (!current.has(name)) events.push(["rename", name]);
@@ -1404,15 +1455,27 @@ export function watch(path, options = {}, listener = undefined) {
     listener = options;
     options = {};
   }
+  if (typeof options === "string") options = { encoding: options };
+  const filename = normalizePath(path);
+  const recursive = Boolean(options?.recursive);
   const listeners = new Map();
   let closed = false;
-  let last = snapshot(normalizePath(path), Boolean(options?.recursive));
+  let persistent = options?.persistent !== false;
+  let last;
+  try {
+    last = snapshot(filename, recursive, true);
+  } catch (error) {
+    if (error?.syscall === "watch") throw error;
+    throw makeFsError(error, filename, "watch");
+  }
   let timer = null;
+  let abortQueued = false;
   const watcher = {
     close() {
       if (closed) return;
       closed = true;
       if (timer != null) clearInterval(timer);
+      options?.signal?.removeEventListener?.("abort", abort);
       emit("close");
     },
     addListener(name, handler) {
@@ -1448,48 +1511,81 @@ export function watch(path, options = {}, listener = undefined) {
       emit(name, ...args);
       return true;
     },
-    ref() { return watcher; },
-    unref() { return watcher; },
+    ref() {
+      if (!closed) {
+        persistent = true;
+        timer?.ref?.();
+      }
+      return watcher;
+    },
+    unref() {
+      persistent = false;
+      timer?.unref?.();
+      return watcher;
+    },
+    hasRef() { return !closed && (timer?.hasRef?.() ?? persistent); },
   };
   const emit = (name, ...args) => {
     for (const handler of listeners.get(name) ?? []) handler(...args);
   };
   if (listener) watcher.on("change", listener);
-  const abort = () => watcher.close();
-  if (options?.signal?.aborted) watcher.close();
+  function abort() {
+    if (closed || abortQueued) return;
+    abortQueued = true;
+    queueMicrotask(() => {
+      abortQueued = false;
+      if (closed) return;
+      try {
+        emit("error", watchAbortError(options?.signal));
+      } finally {
+        watcher.close();
+      }
+    });
+  }
+  if (options?.signal?.aborted) abort();
   else options?.signal?.addEventListener?.("abort", abort, { once: true });
-  if (closed) return watcher;
   timer = setInterval(() => {
     if (closed) return;
     try {
-      const next = snapshot(normalizePath(path), Boolean(options?.recursive));
+      const next = snapshot(filename, recursive);
       for (const [eventType, filename] of diffSnapshots(last, next)) {
         emit("change", eventType, watchFilename(filename, options));
       }
       last = next;
     } catch (error) {
-      emit("error", error);
-      watcher.close();
+      try {
+        emit("error", makeFsError(error, filename, "watch"));
+      } finally {
+        watcher.close();
+      }
     }
   }, Number(options?.interval || 500));
+  if (!persistent) timer?.unref?.();
   return watcher;
 }
 
-function zeroStats() {
-  return makeStats({});
+function zeroStats(options = undefined) {
+  return makeStats({}, options);
 }
 
-function statSnapshot(path) {
-  try { return statSync(path); } catch { return zeroStats(); }
+function statSnapshot(path, options = undefined) {
+  try { return statSync(path, options); } catch { return zeroStats(options); }
 }
 
 function statsEqual(a, b) {
   return a.size === b.size &&
     a.mode === b.mode &&
+    a.dev === b.dev &&
+    a.ino === b.ino &&
+    a.nlink === b.nlink &&
+    a.uid === b.uid &&
+    a.gid === b.gid &&
+    a.rdev === b.rdev &&
+    a.blksize === b.blksize &&
+    a.blocks === b.blocks &&
     a.mtimeMs === b.mtimeMs &&
     a.ctimeMs === b.ctimeMs &&
-    a.birthtimeMs === b.birthtimeMs &&
-    a.atimeMs === b.atimeMs;
+    a.birthtimeMs === b.birthtimeMs;
 }
 
 const fileWatchers = globalThis.__cottontailFileWatchers ??= new Map();
@@ -1501,27 +1597,44 @@ export function watchFile(path, options = {}, listener = undefined) {
   }
   if (typeof listener !== "function") throw new TypeError("The \"listener\" argument must be of type function");
   const filename = normalizePath(path);
+  const statOptions = options?.bigint ? { bigint: true } : undefined;
   let entry = fileWatchers.get(filename);
   if (!entry) {
+    let initialMissing = false;
+    let previous;
+    try {
+      previous = statSync(filename, statOptions);
+    } catch {
+      previous = zeroStats(statOptions);
+      initialMissing = true;
+    }
     entry = {
-      previous: statSnapshot(filename),
+      previous,
       listeners: new Set(),
       timer: null,
     };
     entry.timer = setInterval(() => {
-      const current = statSnapshot(filename);
+      const current = statSnapshot(filename, statOptions);
       if (statsEqual(current, entry.previous)) return;
       const previous = entry.previous;
       entry.previous = current;
       for (const handler of [...entry.listeners]) handler(current, previous);
-    }, Math.max(1, Number(options?.interval || 5007)));
+    }, Math.max(5, Number(options?.interval || 5007)));
+    if (options?.persistent === false) entry.timer?.unref?.();
     fileWatchers.set(filename, entry);
+    if (initialMissing) {
+      queueMicrotask(() => {
+        if (fileWatchers.get(filename) !== entry) return;
+        for (const handler of [...entry.listeners]) handler(entry.previous, entry.previous);
+      });
+    }
   }
   entry.listeners.add(listener);
   return {
     close() { unwatchFile(filename, listener); return this; },
-    ref() { return this; },
-    unref() { return this; },
+    ref() { entry.timer?.ref?.(); return this; },
+    unref() { entry.timer?.unref?.(); return this; },
+    hasRef() { return entry.timer?.hasRef?.() ?? false; },
   };
 }
 

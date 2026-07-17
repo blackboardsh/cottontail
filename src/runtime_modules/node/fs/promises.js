@@ -381,8 +381,68 @@ export async function utimes(path, atime, mtime) {
   return utimesSync(path, atime, mtime);
 }
 
-export async function watch(path, options = {}) {
-  return watchSync(path, options);
+export function watch(path, options = {}) {
+  const events = [];
+  const waiters = [];
+  let terminalError = null;
+  let closed = false;
+
+  const settleWaiters = () => {
+    while (waiters.length > 0) {
+      const waiter = waiters.shift();
+      if (events.length > 0) {
+        waiter.resolve({ value: events.shift(), done: false });
+      } else if (terminalError) {
+        waiter.reject(terminalError);
+      } else if (closed) {
+        waiter.resolve({ value: undefined, done: true });
+      } else {
+        waiters.unshift(waiter);
+        break;
+      }
+    }
+  };
+
+  const watcher = watchSync(path, options, (eventType, filename) => {
+    events.push({ eventType, filename });
+    settleWaiters();
+  });
+  watcher.once("error", error => {
+    terminalError = error;
+    settleWaiters();
+  });
+  watcher.once("close", () => {
+    closed = true;
+    settleWaiters();
+  });
+
+  const iterator = {
+    next() {
+      if (events.length > 0) {
+        return Promise.resolve({ value: events.shift(), done: false });
+      }
+      if (terminalError) return Promise.reject(terminalError);
+      if (closed) return Promise.resolve({ value: undefined, done: true });
+      return new Promise((resolve, reject) => {
+        waiters.push({ resolve, reject });
+      });
+    },
+    return() {
+      events.length = 0;
+      watcher.close();
+      closed = true;
+      settleWaiters();
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    throw(error) {
+      watcher.close();
+      return Promise.reject(error);
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+  return iterator;
 }
 
 function isStreamLikeData(data) {
