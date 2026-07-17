@@ -37,7 +37,7 @@ Emulation is acceptable for debugging, but the final CircleCI jobs run natively.
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  ca-certificates curl git xz-utils build-essential g++ pkg-config \
+  ca-certificates curl git xz-utils build-essential clang g++ pkg-config \
   libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
@@ -56,6 +56,7 @@ node -p 'process.platform + " " + process.arch'
 rustup show
 cargo --version
 g++ --version
+clang++ --version
 ```
 
 Node must be version 24 and its architecture must match the VM.

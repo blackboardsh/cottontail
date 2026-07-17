@@ -210,10 +210,17 @@ fn compileLinuxCppSource(
     source: []const u8,
     output_name: []const u8,
 ) std.Build.LazyPath {
-    // JSC uses the host GNU C++ ABI. Compile the small C++ bridge with the
-    // matching frontend so GCC's include_next headers retain their native
-    // search order, then let Zig link the resulting object into Cottontail.
-    const command = b.addSystemCommand(&.{ "g++", "-std=c++20", "-DJS_NO_EXPORT=1", "-fPIC", "-c" });
+    // JSC's public headers use Clang annotations, while its Linux archives use
+    // the GNU C++ ABI. Native clang++ supplies both the expected frontend and
+    // the host libstdc++ header ordering before Zig links the resulting object.
+    const command = b.addSystemCommand(&.{
+        "clang++",
+        "-std=c++20",
+        "-stdlib=libstdc++",
+        "-DJS_NO_EXPORT=1",
+        "-fPIC",
+        "-c",
+    });
     inline for (&.{
         "src",
         "vendors/libuv/include",

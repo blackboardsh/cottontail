@@ -72,7 +72,7 @@ jobs:
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
+              nodejs clang g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
@@ -100,7 +100,7 @@ jobs:
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
+              nodejs clang g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
