@@ -458,14 +458,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run cottontail");
     run_step.dependOn(&run_cmd.step);
 
+    // Linking vendored JSC, ICU, SQLite, lol-html, and libuv into a Debug test
+    // executable exceeds the Linux CI runner's memory limit. ReleaseSafe keeps
+    // runtime safety checks without the Debug link's memory-heavy metadata.
+    const test_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseSafe else optimize;
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = test_optimize,
         }),
     });
-    unit_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
+    unit_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, test_optimize));
     unit_tests.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
     configureJsc(unit_tests, b, lolhtml);
