@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const Lockfile = @import("package_manager_lockfile.zig");
+const LockfileMigration = @import("package_manager_lockfile_migration.zig");
 const Manifest = @import("package_manager_manifest.zig");
 const Scripts = @import("package_manager_scripts.zig");
 const Git = @import("package_manager_git.zig");
@@ -214,6 +215,19 @@ pub fn run(
             try stderr.writeAll("error: lockfile not found, but lockfile is frozen\n");
         } else if (err == error.IntegrityCheckFailed) {
             try stderr.writeAll("error: Integrity check failed\n");
+        } else if (err == error.NPMLockfileVersionMismatch) {
+            try stderr.writeAll(
+                "error: Please upgrade package-lock.json to lockfileVersion 2 or 3\n" ++
+                    "Run 'npm i --lockfile-version 3 --frozen-lockfile' to upgrade your lockfile without changing dependencies.\n",
+            );
+        } else if (err == error.BinaryLockfileReadUnsupported) {
+            try stderr.writeAll(
+                "error: reading bun.lockb requires Bun's packed Lockfile.Buffers, Package.Serializer, and global string/semver stores; use bun.lock\n",
+            );
+        } else if (err == error.BinaryLockfileWriteUnsupported) {
+            try stderr.writeAll(
+                "error: writing bun.lockb requires Bun's packed Lockfile.Buffers and Package.Serializer; use --save-text-lockfile\n",
+            );
         } else if (err != error.PackageManagerErrorReported) {
             try stderr.print("error: {s}\n", .{@errorName(err)});
         }
@@ -412,6 +426,9 @@ const Manager = struct {
     registry: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
     save_text_lockfile: bool = true,
+    loaded_text_lockfile: bool = false,
+    lockfile_config_version: Lockfile.ConfigVersion = .current,
+    linker_configured: bool = false,
     max_retry_count: u16 = 5,
     client: std.http.Client,
     records: std.array_list.Managed(PackageRecord),
@@ -1199,6 +1216,7 @@ const Manager = struct {
             }
         }
 
+        manager.linker_configured = configured_linker != null;
         manager.node_linker = configured_linker orelse linker: {
             if (manager.options.command == .patch or manager.options.command == .patch_commit) {
                 const store = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bun" });
@@ -1228,26 +1246,76 @@ const Manager = struct {
             text_path,
             manager.allocator,
             .limited(256 * 1024 * 1024),
-        ) catch |err| {
-            if (err != error.FileNotFound) return err;
-            const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
-            std.Io.Dir.cwd().access(manager.init_data.io, binary_path, .{}) catch {
-                if (manager.options.frozen_lockfile) return error.FrozenLockfileNotFound;
-                return;
-            };
-            // COTTONTAIL-COMPAT: Bun's bun.lockb reader deserializes directly
-            // into allocator-owned packed Lockfile.Buffers; it has no clean
-            // standalone graph decoder to extract without Bun global state.
-            return error.BinaryLockfileUnsupported;
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
         };
 
-        manager.lock_graph = try Lockfile.parseText(manager.allocator, source);
-        if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
-            !manager.manifest_policy.?.matchesLockDocument(&manager.lock_graph.?.document))
-        {
-            if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
-            manager.changed = true;
+        if (source) |text| {
+            manager.loaded_text_lockfile = true;
+            manager.lock_graph = try Lockfile.parseText(manager.allocator, text);
+            manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
+            if (manager.lock_graph.?.config_version == null) manager.changed = true;
+            if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
+                !manager.manifest_policy.?.matchesLockDocument(&manager.lock_graph.?.document))
+            {
+                if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
+                manager.changed = true;
+            }
+            manager.selectAutomaticLinker(root);
+            return;
         }
+
+        const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
+        std.Io.Dir.cwd().access(manager.init_data.io, binary_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        if (manager.pathExists(binary_path)) {
+            // COTTONTAIL-COMPAT: bun.lockb embeds Bun's packed Package.Serializer,
+            // Lockfile.Buffers, and global string/semver stores. Those types do
+            // not currently have a standalone graph decoder.
+            return error.BinaryLockfileReadUnsupported;
+        }
+
+        const detection = try LockfileMigration.detect(
+            manager.init_data.io,
+            manager.allocator,
+            manager.root_dir,
+            root,
+        );
+        switch (detection) {
+            .not_found => {
+                if (manager.options.frozen_lockfile) return error.FrozenLockfileNotFound;
+                manager.lockfile_config_version = .current;
+            },
+            .migrated => |migration| {
+                manager.lock_graph = migration.graph;
+                manager.lockfile_config_version = migration.graph.config_version orelse .v0;
+                manager.changed = true;
+                if (!manager.options.silent) {
+                    try manager.stderr.print("migrated lockfile from {s}\n", .{migration.source.filename()});
+                }
+            },
+            .ignored => |ignored| {
+                if (manager.options.frozen_lockfile) return error.FrozenLockfileNotFound;
+                manager.lockfile_config_version = .current;
+                if (!manager.options.silent and ignored.reason == .pnpm_not_implemented) {
+                    try manager.stderr.writeAll("warning: pnpm-lock.yaml migration requires Bun's YAML lockfile parser; continuing with a fresh install\n");
+                }
+            },
+        }
+        manager.selectAutomaticLinker(root);
+    }
+
+    fn selectAutomaticLinker(manager: *Manager, root: *const Value) void {
+        if (manager.linker_configured) return;
+        const npm_migration = if (manager.lock_graph) |*graph| graph.provenance == .npm else false;
+        manager.node_linker = if (manager.lockfile_config_version == .v1 and
+            !npm_migration and packageJSONHasWorkspaces(root))
+            .isolated
+        else
+            .hoisted;
     }
 
     fn validateLockfileWorkspaces(manager: *Manager) !void {
@@ -1774,6 +1842,11 @@ const Manager = struct {
             },
             .remote_tarball => return std.mem.eql(u8, spec, package.source),
             .git, .github => {
+                if (manager.lock_graph.?.provenance == .npm and !isGitSpec(spec)) {
+                    const registry_name, _ = parseNpmAlias(alias, spec);
+                    return std.mem.eql(u8, registry_name, package.name) or
+                        std.mem.eql(u8, alias, package.name);
+                }
                 if (!isGitSpec(spec) or !try Git.matches(manager.allocator, package.source, spec)) return false;
                 const requested = manager.lock_graph.?.rootDependencySpec(alias);
                 if (requested != null and !std.mem.eql(u8, requested.?, spec)) {
@@ -3802,6 +3875,27 @@ const Manager = struct {
         };
         if (failed) return error.PackageManagerErrorReported;
         for (discovery.entries) |workspace| try manager.workspaces.put(workspace.name, workspace);
+
+        const graph = if (manager.lock_graph) |*lock_graph| lock_graph else return;
+        if (graph.provenance != .npm) return;
+        var migrated_workspaces = graph.workspaces.iterator();
+        while (migrated_workspaces.next()) |entry| {
+            const relative_path = entry.key_ptr.*;
+            if (relative_path.len == 0) continue;
+            const package_json = entry.value_ptr.*;
+            const name = jsonString(package_json, "name") orelse continue;
+            if (manager.workspaces.contains(name)) continue;
+            const version_value = if (package_json.* == .object) package_json.object.get("version") else null;
+            const has_version = version_value != null and version_value.? == .string;
+            try manager.workspaces.put(name, .{
+                .name = name,
+                .path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, relative_path }),
+                .relative_path = relative_path,
+                .version = if (has_version) version_value.?.string else "0.0.0",
+                .has_version = has_version,
+                .package_json = @constCast(package_json),
+            });
+        }
     }
 
     fn workspaceForPath(manager: *Manager, path: []const u8) ?*Workspace {
@@ -4051,12 +4145,13 @@ const Manager = struct {
     }
 
     fn addRecord(manager: *Manager, record: PackageRecord) !void {
-        for (manager.records.items) |existing| {
+        for (manager.records.items, 0..) |existing, index| {
             const existing_key = if (existing.key.len > 0) existing.key else existing.alias;
             const record_key = if (record.key.len > 0) record.key else record.alias;
-            if (std.mem.eql(u8, existing_key, record_key) and
-                std.mem.eql(u8, existing.alias, record.alias) and
-                std.mem.eql(u8, existing.version, record.version)) return;
+            if (std.mem.eql(u8, existing_key, record_key)) {
+                manager.records.items[index] = record;
+                return;
+            }
         }
         try manager.records.append(record);
     }
@@ -4131,7 +4226,6 @@ const Manager = struct {
     }
 
     fn writePackageInfo(manager: *Manager, writer: *std.Io.Writer, metadata: ?*const Value) !void {
-        _ = manager;
         const value = metadata orelse {
             try writer.writeAll("{}");
             return;
@@ -4162,20 +4256,20 @@ const Manager = struct {
             first = false;
             try writeJSONString(writer, field);
             try writer.writeAll(": ");
-            try std.json.Stringify.value(field_value, .{}, writer);
+            try writeCanonicalJSON(manager.allocator, writer, field_value);
         }
         try writer.writeByte('}');
     }
 
     fn writeTextLockfile(manager: *Manager, root: *Value) !void {
         if (manager.options.frozen_lockfile and manager.changed) return error.FrozenLockfileChanged;
-        if (!manager.save_text_lockfile and !manager.options.silent) {
-            try manager.stderr.writeAll("warning: binary bun.lockb output is not available; writing bun.lock\n");
-        }
+        if (!manager.loaded_text_lockfile and !manager.save_text_lockfile) return error.BinaryLockfileWriteUnsupported;
         var output: std.Io.Writer.Allocating = .init(manager.allocator);
         const writer = &output.writer;
-        try writer.writeAll("{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n  \"workspaces\": {\n    \"\": ");
-        try manager.writeWorkspaceInfo(writer, root);
+        try writer.print("{{\n  \"lockfileVersion\": 1,\n  \"configVersion\": {d},\n  \"workspaces\": {{\n    \"\": ", .{
+            @intFromEnum(manager.lockfile_config_version),
+        });
+        try manager.writeWorkspaceInfo(writer, root, true);
         var sorted_workspaces = std.array_list.Managed(Workspace).init(manager.allocator);
         defer sorted_workspaces.deinit();
         var workspace_iterator = manager.workspaces.iterator();
@@ -4190,7 +4284,7 @@ const Manager = struct {
             try writer.writeAll(",\n\n    ");
             try writeJSONString(writer, path);
             try writer.writeAll(": ");
-            try manager.writeWorkspaceInfo(writer, workspace.package_json);
+            try manager.writeWorkspaceInfo(writer, workspace.package_json, false);
         }
         try writer.writeAll("\n  }");
         try manager.manifest_policy.?.writeLockFields(writer);
@@ -4201,7 +4295,13 @@ const Manager = struct {
             fn lessThan(_: void, left: PackageRecord, right: PackageRecord) bool {
                 const left_key = if (left.key.len > 0) left.key else left.alias;
                 const right_key = if (right.key.len > 0) right.key else right.alias;
-                return std.mem.order(u8, left_key, right_key) == .lt;
+                const key_order = std.mem.order(u8, left_key, right_key);
+                if (key_order != .eq) return key_order == .lt;
+                const alias_order = std.mem.order(u8, left.alias, right.alias);
+                if (alias_order != .eq) return alias_order == .lt;
+                const name_order = std.mem.order(u8, left.name, right.name);
+                if (name_order != .eq) return name_order == .lt;
+                return std.mem.order(u8, left.version, right.version) == .lt;
             }
         }.lessThan);
         for (records, 0..) |record, index| {
@@ -4219,8 +4319,12 @@ const Manager = struct {
         if (!manager.options.silent) try manager.stderr.writeAll("Saved lockfile\n");
     }
 
-    fn writeWorkspaceInfo(manager: *Manager, writer: *std.Io.Writer, package_json: *const Value) !void {
-        _ = manager;
+    fn writeWorkspaceInfo(
+        manager: *Manager,
+        writer: *std.Io.Writer,
+        package_json: *const Value,
+        is_root: bool,
+    ) !void {
         try writer.writeByte('{');
         var first = true;
         if (jsonString(package_json, "name")) |name| {
@@ -4229,12 +4333,21 @@ const Manager = struct {
             first = false;
         }
         if (package_json.* == .object) {
+            if (!is_root) {
+                for ([_][]const u8{ "version", "bin", "binDir" }) |field| {
+                    const field_value = package_json.object.get(field) orelse continue;
+                    if (!first) try writer.writeByte(',');
+                    try writer.print("\n      \"{s}\": ", .{field});
+                    try writeCanonicalJSON(manager.allocator, writer, field_value);
+                    first = false;
+                }
+            }
             for (all_dependency_sections) |section_name| {
                 const section = package_json.object.get(section_name) orelse continue;
                 if (section != .object or section.object.count() == 0) continue;
                 if (!first) try writer.writeByte(',');
                 try writer.print("\n      \"{s}\": ", .{section_name});
-                try std.json.Stringify.value(section, .{}, writer);
+                try writeCanonicalJSON(manager.allocator, writer, section);
                 first = false;
             }
         }
@@ -4285,7 +4398,8 @@ fn hasExplicitRange(input: []const u8) bool {
 }
 
 fn isLocalSpec(spec: []const u8) bool {
-    return std.mem.startsWith(u8, spec, "file:") or
+    return std.mem.eql(u8, spec, ".") or
+        std.mem.startsWith(u8, spec, "file:") or
         std.mem.startsWith(u8, spec, "link:") or
         std.mem.startsWith(u8, spec, "./") or
         std.mem.startsWith(u8, spec, "../") or
@@ -4919,6 +5033,54 @@ fn writePackageJSON(
 
 fn writeJSONString(writer: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeCanonicalJSON(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: Value,
+) !void {
+    switch (value) {
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeCanonicalJSON(allocator, writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |object| {
+            const keys = try allocator.alloc([]const u8, object.count());
+            @memcpy(keys, object.keys());
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.lessThan);
+            try writer.writeByte('{');
+            for (keys, 0..) |key, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeJSONString(writer, key);
+                try writer.writeAll(": ");
+                try writeCanonicalJSON(allocator, writer, object.get(key).?);
+            }
+            try writer.writeByte('}');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
+}
+
+fn packageJSONHasWorkspaces(package_json: *const Value) bool {
+    if (package_json.* != .object) return false;
+    const workspaces = package_json.object.get("workspaces") orelse return false;
+    return switch (workspaces) {
+        .array => |array| array.items.len > 0,
+        .object => |object| if (object.get("packages")) |packages|
+            packages == .array and packages.array.items.len > 0
+        else
+            false,
+        else => false,
+    };
 }
 
 fn deletePath(io: std.Io, path: []const u8) void {

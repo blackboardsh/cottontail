@@ -14,6 +14,25 @@ pub const Kind = enum {
     root,
 };
 
+pub const Provenance = enum {
+    bun_text,
+    npm,
+    yarn,
+};
+
+pub const ConfigVersion = enum(u32) {
+    v0 = 0,
+    v1 = 1,
+
+    pub const current: ConfigVersion = .v1;
+
+    fn parse(value: Value) !ConfigVersion {
+        if (value != .integer or value.integer < 0) return error.InvalidConfigVersion;
+        if (value.integer == 0) return .v0;
+        return .v1;
+    }
+};
+
 pub const Package = struct {
     key: []const u8,
     name: []const u8,
@@ -35,6 +54,8 @@ pub const Package = struct {
 pub const Graph = struct {
     document: Value,
     version: u32,
+    config_version: ?ConfigVersion,
+    provenance: Provenance,
     root_workspace: *const Value,
     workspaces: std.StringHashMap(*const Value),
     packages: std.StringHashMap(Package),
@@ -66,6 +87,10 @@ pub const Graph = struct {
         }
         return null;
     }
+
+    pub fn migrated(graph: *const Graph) bool {
+        return graph.provenance != .bun_text;
+    }
 };
 
 const dependency_sections = [_][]const u8{
@@ -85,6 +110,10 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
         .integer => |number| if (number >= 0 and number <= 1) @intCast(number) else return error.UnsupportedLockfileVersion,
         else => return error.InvalidLockfileVersion,
     };
+    const config_version = if (document.object.get("configVersion")) |value|
+        try ConfigVersion.parse(value)
+    else
+        null;
 
     const workspaces_value = document.object.getPtr("workspaces") orelse return error.MissingWorkspacesObject;
     if (workspaces_value.* != .object) return error.InvalidWorkspacesObject;
@@ -94,6 +123,8 @@ pub fn parseText(allocator: std.mem.Allocator, source: []const u8) !Graph {
     var graph = Graph{
         .document = document,
         .version = version,
+        .config_version = config_version,
+        .provenance = .bun_text,
         .root_workspace = root_workspace,
         .workspaces = std.StringHashMap(*const Value).init(allocator),
         .packages = std.StringHashMap(Package).init(allocator),
