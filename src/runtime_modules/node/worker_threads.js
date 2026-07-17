@@ -2,6 +2,7 @@ import { EventEmitter } from "./events.js";
 import { resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
+import { format as formatValue } from "./util.js";
 import "../bun/ffi.js";
 
 const wireVersion = 1;
@@ -18,43 +19,74 @@ const typedArrayConstructors = {
   BigInt64Array,
   BigUint64Array,
 };
-const environmentData = new Map(globalThis.__cottontailEnvironmentData ?? []);
+const environmentData = new Map();
 const markedUntransferable = new WeakSet();
 const markedUncloneable = new WeakSet();
-const detachedArrayBuffers = new WeakSet();
 const workerInstances = new Map();
 const broadcastChannels = new Map();
 const transferredPortPeers = new Map();
+const transferredPortRoutes = new Map();
+const transferredPortTargets = new Map();
 const receivedMessagePorts = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 const messagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
+const createMessagePortToken = {};
 let nextPortId = 1;
 let nextWorkerControlRequestId = 1;
-let detachedViewAccessorsPatched = false;
+const inheritedUncaughtExceptionListeners = new Set(globalThis.process?.listeners?.("uncaughtException") ?? []);
+let workerUserCaptureCallbackInstalled = false;
 
 export const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
 export const isMainThread = !cottontail.isWorker?.();
 export const isInternalThread = false;
 export const threadId = isMainThread ? 0 : Number(cottontail.workerThreadId?.() ?? 1);
-export const threadName = isMainThread ? "" : String(globalThis.__cottontailWorkerThreadName ?? "worker");
-export const workerData = isMainThread ? null : globalThis.__cottontailWorkerData ?? null;
-export const resourceLimits = isMainThread ? {} : globalThis.__cottontailWorkerResourceLimits ?? {};
+export let threadName = isMainThread ? "" : "";
+export let workerData = null;
+export let resourceLimits = {};
+
+const workerNativeTimerKinds = new Map();
+const nativeWorkerTimerClear = !isMainThread && typeof cottontail.timerClear === "function"
+  ? cottontail.timerClear
+  : null;
+
+if (!isMainThread && typeof cottontail.timerSchedule === "function") {
+  const nativeTimerSchedule = cottontail.timerSchedule;
+  cottontail.timerSchedule = function timerSchedule(handle, id, delay, repeat, kind, referenced) {
+    const timerId = nativeTimerSchedule(handle, id, delay, repeat, kind, referenced);
+    workerNativeTimerKinds.set(Number(timerId), Number(kind) || 0);
+    return timerId;
+  };
+}
+
+function clearWorkerNativeTimers() {
+  if (nativeWorkerTimerClear === null) return;
+  for (const [timerId, kind] of workerNativeTimerKinds) {
+    nativeWorkerTimerClear(timerId, kind === 2 ? 2 : 0);
+  }
+  workerNativeTimerKinds.clear();
+}
+
+if (!isMainThread && typeof globalThis.process?.setUncaughtExceptionCaptureCallback === "function") {
+  const setCaptureCallback = globalThis.process.setUncaughtExceptionCaptureCallback;
+  globalThis.process.setUncaughtExceptionCaptureCallback = function setUncaughtExceptionCaptureCallback(callback) {
+    const result = setCaptureCallback.call(this, callback);
+    workerUserCaptureCallbackInstalled = typeof callback === "function";
+    return result;
+  };
+}
 
 function dataCloneError(message) {
-  const error = new Error(message);
+  if (typeof globalThis.DOMException === "function") {
+    return new globalThis.DOMException(String(message), "DataCloneError");
+  }
+  const error = new Error(String(message));
   error.name = "DataCloneError";
-  error.code = "ERR_WORKER_UNSERIALIZABLE_ERROR";
   return error;
 }
 
-function bytesFromView(view) {
-  if (detachedArrayBuffers.has(view.buffer)) throw dataCloneError("ArrayBuffer is detached");
-  return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-}
-
 function bytesFromBuffer(buffer) {
-  if (detachedArrayBuffers.has(buffer)) throw dataCloneError("ArrayBuffer is detached");
+  if (isDetachedArrayBuffer(buffer)) throw dataCloneError("ArrayBuffer is detached");
   return Array.from(new Uint8Array(buffer));
 }
 
@@ -65,8 +97,11 @@ function viewName(value) {
 }
 
 function sharedBufferInfo(value) {
+  const buffer = ArrayBuffer.isView(value) ? value.buffer : value;
+  if (typeof globalThis.SharedArrayBuffer !== "function" ||
+      !(buffer instanceof globalThis.SharedArrayBuffer)) return null;
   try {
-    const info = cottontail.sharedArrayBufferInfo?.(value);
+    const info = cottontail.sharedArrayBufferInfo?.(buffer);
     return info && typeof info === "object" && info.id != null ? info : null;
   } catch {
     return null;
@@ -83,6 +118,11 @@ function isTransferable(item) {
 }
 
 function validateTransferList(transferList = undefined) {
+  if (transferList && typeof transferList === "object" &&
+      typeof transferList[Symbol.iterator] !== "function" &&
+      Object.prototype.hasOwnProperty.call(transferList, "transfer")) {
+    transferList = transferList.transfer;
+  }
   if (transferList == null) return [];
   if (typeof transferList[Symbol.iterator] !== "function") throw new TypeError("transferList must be an iterable");
   const transfers = Array.from(transferList);
@@ -93,56 +133,36 @@ function validateTransferList(transferList = undefined) {
     if (!isTransferable(item)) throw dataCloneError("Object is not transferable");
     if (isMarkedAsUntransferable(item)) throw dataCloneError("Object is marked as untransferable");
     if (item instanceof MessagePort && item._closed) throw dataCloneError("MessagePort is closed");
-    if (item instanceof ArrayBuffer && detachedArrayBuffers.has(item)) throw dataCloneError("ArrayBuffer is detached");
+    if (item instanceof ArrayBuffer && isDetachedArrayBuffer(item)) throw dataCloneError("ArrayBuffer is detached");
   }
   return transfers;
 }
 
-function findPropertyDescriptor(proto, key) {
-  for (let cursor = proto; cursor; cursor = Object.getPrototypeOf(cursor)) {
-    const descriptor = Object.getOwnPropertyDescriptor(cursor, key);
-    if (descriptor) return descriptor;
-  }
-  return null;
-}
-
-function patchViewAccessor(proto, key) {
-  const original = findPropertyDescriptor(proto, key);
-  if (typeof original?.get !== "function") return;
+function isDetachedArrayBuffer(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || sharedBufferInfo(buffer)) return false;
   try {
-    Object.defineProperty(proto, key, {
-      configurable: true,
-      get() {
-        if (ArrayBuffer.isView(this)) {
-          try {
-            if (detachedArrayBuffers.has(this.buffer)) return 0;
-          } catch {}
-        }
-        return original.get.call(this);
-      },
-    });
-  } catch {}
-}
-
-function patchDetachedViewAccessors() {
-  if (detachedViewAccessorsPatched) return;
-  detachedViewAccessorsPatched = true;
-  for (const Constructor of Object.values(typedArrayConstructors)) {
-    patchViewAccessor(Constructor.prototype, "length");
-    patchViewAccessor(Constructor.prototype, "byteLength");
-    patchViewAccessor(Constructor.prototype, "byteOffset");
+    new Uint8Array(buffer);
+    return false;
+  } catch {
+    return true;
   }
-  patchViewAccessor(DataView.prototype, "byteLength");
-  patchViewAccessor(DataView.prototype, "byteOffset");
 }
 
 function detachArrayBufferForTransfer(buffer) {
-  if (!(buffer instanceof ArrayBuffer) || sharedBufferInfo(buffer) || detachedArrayBuffers.has(buffer)) return;
-  patchDetachedViewAccessors();
-  detachedArrayBuffers.add(buffer);
-  try {
-    Object.defineProperty(buffer, "byteLength", { get: () => 0, configurable: true });
-  } catch {}
+  if (!(buffer instanceof ArrayBuffer) || sharedBufferInfo(buffer) || isDetachedArrayBuffer(buffer)) return;
+  if (typeof buffer.transfer === "function") {
+    const transferred = buffer.transfer();
+    void transferred;
+    if (isDetachedArrayBuffer(buffer)) return;
+  }
+  if (typeof globalThis.structuredClone !== "function") {
+    throw nativeBoundaryError("worker_threads ArrayBuffer transfer");
+  }
+  const cloned = globalThis.structuredClone(buffer, { transfer: [buffer] });
+  void cloned;
+  if (!isDetachedArrayBuffer(buffer)) {
+    throw nativeBoundaryError("worker_threads ArrayBuffer transfer");
+  }
 }
 
 function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
@@ -166,18 +186,24 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
     if (value._closed) throw dataCloneError("MessagePort is closed");
     const id = state.nextId++;
     state.ids.set(value, id);
+    const remoteEndpointThreadId = value._remoteEndpointThreadId ?? value._remote?.threadId ?? threadId;
     if (value._peer) transferredPortPeers.set(value._id, value._peer);
-    if (state.transferContext?.threadId > 0) {
+    else if (value._remote) transferredPortRoutes.set(value._id, value._remote);
+    if (state.transferContext?.threadId >= 0) {
       value._remote = { threadId: state.transferContext.threadId, portId: value._id };
+      transferredPortTargets.set(value._id, value._remote);
     }
     value._transferred = true;
     value._closed = true;
     queueMicrotask(() => value.emit("close"));
-    return { t: "MessagePort", id, portId: value._id };
+    return { t: "MessagePort", id, portId: value._id, sourceThreadId: threadId, remoteEndpointThreadId };
   }
   const id = state.nextId++;
   state.ids.set(value, id);
 
+  if (value instanceof Boolean) return { t: "Boxed", id, name: "Boolean", v: Boolean(value.valueOf()) };
+  if (value instanceof Number) return { t: "Boxed", id, name: "Number", v: encodeClone(value.valueOf()) };
+  if (value instanceof String) return { t: "Boxed", id, name: "String", v: String(value.valueOf()) };
   if (value instanceof Date) return { t: "Date", id, v: value.toISOString() };
   if (value instanceof RegExp) return { t: "RegExp", id, source: value.source, flags: value.flags };
   if (value instanceof ArrayBuffer) {
@@ -186,23 +212,33 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
     return { t: "ArrayBuffer", id, bytes: bytesFromBuffer(value) };
   }
   if (ArrayBuffer.isView(value)) {
-    const shared = sharedBufferInfo(value.buffer);
-    if (shared) {
-      return {
-        t: "SharedView",
-        id,
-        name: viewName(value),
-        sharedId: shared.id,
-        byteOffset: value.byteOffset,
-        length: value instanceof DataView ? value.byteLength : value.length,
-      };
-    }
-    return { t: "View", id, name: viewName(value), bytes: bytesFromView(value) };
+    return {
+      t: "View",
+      id,
+      name: viewName(value),
+      buffer: encodeClone(value.buffer, state),
+      byteOffset: value.byteOffset,
+      length: value instanceof DataView ? value.byteLength : value.length,
+    };
   }
   if (value instanceof Map) return { t: "Map", id, v: [...value].map(([key, item]) => [encodeClone(key, state), encodeClone(item, state)]) };
   if (value instanceof Set) return { t: "Set", id, v: [...value].map((item) => encodeClone(item, state)) };
-  if (Array.isArray(value)) return { t: "Array", id, v: value.map((item) => encodeClone(item, state)) };
-  if (value instanceof Error) return { t: "Error", id, name: value.name, message: value.message, stack: value.stack };
+  if (Array.isArray(value)) {
+    return {
+      t: "Array",
+      id,
+      length: value.length,
+      v: Object.keys(value).map((key) => [key, encodeClone(value[key], state)]),
+    };
+  }
+  if (value instanceof Error) {
+    const encoded = { t: "Error", id, name: value.name, message: value.message, stack: value.stack };
+    if (Object.prototype.hasOwnProperty.call(value, "cause")) encoded.cause = encodeClone(value.cause, state);
+    if (typeof AggregateError === "function" && value instanceof AggregateError) {
+      encoded.errors = encodeClone(Array.from(value.errors ?? []), state);
+    }
+    return encoded;
+  }
   return { t: "Object", id, v: Object.entries(value).map(([key, item]) => [key, encodeClone(item, state)]) };
 }
 
@@ -211,7 +247,7 @@ function remember(refs, encoded, value) {
   return value;
 }
 
-function decodeClone(encoded, refs = new Map()) {
+function decodeClone(encoded, refs = new Map(), context = undefined) {
   switch (encoded?.t) {
     case "Ref": {
       if (!refs.has(encoded.id)) throw dataCloneError("Invalid cloned reference");
@@ -228,6 +264,11 @@ function decodeClone(encoded, refs = new Map()) {
       if (encoded.v === "-0") return -0;
       return Number(encoded.v);
     case "bigint": return BigInt(encoded.v);
+    case "Boxed": {
+      const primitive = encoded.name === "Number" ? decodeClone(encoded.v, refs, context) : encoded.v;
+      const Constructor = encoded.name === "Boolean" ? Boolean : encoded.name === "Number" ? Number : String;
+      return remember(refs, encoded, new Constructor(primitive));
+    }
     case "Date": return remember(refs, encoded, new Date(encoded.v));
     case "RegExp": return remember(refs, encoded, new RegExp(encoded.source, encoded.flags));
     case "SharedArrayBuffer": return remember(refs, encoded, wrapSharedBuffer(encoded.sharedId));
@@ -239,45 +280,77 @@ function decodeClone(encoded, refs = new Map()) {
     }
     case "ArrayBuffer": return remember(refs, encoded, new Uint8Array(encoded.bytes ?? []).buffer);
     case "View": {
-      const bytes = new Uint8Array(encoded.bytes ?? []);
-      if (encoded.name === "Buffer") return remember(refs, encoded, globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes);
-      if (encoded.name === "DataView") return remember(refs, encoded, new DataView(bytes.buffer));
+      const buffer = encoded.buffer ? decodeClone(encoded.buffer, refs, context) : new Uint8Array(encoded.bytes ?? []).buffer;
+      const byteOffset = Number(encoded.byteOffset ?? 0);
+      if (encoded.name === "Buffer") {
+        const view = new Uint8Array(buffer, byteOffset, Number(encoded.length ?? buffer.byteLength));
+        return remember(refs, encoded, globalThis.Buffer?.from ? globalThis.Buffer.from(view.buffer, view.byteOffset, view.byteLength) : view);
+      }
+      if (encoded.name === "DataView") return remember(refs, encoded, new DataView(buffer, byteOffset, encoded.length ?? undefined));
       const Constructor = typedArrayConstructors[encoded.name] ?? Uint8Array;
-      return remember(refs, encoded, new Constructor(bytes.buffer));
+      return remember(refs, encoded, new Constructor(buffer, byteOffset, encoded.length ?? undefined));
     }
     case "MessagePort": {
-      const port = remember(refs, encoded, new MessagePort());
-      port._id = Number(encoded.portId ?? port._id);
-      if (!isMainThread) {
-        port._remote = { threadId: 0, portId: port._id };
+      const port = remember(refs, encoded, new MessagePort(createMessagePortToken));
+      port._id = String(encoded.portId ?? port._id);
+      const sourceThreadId = Number(encoded.sourceThreadId ?? (isMainThread ? -1 : 0));
+      const remoteEndpointThreadId = Number(encoded.remoteEndpointThreadId ?? sourceThreadId);
+      port._remoteEndpointThreadId = remoteEndpointThreadId;
+      if (sourceThreadId === threadId) {
+        const peer = transferredPortPeers.get(port._id);
+        if (peer) {
+          transferredPortPeers.delete(port._id);
+          port._peer = peer;
+          peer._peer = port;
+        }
+      } else if (sourceThreadId >= 0) {
+        const transportSourceThreadId = Number(context?.transportSourceThreadId);
+        const routeThreadId = remoteEndpointThreadId > 0
+          ? remoteEndpointThreadId
+          : Number.isInteger(transportSourceThreadId) ? transportSourceThreadId : sourceThreadId;
+        port._remote = { threadId: routeThreadId, portId: port._id };
         receivedMessagePorts.set(port._id, port);
       }
       return port;
     }
     case "Map": {
       const map = remember(refs, encoded, new Map());
-      for (const [key, value] of encoded.v ?? []) map.set(decodeClone(key, refs), decodeClone(value, refs));
+      for (const [key, value] of encoded.v ?? []) map.set(decodeClone(key, refs, context), decodeClone(value, refs, context));
       return map;
     }
     case "Set": {
       const set = remember(refs, encoded, new Set());
-      for (const value of encoded.v ?? []) set.add(decodeClone(value, refs));
+      for (const value of encoded.v ?? []) set.add(decodeClone(value, refs, context));
       return set;
     }
     case "Array": {
-      const array = remember(refs, encoded, []);
-      for (let index = 0; index < (encoded.v ?? []).length; index += 1) array[index] = decodeClone(encoded.v[index], refs);
+      const entries = encoded.v ?? [];
+      const legacy = entries.length > 0 && !Array.isArray(entries[0]);
+      const array = remember(refs, encoded, new Array(Number(encoded.length ?? (legacy ? entries.length : 0))));
+      if (legacy) {
+        for (let index = 0; index < entries.length; index += 1) array[index] = decodeClone(entries[index], refs, context);
+      } else {
+        for (const [key, value] of entries) array[key] = decodeClone(value, refs, context);
+      }
       return array;
     }
     case "Error": {
-      const error = new Error(encoded.message);
+      const Constructor = typeof globalThis[encoded.name] === "function" && globalThis[encoded.name].prototype instanceof Error
+        ? globalThis[encoded.name]
+        : Error;
+      const error = encoded.name === "AggregateError" && typeof globalThis.AggregateError === "function"
+        ? new AggregateError([], encoded.message)
+        : new Constructor(encoded.message);
       error.name = encoded.name;
       error.stack = encoded.stack;
-      return remember(refs, encoded, error);
+      remember(refs, encoded, error);
+      if (encoded.cause) error.cause = decodeClone(encoded.cause, refs, context);
+      if (encoded.errors) error.errors = decodeClone(encoded.errors, refs, context);
+      return error;
     }
     case "Object": {
       const object = remember(refs, encoded, {});
-      for (const [key, value] of encoded.v ?? []) object[key] = decodeClone(value, refs);
+      for (const [key, value] of encoded.v ?? []) object[key] = decodeClone(value, refs, context);
       return object;
     }
     default: throw dataCloneError("Invalid cloned worker payload");
@@ -286,126 +359,132 @@ function decodeClone(encoded, refs = new Map()) {
 
 function encodeWireMessage(value, transferList = undefined, transferContext = undefined) {
   const transfers = validateTransferList(transferList);
-  const encoded = JSON.stringify({
-    cottontailWorkerClone: wireVersion,
-    value: encodeClone(value, { ids: new WeakMap(), nextId: 1, transfers: new Set(transfers), transferContext }),
-  });
+  const state = {
+    ids: new WeakMap(),
+    nextId: 1,
+    transfers: new Set(transfers),
+    transferContext,
+  };
+  const encodedValue = encodeClone(value, state);
+  const encodedPorts = transfers
+    .filter(item => item instanceof MessagePort)
+    .map(port => encodeClone(port, state));
   for (const item of transfers) detachArrayBufferForTransfer(item);
-  return encoded;
+  return JSON.stringify({ cottontailWorkerClone: wireVersion, value: encodedValue, ports: encodedPorts });
 }
 
-function decodeWireMessage(value) {
-  if (value && typeof value === "object" && value.cottontailWorkerClone === wireVersion) return decodeClone(value.value);
+function decodeWirePayload(payload, context = undefined) {
+  const refs = new Map();
+  const decoded = decodeClone(payload.value, refs, context);
+  const ports = (payload.ports ?? []).map(port => decodeClone(port, refs, context));
+  if (context) context.transferredPorts = ports;
+  return decoded;
+}
+
+function decodeWireMessage(value, context = undefined) {
+  if (value && typeof value === "object" && value.cottontailWorkerClone === wireVersion) {
+    return decodeWirePayload(value, context);
+  }
   if (typeof value === "string") {
     try {
       const parsed = JSON.parse(value);
-      if (parsed?.cottontailWorkerClone === wireVersion) return decodeClone(parsed.value);
+      if (parsed?.cottontailWorkerClone === wireVersion) return decodeWirePayload(parsed, context);
       return parsed;
     } catch {}
   }
   return value;
 }
 
-function cloneForMessage(value, transferList = undefined) {
-  return decodeClone(JSON.parse(encodeWireMessage(value, transferList)).value);
+function cloneForMessage(value, transferList = undefined, context = undefined) {
+  return decodeWireMessage(encodeWireMessage(value, transferList, { threadId }), context);
 }
 
-function makePortMessage(portId, value) {
-  return { [portMessageEnvelopeKey]: { portId, value } };
+function makePortMessage(portId, valueWire = undefined, type = "message", destinationThreadId = undefined) {
+  return {
+    [portMessageEnvelopeKey]: {
+      portId,
+      valueWire,
+      type,
+      sourceThreadId: threadId,
+      destinationThreadId,
+    },
+  };
+}
+
+function forwardPortMessage(remote, message) {
+  if (!remote) return false;
+  const packet = message?.[portMessageEnvelopeKey];
+  const routed = packet
+    ? {
+        ...message,
+        [portMessageEnvelopeKey]: {
+          ...packet,
+          sourceThreadId: threadId,
+          destinationThreadId: remote.threadId,
+        },
+      }
+    : message;
+  const encoded = encodeWireMessage(routed);
+  if (remote.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+    cottontail.workerPostMessageTo(remote.threadId, encoded);
+    return true;
+  }
+  if (remote.threadId === 0 && !isMainThread && typeof cottontail.workerPostMessage === "function") {
+    cottontail.workerPostMessage(encoded);
+    return true;
+  }
+  return false;
+}
+
+function deliverPortPacket(port, packet) {
+  if (!port || port._closed) return false;
+  if (packet.type === "close") {
+    port._closeLocal();
+    return true;
+  }
+  try {
+    const context = { transportSourceThreadId: packet.sourceThreadId };
+    const value = decodeWireMessage(packet.valueWire, context);
+    port._queue.push({ value, ports: context.transferredPorts ?? [] });
+    port._scheduleDispatch?.();
+  } catch (error) {
+    port._emitMessageError(error);
+  }
+  return true;
 }
 
 function dispatchTransferredPortMessage(message) {
   const packet = message?.[portMessageEnvelopeKey];
   if (!packet || packet.portId == null) return false;
-  const peer = transferredPortPeers.get(Number(packet.portId));
-  if (!peer || peer._closed) return true;
-  peer._queue.push(packet.value);
-  peer._scheduleDispatch?.();
+  const portId = String(packet.portId);
+  const peer = transferredPortPeers.get(portId);
+  if (deliverPortPacket(peer, packet)) return true;
+  const destinationThreadId = Number(packet.destinationThreadId);
+  if (Number.isInteger(destinationThreadId) && destinationThreadId >= 0 && destinationThreadId !== threadId) {
+    return forwardPortMessage({ threadId: destinationThreadId, portId }, message) || true;
+  }
+  const target = transferredPortTargets.get(portId);
+  const route = transferredPortRoutes.get(portId);
+  const next = target && Number(packet.sourceThreadId) === target.threadId ? route : target ?? route;
+  forwardPortMessage(next, message);
   return true;
 }
 
 function dispatchReceivedPortMessage(message) {
   const packet = message?.[portMessageEnvelopeKey];
   if (!packet || packet.portId == null) return false;
-  const port = receivedMessagePorts.get(Number(packet.portId));
-  if (!port || port._closed) return true;
-  port._queue.push(packet.value);
-  port._scheduleDispatch();
+  const portId = String(packet.portId);
+  const port = receivedMessagePorts.get(portId);
+  if (deliverPortPacket(port, packet)) return true;
+  const destinationThreadId = Number(packet.destinationThreadId);
+  if (Number.isInteger(destinationThreadId) && destinationThreadId >= 0 && destinationThreadId !== threadId) {
+    return forwardPortMessage({ threadId: destinationThreadId, portId }, message) || true;
+  }
+  const target = transferredPortTargets.get(portId);
+  const route = transferredPortRoutes.get(portId);
+  const next = target && Number(packet.sourceThreadId) === target.threadId ? route : target ?? route;
+  forwardPortMessage(next, message);
   return true;
-}
-
-function workerCodecSource() {
-  return `
-const __workerTypedArrays = { Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array };
-const __cottontailWorkerPortEnvelopeKey = ${JSON.stringify(portMessageEnvelopeKey)};
-const __cottontailWorkerMessagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
-const __cottontailWorkerPorts = new Map();
-function __workerBytesFromView(view){ return Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength)); }
-function __workerBytesFromBuffer(buffer){ return Array.from(new Uint8Array(buffer)); }
-function __workerViewName(value){ if (globalThis.Buffer?.isBuffer?.(value)) return "Buffer"; if (value instanceof DataView) return "DataView"; return value?.constructor?.name ?? "Uint8Array"; }
-function __workerSharedInfo(value){ try{ const info=cottontail.sharedArrayBufferInfo?.(value); return info&&typeof info==="object"&&info.id!=null?info:null; }catch{ return null; } }
-function __workerWrapShared(id){ const buffer=cottontail.sharedArrayBufferWrap?.(Number(id)); return globalThis.__cottontailMarkSharedArrayBuffer?.(buffer)??buffer; }
-function __workerEncode(value,state={ids:new WeakMap(),nextId:1}){ if(value===undefined)return{t:"undefined"}; if(value===null)return{t:"null"}; if(typeof value==="boolean"||typeof value==="string")return{t:typeof value,v:value}; if(typeof value==="number"){ if(Number.isNaN(value))return{t:"number",v:"NaN"}; if(value===Infinity)return{t:"number",v:"Infinity"}; if(value===-Infinity)return{t:"number",v:"-Infinity"}; if(Object.is(value,-0))return{t:"number",v:"-0"}; return{t:"number",v:value}; } if(typeof value==="bigint")return{t:"bigint",v:value.toString()}; if(typeof value==="function"||typeof value==="symbol")throw new Error("Value cannot be cloned"); if(globalThis.MessagePort&&value instanceof globalThis.MessagePort)throw new Error("MessagePort must be listed in transferList"); const existing=state.ids.get(value); if(existing!=null)return{t:"Ref",id:existing}; const id=state.nextId++; state.ids.set(value,id); if(value instanceof Date)return{t:"Date",id,v:value.toISOString()}; if(value instanceof RegExp)return{t:"RegExp",id,source:value.source,flags:value.flags}; if(value instanceof ArrayBuffer){ const shared=__workerSharedInfo(value); if(shared)return{t:"SharedArrayBuffer",id,sharedId:shared.id,byteLength:shared.byteLength}; return{t:"ArrayBuffer",id,bytes:__workerBytesFromBuffer(value)}; } if(ArrayBuffer.isView(value)){ const shared=__workerSharedInfo(value.buffer); if(shared)return{t:"SharedView",id,name:__workerViewName(value),sharedId:shared.id,byteOffset:value.byteOffset,length:value instanceof DataView?value.byteLength:value.length}; return{t:"View",id,name:__workerViewName(value),bytes:__workerBytesFromView(value)}; } if(value instanceof Map)return{t:"Map",id,v:[...value].map(([key,item])=>[__workerEncode(key,state),__workerEncode(item,state)])}; if(value instanceof Set)return{t:"Set",id,v:[...value].map((item)=>__workerEncode(item,state))}; if(Array.isArray(value))return{t:"Array",id,v:value.map((item)=>__workerEncode(item,state))}; if(value instanceof Error)return{t:"Error",id,name:value.name,message:value.message,stack:value.stack}; return{t:"Object",id,v:Object.entries(value).map(([key,item])=>[key,__workerEncode(item,state)])}; }
-function __workerRemember(refs,encoded,value){ if(encoded?.id!=null)refs.set(encoded.id,value); return value; }
-function __workerDecode(encoded,refs=new Map()){ switch(encoded?.t){ case "Ref": if(!refs.has(encoded.id))throw new Error("Invalid cloned reference"); return refs.get(encoded.id); case "undefined": return undefined; case "null": return null; case "boolean": case "string": return encoded.v; case "number": if(encoded.v==="NaN")return NaN; if(encoded.v==="Infinity")return Infinity; if(encoded.v==="-Infinity")return -Infinity; if(encoded.v==="-0")return -0; return Number(encoded.v); case "bigint": return BigInt(encoded.v); case "Date": return __workerRemember(refs,encoded,new Date(encoded.v)); case "RegExp": return __workerRemember(refs,encoded,new RegExp(encoded.source,encoded.flags)); case "SharedArrayBuffer": return __workerRemember(refs,encoded,__workerWrapShared(encoded.sharedId)); case "SharedView": { const buffer=__workerWrapShared(encoded.sharedId); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(buffer,encoded.byteOffset||0,encoded.length)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(buffer,encoded.byteOffset||0,encoded.length)); } case "ArrayBuffer": return __workerRemember(refs,encoded,new Uint8Array(encoded.bytes||[]).buffer); case "View": { const bytes=new Uint8Array(encoded.bytes||[]); if(encoded.name==="Buffer")return __workerRemember(refs,encoded,globalThis.Buffer?.from?globalThis.Buffer.from(bytes):bytes); if(encoded.name==="DataView")return __workerRemember(refs,encoded,new DataView(bytes.buffer)); const Ctor=__workerTypedArrays[encoded.name]||Uint8Array; return __workerRemember(refs,encoded,new Ctor(bytes.buffer)); } case "MessagePort": return __workerRemember(refs,encoded,__cottontailGetWorkerPort(encoded.portId)); case "Map": { const map=__workerRemember(refs,encoded,new Map()); for(const [key,value] of encoded.v||[])map.set(__workerDecode(key,refs),__workerDecode(value,refs)); return map; } case "Set": { const set=__workerRemember(refs,encoded,new Set()); for(const value of encoded.v||[])set.add(__workerDecode(value,refs)); return set; } case "Array": { const array=__workerRemember(refs,encoded,[]); for(let index=0;index<(encoded.v||[]).length;index++)array[index]=__workerDecode(encoded.v[index],refs); return array; } case "Error": { const error=new Error(encoded.message); error.name=encoded.name; error.stack=encoded.stack; return __workerRemember(refs,encoded,error); } case "Object": { const object=__workerRemember(refs,encoded,{}); for(const [key,value] of encoded.v||[])object[key]=__workerDecode(value,refs); return object; } default: throw new Error("Invalid cloned worker payload"); } }
-function __cottontailEncodeWorkerMessage(value){ return JSON.stringify({ cottontailWorkerClone: ${wireVersion}, value: __workerEncode(value) }); }
-function __cottontailDecodeWorkerMessage(value){ if(value&&typeof value==="object"&&value.cottontailWorkerClone===${wireVersion})return __workerDecode(value.value); if(typeof value==="string"){ try{ const parsed=JSON.parse(value); if(parsed?.cottontailWorkerClone===${wireVersion})return __workerDecode(parsed.value); return parsed; }catch{} } return value; }
-class __CottontailWorkerMessagePort {
-  constructor(id){ this[__cottontailWorkerMessagePortBrand]=true; this._id=Number(id??Math.floor(Math.random()*1000000000)); this._queue=[]; this._closed=false; this._started=false; this._peer=null; this._handlers=new Set(); this.onmessage=null; this.onmessageerror=null; }
-  postMessage(value){ if(this._closed)return; if(this._peer&&!this._peer._closed){ this._peer._queue.push(__cottontailDecodeWorkerMessage(__cottontailEncodeWorkerMessage(value))); this._peer._dispatch(); return; } cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ [__cottontailWorkerPortEnvelopeKey]: { portId: this._id, value } })); }
-  start(){ this._started=true; this._dispatch(); return this; }
-  close(){ this._closed=true; this._handlers.clear(); return this; }
-  ref(){ return this; }
-  unref(){ return this; }
-  hasRef(){ return true; }
-  on(name,handler){ if(String(name)==="message"&&typeof handler==="function"){ this._handlers.add(handler); this.start(); } return this; }
-  once(name,handler){ if(String(name)!=="message"||typeof handler!=="function")return this; const wrapped=(value)=>{ this.off("message",wrapped); handler(value); }; return this.on(name,wrapped); }
-  off(name,handler){ if(String(name)==="message")this._handlers.delete(handler); return this; }
-  addEventListener(name,handler){ return this.on(name,(value)=>handler({ data: value })); }
-  removeEventListener(_name,_handler){ return this; }
-  _dispatch(){ if(!this._started&&typeof this.onmessage!=="function"&&this._handlers.size===0)return; while(this._queue.length>0){ const value=this._queue.shift(); const event={ data: value }; if(typeof this.onmessage==="function")this.onmessage(event); for(const handler of [...this._handlers])handler(value); } }
-}
-class __CottontailWorkerMessageChannel {
-  constructor(){ this.port1=new __CottontailWorkerMessagePort(); this.port2=new __CottontailWorkerMessagePort(); this.port1._peer=this.port2; this.port2._peer=this.port1; }
-}
-function __cottontailGetWorkerPort(portId){ const id=Number(portId); let port=__cottontailWorkerPorts.get(id); if(!port){ port=new __CottontailWorkerMessagePort(id); __cottontailWorkerPorts.set(id,port); } return port; }
-function __cottontailDispatchWorkerPortMessage(message){ const packet=message?.[__cottontailWorkerPortEnvelopeKey]; if(!packet||packet.portId==null)return false; const port=__cottontailGetWorkerPort(packet.portId); port._queue.push(packet.value); port._dispatch(); return true; }
-globalThis.MessagePort = __CottontailWorkerMessagePort;
-globalThis.MessageChannel = __CottontailWorkerMessageChannel;
-globalThis.__cottontailEncodeWorkerMessage = __cottontailEncodeWorkerMessage;
-globalThis.__cottontailDecodeWorkerMessage = __cottontailDecodeWorkerMessage;
-`;
-}
-
-function normalizeWorkerPath(filename, evalMode = false) {
-  if (evalMode) {
-    const dir = workerTempDir();
-    cottontail.mkdirSync?.(dir, true);
-    const source = String(filename);
-    const hasCode = /\S/.test(source);
-    const sourcePath = hasCode
-      ? `${dir}/worker-eval-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`
-      : `${dir}/worker-eval-empty.js`;
-    cottontail.writeFile(sourcePath, hasCode ? source : "");
-    return sourcePath;
-  }
-  const text = String(filename);
-  if (text.startsWith("file://")) return decodeURIComponent(new URL(text).pathname);
-  if (text.startsWith("data:")) {
-    const comma = text.indexOf(",");
-    if (comma < 0) throw new TypeError("Invalid data URL");
-    const metadata = text.slice(5, comma);
-    const payload = text.slice(comma + 1);
-    const source = /;base64(?:;|$)/i.test(metadata)
-      ? globalThis.atob(payload)
-      : decodeURIComponent(payload);
-    const dir = workerTempDir();
-    cottontail.mkdirSync?.(dir, true);
-    const sourcePath = `${dir}/worker-data-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
-    cottontail.writeFile(sourcePath, source);
-    return sourcePath;
-  }
-  return resolve(text);
 }
 
 function workerTempDir() {
@@ -413,145 +492,199 @@ function workerTempDir() {
   return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
 }
 
-const workerWrapperCache = new Map();
+function workerEvalFilename() {
+  return `${String(cottontail.cwd()).replace(/\\/g, "/")}/[worker eval]`;
+}
 
-function makeWorkerWrapper(targetPath, options = {}) {
+function normalizeWorkerInput(filename, options) {
+  if (options.eval === true) {
+    if (typeof filename !== "string") throw invalidArgumentType("filename", "string", filename);
+    return { kind: "eval", source: filename, filename: workerEvalFilename() };
+  }
+
+  if (typeof filename !== "string" && !(filename instanceof URL)) {
+    throw invalidArgumentType("filename", "string or an instance of URL", filename);
+  }
+  let text = String(filename);
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(text) && !text.startsWith("file:") && !text.startsWith("data:")) {
+    const url = new URL(text);
+    const error = new TypeError(`The URL must be of scheme file. Received protocol '${url.protocol}'`);
+    error.code = "ERR_INVALID_URL_SCHEME";
+    throw error;
+  }
+  if (text.startsWith("file:")) {
+    const url = new URL(text);
+    if (url.protocol !== "file:") {
+      const error = new TypeError(`The URL must be of scheme file. Received protocol '${url.protocol}'`);
+      error.code = "ERR_INVALID_URL_SCHEME";
+      throw error;
+    }
+    text = decodeURIComponent(url.pathname);
+  }
+  if (text.startsWith("data:")) return { kind: "module", specifier: text, filename: text };
+  const path = resolve(text);
+  return {
+    kind: path.toLowerCase().endsWith(".cjs") ? "commonjs" : "module",
+    specifier: path.replace(/\\/g, "/"),
+    filename: path,
+  };
+}
+
+function normalizeWorkerOptions(options) {
+  if (options === undefined) return {};
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw invalidArgumentType("options", "object", options);
+  }
   if (options.execArgv && !Array.isArray(options.execArgv)) {
     throw invalidArgumentType("options.execArgv", "an instance of Array", options.execArgv);
   }
-  const workerDataWire = JSON.stringify(JSON.parse(encodeWireMessage(options.workerData ?? null, options.transferList)));
-  const environmentDataWire = JSON.stringify(JSON.parse(encodeWireMessage([...environmentData])));
-  const resourceLimitsWire = JSON.stringify(JSON.parse(encodeWireMessage(options.resourceLimits ?? {})));
-  const execArgvWire = JSON.stringify(options.execArgv ? Array.from(options.execArgv, String) : Array.from(globalThis.process?.execArgv ?? []));
-  const workerEnv = options.env && options.env !== SHARE_ENV ? options.env : globalThis.process?.env ?? cottontail.env?.() ?? {};
-  const environmentWire = JSON.stringify(Object.fromEntries(Object.entries(workerEnv).map(([key, value]) => [key, String(value)])));
-  const bunArgvWire = JSON.stringify(Array.from(globalThis.Bun?.argv ?? globalThis.process?.argv ?? []));
-  const cacheable = !(options.transferList?.length > 0) && !workerDataWire.includes('"t":"Port"');
-  const cacheKey = cacheable
-    ? JSON.stringify([targetPath, workerDataWire, environmentDataWire, resourceLimitsWire, options.name ?? ""])
-    : null;
-  const cached = cacheKey == null ? null : workerWrapperCache.get(cacheKey);
-  if (cached && cottontail.existsSync?.(cached)) return cached;
+  if (options.argv != null && !Array.isArray(options.argv)) {
+    throw invalidArgumentType("options.argv", "an instance of Array", options.argv);
+  }
+  if (options.env != null && options.env !== SHARE_ENV && typeof options.env !== "object") {
+    throw invalidArgumentType("options.env", "object", options.env);
+  }
+  if (options.resourceLimits != null &&
+      (typeof options.resourceLimits !== "object" || Array.isArray(options.resourceLimits))) {
+    throw invalidArgumentType("options.resourceLimits", "object", options.resourceLimits);
+  }
+  return options;
+}
 
+function stringEnvironment(source) {
+  const result = {};
+  for (const key of Object.keys(source ?? {})) {
+    const value = source[key];
+    if (value !== undefined) result[key] = String(value);
+  }
+  return result;
+}
+
+function workerRunSource(input) {
+  if (input.kind === "eval") {
+    return [
+      `const __ctModuleNamespace = await import("node:module");`,
+      `const __ctModule = __ctModuleNamespace.Module ?? __ctModuleNamespace.default;`,
+      `const __ctEvalModule = new __ctModule(${JSON.stringify(input.filename)}, null);`,
+      `__ctEvalModule.filename = ${JSON.stringify(input.filename)};`,
+      `__ctEvalModule.paths = __ctModule._nodeModulePaths?.(${JSON.stringify(cottontail.cwd())}) ?? [];`,
+      `__ctEvalModule._compile(${JSON.stringify(input.source)}, ${JSON.stringify(input.filename)});`,
+    ].join("\n");
+  }
+  if (input.kind === "commonjs") {
+    return [
+      `const __ctModuleNamespace = await import("node:module");`,
+      `const __ctCreateRequire = __ctModuleNamespace.createRequire ?? __ctModuleNamespace.default?.createRequire;`,
+      `__ctCreateRequire(${JSON.stringify(input.filename)})(${JSON.stringify(input.filename)});`,
+    ].join("\n");
+  }
+  return [
+    `const __ctWorkerSpecifier = ${JSON.stringify(input.specifier)};`,
+    `await import(__ctWorkerSpecifier);`,
+  ].join("\n");
+}
+
+function makeWorkerWrapper(input, options = {}) {
+  const workerDataWire = encodeWireMessage(
+    Object.prototype.hasOwnProperty.call(options, "workerData") ? options.workerData : undefined,
+    options.transferList,
+  );
+  const environmentDataWire = encodeWireMessage([...environmentData]);
+  const resourceLimitsWire = encodeWireMessage(options.resourceLimits ?? {});
+  const execArgv = options.execArgv
+    ? Array.from(options.execArgv, String)
+    : Array.from(globalThis.process?.execArgv ?? [], String);
+  const argv = [
+    String(globalThis.process?.argv?.[0] ?? globalThis.process?.execPath ?? "cottontail"),
+    input.filename,
+    ...Array.from(options.argv ?? [], String),
+  ];
+  const shareEnvironment = options.env === SHARE_ENV;
+  const workerEnvironment = stringEnvironment(
+    options.env && !shareEnvironment
+      ? options.env
+      : globalThis.process?.env ?? cottontail.env?.() ?? {},
+  );
+  const bootstrap = {
+    workerDataWire,
+    environmentDataWire,
+    resourceLimitsWire,
+    threadName: String(options.name ?? ""),
+    stdin: options.stdin === true,
+    stdout: options.stdout === true,
+    stderr: options.stderr === true,
+    shareEnvironment,
+  };
   const dir = workerTempDir();
   cottontail.mkdirSync?.(dir, true);
-  const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.js`;
+  const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.mjs`;
   const source = [
-    workerCodecSource(),
-    `globalThis.__cottontailWorkerData = __cottontailDecodeWorkerMessage(${workerDataWire});`,
-    `globalThis.__cottontailEnvironmentData = __cottontailDecodeWorkerMessage(${environmentDataWire});`,
-    `globalThis.__cottontailWorkerResourceLimits = __cottontailDecodeWorkerMessage(${resourceLimitsWire});`,
-    `globalThis.__cottontailWorkerThreadName = ${JSON.stringify(options.name ?? "")};`,
-    `globalThis.workerData = globalThis.__cottontailWorkerData;`,
-    `if (globalThis.process) { globalThis.process.execArgv = ${execArgvWire}; globalThis.process.env = ${environmentWire}; }`,
-    `if (globalThis.Bun) globalThis.Bun.argv = ${bunArgvWire};`,
-    `const __cottontailRuntimeRequire = globalThis.require;`,
-    `const __cottontailWorkerRequireBase = ${JSON.stringify(options.eval === true ? `${cottontail.cwd()}/[worker eval]` : targetPath)};`,
-    `let __cottontailWorkerShouldExit = false;`,
-    `const __cottontailWorkerExitSentinel = { cottontailWorkerExit: true };`,
-    `const __cottontailWorkerImmediateQueue = [];`,
-    `globalThis.setImmediate ??= (callback, ...args) => { const handle = { ref(){ return this; }, unref(){ return this; }, hasRef(){ return true; } }; __cottontailWorkerImmediateQueue.push({ callback, args, handle }); queueMicrotask(() => { const index = __cottontailWorkerImmediateQueue.findIndex((item) => item.handle === handle); if (index < 0 || __cottontailWorkerShouldExit) return; const item = __cottontailWorkerImmediateQueue.splice(index, 1)[0]; try { const result = item.callback(...item.args); if (result && typeof result.then === "function") result.catch((error) => { if (error !== __cottontailWorkerExitSentinel) throw error; }); } catch (error) { if (error !== __cottontailWorkerExitSentinel) throw error; } }); return handle; };`,
-    `globalThis.clearImmediate ??= (handle) => { const index = __cottontailWorkerImmediateQueue.findIndex((item) => item.handle === handle); if (index >= 0) __cottontailWorkerImmediateQueue.splice(index, 1); };`,
-    `globalThis.process ??= { exitCode: 0, execArgv: [], env: {}, nextTick: (callback, ...args) => queueMicrotask(() => callback(...args)), exit(code = 0) { this.exitCode = Number(code) || 0; __cottontailWorkerShouldExit = true; cottontail.exit(this.exitCode); throw __cottontailWorkerExitSentinel; } };`,
-    `globalThis.__cottontailHasActiveHandles = () => !__cottontailWorkerShouldExit && (typeof globalThis.onmessage === "function" || __cottontailParentPortHandlers.size > 0 || globalThis.__cottontailWorkerThreadParentPortActive?.() || (globalThis.__cottontailActiveWorkerIds?.().length ?? 0) > 0 || __cottontailWorkerImmediateQueue.length > 0);`,
-    `const __cottontailParentPortHandlers = new Set();`,
-    `globalThis.addEventListener("message", (event) => {`,
-    `  const message = __cottontailDecodeWorkerMessage(event.data);`,
-    `  const control = message?.[${JSON.stringify(workerControlEnvelopeKey)}];`,
-    `  if (control?.type === "heapSnapshotRequest") {`,
-    `    try {`,
-    `      const snapshot = cottontail.jscHeapSnapshot();`,
-    `      cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ ${JSON.stringify(workerControlEnvelopeKey)}: { type: "heapSnapshotResult", requestId: control.requestId, snapshot } }));`,
-    `    } catch (error) {`,
-    `      cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ ${JSON.stringify(workerControlEnvelopeKey)}: { type: "heapSnapshotResult", requestId: control.requestId, error: String(error?.message ?? error) } }));`,
-    `    }`,
-    `    return;`,
-    `  }`,
-    `  if (__cottontailDispatchWorkerPortMessage(message)) return;`,
-    `  for (const handler of [...__cottontailParentPortHandlers]) handler(message);`,
-    `});`,
-    `globalThis.parentPort = {`,
-    `  on(name, handler) { if (String(name) === "message" && typeof handler === "function") __cottontailParentPortHandlers.add(handler); return this; },`,
-    `  once(name, handler) { const wrapped = (value) => { __cottontailParentPortHandlers.delete(wrapped); handler(value); }; return this.on(name, wrapped); },`,
-    `  off(name, handler) { if (String(name) === "message") __cottontailParentPortHandlers.delete(handler); return this; },`,
-    `  postMessage(value) { cottontail.workerPostMessage(__cottontailEncodeWorkerMessage(value)); },`,
-    `  close() {}, ref() { return this; }, unref() { return this; }`,
-    `};`,
-    `const __cottontailWorkerEnvironmentDataMap = new Map(globalThis.__cottontailEnvironmentData ?? []);`,
-    `function __cottontailWorkerThreadsBuiltin(){ return {`,
-    `  BroadcastChannel: globalThis.BroadcastChannel, MessageChannel: globalThis.MessageChannel, MessagePort: globalThis.MessagePort,`,
-    `  SHARE_ENV: Symbol.for("nodejs.worker_threads.SHARE_ENV"), Worker: globalThis.Worker,`,
-    `  getEnvironmentData: (key) => __cottontailWorkerEnvironmentDataMap.get(key),`,
-    `  setEnvironmentData: (key, value) => { __cottontailWorkerEnvironmentDataMap.set(key, value); },`,
-    `  isInternalThread: false, isMainThread: false, isMarkedAsUntransferable: () => false,`,
-    `  locks: { async request(_name, options, callback){ if (typeof options === "function") callback = options; return callback ? callback({ name: String(_name), mode: "exclusive" }) : undefined; }, async query(){ return { held: [], pending: [] }; } },`,
-    `  markAsUncloneable: () => {}, markAsUntransferable: () => {}, moveMessagePortToContext: (port) => port,`,
-    `  parentPort: globalThis.parentPort, postMessageToThread: async () => false, receiveMessageOnPort: () => undefined,`,
-    `  resourceLimits: globalThis.__cottontailWorkerResourceLimits, threadId: Number(cottontail.workerThreadId?.() ?? 1), threadName: globalThis.__cottontailWorkerThreadName, workerData: globalThis.__cottontailWorkerData`,
-    `}; }`,
-    `function __cottontailWorkerAsyncHooksBuiltin(){ return { createHook(callbacks = {}) { return { enable(){ return this; }, disable(){ return this; }, callbacks }; }, executionAsyncId: () => 0, triggerAsyncId: () => 0, executionAsyncResource: () => ({}), AsyncResource: class AsyncResource { constructor(type){ this.type = String(type); this.id = 0; } asyncId(){ return this.id; } triggerAsyncId(){ return 0; } runInAsyncScope(fn, thisArg, ...args){ return fn.apply(thisArg, args); } emitDestroy(){} bind(fn, thisArg){ return (...args) => this.runInAsyncScope(fn, thisArg, ...args); } } }; }`,
-    `let __cottontailBaseRequire = __cottontailRuntimeRequire;`,
+    `globalThis.__cottontailWorkerBootstrap = ${JSON.stringify(bootstrap)};`,
+    `if (globalThis.process) {`,
+    `  globalThis.process.argv = ${JSON.stringify(argv)};`,
+    `  globalThis.process.execArgv = ${JSON.stringify(execArgv)};`,
+    `}`,
+    `if (globalThis.Bun) globalThis.Bun.argv = ${JSON.stringify(argv)};`,
+    `await import("node:worker_threads");`,
+    `if (globalThis.process) {`,
+    `  const __ctWorkerEnv = globalThis.process.env ?? {};`,
+    `  for (const __ctKey of Object.keys(__ctWorkerEnv)) delete __ctWorkerEnv[__ctKey];`,
+    `  Object.assign(__ctWorkerEnv, ${JSON.stringify(workerEnvironment)});`,
+    `  globalThis.process.env = __ctWorkerEnv;`,
+    `}`,
+    `globalThis.__cottontailConfigureWorkerStdio?.();`,
     `try {`,
-    `  const moduleBuiltin = __cottontailRuntimeRequire?.("node:module") ?? __cottontailRuntimeRequire?.("module");`,
-    `  if (typeof moduleBuiltin?.createRequire === "function") __cottontailBaseRequire = moduleBuiltin.createRequire(__cottontailWorkerRequireBase);`,
-    `} catch {}`,
-    `function __cottontailWorkerRequire(specifier){`,
-    `  const text = String(specifier);`,
-    `  try { if (typeof __cottontailBaseRequire === "function") return __cottontailBaseRequire(text); } catch (error) {`,
-    `    if (text !== "node:worker_threads" && text !== "worker_threads" && text !== "node:async_hooks" && text !== "async_hooks") throw error;`,
-    `  }`,
-    `  if (text === "node:worker_threads" || text === "worker_threads") return __cottontailWorkerThreadsBuiltin();`,
-    `  if (text === "node:async_hooks" || text === "async_hooks") return __cottontailWorkerAsyncHooksBuiltin();`,
-    `  throw new Error("Cannot find module '" + text + "'");`,
+    workerRunSource(input),
+    `} catch (__ctWorkerError) {`,
+    `  globalThis.__cottontailWorkerThreadsReportError?.(__ctWorkerError);`,
     `}`,
-    `globalThis.require = __cottontailWorkerRequire;`,
-    `function __cottontailRewriteWorkerNamedImports(spec){ return spec.split(",").map((part) => { const trimmed = part.trim(); if (!trimmed) return ""; const pieces = trimmed.split(/\\s+as\\s+/); return pieces.length === 2 ? pieces[0].trim() + ": " + pieces[1].trim() : trimmed; }).filter(Boolean).join(", "); }`,
-    `function __cottontailTransformWorkerSource(source, filename){`,
-    `  const dir = String(filename).replace(/\\/[^/]*$/, "") || ".";`,
-    `  const fileUrl = "file://" + String(filename);`,
-    `  let out = String(source);`,
-    `  out = out.replace(/import\\.meta\\.dirname/g, JSON.stringify(dir)).replace(/import\\.meta\\.dir/g, JSON.stringify(dir)).replace(/import\\.meta\\.filename/g, JSON.stringify(filename)).replace(/import\\.meta\\.path/g, JSON.stringify(filename)).replace(/import\\.meta\\.url/g, JSON.stringify(fileUrl)).replace(/import\\.meta\\.main/g, "false");`,
-    `  out = out.replace(/^\\s*import\\s+\\{([^}]*)\\}\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, names, _quote, specifier) => "const { " + __cottontailRewriteWorkerNamedImports(names) + " } = __cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
-    `  out = out.replace(/^\\s*import\\s+\\*\\s+as\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, name, _quote, specifier) => "const " + name + " = __cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
-    `  out = out.replace(/^\\s*import\\s+([A-Za-z_$][\\w$]*)\\s+from\\s+(['"])([^'"]+)\\2\\s*;?\\s*$/mg, (_all, name, _quote, specifier) => "const __module_" + name + " = __cottontailWorkerRequire(" + JSON.stringify(specifier) + "); const " + name + " = __module_" + name + ".default ?? __module_" + name + ";");`,
-    `  out = out.replace(/^\\s*import\\s+(['"])([^'"]+)\\1\\s*;?\\s*$/mg, (_all, _quote, specifier) => "__cottontailWorkerRequire(" + JSON.stringify(specifier) + ");");`,
-    `  out = out.replace(/^\\s*export\\s+\\{[^}]*\\}\\s*;?\\s*$/mg, "");`,
-    `  return out;`,
-    `}`,
-    `async function __cottontailRunWorkerTarget(filename){`,
-    `  try {`,
-    `    const source = __cottontailTransformWorkerSource(cottontail.readFile(filename), filename);`,
-    `    const AsyncFunction = (async function(){}).constructor;`,
-    `    const slash = String(filename).lastIndexOf("/");`,
-    `    const dirname = slash >= 0 ? String(filename).slice(0, slash) : ".";`,
-    `    const module = { exports: {} };`,
-    `    const run = new AsyncFunction("__cottontailWorkerRequire", "require", "module", "exports", "__filename", "__dirname", source + "\\n//# sourceURL=" + filename);`,
-    `    await run(__cottontailWorkerRequire, __cottontailWorkerRequire, module, module.exports, filename, dirname);`,
-    `  } catch (error) {`,
-    `    if (error === __cottontailWorkerExitSentinel) return;`,
-    `    __cottontailWorkerShouldExit = true;`,
-    `    __cottontailParentPortHandlers.clear();`,
-    `    const name = typeof error?.name === "string" ? error.name : "Error";`,
-    `    let message = typeof error?.message === "string" ? error.message : undefined;`,
-    `    if (message === undefined) { try { message = __cottontailBaseRequire?.("node:util")?.inspect?.(error); } catch {} }`,
-    `    if (message === undefined) message = String(error);`,
-    `    const stack = typeof error?.stack === "string" ? error.stack : undefined;`,
-    `    cottontail.workerPostMessage(__cottontailEncodeWorkerMessage({ ${JSON.stringify(workerControlEnvelopeKey)}: { type: "error", error: { name, message, stack } } }));`,
-    `  }`,
-    `}`,
-    `await __cottontailRunWorkerTarget(${JSON.stringify(targetPath)});`,
   ].join("\n");
   cottontail.writeFile(wrapperPath, source);
-  if (cacheKey != null) workerWrapperCache.set(cacheKey, wrapperPath);
   return wrapperPath;
 }
 
-class NullWritable extends Writable {
-  write(_chunk, encoding = undefined, callback = undefined) {
-    if (typeof encoding === "function") callback = encoding;
-    callback?.();
-    return true;
+function bytesForStdio(chunk, encoding = undefined) {
+  if (chunk instanceof ArrayBuffer) return Array.from(new Uint8Array(chunk));
+  if (ArrayBuffer.isView(chunk)) return Array.from(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+  void encoding;
+  return Array.from(new TextEncoder().encode(String(chunk)));
+}
+
+class WorkerStdin extends Writable {
+  constructor(worker) {
+    super();
+    this._worker = worker;
   }
+
+  _write(chunk, encoding, callback) {
+    try {
+      this._worker._postControl({ type: "stdin", data: bytesForStdio(chunk, encoding) });
+      callback?.();
+    } catch (error) {
+      callback?.(error);
+    }
+  }
+
+  _final(callback) {
+    try {
+      this._worker._postControl({ type: "stdin", end: true });
+      callback?.();
+    } catch (error) {
+      callback?.(error);
+    }
+  }
+}
+
+function workerNotRunningError() {
+  const error = new Error("Worker instance not running");
+  error.code = "ERR_WORKER_NOT_RUNNING";
+  return error;
+}
+
+function nativeBoundaryError(api) {
+  const error = new Error(`${api} requires a native per-worker runtime hook`);
+  error.code = "ERR_COTTONTAIL_NATIVE_BOUNDARY";
+  return error;
 }
 
 function deserializeWorkerError(payload) {
@@ -605,7 +738,7 @@ class WorkerPerformance {
     if (utilization2 && typeof utilization2 === "object") {
       return eventLoopUtilizationDelta(utilization1, utilization2);
     }
-    const current = cottontail.workerPerformance?.(this._worker.threadId) ?? { idle: 0, active: 0, utilization: 0 };
+    const current = cottontail.workerPerformance?.(this._worker._nativeThreadId) ?? { idle: 0, active: 0, utilization: 0 };
     return utilization1 && typeof utilization1 === "object"
       ? eventLoopUtilizationDelta(utilization1, current)
       : current;
@@ -613,107 +746,239 @@ class WorkerPerformance {
 }
 
 export class Worker extends EventEmitter {
-  constructor(filename, options = {}) {
+  constructor(filename, options = undefined) {
     super();
+    options = normalizeWorkerOptions(options);
     const processObject = globalThis.process;
     const processEmitAtCreation = processObject?.emit;
-    const emptyEvalSource = options.eval === true && !/\S/.test(String(filename));
-    const target = normalizeWorkerPath(filename, options.eval === true);
-    const wrapper = makeWorkerWrapper(target, options);
+    const input = normalizeWorkerInput(filename, options);
+    const emptyEvalSource = input.kind === "eval" && !/\S/.test(input.source);
+    const wrapper = makeWorkerWrapper(input, options);
+
     this.threadId = 0;
-    this.threadName = options.name ?? "";
+    this.threadName = String(options.name ?? "");
+    // COTTONTAIL-COMPAT: resourceLimits are observable configuration here; JSC
+    // heap and native thread-stack enforcement require worker host hooks.
     this.resourceLimits = { ...(options.resourceLimits ?? {}) };
-    this.stdin = options.stdin ? new NullWritable() : null;
-    this.stdout = options.stdout ? new Readable() : null;
-    this.stderr = options.stderr ? new Readable() : null;
+    this.stdin = null;
+    this.stdout = options.stdout === true ? new Readable() : null;
+    this.stderr = options.stderr === true ? new Readable() : null;
+    if (this.stdout) this.stdout._read = () => {};
+    if (this.stderr) this.stderr._read = () => {};
     this._running = true;
     this._emptyEvalSource = emptyEvalSource;
     this._exitEmitted = false;
-    this._heapSnapshotRequests = new Map();
+    this._exitCode = undefined;
+    this._reportedExitCode = undefined;
+    this._onlineEmitted = false;
+    this._refed = true;
+    this._controlRequests = new Map();
+    this._terminationPromise = null;
+    this._terminationResolve = null;
+    this._terminationFallback = null;
+
     this._worker = new globalThis.Worker(wrapper);
-    this.threadId = this._worker.id ?? this._worker.handle?.id ?? 0;
+    this.threadId = Number(this._worker.id ?? this._worker.handle?.id ?? 0);
+    this._nativeThreadId = this.threadId;
     this.performance = new WorkerPerformance(this);
+    this.stdin = options.stdin === true ? new WorkerStdin(this) : null;
+
     for (const item of options.transferList ?? []) {
-      if (item instanceof MessagePort) item._remote = { threadId: this.threadId, portId: item._id };
+      if (item instanceof MessagePort) {
+        item._remote = { threadId: this._nativeThreadId, portId: item._id };
+        if (item._peer) item._remoteEndpointThreadId = this._nativeThreadId;
+        transferredPortTargets.set(item._id, item._remote);
+      }
     }
-    workerInstances.set(this.threadId, this);
-    this._worker.onmessage = (event) => {
-      const message = decodeWireMessage(event.data);
-      if (dispatchTransferredPortMessage(message)) return;
-      const control = message?.[workerControlEnvelopeKey];
-      if (control?.type === "heapSnapshotResult") {
-        const request = this._heapSnapshotRequests.get(Number(control.requestId));
-        if (!request) return;
-        this._heapSnapshotRequests.delete(Number(control.requestId));
-        if (control.error != null) request.reject(new Error(String(control.error)));
-        else request.resolve(String(control.snapshot ?? ""));
-        return;
-      }
-      if (control?.type === "error") {
-        this.emit("error", deserializeWorkerError(control.error));
-        return;
-      }
-      this.emit("message", message);
+    workerInstances.set(this._nativeThreadId, this);
+
+    this._worker.onmessage = (event) => this._handleMessage(event);
+    this._worker.onerror = (event) => {
+      this._emitWorkerError(event?.error ?? new Error(String(event?.message ?? event)));
     };
-    this._worker.onerror = (event) => this.emit("error", event?.error ?? new Error(String(event?.message ?? event)));
+    this._worker.addEventListener?.("open", () => this._emitOnline());
     this._worker.addEventListener?.("exit", (event) => {
       this._emitExit(Number(event?.code ?? 0));
     });
+
     queueMicrotask(() => {
       const currentEmit = processObject?.emit;
       if (typeof currentEmit !== "function") {
         const error = new TypeError(`${String(currentEmit)} is not a function`);
-        if (typeof processEmitAtCreation === "function" && processEmitAtCreation.call(processObject, "uncaughtException", error)) return;
+        if (typeof processEmitAtCreation === "function" &&
+            processEmitAtCreation.call(processObject, "uncaughtException", error)) return;
         throw error;
       }
       currentEmit.call(processObject, "worker", this);
-      this.emit("online");
     });
+  }
+
+  _emitOnline() {
+    if (this._onlineEmitted || !this._running) return;
+    this._onlineEmitted = true;
+    this.emit("online");
+  }
+
+  _emitWorkerError(error) {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", error);
+      return;
+    }
+    queueMicrotask(() => this.emit("error", error));
+  }
+
+  _handleMessage(event) {
+    let message;
+    try {
+      message = decodeWireMessage(event.data);
+    } catch (error) {
+      this.emit("messageerror", error);
+      return;
+    }
+    if (dispatchTransferredPortMessage(message)) return;
+    const control = message?.[workerControlEnvelopeKey];
+    if (!control) {
+      this.emit("message", message);
+      return;
+    }
+
+    if (control.type === "error") {
+      this._emitWorkerError(deserializeWorkerError(control.error));
+      return;
+    }
+    if (control.type === "threadMessage") {
+      globalThis.process?.emit?.("workerMessage", control.value, Number(control.sourceThreadId));
+      return;
+    }
+    if (control.type === "exitCode") {
+      this._reportedExitCode = Number(control.code) || 0;
+      return;
+    }
+    if (control.type === "stdio") {
+      const stream = control.stream === "stderr" ? this.stderr : this.stdout;
+      if (stream) {
+        const bytes = new Uint8Array(control.data ?? []);
+        stream.push(globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes);
+      }
+      return;
+    }
+    if (control.requestId != null) {
+      const requestId = Number(control.requestId);
+      const request = this._controlRequests.get(requestId);
+      if (!request) return;
+      this._controlRequests.delete(requestId);
+      if (control.error != null) request.reject(new Error(String(control.error)));
+      else request.resolve(control.value ?? control.snapshot ?? control.statistics);
+    }
   }
 
   _emitExit(code) {
     if (this._exitEmitted) return;
     this._exitEmitted = true;
     this._running = false;
-    workerInstances.delete(this.threadId);
-    for (const request of this._heapSnapshotRequests.values()) {
-      const error = new Error("Worker instance not running");
-      error.code = "ERR_WORKER_NOT_RUNNING";
-      request.reject(error);
+    this._exitCode = this._reportedExitCode ?? (Number(code) || 0);
+    workerInstances.delete(this._nativeThreadId);
+    this.threadId = -1;
+    this.threadName = null;
+    this.resourceLimits = {};
+    if (this._terminationFallback !== null) {
+      clearTimeout(this._terminationFallback);
+      this._terminationFallback = null;
     }
-    this._heapSnapshotRequests.clear();
-    this.emit("exit", Number(code) || 0);
+    for (const request of this._controlRequests.values()) request.reject(workerNotRunningError());
+    this._controlRequests.clear();
+    this.stdout?.push(null);
+    this.stderr?.push(null);
+    this._terminationResolve?.(this._exitCode);
+    this._terminationResolve = null;
+    this.emit("exit", this._exitCode);
+  }
+
+  _postControl(control) {
+    if (!this._running) throw workerNotRunningError();
+    this.postMessage({ [workerControlEnvelopeKey]: control });
+  }
+
+  _requestControl(type, payload = undefined) {
+    if (!this._running) return Promise.reject(workerNotRunningError());
+    const requestId = nextWorkerControlRequestId++;
+    return new Promise((resolve, reject) => {
+      this._controlRequests.set(requestId, { resolve, reject });
+      try {
+        this._postControl({ ...payload, type, requestId });
+      } catch (error) {
+        this._controlRequests.delete(requestId);
+        reject(error);
+      }
+    });
   }
 
   postMessage(value, transferList = undefined) {
-    const encoded = encodeWireMessage(value, transferList, { threadId: this.threadId });
-    if (this.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
-      cottontail.workerPostMessageTo(this.threadId, encoded);
+    if (!this._running) return;
+    const encoded = encodeWireMessage(value, transferList, { threadId: this._nativeThreadId });
+    if (this._nativeThreadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+      cottontail.workerPostMessageTo(this._nativeThreadId, encoded);
       return;
     }
     this._worker.postMessage(JSON.parse(encoded));
   }
 
-  terminate() {
-    if (!this._running) return Promise.resolve(0);
-    this._worker.terminate();
-    return new Promise((resolve) => {
-      queueMicrotask(() => {
-        this._emitExit(0);
-        resolve(0);
+  terminate(callback = undefined) {
+    if (callback !== undefined && typeof callback !== "function") {
+      throw invalidArgumentType("callback", "function", callback);
+    }
+    if (typeof callback === "function") {
+      globalThis.process?.emitWarning?.(
+        "Passing a callback to worker.terminate() is deprecated. It returns a Promise instead.",
+        "DeprecationWarning",
+        "DEP0132",
+      );
+    }
+    if (!this._running) {
+      const settled = Promise.resolve(this._exitCode ?? 0);
+      if (callback) settled.then(code => callback(null, code));
+      return settled;
+    }
+    if (!this._terminationPromise) {
+      this._terminationPromise = new Promise(resolve => {
+        this._terminationResolve = resolve;
       });
-    });
+      try {
+        this._postControl({ type: "terminate" });
+      } catch {}
+      this._terminationFallback = setTimeout(() => {
+        this._terminationFallback = null;
+        if (!this._running) return;
+        if (typeof cottontail.workerTerminate === "function") {
+          cottontail.workerTerminate(this._nativeThreadId);
+        } else {
+          this._worker.terminate();
+          queueMicrotask(() => this._emitExit(0));
+        }
+      }, 1000);
+    }
+    if (callback) this._terminationPromise.then(code => callback(null, code));
+    return this._terminationPromise;
   }
 
   async [Symbol.asyncDispose]() {
     await this.terminate();
   }
 
-  ref() { this._worker.ref?.(); return this; }
-  unref() { this._worker.unref?.(); return this; }
+  ref() {
+    this._refed = true;
+    this._worker.ref?.();
+    return this;
+  }
+
+  unref() {
+    this._refed = false;
+    this._worker.unref?.();
+    return this;
+  }
 
   getHeapStatistics() {
-    return Promise.resolve(globalThis.process?.memoryUsage?.() ?? {});
+    return this._requestControl("heapStatisticsRequest");
   }
 
   getHeapSnapshot(options = undefined) {
@@ -725,33 +990,21 @@ export class Worker extends EventEmitter {
         throw invalidArgumentType(`options.${key}`, "boolean", options[key]);
       }
     }
-    if (!this._running || this._emptyEvalSource) {
-      const error = new Error("Worker instance not running");
-      error.code = "ERR_WORKER_NOT_RUNNING";
-      return Promise.reject(error);
-    }
-    const requestId = nextWorkerControlRequestId++;
-    return new Promise((resolve, reject) => {
-      this._heapSnapshotRequests.set(requestId, { resolve, reject });
-      try {
-        this.postMessage({ [workerControlEnvelopeKey]: { type: "heapSnapshotRequest", requestId } });
-      } catch (error) {
-        this._heapSnapshotRequests.delete(requestId);
-        reject(error);
-      }
-    }).then(snapshot => new HeapSnapshotStream(jscHeapSnapshotToV8(snapshot)));
+    if (!this._running || this._emptyEvalSource) return Promise.reject(workerNotRunningError());
+    return this._requestControl("heapSnapshotRequest", { options })
+      .then(snapshot => new HeapSnapshotStream(jscHeapSnapshotToV8(String(snapshot ?? ""))));
   }
 
   cpuUsage() {
-    return Promise.resolve(globalThis.process?.cpuUsage?.() ?? { user: 0, system: 0 });
+    return Promise.reject(nativeBoundaryError("worker_threads.Worker.cpuUsage"));
   }
 
   startCpuProfile() {
-    return Promise.resolve({ stop: () => Promise.resolve({}) });
+    return Promise.reject(nativeBoundaryError("worker_threads.Worker.startCpuProfile"));
   }
 
   startHeapProfile() {
-    return Promise.resolve({ stop: () => Promise.resolve({}) });
+    return Promise.reject(nativeBoundaryError("worker_threads.Worker.startHeapProfile"));
   }
 }
 
@@ -760,44 +1013,67 @@ export class MessagePort extends EventEmitter {
     return Boolean(value && (value[messagePortBrand] || Function.prototype[Symbol.hasInstance].call(this, value)));
   }
 
-  constructor() {
+  constructor(token = undefined) {
+    if (token !== createMessagePortToken) throw new TypeError("Illegal constructor");
     super();
     this[messagePortBrand] = true;
-    this._id = nextPortId++;
+    this._id = `${threadId}:${nextPortId++}`;
     this._queue = [];
     this._closed = false;
     this._started = false;
     this._peer = null;
     this._remote = null;
+    this._remoteEndpointThreadId = null;
     this._transferred = false;
     this._onmessage = null;
-    this.onmessageerror = null;
+    this._onmessageerror = null;
     this._ref = true;
     this._dispatchScheduled = false;
+    this._eventTargetListeners = new Map();
   }
 
-  get onmessage() { return this._onmessage; }
+  get onmessage() {
+    return this._onmessage;
+  }
+
   set onmessage(handler) {
     this._onmessage = typeof handler === "function" ? handler : null;
     if (this._onmessage) this.start();
   }
 
+  get onmessageerror() {
+    return this._onmessageerror;
+  }
+
+  set onmessageerror(handler) {
+    this._onmessageerror = typeof handler === "function" ? handler : null;
+  }
+
   postMessage(value, transferList = undefined) {
     if (this._closed) return;
+    const transfers = validateTransferList(transferList);
+    if (transfers.includes(this)) throw dataCloneError("Transfer list contains source port");
+    if (this._peer && transfers.includes(this._peer)) {
+      throw dataCloneError("Transfer list contains the receiving port");
+    }
     const remote = this._remote ?? this._peer?._remote;
     if (remote) {
-      const encoded = encodeWireMessage(makePortMessage(remote.portId, value), transferList);
+      const endpointThreadId = this._remoteEndpointThreadId ?? this._peer?._remoteEndpointThreadId ?? remote.threadId;
+      const valueWire = encodeWireMessage(value, transfers, { threadId: endpointThreadId });
+      const encoded = encodeWireMessage(makePortMessage(remote.portId, valueWire, "message", endpointThreadId));
       if (remote.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
         cottontail.workerPostMessageTo(remote.threadId, encoded);
         return;
       }
-      if (!isMainThread && typeof cottontail.workerPostMessage === "function") {
+      if (remote.threadId === 0 && !isMainThread && typeof cottontail.workerPostMessage === "function") {
         cottontail.workerPostMessage(encoded);
         return;
       }
     }
     if (!this._peer || this._peer._closed) return;
-    this._peer._queue.push(cloneForMessage(value, transferList));
+    const context = {};
+    const cloned = cloneForMessage(value, transfers, context);
+    this._peer._queue.push({ value: cloned, ports: context.transferredPorts ?? [] });
     this._peer._scheduleDispatch();
   }
 
@@ -808,13 +1084,44 @@ export class MessagePort extends EventEmitter {
 
   close() {
     if (this._closed) return;
-    this._closed = true;
-    queueMicrotask(() => this.emit("close"));
+    const remote = this._remote ?? this._peer?._remote;
+    if (remote) {
+      const endpointThreadId = this._remoteEndpointThreadId ?? this._peer?._remoteEndpointThreadId ?? remote.threadId;
+      const encoded = encodeWireMessage(makePortMessage(remote.portId, undefined, "close", endpointThreadId));
+      if (remote.threadId > 0 && typeof cottontail.workerPostMessageTo === "function") {
+        cottontail.workerPostMessageTo(remote.threadId, encoded);
+      } else if (remote.threadId === 0 && !isMainThread && typeof cottontail.workerPostMessage === "function") {
+        cottontail.workerPostMessage(encoded);
+      }
+    }
+    this._closeLocal();
+    if (this._peer && !this._peer._closed) this._peer._closeLocal();
   }
 
-  ref() { this._ref = true; }
-  unref() { this._ref = false; }
-  hasRef() { return this._ref; }
+  _closeLocal() {
+    if (this._closed) return;
+    this._closed = true;
+    receivedMessagePorts.delete(this._id);
+    queueMicrotask(() => {
+      const event = { type: "close", target: this, currentTarget: this };
+      this._dispatchEventTarget("close", event);
+      this.emit("close");
+    });
+  }
+
+  ref() {
+    this._ref = true;
+    return this;
+  }
+
+  unref() {
+    this._ref = false;
+    return this;
+  }
+
+  hasRef() {
+    return this._ref;
+  }
 
   addListener(name, handler) {
     super.addListener(name, handler);
@@ -832,6 +1139,41 @@ export class MessagePort extends EventEmitter {
     return this;
   }
 
+  addEventListener(name, handler, options = undefined) {
+    if (typeof handler !== "function" && typeof handler?.handleEvent !== "function") return;
+    const key = String(name);
+    const byType = this._eventTargetListeners.get(key) ?? new Map();
+    if (byType.has(handler)) return;
+    byType.set(handler, { handler, once: options?.once === true });
+    this._eventTargetListeners.set(key, byType);
+    if (key === "message") this.start();
+  }
+
+  removeEventListener(name, handler) {
+    const key = String(name);
+    const byType = this._eventTargetListeners.get(key);
+    if (!byType?.has(handler)) return;
+    byType.delete(handler);
+    if (byType.size === 0) this._eventTargetListeners.delete(key);
+  }
+
+  _dispatchEventTarget(name, event) {
+    const byType = this._eventTargetListeners.get(String(name));
+    if (!byType) return;
+    for (const entry of [...byType.values()]) {
+      if (entry.once) this.removeEventListener(name, entry.handler);
+      if (typeof entry.handler === "function") entry.handler.call(this, event);
+      else entry.handler.handleEvent(event);
+    }
+  }
+
+  _emitMessageError(error) {
+    const event = { type: "messageerror", data: error, error, target: this, currentTarget: this };
+    if (typeof this.onmessageerror === "function") this.onmessageerror(event);
+    this._dispatchEventTarget("messageerror", event);
+    this.emit("messageerror", error);
+  }
+
   _scheduleDispatch() {
     if (this._dispatchScheduled || this._closed) return;
     this._dispatchScheduled = true;
@@ -842,24 +1184,66 @@ export class MessagePort extends EventEmitter {
   }
 
   _dispatch() {
-    if (!this._started && typeof this.onmessage !== "function" && this.listenerCount("message") === 0) return;
-    while (this._queue.length > 0) {
-      const value = this._queue.shift();
-      const event = { data: value };
+    if (!this._started && typeof this.onmessage !== "function" && this.listenerCount("message") === 0 &&
+        !this._eventTargetListeners.get("message")?.size) return;
+    while (this._queue.length > 0 && !this._closed) {
+      const entry = this._queue.shift();
+      const value = entry?.value;
+      const event = {
+        type: "message",
+        data: value,
+        ports: entry?.ports ?? [],
+        origin: "",
+        source: null,
+        target: this,
+        currentTarget: this,
+      };
       if (typeof this.onmessage === "function") this.onmessage(event);
+      this._dispatchEventTarget("message", event);
       this.emit("message", value);
     }
   }
 }
 
+Object.defineProperty(MessagePort.prototype, Symbol.toStringTag, {
+  configurable: true,
+  value: "MessagePort",
+});
+
 export class MessageChannel {
   constructor() {
-    this.port1 = new MessagePort();
-    this.port2 = new MessagePort();
+    this.port1 = new MessagePort(createMessagePortToken);
+    this.port2 = new MessagePort(createMessagePortToken);
     this.port1._peer = this.port2;
     this.port2._peer = this.port1;
   }
 }
+
+Object.defineProperty(MessageChannel.prototype, Symbol.toStringTag, {
+  configurable: true,
+  value: "MessageChannel",
+});
+
+globalThis.MessagePort = MessagePort;
+globalThis.MessageChannel = MessageChannel;
+
+function initializeWorkerMetadata() {
+  if (isMainThread) return;
+  const bootstrap = globalThis.__cottontailWorkerBootstrap ?? {};
+  workerData = bootstrap.workerDataWire != null
+    ? decodeWireMessage(bootstrap.workerDataWire)
+    : globalThis.__cottontailWorkerData ?? null;
+  resourceLimits = bootstrap.resourceLimitsWire != null
+    ? decodeWireMessage(bootstrap.resourceLimitsWire)
+    : globalThis.__cottontailWorkerResourceLimits ?? {};
+  threadName = String(bootstrap.threadName ?? globalThis.__cottontailWorkerThreadName ?? "");
+  const entries = bootstrap.environmentDataWire != null
+    ? decodeWireMessage(bootstrap.environmentDataWire)
+    : globalThis.__cottontailEnvironmentData ?? [];
+  for (const [key, value] of entries ?? []) environmentData.set(key, value);
+}
+
+initializeWorkerMetadata();
 
 export class BroadcastChannel extends EventEmitter {
   constructor(name) {
@@ -868,62 +1252,339 @@ export class BroadcastChannel extends EventEmitter {
     this.onmessage = null;
     this.onmessageerror = null;
     this._closed = false;
+    this._refed = true;
+    this._eventTargetListeners = new Map();
     const channels = broadcastChannels.get(this.name) ?? new Set();
     channels.add(this);
     broadcastChannels.set(this.name, channels);
   }
 
   postMessage(value) {
+    if (this._closed) {
+      const error = typeof globalThis.DOMException === "function"
+        ? new DOMException("BroadcastChannel is closed", "InvalidStateError")
+        : new Error("BroadcastChannel is closed");
+      throw error;
+    }
     for (const channel of broadcastChannels.get(this.name) ?? []) {
       if (channel === this || channel._closed) continue;
       const cloned = cloneForMessage(value);
       queueMicrotask(() => {
-        const event = { data: cloned };
+        const event = { type: "message", data: cloned, origin: "", target: channel, currentTarget: channel };
         channel.onmessage?.(event);
-        channel.emit("message", event);
+        channel._dispatchEventTarget("message", event);
+        channel.emit("message", cloned);
       });
     }
   }
 
-  close() {
-    this._closed = true;
-    broadcastChannels.get(this.name)?.delete(this);
+  addEventListener(name, handler, options = undefined) {
+    if (typeof handler !== "function" && typeof handler?.handleEvent !== "function") return;
+    const key = String(name);
+    const byType = this._eventTargetListeners.get(key) ?? new Map();
+    if (byType.has(handler)) return;
+    byType.set(handler, { handler, once: options?.once === true });
+    this._eventTargetListeners.set(key, byType);
   }
 
-  ref() { return this; }
-  unref() { return this; }
+  removeEventListener(name, handler) {
+    const key = String(name);
+    const byType = this._eventTargetListeners.get(key);
+    if (!byType?.has(handler)) return;
+    byType.delete(handler);
+    if (byType.size === 0) this._eventTargetListeners.delete(key);
+  }
+
+  _dispatchEventTarget(name, event) {
+    const byType = this._eventTargetListeners.get(String(name));
+    if (!byType) return;
+    for (const entry of [...byType.values()]) {
+      if (entry.once) this.removeEventListener(name, entry.handler);
+      if (typeof entry.handler === "function") entry.handler.call(this, event);
+      else entry.handler.handleEvent(event);
+    }
+  }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    broadcastChannels.get(this.name)?.delete(this);
+    this._eventTargetListeners.clear();
+  }
+
+  ref() {
+    this._refed = true;
+    return this;
+  }
+
+  unref() {
+    this._refed = false;
+    return this;
+  }
 }
 
-export const parentPort = isMainThread ? null : new class ParentPort extends EventEmitter {
+Object.defineProperty(BroadcastChannel.prototype, Symbol.toStringTag, {
+  configurable: true,
+  value: "BroadcastChannel",
+});
+
+globalThis.BroadcastChannel = BroadcastChannel;
+
+function sendParentControl(control) {
+  if (typeof cottontail.workerPostMessage !== "function") return;
+  cottontail.workerPostMessage(encodeWireMessage({ [workerControlEnvelopeKey]: control }));
+}
+
+function workerErrorPayload(value) {
+  let name = "Error";
+  let message;
+  let stack;
+  try {
+    if (typeof value?.name === "string") name = value.name;
+  } catch {}
+  try {
+    if (typeof value?.message === "string") message = value.message;
+  } catch {}
+  try {
+    if (typeof value?.stack === "string") stack = value.stack;
+  } catch {}
+  if (message === undefined) {
+    try {
+      message = formatValue(value);
+    } catch {
+      try {
+        message = String(value);
+      } catch {
+        message = "Worker execution failed";
+      }
+    }
+  }
+  return { name, message, stack };
+}
+
+export const parentPort = isMainThread ? null : new class ParentPort extends MessagePort {
   constructor() {
-    super();
+    super(createMessagePortToken);
+    this._refed = true;
     const transportListener = (event) => {
-      const message = decodeWireMessage(event.data);
-      if (!dispatchReceivedPortMessage(message)) this.emit("message", message);
+      let message;
+      const context = {};
+      try {
+        message = decodeWireMessage(event.data, context);
+      } catch (error) {
+        this._emitMessageError(error);
+        return;
+      }
+      if (dispatchReceivedPortMessage(message)) return;
+      const control = message?.[workerControlEnvelopeKey];
+      if (control) {
+        this._handleControl(control);
+        return;
+      }
+      if (!this._closed) {
+        this._queue.push({ value: message, ports: context.transferredPorts ?? [] });
+        this._scheduleDispatch();
+      }
     };
     transportListener[Symbol.for("cottontail.worker_threads.transportListener")] = true;
+    this._transportListener = transportListener;
     globalThis.addEventListener?.("message", transportListener);
-    globalThis.__cottontailWorkerThreadParentPortActive = () => this.listenerCount("message") > 0;
+  }
+
+  _handleControl(control) {
+    if (control.type === "terminate") {
+      globalThis.process.exitCode = 1;
+      sendParentControl({ type: "exitCode", code: 1 });
+      globalThis.__cottontailWorkerThreadsFatalCleanup?.();
+      cottontail.exit?.(1);
+      return;
+    }
+    if (control.type === "stdin") {
+      const stdin = globalThis.process?.stdin;
+      if (control.end === true) stdin?.push?.(null);
+      else {
+        const bytes = new Uint8Array(control.data ?? []);
+        stdin?.push?.(globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes);
+      }
+      return;
+    }
+    if (control.type === "threadMessage") {
+      globalThis.process?.emit?.("workerMessage", control.value, Number(control.sourceThreadId));
+      return;
+    }
+
+    const respond = (type, value = undefined, error = undefined) => {
+      sendParentControl({ type, requestId: control.requestId, value, error });
+    };
+    if (control.type === "heapSnapshotRequest") {
+      try {
+        respond("heapSnapshotResult", String(cottontail.jscHeapSnapshot()));
+      } catch (error) {
+        respond("heapSnapshotResult", undefined, String(error?.message ?? error));
+      }
+      return;
+    }
+    if (control.type === "heapStatisticsRequest") {
+      try {
+        respond("heapStatisticsResult", cottontail.jscMemoryUsage?.() ?? {});
+      } catch (error) {
+        respond("heapStatisticsResult", undefined, String(error?.message ?? error));
+      }
+    }
   }
 
   postMessage(value, transferList = undefined) {
-    validateTransferList(transferList);
-    if (typeof cottontail.workerPostMessage === "function") cottontail.workerPostMessage(encodeWireMessage(value, transferList));
-    else globalThis.postMessage?.(value);
+    if (this._closed) return;
+    if (typeof cottontail.workerPostMessage === "function") {
+      cottontail.workerPostMessage(encodeWireMessage(value, transferList, { threadId: 0 }));
+    } else {
+      globalThis.postMessage?.(value, transferList);
+    }
   }
 
-  close() {}
-  ref() { return this; }
-  unref() { return this; }
+  close() {
+    if (this._closed) return;
+    this._closeLocal();
+    this.removeAllListeners();
+  }
+
+  ref() {
+    this._refed = true;
+    return this;
+  }
+
+  unref() {
+    this._refed = false;
+    return this;
+  }
+
+  hasRef() {
+    return this._refed;
+  }
+
+  _keepsEventLoopAlive() {
+    return !this._closed && this._refed &&
+      (this.listenerCount("message") > 0 || typeof this.onmessage === "function" ||
+       Boolean(this._eventTargetListeners.get("message")?.size));
+  }
 }();
 
 if (!isMainThread) {
+  const previousWebHasActiveHandles = globalThis.__cottontailWebHasActiveHandles;
+  const previousWebPollAlways = globalThis.__cottontailWebPollAlways;
+  globalThis.__cottontailWebHasActiveHandles = () => {
+    if (previousWebHasActiveHandles?.()) return true;
+    if (parentPort?._keepsEventLoopAlive()) return true;
+    for (const port of receivedMessagePorts.values()) {
+      if (!port._closed && port._ref &&
+          (port.listenerCount("message") > 0 || typeof port.onmessage === "function")) return true;
+    }
+    return false;
+  };
+  globalThis.__cottontailWebPollAlways = () => {
+    if (previousWebPollAlways?.()) return true;
+    // The transport listener itself is not a user-visible active handle, but it
+    // must be polled while another handle keeps the worker loop alive so control
+    // messages such as terminate and stdin can be consumed.
+    if (parentPort && !parentPort._closed) return true;
+    return receivedMessagePorts.size > 0;
+  };
+  globalThis.__cottontailWorkerThreadsFatalCleanup = () => {
+    clearWorkerNativeTimers();
+    parentPort?.close();
+    globalThis.__cottontailWebHasActiveHandles = () => false;
+    globalThis.__cottontailWebPollAlways = () => false;
+    Object.defineProperty(globalThis, "__cottontailHasActiveHandles", {
+      configurable: true,
+      writable: true,
+      value: () => false,
+    });
+  };
+  globalThis.__cottontailWorkerThreadsReportError = (error) => {
+    if (workerUserCaptureCallbackInstalled &&
+        globalThis.process?.hasUncaughtExceptionCaptureCallback?.() === true &&
+        globalThis.process._fatalException?.(error, false)) return;
+    const userListeners = (globalThis.process?.rawListeners?.("uncaughtException") ??
+      globalThis.process?.listeners?.("uncaughtException") ?? [])
+      .filter(listener => !inheritedUncaughtExceptionListeners.has(listener.listener ?? listener));
+    if (userListeners.length > 0) {
+      for (const listener of userListeners) listener.call(globalThis.process, error, "uncaughtException");
+      return;
+    }
+    sendParentControl({ type: "error", error: workerErrorPayload(error) });
+    sendParentControl({ type: "exitCode", code: 1 });
+    globalThis.__cottontailWorkerThreadsFatalCleanup();
+    cottontail.exit?.(1);
+  };
+  globalThis.__cottontailConfigureWorkerStdio = () => {
+    const bootstrap = globalThis.__cottontailWorkerBootstrap ?? {};
+    if (bootstrap.stdin === true) {
+      const stdin = new Readable();
+      stdin._read = () => {};
+      globalThis.process.stdin = stdin;
+    }
+
+    const installOutput = (streamName) => {
+      const stream = globalThis.process?.[streamName] ?? {};
+      stream.write = (chunk, encoding = undefined, callback = undefined) => {
+        if (typeof encoding === "function") {
+          callback = encoding;
+          encoding = undefined;
+        }
+        sendParentControl({
+          type: "stdio",
+          stream: streamName,
+          data: bytesForStdio(chunk, encoding),
+        });
+        callback?.();
+        return true;
+      };
+      globalThis.process[streamName] = stream;
+    };
+
+    if (bootstrap.stdout === true) {
+      installOutput("stdout");
+      for (const name of ["log", "info", "debug"]) {
+        globalThis.console[name] = (...args) => {
+          sendParentControl({
+            type: "stdio",
+            stream: "stdout",
+            data: bytesForStdio(`${formatValue(...args)}\n`),
+          });
+        };
+      }
+    }
+    if (bootstrap.stderr === true) {
+      installOutput("stderr");
+      for (const name of ["error", "warn"]) {
+        globalThis.console[name] = (...args) => {
+          sendParentControl({
+            type: "stdio",
+            stream: "stderr",
+            data: bytesForStdio(`${formatValue(...args)}\n`),
+          });
+        };
+      }
+    }
+  };
+
   globalThis.parentPort ??= parentPort;
   globalThis.workerData ??= workerData;
+
+  if (typeof globalThis.process?.exit === "function") {
+    const processExit = globalThis.process.exit;
+    globalThis.process.exit = function exit(code = this?.exitCode ?? 0) {
+      const exitCode = Number(code) || 0;
+      sendParentControl({ type: "exitCode", code: exitCode });
+      globalThis.__cottontailWorkerThreadsFatalCleanup?.();
+      return processExit.call(this, exitCode);
+    };
+  }
 }
 
 export function setEnvironmentData(key, value) {
-  environmentData.set(key, value);
+  if (value === undefined) environmentData.delete(key);
+  else environmentData.set(key, value);
 }
 
 export function getEnvironmentData(key) {
@@ -947,36 +1608,164 @@ export function moveMessagePortToContext(port, contextifiedSandbox) {
   if (contextifiedSandbox === null || (typeof contextifiedSandbox !== "object" && typeof contextifiedSandbox !== "function")) {
     throw invalidArgumentType("contextifiedSandbox", "a vm.Context", contextifiedSandbox);
   }
-  return port;
+  throw nativeBoundaryError("worker_threads.moveMessagePortToContext vm realm transfer");
 }
 
 export function receiveMessageOnPort(port) {
   if (!(port instanceof MessagePort)) throw invalidArgumentType("port", "a MessagePort instance", port);
+  if (port._queue.length === 0 && isMainThread) {
+    for (const worker of workerInstances.values()) worker._worker?._poll?.();
+  }
   if (port._queue.length === 0) return undefined;
-  return { message: port._queue.shift() };
+  return { message: port._queue.shift().value };
 }
 
 export function postMessageToThread(targetThreadId, value, transferList = undefined, timeout = undefined) {
-  void timeout;
-  const worker = workerInstances.get(Number(targetThreadId));
-  if (!worker) return Promise.resolve(false);
-  worker.postMessage(value, transferList);
-  return Promise.resolve(true);
+  const target = Number(targetThreadId);
+  if (!Number.isInteger(target) || target < 0) {
+    return Promise.reject(invalidArgumentType("threadId", "an integer", targetThreadId));
+  }
+  if (target === threadId) {
+    const error = new Error("Cannot send a message to the same thread");
+    error.code = "ERR_WORKER_MESSAGING_SAME_THREAD";
+    return Promise.reject(error);
+  }
+  if (timeout !== undefined && (!Number.isFinite(Number(timeout)) || Number(timeout) < 0)) {
+    return Promise.reject(invalidArgumentType("timeout", "a non-negative number", timeout));
+  }
+
+  let encoded;
+  try {
+    encoded = encodeWireMessage({
+      [workerControlEnvelopeKey]: { type: "threadMessage", sourceThreadId: threadId, value },
+    }, transferList, { threadId: target });
+    if (target === 0 && !isMainThread) cottontail.workerPostMessage(encoded);
+    else if (target > 0) cottontail.workerPostMessageTo(target, encoded);
+    else throw new Error("worker not found");
+  } catch (cause) {
+    const error = new Error("Cannot find the destination thread or listener", { cause });
+    error.code = "ERR_WORKER_MESSAGING_FAILED";
+    return Promise.reject(error);
+  }
+  return Promise.resolve(undefined);
+}
+
+const localLockStates = new Map();
+let nextLockClientId = 1;
+
+function lockAbortError() {
+  if (typeof globalThis.DOMException === "function") return new DOMException("The operation was aborted", "AbortError");
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function lockState(name) {
+  let state = localLockStates.get(name);
+  if (!state) {
+    state = { held: [], pending: [] };
+    localLockStates.set(name, state);
+  }
+  return state;
+}
+
+function canGrantLock(state, mode) {
+  return state.held.length === 0 || (mode === "shared" && state.held.every(lock => lock.mode === "shared"));
+}
+
+function releaseLockRequest(request) {
+  const state = lockState(request.name);
+  const index = state.held.indexOf(request);
+  if (index >= 0) state.held.splice(index, 1);
+  queueMicrotask(() => pumpLockQueue(request.name));
+}
+
+function grantLockRequest(request) {
+  const state = lockState(request.name);
+  state.held.push(request);
+  request.abortCleanup?.();
+  Promise.resolve()
+    .then(() => request.callback({ name: request.name, mode: request.mode }))
+    .then(request.resolve, request.reject)
+    .finally(() => releaseLockRequest(request));
+}
+
+function pumpLockQueue(name) {
+  const state = lockState(name);
+  while (state.pending.length > 0) {
+    const request = state.pending[0];
+    if (!canGrantLock(state, request.mode)) break;
+    state.pending.shift();
+    grantLockRequest(request);
+    if (request.mode === "exclusive") break;
+  }
+  if (state.held.length === 0 && state.pending.length === 0) localLockStates.delete(name);
 }
 
 export const locks = {
-  async request(name, options = {}, callback = undefined) {
+  request(name, options = {}, callback = undefined) {
     if (typeof options === "function") {
       callback = options;
       options = {};
     }
-    const lock = { name: String(name), mode: options.mode ?? "exclusive" };
-    return callback ? callback(lock) : undefined;
+    if (typeof callback !== "function") throw invalidArgumentType("callback", "function", callback);
+    if (options === null || typeof options !== "object") throw invalidArgumentType("options", "object", options);
+    const lockName = String(name);
+    const mode = options.mode ?? "exclusive";
+    if (mode !== "exclusive" && mode !== "shared") {
+      const error = new TypeError(`The provided value '${String(mode)}' is not a valid enum value of type LockMode.`);
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason ?? lockAbortError());
+
+    return new Promise((resolve, reject) => {
+      const state = lockState(lockName);
+      const request = {
+        name: lockName,
+        mode,
+        clientId: String(nextLockClientId++),
+        callback,
+        resolve,
+        reject,
+        abortCleanup: null,
+      };
+      if (options.ifAvailable === true && !canGrantLock(state, mode)) {
+        Promise.resolve().then(() => callback(null)).then(resolve, reject);
+        return;
+      }
+      if (options.signal?.addEventListener) {
+        const abort = () => {
+          const index = state.pending.indexOf(request);
+          if (index >= 0) state.pending.splice(index, 1);
+          reject(options.signal.reason ?? lockAbortError());
+        };
+        options.signal.addEventListener("abort", abort, { once: true });
+        request.abortCleanup = () => options.signal.removeEventListener?.("abort", abort);
+      }
+      state.pending.push(request);
+      pumpLockQueue(lockName);
+    });
   },
+
   async query() {
-    return { held: [], pending: [] };
+    const held = [];
+    const pending = [];
+    for (const state of localLockStates.values()) {
+      for (const lock of state.held) held.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
+      for (const lock of state.pending) pending.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
+    }
+    return { held, pending };
   },
 };
+
+// COTTONTAIL-COMPAT: node:worker_threads native boundaries - hard interruption of
+// running JSC, parent-loop ref/unref, resource-limit enforcement and OS thread
+// naming, per-thread CPU/profilers, live SHARE_ENV, process-wide BroadcastChannel
+// and Web Locks, vm realm transfer, postMessageToThread acknowledgement/timeouts,
+// natural exitCode/beforeExit propagation, and native stdio backpressure need host
+// support. The JavaScript implementation does not synthesize those measurements
+// or claim enforcement; focused boundary tests encode each remaining contract.
 
 export default {
   BroadcastChannel,
