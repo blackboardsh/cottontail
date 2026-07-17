@@ -5,7 +5,7 @@ import { connect as netConnect, isIP, Server as NetServer, Socket } from "./net.
 
 export const CLIENT_RENEG_LIMIT = 3;
 export const CLIENT_RENEG_WINDOW = 600;
-export const DEFAULT_CIPHERS = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
+export const DEFAULT_CIPHERS = "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA";
 export const DEFAULT_ECDH_CURVE = "auto";
 export const DEFAULT_MAX_VERSION = "TLSv1.3";
 export const DEFAULT_MIN_VERSION = "TLSv1.2";
@@ -17,8 +17,49 @@ const certificatePaths = [
   "/usr/local/etc/openssl@3/cert.pem",
 ];
 
+const bunTlsConnectOptions = Symbol.for("::buntlsconnectoptions::");
+
+function tlsError(message, code, details = undefined) {
+  const error = new Error(message);
+  if (code != null) error.code = code;
+  if (details) Object.assign(error, details);
+  return error;
+}
+
+function normalizeTlsError(value, fallback = "TLS operation failed") {
+  if (value instanceof Error) return value;
+  const error = new Error(value == null ? fallback : String(value));
+  if (/connection reset|unexpected eof|closed before.*handshake/i.test(error.message)) error.code = "ECONNRESET";
+  return error;
+}
+
+function validateCiphers(ciphers, name = "options") {
+  if (ciphers == null) return;
+  if (typeof ciphers !== "string") {
+    const error = new TypeError(`The "${name}.ciphers" property must be of type string. Received ${typeof ciphers}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (ciphers.length === 0) return;
+  try {
+    cottontail.tlsValidateCiphers?.(ciphers);
+  } catch (error) {
+    if (error?.code !== "ERR_SSL_NO_CIPHER_MATCH") throw error;
+    error.library = "SSL routines";
+    error.reason = "no cipher match";
+    error.message = "No cipher match";
+    throw error;
+  }
+}
+
+function normalizeCertificateLabels(value) {
+  return String(value ?? "")
+    .replace(/-----BEGIN (?:X509 |TRUSTED )CERTIFICATE-----/g, "-----BEGIN CERTIFICATE-----")
+    .replace(/-----END (?:X509 |TRUSTED )CERTIFICATE-----/g, "-----END CERTIFICATE-----");
+}
+
 function parsePemCertificates(text) {
-  const matches = String(text || "").match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+  const matches = normalizeCertificateLabels(text).match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
   return matches ? matches.map((cert) => cert.trim()) : [];
 }
 
@@ -94,7 +135,8 @@ function normalizeListenArgs(args) {
 
 function flattenPem(value) {
   if (value == null) return "";
-  return Array.isArray(value) ? value.map(String).join("\n") : String(value);
+  const text = Array.isArray(value) ? value.map(String).join("\n") : String(value);
+  return normalizeCertificateLabels(text);
 }
 
 // Decrypt a traditional (Proc-Type: 4,ENCRYPTED) PEM private key in JS: the
@@ -169,8 +211,15 @@ function tlsCredentialOptions(options) {
     : ArrayBuffer.isView(passphraseOption) || passphraseOption instanceof ArrayBuffer
       ? Buffer.from(passphraseOption).toString()
       : String(passphraseOption);
+  let ca = flattenPem(options?.ca ?? context.ca);
+  if (!ca && process.env.NODE_EXTRA_CA_CERTS) {
+    try {
+      const extra = cottontail.readFile(String(process.env.NODE_EXTRA_CA_CERTS));
+      ca = flattenPem([...rootCertificates, extra]);
+    } catch {}
+  }
   return {
-    ca: flattenPem(options?.ca ?? context.ca),
+    ca,
     cert: flattenPem(options?.cert ?? context.cert),
     key: prepareTlsKey(options?.key ?? context.key, passphrase),
     passphrase,
@@ -282,6 +331,7 @@ export function checkServerIdentity(host, cert) {
 
 export class SecureContext {
   constructor(options = {}) {
+    validateCiphers(options?.ciphers);
     this.context = {
       ...options,
       ca: options.ca == null ? undefined : normalizeCertificates(options.ca),
@@ -329,8 +379,24 @@ export class TLSSocket extends Socket {
     this._encoding = null;
     this._tlsListenerInstalled = false;
     this._tlsHandshakeTimer = null;
+    this._memoryTransport = null;
+    this._memoryTransportListeners = null;
+    this._memoryTransportEnded = false;
+    this._memoryTransportEndPending = null;
+    this._secureEventsEmitted = false;
     this._session = bufferFromNativeBytes(options?.session);
     this._renegotiationDisabled = false;
+    this._rejectUnauthorized = options?.rejectUnauthorized !== false;
+    this._requestCert = options?.requestCert !== false;
+    this._checkServerIdentity = options?.checkServerIdentity ?? checkServerIdentity;
+    this.isServer = options?.isServer === true;
+    this.secureConnecting = true;
+    this._secureEstablished = false;
+    this._securePending = true;
+    if (socket && typeof socket === "object" && typeof socket._detachFdForTls !== "function") {
+      this._handle = socket;
+      try { socket._parentWrap = this; } catch {}
+    }
     // Node's TLSSocket always disables half-open, ignoring the option.
     this.allowHalfOpen = false;
     this.connecting = true;
@@ -354,17 +420,172 @@ export class TLSSocket extends Socket {
     return this;
   }
 
+  _attachMemoryTransport(native, transport, connectedEvent = "secureConnect") {
+    this._tlsId = Number(native.id);
+    this.fd = -1;
+    this._tlsInfo = native;
+    this._memoryTransport = transport;
+    this.destroyed = false;
+    this.readable = true;
+    this.writable = true;
+    const onData = (chunk) => {
+      if (this.destroyed || this._tlsId == null) return;
+      try {
+        cottontail.tlsConnectionFeedMemory(this._tlsId, bytesFrom(chunk));
+        this._refreshTimeout?.();
+        if (this.connecting) this._driveMemoryHandshake(connectedEvent);
+        else if (this._secureEventsEmitted) {
+          this._drainMemoryPlaintext();
+          this._flushMemoryCiphertext();
+        }
+      } catch (error) {
+        this.destroy(normalizeTlsError(error));
+      }
+    };
+    const onEnd = () => this._endMemoryTransport();
+    const onClose = () => this._endMemoryTransport();
+    const onError = (error) => this.destroy(normalizeTlsError(error));
+    const onDrain = () => this.emit("drain");
+    this._memoryTransportListeners = { onData, onEnd, onClose, onError, onDrain };
+    transport.on("data", onData);
+    transport.once("end", onEnd);
+    transport.once("close", onClose);
+    transport.once("error", onError);
+    transport.on("drain", onDrain);
+    this._tlsHandshakeTimer = setTimeout(() => {
+      if (!this.connecting || this.destroyed) return;
+      const error = tlsError("TLS handshake timed out", "ETIMEDOUT");
+      this.destroy(error);
+    }, 10000);
+    this._driveMemoryHandshake(connectedEvent);
+    return this;
+  }
+
+  _driveMemoryHandshake(connectedEvent) {
+    if (this.destroyed || this._tlsId == null || !this.connecting) return;
+    try {
+      const complete = cottontail.tlsClientHandshake(this._tlsId) === true;
+      this._flushMemoryCiphertext();
+      if (!complete) return;
+      if (this._tlsHandshakeTimer != null) {
+        clearTimeout(this._tlsHandshakeTimer);
+        this._tlsHandshakeTimer = null;
+      }
+      this._tlsInfo = cottontail.tlsConnectionInfo?.(this._tlsId) ?? this._tlsInfo;
+      this._finishTlsConnect(connectedEvent);
+      this._flushMemoryCiphertext();
+    } catch (error) {
+      this.destroy(normalizeTlsError(error));
+    }
+  }
+
+  _flushMemoryCiphertext() {
+    if (this._tlsId == null || this._memoryTransport == null) return true;
+    let writable = true;
+    for (;;) {
+      const encrypted = cottontail.tlsConnectionDrainMemory(this._tlsId);
+      const chunk = bufferFromNativeBytes(encrypted);
+      if (chunk == null || chunk.byteLength === 0) break;
+      writable = this._memoryTransport.write(chunk) !== false && writable;
+    }
+    return writable;
+  }
+
+  _drainMemoryPlaintext() {
+    if (this._tlsId == null || this._memoryTransport == null || this.connecting) return;
+    const result = cottontail.tlsConnectionReadMemory(this._tlsId);
+    const chunk = bufferFromNativeBytes(result?.data);
+    if (chunk != null && chunk.byteLength > 0) {
+      this.bytesRead += chunk.byteLength;
+      this._emitData(this._encoding ? chunk.toString(this._encoding) : chunk);
+      this._refreshTimeout?.();
+    }
+    if (result?.error) {
+      const error = tlsError(String(result.error), result.code);
+      this.destroy(error);
+      return;
+    }
+    if (result?.ended) this._endMemoryTransport(true);
+  }
+
+  _endMemoryTransport(receivedCloseNotify = false) {
+    if (this._memoryTransportEnded || this.destroyed) return;
+    if (!this.connecting && !this._secureEventsEmitted) {
+      this._memoryTransportEndPending = Boolean(receivedCloseNotify || this._memoryTransportEndPending);
+      return;
+    }
+    this._memoryTransportEnded = true;
+    if (this.connecting) {
+      this.destroy(tlsError("Client network socket disconnected before secure TLS connection was established", "ECONNRESET"));
+      return;
+    }
+    if (!receivedCloseNotify) {
+      try { this._drainMemoryPlaintext(); } catch {}
+      if (this.destroyed) return;
+    }
+    if (this.writable) this.end();
+    this.readable = false;
+    this._emitEnd();
+  }
+
+  _removeMemoryTransportListeners() {
+    const transport = this._memoryTransport;
+    const listeners = this._memoryTransportListeners;
+    if (transport == null || listeners == null) return;
+    transport.removeListener?.("data", listeners.onData);
+    transport.removeListener?.("end", listeners.onEnd);
+    transport.removeListener?.("close", listeners.onClose);
+    transport.removeListener?.("error", listeners.onError);
+    transport.removeListener?.("drain", listeners.onDrain);
+    this._memoryTransportListeners = null;
+  }
+
   _finishTlsConnect(connectedEvent) {
     this.connecting = false;
-    this.authorized = true;
-    this.authorizationError = null;
+    this.secureConnecting = false;
+    this._secureEstablished = true;
+    this._securePending = false;
+    const info = this._currentTlsInfo() ?? {};
+    let authorizationError = info.verifyErrorCode
+      ? tlsError(info.verifyErrorMessage || info.verifyErrorCode, info.verifyErrorCode)
+      : null;
+    if (!this.isServer && !authorizationError && typeof this._checkServerIdentity === "function") {
+      const certificate = legacyCertificateFromBytes(info.peerCertificate);
+      if (certificate?.raw) {
+        try {
+          authorizationError = this._checkServerIdentity(this.servername || this._host || "localhost", certificate) || null;
+        } catch (error) {
+          authorizationError = normalizeTlsError(error);
+        }
+      }
+    }
+    this.authorized = authorizationError == null;
+    this.authorizationError = authorizationError == null
+      ? null
+      : authorizationError.code || authorizationError.message;
+    this.servername = info.servername || this.servername;
     this.alpnProtocol = this._tlsInfo?.alpnProtocol || false;
+    if (authorizationError && this._rejectUnauthorized) {
+      this.destroy(authorizationError);
+      return;
+    }
     queueMicrotask(() => {
       if (this.destroyed) return;
       this._flushPendingWrites?.();
+      this._startTlsRead();
       this.emit("connect");
       this.emit(connectedEvent);
-      this._startTlsRead();
+      this.emit("secure", this);
+      this._secureEventsEmitted = true;
+      if (this._memoryTransport != null) {
+        this._drainMemoryPlaintext();
+        this._flushMemoryCiphertext();
+        if (!this.destroyed && this._memoryTransportEndPending != null) {
+          const receivedCloseNotify = this._memoryTransportEndPending;
+          this._memoryTransportEndPending = null;
+          this._endMemoryTransport(receivedCloseNotify);
+        }
+      }
     });
   }
 
@@ -386,6 +607,7 @@ export class TLSSocket extends Socket {
         }
         this._tlsHandshakeTimer = setTimeout(step, 1);
       } catch (error) {
+        error = normalizeTlsError(error);
         this.authorized = false;
         this.authorizationError = error?.message ?? String(error);
         this.connecting = false;
@@ -405,6 +627,7 @@ export class TLSSocket extends Socket {
 
   _startTlsRead() {
     if (this._tlsId == null || this._tlsListenerInstalled) return this;
+    if (this._memoryTransport != null) return this;
     const listeners = installTlsEventDispatcher();
     listeners.set(this._tlsId, _wrapAsyncCallback((event) => {
       if (this.destroyed) return;
@@ -449,7 +672,7 @@ export class TLSSocket extends Socket {
       callback = encoding;
       encoding = undefined;
     }
-    if (this.connecting && this._tlsId == null && !this.destroyed && this.writable) {
+    if (this.connecting && !this.destroyed && this.writable) {
       this._pendingWrites.push({ chunk, encoding, callback });
       return true;
     }
@@ -461,6 +684,7 @@ export class TLSSocket extends Socket {
     }
     const bytes = bytesFrom(chunk, encoding);
     const ok = cottontail.tlsConnectionWrite(this._tlsId, bytes) === true;
+    if (this._memoryTransport != null) this._flushMemoryCiphertext();
     if (ok) {
       this.bytesWritten += bytes.byteLength;
       this._refreshTimeout?.();
@@ -485,7 +709,13 @@ export class TLSSocket extends Socket {
       this.emit("finish");
     }
     if (this._tlsId != null) {
-      try { cottontail.tlsConnectionShutdown(this._tlsId); } catch {}
+      try {
+        cottontail.tlsConnectionShutdown(this._tlsId);
+        if (this._memoryTransport != null) this._flushMemoryCiphertext();
+      } catch {}
+    }
+    if (this._memoryTransport != null) {
+      try { this._memoryTransport.end?.(); } catch {}
     }
     if (typeof callback === "function") callback();
     return this;
@@ -502,6 +732,7 @@ export class TLSSocket extends Socket {
       this._tlsHandshakeTimer = null;
     }
     const listeners = globalThis.__cottontailTlsListeners;
+    this._removeMemoryTransportListeners();
     if (this._tlsId != null) {
       listeners?.delete?.(this._tlsId);
       try { cottontail.tlsConnectionClose(this._tlsId); } catch {}
@@ -526,12 +757,24 @@ export class TLSSocket extends Socket {
   getCipher() {
     const info = this._currentTlsInfo();
     if (!info?.cipher) return undefined;
-    return { name: info.cipher, standardName: info.cipher, version: info.protocol ?? undefined };
+    return { name: info.cipher, standardName: info.cipher, version: info.cipherVersion ?? info.protocol ?? undefined };
   }
   getEphemeralKeyInfo() { return {}; }
+  getSharedSigalgs() {
+    const value = this._currentTlsInfo()?.sharedSigalgs;
+    return Array.isArray(value) ? [...value] : [];
+  }
   getFinished() { return undefined; }
   getPeerCertificate() {
     return legacyCertificateFromBytes(this._currentTlsInfo()?.peerCertificate);
+  }
+  getPeerX509Certificate() {
+    const raw = bufferFromNativeBytes(this._currentTlsInfo()?.peerCertificate);
+    return raw == null || raw.byteLength === 0 ? undefined : new X509Certificate(raw);
+  }
+  getX509Certificate() {
+    const raw = bufferFromNativeBytes(this._currentTlsInfo()?.localCertificate);
+    return raw == null || raw.byteLength === 0 ? undefined : new X509Certificate(raw);
   }
   getPeerFinished() { return undefined; }
   getProtocol() {
@@ -554,6 +797,44 @@ export class TLSSocket extends Socket {
     this._session = bufferFromNativeBytes(session) ?? Buffer.from(session ?? []);
     return this;
   }
+  setServername(name) {
+    if (typeof name !== "string") {
+      const error = new TypeError(`The "name" argument must be of type string. Received ${name === null ? "null" : `type ${typeof name} (${String(name)})`}`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (this.isServer) {
+      throw tlsError("Cannot issue SNI from a TLS server-side socket", "ERR_TLS_SNI_FROM_SERVER");
+    }
+    this.servername = name;
+    if (this._tlsId != null) cottontail.tlsConnectionSetServername?.(this._tlsId, name);
+  }
+  setMaxSendFragment(size) {
+    if (typeof size !== "number") {
+      const error = new TypeError(`The "size" argument must be of type number. Received type ${typeof size} (${String(size)})`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (!Number.isInteger(size)) {
+      const error = new RangeError(`The value of "size" is out of range. It must be an integer. Received ${String(size)}`);
+      error.code = "ERR_OUT_OF_RANGE";
+      throw error;
+    }
+    if (size < 512 || size > 16384) return false;
+    return this._tlsId == null ? true : cottontail.tlsConnectionSetMaxSendFragment?.(this._tlsId, size) === true;
+  }
+  exportKeyingMaterial(length, label, context = undefined) {
+    if (this._tlsId == null || typeof cottontail.tlsConnectionExportKeyingMaterial !== "function") {
+      throw tlsError("TLS socket is not connected", "ERR_TLS_INVALID_STATE");
+    }
+    const result = cottontail.tlsConnectionExportKeyingMaterial(
+      this._tlsId,
+      Number(length),
+      String(label),
+      context == null ? undefined : bytesFrom(context),
+    );
+    return bufferFromNativeBytes(result) ?? Buffer.alloc(0);
+  }
   disableRenegotiation() {
     this._renegotiationDisabled = true;
     return undefined;
@@ -574,7 +855,6 @@ export class TLSSocket extends Socket {
     if (typeof callback === "function") queueMicrotask(() => callback(null));
     return true;
   }
-  setMaxSendFragment() { return false; }
 }
 
 export class Server extends NetServer {
@@ -584,7 +864,49 @@ export class Server extends NetServer {
     this._tlsServerId = null;
     this._tlsAcceptTimer = null;
     this._tlsAddress = null;
+    this._tlsContexts = new Map();
+    validateCiphers(this._tlsOptions.ciphers);
+    this.on("connection", (socket) => {
+      if (!socket?.encrypted) this._upgradeAcceptedSocket(socket);
+    });
     if (typeof secureConnectionListener === "function") this.on("secureConnection", secureConnectionListener);
+  }
+
+  setSecureContext(options = {}) {
+    const context = options instanceof SecureContext ? options.context : options;
+    validateCiphers(context?.ciphers);
+    this._tlsOptions = { ...this._tlsOptions, ...(context ?? {}) };
+    return this;
+  }
+
+  addContext(hostname, context) {
+    if (typeof hostname !== "string" || hostname.length === 0) {
+      const error = new TypeError("hostname must be a string");
+      error.code = "ERR_TLS_REQUIRED_SERVER_NAME";
+      throw error;
+    }
+    const secureContext = context instanceof SecureContext ? context : createSecureContext(context);
+    this._tlsContexts.set(hostname, secureContext);
+    return this;
+  }
+
+  _upgradeAcceptedSocket(parentSocket) {
+    let socket;
+    try {
+      socket = _upgradeServerSocket(parentSocket, {
+        ...this._tlsOptions,
+        isServer: true,
+        contexts: this._tlsContexts,
+      });
+    } catch (error) {
+      error = normalizeTlsError(error);
+      parentSocket?.destroy?.();
+      this.emit("tlsClientError", error, parentSocket);
+      return;
+    }
+    socket.server = this;
+    socket.once("error", (error) => this.emit("tlsClientError", error, socket));
+    socket.once("secureConnect", () => this.emit("secureConnection", socket));
   }
 
   listen(...args) {
@@ -605,34 +927,26 @@ export class Server extends NetServer {
         throw error;
       }
     }
-    if (typeof callback === "function") this.once("listening", callback);
-    queueMicrotask(() => {
-      try {
-        if (listenOptions.path != null) {
-          const err = new Error("TLS servers over unix domain sockets require native support in Cottontail");
-          err.code = "ERR_NOT_IMPLEMENTED";
-          throw err;
-        }
-        const key = prepareTlsKey(this._tlsOptions.key, this._tlsOptions.passphrase);
-        const alpnProtocols = prepareALPNProtocols(this._tlsOptions.ALPNProtocols);
-        const native = cottontail.tlsServerListen(
-          Number(listenOptions.port ?? 0) || 0,
-          listenOptions.host ?? listenOptions.hostname ?? "127.0.0.1",
-          flattenPem(this._tlsOptions.cert),
-          key,
-          this._tlsOptions.passphrase == null ? undefined : String(this._tlsOptions.passphrase),
-          alpnProtocols,
-        );
-        this._tlsServerId = Number(native.id);
-        this._tlsAddress = native.address ?? null;
-        this.listening = true;
-        this._tlsAcceptTimer = setInterval(() => this._acceptTls(), 1);
-        this.emit("listening", undefined, this._tlsAddress?.address, Number(this._tlsAddress?.port ?? 0));
-      } catch (error) {
-        this.emit("error", error);
-      }
-    });
-    return this;
+    try {
+      const credentials = tlsCredentialOptions(this._tlsOptions);
+      cottontail.tlsValidateServerContext?.(
+        credentials.cert,
+        credentials.key,
+        credentials.passphrase,
+        credentials.ca,
+        this._tlsOptions.ciphers,
+        Boolean(this._tlsOptions.requestCert),
+        this._tlsOptions.rejectUnauthorized !== false,
+      );
+    } catch (error) {
+      queueMicrotask(() => this.emit("error", normalizeTlsError(error)));
+      return this;
+    }
+    if (listenOptions.path == null && listenOptions.host == null && listenOptions.hostname == null) {
+      listenOptions.host = "::";
+      listenOptions.family = 6;
+    }
+    return super.listen(listenOptions, callback);
   }
 
   _acceptTls() {
@@ -646,7 +960,7 @@ export class Server extends NetServer {
         return;
       }
       if (accepted == null) return;
-      const socket = new TLSSocket(undefined, this._tlsOptions)._attachNative(accepted, "secureConnect");
+      const socket = new TLSSocket(undefined, { ...this._tlsOptions, isServer: true })._attachNative(accepted, "secureConnect");
       this.connections += 1;
       socket.once("close", () => {
         if (this.connections > 0) this.connections -= 1;
@@ -657,6 +971,7 @@ export class Server extends NetServer {
   }
 
   close(callback = undefined) {
+    if (this._tlsServerId == null) return super.close(callback);
     if (callback) this.once("close", callback);
     if (this._tlsAcceptTimer) {
       clearInterval(this._tlsAcceptTimer);
@@ -672,14 +987,37 @@ export class Server extends NetServer {
   }
 
   address() {
-    return this._tlsAddress;
+    return this._tlsAddress ?? super.address();
+  }
+
+
+  getTicketKeys() {
+    throw new Error("TLS ticket key access is not available");
+  }
+
+  setTicketKeys() {
+    throw new Error("TLS ticket key access is not available");
   }
 }
 
 export function connect(...args) {
   const [options, callback] = normalizeConnectArgs(args);
+  validateCiphers(options.ciphers);
   let parentSocket = options.socket;
   const socket = new TLSSocket(parentSocket, options);
+  const host = options.host ?? options.hostname ?? "localhost";
+  const defaultServername = isIP(String(host)) ? "" : String(host);
+  const servername = options.servername ?? defaultServername;
+  socket.servername = servername || undefined;
+  socket._host = String(host);
+  socket[bunTlsConnectOptions] = {
+    serverName: options.servername ?? String(host),
+    servername,
+    rejectUnauthorized: options.rejectUnauthorized !== false,
+    requestCert: options.requestCert !== false,
+    checkServerIdentity: options.checkServerIdentity ?? checkServerIdentity,
+    session: options.session ?? null,
+  };
   if (typeof callback === "function") socket.once("secureConnect", callback);
 
   const fail = (error) => {
@@ -694,25 +1032,41 @@ export function connect(...args) {
     parentSocket?.removeListener?.("error", fail);
     try {
       const credentials = tlsCredentialOptions(options);
-      const servername = options.servername ?? options.host ?? options.hostname ?? "localhost";
       const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
-      if (typeof parentSocket?._detachFdForTls !== "function" || typeof cottontail.tlsClientConnectFd !== "function") {
-        const error = new TypeError('The "options.socket" property must be a Cottontail net.Socket');
-        error.code = "ERR_INVALID_ARG_TYPE";
-        throw error;
+      if (typeof parentSocket?._detachFdForTls === "function" && typeof cottontail.tlsClientConnectFd === "function") {
+        const fd = parentSocket._detachFdForTls();
+        const native = cottontail.tlsClientConnectFd(
+          fd,
+          servername,
+          options.rejectUnauthorized !== false,
+          credentials.ca,
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          alpnProtocols,
+          options.ciphers,
+        );
+        socket._attachNative(native, "secureConnect");
+        return;
       }
-      const fd = parentSocket._detachFdForTls();
-      const native = cottontail.tlsClientConnectFd(
-        fd,
-        servername,
-        options.rejectUnauthorized !== false,
-        credentials.ca,
-        credentials.cert,
-        credentials.key,
-        credentials.passphrase,
-        alpnProtocols,
-      );
-      socket._attachNative(native, "secureConnect");
+      if (typeof parentSocket?.on === "function" && typeof parentSocket?.write === "function" &&
+          typeof cottontail.tlsClientConnectMemory === "function") {
+        const native = cottontail.tlsClientConnectMemory(
+          servername,
+          options.rejectUnauthorized !== false,
+          credentials.ca,
+          credentials.cert,
+          credentials.key,
+          credentials.passphrase,
+          alpnProtocols,
+          options.ciphers,
+        );
+        socket._attachMemoryTransport(native, parentSocket, "secureConnect");
+        return;
+      }
+      const error = new TypeError('The "options.socket" property must be a Duplex stream');
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
     } catch (error) {
       fail(error);
     }
@@ -742,14 +1096,35 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
   }
   const socket = new TLSSocket(parentSocket, options);
   const fd = parentSocket._detachFdForTls();
-  const key = prepareTlsKey(options.key, options.passphrase);
+  const credentials = tlsCredentialOptions(options);
   const native = cottontail.tlsServerUpgradeFd(
     fd,
-    flattenPem(options.cert),
-    key,
-    options.passphrase == null ? undefined : String(options.passphrase),
+    credentials.cert,
+    credentials.key,
+    credentials.passphrase,
     prepareALPNProtocols(options.ALPNProtocols),
+    credentials.ca,
+    Boolean(options.requestCert),
+    options.rejectUnauthorized !== false,
+    options.ciphers,
   );
+  if (options.contexts && typeof cottontail.tlsConnectionAddServerContext === "function") {
+    for (const [hostname, secureContext] of options.contexts) {
+      const contextOptions = secureContext instanceof SecureContext ? secureContext.context : secureContext;
+      const contextCredentials = tlsCredentialOptions(contextOptions);
+      cottontail.tlsConnectionAddServerContext(
+        native.id,
+        hostname,
+        contextCredentials.cert,
+        contextCredentials.key,
+        contextCredentials.ca,
+        contextCredentials.passphrase,
+        Boolean(options.requestCert),
+        options.rejectUnauthorized !== false,
+        contextOptions?.ciphers ?? options.ciphers,
+      );
+    }
+  }
   parentSocket._tlsOwner = socket;
   socket.once("close", (hadError) => {
     parentSocket._tlsOwner = null;
@@ -790,7 +1165,20 @@ function prepareALPNProtocols(protocols) {
   return out.ALPNProtocols;
 }
 
-export const rootCertificates = Object.freeze(systemRootCertificates());
+function immutableCertificateArray(certificates) {
+  const target = Object.freeze([...certificates]);
+  const readonly = () => {
+    throw new TypeError("Attempted to assign to readonly property.");
+  };
+  return new Proxy(target, {
+    set: readonly,
+    defineProperty: readonly,
+    deleteProperty: readonly,
+    setPrototypeOf: readonly,
+  });
+}
+
+export const rootCertificates = immutableCertificateArray(systemRootCertificates());
 let defaultCACertificates = [...rootCertificates];
 
 export function getCACertificates(type = "default") {
@@ -811,7 +1199,7 @@ export function getCiphers() {
   return [...defaultCipherNames];
 }
 
-// COTTONTAIL-COMPAT: node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, session buffers, CA certificate helpers, SecureContext option capture, constants, ALPN encoding, default cipher inventory, session setters, trace toggles, and OCSP/TLS-ticket accessors are implemented; protocol-level renegotiation, OCSP stapling generation, and resumable session cache wiring need deeper bindings.
+// COTTONTAIL-COMPAT: node:tls sockets - OpenSSL-backed connect/createServer/TLSSocket streams, certificate identity checks, legacy peer/local certificate objects, CA helpers, SNI contexts, arbitrary Duplex transports, ALPN, cipher selection, and keying-material export are implemented; active renegotiation, finished-message/OCSP/TLS-ticket extraction, and resumable session injection need deeper native bindings.
 
 const tlsDefault = {
   CLIENT_RENEG_LIMIT,

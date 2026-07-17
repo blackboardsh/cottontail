@@ -1286,6 +1286,16 @@ typedef struct CtHttpReadBuffer {
     size_t capacity;
 } CtHttpReadBuffer;
 
+typedef struct CtTlsSniContext {
+    char *pattern;
+#if CT_HAS_OPENSSL
+    SSL_CTX *ctx;
+#else
+    void *ctx;
+#endif
+    struct CtTlsSniContext *next;
+} CtTlsSniContext;
+
 typedef struct CtTlsConnection {
     uint32_t id;
     int fd;
@@ -1307,8 +1317,10 @@ typedef struct CtTlsConnection {
     bool shutdown_started;
     bool server_side;
     bool handshake_complete;
+    bool memory_bio;
     unsigned char *alpn_protocols;
     unsigned int alpn_protocols_len;
+    CtTlsSniContext *sni_contexts;
     struct CtTlsConnection *next;
 } CtTlsConnection;
 
@@ -9914,6 +9926,58 @@ static char *ct_tls_error_message(const char *fallback) {
     return ct_duplicate_string(buffer);
 }
 
+static const char *ct_tls_verify_error_code(long verify_error) {
+    switch (verify_error) {
+        case X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE: return "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+        case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT: return "UNABLE_TO_GET_ISSUER_CERT";
+        case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: return "UNABLE_TO_GET_ISSUER_CERT_LOCALLY";
+        case X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN: return "SELF_SIGNED_CERT_IN_CHAIN";
+        case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT: return "DEPTH_ZERO_SELF_SIGNED_CERT";
+        case X509_V_ERR_CERT_HAS_EXPIRED: return "CERT_HAS_EXPIRED";
+        case X509_V_ERR_CERT_NOT_YET_VALID: return "CERT_NOT_YET_VALID";
+        case X509_V_ERR_CERT_REVOKED: return "CERT_REVOKED";
+        case X509_V_ERR_INVALID_CA: return "INVALID_CA";
+#ifdef X509_V_ERR_HOSTNAME_MISMATCH
+        case X509_V_ERR_HOSTNAME_MISMATCH: return "ERR_TLS_CERT_ALTNAME_INVALID";
+#endif
+        default: return "CERTIFICATE_VERIFY_FAILED";
+    }
+}
+
+static void ct_tls_throw_error(JSContextRef ctx, JSValueRef *exception, const char *message, const char *code) {
+    if (exception == NULL) return;
+    JSValueRef argument = ct_make_string(ctx, message != NULL ? message : "TLS operation failed");
+    JSObjectRef error = JSObjectMakeError(ctx, 1, &argument, NULL);
+    if (code != NULL) ct_set_property(ctx, error, "code", ct_make_string(ctx, code), NULL);
+    *exception = error;
+}
+
+static void ct_tls_throw_verify_error(JSContextRef ctx, JSValueRef *exception, long verify_error) {
+    const char *message = X509_verify_cert_error_string(verify_error);
+    ct_tls_throw_error(
+        ctx,
+        exception,
+        message != NULL ? message : "certificate verify failed",
+        ct_tls_verify_error_code(verify_error)
+    );
+}
+
+static int ct_tls_allow_verify_error(int preverify_ok, X509_STORE_CTX *store) {
+    (void)preverify_ok;
+    (void)store;
+    return 1;
+}
+
+static void ct_tls_sni_contexts_free(CtTlsSniContext *context) {
+    while (context != NULL) {
+        CtTlsSniContext *next = context->next;
+        if (context->ctx != NULL) SSL_CTX_free(context->ctx);
+        free(context->pattern);
+        free(context);
+        context = next;
+    }
+}
+
 static void ct_tls_connection_add(CtTlsConnection *connection) {
     pthread_mutex_lock(&ct_tls_mutex);
     connection->next = ct_tls_connections;
@@ -9954,6 +10018,7 @@ static void ct_tls_connection_free(CtTlsConnection *connection) {
     if (connection->ctx != NULL) SSL_CTX_free(connection->ctx);
     if (connection->fd >= 0) close(connection->fd);
     free(connection->alpn_protocols);
+    ct_tls_sni_contexts_free(connection->sni_contexts);
     pthread_mutex_destroy(&connection->mutex);
     free(connection);
 }
@@ -10067,7 +10132,7 @@ static int ct_tls_use_cert_pem(JSContextRef ctx, SSL_CTX *ssl_ctx, const char *c
         ct_throw_message(ctx, exception, "Failed to allocate TLS certificate BIO");
         return -1;
     }
-    X509 *cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
+    X509 *cert = PEM_read_bio_X509_AUX(bio, NULL, 0, NULL);
     if (cert == NULL) {
         BIO_free(bio);
         char *message = ct_tls_error_message("Failed to parse TLS certificate");
@@ -10077,13 +10142,28 @@ static int ct_tls_use_cert_pem(JSContextRef ctx, SSL_CTX *ssl_ctx, const char *c
     }
     int ok = SSL_CTX_use_certificate(ssl_ctx, cert);
     X509_free(cert);
-    BIO_free(bio);
     if (ok != 1) {
+        BIO_free(bio);
         char *message = ct_tls_error_message("Failed to use TLS certificate");
         ct_throw_message(ctx, exception, message);
         free(message);
         return -1;
     }
+    SSL_CTX_clear_chain_certs(ssl_ctx);
+    for (;;) {
+        X509 *chain_cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
+        if (chain_cert == NULL) break;
+        if (SSL_CTX_add_extra_chain_cert(ssl_ctx, chain_cert) != 1) {
+            X509_free(chain_cert);
+            BIO_free(bio);
+            char *message = ct_tls_error_message("Failed to use TLS certificate chain");
+            ct_throw_message(ctx, exception, message);
+            free(message);
+            return -1;
+        }
+    }
+    BIO_free(bio);
+    ERR_clear_error();
     return 0;
 }
 
@@ -10129,7 +10209,7 @@ static int ct_tls_load_ca_pem(SSL_CTX *ssl_ctx, const char *ca_pem) {
     if (bio == NULL) return -1;
     int loaded = 0;
     for (;;) {
-        X509 *cert = PEM_read_bio_X509(bio, NULL, 0, NULL);
+        X509 *cert = PEM_read_bio_X509_AUX(bio, NULL, 0, NULL);
         if (cert == NULL) break;
         if (X509_STORE_add_cert(SSL_CTX_get_cert_store(ssl_ctx), cert) == 1) loaded += 1;
         X509_free(cert);
@@ -10137,6 +10217,73 @@ static int ct_tls_load_ca_pem(SSL_CTX *ssl_ctx, const char *ca_pem) {
     BIO_free(bio);
     ERR_clear_error();
     return loaded > 0 ? 0 : -1;
+}
+
+static int ct_tls_configure_ctx(
+    JSContextRef ctx,
+    SSL_CTX *ssl_ctx,
+    bool server_side,
+    const char *cert,
+    const char *key,
+    const char *passphrase,
+    const char *ca,
+    bool request_cert,
+    bool reject_unauthorized,
+    const char *ciphers,
+    JSValueRef *exception
+) {
+    if (ssl_ctx == NULL) {
+        ct_throw_message(ctx, exception, "Failed to initialize TLS context");
+        return -1;
+    }
+    if (cert != NULL && cert[0] != '\0' && ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0) return -1;
+    if (key != NULL && key[0] != '\0' && ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0) return -1;
+    if ((cert == NULL || cert[0] == '\0') != (key == NULL || key[0] == '\0')) {
+        ct_throw_message(ctx, exception, "TLS certificate and private key must be provided together");
+        return -1;
+    }
+    if (cert != NULL && cert[0] != '\0' && SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        char *message = ct_tls_error_message("TLS private key does not match certificate");
+        ct_throw_message(ctx, exception, message);
+        free(message);
+        return -1;
+    }
+    if (ca != NULL && ca[0] != '\0') {
+        X509_STORE *store = X509_STORE_new();
+        if (store == NULL) {
+            ct_throw_message(ctx, exception, "Failed to initialize TLS certificate store");
+            return -1;
+        }
+        SSL_CTX_set_cert_store(ssl_ctx, store);
+        if (ct_tls_load_ca_pem(ssl_ctx, ca) != 0) {
+            ct_throw_message(ctx, exception, "Failed to parse TLS CA certificates");
+            return -1;
+        }
+    } else if (!server_side) {
+        SSL_CTX_set_default_verify_paths(ssl_ctx);
+    }
+    if (ciphers != NULL && ciphers[0] != '\0') {
+        ERR_clear_error();
+        int legacy_ciphers = SSL_CTX_set_cipher_list(ssl_ctx, ciphers);
+        int tls13_ciphers = 0;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        tls13_ciphers = SSL_CTX_set_ciphersuites(ssl_ctx, ciphers);
+#endif
+        if (legacy_ciphers != 1 && tls13_ciphers != 1) {
+            ERR_clear_error();
+            ct_tls_throw_error(ctx, exception, "No cipher match", "ERR_SSL_NO_CIPHER_MATCH");
+            return -1;
+        }
+        ERR_clear_error();
+    }
+    if (server_side) {
+        int mode = request_cert ? SSL_VERIFY_PEER : SSL_VERIFY_NONE;
+        if (request_cert && reject_unauthorized) mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        SSL_CTX_set_verify(ssl_ctx, mode, request_cert && !reject_unauthorized ? ct_tls_allow_verify_error : NULL);
+    } else {
+        SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, reject_unauthorized ? NULL : ct_tls_allow_verify_error);
+    }
+    return 0;
 }
 
 static int ct_tls_make_socket(JSContextRef ctx, const char *host, int port, int family, JSValueRef *exception) {
@@ -10210,15 +10357,24 @@ static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *c
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, connection->id), exception);
     ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, connection->fd), exception);
-    JSObjectRef local = ct_tcp_address_object(ctx, connection->fd, false, exception);
-    if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
-    JSObjectRef remote = ct_tcp_address_object(ctx, connection->fd, true, exception);
-    if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    if (connection->fd >= 0) {
+        JSObjectRef local = ct_tcp_address_object(ctx, connection->fd, false, exception);
+        if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+        JSObjectRef remote = ct_tcp_address_object(ctx, connection->fd, true, exception);
+        if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    }
     pthread_mutex_lock(&connection->mutex);
     const char *protocol = SSL_get_version(connection->ssl);
     const SSL_CIPHER *cipher = SSL_get_current_cipher(connection->ssl);
     ct_set_property(ctx, result, "protocol", protocol != NULL ? ct_make_string(ctx, protocol) : JSValueMakeNull(ctx), exception);
     ct_set_property(ctx, result, "cipher", cipher != NULL ? ct_make_string(ctx, SSL_CIPHER_get_name(cipher)) : JSValueMakeNull(ctx), exception);
+    ct_set_property(
+        ctx,
+        result,
+        "cipherVersion",
+        cipher != NULL ? ct_make_string(ctx, SSL_CIPHER_get_version(cipher)) : JSValueMakeNull(ctx),
+        exception
+    );
     const unsigned char *alpn_protocol = NULL;
     unsigned int alpn_protocol_len = 0;
     SSL_get0_alpn_selected(connection->ssl, &alpn_protocol, &alpn_protocol_len);
@@ -10234,6 +10390,43 @@ static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *c
     X509 *peer_cert = SSL_get_peer_certificate(connection->ssl);
     ct_set_property(ctx, result, "peerCertificate", ct_tls_x509_der(ctx, peer_cert, exception), exception);
     if (peer_cert != NULL) X509_free(peer_cert);
+    const char *servername = SSL_get_servername(connection->ssl, TLSEXT_NAMETYPE_host_name);
+    ct_set_property(ctx, result, "servername", servername != NULL ? ct_make_string(ctx, servername) : JSValueMakeNull(ctx), exception);
+    long verify_error = SSL_get_verify_result(connection->ssl);
+    ct_set_property(ctx, result, "authorized", JSValueMakeBoolean(ctx, verify_error == X509_V_OK), exception);
+    if (verify_error != X509_V_OK) {
+        const char *verify_message = X509_verify_cert_error_string(verify_error);
+        ct_set_property(ctx, result, "verifyErrorCode", ct_make_string(ctx, ct_tls_verify_error_code(verify_error)), exception);
+        ct_set_property(
+            ctx,
+            result,
+            "verifyErrorMessage",
+            ct_make_string(ctx, verify_message != NULL ? verify_message : "certificate verify failed"),
+            exception
+        );
+    }
+    JSValueRef shared_values[64];
+    size_t shared_count = 0;
+    for (int index = 0; index < 64; index += 1) {
+        int sign_nid = NID_undef;
+        int hash_nid = NID_undef;
+        int sign_hash_nid = NID_undef;
+        unsigned char remote_sign = 0;
+        unsigned char remote_hash = 0;
+        if (SSL_get_shared_sigalgs(
+                connection->ssl,
+                index,
+                &sign_nid,
+                &hash_nid,
+                &sign_hash_nid,
+                &remote_sign,
+                &remote_hash
+            ) <= 0) break;
+        const char *name = sign_hash_nid != NID_undef ? OBJ_nid2sn(sign_hash_nid) : NULL;
+        if (name == NULL && sign_nid != NID_undef) name = OBJ_nid2sn(sign_nid);
+        if (name != NULL) shared_values[shared_count++] = ct_make_string(ctx, name);
+    }
+    ct_set_property(ctx, result, "sharedSigalgs", ct_make_array(ctx, shared_count, shared_values, exception), exception);
     ct_set_property(ctx, result, "session", ct_tls_session_der(ctx, connection->ssl, exception), exception);
     ct_set_property(ctx, result, "sessionReused", JSValueMakeBoolean(ctx, SSL_session_reused(connection->ssl) == 1), exception);
     pthread_mutex_unlock(&connection->mutex);
@@ -10286,6 +10479,47 @@ static int ct_tls_connection_alpn_select(
         client_protocols_len
     );
     return selected == OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
+
+static bool ct_tls_ascii_equal_ignore_case(const char *left, const char *right) {
+    if (left == NULL || right == NULL) return false;
+    while (*left != '\0' && *right != '\0') {
+        unsigned char a = (unsigned char)*left++;
+        unsigned char b = (unsigned char)*right++;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b) return false;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static bool ct_tls_servername_matches(const char *pattern, const char *servername) {
+    if (pattern == NULL || servername == NULL) return false;
+    if (ct_tls_ascii_equal_ignore_case(pattern, servername)) return true;
+    if (pattern[0] != '*' || pattern[1] != '.') return false;
+    const char *first_dot = strchr(servername, '.');
+    return first_dot != NULL && ct_tls_ascii_equal_ignore_case(pattern + 1, first_dot);
+}
+
+static int ct_tls_connection_servername_select(SSL *ssl, int *alert, void *opaque) {
+    (void)alert;
+    CtTlsConnection *connection = (CtTlsConnection *)opaque;
+    const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (connection == NULL || servername == NULL) return SSL_TLSEXT_ERR_OK;
+    for (CtTlsSniContext *candidate = connection->sni_contexts; candidate != NULL; candidate = candidate->next) {
+        if (!ct_tls_servername_matches(candidate->pattern, servername)) continue;
+        SSL_set_SSL_CTX(ssl, candidate->ctx);
+        SSL_set_verify(
+            ssl,
+            SSL_CTX_get_verify_mode(candidate->ctx),
+            SSL_CTX_get_verify_callback(candidate->ctx)
+        );
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        SSL_set1_verify_cert_store(ssl, SSL_CTX_get_cert_store(candidate->ctx));
+#endif
+        return SSL_TLSEXT_ERR_OK;
+    }
+    return SSL_TLSEXT_ERR_OK;
 }
 
 static void *ct_tls_server_thread(void *opaque) {
@@ -10440,6 +10674,7 @@ static JSValueRef ct_tls_client_connect_owned_fd(
     const char *passphrase,
     const uint8_t *alpn_protocols,
     size_t alpn_protocols_len,
+    const char *ciphers,
     bool defer_handshake,
     JSValueRef *exception
 ) {
@@ -10451,29 +10686,21 @@ static JSValueRef ct_tls_client_connect_owned_fd(
         free(message);
         return JSValueMakeUndefined(ctx);
     }
-    SSL_CTX_set_default_verify_paths(ssl_ctx);
-    if (ca != NULL && ca[0] != '\0' && ct_tls_load_ca_pem(ssl_ctx, ca) != 0) {
+    if (ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            false,
+            cert,
+            key,
+            passphrase,
+            ca,
+            true,
+            reject_unauthorized,
+            ciphers,
+            exception
+        ) != 0) {
         SSL_CTX_free(ssl_ctx);
         close(fd);
-        ct_throw_message(ctx, exception, "Failed to parse TLS CA certificate");
-        return JSValueMakeUndefined(ctx);
-    }
-    if (cert != NULL && cert[0] != '\0' && ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0) {
-        SSL_CTX_free(ssl_ctx);
-        close(fd);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (key != NULL && key[0] != '\0' && ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0) {
-        SSL_CTX_free(ssl_ctx);
-        close(fd);
-        return JSValueMakeUndefined(ctx);
-    }
-    if (cert != NULL && cert[0] != '\0' && key != NULL && key[0] != '\0' && SSL_CTX_check_private_key(ssl_ctx) != 1) {
-        char *message = ct_tls_error_message("TLS client private key does not match certificate");
-        SSL_CTX_free(ssl_ctx);
-        close(fd);
-        ct_throw_message(ctx, exception, message);
-        free(message);
         return JSValueMakeUndefined(ctx);
     }
 
@@ -10486,7 +10713,6 @@ static JSValueRef ct_tls_client_connect_owned_fd(
         free(message);
         return JSValueMakeUndefined(ctx);
     }
-    SSL_set_verify(ssl, reject_unauthorized ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
     if (servername != NULL && servername[0] != '\0') SSL_set_tlsext_host_name(ssl, servername);
     if (alpn_protocols_len > UINT_MAX || (alpn_protocols_len > 0 && SSL_set_alpn_protos(ssl, alpn_protocols, (unsigned int)alpn_protocols_len) != 0)) {
         SSL_free(ssl);
@@ -10504,21 +10730,31 @@ static JSValueRef ct_tls_client_connect_owned_fd(
         struct timeval handshake_timeout = { .tv_sec = 10, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &handshake_timeout, sizeof(handshake_timeout));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &handshake_timeout, sizeof(handshake_timeout));
-        if (SSL_connect(ssl) != 1) {
-            char *message = ct_tls_error_message("TLS connect failed");
+        int status = SSL_connect(ssl);
+        int connect_errno = errno;
+        if (status != 1) {
+            int ssl_error = SSL_get_error(ssl, status);
+            long verify_error = SSL_get_verify_result(ssl);
+            char *message = verify_error == X509_V_OK ? ct_tls_error_message("TLS connect failed") : NULL;
             SSL_free(ssl);
             SSL_CTX_free(ssl_ctx);
             close(fd);
-            ct_throw_message(ctx, exception, message);
+            if (verify_error != X509_V_OK) {
+                ct_tls_throw_verify_error(ctx, exception, verify_error);
+            } else if (status == 0 || ssl_error == SSL_ERROR_ZERO_RETURN || (ssl_error == SSL_ERROR_SYSCALL && connect_errno == 0)) {
+                ct_tls_throw_error(ctx, exception, "Client network socket disconnected before secure TLS connection was established", "ECONNRESET");
+            } else {
+                ct_tls_throw_error(ctx, exception, message, NULL);
+            }
             free(message);
             return JSValueMakeUndefined(ctx);
         }
         if (reject_unauthorized && SSL_get_verify_result(ssl) != X509_V_OK) {
-            const char *verify_error = X509_verify_cert_error_string(SSL_get_verify_result(ssl));
+            long verify_error = SSL_get_verify_result(ssl);
             SSL_free(ssl);
             SSL_CTX_free(ssl_ctx);
             close(fd);
-            ct_throw_message(ctx, exception, verify_error != NULL ? verify_error : "TLS certificate verification failed");
+            ct_tls_throw_verify_error(ctx, exception, verify_error);
             return JSValueMakeUndefined(ctx);
         }
         ct_set_nonblocking_fd(fd);
@@ -10576,6 +10812,7 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
     char *cert = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
     char *key = argc >= 7 ? ct_value_to_optional_string(ctx, argv[6]) : NULL;
     char *passphrase = argc >= 8 ? ct_value_to_optional_string(ctx, argv[7]) : NULL;
+    char *ciphers = argc >= 10 ? ct_value_to_optional_string(ctx, argv[9]) : NULL;
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 9 && !JSValueIsUndefined(ctx, argv[8]) && !JSValueIsNull(ctx, argv[8]) &&
@@ -10586,13 +10823,14 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
         free(cert);
         free(key);
         free(passphrase);
+        free(ciphers);
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
 
     int fd = ct_tls_make_socket(ctx, host != NULL ? host : "127.0.0.1", port, AF_UNSPEC, exception);
     JSValueRef result = fd >= 0
-        ? ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, false, exception)
+        ? ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, ciphers, false, exception)
         : JSValueMakeUndefined(ctx);
     free(host);
     free(servername);
@@ -10600,6 +10838,7 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
     free(cert);
     free(key);
     free(passphrase);
+    free(ciphers);
     return result;
 }
 
@@ -10618,6 +10857,7 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
     char *cert = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
     char *key = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
     char *passphrase = argc >= 7 ? ct_value_to_optional_string(ctx, argv[6]) : NULL;
+    char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 8 && !JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7]) &&
@@ -10628,22 +10868,143 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
         free(cert);
         free(key);
         free(passphrase);
+        free(ciphers);
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
-    JSValueRef result = ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, true, exception);
+    JSValueRef result = ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, ciphers, true, exception);
     free(servername);
     free(ca);
     free(cert);
     free(key);
     free(passphrase);
+    free(ciphers);
+    return result;
+}
+
+static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsClientConnectMemory(servername, rejectUnauthorized[, ca, cert, key, passphrase, ALPNProtocols, ciphers]) requires servername and rejectUnauthorized");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    char *servername = ct_value_to_optional_string(ctx, argv[0]);
+    bool reject_unauthorized = ct_value_to_bool(ctx, argv[1]);
+    char *ca = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
+    char *cert = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
+    char *key = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
+    char *passphrase = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
+    char *ciphers = argc >= 8 ? ct_value_to_optional_string(ctx, argv[7]) : NULL;
+    uint8_t *alpn_protocols = NULL;
+    size_t alpn_protocols_len = 0;
+    if (argc >= 7 && !JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6]) &&
+        (ct_get_bytes(ctx, argv[6], &alpn_protocols, &alpn_protocols_len) != 0 || alpn_protocols_len > UINT_MAX)) {
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "TLS ALPN protocols must be a valid ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (ssl_ctx == NULL || ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            false,
+            cert,
+            key,
+            passphrase,
+            ca,
+            true,
+            reject_unauthorized,
+            ciphers,
+            exception
+        ) != 0) {
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
+    SSL *ssl = SSL_new(ssl_ctx);
+    BIO *read_bio = BIO_new(BIO_s_mem());
+    BIO *write_bio = BIO_new(BIO_s_mem());
+    if (ssl == NULL || read_bio == NULL || write_bio == NULL) {
+        if (ssl != NULL) SSL_free(ssl);
+        if (read_bio != NULL) BIO_free(read_bio);
+        if (write_bio != NULL) BIO_free(write_bio);
+        SSL_CTX_free(ssl_ctx);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "Failed to initialize TLS memory transport");
+        return JSValueMakeUndefined(ctx);
+    }
+    BIO_set_mem_eof_return(read_bio, -1);
+    BIO_set_mem_eof_return(write_bio, -1);
+    SSL_set_bio(ssl, read_bio, write_bio);
+    SSL_set_connect_state(ssl);
+    if (servername != NULL && servername[0] != '\0') SSL_set_tlsext_host_name(ssl, servername);
+    if (alpn_protocols_len > 0 && SSL_set_alpn_protos(ssl, alpn_protocols, (unsigned int)alpn_protocols_len) != 0) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "Invalid TLS ALPN protocol list");
+        return JSValueMakeUndefined(ctx);
+    }
+    free(servername);
+    free(ca);
+    free(cert);
+    free(key);
+    free(passphrase);
+    free(ciphers);
+
+    CtTlsConnection *connection = (CtTlsConnection *)calloc(1, sizeof(CtTlsConnection));
+    if (connection == NULL) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_init(&connection->mutex, NULL);
+    connection->fd = -1;
+    connection->ctx = ssl_ctx;
+    connection->ssl = ssl;
+    connection->runtime = JSObjectGetPrivate(function);
+    connection->active = true;
+    connection->memory_bio = true;
+    pthread_mutex_lock(&ct_tls_mutex);
+    connection->id = ct_next_tls_connection_id++;
+    if (ct_next_tls_connection_id == 0) ct_next_tls_connection_id = 1;
+    pthread_mutex_unlock(&ct_tls_mutex);
+    ct_tls_connection_add(connection);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, connection->id), exception);
+    ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, -1), exception);
+    ct_set_property(ctx, result, "pending", JSValueMakeBoolean(ctx, true), exception);
     return result;
 }
 
 static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)thisObject;
     if (argc < 3) {
-        ct_throw_message(ctx, exception, "tlsServerUpgradeFd(fd, cert, key[, passphrase, ALPNProtocols]) requires fd, cert, and key");
+        ct_throw_message(ctx, exception, "tlsServerUpgradeFd(fd, cert, key[, passphrase, ALPNProtocols, ca, requestCert, rejectUnauthorized, ciphers]) requires fd, cert, and key");
         return JSValueMakeUndefined(ctx);
     }
     int fd;
@@ -10652,6 +11013,10 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     char *cert = ct_value_to_string_copy(ctx, argv[1]);
     char *key = ct_value_to_string_copy(ctx, argv[2]);
     char *passphrase = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
+    char *ca = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
+    bool request_cert = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
+    bool reject_unauthorized = argc < 8 || ct_value_to_bool(ctx, argv[7]);
+    char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]) &&
@@ -10660,15 +11025,27 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
         free(cert);
         free(key);
         free(passphrase);
+        free(ca);
+        free(ciphers);
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be a valid ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
 
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (ssl_ctx == NULL || cert == NULL || key == NULL ||
-        ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0 ||
-        ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0 ||
-        SSL_CTX_check_private_key(ssl_ctx) != 1) {
+    if (ssl_ctx == NULL || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
+        ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            true,
+            cert,
+            key,
+            passphrase,
+            ca,
+            request_cert,
+            reject_unauthorized,
+            ciphers,
+            exception
+        ) != 0) {
         if (exception != NULL && *exception == NULL) {
             char *message = ct_tls_error_message("Failed to initialize TLS server credentials");
             ct_throw_message(ctx, exception, message);
@@ -10679,11 +11056,15 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
         free(cert);
         free(key);
         free(passphrase);
+        free(ca);
+        free(ciphers);
         return JSValueMakeUndefined(ctx);
     }
     free(cert);
     free(key);
     free(passphrase);
+    free(ca);
+    free(ciphers);
 
     CtTlsConnection *connection = (CtTlsConnection *)calloc(1, sizeof(CtTlsConnection));
     if (connection == NULL) {
@@ -10699,6 +11080,8 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     connection->active = true;
     connection->server_side = true;
     connection->handshake_complete = false;
+    SSL_CTX_set_tlsext_servername_callback(ssl_ctx, ct_tls_connection_servername_select);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, connection);
     if (alpn_protocols_len > 0) {
         connection->alpn_protocols = (unsigned char *)malloc(alpn_protocols_len);
         if (connection->alpn_protocols == NULL) {
@@ -10739,6 +11122,148 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     return result;
 }
 
+static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 4) {
+        ct_throw_message(ctx, exception, "tlsConnectionAddServerContext(id, hostname, cert, key[, ca, passphrase, requestCert, rejectUnauthorized, ciphers]) requires id, hostname, cert, and key");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || !connection->server_side || connection->handshake_complete) {
+        ct_throw_message(ctx, exception, "TLS server connection is not available for SNI configuration");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *hostname = ct_value_to_string_copy(ctx, argv[1]);
+    char *cert = ct_value_to_string_copy(ctx, argv[2]);
+    char *key = ct_value_to_string_copy(ctx, argv[3]);
+    char *ca = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
+    char *passphrase = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
+    bool request_cert = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
+    bool reject_unauthorized = argc < 8 || ct_value_to_bool(ctx, argv[7]);
+    char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (hostname == NULL || hostname[0] == '\0' || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
+        ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            true,
+            cert,
+            key,
+            passphrase,
+            ca,
+            request_cert,
+            reject_unauthorized,
+            ciphers,
+            exception
+        ) != 0) {
+        if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+        free(hostname);
+        free(cert);
+        free(key);
+        free(ca);
+        free(passphrase);
+        free(ciphers);
+        if (exception != NULL && *exception == NULL) ct_throw_message(ctx, exception, "Invalid TLS SNI context");
+        return JSValueMakeUndefined(ctx);
+    }
+    free(cert);
+    free(key);
+    free(ca);
+    free(passphrase);
+    free(ciphers);
+    if (connection->alpn_protocols_len > 0) {
+        SSL_CTX_set_alpn_select_cb(ssl_ctx, ct_tls_connection_alpn_select, connection);
+    }
+    CtTlsSniContext *sni_context = (CtTlsSniContext *)calloc(1, sizeof(CtTlsSniContext));
+    if (sni_context == NULL) {
+        SSL_CTX_free(ssl_ctx);
+        free(hostname);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    sni_context->pattern = hostname;
+    sni_context->ctx = ssl_ctx;
+    pthread_mutex_lock(&connection->mutex);
+    sni_context->next = connection->sni_contexts;
+    connection->sni_contexts = sni_context;
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    pthread_once(&ct_tls_init_once_control, ct_tls_init_once);
+    char *cert = argc >= 1 ? ct_value_to_optional_string(ctx, argv[0]) : NULL;
+    char *key = argc >= 2 ? ct_value_to_optional_string(ctx, argv[1]) : NULL;
+    char *passphrase = argc >= 3 ? ct_value_to_optional_string(ctx, argv[2]) : NULL;
+    char *ca = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
+    char *ciphers = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
+    bool request_cert = argc >= 6 && ct_value_to_bool(ctx, argv[5]);
+    bool reject_unauthorized = argc < 7 || ct_value_to_bool(ctx, argv[6]);
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+    int status = -1;
+    if (cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0') {
+        ct_throw_message(ctx, exception, "TLS server requires both a certificate and private key");
+    } else {
+        status = ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            true,
+            cert,
+            key,
+            passphrase,
+            ca,
+            request_cert,
+            reject_unauthorized,
+            ciphers,
+            exception
+        );
+    }
+    if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
+    free(cert);
+    free(key);
+    free(passphrase);
+    free(ca);
+    free(ciphers);
+    return status == 0 ? JSValueMakeBoolean(ctx, true) : JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_tls_validate_ciphers(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsValidateCiphers(ciphers) requires a cipher list");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *ciphers = ct_value_to_string_copy(ctx, argv[0]);
+    if (ciphers == NULL || ciphers[0] == '\0') {
+        free(ciphers);
+        return JSValueMakeBoolean(ctx, true);
+    }
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_method());
+    if (ssl_ctx == NULL) {
+        free(ciphers);
+        ct_throw_message(ctx, exception, "Failed to initialize TLS context");
+        return JSValueMakeUndefined(ctx);
+    }
+    ERR_clear_error();
+    int legacy_ciphers = SSL_CTX_set_cipher_list(ssl_ctx, ciphers);
+    int tls13_ciphers = 0;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    tls13_ciphers = SSL_CTX_set_ciphersuites(ssl_ctx, ciphers);
+#endif
+    SSL_CTX_free(ssl_ctx);
+    free(ciphers);
+    ERR_clear_error();
+    if (legacy_ciphers != 1 && tls13_ciphers != 1) {
+        ct_tls_throw_error(ctx, exception, "No cipher match", "ERR_SSL_NO_CIPHER_MATCH");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
 static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -10754,15 +11279,17 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
 
     pthread_mutex_lock(&connection->mutex);
     int status = connection->server_side ? SSL_accept(connection->ssl) : SSL_connect(connection->ssl);
+    int handshake_errno = errno;
     int ssl_error = status == 1 ? SSL_ERROR_NONE : SSL_get_error(connection->ssl, status);
-    long verify_result = status == 1 ? SSL_get_verify_result(connection->ssl) : X509_V_OK;
+    long verify_result = SSL_get_verify_result(connection->ssl);
     int verify_mode = SSL_get_verify_mode(connection->ssl);
     pthread_mutex_unlock(&connection->mutex);
 
     if (status == 1) {
-        if ((verify_mode & SSL_VERIFY_PEER) != 0 && verify_result != X509_V_OK) {
-            const char *verify_error = X509_verify_cert_error_string(verify_result);
-            ct_throw_message(ctx, exception, verify_error != NULL ? verify_error : "TLS certificate verification failed");
+        if ((verify_mode & SSL_VERIFY_PEER) != 0 &&
+            verify_result != X509_V_OK &&
+            SSL_get_verify_callback(connection->ssl) != ct_tls_allow_verify_error) {
+            ct_tls_throw_verify_error(ctx, exception, verify_result);
             return JSValueMakeUndefined(ctx);
         }
         pthread_mutex_lock(&connection->mutex);
@@ -10773,8 +11300,17 @@ static JSValueRef ct_tls_client_handshake(JSContextRef ctx, JSObjectRef function
     if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
         return JSValueMakeBoolean(ctx, false);
     }
+    if (verify_result != X509_V_OK) {
+        ct_tls_throw_verify_error(ctx, exception, verify_result);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (status == 0 || ssl_error == SSL_ERROR_ZERO_RETURN || (ssl_error == SSL_ERROR_SYSCALL && handshake_errno == 0)) {
+        ct_tls_throw_error(ctx, exception, "Client network socket disconnected before secure TLS connection was established", "ECONNRESET");
+        return JSValueMakeUndefined(ctx);
+    }
     char *message = ct_tls_error_message(connection->server_side ? "TLS accept failed" : "TLS connect failed");
-    ct_throw_message(ctx, exception, message);
+    const char *code = message != NULL && strstr(message, "unexpected eof") != NULL ? "ECONNRESET" : NULL;
+    ct_tls_throw_error(ctx, exception, message, code);
     free(message);
     return JSValueMakeUndefined(ctx);
 }
@@ -10792,6 +11328,10 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
     char *cert = ct_value_to_string_copy(ctx, argv[2]);
     char *key = ct_value_to_string_copy(ctx, argv[3]);
     char *passphrase = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
+    char *ca = argc >= 7 ? ct_value_to_optional_string(ctx, argv[6]) : NULL;
+    bool request_cert = argc >= 8 && ct_value_to_bool(ctx, argv[7]);
+    bool reject_unauthorized = argc < 9 || ct_value_to_bool(ctx, argv[8]);
+    char *ciphers = argc >= 10 ? ct_value_to_optional_string(ctx, argv[9]) : NULL;
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 6 && !JSValueIsUndefined(ctx, argv[5]) && !JSValueIsNull(ctx, argv[5]) &&
@@ -10800,12 +11340,27 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
         free(cert);
         free(key);
         free(passphrase);
+        free(ca);
+        free(ciphers);
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be a valid ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
 
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (ssl_ctx == NULL || cert == NULL || key == NULL || ct_tls_use_cert_pem(ctx, ssl_ctx, cert, exception) != 0 || ct_tls_use_key_pem(ctx, ssl_ctx, key, passphrase, exception) != 0 || SSL_CTX_check_private_key(ssl_ctx) != 1) {
+    if (ssl_ctx == NULL || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
+        ct_tls_configure_ctx(
+            ctx,
+            ssl_ctx,
+            true,
+            cert,
+            key,
+            passphrase,
+            ca,
+            request_cert,
+            reject_unauthorized,
+            ciphers,
+            exception
+        ) != 0) {
         if (exception != NULL && *exception == NULL) {
             char *message = ct_tls_error_message("Failed to initialize TLS server credentials");
             ct_throw_message(ctx, exception, message);
@@ -10816,11 +11371,15 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
         free(cert);
         free(key);
         free(passphrase);
+        free(ca);
+        free(ciphers);
         return JSValueMakeUndefined(ctx);
     }
     free(cert);
     free(key);
     free(passphrase);
+    free(ca);
+    free(ciphers);
 
     struct addrinfo *results = NULL;
     int family = host != NULL && host[0] != '\0' ? AF_UNSPEC : AF_INET;
@@ -10921,6 +11480,150 @@ static JSValueRef ct_tls_server_close(JSContextRef ctx, JSObjectRef function, JS
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_tls_connection_feed_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsConnectionFeedMemory(id, data) requires connection id and data");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    if (connection == NULL || !connection->memory_bio || ct_get_bytes(ctx, argv[1], &bytes, &len) != 0) {
+        ct_throw_message(ctx, exception, connection == NULL ? "TLS connection not found" : "Invalid TLS memory transport input");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t offset = 0;
+    bool ok = true;
+    pthread_mutex_lock(&connection->mutex);
+    BIO *read_bio = SSL_get_rbio(connection->ssl);
+    while (offset < len) {
+        size_t remaining = len - offset;
+        int chunk_len = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        int written = read_bio != NULL ? BIO_write(read_bio, bytes + offset, chunk_len) : -1;
+        if (written <= 0) {
+            ok = false;
+            break;
+        }
+        offset += (size_t)written;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    if (!ok) {
+        ct_tls_throw_error(ctx, exception, "Failed to feed TLS memory transport", "ERR_SSL_INTERNAL_ERROR");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tls_connection_drain_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionDrainMemory(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || !connection->memory_bio) return JSValueMakeNull(ctx);
+
+    pthread_mutex_lock(&connection->mutex);
+    BIO *write_bio = SSL_get_wbio(connection->ssl);
+    size_t pending = write_bio != NULL ? (size_t)BIO_ctrl_pending(write_bio) : 0;
+    unsigned char *output = pending > 0 ? (unsigned char *)malloc(pending) : NULL;
+    size_t offset = 0;
+    while (output != NULL && offset < pending) {
+        size_t remaining = pending - offset;
+        int chunk_len = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        int received = BIO_read(write_bio, output + offset, chunk_len);
+        if (received <= 0) break;
+        offset += (size_t)received;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    if (pending > 0 && output == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (offset == 0) {
+        free(output);
+        return JSValueMakeNull(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, offset, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_tls_connection_read_memory(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tlsConnectionReadMemory(id) requires a connection id");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || !connection->memory_bio) return JSValueMakeNull(ctx);
+
+    unsigned char *output = NULL;
+    size_t output_len = 0;
+    bool ended = false;
+    char *error_message = NULL;
+    const char *error_code = NULL;
+    pthread_mutex_lock(&connection->mutex);
+    for (;;) {
+        unsigned char buffer[65536];
+        errno = 0;
+        int received = SSL_read(connection->ssl, buffer, sizeof(buffer));
+        int read_errno = errno;
+        int ssl_error = received <= 0 ? SSL_get_error(connection->ssl, received) : SSL_ERROR_NONE;
+        if (received > 0) {
+            unsigned char *grown = (unsigned char *)realloc(output, output_len + (size_t)received);
+            if (grown == NULL) {
+                free(output);
+                output = NULL;
+                output_len = 0;
+                error_message = ct_duplicate_string("Out of memory");
+                break;
+            }
+            output = grown;
+            memcpy(output + output_len, buffer, (size_t)received);
+            output_len += (size_t)received;
+            continue;
+        }
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) break;
+        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+            ended = true;
+            break;
+        }
+        if (ssl_error == SSL_ERROR_SYSCALL && (read_errno == EAGAIN || read_errno == EWOULDBLOCK || read_errno == EINTR)) break;
+        if (ssl_error == SSL_ERROR_SYSCALL && read_errno != 0) {
+            error_message = ct_duplicate_string(strerror(read_errno));
+            error_code = read_errno == ECONNRESET ? "ECONNRESET" : NULL;
+            break;
+        }
+        error_message = ct_tls_error_message("TLS read failed");
+        if (error_message != NULL && strstr(error_message, "unexpected eof") != NULL) error_code = "ECONNRESET";
+        break;
+    }
+    pthread_mutex_unlock(&connection->mutex);
+
+    JSObjectRef result = ct_make_object(ctx);
+    if (output_len > 0) {
+        ct_set_property(
+            ctx,
+            result,
+            "data",
+            JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, output_len, ct_array_buffer_free, NULL, exception),
+            exception
+        );
+    } else {
+        free(output);
+    }
+    ct_set_property(ctx, result, "ended", JSValueMakeBoolean(ctx, ended), exception);
+    if (error_message != NULL) {
+        ct_set_property(ctx, result, "error", ct_make_string(ctx, error_message), exception);
+        if (error_code != NULL) ct_set_property(ctx, result, "code", ct_make_string(ctx, error_code), exception);
+        free(error_message);
+    }
+    return result;
+}
+
 static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -10930,6 +11633,7 @@ static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef fun
     }
     CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
     if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    if (connection->memory_bio) return JSValueMakeBoolean(ctx, true);
     if (!connection->watcher_started) {
         connection->watcher_started = true;
         if (pthread_create(&connection->thread, NULL, ct_tls_read_thread, connection) != 0) {
@@ -10962,8 +11666,10 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
     size_t written_total = 0;
     bool ok = true;
     while (written_total < len) {
+        size_t remaining = len - written_total;
+        int chunk_len = remaining > INT_MAX ? INT_MAX : (int)remaining;
         pthread_mutex_lock(&connection->mutex);
-        int written = SSL_write(connection->ssl, bytes + written_total, (int)(len - written_total));
+        int written = SSL_write(connection->ssl, bytes + written_total, chunk_len);
         int ssl_error = written <= 0 ? SSL_get_error(connection->ssl, written) : SSL_ERROR_NONE;
         pthread_mutex_unlock(&connection->mutex);
         if (written > 0) {
@@ -10971,6 +11677,10 @@ static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function
             continue;
         }
         if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            if (connection->memory_bio) {
+                ok = false;
+                break;
+            }
             usleep(1000);
             continue;
         }
@@ -11035,6 +11745,103 @@ static JSValueRef ct_tls_connection_info(JSContextRef ctx, JSObjectRef function,
     if (connection == NULL) return JSValueMakeNull(ctx);
     return ct_tls_connection_result(ctx, connection, exception);
 }
+
+static JSValueRef ct_tls_connection_set_servername(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsConnectionSetServername(id, servername) requires a connection id and servername");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    char *servername = ct_value_to_string_copy(ctx, argv[1]);
+    if (connection == NULL || connection->server_side || connection->handshake_complete || servername == NULL) {
+        free(servername);
+        ct_tls_throw_error(ctx, exception, "TLS servername cannot be changed in the current state", "ERR_TLS_INVALID_STATE");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_lock(&connection->mutex);
+    int status = SSL_set_tlsext_host_name(connection->ssl, servername);
+    pthread_mutex_unlock(&connection->mutex);
+    free(servername);
+    if (status != 1) {
+        ct_tls_throw_error(ctx, exception, "Failed to set TLS servername", "ERR_SSL_INTERNAL_ERROR");
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tls_connection_set_max_send_fragment(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsConnectionSetMaxSendFragment(id, size) requires a connection id and size");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    int size = 0;
+    if (connection == NULL || !ct_value_to_int_checked(ctx, argv[1], 512, 16384, &size, exception, "Invalid TLS fragment size")) {
+        if (connection == NULL) ct_throw_message(ctx, exception, "TLS connection not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_lock(&connection->mutex);
+    int status = SSL_set_max_send_fragment(connection->ssl, (size_t)size);
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeBoolean(ctx, status == 1);
+}
+
+static JSValueRef ct_tls_connection_export_keying_material(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "tlsConnectionExportKeyingMaterial(id, length, label[, context]) requires id, length, and label");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    int length = 0;
+    if (connection == NULL || !ct_value_to_int_checked(ctx, argv[1], 0, 16 * 1024 * 1024, &length, exception, "Invalid TLS keying material length")) {
+        if (connection == NULL) ct_throw_message(ctx, exception, "TLS connection not found");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *label = ct_value_to_string_copy(ctx, argv[2]);
+    uint8_t *context = NULL;
+    size_t context_len = 0;
+    bool use_context = argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) && !JSValueIsNull(ctx, argv[3]);
+    if (use_context && ct_get_bytes(ctx, argv[3], &context, &context_len) != 0) {
+        free(label);
+        ct_throw_message(ctx, exception, "TLS keying material context must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    unsigned char *output = (unsigned char *)malloc(length > 0 ? (size_t)length : 1);
+    if (output == NULL) {
+        free(label);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_lock(&connection->mutex);
+    int status = connection->handshake_complete && label != NULL
+        ? SSL_export_keying_material(
+            connection->ssl,
+            output,
+            (size_t)length,
+            label,
+            strlen(label),
+            context,
+            context_len,
+            use_context ? 1 : 0
+        )
+        : 0;
+    pthread_mutex_unlock(&connection->mutex);
+    free(label);
+    if (status != 1) {
+        free(output);
+        char *message = ct_tls_error_message("Failed to export TLS keying material");
+        ct_tls_throw_error(ctx, exception, message, "ERR_TLS_INVALID_STATE");
+        free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, output, (size_t)length, ct_array_buffer_free, NULL, exception);
+}
 #else
 static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
@@ -11046,16 +11853,26 @@ static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSO
 }
 #define ct_tls_client_connect ct_tls_unavailable
 #define ct_tls_client_connect_fd ct_tls_unavailable
+#define ct_tls_client_connect_memory ct_tls_unavailable
 #define ct_tls_client_handshake ct_tls_unavailable
 #define ct_tls_server_upgrade_fd ct_tls_unavailable
 #define ct_tls_server_listen ct_tls_unavailable
 #define ct_tls_server_accept ct_tls_unavailable
 #define ct_tls_server_close ct_tls_unavailable
+#define ct_tls_connection_feed_memory ct_tls_unavailable
+#define ct_tls_connection_drain_memory ct_tls_unavailable
+#define ct_tls_connection_read_memory ct_tls_unavailable
 #define ct_tls_connection_read_start ct_tls_unavailable
 #define ct_tls_connection_write ct_tls_unavailable
 #define ct_tls_connection_close ct_tls_unavailable
 #define ct_tls_connection_shutdown ct_tls_unavailable
 #define ct_tls_connection_info ct_tls_unavailable
+#define ct_tls_connection_set_servername ct_tls_unavailable
+#define ct_tls_connection_set_max_send_fragment ct_tls_unavailable
+#define ct_tls_connection_add_server_context ct_tls_unavailable
+#define ct_tls_validate_server_context ct_tls_unavailable
+#define ct_tls_validate_ciphers ct_tls_unavailable
+#define ct_tls_connection_export_keying_material ct_tls_unavailable
 #endif
 
 static double ct_rusage_maxrss_bytes(const struct rusage *usage) {
@@ -18168,16 +18985,26 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "unixSocketConnect", ct_unix_socket_connect, runtime);
     ct_install_function(ctx, host, "tlsClientConnect", ct_tls_client_connect, runtime);
     ct_install_function(ctx, host, "tlsClientConnectFd", ct_tls_client_connect_fd, runtime);
+    ct_install_function(ctx, host, "tlsClientConnectMemory", ct_tls_client_connect_memory, runtime);
     ct_install_function(ctx, host, "tlsClientHandshake", ct_tls_client_handshake, runtime);
     ct_install_function(ctx, host, "tlsServerUpgradeFd", ct_tls_server_upgrade_fd, runtime);
+    ct_install_function(ctx, host, "tlsConnectionAddServerContext", ct_tls_connection_add_server_context, runtime);
+    ct_install_function(ctx, host, "tlsValidateServerContext", ct_tls_validate_server_context, runtime);
+    ct_install_function(ctx, host, "tlsValidateCiphers", ct_tls_validate_ciphers, runtime);
     ct_install_function(ctx, host, "tlsServerListen", ct_tls_server_listen, runtime);
     ct_install_function(ctx, host, "tlsServerAccept", ct_tls_server_accept, runtime);
     ct_install_function(ctx, host, "tlsServerClose", ct_tls_server_close, runtime);
+    ct_install_function(ctx, host, "tlsConnectionFeedMemory", ct_tls_connection_feed_memory, runtime);
+    ct_install_function(ctx, host, "tlsConnectionDrainMemory", ct_tls_connection_drain_memory, runtime);
+    ct_install_function(ctx, host, "tlsConnectionReadMemory", ct_tls_connection_read_memory, runtime);
     ct_install_function(ctx, host, "tlsConnectionReadStart", ct_tls_connection_read_start, runtime);
     ct_install_function(ctx, host, "tlsConnectionWrite", ct_tls_connection_write, runtime);
     ct_install_function(ctx, host, "tlsConnectionShutdown", ct_tls_connection_shutdown, runtime);
     ct_install_function(ctx, host, "tlsConnectionClose", ct_tls_connection_close, runtime);
     ct_install_function(ctx, host, "tlsConnectionInfo", ct_tls_connection_info, runtime);
+    ct_install_function(ctx, host, "tlsConnectionSetServername", ct_tls_connection_set_servername, runtime);
+    ct_install_function(ctx, host, "tlsConnectionSetMaxSendFragment", ct_tls_connection_set_max_send_fragment, runtime);
+    ct_install_function(ctx, host, "tlsConnectionExportKeyingMaterial", ct_tls_connection_export_keying_material, runtime);
     ct_install_function(ctx, host, "sqliteOpen", ct_sqlite_open, runtime);
     ct_install_function(ctx, host, "sqliteClose", ct_sqlite_close, runtime);
     ct_install_function(ctx, host, "sqliteExec", ct_sqlite_exec, runtime);

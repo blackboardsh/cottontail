@@ -749,6 +749,9 @@ export class Socket extends EventEmitter {
     this._paused = true;
     return this;
   }
+  isPaused() {
+    return this._paused;
+  }
   resume() {
     this._paused = false;
     this._flushPendingData();

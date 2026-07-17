@@ -1801,10 +1801,20 @@ function parseX509PublicKeyInfo(node) {
 function parseX509GeneralNames(node) {
   const names = [];
   for (const child of asn1Children(asn1Read(node.value))) {
-    if (child.tag === 0x82) names.push(`DNS:${new TextDecoder().decode(child.value)}`);
+    if (child.tag === 0x82) {
+      const value = new TextDecoder().decode(child.value);
+      const formatted = /[\u0000-\u001f\u007f-\u009f",\\]/.test(value) ? JSON.stringify(value) : value;
+      names.push(`DNS:${formatted}`);
+    }
     if (child.tag === 0x87) {
       if (child.value.byteLength === 4) names.push(`IP Address:${Array.from(child.value).join(".")}`);
-      else names.push(`IP Address:${Array.from(child.value, (byte) => byte.toString(16).padStart(2, "0")).join(":")}`);
+      else if (child.value.byteLength === 16) {
+        const groups = [];
+        for (let index = 0; index < child.value.byteLength; index += 2) {
+          groups.push(((child.value[index] << 8) | child.value[index + 1]).toString(16));
+        }
+        names.push(`IP Address:${groups.join(":")}`);
+      }
     }
     if (child.tag === 0x81) names.push(`email:${new TextDecoder().decode(child.value)}`);
   }
@@ -3159,11 +3169,24 @@ export class X509Certificate {
   }
 
   toLegacyObject() {
+    let infoAccess = this.infoAccess;
+    if (typeof infoAccess === "string") {
+      const entries = Object.create(null);
+      for (const line of infoAccess.split("\n")) {
+        if (!line) continue;
+        const separator = line.indexOf(":");
+        if (separator < 0) continue;
+        const name = line.slice(0, separator);
+        const value = line.slice(separator + 1);
+        (entries[name] ??= []).push(value);
+      }
+      infoAccess = entries;
+    }
     return {
       subject: this.subjectObject,
       issuer: this.issuerObject,
       subjectaltname: this.subjectAltName,
-      infoAccess: this.infoAccess,
+      infoAccess,
       ca: this.ca,
       ...this._parsed.legacyPublicKey,
       valid_from: this.validFrom,
