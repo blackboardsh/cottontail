@@ -3685,30 +3685,30 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
     file,
     normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }, true),
   );
-  const captureOutput = nativeOptions.stdout !== "inherit" || nativeOptions.stderr !== "inherit";
-  // COTTONTAIL-COMPAT: Bun.spawnSync native contract - the host currently
-  // exposes one captureOutput switch plus input. Literal parity requires
-  // per-fd stdio/dup2, argv0, pid+rusage, timeout/AbortSignal deadlines,
-  // maxBuffer enforcement, and killSignal to be accepted and returned by this
-  // single blocking hook. JavaScript cannot interrupt it while the VM thread
-  // is blocked, so those fields cannot be completed in this owned boundary.
+  const signalState = abortSignalState.get(nativeOptions.signal);
+  if (!nativeOptions.signal?.aborted && signalState?.timeoutDeadline != null) {
+    const signalTimeout = Math.max(1, Math.ceil(signalState.timeoutDeadline - Date.now()));
+    if (nativeOptions.timeout == null || signalTimeout < nativeOptions.timeout) {
+      nativeOptions.timeout = signalTimeout;
+    }
+  }
   let result;
   try {
     result = cottontail.spawnSync(file, args, {
       cwd: nativeOptions.cwd,
       env: nativeOptions.env,
       clearEnv: nativeOptions.clearEnv,
-      stdio: captureOutput ? "pipe" : "inherit",
+      stdin: nativeOptions.stdin,
+      stdout: nativeOptions.stdout,
+      stderr: nativeOptions.stderr,
       input: nativeOptions.input,
+      timeout: nativeOptions.timeout,
+      maxBuffer: nativeOptions.maxBuffer,
+      killSignal: nativeOptions.killSignal,
+      signal: nativeOptions.signal,
     });
   } catch (error) {
     throw normalizeBunSpawnError(error, file, nativeOptions.cwd);
-  }
-  if (captureOutput && nativeOptions.stdout === "inherit" && result.stdout != null) {
-    globalThis.process?.stdout?.write?.(result.stdout);
-  }
-  if (captureOutput && nativeOptions.stderr === "inherit" && result.stderr != null) {
-    globalThis.process?.stderr?.write?.(result.stderr);
   }
   const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
   const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
@@ -3745,8 +3745,8 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
     pid: result.pid,
   };
   if (signalCode != null) response.signalCode = signalCode;
-  if (nativeOptions.timeout != null) response.exitedDueToTimeout = false;
-  if (nativeOptions.maxBuffer != null) response.exitedDueToMaxBuffer = false;
+  if (nativeOptions.timeout != null) response.exitedDueToTimeout = result.exitedDueToTimeout === true;
+  if (nativeOptions.maxBuffer != null) response.exitedDueToMaxBuffer = result.exitedDueToMaxBuffer === true;
   return response;
 }
 
