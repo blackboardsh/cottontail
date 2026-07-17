@@ -27,6 +27,7 @@ pub const BundleOptions = struct {
     loader_values: []const compiler.schema.api.Loader = &.{},
     external_packages: bool = false,
     include_runtime_modules: bool = false,
+    runtime_file_loader_paths: bool = false,
     /// Runtime bundles execute with a global Node-style `require`. Keeping the
     /// original identifier makes Function.prototype.toString() output usable
     /// with `new Function("require", ...)`, matching Bun's module transpiler.
@@ -35,6 +36,8 @@ pub const BundleOptions = struct {
     minify_whitespace: bool = false,
     minify_identifiers: bool = false,
     minify_syntax: bool = false,
+    keep_names: bool = false,
+    no_macros: bool = false,
     ignore_dce_annotations: bool = false,
     emit_dce_annotations: ?bool = null,
     production: bool = false,
@@ -59,6 +62,7 @@ pub const BundleOptions = struct {
     code_splitting: bool = false,
     /// `Bun.build({ external: [...] })`: import specifiers left unresolved.
     external: []const []const u8 = &.{},
+    allow_unresolved: ?[]const []const u8 = null,
     /// Package names whose pure barrel modules should only load the exports
     /// requested by the importing graph.
     optimize_imports: []const []const u8 = &.{},
@@ -264,12 +268,17 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    transpiler.options.no_macros = options.no_macros;
+    transpiler.options.allow_unresolved = if (options.allow_unresolved) |patterns|
+        compiler.options.AllowUnresolved.fromStrings(patterns)
+    else
+        .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
     // Runtime execution bundles modules into one linker scope. Preserve each
     // module's observable function/class names when the linker renames a
     // colliding binding, matching direct ESM/CJS evaluation semantics.
-    transpiler.options.keep_names = options.include_runtime_modules;
+    transpiler.options.keep_names = options.keep_names or options.include_runtime_modules;
     transpiler.options.setProduction(options.production);
     if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
     transpiler.options.supports_multiple_outputs = false;
@@ -278,7 +287,7 @@ pub fn bundleEntryPointWithOptionsAndSourceMap(
     // of becoming an additional output file (which single-output in-memory
     // bundles cannot emit).
     transpiler.options.externalize_runtime_require_resolve = true;
-    transpiler.options.runtime_file_loader_paths = options.include_runtime_modules;
+    transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths or options.include_runtime_modules;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
@@ -514,6 +523,8 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                 .node
             else if (std.ascii.eqlIgnoreCase(value.string, "bun"))
                 .bun
+            else if (std.ascii.eqlIgnoreCase(value.string, "macro") or std.ascii.eqlIgnoreCase(value.string, "bun_macro"))
+                .bun_macro
             else
                 return error.InvalidTarget;
         }
@@ -580,6 +591,9 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     if (object.get("bytecode")) |value| {
         if (value == .bool) options.bytecode = value.bool;
     }
+    if (object.get("macros")) |value| {
+        if (value == .bool) options.no_macros = !value.bool;
+    }
     if (object.get("loader")) |value| switch (value) {
         .string => |loader_name| options.loader = loader_name,
         .object => |loader_map| {
@@ -588,6 +602,9 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
             var iterator = loader_map.iterator();
             while (iterator.next()) |entry| {
                 if (entry.value_ptr.* != .string) continue;
+                if (!std.mem.startsWith(u8, entry.key_ptr.*, ".") or entry.key_ptr.len < 2) {
+                    return error.InvalidLoaderExtension;
+                }
                 const loader = compiler.options.Loader.fromString(entry.value_ptr.string) orelse return error.InvalidLoader;
                 try extensions.append(allocator, entry.key_ptr.*);
                 try loaders.append(allocator, loader.toAPI());
@@ -620,12 +637,17 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
         }
     }
     if (object.get("conditions")) |value| {
-        if (value == .array) {
+        if (value == .string) {
+            options.conditions = try allocator.dupe([]const u8, &.{value.string});
+        } else if (value == .array) {
             var conditions: std.ArrayList([]const u8) = .empty;
             for (value.array.items) |item| {
-                if (item == .string) try conditions.append(allocator, item.string);
+                if (item != .string) return error.InvalidConditions;
+                try conditions.append(allocator, item.string);
             }
             options.conditions = conditions.items;
+        } else {
+            return error.InvalidConditions;
         }
     }
     if (object.get("minify")) |value| switch (value) {
@@ -643,6 +665,9 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
             }
             if (minify.get("syntax")) |item| {
                 if (item == .bool) options.minify_syntax = item.bool;
+            }
+            if (minify.get("keepNames")) |item| {
+                if (item == .bool) options.keep_names = item.bool;
             }
         },
         else => {},
@@ -713,6 +738,9 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     if (object.get("includeRuntimeModules")) |value| {
         if (value == .bool) options.include_runtime_modules = value.bool;
     }
+    if (object.get("runtimeFileLoaderPaths")) |value| {
+        if (value == .bool) options.runtime_file_loader_paths = value.bool;
+    }
     if (object.get("inlineImportMetaProperties")) |value| {
         if (value == .bool) options.inline_import_meta_properties = value.bool;
     }
@@ -723,6 +751,20 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
                 if (item == .string) try external.append(allocator, item.string);
             }
             options.external = external.items;
+        }
+    }
+    if (object.get("allowUnresolved")) |value| {
+        if (value == .null) {
+            options.allow_unresolved = null;
+        } else if (value == .array) {
+            var patterns: std.ArrayList([]const u8) = .empty;
+            for (value.array.items) |item| {
+                if (item != .string) return error.InvalidAllowUnresolved;
+                try patterns.append(allocator, item.string);
+            }
+            options.allow_unresolved = patterns.items;
+        } else {
+            return error.InvalidAllowUnresolved;
         }
     }
     if (object.get("optimizeImports")) |value| {
@@ -1150,9 +1192,13 @@ pub fn buildEntryPointsJson(
         try std.fs.path.resolve(arena_allocator, &.{ working_dir, requested_root });
     const build_root_z = try allocator.dupeZ(u8, build_root);
     defer allocator.free(build_root_z);
+    const working_dir_z = try allocator.dupeZ(u8, working_dir);
+    defer allocator.free(working_dir_z);
 
     var transform_options = std.mem.zeroes(compiler.schema.api.TransformOptions);
-    transform_options.absolute_working_dir = build_root_z;
+    // Bun resolves and labels source files relative to the process working
+    // directory. Its inferred/configured root only controls output naming.
+    transform_options.absolute_working_dir = working_dir_z;
     transform_options.entry_points = entry_points.items;
     transform_options.target = options.target;
     transform_options.write = false;
@@ -1209,7 +1255,7 @@ pub fn buildEntryPointsJson(
     // Match Bun's compiler lifecycle so package resolution sees NODE_PATH and
     // the rest of the inherited process environment.
     try transpiler.env.loadProcess();
-    try transpiler.fs.setTopLevelDir(build_root_z);
+    try transpiler.fs.setTopLevelDir(working_dir_z);
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
@@ -1223,6 +1269,12 @@ pub fn buildEntryPointsJson(
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
+    transpiler.options.keep_names = options.keep_names;
+    transpiler.options.no_macros = options.no_macros;
+    transpiler.options.allow_unresolved = if (options.allow_unresolved) |patterns|
+        compiler.options.AllowUnresolved.fromStrings(patterns)
+    else
+        .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
     transpiler.options.setProduction(options.production);

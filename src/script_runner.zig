@@ -2768,6 +2768,12 @@ fn appendDynamicTargetFactory(
                 "{{ const error = new Error({s}); error.code = \"MODULE_NOT_FOUND\"; throw error; }}",
                 .{try jsonStringLiteral(ctx, build_error.?)},
             )
+        else if (allowed.items.len == 0 and build_error != null)
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "{{ const error = new SyntaxError({s}); error.name = \"BuildMessage\"; throw error; }}",
+                .{try jsonStringLiteral(ctx, build_error.?)},
+            )
         else if (allowed.items.len == 0)
             "{ const error = new SyntaxError(\"Unable to parse module with the selected loader\"); error.name = \"BuildMessage\"; throw error; }"
         else

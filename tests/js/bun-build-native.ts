@@ -38,4 +38,18 @@ assert(pluginResult.outputs[0] instanceof Blob, "plugin builds should return Bui
 assert((await pluginResult.outputs[0].text()).includes("var answer = 42"), "onLoad output should be transpiled");
 assert(lifecycle.join(",") === "start,end", "plugin lifecycle hooks should run in order");
 
+const keepNamesResult = await Bun.build({
+  entrypoints: ["virtual-keep-names.js"],
+  files: {
+    "virtual-keep-names.js": "function LongFunctionName() {}; console.log(LongFunctionName.name);",
+  },
+  target: "bun",
+  conditions: "development",
+  minify: { identifiers: true, keepNames: true },
+});
+
+assert(keepNamesResult.success, "Bun.build should accept a single string condition");
+const keepNamesSource = await keepNamesResult.outputs[0].text();
+assert(keepNamesSource.includes('"LongFunctionName"'), "minify.keepNames should preserve the original function name");
+
 console.log("bun build native passed");

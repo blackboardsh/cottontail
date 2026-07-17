@@ -980,7 +980,33 @@ function formatExtensionCompileSource(source) {
   return body ? `\n${body}\n` : "\n";
 }
 
+function executeBundledCommonJsModule(module, filename) {
+  const bundled = String(cottontail.bundleNative(
+    filename,
+    dirname(filename),
+    JSON.stringify({
+      format: "cjs",
+      target: "bun",
+      preserveExternalRequireName: true,
+      runtimeFileLoaderPaths: true,
+    }),
+  ));
+  maybeRegisterSourceMap(filename, bundled);
+  recordCompileCache(filename, bundled);
+  const factory = cottontail.compileFunction(bundled, filename);
+  if (typeof factory !== "function") {
+    throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
+  }
+  factory(module.exports, module.require, module, filename, dirname(filename));
+  module.loaded = true;
+  return module.exports;
+}
+
 function executeDefaultExtension(module, filename, loader) {
+  const originalSource = cottontail.readFile(filename).replace(/^#![^\n]*(\n|$)/, "");
+  if (esmSyntaxPattern.test(originalSource) && typeof cottontail.bundleNative === "function") {
+    return executeBundledCommonJsModule(module, filename);
+  }
   const source = transpileExtensionSource(filename, loader);
   // Bun's synchronous ESM path does not call an overridden module._compile.
   if (esmSyntaxPattern.test(source)) return executeCommonJsSource(module, filename, source);
