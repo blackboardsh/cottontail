@@ -6,6 +6,7 @@
 #endif
 
 #include "jsc_runner.h"
+#include "napi_bridge.h"
 
 #include <JavaScriptCore/JavaScript.h>
 
@@ -1080,8 +1081,6 @@ typedef enum {
     CT_FFI_TYPE_NAPI_VALUE,
 } CtFfiType;
 
-static _Thread_local JSContextRef ct_active_napi_context = NULL;
-
 typedef union {
     uint8_t u8;
     int8_t i8;
@@ -1500,6 +1499,7 @@ struct CtJscRuntime {
     size_t referenced_timer_count;
     size_t protected_timer_count;
     CtBrotliEncoderHandle *brotli_encoders;
+    CtNapiEnv *napi_env;
     uint32_t next_brotli_encoder_id;
     bool next_tick_pending;
     bool next_tick_priority_armed;
@@ -1511,6 +1511,10 @@ static void ct_runtime_wake(CtJscRuntime *runtime) {
     runtime->wake_pending = true;
     pthread_cond_signal(&runtime->wake_cond);
     pthread_mutex_unlock(&runtime->wake_mutex);
+}
+
+static void ct_napi_wake(void *opaque) {
+    ct_runtime_wake((CtJscRuntime *)opaque);
 }
 
 static void ct_runtime_wait(CtJscRuntime *runtime, int delay_ms) {
@@ -2489,19 +2493,6 @@ static JSValueRef ct_make_string_len(JSContextRef ctx, const char *value, size_t
     JSValueRef result = JSValueMakeString(ctx, string);
     JSStringRelease(string);
     return result;
-}
-
-__attribute__((visibility("default"))) int napi_create_string_utf8(
-    void *env,
-    const char *value,
-    size_t length,
-    void **result
-) {
-    (void)env;
-    if (ct_active_napi_context == NULL || value == NULL || result == NULL) return 1;
-    if (length == (size_t)-1) length = strlen(value);
-    *result = (void *)ct_make_string_len(ct_active_napi_context, value, length);
-    return 0;
 }
 
 static char *ct_value_to_string_copy(JSContextRef ctx, JSValueRef value) {
@@ -13504,6 +13495,7 @@ static JSValueRef ct_shared_atomic_notify(JSContextRef ctx, JSObjectRef function
 }
 
 static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     void *handle = NULL;
     void *symbol = NULL;
     char *open_error = NULL;
@@ -13515,7 +13507,6 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
     CtFfiValue result;
     ffi_cif cif;
     size_t arg_count = 0;
-    (void)function;
     (void)thisObject;
 
     memset(&result, 0, sizeof(result));
@@ -13548,6 +13539,38 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
 
+    bool uses_napi = return_type == CT_FFI_TYPE_NAPI_ENV || return_type == CT_FFI_TYPE_NAPI_VALUE;
+    for (size_t index = 0; index < arg_count; index += 1) {
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV || arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
+            uses_napi = true;
+            break;
+        }
+    }
+    if (uses_napi && runtime == NULL) {
+        free(library_path);
+        free(symbol_name);
+        ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (uses_napi && runtime->napi_env == NULL) {
+        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        if (runtime->napi_env == NULL) {
+            free(library_path);
+            free(symbol_name);
+            ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    CtNapiEnv *ffi_napi_env = uses_napi
+        ? ct_napi_env_for_ffi_library(runtime->napi_env, library_path)
+        : NULL;
+    if (uses_napi && ffi_napi_env == NULL) {
+        free(library_path);
+        free(symbol_name);
+        ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
+        return JSValueMakeUndefined(ctx);
+    }
+
     JSObjectRef args_array = (JSObjectRef)argv[4];
     for (size_t index = 0; index < arg_count; index += 1) {
         JSValueRef item = JSObjectGetPropertyAtIndex(ctx, args_array, (unsigned)index, exception);
@@ -13555,6 +13578,16 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
             free(library_path);
             free(symbol_name);
             return JSValueMakeUndefined(ctx);
+        }
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)ffi_napi_env;
+            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+            continue;
+        }
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)item;
+            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+            continue;
         }
         if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index], exception) != 0) {
             free(library_path);
@@ -13594,10 +13627,16 @@ static JSValueRef ct_native_call(JSContextRef ctx, JSObjectRef function, JSObjec
         return JSValueMakeUndefined(ctx);
     }
 
-    JSContextRef previous_napi_context = ct_active_napi_context;
-    ct_active_napi_context = ctx;
     ffi_call(&cif, FFI_FN(symbol), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
-    ct_active_napi_context = previous_napi_context;
+    if (uses_napi) {
+        JSValueRef napi_exception = ct_napi_env_take_exception(ffi_napi_env);
+        if (napi_exception != NULL) {
+            *exception = napi_exception;
+            free(library_path);
+            free(symbol_name);
+            return JSValueMakeUndefined(ctx);
+        }
+    }
     JSValueRef js_result = ct_ffi_value_to_js(ctx, return_type, result);
 
     free(library_path);
@@ -13652,7 +13691,41 @@ static JSValueRef ct_native_symbol(JSContextRef ctx, JSObjectRef function, JSObj
     return JSValueMakeNumber(ctx, (double)(uintptr_t)symbol);
 }
 
+static JSValueRef ct_native_addon_load(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    if (runtime == NULL || argc < 1) {
+        ct_throw_message(ctx, exception, "cottontail.nativeAddonLoad(path[, exports]) requires an addon path");
+        return JSValueMakeUndefined(ctx);
+    }
+    char *path = ct_value_to_string_copy(ctx, argv[0]);
+    if (path == NULL) {
+        ct_throw_message(ctx, exception, "native addon path must be a string");
+        return JSValueMakeUndefined(ctx);
+    }
+    JSObjectRef exports = NULL;
+    if (argc >= 2 && JSValueIsObject(ctx, argv[1])) {
+        exports = JSValueToObject(ctx, argv[1], exception);
+        if (exception != NULL && *exception != NULL) {
+            free(path);
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    if (runtime->napi_env == NULL) {
+        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        if (runtime->napi_env == NULL) {
+            free(path);
+            ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    JSValueRef result = ct_napi_load_addon(runtime->napi_env, path, exports, exception);
+    free(path);
+    return result != NULL ? result : JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     uint64_t pointer = 0;
     CtFfiType return_type = CT_FFI_TYPE_VOID;
     CtFfiType arg_types[CT_FFI_MAX_ARGS];
@@ -13662,7 +13735,6 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
     CtFfiValue result;
     ffi_cif cif;
     size_t arg_count = 0;
-    (void)function;
     (void)thisObject;
 
     memset(&result, 0, sizeof(result));
@@ -13682,10 +13754,49 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
 
+    bool uses_napi = return_type == CT_FFI_TYPE_NAPI_ENV || return_type == CT_FFI_TYPE_NAPI_VALUE;
+    for (size_t index = 0; index < arg_count; index += 1) {
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV || arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
+            uses_napi = true;
+            break;
+        }
+    }
+    if (uses_napi && runtime == NULL) {
+        ct_throw_message(ctx, exception, "N-API FFI calls require an active Cottontail runtime");
+        return JSValueMakeUndefined(ctx);
+    }
+    if (uses_napi && runtime->napi_env == NULL) {
+        runtime->napi_env = ct_napi_env_create(runtime->context, runtime, ct_napi_wake);
+        if (runtime->napi_env == NULL) {
+            ct_throw_message(ctx, exception, "failed to initialize the Node-API environment");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+    char ffi_identity[64];
+    CtNapiEnv *ffi_napi_env = NULL;
+    if (uses_napi) {
+        snprintf(ffi_identity, sizeof(ffi_identity), "pointer:%" PRIu64, pointer);
+        ffi_napi_env = ct_napi_env_for_ffi_library(runtime->napi_env, ffi_identity);
+        if (ffi_napi_env == NULL) {
+            ct_throw_message(ctx, exception, "failed to initialize the FFI Node-API environment");
+            return JSValueMakeUndefined(ctx);
+        }
+    }
+
     JSObjectRef args_array = (JSObjectRef)argv[3];
     for (size_t index = 0; index < arg_count; index += 1) {
         JSValueRef item = JSObjectGetPropertyAtIndex(ctx, args_array, (unsigned)index, exception);
         if (exception != NULL && *exception != NULL) return JSValueMakeUndefined(ctx);
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_ENV) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)ffi_napi_env;
+            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+            continue;
+        }
+        if (arg_types[index] == CT_FFI_TYPE_NAPI_VALUE) {
+            arg_values[index].u64 = (uint64_t)(uintptr_t)item;
+            arg_value_ptrs[index] = ct_ffi_value_ptr(&arg_values[index], arg_types[index]);
+            continue;
+        }
         if (ct_ffi_value_from_js(ctx, item, arg_types[index], &arg_values[index], exception) != 0) {
             return JSValueMakeUndefined(ctx);
         }
@@ -13697,10 +13808,14 @@ static JSValueRef ct_native_call_pointer(JSContextRef ctx, JSObjectRef function,
         return JSValueMakeUndefined(ctx);
     }
 
-    JSContextRef previous_napi_context = ct_active_napi_context;
-    ct_active_napi_context = ctx;
     ffi_call(&cif, FFI_FN((void *)(uintptr_t)pointer), ct_ffi_value_ptr(&result, return_type), arg_value_ptrs);
-    ct_active_napi_context = previous_napi_context;
+    if (uses_napi) {
+        JSValueRef napi_exception = ct_napi_env_take_exception(ffi_napi_env);
+        if (napi_exception != NULL) {
+            *exception = napi_exception;
+            return JSValueMakeUndefined(ctx);
+        }
+    }
     return ct_ffi_value_to_js(ctx, return_type, result);
 }
 
@@ -16246,16 +16361,21 @@ static JSValueRef ct_undefined(JSContextRef ctx, JSObjectRef function, JSObjectR
 }
 
 static JSValueRef ct_gc(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
     (void)thisObject;
     (void)argc;
     (void)argv;
-    (void)exception;
 #if defined(__APPLE__)
     JSSynchronousGarbageCollectForDebugging(ctx);
     malloc_zone_pressure_relief(NULL, 0);
 #else
     JSGarbageCollect(ctx);
 #endif
+    if (runtime != NULL && runtime->napi_env != NULL) {
+        JSValueRef napi_exception = NULL;
+        ct_napi_env_drain_gc(runtime->napi_env, &napi_exception);
+        if (napi_exception != NULL && exception != NULL) *exception = napi_exception;
+    }
     return JSValueMakeUndefined(ctx);
 }
 
@@ -18951,6 +19071,7 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "sharedAtomicNotify", ct_shared_atomic_notify, runtime);
     ct_install_function(ctx, host, "nativeCall", ct_native_call, runtime);
     ct_install_function(ctx, host, "nativeSymbol", ct_native_symbol, runtime);
+    ct_install_function(ctx, host, "nativeAddonLoad", ct_native_addon_load, runtime);
     ct_install_function(ctx, host, "nativeCallPointer", ct_native_call_pointer, runtime);
     ct_install_function(ctx, host, "createCallback", ct_create_callback, runtime);
     ct_install_function(ctx, host, "closeCallback", ct_close_callback, runtime);
@@ -19438,6 +19559,10 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
 
     JSContextRef ctx = runtime->context;
     if (ctx != NULL) {
+        if (runtime->napi_env != NULL) {
+            ct_napi_env_destroy(runtime->napi_env);
+            runtime->napi_env = NULL;
+        }
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);
         if (runtime->spawn_event_handler != NULL) JSValueUnprotect(ctx, runtime->spawn_event_handler);
@@ -20136,6 +20261,7 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
 
     if (runtime->next_tick_pending) return true;
     if (runtime->referenced_timer_count > 0) return true;
+    if (runtime->napi_env != NULL && ct_napi_env_has_pending_work(runtime->napi_env)) return true;
 
 #if CT_HAS_OPENSSL
     pthread_mutex_lock(&ct_tls_mutex);
@@ -20320,6 +20446,17 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
     ct_jsc_run_loop_cycle();
     if (ct_drain_next_ticks(runtime, true, error_out) != 0) return -1;
     if (ct_drain_ffi_callbacks(runtime, error_out) != 0) return -1;
+    if (runtime->napi_env != NULL) {
+        JSValueRef napi_exception = NULL;
+        ct_napi_env_drain(runtime->napi_env, &napi_exception);
+        if (napi_exception != NULL) {
+            JSValueRef handler_exception = NULL;
+            if (!ct_handle_uncaught_exception(ctx, napi_exception, &handler_exception)) {
+                ct_set_error_out(error_out, ct_copy_exception(ctx, handler_exception != NULL ? handler_exception : napi_exception));
+                return -1;
+            }
+        }
+    }
     if (ct_dispatch_timers(runtime, error_out) != 0) return -1;
     JSStringRef source = ct_js_string(
         "(function(){"

@@ -151,6 +151,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             "-DJS_NO_EXPORT=1",
         },
     });
+    step.root_module.addCSourceFile(.{
+        .file = b.path("src/napi_bridge.cpp"),
+        .flags = &[_][]const u8{
+            "-std=c++20",
+            "-DJS_NO_EXPORT=1",
+        },
+    });
     step.root_module.addObjectFile(lolhtml);
     step.root_module.addCSourceFile(.{
         .file = b.path("src/compiler/src/jsc/bindings/sqlite/sqlite3.c"),
