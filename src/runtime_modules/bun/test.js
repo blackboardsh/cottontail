@@ -1,5 +1,6 @@
 import nodeAssert from "../node/assert.js";
 import { existsSync as nodeExistsSync } from "../node/fs.js";
+import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import {
   after as nodeAfter,
@@ -3243,12 +3244,12 @@ function makeBunTestFunction(base) {
     }
     return base(
       normalizeTestName(parsed.name),
-      {
+      applyBunFileConcurrency({
         ...parsed.options,
         ...extraOptions,
         __bunTest: true,
         __bunUsesDoneCallback: typeof parsed.callback === "function" && parsed.callback.length > 0,
-      },
+      }),
       wrapTestCallback(parsed.callback),
     );
   };
@@ -3286,7 +3287,7 @@ function makeBunDescribe(base) {
     const parsed = parseDescribeArgs(args);
     return base(
       normalizeTestName(parsed.name),
-      { ...parsed.options, __bunDeferredDefinition: true, __bunTest: true },
+      applyBunFileConcurrency({ ...parsed.options, __bunDeferredDefinition: true, __bunTest: true }),
       parsed.callback,
     );
   };
@@ -3298,7 +3299,7 @@ function makeBunDescribe(base) {
       const parsed = parseDescribeArgs(args);
       return base(
         normalizeTestName(parsed.name),
-        { ...parsed.options, ...extraOptions, __bunDeferredDefinition: true, __bunTest: true },
+        applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunDeferredDefinition: true, __bunTest: true }),
         parsed.callback,
       );
     };
