@@ -283,6 +283,14 @@ const upstreamDisabledStatuses = new Set(['disabled', 'skip']);
 
 function countAllFiles(dir) {
   if (!existsSync(dir)) return 0;
+  const tracked = spawnSync('git', ['ls-files', '-z', '--', relative(rootDir, dir)], {
+    cwd: rootDir,
+    encoding: 'utf8',
+  });
+  if (tracked.status === 0) {
+    return tracked.stdout.split('\0').filter(Boolean).length;
+  }
+
   let count = 0;
   const stack = [dir];
   const installedDependencies = join(dir, 'test', 'node_modules');

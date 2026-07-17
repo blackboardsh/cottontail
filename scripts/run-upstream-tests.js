@@ -3,7 +3,7 @@
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import os from 'os';
-import { join, resolve } from 'path';
+import { join, relative, resolve } from 'path';
 
 const rootDir = process.cwd();
 const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
@@ -184,6 +184,14 @@ function parseArgs(argv) {
 }
 
 function countFiles(dir) {
+  const tracked = spawnSync('git', ['ls-files', '-z', '--', relative(rootDir, dir)], {
+    cwd: rootDir,
+    encoding: 'utf8',
+  });
+  if (tracked.status === 0) {
+    return tracked.stdout.split('\0').filter(Boolean).length;
+  }
+
   let count = 0;
   const stack = [dir];
   const installedDependencies = join(dir, 'test', 'node_modules');
