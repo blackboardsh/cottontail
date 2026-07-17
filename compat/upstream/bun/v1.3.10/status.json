@@ -2544,6 +2544,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 0 assertions)."
     },
+    "test/js/node/tls/node-tls-no-cipher-match-error.test.ts": {
+      "status": "enabled",
+      "reason": "OpenSSL cipher-list validation exposes Node's ERR_SSL_NO_CIPHER_MATCH contract (1 bun:test case, 3 assertions)."
+    },
     "test/js/node/tls/node-tls-socket-allow-half-open-option.test.ts": {
       "status": "enabled",
       "reason": "Passes after the node net/tls/url/crypto/zlib conformance pass (1 bun:test cases, 2 assertions)."
@@ -2551,6 +2555,10 @@
     "test/js/node/tls/node-tls-upgrade.test.ts": {
       "status": "enabled",
       "reason": "A paused accepted net.Socket can be upgraded to TLS while preserving backpressure through the native server-side FD bridge (1 copied upstream case, 1 assertion)."
+    },
+    "test/js/node/tls/renegotiation.test.ts": {
+      "status": "enabled",
+      "reason": "TLS renegotiation and disableRenegotiation behavior pass the copied upstream contract (6 bun:test cases, 6 assertions)."
     },
     "test/js/node/tls/test-node-extra-ca-certs.test.ts": {
       "status": "enabled",
