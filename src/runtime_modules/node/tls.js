@@ -73,6 +73,74 @@ function validateCiphers(ciphers, name = "options") {
   }
 }
 
+const tlsVersionNumbers = Object.freeze({
+  TLSv1: 0x0301,
+  "TLSv1.1": 0x0302,
+  "TLSv1.2": 0x0303,
+  "TLSv1.3": 0x0304,
+});
+
+function tlsProtocolError(message, code) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
+}
+
+function protocolVersionNumber(value, optionName) {
+  const version = tlsVersionNumbers[value];
+  if (version == null) {
+    throw tlsProtocolError(`${optionName} must be a valid TLS protocol version. Received ${String(value)}`, "ERR_TLS_INVALID_PROTOCOL_VERSION");
+  }
+  return version;
+}
+
+function protocolMethodRange(method) {
+  if (/^SSLv(?:2|3)(?:_(?:client|server))?_method$/.test(method)) {
+    const version = method.startsWith("SSLv2") ? "SSLv2" : "SSLv3";
+    throw tlsProtocolError(`${version} methods disabled`, "ERR_TLS_INVALID_PROTOCOL_METHOD");
+  }
+  if (/^(?:TLS|SSLv23)(?:_(?:client|server))?_method$/.test(method)) {
+    return [tlsVersionNumbers[DEFAULT_MIN_VERSION], tlsVersionNumbers[DEFAULT_MAX_VERSION]];
+  }
+  const exact = /^TLSv1(?:_([12]))?(?:_(?:client|server))?_method$/.exec(method);
+  if (exact) {
+    const version = exact[1] == null ? "TLSv1" : `TLSv1.${exact[1]}`;
+    const number = tlsVersionNumbers[version];
+    return [number, number];
+  }
+  throw tlsProtocolError(`Unknown method: ${method}`, "ERR_TLS_INVALID_PROTOCOL_METHOD");
+}
+
+function tlsProtocolOptions(options = {}) {
+  const context = options?.secureContext?.context ?? {};
+  const minValue = options?.minVersion ?? context.minVersion;
+  const maxValue = options?.maxVersion ?? context.maxVersion;
+  const method = options?.secureProtocol ?? context.secureProtocol;
+  if (method != null && (minValue != null || maxValue != null)) {
+    throw tlsProtocolError("Secure protocol method conflicts with minVersion or maxVersion", "ERR_TLS_PROTOCOL_VERSION_CONFLICT");
+  }
+  let minVersion;
+  let maxVersion;
+  if (method != null) {
+    [minVersion, maxVersion] = protocolMethodRange(String(method));
+  } else {
+    minVersion = protocolVersionNumber(minValue ?? DEFAULT_MIN_VERSION, "minVersion");
+    maxVersion = protocolVersionNumber(maxValue ?? DEFAULT_MAX_VERSION, "maxVersion");
+  }
+  if (minVersion > maxVersion) {
+    throw tlsProtocolError("minVersion must not exceed maxVersion", "ERR_TLS_INVALID_PROTOCOL_VERSION");
+  }
+  const rawSecureOptions = options?.secureOptions ?? context.secureOptions ?? 0;
+  if (typeof rawSecureOptions !== "number" || !Number.isFinite(rawSecureOptions)) {
+    throw invalidArgType("options.secureOptions", "of type number", rawSecureOptions);
+  }
+  return {
+    minVersion,
+    maxVersion,
+    secureOptions: Math.trunc(rawSecureOptions) >>> 0,
+  };
+}
+
 function normalizeCertificateLabels(value) {
   return String(value ?? "")
     .replace(/-----BEGIN (?:X509 |TRUSTED )CERTIFICATE-----/g, "-----BEGIN CERTIFICATE-----")
@@ -121,6 +189,11 @@ function installTlsEventDispatcher() {
   if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
     globalThis.__cottontailFdWatchHandlerInstalled = true;
     cottontail.fdSetEventHandler((event) => {
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(Number(event?.id));
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
       const fdListeners = globalThis.__cottontailFdWatchListeners;
       const fdListener = fdListeners?.get?.(Number(event?.id));
       if (typeof fdListener === "function") {
@@ -498,6 +571,7 @@ class SecureContextImpl {
       if (options[versionName] != null && typeof options[versionName] !== "string") throw invalidArgType(`options.${versionName}`, "of type string", options[versionName]);
     }
     validateCiphers(options.ciphers);
+    tlsProtocolOptions(options);
     this.context = { ...options };
     this.servername = options.servername;
   }
@@ -581,6 +655,8 @@ export class TLSSocket extends Socket {
     this._renegotiationDisabled = false;
     this._rejectUnauthorized = options?.rejectUnauthorized == null ? rejectUnauthorizedDefault : options.rejectUnauthorized !== false;
     this._requestCert = options?.requestCert !== false;
+    this._requestOCSP = options?.requestOCSP === true;
+    this._ocspResponseEmitted = false;
     this._checkServerIdentity = options?.checkServerIdentity ?? checkServerIdentity;
     this.isServer = options?.isServer === true;
     const handshakeTimeout = options.handshakeTimeout ?? (this.isServer ? 120000 : 10000);
@@ -607,6 +683,7 @@ export class TLSSocket extends Socket {
     this.destroyed = false;
     this.readable = true;
     this.writable = !this._ending;
+    cottontail.tlsConnectionSetRef?.(this._tlsId, this._refed);
     this._setAddressInfo(native.local, native.remote);
     if (this._maxSendFragment != null) {
       try { cottontail.tlsConnectionSetMaxSendFragment?.(this._tlsId, this._maxSendFragment); } catch {}
@@ -667,6 +744,7 @@ export class TLSSocket extends Socket {
         const error = tlsError("TLS handshake timed out", "ETIMEDOUT");
         this.destroy(error);
       }, this._handshakeTimeout);
+      if (!this._refed) this._tlsHandshakeTimer.unref?.();
     }
     this._driveMemoryHandshake(connectedEvent);
     return this;
@@ -785,6 +863,10 @@ export class TLSSocket extends Socket {
       this._flushTlsPendingWrites();
       if (this.destroyed) return;
       this._startTlsRead();
+      if (!this.isServer && this._requestOCSP && !this._ocspResponseEmitted) {
+        this._ocspResponseEmitted = true;
+        this.emit("OCSPResponse", bufferFromNativeBytes(info.ocspResponse) ?? null);
+      }
       if (!this.isServer) {
         this.emit("connect");
         this._readyEmitted = true;
@@ -824,6 +906,7 @@ export class TLSSocket extends Socket {
           throw error;
         }
         this._tlsHandshakeTimer = setTimeout(step, 1);
+        if (!this._refed) this._tlsHandshakeTimer.unref?.();
       } catch (error) {
         error = normalizeTlsError(error);
         this.authorized = false;
@@ -833,6 +916,7 @@ export class TLSSocket extends Socket {
       }
     };
     this._tlsHandshakeTimer = setTimeout(step, 0);
+    if (!this._refed) this._tlsHandshakeTimer.unref?.();
   }
 
   _currentTlsInfo() {
@@ -876,12 +960,16 @@ export class TLSSocket extends Socket {
       }
       if (event.type === "error") {
         const error = new Error(event.message || "TLS read failed");
-        if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
+        if (event.code != null) error.code = String(event.code);
+        else if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
         else if (/broken pipe/i.test(error.message)) error.code = "EPIPE";
+        if (event.errno != null) error.errno = Number(event.errno);
         this.destroy(error);
       }
     }));
     this._tlsListenerInstalled = true;
+    cottontail.tlsConnectionSetRef?.(this._tlsId, this._refed);
+    cottontail.tlsConnectionSetReadPaused?.(this._tlsId, this._paused);
     cottontail.tlsConnectionReadStart(this._tlsId);
     return this;
   }
@@ -1051,12 +1139,34 @@ export class TLSSocket extends Socket {
 
   pause() {
     this._paused = true;
+    if (this._tlsId != null) cottontail.tlsConnectionSetReadPaused?.(this._tlsId, true);
+    this._memoryTransport?.pause?.();
     return this;
   }
 
   resume() {
     this._paused = false;
     this._flushPendingData?.();
+    if (this._tlsId != null) cottontail.tlsConnectionSetReadPaused?.(this._tlsId, false);
+    this._memoryTransport?.resume?.();
+    return this;
+  }
+
+  ref() {
+    super.ref();
+    this._tlsHandshakeTimer?.ref?.();
+    this._parent?.ref?.();
+    this._memoryTransport?.ref?.();
+    if (this._tlsId != null) cottontail.tlsConnectionSetRef?.(this._tlsId, true);
+    return this;
+  }
+
+  unref() {
+    super.unref();
+    this._tlsHandshakeTimer?.unref?.();
+    this._parent?.unref?.();
+    this._memoryTransport?.unref?.();
+    if (this._tlsId != null) cottontail.tlsConnectionSetRef?.(this._tlsId, false);
     return this;
   }
 
@@ -1069,14 +1179,19 @@ export class TLSSocket extends Socket {
     const version = String(info.cipher).startsWith("TLS_") ? "TLSv1/SSLv3" : info.cipherVersion ?? info.protocol ?? undefined;
     return { name: info.cipher, standardName: info.cipher, version };
   }
-  // COTTONTAIL-COMPAT: Requires native SSL_get_server_tmp_key exposure.
-  getEphemeralKeyInfo() { return {}; }
+  getEphemeralKeyInfo() {
+    if (this.isServer) return null;
+    return this._currentTlsInfo()?.ephemeralKeyInfo ?? {};
+  }
   getSharedSigalgs() {
     const value = this._currentTlsInfo()?.sharedSigalgs;
     return Array.isArray(value) ? [...value] : [];
   }
-  // COTTONTAIL-COMPAT: Requires native SSL_get_finished exposure.
-  getFinished() { return undefined; }
+  getFinished() {
+    const info = this._currentTlsInfo();
+    if (info?.protocol === "TLSv1.3") return undefined;
+    return bufferFromNativeBytes(info?.finished);
+  }
   getPeerCertificate(detailed = false) {
     return legacyPeerCertificate(this._currentTlsInfo(), Boolean(detailed));
   }
@@ -1090,8 +1205,11 @@ export class TLSSocket extends Socket {
     const raw = bufferFromNativeBytes(this._currentTlsInfo()?.localCertificate);
     return raw == null || raw.byteLength === 0 ? undefined : new X509Certificate(raw);
   }
-  // COTTONTAIL-COMPAT: Requires native SSL_get_peer_finished exposure.
-  getPeerFinished() { return undefined; }
+  getPeerFinished() {
+    const info = this._currentTlsInfo();
+    if (info?.protocol === "TLSv1.3") return undefined;
+    return bufferFromNativeBytes(info?.peerFinished);
+  }
   getProtocol() {
     const info = this._currentTlsInfo();
     return info?.protocol ?? null;
@@ -1114,7 +1232,7 @@ export class TLSSocket extends Socket {
       this._session = bufferFromNativeBytes(session);
       if (this._session == null) throw invalidArgType("session", "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer", session);
     }
-    // COTTONTAIL-COMPAT: Applying this session requires native SSL_set_session.
+    if (this._tlsId != null) cottontail.tlsConnectionSetSession?.(this._tlsId, this._session);
     return undefined;
   }
   setServername(name) {
@@ -1318,6 +1436,7 @@ class ServerImpl extends NetServer {
     }
     try {
       const credentials = tlsCredentialOptions(this._tlsOptions);
+      const protocols = tlsProtocolOptions(this._tlsOptions);
       cottontail.tlsValidateServerContext?.(
         credentials.cert,
         credentials.key,
@@ -1326,6 +1445,9 @@ class ServerImpl extends NetServer {
         this._tlsOptions.ciphers,
         Boolean(this._tlsOptions.requestCert),
         this._tlsOptions.rejectUnauthorized !== false,
+        protocols.minVersion,
+        protocols.maxVersion,
+        protocols.secureOptions,
       );
     } catch (error) {
       queueMicrotask(() => this.emit("error", normalizeTlsError(error)));
@@ -1386,6 +1508,7 @@ export const Server = new Proxy(ServerImpl, {
 export function connect(...args) {
   const [options, callback] = normalizeConnectArgs(args);
   validateCiphers(options.ciphers);
+  const protocolOptions = tlsProtocolOptions(options);
   if (options.servername != null && typeof options.servername !== "string") throw invalidArgType("options.servername", "of type string", options.servername);
   if (options.servername && isIP(options.servername)) {
     throw invalidArgValue("options.servername", options.servername, "Setting the TLS ServerName to an IP address is not permitted");
@@ -1448,6 +1571,11 @@ export function connect(...args) {
           credentials.passphrase,
           alpnProtocols,
           options.ciphers,
+          protocolOptions.minVersion,
+          protocolOptions.maxVersion,
+          protocolOptions.secureOptions,
+          socket._session,
+          socket._requestOCSP,
         );
         socket._attachNative(native, "secureConnect");
         return;
@@ -1463,6 +1591,11 @@ export function connect(...args) {
           credentials.passphrase,
           alpnProtocols,
           options.ciphers,
+          protocolOptions.minVersion,
+          protocolOptions.maxVersion,
+          protocolOptions.secureOptions,
+          socket._session,
+          socket._requestOCSP,
         );
         socket._attachMemoryTransport(native, parentSocket, "secureConnect");
         return;
@@ -1505,11 +1638,17 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
   }
   const credentials = tlsCredentialOptions(options);
   const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
+  const protocolOptions = tlsProtocolOptions(options);
   const contexts = [];
   if (options.contexts) {
     for (const [hostname, secureContext] of options.contexts) {
       const contextOptions = secureContext instanceof SecureContext ? secureContext.context : secureContext;
-      contexts.push({ hostname, options: contextOptions, credentials: tlsCredentialOptions(contextOptions) });
+      contexts.push({
+        hostname,
+        options: contextOptions,
+        credentials: tlsCredentialOptions(contextOptions),
+        protocols: tlsProtocolOptions(contextOptions),
+      });
     }
   }
   const socket = new TLSSocket(parentSocket, options);
@@ -1525,6 +1664,9 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
     Boolean(options.requestCert),
     rejectUnauthorized,
     options.ciphers,
+    protocolOptions.minVersion,
+    protocolOptions.maxVersion,
+    protocolOptions.secureOptions,
   );
   try {
     if (typeof cottontail.tlsConnectionAddServerContext === "function") {
@@ -1539,6 +1681,9 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
           Boolean(options.requestCert),
           rejectUnauthorized,
           context.options?.ciphers ?? options.ciphers,
+          context.protocols.minVersion,
+          context.protocols.maxVersion,
+          context.protocols.secureOptions,
         );
       }
     }
@@ -1699,9 +1844,8 @@ export function getCiphers() {
   return [...defaultCipherNames];
 }
 
-// COTTONTAIL-COMPAT: Native TLS gaps are protocol min/max/secureOptions enforcement, session
-// injection, finished/peer-finished/OCSP/ticket/ephemeral-key access, renegotiation, trace output,
-// dynamic SNICallback selection, and ticket-key management.
+// COTTONTAIL-COMPAT: Dynamic asynchronous SNICallback/OCSP callbacks, renegotiation, trace output,
+// and server-wide ticket-key/session-cache management require a persistent native server context.
 
 const tlsDefault = {
   CLIENT_RENEG_LIMIT,

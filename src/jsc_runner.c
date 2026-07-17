@@ -874,7 +874,9 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 
 #if __has_include(<openssl/evp.h>) && __has_include(<openssl/kdf.h>) && __has_include(<openssl/ssl.h>) && __has_include(<openssl/err.h>)
 #define CT_HAS_OPENSSL 1
+#if __has_include(<openssl/core_names.h>)
 #include <openssl/core_names.h>
+#endif
 #include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -918,6 +920,7 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 static int ct_get_bytes(JSContextRef ctx, JSValueRef value, uint8_t **out_data, size_t *out_len);
 static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *data, size_t data_len);
 static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message);
+static void ct_queue_fd_error(CtJscRuntime *runtime, uint32_t id, int error_code, const char *message);
 
 #if defined(__APPLE__)
 #pragma clang diagnostic push
@@ -1143,6 +1146,8 @@ typedef struct CtFdEvent {
     char *data;
     size_t data_len;
     char *message;
+    int error_code;
+    bool has_error_code;
     struct CtFdEvent *next;
 } CtFdEvent;
 
@@ -1227,8 +1232,30 @@ typedef struct CtFdWatcher {
     pthread_t thread;
     pthread_mutex_t mutex;
     bool active;
+    bool referenced;
+    bool paused;
     struct CtFdWatcher *next;
 } CtFdWatcher;
+
+typedef struct CtTcpConnect {
+    uint32_t id;
+    int fd;
+    int port;
+    int family;
+    char *address;
+    char *local_address;
+    int local_port;
+    CtJscRuntime *runtime;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    bool active;
+    bool referenced;
+    bool canceled;
+    bool completed;
+    bool succeeded;
+    int error_code;
+    struct CtTcpConnect *next;
+} CtTcpConnect;
 
 typedef enum {
     CT_PROCESS_STDIO_PIPE,
@@ -1240,6 +1267,9 @@ static pthread_mutex_t ct_async_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtAsyncProcess *ct_async_processes = NULL;
 static pthread_mutex_t ct_fd_watchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtFdWatcher *ct_fd_watchers = NULL;
+static pthread_mutex_t ct_tcp_connects_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CtTcpConnect *ct_tcp_connects = NULL;
+static uint32_t ct_next_tcp_connect_id = 0x40000000u;
 static pthread_mutex_t ct_workers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtWorker *ct_workers = NULL;
 static uint32_t ct_next_worker_id = 1;
@@ -1322,6 +1352,8 @@ typedef struct CtTlsConnection {
     pthread_t thread;
     pthread_mutex_t mutex;
     bool active;
+    bool referenced;
+    bool read_paused;
     bool watcher_started;
     bool watcher_finished;
     bool close_requested;
@@ -9455,7 +9487,10 @@ static JSValueRef ct_udp_socket_membership(JSContextRef ctx, JSObjectRef functio
 }
 
 static int ct_tcp_family_from_arg(JSContextRef ctx, JSValueRef value) {
-    return ct_value_to_number(ctx, value) == 6.0 ? AF_INET6 : AF_INET;
+    double family = ct_value_to_number(ctx, value);
+    if (family == 6.0) return AF_INET6;
+    if (family == 4.0) return AF_INET;
+    return AF_UNSPEC;
 }
 
 static int ct_tcp_resolve_address(JSContextRef ctx, const char *address, int port, int family, bool passive, struct addrinfo **out_results, JSValueRef *exception) {
@@ -9526,7 +9561,15 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
     }
     int port = (int)port_number;
     char *address = ct_value_to_optional_string(ctx, argv[1]);
-    int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_INET;
+    int family = argc >= 3 ? ct_tcp_family_from_arg(ctx, argv[2]) : AF_UNSPEC;
+    int backlog = 511;
+    if (argc >= 4 && !JSValueIsUndefined(ctx, argv[3]) &&
+        !ct_value_to_int_checked(ctx, argv[3], 0, INT_MAX, &backlog, exception, "Invalid socket backlog")) {
+        free(address);
+        return JSValueMakeUndefined(ctx);
+    }
+    bool ipv6_only = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
+    bool reuse_port = argc >= 6 && ct_value_to_bool(ctx, argv[5]);
 
     struct addrinfo *results = NULL;
     if (ct_tcp_resolve_address(ctx, address, port, family, true, &results, exception) != 0) {
@@ -9541,7 +9584,38 @@ static JSValueRef ct_tcp_server_listen(JSContextRef ctx, JSObjectRef function, J
         if (listen_fd < 0) continue;
         int yes = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        if (bind(listen_fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0 && listen(listen_fd, 128) == 0) {
+#if defined(IPV6_V6ONLY)
+        if (entry->ai_family == AF_INET6) {
+            int only = ipv6_only ? 1 : 0;
+            if (setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &only, sizeof(only)) != 0) {
+                close(listen_fd);
+                listen_fd = -1;
+                continue;
+            }
+        }
+#else
+        if (ipv6_only && entry->ai_family == AF_INET6) {
+            close(listen_fd);
+            listen_fd = -1;
+            errno = ENOTSUP;
+            continue;
+        }
+#endif
+        if (reuse_port) {
+#if defined(SO_REUSEPORT) && !defined(_WIN32)
+            if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)) != 0) {
+                close(listen_fd);
+                listen_fd = -1;
+                continue;
+            }
+#else
+            close(listen_fd);
+            listen_fd = -1;
+            errno = ENOTSUP;
+            continue;
+#endif
+        }
+        if (bind(listen_fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0 && listen(listen_fd, backlog) == 0) {
             ct_set_nonblocking_fd(listen_fd);
             break;
         }
@@ -9651,6 +9725,375 @@ static JSValueRef ct_tcp_socket_connect(JSContextRef ctx, JSObjectRef function, 
     JSObjectRef remote = ct_tcp_address_object(ctx, fd, true, exception);
     if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
     return result;
+}
+
+static const char *ct_socket_error_code(int error_code) {
+    switch (error_code) {
+        case EACCES: return "EACCES";
+        case EADDRINUSE: return "EADDRINUSE";
+        case EADDRNOTAVAIL: return "EADDRNOTAVAIL";
+        case EAFNOSUPPORT: return "EAFNOSUPPORT";
+        case EALREADY: return "EALREADY";
+        case EBADF: return "EBADF";
+        case ECONNABORTED: return "ECONNABORTED";
+        case ECONNREFUSED: return "ECONNREFUSED";
+        case ECONNRESET: return "ECONNRESET";
+        case EHOSTUNREACH: return "EHOSTUNREACH";
+        case EINPROGRESS: return "EINPROGRESS";
+        case EINVAL: return "EINVAL";
+        case EISCONN: return "EISCONN";
+        case ENETDOWN: return "ENETDOWN";
+        case ENETUNREACH: return "ENETUNREACH";
+        case ENOBUFS: return "ENOBUFS";
+        case ENOTCONN: return "ENOTCONN";
+        case EPIPE: return "EPIPE";
+        case ETIMEDOUT: return "ETIMEDOUT";
+        default: return "EIO";
+    }
+}
+
+static CtTcpConnect *ct_tcp_connect_find_locked(uint32_t id) {
+    for (CtTcpConnect *operation = ct_tcp_connects; operation != NULL; operation = operation->next) {
+        if (operation->id == id) return operation;
+    }
+    return NULL;
+}
+
+static void ct_tcp_connect_remove_locked(CtTcpConnect *operation) {
+    CtTcpConnect **cursor = &ct_tcp_connects;
+    while (*cursor != NULL) {
+        if (*cursor == operation) {
+            *cursor = operation->next;
+            operation->next = NULL;
+            return;
+        }
+        cursor = &(*cursor)->next;
+    }
+}
+
+static void ct_tcp_connect_free(CtTcpConnect *operation) {
+    if (operation == NULL) return;
+    if (operation->fd >= 0) close(operation->fd);
+    free(operation->address);
+    free(operation->local_address);
+    pthread_mutex_destroy(&operation->mutex);
+    free(operation);
+}
+
+static bool ct_tcp_connect_is_canceled(CtTcpConnect *operation) {
+    bool canceled;
+    pthread_mutex_lock(&operation->mutex);
+    canceled = operation->canceled;
+    pthread_mutex_unlock(&operation->mutex);
+    return canceled;
+}
+
+static void ct_tcp_connect_complete(CtTcpConnect *operation, bool succeeded, int error_code) {
+    bool canceled;
+    int fd_to_close = -1;
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    pthread_mutex_lock(&operation->mutex);
+    canceled = operation->canceled;
+    if (canceled || !succeeded) {
+        fd_to_close = operation->fd;
+        operation->fd = -1;
+        succeeded = false;
+    }
+    operation->succeeded = succeeded;
+    operation->error_code = error_code;
+    operation->completed = true;
+    operation->active = false;
+    pthread_mutex_unlock(&operation->mutex);
+    if (canceled) ct_tcp_connect_remove_locked(operation);
+    if (!canceled) {
+        ct_queue_fd_simple(
+            operation->runtime,
+            operation->id,
+            "connect",
+            succeeded ? NULL : strerror(error_code != 0 ? error_code : EIO)
+        );
+    }
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    if (fd_to_close >= 0) close(fd_to_close);
+    if (canceled) ct_tcp_connect_free(operation);
+}
+
+static int ct_tcp_bind_local(CtTcpConnect *operation, int fd) {
+    if ((operation->local_address == NULL || operation->local_address[0] == '\0') && operation->local_port == 0) return 0;
+    char port_text[32];
+    snprintf(port_text, sizeof(port_text), "%d", operation->local_port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = operation->family;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    struct addrinfo *results = NULL;
+    int status = getaddrinfo(
+        operation->local_address != NULL && operation->local_address[0] != '\0' ? operation->local_address : NULL,
+        port_text,
+        &hints,
+        &results
+    );
+    if (status != 0) return EADDRNOTAVAIL;
+    int bind_error = EADDRNOTAVAIL;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        if (bind(fd, entry->ai_addr, (socklen_t)entry->ai_addrlen) == 0) {
+            bind_error = 0;
+            break;
+        }
+        bind_error = errno;
+    }
+    freeaddrinfo(results);
+    return bind_error;
+}
+
+static void *ct_tcp_connect_thread(void *opaque) {
+    CtTcpConnect *operation = (CtTcpConnect *)opaque;
+    char port_text[32];
+    snprintf(port_text, sizeof(port_text), "%d", operation->port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = operation->family;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *results = NULL;
+    int resolve_status = getaddrinfo(operation->address, port_text, &hints, &results);
+    if (resolve_status != 0) {
+        ct_tcp_connect_complete(operation, false, EADDRNOTAVAIL);
+        return NULL;
+    }
+
+    int last_error = ECONNREFUSED;
+    for (struct addrinfo *entry = results; entry != NULL && !ct_tcp_connect_is_canceled(operation); entry = entry->ai_next) {
+        int fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        if (fd < 0) {
+            last_error = errno;
+            continue;
+        }
+        ct_set_nonblocking_fd(fd);
+        pthread_mutex_lock(&operation->mutex);
+        operation->fd = fd;
+        pthread_mutex_unlock(&operation->mutex);
+
+        int bind_error = ct_tcp_bind_local(operation, fd);
+        if (bind_error != 0) {
+            last_error = bind_error;
+            pthread_mutex_lock(&operation->mutex);
+            operation->fd = -1;
+            pthread_mutex_unlock(&operation->mutex);
+            close(fd);
+            continue;
+        }
+
+        int connect_status = connect(fd, entry->ai_addr, (socklen_t)entry->ai_addrlen);
+        int connect_error = connect_status == 0 ? 0 : errno;
+        if (connect_status != 0 && connect_error != EINPROGRESS && connect_error != EWOULDBLOCK && connect_error != EALREADY) {
+            last_error = connect_error;
+            pthread_mutex_lock(&operation->mutex);
+            operation->fd = -1;
+            pthread_mutex_unlock(&operation->mutex);
+            close(fd);
+            continue;
+        }
+
+        while (connect_status != 0 && !ct_tcp_connect_is_canceled(operation)) {
+            struct pollfd poll_fd;
+            poll_fd.fd = fd;
+            poll_fd.events = POLLOUT | POLLERR | POLLHUP;
+            poll_fd.revents = 0;
+            int ready = poll(&poll_fd, 1, 25);
+            if (ready == 0) continue;
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                connect_error = errno;
+                break;
+            }
+            int socket_error = 0;
+            socklen_t socket_error_len = sizeof(socket_error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len) != 0) socket_error = errno;
+            connect_error = socket_error;
+            connect_status = socket_error == 0 ? 0 : -1;
+            break;
+        }
+
+        if (ct_tcp_connect_is_canceled(operation)) {
+            last_error = ECONNABORTED;
+            break;
+        }
+        if (connect_status == 0) {
+            int no_delay = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+            freeaddrinfo(results);
+            ct_tcp_connect_complete(operation, true, 0);
+            return NULL;
+        }
+        last_error = connect_error != 0 ? connect_error : ECONNREFUSED;
+        pthread_mutex_lock(&operation->mutex);
+        operation->fd = -1;
+        pthread_mutex_unlock(&operation->mutex);
+        close(fd);
+    }
+    freeaddrinfo(results);
+    ct_tcp_connect_complete(operation, false, last_error);
+    return NULL;
+}
+
+static JSValueRef ct_tcp_socket_connect_start(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || argc < 3) {
+        ct_throw_message(ctx, exception, "tcpSocketConnectStart(port, address, family[, localAddress, localPort, referenced]) requires port, address, and family");
+        return JSValueMakeUndefined(ctx);
+    }
+    int port;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, 65535, &port, exception, "Invalid TCP port")) return JSValueMakeUndefined(ctx);
+    char *address = ct_value_to_string_copy(ctx, argv[1]);
+    int family = ct_tcp_family_from_arg(ctx, argv[2]);
+    char *local_address = argc >= 4 ? ct_value_to_optional_string(ctx, argv[3]) : NULL;
+    int local_port = 0;
+    if (argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]) &&
+        !ct_value_to_int_checked(ctx, argv[4], 0, 65535, &local_port, exception, "Invalid local TCP port")) {
+        free(address);
+        free(local_address);
+        return JSValueMakeUndefined(ctx);
+    }
+    bool referenced = argc < 6 || ct_value_to_bool(ctx, argv[5]);
+    if (address == NULL || (family != AF_INET && family != AF_INET6)) {
+        free(address);
+        free(local_address);
+        ct_throw_message(ctx, exception, "Invalid TCP connection address");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtTcpConnect *operation = (CtTcpConnect *)calloc(1, sizeof(*operation));
+    if (operation == NULL) {
+        free(address);
+        free(local_address);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    operation->fd = -1;
+    operation->port = port;
+    operation->family = family;
+    operation->address = address;
+    operation->local_address = local_address;
+    operation->local_port = local_port;
+    operation->runtime = runtime;
+    operation->active = true;
+    operation->referenced = referenced;
+    pthread_mutex_init(&operation->mutex, NULL);
+
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    operation->id = ct_next_tcp_connect_id++;
+    if (ct_next_tcp_connect_id < 0x40000000u || ct_next_tcp_connect_id >= 0x7fffffffu) ct_next_tcp_connect_id = 0x40000000u;
+    operation->next = ct_tcp_connects;
+    ct_tcp_connects = operation;
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    if (pthread_create(&operation->thread, NULL, ct_tcp_connect_thread, operation) != 0) {
+        pthread_mutex_lock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_remove_locked(operation);
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        ct_tcp_connect_free(operation);
+        ct_throw_message(ctx, exception, "Failed to start TCP connection attempt");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_detach(operation->thread);
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, operation->id), exception);
+    return result;
+}
+
+static JSValueRef ct_tcp_socket_connect_take(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) return JSValueMakeNull(ctx);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    CtTcpConnect *operation = ct_tcp_connect_find_locked(id);
+    if (operation == NULL) {
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        return JSValueMakeNull(ctx);
+    }
+    pthread_mutex_lock(&operation->mutex);
+    if (!operation->completed) {
+        pthread_mutex_unlock(&operation->mutex);
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        return JSValueMakeNull(ctx);
+    }
+    bool succeeded = operation->succeeded;
+    int error_code = operation->error_code;
+    int fd = operation->fd;
+    if (succeeded) operation->fd = -1;
+    pthread_mutex_unlock(&operation->mutex);
+    ct_tcp_connect_remove_locked(operation);
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "ok", JSValueMakeBoolean(ctx, succeeded), exception);
+    if (succeeded) {
+        ct_set_property(ctx, result, "fd", JSValueMakeNumber(ctx, fd), exception);
+        JSObjectRef local = ct_tcp_address_object(ctx, fd, false, NULL);
+        if (local != NULL) ct_set_property(ctx, result, "local", local, exception);
+        JSObjectRef remote = ct_tcp_address_object(ctx, fd, true, NULL);
+        if (remote != NULL) ct_set_property(ctx, result, "remote", remote, exception);
+    } else {
+        ct_set_property(ctx, result, "errno", JSValueMakeNumber(ctx, error_code), exception);
+        ct_set_property(ctx, result, "code", ct_make_string(ctx, ct_socket_error_code(error_code)), exception);
+        ct_set_property(ctx, result, "message", ct_make_string(ctx, strerror(error_code != 0 ? error_code : EIO)), exception);
+    }
+    ct_tcp_connect_free(operation);
+    return result;
+}
+
+static bool ct_tcp_connect_cancel_id(uint32_t id) {
+    bool completed;
+    int fd;
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    CtTcpConnect *operation = ct_tcp_connect_find_locked(id);
+    if (operation == NULL) {
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        return false;
+    }
+    pthread_mutex_lock(&operation->mutex);
+    operation->canceled = true;
+    fd = operation->fd;
+    completed = operation->completed;
+    if (fd >= 0 && !completed) shutdown(fd, SHUT_RDWR);
+    if (completed) {
+        operation->fd = -1;
+        ct_tcp_connect_remove_locked(operation);
+    }
+    pthread_mutex_unlock(&operation->mutex);
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    if (completed) {
+        if (fd >= 0) close(fd);
+        ct_tcp_connect_free(operation);
+    }
+    return true;
+}
+
+static JSValueRef ct_tcp_socket_connect_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(ctx, ct_tcp_connect_cancel_id((uint32_t)ct_value_to_number(ctx, argv[0])));
+}
+
+static JSValueRef ct_tcp_socket_connect_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    CtTcpConnect *operation = ct_tcp_connect_find_locked(id);
+    if (operation != NULL) {
+        pthread_mutex_lock(&operation->mutex);
+        operation->referenced = ct_value_to_bool(ctx, argv[1]);
+        pthread_mutex_unlock(&operation->mutex);
+    }
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    return JSValueMakeBoolean(ctx, operation != NULL);
 }
 
 static JSObjectRef ct_unix_address_from_path(JSContextRef ctx, const char *path, JSValueRef *exception) {
@@ -9944,6 +10387,29 @@ static JSValueRef ct_tcp_socket_shutdown(JSContextRef ctx, JSObjectRef function,
     return JSValueMakeUndefined(ctx);
 }
 
+static JSValueRef ct_tcp_socket_reset(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) {
+        ct_throw_message(ctx, exception, "tcpSocketReset(fd) requires a file descriptor");
+        return JSValueMakeUndefined(ctx);
+    }
+    int fd;
+    if (!ct_value_to_int_checked(ctx, argv[0], 0, INT_MAX, &fd, exception, "Invalid TCP socket")) return JSValueMakeUndefined(ctx);
+    struct linger linger_option;
+    memset(&linger_option, 0, sizeof(linger_option));
+    linger_option.l_onoff = 1;
+    linger_option.l_linger = 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_option, sizeof(linger_option)) != 0) {
+        int option_error = errno;
+        close(fd);
+        ct_throw_message(ctx, exception, strerror(option_error));
+        return JSValueMakeUndefined(ctx);
+    }
+    close(fd);
+    return JSValueMakeBoolean(ctx, true);
+}
+
 #if CT_HAS_OPENSSL
 static pthread_once_t ct_tls_init_once_control = PTHREAD_ONCE_INIT;
 
@@ -10058,6 +10524,60 @@ static void ct_tls_connection_free(CtTlsConnection *connection) {
     free(connection);
 }
 
+static bool ct_tls_connection_id_exists(uint32_t id, CtJscRuntime *runtime) {
+    bool exists = false;
+    pthread_mutex_lock(&ct_tls_mutex);
+    for (CtTlsConnection *connection = ct_tls_connections; connection != NULL; connection = connection->next) {
+        if (connection->id == id && connection->runtime == runtime) {
+            exists = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_tls_mutex);
+    return exists;
+}
+
+static void ct_tls_connections_stop_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        CtTlsConnection *connection = NULL;
+        uint32_t id = 0;
+        bool should_free = false;
+        pthread_mutex_lock(&ct_tls_mutex);
+        for (CtTlsConnection *candidate = ct_tls_connections; candidate != NULL; candidate = candidate->next) {
+            if (candidate->runtime == runtime) {
+                connection = candidate;
+                id = candidate->id;
+                break;
+            }
+        }
+        if (connection == NULL) {
+            pthread_mutex_unlock(&ct_tls_mutex);
+            break;
+        }
+        pthread_mutex_lock(&connection->mutex);
+        connection->active = false;
+        connection->close_requested = true;
+        connection->shutdown_started = true;
+        if (connection->ssl != NULL && connection->handshake_complete) SSL_shutdown(connection->ssl);
+        if (connection->fd >= 0) {
+            shutdown(connection->fd, SHUT_RDWR);
+            close(connection->fd);
+            connection->fd = -1;
+        }
+        if ((!connection->watcher_started || connection->watcher_finished) && !connection->free_claimed) {
+            connection->free_claimed = true;
+            should_free = true;
+        }
+        pthread_mutex_unlock(&connection->mutex);
+        pthread_mutex_unlock(&ct_tls_mutex);
+        if (should_free) {
+            ct_tls_connection_free(connection);
+            continue;
+        }
+        while (ct_tls_connection_id_exists(id, runtime)) usleep(1000);
+    }
+}
+
 static CtTlsServer *ct_tls_server_find(uint32_t id) {
     CtTlsServer *result = NULL;
     pthread_mutex_lock(&ct_tls_mutex);
@@ -10147,12 +10667,36 @@ static void ct_tls_server_free(CtTlsServer *server) {
     free(server);
 }
 
+static void ct_tls_servers_stop_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        CtTlsServer *server = NULL;
+        pthread_mutex_lock(&ct_tls_mutex);
+        for (CtTlsServer *candidate = ct_tls_servers; candidate != NULL; candidate = candidate->next) {
+            if (candidate->runtime == runtime) {
+                server = candidate;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&ct_tls_mutex);
+        if (server == NULL) break;
+        ct_tls_server_free(server);
+    }
+}
+
 static bool ct_tls_connection_is_active(CtTlsConnection *connection) {
     bool active = false;
     pthread_mutex_lock(&connection->mutex);
     active = connection->active;
     pthread_mutex_unlock(&connection->mutex);
     return active;
+}
+
+static bool ct_tls_connection_read_is_paused(CtTlsConnection *connection) {
+    bool paused = false;
+    pthread_mutex_lock(&connection->mutex);
+    paused = connection->read_paused;
+    pthread_mutex_unlock(&connection->mutex);
+    return paused;
 }
 
 static void ct_tls_connection_set_active(CtTlsConnection *connection, bool active) {
@@ -10254,6 +10798,48 @@ static int ct_tls_load_ca_pem(SSL_CTX *ssl_ctx, const char *ca_pem) {
     return loaded > 0 ? 0 : -1;
 }
 
+static bool ct_tls_context_limits_from_args(
+    JSContextRef ctx,
+    size_t argc,
+    const JSValueRef argv[],
+    size_t min_index,
+    size_t max_index,
+    size_t options_index,
+    int *min_version,
+    int *max_version,
+    uint64_t *secure_options,
+    JSValueRef *exception
+) {
+    *min_version = TLS1_2_VERSION;
+    *max_version = TLS1_3_VERSION;
+    *secure_options = 0;
+    if (argc > min_index && !JSValueIsUndefined(ctx, argv[min_index]) &&
+        !ct_value_to_int_checked(
+            ctx,
+            argv[min_index],
+            TLS1_VERSION,
+            TLS1_3_VERSION,
+            min_version,
+            exception,
+            "Invalid minimum TLS protocol version"
+        )) return false;
+    if (argc > max_index && !JSValueIsUndefined(ctx, argv[max_index]) &&
+        !ct_value_to_int_checked(
+            ctx,
+            argv[max_index],
+            TLS1_VERSION,
+            TLS1_3_VERSION,
+            max_version,
+            exception,
+            "Invalid maximum TLS protocol version"
+        )) return false;
+    uint32_t options = 0;
+    if (argc > options_index && !JSValueIsUndefined(ctx, argv[options_index]) &&
+        !ct_value_to_uint32_checked(ctx, argv[options_index], &options, exception, "Invalid TLS secureOptions")) return false;
+    *secure_options = options;
+    return true;
+}
+
 static int ct_tls_configure_ctx(
     JSContextRef ctx,
     SSL_CTX *ssl_ctx,
@@ -10265,6 +10851,9 @@ static int ct_tls_configure_ctx(
     bool request_cert,
     bool reject_unauthorized,
     const char *ciphers,
+    int min_version,
+    int max_version,
+    uint64_t secure_options,
     JSValueRef *exception
 ) {
     if (ssl_ctx == NULL) {
@@ -10311,6 +10900,19 @@ static int ct_tls_configure_ctx(
         }
         ERR_clear_error();
     }
+    if (min_version != 0 && SSL_CTX_set_min_proto_version(ssl_ctx, min_version) != 1) {
+        ct_tls_throw_error(ctx, exception, "Failed to set minimum TLS protocol version", "ERR_TLS_INVALID_PROTOCOL_VERSION");
+        return -1;
+    }
+    if (max_version != 0 && SSL_CTX_set_max_proto_version(ssl_ctx, max_version) != 1) {
+        ct_tls_throw_error(ctx, exception, "Failed to set maximum TLS protocol version", "ERR_TLS_INVALID_PROTOCOL_VERSION");
+        return -1;
+    }
+    if (min_version != 0 && max_version != 0 && min_version > max_version) {
+        ct_tls_throw_error(ctx, exception, "Minimum TLS protocol version exceeds maximum TLS protocol version", "ERR_TLS_INVALID_PROTOCOL_VERSION");
+        return -1;
+    }
+    if (secure_options != 0) SSL_CTX_set_options(ssl_ctx, (uint64_t)secure_options);
     if (server_side) {
         int mode = request_cert ? SSL_VERIFY_PEER : SSL_VERIFY_NONE;
         if (request_cert && reject_unauthorized) mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
@@ -10416,6 +11018,141 @@ static JSValueRef ct_tls_session_der(JSContextRef ctx, SSL *ssl, JSValueRef *exc
     return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, (size_t)len, ct_array_buffer_free, NULL, exception);
 }
 
+static int ct_tls_apply_session(
+    JSContextRef ctx,
+    SSL *ssl,
+    const uint8_t *session_bytes,
+    size_t session_len,
+    JSValueRef *exception
+) {
+    if (session_bytes == NULL || session_len == 0) return 0;
+    if (session_len > LONG_MAX) {
+        ct_tls_throw_error(ctx, exception, "TLS session is too large", "ERR_INVALID_ARG_VALUE");
+        return -1;
+    }
+    const unsigned char *cursor = session_bytes;
+    ERR_clear_error();
+    SSL_SESSION *session = d2i_SSL_SESSION(NULL, &cursor, (long)session_len);
+    if (session == NULL) {
+        char *message = ct_tls_error_message("Failed to parse TLS session");
+        ct_tls_throw_error(ctx, exception, message, "ERR_SSL_SESSION_ID_CONTEXT_UNINITIALIZED");
+        free(message);
+        return -1;
+    }
+    int status = SSL_set_session(ssl, session);
+    SSL_SESSION_free(session);
+    if (status != 1) {
+        char *message = ct_tls_error_message("Failed to set TLS session");
+        ct_tls_throw_error(ctx, exception, message, "ERR_SSL_SESSION_ID_CONTEXT_UNINITIALIZED");
+        free(message);
+        return -1;
+    }
+    return 0;
+}
+
+static JSValueRef ct_tls_finished_bytes(JSContextRef ctx, SSL *ssl, bool peer, JSValueRef *exception) {
+    unsigned char dummy = 0;
+    size_t len = peer
+        ? SSL_get_peer_finished(ssl, &dummy, sizeof(dummy))
+        : SSL_get_finished(ssl, &dummy, sizeof(dummy));
+    if (len == 0) return JSValueMakeNull(ctx);
+    unsigned char *buffer = (unsigned char *)malloc(len);
+    if (buffer == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t written = peer
+        ? SSL_get_peer_finished(ssl, buffer, len)
+        : SSL_get_finished(ssl, buffer, len);
+    if (written != len) {
+        free(buffer);
+        return JSValueMakeNull(ctx);
+    }
+    return JSObjectMakeArrayBufferWithBytesNoCopy(ctx, buffer, len, ct_array_buffer_free, NULL, exception);
+}
+
+static JSValueRef ct_tls_ocsp_response(JSContextRef ctx, SSL *ssl, JSValueRef *exception) {
+    const unsigned char *response = NULL;
+    long len = SSL_get_tlsext_status_ocsp_resp(ssl, &response);
+    if (response == NULL || len <= 0) return JSValueMakeNull(ctx);
+    return ct_array_buffer_from_copy(ctx, (const char *)response, (size_t)len, exception);
+}
+
+static JSValueRef ct_tls_ticket(JSContextRef ctx, SSL *ssl, JSValueRef *exception) {
+    SSL_SESSION *session = SSL_get1_session(ssl);
+    if (session == NULL) return JSValueMakeNull(ctx);
+    const unsigned char *ticket = NULL;
+    size_t ticket_len = 0;
+    SSL_SESSION_get0_ticket(session, &ticket, &ticket_len);
+    JSValueRef result = ticket != NULL && ticket_len > 0
+        ? ct_array_buffer_from_copy(ctx, (const char *)ticket, ticket_len, exception)
+        : JSValueMakeNull(ctx);
+    SSL_SESSION_free(session);
+    return result;
+}
+
+static JSValueRef ct_tls_ephemeral_key_info(
+    JSContextRef ctx,
+    SSL *ssl,
+    bool server_side,
+    JSValueRef *exception
+) {
+    if (server_side) return JSValueMakeNull(ctx);
+    JSObjectRef result = ct_make_object(ctx);
+    EVP_PKEY *key = NULL;
+    if (SSL_get_server_tmp_key(ssl, &key) != 1 || key == NULL) return result;
+
+    int key_type = EVP_PKEY_base_id(key);
+    int bits = EVP_PKEY_bits(key);
+    if (key_type == EVP_PKEY_DH
+#ifdef EVP_PKEY_DHX
+        || key_type == EVP_PKEY_DHX
+#endif
+    ) {
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "DH"), exception);
+        ct_set_property(ctx, result, "size", JSValueMakeNumber(ctx, bits), exception);
+    } else if (key_type == EVP_PKEY_EC
+#ifdef EVP_PKEY_X25519
+        || key_type == EVP_PKEY_X25519
+#endif
+#ifdef EVP_PKEY_X448
+        || key_type == EVP_PKEY_X448
+#endif
+    ) {
+        const char *name = NULL;
+        char group_name[128];
+        group_name[0] = '\0';
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && defined(OSSL_PKEY_PARAM_GROUP_NAME)
+        size_t group_name_len = 0;
+        if (EVP_PKEY_get_utf8_string_param(
+                key,
+                OSSL_PKEY_PARAM_GROUP_NAME,
+                group_name,
+                sizeof(group_name),
+                &group_name_len
+            ) == 1 && group_name_len > 0) {
+            name = group_name;
+        }
+#else
+        if (key_type == EVP_PKEY_EC) {
+            EC_KEY *ec_key = EVP_PKEY_get1_EC_KEY(key);
+            if (ec_key != NULL) {
+                const EC_GROUP *group = EC_KEY_get0_group(ec_key);
+                int curve_nid = group != NULL ? EC_GROUP_get_curve_name(group) : NID_undef;
+                if (curve_nid != NID_undef) name = OBJ_nid2sn(curve_nid);
+                EC_KEY_free(ec_key);
+            }
+        }
+#endif
+        if (name == NULL && key_type != NID_undef) name = OBJ_nid2sn(key_type);
+        ct_set_property(ctx, result, "type", ct_make_string(ctx, "ECDH"), exception);
+        if (name != NULL) ct_set_property(ctx, result, "name", ct_make_string(ctx, name), exception);
+        ct_set_property(ctx, result, "size", JSValueMakeNumber(ctx, bits), exception);
+    }
+    EVP_PKEY_free(key);
+    return result;
+}
+
 static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *connection, JSValueRef *exception) {
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, connection->id), exception);
@@ -10494,6 +11231,17 @@ static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *c
     ct_set_property(ctx, result, "sharedSigalgs", ct_make_array(ctx, shared_count, shared_values, exception), exception);
     ct_set_property(ctx, result, "session", ct_tls_session_der(ctx, connection->ssl, exception), exception);
     ct_set_property(ctx, result, "sessionReused", JSValueMakeBoolean(ctx, SSL_session_reused(connection->ssl) == 1), exception);
+    ct_set_property(ctx, result, "finished", ct_tls_finished_bytes(ctx, connection->ssl, false, exception), exception);
+    ct_set_property(ctx, result, "peerFinished", ct_tls_finished_bytes(ctx, connection->ssl, true, exception), exception);
+    ct_set_property(ctx, result, "ocspResponse", ct_tls_ocsp_response(ctx, connection->ssl, exception), exception);
+    ct_set_property(ctx, result, "tlsTicket", ct_tls_ticket(ctx, connection->ssl, exception), exception);
+    ct_set_property(
+        ctx,
+        result,
+        "ephemeralKeyInfo",
+        ct_tls_ephemeral_key_info(ctx, connection->ssl, connection->server_side, exception),
+        exception
+    );
     pthread_mutex_unlock(&connection->mutex);
     return result;
 }
@@ -10637,6 +11385,7 @@ static void *ct_tls_server_thread(void *opaque) {
         connection->ssl = ssl;
         connection->runtime = server->runtime;
         connection->active = true;
+        connection->referenced = true;
         connection->server_side = true;
         connection->handshake_complete = true;
         pthread_mutex_lock(&ct_tls_mutex);
@@ -10652,6 +11401,10 @@ static void *ct_tls_server_thread(void *opaque) {
 static void *ct_tls_read_thread(void *opaque) {
     CtTlsConnection *connection = (CtTlsConnection *)opaque;
     while (ct_tls_connection_is_active(connection)) {
+        if (ct_tls_connection_read_is_paused(connection)) {
+            usleep(1000);
+            continue;
+        }
         struct pollfd poll_fd;
         poll_fd.fd = connection->fd;
         poll_fd.events = POLLIN | POLLHUP | POLLERR;
@@ -10661,11 +11414,11 @@ static void *ct_tls_read_thread(void *opaque) {
         if (ready == 0) continue;
         if (ready < 0) {
             if (errno == EINTR) continue;
-            ct_queue_fd_simple(connection->runtime, connection->id, "error", strerror(errno));
+            ct_queue_fd_error(connection->runtime, connection->id, errno, NULL);
             break;
         }
         if ((poll_fd.revents & POLLNVAL) != 0) {
-            ct_queue_fd_simple(connection->runtime, connection->id, "error", "invalid TLS socket");
+            ct_queue_fd_error(connection->runtime, connection->id, EBADF, "invalid TLS socket");
             break;
         }
 
@@ -10696,7 +11449,7 @@ static void *ct_tls_read_thread(void *opaque) {
                 break;
             }
             if (ssl_error == SSL_ERROR_SYSCALL && read_errno != 0) {
-                ct_queue_fd_simple(connection->runtime, connection->id, "error", strerror(read_errno));
+                ct_queue_fd_error(connection->runtime, connection->id, read_errno, NULL);
                 terminal = true;
                 break;
             }
@@ -10740,6 +11493,12 @@ static JSValueRef ct_tls_client_connect_owned_fd(
     const uint8_t *alpn_protocols,
     size_t alpn_protocols_len,
     const char *ciphers,
+    int min_version,
+    int max_version,
+    uint64_t secure_options,
+    const uint8_t *session_bytes,
+    size_t session_len,
+    bool request_ocsp,
     bool defer_handshake,
     JSValueRef *exception
 ) {
@@ -10762,13 +11521,15 @@ static JSValueRef ct_tls_client_connect_owned_fd(
             true,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         ) != 0) {
         SSL_CTX_free(ssl_ctx);
         close(fd);
         return JSValueMakeUndefined(ctx);
     }
-
     SSL *ssl = SSL_new(ssl_ctx);
     if (ssl == NULL) {
         SSL_CTX_free(ssl_ctx);
@@ -10776,6 +11537,19 @@ static JSValueRef ct_tls_client_connect_owned_fd(
         char *message = ct_tls_error_message("Failed to initialize TLS client");
         ct_throw_message(ctx, exception, message);
         free(message);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (ct_tls_apply_session(ctx, ssl, session_bytes, session_len, exception) != 0) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (request_ocsp && SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(fd);
+        ct_tls_throw_error(ctx, exception, "Failed to request an OCSP response", "ERR_SSL_INTERNAL_ERROR");
         return JSValueMakeUndefined(ctx);
     }
     if (servername != NULL && servername[0] != '\0') SSL_set_tlsext_host_name(ssl, servername);
@@ -10839,6 +11613,7 @@ static JSValueRef ct_tls_client_connect_owned_fd(
     connection->ssl = ssl;
     connection->runtime = JSObjectGetPrivate(function);
     connection->active = true;
+    connection->referenced = true;
     connection->handshake_complete = !defer_handshake;
     pthread_mutex_lock(&ct_tls_mutex);
     connection->id = ct_next_tls_connection_id++;
@@ -10878,6 +11653,30 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
     char *key = argc >= 7 ? ct_value_to_optional_string(ctx, argv[6]) : NULL;
     char *passphrase = argc >= 8 ? ct_value_to_optional_string(ctx, argv[7]) : NULL;
     char *ciphers = argc >= 10 ? ct_value_to_optional_string(ctx, argv[9]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            10,
+            11,
+            12,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        free(host);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 9 && !JSValueIsUndefined(ctx, argv[8]) && !JSValueIsNull(ctx, argv[8]) &&
@@ -10892,10 +11691,46 @@ static JSValueRef ct_tls_client_connect(JSContextRef ctx, JSObjectRef function, 
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
+    uint8_t *session_bytes = NULL;
+    size_t session_len = 0;
+    if (argc >= 14 && !JSValueIsUndefined(ctx, argv[13]) && !JSValueIsNull(ctx, argv[13]) &&
+        ct_get_bytes(ctx, argv[13], &session_bytes, &session_len) != 0) {
+        free(host);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "TLS session must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool request_ocsp = argc >= 15 && ct_value_to_bool(ctx, argv[14]);
 
     int fd = ct_tls_make_socket(ctx, host != NULL ? host : "127.0.0.1", port, AF_UNSPEC, exception);
     JSValueRef result = fd >= 0
-        ? ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, ciphers, false, exception)
+        ? ct_tls_client_connect_owned_fd(
+            ctx,
+            function,
+            fd,
+            servername,
+            reject_unauthorized,
+            ca,
+            cert,
+            key,
+            passphrase,
+            alpn_protocols,
+            alpn_protocols_len,
+            ciphers,
+            min_version,
+            max_version,
+            secure_options,
+            session_bytes,
+            session_len,
+            request_ocsp,
+            false,
+            exception
+        )
         : JSValueMakeUndefined(ctx);
     free(host);
     free(servername);
@@ -10923,6 +11758,30 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
     char *key = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
     char *passphrase = argc >= 7 ? ct_value_to_optional_string(ctx, argv[6]) : NULL;
     char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            9,
+            10,
+            11,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        close(fd);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 8 && !JSValueIsUndefined(ctx, argv[7]) && !JSValueIsNull(ctx, argv[7]) &&
@@ -10937,7 +11796,43 @@ static JSValueRef ct_tls_client_connect_fd(JSContextRef ctx, JSObjectRef functio
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be an ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
-    JSValueRef result = ct_tls_client_connect_owned_fd(ctx, function, fd, servername, reject_unauthorized, ca, cert, key, passphrase, alpn_protocols, alpn_protocols_len, ciphers, true, exception);
+    uint8_t *session_bytes = NULL;
+    size_t session_len = 0;
+    if (argc >= 13 && !JSValueIsUndefined(ctx, argv[12]) && !JSValueIsNull(ctx, argv[12]) &&
+        ct_get_bytes(ctx, argv[12], &session_bytes, &session_len) != 0) {
+        close(fd);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "TLS session must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool request_ocsp = argc >= 14 && ct_value_to_bool(ctx, argv[13]);
+    JSValueRef result = ct_tls_client_connect_owned_fd(
+        ctx,
+        function,
+        fd,
+        servername,
+        reject_unauthorized,
+        ca,
+        cert,
+        key,
+        passphrase,
+        alpn_protocols,
+        alpn_protocols_len,
+        ciphers,
+        min_version,
+        max_version,
+        secure_options,
+        session_bytes,
+        session_len,
+        request_ocsp,
+        true,
+        exception
+    );
     free(servername);
     free(ca);
     free(cert);
@@ -10961,6 +11856,29 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
     char *key = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
     char *passphrase = argc >= 6 ? ct_value_to_optional_string(ctx, argv[5]) : NULL;
     char *ciphers = argc >= 8 ? ct_value_to_optional_string(ctx, argv[7]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            8,
+            9,
+            10,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 7 && !JSValueIsUndefined(ctx, argv[6]) && !JSValueIsNull(ctx, argv[6]) &&
@@ -10974,6 +11892,20 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
         ct_throw_message(ctx, exception, "TLS ALPN protocols must be a valid ArrayBuffer or typed array");
         return JSValueMakeUndefined(ctx);
     }
+    uint8_t *session_bytes = NULL;
+    size_t session_len = 0;
+    if (argc >= 12 && !JSValueIsUndefined(ctx, argv[11]) && !JSValueIsNull(ctx, argv[11]) &&
+        ct_get_bytes(ctx, argv[11], &session_bytes, &session_len) != 0) {
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_throw_message(ctx, exception, "TLS session must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    bool request_ocsp = argc >= 13 && ct_value_to_bool(ctx, argv[12]);
 
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (ssl_ctx == NULL || ct_tls_configure_ctx(
@@ -10987,6 +11919,9 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
             true,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         ) != 0) {
         if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
@@ -10999,6 +11934,29 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
         return JSValueMakeUndefined(ctx);
     }
     SSL *ssl = SSL_new(ssl_ctx);
+    if (ssl != NULL && ct_tls_apply_session(ctx, ssl, session_bytes, session_len, exception) != 0) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
+    if (ssl != NULL && request_ocsp && SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        free(servername);
+        free(ca);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ciphers);
+        ct_tls_throw_error(ctx, exception, "Failed to request an OCSP response", "ERR_SSL_INTERNAL_ERROR");
+        return JSValueMakeUndefined(ctx);
+    }
     BIO *read_bio = BIO_new(BIO_s_mem());
     BIO *write_bio = BIO_new(BIO_s_mem());
     if (ssl == NULL || read_bio == NULL || write_bio == NULL) {
@@ -11052,6 +12010,7 @@ static JSValueRef ct_tls_client_connect_memory(JSContextRef ctx, JSObjectRef fun
     connection->ssl = ssl;
     connection->runtime = JSObjectGetPrivate(function);
     connection->active = true;
+    connection->referenced = true;
     connection->memory_bio = true;
     pthread_mutex_lock(&ct_tls_mutex);
     connection->id = ct_next_tls_connection_id++;
@@ -11082,6 +12041,29 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     bool request_cert = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
     bool reject_unauthorized = argc < 8 || ct_value_to_bool(ctx, argv[7]);
     char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            9,
+            10,
+            11,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        close(fd);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ca);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 5 && !JSValueIsUndefined(ctx, argv[4]) && !JSValueIsNull(ctx, argv[4]) &&
@@ -11109,6 +12091,9 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
             request_cert,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         ) != 0) {
         if (exception != NULL && *exception == NULL) {
@@ -11143,6 +12128,7 @@ static JSValueRef ct_tls_server_upgrade_fd(JSContextRef ctx, JSObjectRef functio
     connection->ctx = ssl_ctx;
     connection->runtime = JSObjectGetPrivate(function);
     connection->active = true;
+    connection->referenced = true;
     connection->server_side = true;
     connection->handshake_complete = false;
     SSL_CTX_set_tlsext_servername_callback(ssl_ctx, ct_tls_connection_servername_select);
@@ -11207,6 +12193,29 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
     bool request_cert = argc >= 7 && ct_value_to_bool(ctx, argv[6]);
     bool reject_unauthorized = argc < 8 || ct_value_to_bool(ctx, argv[7]);
     char *ciphers = argc >= 9 ? ct_value_to_optional_string(ctx, argv[8]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            9,
+            10,
+            11,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        free(hostname);
+        free(cert);
+        free(key);
+        free(ca);
+        free(passphrase);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
     if (hostname == NULL || hostname[0] == '\0' || cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0' ||
         ct_tls_configure_ctx(
@@ -11220,6 +12229,9 @@ static JSValueRef ct_tls_connection_add_server_context(JSContextRef ctx, JSObjec
             request_cert,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         ) != 0) {
         if (ssl_ctx != NULL) SSL_CTX_free(ssl_ctx);
@@ -11267,6 +12279,28 @@ static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef f
     char *ciphers = argc >= 5 ? ct_value_to_optional_string(ctx, argv[4]) : NULL;
     bool request_cert = argc >= 6 && ct_value_to_bool(ctx, argv[5]);
     bool reject_unauthorized = argc < 7 || ct_value_to_bool(ctx, argv[6]);
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            7,
+            8,
+            9,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ca);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
     int status = -1;
     if (cert == NULL || cert[0] == '\0' || key == NULL || key[0] == '\0') {
@@ -11283,6 +12317,9 @@ static JSValueRef ct_tls_validate_server_context(JSContextRef ctx, JSObjectRef f
             request_cert,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         );
     }
@@ -11397,6 +12434,29 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
     bool request_cert = argc >= 8 && ct_value_to_bool(ctx, argv[7]);
     bool reject_unauthorized = argc < 9 || ct_value_to_bool(ctx, argv[8]);
     char *ciphers = argc >= 10 ? ct_value_to_optional_string(ctx, argv[9]) : NULL;
+    int min_version;
+    int max_version;
+    uint64_t secure_options;
+    if (!ct_tls_context_limits_from_args(
+            ctx,
+            argc,
+            argv,
+            10,
+            11,
+            12,
+            &min_version,
+            &max_version,
+            &secure_options,
+            exception
+        )) {
+        free(host);
+        free(cert);
+        free(key);
+        free(passphrase);
+        free(ca);
+        free(ciphers);
+        return JSValueMakeUndefined(ctx);
+    }
     uint8_t *alpn_protocols = NULL;
     size_t alpn_protocols_len = 0;
     if (argc >= 6 && !JSValueIsUndefined(ctx, argv[5]) && !JSValueIsNull(ctx, argv[5]) &&
@@ -11424,6 +12484,9 @@ static JSValueRef ct_tls_server_listen(JSContextRef ctx, JSObjectRef function, J
             request_cert,
             reject_unauthorized,
             ciphers,
+            min_version,
+            max_version,
+            secure_options,
             exception
         ) != 0) {
         if (exception != NULL && *exception == NULL) {
@@ -11711,6 +12774,32 @@ static JSValueRef ct_tls_connection_read_start(JSContextRef ctx, JSObjectRef fun
     return JSValueMakeBoolean(ctx, true);
 }
 
+static JSValueRef ct_tls_connection_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    pthread_mutex_lock(&connection->mutex);
+    connection->referenced = ct_value_to_bool(ctx, argv[1]);
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeBoolean(ctx, true);
+}
+
+static JSValueRef ct_tls_connection_set_read_paused(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL) return JSValueMakeBoolean(ctx, false);
+    pthread_mutex_lock(&connection->mutex);
+    connection->read_paused = ct_value_to_bool(ctx, argv[1]);
+    pthread_mutex_unlock(&connection->mutex);
+    return JSValueMakeBoolean(ctx, true);
+}
+
 static JSValueRef ct_tls_connection_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -11836,6 +12925,30 @@ static JSValueRef ct_tls_connection_set_servername(JSContextRef ctx, JSObjectRef
     return JSValueMakeBoolean(ctx, true);
 }
 
+static JSValueRef ct_tls_connection_set_session(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 2) {
+        ct_throw_message(ctx, exception, "tlsConnectionSetSession(id, session) requires a connection id and session");
+        return JSValueMakeUndefined(ctx);
+    }
+    CtTlsConnection *connection = ct_tls_connection_find((uint32_t)ct_value_to_number(ctx, argv[0]));
+    if (connection == NULL || connection->server_side) {
+        ct_tls_throw_error(ctx, exception, "TLS session cannot be changed in the current state", "ERR_TLS_INVALID_STATE");
+        return JSValueMakeUndefined(ctx);
+    }
+    uint8_t *session_bytes = NULL;
+    size_t session_len = 0;
+    if (ct_get_bytes(ctx, argv[1], &session_bytes, &session_len) != 0) {
+        ct_throw_message(ctx, exception, "TLS session must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+    pthread_mutex_lock(&connection->mutex);
+    int status = ct_tls_apply_session(ctx, connection->ssl, session_bytes, session_len, exception);
+    pthread_mutex_unlock(&connection->mutex);
+    return status == 0 ? JSValueMakeBoolean(ctx, true) : JSValueMakeUndefined(ctx);
+}
+
 static JSValueRef ct_tls_connection_set_max_send_fragment(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -11928,11 +13041,14 @@ static JSValueRef ct_tls_unavailable(JSContextRef ctx, JSObjectRef function, JSO
 #define ct_tls_connection_drain_memory ct_tls_unavailable
 #define ct_tls_connection_read_memory ct_tls_unavailable
 #define ct_tls_connection_read_start ct_tls_unavailable
+#define ct_tls_connection_set_ref ct_tls_unavailable
+#define ct_tls_connection_set_read_paused ct_tls_unavailable
 #define ct_tls_connection_write ct_tls_unavailable
 #define ct_tls_connection_close ct_tls_unavailable
 #define ct_tls_connection_shutdown ct_tls_unavailable
 #define ct_tls_connection_info ct_tls_unavailable
 #define ct_tls_connection_set_servername ct_tls_unavailable
+#define ct_tls_connection_set_session ct_tls_unavailable
 #define ct_tls_connection_set_max_send_fragment ct_tls_unavailable
 #define ct_tls_connection_add_server_context ct_tls_unavailable
 #define ct_tls_validate_server_context ct_tls_unavailable
@@ -14913,7 +16029,14 @@ static void ct_queue_fd_data(CtJscRuntime *runtime, uint32_t id, const char *dat
     ct_queue_fd_event(runtime, event);
 }
 
-static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message) {
+static void ct_queue_fd_simple_with_code(
+    CtJscRuntime *runtime,
+    uint32_t id,
+    const char *type,
+    const char *message,
+    int error_code,
+    bool has_error_code
+) {
     if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
         fprintf(stderr, "[cottontail:fd] %s id=%u%s%s\n", type, id, message != NULL ? " message=" : "", message != NULL ? message : "");
         fflush(stderr);
@@ -14923,6 +16046,8 @@ static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *t
     event->watch_id = id;
     event->type = ct_duplicate_bytes(type, strlen(type));
     if (message != NULL) event->message = ct_duplicate_bytes(message, strlen(message));
+    event->error_code = error_code;
+    event->has_error_code = has_error_code;
     if (event->type == NULL || (message != NULL && event->message == NULL)) {
         free(event->type);
         free(event->message);
@@ -14932,12 +16057,43 @@ static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *t
     ct_queue_fd_event(runtime, event);
 }
 
+static void ct_queue_fd_simple(CtJscRuntime *runtime, uint32_t id, const char *type, const char *message) {
+    ct_queue_fd_simple_with_code(runtime, id, type, message, 0, false);
+}
+
+static void ct_queue_fd_error(CtJscRuntime *runtime, uint32_t id, int error_code, const char *message) {
+    ct_queue_fd_simple_with_code(
+        runtime,
+        id,
+        "error",
+        message != NULL ? message : strerror(error_code),
+        error_code,
+        true
+    );
+}
+
 static bool ct_fd_watcher_is_active(CtFdWatcher *watcher) {
     bool active = false;
     pthread_mutex_lock(&watcher->mutex);
     active = watcher->active;
     pthread_mutex_unlock(&watcher->mutex);
     return active;
+}
+
+static bool ct_fd_watcher_is_paused(CtFdWatcher *watcher) {
+    bool paused = false;
+    pthread_mutex_lock(&watcher->mutex);
+    paused = watcher->paused;
+    pthread_mutex_unlock(&watcher->mutex);
+    return paused;
+}
+
+static bool ct_fd_watcher_is_referenced(CtFdWatcher *watcher) {
+    bool referenced = false;
+    pthread_mutex_lock(&watcher->mutex);
+    referenced = watcher->referenced;
+    pthread_mutex_unlock(&watcher->mutex);
+    return referenced;
 }
 
 static void ct_fd_watcher_set_active(CtFdWatcher *watcher, bool active) {
@@ -14986,7 +16142,7 @@ static bool ct_fd_watchers_contains_id(uint32_t id) {
     return found;
 }
 
-static bool ct_fd_watchers_has_runtime(CtJscRuntime *runtime) {
+static bool ct_fd_watchers_has_active_runtime(CtJscRuntime *runtime) {
     bool found = false;
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
@@ -14997,6 +16153,50 @@ static bool ct_fd_watchers_has_runtime(CtJscRuntime *runtime) {
     }
     pthread_mutex_unlock(&ct_fd_watchers_mutex);
     return found;
+}
+
+static bool ct_fd_watchers_has_referenced_runtime(CtJscRuntime *runtime) {
+    bool found = false;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->runtime == runtime && ct_fd_watcher_is_active(watcher) && ct_fd_watcher_is_referenced(watcher)) {
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return found;
+}
+
+static bool ct_tcp_connects_has_referenced_runtime(CtJscRuntime *runtime) {
+    bool found = false;
+    pthread_mutex_lock(&ct_tcp_connects_mutex);
+    for (CtTcpConnect *operation = ct_tcp_connects; operation != NULL; operation = operation->next) {
+        if (operation->runtime != runtime) continue;
+        pthread_mutex_lock(&operation->mutex);
+        found = operation->active && operation->referenced;
+        pthread_mutex_unlock(&operation->mutex);
+        if (found) break;
+    }
+    pthread_mutex_unlock(&ct_tcp_connects_mutex);
+    return found;
+}
+
+static void ct_tcp_connects_stop_runtime(CtJscRuntime *runtime) {
+    for (;;) {
+        uint32_t id = 0;
+        pthread_mutex_lock(&ct_tcp_connects_mutex);
+        for (CtTcpConnect *operation = ct_tcp_connects; operation != NULL; operation = operation->next) {
+            if (operation->runtime == runtime) {
+                id = operation->id;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&ct_tcp_connects_mutex);
+        if (id == 0) break;
+        (void)ct_tcp_connect_cancel_id(id);
+        usleep(1000);
+    }
 }
 
 static void ct_fd_watchers_stop_runtime(CtJscRuntime *runtime) {
@@ -15011,7 +16211,7 @@ static void ct_fd_watchers_stop_runtime(CtJscRuntime *runtime) {
 
 static void ct_fd_watchers_wait_for_runtime(CtJscRuntime *runtime) {
     ct_fd_watchers_stop_runtime(runtime);
-    for (int attempt = 0; attempt < 500 && ct_fd_watchers_has_runtime(runtime); attempt += 1) {
+    for (int attempt = 0; attempt < 500 && ct_fd_watchers_has_active_runtime(runtime); attempt += 1) {
         usleep(1000);
     }
 }
@@ -15036,6 +16236,10 @@ static void *ct_fd_watcher_thread(void *opaque) {
 #endif
 
     while (ct_fd_watcher_is_active(watcher)) {
+        if (ct_fd_watcher_is_paused(watcher)) {
+            usleep(1000);
+            continue;
+        }
 #if defined(_WIN32)
         if (is_crt_pipe) {
             DWORD available = 0;
@@ -15044,7 +16248,7 @@ static void *ct_fd_watcher_thread(void *opaque) {
                 if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) {
                     ct_queue_fd_simple(watcher->runtime, watcher->id, "end", NULL);
                 } else {
-                    ct_queue_fd_simple(watcher->runtime, watcher->id, "error", "PeekNamedPipe failed");
+                    ct_queue_fd_error(watcher->runtime, watcher->id, EIO, "PeekNamedPipe failed");
                 }
                 break;
             }
@@ -15078,11 +16282,11 @@ static void *ct_fd_watcher_thread(void *opaque) {
         if (ready == 0) continue;
         if (ready < 0) {
             if (errno == EINTR) continue;
-            ct_queue_fd_simple(watcher->runtime, watcher->id, "error", strerror(errno));
+            ct_queue_fd_error(watcher->runtime, watcher->id, errno, NULL);
             break;
         }
         if ((poll_fd.revents & POLLNVAL) != 0) {
-            ct_queue_fd_simple(watcher->runtime, watcher->id, "error", "invalid file descriptor");
+            ct_queue_fd_error(watcher->runtime, watcher->id, EBADF, "invalid file descriptor");
             break;
         }
         if ((poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
@@ -15124,7 +16328,7 @@ static void *ct_fd_watcher_thread(void *opaque) {
                 break;
             }
 
-            ct_queue_fd_simple(watcher->runtime, watcher->id, "error", strerror(errno));
+            ct_queue_fd_error(watcher->runtime, watcher->id, errno, NULL);
             terminal = true;
             break;
         }
@@ -16742,6 +17946,10 @@ static JSValueRef ct_dispatch_fd_events(JSContextRef ctx, CtJscRuntime *runtime,
         if (event->message != NULL) {
             ct_set_property(ctx, item, "message", ct_make_string(ctx, event->message), exception);
         }
+        if (event->has_error_code) {
+            ct_set_property(ctx, item, "errno", JSValueMakeNumber(ctx, event->error_code), exception);
+            ct_set_property(ctx, item, "code", ct_make_string(ctx, ct_socket_error_code(event->error_code)), exception);
+        }
         if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
             fprintf(stderr, "[cottontail:fd] dispatch %s id=%u\n", event->type != NULL ? event->type : "", event->watch_id);
             fflush(stderr);
@@ -18256,6 +19464,8 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
     watcher->max_bytes = max_bytes;
     watcher->runtime = runtime;
     watcher->active = true;
+    watcher->referenced = argc < 3 || ct_value_to_bool(ctx, argv[2]);
+    watcher->paused = argc >= 4 && ct_value_to_bool(ctx, argv[3]);
     pthread_mutex_init(&watcher->mutex, NULL);
     if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
         fprintf(stderr, "[cottontail:fd] start id=%u fd=%d max=%zu\n", watcher->id, watcher->fd, watcher->max_bytes);
@@ -18301,6 +19511,46 @@ static JSValueRef ct_fd_watch_stop(JSContextRef ctx, JSObjectRef function, JSObj
         }
     }
     return JSValueMakeBoolean(ctx, stopped);
+}
+
+static JSValueRef ct_fd_watch_set_ref(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool found = false;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->id != id) continue;
+        pthread_mutex_lock(&watcher->mutex);
+        watcher->referenced = ct_value_to_bool(ctx, argv[1]);
+        pthread_mutex_unlock(&watcher->mutex);
+        found = true;
+        break;
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return JSValueMakeBoolean(ctx, found);
+}
+
+static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool found = false;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->id != id) continue;
+        pthread_mutex_lock(&watcher->mutex);
+        watcher->paused = ct_value_to_bool(ctx, argv[1]);
+        pthread_mutex_unlock(&watcher->mutex);
+        found = true;
+        break;
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+    return JSValueMakeBoolean(ctx, found);
 }
 
 static JSValueRef ct_fd_set_event_handler(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -19237,6 +20487,8 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "statfsSync", ct_statfs_sync_native, runtime);
     ct_install_function(ctx, host, "fdWatchStart", ct_fd_watch_start, runtime);
     ct_install_function(ctx, host, "fdWatchStop", ct_fd_watch_stop, runtime);
+    ct_install_function(ctx, host, "fdWatchSetRef", ct_fd_watch_set_ref, runtime);
+    ct_install_function(ctx, host, "fdWatchSetPaused", ct_fd_watch_set_paused, runtime);
     ct_install_function(ctx, host, "fdSetEventHandler", ct_fd_set_event_handler, runtime);
     ct_install_function(ctx, host, "env", ct_env, runtime);
     ct_install_function(ctx, host, "existsSync", ct_exists_sync, runtime);
@@ -19372,11 +20624,16 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "tcpServerListen", ct_tcp_server_listen, runtime);
     ct_install_function(ctx, host, "tcpServerAccept", ct_tcp_server_accept, runtime);
     ct_install_function(ctx, host, "tcpSocketConnect", ct_tcp_socket_connect, runtime);
+    ct_install_function(ctx, host, "tcpSocketConnectStart", ct_tcp_socket_connect_start, runtime);
+    ct_install_function(ctx, host, "tcpSocketConnectTake", ct_tcp_socket_connect_take, runtime);
+    ct_install_function(ctx, host, "tcpSocketConnectCancel", ct_tcp_socket_connect_cancel, runtime);
+    ct_install_function(ctx, host, "tcpSocketConnectSetRef", ct_tcp_socket_connect_set_ref, runtime);
     ct_install_function(ctx, host, "tcpSocketAddress", ct_tcp_socket_address, runtime);
     ct_install_function(ctx, host, "socketPair", ct_socket_pair, runtime);
     ct_install_function(ctx, host, "tcpSocketSetNoDelay", ct_tcp_socket_set_no_delay, runtime);
     ct_install_function(ctx, host, "tcpSocketSetKeepAlive", ct_tcp_socket_set_keep_alive, runtime);
     ct_install_function(ctx, host, "tcpSocketShutdown", ct_tcp_socket_shutdown, runtime);
+    ct_install_function(ctx, host, "tcpSocketReset", ct_tcp_socket_reset, runtime);
     ct_install_function(ctx, host, "unixServerListen", ct_unix_server_listen, runtime);
     ct_install_function(ctx, host, "unixServerAccept", ct_unix_server_accept, runtime);
     ct_install_function(ctx, host, "unixSocketConnect", ct_unix_socket_connect, runtime);
@@ -19395,11 +20652,14 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     ct_install_function(ctx, host, "tlsConnectionDrainMemory", ct_tls_connection_drain_memory, runtime);
     ct_install_function(ctx, host, "tlsConnectionReadMemory", ct_tls_connection_read_memory, runtime);
     ct_install_function(ctx, host, "tlsConnectionReadStart", ct_tls_connection_read_start, runtime);
+    ct_install_function(ctx, host, "tlsConnectionSetRef", ct_tls_connection_set_ref, runtime);
+    ct_install_function(ctx, host, "tlsConnectionSetReadPaused", ct_tls_connection_set_read_paused, runtime);
     ct_install_function(ctx, host, "tlsConnectionWrite", ct_tls_connection_write, runtime);
     ct_install_function(ctx, host, "tlsConnectionShutdown", ct_tls_connection_shutdown, runtime);
     ct_install_function(ctx, host, "tlsConnectionClose", ct_tls_connection_close, runtime);
     ct_install_function(ctx, host, "tlsConnectionInfo", ct_tls_connection_info, runtime);
     ct_install_function(ctx, host, "tlsConnectionSetServername", ct_tls_connection_set_servername, runtime);
+    ct_install_function(ctx, host, "tlsConnectionSetSession", ct_tls_connection_set_session, runtime);
     ct_install_function(ctx, host, "tlsConnectionSetMaxSendFragment", ct_tls_connection_set_max_send_fragment, runtime);
     ct_install_function(ctx, host, "tlsConnectionExportKeyingMaterial", ct_tls_connection_export_keying_material, runtime);
     ct_install_function(ctx, host, "sqliteOpen", ct_sqlite_open, runtime);
@@ -19761,7 +21021,12 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
 void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     if (runtime == NULL) return;
     ct_async_processes_wait_for_runtime(runtime);
+    ct_tcp_connects_stop_runtime(runtime);
     ct_fd_watchers_wait_for_runtime(runtime);
+#if CT_HAS_OPENSSL
+    ct_tls_servers_stop_runtime(runtime);
+    ct_tls_connections_stop_runtime(runtime);
+#endif
     pthread_mutex_lock(&ct_http_servers_mutex);
     CtHttpServer *servers = ct_http_servers;
     ct_http_servers = NULL;
@@ -20575,7 +21840,7 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     for (CtTlsConnection *connection = ct_tls_connections; connection != NULL; connection = connection->next) {
         if (connection->runtime != runtime) continue;
         pthread_mutex_lock(&connection->mutex);
-        pending = connection->active;
+        pending = connection->active && connection->referenced;
         pthread_mutex_unlock(&connection->mutex);
         if (pending) break;
     }
@@ -20604,7 +21869,8 @@ static bool ct_runtime_has_pending_native_events(CtJscRuntime *runtime) {
     pthread_mutex_unlock(&runtime->worker_event_mutex);
     if (pending) return true;
 
-    return ct_fd_watchers_has_runtime(runtime);
+    if (ct_tcp_connects_has_referenced_runtime(runtime)) return true;
+    return ct_fd_watchers_has_referenced_runtime(runtime);
 }
 
 static int ct_jsc_runtime_has_active_handles(CtJscRuntime *runtime, bool *has_active_handles_out, char **error_out) {

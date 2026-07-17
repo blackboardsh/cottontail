@@ -79,6 +79,11 @@ function installFdWatchDispatcher() {
   if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
     globalThis.__cottontailFdWatchHandlerInstalled = true;
     cottontail.fdSetEventHandler((event) => {
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(Number(event?.id));
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
       const listener = listeners.get(Number(event?.id));
       if (typeof listener === "function") {
         listener(event);
@@ -235,6 +240,9 @@ class SocketImpl extends EventEmitter {
       : null;
     this._abortSignal = null;
     this._abortReason = undefined;
+    this._connectAttemptIds = new Set();
+    this._connectAttemptTimers = new Set();
+    this._connectGeneration = 0;
     this._host = undefined;
     this._port = undefined;
     this._peername = null;
@@ -321,6 +329,7 @@ class SocketImpl extends EventEmitter {
         this._timeoutTimer = null;
         if (!this.destroyed && Number(this._timeoutValue) > 0) this.emit("timeout");
       }, timeout);
+      if (!this._refed) this._timeoutTimer.unref?.();
     }
     return this;
   }
@@ -378,6 +387,7 @@ class SocketImpl extends EventEmitter {
       this._writeRetryTimer = null;
       this._flushOutboundWrites();
     }, 0);
+    if (!this._refed) this._writeRetryTimer.unref?.();
   }
 
   _flushOutboundWrites() {
@@ -630,9 +640,14 @@ class SocketImpl extends EventEmitter {
   }
 
   _startRead() {
-    if (this.fd == null || this.destroyed || this._watchId || typeof cottontail.fdWatchStart !== "function") return this;
+    if (this.fd == null || this.destroyed || typeof cottontail.fdWatchStart !== "function") return this;
+    if (this._watchId) {
+      cottontail.fdWatchSetPaused?.(this._watchId, this._paused);
+      cottontail.fdWatchSetRef?.(this._watchId, this._refed);
+      return this;
+    }
     const fdWatchListeners = installFdWatchDispatcher();
-    const watch = cottontail.fdWatchStart(this.fd, 1024 * 1024);
+    const watch = cottontail.fdWatchStart(this.fd, 1024 * 1024, this._refed, this._paused);
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
     const watchId = this._watchId;
@@ -659,13 +674,30 @@ class SocketImpl extends EventEmitter {
         return;
       }
       if (event.type === "error") {
-        this.destroy(new Error(event.message || "socket read failed"));
+        const error = new Error(event.message || "socket read failed");
+        if (event.code != null) error.code = String(event.code);
+        else if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
+        else if (/broken pipe/i.test(error.message)) error.code = "EPIPE";
+        if (event.errno != null) error.errno = Number(event.errno);
+        this.destroy(error);
       }
     }));
     this._unregisterWatch = () => {
       fdWatchListeners.delete(watchId);
     };
     return this;
+  }
+
+  _cancelConnectAttempts() {
+    this._connectGeneration += 1;
+    for (const timer of this._connectAttemptTimers) clearTimeout(timer);
+    this._connectAttemptTimers.clear();
+    const listeners = globalThis.__cottontailTcpConnectListeners;
+    for (const id of this._connectAttemptIds) {
+      listeners?.delete?.(id);
+      try { cottontail.tcpSocketConnectCancel?.(id); } catch {}
+    }
+    this._connectAttemptIds.clear();
   }
 
   _setupAbortSignal(signal) {
@@ -680,7 +712,9 @@ class SocketImpl extends EventEmitter {
         return err;
       })();
       this._abortReason = reason;
-      if (!this.destroyed) this.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+      if (!this.destroyed) {
+        this.destroy(reason != null && typeof reason === "object" ? reason : new Error(String(reason)));
+      }
     };
     if (signal.aborted) {
       // Node destroys asynchronously so callers can attach "error" listeners.
@@ -796,40 +830,129 @@ class SocketImpl extends EventEmitter {
     const attempted = [];
     const errors = [];
     this.autoSelectFamilyAttemptedAddresses = addresses.length > 1 ? attempted : undefined;
-    for (const candidate of addresses) {
-      if (this.destroyed || !this.connecting) return;
-      const { address, family } = candidate;
+    const generation = this._connectGeneration;
+    const listeners = globalThis.__cottontailTcpConnectListeners ??= new Map();
+    installFdWatchDispatcher();
+    const attemptTimeout = Math.max(10, Number(options.autoSelectFamilyAttemptTimeout ?? defaultAutoSelectFamilyAttemptTimeout));
+    let index = 0;
+
+    const fail = () => {
+      if (this.destroyed || !this.connecting || generation !== this._connectGeneration) return;
+      this.connecting = false;
+      if (errors.length > 1) {
+        const error = new AggregateError(errors, "All connection attempts failed");
+        error.code = errors[0]?.code;
+        this.destroy(error);
+      } else {
+        this.destroy(errors[0] ?? connectionException(new Error("Failed to connect"), options, host, port));
+      }
+    };
+
+    const startNext = () => {
+      if (this.destroyed || !this.connecting || generation !== this._connectGeneration) return;
+      if (index >= addresses.length) {
+        fail();
+        return;
+      }
+      const { address, family } = addresses[index++];
       attempted.push(`${address}:${port}`);
       this.emit("connectionAttempt", address, port, family);
       if (this.blockList?.check(address, `ipv${family}`)) {
         const blocked = makeNodeError(Error, `IP address is blocked by the supplied net.BlockList: ${address}`, "ERR_IP_BLOCKED", { address });
         errors.push(blocked);
         this.emit("connectionAttemptFailed", address, port, family, blocked);
-        continue;
+        startNext();
+        return;
       }
+
+      let nativeAttempt;
       try {
-        const result = cottontail.tcpSocketConnect(port, address, family);
-        if (this.destroyed || !this.connecting) {
-          try { cottontail.closeFd?.(result.fd); } catch {}
+        if (typeof cottontail.tcpSocketConnectStart !== "function") {
+          const result = cottontail.tcpSocketConnect(port, address, family);
+          this._attachFd(result.fd, result.local, result.remote, true);
           return;
         }
-        this._attachFd(result.fd, result.local, result.remote, true);
-        return;
+        nativeAttempt = cottontail.tcpSocketConnectStart(
+          port,
+          address,
+          family,
+          options.localAddress,
+          options.localPort,
+          this._refed,
+        );
       } catch (rawError) {
         const error = connectionException(rawError, options, address, port);
         errors.push(error);
         this.emit("connectionAttemptFailed", address, port, family, error);
+        startNext();
+        return;
       }
-    }
-    if (errors.length > 1) {
-      const error = new AggregateError(errors, "All connection attempts failed");
-      error.code = errors[0]?.code;
-      this.connecting = false;
-      this.destroy(error);
-    } else {
-      this.connecting = false;
-      this.destroy(errors[0] ?? connectionException(new Error("Failed to connect"), options, host, port));
-    }
+      const attemptId = Number(nativeAttempt?.id ?? 0);
+      if (!attemptId) {
+        const error = connectionException(new Error("Failed to start connection attempt"), options, address, port);
+        errors.push(error);
+        this.emit("connectionAttemptFailed", address, port, family, error);
+        startNext();
+        return;
+      }
+      this._connectAttemptIds.add(attemptId);
+
+      let timeoutTimer = null;
+      const clearAttempt = () => {
+        listeners.delete(attemptId);
+        this._connectAttemptIds.delete(attemptId);
+        if (timeoutTimer != null) {
+          clearTimeout(timeoutTimer);
+          this._connectAttemptTimers.delete(timeoutTimer);
+          timeoutTimer = null;
+        }
+      };
+      listeners.set(attemptId, _wrapAsyncCallback((event) => {
+        if (event?.type !== "connect") return;
+        clearAttempt();
+        let result;
+        try {
+          result = cottontail.tcpSocketConnectTake(attemptId);
+        } catch (rawError) {
+          result = { ok: false, message: rawError?.message ?? String(rawError), code: rawError?.code };
+        }
+        if (this.destroyed || !this.connecting || generation !== this._connectGeneration) {
+          if (result?.ok && result.fd != null) try { cottontail.closeFd?.(result.fd); } catch {}
+          return;
+        }
+        if (result?.ok) {
+          this._attachFd(result.fd, result.local, result.remote, true);
+          return;
+        }
+        const nativeError = Object.assign(new Error(result?.message || "Failed to connect"), {
+          code: result?.code,
+          errno: result?.errno,
+        });
+        const error = connectionException(nativeError, options, address, port);
+        errors.push(error);
+        this.emit("connectionAttemptFailed", address, port, family, error);
+        startNext();
+      }));
+
+      if (index < addresses.length) {
+        timeoutTimer = setTimeout(() => {
+          this._connectAttemptTimers.delete(timeoutTimer);
+          timeoutTimer = null;
+          if (this.destroyed || !this.connecting || generation !== this._connectGeneration) return;
+          listeners.delete(attemptId);
+          this._connectAttemptIds.delete(attemptId);
+          try { cottontail.tcpSocketConnectCancel(attemptId); } catch {}
+          const error = connectionException(Object.assign(new Error("Connection attempt timed out"), { code: "ETIMEDOUT" }), options, address, port);
+          errors.push(error);
+          this.emit("connectionAttemptTimeout", address, port, family);
+          startNext();
+        }, attemptTimeout);
+        timeoutTimer.unref?.();
+        this._connectAttemptTimers.add(timeoutTimer);
+      }
+    };
+
+    startNext();
   }
 
   connect(...args) {
@@ -852,6 +975,7 @@ class SocketImpl extends EventEmitter {
         throw outOfRange("options.autoSelectFamilyAttemptTimeout", ">= 1", options.autoSelectFamilyAttemptTimeout);
       }
     }
+    this._cancelConnectAttempts();
     const port = options.path == null && options.fd === undefined ? validatePort(options.port) : undefined;
     if (callback) this.once("connect", callback);
     if (options.onread && typeof options.onread === "object" && typeof options.onread.callback === "function") {
@@ -1011,6 +1135,7 @@ class SocketImpl extends EventEmitter {
       return this;
     }
     if (this.destroyed) return this;
+    this._cancelConnectAttempts();
     this.destroyed = true;
     this.connecting = false;
     this.readable = false;
@@ -1076,7 +1201,7 @@ class SocketImpl extends EventEmitter {
   }
   pause() {
     this._paused = true;
-    if (!this.connecting && this.fd != null) this._stopRead();
+    if (this._watchId) cottontail.fdWatchSetPaused?.(this._watchId, true);
     return this;
   }
   isPaused() {
@@ -1085,7 +1210,10 @@ class SocketImpl extends EventEmitter {
   resume() {
     this._paused = false;
     this._flushPendingData();
-    if (!this.destroyed && this.fd != null) this._startRead();
+    if (!this.destroyed && this.fd != null) {
+      if (this._watchId) cottontail.fdWatchSetPaused?.(this._watchId, false);
+      else this._startRead();
+    }
     return this;
   }
   setDefaultEncoding(encoding = "utf8") {
@@ -1103,12 +1231,38 @@ class SocketImpl extends EventEmitter {
       this.destroy(makeNodeError(Error, "Socket is closed", "ERR_SOCKET_CLOSED"));
       return this;
     }
-    if (this.connecting) this.once("connect", () => this.destroy());
-    else this.destroy();
+    if (this.connecting) {
+      this.once("connect", () => this.resetAndDestroy());
+      return this;
+    }
+    const fd = this.fd;
+    this._stopRead();
+    this.fd = null;
+    if (fd != null) {
+      try { cottontail.tcpSocketReset?.(fd); } catch (error) {
+        this.destroy(error);
+        return this;
+      }
+    }
+    this.destroy();
     return this;
   }
-  ref() { this._refed = true; return this; }
-  unref() { this._refed = false; return this; }
+  ref() {
+    this._refed = true;
+    this._timeoutTimer?.ref?.();
+    this._writeRetryTimer?.ref?.();
+    if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, true);
+    for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, true);
+    return this;
+  }
+  unref() {
+    this._refed = false;
+    this._timeoutTimer?.unref?.();
+    this._writeRetryTimer?.unref?.();
+    if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, false);
+    for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, false);
+    return this;
+  }
 
   get bytesWritten() { return this._bytesDispatchedValue + this.writableLength; }
   get _bytesDispatched() { return this._bytesDispatchedValue; }
@@ -1243,6 +1397,11 @@ class ServerImpl extends EventEmitter {
     if (options.backlog != null && (!Number.isInteger(Number(options.backlog)) || Number(options.backlog) < 0)) {
       throw outOfRange("options.backlog", "a non-negative integer", options.backlog);
     }
+    for (const optionName of ["ipv6Only", "reusePort"]) {
+      if (options[optionName] != null && typeof options[optionName] !== "boolean") {
+        throw invalidArgType(`options.${optionName}`, "of type boolean", options[optionName]);
+      }
+    }
     if (options.signal !== undefined) {
       validateAbortSignal(options.signal);
       const signal = options.signal;
@@ -1279,7 +1438,14 @@ class ServerImpl extends EventEmitter {
       } else {
         const host = String(options.host ?? "::");
         const family = normalizeSocketFamily(options.family) || (isIPv6(host) ? 6 : isIPv4(host) ? 4 : (host === "::" ? 6 : 0));
-        result = cottontail.tcpServerListen(validatePort(options.port ?? 0), host, family || 0);
+        result = cottontail.tcpServerListen(
+          validatePort(options.port ?? 0),
+          host,
+          family || 0,
+          Number(options.backlog ?? 511),
+          options.ipv6Only === true,
+          options.reusePort === true,
+        );
       }
       if (result != null) {
         this._fd = Number(result.fd);
@@ -1403,9 +1569,6 @@ class ServerImpl extends EventEmitter {
     if (this._fd != null) {
       try { cottontail.closeFd?.(this._fd); } catch {}
       this._fd = null;
-    }
-    if (this._isPipe && this._path) {
-      try { cottontail.unlinkSync?.(this._path); } catch {}
     }
     this.listening = false;
     this._address = null;
@@ -1924,8 +2087,9 @@ export function isIP(input) {
   return 0;
 }
 
-// COTTONTAIL-COMPAT: Native transport gaps are cancellable/asynchronous TCP connect attempts,
-// local-address binding, listener backlog/ipv6Only/reusePort controls, watcher ref/unref, and TCP RST.
+// COTTONTAIL-COMPAT: Dynamic platform interface enumeration and libuv-specific handle internals
+// remain outside this source port; socket I/O, connect cancellation/fallback, listener options,
+// watcher lifecycle, local binding, Unix ownership, and TCP reset are backed by native handles.
 
 export default {
   BlockList,
