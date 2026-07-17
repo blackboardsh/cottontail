@@ -1464,7 +1464,7 @@
     },
     "test/js/bun/spawn/spawn-maxbuf.test.ts": {
       "status": "expected-failure",
-      "reason": "Requires CommonJS __dirname semantics for bundled upstream Node common fixtures; Cottontail's bundling path does not provide module-local __dirname yet."
+      "reason": "All four asynchronous maxBuffer/timeout cases pass (17 assertions); the synchronous cases require maxBuffer, timeout, and killSignal enforcement inside Cottontail's blocking native spawnSync hook."
     },
     "test/js/bun/spawn/spawn-noread-leak.test.ts": {
       "status": "enabled",
@@ -1477,7 +1477,15 @@
     },
     "test/js/bun/spawn/spawn-pipe-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "Long-running Bun.spawn pipe leak coverage currently exceeds the direct upstream runner timeout."
+      "reason": "The leak workload launches 2,250 nested Cottontail processes and exceeds its 30-second per-case budget because each child still bundles/evaluates runtime modules at startup."
+    },
+    "test/js/bun/spawn/spawn-signal.test.ts": {
+      "status": "expected-failure",
+      "reason": "All three asynchronous AbortSignal cases pass (5 assertions); spawnSync AbortSignal.timeout requires deadline enforcement inside the blocking native spawnSync hook."
+    },
+    "test/js/bun/spawn/spawn-stdin-readable-stream-edge-cases.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn ReadableStream stdin exceptions, cancellation, mixed chunks, reuse prevention, byte streams, backpressure, and large writes pass all 13 upstream cases with 41 assertions."
     },
     "test/js/bun/spawn/spawn-socketpair-shutdown.test.ts": {
       "status": "enabled",
@@ -1495,13 +1503,17 @@
       "status": "enabled",
       "reason": "Bun.spawnSync ReadableStream stdin fixture coverage passes under Cottontail."
     },
+    "test/js/bun/spawn/spawn-stdin-readable-stream.test.ts": {
+      "status": "expected-failure",
+      "reason": "ReadableStream stdin behavior passes 19 cases with one upstream todo; only the 50-concurrent-child object-count case exceeds bun:test's 5-second budget due to Cottontail child startup cost."
+    },
     "test/js/bun/spawn/spawn-stream-serve.test.ts": {
       "status": "enabled",
       "reason": "Bun.spawn stdout streaming into Bun.serve responses now passes under Cottontail."
     },
     "test/js/bun/spawn/spawn-streaming-stdin.test.ts": {
-      "status": "expected-failure",
-      "reason": "Streaming semantics are correct for a single child (chunked stdin delivery verified in isolation), but the test spawns 16 concurrent cottontail children x50; under that herd a few children need >1.05s to begin reading stdin (runtime-module bundling+evaluation per process), receive all 7 writes as one pipe chunk, and exit 1 via the fixture's own 2-chunk assertion (verified 6x)."
+      "status": "enabled",
+      "reason": "Bun.spawn writable stdin preserves streaming delivery across all 16 concurrent fixture variants and passes the upstream case with 133 assertions."
     },
     "test/js/bun/spawn/spawn-streaming-stdout.test.ts": {
       "status": "enabled",
@@ -1511,9 +1523,25 @@
       "status": "enabled",
       "reason": "Bun.spawn stress coverage now passes under Cottontail."
     },
+    "test/js/bun/spawn/spawn.ipc.bun-node.test.ts": {
+      "status": "enabled",
+      "reason": "Bun-parent/Node-child JSON IPC uses Node channel framing and passes the upstream cross-runtime case with 2 assertions."
+    },
+    "test/js/bun/spawn/spawn.ipc.node-bun.test.ts": {
+      "status": "enabled",
+      "reason": "Node-parent/Bun-child JSON IPC initializes inherited NODE_CHANNEL_FD during runtime startup and passes the upstream cross-runtime case with 2 assertions."
+    },
+    "test/js/bun/spawn/spawn.ipc.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.spawn send/receive IPC lifecycle passes all 4 JSON and advanced-mode upstream cases with 6 assertions."
+    },
     "test/js/bun/spawn/spawn.test.ts": {
       "status": "expected-failure",
-      "reason": "Large Bun.spawn conformance file still exceeds the direct upstream runner timeout under Cottontail."
+      "reason": "Ordinary sync, async, pipe, stdio ownership, IPC/disconnect, disposal, kill, and argv0 coverage passes in bounded groups; startup-heavy loops create thousands of nested Cottontail processes and exceed Bun's 5-second case and 30-second file budgets."
+    },
+    "test/js/bun/spawn/spawnSync.test.ts": {
+      "status": "expected-failure",
+      "reason": "Four cases pass and the Linux memfd case is platform-skipped; the final optimization-counter fixture imports getCounters from bun:internal-for-testing, which that separately-owned private test module does not export."
     },
     "test/js/bun/spawn/spawn_waiter_thread.test.ts": {
       "status": "expected-failure",

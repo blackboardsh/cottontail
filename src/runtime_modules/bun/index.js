@@ -43,6 +43,46 @@ import * as bunJscModule from "./jsc.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
 import { jest as bunJest } from "./test.js";
 import { captureV8HeapSnapshot } from "../node/internal/heap_snapshot.js";
+import {
+  assertBunAbortSignal,
+  bunSignalName,
+  bunSignalNumber,
+  isEmptyBunSpawnOption,
+  isReadableStreamLike,
+  normalizeBunSpawnCommand,
+  normalizeBunSpawnMaxBuffer,
+  normalizeBunSpawnTimeout,
+  validateBunSpawnCallbacks,
+} from "../internal/bun-spawn-contract.js";
+import {
+  decodeBunSpawnIpc,
+  encodeBunSpawnIpc,
+  installInheritedNodeIpc,
+  isCottontailIpcFrame,
+} from "../internal/bun-spawn-ipc.js";
+
+installInheritedNodeIpc(cottontail);
+
+const inheritedSpawnArgv0 = globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0;
+if (inheritedSpawnArgv0 != null) {
+  Object.defineProperty(globalThis.process, "argv0", {
+    value: String(inheritedSpawnArgv0),
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  try { delete globalThis.process.env.COTTONTAIL_SPAWN_ARGV0; } catch {}
+}
+const inheritedSpawnExecPath = globalThis.process?.env?.COTTONTAIL_SPAWN_EXEC_PATH;
+if (inheritedSpawnExecPath != null) {
+  Object.defineProperty(globalThis.process, "execPath", {
+    value: String(inheritedSpawnExecPath),
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  try { delete globalThis.process.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
+}
 
 function ctRemapStackString(stack) {
   let remapped = remapBundleStack(stack);
@@ -2781,45 +2821,111 @@ export function build(options) {
 }
 
 function normalizeCommand(command, maybeArgs = undefined, maybeOptions = undefined) {
-  if (command && typeof command === "object" && !Array.isArray(command) && Array.isArray(command.cmd)) {
-    if (command.cmd.length === 0) throw new TypeError("Bun.spawn requires a non-empty cmd array");
-    if (command.cmd.length > 0xfffffffd) throw new TypeError("cmd array is too large");
-    return [String(command.cmd[0]), command.cmd.slice(1).map(String), { ...command, cmd: undefined, ...(maybeArgs || {}) }];
-  }
-  if (Array.isArray(command)) {
-    if (command.length === 0) throw new TypeError("Bun.spawn requires a non-empty command array");
-    if (command.length > 0xfffffffd) throw new TypeError("cmd array is too large");
-    return [String(command[0]), command.slice(1).map(String), maybeArgs || {}];
-  }
-  return [String(command), Array.from(maybeArgs ?? [], String), maybeOptions || {}];
+  return normalizeBunSpawnCommand(command, maybeArgs, maybeOptions);
 }
 
-function normalizeStdio(value, fallback) {
+function stdioFileDescriptor(value) {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (value != null && typeof value === "object" && typeof value.fd === "number" && Number.isInteger(value.fd)) {
+    return value.fd;
+  }
+  return null;
+}
+
+function normalizeStdio(value, fallback, index, details) {
   if (value === undefined) return fallback;
   if (value === null) return "ignore";
-  if (value === "pipe" || value === "inherit" || value === "ignore") return value;
-  if (typeof value === "number") return "inherit";
-  return "pipe";
+  if (typeof value === "string") {
+    if (value === "overlapped") return "pipe";
+    if (value === "pipe" || value === "inherit" || value === "ignore") return value;
+    if (value === "ipc" && index > 2) return "pipe";
+    throw new TypeError("stdio must be an array of 'inherit', 'pipe', 'ignore', Bun.file(pathOrFd), number, or null");
+  }
+
+  const fd = stdioFileDescriptor(value);
+  if (fd != null) {
+    if (fd < 0) throw new TypeError("file descriptor must be a positive integer");
+    if (index === 0 && (fd === 1 || fd === 2)) {
+      throw new TypeError("stdout and stderr cannot be used for stdin");
+    }
+    if ((index === 1 || index === 2) && fd === 0) {
+      throw new TypeError("stdin cannot be used for stdout or stderr");
+    }
+    details[`${index === 0 ? "stdin" : index === 1 ? "stdout" : "stderr"}Fd`] = fd;
+    // COTTONTAIL-COMPAT: Bun.spawn fd routing - the native spawn hooks need an
+    // ordered stdio descriptor array with dup2(source, target), extra pipe
+    // creation, owned-fd lifetimes, and returned handles for descriptors > 2.
+    // Matching standard inherited descriptors are exact with today's hook.
+    return "inherit";
+  }
+
+  if (index === 0) {
+    if ((value instanceof ArrayBuffer || ArrayBuffer.isView(value)) && value.byteLength === 0) return "ignore";
+    if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob && value.size === 0) return "ignore";
+    if (isBunFileLike(value) || isReadableStreamLike(value) || value instanceof ArrayBuffer ||
+        ArrayBuffer.isView(value) || (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) ||
+        typeof value?.arrayBuffer === "function" || typeof value?.bytes === "function") {
+      details.input = value;
+      return "pipe";
+    }
+  } else {
+    const outputName = index === 1 ? "stdout" : "stderr";
+    if (isBunFileLike(value) && typeof value._bunFilePath === "string") {
+      details[`${outputName}FilePath`] = value._bunFilePath;
+      return "pipe";
+    }
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      if (value.byteLength === 0) return "ignore";
+      details[`${outputName}Buffer`] = value;
+      return "pipe";
+    }
+    if (isReadableStreamLike(value)) {
+      throw new TypeError(`ReadableStream cannot be used for ${outputName} yet. For now, do .${outputName}`);
+    }
+    if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
+      throw new TypeError("Blobs are immutable, and cannot be used for stdout/stderr");
+    }
+  }
+
+  throw new TypeError("stdio must be an array of 'inherit', 'pipe', 'ignore', Bun.file(pathOrFd), number, or null");
 }
 
-function normalizeSpawnOptions(options = {}, defaults = {}) {
+function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
+  if (options == null || typeof options !== "object") options = {};
+  validateBunSpawnCallbacks(options, sync);
+  assertBunAbortSignal(options.signal);
+  if (!sync && !isEmptyBunSpawnOption(options.terminal)) {
+    if (typeof options.terminal !== "object") {
+      throw new TypeError("terminal must be a Terminal object or options object");
+    }
+    // COTTONTAIL-COMPAT: Bun.spawn terminal - PTY/ConPTY creation, resize,
+    // slave-fd stdio wiring, and terminal lifetime require a native host hook.
+    throw new Error("Bun.spawn terminal requires native PTY support");
+  }
+
+  const details = {};
   let stdin = defaults.stdin ?? "ignore";
   let stdout = defaults.stdout ?? "pipe";
   let stderr = defaults.stderr ?? "inherit";
 
-  if (Array.isArray(options.stdio)) {
-    stdin = normalizeStdio(options.stdio[0], stdin);
-    stdout = normalizeStdio(options.stdio[1], stdout);
-    stderr = normalizeStdio(options.stdio[2], stderr);
-  } else if (typeof options.stdio === "string") {
-    stdin = stdout = stderr = normalizeStdio(options.stdio, stdout);
+  if (options.stdio !== undefined) {
+    if (Array.isArray(options.stdio)) {
+      stdin = normalizeStdio(options.stdio[0], stdin, 0, details);
+      stdout = normalizeStdio(options.stdio[1], stdout, 1, details);
+      stderr = normalizeStdio(options.stdio[2], stderr, 2, details);
+      for (let index = 3; index < options.stdio.length; index += 1) {
+        normalizeStdio(options.stdio[index], "ignore", index, details);
+      }
+    } else if (options.stdio !== null) {
+      throw new TypeError("stdio must be an array");
+    }
+  } else {
+    stdin = normalizeStdio(options.stdin, stdin, 0, details);
+    stdout = normalizeStdio(options.stdout, stdout, 1, details);
+    stderr = normalizeStdio(options.stderr, stderr, 2, details);
   }
 
-  stdin = normalizeStdio(options.stdin, stdin);
-  stdout = normalizeStdio(options.stdout, stdout);
-  stderr = normalizeStdio(options.stderr, stderr);
-
-  let input = options.input ?? options.stdin;
+  let input = options.input ?? details.input;
   // Bun.file(...) as stdin: read the file contents and feed them as input,
   // matching bun's behavior of wiring the file to the child's stdin.
   if (input != null && isBunFileLike(input) && typeof input._bunFilePath === "string") {
@@ -2829,39 +2935,59 @@ function normalizeSpawnOptions(options = {}, defaults = {}) {
       input = asBuffer("");
     }
   }
+  if (sync && isReadableStreamLike(input)) {
+    throw new TypeError("'stdin' ReadableStream cannot be used in sync mode");
+  }
+  if (sync && typeof globalThis.Blob === "function" && input instanceof globalThis.Blob) {
+    input = blobBytesSync(input);
+  }
   if (input != null && input !== "pipe" && input !== "inherit" && input !== "ignore") {
     stdin = "pipe";
   }
   // Bun.file(...) as stdout/stderr: capture the stream and persist it to the
   // target file once the process finishes.
-  const stdoutFilePath = options.stdout != null && isBunFileLike(options.stdout) && typeof options.stdout._bunFilePath === "string"
-    ? options.stdout._bunFilePath
+  const timeout = normalizeBunSpawnTimeout(options.timeout);
+  const parsedMaxBuffer = normalizeBunSpawnMaxBuffer(options.maxBuffer);
+  const maxBuffer = parsedMaxBuffer != null && (stdin === "pipe" || stdout === "pipe" || stderr === "pipe")
+    ? parsedMaxBuffer
     : undefined;
-  const stderrFilePath = options.stderr != null && isBunFileLike(options.stderr) && typeof options.stderr._bunFilePath === "string"
-    ? options.stderr._bunFilePath
-    : undefined;
-  let timeout = options.timeout;
-  if (timeout !== undefined) {
-    timeout = Number(timeout);
-    if (!Number.isFinite(timeout) || timeout < 0 || timeout > Number.MAX_SAFE_INTEGER) {
-      throw new RangeError(`The value of "timeout" is out of range. It must be >= 0 and <= ${Number.MAX_SAFE_INTEGER}. Received ${timeout}`);
-    }
+  const killSignalNumber = bunSignalNumber(options.killSignal);
+  let env;
+  let clearEnv = false;
+  if (!isEmptyBunSpawnOption(options.env)) {
+    if (typeof options.env !== "object") throw new TypeError("env must be an object");
+    env = sanitizeSpawnEnv(options.env);
+    clearEnv = true;
   }
 
   return {
-    cwd: options.cwd,
-    env: sanitizeSpawnEnv(options.env),
-    clearEnv: options.env !== undefined,
+    cwd: isEmptyBunSpawnOption(options.cwd) ? undefined : String(options.cwd),
+    env,
+    clearEnv,
     stdin,
     stdout,
     stderr,
-    stdoutFilePath,
-    stderrFilePath,
+    stdoutFilePath: details.stdoutFilePath,
+    stderrFilePath: details.stderrFilePath,
+    stdoutBuffer: details.stdoutBuffer,
+    stderrBuffer: details.stderrBuffer,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
-    killSignal: options.killSignal,
-    maxBuffer: options.maxBuffer,
+    killSignal: killSignalNumber,
+    maxBuffer,
     timeout,
-    ipc: typeof options.ipc === "function" || options.ipc === true,
+    ipc: !sync && typeof options.ipc === "function",
+    signal: isEmptyBunSpawnOption(options.signal) ? undefined : options.signal,
+    argv0: isEmptyBunSpawnOption(options.argv0) ? undefined : String(options.argv0),
+    detached: options.detached === true,
+    windowsHide: typeof options.windowsHide === "boolean" ? options.windowsHide : false,
+    windowsVerbatimArguments: typeof options.windowsVerbatimArguments === "boolean"
+      ? options.windowsVerbatimArguments
+      : false,
+    lazy: options.lazy === true,
+    serialization: options.serialization === "json" ? "json" : "advanced",
+    onExit: isEmptyBunSpawnOption(options.onExit) ? undefined : _wrapAsyncCallback(options.onExit),
+    onDisconnect: isEmptyBunSpawnOption(options.onDisconnect) ? undefined : _wrapAsyncCallback(options.onDisconnect),
+    ipcCallback: typeof options.ipc === "function" ? _wrapAsyncCallback(options.ipc) : undefined,
   };
 }
 
@@ -2870,7 +2996,7 @@ function sanitizeSpawnEnv(env) {
   const sanitized = {};
   for (const key of Object.keys(env)) {
     const value = env[key];
-    if (value === undefined || value === null) continue;
+    if (value === undefined) continue;
     sanitized[key] = String(value);
   }
   return sanitized;
@@ -2894,10 +3020,18 @@ function isCurrentCottontailExecutable(file) {
 }
 
 function prepareNativeSpawnOptions(file, nativeOptions) {
-  if (isCurrentCottontailExecutable(file) && nativeOptions.env === undefined) {
+  if (isCurrentCottontailExecutable(file)) {
+    // COTTONTAIL-COMPAT: spawn argv0 - Cottontail children use this internal
+    // override; arbitrary executables still need the native hooks to set
+    // argv[0] before exec.
+    const env = nativeOptions.env === undefined
+      ? withoutElectrobunHostEnv(currentProcessEnv())
+      : { ...nativeOptions.env };
+    env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
+    if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
     return {
       ...nativeOptions,
-      env: withoutElectrobunHostEnv(currentProcessEnv()),
+      env,
       clearEnv: true,
     };
   }
@@ -3252,84 +3386,124 @@ function concatManyBuffers(chunks) {
 }
 
 function signalName(signalNumber) {
-  const signals = {
-    1: "SIGHUP",
-    2: "SIGINT",
-    3: "SIGQUIT",
-    6: "SIGABRT",
-    9: "SIGKILL",
-    14: "SIGALRM",
-    15: "SIGTERM",
-  };
-  return signals[Number(signalNumber)] ?? null;
+  return bunSignalName(signalNumber);
 }
 
 function signalNumber(signal = "SIGTERM") {
-  if (signal == null || signal === "") return 15;
-  if (typeof signal === "number") {
-    if (Number.isNaN(signal)) return 15;
-    if (!Number.isFinite(signal)) throw new TypeError("Invalid signal");
-    return signal;
-  }
-  if (typeof signal !== "string") throw new TypeError("Invalid signal");
-  const name = String(signal).toUpperCase();
-  const signals = {
-    SIGHUP: 1,
-    SIGINT: 2,
-    SIGQUIT: 3,
-    SIGABRT: 6,
-    SIGKILL: 9,
-    SIGALRM: 14,
-    SIGTERM: 15,
+  return bunSignalNumber(signal);
+}
+
+function normalizeSpawnResourceUsage(usage) {
+  if (usage == null) return undefined;
+  if (usage.cpuTime?.user != null && usage.cpuTime?.system != null) return usage;
+  const user = BigInt(Math.max(0, Math.trunc(Number(usage.userCPUTime) || 0)));
+  const system = BigInt(Math.max(0, Math.trunc(Number(usage.systemCPUTime) || 0)));
+  return {
+    maxRSS: Number(usage.maxRSS) || 0,
+    shmSize: Number(usage.sharedMemorySize) || 0,
+    swapCount: Number(usage.swappedOut) || 0,
+    messages: {
+      sent: Number(usage.ipcSent) || 0,
+      received: Number(usage.ipcReceived) || 0,
+    },
+    signalCount: Number(usage.signalsCount) || 0,
+    contextSwitches: {
+      voluntary: Number(usage.voluntaryContextSwitches) || 0,
+      involuntary: Number(usage.involuntaryContextSwitches) || 0,
+    },
+    cpuTime: { user, system, total: user + system },
+    ops: {
+      in: Number(usage.fsRead) || 0,
+      out: Number(usage.fsWrite) || 0,
+    },
   };
-  if (signals[name] == null) throw new TypeError("Invalid signal");
-  return signals[name];
+}
+
+function normalizeBunSpawnError(error, file, cwd = undefined) {
+  const source = String(error?.message ?? error ?? "");
+  if (!source.includes("FileNotFound") && !source.includes("ENOENT") && !source.includes("No such file or directory")) {
+    return error;
+  }
+  const out = new Error(cwd != null
+    ? `ENOENT: no such file or directory, posix_spawn '${file}'`
+    : `Executable not found in $PATH: ${JSON.stringify(String(file))}`);
+  out.code = "ENOENT";
+  out.errno = -2;
+  out.path = String(file);
+  if (cwd != null) out.syscall = "posix_spawn";
+  return out;
 }
 
 export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
   const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
   validateSpawnInput(file, args, options);
-  const nativeOptions = prepareNativeSpawnOptions(file, normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
+  const nativeOptions = prepareNativeSpawnOptions(
+    file,
+    normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }, true),
+  );
   const captureOutput = nativeOptions.stdout !== "inherit" || nativeOptions.stderr !== "inherit";
-  const result = cottontail.spawnSync(file, args, {
-    cwd: nativeOptions.cwd,
-    env: nativeOptions.env,
-    clearEnv: nativeOptions.clearEnv,
-    stdio: captureOutput ? "pipe" : "inherit",
-    input: nativeOptions.input,
-  });
+  // COTTONTAIL-COMPAT: Bun.spawnSync native contract - the host currently
+  // exposes one captureOutput switch plus input. Literal parity requires
+  // per-fd stdio/dup2, argv0, pid+rusage, timeout/AbortSignal deadlines,
+  // maxBuffer enforcement, and killSignal to be accepted and returned by this
+  // single blocking hook. JavaScript cannot interrupt it while the VM thread
+  // is blocked, so those fields cannot be completed in this owned boundary.
+  let result;
+  try {
+    result = cottontail.spawnSync(file, args, {
+      cwd: nativeOptions.cwd,
+      env: nativeOptions.env,
+      clearEnv: nativeOptions.clearEnv,
+      stdio: captureOutput ? "pipe" : "inherit",
+      input: nativeOptions.input,
+    });
+  } catch (error) {
+    throw normalizeBunSpawnError(error, file, nativeOptions.cwd);
+  }
   if (captureOutput && nativeOptions.stdout === "inherit" && result.stdout != null) {
     globalThis.process?.stdout?.write?.(result.stdout);
   }
   if (captureOutput && nativeOptions.stderr === "inherit" && result.stderr != null) {
     globalThis.process?.stderr?.write?.(result.stderr);
   }
-  const exitCode = Number(result.status ?? result.exitCode ?? 0);
-  const signalCode = result.signalCode == null
-    ? (result.signal == null ? undefined : String(result.signal))
-    : signalName(result.signalCode) ?? String(result.signalCode);
-  const stdout = nativeOptions.stdout === "pipe" ? asBuffer(result.stdout ?? "") : asBuffer("");
-  let stderr = nativeOptions.stderr === "pipe" ? asBuffer(result.stderr ?? "") : asBuffer("");
+  const rawSignalCode = Number(result.signalCode ?? result.signal ?? 0);
+  const exitCode = rawSignalCode > 0 ? null : Number(result.status ?? result.exitCode ?? 0);
+  const resultSignal = result.signalCode ?? result.signal;
+  const signalCode = resultSignal == null
+    ? undefined
+    : signalName(resultSignal) ?? String(resultSignal);
+  const rawStdout = asBuffer(result.stdout ?? "");
+  let rawStderr = asBuffer(result.stderr ?? "");
   if (nativeOptions.stdoutFilePath != null) {
-    try { cottontail.writeFile(nativeOptions.stdoutFilePath, stdout); } catch {}
+    try { cottontail.writeFile(nativeOptions.stdoutFilePath, rawStdout); } catch {}
   }
   if (nativeOptions.stderrFilePath != null) {
-    try { cottontail.writeFile(nativeOptions.stderrFilePath, stderr); } catch {}
+    try { cottontail.writeFile(nativeOptions.stderrFilePath, rawStderr); } catch {}
   }
-  if (exitCode !== 0 && isCurrentCottontailExecutable(file) && stderr.byteLength > 0) {
-    stderr = augmentCottontailErrorSource(stderr, nativeOptions.cwd);
+  if (nativeOptions.stdoutBuffer != null) writeOutputBuffer(nativeOptions.stdoutBuffer, rawStdout);
+  if (nativeOptions.stderrBuffer != null) writeOutputBuffer(nativeOptions.stderrBuffer, rawStderr);
+  if (exitCode !== 0 && isCurrentCottontailExecutable(file) && rawStderr.byteLength > 0) {
+    rawStderr = augmentCottontailErrorSource(rawStderr, nativeOptions.cwd);
   }
   if (exitCode !== 0 && isCurrentCottontailExecutable(file) && args[0] === "test") {
-    stderr = formatCottontailTestStderr(stderr);
+    rawStderr = formatCottontailTestStderr(rawStderr);
   }
-  return {
-    stdout,
-    stderr,
+  const response = {
     exitCode,
-    signalCode,
+    stdout: nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
+      ? rawStdout
+      : undefined,
+    stderr: nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
+      ? rawStderr
+      : undefined,
     success: exitCode === 0,
-    status: exitCode,
+    resourceUsage: normalizeSpawnResourceUsage(result.resourceUsage),
+    pid: result.pid,
   };
+  if (signalCode != null) response.signalCode = signalCode;
+  if (nativeOptions.timeout != null) response.exitedDueToTimeout = false;
+  if (nativeOptions.maxBuffer != null) response.exitedDueToMaxBuffer = false;
+  return response;
 }
 
 function augmentCottontailErrorSource(stderr, cwd = undefined) {
@@ -3360,13 +3534,61 @@ function formatCottontailTestStderr(stderr) {
   return message ? asBuffer(`error: ${message}\n${text}`) : stderr;
 }
 
+function prepareReadableSpawnInput(input) {
+  if (!isReadableStreamLike(input)) return null;
+  if (input.locked || input._disturbed === true) {
+    throw new TypeError("'stdin' ReadableStream has already been used");
+  }
+
+  const reader = input.getReader();
+  let finished = false;
+  let cancelled = false;
+  return {
+    get finished() {
+      return finished;
+    },
+    async pump(write) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            finished = true;
+            return null;
+          }
+          const bytes = asBuffer(value);
+          if (bytes.byteLength > 0 && write(bytes) !== true) {
+            await this.cancel(new Error("Subprocess stdin closed"));
+            return null;
+          }
+        }
+      } catch (error) {
+        finished = true;
+        return error;
+      }
+    },
+    async cancel(reason = undefined) {
+      if (finished || cancelled) return;
+      cancelled = true;
+      finished = true;
+      try { await reader.cancel(reason); } catch {}
+    },
+  };
+}
+
 class ProcessReadable {
-  constructor(read) {
-    this._read = read;
+  constructor(cancel = undefined) {
+    this._cancel = cancel;
     this._listeners = new Map();
     this._chunks = [];
     this._readRequests = [];
     this._ended = false;
+    this._locked = false;
+  }
+  get locked() {
+    return this._locked;
+  }
+  get readable() {
+    return !this._ended;
   }
   on(name, handler) {
     if (typeof handler !== "function") return this;
@@ -3375,6 +3597,9 @@ class ProcessReadable {
     handlers.push(handler);
     this._listeners.set(key, handlers);
     return this;
+  }
+  addListener(name, handler) {
+    return this.on(name, handler);
   }
   once(name, handler) {
     const wrapped = (...args) => {
@@ -3393,10 +3618,19 @@ class ProcessReadable {
   removeListener(name, handler) {
     return this.off(name, handler);
   }
+  removeAllListeners(name = undefined) {
+    if (name === undefined) this._listeners.clear();
+    else this._listeners.delete(String(name));
+    return this;
+  }
+  listenerCount(name) {
+    return (this._listeners.get(String(name)) ?? []).length;
+  }
   emit(name, ...args) {
     if (name === "data") this._push(args[0]);
     if (name === "end" || name === "close") this._finish();
     for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
+    return this.listenerCount(name) > 0;
   }
   _push(chunk) {
     if (this._ended) return;
@@ -3416,11 +3650,22 @@ class ProcessReadable {
     }
   }
   async arrayBuffer() {
-    const bytes = asBuffer(await this._read());
+    const bytes = await this.bytes();
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
   async bytes() {
-    return asBuffer(await this._read());
+    const reader = this.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(asBuffer(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return concatManyBuffers(chunks);
   }
   async blob() {
     return new Blob([await this.bytes()]);
@@ -3429,33 +3674,82 @@ class ProcessReadable {
     return new TextDecoder().decode(await this.bytes());
   }
   async json() {
-    return JSON.parse(await this.text());
+    const wasBufferedAtCall = this._ended;
+    try {
+      return JSON.parse(await this.text());
+    } catch (error) {
+      if (!wasBufferedAtCall) throw error;
+      throw new SyntaxError("Failed to parse JSON");
+    }
   }
   getReader() {
+    if (this._locked) throw new TypeError("ReadableStream is locked");
+    this._locked = true;
     let cancelled = false;
+    let released = false;
+    const owner = this;
     return {
       read: async () => {
-        if (cancelled) return { done: true, value: undefined };
-        if (this._chunks.length > 0) {
-          const chunks = this._chunks.splice(0);
+        if (cancelled || released) return { done: true, value: undefined };
+        if (owner._chunks.length > 0) {
+          const chunks = owner._chunks.splice(0);
           return { done: false, value: concatManyBuffers(chunks) };
         }
-        if (this._ended) return { done: true, value: undefined };
-        return new Promise((resolve) => this._readRequests.push(resolve));
+        if (owner._ended) return { done: true, value: undefined };
+        return new Promise((resolve) => owner._readRequests.push(resolve));
       },
-      releaseLock() {},
-      cancel() {
+      releaseLock() {
+        if (released) return;
+        released = true;
+        owner._locked = false;
+      },
+      cancel(reason = undefined) {
         cancelled = true;
-        return Promise.resolve();
+        owner._locked = false;
+        return owner.cancel(reason);
       },
     };
   }
+  cancel(reason = undefined) {
+    this._finish();
+    try {
+      return Promise.resolve(this._cancel?.(reason));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+  _asReadableStream() {
+    const reader = this.getReader();
+    return new globalThis.ReadableStream({
+      async pull(controller) {
+        const result = await reader.read();
+        if (result.done) controller.close();
+        else controller.enqueue(result.value);
+      },
+      cancel(reason) {
+        return reader.cancel(reason);
+      },
+    });
+  }
+  pipeTo(destination, options = undefined) {
+    return this._asReadableStream().pipeTo(destination, options);
+  }
+  pipeThrough(transform, options = undefined) {
+    return this._asReadableStream().pipeThrough(transform, options);
+  }
+  tee() {
+    return this._asReadableStream().tee();
+  }
   async *[Symbol.asyncIterator]() {
     const reader = this.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      yield value;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        yield value;
+      }
+    } finally {
+      reader.releaseLock();
     }
   }
 }
@@ -3464,6 +3758,10 @@ class ProcessWritable {
   constructor(processId) {
     this._processId = processId;
     this._listeners = new Map();
+    this.writable = true;
+    this.writableEnded = false;
+    this.writableFinished = false;
+    this.destroyed = false;
   }
   on(name, handler) {
     if (typeof handler !== "function") return this;
@@ -3472,6 +3770,9 @@ class ProcessWritable {
     handlers.push(handler);
     this._listeners.set(key, handlers);
     return this;
+  }
+  addListener(name, handler) {
+    return this.on(name, handler);
   }
   once(name, handler) {
     const wrapped = (...args) => {
@@ -3490,10 +3791,29 @@ class ProcessWritable {
   removeListener(name, handler) {
     return this.off(name, handler);
   }
+  removeAllListeners(name = undefined) {
+    if (name === undefined) this._listeners.clear();
+    else this._listeners.delete(String(name));
+    return this;
+  }
+  listenerCount(name) {
+    return (this._listeners.get(String(name)) ?? []).length;
+  }
   emit(name, ...args) {
     for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
+    return this.listenerCount(name) > 0;
   }
-  write(chunk, callback) {
+  write(chunk, encoding = undefined, callback = undefined) {
+    if (typeof encoding === "function") {
+      callback = encoding;
+      encoding = undefined;
+    }
+    if (!this.writable || this.destroyed) {
+      const error = new Error("write after end");
+      if (typeof callback === "function") callback(error);
+      else if (this.listenerCount("error") > 0) this.emit("error", error);
+      return false;
+    }
     const ok = cottontail.spawnWrite?.(this._processId, chunk) === true;
     if (typeof callback === "function") callback(ok ? null : new Error("write failed"));
     return ok;
@@ -3501,15 +3821,32 @@ class ProcessWritable {
   flush() {
     return undefined;
   }
-  end(chunk) {
+  end(chunk = undefined, encoding = undefined, callback = undefined) {
+    if (typeof chunk === "function") {
+      callback = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      callback = encoding;
+    }
     if (chunk != null) this.write(chunk);
     cottontail.spawnCloseStdin?.(this._processId);
+    this.writable = false;
+    this.writableEnded = true;
+    this.writableFinished = true;
     this.emit("finish");
     this.emit("close");
+    this.destroyed = true;
+    if (typeof callback === "function") callback();
   }
-  destroy() {
+  destroy(error = undefined) {
+    if (this.destroyed) return this;
     cottontail.spawnCloseStdin?.(this._processId);
+    this.writable = false;
+    this.writableEnded = true;
+    if (error != null) this.emit("error", error);
     this.emit("close");
+    this.destroyed = true;
+    return this;
   }
   ref() {
     return this;
@@ -3522,9 +3859,14 @@ class ProcessWritable {
 export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined) {
   const [file, args, options] = normalizeCommand(command, maybeArgsOrOptions, maybeOptions);
   validateSpawnInput(file, args, options);
-  const nativeOptions = prepareNativeSpawnOptions(file, normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
+  const nativeOptions = prepareNativeSpawnOptions(
+    file,
+    normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "inherit" }, false),
+  );
+  const readableInput = prepareReadableSpawnInput(nativeOptions.input);
   const listeners = new Map();
   let killed = false;
+  let killRequested = false;
   let exitCode = null;
   let signalCode = null;
   const stdoutChunks = [];
@@ -3536,14 +3878,32 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   let exceededMaxBuffer = false;
   let ipcBuffer = "";
   let resourceUsage = undefined;
+  let abortHandler = null;
+  let disconnected = false;
+  let disconnectNotified = false;
+  let nodeIpcProtocol = false;
 
   const child = {
     pid: 0,
-    stdin: null,
-    stdout: nativeOptions.stdout === "pipe" ? new ProcessReadable(() => child.exited.then(() => concatManyBuffers(stdoutChunks))) : null,
-    stderr: nativeOptions.stderr === "pipe" ? new ProcessReadable(() => child.exited.then(() => concatManyBuffers(stderrChunks))) : null,
+    stdin: undefined,
+    stdout: nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
+      ? new ProcessReadable(
+        () => cottontail.spawnCloseOutput?.(child._id, 1),
+      )
+      : undefined,
+    stderr: nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
+      ? new ProcessReadable(
+        () => cottontail.spawnCloseOutput?.(child._id, 2),
+      )
+      : undefined,
     get readable() {
       return child.stdout;
+    },
+    get writable() {
+      return child.stdin;
+    },
+    get stdio() {
+      return [null, null, null];
     },
     terminal: undefined,
     get exitCode() {
@@ -3554,6 +3914,9 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     },
     get killed() {
       return killed;
+    },
+    get connected() {
+      return nativeOptions.ipc && !disconnected;
     },
     exited: null,
     on(name, handler) {
@@ -3575,7 +3938,9 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       return child;
     },
     kill(signal = "SIGTERM") {
-      killed = cottontail.spawnKill?.(child._id, signalNumber(signal)) === true;
+      const code = signalNumber(signal);
+      const sent = cottontail.spawnKill?.(child._id, code) === true;
+      if (sent && code !== 0) killRequested = true;
     },
     ref() {
       unregisterSpawnListener?.ref?.();
@@ -3585,18 +3950,25 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       unregisterSpawnListener?.unref?.();
       return child;
     },
-    send() {
-      return false;
+    send(message) {
+      if (!nativeOptions.ipc || disconnected || !Number.isInteger(child._ipcFd) || child._ipcFd < 0) return false;
+      const frame = encodeBunSpawnIpc(message, nodeIpcProtocol);
+      return cottontail.ipcSend?.(child._ipcFd, frame) === true;
     },
-    disconnect() {},
+    disconnect() {
+      if (!nativeOptions.ipc || disconnected) return;
+      disconnected = true;
+      cottontail.spawnCloseIpc?.(child._id);
+      notifyDisconnect();
+    },
     resourceUsage() {
       return resourceUsage;
     },
     [Symbol.dispose]() {
-      if (exitCode == null && !killed) child.kill();
+      if (exitCode == null && !killRequested) child.kill();
     },
     async [Symbol.asyncDispose]() {
-      if (exitCode == null && !killed) child.kill();
+      if (exitCode == null && !killRequested) child.kill();
       try {
         await child.exited;
       } catch {}
@@ -3607,15 +3979,17 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     for (const handler of listeners.get(name) ?? []) handler(...args);
   }
 
-  if (options.detached) {
-    child.pid = cottontail.spawnDetached(file, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: "ignore",
-    });
-    exitCode = 0;
-    child.exited = Promise.resolve(0);
-    return child;
+  function notifyDisconnect() {
+    if (disconnectNotified || !nativeOptions.ipc) return;
+    disconnectNotified = true;
+    disconnected = true;
+    if (typeof nativeOptions.onDisconnect === "function") {
+      try {
+        nativeOptions.onDisconnect.call(child, true);
+      } catch (error) {
+        queueMicrotask(() => { throw error; });
+      }
+    }
   }
 
   let spawnFile = file;
@@ -3629,24 +4003,33 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     // in non-cottontail children (node writes bare JSON lines on the fd).
     spawnFile = "/bin/sh";
     spawnArgs = ["-c", 'NODE_CHANNEL_FD="$COTTONTAIL_IPC_FD" exec "$@"', "sh", file, ...args];
+    nodeIpcProtocol = true;
   }
-  const native = cottontail.spawnStart(spawnFile, spawnArgs, nativeOptions);
+  let native;
+  try {
+    native = cottontail.spawnStart(spawnFile, spawnArgs, {
+      ...nativeOptions,
+      argv0: nativeOptions.argv0,
+      detached: nativeOptions.detached,
+    });
+  } catch (error) {
+    if (readableInput != null && !readableInput.finished) void readableInput.cancel(error);
+    throw normalizeBunSpawnError(error, file, nativeOptions.cwd);
+  }
   child._id = native.id;
+  child._ipcFd = native.ipcFd == null ? -1 : Number(native.ipcFd);
   child.pid = native.pid;
-  child.stdin = nativeOptions.stdin === "pipe" && nativeOptions.input === undefined ? new ProcessWritable(native.id) : null;
+  child.stdin = readableInput != null
+    ? nativeOptions.input
+    : nativeOptions.stdin === "pipe" && nativeOptions.input === undefined
+      ? new ProcessWritable(native.id)
+      : undefined;
   if (nativeOptions.input !== undefined) {
     const input = nativeOptions.input;
-    const iterable = typeof input === "function" ? input() : input;
-    const isStreaming = typeof input?.getReader === "function" || typeof iterable?.[Symbol.asyncIterator] === "function";
     const writeInput = async () => {
       try {
-        if (isStreaming) {
-          await consumeStreamingBody(input, (chunk) => {
-            const bytes = asBuffer(chunk);
-            if (bytes.byteLength > 0 && cottontail.spawnWrite?.(native.id, bytes) !== true) {
-              throw new Error("Failed to write subprocess stdin");
-            }
-          });
+        if (readableInput != null) {
+          return await readableInput.pump((bytes) => cottontail.spawnWrite?.(native.id, bytes));
         } else {
           const bytes = await bytesFromBody(input);
           if (bytes.byteLength > 0) cottontail.spawnWrite?.(native.id, bytes);
@@ -3662,11 +4045,12 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     });
   }
 
-  const maxBuffer = nativeOptions.maxBuffer == null ? Infinity : Number(nativeOptions.maxBuffer);
-  const killSignal = nativeOptions.killSignal ?? "SIGTERM";
+  const maxBuffer = nativeOptions.maxBuffer == null ? Infinity : nativeOptions.maxBuffer;
+  const killSignal = nativeOptions.killSignal;
   const enforceMaxBuffer = () => {
-    if (exceededMaxBuffer || !Number.isFinite(maxBuffer) || maxBuffer < 0) return;
-    if ((child.stdout && stdoutLength > maxBuffer) || (child.stderr && stderrLength > maxBuffer)) {
+    if (exceededMaxBuffer || !Number.isFinite(maxBuffer)) return;
+    if ((nativeOptions.stdout === "pipe" && stdoutLength > maxBuffer) ||
+        (nativeOptions.stderr === "pipe" && stderrLength > maxBuffer)) {
       exceededMaxBuffer = true;
       child.kill(killSignal);
     }
@@ -3678,7 +4062,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   }
 
   child.exited = new Promise((resolve, reject) => {
-    const complete = async (result) => {
+    const complete = (result) => {
       if (unregisterSpawnListener != null) {
         unregisterSpawnListener();
         unregisterSpawnListener = null;
@@ -3687,33 +4071,27 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
         clearTimeout(timeoutTimer);
         timeoutTimer = null;
       }
-      exitCode = result.exitCode == null ? null : Number(result.exitCode);
-      signalCode = result.signalCode == null ? null : signalName(result.signalCode) ?? String(result.signalCode);
-      killed = killed || result.killed === true;
-      if (result.resourceUsage) {
-        const user = BigInt(Math.max(0, Math.trunc(Number(result.resourceUsage.userCPUTime) || 0)));
-        const system = BigInt(Math.max(0, Math.trunc(Number(result.resourceUsage.systemCPUTime) || 0)));
-        resourceUsage = {
-          maxRSS: Number(result.resourceUsage.maxRSS) || 0,
-          shmSize: Number(result.resourceUsage.sharedMemorySize) || 0,
-          swapCount: Number(result.resourceUsage.swappedOut) || 0,
-          messages: {
-            sent: Number(result.resourceUsage.ipcSent) || 0,
-            received: Number(result.resourceUsage.ipcReceived) || 0,
-          },
-          signalCount: Number(result.resourceUsage.signalsCount) || 0,
-          contextSwitches: {
-            voluntary: Number(result.resourceUsage.voluntaryContextSwitches) || 0,
-            involuntary: Number(result.resourceUsage.involuntaryContextSwitches) || 0,
-          },
-          cpuTime: { user, system, total: user + system },
-          ops: {
-            in: Number(result.resourceUsage.fsRead) || 0,
-            out: Number(result.resourceUsage.fsWrite) || 0,
-          },
-        };
+      if (abortHandler != null) {
+        nativeOptions.signal?.removeEventListener?.("abort", abortHandler);
+        abortHandler = null;
       }
+      const resultSignalNumber = Number(result.signalCode ?? 0);
+      signalCode = resultSignalNumber > 0 ? signalName(resultSignalNumber) ?? String(resultSignalNumber) : null;
+      exitCode = resultSignalNumber > 0 || result.exitCode == null ? null : Number(result.exitCode);
+      killed = result.killed === true || (killRequested && resultSignalNumber > 0);
+      resourceUsage = normalizeSpawnResourceUsage(result.resourceUsage);
       try {
+        if (readableInput != null && !readableInput.finished) void readableInput.cancel(new Error("Subprocess exited"));
+        const stdoutBytes = concatManyBuffers(stdoutChunks);
+        const stderrBytes = concatManyBuffers(stderrChunks);
+        if (nativeOptions.stdoutFilePath != null) {
+          try { cottontail.writeFile(nativeOptions.stdoutFilePath, stdoutBytes); } catch {}
+        }
+        if (nativeOptions.stderrFilePath != null) {
+          try { cottontail.writeFile(nativeOptions.stderrFilePath, stderrBytes); } catch {}
+        }
+        if (nativeOptions.stdoutBuffer != null) writeOutputBuffer(nativeOptions.stdoutBuffer, stdoutBytes);
+        if (nativeOptions.stderrBuffer != null) writeOutputBuffer(nativeOptions.stderrBuffer, stderrBytes);
         if (child.stdout) {
           child.stdout.emit("end");
           child.stdout.emit("close");
@@ -3722,13 +4100,19 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
           child.stderr.emit("end");
           child.stderr.emit("close");
         }
-        if (typeof options.onExit === "function") {
-          await options.onExit(child, exitCode, signalCode, undefined);
+        const exitedValue = exitCode ?? (resultSignalNumber > 0 ? 128 + resultSignalNumber : null);
+        resolve(exitedValue);
+        if (typeof nativeOptions.onExit === "function") {
+          try {
+            nativeOptions.onExit.call(child, child, exitCode, signalCode, undefined);
+          } catch (error) {
+            queueMicrotask(() => { throw error; });
+          }
         }
+        notifyDisconnect();
         emit("exit", exitCode, signalCode);
         emit("close", exitCode, signalCode);
         cottontail.spawnDispose?.(native.id);
-        resolve(exitCode ?? (result.signalCode == null ? null : 128 + Number(result.signalCode)));
       } catch (error) {
         reject(error);
       }
@@ -3765,15 +4149,19 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
           ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
           // Cottontail children frame IPC messages with a prefix; node children
           // (NODE_CHANNEL_FD bridging) write bare JSON lines.
-          const payload = line.startsWith("__COTTONTAIL_IPC__")
-            ? line.slice("__COTTONTAIL_IPC__".length)
-            : line;
-          if (payload.trim() === "") continue;
+          if (line.trim() === "") continue;
+          let message;
           try {
-            options.ipc?.(JSON.parse(payload), child);
+            message = decodeBunSpawnIpc(line);
           } catch (error) {
-            if (!line.startsWith("__COTTONTAIL_IPC__")) continue;
+            if (!isCottontailIpcFrame(line)) continue;
             emit("error", error);
+            continue;
+          }
+          try {
+            nativeOptions.ipcCallback?.call(child, message, child, undefined);
+          } catch (error) {
+            queueMicrotask(() => { throw error; });
           }
         }
         return;
@@ -3783,6 +4171,15 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       }
     });
   });
+
+  if (nativeOptions.signal != null) {
+    abortHandler = () => {
+      if (readableInput != null && !readableInput.finished) void readableInput.cancel(nativeOptions.signal.reason);
+      child.kill(killSignal);
+    };
+    if (nativeOptions.signal.aborted) abortHandler();
+    else nativeOptions.signal.addEventListener("abort", abortHandler, { once: true });
+  }
 
   return child;
 }
