@@ -29,6 +29,29 @@ commands:
           root: .
           paths:
             - release
+  smoke-test-linux-icu-fallback:
+    steps:
+      - run:
+          name: Smoke test packaged pinned ICU fallback
+          command: |
+            archive=$(find "$PWD/release" -maxdepth 1 -name 'cottontail-*-linux-*.tar.gz' -print -quit)
+            test -n "$archive"
+            docker run --rm \
+              -v "$archive:/release.tar.gz:ro" \
+              -v "$PWD/tests/js/icu-fallback-smoke.js:/icu-fallback-smoke.js:ro" \
+              ubuntu:24.04 \
+              bash -euc '
+                apt-get update >/dev/null
+                apt-get install -y --no-install-recommends \
+                  ca-certificates libatomic1 libbrotli1 libffi8 libgcc-s1 libstdc++6 zlib1g >/dev/null
+                if ldconfig -p | grep -q "libicu"; then
+                  echo "minimal test image unexpectedly contains system ICU" >&2
+                  exit 1
+                fi
+                mkdir /app
+                tar -xzf /release.tar.gz --strip-components=1 -C /app
+                test "$(/app/bin/cottontail /icu-fallback-smoke.js)" = "icu fallback passed"
+              '
 
 jobs:
   build-macos-arm64:
@@ -72,7 +95,7 @@ jobs:
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs clang g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
+              nodejs clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
@@ -85,6 +108,7 @@ jobs:
             - ~/.rustup
             - .zig-cache/lolhtml
       - build-test-package-unix
+      - smoke-test-linux-icu-fallback
 
   build-linux-arm64:
     machine:
@@ -100,7 +124,7 @@ jobs:
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
-              nodejs clang g++ libbrotli-dev libffi-dev libicu-dev libssl-dev libzstd-dev zlib1g-dev
+              nodejs clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
             echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
@@ -113,6 +137,7 @@ jobs:
             - ~/.rustup
             - .zig-cache/lolhtml
       - build-test-package-unix
+      - smoke-test-linux-icu-fallback
 
   build-windows-x64:
     executor:

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
 const runtime = @import("runtime.zig");
+const icu_bootstrap = @import("icu_bootstrap.zig");
 const native_bundler = @import("cottontail_bundler.zig");
 const native_transpiler = @import("cottontail_transpiler.zig");
 const embedded_runtime_modules = @import("embedded_runtime_modules.zig");
@@ -623,6 +624,10 @@ fn runPrepared(
 ) !u8 {
     const allocator = init.arena.allocator();
     if (!applyRuntimeEnvFlags(init.io, allocator, exec_args)) return 1;
+    icu_bootstrap.ensure(init) catch |err| {
+        ctx.writeStderr("cottontail: failed to initialize ICU: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     var execution = ScriptExecution{
         .io = init.io,
         .allocator = allocator,

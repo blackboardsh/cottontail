@@ -31,11 +31,13 @@ gitignored `vendors/jsc/` directory (with sha256 verification), and the regular
 distribution uses these Cottontail-owned builds. The pinned release ships
 macOS arm64, Linux x64/arm64, and Windows x64 archives. Cottontail's release
 matrix uses all four directly. The only intended
-Cottontail-specific WebKit change is
-Electrobun's support for packaging ICU data separately from the engine. Keeping
-that boundary allows a future Electrobun packaging step to include only the ICU
-data an application requests, without changing JavaScriptCore behavior or its
-public API.
+Cottontail-specific engine contract is that JSC uses the unversioned ICU 70 C
+ABI. On every supported platform, Cottontail's runtime bridge first uses a
+system ICU with ABI 70 or newer. If none is usable, the executable switches to
+its statically linked ICU 70.1 fallback implementation and a checksum-pinned
+external data file. JSC SDK artifacts publish the fallback code and canonical
+data; setup can also reproduce the Unix fallback from its checksum-pinned ICU
+source when consuming an older artifact.
 
 Known engine difference: ShadowRealm stays disabled because the JSCOnly port
 cannot construct ShadowRealms from C-API-created contexts (the constructor
@@ -50,6 +52,7 @@ exposed by Cottontail itself.
 
 - `bun run setup` downloads the pinned Zig toolchain and the pinned JavaScriptCore build if needed.
 - `bun run setup:jsc` vendors only the pinned JavaScriptCore build (see `scripts/jsc-manifest.json`).
+- `bun run pin:jsc -- [WebKit-tag]` pins a completed R2 JSC matrix (or `jsc/latest.json` when omitted) and updates the matching build path.
 - `bun run build` builds the debug executable.
 - `bun run build:release` builds with `ReleaseSmall`.
 - `bun run package:release` creates a platform archive and SHA-256 file under `release/`.
@@ -81,6 +84,15 @@ The schema 2 archive layout contains a standalone executable for Dash CLI consum
 - `bin/cottontail` (`bin/cottontail.exe` on Windows)
 - `runtime_modules/` for downstream bundlers that need physical module paths
 - `cottontail-release.json`
+
+Cottontail does not put downloaded files beside its executable. When no
+compatible system ICU exists, it downloads and verifies `icudt70l.dat` into a
+shared per-user location: `~/Library/Application Support/Cottontail/icu/70.1`
+on macOS, `%LOCALAPPDATA%\Cottontail\icu\70.1` on Windows, and
+`${XDG_DATA_HOME:-~/.local/share}/cottontail/icu/70.1` on Linux. A small verified
+marker avoids hashing the 28 MB database on every launch. CircleCI runs the
+packaged Linux binary in a minimal image with no system ICU to exercise this
+production download path without a CI-only switch.
 
 The current C host bridge uses POSIX APIs directly for process, socket, DNS,
 polling, mmap, user/group, and filesystem behavior; those paths still need

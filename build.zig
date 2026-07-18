@@ -85,7 +85,7 @@ const libuv_windows_sources = &.{
 };
 
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
-const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6";
+const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6-455a8f186b55";
 
 fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     return switch (target.os.tag) {
@@ -325,7 +325,49 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
         std.process.exit(1);
     };
     const vendor_dir = b.fmt("vendors/jsc/{s}/{s}", .{ jsc_vendor_tag, platform_key });
+    const fallback_dir = b.fmt("{s}/lib/cottontail-icu", .{vendor_dir});
+    const fallback_libraries: []const []const u8 = if (resolved_target.os.tag == .windows)
+        &.{ "icui18n.lib", "icuuc.lib", "icudata.lib" }
+    else
+        &.{ "libicui18n.a", "libicuuc.a", "libicudata.a" };
+    var has_icu_fallback = true;
+    for (fallback_libraries) |library| {
+        const path = b.fmt("{s}/{s}", .{ fallback_dir, library });
+        std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(path), .{}) catch {
+            has_icu_fallback = false;
+        };
+    }
     step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
+    const icu_bridge_flags: []const []const u8 = if (has_icu_fallback)
+        &.{
+            "-std=c11",
+            "-fPIC",
+            "-DCOTTONTAIL_ICU_MIN_VERSION=70",
+            "-DCOTTONTAIL_ICU_MAX_VERSION=99",
+            "-DCOTTONTAIL_ICU_FALLBACK_VERSION=70",
+            "-DCOTTONTAIL_ICU_HAS_FALLBACK=1",
+        }
+    else
+        &.{
+            "-std=c11",
+            "-fPIC",
+            "-DCOTTONTAIL_ICU_MIN_VERSION=70",
+            "-DCOTTONTAIL_ICU_MAX_VERSION=99",
+            "-DCOTTONTAIL_ICU_FALLBACK_VERSION=70",
+        };
+    step.root_module.addCSourceFile(.{
+        .file = b.path("src/icu_bridge/icu-bridge.c"),
+        .flags = icu_bridge_flags,
+    });
+    step.root_module.addCSourceFile(.{
+        .file = b.path(switch (resolved_target.os.tag) {
+            .macos => "src/icu_bridge/macos-trampolines.S",
+            .linux => "src/icu_bridge/linux-trampolines.S",
+            .windows => "src/icu_bridge/windows-trampolines.S",
+            else => unreachable,
+        }),
+        .flags = &.{"-fPIC"},
+    });
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
         .flags = &[_][]const u8{
@@ -389,14 +431,17 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
         .macos => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
             // The vendored build is a JSCOnly static build: link the archives
-            // directly plus the system pieces the jsc binary itself depends on
-            // (Apple libc++, libicucore for i18n, Foundation/objc for CF glue).
+            // directly plus the platform pieces the jsc binary itself depends
+            // on. ICU calls are supplied by Cottontail's dispatch bridge.
             step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
             step.root_module.link_libcpp = true;
-            step.root_module.linkSystemLibrary("icucore", .{});
+            if (!has_icu_fallback)
+                @panic("macOS JSC setup did not provide the static ICU fallback");
+            for (fallback_libraries) |library|
+                step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
             step.root_module.linkSystemLibrary("objc", .{});
             step.root_module.linkFramework("Foundation", .{});
             step.root_module.linkSystemLibrary("ffi", .{});
@@ -413,11 +458,13 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
         },
         .linux => {
             requireJscLibrary(b, vendor_dir, "libJavaScriptCore.a");
-            requireJscLibrary(b, vendor_dir, "libcottontail_icu.a");
+            if (!has_icu_fallback)
+                @panic("Linux JSC setup did not provide the static ICU fallback");
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libJavaScriptCore.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libWTF.a", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libbmalloc.a", .{vendor_dir})));
-            step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/libcottontail_icu.a", .{vendor_dir})));
+            for (fallback_libraries) |library|
+                step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
             inline for (&.{
                 "atomic", "brotlicommon", "brotlidec", "brotlienc", "ffi", "m", "pthread", "z",
             }) |library| step.root_module.linkSystemLibrary(library, .{});
@@ -446,14 +493,16 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/JavaScriptCore.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/WTF.lib", .{vendor_dir})));
             step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/bmalloc.lib", .{vendor_dir})));
+            if (!has_icu_fallback)
+                @panic("Windows JSC setup did not provide the static ICU fallback");
+            for (fallback_libraries) |library|
+                step.root_module.addObjectFile(b.path(b.fmt("{s}/{s}", .{ fallback_dir, library })));
             inline for (&.{
                 "brotlicommon.lib", "brotlidec.lib", "brotlienc.lib", "dl.lib", "ffi.lib", "libcrypto.lib", "libssl.lib", "zs.lib",
             }) |library| {
                 step.root_module.addObjectFile(b.path(b.fmt("{s}/lib/{s}", .{ dependency_dir, library })));
             }
-            // This JSC build uses the operating-system ICU data and API. The
-            // Windows SDK provides its import library as icu.lib.
-            inline for (&.{ "advapi32", "bcrypt", "crypt32", "dnsapi", "icu", "iphlpapi", "psapi", "shell32", "user32", "userenv", "winmm", "ws2_32" }) |library| {
+            inline for (&.{ "advapi32", "bcrypt", "crypt32", "dnsapi", "iphlpapi", "psapi", "shell32", "user32", "userenv", "winmm", "ws2_32" }) |library| {
                 step.root_module.linkSystemLibrary(library, .{});
             }
         },
@@ -462,10 +511,14 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
 }
 
 fn requireJscLibrary(b: *std.Build, vendor_dir: []const u8, library: []const u8) void {
-    const path = b.fmt("{s}/lib/{s}", .{ vendor_dir, library });
+    requireJscFile(b, vendor_dir, b.fmt("lib/{s}", .{library}));
+}
+
+fn requireJscFile(b: *std.Build, vendor_dir: []const u8, relative_path: []const u8) void {
+    const path = b.fmt("{s}/{s}", .{ vendor_dir, relative_path });
     std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(path), .{}) catch {
         std.debug.print(
-            "error: vendored JavaScriptCore library not found at {s}; run `node scripts/setup-jsc.js` first\n",
+            "error: vendored JavaScriptCore file not found at {s}; run `node scripts/setup-jsc.js` first\n",
             .{path},
         );
         std.process.exit(1);

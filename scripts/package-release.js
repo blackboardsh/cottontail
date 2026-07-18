@@ -69,6 +69,12 @@ const manifest = {
   revision: gitRevision(),
   executable: `bin/${executableName}`,
   runtimeModules: 'runtime_modules',
+  icu: {
+    policy: 'system-first-global-data',
+    minimumSystemAbi: 70,
+    fallbackAbi: 70,
+    fallbackDataVersion: '70.1',
+  },
 };
 writeFileSync(join(packageRoot, 'cottontail-release.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 

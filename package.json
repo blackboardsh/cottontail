@@ -9,6 +9,7 @@
   "scripts": {
     "setup": "node scripts/setup.js && node scripts/setup-jsc.js",
     "setup:jsc": "node scripts/setup-jsc.js",
+    "pin:jsc": "node scripts/pin-jsc-release.js",
     "check-zig-version": "bun run setup && node scripts/zig.js version",
     "build": "bun run setup && node scripts/zig.js build",
     "build:release": "bun run setup && node scripts/zig.js build -Doptimize=ReleaseSmall",

@@ -1,8 +1,19 @@
 #!/usr/bin/env node
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs';
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
+import { cpus } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -54,6 +65,208 @@ function isCurrentJscVendored(vendorDir, stampPath, expectedStamp) {
   return readFileSync(stampPath, 'utf8').trim() === expectedStamp;
 }
 
+function exec(command, args, options = {}) {
+  execFileSync(command, args, {
+    stdio: 'inherit',
+    ...options,
+  });
+}
+
+function downloadFile(url, destination) {
+  exec('curl', [
+    '--fail',
+    '--location',
+    '--retry',
+    '3',
+    '--output',
+    destination,
+    url,
+  ]);
+}
+
+function fallbackLibraryNames(platformKey) {
+  if (platformKey.startsWith('windows-')) {
+    return ['icudata.lib', 'icuuc.lib', 'icui18n.lib'];
+  }
+  return ['libicudata.a', 'libicuuc.a', 'libicui18n.a'];
+}
+
+function validFallbackDirectory(fallbackDir, platformKey) {
+  return fallbackLibraryNames(platformKey).every((name) => {
+    const path = join(fallbackDir, name);
+    return existsSync(path) && statSync(path).isFile() && statSync(path).size > 0;
+  });
+}
+
+function verifyJscIcuContract(vendorDir) {
+  const publishedSymbols = join(vendorDir, 'share', 'cottontail-jsc', 'icu-symbols.inc');
+  const publishedAbi = join(vendorDir, 'share', 'cottontail-jsc', 'ICU_ABI');
+
+  if (existsSync(publishedAbi)) {
+    const expected = `ICU_ABI_FLOOR=${MANIFEST.icuFallback.abi}`;
+    if (readFileSync(publishedAbi, 'utf8').trim() !== expected) {
+      fail(`The pinned JSC artifact does not use the expected ${expected} contract.`);
+    }
+  }
+
+  if (!existsSync(publishedSymbols)) return;
+
+  const localSymbols = join(ROOT, 'src', 'icu_bridge', 'icu-symbols.inc');
+  if (readFileSync(publishedSymbols, 'utf8') !== readFileSync(localSymbols, 'utf8')) {
+    fail(
+      'The pinned JSC artifact requires a different ICU symbol contract than ' +
+        'src/icu_bridge/icu-symbols.inc. Update Cottontail\'s ICU bridge before building.'
+    );
+  }
+}
+
+function verifyPublishedFallbackMetadata(fallbackDir) {
+  const metadataPath = join(fallbackDir, 'ICU_FALLBACK.json');
+  if (!existsSync(metadataPath)) return;
+
+  const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+  const expected = MANIFEST.icuFallback;
+  if (
+    metadata.version !== expected.version ||
+    metadata.abi !== expected.abi ||
+    (metadata.dataSha256 && metadata.dataSha256 !== expected.dataSha256) ||
+    metadata.sourceSha256 !== expected.sha256
+  ) {
+    fail(`The JSC artifact's pinned ICU metadata does not match scripts/jsc-manifest.json.`);
+  }
+}
+
+function globalIcuDataDirectory() {
+  if (process.platform === 'darwin' && process.env.HOME) {
+    return join(process.env.HOME, 'Library', 'Application Support', 'Cottontail', 'icu', MANIFEST.icuFallback.version);
+  }
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    return join(process.env.LOCALAPPDATA, 'Cottontail', 'icu', MANIFEST.icuFallback.version);
+  }
+  const dataHome = process.env.XDG_DATA_HOME || (process.env.HOME && join(process.env.HOME, '.local', 'share'));
+  return dataHome ? join(dataHome, 'cottontail', 'icu', MANIFEST.icuFallback.version) : null;
+}
+
+function seedGlobalIcuData(fallbackDir) {
+  const root = globalIcuDataDirectory();
+  if (!root) return;
+  const source = join(fallbackDir, MANIFEST.icuFallback.dataFile);
+  if (!existsSync(source)) return;
+  const actual = sha256File(source);
+  if (actual !== MANIFEST.icuFallback.dataSha256) {
+    fail(`Pinned ICU data checksum mismatch: expected ${MANIFEST.icuFallback.dataSha256}, got ${actual}`);
+  }
+  mkdirSync(root, { recursive: true });
+  const destination = join(root, MANIFEST.icuFallback.dataFile);
+  copyFileSync(source, destination);
+  writeFileSync(`${destination}.verified`, `${actual}\n`);
+}
+
+function buildPinnedIcuFallback(vendorDir, platformKey) {
+  const fallback = MANIFEST.icuFallback;
+  const fallbackDir = join(vendorDir, 'lib', 'cottontail-icu');
+  verifyJscIcuContract(vendorDir);
+
+  if (validFallbackDirectory(fallbackDir, platformKey)) {
+    verifyPublishedFallbackMetadata(fallbackDir);
+    seedGlobalIcuData(fallbackDir);
+    console.log(`✓ Pinned ICU ${fallback.version} fallback already vendored`);
+    return;
+  }
+
+  if (platformKey.startsWith('windows-')) {
+    fail(
+      'The pinned Windows JSC artifact has no static ICU fallback. ' +
+        'Publish and pin a current blackboardsh/jsc CircleCI artifact.'
+    );
+  }
+
+  const workDir = join(JSC_ROOT, `.icu-${fallback.version}-${platformKey}`);
+  const sourceDir = join(workDir, 'source');
+  const buildDir = join(workDir, 'build');
+  const installDir = join(workDir, 'install');
+  const archivePath = join(workDir, `icu4c-${fallback.version}-src.tgz`);
+
+  console.log(`Building pinned ICU ${fallback.version} fallback (${platformKey})...`);
+  rmSync(workDir, { recursive: true, force: true });
+  rmSync(fallbackDir, { recursive: true, force: true });
+  mkdirSync(sourceDir, { recursive: true });
+  mkdirSync(buildDir, { recursive: true });
+
+  try {
+    downloadFile(fallback.source, archivePath);
+    const actualSha256 = sha256File(archivePath);
+    if (actualSha256 !== fallback.sha256) {
+      fail(
+        `The pinned ICU source archive failed verification.\n` +
+          `Expected: ${fallback.sha256}\n` +
+          `Actual:   ${actualSha256}`
+      );
+    }
+
+    exec('tar', ['-xzf', archivePath, '-C', sourceDir, '--strip-components=1']);
+    const configurePlatform = platformKey.startsWith('macos-') ? 'MacOSX' : 'Linux';
+    exec(
+      join(sourceDir, 'source', 'runConfigureICU'),
+      [
+        configurePlatform,
+        `--prefix=${installDir}`,
+        '--enable-static',
+        '--disable-shared',
+        '--with-data-packaging=archive',
+        '--disable-tests',
+        '--disable-samples',
+        '--disable-extras',
+        '--disable-icuio',
+      ],
+      {
+        cwd: buildDir,
+        env: {
+          ...process.env,
+          CC: process.env.CC || 'cc',
+          CXX: process.env.CXX || 'c++',
+        },
+      }
+    );
+    exec('make', [`-j${Math.max(1, Math.min(8, cpus().length))}`], { cwd: buildDir });
+    exec('make', ['install'], { cwd: buildDir });
+
+    mkdirSync(fallbackDir, { recursive: true });
+    for (const name of fallbackLibraryNames(platformKey)) {
+      copyFileSync(join(installDir, 'lib', name), join(fallbackDir, name));
+    }
+    copyFileSync(
+      join(installDir, 'share', 'icu', fallback.version, fallback.dataFile),
+      join(fallbackDir, fallback.dataFile)
+    );
+    copyFileSync(join(sourceDir, 'LICENSE'), join(fallbackDir, 'LICENSE'));
+    writeFileSync(
+      join(fallbackDir, 'ICU_FALLBACK.json'),
+      `${JSON.stringify({
+        version: fallback.version,
+        abi: fallback.abi,
+        dataFile: fallback.dataFile,
+        dataSha256: fallback.dataSha256,
+        source: fallback.source,
+        sourceSha256: fallback.sha256,
+      }, null, 2)}\n`
+    );
+
+    if (!validFallbackDirectory(fallbackDir, platformKey)) {
+      fail(`Pinned ICU installation is incomplete under ${fallbackDir}`);
+    }
+    seedGlobalIcuData(fallbackDir);
+    console.log(`✓ Pinned ICU ${fallback.version} fallback vendored`);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+function ensureIcuFallback(vendorDir, platformKey) {
+  if (!platformKey.startsWith('linux-') && !platformKey.startsWith('macos-') && !platformKey.startsWith('windows-')) return;
+  buildPinnedIcuFallback(vendorDir, platformKey);
+}
+
 function vendorJsc() {
   const platformKey = getPlatformKey();
 
@@ -73,9 +286,12 @@ function vendorJsc() {
 
   const vendorDir = join(JSC_ROOT, MANIFEST.tag, platformKey);
   const stampPath = join(vendorDir, '.jsc-vendored');
-  const expectedStamp = `${MANIFEST.tag} ${asset.sha256}`;
+  const expectedStamp = platformKey.startsWith('linux-') || platformKey.startsWith('macos-') || platformKey.startsWith('windows-')
+    ? `${MANIFEST.tag} ${asset.sha256} icu-${MANIFEST.icuFallback.version} ${MANIFEST.icuFallback.sha256}`
+    : `${MANIFEST.tag} ${asset.sha256}`;
 
   if (isCurrentJscVendored(vendorDir, stampPath, expectedStamp)) {
+    ensureIcuFallback(vendorDir, platformKey);
     console.log(`✓ JavaScriptCore ${MANIFEST.tag} (${platformKey}) already vendored`);
     return;
   }
@@ -83,13 +299,14 @@ function vendorJsc() {
   const url = asset.url ??
     `https://github.com/${MANIFEST.repo}/releases/download/${MANIFEST.tag}/${asset.name}`;
   const archivePath = join(JSC_ROOT, asset.name);
+  const stagingDir = `${vendorDir}.staging`;
 
   console.log(`Vendoring JavaScriptCore ${MANIFEST.tag} (${platformKey})...`);
-  rmSync(vendorDir, { recursive: true, force: true });
-  mkdirSync(vendorDir, { recursive: true });
+  rmSync(stagingDir, { recursive: true, force: true });
+  mkdirSync(stagingDir, { recursive: true });
 
   try {
-    execSync(`curl -fL "${url}" -o "${archivePath}"`, { stdio: 'inherit' });
+    downloadFile(url, archivePath);
 
     const actualSha256 = sha256File(archivePath);
     if (actualSha256 !== asset.sha256) {
@@ -102,20 +319,22 @@ function vendorJsc() {
       );
     }
 
-    execSync(`tar -xzf "${archivePath}" --strip-components=1 -C "${vendorDir}"`, {
-      stdio: 'inherit',
-    });
+    exec('tar', ['-xzf', archivePath, '--strip-components=1', '-C', stagingDir]);
     unlinkSync(archivePath);
 
-    const libDir = join(vendorDir, 'lib');
-    const includeDir = join(vendorDir, 'include', 'JavaScriptCore');
+    const libDir = join(stagingDir, 'lib');
+    const includeDir = join(stagingDir, 'include', 'JavaScriptCore');
     if (!existsSync(libDir) || !existsSync(includeDir)) {
       fail(`Vendored JavaScriptCore layout is incomplete under ${vendorDir}`);
     }
 
-    writeFileSync(stampPath, `${expectedStamp}\n`);
+    ensureIcuFallback(stagingDir, platformKey);
+    writeFileSync(join(stagingDir, '.jsc-vendored'), `${expectedStamp}\n`);
+    rmSync(vendorDir, { recursive: true, force: true });
+    renameSync(stagingDir, vendorDir);
     console.log(`✓ JavaScriptCore ${MANIFEST.tag} vendored at vendors/jsc/${MANIFEST.tag}/${platformKey}`);
   } catch (error) {
+    rmSync(stagingDir, { recursive: true, force: true });
     fail('Failed to vendor JavaScriptCore.', error);
   }
 }

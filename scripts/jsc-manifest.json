@@ -1,24 +1,39 @@
 {
   "repo": "blackboardsh/jsc",
-  "tag": "jsc-WebKit-7624.2.5.10.6",
+  "tag": "jsc-WebKit-7624.2.5.10.6-455a8f186b55",
   "upstreamTag": "WebKit-7624.2.5.10.6",
   "upstreamCommit": "c279202f1882bdbf0d7c02141a95a4d1688fdf2a",
+  "jscBuildRevision": "455a8f186b55148577d1b76dd4a0f6e2c74c90b7",
+  "icuFallback": {
+    "version": "70.1",
+    "abi": 70,
+    "dataFile": "icudt70l.dat",
+    "dataSize": 29466000,
+    "dataSha256": "672dafc4940a0183cb48c3e369c1a0795cc8dfbf19951c86ced0ad78398f9480",
+    "dataUrl": "https://electrobun-artifacts.blackboard.sh/jsc/icu/70.1/icudt70l.dat",
+    "source": "https://github.com/unicode-org/icu/releases/download/release-70-1/icu4c-70_1-src.tgz",
+    "sha256": "8d205428c17bf13bb535300669ed28b338a157b1c01ae66d31d0d3e2d47c3fd5"
+  },
   "assets": {
     "macos-arm64": {
       "name": "cottontail-jsc-macos-arm64.tar.gz",
-      "sha256": "770ccaf162f28d59655099fa11b2705991be3f52687c8b463c2cb4c337751d27"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/455a8f186b55148577d1b76dd4a0f6e2c74c90b7/macos-arm64/jsc.tar.gz",
+      "sha256": "5435c1e0a5db498bb0be5e5a354e2910cd910cb61b05c0e3d4a4de85fd5a4d5c"
     },
     "linux-amd64": {
       "name": "cottontail-jsc-linux-amd64.tar.gz",
-      "sha256": "87ca8b90aa8d94accfaa62a4c5e821606913722c100b7d95965393bda3906d44"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/455a8f186b55148577d1b76dd4a0f6e2c74c90b7/linux-x64/jsc.tar.gz",
+      "sha256": "cc40ce4c70b7dcec917e1942472c738c255f1a760be12364fd5581899b4d3336"
     },
     "linux-arm64": {
       "name": "cottontail-jsc-linux-arm64.tar.gz",
-      "sha256": "c6424fa7f6bf705a308e92396fadc92642f21fa41aaa01066dfb7c7bcb9b6503"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/455a8f186b55148577d1b76dd4a0f6e2c74c90b7/linux-arm64/jsc.tar.gz",
+      "sha256": "7bc154a402db0ab742f60bf0fbfc3162f5f8827d198b1db28c833fd43d67a889"
     },
     "windows-amd64": {
       "name": "cottontail-jsc-windows-amd64.tar.gz",
-      "sha256": "43c383579a5195586381968c2a67da90e1f7c0f39aaa088bde92e022352cc099"
+      "url": "https://electrobun-artifacts.blackboard.sh/jsc/builds/455a8f186b55148577d1b76dd4a0f6e2c74c90b7/windows-x64/jsc.tar.gz",
+      "sha256": "d99aee4f46a8886d32b1f4f919f5c6f03d3c9c1b0d4a524ce7d8f99e29adf202"
     }
   }
 }
