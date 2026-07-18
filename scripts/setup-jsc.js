@@ -98,6 +98,54 @@ function validFallbackDirectory(fallbackDir, platformKey) {
   });
 }
 
+function validIcuHeaders(vendorDir) {
+  const unicodeDir = join(vendorDir, 'include', 'unicode');
+  return ['uchar.h', 'ucol.h', 'utypes.h'].every((name) => {
+    const path = join(unicodeDir, name);
+    return existsSync(path) && statSync(path).isFile() && statSync(path).size > 0;
+  });
+}
+
+function ensureIcuHeaders(vendorDir) {
+  if (validIcuHeaders(vendorDir)) return;
+
+  const fallback = MANIFEST.icuFallback;
+  const workDir = join(JSC_ROOT, `.icu-headers-${fallback.version}`);
+  const archivePath = join(workDir, `icu4c-${fallback.version}-src.tgz`);
+  const includeDir = join(vendorDir, 'include');
+
+  console.log(`Vendoring pinned ICU ${fallback.version} headers...`);
+  rmSync(workDir, { recursive: true, force: true });
+  mkdirSync(workDir, { recursive: true });
+  mkdirSync(includeDir, { recursive: true });
+
+  try {
+    downloadFile(fallback.source, archivePath);
+    const actualSha256 = sha256File(archivePath);
+    if (actualSha256 !== fallback.sha256) {
+      fail(
+        `The pinned ICU source archive failed verification.\n` +
+          `Expected: ${fallback.sha256}\n` +
+          `Actual:   ${actualSha256}`
+      );
+    }
+    exec('tar', [
+      '-xzf',
+      archivePath,
+      '-C',
+      includeDir,
+      '--strip-components=3',
+      'icu/source/common/unicode',
+      'icu/source/i18n/unicode',
+    ]);
+    if (!validIcuHeaders(vendorDir)) {
+      fail(`Pinned ICU headers are incomplete under ${join(includeDir, 'unicode')}`);
+    }
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
 function verifyJscIcuContract(vendorDir) {
   const publishedSymbols = join(vendorDir, 'share', 'cottontail-jsc', 'icu-symbols.inc');
   const publishedAbi = join(vendorDir, 'share', 'cottontail-jsc', 'ICU_ABI');
@@ -291,6 +339,7 @@ function vendorJsc() {
     : `${MANIFEST.tag} ${asset.sha256}`;
 
   if (isCurrentJscVendored(vendorDir, stampPath, expectedStamp)) {
+    ensureIcuHeaders(vendorDir);
     ensureIcuFallback(vendorDir, platformKey);
     console.log(`✓ JavaScriptCore ${MANIFEST.tag} (${platformKey}) already vendored`);
     return;
@@ -328,6 +377,7 @@ function vendorJsc() {
       fail(`Vendored JavaScriptCore layout is incomplete under ${vendorDir}`);
     }
 
+    ensureIcuHeaders(stagingDir);
     ensureIcuFallback(stagingDir, platformKey);
     writeFileSync(join(stagingDir, '.jsc-vendored'), `${expectedStamp}\n`);
     rmSync(vendorDir, { recursive: true, force: true });

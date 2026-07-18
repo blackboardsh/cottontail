@@ -339,13 +339,29 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
     }
     step.root_module.addIncludePath(b.path(b.fmt("{s}/include", .{vendor_dir})));
     const icu_bridge_flags: []const []const u8 = if (has_icu_fallback)
+        if (resolved_target.os.tag == .windows)
+            &.{
+                "-std=c11",
+                "-DCOTTONTAIL_ICU_MIN_VERSION=70",
+                "-DCOTTONTAIL_ICU_MAX_VERSION=99",
+                "-DCOTTONTAIL_ICU_FALLBACK_VERSION=70",
+                "-DCOTTONTAIL_ICU_HAS_FALLBACK=1",
+            }
+        else
+            &.{
+                "-std=c11",
+                "-fPIC",
+                "-DCOTTONTAIL_ICU_MIN_VERSION=70",
+                "-DCOTTONTAIL_ICU_MAX_VERSION=99",
+                "-DCOTTONTAIL_ICU_FALLBACK_VERSION=70",
+                "-DCOTTONTAIL_ICU_HAS_FALLBACK=1",
+            }
+    else if (resolved_target.os.tag == .windows)
         &.{
             "-std=c11",
-            "-fPIC",
             "-DCOTTONTAIL_ICU_MIN_VERSION=70",
             "-DCOTTONTAIL_ICU_MAX_VERSION=99",
             "-DCOTTONTAIL_ICU_FALLBACK_VERSION=70",
-            "-DCOTTONTAIL_ICU_HAS_FALLBACK=1",
         }
     else
         &.{
@@ -366,7 +382,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             .windows => "src/icu_bridge/windows-trampolines.S",
             else => unreachable,
         }),
-        .flags = &.{"-fPIC"},
+        .flags = if (resolved_target.os.tag == .windows) &.{} else &.{"-fPIC"},
     });
     step.root_module.addCSourceFile(.{
         .file = b.path("src/jsc_runner.c"),
