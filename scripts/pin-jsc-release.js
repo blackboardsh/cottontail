@@ -35,9 +35,13 @@ const platformMap = {
 };
 const assets = {};
 for (const [local, published] of Object.entries(platformMap)) {
-  const archive = release.platforms?.[published]?.archive;
+  const platform = release.platforms?.[published];
+  const archive = platform?.archive;
   if (!archive || !/^https:\/\//.test(archive.url) || !/^[0-9a-f]{64}$/.test(archive.sha256)) {
     throw new Error(`JSC release is missing a valid ${published} archive`);
+  }
+  if (published === 'windows-x64' && platform.msvcRuntime !== 'MT') {
+    throw new Error('JSC Windows release must use the MT static runtime');
   }
   assets[local] = {
     name: `cottontail-jsc-${local}.tar.gz`,

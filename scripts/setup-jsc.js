@@ -168,7 +168,7 @@ function verifyJscIcuContract(vendorDir) {
   }
 }
 
-function verifyPublishedFallbackMetadata(fallbackDir) {
+function verifyPublishedFallbackMetadata(fallbackDir, platformKey) {
   const metadataPath = join(fallbackDir, 'ICU_FALLBACK.json');
   if (!existsSync(metadataPath)) return;
 
@@ -177,6 +177,7 @@ function verifyPublishedFallbackMetadata(fallbackDir) {
   if (
     metadata.version !== expected.version ||
     metadata.abi !== expected.abi ||
+    (platformKey.startsWith('windows-') && metadata.msvcRuntime !== 'MT') ||
     (metadata.dataSha256 && metadata.dataSha256 !== expected.dataSha256) ||
     metadata.sourceSha256 !== expected.sha256
   ) {
@@ -216,7 +217,7 @@ function buildPinnedIcuFallback(vendorDir, platformKey) {
   verifyJscIcuContract(vendorDir);
 
   if (validFallbackDirectory(fallbackDir, platformKey)) {
-    verifyPublishedFallbackMetadata(fallbackDir);
+    verifyPublishedFallbackMetadata(fallbackDir, platformKey);
     seedGlobalIcuData(fallbackDir);
     console.log(`✓ Pinned ICU ${fallback.version} fallback already vendored`);
     return;

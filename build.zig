@@ -85,7 +85,7 @@ const libuv_windows_sources = &.{
 };
 
 /// Must match scripts/jsc-manifest.json (the setup script vendors this tag).
-const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6-455a8f186b55";
+const jsc_vendor_tag = "jsc-WebKit-7624.2.5.10.6-53fd9fcd3043";
 
 fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     return switch (target.os.tag) {
