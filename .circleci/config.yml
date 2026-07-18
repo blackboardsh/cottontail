@@ -209,12 +209,14 @@ jobs:
       - run:
           name: Run Zig tests
           shell: powershell.exe
+          no_output_timeout: 30m
           command: |
             node scripts/zig.js build test
             if ($LASTEXITCODE -ne 0) { throw "Windows tests failed" }
       - run:
           name: Build release binary
           shell: powershell.exe
+          no_output_timeout: 30m
           command: |
             node scripts/zig.js build -Doptimize=ReleaseSmall
             if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
