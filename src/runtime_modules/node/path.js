@@ -1317,19 +1317,19 @@ win32.posix = posix;
 
 const active = cottontail.platform() === "win32" ? win32 : posix;
 
-export const normalize = posix.normalize;
-export const join = posix.join;
-export const isAbsolute = posix.isAbsolute;
-export const resolve = posix.resolve;
-export const dirname = posix.dirname;
-export const basename = posix.basename;
-export const extname = posix.extname;
-export const parse = posix.parse;
-export const format = posix.format;
-export const relative = posix.relative;
-export const matchesGlob = posix.matchesGlob;
-export const toNamespacedPath = posix.toNamespacedPath;
-export const _makeLong = posix._makeLong;
+export const normalize = active.normalize;
+export const join = active.join;
+export const isAbsolute = active.isAbsolute;
+export const resolve = active.resolve;
+export const dirname = active.dirname;
+export const basename = active.basename;
+export const extname = active.extname;
+export const parse = active.parse;
+export const format = active.format;
+export const relative = active.relative;
+export const matchesGlob = active.matchesGlob;
+export const toNamespacedPath = active.toNamespacedPath;
+export const _makeLong = active._makeLong;
 export const sep = active.sep;
 export const delimiter = active.delimiter;
 

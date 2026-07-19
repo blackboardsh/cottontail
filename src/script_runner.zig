@@ -22,6 +22,34 @@ const Win32Library = opaque {};
 extern "kernel32" fn LoadLibraryA(path: [*:0]const u8) callconv(.c) ?*Win32Library;
 extern "kernel32" fn GetProcAddress(library: *Win32Library, name: [*:0]const u8) callconv(.c) ?*anyopaque;
 extern "kernel32" fn FreeLibrary(library: *Win32Library) callconv(.c) c_int;
+extern "kernel32" fn CreateThread(
+    thread_attributes: ?*anyopaque,
+    stack_size: usize,
+    start_address: *const fn (?*anyopaque) callconv(.winapi) u32,
+    parameter: ?*anyopaque,
+    creation_flags: u32,
+    thread_id: ?*u32,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+extern "kernel32" fn VirtualQuery(
+    address: ?*const anyopaque,
+    information: *WindowsMemoryBasicInformation,
+    information_size: usize,
+) callconv(.winapi) usize;
+
+const stack_size_param_is_a_reservation = 0x00010000;
+const mem_reserve = 0x00002000;
+const page_guard = 0x00000100;
+
+const WindowsMemoryBasicInformation = extern struct {
+    base_address: ?*anyopaque,
+    allocation_base: ?*anyopaque,
+    allocation_protect: u32,
+    partition_id: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+};
 
 const ScriptExecution = struct {
     io: std.Io,
@@ -35,6 +63,89 @@ const ScriptExecution = struct {
     embedded_files: ?[]const u8 = null,
     exit_code: u8 = 1,
 };
+
+const WindowsScriptThread = struct {
+    handle: std.os.windows.HANDLE,
+
+    fn start(execution: *ScriptExecution) !WindowsScriptThread {
+        return startRaw(windowsScriptThreadEntry, execution);
+    }
+
+    fn startRaw(
+        start_address: *const fn (?*anyopaque) callconv(.winapi) u32,
+        parameter: ?*anyopaque,
+    ) !WindowsScriptThread {
+        const handle = CreateThread(
+            null,
+            script_thread_stack_size,
+            start_address,
+            parameter,
+            stack_size_param_is_a_reservation,
+            null,
+        ) orelse return error.ScriptThreadSpawnFailed;
+        return .{ .handle = handle };
+    }
+
+    fn join(self: WindowsScriptThread) void {
+        const infinite_timeout: std.os.windows.LARGE_INTEGER = std.math.minInt(std.os.windows.LARGE_INTEGER);
+        switch (std.os.windows.ntdll.NtWaitForSingleObject(self.handle, .FALSE, &infinite_timeout)) {
+            .WAIT_0 => {},
+            else => |status| std.os.windows.unexpectedStatus(status) catch unreachable,
+        }
+    }
+
+    fn deinit(self: WindowsScriptThread) void {
+        std.os.windows.CloseHandle(self.handle);
+    }
+};
+
+fn windowsScriptThreadEntry(raw_execution: ?*anyopaque) callconv(.winapi) u32 {
+    const execution: *ScriptExecution = @ptrCast(@alignCast(raw_execution.?));
+    runScriptExecution(execution);
+    return 0;
+}
+
+fn windowsStackLayoutSupportsWebKit() bool {
+    var marker: u8 = 0;
+    var current_region: WindowsMemoryBasicInformation = undefined;
+    if (VirtualQuery(&marker, &current_region, @sizeOf(WindowsMemoryBasicInformation)) == 0) return false;
+    const allocation_base = current_region.allocation_base orelse return false;
+    const region_base = current_region.base_address orelse return false;
+    const origin = @intFromPtr(region_base) + current_region.region_size;
+
+    var reserved_region: WindowsMemoryBasicInformation = undefined;
+    if (VirtualQuery(allocation_base, &reserved_region, @sizeOf(WindowsMemoryBasicInformation)) == 0) return false;
+    if (reserved_region.state != mem_reserve) return false;
+
+    const guard_address: *const anyopaque = @ptrFromInt(@intFromPtr(reserved_region.base_address orelse return false) + reserved_region.region_size);
+    var guard_region: WindowsMemoryBasicInformation = undefined;
+    if (VirtualQuery(guard_address, &guard_region, @sizeOf(WindowsMemoryBasicInformation)) == 0) return false;
+    if (guard_region.protect & page_guard == 0) return false;
+
+    const guard_base = guard_region.base_address orelse return false;
+    if (@intFromPtr(guard_base) != @intFromPtr(guard_address)) return false;
+    const bound = @intFromPtr(guard_base) + guard_region.region_size;
+    const marker_address = @intFromPtr(&marker);
+    return origin >= marker_address and marker_address > bound;
+}
+
+test "Windows script thread reserves a WebKit-compatible stack" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const Probe = struct {
+        fn run(raw_result: ?*anyopaque) callconv(.winapi) u32 {
+            const result: *bool = @ptrCast(@alignCast(raw_result.?));
+            result.* = windowsStackLayoutSupportsWebKit();
+            return 0;
+        }
+    };
+
+    var valid = false;
+    const thread = try WindowsScriptThread.startRaw(Probe.run, &valid);
+    defer thread.deinit();
+    thread.join();
+    try std.testing.expect(valid);
+}
 
 pub const StandaloneSource = struct {
     source: []const u8,
@@ -639,23 +750,43 @@ fn runPrepared(
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
     };
-    const thread = try std.Thread.spawn(
-        .{ .stack_size = script_thread_stack_size },
-        runScriptExecution,
-        .{&execution},
-    );
+    const main_thread_status: ?u8 = if (builtin.os.tag == .windows) blk: {
+        // Zig's Windows Thread.spawn passes stack_size to NtCreateThreadEx as
+        // committed memory. A fully committed 128 MiB stack has no reserved
+        // region or guard page for WebKit's Windows StackBounds discovery.
+        // Reserve the large limit while retaining normal incremental commits.
+        const thread = try WindowsScriptThread.start(&execution);
+        defer thread.deinit();
+        const status = if (shouldRunElectrobunMainThread(ctx))
+            runElectrobunMainThread(ctx) catch |err| status: {
+                ctx.writeStderr("cottontail: failed to run Electrobun main thread: {s}\n", .{@errorName(err)});
+                break :status @as(u8, 1);
+            }
+        else
+            null;
+        thread.join();
+        break :blk status;
+    } else blk: {
+        const thread = try std.Thread.spawn(
+            .{ .stack_size = script_thread_stack_size },
+            runScriptExecution,
+            .{&execution},
+        );
+        const status = if (shouldRunElectrobunMainThread(ctx))
+            runElectrobunMainThread(ctx) catch |err| status: {
+                ctx.writeStderr("cottontail: failed to run Electrobun main thread: {s}\n", .{@errorName(err)});
+                break :status @as(u8, 1);
+            }
+        else
+            null;
+        thread.join();
+        break :blk status;
+    };
 
-    if (shouldRunElectrobunMainThread(ctx)) {
-        const main_thread_status = runElectrobunMainThread(ctx) catch |err| blk: {
-            ctx.writeStderr("cottontail: failed to run Electrobun main thread: {s}\n", .{@errorName(err)});
-            break :blk @as(u8, 1);
-        };
-        thread.join();
-        if (main_thread_status != 0) {
-            return main_thread_status;
+    if (main_thread_status) |status| {
+        if (status != 0) {
+            return status;
         }
-    } else {
-        thread.join();
     }
 
     return execution.exit_code;

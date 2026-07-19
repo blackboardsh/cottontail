@@ -15,6 +15,9 @@
 #endif
 
 extern bool ct_jsc_string_is_8_bit(JSStringRef string);
+#if defined(_WIN32)
+extern void ct_jsc_initialize_main_thread(void);
+#endif
 extern void ct_jsc_run_loop_cycle(void);
 extern void ct_jsc_drain_microtasks(JSContextRef context);
 extern void *ct_jsc_microtask_delay_begin(JSContextGroupRef group);
@@ -186,7 +189,8 @@ static int ct_windows_thread_create(
     if (start == NULL) return ENOMEM;
     start->start_routine = start_routine;
     start->argument = argument;
-    uintptr_t handle = _beginthreadex(NULL, (unsigned)stack_size, ct_windows_thread_entry, start, 0, NULL);
+    unsigned init_flag = stack_size == 0 ? 0 : STACK_SIZE_PARAM_IS_A_RESERVATION;
+    uintptr_t handle = _beginthreadex(NULL, (unsigned)stack_size, ct_windows_thread_entry, start, init_flag, NULL);
     if (handle == 0) {
         int error = errno == 0 ? EAGAIN : errno;
         free(start);
@@ -18775,6 +18779,9 @@ static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef
         free(flags);
         return JSValueMakeNumber(ctx, -1);
     }
+#if defined(_WIN32)
+    open_flags |= _O_BINARY;
+#endif
     int fd = open(path, open_flags, (mode_t)mode);
     if (fd < 0) ct_throw_message(ctx, exception, strerror(errno));
     free(path);
@@ -21091,6 +21098,9 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
     (void)stack_size;
 #if defined(_WIN32)
     if (ct_windows_ensure_winsock() != 0) return NULL;
+#endif
+#if defined(_WIN32)
+    ct_jsc_initialize_main_thread();
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
     if (runtime == NULL) return NULL;

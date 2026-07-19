@@ -1,4 +1,4 @@
-import { basename, dirname, join, resolve } from "./path.js";
+import { basename, dirname, isAbsolute, join, resolve } from "./path.js";
 import { fileURLToPath, pathToFileURL } from "./url.js";
 import { parse as parseTOML } from "../bun/toml.js";
 import * as assert from "./assert.js";
@@ -217,7 +217,7 @@ let mainModule = null;
 
 globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
   let resolved = String(specifier);
-  if (!resolved.startsWith("/") && !resolved.startsWith("file://")) {
+  if (!isAbsolute(resolved) && !resolved.startsWith("file://")) {
     try { resolved = resolveRequestCore(resolved, cottontail.cwd()); } catch {}
   }
   if (resolved.startsWith("file://")) resolved = fileURLToPath(resolved);
@@ -723,6 +723,7 @@ function resolvedToUrl(resolved) {
   if (text.startsWith("node:")) return text;
   if (builtinModuleMap.has(text)) return `node:${text.replace(/^node:/, "")}`;
   if (hasRuntimePackageReplacement(text)) return text;
+  if (isAbsolute(text)) return pathToFileURL(text).href + suffix;
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
   return pathToFileURL(text).href + suffix;
 }
@@ -744,6 +745,7 @@ function formatForResolved(resolved) {
 
 function parentURLForBase(basePath) {
   const text = String(basePath || cottontail.cwd());
+  if (isAbsolute(text)) return pathToFileURL(text).href;
   if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text)) return text;
   return pathToFileURL(text).href;
 }
@@ -762,7 +764,7 @@ function splitSpecifierSuffix(value) {
   const index = specifierSuffixIndex(text);
   if (index < 0) return { bare: text, suffix: "" };
   const lastSeparator = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"));
-  if (index < lastSeparator && (text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text))) {
+  if (index < lastSeparator && isAbsolute(text)) {
     try {
       if (modulePathExists(text)) return { bare: text, suffix: "" };
     } catch {}
@@ -905,7 +907,7 @@ function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
     if (resolved) return resolved;
     throw moduleNotFoundError(target);
   }
-  if (target.startsWith("../") || target.startsWith("/") || target.startsWith("file:")) {
+  if (target.startsWith("../") || isAbsolute(target) || target.startsWith("file:")) {
     throw packageImportNotDefinedError(specifier, basePath);
   }
   return resolveRequestCore(target, scope.packageJsonPath, kind, seen);
@@ -967,11 +969,10 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   const lastSeparator = Math.max(originalText.lastIndexOf("/"), originalText.lastIndexOf("\\"));
   if (suffixIndex >= 0 && suffixIndex < lastSeparator && (
     originalText.startsWith(".") ||
-    originalText.startsWith("/") ||
-    /^[A-Za-z]:[\\/]/.test(originalText)
+    isAbsolute(originalText)
   )) {
     const exactStartDir = resolutionStartDir(basePath);
-    const exactCandidate = originalText.startsWith("/") || /^[A-Za-z]:[\\/]/.test(originalText)
+    const exactCandidate = isAbsolute(originalText)
       ? originalText
       : resolve(exactStartDir, originalText);
     const exact = resolveAsFile(exactCandidate) || resolveAsDirectory(exactCandidate, kind);
@@ -989,8 +990,8 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   if (hasRuntimePackageReplacement(text)) return text;
 
   const startDir = resolutionStartDir(basePath);
-  if (text.startsWith(".") || text.startsWith("/")) {
-    const candidate = text.startsWith("/") ? text : resolve(startDir, text);
+  if (text.startsWith(".") || isAbsolute(text)) {
+    const candidate = isAbsolute(text) ? text : resolve(startDir, text);
     const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
     if (resolved) return withSpecifierSuffix(resolved, suffix);
     throw moduleNotFoundError(originalText, Boolean(suffix));
@@ -1030,10 +1031,10 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
 function resolveRequest(request, basePath, useHooks = true, kind = "require") {
   if (bunModuleMockFor(request).found) {
     const text = String(request).replace(/^file:(?=\.\/)/, "");
-    if (text.startsWith(".") || text.startsWith("/")) {
+    if (text.startsWith(".") || isAbsolute(text)) {
       const startDir = resolutionStartDir(basePath);
-      const absoluteStartDir = startDir.startsWith("/") ? startDir : resolve(cottontail.cwd(), startDir);
-      return text.startsWith("/") ? text : `${absoluteStartDir}/${text}`;
+      const absoluteStartDir = isAbsolute(startDir) ? startDir : resolve(cottontail.cwd(), startDir);
+      return isAbsolute(text) ? text : resolve(absoluteStartDir, text);
     }
     return text;
   }
@@ -1833,7 +1834,7 @@ export function createRequire(basePath = cottontail.cwd(), parentModule = null) 
   require.resolve.paths = (request) => {
     const text = String(request);
     if (builtinModuleMap.has(text) || (text.startsWith("node:") && builtinModuleMap.has(text.slice(5)))) return null;
-    if (text.startsWith("./") || text.startsWith("../") || text.startsWith("/")) {
+    if (text.startsWith("./") || text.startsWith("../") || isAbsolute(text)) {
       return [normalizedBasePath.endsWith("/") ? normalizedBasePath.slice(0, -1) : dirname(normalizedBasePath)];
     }
     return _nodeModulePaths(normalizedBasePath.endsWith("/") ? normalizedBasePath : dirname(normalizedBasePath));
@@ -1905,7 +1906,7 @@ const commonJsCacheObject = new Proxy(Object.create(null), {
 function isBundledImportMetaBase(path) {
   const mainPath = globalThis.process?.argv?.[1] ?? processModule.argv?.[1];
   if (typeof mainPath !== "string" || mainPath.length === 0) return false;
-  const resolvedMainPath = mainPath.startsWith("/") ? mainPath : resolve(cottontail.cwd(), mainPath);
+  const resolvedMainPath = isAbsolute(mainPath) ? mainPath : resolve(cottontail.cwd(), mainPath);
   return path === resolvedMainPath;
 }
 
@@ -1923,7 +1924,7 @@ function bundledCallerPathFromStack() {
         continue;
       }
     }
-    const candidate = frame.startsWith("/") ? frame : resolve(cottontail.cwd(), frame);
+    const candidate = isAbsolute(frame) ? frame : resolve(cottontail.cwd(), frame);
     if (isFile(candidate)) return candidate;
   }
   return null;
@@ -2253,7 +2254,7 @@ function remapRegisteredSourceMapStack(stack) {
     const entry = sourceMap.findEntry(Number(lineText) - 1, Number(columnText) - 1);
     if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return frame;
     const source = String(entry.originalSource);
-    const resolvedSource = source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
+    const resolvedSource = isAbsolute(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
       ? source
       : resolve(dirname(file), source);
     return `${resolvedSource}:${entry.originalLine + 1}:${entry.originalColumn + 1}`;
@@ -2318,7 +2319,7 @@ function originalErrorLocation(error, metadata) {
   const entry = sourceMap.findEntry(generatedLine - 1, mapColumn);
   if (entry?.originalSource == null || entry.originalLine == null || entry.originalColumn == null) return null;
   const source = String(entry.originalSource);
-  const filename = source.startsWith("/") || /^[A-Za-z]:[\\/]/.test(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
+  const filename = isAbsolute(source) || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(source)
     ? source
     : resolve(dirname(metadata.filename), source);
   const payload = sourceMap.payload;
@@ -2497,7 +2498,7 @@ export function _resolveLookupPaths(request, parent = undefined) {
 export function _findPath(request, paths = [], isMain = false) {
   void isMain;
   const text = String(request);
-  if (text.startsWith("/") || text.startsWith(".")) {
+  if (isAbsolute(text) || text.startsWith(".")) {
     try {
       return resolveRequest(text, cottontail.cwd());
     } catch {

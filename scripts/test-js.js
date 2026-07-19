@@ -72,6 +72,10 @@ const nativeBuildOutDir = join(tempDir, 'native-build');
 
 try {
   writeFileSync(join(tempDir, 'eval-data.json'), JSON.stringify({ value: 42 }));
+  writeFileSync(
+    join(tempDir, 'node-fs-binary-source.bin'),
+    Uint8Array.from([0x00, 0x41, 0x0d, 0x0a, 0x42, 0x1a, 0x43, 0x0a, 0x0d, 0xff])
+  );
   writeFileSync(join(tempDir, 'plain.test.js'), 'console.log("plain-test-body");\n');
   writeFileSync(
     join(tempDir, 'commonjs-using.js'),
@@ -118,6 +122,25 @@ try {
       ],
       expectExitCode: 0,
       stdoutIncludes: ['alpha|beta', '-e:true'],
+    },
+    {
+      name: 'jsc-main-run-loop-gc-timer',
+      scriptPath: join(rootDir, 'tests', 'js', 'jsc-main-run-loop-gc-timer.ts'),
+      env: {
+        JSC_percentCPUPerMBForFullTimer: '1',
+        JSC_collectionTimerMaxPercentCPU: '0.5',
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['jsc gc timer passed'],
+    },
+    {
+      name: 'jsc-worker-stack-reservation',
+      scriptPath: join(rootDir, 'tests', 'js', 'jsc-worker-stack-reservation.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['jsc worker stack reservation passed'],
     },
     {
       name: 'cli-eval-relative-import',
@@ -173,6 +196,15 @@ try {
       argv: ['--no-warnings', '-p', 'process.execArgv.includes("--no-warnings")'],
       expectExitCode: 0,
       stdoutIncludes: ['true'],
+    },
+    {
+      name: 'bun-which-windows-extension',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-which-windows-extension.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun which windows extension passed'],
     },
     {
       name: 'host-api',
@@ -316,6 +348,12 @@ try {
       stdoutIncludes: ['await then serve passed'],
     },
     {
+      name: 'node-path-platform',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-path-platform.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node path platform exports passed'],
+    },
+    {
       name: 'node-fs',
       scriptPath: join(rootDir, 'tests', 'js', 'node-fs.ts'),
       env: {
@@ -323,6 +361,30 @@ try {
       },
       expectExitCode: 0,
       stdoutIncludes: ['node fs passed'],
+    },
+    {
+      name: 'node-fs-binary-io',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-fs-binary-io.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node fs binary io passed'],
+    },
+    {
+      name: 'node-fs-windows-long-path',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-fs-windows-long-path.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node fs windows long path passed'],
+    },
+    {
+      name: 'node-fs-unlink-directory-link',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-fs-unlink-directory-link.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['node fs unlink directory link passed'],
     },
     {
       name: 'node-fs-surface',
@@ -334,11 +396,18 @@ try {
       stdoutIncludes: ['node fs surface passed'],
     },
     {
+      name: 'node-child-process-inherited-sync',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-inherited-sync.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['inherited-sync-stdout', 'node child inherited sync passed'],
+      stderrIncludes: ['inherited-sync-stderr'],
+    },
+    {
       name: 'node-child-process',
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process.ts'),
       expectExitCode: 0,
-      stdoutIncludes: ['inherited-stdout', 'node child_process spawn passed'],
-      stderrIncludes: ['inherited-stderr'],
+      stdoutIncludes: ['inherited-stdout', 'inherited-sync-stdout', 'node child_process spawn passed'],
+      stderrIncludes: ['inherited-stderr', 'inherited-sync-stderr'],
     },
     {
       name: 'node-child-process-fork',
@@ -375,6 +444,12 @@ try {
       },
       expectExitCode: 0,
       stdoutIncludes: ['node module direct package root passed'],
+    },
+    {
+      name: 'node-module-absolute-main',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-module-absolute-main.cjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node module absolute main passed'],
     },
     {
       name: 'node-module-surface',

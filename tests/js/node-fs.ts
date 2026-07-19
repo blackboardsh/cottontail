@@ -13,6 +13,7 @@ import {
   watchFile,
   writeFileSync,
 } from "node:fs";
+import { delimiter, isAbsolute, sep } from "node:path";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -20,6 +21,18 @@ function assert(condition: unknown, message: string): asserts condition {
 
 const tmpDir = cottontail.env("COTTONTAIL_TMP_DIR");
 assert(tmpDir, "COTTONTAIL_TMP_DIR missing");
+
+if (cottontail.platform() === "win32") {
+  assert(sep === "\\", `node:path named sep export mismatch: ${JSON.stringify(sep)}`);
+  assert(delimiter === ";", `node:path named delimiter export mismatch: ${JSON.stringify(delimiter)}`);
+  assert(isAbsolute("C:\\windows-absolute"), "node:path named isAbsolute export rejected a drive path");
+  assert(isAbsolute("\\\\server\\share\\windows-absolute"), "node:path named isAbsolute export rejected a UNC path");
+  const absoluteChildDir = `${tmpDir}\\node-fs-windows-absolute\\child`;
+  mkdirSync(absoluteChildDir, { recursive: true });
+  assert(existsSync(absoluteChildDir), "mkdirSync did not preserve a Windows absolute path");
+  assert(!existsSync(`${tmpDir}\\**\\*.tsx`), "existsSync should return false for a Windows glob path");
+  assert(!existsSync(`${tmpDir}\\invalid<name`), "existsSync should return false for an invalid Windows name");
+}
 
 const root = `${tmpDir}/node-fs`;
 const childDir = `${root}/child`;

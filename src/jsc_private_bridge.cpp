@@ -21,6 +21,9 @@
 #include <utility>
 #include <vector>
 #include <wtf/ThreadSafeRefCounted.h>
+#if defined(_WIN32)
+#include <wtf/MainThread.h>
+#endif
 #include <wtf/PtrTag.h>
 #include <wtf/text/ExternalStringImpl.h>
 #include <wtf/text/StringImpl.h>
@@ -97,6 +100,9 @@ private:
 
 struct OpaqueJSString : public ThreadSafeRefCounted<OpaqueJSString> {
     static RefPtr<OpaqueJSString> tryCreate(WTF::String&&);
+    // Keep this declaration ABI-owned by JavaScriptCore. Without it, MSVC
+    // synthesizes another public destructor in this bridge object.
+    ~OpaqueJSString();
     bool is8Bit() { return m_string_impl == nullptr || m_string_impl->is8Bit(); }
     WTF::String string() const;
 
@@ -206,6 +212,18 @@ extern "C" void ct_jsc_run_loop_cycle()
 {
     WTF::RunLoop::cycle(0);
 }
+
+#if defined(_WIN32)
+extern "C" void ct_jsc_initialize_main_thread()
+{
+    // The public JSContext API initializes JSC/WTF, but it does not establish
+    // WTF's main RunLoop. JSC's delayed GC callbacks eventually consult the
+    // process-wide MemoryPressureHandler, whose Windows timer is bound to that
+    // main RunLoop. Match WebKit's own `jsc` embedding sequence before the
+    // first VM is created.
+    WTF::initializeMainThread();
+}
+#endif
 
 namespace JSC {
 using EncodedJSValue = int64_t;

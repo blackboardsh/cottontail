@@ -82,6 +82,78 @@ fn setErrorOut(error_out: *?[*:0]u8, message: []const u8) void {
     error_out.* = allocCString(message);
 }
 
+fn windowsPathAttributes(sub_path: []const u8) ?std.os.windows.FILE.ATTRIBUTE {
+    if (sub_path.len == 0) return null;
+    const windows = std.os.windows;
+    const cwd = std.Io.Dir.cwd();
+    const sub_path_w = std.Io.Threaded.sliceToPrefixedFileW(cwd.handle, sub_path, .{}) catch return null;
+    const attributes: windows.OBJECT.ATTRIBUTES = .{
+        .RootDirectory = if (std.Io.Dir.path.isAbsoluteWindowsWtf16(sub_path_w.span())) null else cwd.handle,
+        .ObjectName = @constCast(&sub_path_w.string()),
+    };
+    var basic_info: windows.FILE.BASIC_INFORMATION = undefined;
+    if (windows.ntdll.NtQueryAttributesFile(&attributes, &basic_info) != .SUCCESS) return null;
+    return basic_info.FileAttributes;
+}
+
+fn windowsDirectoryLinkTag(sub_path: []const u8) ?std.os.windows.IO_REPARSE_TAG {
+    const windows = std.os.windows;
+    const cwd = std.Io.Dir.cwd();
+    const sub_path_w = std.Io.Threaded.sliceToPrefixedFileW(cwd.handle, sub_path, .{}) catch return null;
+    const attributes: windows.OBJECT.ATTRIBUTES = .{
+        .RootDirectory = if (std.Io.Dir.path.isAbsoluteWindowsWtf16(sub_path_w.span())) null else cwd.handle,
+        .ObjectName = @constCast(&sub_path_w.string()),
+    };
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var handle: windows.HANDLE = undefined;
+    if (windows.ntdll.NtCreateFile(
+        &handle,
+        .{
+            .SPECIFIC = .{ .FILE = .{ .READ_ATTRIBUTES = true } },
+            .STANDARD = .{ .SYNCHRONIZE = true },
+        },
+        &attributes,
+        &io_status_block,
+        null,
+        .{ .NORMAL = true },
+        .VALID_FLAGS,
+        .OPEN,
+        .{
+            .DIRECTORY_FILE = true,
+            .IO = .SYNCHRONOUS_NONALERT,
+            .OPEN_REPARSE_POINT = true,
+        },
+        null,
+        0,
+    ) != .SUCCESS) return null;
+    defer windows.CloseHandle(handle);
+
+    var tag_info: windows.FILE.ATTRIBUTE_TAG_INFO = undefined;
+    if (windows.ntdll.NtQueryInformationFile(
+        handle,
+        &io_status_block,
+        &tag_info,
+        @sizeOf(windows.FILE.ATTRIBUTE_TAG_INFO),
+        .AttributeTag,
+    ) != .SUCCESS) return null;
+    return tag_info.ReparseTag;
+}
+
+fn isWindowsDirectoryLinkTag(tag: std.os.windows.IO_REPARSE_TAG) bool {
+    const TagInt = @typeInfo(std.os.windows.IO_REPARSE_TAG).@"struct".backing_integer.?;
+    const value: TagInt = @bitCast(tag);
+    return value == @as(TagInt, @bitCast(std.os.windows.IO_REPARSE_TAG.SYMLINK)) or
+        value == @as(TagInt, @bitCast(std.os.windows.IO_REPARSE_TAG.MOUNT_POINT));
+}
+
+test "Windows unlink only recognizes symbolic-link and mount-point reparse tags" {
+    try std.testing.expect(isWindowsDirectoryLinkTag(.SYMLINK));
+    try std.testing.expect(isWindowsDirectoryLinkTag(.MOUNT_POINT));
+    try std.testing.expect(!isWindowsDirectoryLinkTag(.IIS_CACHE));
+    try std.testing.expect(!isWindowsDirectoryLinkTag(.PROJFS));
+    try std.testing.expect(!isWindowsDirectoryLinkTag(std.os.windows.IO_REPARSE_TAG.CLOUD(0)));
+}
+
 fn allocCString(bytes: []const u8) ?[*:0]u8 {
     const raw = c.malloc(bytes.len + 1) orelse return null;
     const ptr: [*]u8 = @ptrCast(raw);
@@ -129,6 +201,22 @@ fn spawnStdioOption(mode: c_int) std.process.SpawnOptions.StdIo {
         .inherit => .inherit,
         .ignore => .ignore,
     };
+}
+
+fn shouldCreateNoWindow(stdin_mode: c_int, stdout_mode: c_int, stderr_mode: c_int) bool {
+    const inherit = @intFromEnum(SpawnStdio.inherit);
+    return stdin_mode != inherit and stdout_mode != inherit and stderr_mode != inherit;
+}
+
+test "spawn window policy preserves inherited stdio" {
+    const pipe = @intFromEnum(SpawnStdio.pipe);
+    const inherit = @intFromEnum(SpawnStdio.inherit);
+    const ignore = @intFromEnum(SpawnStdio.ignore);
+
+    try std.testing.expect(shouldCreateNoWindow(ignore, pipe, pipe));
+    try std.testing.expect(!shouldCreateNoWindow(inherit, pipe, pipe));
+    try std.testing.expect(!shouldCreateNoWindow(ignore, inherit, pipe));
+    try std.testing.expect(!shouldCreateNoWindow(ignore, pipe, inherit));
 }
 
 fn processId(id: std.process.Child.Id) u64 {
@@ -369,7 +457,11 @@ export fn ct_host_buffer_free(value: ?[*]u8) void {
 }
 
 export fn ct_host_exists(path: [*:0]const u8) bool {
-    std.Io.Dir.cwd().access(getIo(), std.mem.span(path), .{}) catch return false;
+    const sub_path = std.mem.span(path);
+    if (comptime builtin.os.tag == .windows) {
+        return windowsPathAttributes(sub_path) != null;
+    }
+    std.Io.Dir.cwd().access(getIo(), sub_path, .{}) catch return false;
     return true;
 }
 
@@ -438,7 +530,26 @@ export fn ct_host_rmdir(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
 export fn ct_host_unlink(path: [*:0]const u8, error_out: *?[*:0]u8) c_int {
     error_out.* = null;
 
-    std.Io.Dir.cwd().deleteFile(getIo(), std.mem.span(path)) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const sub_path = std.mem.span(path);
+
+    if (comptime builtin.os.tag == .windows) {
+        const attributes = windowsPathAttributes(sub_path);
+        if (attributes != null and attributes.?.DIRECTORY and attributes.?.REPARSE_POINT) {
+            const tag = windowsDirectoryLinkTag(sub_path);
+            if (tag == null or !isWindowsDirectoryLinkTag(tag.?)) {
+                setErrorOut(error_out, "IsDir");
+                return -1;
+            }
+            cwd.deleteDir(getIo(), sub_path) catch |err| {
+                setErrorOut(error_out, @errorName(err));
+                return -1;
+            };
+            return 0;
+        }
+    }
+
+    cwd.deleteFile(getIo(), sub_path) catch |err| {
         setErrorOut(error_out, @errorName(err));
         return -1;
     };
@@ -535,7 +646,7 @@ export fn ct_host_spawn_sync(
         .stdout = spawnStdioOption(options.stdout_mode),
         .stderr = spawnStdioOption(options.stderr_mode),
         .request_resource_usage_statistics = true,
-        .create_no_window = true,
+        .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
     }) catch |err| {
         setErrorOut(error_out, @errorName(err));
         return -1;

@@ -42,6 +42,13 @@ assert(inherited.stderr === null, "inherited child stderr should be null");
 assert(inheritedResult.code === 0, `inherited child exit mismatch: ${inheritedResult.code}`);
 assert(inheritedResult.signal === null, `inherited child signal mismatch: ${inheritedResult.signal}`);
 
+const inheritedSync = cottontail.platform() === "win32"
+  ? spawnSync("cmd.exe", ["/D", "/C", "echo inherited-sync-stdout & echo inherited-sync-stderr 1>&2"], { stdio: "inherit" })
+  : spawnSync("sh", ["-c", "printf inherited-sync-stdout; printf inherited-sync-stderr >&2"], { stdio: "inherit" });
+assert(inheritedSync.status === 0, `inherited spawnSync exit mismatch: ${inheritedSync.status}`);
+assert(inheritedSync.stdout === null, "inherited spawnSync stdout should be null");
+assert(inheritedSync.stderr === null, "inherited spawnSync stderr should be null");
+
 const shellChild = spawn("printf shell-ok", { shell: "/bin/sh", stdio: ["ignore", "pipe", "pipe"] });
 shellChild.stdout.setEncoding("utf8");
 let shellOut = "";

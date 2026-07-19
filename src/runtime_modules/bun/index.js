@@ -1950,11 +1950,20 @@ function which(command, options = undefined) {
 
   const env = BunObject.env ?? cottontail.env();
   const pathValue = String(options?.PATH ?? options?.Path ?? options?.path ?? env.PATH ?? env.Path ?? env.path ?? "");
-  const extensions = cottontail.platform() === "win32"
-    ? String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
-    : [""];
+  const isWindows = cottontail.platform() === "win32";
+  const extensions = [""];
+  if (isWindows) {
+    const seen = new Set(extensions);
+    for (const extension of String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")) {
+      const candidateExtension = extension.trim();
+      const key = candidateExtension.toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      extensions.push(candidateExtension);
+    }
+  }
 
-  for (const dir of pathValue.split(cottontail.platform() === "win32" ? ";" : ":")) {
+  for (const dir of pathValue.split(isWindows ? ";" : ":")) {
     if (!dir) continue;
     for (const ext of extensions) {
       const candidate = pathJoin(dir, `${value}${ext}`);
