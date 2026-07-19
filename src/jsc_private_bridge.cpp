@@ -273,6 +273,15 @@ public:
     };
 
     void drainMicrotasks();
+    Exception* cottontailThrowException(JSGlobalObject* global_object, JSObject* exception)
+    {
+        return throwException(global_object, exception);
+    }
+
+private:
+    // Access control is part of an MSVC C++ symbol name. WebKit declares this
+    // overload private, so keeping it private here is required when linking
+    // the static Windows SDK. The public inline wrapper is Cottontail-only.
     Exception* throwException(JSGlobalObject*, JSObject*);
 };
 
@@ -296,7 +305,9 @@ public:
     enum SnapshotType { InspectorSnapshot, GCDebuggingSnapshot };
 
     HeapSnapshotBuilder(HeapProfiler&, SnapshotType = InspectorSnapshot);
-    ~HeapSnapshotBuilder();
+    // The real class inherits HeapAnalyzer and declares a final virtual
+    // destructor. Virtualness is part of its MSVC C++ symbol name.
+    virtual ~HeapSnapshotBuilder();
     void buildSnapshot();
     WTF::String json();
 
@@ -468,7 +479,7 @@ static JSC::EncodedJSValue ct_jsc_throw(
     auto* error = type_error
         ? JSC::createTypeError(global_object, text)
         : JSC::createError(global_object, text);
-    ct_jsc_vm(context)->throwException(global_object, error);
+    ct_jsc_vm(context)->cottontailThrowException(global_object, error);
     return 0;
 }
 
@@ -562,7 +573,7 @@ static JSC::EncodedJSValue ct_jsc_not_implemented(
     if (exception != nullptr) {
         auto* error = reinterpret_cast<JSC::JSObject*>(
             const_cast<OpaqueJSValue*>(exception));
-        ct_jsc_vm(context)->throwException(global_object, error);
+        ct_jsc_vm(context)->cottontailThrowException(global_object, error);
         return 0;
     }
     return ct_jsc_encode(result);

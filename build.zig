@@ -413,6 +413,9 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
                 "-DWIN32_LEAN_AND_MEAN=1",
                 "-DNOMINMAX=1",
                 "-DU_DISABLE_RENAMING=1",
+                // The vendored Windows SDK is static. Installed WTF headers
+                // otherwise mark private WTF entry points as dllimport.
+                "-DWTF_EXPORT_PRIVATE=",
                 "-Wno-unused-command-line-argument",
             }
         else

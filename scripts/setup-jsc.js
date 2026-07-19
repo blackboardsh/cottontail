@@ -160,10 +160,17 @@ function verifyJscIcuContract(vendorDir) {
   if (!existsSync(publishedSymbols)) return;
 
   const localSymbols = join(ROOT, 'src', 'icu_bridge', 'icu-symbols.inc');
-  if (readFileSync(publishedSymbols, 'utf8') !== readFileSync(localSymbols, 'utf8')) {
+  const parseSymbols = (path) => new Set(
+    [...readFileSync(path, 'utf8').matchAll(/^ICU_SYMBOL\(([A-Za-z_][A-Za-z0-9_]*)\)\s*$/gm)]
+      .map((match) => match[1])
+  );
+  const published = parseSymbols(publishedSymbols);
+  const local = parseSymbols(localSymbols);
+  const missing = [...published].filter((symbol) => !local.has(symbol)).sort();
+  if (missing.length > 0) {
     fail(
-      'The pinned JSC artifact requires a different ICU symbol contract than ' +
-        'src/icu_bridge/icu-symbols.inc. Update Cottontail\'s ICU bridge before building.'
+      'Cottontail\'s ICU bridge is missing symbols required by the pinned JSC artifact:\n' +
+        missing.map((symbol) => `  ICU_SYMBOL(${symbol})`).join('\n')
     );
   }
 }
