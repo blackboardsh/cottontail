@@ -183,7 +183,7 @@ function build() {
 
 function buildRelease() {
   ensureSetup();
-  runZig(['build', '-Doptimize=ReleaseSmall']);
+  runZig(['build', '-Doptimize=ReleaseSmall', '-Dcpu=baseline']);
 }
 
 function runCommand(scriptArgs) {
