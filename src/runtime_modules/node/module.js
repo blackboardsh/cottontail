@@ -1193,9 +1193,9 @@ function executeCommonJsSource(module, filename, source) {
   // helper as a wrapper binding so an explicit strict-mode directive remains
   // the first statement in the CommonJS function body.
   let effectiveSource = source;
-  if (/(?<![.\w$])import\s*\(/.test(effectiveSource)) {
+  if (/(?<![.\w$])import\s*\((?!\s*\))/.test(effectiveSource)) {
     effectiveSource = effectiveSource.replace(
-      /(?<![.\w$])import\s*\(/g,
+      /(?<![.\w$])import\s*\((?!\s*\))/g,
       `${CJS_DYNAMIC_IMPORT_BINDING}(`,
     );
   }

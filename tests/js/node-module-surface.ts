@@ -62,6 +62,15 @@ assert(localRequire("_http_agent").Agent === localRequire("node:http").Agent, "l
 assert(localRequire("_tls_wrap").TLSSocket === localRequire("node:tls").TLSSocket, "legacy TLS builtin identity mismatch");
 assert((await import("_stream_writable")).default === localRequire("node:stream").Writable, "legacy builtin dynamic import mismatch");
 assert(localRequire("./sample.cjs").value === 42, "createRequire local module mismatch");
+const importMethodPath = join(root, "import-method.cjs");
+writeFileSync(importMethodPath, "module.exports = class Builder { import() { return 42; } };\n");
+const ImportMethodBuilder = localRequire("./import-method.cjs");
+assert(new ImportMethodBuilder().import() === 42, "CommonJS import-named method was rewritten");
+writeFileSync(
+  join(root, "dynamic-import.cjs"),
+  "module.exports = async () => (await import('./sample.cjs')).value;\n",
+);
+assert(await localRequire("./dynamic-import.cjs")() === 42, "CommonJS dynamic import mismatch");
 // Node's Module._cache is a plain object keyed by resolved path.
 assert(modulePath in _cache, "_cache should contain required module");
 assert(_cache[modulePath]?.exports?.value === 42, "_cache entry should expose module exports");
