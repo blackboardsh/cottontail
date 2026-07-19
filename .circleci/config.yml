@@ -218,7 +218,7 @@ jobs:
           shell: powershell.exe
           no_output_timeout: 30m
           command: |
-            node scripts/zig.js build -Doptimize=ReleaseSmall -Dcpu=baseline
+            node scripts/zig.js build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows-msvc -Dcpu=baseline
             if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
       - run:
           name: Smoke test release binary
