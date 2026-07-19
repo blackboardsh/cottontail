@@ -79,12 +79,41 @@ const manifest = {
 writeFileSync(join(packageRoot, 'cottontail-release.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
 const packagedExecutable = join(packageRoot, 'bin', executableName);
-const smoke = spawnSync(packagedExecutable, ['-p', '6 * 7'], {
+if (sha256(packagedExecutable) !== sha256(executablePath)) {
+  fail('Packaged executable differs from the release executable after copying.');
+}
+
+const smokeCommand = process.platform === 'win32' ? 'powershell.exe' : packagedExecutable;
+const smokeArgs = process.platform === 'win32'
+  ? [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "& $env:COTTONTAIL_PACKAGED_EXECUTABLE -p '6 * 7'; exit $LASTEXITCODE",
+    ]
+  : ['-p', '6 * 7'];
+const smoke = spawnSync(smokeCommand, smokeArgs, {
   cwd: packageRoot,
   encoding: 'utf8',
+  env: {
+    ...process.env,
+    COTTONTAIL_PACKAGED_EXECUTABLE: packagedExecutable,
+  },
 });
 if (smoke.status !== 0 || smoke.stdout.trim() !== '42') {
-  fail(`Packaged runtime smoke test failed:\n${smoke.stderr || smoke.stdout}`);
+  const status = smoke.status == null
+    ? 'none'
+    : `${smoke.status} (0x${(smoke.status >>> 0).toString(16).padStart(8, '0')})`;
+  fail([
+    'Packaged runtime smoke test failed.',
+    `command: ${smokeCommand}`,
+    `status: ${status}`,
+    `signal: ${smoke.signal ?? 'none'}`,
+    `error: ${smoke.error?.stack ?? 'none'}`,
+    `stdout: ${JSON.stringify(smoke.stdout ?? '')}`,
+    `stderr: ${JSON.stringify(smoke.stderr ?? '')}`,
+  ].join('\n'));
 }
 rmSync(join(packageRoot, '.cottontail-tmp'), { recursive: true, force: true });
 
