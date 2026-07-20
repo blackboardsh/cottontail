@@ -342,11 +342,21 @@ const SpawnWriteContext = struct {
 };
 
 fn spawnReadThread(context: *SpawnReadContext) std.Thread.SpawnError!std.Thread {
-    return std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SpawnReadContext.run, .{context});
+    // Let libc account for platform TLS requirements. A fixed 256 KiB stack
+    // is rejected with EINVAL on Linux ARM64 once JavaScriptCore is linked.
+    const config: std.Thread.SpawnConfig = if (comptime builtin.os.tag == .linux)
+        .{}
+    else
+        .{ .stack_size = 256 * 1024 };
+    return std.Thread.spawn(config, SpawnReadContext.run, .{context});
 }
 
 fn spawnWriteThread(context: *SpawnWriteContext) std.Thread.SpawnError!std.Thread {
-    return std.Thread.spawn(.{ .stack_size = 256 * 1024 }, SpawnWriteContext.run, .{context});
+    const config: std.Thread.SpawnConfig = if (comptime builtin.os.tag == .linux)
+        .{}
+    else
+        .{ .stack_size = 256 * 1024 };
+    return std.Thread.spawn(config, SpawnWriteContext.run, .{context});
 }
 
 fn joinThread(thread: ?std.Thread) void {

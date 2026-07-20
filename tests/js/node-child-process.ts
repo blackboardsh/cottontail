@@ -1,4 +1,4 @@
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -88,6 +88,13 @@ assert(syncResult.signal === null, "spawnSync signal mismatch");
 assert(syncResult.stdout.toString() === "sync-out", "spawnSync stdout Buffer mismatch");
 assert(syncResult.stderr.toString() === "sync-err", "spawnSync stderr Buffer mismatch");
 assert(syncResult.output[1].toString() === "sync-out", "spawnSync output stdout mismatch");
+
+const nestedOutput = execFileSync(
+  process.execPath,
+  ["-e", "process.stdout.write('nested-ok')"],
+  { encoding: "utf8" },
+);
+assert(nestedOutput === "nested-ok", `nested process.execPath output mismatch: ${JSON.stringify(nestedOutput)}`);
 
 const maxBufferError = await new Promise<any>((resolve) => {
   execFile("sh", ["-c", "printf too-long"], { maxBuffer: 3 }, (error) => resolve(error));

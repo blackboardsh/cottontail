@@ -1,4 +1,5 @@
 import { spawn } from "bun";
+import { isAbsolute } from "node:path";
 
 function assert(value: unknown, message: string) {
   if (!value) throw new Error(message);
@@ -6,6 +7,9 @@ function assert(value: unknown, message: string) {
 
 process.env.COTTONTAIL_ELECTROBUN_DIST = "/tmp/fake-electrobun";
 process.env.COTTONTAIL_ELECTROBUN_NAME = "Fake";
+
+assert(isAbsolute(process.execPath), `process.execPath is not absolute: ${process.execPath}`);
+assert(cottontail.execPath() === process.execPath, "host and process exec paths differ");
 
 const childPath = `${import.meta.dirname}/fixtures/print-electrobun-env.ts`;
 const proc = spawn([process.execPath, childPath], {

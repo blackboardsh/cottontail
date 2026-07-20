@@ -309,6 +309,15 @@ try {
       stdoutIncludes: ['bun spawn streaming passed'],
     },
     {
+      name: 'bun-shell-long-top-level-await',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-shell-long-top-level-await.ts'),
+      env: {
+        COTTONTAIL_TEST_SPIN_TOP_LEVEL_AWAIT: '1',
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun shell long top-level await passed'],
+    },
+    {
       name: 'bun-spawn-execpath-env',
       scriptPath: join(rootDir, 'tests', 'js', 'bun-spawn-execpath-env.ts'),
       expectExitCode: 0,

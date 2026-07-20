@@ -15,7 +15,7 @@
 #endif
 
 extern bool ct_jsc_string_is_8_bit(JSStringRef string);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 extern void ct_jsc_initialize_main_thread(void);
 #endif
 extern void ct_jsc_run_loop_cycle(void);
@@ -876,7 +876,6 @@ extern JSObjectRef JSGetMemoryUsageStatistics(JSContextRef ctx);
 #include <CommonCrypto/CommonDigest.h>
 #include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonHMAC.h>
-#include <mach-o/dyld.h>
 extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #endif
 
@@ -8615,11 +8614,9 @@ static JSValueRef ct_exec_path(JSContextRef ctx, JSObjectRef function, JSObjectR
     (void)thisObject;
     (void)argc;
     (void)argv;
-#if defined(__APPLE__)
-    char buffer[4096];
-    uint32_t size = sizeof(buffer);
-    if (_NSGetExecutablePath(buffer, &size) == 0) return ct_make_string(ctx, buffer);
-#endif
+    char buffer[32768];
+    size_t size = sizeof(buffer);
+    if (uv_exepath(buffer, &size) == 0 && size > 0) return ct_make_string_len(ctx, buffer, size);
     (void)exception;
     return ct_make_string(ctx, "cottontail");
 }
@@ -21099,7 +21096,12 @@ CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size) {
 #if defined(_WIN32)
     if (ct_windows_ensure_winsock() != 0) return NULL;
 #endif
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
+    /* JSC's public C API initializes the VM, but the generic static ports do
+     * not establish WTF's main thread/run loop. GC activity callbacks create
+     * the process-wide MemoryPressureHandler lazily and require that main run
+     * loop to exist. Initialize it on the runtime owner thread before creating
+     * the first VM. */
     ct_jsc_initialize_main_thread();
 #endif
     CtJscRuntime *runtime = (CtJscRuntime *)calloc(1, sizeof(CtJscRuntime));
@@ -22096,7 +22098,10 @@ static int ct_jsc_runtime_eval_internal(
         return -1;
     }
 
-    for (int index = 0; index < 30000 && !ct_global_bool(ctx, "__ctDone"); index += 1) {
+    /* Accelerate the long-running Bun.$ regression without changing normal
+     * event-loop pacing. */
+    bool spin_top_level_await = ct_debug_flag("COTTONTAIL_TEST_SPIN_TOP_LEVEL_AWAIT");
+    while (!ct_global_bool(ctx, "__ctDone")) {
         if (ct_jsc_runtime_tick(runtime, error_out) != 0) return -1;
         if (wait_for_active_handles && !ct_global_bool(ctx, "__ctDone")) {
             bool has_active_handles = false;
@@ -22109,9 +22114,8 @@ static int ct_jsc_runtime_eval_internal(
                 return -13;
             }
         }
-        ct_runtime_wait(runtime, 1);
+        ct_runtime_wait(runtime, spin_top_level_await ? 0 : 1);
     }
-    if (!ct_global_bool(ctx, "__ctDone")) return -13;
     JSValueRef error_value = ct_global_value(ctx, "__ctError");
     if (error_value != NULL && !JSValueIsUndefined(ctx, error_value) && !JSValueIsNull(ctx, error_value)) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, error_value));

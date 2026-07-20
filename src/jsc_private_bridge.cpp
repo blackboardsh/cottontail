@@ -32,6 +32,10 @@ namespace WTF {
 
 // Minimal ABI declaration for the pinned JSCOnly artifact. Its installed
 // RunLoop.h depends on private platform headers that the artifact omits.
+#if defined(__linux__)
+void initializeMainThread();
+#endif
+
 class RunLoop {
 public:
     enum class CycleResult { Continue, Stop };
@@ -213,14 +217,14 @@ extern "C" void ct_jsc_run_loop_cycle()
     WTF::RunLoop::cycle(0);
 }
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 extern "C" void ct_jsc_initialize_main_thread()
 {
     // The public JSContext API initializes JSC/WTF, but it does not establish
-    // WTF's main RunLoop. JSC's delayed GC callbacks eventually consult the
-    // process-wide MemoryPressureHandler, whose Windows timer is bound to that
-    // main RunLoop. Match WebKit's own `jsc` embedding sequence before the
-    // first VM is created.
+    // WTF's main RunLoop on the generic static ports. JSC's delayed GC
+    // callbacks eventually consult the process-wide MemoryPressureHandler,
+    // whose timer is bound to that main RunLoop. Match WebKit's own `jsc`
+    // embedding sequence before the first VM is created.
     WTF::initializeMainThread();
 }
 #endif
