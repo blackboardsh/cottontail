@@ -15,6 +15,21 @@ const source = await result.outputs[0].text();
 assert(source.includes("var rexported = 42"), "native Bun.build should include imported modules");
 assert(source.includes("var doubled = rexported * 2"), "native Bun.build should transpile TypeScript");
 
+const aliasTarget = `${import.meta.dir}/fixtures/bun-build-alias-target.ts`;
+const aliasResult = await Bun.build({
+  entrypoints: ["tests/js/fixtures/bun-build-alias-entry.ts"],
+  target: "bun",
+  format: "esm",
+  alias: {
+    "cottontail-build-alias": aliasTarget,
+  },
+});
+
+assert(aliasResult.success, "native Bun.build aliases should succeed");
+const aliasSource = await aliasResult.outputs[0].text();
+assert(aliasSource.includes("cottontail-alias-target"), "Bun.build should bundle the aliased module");
+assert(!aliasSource.includes("cottontail-build-alias"), "Bun.build should not preserve the original bare alias");
+
 const lifecycle: string[] = [];
 const pluginResult = await Bun.build({
   entrypoints: ["virtual-entry"],

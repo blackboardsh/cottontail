@@ -1208,6 +1208,21 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
             return error.InvalidConditions;
         }
     }
+    if (object.get("alias")) |value| {
+        if (value == .object) {
+            var aliases: std.ArrayList(RuntimeAlias) = .empty;
+            var iterator = value.object.iterator();
+            while (iterator.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                if (entry.key_ptr.len == 0 or entry.value_ptr.string.len == 0) continue;
+                try aliases.append(allocator, .{
+                    .specifier = entry.key_ptr.*,
+                    .path = entry.value_ptr.string,
+                });
+            }
+            options.aliases = aliases.items;
+        }
+    }
     if (object.get("minify")) |value| switch (value) {
         .bool => |enabled| {
             options.minify_whitespace = enabled;
@@ -1818,6 +1833,7 @@ pub fn buildEntryPointsJson(
     // the rest of the inherited process environment.
     try transpiler.env.loadProcess();
     try transpiler.fs.setTopLevelDir(working_dir_z);
+    transpiler.resolver.runtime_aliases = options.aliases;
 
     transpiler.options.output_format = options.output_format;
     transpiler.options.source_map = compiler.options.SourceMapOption.fromApi(options.source_map);
