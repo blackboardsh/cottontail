@@ -639,6 +639,8 @@ export class TLSSocket extends Socket {
     this._tlsListenerInstalled = false;
     this._tlsReadEndTimer = null;
     this._tlsHandshakeTimer = null;
+    this._tlsDestroyTimer = null;
+    this._tlsDestroyId = null;
     this._memoryTransport = null;
     this._memoryTransportListeners = null;
     this._memoryTransportEnded = false;
@@ -1126,25 +1128,35 @@ export class TLSSocket extends Socket {
     }
     const listeners = globalThis.__cottontailTlsListeners;
     this._removeMemoryTransportListeners();
+    const tlsId = this._tlsId;
     if (this._tlsId != null) {
       listeners?.delete?.(this._tlsId);
-      try { cottontail.tlsConnectionClose(this._tlsId); } catch {}
+      this._tlsDestroyId = this._tlsId;
       this._tlsId = null;
     }
     this._tlsListenerInstalled = false;
     const writeError = error ?? tlsError("TLS socket is closed", "ERR_SOCKET_CLOSED");
     for (const entry of this._pendingWrites.splice(0)) queueMicrotask(() => entry.callback?.(writeError));
     this.writableLength = 0;
-    if (this._memoryTransport && !this._memoryTransport.destroyed) {
-      try { this._memoryTransport.destroy?.(error); } catch {}
-    }
-    if (this._parent && !this._parent._tlsDetached) {
-      try { this._parent.destroy(error); } catch {}
-    }
-    if (error) this.emit("error", error);
     if (!this._closeEmitted) {
+      const hadError = Boolean(error);
       this._closeEmitted = true;
-      this.emit("close", Boolean(error));
+      this._tlsDestroyTimer = setTimeout(() => {
+        this._tlsDestroyTimer = null;
+        if (tlsId != null) {
+          try { cottontail.tlsConnectionClose(tlsId); } catch {}
+          this._tlsDestroyId = null;
+        }
+        if (this._memoryTransport && !this._memoryTransport.destroyed) {
+          try { this._memoryTransport.destroy?.(error); } catch {}
+        }
+        if (this._parent && !this._parent._tlsDetached) {
+          try { this._parent.destroy(error); } catch {}
+        }
+        if (error) this.emit("error", error);
+        this.emit("close", hadError);
+      }, 0);
+      if (!this._refed) this._tlsDestroyTimer.unref?.();
     }
     return this;
   }
@@ -1172,18 +1184,22 @@ export class TLSSocket extends Socket {
   ref() {
     super.ref();
     this._tlsHandshakeTimer?.ref?.();
+    this._tlsDestroyTimer?.ref?.();
     this._parent?.ref?.();
     this._memoryTransport?.ref?.();
-    if (this._tlsId != null) cottontail.tlsConnectionSetRef?.(this._tlsId, true);
+    const tlsId = this._tlsId ?? this._tlsDestroyId;
+    if (tlsId != null) cottontail.tlsConnectionSetRef?.(tlsId, true);
     return this;
   }
 
   unref() {
     super.unref();
     this._tlsHandshakeTimer?.unref?.();
+    this._tlsDestroyTimer?.unref?.();
     this._parent?.unref?.();
     this._memoryTransport?.unref?.();
-    if (this._tlsId != null) cottontail.tlsConnectionSetRef?.(this._tlsId, false);
+    const tlsId = this._tlsId ?? this._tlsDestroyId;
+    if (tlsId != null) cottontail.tlsConnectionSetRef?.(tlsId, false);
     return this;
   }
 
