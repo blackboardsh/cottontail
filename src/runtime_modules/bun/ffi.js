@@ -421,6 +421,8 @@ const consoleOwnValue = (value, key) => {
   return descriptor && "value" in descriptor ? descriptor.value : undefined;
 };
 
+const commonJsExportsMarker = Symbol.for("cottontail.commonjsExports");
+
 const consolePrototypeValue = (value, key) => {
   let current = value;
   for (let depth = 0; current != null && depth < 8; depth += 1) {
@@ -528,6 +530,16 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
   }
   if (value === null) return "null";
   if (seen.has(value)) return "[Circular]";
+
+  const jsxMarker = Object.getOwnPropertyDescriptor(value, "$$typeof")?.value;
+  if (
+    (jsxMarker === Symbol.for("react.element") ||
+      jsxMarker === Symbol.for("react.transitional.element") ||
+      jsxMarker === Symbol.for("react.fragment")) &&
+    typeof g.Bun?.inspect === "function"
+  ) {
+    return g.Bun.inspect(value, { colors: false });
+  }
 
   if (options.customInspect) {
     const custom = consolePrototypeValue(value, consoleInspectCustom);
@@ -658,14 +670,20 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
 
     if (objectDepth > options.depth) return "[Object ...]";
     let prefix = "";
-    if (prototype === null) prefix = "[Object: null prototype] ";
+    const tag = consoleOwnValue(value, Symbol.toStringTag);
+    if (typeof tag === "string") {
+      if (tag !== "Object") prefix = `${tag} `;
+    } else if (prototype === null) prefix = "[Object: null prototype] ";
     else {
-      const tag = consoleOwnValue(value, Symbol.toStringTag);
       const constructor = Object.getOwnPropertyDescriptor(prototype, "constructor")?.value;
-      const name = typeof tag === "string" ? tag : constructor?.name;
+      const name = constructor?.name;
       if (name && name !== "Object") prefix = `${name} `;
     }
-    const keys = Reflect.ownKeys(value).filter((key) => Object.getOwnPropertyDescriptor(value, key)?.enumerable);
+    const showCommonJsDescriptors = consoleOwnValue(value, commonJsExportsMarker) === true;
+    const keys = Reflect.ownKeys(value).filter((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor?.enumerable === true || (showCommonJsDescriptors && typeof key === "string");
+    });
     if (prototype && prototype !== Object.prototype && prototype !== null) {
       for (const key of Reflect.ownKeys(prototype)) {
         if (key === "constructor" || keys.includes(key)) continue;
@@ -680,7 +698,15 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
       const descriptor = Object.getOwnPropertyDescriptor(value, key) ?? Object.getOwnPropertyDescriptor(prototype, key);
       let rendered;
       if (descriptor && !("value" in descriptor)) {
-        rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
+        if (tag === "Module" && typeof descriptor.get === "function") {
+          try {
+            rendered = formatConsoleValue(Reflect.get(value, key), seen, objectDepth + 1, indent + 2, options);
+          } catch {
+            rendered = descriptor.set ? "[Getter/Setter]" : "[Getter]";
+          }
+        } else {
+          rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
+        }
       } else {
         rendered = formatConsoleValue(descriptor?.value, seen, objectDepth + 1, indent + 2, options);
       }

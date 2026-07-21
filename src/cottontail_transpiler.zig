@@ -31,6 +31,7 @@ const TransformConfig = struct {
     import_meta_main: ?bool = null,
     preserve_use_strict: bool = false,
     structured_errors: bool = false,
+    eval_print: bool = false,
     log_level: compiler.logger.Log.Level = .warn,
 };
 
@@ -251,6 +252,7 @@ fn parseConfig(options_json: []const u8, loader_override: []const u8, arena: std
         if (jsonBool(object, "_cottontailImportMetaMain")) |value| config.import_meta_main = value;
         if (jsonBool(object, "_cottontailPreserveUseStrict")) |value| config.preserve_use_strict = value;
         if (jsonBool(object, "_cottontailStructuredErrors")) |value| config.structured_errors = value;
+        if (jsonBool(object, "_cottontailEvalPrint")) |value| config.eval_print = value;
         if (object.get("_cottontailInitialIndent")) |value| switch (value) {
             .integer => |count| {
                 if (count < 0 or count > 64) return error.InvalidIndentOption;
@@ -471,6 +473,30 @@ fn process(
     };
     defer ast.deinit();
 
+    if (config.eval_print) {
+        var parts = ast.parts.slice();
+        var part_index = parts.len;
+        outer: while (part_index > 0) {
+            part_index -= 1;
+            var statement_index = parts[part_index].stmts.len;
+            while (statement_index > 0) {
+                statement_index -= 1;
+                const statement = &parts[part_index].stmts[statement_index];
+                if (statement.data != .s_expr) continue;
+                const expression = statement.data.s_expr.value;
+                statement.* = compiler.ast.Stmt.alloc(
+                    compiler.ast.S.ExportDefault,
+                    compiler.ast.S.ExportDefault{
+                        .value = .{ .expr = expression },
+                        .default_name = .{ .loc = statement.loc, .ref = compiler.ast.Ref.None },
+                    },
+                    statement.loc,
+                );
+                break :outer;
+            }
+        }
+    }
+
     if (operation != .transform) {
         if (operation == .scan_import_ranges) {
             var imports = std.ArrayList(ImportRangeResult).empty;
@@ -595,6 +621,36 @@ pub fn transformEntrypointImportMetaMain(source_code: []const u8, loader: []cons
     var error_message: ?[*:0]u8 = null;
     defer if (error_message) |message| ct_transpiler_string_free(message);
     return process(.transform, source_code, "{\"_cottontailImportMetaMain\":true}", loader, &error_message);
+}
+
+pub fn transformEvalPrintModule(source_code: []const u8, error_out: *?[*:0]u8) ![]u8 {
+    const transformed = try process(
+        .transform,
+        source_code,
+        "{\"target\":\"bun\",\"deadCodeElimination\":false,\"allowBunRuntime\":true,\"_cottontailEvalPrint\":true}",
+        "tsx",
+        error_out,
+    );
+    const helper_prefix = "jsxDEV_";
+    const helper_start = std.mem.indexOf(u8, transformed, helper_prefix) orelse return transformed;
+    var helper_end = helper_start + helper_prefix.len;
+    while (helper_end < transformed.len and
+        (std.ascii.isAlphanumeric(transformed[helper_end]) or transformed[helper_end] == '_' or transformed[helper_end] == '$'))
+    {
+        helper_end += 1;
+    }
+    const helper_name = transformed[helper_start..helper_end];
+    const prelude = try std.fmt.allocPrint(
+        c_allocator,
+        "import {{ jsxDEV as {s} }} from \"react/jsx-dev-runtime\";\n",
+        .{helper_name},
+    );
+    defer c_allocator.free(prelude);
+    const result = try c_allocator.alloc(u8, prelude.len + transformed.len);
+    @memcpy(result[0..prelude.len], prelude);
+    @memcpy(result[prelude.len..], transformed);
+    c_allocator.free(transformed);
+    return result;
 }
 
 export fn ct_transpiler_process(

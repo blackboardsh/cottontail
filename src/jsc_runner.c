@@ -16131,7 +16131,20 @@ static JSValueRef ct_env(JSContextRef ctx, JSObjectRef function, JSObjectRef thi
             free(name);
             continue;
         }
-        ct_set_property(ctx, env, name, ct_make_string(ctx, equals + 1), exception);
+        JSStringRef property = ct_js_string_from_utf8_len(*entry, (size_t)(equals - *entry));
+        JSStringRef string_value = ct_js_string_from_utf8_len(equals + 1, strlen(equals + 1));
+        if (property != NULL && string_value != NULL) {
+            JSObjectSetProperty(
+                ctx,
+                env,
+                property,
+                JSValueMakeString(ctx, string_value),
+                kJSPropertyAttributeNone,
+                exception
+            );
+        }
+        if (property != NULL) JSStringRelease(property);
+        if (string_value != NULL) JSStringRelease(string_value);
         free(name);
         if (exception != NULL && *exception != NULL) return env;
     }

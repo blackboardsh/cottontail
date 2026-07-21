@@ -2517,6 +2517,8 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   // an ES module (e.g. re-importing a Bun.build output). The object-URL
   // registry lives on globalThis (installed by the Blob shim).
   const specifierText = String(specifier);
+  const virtualNamespace = globalThis.__cottontailVirtualModuleNamespaces?.get(specifierText);
+  if (virtualNamespace !== undefined) return virtualNamespace;
   const parent = referrer == null
     ? cottontail.cwd()
     : (String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer));
@@ -2841,27 +2843,35 @@ function extensionsForRequire(filename) {
 // Node exposes require.cache as a plain object keyed by resolved path;
 // mirror the internal Map through a Proxy so `delete require.cache[path]`
 // really evicts entries.
-const commonJsCacheObject = new Proxy(Object.create(null), {
-  get(_target, property) {
-    if (typeof property !== "string") return undefined;
+const commonJsCacheTarget = Object.create(null);
+Object.defineProperty(commonJsCacheTarget, Symbol.toStringTag, {
+  value: "Module",
+  configurable: true,
+});
+const commonJsCacheObject = new Proxy(commonJsCacheTarget, {
+  get(target, property) {
+    if (typeof property !== "string") return Reflect.get(target, property);
     return commonJsCache.get(property);
   },
-  set(_target, property, value) {
+  set(target, property, value) {
+    if (typeof property !== "string") return Reflect.set(target, property, value);
     if (typeof property === "string") commonJsCache.set(property, value);
     return true;
   },
-  has(_target, property) {
-    return typeof property === "string" && commonJsCache.has(property);
+  has(target, property) {
+    return typeof property === "string" ? commonJsCache.has(property) : Reflect.has(target, property);
   },
-  deleteProperty(_target, property) {
+  deleteProperty(target, property) {
+    if (typeof property !== "string") return Reflect.deleteProperty(target, property);
     if (typeof property === "string") commonJsCache.delete(property);
     return true;
   },
-  ownKeys() {
-    return [...commonJsCache.keys()];
+  ownKeys(target) {
+    return [...commonJsCache.keys(), ...Reflect.ownKeys(target)];
   },
-  getOwnPropertyDescriptor(_target, property) {
-    if (typeof property !== "string" || !commonJsCache.has(property)) return undefined;
+  getOwnPropertyDescriptor(target, property) {
+    if (typeof property !== "string") return Reflect.getOwnPropertyDescriptor(target, property);
+    if (!commonJsCache.has(property)) return undefined;
     return { value: commonJsCache.get(property), writable: true, enumerable: true, configurable: true };
   },
 });

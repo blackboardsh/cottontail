@@ -12314,15 +12314,22 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
       seen.delete(value);
     }
   }
-  if (bunInspectIsPlainObject(value)) {
+  const ownTag = Object.getOwnPropertyDescriptor(value, Symbol.toStringTag)?.value;
+  const showCommonJsDescriptors = Object.getOwnPropertyDescriptor(
+    value,
+    Symbol.for("cottontail.commonjsExports"),
+  )?.value === true;
+  if (bunInspectIsPlainObject(value) || ownTag === "Module") {
     if (depth > ctx.maxDepth) return "[Object ...]";
     const keys = Reflect.ownKeys(value).filter((key) => {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable) return false;
+      if (!descriptor?.enumerable && !(showCommonJsDescriptors && typeof key === "string")) return false;
       return key !== ctInspectSymbol || !("value" in descriptor && typeof descriptor.value === "function");
     });
-    const nullPrototypePrefix = Object.getPrototypeOf(value) === null ? "[Object: null prototype] " : "";
-    if (keys.length === 0) return `${nullPrototypePrefix}{}`;
+    const objectPrefix = ownTag === "Module"
+      ? "Module "
+      : (Object.getPrototypeOf(value) === null ? "[Object: null prototype] " : "");
+    if (keys.length === 0) return `${objectPrefix}{}`;
     seen.add(value);
     try {
       const entries = keys.map((key) => {
@@ -12331,12 +12338,17 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
           : (bunInspectIdentifierRe.test(key) ? key : bunInspectQuote(key));
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
         const rendered = descriptor && !("value" in descriptor)
-          ? (descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]")
+          ? (ownTag === "Module" && typeof descriptor.get === "function"
+            ? (() => {
+              try { return bunStyleInspect(Reflect.get(value, key), ctx, nested, seen, depth + 1); }
+              catch { return descriptor.set ? "[Getter/Setter]" : "[Getter]"; }
+            })()
+            : (descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]"))
           : bunStyleInspect(descriptor?.value, ctx, nested, seen, depth + 1);
         return `${bunInspectKeyPrefix(printedKey, ctx)}${rendered}`;
       });
-      if (ctx.compact) return `${nullPrototypePrefix}{ ${entries.join(`${comma} `)} }`;
-      return `${nullPrototypePrefix}{\n${entries.map((entry) => `${nested}${entry}${comma}`).join("\n")}\n${indent}}`;
+      if (ctx.compact) return `${objectPrefix}{ ${entries.join(`${comma} `)} }`;
+      return `${objectPrefix}{\n${entries.map((entry) => `${nested}${entry}${comma}`).join("\n")}\n${indent}}`;
     } finally {
       seen.delete(value);
     }

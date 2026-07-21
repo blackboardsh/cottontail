@@ -1,5 +1,6 @@
 import { createWritableStdio } from "../node/stdio.js";
 import { remapStackString } from "../vendor/sourcemap.js";
+import { installDotenvLoader } from "./dotenv.js";
 
 const nodeCompatVersion = "24.11.1";
 const bunCompatVersion = "1.3.10";
@@ -150,6 +151,15 @@ function installProcess() {
 }
 
 const processObject = installProcess();
+installDotenvLoader(processObject);
+try {
+  __ctMetaEnv = processObject.env;
+} catch {}
+if (globalThis.console && typeof globalThis.console.write !== "function") {
+  globalThis.console.write = (chunk = "") => {
+    processObject.stdout?.write?.(String(chunk));
+  };
+}
 const bunObject = globalThis.Bun ?? {};
 Object.defineProperty(bunObject, Symbol.toStringTag, { value: "Bun", configurable: true });
 bunObject.argv ??= processObject.argv;

@@ -12,6 +12,7 @@ const package_manager_cli = @import("package_manager_cli.zig");
 const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const host = @import("host.zig");
+const cli_run = @import("cli_run.zig");
 const script_runner = @import("script_runner.zig");
 
 comptime {
@@ -294,7 +295,7 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
 }
 
 fn isRuntimeFlag(arg: []const u8) bool {
-    if (std.mem.eql(u8, arg, "-r")) return true;
+    if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "-i")) return true;
     return std.mem.startsWith(u8, arg, "--");
 }
 
@@ -462,41 +463,120 @@ fn findPackageScripts(
     name: []const u8,
 ) !?PackageScripts {
     const cwd_abs = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
-    const package_json = try std.fs.path.join(allocator, &.{ cwd_abs, "package.json" });
-    if (!cliPathExists(io, package_json)) return null;
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        package_json,
-        allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch return null;
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch return null;
-    const root = parsed.value;
-    if (root != .object) return null;
-    const scripts = root.object.get("scripts") orelse return null;
-    if (scripts != .object) return null;
-    const main_command = jsonScriptValue(scripts, name) orelse return null;
-    const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
-    const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
-    var config_entries = std.array_list.Managed(PackageConfigEntry).init(allocator);
-    if (root.object.get("config")) |config| {
-        if (config == .object) {
-            for (config.object.keys(), config.object.values()) |key, value| {
-                try config_entries.append(.{
-                    .name = try std.fmt.allocPrint(allocator, "npm_package_config_{s}", .{key}),
-                    .value = try packageConfigValue(allocator, value),
-                });
+    var current: []const u8 = cwd_abs;
+    while (true) {
+        const package_json = try std.fs.path.join(allocator, &.{ current, "package.json" });
+        if (cliPathExists(io, package_json)) {
+            const source = std.Io.Dir.cwd().readFileAlloc(
+                io,
+                package_json,
+                allocator,
+                .limited(16 * 1024 * 1024),
+            ) catch null;
+            if (source) |contents| {
+                const parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch null;
+                if (parsed) |document| {
+                    const root = document.value;
+                    if (root == .object) {
+                        if (root.object.get("scripts")) |scripts| {
+                            if (scripts == .object) {
+                                if (jsonScriptValue(scripts, name)) |main_command| {
+                                    const pre_name = try std.mem.concat(allocator, u8, &.{ "pre", name });
+                                    const post_name = try std.mem.concat(allocator, u8, &.{ "post", name });
+                                    var config_entries = std.array_list.Managed(PackageConfigEntry).init(allocator);
+                                    if (root.object.get("config")) |config| {
+                                        if (config == .object) {
+                                            for (config.object.keys(), config.object.values()) |key, value| {
+                                                try config_entries.append(.{
+                                                    .name = try std.fmt.allocPrint(allocator, "npm_package_config_{s}", .{key}),
+                                                    .value = try packageConfigValue(allocator, value),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    return .{
+                                        .dir = try allocator.dupe(u8, current),
+                                        .pre = jsonScriptValue(scripts, pre_name),
+                                        .main = try allocator.dupe(u8, main_command),
+                                        .post = jsonScriptValue(scripts, post_name),
+                                        .name = name,
+                                        .config = try config_entries.toOwnedSlice(),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
     }
-    return .{
-        .dir = try allocator.dupe(u8, cwd_abs),
-        .pre = jsonScriptValue(scripts, pre_name),
-        .main = try allocator.dupe(u8, main_command),
-        .post = jsonScriptValue(scripts, post_name),
-        .name = name,
-        .config = try config_entries.toOwnedSlice(),
-    };
+    return null;
+}
+
+fn prependAncestorBinPaths(
+    allocator: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    start_dir: []const u8,
+) !void {
+    var parts = std.array_list.Managed([]const u8).init(allocator);
+    var current = start_dir;
+    while (true) {
+        try parts.append(try std.fs.path.join(allocator, &.{ current, "node_modules", ".bin" }));
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
+    if (env.get("PATH")) |path| try parts.append(path);
+    const separator = if (builtin.os.tag == .windows) ";" else ":";
+    try env.put("PATH", try std.mem.join(allocator, separator, parts.items));
+}
+
+fn findAncestorBin(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    const cwd_abs = std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator) catch return null;
+    var current: []const u8 = cwd_abs;
+    while (true) {
+        const bin_dir = try std.fs.path.join(allocator, &.{ current, "node_modules", ".bin" });
+        const candidate = try std.fs.path.join(allocator, &.{ bin_dir, name });
+        if (pathIsFile(io, candidate)) return candidate;
+        if (builtin.os.tag == .windows) {
+            for ([_][]const u8{ ".exe", ".cmd", ".bat" }) |extension| {
+                const with_extension = try std.mem.concat(allocator, u8, &.{ candidate, extension });
+                if (pathIsFile(io, with_extension)) return with_extension;
+            }
+        }
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+    }
+    return null;
+}
+
+fn runAncestorBin(
+    init: std.process.Init,
+    executable: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const cwd_abs = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    var env = try init.environ_map.clone(allocator);
+    try prependAncestorBinPaths(allocator, &env, cwd_abs);
+
+    const argv = try allocator.alloc([]const u8, args.len + 1);
+    argv[0] = executable;
+    for (args, 0..) |arg, index| argv[index + 1] = arg;
+    var child = try std.process.spawn(init.io, .{
+        .argv = argv,
+        .environ_map = &env,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    });
+    defer child.kill(init.io);
+    return childExitCode(try child.wait(init.io));
 }
 
 fn shellEscapeArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
@@ -567,12 +647,9 @@ fn runPackageScripts(
     try env.put("BUN", executable);
     try env.put("npm_execpath", executable);
     try env.put("npm_node_execpath", executable);
-
-    const bin_dir = try std.fs.path.join(allocator, &.{ pkg.dir, "node_modules", ".bin" });
-    const separator: u8 = if (builtin.os.tag == .windows) ';' else ':';
-    const old_path = env.get("PATH") orelse "";
-    const new_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ bin_dir, separator, old_path });
-    try env.put("PATH", new_path);
+    const init_cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    try env.put("INIT_CWD", init_cwd);
+    try prependAncestorBinPaths(allocator, &env, pkg.dir);
     for (pkg.config) |entry| try env.put(entry.name, entry.value);
 
     if (pkg.pre) |pre_command| {
@@ -1390,6 +1467,37 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
 
 fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
+    if (builtin.os.tag != .windows) {
+        const syntax = try std.process.run(allocator, init.io, .{
+            .argv = &.{ "/bin/sh", "-n", script_path },
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+        });
+        const syntax_code = childExitCode(syntax.term);
+        if (syntax_code != 0) {
+            const marker = "unexpected token `";
+            const token = if (std.mem.indexOf(u8, syntax.stderr, marker)) |start| blk: {
+                const value_start = start + marker.len;
+                const value_end = std.mem.indexOfScalarPos(u8, syntax.stderr, value_start, '\'') orelse value_start;
+                break :blk syntax.stderr[value_start..value_end];
+            } else "";
+            var stderr_buffer: [1024]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+            if (token.len > 0) {
+                try stderr_writer.interface.print(
+                    "error: Failed to run {s} due to error Unexpected '{s}'\n",
+                    .{ std.fs.path.basename(script_path), token },
+                );
+            } else {
+                try stderr_writer.interface.print(
+                    "error: Failed to run {s} due to error Syntax error\n",
+                    .{std.fs.path.basename(script_path)},
+                );
+            }
+            try stderr_writer.interface.flush();
+            return syntax_code;
+        }
+    }
     const argv = try allocator.alloc([]const u8, script_args.len + 2);
     argv[0] = "sh";
     argv[1] = script_path;
@@ -2011,6 +2119,7 @@ fn parseRunInvocation(
     var index: usize = start_index;
     while (index < args.len) {
         const arg = args[index];
+        if (std.mem.eql(u8, arg, "-")) break;
         if (std.mem.eql(u8, arg, "--")) {
             index += 1;
             break;
@@ -2051,7 +2160,7 @@ fn parseRunInvocation(
     }
     if (index >= args.len) return CliParseError.MissingEntrypoint;
     return .{
-        .mode = .script,
+        .mode = if (std.mem.eql(u8, args[index], "-")) .stdin else .script,
         .payload = args[index],
         .args = args[index + 1 ..],
         .exec_args = exec_args_storage[0..exec_len.*],
@@ -2111,7 +2220,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
             return .{
                 .mode = .eval,
                 .payload = args[index + 1],
-                .args = args[index + 2 ..],
+                .args = args[index + 2 + @intFromBool(index + 2 < args.len and std.mem.eql(u8, args[index + 2], "--")) ..],
                 .exec_args = exec_args_storage[0..exec_len],
             };
         }
@@ -2121,7 +2230,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
             return .{
                 .mode = .eval,
                 .payload = try argAfterPrefix(allocator, arg, "--eval="),
-                .args = args[index + 1 ..],
+                .args = args[index + 1 + @intFromBool(index + 1 < args.len and std.mem.eql(u8, args[index + 1], "--")) ..],
                 .exec_args = exec_args_storage[0..exec_len],
             };
         }
@@ -2133,7 +2242,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
             return .{
                 .mode = .print,
                 .payload = args[index + 1],
-                .args = args[index + 2 ..],
+                .args = args[index + 2 + @intFromBool(index + 2 < args.len and std.mem.eql(u8, args[index + 2], "--")) ..],
                 .exec_args = exec_args_storage[0..exec_len],
             };
         }
@@ -2143,7 +2252,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
             return .{
                 .mode = .print,
                 .payload = try argAfterPrefix(allocator, arg, "--print="),
-                .args = args[index + 1 ..],
+                .args = args[index + 1 + @intFromBool(index + 1 < args.len and std.mem.eql(u8, args[index + 1], "--")) ..],
                 .exec_args = exec_args_storage[0..exec_len],
             };
         }
@@ -2194,7 +2303,7 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
         }
 
         return .{
-            .mode = .script,
+            .mode = if (std.mem.eql(u8, arg, "-")) .stdin else .script,
             .payload = arg,
             .args = args[index + 1 ..],
             .exec_args = exec_args_storage[0..exec_len],
@@ -2460,6 +2569,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (try cli_run.tryRun(init, args)) |exit_code| {
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (validateTestCliOptions(args)) |validation_error| {
         switch (validation_error) {
             .invalid_bail => try stderr.writeAll("error: --bail expects a number greater than 0\n"),
@@ -2525,6 +2639,11 @@ pub fn main(init: std.process.Init) !void {
             if (try findPackageScripts(init.io, init.arena.allocator(), payload)) |pkg| {
                 const script_exit = try runPackageScripts(init, pkg, invocation.flags, invocation.args);
                 if (script_exit != 0) std.process.exit(script_exit);
+                return;
+            }
+            if (try findAncestorBin(init.io, init.arena.allocator(), payload)) |executable| {
+                const binary_exit = try runAncestorBin(init, executable, invocation.args);
+                if (binary_exit != 0) std.process.exit(binary_exit);
                 return;
             }
         }
