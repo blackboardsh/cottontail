@@ -25,6 +25,7 @@ const snapshotArtifactRoots = new Map();
 const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
+  'package.json',
   'src',
   'status.json',
   'test',

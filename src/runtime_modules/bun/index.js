@@ -12843,9 +12843,9 @@ function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
 function bunInspectDynamicErrorSource(error, rendered) {
   const metadata = error?.[dynamicErrorSourceSymbol];
   if (!metadata || typeof metadata.source !== "string") return rendered;
-  const functionName = String(error.stack ?? "")
-    .match(/(?:^|\n)\s*(?:at\s+)?([^@\n]+)@/)?.[1]
-    ?.trim();
+  const stack = String(error.stack ?? "");
+  const functionName = stack.match(/(?:^|\n)\s*(?:at\s+)?([^@\n]+)@/)?.[1]?.trim() ??
+    stack.match(/(?:^|\n)\s*at\s+([^\s(]+)\s*(?:\(|$)/)?.[1]?.trim();
   if (!functionName) return rendered;
   const escapedName = functionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const lines = metadata.source.split(/\r?\n/);
@@ -12996,6 +12996,9 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
     return globalThis.__cottontailInspectBunExpectationError(value, ctx.colors);
   }
   if (value instanceof Error && typeof custom !== "function") {
+    if (value?.[dynamicErrorSourceSymbol]?.source != null) {
+      return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
+    }
     const diagnostic = bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx);
     if (diagnostic !== null) {
       const causeDescriptor = Object.getOwnPropertyDescriptor(value, "cause");

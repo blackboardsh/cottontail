@@ -646,6 +646,7 @@ fn findPackageScripts(
                     }
                 }
             }
+            return null;
         }
         const parent = std.fs.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;

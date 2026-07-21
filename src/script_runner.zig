@@ -327,6 +327,150 @@ fn packageIsInstalled(ctx: *const Context, start_dir: []const u8, package_name: 
     }
 }
 
+const ModuleIdentifier = enum { other, import_keyword, export_keyword, require_identifier, from_keyword };
+
+const ScannedModuleIdentifier = struct {
+    end: usize,
+    kind: ModuleIdentifier,
+};
+
+const UnicodeIdentifierEscape = struct {
+    end: usize,
+    codepoint: u21,
+};
+
+fn scanUnicodeIdentifierEscape(source: []const u8, start: usize) ?UnicodeIdentifierEscape {
+    if (start + 2 > source.len or source[start] != '\\' or source[start + 1] != 'u') return null;
+    var cursor = start + 2;
+    var value: u32 = 0;
+    if (cursor < source.len and source[cursor] == '{') {
+        cursor += 1;
+        const digits_start = cursor;
+        while (cursor < source.len and source[cursor] != '}') : (cursor += 1) {
+            const digit = std.fmt.charToDigit(source[cursor], 16) catch return null;
+            value = std.math.mul(u32, value, 16) catch return null;
+            value = std.math.add(u32, value, digit) catch return null;
+            if (value > 0x10ffff) return null;
+        }
+        if (cursor == digits_start or cursor >= source.len) return null;
+        cursor += 1;
+    } else {
+        if (cursor + 4 > source.len) return null;
+        for (source[cursor .. cursor + 4]) |byte| {
+            const digit = std.fmt.charToDigit(byte, 16) catch return null;
+            value = value * 16 + digit;
+        }
+        cursor += 4;
+    }
+    return .{ .end = cursor, .codepoint = @intCast(value) };
+}
+
+fn scanModuleIdentifier(source: []const u8, start: usize) ScannedModuleIdentifier {
+    var cursor = start;
+    var decoded: [8]u8 = undefined;
+    var decoded_len: usize = 0;
+    var can_match = true;
+    while (cursor < source.len) {
+        if (isIdentifierPart(source[cursor])) {
+            if (decoded_len < decoded.len) {
+                decoded[decoded_len] = source[cursor];
+                decoded_len += 1;
+            } else {
+                can_match = false;
+            }
+            cursor += 1;
+            continue;
+        }
+        const escape = scanUnicodeIdentifierEscape(source, cursor) orelse break;
+        if (escape.codepoint <= std.math.maxInt(u8) and isIdentifierPart(@intCast(escape.codepoint))) {
+            if (decoded_len < decoded.len) {
+                decoded[decoded_len] = @intCast(escape.codepoint);
+                decoded_len += 1;
+            } else {
+                can_match = false;
+            }
+        } else {
+            can_match = false;
+        }
+        cursor = escape.end;
+    }
+    const identifier = decoded[0..decoded_len];
+    const kind: ModuleIdentifier = if (!can_match)
+        .other
+    else if (std.mem.eql(u8, identifier, "import"))
+        .import_keyword
+    else if (std.mem.eql(u8, identifier, "export"))
+        .export_keyword
+    else if (std.mem.eql(u8, identifier, "require"))
+        .require_identifier
+    else if (std.mem.eql(u8, identifier, "from"))
+        .from_keyword
+    else
+        .other;
+    return .{ .end = @max(cursor, start + 1), .kind = kind };
+}
+
+fn containsModuleIdentifier(source: []const u8) bool {
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        if (isIdentifierStart(source[cursor]) or scanUnicodeIdentifierEscape(source, cursor) != null) {
+            const identifier = scanModuleIdentifier(source, cursor);
+            if (identifier.kind == .import_keyword or
+                identifier.kind == .export_keyword or
+                identifier.kind == .require_identifier) return true;
+            cursor = identifier.end;
+        } else {
+            cursor += 1;
+        }
+    }
+    return false;
+}
+
+fn sourceMayLoadModules(source: []const u8) bool {
+    var cursor: usize = 0;
+    var previous_was_dot = false;
+    var export_clause = false;
+    while (cursor < source.len) {
+        cursor = skipJavaScriptTrivia(source, cursor);
+        if (cursor >= source.len) break;
+
+        const byte = source[cursor];
+        if (byte == '\'' or byte == '"') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            previous_was_dot = false;
+            continue;
+        }
+        if (byte == '`') {
+            const end = skipQuotedJavaScript(source, cursor);
+            if (containsModuleIdentifier(source[cursor + 1 .. end])) return true;
+            cursor = end;
+            previous_was_dot = false;
+            continue;
+        }
+        if (isIdentifierStart(byte) or scanUnicodeIdentifierEscape(source, cursor) != null) {
+            const identifier = scanModuleIdentifier(source, cursor);
+            cursor = identifier.end;
+            if (!previous_was_dot and identifier.kind == .import_keyword) return true;
+            if (identifier.kind == .require_identifier) {
+                const next = skipJavaScriptTrivia(source, cursor);
+                if (next < source.len and source[next] == '(') return true;
+            }
+            if (!previous_was_dot and identifier.kind == .export_keyword) {
+                export_clause = true;
+            } else if (export_clause and identifier.kind == .from_keyword) {
+                return true;
+            }
+            previous_was_dot = false;
+            continue;
+        }
+
+        previous_was_dot = byte == '.';
+        if (byte == ';') export_clause = false;
+        cursor += 1;
+    }
+    return false;
+}
+
 fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args: []const [:0]const u8) !void {
     const mode = autoInstallMode(exec_args);
     if (mode == .disable) return;
@@ -340,6 +484,10 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
         ctx.allocator,
         .limited(16 * 1024 * 1024),
     ) catch return;
+    // COTTONTAIL-COMPAT: Bun discovers missing packages during its normal
+    // parser pass. Avoid a redundant compiler pass when no module-loading
+    // token exists; large generated scripts otherwise miss Bun's test deadline.
+    if (!sourceMayLoadModules(source)) return;
     const imports_json = native_transpiler.scanImportsJson(source, loader) catch return;
     defer std.heap.c_allocator.free(imports_json);
     const ScannedImport = struct { path: []const u8, kind: []const u8 };
@@ -377,6 +525,16 @@ fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args:
         .exited => |code| if (code != 0) return error.AutoInstallFailed,
         else => return error.AutoInstallFailed,
     }
+}
+
+test "auto-install preflight cannot skip module-loading syntax" {
+    try std.testing.expect(sourceMayLoadModules("import value from 'pkg';"));
+    try std.testing.expect(sourceMayLoadModules("export * from 'pkg';"));
+    try std.testing.expect(sourceMayLoadModules("const value = `${await import('pkg')}`;"));
+    try std.testing.expect(sourceMayLoadModules("module.require('pkg');"));
+    try std.testing.expect(sourceMayLoadModules("requ\\u0069re('pkg');"));
+    try std.testing.expect(!sourceMayLoadModules("const __require = require.apply.bind(require);"));
+    try std.testing.expect(!sourceMayLoadModules("const answer = 42;"));
 }
 
 const BundleDiagnostic = struct {
@@ -633,6 +791,15 @@ fn quotedDiagnosticName(message: []const u8, prefix: []const u8) ?[]const u8 {
     return message[prefix.len..end];
 }
 
+fn isRuntimePackageDiagnostic(name: []const u8) bool {
+    return name.len > 0 and
+        name[0] != '.' and
+        name[0] != '/' and
+        name[0] != '\\' and
+        std.mem.indexOfScalar(u8, name, ':') == null and
+        std.mem.indexOfScalar(u8, name, '/') == null;
+}
+
 // COTTONTAIL-COMPAT: Direct execution currently links through Cottontail's
 // native bundler instead of JSC's module loader. Preserve Bun's runtime-facing
 // linkage diagnostics here; Bun.build continues to expose compiler diagnostics.
@@ -643,12 +810,7 @@ fn runtimeLinkDiagnostic(
 ) !?[]const u8 {
     const diagnostic = parseBundleDiagnostic(text, script_abs);
     if (quotedDiagnosticName(diagnostic.message, "Could not resolve: \"")) |name| {
-        const is_bare_package = name.len > 0 and
-            name[0] != '.' and
-            name[0] != '/' and
-            name[0] != '\\' and
-            std.mem.indexOfScalar(u8, name, ':') == null;
-        if (is_bare_package) {
+        if (isRuntimePackageDiagnostic(name)) {
             return try std.fmt.allocPrint(
                 ctx.allocator,
                 "error: Cannot find package '{s}'\n    at {s}:{}:{}",
@@ -737,6 +899,13 @@ test "parse Bun and legacy compiler diagnostics" {
     try std.testing.expectEqualStrings("C:\\project\\source.ts", legacy.file);
     try std.testing.expectEqual(@as(usize, 2), legacy.line);
     try std.testing.expectEqual(@as(usize, 7), legacy.column);
+}
+
+test "runtime missing-package diagnostics follow Bun's resolver classification" {
+    try std.testing.expect(isRuntimePackageDiagnostic("is-even"));
+    try std.testing.expect(!isRuntimePackageDiagnostic("@helpers/math"));
+    try std.testing.expect(!isRuntimePackageDiagnostic("package/subpath"));
+    try std.testing.expect(!isRuntimePackageDiagnostic("./local.js"));
 }
 
 test "classify runtime missing-export diagnostics" {

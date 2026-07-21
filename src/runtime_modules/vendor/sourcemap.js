@@ -272,6 +272,51 @@ function virtualSourceMapping(state, sourceIndex) {
   return mapping;
 }
 
+function remapVirtualSourcePosition(mapping, line, column) {
+  if (!mapping || mapping.anchors.length === 0) return null;
+
+  let target = Math.max(0, Number(line) - 1);
+  let mappedColumn = Number(column);
+  for (let index = target; index >= Math.max(0, target - 1); index -= 1) {
+    const constructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(
+      mapping.transformedLines[index] ?? "",
+    );
+    if (!constructor) continue;
+    target = index;
+    mappedColumn = constructor.index + constructor[0].lastIndexOf(constructor[1]) + 1;
+    break;
+  }
+  for (let index = target; index >= Math.max(0, target - 2); index -= 1) {
+    if (!/\brequire\s*\(/.test(mapping.transformedLines[index] ?? "")) continue;
+    const tryIndex = index - 1;
+    const tryLine = mapping.transformedLines[tryIndex] ?? "";
+    const brace = /^\s*try\s*\{/.test(tryLine) ? tryLine.indexOf("{") : -1;
+    if (brace >= 0) {
+      target = tryIndex;
+      mappedColumn = brace + 1;
+    }
+    break;
+  }
+  let best = mapping.anchors[0];
+  let bestDistance = Math.abs(best[0] - target);
+  for (const anchor of mapping.anchors) {
+    const distance = Math.abs(anchor[0] - target);
+    if (distance > bestDistance && anchor[0] > target) break;
+    if (distance <= bestDistance) {
+      best = anchor;
+      bestDistance = distance;
+    }
+  }
+  const mappedLine = Math.max(0, Math.min(mapping.originalLines.length - 1, target + best[1] - best[0]));
+  return { source: mapping.source, line: mappedLine + 1, column: mappedColumn };
+}
+
+function finalizeMappedPosition(state, mapped) {
+  if (!mapped || mapped.sourceIndex == null) return mapped;
+  const virtual = virtualSourceMapping(state, mapped.sourceIndex);
+  return remapVirtualSourcePosition(virtual, mapped.line, mapped.column) ?? mapped;
+}
+
 function remapVirtualSourceFrame(state, file, line, column) {
   const cacheMarker = "/cache/";
   const cacheIndex = file.lastIndexOf(cacheMarker);
@@ -295,30 +340,7 @@ function remapVirtualSourceFrame(state, file, line, column) {
       ? { source: entrySource, line: Number(line), column: Number(column) }
       : null;
   }
-
-  let target = Math.max(0, Number(line) - 1);
-  let mappedColumn = Number(column);
-  for (let index = target; index >= Math.max(0, target - 1); index -= 1) {
-    const constructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(
-      mapping.transformedLines[index] ?? "",
-    );
-    if (!constructor) continue;
-    target = index;
-    mappedColumn = constructor.index + constructor[0].lastIndexOf(constructor[1]) + 1;
-    break;
-  }
-  let best = mapping.anchors[0];
-  let bestDistance = Math.abs(best[0] - target);
-  for (const anchor of mapping.anchors) {
-    const distance = Math.abs(anchor[0] - target);
-    if (distance > bestDistance && anchor[0] > target) break;
-    if (distance <= bestDistance) {
-      best = anchor;
-      bestDistance = distance;
-    }
-  }
-  const mappedLine = Math.max(0, Math.min(mapping.originalLines.length - 1, target + best[1] - best[0]));
-  return { source: mapping.source, line: mappedLine + 1, column: mappedColumn };
+  return remapVirtualSourcePosition(mapping, line, column);
 }
 
 function lookup(state, line, column) {
@@ -349,7 +371,8 @@ export function remapPosition(line, column) {
   const state = getState();
   if (!state) return null;
   const mapped = lookup(state, Number(line), Number(column));
-  return mapped && { source: mapped.source, line: mapped.line, column: mapped.column };
+  const display = finalizeMappedPosition(state, mapped);
+  return display && { source: display.source, line: display.line, column: display.column };
 }
 
 export function remapErrorPosition(line, column) {
@@ -360,13 +383,14 @@ export function remapErrorPosition(line, column) {
   const initial = lookup(state, generatedLine, generatedColumn);
   const mapped = initial ? preferConstructedErrorCallSite(state, generatedLine, generatedColumn, initial) : null;
   if (!mapped) return null;
+  const display = finalizeMappedPosition(state, mapped);
   const firstExecutableGeneratedLine = state.firstExecutableGeneratedLines[mapped.sourceIndex];
   const firstGeneratedLine = state.firstGeneratedLines[mapped.sourceIndex];
   const mappedGeneratedLine = mapped.generatedLine ?? generatedLine;
   return {
-    source: mapped.source,
-    line: mapped.line,
-    column: mapped.column,
+    source: display.source,
+    line: display.line,
+    column: display.column,
     originalLine: firstExecutableGeneratedLine >= 0
       ? mappedGeneratedLine - firstExecutableGeneratedLine
       : firstGeneratedLine >= 0
@@ -403,11 +427,12 @@ export function sourceContextForLocation(source, line, column) {
     sourceIndex = bestIndex;
   }
   if (sourceIndex < 0 || !state.sourceLines[sourceIndex]) return null;
+  const virtual = virtualSourceMapping(state, sourceIndex);
   return {
-    source: state.sources[sourceIndex],
+    source: virtual?.source ?? state.sources[sourceIndex],
     line: Number(line),
     column: Number(column),
-    lines: state.sourceLines[sourceIndex],
+    lines: virtual?.originalLines ?? state.sourceLines[sourceIndex],
   };
 }
 
@@ -459,7 +484,8 @@ export function remapStackString(stack) {
       const column = Number(columnText);
       const initial = lookup(state, line, column);
       const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
-      return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
+      const display = finalizeMappedPosition(state, mapped);
+      return display ? `${display.source}:${display.line}:${display.column}` : match;
     });
   }
   if (state && (remapped.includes("/cache/") || remapped.includes("/run/"))) {
@@ -474,7 +500,20 @@ export function remapStackString(stack) {
   for (let index = 0; index < state.generatedSources.length; index += 1) {
     const generated = state.generatedSources[index];
     const original = state.sources[index];
-    if (generated !== original && remapped.includes(generated)) remapped = remapped.replaceAll(generated, original);
+    if (generated === original || !remapped.includes(generated)) continue;
+    const virtual = virtualSourceMapping(state, index);
+    if (virtual) {
+      const sourcePattern = escapeRegExp(generated);
+      remapped = remapped.replace(
+        new RegExp(`((?:file:\\/\\/)?)${sourcePattern}:(\\d+):(\\d+)`, "g"),
+        (match, fileScheme, lineText, columnText) => {
+          const mapped = remapVirtualSourcePosition(virtual, Number(lineText), Number(columnText));
+          return mapped ? `${fileScheme}${mapped.source}:${mapped.line}:${mapped.column}` : match;
+        },
+      );
+    } else {
+      remapped = remapped.replaceAll(generated, original);
+    }
   }
   remapped = remapAdjacentBundleFrames(remapped);
   const activeBundlePath = state?.bundlePath;
@@ -496,7 +535,8 @@ function remapAdjacentBundleFrames(stack) {
     const column = Number(columnText);
     const initial = lookup(state, line, column);
     const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
-    return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
+    const display = finalizeMappedPosition(state, mapped);
+    return display ? `${display.source}:${display.line}:${display.column}` : match;
   });
 }
 

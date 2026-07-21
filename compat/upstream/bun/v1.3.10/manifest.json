@@ -13,6 +13,7 @@
   ],
   "notes": [
     "This is an owned Cottontail compatibility-test snapshot copied from Bun.",
+    "The minimal root package.json preserves Bun's repository package boundary so ancestor package discovery cannot escape into Cottontail's own package.json.",
     "Do not edit copied upstream tests in place unless intentionally forking them; document local ownership changes in status.json."
   ]
 }
