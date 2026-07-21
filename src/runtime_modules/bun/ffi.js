@@ -573,9 +573,20 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
   if (prototype === Symbol.prototype) return `[Symbol: ${String(Symbol.prototype.valueOf.call(value))}]`;
 
   if (value instanceof Error) {
-    const name = value.name ?? "Error";
-    const header = value.message ? `${name}: ${value.message}` : String(name);
-    const stack = typeof value.stack === "string" && value.stack.length > 0 ? value.stack : "";
+    let name = "Error";
+    let message = "";
+    let stack = "";
+    try {
+      if (value.name != null) name = String(value.name);
+    } catch {}
+    try {
+      if (value.message != null) message = String(value.message);
+    } catch {}
+    try {
+      const candidate = value.stack;
+      if (typeof candidate === "string" && candidate.length > 0) stack = candidate;
+    } catch {}
+    const header = message ? `${name}: ${message}` : name;
     const rendered = !stack ? header : stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`;
     return `${rendered}${formatConsoleErrorProperties(value, seen, objectDepth, indent, options)}`;
   }
