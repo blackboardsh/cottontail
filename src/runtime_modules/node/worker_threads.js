@@ -32,6 +32,7 @@ const transferredPortPeers = new Map();
 const transferredPortRoutes = new Map();
 const transferredPortTargets = new Map();
 const receivedMessagePorts = new Map();
+const sharedEnvironmentGroups = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 const messagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
@@ -40,6 +41,10 @@ let nextPortId = 1;
 let nextBroadcastChannelId = 1;
 let nextWorkerControlRequestId = 1;
 let nextThreadMessageRequestId = 1;
+let nextSharedEnvironmentGroupId = 1;
+let activeSharedEnvironmentGroupId = null;
+let sharedEnvironmentProxyInstalled = false;
+let applyingSharedEnvironmentUpdate = false;
 const threadMessageRequests = new Map();
 const inheritedUncaughtExceptionListeners = new Set(globalThis.process?.listeners?.("uncaughtException") ?? []);
 let workerUserCaptureCallbackInstalled = false;
@@ -596,6 +601,147 @@ function stringEnvironment(source) {
   return result;
 }
 
+function sharedEnvironmentGroup(groupId) {
+  const id = String(groupId);
+  let group = sharedEnvironmentGroups.get(id);
+  if (!group) {
+    group = { members: new Set() };
+    sharedEnvironmentGroups.set(id, group);
+  }
+  return group;
+}
+
+function applySharedEnvironmentUpdate(key, value, deleted) {
+  if (!globalThis.process?.env) return;
+  applyingSharedEnvironmentUpdate = true;
+  try {
+    if (deleted) delete globalThis.process.env[key];
+    else globalThis.process.env[key] = value;
+  } finally {
+    applyingSharedEnvironmentUpdate = false;
+  }
+}
+
+function brokerSharedEnvironmentUpdate(control) {
+  if (!isMainThread) return;
+  const groupId = String(control.groupId);
+  const group = sharedEnvironmentGroups.get(groupId);
+  if (!group) return;
+  const sourceThreadId = Number(control.sourceThreadId);
+  for (const targetThreadId of group.members) {
+    if (targetThreadId === sourceThreadId) continue;
+    if (targetThreadId === 0) {
+      applySharedEnvironmentUpdate(String(control.key), control.value, control.deleted === true);
+      continue;
+    }
+    try {
+      sendControlToThread(targetThreadId, {
+        type: "sharedEnvironmentUpdate",
+        groupId,
+        sourceThreadId,
+        key: String(control.key),
+        value: control.value,
+        deleted: control.deleted === true,
+      });
+    } catch {
+      group.members.delete(targetThreadId);
+    }
+  }
+}
+
+function publishSharedEnvironmentUpdate(key, value, deleted = false) {
+  if (activeSharedEnvironmentGroupId === null || applyingSharedEnvironmentUpdate) return;
+  const control = {
+    type: "sharedEnvironmentUpdate",
+    groupId: activeSharedEnvironmentGroupId,
+    sourceThreadId: threadId,
+    key: String(key),
+    value,
+    deleted,
+  };
+  if (isMainThread) brokerSharedEnvironmentUpdate(control);
+  else sendControlToThread(0, control);
+}
+
+function installSharedEnvironmentProxy() {
+  if (sharedEnvironmentProxyInstalled || !globalThis.process?.env) return;
+  const environment = globalThis.process.env;
+  const shared = new Proxy(environment, {
+    set(target, key, value) {
+      const result = Reflect.set(target, key, value, target);
+      if (result && typeof key !== "symbol") {
+        publishSharedEnvironmentUpdate(key, Reflect.get(target, key, target), false);
+      }
+      return result;
+    },
+    defineProperty(target, key, descriptor) {
+      const result = Reflect.defineProperty(target, key, descriptor);
+      if (result && typeof key !== "symbol") {
+        publishSharedEnvironmentUpdate(key, Reflect.get(target, key, target), false);
+      }
+      return result;
+    },
+    deleteProperty(target, key) {
+      const result = Reflect.deleteProperty(target, key);
+      if (result && typeof key !== "symbol") publishSharedEnvironmentUpdate(key, undefined, true);
+      return result;
+    },
+  });
+  globalThis.process.env = shared;
+  if (globalThis.Bun) globalThis.Bun.env = shared;
+  sharedEnvironmentProxyInstalled = true;
+}
+
+function activateSharedEnvironment(groupId) {
+  if (groupId == null) return null;
+  activeSharedEnvironmentGroupId = String(groupId);
+  installSharedEnvironmentProxy();
+  return activeSharedEnvironmentGroupId;
+}
+
+function ensureSharedEnvironmentGroup() {
+  if (activeSharedEnvironmentGroupId === null) {
+    activateSharedEnvironment(`${threadId}:${nextSharedEnvironmentGroupId++}`);
+    if (isMainThread) sharedEnvironmentGroup(activeSharedEnvironmentGroupId).members.add(threadId);
+    else sendControlToThread(0, {
+      type: "sharedEnvironmentRegister",
+      groupId: activeSharedEnvironmentGroupId,
+      memberThreadIds: [threadId],
+    });
+  }
+  return activeSharedEnvironmentGroupId;
+}
+
+function registerSharedEnvironmentWorker(groupId, workerThreadId) {
+  if (groupId == null) return;
+  const members = [threadId, Number(workerThreadId)];
+  if (isMainThread) {
+    const group = sharedEnvironmentGroup(groupId);
+    for (const member of members) group.members.add(member);
+  } else {
+    sendControlToThread(0, {
+      type: "sharedEnvironmentRegister",
+      groupId: String(groupId),
+      memberThreadIds: members,
+    });
+  }
+}
+
+function unregisterSharedEnvironmentWorker(groupId, workerThreadId) {
+  if (groupId == null) return;
+  if (isMainThread) {
+    sharedEnvironmentGroups.get(String(groupId))?.members.delete(Number(workerThreadId));
+  } else {
+    try {
+      sendControlToThread(0, {
+        type: "sharedEnvironmentUnregister",
+        groupId: String(groupId),
+        memberThreadId: Number(workerThreadId),
+      });
+    } catch {}
+  }
+}
+
 function workerRunSource(input) {
   if (input.kind === "eval") {
     return [
@@ -630,7 +776,7 @@ function workerRunSource(input) {
   ].join("\n");
 }
 
-function makeWorkerWrapper(input, options = {}) {
+function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null) {
   const workerDataWire = encodeWireMessage(
     Object.prototype.hasOwnProperty.call(options, "workerData") ? options.workerData : undefined,
     options.transferList,
@@ -660,6 +806,7 @@ function makeWorkerWrapper(input, options = {}) {
     stdout: options.stdout === true,
     stderr: options.stderr === true,
     shareEnvironment,
+    sharedEnvironmentGroupId,
   };
   const dir = workerTempDir();
   cottontail.mkdirSync?.(dir, true);
@@ -672,13 +819,13 @@ function makeWorkerWrapper(input, options = {}) {
     `  globalThis.process.execArgv = ${JSON.stringify(execArgv)};`,
     `}`,
     `if (globalThis.Bun) globalThis.Bun.argv = ${JSON.stringify(argv)};`,
-    `await import("node:worker_threads");`,
     `if (globalThis.process) {`,
     `  const __ctWorkerEnv = globalThis.process.env ?? {};`,
     `  for (const __ctKey of Object.keys(__ctWorkerEnv)) delete __ctWorkerEnv[__ctKey];`,
     `  Object.assign(__ctWorkerEnv, ${JSON.stringify(workerEnvironment)});`,
     `  globalThis.process.env = __ctWorkerEnv;`,
     `}`,
+    `await import("node:worker_threads");`,
     `globalThis.__cottontailConfigureWorkerStdio?.();`,
     `globalThis.__cottontailWorkerThreadsNotifyReady?.();`,
     `try {`,
@@ -824,7 +971,8 @@ export class Worker extends EventEmitter {
     const processEmitAtCreation = processObject?.emit;
     const input = normalizeWorkerInput(filename, options);
     const emptyEvalSource = input.kind === "eval" && !/\S/.test(input.source);
-    const wrapper = makeWorkerWrapper(input, options);
+    const sharedEnvironmentGroupId = options.env === SHARE_ENV ? ensureSharedEnvironmentGroup() : null;
+    const wrapper = makeWorkerWrapper(input, options, sharedEnvironmentGroupId);
 
     this.threadId = 0;
     this.threadName = String(options.name ?? "");
@@ -850,10 +998,15 @@ export class Worker extends EventEmitter {
     this._terminationResolve = null;
     this._terminationFallback = null;
     this._terminationDeferred = false;
+    this._sharedEnvironmentGroupId = sharedEnvironmentGroupId;
 
     this._worker = new globalThis.Worker(wrapper, {
       [Symbol.for("cottontail.worker.prepared-script")]: true,
       [Symbol.for("cottontail.worker.eval-source")]: input.kind === "eval" ? input.source : undefined,
+      [Symbol.for("cottontail.worker.thread-name")]: this.threadName,
+      [Symbol.for("cottontail.worker.stack-size")]: Number(options.resourceLimits?.stackSizeMb) > 0
+        ? Number(options.resourceLimits.stackSizeMb) * 1024 * 1024
+        : undefined,
     });
     this.threadId = Number(this._worker.id ?? this._worker.handle?.id ?? 0);
     this._nativeThreadId = this.threadId;
@@ -871,6 +1024,7 @@ export class Worker extends EventEmitter {
       }
     }
     workerInstances.set(this._nativeThreadId, this);
+    registerSharedEnvironmentWorker(this._sharedEnvironmentGroupId, this._nativeThreadId);
 
     this._worker.onmessage = (event) => this._handleMessage(event);
     this._worker.onerror = (event) => {
@@ -978,6 +1132,7 @@ export class Worker extends EventEmitter {
     this._refed = false;
     this._exitCode = this._reportedExitCode ?? (Number(code) || 0);
     workerInstances.delete(this._nativeThreadId);
+    unregisterSharedEnvironmentWorker(this._sharedEnvironmentGroupId, this._nativeThreadId);
     if (isMainThread) {
       removeBroadcastSubscriptionsForThread(this._nativeThreadId);
       cleanupBrokerLocksForThread(this._nativeThreadId);
@@ -1387,6 +1542,7 @@ globalThis.MessageChannel = MessageChannel;
 function initializeWorkerMetadata() {
   if (isMainThread) return;
   const bootstrap = globalThis.__cottontailWorkerBootstrap ?? {};
+  activateSharedEnvironment(bootstrap.sharedEnvironmentGroupId);
   workerData = bootstrap.workerDataWire != null
     ? decodeWireMessage(bootstrap.workerDataWire)
     : globalThis.__cottontailWorkerData ?? null;
@@ -1730,6 +1886,25 @@ function handleWorkerControl(control) {
     return true;
   }
   switch (control?.type) {
+    case "sharedEnvironmentRegister": {
+      if (isMainThread) {
+        const group = sharedEnvironmentGroup(control.groupId);
+        for (const member of control.memberThreadIds ?? []) group.members.add(Number(member));
+      }
+      return true;
+    }
+    case "sharedEnvironmentUnregister": {
+      if (isMainThread) {
+        sharedEnvironmentGroups.get(String(control.groupId))?.members.delete(Number(control.memberThreadId));
+      }
+      return true;
+    }
+    case "sharedEnvironmentUpdate":
+      if (isMainThread) brokerSharedEnvironmentUpdate(control);
+      else if (String(control.groupId) === activeSharedEnvironmentGroupId) {
+        applySharedEnvironmentUpdate(String(control.key), control.value, control.deleted === true);
+      }
+      return true;
     case "threadMessage":
       dispatchThreadMessage(control);
       return true;

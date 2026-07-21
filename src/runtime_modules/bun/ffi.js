@@ -2305,6 +2305,8 @@ const workerBundleCache = new Map();
 const workerRuntimePreludeCache = new Map();
 const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
+const workerThreadName = Symbol.for("cottontail.worker.thread-name");
+const workerStackSize = Symbol.for("cottontail.worker.stack-size");
 
 function workerTempDir() {
   const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
@@ -2509,7 +2511,12 @@ g.Worker ??= class Worker {
   _startWorker(scriptPath, options) {
     if (this._terminated) return;
     this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
-    this.handle = cottontail.spawnWorker(this.scriptPath, options?.[workerEvalSource]);
+    this.handle = cottontail.spawnWorker(
+      this.scriptPath,
+      options?.[workerEvalSource],
+      options?.[workerThreadName],
+      options?.[workerStackSize],
+    );
     this.id = this.handle.id;
     this.threadId = this.id;
     if (typeof cottontail.workerHasRef === "function") {

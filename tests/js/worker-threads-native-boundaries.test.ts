@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import {
   BroadcastChannel,
   MessageChannel,
-  SHARE_ENV,
   Worker,
   locks,
   moveMessagePortToContext,
@@ -52,20 +51,12 @@ test("Worker ref state follows native startup and exit lifecycle", async () => {
   expect(worker.hasRef()).toBe(false);
 });
 
-test.todo("COTTONTAIL-COMPAT: resourceLimits needs native JSC heap and thread-stack enforcement", async () => {
+test.todo("COTTONTAIL-COMPAT: resourceLimits still needs native JSC heap enforcement", async () => {
   const worker = new Worker(`for (;;) new ArrayBuffer(1024 * 1024);`, {
     eval: true,
     resourceLimits: { maxOldGenerationSizeMb: 8, stackSizeMb: 1 },
   });
   expect(await once(worker, "error")).toBeDefined();
-});
-
-test.todo("COTTONTAIL-COMPAT: Worker name needs native OS-thread naming in addition to JS metadata", () => {});
-
-test.todo("COTTONTAIL-COMPAT: SHARE_ENV needs a process-wide live environment binding", async () => {
-  const worker = new Worker(`process.env.CT_SHARE_ENV_PROBE = "worker";`, { eval: true, env: SHARE_ENV });
-  await once(worker, "exit");
-  expect(process.env.CT_SHARE_ENV_PROBE).toBe("worker");
 });
 
 test("BroadcastChannel delivers across worker isolates", async () => {
