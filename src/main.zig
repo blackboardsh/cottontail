@@ -1578,10 +1578,30 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     if (result.get("success")) |success| {
         if (success == .bool and !success.bool) {
             if (result.get("logs")) |logs| {
+                var printed_error = false;
                 if (logs == .array) for (logs.array.items) |log| {
                     if (log == .object) {
                         if (log.object.get("message")) |message| {
                             if (message == .string) {
+                                if (printed_error) try stderr.writeAll("\n");
+                                printed_error = true;
+                                if (log.object.get("position")) |position| {
+                                    if (position == .object) {
+                                        const line_text = position.object.get("lineText");
+                                        const line = position.object.get("line");
+                                        const column = position.object.get("column");
+                                        if (line_text != null and line_text.? == .string and
+                                            line != null and line.? == .integer and line.?.integer > 0 and
+                                            column != null and column.? == .integer and column.?.integer > 0)
+                                        {
+                                            try stderr.print("{} | {s}\n", .{ line.?.integer, line_text.?.string });
+                                            const caret_padding = std.fmt.count("{} | ", .{line.?.integer}) +
+                                                @as(usize, @intCast(column.?.integer - 1));
+                                            try stderr.splatByteAll(' ', caret_padding);
+                                            try stderr.writeAll("^\n");
+                                        }
+                                    }
+                                }
                                 try stderr.print("error: {s}\n", .{message.string});
                                 if (log.object.get("position")) |position| {
                                     if (position == .object) {

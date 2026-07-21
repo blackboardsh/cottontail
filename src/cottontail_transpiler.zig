@@ -179,22 +179,65 @@ fn setLogError(
         setStructuredLogError(error_out, log, allocator) catch {};
         if (error_out.* != null) return;
     }
+    var output: std.Io.Writer.Allocating = .init(c_allocator);
+    defer output.deinit();
+    var count: usize = 0;
     for (log.msgs.items) |message| {
-        if (message.kind == .err or message.kind == .warn) {
-            if (message.data.location) |location| {
-                setError(error_out, "{s}:{}:{}: {s}", .{
-                    location.file,
-                    location.line,
-                    location.column,
-                    message.data.text,
-                });
-            } else {
-                setError(error_out, "{s}", .{message.data.text});
+        if (message.kind != .err and message.kind != .warn) continue;
+        if (count > 0) output.writer.writeAll("\n\n") catch break;
+        if (message.data.location) |location| {
+            if (location.line_text) |raw_line_text| {
+                const line_text = std.mem.trimStart(
+                    u8,
+                    std.mem.trimEnd(u8, raw_line_text, " \r\n\t"),
+                    "\n\r",
+                );
+                if (location.line > 0 and location.column > 0 and line_text.len > 0) {
+                    output.writer.print("{d} | {s}\n", .{ location.line, line_text }) catch break;
+                    const caret_padding = std.fmt.count("{d} | ", .{location.line}) +
+                        @as(usize, @intCast(location.column - 1));
+                    output.writer.splatByteAll(' ', caret_padding) catch break;
+                    output.writer.writeAll("^\n") catch break;
+                }
             }
-            return;
+            output.writer.print("{s}: {s}\n    at {s}:{d}:{d}", .{
+                message.kind.string(),
+                message.data.text,
+                location.file,
+                location.line,
+                location.column,
+            }) catch break;
+        } else {
+            output.writer.print("{s}: {s}", .{ message.kind.string(), message.data.text }) catch break;
         }
+        count += 1;
+    }
+    if (count > 0) {
+        setError(error_out, "{s}", .{output.written()});
+        return;
     }
     setError(error_out, "JavaScript transform failed: {s}", .{@errorName(fallback)});
+}
+
+test "transform errors retain all source diagnostics" {
+    var error_message: ?[*:0]u8 = null;
+    const source =
+        \\const object = {
+        \\  a() {}
+        \\  b: async function(first) {}
+        \\};
+    ;
+    const output = process(.scan_imports, source, "", "js", &error_message) catch null;
+    defer if (output) |bytes| c_allocator.free(bytes);
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    const text = std.mem.span(error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2 |   a() {}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3 |   b: async function(first) {}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "error:") != null);
+    var separators = std.mem.splitSequence(u8, text, "\n\n");
+    var diagnostic_count: usize = 0;
+    while (separators.next()) |_| diagnostic_count += 1;
+    try std.testing.expect(diagnostic_count > 1);
 }
 
 fn jsonBool(object: std.json.ObjectMap, name: []const u8) ?bool {
