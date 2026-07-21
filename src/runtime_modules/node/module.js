@@ -222,6 +222,413 @@ let moduleParentWarningEmitted = false;
 let activeResolverConditions = null;
 let stripTypesWarningEmitted = false;
 
+const runtimePluginOnResolve = [];
+const runtimePluginOnLoad = [];
+const runtimePluginVirtualModules = new Map();
+const runtimePluginResolvedModules = new Map();
+const runtimePluginPendingLoads = new Map();
+const runtimePluginNamespacePattern = /^[/@A-Za-z0-9_-]+$/;
+
+function runtimePluginFilterMatches(filter, path) {
+  filter.lastIndex = 0;
+  const matched = filter.test(path);
+  filter.lastIndex = 0;
+  return matched;
+}
+
+function runtimePluginNamespace(value) {
+  const namespace = value == null || value === "" ? "file" : String(value);
+  if (!runtimePluginNamespacePattern.test(namespace)) {
+    throw new Error("namespace can only contain letters, numbers, dashes, or underscores");
+  }
+  return namespace;
+}
+
+function runtimePluginRegistration(kind, constraints, callback) {
+  if (constraints == null || typeof constraints !== "object" || !(constraints.filter instanceof RegExp)) {
+    throw new Error(`${kind}() expects first argument to be an object with a filter RegExp`);
+  }
+  if (typeof callback !== "function") {
+    throw new Error(`${kind}() expects second argument to be a function`);
+  }
+  return {
+    filter: constraints.filter,
+    namespace: runtimePluginNamespace(constraints.namespace),
+    callback,
+  };
+}
+
+function splitRuntimePluginSpecifier(specifier) {
+  const text = String(specifier);
+  const colon = text.indexOf(":");
+  if (colon < 0 || (colon === 1 && /^[A-Za-z]:[\\/]/.test(text))) {
+    return { namespace: "file", path: text };
+  }
+  const namespace = text.slice(0, colon);
+  if (!runtimePluginNamespacePattern.test(namespace)) return { namespace: "file", path: text };
+  return { namespace, path: text.slice(colon + 1) };
+}
+
+function runtimePluginKey(namespace, path) {
+  return namespace === "file" ? String(path) : `${namespace}:${path}`;
+}
+
+function runtimePluginRuleFor(rules, namespace, path) {
+  for (const rule of rules) {
+    if (rule.namespace !== namespace) continue;
+    if (runtimePluginFilterMatches(rule.filter, path)) return rule;
+  }
+  return null;
+}
+
+function normalizeRuntimePluginThrownError(error) {
+  if (error instanceof RangeError && error.message === "Maximum call stack size exceeded.") {
+    for (const property of ["sourceURL", "fileName", "line", "lineNumber", "column", "columnNumber"]) {
+      try { delete error[property]; } catch {}
+    }
+  }
+  return error;
+}
+
+function normalizeRuntimePluginResolution(result, importer) {
+  if (result == null) return null;
+  if (typeof result !== "object") throw new TypeError("onResolve() expects an object returned");
+  if (result.path == null) return null;
+  if (typeof result.path !== "string") {
+    throw new TypeError('Expected "path" to be a string in onResolve plugin');
+  }
+  if (result.path.length === 0) {
+    throw new TypeError('Expected "path" to be a non-empty string in onResolve plugin');
+  }
+  if (result.path === "." || result.path === ".." || result.path === "..." || result.path === " ") {
+    throw new TypeError('"path" is invalid in onResolve plugin');
+  }
+  if (result.namespace != null && typeof result.namespace !== "string") {
+    throw new TypeError('Expected "namespace" to be a string');
+  }
+  const namespace = runtimePluginNamespace(result.namespace);
+  let path = result.path;
+  if (namespace === "file" && !isAbsolute(path) && !path.startsWith("file:")) {
+    const base = importer && isAbsolute(importer) ? dirname(importer) : cottontail.cwd();
+    path = resolve(base, path);
+  }
+  const descriptor = { namespace, path, key: runtimePluginKey(namespace, path) };
+  runtimePluginResolvedModules.set(descriptor.key, descriptor);
+  return descriptor;
+}
+
+function resolveWithRuntimePlugins(specifier, importer = "", kind = "import") {
+  const text = String(specifier);
+  if (runtimePluginVirtualModules.has(text)) {
+    return { namespace: "virtual", path: text, key: text, virtual: true };
+  }
+  const initial = splitRuntimePluginSpecifier(text);
+  for (const rule of runtimePluginOnResolve) {
+    if (rule.namespace !== initial.namespace) continue;
+    if (!runtimePluginFilterMatches(rule.filter, initial.path)) continue;
+    let result;
+    try {
+      result = rule.callback({
+        path: initial.path,
+        importer: String(importer ?? ""),
+        namespace: initial.namespace,
+        kind,
+      });
+    } catch (error) {
+      throw normalizeRuntimePluginThrownError(error);
+    }
+    if (result && typeof result.then === "function") {
+      throw new TypeError("onResolve() doesn't support pending promises yet");
+    }
+    const descriptor = normalizeRuntimePluginResolution(result, importer);
+    if (descriptor) return descriptor;
+  }
+  if (initial.namespace !== "file" && runtimePluginRuleFor(runtimePluginOnLoad, initial.namespace, initial.path)) {
+    const descriptor = { ...initial, key: runtimePluginKey(initial.namespace, initial.path) };
+    runtimePluginResolvedModules.set(descriptor.key, descriptor);
+    return descriptor;
+  }
+  return null;
+}
+
+function runtimePluginDefaultLoader(path) {
+  const extension = String(path).replace(/[?#].*$/, "").toLowerCase().match(/\.[^.\\/]+$/)?.[0];
+  if (extension === ".jsx") return "jsx";
+  if (extension === ".ts" || extension === ".mts" || extension === ".cts") return "ts";
+  if (extension === ".tsx") return "tsx";
+  if (extension === ".json") return "json";
+  if (extension === ".toml") return "toml";
+  if (extension === ".yaml" || extension === ".yml") return "yaml";
+  if (extension === ".md") return "md";
+  return "js";
+}
+
+function runtimePluginContents(value) {
+  if (typeof value === "string") return value;
+  if (ArrayBuffer.isView(value)) {
+    return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+  }
+  throw new TypeError('Expected "contents" to be a string or an ArrayBufferView');
+}
+
+function normalizeRuntimePluginLoadResult(result, descriptor) {
+  if (result == null || typeof result !== "object") {
+    throw new TypeError("onLoad() expects an object returned");
+  }
+  const loader = result.loader == null ? runtimePluginDefaultLoader(descriptor.path) : String(result.loader);
+  if (!new Set(["js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", "md"]).has(loader)) {
+    throw new TypeError('Expected loader to be one of "js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", or "md"');
+  }
+  if (result.resolveDir != null && typeof result.resolveDir !== "string") {
+    throw new TypeError('Expected "resolveDir" to be a string');
+  }
+  if (loader === "object") {
+    if (!Object.hasOwn(result, "exports") || result.exports === null || typeof result.exports !== "object") {
+      throw new TypeError('"object" loader must return an "exports" object');
+    }
+    return { loader, exports: result.exports, resolveDir: result.resolveDir };
+  }
+  return {
+    loader,
+    contents: runtimePluginContents(result.contents),
+    resolveDir: result.resolveDir,
+  };
+}
+
+function runtimePluginObjectValues(exportsObject) {
+  const namespace = {};
+  for (const key of Object.keys(exportsObject)) namespace[key] = exportsObject[key];
+  if (!Object.hasOwn(namespace, "default")) namespace.default = exportsObject;
+  const requireValue = exportsObject.__esModule && Object.hasOwn(exportsObject, "default")
+    ? exportsObject.default
+    : Object.fromEntries(Object.keys(exportsObject).map((key) => [key, exportsObject[key]]));
+  return { namespace, requireValue };
+}
+
+function runtimePluginExecutionPath(descriptor, result) {
+  if (descriptor.namespace === "file" && isAbsolute(descriptor.path)) {
+    return splitSpecifierSuffix(descriptor.path).bare;
+  }
+  const root = result.resolveDir == null ? cottontail.cwd() : resolve(String(result.resolveDir));
+  const name = `${descriptor.namespace}-${descriptor.path}`.replace(/[^A-Za-z0-9._-]+/g, "_") || "module";
+  const extension = result.loader === "ts" ? ".ts"
+    : result.loader === "tsx" ? ".tsx"
+    : result.loader === "jsx" ? ".jsx"
+    : ".js";
+  return join(root, `__cottontail_plugin_${name}${extension}`);
+}
+
+function runtimePluginTranspile(contents, loader, path, specifier) {
+  if (loader === "json") return `export default ${JSON.stringify(JSON.parse(contents))};`;
+  if (loader === "toml") return `export default ${JSON.stringify(parseTOML(contents))};`;
+  if (loader === "yaml") {
+    const value = globalThis.Bun?.YAML?.parse?.(contents);
+    return `export default ${JSON.stringify(value)};`;
+  }
+  if (loader === "md") return `export default ${JSON.stringify(contents)};`;
+  if (typeof cottontail.transpilerTransform !== "function") {
+    return maybeStripTypeScript(path, contents);
+  }
+  try {
+    return String(cottontail.transpilerTransform(
+      contents,
+      JSON.stringify({
+        target: "bun",
+        deadCodeElimination: false,
+        _cottontailStructuredErrors: true,
+      }),
+      loader,
+    ));
+  } catch (error) {
+    const message = error?.message ?? String(error ?? "JavaScript transform failed");
+    const prefix = "COTTONTAIL_DIAGNOSTICS:";
+    if (message.startsWith(prefix)) {
+      try {
+        const diagnostics = JSON.parse(message.slice(prefix.length)).errors ?? [];
+        const errors = diagnostics.map((diagnostic) => {
+          const item = new SyntaxError(String(diagnostic.message ?? "Syntax error"));
+          if (diagnostic.position) item.position = diagnostic.position;
+          return item;
+        });
+        throw new AggregateError(errors, `${errors.length} errors building "${specifier}"`);
+      } catch (structuredError) {
+        if (structuredError instanceof AggregateError) throw structuredError;
+      }
+    }
+    if (error && (typeof error === "object" || typeof error === "function")) throw error;
+    throw new SyntaxError(message);
+  }
+}
+
+function cacheRuntimePluginModule(descriptor, requireValue, namespace) {
+  const module = makeModule(descriptor.key);
+  module.exports = requireValue;
+  module.loaded = true;
+  Object.defineProperty(module, "__cottontailPluginNamespace", {
+    value: namespace,
+    configurable: true,
+  });
+  commonJsCache.set(descriptor.key, module);
+  return module;
+}
+
+function evaluateRuntimePluginResult(descriptor, rawResult) {
+  const result = normalizeRuntimePluginLoadResult(rawResult, descriptor);
+  if (result.loader === "object") {
+    const values = runtimePluginObjectValues(result.exports);
+    return { ...values, async: false };
+  }
+  const executionPath = runtimePluginExecutionPath(descriptor, result);
+  const source = runtimePluginTranspile(result.contents, result.loader, executionPath, descriptor.key);
+  const namespace = executeDynamicImportSource(executionPath, source, "module");
+  if (namespace && typeof namespace.then === "function") {
+    return {
+      async: true,
+      promise: Promise.resolve(namespace).then((value) => {
+        if (value && typeof value === "object" && !Object.hasOwn(value, "__esModule")) {
+          Object.defineProperty(value, "__esModule", { value: true, configurable: true });
+        }
+        return { namespace: value, requireValue: value };
+      }),
+    };
+  }
+  if (namespace && typeof namespace === "object" && !Object.hasOwn(namespace, "__esModule")) {
+    Object.defineProperty(namespace, "__esModule", { value: true, configurable: true });
+  }
+  return { namespace, requireValue: namespace, async: false };
+}
+
+function runtimePluginCallback(descriptor) {
+  if (descriptor.virtual) return runtimePluginVirtualModules.get(descriptor.path);
+  return runtimePluginRuleFor(runtimePluginOnLoad, descriptor.namespace, descriptor.path)?.callback ?? null;
+}
+
+function loadRuntimePluginSync(descriptor) {
+  const cached = commonJsCache.get(descriptor.key);
+  if (cached) return cached.exports;
+  const callback = runtimePluginCallback(descriptor);
+  if (!callback) return undefined;
+  const rawResult = callback({ path: descriptor.path, namespace: descriptor.namespace });
+  if (rawResult && typeof rawResult.then === "function") {
+    Promise.resolve(rawResult).catch(() => {});
+    throw new TypeError(`require() async module "${descriptor.key}" is unsupported. use "await import()" instead.`);
+  }
+  const evaluated = evaluateRuntimePluginResult(descriptor, rawResult);
+  if (evaluated.async) {
+    evaluated.promise.catch(() => {});
+    throw new TypeError(`require() async module "${descriptor.key}" is unsupported. use "await import()" instead.`);
+  }
+  return cacheRuntimePluginModule(descriptor, evaluated.requireValue, evaluated.namespace).exports;
+}
+
+function importRuntimePlugin(descriptor) {
+  const cached = commonJsCache.get(descriptor.key);
+  if (cached) return cached.__cottontailPluginNamespace ?? namespaceFromCommonJs(cached.exports);
+  if (runtimePluginPendingLoads.has(descriptor.key)) return runtimePluginPendingLoads.get(descriptor.key);
+  const callback = runtimePluginCallback(descriptor);
+  if (!callback) return undefined;
+  let rawResult;
+  try {
+    rawResult = callback({ path: descriptor.path, namespace: descriptor.namespace });
+  } catch (error) {
+    throw error;
+  }
+  const finish = (value) => {
+    const evaluated = evaluateRuntimePluginResult(descriptor, value);
+    if (evaluated.async) {
+      return evaluated.promise.then((resolved) => {
+        cacheRuntimePluginModule(descriptor, resolved.requireValue, resolved.namespace);
+        return resolved.namespace;
+      });
+    }
+    cacheRuntimePluginModule(descriptor, evaluated.requireValue, evaluated.namespace);
+    return evaluated.namespace;
+  };
+  if (!rawResult || typeof rawResult.then !== "function") return finish(rawResult);
+  const pending = Promise.resolve(rawResult).then(finish);
+  runtimePluginPendingLoads.set(descriptor.key, pending);
+  pending.then(
+    () => runtimePluginPendingLoads.delete(descriptor.key),
+    () => runtimePluginPendingLoads.delete(descriptor.key),
+  );
+  return pending;
+}
+
+function tryImportRuntimePlugin(specifier, referrer, options = undefined, resolvedPath = undefined) {
+  void options;
+  const text = String(specifier);
+  const importer = referrer == null
+    ? cottontail.cwd()
+    : String(referrer).startsWith("file:") ? fileURLToPath(String(referrer)) : String(referrer);
+  const descriptor = resolveWithRuntimePlugins(text, importer, "dynamic-import");
+  if (descriptor) {
+    const value = importRuntimePlugin(descriptor);
+    if (value !== undefined) return { matched: true, value };
+    if (descriptor.namespace === "file") return { matched: false, resolved: descriptor.path };
+    throw moduleNotFoundError(descriptor.key, false);
+  }
+
+  let resolved = resolvedPath;
+  if (resolved == null) {
+    try {
+      resolved = resolveRequest(text, importer, true, "import");
+    } catch {
+      return null;
+    }
+  }
+  const fileDescriptor = {
+    namespace: "file",
+    path: String(resolved),
+    key: String(resolved),
+  };
+  if (!runtimePluginCallback(fileDescriptor)) return null;
+  return { matched: true, value: importRuntimePlugin(fileDescriptor) };
+}
+
+export function _registerBunPlugin(pluginOptions) {
+  if (arguments.length === 0) throw new TypeError("plugin needs at least one argument (an object)");
+  if (pluginOptions == null || typeof pluginOptions !== "object") {
+    throw new TypeError("plugin needs an object as first argument");
+  }
+  if (typeof pluginOptions.setup !== "function") throw new TypeError("plugin needs a setup() function");
+  if (pluginOptions.target != null && !["node", "bun", "browser"].includes(String(pluginOptions.target))) {
+    throw new TypeError("plugin target must be one of 'node', 'bun' or 'browser'");
+  }
+  const builder = {
+    target: "bun",
+    onResolve(constraints, callback) {
+      runtimePluginOnResolve.push(runtimePluginRegistration("onResolve", constraints, callback));
+      return builder;
+    },
+    onLoad(constraints, callback) {
+      runtimePluginOnLoad.push(runtimePluginRegistration("onLoad", constraints, callback));
+      return builder;
+    },
+    module(id, callback) {
+      if (arguments.length < 2) throw new Error("module() needs 2 arguments: a module ID and a function to call");
+      if (typeof id !== "string") throw new Error("module() expects first argument to be a string for the module ID");
+      if (typeof callback !== "function") throw new Error("module() expects second argument to be a function");
+      if (id.length === 0) throw new Error("virtual module cannot be blank");
+      if (isBuiltin(id)) throw new Error(`module() cannot be used to override builtin module "${id}"`);
+      if (id.startsWith(".")) throw new Error('virtual module cannot start with "."');
+      runtimePluginVirtualModules.set(id, callback);
+      runtimePluginPendingLoads.delete(id);
+      commonJsCache.delete(id);
+      globalThis.Loader?.registry?.delete?.(id);
+      return builder;
+    },
+  };
+  return pluginOptions.setup(builder);
+}
+
+globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resolvedPath) => {
+  try {
+    return tryImportRuntimePlugin(specifier, referrer, options, resolvedPath);
+  } catch (error) {
+    return { matched: true, value: Promise.reject(error) };
+  }
+};
+
 globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
   let resolved = String(specifier);
   if (!isAbsolute(resolved) && !resolved.startsWith("file://")) {
@@ -2143,10 +2550,12 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     }
     throw moduleNotFoundError(specifierText, false);
   }
+  const pluginAttempt = tryImportRuntimePlugin(specifierText, parent, options);
+  if (pluginAttempt?.matched) return pluginAttempt.value;
   if (specifierText.includes("://") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(specifierText)) {
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
-  const resolved = resolveRequest(String(specifier), parent, true, "import");
+  const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   if (loader === "text") {
     return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
@@ -2246,6 +2655,16 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
     const cached = commonJsCache.get(resolved);
     attachModuleChild(parent, cached);
     return cached.loaded === false ? circularRequireExports(cached) : cached.exports;
+  }
+  const pluginDescriptor = runtimePluginResolvedModules.get(resolved)
+    ?? (runtimePluginVirtualModules.has(resolved)
+      ? { namespace: "virtual", path: resolved, key: resolved, virtual: true }
+      : { namespace: "file", path: resolvedPath, key: resolved });
+  if (runtimePluginCallback(pluginDescriptor)) {
+    return loadRuntimePluginSync(pluginDescriptor);
+  }
+  if (runtimePluginResolvedModules.has(resolved) && pluginDescriptor.namespace !== "file") {
+    throw moduleNotFoundError(pluginDescriptor.key);
   }
   const hooked = applyLoadHooks(resolvedPath);
   if (hooked !== null) return hooked;
@@ -3122,6 +3541,9 @@ export function _resolveFilename(request, parent = undefined, isMain = false, op
   if (options !== undefined && options !== null && options.paths !== undefined && !Array.isArray(options.paths)) {
     throw invalidResolvePaths(options.paths);
   }
+  const base = parent?.filename || parent?.path || cottontail.cwd();
+  const pluginDescriptor = resolveWithRuntimePlugins(text, base, "require-call");
+  if (pluginDescriptor) return pluginDescriptor.key;
   if (options !== undefined && options !== null && Array.isArray(options.paths)) {
     if (options.paths.some((searchPath) => typeof searchPath !== "string")) {
       throw invalidResolvePathEntries();
@@ -3140,7 +3562,6 @@ export function _resolveFilename(request, parent = undefined, isMain = false, op
     }
     throw lastError ?? moduleNotFoundError(text);
   }
-  const base = parent?.filename || parent?.path || cottontail.cwd();
   return resolveRequest(text, base);
 }
 

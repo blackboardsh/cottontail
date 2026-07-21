@@ -3939,7 +3939,34 @@ fn writeWasiEntryWrapper(
 
 fn cleanupGeneratedSource(ctx: *const Context, generated_path: []const u8, original_path: []const u8) void {
     if (std.mem.eql(u8, generated_path, original_path)) return;
+    if (isTestAggregateEntrypointPath(original_path)) {
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            ctx.io,
+            generated_path,
+            ctx.allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch null;
+        if (source) |contents| cleanupGeneratedTestDependencies(ctx, contents);
+    }
     std.Io.Dir.cwd().deleteFile(ctx.io, generated_path) catch {};
+}
+
+const generated_test_dependency_marker = "/*@cottontail-generated-test-dependency-base64:";
+
+fn cleanupGeneratedTestDependencies(ctx: *const Context, source: []const u8) void {
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, generated_test_dependency_marker)) |start| {
+        const encoded_start = start + generated_test_dependency_marker.len;
+        const encoded_end = std.mem.indexOfPos(u8, source, encoded_start, "*/") orelse return;
+        cursor = encoded_end + 2;
+        const encoded = source[encoded_start..encoded_end];
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch continue;
+        const path = ctx.allocator.alloc(u8, decoded_len) catch continue;
+        std.base64.standard.Decoder.decode(path, encoded) catch continue;
+        if (std.mem.startsWith(u8, std.fs.path.basename(path), ".cottontail-compat-")) {
+            std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+        }
+    }
 }
 
 const EmptyMetadataPatch = struct {
@@ -3988,7 +4015,7 @@ fn writeBunCompatTransformedSource(
     ctx: *const Context,
     script_abs: []const u8,
     source_base_dir: ?[]const u8,
-) ![]const u8 {
+) anyerror![]const u8 {
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
         script_abs,
@@ -3997,6 +4024,12 @@ fn writeBunCompatTransformedSource(
     ) catch return script_abs;
     var transformed_source: []const u8 = source;
     var changed = false;
+    if (isTestAggregateEntrypointPath(script_abs)) {
+        if (try rewriteTestAggregateImports(ctx, transformed_source)) |transformed| {
+            transformed_source = transformed;
+            changed = true;
+        }
+    }
     const has_bun_transpiled_pragma = hasBunTranspiledPragma(source);
     if (bunCjsFactorySource(source)) |factory| {
         transformed_source = try std.mem.concat(ctx.allocator, u8, &.{
@@ -4077,6 +4110,67 @@ fn writeBunCompatTransformedSource(
     });
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = generated_path, .data = generated_source }) catch return script_abs;
     return generated_path;
+}
+
+fn rewriteTestAggregateImports(ctx: *const Context, source: []const u8) anyerror!?[]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(ctx.allocator);
+    var generated_paths: std.ArrayList([]const u8) = .empty;
+    defer generated_paths.deinit(ctx.allocator);
+    var copied_until: usize = 0;
+    var cursor: usize = 0;
+
+    while (cursor < source.len) {
+        if (!std.mem.startsWith(u8, source[cursor..], "import") or
+            (cursor > 0 and isIdentifierPart(source[cursor - 1])) or
+            (cursor + "import".len < source.len and isIdentifierPart(source[cursor + "import".len])))
+        {
+            cursor += 1;
+            continue;
+        }
+        const quote_start = skipWhitespace(source, cursor + "import".len);
+        if (quote_start >= source.len or (source[quote_start] != '\'' and source[quote_start] != '"')) {
+            cursor += "import".len;
+            continue;
+        }
+        const quote_end = skipQuotedJavaScript(source, quote_start);
+        if (quote_end > source.len) break;
+        const specifier = (try decodeJavaScriptStringPrefix(ctx.allocator, source[quote_start..quote_end])) orelse {
+            cursor = quote_end;
+            continue;
+        };
+        if (!std.fs.path.isAbsolute(specifier) or !isTestEntrypointPath(specifier)) {
+            cursor = quote_end;
+            continue;
+        }
+
+        const transformed_path = try writeBunCompatTransformedSource(ctx, specifier, null);
+        if (std.mem.eql(u8, transformed_path, specifier)) {
+            cursor = quote_end;
+            continue;
+        }
+        try output.appendSlice(ctx.allocator, source[copied_until..quote_start]);
+        try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, transformed_path));
+        copied_until = quote_end;
+        try generated_paths.append(ctx.allocator, transformed_path);
+        cursor = quote_end;
+    }
+
+    if (generated_paths.items.len == 0) {
+        output.deinit(ctx.allocator);
+        return null;
+    }
+    try output.appendSlice(ctx.allocator, source[copied_until..]);
+    const encoder = std.base64.standard.Encoder;
+    for (generated_paths.items) |path| {
+        const encoded_buffer = try ctx.allocator.alloc(u8, encoder.calcSize(path.len));
+        const encoded = encoder.encode(encoded_buffer, path);
+        try output.append(ctx.allocator, '\n');
+        try output.appendSlice(ctx.allocator, generated_test_dependency_marker);
+        try output.appendSlice(ctx.allocator, encoded);
+        try output.appendSlice(ctx.allocator, "*/\n");
+    }
+    return try output.toOwnedSlice(ctx.allocator);
 }
 
 fn hasBunTranspiledPragma(source: []const u8) bool {
@@ -4815,7 +4909,12 @@ fn scanDynamicImports(
                     break;
                 }
             }
-            if (!is_runtime_import) {
+            const literal = try decodeJavaScriptStringPrefix(ctx.allocator, expression);
+            const may_use_runtime_plugin = if (literal) |specifier|
+                if (inferredLoaderForTarget(specifier)) |loader| std.mem.eql(u8, loader, "file") else false
+            else
+                false;
+            if (!is_runtime_import and !may_use_runtime_plugin) {
                 cursor = close + 1;
                 continue;
             }
@@ -5102,6 +5201,8 @@ fn appendDynamicTargetFactory(
         \\  const __ctText = String(specifier);
         \\  const __ctMarker = __ctText.search(/[?#]/);
         \\  const __ctSuffix = __ctMarker < 0 ? "" : __ctText.slice(__ctMarker);
+        \\  const __ctPlugin = globalThis.__cottontailImportPluginModule?.(__ctText, __ctPath{d}, options, __ctPath{d} + __ctSuffix);
+        \\  if (__ctPlugin?.matched) return Promise.resolve(__ctPlugin.value);
         \\  const __ctInferredType = {s};
         \\  const __ctType = options?.with?.type ?? options?.assert?.type ?? options?.type ?? (__ctSuffix === "?raw" ? "text" : __ctInferredType);
         \\  const __ctKey = __ctPath{d} + __ctSuffix + (__ctType == null ? "" : "\\u0000" + __ctType);
@@ -5137,7 +5238,7 @@ fn appendDynamicTargetFactory(
         \\    const module = {{ exports: {{}} }};
         \\    const exports = module.exports;
         \\
-    , .{ index, path_literal, index, url_literal, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
+    , .{ index, path_literal, index, url_literal, index, index, index, inferred_loader_literal, index, index, dirname_literal, dirname_literal, basename_literal, index, index, index, index, index, raw_literal, index, index, index, index });
     try output.appendSlice(ctx.allocator, prefix);
     try output.appendSlice(ctx.allocator, "    const __ctDefaultFactorySource = ");
     try appendDynamicFactorySourceLiteral(

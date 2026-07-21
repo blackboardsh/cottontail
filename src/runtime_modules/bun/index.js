@@ -14,6 +14,7 @@ import * as zlib from "../node/zlib.js";
 import { createUndiciModule } from "../node/undici.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
+  _registerBunPlugin as nodeRegisterBunPlugin,
   _resolveForImport as nodeResolveForImport,
   __setBuiltinModules as nodeSetBuiltinModules,
   createRequire as nodeCreateRequire,
@@ -13713,8 +13714,8 @@ export async function udpSocket(options = {}) {
   return result;
 }
 
-export function plugin(_plugin) {
-  return undefined;
+export function plugin(pluginOptions) {
+  return nodeRegisterBunPlugin(...arguments);
 }
 
 export function registerMacro(_name, _macro = undefined) {
