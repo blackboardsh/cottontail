@@ -3059,7 +3059,7 @@ pub const BundleV2 = struct {
             }
 
             const runtime_alias = if (ctx.target.isBun())
-                this.transpiler.resolver.runtimeAlias(import_record.path.text)
+                this.transpiler.resolver.runtimeAliasForImport(import_record.path.text, import_record.kind)
             else
                 null;
 

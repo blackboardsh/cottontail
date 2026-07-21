@@ -2601,6 +2601,20 @@ pub const LinkerContext = struct {
                 },
                 .ignore => {},
             }
+
+            // Each internal Bake module executes in its own factory. Keep
+            // imported bindings attached to that factory's namespace object
+            // instead of letting the linker point them at another factory's
+            // local symbol.
+            if (c.options.output_format == .internal_bake_dev and !named_import.alias_is_star) {
+                if (named_import.namespace_ref) |namespace_ref| {
+                    c.graph.symbols.get(import_ref).?.namespace_alias = .{
+                        .namespace_ref = namespace_ref,
+                        .alias = named_import.alias orelse "",
+                        .import_record_index = named_import.import_record_index,
+                    };
+                }
+            }
         }
     }
 

@@ -60,10 +60,21 @@ pub fn convertStmtsForChunkForDevServer(
             const record = ast.import_records.mut(st.import_record_index);
             if (record.path.is_disabled) continue;
 
-            if (record.flags.is_unused) {
-                // Barrel optimization: this import was deferred (unused submodule).
-                // Don't add to dep array, but declare the namespace ref as an
-                // empty object so body code referencing it doesn't throw.
+            var target_has_live_parts = true;
+            if (record.source_index.isValid()) {
+                target_has_live_parts = false;
+                for (c.graph.ast.items(.parts)[record.source_index.get()].slice()) |part| {
+                    if (part.is_live) {
+                        target_has_live_parts = true;
+                        break;
+                    }
+                }
+            }
+
+            if (record.flags.is_unused or !target_has_live_parts) {
+                // Keep imports removed by barrel optimization or tree shaking
+                // out of the HMR dependency table. Declare a namespace object
+                // defensively when the converted body still has a reference.
                 if (st.star_name_loc != null or st.items.len > 0 or st.default_name != null) {
                     try stmts.inside_wrapper_prefix.appendNonDependency(Stmt.alloc(S.Local, .{
                         .kind = .k_var,

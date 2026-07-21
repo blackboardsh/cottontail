@@ -1,5 +1,5 @@
 import path from "../node/path.js";
-import { readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { Bun, serve } from "./index.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
@@ -57,16 +57,31 @@ const socketUrl = new URL("/_bun/hmr", location.href);
 socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
 const socket = new WebSocket(socketUrl);
 socket.binaryType = "arraybuffer";
+let versionSeen = false;
 socket.addEventListener("open", () => {
   console.info("[Bun] Hot-module-reloading socket connected, waiting for changes...");
-  socket.send("she");
+  socket.send("n");
 });
 socket.addEventListener("message", event => {
   const data = event.data;
-  const id = typeof data === "string"
-    ? data.charCodeAt(0)
-    : new Uint8Array(data)[0];
-  if (id === 117) window.location.reload();
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+  const id = bytes[0];
+  if (id === 86) {
+    if (versionSeen) window.location.reload();
+    versionSeen = true;
+    return;
+  }
+  if (id !== 117) return;
+  if (bytes.length <= 17) {
+    window.location.reload();
+    return;
+  }
+  try {
+    (0, eval)(new TextDecoder().decode(bytes.subarray(17)));
+  } catch (error) {
+    console.error(error);
+    window.location.reload();
+  }
 });
 </script>`;
 
@@ -104,51 +119,71 @@ async function loadBakeStaticConfig(projectRoot) {
   return config && typeof config === "object" ? config : {};
 }
 
-function bakeBuildErrorPage(logs, fallbackPath) {
-  const errors = logs.map(log => ({
+function bakeBuildErrors(logs, fallbackPath) {
+  return logs.map(log => ({
     file: path.basename(log.position?.file || fallbackPath),
     line: Number(log.position?.line || 0),
     column: Number(log.position?.column || 0),
     level: String(log.level || "error"),
     message: String(log.message || log),
   }));
+}
+
+const bakeSetErrorsClientSource = `(errors => {
+  const symbol = Symbol.for("cottontail.bake.set-errors");
+  let setErrors = globalThis[symbol];
+  if (!setErrors) {
+    let host = document.querySelector("bun-hmr");
+    if (!host) {
+      host = document.createElement("bun-hmr");
+      document.body.append(host);
+    }
+    const root = host.shadowRoot ?? host.attachShadow({ mode: "open" });
+    setErrors = nextErrors => {
+      host.style.display = nextErrors.length > 0 ? "block" : "none";
+      root.replaceChildren();
+      for (const error of nextErrors) {
+        const group = document.createElement("div");
+        group.className = "b-group";
+        const file = document.createElement("span");
+        file.className = "file-name";
+        file.textContent = error.file;
+        group.append(file);
+        const message = document.createElement("div");
+        message.className = "b-msg";
+        const label = document.createElement("span");
+        label.className = "log-label";
+        label.textContent = error.level;
+        const text = document.createElement("span");
+        text.className = "log-text";
+        text.textContent = error.message;
+        message.append(label, text);
+        if (error.line > 0) {
+          const gutter = document.createElement("span");
+          gutter.className = "gutter";
+          gutter.textContent = String(error.line);
+          const highlight = document.createElement("span");
+          highlight.className = "highlight-wrap";
+          const space = document.createElement("span");
+          space.className = "space";
+          space.textContent = " ".repeat(Math.max(0, error.column - 1));
+          highlight.append(space);
+          message.append(gutter, highlight);
+        }
+        group.append(message);
+        root.append(group);
+      }
+    };
+    globalThis[symbol] = setErrors;
+  }
+  setErrors(errors);
+})`;
+
+function bakeBuildErrorPage(errors) {
   const serialized = JSON.stringify(errors).replaceAll("<", "\\u003c");
   return `<!doctype html><html><head></head><body>
-<bun-hmr style="display:block"></bun-hmr>
 <script type="module">
-const host = document.querySelector("bun-hmr");
-const root = host.attachShadow({ mode: "open" });
-for (const error of ${serialized}) {
-  const group = document.createElement("div");
-  group.className = "b-group";
-  const file = document.createElement("span");
-  file.className = "file-name";
-  file.textContent = error.file;
-  group.append(file);
-  const message = document.createElement("div");
-  message.className = "b-msg";
-  const label = document.createElement("span");
-  label.className = "log-label";
-  label.textContent = error.level;
-  const text = document.createElement("span");
-  text.className = "log-text";
-  text.textContent = error.message;
-  message.append(label, text);
-  if (error.line > 0) {
-    const gutter = document.createElement("span");
-    gutter.className = "gutter";
-    gutter.textContent = String(error.line);
-    const highlight = document.createElement("span");
-    highlight.className = "highlight-wrap";
-    const space = document.createElement("span");
-    space.className = "space";
-    space.textContent = " ".repeat(Math.max(0, error.column - 1));
-    highlight.append(space);
-    message.append(gutter, highlight);
-  }
-  group.append(message);
-  root.append(group);
-}
+${bakeSetErrorsClientSource}(${serialized});
 </script>
 ${bakeLiveReloadClient}
 </body></html>`;
@@ -172,6 +207,10 @@ function isJavaScriptEntry(artifact) {
   return artifact.kind === "entry-point" && ["js", "jsx", "ts", "tsx"].includes(artifact.loader);
 }
 
+function isJavaScriptArtifact(artifact) {
+  return ["js", "jsx", "ts", "tsx"].includes(artifact.loader);
+}
+
 async function sourceEntryForArtifact(artifact, projectRoot) {
   if (!artifact.sourcemap) return null;
   let sourceMap;
@@ -193,6 +232,31 @@ async function sourceEntryForArtifact(artifact, projectRoot) {
       try {
         if (statSync(candidate).isFile()) return candidate;
       } catch {}
+    }
+  }
+  return null;
+}
+
+function metafileInputPath(projectRoot, inputPath) {
+  return path.isAbsolute(inputPath) ? path.normalize(inputPath) : path.resolve(projectRoot, inputPath);
+}
+
+function htmlJavaScriptEntries(metafile, htmlPath, projectRoot) {
+  for (const [inputPath, input] of Object.entries(metafile?.inputs ?? {})) {
+    if (metafileInputPath(projectRoot, inputPath) !== htmlPath) continue;
+    return (input.imports ?? [])
+      .map(item => metafileInputPath(projectRoot, item.path))
+      .filter(entryPath => isJavaScriptArtifact({ loader: loaderForPath(entryPath) }));
+  }
+  return [];
+}
+
+function sourceEntryForMetafileArtifact(metafile, artifact, outdir, projectRoot, htmlEntries) {
+  for (const [outputPath, output] of Object.entries(metafile?.outputs ?? {})) {
+    if (path.resolve(outdir, outputPath) !== path.normalize(artifact.path)) continue;
+    for (const inputPath of Object.keys(output.inputs ?? {})) {
+      const absoluteInput = metafileInputPath(projectRoot, inputPath);
+      if (htmlEntries.includes(absoluteInput)) return absoluteInput;
     }
   }
   return null;
@@ -229,9 +293,18 @@ function bakeRegistrySource(source) {
   return source.slice(start, end);
 }
 
-function createBakeHotUpdatePacket(source, scriptId) {
-  const registry = bakeRegistrySource(source);
-  const code = `globalThis[Symbol.for("bun:hmr")]({${registry}\n}, ${JSON.stringify(scriptId)})\n//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`;
+function bakeRegistryModules(source) {
+  return (0, eval)(`({${bakeRegistrySource(source)}\n})`);
+}
+
+function bakeModuleDefinitionSource(value) {
+  if (typeof value === "function") return value.toString();
+  if (Array.isArray(value)) return `[${value.map(bakeModuleDefinitionSource).join(",")}]`;
+  if (value === undefined) return "undefined";
+  return JSON.stringify(value);
+}
+
+function createBakeJavaScriptPacket(code) {
   const codeBytes = new TextEncoder().encode(code);
   const packet = new Uint8Array(17 + codeBytes.length);
   const view = new DataView(packet.buffer);
@@ -242,6 +315,34 @@ function createBakeHotUpdatePacket(source, scriptId) {
   view.setUint32(13, codeBytes.length, true);
   packet.set(codeBytes, 17);
   return packet;
+}
+
+function createBakeHotUpdatePacket(modules, scriptId) {
+  const registry = Object.entries(modules)
+    .map(([id, definition]) => `${JSON.stringify(id)}:${bakeModuleDefinitionSource(definition)}`)
+    .join(",\n");
+  return createBakeJavaScriptPacket(
+    `globalThis[Symbol.for("bun:hmr")]({${registry}\n}, ${JSON.stringify(scriptId)})\n` +
+    `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`,
+  );
+}
+
+function createBakeErrorUpdatePacket(errors, scriptId) {
+  return createBakeJavaScriptPacket(
+    `${bakeSetErrorsClientSource}(${JSON.stringify(errors)});\n` +
+    `globalThis[Symbol.for("bun:hmr")]?.({}, ${JSON.stringify(scriptId)});\n` +
+    `//# sourceMappingURL=/_bun/client/${scriptId}.js.map\n`,
+  );
+}
+
+function changedPathMatchesModule(projectRoot, changedPaths, moduleId) {
+  const cleanId = String(moduleId).split(/[?#]/, 1)[0];
+  if (!cleanId || cleanId.startsWith("bun:")) return false;
+  const modulePath = path.isAbsolute(cleanId) ? path.normalize(cleanId) : path.resolve(projectRoot, cleanId);
+  for (const changedPath of changedPaths) {
+    if (modulePath === path.resolve(projectRoot, changedPath)) return true;
+  }
+  return false;
 }
 
 function createHtmlDispatcher(config, development) {
@@ -261,6 +362,7 @@ function createHtmlDispatcher(config, development) {
   if (htmlRoutes.length === 0) return null;
 
   const bundles = new Map();
+  const successfulBundles = new Map();
   const assets = new Map();
   const retiredAssets = new Set();
   const staticConfig = loadBakeStaticConfig(projectRoot);
@@ -289,15 +391,18 @@ function createHtmlDispatcher(config, development) {
         sourcemap: development ? "external" : "none",
         define: buildConfig.define,
         env: buildConfig.env,
+        metafile: true,
         throw: false,
       });
       if (!result.success) {
         if (development) {
+          const errors = bakeBuildErrors(result.logs ?? [], htmlPath);
           return {
-            body: bakeBuildErrorPage(result.logs ?? [], htmlPath),
+            body: bakeBuildErrorPage(errors),
             sourceText,
             hmrEntries: [],
             buildError: true,
+            errors,
           };
         }
         throw new AggregateError(result.logs ?? [], `Failed to bundle Bake HTML route ${htmlPath}`);
@@ -305,6 +410,7 @@ function createHtmlDispatcher(config, development) {
 
       let htmlArtifact = null;
       const hmrEntries = [];
+      const htmlEntries = htmlJavaScriptEntries(result.metafile, htmlPath, projectRoot);
       const supportsInternalHmr = !result.outputs.some(output => output.kind === "asset" && output.loader === "file");
       for (const artifact of result.outputs) {
         if (artifact.loader === "html" && artifact.kind === "entry-point") {
@@ -313,13 +419,39 @@ function createHtmlDispatcher(config, development) {
         }
         const assetPath = outputAssetPath(outdir, artifact, buildConfig.publicPath);
         let servedArtifact = artifact;
-        if (development && buildConfig.hmr !== false && supportsInternalHmr && isJavaScriptEntry(artifact)) {
-          const entryPath = await sourceEntryForArtifact(artifact, projectRoot);
+        if (development && buildConfig.hmr !== false && supportsInternalHmr && isJavaScriptArtifact(artifact)) {
+          const entryPath = sourceEntryForMetafileArtifact(
+            result.metafile,
+            artifact,
+            outdir,
+            projectRoot,
+            htmlEntries,
+          ) ?? await sourceEntryForArtifact(artifact, projectRoot);
           if (entryPath) {
-            const internalArtifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+            let internalArtifact;
+            try {
+              internalArtifact = await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+            } catch (error) {
+              if (error instanceof AggregateError) {
+                const errors = bakeBuildErrors(error.errors ?? [], entryPath);
+                return {
+                  body: bakeBuildErrorPage(errors),
+                  sourceText,
+                  hmrEntries: [],
+                  buildError: true,
+                  errors,
+                };
+              }
+              throw error;
+            }
             const source = await internalArtifact.text();
             servedArtifact = internalArtifact;
-            hmrEntries.push({ entryPath, assetPath, source });
+            hmrEntries.push({
+              entryPath,
+              assetPath,
+              source,
+              modules: bakeRegistryModules(source),
+            });
           }
         }
         retiredAssets.delete(assetPath);
@@ -331,7 +463,7 @@ function createHtmlDispatcher(config, development) {
       const body = development && buildConfig.hmr !== false && hmrEntries.length === 0
         ? withBakeLiveReloadClient(await htmlArtifact.text())
         : development ? await htmlArtifact.text() : htmlArtifact;
-      return { body, sourceText, hmrEntries, buildError: false };
+      return { body, sourceText, hmrEntries, buildError: false, errors: [] };
     })();
     bundles.set(htmlPath, pending);
     try {
@@ -354,6 +486,7 @@ function createHtmlDispatcher(config, development) {
     for (const route of htmlRoutes) {
       if (!matchesHtmlRoute(route.pattern, pathname)) continue;
       const bundle = await buildHtml(route.path);
+      if (!bundle.buildError) successfulBundles.set(route.path, bundle);
       return new Response(bundle.body, {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
@@ -367,7 +500,7 @@ function createHtmlDispatcher(config, development) {
     for (const assetPath of assets.keys()) retiredAssets.add(assetPath);
     assets.clear();
   };
-  dispatchHtmlRequest.update = async () => {
+  dispatchHtmlRequest.update = async (changedPaths = []) => {
     const activePaths = [...bundles.keys()];
     const previousBundles = new Map();
     for (const htmlPath of activePaths) previousBundles.set(htmlPath, await bundles.get(htmlPath));
@@ -377,15 +510,40 @@ function createHtmlDispatcher(config, development) {
     const packets = [];
     for (const htmlPath of activePaths) {
       const previous = previousBundles.get(htmlPath);
+      const previousSuccessful = successfulBundles.get(htmlPath);
       const next = await buildHtml(htmlPath);
-      if (next.buildError || previous?.sourceText !== next.sourceText ||
-          previous?.hmrEntries.length === 0 || next.hmrEntries.length === 0) {
-        hardReload = true;
+      if (next.buildError) {
+        packets.push(createBakeErrorUpdatePacket(next.errors, nextHotUpdateId()));
         continue;
       }
-      for (const entry of next.hmrEntries) {
-        packets.push(createBakeHotUpdatePacket(entry.source, nextHotUpdateId()));
+      if (!previousSuccessful || previousSuccessful.sourceText !== next.sourceText ||
+          previousSuccessful.hmrEntries.length === 0 || next.hmrEntries.length === 0) {
+        hardReload = true;
+        successfulBundles.set(htmlPath, next);
+        continue;
       }
+      if (previous?.buildError) {
+        packets.push(createBakeErrorUpdatePacket([], nextHotUpdateId()));
+      }
+      for (const entry of next.hmrEntries) {
+        const previousEntry = previousSuccessful.hmrEntries.find(item => item.entryPath === entry.entryPath);
+        if (!previousEntry) {
+          hardReload = true;
+          continue;
+        }
+        const changedModules = {};
+        for (const [id, definition] of Object.entries(entry.modules)) {
+          const previousDefinition = previousEntry.modules[id];
+          if (changedPathMatchesModule(projectRoot, changedPaths, id) ||
+              moduleDefinitionSignature(previousDefinition) !== moduleDefinitionSignature(definition)) {
+            changedModules[id] = definition;
+          }
+        }
+        if (Object.keys(changedModules).length > 0) {
+          packets.push(createBakeHotUpdatePacket(changedModules, nextHotUpdateId()));
+        }
+      }
+      successfulBundles.set(htmlPath, next);
     }
     return { hardReload, packets };
   };
@@ -487,11 +645,32 @@ function routeFiles(route) {
 }
 
 function executeCommonJSArtifact(source, filename) {
-  const factory = (0, eval)(source);
+  const sourceUrl = pathToFileURL(filename).href.replaceAll("\n", "");
+  const factory = (0, eval)(`${source}\n//# sourceURL=${sourceUrl}`);
   if (typeof factory !== "function") throw new TypeError("Bake's server bundle did not produce a CommonJS factory");
   const module = { exports: {} };
   factory(module.exports, globalThis.require, module, filename, path.dirname(filename));
   return module.exports;
+}
+
+function bakeBuiltinNamespace(specifier) {
+  const value = globalThis.require(specifier);
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return { default: value };
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "default")) return value;
+
+  const namespace = Object.create(null);
+  Object.defineProperty(namespace, "default", { enumerable: true, value });
+  for (const key of Object.getOwnPropertyNames(value)) {
+    if (key === "default") continue;
+    Object.defineProperty(namespace, key, {
+      configurable: true,
+      enumerable: Object.getOwnPropertyDescriptor(value, key)?.enumerable ?? true,
+      get: () => value[key],
+    });
+  }
+  return namespace;
 }
 
 function commonJSRouteWrapperSource(serverEntryPoint, page, layouts) {
@@ -615,7 +794,7 @@ function createFrameworkDispatcher(config) {
           hmrRuntime = parsed.factory(framework.serverComponents?.separateSSRGraph === true, {
             require: globalThis.require,
             resolve: specifier => specifier,
-            bakeBuiltin: specifier => globalThis.require(specifier),
+            bakeBuiltin: bakeBuiltinNamespace,
             url: pathToFileURL(`${projectRoot}${path.sep}`).href,
           });
           if (typeof hmrRuntime?.handleRequest !== "function" || typeof hmrRuntime?.registerUpdate !== "function") {
@@ -723,6 +902,29 @@ function projectSnapshot(root) {
   return files.join("\n");
 }
 
+function changedSnapshotPaths(previous, next) {
+  const previousEntries = new Map();
+  for (const line of previous.split("\n")) {
+    if (!line) continue;
+    const separator = line.indexOf("\0");
+    previousEntries.set(line.slice(0, separator), line.slice(separator + 1));
+  }
+  const nextEntries = new Map();
+  for (const line of next.split("\n")) {
+    if (!line) continue;
+    const separator = line.indexOf("\0");
+    nextEntries.set(line.slice(0, separator), line.slice(separator + 1));
+  }
+
+  const changed = [];
+  for (const [filename, signature] of nextEntries) {
+    if (previousEntries.get(filename) !== signature) changed.push(filename);
+    previousEntries.delete(filename);
+  }
+  changed.push(...previousEntries.keys());
+  return changed;
+}
+
 function socketMessageText(message) {
   if (typeof message === "string") return message;
   try {
@@ -747,6 +949,7 @@ function installDevelopmentSocket(config, bakeRuntime) {
   let explicitWatchers = 0;
   let updatePromise = null;
   let updateQueued = false;
+  const queuedChangedPaths = new Set();
 
   function broadcastUpdate(update) {
     for (const browserSocket of browserSockets) {
@@ -762,7 +965,8 @@ function installDevelopmentSocket(config, bakeRuntime) {
     }
   }
 
-  async function runUpdate() {
+  async function runUpdate(changedPaths = []) {
+    for (const filename of changedPaths) queuedChangedPaths.add(filename);
     if (updatePromise) {
       updateQueued = true;
       return updatePromise;
@@ -771,7 +975,9 @@ function installDevelopmentSocket(config, bakeRuntime) {
       let update;
       do {
         updateQueued = false;
-        update = await bakeRuntime?.update?.() ?? { hardReload: true, packets: [] };
+        const currentChangedPaths = [...queuedChangedPaths];
+        queuedChangedPaths.clear();
+        update = await bakeRuntime?.update?.(currentChangedPaths) ?? { hardReload: true, packets: [] };
         broadcastUpdate(update);
       } while (updateQueued);
       return update;
@@ -791,8 +997,9 @@ function installDevelopmentSocket(config, bakeRuntime) {
       if (browserSockets.size === 0) return;
       const nextSnapshot = projectSnapshot(projectRoot);
       if (nextSnapshot !== automaticSnapshot) {
+        const changedPaths = changedSnapshotPaths(automaticSnapshot, nextSnapshot);
         automaticSnapshot = nextSnapshot;
-        if (explicitWatchers === 0) void runUpdate().catch(error => console.error(error));
+        if (explicitWatchers === 0) void runUpdate(changedPaths).catch(error => console.error(error));
       }
       automaticTimer = setTimeout(poll, 5);
       automaticTimer.unref?.();
@@ -826,7 +1033,13 @@ function installDevelopmentSocket(config, bakeRuntime) {
       ...userWebSocket,
       open(socket) {
         socket.sendBinary(new TextEncoder().encode(`V${bakeClientVersion()}`));
-        watchSessions.set(socket, { phase: "idle", snapshot: "", timer: null, kind: "unknown" });
+        watchSessions.set(socket, {
+          phase: "idle",
+          snapshot: "",
+          changedPaths: [],
+          timer: null,
+          kind: "unknown",
+        });
         userWebSocket.open?.(socket);
       },
       async message(socket, message) {
@@ -841,7 +1054,13 @@ function installDevelopmentSocket(config, bakeRuntime) {
           browserSockets.add(socket);
         }
         if (text === "H") {
-          const session = existing ?? { phase: "idle", snapshot: "", timer: null, kind: "control" };
+          const session = existing ?? {
+            phase: "idle",
+            snapshot: "",
+            changedPaths: [],
+            timer: null,
+            kind: "control",
+          };
           session.kind = "control";
           browserSockets.delete(socket);
           watchSessions.set(socket, session);
@@ -849,11 +1068,14 @@ function installDevelopmentSocket(config, bakeRuntime) {
             session.phase = "watching";
             explicitWatchers += 1;
             session.snapshot = projectSnapshot(projectRoot);
+            session.changedPaths = [];
             sendWatchEvent(socket, 0);
             const poll = () => {
               if (session.phase !== "watching") return;
-              if (projectSnapshot(projectRoot) !== session.snapshot) {
+              const nextSnapshot = projectSnapshot(projectRoot);
+              if (nextSnapshot !== session.snapshot) {
                 session.timer = null;
+                session.changedPaths = changedSnapshotPaths(session.snapshot, nextSnapshot);
                 sendWatchEvent(socket, 1);
                 return;
               }
@@ -866,7 +1088,7 @@ function installDevelopmentSocket(config, bakeRuntime) {
             session.phase = "building";
             explicitWatchers = Math.max(0, explicitWatchers - 1);
             try {
-              await runUpdate();
+              await runUpdate(session.changedPaths);
               automaticSnapshot = projectSnapshot(projectRoot);
               sendWatchEvent(socket, browserSockets.size > 0 ? 4 : 3);
             } catch (error) {
@@ -912,6 +1134,170 @@ function trackLifecycle(server) {
   return server;
 }
 
+function productionPageFiles(root) {
+  const files = [];
+  const visit = directory => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolute);
+      } else if (entry.isFile() && /\.(?:[cm]?[jt]sx?)$/i.test(entry.name)) {
+        files.push(absolute);
+      }
+    }
+  };
+  visit(root);
+  return files.sort();
+}
+
+function resolveProductionImport(importer, specifier) {
+  if (!specifier.startsWith(".") && !specifier.startsWith("/")) return null;
+  const base = specifier.startsWith("/") ? specifier : path.resolve(path.dirname(importer), specifier);
+  const candidates = [
+    base,
+    ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"].map(extension => base + extension),
+    ...[".tsx", ".ts", ".jsx", ".js"].map(extension => path.join(base, `index${extension}`)),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+function productionClientEntries(page) {
+  const clients = new Set();
+  const visited = new Set();
+  const visit = filename => {
+    filename = path.resolve(filename);
+    if (visited.has(filename)) return;
+    visited.add(filename);
+    let source;
+    try {
+      source = readFileSync(filename, "utf8");
+    } catch {
+      return;
+    }
+    if (/^\s*["']use client["'];?/m.test(source)) clients.add(filename);
+    const pattern = /(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g;
+    for (const match of source.matchAll(pattern)) {
+      const resolved = resolveProductionImport(filename, match[1]);
+      if (resolved) visit(resolved);
+    }
+  };
+  visit(page);
+  return [...clients];
+}
+
+function productionRouteInfo(pagesRoot, page) {
+  const relative = path.relative(pagesRoot, page).replaceAll(path.sep, "/").replace(/\.[^.]+$/, "");
+  const segments = relative.split("/");
+  if (segments.at(-1) === "index") segments.pop();
+  const catchAll = segments.findIndex(segment => /^\[\.\.\.[^\]]+\]$/.test(segment));
+  return {
+    segments,
+    catchAll,
+    parameter: catchAll >= 0 ? segments[catchAll].slice(4, -1) : null,
+  };
+}
+
+async function loadProductionPage(page) {
+  const result = await Bun.build({
+    entrypoints: [page],
+    target: "bun",
+    format: "cjs",
+    packages: "external",
+    sourcemap: "inline",
+    inlineImportMetaProperties: true,
+    minify: false,
+  });
+  const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+  if (!artifact) throw new Error(`Bake production build did not emit ${page}`);
+  return executeCommonJSArtifact(await artifact.text(), page);
+}
+
+async function productionClientScripts(entries, outdir) {
+  if (entries.length === 0) return [];
+  const result = await Bun.build({
+    entrypoints: entries,
+    target: "browser",
+    format: "esm",
+    outdir,
+    minify: false,
+    naming: { entry: "[hash].[ext]" },
+  });
+  return result.outputs
+    .filter(output => output.kind === "entry-point" && ["js", "jsx", "ts", "tsx"].includes(output.loader))
+    .map(output => `/_bun/${path.basename(output.path)}`);
+}
+
+function productionDocument(markup, scripts) {
+  const tags = scripts.map(source => `<script type="module" src="${source}"></script>`).join("");
+  return `<!DOCTYPE html>${markup}${tags}`;
+}
+
+export async function buildProductionApp({ outdir = "dist" } = {}) {
+  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const pagesRoot = path.join(projectRoot, "pages");
+  const outputRoot = path.resolve(projectRoot, outdir);
+  const clientRoot = path.join(outputRoot, "_bun");
+  mkdirSync(clientRoot, { recursive: true });
+
+  const reactModule = globalThis.require("react");
+  const React = reactModule.default ?? reactModule;
+  const { renderToStaticMarkup } = globalThis.require("react-dom/server");
+  for (const page of productionPageFiles(pagesRoot)) {
+    const source = readFileSync(page, "utf8");
+    if (!/^\s*["']use client["'];?/m.test(source) &&
+        /\bimport\s*\{[^}]*\buseState\b[^}]*\}\s*from\s*["']react["']/.test(source)) {
+      throw new Error(
+        '"useState" is not available in a server component. If you need interactivity, consider converting part of this to a Client Component (by adding `"use client";` to the top of the file).',
+      );
+    }
+
+    const pageModule = await loadProductionPage(page);
+    const Page = pageModule.default ?? pageModule;
+    if (typeof Page !== "function") continue;
+    const route = productionRouteInfo(pagesRoot, page);
+    let variants = [{ params: {} }];
+    if (route.catchAll >= 0 && typeof pageModule.getStaticPaths === "function") {
+      const paths = await pageModule.getStaticPaths();
+      variants = Array.isArray(paths?.paths) ? paths.paths : [];
+    }
+
+    const clients = productionClientEntries(page);
+    const scripts = await productionClientScripts(clients, clientRoot);
+    for (const variant of variants) {
+      const params = variant?.params ?? {};
+      const segments = [...route.segments];
+      if (route.catchAll >= 0) {
+        const value = params[route.parameter];
+        const replacement = Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)];
+        segments.splice(route.catchAll, 1, ...replacement);
+      }
+      const destination = path.join(outputRoot, ...segments, "index.html");
+      mkdirSync(path.dirname(destination), { recursive: true });
+      const markup = renderToStaticMarkup(React.createElement(Page, { params }));
+      writeFileSync(destination, productionDocument(markup, scripts));
+    }
+  }
+}
+
+Object.defineProperty(globalThis, Symbol.for("cottontail.internal.buildBakeProduction"), {
+  configurable: true,
+  enumerable: false,
+  value: buildProductionApp,
+  writable: false,
+});
+
 export function startDefaultApp(entryNamespace) {
   const config = entryNamespace?.default;
   if (!isServerConfig(config) || globalThis.__cottontailServeEverCalled) return null;
@@ -929,8 +1315,8 @@ export function startDefaultApp(entryNamespace) {
           htmlFetch?.invalidate?.();
           frameworkFetch?.invalidate?.();
         },
-        async update() {
-          const htmlUpdate = htmlFetch ? await htmlFetch.update() : null;
+        async update(changedPaths) {
+          const htmlUpdate = htmlFetch ? await htmlFetch.update(changedPaths) : null;
           frameworkFetch?.invalidate?.();
           return htmlUpdate ?? { hardReload: true, packets: [] };
         },

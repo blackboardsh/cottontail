@@ -894,19 +894,44 @@ fn rewriteRuntimeEntrypointSourceMap(
     physical_path: []const u8,
     identity_path: []const u8,
 ) ![]const u8 {
-    if (std.mem.eql(u8, physical_path, identity_path)) return source_map;
-
     var parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, source_map, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return source_map;
     const sources = parsed.value.object.getPtr("sources") orelse return source_map;
     if (sources.* != .array) return source_map;
+    const sources_content = parsed.value.object.getPtr("sourcesContent");
 
     const physical_name = std.fs.path.basename(physical_path);
     const identity_name = std.fs.path.basename(identity_path);
     var changed = false;
-    for (sources.array.items) |*source| {
-        if (source.* != .string or !sourcePathEndsWithComponent(source.string, physical_name)) continue;
+    for (sources.array.items, 0..) |*source, index| {
+        if (sources_content) |content_value| {
+            if (content_value.* == .array and index < content_value.array.items.len) {
+                const content = content_value.array.items[index];
+                if (content == .string) {
+                    if (try originalPathFromSourceMarker(ctx.allocator, content.string)) |original_path| {
+                        source.* = .{ .string = original_path };
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        if (source.* == .string and !std.fs.path.isAbsolute(source.string)) {
+            const project_path = try std.fs.path.resolve(ctx.allocator, &.{ ctx.project_root, source.string });
+            const stat = std.Io.Dir.cwd().statFile(ctx.io, project_path, .{}) catch null;
+            if (stat != null and stat.?.kind == .file) {
+                source.* = .{ .string = project_path };
+                changed = true;
+                continue;
+            }
+        }
+        if (std.mem.eql(u8, physical_path, identity_path) or
+            source.* != .string or
+            !sourcePathEndsWithComponent(source.string, physical_name))
+        {
+            continue;
+        }
         source.* = .{ .string = try std.mem.concat(ctx.allocator, u8, &.{
             source.string[0 .. source.string.len - physical_name.len],
             identity_name,
@@ -2515,6 +2540,7 @@ fn bundleScriptNative(
     options.include_runtime_modules = true;
     options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
+    options.rewrite_jest_for_tests = is_test_cli_execution;
     options.inline_import_meta_properties = true;
     var runtime_define_keys: std.ArrayList([]const u8) = .empty;
     var runtime_define_values: std.ArrayList([]const u8) = .empty;

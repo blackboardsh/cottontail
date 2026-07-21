@@ -581,7 +581,15 @@ pub const Resolver = struct {
                 if (alias.node_builtin) return null;
             }
         }
-        return r.runtimeAlias(specifier);
+        if (r.runtimeAlias(specifier)) |alias| return alias;
+        if (bun.jsc.ModuleLoader.HardcodedModule.Alias.get(
+            specifier,
+            r.opts.target,
+            .{ .rewrite_jest_for_tests = r.opts.rewrite_jest_for_tests },
+        )) |alias| {
+            return r.runtimeAlias(alias.path);
+        }
+        return null;
     }
 
     pub inline fn usePackageManager(self: *const ThisResolver) bool {
