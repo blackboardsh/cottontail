@@ -706,8 +706,11 @@ class WebSocketServer extends EventEmitter {
     this._upgradedSockets.add(socket);
     let protocol = "";
     if (protocols.size > 0) {
-      protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, request) : protocols.values().next().value;
-      if (protocol === false) protocol = "";
+      const defaultProtocol = protocols.values().next().value;
+      protocol = this.options.handleProtocols ? this.options.handleProtocols(protocols, request) : defaultProtocol;
+      // Bun's ws adapter omits the explicit protocol header for an empty
+      // selection, after which Bun.serve falls back to the first offer.
+      if (!protocol) protocol = defaultProtocol;
     }
     const headers = [
       "HTTP/1.1 101 Switching Protocols",
