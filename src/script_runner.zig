@@ -232,6 +232,8 @@ pub fn runWithExecArgvDisplay(
     const ctx = try makeContext(init);
     const entrypoint_path = try resolveBunEntrypointFallback(&ctx, script_path);
 
+    maybeAutoInstall(&ctx, entrypoint_path, exec_args) catch {};
+
     if (try rejectInvalidBunCjsPragma(&ctx, entrypoint_path)) return 1;
 
     const runnable_path = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false) catch |err| {
@@ -254,6 +256,127 @@ pub fn runWithExecArgvDisplay(
     }
 
     return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
+}
+
+const AutoInstallMode = enum { auto, fallback, force, disable };
+
+fn autoInstallMode(exec_args: []const [:0]const u8) AutoInstallMode {
+    var mode: AutoInstallMode = .auto;
+    var index: usize = 0;
+    while (index < exec_args.len) : (index += 1) {
+        const arg: []const u8 = exec_args[index];
+        if (std.mem.eql(u8, arg, "-i")) {
+            mode = .fallback;
+        } else if (std.mem.startsWith(u8, arg, "--install=")) {
+            const value = arg["--install=".len..];
+            if (std.mem.eql(u8, value, "auto")) mode = .auto else if (std.mem.eql(u8, value, "fallback")) mode = .fallback else if (std.mem.eql(u8, value, "force")) mode = .force else if (std.mem.eql(u8, value, "disable")) mode = .disable;
+        } else if (std.mem.eql(u8, arg, "--install") and index + 1 < exec_args.len) {
+            index += 1;
+            const value: []const u8 = exec_args[index];
+            if (std.mem.eql(u8, value, "auto")) mode = .auto else if (std.mem.eql(u8, value, "fallback")) mode = .fallback else if (std.mem.eql(u8, value, "force")) mode = .force else if (std.mem.eql(u8, value, "disable")) mode = .disable;
+        } else if (std.mem.eql(u8, arg, "--no-install")) {
+            mode = .disable;
+        }
+    }
+    return mode;
+}
+
+fn packageNameFromSpecifier(specifier: []const u8) ?[]const u8 {
+    if (specifier.len == 0 or
+        std.fs.path.isAbsolute(specifier) or
+        std.mem.startsWith(u8, specifier, "./") or
+        std.mem.startsWith(u8, specifier, "../") or
+        std.mem.startsWith(u8, specifier, "node:") or
+        std.mem.startsWith(u8, specifier, "bun:") or
+        std.mem.startsWith(u8, specifier, "data:") or
+        std.mem.startsWith(u8, specifier, "file:")) return null;
+    if (isMinimalRuntimeAliasSpecifier(specifier)) return null;
+
+    if (specifier[0] == '@') {
+        const slash = std.mem.indexOfScalarPos(u8, specifier, 1, '/') orelse return null;
+        const end = std.mem.indexOfScalarPos(u8, specifier, slash + 1, '/') orelse specifier.len;
+        return specifier[0..end];
+    }
+    const end = std.mem.indexOfScalar(u8, specifier, '/') orelse specifier.len;
+    return specifier[0..end];
+}
+
+fn directoryHasNodeModules(ctx: *const Context, start_dir: []const u8) bool {
+    var current = start_dir;
+    while (true) {
+        const path = std.fs.path.join(ctx.allocator, &.{ current, "node_modules" }) catch return false;
+        if (std.Io.Dir.cwd().statFile(ctx.io, path, .{})) |stat| {
+            if (stat.kind == .directory) return true;
+        } else |_| {}
+        const parent = std.fs.path.dirname(current) orelse return false;
+        if (std.mem.eql(u8, parent, current)) return false;
+        current = parent;
+    }
+}
+
+fn packageIsInstalled(ctx: *const Context, start_dir: []const u8, package_name: []const u8) bool {
+    var current = start_dir;
+    while (true) {
+        const path = std.fs.path.join(ctx.allocator, &.{ current, "node_modules", package_name, "package.json" }) catch return false;
+        if (std.Io.Dir.cwd().statFile(ctx.io, path, .{})) |stat| {
+            if (stat.kind == .file) return true;
+        } else |_| {}
+        const parent = std.fs.path.dirname(current) orelse return false;
+        if (std.mem.eql(u8, parent, current)) return false;
+        current = parent;
+    }
+}
+
+fn maybeAutoInstall(ctx: *const Context, entrypoint_path: []const u8, exec_args: []const [:0]const u8) !void {
+    const mode = autoInstallMode(exec_args);
+    if (mode == .disable) return;
+    const entry_dir = std.fs.path.dirname(entrypoint_path) orelse ctx.project_root;
+    if (mode == .auto and directoryHasNodeModules(ctx, entry_dir)) return;
+
+    const loader = transpilerLoaderForPath(entrypoint_path) orelse return;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        entrypoint_path,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return;
+    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return;
+    defer std.heap.c_allocator.free(imports_json);
+    const ScannedImport = struct { path: []const u8, kind: []const u8 };
+    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return;
+    defer parsed.deinit();
+
+    var packages: std.ArrayList([]const u8) = .empty;
+    for (parsed.value) |item| {
+        const package_name = packageNameFromSpecifier(item.path) orelse continue;
+        if (packageIsInstalled(ctx, entry_dir, package_name)) continue;
+        var duplicate = false;
+        for (packages.items) |existing| {
+            if (std.mem.eql(u8, existing, package_name)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try packages.append(ctx.allocator, package_name);
+    }
+    if (packages.items.len == 0) return;
+
+    const executable = try std.process.executablePathAlloc(ctx.io, ctx.allocator);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(ctx.allocator, &.{ executable, "add", "--no-save", "--silent" });
+    if (mode == .force) try argv.append(ctx.allocator, "--force");
+    try argv.appendSlice(ctx.allocator, packages.items);
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = entry_dir },
+        .environ_map = ctx.environ_map,
+        .stdout_limit = .limited(64 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024 * 1024),
+    });
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.AutoInstallFailed,
+        else => return error.AutoInstallFailed,
+    }
 }
 
 const BundleDiagnostic = struct {
@@ -519,6 +642,25 @@ fn runtimeLinkDiagnostic(
     text: []const u8,
 ) !?[]const u8 {
     const diagnostic = parseBundleDiagnostic(text, script_abs);
+    if (quotedDiagnosticName(diagnostic.message, "Could not resolve: \"")) |name| {
+        const is_bare_package = name.len > 0 and
+            name[0] != '.' and
+            name[0] != '/' and
+            name[0] != '\\' and
+            std.mem.indexOfScalar(u8, name, ':') == null;
+        if (is_bare_package) {
+            return try std.fmt.allocPrint(
+                ctx.allocator,
+                "error: Cannot find package '{s}'\n    at {s}:{}:{}",
+                .{ name, diagnostic.file, diagnostic.line, diagnostic.column },
+            );
+        }
+        return try std.fmt.allocPrint(
+            ctx.allocator,
+            "error: Cannot find module \"{s}\"\n    at {s}:{}:{}",
+            .{ name, diagnostic.file, diagnostic.line, diagnostic.column },
+        );
+    }
     if (parseMissingExportDiagnostic(diagnostic.message)) |missing| {
         const source = std.Io.Dir.cwd().readFileAlloc(
             ctx.io,
@@ -750,22 +892,51 @@ pub fn runEval(
     print_result: bool,
 ) !u8 {
     const ctx = try makeContext(init);
-    const module_input = hasModuleInputType(exec_args) or sourceLooksEsm(source);
-    const eval_path = try writeEvalEntrypoint(&ctx, ctx.project_root, source, print_result, module_input);
-    var eval_path_active = true;
-    defer if (eval_path_active) std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
-    const runnable_path = try bundleScriptNative(&ctx, eval_path, exec_args, script_args, ctx.project_root, null, null, false);
-    try canonicalizeEvalSourceMap(&ctx, runnable_path, eval_path);
-    if (!std.mem.eql(u8, runnable_path, eval_path)) {
-        std.Io.Dir.cwd().deleteFile(ctx.io, eval_path) catch {};
-        eval_path_active = false;
-    }
+    const executable_source = (try rewriteLegacyHtmlClosingComments(ctx.allocator, source)) orelse source;
+    if (!validateEvalSyntax(&ctx, executable_source)) return 1;
+    const module_input = hasModuleInputType(exec_args) or sourceLooksEsm(executable_source);
+    const eval_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, executable_source, print_result, module_input, "[eval]", true, .omit_entrypoint);
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
+    defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+    const runnable_path = try bundleScriptNative(&ctx, eval_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    canonicalizeEvalSourceMap(&ctx, runnable_path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
+        error.EvalSourceMissingFromSourceMap => {},
+        else => return err,
+    };
     defer cleanupRunnableDirectory(&ctx, runnable_path);
     const runnable_path_z = try init.arena.allocator().dupeZ(u8, runnable_path);
-    return try runPrepared(init, &ctx, runnable_path_z, script_args, 0, exec_args, null, null, null);
+    const process_args = try init.arena.allocator().alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = try init.arena.allocator().dupeZ(u8, eval_entry.entry_path);
+    for (script_args, 0..) |arg, index| process_args[index + 1] = arg;
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
+}
+
+fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
+    var error_message: ?[*:0]u8 = null;
+    const imports = native_transpiler.scanImportsJsonWithError(source, "tsx", &error_message) catch {
+        ctx.writeStderr("{s}\n", .{source});
+        if (error_message) |message| {
+            defer native_transpiler.ct_transpiler_string_free(message);
+            ctx.writeStderr("error: {s}\n", .{std.mem.span(message)});
+        } else {
+            ctx.writeStderr("error: Syntax Error\n", .{});
+        }
+        return false;
+    };
+    std.heap.c_allocator.free(imports);
+    return true;
 }
 
 fn canonicalizeEvalSourceMap(ctx: *const Context, runnable_path: []const u8, eval_path: []const u8) !void {
+    return canonicalizeVirtualSourceMap(ctx, runnable_path, eval_path, "[eval]");
+}
+
+fn canonicalizeVirtualSourceMap(
+    ctx: *const Context,
+    runnable_path: []const u8,
+    physical_path: []const u8,
+    virtual_name: []const u8,
+) !void {
     const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ runnable_path, ".map" });
     const allocator = std.heap.c_allocator;
     const source_map = try std.Io.Dir.cwd().readFileAlloc(
@@ -778,7 +949,7 @@ fn canonicalizeEvalSourceMap(ctx: *const Context, runnable_path: []const u8, eva
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, source_map, .{});
     defer parsed.deinit();
-    if (!try replaceEvalSourcePath(allocator, &parsed.value, eval_path)) return error.EvalSourceMissingFromSourceMap;
+    if (!try replaceVirtualSourcePath(allocator, &parsed.value, physical_path, virtual_name)) return error.EvalSourceMissingFromSourceMap;
 
     const rewritten = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
     defer allocator.free(rewritten);
@@ -786,18 +957,27 @@ fn canonicalizeEvalSourceMap(ctx: *const Context, runnable_path: []const u8, eva
 }
 
 fn replaceEvalSourcePath(allocator: std.mem.Allocator, source_map: *std.json.Value, eval_path: []const u8) !bool {
+    return replaceVirtualSourcePath(allocator, source_map, eval_path, "[eval]");
+}
+
+fn replaceVirtualSourcePath(
+    allocator: std.mem.Allocator,
+    source_map: *std.json.Value,
+    physical_path: []const u8,
+    virtual_name: []const u8,
+) !bool {
     if (source_map.* != .object) return false;
     const sources = source_map.object.getPtr("sources") orelse return false;
     if (sources.* != .array) return false;
     const sources_content = source_map.object.getPtr("sourcesContent");
 
-    const eval_name = std.fs.path.basename(eval_path);
+    const physical_name = std.fs.path.basename(physical_path);
     const encoder = std.base64.standard.Encoder;
-    const encoded_path = try allocator.alloc(u8, encoder.calcSize(eval_path.len));
+    const encoded_path = try allocator.alloc(u8, encoder.calcSize(physical_path.len));
     defer allocator.free(encoded_path);
-    const encoded_eval_path = encoder.encode(encoded_path, eval_path);
-    const eval_dir = std.fs.path.dirname(eval_path) orelse ".";
-    const virtual_eval_path = try std.fs.path.join(allocator, &.{ eval_dir, "[eval]" });
+    const encoded_physical_path = encoder.encode(encoded_path, physical_path);
+    const physical_dir = std.fs.path.dirname(physical_path) orelse ".";
+    const virtual_eval_path = try std.fs.path.join(allocator, &.{ physical_dir, virtual_name });
     defer allocator.free(virtual_eval_path);
     const encoded_virtual_path_buffer = try allocator.alloc(u8, encoder.calcSize(virtual_eval_path.len));
     defer allocator.free(encoded_virtual_path_buffer);
@@ -805,11 +985,11 @@ fn replaceEvalSourcePath(allocator: std.mem.Allocator, source_map: *std.json.Val
     var replaced = false;
     for (sources.array.items, 0..) |*source, index| {
         if (source.* != .string) continue;
-        const direct_match = sourcePathEndsWithComponent(source.string, eval_name);
+        const direct_match = sourcePathEndsWithComponent(source.string, physical_name);
         const generated_match = if (sources_content) |content_value|
             content_value.* == .array and
                 index < content_value.array.items.len and
-                (sourceHasOriginalPath(content_value.array.items[index], encoded_eval_path) or
+                (sourceHasOriginalPath(content_value.array.items[index], encoded_physical_path) or
                     sourceHasOriginalPath(content_value.array.items[index], encoded_virtual_path))
         else
             false;
@@ -817,7 +997,7 @@ fn replaceEvalSourcePath(allocator: std.mem.Allocator, source_map: *std.json.Val
         // COTTONTAIL-COMPAT: Bun evaluates a virtual cwd/[eval] module. Keep
         // Cottontail's concurrency-safe disk path for resolution, but expose
         // the same virtual source identity through the generated source map.
-        source.* = .{ .string = "[eval]" };
+        source.* = .{ .string = virtual_name };
         replaced = true;
     }
     return replaced;
@@ -1349,8 +1529,24 @@ pub fn runStdin(
         try source.appendSlice(allocator, buffer[0..count]);
     }
 
+    const ctx = try makeContext(init);
     const source_z = try allocator.dupeZ(u8, source.items);
-    return try runEval(init, source_z, script_args, exec_args, false);
+    const module_input = hasModuleInputType(exec_args) or sourceLooksEsm(source_z);
+    const stdin_entry = try writeEvalEntrypoint(&ctx, ctx.project_root, source_z, false, module_input, "[stdin]", true, .stdin);
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, stdin_entry.entry_path) catch {};
+    defer if (stdin_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+    const runnable_path = try bundleScriptNative(&ctx, stdin_entry.entry_path, exec_args, script_args, ctx.project_root, null, null, false);
+    canonicalizeVirtualSourceMap(&ctx, runnable_path, stdin_entry.source_path orelse stdin_entry.entry_path, "[stdin]") catch |err| switch (err) {
+        error.EvalSourceMissingFromSourceMap => {},
+        else => return err,
+    };
+    defer cleanupRunnableDirectory(&ctx, runnable_path);
+
+    const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
+    const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
+    process_args[0] = try allocator.dupeZ(u8, stdin_entry.entry_path);
+    @memcpy(process_args[1..], script_args);
+    return try runPrepared(init, &ctx, runnable_path_z, process_args, 1, exec_args, null, null, null);
 }
 
 fn makeContext(init: std.process.Init) !Context {
@@ -3357,8 +3553,8 @@ fn hasCustomConditions(cli_args: []const [:0]const u8) bool {
 }
 
 fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
-    if (std.mem.endsWith(u8, script_abs, ".cjs")) return true;
-    if (std.mem.endsWith(u8, script_abs, ".mjs")) return false;
+    if (std.mem.endsWith(u8, script_abs, ".cjs") or std.mem.endsWith(u8, script_abs, ".cts")) return true;
+    if (std.mem.endsWith(u8, script_abs, ".mjs") or std.mem.endsWith(u8, script_abs, ".mts")) return false;
     if (!std.mem.endsWith(u8, script_abs, ".js")) {
         if (std.fs.path.extension(script_abs).len == 0) {
             return try extensionlessEntrypointLooksCommonJs(ctx, script_abs);
@@ -3509,6 +3705,10 @@ fn hasModuleInputType(exec_args: []const [:0]const u8) bool {
 // Bun exposes its built-in modules as writable, enumerable globals for -e/-p.
 // Keep these lazy so an eval only initializes the modules it actually touches.
 const bun_eval_globals_bootstrap =
+    \\globalThis.__cottontailImportMeta ??= {};
+    \\Object.defineProperty(globalThis.__cottontailImportMeta, "require", {
+    \\  value: globalThis.require, writable: true, enumerable: true, configurable: true,
+    \\});
     \\const __ctEvalGlobalModules = {
     \\  ffi: "bun:ffi", assert: "node:assert", async_hooks: "node:async_hooks",
     \\  child_process: "node:child_process", cluster: "node:cluster", dgram: "node:dgram",
@@ -3552,14 +3752,64 @@ const bun_eval_globals_bootstrap =
     \\}
 ;
 
+fn sourceNeedsEvalModuleGlobals(allocator: std.mem.Allocator, source: []const u8) !bool {
+    const module_globals = [_][]const u8{
+        "ffi",         "assert",              "async_hooks",    "child_process", "cluster",
+        "dgram",       "diagnostics_channel", "dns",            "domain",        "events",
+        "fs",          "http",                "http2",          "https",         "inspector",
+        "net",         "os",                  "path",           "perf_hooks",    "punycode",
+        "querystring", "readline",            "stream",         "sys",           "timers",
+        "tls",         "trace_events",        "tty",            "url",           "util",
+        "v8",          "vm",                  "wasi",           "sqlite",        "worker_threads",
+        "zlib",        "constants",           "string_decoder", "buffer",        "jsc",
+        "require",     "module",              "exports",        "__filename",    "__dirname",
+    };
+    const tokens = try tokenizeJavaScriptModuleSyntax(allocator, source);
+    for (tokens) |token| {
+        if (token.kind != .identifier) continue;
+        for (module_globals) |name| {
+            if (std.mem.eql(u8, token.text, name)) return true;
+        }
+    }
+    return false;
+}
+
+const EvalArgvMode = enum { unchanged, omit_entrypoint, stdin };
+
+const EvalEntrypoint = struct {
+    entry_path: []const u8,
+    source_path: ?[]const u8 = null,
+};
+
+fn markVirtualSource(
+    ctx: *const Context,
+    tmp_dir: []const u8,
+    virtual_name: []const u8,
+    source: []const u8,
+) ![]const u8 {
+    const virtual_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, virtual_name });
+    const encoder = std.base64.standard.Encoder;
+    const encoded_path = try ctx.allocator.alloc(u8, encoder.calcSize(virtual_path.len));
+    const encoded = encoder.encode(encoded_path, virtual_path);
+    return try std.mem.concat(ctx.allocator, u8, &.{
+        "/*@cottontail-original-path-base64:",
+        encoded,
+        "*/",
+        source,
+    });
+}
+
 fn writeEvalEntrypoint(
     ctx: *const Context,
     tmp_dir: []const u8,
     source: []const u8,
     print_result: bool,
     module_input: bool,
-) ![]const u8 {
-    const extension = if (module_input) "mts" else "cts";
+    virtual_name: []const u8,
+    expose_process_eval: bool,
+    argv_mode: EvalArgvMode,
+) !EvalEntrypoint {
+    const extension = if (module_input) "tsx" else "cts";
     var random_bytes: [8]u8 = undefined;
     ctx.io.random(&random_bytes);
     const wrapper_name = try std.fmt.allocPrint(
@@ -3574,6 +3824,8 @@ fn writeEvalEntrypoint(
     const wrapper_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, wrapper_name });
     const source_literal = try jsonStringLiteral(ctx, source);
 
+    var transformed_source_path: ?[]const u8 = null;
+    var transformed_module_source: ?[]const u8 = null;
     const eval_source = if (!print_result and !module_input)
         try std.fmt.allocPrint(
             ctx.allocator,
@@ -3589,43 +3841,94 @@ fn writeEvalEntrypoint(
         )
     else if (!print_result)
         source
-    else if (module_input)
-        try std.fmt.allocPrint(
+    else if (module_input) blk: {
+        var transform_error: ?[*:0]u8 = null;
+        const transformed = native_transpiler.transformEvalPrintModule(source, &transform_error) catch |err| {
+            if (transform_error) |message| {
+                defer native_transpiler.ct_transpiler_string_free(message);
+                ctx.writeStderr("{s}\nerror: {s}\n", .{ source, std.mem.span(message) });
+            }
+            return err;
+        };
+        defer std.heap.c_allocator.free(transformed);
+        const source_name = try std.fmt.allocPrint(
+            ctx.allocator,
+            ".cottontail-eval-source-{x}-{x}.tsx",
+            .{ std.hash.Wyhash.hash(2, source), std.mem.readInt(u64, &random_bytes, .little) },
+        );
+        const source_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, source_name });
+        transformed_source_path = source_path;
+        transformed_module_source = try ctx.allocator.dupe(u8, transformed);
+        break :blk try std.fmt.allocPrint(
             ctx.allocator,
             \\const gc = globalThis.gc;
-            \\const __ctPrintResult = eval({s});
-            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Bun.inspect(__ctPrintResult));
+            \\const __ctPrintNamespace = await import({s});
+            \\const __ctPrintResult = __ctPrintNamespace.default;
+            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Array.isArray(__ctPrintResult) ? JSON.stringify(__ctPrintResult) : Bun.inspect(__ctPrintResult));
             \\
         ,
+            .{try jsonStringLiteral(ctx, source_path)},
+        );
+    } else try std.fmt.allocPrint(
+        ctx.allocator,
+        \\const gc = globalThis.gc;
+        \\const __ctPrintResult = eval({s});
+        \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Array.isArray(__ctPrintResult) ? JSON.stringify(__ctPrintResult) : Bun.inspect(__ctPrintResult));
+        \\
+    ,
+        .{source_literal},
+    );
+
+    const process_eval_source = if (expose_process_eval)
+        try std.fmt.allocPrint(
+            ctx.allocator,
+            "Object.defineProperty(process, \"_eval\", {{ value: {s}, writable: true, configurable: true }});\n",
             .{source_literal},
         )
     else
-        try std.fmt.allocPrint(
-            ctx.allocator,
-            \\const gc = globalThis.gc;
-            \\const __ctPrintResult = eval({s});
-            \\console.log(typeof __ctPrintResult === "string" ? __ctPrintResult : Bun.inspect(__ctPrintResult));
-            \\
-        ,
-            .{source_literal},
-        );
-
-    const virtual_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "[eval]" });
-    const encoder = std.base64.standard.Encoder;
-    const encoded_path = try ctx.allocator.alloc(u8, encoder.calcSize(virtual_path.len));
-    const encoded = encoder.encode(encoded_path, virtual_path);
+        "";
+    const argv_source = switch (argv_mode) {
+        .unchanged => "",
+        .omit_entrypoint => "process.argv.splice(1, 1);\n",
+        .stdin => "process.argv[1] = \"-\";\n",
+    };
+    const virtual_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, virtual_name });
+    const virtual_url = try std.fmt.allocPrint(ctx.allocator, "file://{s}", .{virtual_path});
+    const virtual_namespace_source = try std.fmt.allocPrint(ctx.allocator,
+        \\globalThis.__cottontailVirtualModuleNamespaces ??= new Map();
+        \\{{
+        \\  const __ctVirtualNamespace = {{}};
+        \\  Object.defineProperty(__ctVirtualNamespace, Symbol.toStringTag, {{ value: "Module" }});
+        \\  globalThis.__cottontailVirtualModuleNamespaces.set({s}, __ctVirtualNamespace);
+        \\  globalThis.__cottontailVirtualModuleNamespaces.set({s}, __ctVirtualNamespace);
+        \\}}
+    , .{ try jsonStringLiteral(ctx, virtual_path), try jsonStringLiteral(ctx, virtual_url) });
+    const eval_globals_source = if (try sourceNeedsEvalModuleGlobals(ctx.allocator, source))
+        bun_eval_globals_bootstrap
+    else
+        "";
     // COTTONTAIL-COMPAT: Keep eval on disk for stock JSC and concurrent
     // invocations while exposing Bun's virtual cwd/[eval] identity to
     // import.meta through the compiler's generated-source marker.
-    const marked_source = try std.mem.concat(ctx.allocator, u8, &.{
-        "/*@cottontail-original-path-base64:",
-        encoded,
-        "*/",
-        bun_eval_globals_bootstrap,
-        eval_source,
+    const preamble = try std.mem.concat(ctx.allocator, u8, &.{
+        eval_globals_source,
+        process_eval_source,
+        argv_source,
+        virtual_namespace_source,
     });
+    const wrapper_source = if (transformed_source_path) |source_path| blk: {
+        const module_source = try std.mem.concat(ctx.allocator, u8, &.{ preamble, transformed_module_source.? });
+        const marked_module_source = try markVirtualSource(ctx, tmp_dir, virtual_name, module_source);
+        try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_path, .data = marked_module_source });
+        errdefer std.Io.Dir.cwd().deleteFile(ctx.io, source_path) catch {};
+        break :blk eval_source;
+    } else try std.mem.concat(ctx.allocator, u8, &.{ preamble, eval_source });
+    const marked_source = if (transformed_source_path == null)
+        try markVirtualSource(ctx, tmp_dir, virtual_name, wrapper_source)
+    else
+        wrapper_source;
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = wrapper_path, .data = marked_source });
-    return wrapper_path;
+    return .{ .entry_path = wrapper_path, .source_path = transformed_source_path };
 }
 
 fn isTestEntrypointPath(path: []const u8) bool {
@@ -3867,6 +4170,7 @@ fn writeMinimalRuntimeEntryWrapper(
         \\globalThis.__dirname ??= {s};
         \\globalThis.Loader ??= {{ registry: new Map() }};
         \\{s}
+        \\globalThis.__cottontailLoadDotenv?.();
         \\globalThis.__cottontailLoadingTestModules = true;
         \\try {{
         \\{s}
@@ -4135,6 +4439,213 @@ fn restoreEmptyMetadataPatch(ctx: *const Context, patch: *EmptyMetadataPatch) vo
     patch.active = false;
 }
 
+fn rewriteLegacyHtmlClosingComments(allocator: std.mem.Allocator, source: []const u8) !?[]u8 {
+    var rewritten = try allocator.dupe(u8, source);
+    var changed = false;
+    var line_start: usize = 0;
+    while (line_start < rewritten.len) {
+        var cursor = line_start;
+        while (cursor < rewritten.len and (rewritten[cursor] == ' ' or rewritten[cursor] == '\t')) cursor += 1;
+        if (cursor + 3 <= rewritten.len and std.mem.eql(u8, rewritten[cursor .. cursor + 3], "-->")) {
+            rewritten[cursor] = '/';
+            rewritten[cursor + 1] = '/';
+            changed = true;
+        }
+        const newline = std.mem.indexOfScalarPos(u8, rewritten, line_start, '\n') orelse break;
+        line_start = newline + 1;
+    }
+    return if (changed) rewritten else null;
+}
+
+fn sourceIsStrictDirectiveOnly(allocator: std.mem.Allocator, source: []const u8) !bool {
+    const tokens = try tokenizeJavaScriptModuleSyntax(allocator, source);
+    defer allocator.free(tokens);
+    if (tokens.len == 0) return false;
+
+    var has_strict = false;
+    var index: usize = 0;
+    while (index < tokens.len) {
+        if (tokens[index].kind != .string) return false;
+        has_strict = has_strict or std.mem.eql(u8, tokens[index].text, "use strict");
+        index += 1;
+        if (index < tokens.len and tokenIs(tokens[index], .punct, ";")) index += 1;
+    }
+    return has_strict;
+}
+
+const SelfNamespaceExport = struct {
+    exported_name: []const u8,
+    local_name: []const u8,
+};
+
+fn appendSelfNamespaceExport(
+    allocator: std.mem.Allocator,
+    exports: *std.ArrayList(SelfNamespaceExport),
+    exported_name: []const u8,
+    local_name: []const u8,
+) !void {
+    for (exports.items) |item| {
+        if (std.mem.eql(u8, item.exported_name, exported_name)) return;
+    }
+    try exports.append(allocator, .{ .exported_name = exported_name, .local_name = local_name });
+}
+
+fn collectSelfNamespaceExports(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) ![]SelfNamespaceExport {
+    const tokens = try tokenizeJavaScriptModuleSyntax(allocator, source);
+    defer allocator.free(tokens);
+    var exports: std.ArrayList(SelfNamespaceExport) = .empty;
+
+    var index: usize = 0;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (!tokenIs(tokens[index], .identifier, "export")) continue;
+        const next = tokens[index + 1];
+        if (next.kind == .identifier and
+            (std.mem.eql(u8, next.text, "const") or
+                std.mem.eql(u8, next.text, "let") or
+                std.mem.eql(u8, next.text, "var") or
+                std.mem.eql(u8, next.text, "function") or
+                std.mem.eql(u8, next.text, "class")))
+        {
+            if (index + 2 < tokens.len and tokens[index + 2].kind == .identifier) {
+                try appendSelfNamespaceExport(allocator, &exports, tokens[index + 2].text, tokens[index + 2].text);
+            }
+            continue;
+        }
+        if (!tokenIs(next, .punct, "{")) continue;
+        const close = closingModuleClause(tokens, index + 1) orelse continue;
+        var item = index + 2;
+        while (item < close) {
+            if (tokenIs(tokens[item], .punct, ",")) {
+                item += 1;
+                continue;
+            }
+            if (tokens[item].kind != .identifier and tokens[item].kind != .string) break;
+            const local_name = tokens[item].text;
+            var exported_name = local_name;
+            item += 1;
+            if (item + 1 < close and tokenIs(tokens[item], .identifier, "as")) {
+                exported_name = tokens[item + 1].text;
+                item += 2;
+            }
+            try appendSelfNamespaceExport(allocator, &exports, exported_name, local_name);
+            while (item < close and !tokenIs(tokens[item], .punct, ",")) item += 1;
+        }
+        index = close;
+    }
+    return try exports.toOwnedSlice(allocator);
+}
+
+fn rewriteSelfNamespaceImports(
+    ctx: *const Context,
+    source: []const u8,
+    source_path: []const u8,
+    resolution_dir: []const u8,
+) !?[]u8 {
+    const exports = try collectSelfNamespaceExports(ctx.allocator, source);
+    var output: std.ArrayList(u8) = .empty;
+    var copied_until: usize = 0;
+    var changed = false;
+    var cursor: usize = 0;
+
+    while (cursor < source.len) {
+        if (source[cursor] == '\'' or source[cursor] == '"' or source[cursor] == '`') {
+            cursor = skipQuotedJavaScript(source, cursor);
+            continue;
+        }
+        if (source[cursor] == '/') {
+            const after_comment = skipJavaScriptComment(source, cursor);
+            if (after_comment != cursor) {
+                cursor = after_comment;
+                continue;
+            }
+        }
+        if (!std.mem.startsWith(u8, source[cursor..], "import") or
+            (cursor > 0 and isIdentifierPart(source[cursor - 1])) or
+            (cursor + "import".len < source.len and isIdentifierPart(source[cursor + "import".len])))
+        {
+            cursor += 1;
+            continue;
+        }
+
+        const clause_start = skipWhitespace(source, cursor + "import".len);
+        if (clause_start >= source.len or source[clause_start] != '*') {
+            cursor += "import".len;
+            continue;
+        }
+        var specifier_start = clause_start;
+        while (specifier_start < source.len and source[specifier_start] != '\'' and source[specifier_start] != '"') : (specifier_start += 1) {}
+        if (specifier_start >= source.len) break;
+        const specifier_end = skipQuotedJavaScript(source, specifier_start);
+        const semicolon = std.mem.indexOfScalarPos(u8, source, specifier_end, ';') orelse {
+            cursor = specifier_end;
+            continue;
+        };
+        const specifier = (try decodeJavaScriptStringPrefix(ctx.allocator, source[specifier_start..specifier_end])) orelse {
+            cursor = semicolon + 1;
+            continue;
+        };
+        const target_path = (try resolveDynamicImportTarget(ctx, resolution_dir, specifier)) orelse {
+            cursor = semicolon + 1;
+            continue;
+        };
+        if (!std.mem.eql(u8, target_path, source_path)) {
+            cursor = semicolon + 1;
+            continue;
+        }
+
+        const clause = std.mem.trim(u8, source[clause_start..specifier_start], " \t\r\n");
+        if (!std.mem.endsWith(u8, clause, "from")) {
+            cursor = semicolon + 1;
+            continue;
+        }
+        const namespace_clause = std.mem.trim(u8, clause[0 .. clause.len - "from".len], " \t\r\n");
+        const after_star = std.mem.trim(u8, namespace_clause[1..], " \t\r\n");
+        if (!std.mem.startsWith(u8, after_star, "as")) {
+            cursor = semicolon + 1;
+            continue;
+        }
+        const binding = std.mem.trim(u8, after_star["as".len..], " \t\r\n");
+        if (binding.len == 0 or !isIdentifierStart(binding[0])) {
+            cursor = semicolon + 1;
+            continue;
+        }
+        var valid_binding = true;
+        for (binding[1..]) |byte| {
+            if (!isIdentifierPart(byte)) valid_binding = false;
+        }
+        if (!valid_binding) {
+            cursor = semicolon + 1;
+            continue;
+        }
+
+        try output.appendSlice(ctx.allocator, source[copied_until..cursor]);
+        try output.appendSlice(ctx.allocator, "const ");
+        try output.appendSlice(ctx.allocator, binding);
+        try output.appendSlice(ctx.allocator, " = {}; Object.defineProperty(");
+        try output.appendSlice(ctx.allocator, binding);
+        try output.appendSlice(ctx.allocator, ", Symbol.toStringTag, { value: \"Module\" });\n");
+        for (exports) |item| {
+            try output.appendSlice(ctx.allocator, "Object.defineProperty(");
+            try output.appendSlice(ctx.allocator, binding);
+            try output.appendSlice(ctx.allocator, ", ");
+            try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, item.exported_name));
+            try output.appendSlice(ctx.allocator, ", { enumerable: true, get: () => ");
+            try output.appendSlice(ctx.allocator, item.local_name);
+            try output.appendSlice(ctx.allocator, " });\n");
+        }
+        copied_until = semicolon + 1;
+        cursor = copied_until;
+        changed = true;
+    }
+
+    if (!changed) return null;
+    try output.appendSlice(ctx.allocator, source[copied_until..]);
+    return try output.toOwnedSlice(ctx.allocator);
+}
+
 fn writeBunCompatTransformedSource(
     ctx: *const Context,
     script_abs: []const u8,
@@ -4167,11 +4678,19 @@ fn writeBunCompatTransformedSource(
     // in `.ts`. Give the compiler a generated `.js` path so type syntax is
     // rejected instead of silently stripped.
     if (has_bun_transpiled_pragma) changed = true;
-    if (std.mem.indexOf(u8, source, ".__esModule") != null) {
-        if (try rewriteNamespaceEsModuleAssignments(ctx.allocator, source)) |transformed| {
+    if (std.mem.indexOf(u8, transformed_source, ".__esModule") != null) {
+        if (try rewriteNamespaceEsModuleAssignments(ctx.allocator, transformed_source)) |transformed| {
             transformed_source = transformed;
             changed = true;
         }
+    }
+    if (try rewriteLegacyHtmlClosingComments(ctx.allocator, transformed_source)) |transformed| {
+        transformed_source = transformed;
+        changed = true;
+    }
+    if (try sourceIsStrictDirectiveOnly(ctx.allocator, transformed_source)) {
+        transformed_source = try std.mem.concat(ctx.allocator, u8, &.{ transformed_source, "\nvoid 0;\n" });
+        changed = true;
     }
 
     var import_meta_main_source: ?[]u8 = null;
@@ -4186,6 +4705,10 @@ fn writeBunCompatTransformedSource(
     }
 
     const resolution_dir = source_base_dir orelse std.fs.path.dirname(script_abs) orelse ctx.project_root;
+    if (try rewriteSelfNamespaceImports(ctx, transformed_source, script_abs, resolution_dir)) |transformed| {
+        transformed_source = transformed;
+        changed = true;
+    }
     if (try rewriteQueryImports(ctx, transformed_source, resolution_dir, transpilerLoaderForPath(script_abs))) |transformed| {
         transformed_source = transformed;
         changed = true;
@@ -4601,7 +5124,7 @@ fn resolveDynamicImportTarget(
         const loader = inferredLoaderForTarget(candidate);
         if (loader == null or !std.mem.eql(u8, loader.?, "file")) return null;
     }
-    for ([_][]const u8{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json" }) |extension| {
+    for ([_][]const u8{ ".js", ".jsx", ".ts", ".tsx", ".mjs", ".mts", ".cjs", ".cts", ".json" }) |extension| {
         const with_extension = try std.mem.concat(ctx.allocator, u8, &.{ candidate, extension });
         if (realPathIfFile(ctx, with_extension)) |resolved| return resolved;
     }
@@ -5212,12 +5735,13 @@ fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, extension, ".toml")) return "toml";
     if (std.mem.eql(u8, extension, ".yaml") or std.mem.eql(u8, extension, ".yml")) return "yaml";
     if (std.mem.eql(u8, extension, ".txt")) return "text";
-    if (std.mem.eql(u8, extension, ".cjs")) return "js";
+    if (std.mem.eql(u8, extension, ".cjs") or std.mem.eql(u8, extension, ".cts")) return "js";
     if (std.mem.eql(u8, extension, ".js") or
         std.mem.eql(u8, extension, ".jsx") or
         std.mem.eql(u8, extension, ".ts") or
         std.mem.eql(u8, extension, ".tsx") or
         std.mem.eql(u8, extension, ".mjs") or
+        std.mem.eql(u8, extension, ".mts") or
         extension.len == 0)
     {
         return null;
@@ -5312,7 +5836,8 @@ fn appendDynamicTargetFactory(
         try jsonStringLiteral(ctx, loader)
     else
         "null";
-    const is_cjs_target = std.mem.eql(u8, std.fs.path.extension(target.path), ".cjs");
+    const is_cjs_target = std.mem.eql(u8, std.fs.path.extension(target.path), ".cjs") or
+        std.mem.eql(u8, std.fs.path.extension(target.path), ".cts");
     const package_type_module = if (is_cjs_target)
         try nearestPackageTypeIsModule(ctx, dirname)
     else
@@ -5388,7 +5913,7 @@ fn appendDynamicTargetFactory(
         );
         try output.append(ctx.allocator, ',');
     }
-    try output.appendSlice(ctx.allocator, "};\n    const __ctFactorySource = __ctType == null ? __ctDefaultFactorySource : __ctJavaScriptFactories[__ctType];\n    if (__ctFactorySource == null) ");
+    try output.appendSlice(ctx.allocator, "};\n    const __ctFactorySource = __ctType == null || (__ctType === __ctInferredType && __ctJavaScriptFactories[__ctType] == null) ? __ctDefaultFactorySource : __ctJavaScriptFactories[__ctType];\n    if (__ctFactorySource == null) ");
     try output.appendSlice(ctx.allocator, factory_error);
     try output.appendSlice(ctx.allocator, "\n    new Function(\"module\", \"exports\", \"require\", \"__ctImportMeta\", \"__ctDynamicImport\", __ctFactorySource)(module, exports, __ctCreateRequire(__ctPath");
     try output.appendSlice(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "{d}", .{index}));
@@ -5657,19 +6182,27 @@ fn rewriteQueryImports(
         \\}
         \\function __ctCommonJSNamespace(value, packageTypeModule) {
         \\  const namespace = { default: value };
+        \\  Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
         \\  if (value !== null && (typeof value === "object" || typeof value === "function")) {
-        \\    if (!packageTypeModule && value.__esModule === true && Object.hasOwn(value, "default")) {
-        \\      namespace.default = value.default;
-        \\    }
-        \\    for (const key of Object.keys(value)) {
+        \\    try { Object.defineProperty(value, Symbol.for("cottontail.commonjsExports"), { value: true }); } catch {}
+        \\    let isEsModule = false;
+        \\    try { isEsModule = value.__esModule === true; } catch {}
+        \\    if (!packageTypeModule && isEsModule && Object.hasOwn(value, "default")) namespace.default = value.default;
+        \\    for (const key of Object.getOwnPropertyNames(value)) {
         \\      if (key === "default" || (!packageTypeModule && key === "__esModule")) continue;
-        \\      namespace[key] = value[key];
+        \\      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        \\      if (!descriptor) continue;
+        \\      if ("value" in descriptor) namespace[key] = descriptor.value;
+        \\      else if (descriptor.enumerable) {
+        \\        try { namespace[key] = value[key]; } catch { namespace[key] = undefined; }
+        \\      }
         \\    }
         \\  }
         \\  return namespace;
         \\}
         \\function __ctMutableNamespace(value) {
         \\  const namespace = {};
+        \\  Object.defineProperty(namespace, Symbol.toStringTag, { value: "Module" });
         \\  for (const key of Object.keys(value ?? {})) {
         \\    if (key !== "__esModule") namespace[key] = value[key];
         \\  }
@@ -6187,6 +6720,7 @@ fn writeCommonJsEntryWrapper(
         ctx.allocator,
         \\globalThis.__cottontailBundleSourceMap ??= {s};
         \\globalThis.__cottontailBundleSourceRoot ??= {s};
+        \\globalThis.Loader ??= {{ registry: new Map() }};
         \\const eventsBuiltin = events.default ?? events;
         \\const assertBuiltin = assert.default ?? assert;
         \\const assertStrictBuiltin = assertStrict.default ?? assertStrict;
