@@ -167,26 +167,108 @@ fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void 
     error_out.* = message.ptr;
 }
 
-fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback: anyerror) void {
-    for (log.msgs.items) |message| {
-        if (message.kind == .err) {
-            if (message.data.location) |location| {
-                // Bun's CLI diagnostics lead with the error text and put the
-                // source location on the following line. Keep this C bridge
-                // message-first too; callers add the leading "error: ".
-                setError(error_out, "{s}\n    at {s}:{}:{}", .{
-                    message.data.text,
-                    location.file,
-                    location.line,
-                    location.column,
-                });
-            } else {
-                setError(error_out, "{s}", .{message.data.text});
+fn writeBuildDiagnosticData(
+    writer: *std.Io.Writer,
+    data: *const compiler.logger.Data,
+    kind: []const u8,
+) !void {
+    if (data.location) |location| {
+        if (location.line_text) |raw_line_text| {
+            const line_text = std.mem.trimStart(
+                u8,
+                std.mem.trimEnd(u8, raw_line_text, " \r\n\t"),
+                "\n\r",
+            );
+            if (location.line > 0 and location.column > 0 and line_text.len > 0) {
+                try writer.print("{d} | {s}\n", .{ location.line, line_text });
+                const caret_padding = std.fmt.count("{d} | ", .{location.line}) +
+                    @as(usize, @intCast(location.column - 1));
+                try writer.splatByteAll(' ', caret_padding);
+                try writer.writeAll("^\n");
             }
-            return;
         }
     }
+
+    try writer.print("{s}: {s}", .{ kind, data.text });
+    if (data.location) |location| {
+        if (location.file.len > 0) {
+            try writer.writeAll("\n");
+            try writer.splatByteAll(' ', kind.len + 2 - "at ".len);
+            try writer.print("at {s}", .{location.file});
+            if (location.line > 0 and location.column >= 0) {
+                try writer.print(":{d}:{d}", .{ location.line, location.column });
+            } else if (location.line >= 0) {
+                try writer.print(":{d}", .{location.line});
+            }
+        }
+    }
+}
+
+fn writeBuildDiagnostic(writer: *std.Io.Writer, message: *const compiler.logger.Msg) !void {
+    try writeBuildDiagnosticData(writer, &message.data, "error");
+    for (message.notes) |*note| {
+        try writer.writeAll("\n\n");
+        try writeBuildDiagnosticData(writer, note, "note");
+    }
+}
+
+fn setBuildError(error_out: *?[*:0]u8, log: *const compiler.logger.Log, fallback: anyerror) void {
+    var output: std.Io.Writer.Allocating = .init(c_allocator);
+    defer output.deinit();
+
+    var error_count: usize = 0;
+    for (log.msgs.items) |*message| {
+        if (message.kind != .err) continue;
+        if (error_count > 0) output.writer.writeAll("\n\n") catch break;
+        writeBuildDiagnostic(&output.writer, message) catch break;
+        error_count += 1;
+    }
+
+    if (error_count > 0) {
+        setError(error_out, "{s}", .{output.written()});
+        return;
+    }
+
     setError(error_out, "JavaScript bundle failed: {s}", .{@errorName(fallback)});
+}
+
+test "build errors retain every formatted source diagnostic" {
+    var log = compiler.logger.Log.init(std.testing.allocator);
+    defer log.msgs.deinit();
+
+    try log.msgs.append(.{
+        .kind = .err,
+        .data = .{
+            .text = "Expected identifier",
+            .location = .{
+                .file = "input.js",
+                .line = 2,
+                .column = 3,
+                .line_text = "  broken syntax",
+            },
+        },
+    });
+    try log.msgs.append(.{
+        .kind = .err,
+        .data = .{
+            .text = "Unexpected token",
+            .location = .{
+                .file = "input.js",
+                .line = 3,
+                .column = 1,
+                .line_text = "}",
+            },
+        },
+    });
+
+    var error_message: ?[*:0]u8 = null;
+    setBuildError(&error_message, &log, error.SyntaxError);
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    const text = std.mem.span(error_message.?);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2 |   broken syntax") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "error: Expected identifier") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3 | }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "error: Unexpected token") != null);
 }
 
 pub const EntryPointOutput = struct {

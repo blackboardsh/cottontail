@@ -2822,13 +2822,27 @@ pub inline fn clamp(value: anytype, minimum: @TypeOf(value), maximum: @TypeOf(va
 }
 
 pub fn intFromFloat(comptime Int: type, value: anytype) Int {
+    const Float = @TypeOf(value);
+    comptime {
+        if (!(Float == f32 or Float == f64)) {
+            @compileError("intFromFloat: value must be f32 or f64");
+        }
+    }
+
     if (std.math.isNan(value)) return 0;
     const truncated = @trunc(value);
     const maximum = std.math.maxInt(Int);
     const minimum = std.math.minInt(Int);
-    if (truncated > @as(@TypeOf(value), @floatFromInt(maximum))) return maximum;
-    if (truncated < @as(@TypeOf(value), @floatFromInt(minimum))) return minimum;
-    return @intFromFloat(truncated);
+    if (truncated > @as(f64, @floatFromInt(maximum))) return maximum;
+    if (truncated < @as(f64, @floatFromInt(minimum))) return minimum;
+    return @as(Int, @intFromFloat(truncated));
+}
+
+test "intFromFloat saturates values rounded beyond integer bounds" {
+    try std.testing.expectEqual(std.math.maxInt(i32), intFromFloat(i32, @as(f32, 2_147_483_648.0)));
+    try std.testing.expectEqual(std.math.minInt(i32), intFromFloat(i32, @as(f32, -2_147_483_649.0)));
+    try std.testing.expectEqual(std.math.maxInt(u8), intFromFloat(u8, @as(f32, 300.0)));
+    try std.testing.expectEqual(@as(u8, 0), intFromFloat(u8, @as(f32, -50.0)));
 }
 
 pub fn splitAtMut(comptime Type: type, slice: []Type, middle: usize) struct { []Type, []Type } {

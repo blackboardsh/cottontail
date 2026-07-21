@@ -1034,7 +1034,6 @@ fn reportTestBundleError(ctx: *const Context, script_abs: []const u8, text: []co
 }
 
 fn validateCommonJsTestSyntax(ctx: *const Context, script_abs: []const u8) !void {
-    if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") == null) return;
     const loader = transpilerLoaderForPath(script_abs) orelse return;
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
@@ -1046,11 +1045,21 @@ fn validateCommonJsTestSyntax(ctx: *const Context, script_abs: []const u8) !void
     const imports = native_transpiler.scanImportsJsonWithError(source, loader, &error_message) catch {
         if (error_message) |message| {
             defer native_transpiler.ct_transpiler_string_free(message);
-            reportTestBundleError(ctx, script_abs, std.mem.span(message));
+            writeTranspilerDiagnostic(ctx, std.mem.span(message), script_abs);
         }
         return error.TestBundleFailed;
     };
     std.heap.c_allocator.free(imports);
+}
+
+fn writeTranspilerDiagnostic(ctx: *const Context, text: []const u8, display_path: []const u8) void {
+    var rewritten = text;
+    for ([_][]const u8{ "input.js", "input.jsx", "input.ts", "input.tsx" }) |stdin_name| {
+        const needle = std.fmt.allocPrint(ctx.allocator, "    at {s}:", .{stdin_name}) catch continue;
+        const replacement = std.fmt.allocPrint(ctx.allocator, "    at {s}:", .{display_path}) catch continue;
+        rewritten = std.mem.replaceOwned(u8, ctx.allocator, rewritten, needle, replacement) catch rewritten;
+    }
+    ctx.writeStderr("{s}\n", .{rewritten});
 }
 
 pub fn runEval(
@@ -1083,10 +1092,10 @@ pub fn runEval(
 fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
     var error_message: ?[*:0]u8 = null;
     const imports = native_transpiler.scanImportsJsonWithError(source, "tsx", &error_message) catch {
-        ctx.writeStderr("{s}\n", .{source});
         if (error_message) |message| {
             defer native_transpiler.ct_transpiler_string_free(message);
-            ctx.writeStderr("error: {s}\n", .{std.mem.span(message)});
+            const display_path = std.fs.path.join(ctx.allocator, &.{ ctx.project_root, "[eval]" }) catch "[eval]";
+            writeTranspilerDiagnostic(ctx, std.mem.span(message), display_path);
         } else {
             ctx.writeStderr("error: Syntax Error\n", .{});
         }
