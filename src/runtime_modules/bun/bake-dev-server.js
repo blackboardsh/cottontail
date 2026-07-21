@@ -20,6 +20,13 @@ function isServerConfig(value) {
     typeof value.stop !== "function";
 }
 
+function normalizeDefaultServerConfig(config) {
+  // Bun ignores array-valued `routes` fields. Framework applications such as
+  // Hono expose their own route registry there while also providing fetch().
+  if (!Array.isArray(config.routes)) return config;
+  return { ...config, routes: undefined };
+}
+
 function isHtmlAsset(value) {
   return (typeof value === "string" && /\.html?$/i.test(value)) ||
     (value && typeof value === "object" && typeof value.index === "string" && Array.isArray(value.files));
@@ -1299,8 +1306,9 @@ Object.defineProperty(globalThis, Symbol.for("cottontail.internal.buildBakeProdu
 });
 
 export function startDefaultApp(entryNamespace) {
-  const config = entryNamespace?.default;
-  if (!isServerConfig(config) || globalThis.__cottontailServeEverCalled) return null;
+  const exportedConfig = entryNamespace?.default;
+  if (!isServerConfig(exportedConfig) || globalThis.__cottontailServeEverCalled) return null;
+  const config = normalizeDefaultServerConfig(exportedConfig);
 
   const bakeManaged = isBakeConfig(config);
   const development = bakeManaged && globalThis.process?.env?.NODE_ENV !== "production";
