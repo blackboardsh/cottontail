@@ -123,11 +123,14 @@ export class Http2ServerResponse extends ServerResponse {
     this.connection = this.socket;
     this._trailerHeaders = {};
     this._closed = false;
+    this._ownsStreamResponse = false;
     stream.on("drain", () => this.emit("drain"));
     stream.on("timeout", () => this.emit("timeout"));
     stream.on("aborted", () => this.emit("aborted"));
     stream.on("wantTrailers", () => {
-      if (!stream.sentTrailers && !stream.closed) stream.sendTrailers(this._trailerHeaders);
+      if (this._ownsStreamResponse && !stream.sentTrailers && !stream.closed) {
+        stream.sendTrailers(this._trailerHeaders);
+      }
     });
     stream.on("finish", () => {
       if (!this._finishEmitted) {
@@ -172,6 +175,7 @@ export class Http2ServerResponse extends ServerResponse {
   _sendHead() {
     if (this.headersSent) return;
     const headers = { ":status": this.statusCode, ...this.getHeaders() };
+    this._ownsStreamResponse = true;
     this.stream.respond(headers, { waitForTrailers: true, sendDate: this.sendDate });
     this.headersSent = true;
   }
@@ -1235,6 +1239,7 @@ export class Http2Stream extends Duplex {
     this._responseEmitted = false;
     this._waitForTrailers = false;
     this._trailersReady = false;
+    this._gracefulClosePending = false;
     this._closeEmitted = false;
     this._abortCleanup = null;
     this._sendQueue = [];
@@ -1606,6 +1611,10 @@ export class Http2Stream extends Duplex {
         ? constants.NGHTTP2_STREAM_STATE_CLOSED
         : constants.NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE;
       this.push(null);
+      // Node's ClientHttp2Stream completes an empty readable side when the
+      // peer's END_STREAM arrives, even if a data listener paused the stream.
+      // read(0) only advances EOF when no received data remains buffered.
+      if (this._readableState?.length === 0) this.read(0);
       this._maybeClose();
     }
   }
@@ -1640,13 +1649,20 @@ export class Http2Stream extends Duplex {
   }
 
   _maybeClose() {
-    if (this.closed || !this._endStreamSent || !this._endStreamReceived) return;
-    this.closed = true;
-    this.destroyed = true;
-    this.state.state = constants.NGHTTP2_STREAM_STATE_CLOSED;
-    const session = this.session;
-    session?._streamClosed(this);
-    queueMicrotask(() => this._emitClose());
+    if (this.closed || this._gracefulClosePending || !this._endStreamSent || !this._endStreamReceived) return;
+    this._gracefulClosePending = true;
+    const finish = () => {
+      if (this.closed) return;
+      this.closed = true;
+      this.destroyed = true;
+      this.state.state = constants.NGHTTP2_STREAM_STATE_CLOSED;
+      const session = this.session;
+      session?._streamClosed(this);
+      this.session = null;
+      queueMicrotask(() => this._emitClose());
+    };
+    if (this.readableEnded || this._readableState?.endEmitted) queueMicrotask(finish);
+    else this.once("end", finish);
   }
 }
 
@@ -1698,6 +1714,9 @@ class Http2Session extends EventEmitter {
     this._closeEmitted = false;
     this._protocolReady = isServer;
     this._outboundFrames = [];
+    this._inboundFrames = [];
+    this._dispatchingFrames = false;
+    this._frameDispatchScheduled = false;
     this._pendingHeaderBlock = null;
     this._hpackDecoder = new HpackDecoder();
     this.localSettings = defaultSettingsObject();
@@ -2050,7 +2069,30 @@ class Http2Session extends EventEmitter {
     }
     const parsed = parseFrames(this._buffer);
     this._buffer = parsed.remaining;
-    for (const frame of parsed.frames) this._handleFrame(frame);
+    this._inboundFrames.push(...parsed.frames);
+    this._drainInboundFrames();
+  }
+
+  _drainInboundFrames() {
+    if (this._dispatchingFrames || this._frameDispatchScheduled || this.destroyed) return;
+    this._dispatchingFrames = true;
+    while (this._inboundFrames.length > 0 && !this.destroyed) {
+      const frame = this._inboundFrames.shift();
+      const stream = frame.type === frameTypes.DATA ? this._streams.get(frame.streamId) : null;
+      this._handleFrame(frame);
+      if (stream?.isPaused?.() && this._inboundFrames.length > 0) {
+        this._dispatchingFrames = false;
+        this._frameDispatchScheduled = true;
+        const resume = () => {
+          this._frameDispatchScheduled = false;
+          this._drainInboundFrames();
+        };
+        if (typeof setImmediate === "function") setImmediate(resume);
+        else setTimeout(resume, 0);
+        return;
+      }
+    }
+    this._dispatchingFrames = false;
   }
 
   _dispatchHeaders(streamId, block, endStream, frameFlags) {
@@ -2066,6 +2108,10 @@ class Http2Session extends EventEmitter {
     let stream = this._streams.get(streamId);
     if (this.isServer) {
       if (!stream) {
+        if (this.closed) {
+          this._sendRstStream(streamId, constants.NGHTTP2_REFUSED_STREAM);
+          return;
+        }
         stream = new Http2Stream(this, streamId, headers);
         this._streams.set(streamId, stream);
         this.state.lastProcStreamID = streamId;
@@ -2723,6 +2769,7 @@ class Http2Server extends EventEmitter {
     this._secure = secure;
     this._server = null;
     this._sessions = new Set();
+    this._pendingContexts = [];
     this._closing = false;
     this._serverClosed = false;
     this._closeEmitted = false;
@@ -2767,11 +2814,16 @@ class Http2Server extends EventEmitter {
     }
     session.on("stream", (stream, headers, streamFlags, rawHeaders) => {
       this.emit("stream", stream, headers, streamFlags, rawHeaders);
+      const method = String(headers[":method"] ?? "").toUpperCase();
+      const hasExpectation = headers.expect !== undefined;
+      const needsCompatibilityApi = this.listenerCount("request") > 0 ||
+        (method === "CONNECT" && this.listenerCount("connect") > 0) ||
+        (hasExpectation && (this.listenerCount("checkContinue") > 0 || this.listenerCount("checkExpectation") > 0));
+      if (!needsCompatibilityApi) return;
       const RequestCtor = this._options.Http2ServerRequest ?? Http2ServerRequest;
       const ResponseCtor = this._options.Http2ServerResponse ?? Http2ServerResponse;
       const request = new RequestCtor(stream, headers, undefined, rawHeaders);
       const response = new ResponseCtor(stream, request);
-      const method = String(headers[":method"] ?? "").toUpperCase();
       if (method === "CONNECT") {
         if (!this.emit("connect", request, response)) {
           response.statusCode = 405;
@@ -2826,6 +2878,27 @@ class Http2Server extends EventEmitter {
     return this;
   }
 
+  setSecureContext(options = {}) {
+    if (!this._secure) {
+      throw codedError("ERR_INVALID_ARG_VALUE", "setSecureContext is only available on secure HTTP/2 servers", TypeError);
+    }
+    validateObject(options, "options");
+    const context = options?.context ?? options;
+    this._options = { ...this._options, ...context };
+    this._server?.setSecureContext?.(options);
+  }
+
+  addContext(hostname, context) {
+    if (!this._secure) {
+      throw codedError("ERR_INVALID_ARG_VALUE", "addContext is only available on secure HTTP/2 servers", TypeError);
+    }
+    if (typeof hostname !== "string") {
+      throw codedError("ERR_INVALID_ARG_TYPE", "The hostname argument must be a string", TypeError);
+    }
+    if (this._server) this._server.addContext(hostname, context);
+    else this._pendingContexts.push([hostname, context]);
+  }
+
   listen(...args) {
     const callback = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
     if (callback) this.once("listening", callback);
@@ -2839,8 +2912,13 @@ class Http2Server extends EventEmitter {
     this._server = this._secure
       ? createTlsServer(tlsOptions, connectionListener)
       : createNetServer(connectionListener);
+    for (const [hostname, context] of this._pendingContexts.splice(0)) {
+      this._server.addContext?.(hostname, context);
+    }
     this._server.once("error", (error) => this.emit("error", error));
     this._server.on?.("connection", socket => this.emit("connection", socket));
+    this._server.on?.("secureConnection", socket => this.emit("secureConnection", socket));
+    this._server.on?.("tlsClientError", (error, socket) => this.emit("tlsClientError", error, socket));
     this._server.listen(...args, () => {
       this.listening = true;
       this.emit("listening");
