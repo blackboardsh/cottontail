@@ -17,6 +17,7 @@ const Workspaces = @import("package_manager_workspaces.zig");
 const Analyzer = @import("package_manager_analyzer.zig");
 const Audit = @import("package_manager_audit.zig");
 const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
+const Pack = @import("package_manager_pack.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -112,6 +113,9 @@ const Options = struct {
     invalid_os: ?[]const u8 = null,
     minimum_release_age_ms: ?f64 = null,
     minimum_release_age_cli: bool = false,
+    pack_destination: ?[]const u8 = null,
+    pack_filename: ?[]const u8 = null,
+    pack_gzip_level: ?[]const u8 = null,
 };
 
 const PackageSpec = struct {
@@ -574,6 +578,24 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.force = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--destination")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_destination = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--destination=")) {
+            options.pack_destination = arg["--destination=".len..];
+        } else if (std.mem.eql(u8, arg, "--filename")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_filename = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--filename=")) {
+            options.pack_filename = arg["--filename=".len..];
+        } else if (std.mem.eql(u8, arg, "--gzip-level")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_gzip_level = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--gzip-level=")) {
+            options.pack_gzip_level = arg["--gzip-level=".len..];
         } else if (std.mem.eql(u8, arg, "--silent") or std.mem.eql(u8, arg, "--quiet")) {
             options.silent = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
@@ -770,6 +792,25 @@ fn runPm(
         return 0;
     }
     if (std.mem.eql(u8, subcommand, "migrate")) return runPmMigrate(init, options, stdout, stderr);
+    if (std.mem.eql(u8, subcommand, "pack")) {
+        const invocation_dir = try absolutePath(init.io, init.arena.allocator(), ".");
+        const project = try findInstallProject(init.io, init.arena.allocator(), invocation_dir);
+        return Pack.run(
+            init,
+            project.root_dir,
+            project.package_dir,
+            .{
+                .destination = options.pack_destination,
+                .filename = options.pack_filename,
+                .gzip_level = options.pack_gzip_level,
+                .dry_run = options.dry_run,
+                .ignore_scripts = options.ignore_scripts,
+                .quiet = options.silent,
+            },
+            stdout,
+            stderr,
+        );
+    }
     if (std.mem.eql(u8, subcommand, "pkg")) {
         const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
         return PmPkg.run(

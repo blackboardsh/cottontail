@@ -146,6 +146,62 @@ pub fn runNamedStage(
     try runStage(init, root_dir, task, &scripts, stage, stderr, .version);
 }
 
+pub fn runPackStage(
+    init: std.process.Init,
+    root_dir: []const u8,
+    manifest: *const Value,
+    stage: []const u8,
+    quiet: bool,
+    stderr: *std.Io.Writer,
+) !void {
+    const scripts = if (manifest.* == .object) manifest.object.get("scripts") orelse return else return;
+    if (scripts != .object) return;
+    const value = scripts.object.get(stage) orelse return;
+    if (value != .string or value.string.len == 0) return;
+
+    const task: Task = .{
+        .name = jsonString(manifest, "name") orelse "root",
+        .version = jsonString(manifest, "version") orelse "0.0.0",
+        .cwd = root_dir,
+        .kind = .git,
+        .optional = false,
+    };
+    const allocator = init.arena.allocator();
+    var environment = try init.environ_map.clone(allocator);
+    defer environment.deinit();
+    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, value.string);
+    try environment.put("npm_command", "pack");
+
+    const command = try replaceBunCommand(allocator, init.io, value.string);
+    if (!quiet) {
+        try stderr.print("$ {s}\n", .{value.string});
+        try stderr.flush();
+    }
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/d", "/s", "/c", command }
+    else
+        &.{ "/bin/sh", "-c", command };
+    var child = try std.process.spawn(init.io, .{
+        .argv = shell_args,
+        .cwd = .{ .path = root_dir },
+        .environ_map = &environment,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    });
+    defer child.kill(init.io);
+    const result = try child.wait(init.io);
+    const exit_code: u8 = switch (result) {
+        .exited => |code| @intCast(@min(code, 255)),
+        else => 1,
+    };
+    if (exit_code == 0) return;
+    try stderr.print("error: script \"{s}\" exited with code {d}\n", .{ stage, exit_code });
+    try stderr.flush();
+    return error.LifecycleScriptFailed;
+}
+
 fn runPackage(init: std.process.Init, root_dir: []const u8, task: Task, stderr: *std.Io.Writer) !void {
     const package_json_path = try std.fs.path.join(init.arena.allocator(), &.{ task.cwd, "package.json" });
     const source = std.Io.Dir.cwd().readFileAlloc(
