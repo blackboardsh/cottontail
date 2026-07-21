@@ -14085,7 +14085,8 @@ function bunDnsLookupOptions(options) {
 function bunDnsError(error) {
   const rawCode = String(error?.code || "ENOTFOUND").replace(/^DNS_/, "");
   const syscall = error?.syscall ?? "getaddrinfo";
-  const out = new Error(`${syscall} ${rawCode}`);
+  const hostname = error?.hostname == null ? undefined : String(error.hostname);
+  const out = new Error(hostname === undefined ? `${syscall} ${rawCode}` : `${syscall} ${rawCode} ${hostname}`);
   out.name = "DNSException";
   out.code = `DNS_${rawCode}`;
   out.errno = ({
@@ -14099,7 +14100,69 @@ function bunDnsError(error) {
     ECONNREFUSED: 11,
   })[rawCode] ?? error?.errno ?? 4;
   out.syscall = syscall;
+  if (hostname !== undefined) out.hostname = hostname;
   return out;
+}
+
+function bunDnsMissingArgs(method, expected, received) {
+  const error = new TypeError(`Not enough arguments to '${method}'. Expected ${expected}, got ${received}.`);
+  error.code = "ERR_MISSING_ARGS";
+  return error;
+}
+
+function bunDnsInvalidString(method, property, nonEmpty = false) {
+  const error = new TypeError(`Expected ${property} to be a ${nonEmpty ? "non-empty " : ""}string for '${method}'.`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function bunDnsValidateName(method, hostname, allowEmpty = false) {
+  if (typeof hostname !== "string") throw bunDnsInvalidString(method, method === "resolve" ? "name" : "hostname");
+  if (!allowEmpty && hostname.length === 0) throw bunDnsInvalidString(method, method === "resolve" ? "name" : "hostname", true);
+}
+
+function bunDnsPromise(promise, hostname = undefined) {
+  return Promise.resolve(promise).catch((error) => {
+    if (hostname != null && error != null && typeof error === "object" && error.hostname == null) {
+      error.hostname = String(hostname);
+    }
+    throw bunDnsError(error);
+  });
+}
+
+function bunDnsSystemLookup(hostname, lookupOptions) {
+  return new Promise((resolve, reject) => {
+    nodeDns.lookup(hostname, lookupOptions, (error, records) => {
+      if (error) reject(error);
+      else resolve(Array.from(records ?? []).map((record) => ({
+        address: String(record.address),
+        family: Number(record.family),
+        ttl: Number(record.ttl ?? 0),
+      })));
+    });
+  });
+}
+
+async function bunDnsCaresLookup(hostname, lookupOptions) {
+  const families = lookupOptions.family === 4 ? [4] : lookupOptions.family === 6 ? [6] : [6, 4];
+  const results = await Promise.allSettled(families.map((family) =>
+    family === 4
+      ? nodeDns.promises.resolve4(hostname, { ttl: true })
+      : nodeDns.promises.resolve6(hostname, { ttl: true })));
+  const records = [];
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    if (result.status !== "fulfilled") continue;
+    const family = families[index];
+    for (const record of result.value) {
+      records.push({ address: String(record.address), family, ttl: Number(record.ttl ?? 0) });
+    }
+  }
+  if (records.length > 0) return records;
+
+  // c-ares getaddrinfo also consults local hosts files. Keep that behavior when
+  // raw A/AAAA DNS queries have no answer (notably for localhost aliases).
+  return bunDnsSystemLookup(hostname, lookupOptions);
 }
 
 function bunDnsLookup(hostname, options = {}) {
@@ -14114,19 +14177,102 @@ function bunDnsLookup(hostname, options = {}) {
     throw error;
   }
   const lookupOptions = bunDnsLookupOptions(options);
-  return new Promise((resolve, reject) => {
-    nodeDns.lookup(hostname, lookupOptions, (error, records) => {
-      if (error) {
-        reject(bunDnsError(error));
-        return;
-      }
-      resolve(Array.from(records ?? []).map((record) => ({
-        address: String(record.address),
-        family: Number(record.family),
-        ttl: Number(record.ttl ?? 0),
-      })));
-    });
+  const promise = lookupOptions.backend === "c-ares"
+    ? bunDnsCaresLookup(hostname, lookupOptions)
+    : bunDnsSystemLookup(hostname, lookupOptions);
+  return bunDnsPromise(promise, hostname);
+}
+
+const bunDnsResolveMethods = {
+  A: (hostname) => nodeDns.promises.resolve4(hostname, { ttl: true }),
+  AAAA: (hostname) => nodeDns.promises.resolve6(hostname, { ttl: true }),
+  ANY: (hostname) => nodeDns.promises.resolveAny(hostname),
+  CAA: (hostname) => nodeDns.promises.resolveCaa(hostname),
+  CNAME: (hostname) => nodeDns.promises.resolveCname(hostname),
+  MX: (hostname) => nodeDns.promises.resolveMx(hostname),
+  NS: (hostname) => nodeDns.promises.resolveNs(hostname),
+  PTR: (hostname) => nodeDns.promises.resolvePtr(hostname),
+  SOA: (hostname) => nodeDns.promises.resolveSoa(hostname),
+  SRV: (hostname) => nodeDns.promises.resolveSrv(hostname),
+  TXT: (hostname) => nodeDns.promises.resolveTxt(hostname),
+};
+
+function bunDnsResolve(hostname, record = "A") {
+  if (arguments.length < 1) throw bunDnsMissingArgs("resolve", 3, arguments.length);
+  bunDnsValidateName("resolve", hostname);
+  if (record == null || typeof record !== "string" || record.length === 0) record = "A";
+  const method = bunDnsResolveMethods[record] ?? bunDnsResolveMethods[record.toLowerCase() === record ? record.toUpperCase() : ""];
+  if (method == null) {
+    const error = new TypeError(`The property "record" is invalid. Expected one of: A, AAAA, ANY, CAA, CNAME, MX, NS, PTR, SOA, SRV, TXT, received type string ('${record}')`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  return bunDnsPromise(method(hostname), hostname);
+}
+
+function bunDnsResolveWith(method, hostname, allowEmpty, received) {
+  if (received < 1) throw bunDnsMissingArgs(method, 1, received);
+  bunDnsValidateName(method, hostname, allowEmpty);
+  const promiseMethod = nodeDns.promises[method];
+  return bunDnsPromise(promiseMethod(hostname), hostname);
+}
+
+function bunDnsResolveSrv(hostname) { return bunDnsResolveWith("resolveSrv", hostname, false, arguments.length); }
+function bunDnsResolveTxt(hostname) { return bunDnsResolveWith("resolveTxt", hostname, false, arguments.length); }
+function bunDnsResolveSoa(hostname) { return bunDnsResolveWith("resolveSoa", hostname, true, arguments.length); }
+function bunDnsResolveNaptr(hostname) { return bunDnsResolveWith("resolveNaptr", hostname, false, arguments.length); }
+function bunDnsResolveMx(hostname) { return bunDnsResolveWith("resolveMx", hostname, false, arguments.length); }
+function bunDnsResolveCaa(hostname) { return bunDnsResolveWith("resolveCaa", hostname, false, arguments.length); }
+function bunDnsResolveNs(hostname) { return bunDnsResolveWith("resolveNs", hostname, true, arguments.length); }
+function bunDnsResolvePtr(hostname) { return bunDnsResolveWith("resolvePtr", hostname, false, arguments.length); }
+function bunDnsResolveCname(hostname) { return bunDnsResolveWith("resolveCname", hostname, false, arguments.length); }
+function bunDnsResolveAny(hostname) { return bunDnsResolveWith("resolveAny", hostname, false, arguments.length); }
+
+function bunDnsReverse(ip) {
+  if (arguments.length < 1) throw bunDnsMissingArgs("reverse", 1, arguments.length);
+  if (typeof ip !== "string") throw bunDnsInvalidString("reverse", "ip");
+  if (ip.length === 0) throw bunDnsInvalidString("reverse", "ip", true);
+  return bunDnsPromise(nodeDns.promises.reverse(ip), ip);
+}
+
+function bunDnsLookupService(address, port) {
+  if (arguments.length < 2) throw bunDnsMissingArgs("lookupService", 2, arguments.length);
+  if (typeof address !== "string") throw bunDnsInvalidString("lookupService", "address");
+  if (address.length === 0) throw bunDnsInvalidString("lookupService", "address", true);
+  const promise = nodeDns.promises.lookupService(address, port).then(({ hostname, service }) => [hostname, service]);
+  return bunDnsPromise(promise, address);
+}
+
+function bunDnsSetServers(nextServers) {
+  if (arguments.length < 1) throw bunDnsMissingArgs("setServers", 1, arguments.length);
+  if (!Array.isArray(nextServers)) {
+    const error = new TypeError("Expected servers to be a array for 'setServers'.");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const normalized = nextServers.map((triple) => {
+    if (!Array.isArray(triple)) {
+      const error = new TypeError("Expected triple to be a array for 'setServers'.");
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    const family = Number(triple[0]);
+    const address = String(triple[1]);
+    const port = Number(triple[2]);
+    if ((family !== 4 && family !== 6) || nodeNet.isIP(address) !== family) {
+      const error = new TypeError(family !== 4 && family !== 6 ? "Invalid address family" : `Invalid IP address: "${address}"`);
+      error.code = family !== 4 && family !== 6 ? "ERR_INVALID_ARG_VALUE" : "ERR_INVALID_IP_ADDRESS";
+      throw error;
+    }
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      const error = new RangeError(`Port should be >= 0 and < 65536. Received ${port}.`);
+      error.code = "ERR_SOCKET_BAD_PORT";
+      throw error;
+    }
+    if (port === 53) return address;
+    return family === 6 ? `[${address}]:${port}` : `${address}:${port}`;
   });
+  nodeDns.setServers(normalized);
 }
 
 const bunDnsResolverHookKey = Symbol.for("cottontail.runtime.bun-dns-resolver-hook");
@@ -14163,8 +14309,27 @@ function installBunDnsResolverCache() {
 installBunDnsResolverCache();
 
 export const dns = {
-  ...nodeDns,
   lookup: bunDnsLookup,
+  resolve: bunDnsResolve,
+  resolveSrv: bunDnsResolveSrv,
+  resolveTxt: bunDnsResolveTxt,
+  resolveSoa: bunDnsResolveSoa,
+  resolveNaptr: bunDnsResolveNaptr,
+  resolveMx: bunDnsResolveMx,
+  resolveCaa: bunDnsResolveCaa,
+  resolveNs: bunDnsResolveNs,
+  resolvePtr: bunDnsResolvePtr,
+  resolveCname: bunDnsResolveCname,
+  resolveAny: bunDnsResolveAny,
+  getServers: nodeDns.getServers,
+  setServers: bunDnsSetServers,
+  reverse: bunDnsReverse,
+  lookupService: bunDnsLookupService,
+  prefetch: nodeDns.prefetch,
+  getCacheStats: nodeDns.getCacheStats,
+  ADDRCONFIG: nodeDns.ADDRCONFIG,
+  ALL: nodeDns.ALL,
+  V4MAPPED: nodeDns.V4MAPPED,
 };
 
 export function generateHeapSnapshot(format = undefined, output = undefined) {
