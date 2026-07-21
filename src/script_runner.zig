@@ -2303,6 +2303,7 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
             if (!minimalRuntimeBunProperty(property)) return .full;
         } else if (std.mem.eql(u8, token.text, "process")) {
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
+            if (std.mem.eql(u8, property, "mainModule")) return .full;
             if (!minimalRuntimeProcessProperty(property)) mode = .process;
         } else if (fullRuntimeGlobal(token.text)) {
             return .full;

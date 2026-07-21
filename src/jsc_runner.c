@@ -8551,8 +8551,13 @@ static JSValueRef ct_timer_has_active(JSContextRef ctx, JSObjectRef function, JS
 }
 
 static JSObjectRef ct_process_object(JSContextRef ctx) {
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
     JSValueRef exception = NULL;
-    JSValueRef value = ct_get_property(ctx, JSContextGetGlobalObject(ctx), "process", &exception);
+    JSValueRef value = ct_get_property(ctx, global, "__cottontailProcessObject", &exception);
+    if (exception != NULL || value == NULL || !JSValueIsObject(ctx, value)) {
+        exception = NULL;
+        value = ct_get_property(ctx, global, "process", &exception);
+    }
     if (exception != NULL || value == NULL || !JSValueIsObject(ctx, value)) return NULL;
     return JSValueToObject(ctx, value, &exception);
 }
@@ -23908,11 +23913,11 @@ static char *ct_prepare_wrapped_source(const uint8_t *source, size_t source_len,
         source,
         source_len,
         filename,
-        "globalThis.__ctDone=false;globalThis.__ctError=undefined;"
+        "globalThis.__ctDone=false;globalThis.__ctError=undefined;globalThis.__ctErrorSet=false;"
         "(()=>{const __ctTopLevelPromise=(async()=>{\n",
         "\n})();try{globalThis.__cottontailSuppressAsyncHookPromise=true;"
         "__ctTopLevelPromise.then(()=>{globalThis.__ctDone=true;},"
-        "e=>{globalThis.__ctError=e;globalThis.__ctDone=true;});}"
+        "e=>{globalThis.__ctError=e;globalThis.__ctErrorSet=true;globalThis.__ctDone=true;});}"
         "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();"
     );
 }
@@ -23942,7 +23947,8 @@ static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char 
     JSContextRef ctx = runtime->context;
     JSObjectRef global = JSContextGetGlobalObject(ctx);
     JSValueRef thrown = ct_global_value(ctx, name);
-    if (thrown == NULL || JSValueIsUndefined(ctx, thrown) || JSValueIsNull(ctx, thrown)) return 0;
+    bool was_set = strcmp(name, "__ctError") == 0 && ct_global_bool(ctx, "__ctErrorSet");
+    if (!was_set && (thrown == NULL || JSValueIsUndefined(ctx, thrown) || JSValueIsNull(ctx, thrown))) return 0;
 
     JSValueRef handler_exception = NULL;
     if (!ct_handle_uncaught_exception(runtime, thrown, &handler_exception)) {
@@ -23952,6 +23958,9 @@ static int ct_route_global_uncaught_exception(CtJscRuntime *runtime, const char 
 
     JSValueRef clear_exception = NULL;
     ct_set_property(ctx, global, name, JSValueMakeUndefined(ctx), &clear_exception);
+    if (clear_exception == NULL && was_set) {
+        ct_set_property(ctx, global, "__ctErrorSet", JSValueMakeBoolean(ctx, false), &clear_exception);
+    }
     if (clear_exception != NULL) {
         ct_set_error_out(error_out, ct_copy_exception(ctx, clear_exception));
         return -1;
@@ -24131,13 +24140,10 @@ int ct_jsc_runtime_exit_code(CtJscRuntime *runtime) {
     if (runtime == NULL || runtime->context == NULL) return 0;
 
     JSContextRef ctx = runtime->context;
-    JSValueRef process_value = ct_global_value(ctx, "process");
-    if (process_value == NULL || !JSValueIsObject(ctx, process_value)) return 0;
+    JSObjectRef process = ct_process_object(ctx);
+    if (process == NULL) return 0;
 
     JSValueRef exception = NULL;
-    JSObjectRef process = JSValueToObject(ctx, process_value, &exception);
-    if (exception != NULL || process == NULL) return 0;
-
     JSValueRef value = ct_get_property(ctx, process, "exitCode", &exception);
     if (exception != NULL || value == NULL || JSValueIsUndefined(ctx, value) || JSValueIsNull(ctx, value)) return 0;
 

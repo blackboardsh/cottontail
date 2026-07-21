@@ -17,7 +17,7 @@ import { makeHttpParserBinding } from "../internal/node-http-parser.js";
 import EventEmitter from "./events.js";
 
 const processStartMs = Date.now();
-const nodeCompatVersion = "24.11.1";
+const nodeCompatVersion = "24.3.0";
 let sourceMapsState = false;
 let uncaughtExceptionCaptureCallback = null;
 let lastClockNs = 0n;
@@ -868,12 +868,6 @@ function makeProcessBinding(name) {
       return makeFsBinding();
     case "buffer":
       return makeBufferBinding();
-    case "os":
-      return makeOsBinding();
-    case "spawn_sync":
-      return makeSpawnSyncBinding();
-    case "zlib":
-      return makeZlibBinding();
     case "uv":
       return uvBinding;
     case "util":
@@ -978,6 +972,11 @@ const processObject = globalThis.process ?? {
 };
 
 globalThis.process = processObject;
+Object.defineProperty(globalThis, "__cottontailProcessObject", {
+  value: processObject,
+  writable: true,
+  configurable: true,
+});
 createEventApi(processObject);
 
 processObject.argv ??= cottontailArgv;
@@ -1072,7 +1071,33 @@ processObject.pid ??= cottontail.pid?.() ?? 0;
 processObject.ppid = processInfo("ppid");
 processObject.version = `v${nodeCompatVersion}`;
 processObject.versions ??= { node: nodeCompatVersion, cottontail: "0.0.0-dev" };
-processObject.versions.node = nodeCompatVersion;
+Object.assign(processObject.versions, {
+  node: nodeCompatVersion,
+  bun: "1.3.10",
+  boringssl: "29a2cd359458c9384694b75456026e4b57e3e567",
+  openssl: "1.1.0",
+  llhttp: "9.3.0",
+  libarchive: "898dc8319355b7e985f68a9819f182aaed61b53a",
+  mimalloc: "4c283af60cdae205df5a872530c77e2a6a307d43",
+  picohttpparser: "066d2b1e9ab820703db0837a7255d92d30f0c9f5",
+  uwebsockets: "30e609e08073cf7114bfb278506962a5b19d0677",
+  webkit: "0ddf6f47af0a9782a354f61e06d7f83d097d9f84",
+  zig: "0.14.1",
+  zlib: "886098f3f339617b4243b286f5ed364b9989e245",
+  tinycc: "ab631362d839333660a265d3084d8ff060b96753",
+  lolhtml: "8d4c273ded322193d017042d1f48df2766b0f88b",
+  ares: "d1722e6e8acaf10eb73fa995798a9cd421d9f85e",
+  libdeflate: "dc76454a39e7e83b68c3704b6e3784654f8d5ac5",
+  usockets: "30e609e08073cf7114bfb278506962a5b19d0677",
+  lshpack: "3d0f1fc1d6e66a642e7a98c55deb38aa986eb4b0",
+  zstd: "794ea1b0afca0f020f4e57b6732332231fb23c70",
+  v8: "13.6.233.10-node.18",
+  uv: "1.48.0",
+  napi: "10",
+  icu: "74.2",
+  unicode: "15.1",
+  modules: "137",
+});
 processObject.versions.cottontail ??= "0.0.0-dev";
 const bunReleasePlatform = processObject.platform === "win32" ? "windows" : processObject.platform;
 const bunReleaseArch = processObject.arch === "arm64" ? "aarch64" : processObject.arch;
@@ -1604,6 +1629,30 @@ for (const stdioStream of [processObject.stdout, processObject.stderr]) {
   };
   Object.defineProperty(stdioStream, "__cottontailWellFormedWrites", { value: true, configurable: true });
 }
+
+for (const name of ["stdin", "stdout", "stderr"]) {
+  let stream = processObject[name];
+  let reportedInvalidGlobal = false;
+  Object.defineProperty(processObject, name, {
+    get() {
+      if (globalThis.process !== processObject) {
+        if (!reportedInvalidGlobal) {
+          reportedInvalidGlobal = true;
+          processObject.nextTick(() => {
+            throw new TypeError(`${String(globalThis.process)} is not an object`);
+          });
+        }
+        return undefined;
+      }
+      return stream;
+    },
+    set(value) {
+      stream = value;
+    },
+    enumerable: true,
+    configurable: true,
+  });
+}
 const configTargetDefaults = Object.freeze({
   cflags: Object.freeze([...(processObject.config?.target_defaults?.cflags ?? [])]),
   default_configuration: processObject.config?.target_defaults?.default_configuration ?? "Release",
@@ -1703,25 +1752,7 @@ export const _maxListeners = processObject._maxListeners;
 export let _exiting = processObject._exiting;
 export let exitCode = normalizeExitCode(processObject.exitCode);
 export let sourceMapsEnabled = sourceMapsState;
-export const allowedNodeEnvironmentFlags = new ImmutableSet([
-  "--conditions",
-  "--enable-source-maps",
-  "--experimental-modules",
-  "--inspect",
-  "--inspect-brk",
-  "--loader",
-  "--max-old-space-size",
-  "--no-deprecation",
-  "--preserve-symlinks",
-  "--require",
-  "--throw-deprecation",
-  "--trace-deprecation",
-  "--trace-warnings",
-  "--unhandled-rejections",
-  "--perf-basic-prof",
-  "--stack-trace-limit",
-  "-r",
-]);
+export const allowedNodeEnvironmentFlags = new ImmutableSet([]);
 processObject.allowedNodeEnvironmentFlags = allowedNodeEnvironmentFlags;
 Object.defineProperty(processObject, "exitCode", {
   get() { return exitCode; },
