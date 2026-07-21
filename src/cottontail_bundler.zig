@@ -1447,6 +1447,7 @@ const BuildOutputJson = struct {
     kind: []const u8,
     loader: []const u8,
     hash: ?[]const u8 = null,
+    contentHash: ?[]const u8 = null,
     sourcemapIndex: ?u32 = null,
     b64: []const u8,
 };
@@ -2022,6 +2023,7 @@ pub fn buildEntryPointsJson(
         const encoded = try arena_allocator.alloc(u8, base64.calcSize(bytes.len));
         _ = base64.encode(encoded, bytes);
         const hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.truncatedHash32(output_file.hash)});
+        const content_hash = try std.fmt.allocPrint(arena_allocator, "{f}", .{compiler.fmt.hexIntLower(output_file.hash)});
         // HTML entries produce associated JavaScript and CSS artifacts. Bun
         // reports those artifacts' generated loaders while preserving the
         // input loader for ordinary JS-family entry points (for example JSX).
@@ -2034,6 +2036,7 @@ pub fn buildEntryPointsJson(
             .kind = @tagName(output_file.output_kind),
             .loader = @tagName(artifact_loader),
             .hash = hash,
+            .contentHash = content_hash,
             .sourcemapIndex = if (output_file.source_map_index != std.math.maxInt(u32))
                 output_file.source_map_index
             else

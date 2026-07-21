@@ -2470,7 +2470,10 @@ class BuildMessage {
 }
 
 function runBuildDriver(spec) {
-  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const processCwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const cwd = spec.__cottontailWorkingDirectory != null
+    ? nodePathResolve(processCwd, String(spec.__cottontailWorkingDirectory))
+    : processCwd;
   const toAbsolute = (value) => (
     value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) ? value : nodePathResolve(cwd, value)
   );
@@ -2495,7 +2498,7 @@ function runBuildDriver(spec) {
       }
       entrypoints.push(absoluteEntry);
     }
-    const request = { ...spec, plugins: undefined, entrypoints };
+    const request = { ...spec, plugins: undefined, __cottontailWorkingDirectory: undefined, entrypoints };
     const parsed = JSON.parse(cottontail.buildNative(JSON.stringify(request), cwd));
     const metafile = parsed.metafile == null ? null : JSON.parse(parsed.metafile);
     const outdir = spec.outdir != null ? toAbsolute(String(spec.outdir)) : null;
@@ -2668,6 +2671,20 @@ function scanBundleImportsForLoader(source, loader) {
   if (loader === "html") {
     return JSON.parse(cottontail.transpilerScanImports(String(source), "{}", "html"))
       .map(({ path, kind }) => ({ specifier: path, kind }));
+  }
+  if (loader === "css") {
+    const found = new Map();
+    const push = (specifier, kind) => {
+      const value = String(specifier ?? "").trim();
+      if (!value || value.startsWith("#") || /^(?:data|https?):/i.test(value) || found.has(value)) return;
+      found.set(value, kind);
+    };
+    const text = String(source).replace(/\/\*[\s\S]*?\*\//g, "");
+    for (const match of text.matchAll(/@import\s+(?:url\(\s*)?["']([^"']+)["']/gi)) push(match[1], "import-rule");
+    for (const match of text.matchAll(/url\(\s*(?:["']([^"']+)["']|([^\s)'\"]+))\s*\)/gi)) {
+      push(match[1] ?? match[2], "url-token");
+    }
+    return [...found].map(([specifier, kind]) => ({ specifier, kind }));
   }
   return scanBundleImports(source);
 }
@@ -2941,9 +2958,18 @@ async function buildWithPlugins(options, plugins) {
       ? (sourceExtension || ".bin")
       : (bundleLoaderExtensions[loader] ?? (known ? known[0] : ".js"));
     const location = namespace === "file" ? packageLocation(sourcePath) : null;
+    const sourceRoot = nodePathResolve(options?.root ?? cottontail.cwd());
+    const sourceRelative = namespace === "file"
+      ? nodePathRelative(sourceRoot, nodePathResolve(sourcePath)).replace(/\\/g, "/")
+      : "";
+    const sourceRelativeIsLocal = sourceRelative !== "" && sourceRelative !== ".." &&
+      !sourceRelative.startsWith("../") && !sourceRelative.startsWith("/");
+    const sourceRelativeDir = sourceRelativeIsLocal ? pathDirname(sourceRelative).replace(/\\/g, "/") : "";
     let name = location
       ? `${location.relativePath.slice(0, location.relativePath.length - base.length)}${stem}${ext}`
-      : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
+      : sourceRelativeIsLocal
+        ? `${sourceRelativeDir === "." ? "" : `${sourceRelativeDir}/`}${stem}${ext}`
+        : `${entryName == null ? `deps/dep-${depCounter++}-` : ""}${stem}${ext}`;
     let counter = 1;
     const originalName = name;
     while (usedShadowNames.has(name)) {
@@ -2984,7 +3010,7 @@ async function buildWithPlugins(options, plugins) {
       if (extension) materializedLoaders[extension] = "file";
     }
     if (record.namespace === "file") preservePackageMetadata(record.path);
-    if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html") {
+    if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html" || loader === "css") {
       const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
         const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
         let target;
@@ -3077,6 +3103,7 @@ async function buildWithPlugins(options, plugins) {
     files: undefined,
     plugins: undefined,
     root: shadowRoot,
+    __cottontailWorkingDirectory: shadowRoot,
     loader: Object.keys(materializedLoaders).length > 0
       ? {
           ...(options?.loader && typeof options.loader === "object" ? options.loader : {}),
@@ -3198,6 +3225,8 @@ function ctBuildArtifactMime(meta) {
   }
 }
 
+const ctBuildArtifactContentHashSymbol = Symbol("cottontail.buildArtifactContentHash");
+
 const CTBuildArtifact = class BuildArtifact extends Blob {
   constructor(bytes, meta = {}) {
     const type = ctBuildArtifactMime(meta);
@@ -3207,6 +3236,7 @@ const CTBuildArtifact = class BuildArtifact extends Blob {
     this.hash = meta.hash ?? null;
     this.kind = meta.kind ?? "chunk";
     this.sourcemap = null;
+    Object.defineProperty(this, ctBuildArtifactContentHashSymbol, { value: meta.contentHash ?? null });
   }
 };
 
@@ -3262,6 +3292,7 @@ async function ctRunBuildDriver(options, state) {
       path: output.path,
       kind: output.kind ?? "entry-point",
       hash: output.hash ?? null,
+      contentHash: output.contentHash ?? null,
       loader: output.loader ?? "js",
       b64: output.b64 ?? "",
       sourcemapIndex: output.sourcemapIndex ?? null,
@@ -8758,12 +8789,11 @@ function selectRoute(routes, request) {
     const currentOrder = order;
     order += 1;
     if (!params) continue;
-    if (route === false) continue;
 
     let handler = route;
-    if (handler && typeof handler === "object" && !(handler instanceof Response) && typeof handler.arrayBuffer !== "function") {
+    if (handler && typeof handler === "object" && !isDirectServeRoute(handler)) {
       handler = handler[request.method] ?? handler[request.method.toLowerCase()] ?? handler.ALL ?? handler.all;
-      if (handler == null || handler === false) continue;
+      if (handler == null) continue;
     }
     const specificity = routeSpecificity(pattern);
     const candidate = { handler, params, specificity, order: currentOrder };
@@ -8782,10 +8812,7 @@ function selectRoute(routes, request) {
 }
 
 function selectStaticRoute(staticRoutes, request) {
-  if (!staticRoutes || typeof staticRoutes !== "object") return null;
-  const pathname = requestPathname(request);
-  if (!Object.prototype.hasOwnProperty.call(staticRoutes, pathname)) return null;
-  return staticRoutes[pathname];
+  return selectRoute(staticRoutes, request);
 }
 
 function bodyType(body) {
@@ -9181,24 +9208,35 @@ function runServeHandler(options, request, server) {
       return new Response(null, { status: 413, statusText: "Payload Too Large" });
     }
   }
+  const htmlState = options[serveHtmlStateSymbol];
+  if (htmlState && (request.method === "GET" || request.method === "HEAD")) {
+    const asset = htmlState.assets.get(requestPathname(request));
+    if (asset) return prepareServeHtmlDescriptor(asset, request);
+  }
   if (options.static && typeof options.static === "object") {
     const staticRoute = selectStaticRoute(options.static, request);
     if (staticRoute != null) {
-      return prepareServeResponseResult(staticRoute, request, {
+      if (staticRoute === false) return runFetchFallback(options, request, server);
+      if (isHtmlAssetRoute(staticRoute) || isHtmlSourceRoute(staticRoute) || isHtmlManifestRoute(staticRoute)) {
+        return prepareServeHtmlRoute(htmlState, options, staticRoute, request);
+      }
+      const response = typeof staticRoute === "function" ? staticRoute(request, server) : staticRoute;
+      return prepareServeResponseResult(response, request, {
         addEtag: true,
-        cacheKey: staticRoute && typeof staticRoute === "object" ? staticRoute : null,
+        cacheKey: typeof staticRoute === "function"
+          ? null
+          : staticRoute && typeof staticRoute === "object" ? staticRoute : null,
       });
     }
   }
 
   const route = selectRoute(options.routes, request);
   if (route != null) {
-    let response = typeof route === "function" ? route(request, server) : route;
-    if (isHtmlAssetRoute(response)) {
-      response = new Response(file(response), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+    if (route === false) return runFetchFallback(options, request, server);
+    if (isHtmlAssetRoute(route) || isHtmlSourceRoute(route) || isHtmlManifestRoute(route)) {
+      return prepareServeHtmlRoute(htmlState, options, route, request);
     }
+    let response = typeof route === "function" ? route(request, server) : route;
     const prepared = prepareServeResponseResult(response, request, {
       allowFileFallback: true,
       preserveFileSliceStatus: typeof route !== "function",
@@ -9267,16 +9305,288 @@ serve({
 See https://bun.com/docs/api/http for more information.`;
 }
 
+const serveHtmlStateSymbol = Symbol("cottontail.serveHtmlState");
+
+function isHtmlManifestRoute(value) {
+  return value != null && typeof value === "object" &&
+    typeof value.index === "string" && Array.isArray(value.files);
+}
+
+function isHtmlSourceRoute(value) {
+  return value != null && typeof value === "object" &&
+    typeof value.index === "string" && value.files == null && /\.html?$/i.test(value.index);
+}
+
 function isHtmlAssetRoute(value) {
   // HTML imports resolve to their on-disk asset path (cottontail's
   // representation of Bun's HTMLBundle), e.g. `import app from "./app.html"`.
-  return typeof value === "string" && /\.html?$/i.test(value) && value.includes("/");
+  return typeof value === "string" && /\.html?$/i.test(value);
+}
+
+function isDirectServeRoute(value) {
+  return value instanceof Response || isHtmlManifestRoute(value) || isHtmlSourceRoute(value) || isHtmlAssetRoute(value) ||
+    (value && typeof value === "object" && typeof value.arrayBuffer === "function");
+}
+
+function manifestPublicRoute(path) {
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const raw = String(path).replace(/\\/g, "/");
+  let relative = raw;
+  if (raw.startsWith("/") || /^[A-Za-z]:\//.test(raw)) {
+    relative = nodePathRelative(cwd, raw).replace(/\\/g, "/");
+  }
+  while (relative.startsWith("./")) relative = relative.slice(2);
+  while (relative.startsWith("../")) relative = relative.slice(3);
+  return `/${relative.replace(/^\/+/, "")}`;
+}
+
+function serveHtmlFileDescriptor(path, headers, loader = "file", kind = "entry-point", hash = null, sourcemap = null) {
+  return { path, headers: new Headers(headers), loader, kind, hash, sourcemap, cacheKey: {} };
+}
+
+function registerServeHtmlManifest(state, manifest) {
+  const existing = state.manifests.get(manifest);
+  if (existing) return existing;
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  let indexDescriptor = null;
+  for (const item of manifest.files) {
+    if (item == null || typeof item !== "object" || typeof item.path !== "string") continue;
+    const absolutePath = nodePathResolve(cwd, item.path);
+    let stat;
+    try { stat = cottontail.statSync(absolutePath, true); } catch {}
+    if (!stat?.isFile) {
+      throw new TypeError(`Bundled file ${item.path} not found. You may want to configure --asset-naming or \`naming\` when bundling.`);
+    }
+    const descriptor = serveHtmlFileDescriptor(
+      absolutePath,
+      item.headers ?? {},
+      String(item.loader ?? "file"),
+      item.isEntry ? "entry-point" : "asset",
+      item.headers?.etag ?? null,
+    );
+    if (item.path === manifest.index) indexDescriptor = descriptor;
+    else state.assets.set(manifestPublicRoute(item.path), descriptor);
+  }
+  if (!indexDescriptor) throw new TypeError(`Bundled HTML entry ${manifest.index} not found in manifest.`);
+  state.manifests.set(manifest, indexDescriptor);
+  return indexDescriptor;
+}
+
+function visitServeHtmlRouteValues(state, routes) {
+  if (routes == null || typeof routes !== "object") return;
+  for (const value of Object.values(routes)) {
+    if (isHtmlAssetRoute(value) || isHtmlSourceRoute(value)) {
+      state.sources.add(nodePathResolve(isHtmlSourceRoute(value) ? value.index : value));
+    } else if (isHtmlManifestRoute(value)) {
+      registerServeHtmlManifest(state, value);
+    } else if (value && typeof value === "object" && !isDirectServeRoute(value)) {
+      visitServeHtmlRouteValues(state, value);
+    }
+  }
+}
+
+function registerServeHtmlOptions(state, options) {
+  visitServeHtmlRouteValues(state, options?.routes);
+  visitServeHtmlRouteValues(state, options?.static);
+}
+
+function createServeHtmlState(options) {
+  const state = {
+    assets: new Map(),
+    manifests: new WeakMap(),
+    sources: new Set(),
+    htmlBySource: new Map(),
+    builtSources: new Set(),
+    buildPromise: null,
+    configPromise: null,
+  };
+  registerServeHtmlOptions(state, options);
+  return state;
+}
+
+function serveIsDevelopment(options) {
+  return options?.development === true ||
+    (options?.development != null && typeof options.development === "object");
+}
+
+function commonHtmlBuildRoot(paths) {
+  let root = pathDirname(paths[0]);
+  for (const path of paths.slice(1)) {
+    while (root !== pathDirname(root)) {
+      const relative = nodePathRelative(root, path).replace(/\\/g, "/");
+      if (relative !== ".." && !relative.startsWith("../")) break;
+      root = pathDirname(root);
+    }
+  }
+  return root;
+}
+
+async function serveHtmlBuildConfig(state) {
+  if (state.configPromise) return state.configPromise;
+  state.configPromise = (async () => {
+    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+    const bunfigPath = nodePathResolve(cwd, "bunfig.toml");
+    let staticConfig = {};
+    try {
+      staticConfig = parseTOML(cottontail.readFile(bunfigPath))?.serve?.static ?? {};
+    } catch {}
+    const plugins = [];
+    for (const pluginPath of Array.isArray(staticConfig.plugins) ? staticConfig.plugins : []) {
+      const absolutePath = nodePathResolve(pathDirname(bunfigPath), String(pluginPath));
+      const namespace = await import(nodePathToFileURL(absolutePath).href);
+      let plugin = namespace;
+      while (plugin != null && typeof plugin === "object" && typeof plugin.setup !== "function" &&
+        plugin.default != null && plugin.default !== plugin) {
+        plugin = plugin.default;
+      }
+      if (plugin != null) plugins.push(plugin);
+    }
+    return {
+      env: staticConfig.env,
+      plugins,
+    };
+  })();
+  return state.configPromise;
+}
+
+function generatedArtifactRoute(path) {
+  let relative = String(path ?? "").replace(/\\/g, "/");
+  while (relative.startsWith("./")) relative = relative.slice(2);
+  while (relative.startsWith("../")) relative = relative.slice(3);
+  return `/${relative.replace(/^\/+/, "")}`;
+}
+
+async function buildServeHtmlBatch(state, options, batch) {
+  const development = serveIsDevelopment(options);
+  const root = commonHtmlBuildRoot(batch);
+  const config = await serveHtmlBuildConfig(state);
+  const buildOptions = {
+    entrypoints: batch,
+    target: "browser",
+    root,
+    __cottontailWorkingDirectory: root,
+    publicPath: "/",
+    sourcemap: "linked",
+    minify: !development,
+    production: !development,
+    define: {
+      "process.env.NODE_ENV": JSON.stringify(development ? "development" : "production"),
+    },
+    jsx: { development },
+    ...(config.env != null ? { env: config.env } : {}),
+    ...(config.plugins.length > 0 ? { plugins: config.plugins } : {}),
+  };
+  const result = await build(buildOptions);
+  if (!result.success) throw new AggregateError(result.logs ?? [], "Bundle failed");
+
+  const htmlOutputs = [];
+  const outputDescriptors = [];
+  for (const artifact of result.outputs) {
+    const route = generatedArtifactRoute(artifact.path);
+    const headers = new Headers();
+    const contentType = artifact.type || guessMimeType(artifact.path);
+    if (contentType) headers.set("Content-Type", contentType);
+    if (artifact.loader !== "html" && artifact[ctBuildArtifactContentHashSymbol] != null) {
+      headers.set("ETag", String(artifact[ctBuildArtifactContentHashSymbol]));
+    }
+    if (!development && artifact.kind === "chunk") {
+      headers.set("Cache-Control", "public, max-age=31536000");
+    }
+    if (development && artifact.sourcemap?.path) {
+      headers.set("SourceMap", generatedArtifactRoute(artifact.sourcemap.path));
+    }
+    const descriptor = {
+      artifact,
+      headers,
+      loader: artifact.loader,
+      kind: artifact.kind,
+      hash: artifact.hash,
+      sourcemap: artifact.sourcemap,
+      cacheKey: {},
+    };
+    state.assets.set(route, descriptor);
+    outputDescriptors.push({ route, descriptor });
+    if (artifact.loader === "html" && artifact.kind === "entry-point") {
+      htmlOutputs.push({ route: route.slice(1), descriptor });
+    }
+  }
+
+  const escapeRegExp = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const { descriptor } of outputDescriptors) {
+    if (!new Set(["html", "css", "js"]).has(descriptor.loader)) continue;
+    let contents = await descriptor.artifact.text();
+    if (!contents.includes("/../")) continue;
+    for (const { route } of outputDescriptors) {
+      const basename = nodePathBasename(route);
+      const quotedUrl = new RegExp(`(["'])/[^"'\\s<>]*${escapeRegExp(basename)}\\1`, "g");
+      contents = contents.replace(quotedUrl, (_, quote) => `${quote}${route}${quote}`);
+    }
+    descriptor.body = contents;
+  }
+
+  const unmatched = [...htmlOutputs];
+  for (const source of batch) {
+    const relative = nodePathRelative(root, source).replace(/\\/g, "/").replace(/^\.\//, "");
+    let index = unmatched.findIndex(output => output.route === relative);
+    if (index < 0) {
+      const basename = nodePathBasename(source);
+      index = unmatched.findIndex(output => nodePathBasename(output.route) === basename);
+    }
+    if (index < 0) throw new Error(`HTML entry point not found in bundle output: ${source}`);
+    const [{ descriptor }] = unmatched.splice(index, 1);
+    state.htmlBySource.set(source, descriptor);
+    state.builtSources.add(source);
+  }
+}
+
+function ensureServeHtmlSource(state, options, source) {
+  const absoluteSource = nodePathResolve(source);
+  state.sources.add(absoluteSource);
+  const ready = state.htmlBySource.get(absoluteSource);
+  if (ready) return Promise.resolve(ready);
+  if (!state.buildPromise) {
+    const batch = [...state.sources].filter(path => !state.builtSources.has(path));
+    state.buildPromise = buildServeHtmlBatch(state, options, batch).finally(() => {
+      state.buildPromise = null;
+    });
+  }
+  return state.buildPromise.then(() => {
+    const descriptor = state.htmlBySource.get(absoluteSource);
+    if (descriptor) return descriptor;
+    return ensureServeHtmlSource(state, options, absoluteSource);
+  });
+}
+
+function responseForServeHtmlDescriptor(descriptor) {
+  const body = descriptor.body ?? descriptor.artifact ?? file(descriptor.path);
+  return new Response(body, { headers: new Headers(descriptor.headers) });
+}
+
+function prepareServeHtmlDescriptor(descriptor, request) {
+  return prepareServeResponseResult(responseForServeHtmlDescriptor(descriptor), request, {
+    cacheKey: descriptor.cacheKey,
+  });
+}
+
+function prepareServeHtmlRoute(state, options, route, request) {
+  if (isHtmlManifestRoute(route)) {
+    return prepareServeHtmlDescriptor(registerServeHtmlManifest(state, route), request);
+  }
+  return ensureServeHtmlSource(state, options, isHtmlSourceRoute(route) ? route.index : route).then(
+    descriptor => prepareServeHtmlDescriptor(descriptor, request),
+    error => prepareServeResponseResult(new Response(error instanceof Error ? error.stack || error.message : String(error), {
+      status: 500,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    }), request),
+  );
 }
 
 function isValidRouteHandler(value) {
   return value === false ||
     typeof value === "function" ||
     value instanceof Response ||
+    isHtmlManifestRoute(value) ||
+    isHtmlSourceRoute(value) ||
     isHtmlAssetRoute(value) ||
     (value && typeof value === "object" && typeof value.arrayBuffer === "function");
 }
@@ -10394,7 +10704,9 @@ function serveNodeBacked(options, context) {
       return server.stop(true);
     },
     reload(nextOptions = {}) {
+      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
       activeOptions = { ...activeOptions, ...nextOptions };
+      server.development = activeOptions.development ?? false;
       return server;
     },
     async fetch(input, init = {}) {
@@ -10520,6 +10832,8 @@ function serveNodeBacked(options, context) {
 
   const writeNodeResponse = (nodeResponse, response, request) => {
     const method = String(request.method ?? "GET").toUpperCase();
+    nodeResponse._omitImplicitConnectionHeader = true;
+    nodeResponse.setHeader("X-Cottontail-Omit-Implicit-Connection", "1");
     nodeResponse.statusCode = response.status;
     if (response.statusText) nodeResponse.statusMessage = response.statusText;
     const setCookies = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie() : [];
@@ -10711,6 +11025,7 @@ export function serve(options) {
   if (typeof options.fetch !== "function" && !hasRoutes && !hasStaticRoutes) {
     throw new TypeError(bunServeNeedsHandlerMessage());
   }
+  options[serveHtmlStateSymbol] = createServeHtmlState(options);
 
   const unixPath = normalizeServeUnixPath(options.unix);
   const suppliedHostname = options.hostname === null || options.hostname === undefined
@@ -10792,7 +11107,10 @@ export function serve(options) {
       return server.stop();
     },
     reload(nextOptions = {}) {
+      registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
       activeOptions = { ...activeOptions, ...nextOptions };
+      server.development = activeOptions.development ?? false;
+      return server;
     },
     async fetch(input, init = {}) {
       if (typeof activeOptions.fetch !== "function") {
@@ -10944,7 +11262,13 @@ export function serve(options) {
 
   const pump = () => {
     if (stopped || pumping) return;
+    if (globalThis.__cottontailProcessIpcPending === true) return;
     pumping = true;
+    if ((globalThis.__cottontailPollProcessIpc?.() ?? 0) > 0) {
+      cottontail.drainJobs?.();
+      pumping = false;
+      return;
+    }
     while (!stopped && server.pendingRequests < maxConcurrentNativeRequests) {
       const item = cottontail.httpServerPoll(native.id);
       if (!item) break;
@@ -11248,6 +11572,7 @@ function guessMimeType(path) {
   if (lower.endsWith(".png")) return "image/png";
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
   if (lower.endsWith(".svg")) return "image/svg+xml";
+  if (lower.endsWith(".pdf")) return "application/pdf";
   if (lower.endsWith(".wasm")) return "application/wasm";
   return "application/octet-stream";
 }

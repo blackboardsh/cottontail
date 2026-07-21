@@ -103,8 +103,18 @@ export function installInheritedBunIpcCodec(host, processObject = globalThis.pro
 
   const originalEmit = processObject.emit;
   processObject.emit = function emit(name, ...args) {
-    if (name === "message" && args.length > 0) args[0] = decodeAdvancedEnvelope(args[0]);
-    return originalEmit.call(this, name, ...args);
+    if (name !== "message") return originalEmit.call(this, name, ...args);
+    if (args.length > 0) args[0] = decodeAdvancedEnvelope(args[0]);
+    const generation = (globalThis.__cottontailProcessIpcGeneration ?? 0) + 1;
+    globalThis.__cottontailProcessIpcGeneration = generation;
+    globalThis.__cottontailProcessIpcPending = true;
+    const emitted = originalEmit.call(this, name, ...args);
+    setTimeout(() => {
+      if (globalThis.__cottontailProcessIpcGeneration === generation) {
+        globalThis.__cottontailProcessIpcPending = false;
+      }
+    }, 0);
+    return emitted;
   };
 
   const send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {

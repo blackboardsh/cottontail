@@ -117,6 +117,17 @@ pub fn formatEscapedJSON(this: HTMLImportManifest) std.fmt.Alt(HTMLImportManifes
     return .{ .data = this };
 }
 
+fn removeLeadingDotSlashes(path: []const u8) []const u8 {
+    var normalized = path;
+    while (normalized.len >= 2 and
+        (strings.hasPrefixComptime(normalized, "./") or
+            (bun.Environment.isWindows and strings.hasPrefixComptime(normalized, ".\\"))))
+    {
+        normalized = normalized[2..];
+    }
+    return normalized;
+}
+
 pub fn write(index: u32, graph: *const Graph, linker_graph: *const LinkerGraph, chunks: []const Chunk, writer: anytype) !void {
     const browser_source_index = graph.html_imports.html_source_indices.slice()[index];
     const server_source_index = graph.html_imports.server_source_indices.slice()[index];
@@ -144,10 +155,13 @@ pub fn write(index: u32, graph: *const Graph, linker_graph: *const LinkerGraph, 
                 if (inject_compiler_filesystem_prefix) {
                     temp_buffer.clearRetainingCapacity();
                     try temp_buffer.appendSlice(public_path);
-                    try temp_buffer.appendSlice(bun.strings.removeLeadingDotSlash(ch.final_rel_path));
+                    try temp_buffer.appendSlice(removeLeadingDotSlashes(ch.final_rel_path));
                     try bun.js_printer.writeJSONString(temp_buffer.items, @TypeOf(writer), writer, .utf8);
                 } else {
-                    try bun.js_printer.writeJSONString(ch.final_rel_path, @TypeOf(writer), writer, .utf8);
+                    temp_buffer.clearRetainingCapacity();
+                    try temp_buffer.appendSlice("./");
+                    try temp_buffer.appendSlice(removeLeadingDotSlashes(ch.final_rel_path));
+                    try bun.js_printer.writeJSONString(temp_buffer.items, @TypeOf(writer), writer, .utf8);
                 }
                 try writer.writeAll(",");
             }
@@ -196,10 +210,13 @@ pub fn write(index: u32, graph: *const Graph, linker_graph: *const LinkerGraph, 
                     if (inject_compiler_filesystem_prefix) {
                         temp_buffer.clearRetainingCapacity();
                         try temp_buffer.appendSlice(public_path);
-                        try temp_buffer.appendSlice(bun.strings.removeLeadingDotSlash(ch.final_rel_path));
+                        try temp_buffer.appendSlice(removeLeadingDotSlashes(ch.final_rel_path));
                         break :brk temp_buffer.items;
                     }
-                    break :brk ch.final_rel_path;
+                    temp_buffer.clearRetainingCapacity();
+                    try temp_buffer.appendSlice("./");
+                    try temp_buffer.appendSlice(removeLeadingDotSlashes(ch.final_rel_path));
+                    break :brk temp_buffer.items;
                 },
                 // The HTML chunk's body embeds the hashed paths of its JS/CSS
                 // chunks, so its etag must change when those do. `isolated_hash`
@@ -243,10 +260,13 @@ pub fn write(index: u32, graph: *const Graph, linker_graph: *const LinkerGraph, 
                         if (inject_compiler_filesystem_prefix) {
                             temp_buffer.clearRetainingCapacity();
                             try temp_buffer.appendSlice(public_path);
-                            try temp_buffer.appendSlice(bun.strings.removeLeadingDotSlash(output_file.dest_path));
+                            try temp_buffer.appendSlice(removeLeadingDotSlashes(output_file.dest_path));
                             break :brk temp_buffer.items;
                         }
-                        break :brk output_file.dest_path;
+                        temp_buffer.clearRetainingCapacity();
+                        try temp_buffer.appendSlice("./");
+                        try temp_buffer.appendSlice(removeLeadingDotSlashes(output_file.dest_path));
+                        break :brk temp_buffer.items;
                     },
                     output_file.hash,
                     output_file.loader,

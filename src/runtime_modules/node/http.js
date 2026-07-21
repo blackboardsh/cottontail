@@ -1655,6 +1655,11 @@ export class ServerResponse extends OutgoingMessage {
       error.code = "ERR_INVALID_CHAR";
       throw error;
     }
+    const omitImplicitConnectionHeader = this._omitImplicitConnectionHeader ||
+      this.hasHeader("x-cottontail-omit-implicit-connection");
+    if (this.hasHeader("x-cottontail-omit-implicit-connection")) {
+      this.removeHeader("x-cottontail-omit-implicit-connection");
+    }
     this._headerSent = true;
     this.headersSent = true;
     this.statusMessage = statusText;
@@ -1698,10 +1703,10 @@ export class ServerResponse extends OutgoingMessage {
     if (lowerNames.has("connection")) {
       const value = String(this.getHeader("connection")).toLowerCase();
       if (value.split(",").some((item) => item.trim() === "close")) this._keepAlive = false;
-    } else {
+    } else if (!omitImplicitConnectionHeader || !this._keepAlive) {
       lines.push(this._keepAlive ? "Connection: keep-alive" : "Connection: close");
     }
-    if (this._keepAlive && !lowerNames.has("keep-alive") && this._server?.keepAliveTimeout > 0) {
+    if (this._keepAlive && !omitImplicitConnectionHeader && !lowerNames.has("keep-alive") && this._server?.keepAliveTimeout > 0) {
       const timeout = Math.max(1, Math.floor(this._server.keepAliveTimeout / 1000));
       const max = Number(this._server.maxRequestsPerSocket) > 0 ? `, max=${this._server.maxRequestsPerSocket}` : "";
       lines.push(`Keep-Alive: timeout=${timeout}${max}`);

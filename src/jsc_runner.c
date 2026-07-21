@@ -2541,14 +2541,15 @@ static void ct_http_send_response(CtHttpRequest *request) {
     if (!has_framing) {
         snprintf(content_length, sizeof(content_length), "Content-Length: %zu\r\n", request->response_body_len);
     }
+    const char *connection = request->keep_alive ? "" : "Connection: close\r\n";
     int head_len = snprintf(
         NULL,
         0,
-        "HTTP/1.1 %d %s\r\n%sConnection: %s\r\n%s\r\n",
+        "HTTP/1.1 %d %s\r\n%s%s%s\r\n",
         status,
         reason,
         content_length,
-        request->keep_alive ? "keep-alive" : "close",
+        connection,
         headers
     );
     if (head_len < 0) return;
@@ -2562,11 +2563,11 @@ static void ct_http_send_response(CtHttpRequest *request) {
     snprintf(
         response,
         head_size + 1,
-        "HTTP/1.1 %d %s\r\n%sConnection: %s\r\n%s\r\n",
+        "HTTP/1.1 %d %s\r\n%s%s%s\r\n",
         status,
         reason,
         content_length,
-        request->keep_alive ? "keep-alive" : "close",
+        connection,
         headers
     );
     if (body_size > 0) memcpy(response + head_size, request->response_body, body_size);
@@ -2578,11 +2579,11 @@ static ssize_t ct_http_send_chunked_response_head(CtHttpRequest *request) {
     int status = request->status > 0 ? request->status : 200;
     const char *reason = ct_http_reason_phrase(status);
     const char *headers = request->response_headers_text != NULL ? request->response_headers_text : "";
-    const char *connection = request->keep_alive ? "keep-alive" : "close";
+    const char *connection = request->keep_alive ? "" : "Connection: close\r\n";
     int head_len = snprintf(
         NULL,
         0,
-        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n%s\r\n",
+        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\n%s%s\r\n",
         status,
         reason,
         connection,
@@ -2595,7 +2596,7 @@ static ssize_t ct_http_send_chunked_response_head(CtHttpRequest *request) {
     snprintf(
         head,
         (size_t)head_len + 1,
-        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\nConnection: %s\r\n%s\r\n",
+        "HTTP/1.1 %d %s\r\nTransfer-Encoding: chunked\r\n%s%s\r\n",
         status,
         reason,
         connection,

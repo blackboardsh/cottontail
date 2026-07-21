@@ -639,7 +639,23 @@ fn getAST(
             bun.assert(loader.shouldCopyForBundling());
 
             if (loader == .file and transpiler.options.runtime_file_loader_paths) {
-                const root = Expr.init(E.String, .{ .data = source.path.text }, .{ .start = 0 });
+                const extension = std.fs.path.extension(source.path.text);
+                const is_html = std.ascii.eqlIgnoreCase(extension, ".html") or std.ascii.eqlIgnoreCase(extension, ".htm");
+                const root = if (is_html) blk: {
+                    const properties = allocator.alloc(G.Property, 2) catch unreachable;
+                    properties[0] = .{
+                        .key = Expr.init(E.String, .{ .data = "index" }, Logger.Loc.Empty),
+                        .value = Expr.init(E.String, .{ .data = source.path.text }, Logger.Loc.Empty),
+                    };
+                    properties[1] = .{
+                        .key = Expr.init(E.String, .{ .data = "files" }, Logger.Loc.Empty),
+                        .value = Expr{ .data = .{ .e_null = .{} }, .loc = Logger.Loc.Empty },
+                    };
+                    break :blk Expr.init(E.Object, .{
+                        .properties = G.Property.List.fromOwnedSlice(properties),
+                        .is_single_line = true,
+                    }, Logger.Loc.Empty);
+                } else Expr.init(E.String, .{ .data = source.path.text }, .{ .start = 0 });
                 return JSAst.init((try js_parser.newLazyExportAST(
                     allocator,
                     transpiler.options.define,

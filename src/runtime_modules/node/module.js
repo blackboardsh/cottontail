@@ -2580,6 +2580,9 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
   }
   const resolvedPath = splitSpecifierSuffix(resolved).bare;
+  if (/\.html?$/i.test(resolvedPath)) {
+    return { default: { index: resolvedPath, files: null } };
+  }
   const embedded = standaloneFileEntry(resolvedPath);
   if (embedded.found && hasEsmSyntax(embedded.value)) {
     return executeDynamicImportSource(resolved, embedded.value, "module");
