@@ -18392,7 +18392,7 @@ BunFile.prototype = CottontailFile.prototype;
 // FormData for entries that carry an explicit filename.
 let CottontailFormDataFileClass = null;
 function formDataFileView(source, filename) {
-  CottontailFormDataFileClass ??= class File extends CottontailFile {
+  CottontailFormDataFileClass ??= class File extends globalThis.File {
     constructor(src, name) {
       super([], name, {
         type: typeof src?.type === "string" ? src.type : "",
