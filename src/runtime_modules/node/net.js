@@ -760,6 +760,47 @@ class SocketImpl extends EventEmitter {
     this._connectAttemptIds.clear();
   }
 
+  _resetCompletedConnection() {
+    const completed = this.destroyed || this._ending || this._endEmitted ||
+      this._finishEmitted || this._closeEmitted;
+    if (!completed) return;
+
+    // A finish callback can run before the peer FIN has driven the socket
+    // through destroy(). Reconnecting at that point must not orphan the old fd.
+    if (!this.destroyed && (this.fd != null || this._watchId)) this._destroyImmediately();
+    this._finishDeferredDestroy();
+
+    this.destroyed = false;
+    this.readable = true;
+    this.writable = true;
+    this.connecting = false;
+    this.fd = null;
+    this.remoteAddress = undefined;
+    this.remoteFamily = undefined;
+    this.remotePort = undefined;
+    this.localAddress = undefined;
+    this.localPort = undefined;
+    this.localFamily = undefined;
+    this.bytesRead = 0;
+    this._bytesDispatchedValue = 0;
+    this.writableLength = 0;
+    this.writableNeedDrain = false;
+    this._drainQueued = false;
+    this._pendingData = [];
+    this._pendingEnd = false;
+    this._pendingWrites = [];
+    this._outboundWrites = [];
+    this._ending = false;
+    this._endEmitted = false;
+    this._finishEmitted = false;
+    this._closeEmitted = false;
+    this._hadError = false;
+    this._readyEmitted = false;
+    this.autoSelectFamilyAttemptedAddresses = undefined;
+    this._peername = null;
+    this._sockname = null;
+  }
+
   _setupAbortSignal(signal) {
     if (signal == null || typeof signal !== "object" || this._abortSignal === signal) return;
     if (typeof signal.addEventListener !== "function") return;
@@ -1044,6 +1085,7 @@ class SocketImpl extends EventEmitter {
     }
     this._finishDeferredDestroy();
     this._cancelConnectAttempts();
+    this._resetCompletedConnection();
     const port = options.path == null && options.fd === undefined ? validatePort(options.port) : undefined;
     if (callback) this.once("connect", callback);
     if (options.onread && typeof options.onread === "object" && typeof options.onread.callback === "function") {
@@ -1058,33 +1100,25 @@ class SocketImpl extends EventEmitter {
     if (options.noDelay != null) this._noDelay = Boolean(options.noDelay);
     if (options.keepAlive != null) this._keepAlive = Boolean(options.keepAlive);
     if (options.keepAliveInitialDelay != null) this._keepAliveInitialDelay = Math.max(0, Number(options.keepAliveInitialDelay) || 0);
+    this._isPipe = options.path != null || options.pipe === true;
+    this._path = this._isPipe ? options.path : undefined;
     this.connecting = true;
-    // Node sockets support reconnecting after end()/destroy().
-    if (this.destroyed && this._abortReason === undefined) {
-      this.destroyed = false;
-      this.readable = true;
-      this.writable = true;
-      this._ending = false;
-      this._endEmitted = false;
-      this._finishEmitted = false;
-      this._pendingEnd = false;
-      this._pendingData = [];
-      this._outboundWrites = [];
-      this._closeEmitted = false;
-      this._hadError = false;
-      this._readyEmitted = false;
-    }
     if (this._abortReason !== undefined) return this;
     let host = options.host ?? "localhost";
     this._host = String(host);
     this._port = port;
     const failConnect = (rawError) => {
       const error = connectionException(rawError, options, host, port);
-      queueMicrotask(() => {
+      const timer = setTimeout(() => {
+        this._connectAttemptTimers.delete(timer);
         if (this.destroyed || !this.connecting || this._abortReason !== undefined) return;
         this.connecting = false;
         this.destroy(error);
-      });
+      // A synchronous resolver failure still has to leave user code a turn to
+      // unref the pending socket before the error becomes runnable.
+      }, 10);
+      this._connectAttemptTimers.add(timer);
+      if (!this._refed) timer.unref?.();
     };
     const attachConnected = (result) => {
       queueMicrotask(() => {
@@ -1104,8 +1138,6 @@ class SocketImpl extends EventEmitter {
       }
       if (options.path != null) {
         const result = cottontail.unixSocketConnect(String(options.path));
-        this._isPipe = true;
-        this._path = options.path;
         attachConnected(result);
         return this;
       }
@@ -1612,7 +1644,7 @@ class ServerImpl extends EventEmitter {
     const server = new Server(options);
     server._fd = Number(fd);
     server._isPipe = options.pipe === true || options.path != null;
-    server._ownsPipePath = false;
+    server._ownsPipePath = options.ownsPipePath === true;
     server._path = options.path ?? null;
     try {
       server._address = server._isPipe ? server._path : cottontail.tcpSocketAddress?.(server._fd, false);

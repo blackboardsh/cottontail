@@ -13620,8 +13620,13 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
       if (!acceptedWithoutBackpressure) socket.__cottontailScheduleBunDrain?.();
       return acceptedWithoutBackpressure ? length : written;
     };
-    socket.flush = () => 0;
-    socket.shutdown = () => socket.end();
+    socket.flush = () => {
+      if (typeof socket._flushTlsPendingWrites === "function") socket._flushTlsPendingWrites();
+      else socket._flushOutboundWrites?.();
+    };
+    socket.shutdown = () => {
+      socket.end();
+    };
     const timeout = (milliseconds) => {
       nodeSetTimeout(milliseconds);
       socket.timeout = timeout;
@@ -13688,10 +13693,19 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
   });
   socket.on("close", (hadError) => {
     if (connectionState?.failed && !connectionState.opened) return;
-    call("close", socket, hadError ? new Error("Socket closed with an error") : null);
+    call("close", socket, hadError ? new Error("Socket closed with an error") : undefined);
   });
   if (typeof socket.terminate !== "function") {
     Object.defineProperty(socket, "terminate", {
+      value() {
+        socket.destroy();
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+  if (typeof socket.close !== "function") {
+    Object.defineProperty(socket, "close", {
       value() {
         socket.destroy();
       },
@@ -13840,8 +13854,8 @@ export function connect(options = {}) {
         resolve(socket);
       };
       const onTransportOpen = () => {
-        if (typeof handlers.handshake === "function") callBunSocketOpen(attached);
         settle();
+        if (typeof handlers.handshake === "function") callBunSocketOpen(attached);
         if (!normalized.unix) {
           const host = normalized.hostname.includes(":") ? `[${normalized.hostname}]` : normalized.hostname;
           const plainHttpServer = activeServerForFetchUrl(`http://${host}:${normalized.port}/`);
@@ -13930,6 +13944,7 @@ export function listen(options = {}) {
     server = nodeNet.Server._fromFd(native.fd, {
       pipe: Boolean(normalized.unix),
       path: normalized.unix || undefined,
+      ownsPipePath: Boolean(normalized.unix),
     });
   }
   let stopped = false;
@@ -13937,6 +13952,7 @@ export function listen(options = {}) {
   const tlsConnections = new WeakMap();
 
   server.on("connection", (socket) => {
+    socket.listener = listener;
     const attached = attachBunSocketHandlers(socket, activeOptions.socket ?? handlers, activeOptions.data);
     attached.handlers = activeOptions.socket ?? handlers;
     if (useTls) {
@@ -13954,8 +13970,19 @@ export function listen(options = {}) {
   }
 
   const listener = {
-    data: options.data,
-    hostname: normalized.unix ? undefined : String(address?.address ?? normalized.hostname),
+    get data() {
+      return activeOptions.data;
+    },
+    set data(value) {
+      activeOptions = { ...activeOptions, data: value };
+    },
+    get connections() {
+      return Number(server._connections ?? server._activeSockets?.size ?? 0);
+    },
+    get fd() {
+      return server._fd == null ? -1 : Number(server._fd);
+    },
+    hostname: normalized.unix ? undefined : normalized.hostname,
     port: normalized.unix ? undefined : Number(address?.port ?? normalized.port),
     unix: normalized.unix || undefined,
     stop(closeActiveConnections = false) {
@@ -13972,7 +13999,6 @@ export function listen(options = {}) {
     },
     reload(nextOptions = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
-      listener.data = activeOptions.data;
       return listener;
     },
     addServerName(serverName, tls) {
@@ -13986,7 +14012,7 @@ export function listen(options = {}) {
         out.address = String(address?.path ?? normalized.unix);
       } else {
         out.family = String(address?.family ?? (listener.hostname.includes(":") ? "IPv6" : "IPv4"));
-        out.address = listener.hostname;
+        out.address = String(address?.address ?? listener.hostname);
         out.port = listener.port;
       }
       return undefined;
