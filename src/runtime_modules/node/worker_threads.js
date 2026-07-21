@@ -220,9 +220,9 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
   if (value instanceof String) return { t: "Boxed", id, name: "String", v: String(value.valueOf()) };
   if (value instanceof Date) return { t: "Date", id, v: value.toISOString() };
   if (value instanceof RegExp) return { t: "RegExp", id, source: value.source, flags: value.flags };
+  const shared = !ArrayBuffer.isView(value) ? sharedBufferInfo(value) : null;
+  if (shared) return { t: "SharedArrayBuffer", id, sharedId: shared.id, byteLength: shared.byteLength };
   if (value instanceof ArrayBuffer) {
-    const shared = sharedBufferInfo(value);
-    if (shared) return { t: "SharedArrayBuffer", id, sharedId: shared.id, byteLength: shared.byteLength };
     return { t: "ArrayBuffer", id, bytes: bytesFromBuffer(value) };
   }
   if (ArrayBuffer.isView(value)) {
