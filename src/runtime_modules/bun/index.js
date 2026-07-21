@@ -46,6 +46,7 @@ import {
 import { URL, URLSearchParams } from "../vendor/whatwg-url.js";
 import { URLPattern as CottontailURLPattern } from "../vendor/urlpattern.js";
 import { S3Client, s3 } from "./s3.js";
+import { RedisClient, redis } from "./redis.js";
 import { SQL } from "./sql.js";
 import { color as bunColor } from "./color.js";
 import * as bunTestModule from "./test.js";
@@ -17306,9 +17307,8 @@ export class Terminal {
     this.close();
   }
 }
-export class RedisClient {}
 export { S3Client, s3 };
-export const redis = null;
+export { RedisClient, redis };
 export const postgres = null;
 function secretsError(message, code = "ERR_INVALID_ARG_TYPE") {
   const error = new TypeError(message);
