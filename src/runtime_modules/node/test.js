@@ -395,6 +395,7 @@ function createSuite(name, options = {}, parent = null) {
     beforeRan: false,
     afterRan: false,
     beforeError: null,
+    preloadBeforeErrorFile: null,
     definitionError: null,
     definitionErrorReported: false,
     definitionFn: null,
@@ -625,6 +626,27 @@ async function runHookList(hooks, context, reverseLayers = false) {
     }
   }
   return null;
+}
+
+function tagPerTestHookError(error) {
+  if (error === null) return null;
+  if ((typeof error === "object" || typeof error === "function") &&
+      Object.prototype.hasOwnProperty.call(error, "__cottontailBunPrimitiveError")) {
+    const wrapped = new Error(String(error.__cottontailBunPrimitiveError));
+    wrapped.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
+    wrapped.errors = [error.__cottontailBunPrimitiveError];
+    return wrapped;
+  }
+  if (typeof error !== "object" && typeof error !== "function") {
+    const wrapped = new Error(String(error));
+    wrapped.code = "ERR_BUN_TEST_CALLBACK_FAILURES";
+    wrapped.errors = [error];
+    return wrapped;
+  }
+  try {
+    Object.defineProperty(error, "__cottontailBunPerTestHook", { value: true, configurable: true });
+  } catch {}
+  return error;
 }
 
 function suiteChain(suite) {
@@ -876,7 +898,7 @@ async function executeAttempt(record) {
     try {
       if (!setupError) {
         for (const suite of chain) {
-          const error = await runHookList(suite.beforeEachHooks, context);
+          const error = tagPerTestHookError(await runHookList(suite.beforeEachHooks, context));
           setupError ??= error;
           if (error) break;
         }
@@ -896,10 +918,10 @@ async function executeAttempt(record) {
       if (!beforeAllError) {
         const afterBodyError = await runHookList(execution.afterBodyHooks, context);
         cleanupError ??= afterBodyError;
-        const dynamicAfterEachError = await runHookList(execution.afterEachHooks, context);
+        const dynamicAfterEachError = tagPerTestHookError(await runHookList(execution.afterEachHooks, context));
         cleanupError ??= dynamicAfterEachError;
         for (const suite of Array.from(chain).reverse()) {
-          const afterEachError = await runHookList(suite.afterEachHooks, context, true);
+          const afterEachError = tagPerTestHookError(await runHookList(suite.afterEachHooks, context, true));
           cleanupError ??= afterEachError;
         }
       }
@@ -940,6 +962,11 @@ async function execute(record) {
   emit("test:start", { name: record.name });
 
   if (!selectedByOnly(record)) {
+    record.status = "filtered";
+    record.resolve?.();
+    return undefined;
+  }
+  if (rootSuite.preloadBeforeErrorFile === record.filePath) {
     record.status = "filtered";
     record.resolve?.();
     return undefined;
@@ -1022,11 +1049,12 @@ async function execute(record) {
   if (globalThis.process?.env?.COTTONTAIL_TEST_DEBUG === "1") console.error(`test:pass ${record.name}`);
 }
 
-function recordHookFailure(name, error, isRunnerError = false) {
+function recordHookFailure(name, error, isRunnerError = false, filePath = undefined) {
   const record = {
     name,
     status: isRunnerError ? "error" : "fail",
     suite: currentSuite,
+    filePath: String(filePath ?? currentSuite?.filePath ?? ""),
     reportOrder: nextReportOrder++,
   };
   if (isRunnerError) runnerErrors += 1;
@@ -1085,11 +1113,19 @@ async function executeSuite(suite, concurrentGroup) {
     recordHookFailure(suite.name, suite.definitionError, !(suite.definitionError instanceof TypeError));
   }
 
-  const runnable = suiteHasRunnableWork(suite) || suiteHasLifecycleWork(suite);
-  if (runnable && !suite.beforeRan) {
+  const hasRunnableWork = suiteHasRunnableWork(suite);
+  const runnable = hasRunnableWork || suiteHasLifecycleWork(suite);
+  const shouldRunBefore = runnable && !suite.beforeRan && (suite !== rootSuite || hasRunnableWork);
+  if (shouldRunBefore) {
     if (suite.beforeHooks.length > 0) await flushConcurrent(concurrentGroup);
     suite.beforeRan = true;
     suite.beforeError = await runHookList(suite.beforeHooks, new TestContext({ name: suite.name }));
+    if (suite === rootSuite && suite.beforeError) {
+      const firstRecord = tests.find((record) => !record.ran && recordIsRunnable(record));
+      suite.preloadBeforeErrorFile = firstRecord?.filePath ?? null;
+      recordHookFailure("(unnamed)", suite.beforeError, false, suite.preloadBeforeErrorFile);
+      suite.beforeError = null;
+    }
   }
 
   for (const child of suite.children) {
@@ -1138,6 +1174,10 @@ function annotatePrimitiveError(error, filePath) {
   if (lineNumber < 0) return error;
   const wrapped = new Error(message);
   wrapped.stack = `Error: ${message}\n<anonymous>@${filePath}:${lineNumber}:${column}`;
+  Object.defineProperty(wrapped, "__cottontailBunPrimitiveError", {
+    value: error,
+    configurable: true,
+  });
   return wrapped;
 }
 
@@ -1204,7 +1244,7 @@ function failureStackFrames(error) {
       column: Number(frame.column),
     });
   }
-  return frames;
+  return frames.map(normalizeConstructedErrorFrame);
 }
 
 function sourceLinesFor(path) {
@@ -1213,8 +1253,25 @@ function sourceLinesFor(path) {
   try {
     lines = String(readFileSync(path, "utf8")).split(/\r?\n/);
   } catch {}
+  if (!lines) {
+    try {
+      lines = globalThis.__cottontailSourceContextForLocation?.(path, 1, 1)?.lines ?? null;
+    } catch {}
+  }
   sourceLineCache.set(path, lines);
   return lines;
+}
+
+function normalizeConstructedErrorFrame(frame) {
+  const sourceLine = sourceLinesFor(frame.filePath)?.[frame.line - 1];
+  if (!sourceLine || !/\bnew\s+(?:Error|[A-Za-z_$][\w$]*Error)\s*\(/.test(sourceLine)) return frame;
+  const closingParen = sourceLine.lastIndexOf(")");
+  return closingParen < 0 ? frame : { ...frame, column: closingParen + 1 };
+}
+
+function durationSuffix(durationMs) {
+  const duration = Number(durationMs);
+  return Number.isFinite(duration) && duration >= 10 ? ` [${duration.toFixed(2)}ms]` : "";
 }
 
 function appendSourceFrame(lines, frame) {
@@ -1258,6 +1315,8 @@ function appendErrorDiagnostic(lines, error) {
     const functionName = frame.functionName === "@" ? "<anonymous>" : frame.functionName;
     if (error?.__cottontailBunExpectation) {
       if (!formatFailure(error).endsWith("\n")) lines.push("");
+      lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
+    } else if (error?.__cottontailBunPerTestHook) {
       lines.push(`      at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
     } else {
       lines.push(`    at ${functionName} (${frame.filePath}:${frame.line}:${frame.column})`);
@@ -1350,7 +1409,7 @@ function appendFailure(lines, record, error) {
   }
   const name = fullTestName(record);
   if (error?.code === "ERR_TEST_FAILING_PASSED") {
-    lines.push(`(fail) ${name}`);
+    lines.push(`(fail) ${name}${durationSuffix(record.durationMs)}`);
     lines.push(`  ^ ${formatFailure(error)}`);
     return;
   }
@@ -1367,7 +1426,7 @@ function appendFailure(lines, record, error) {
     return;
   }
   appendErrorDiagnostic(lines, error);
-  lines.push(`(fail) ${name}`);
+  lines.push(`(fail) ${name}${durationSuffix(record.durationMs)}`);
 }
 
 function appendFailureSummary(lines, view) {
@@ -1436,7 +1495,7 @@ function appendRunRecords(lines, views, extraFailures = []) {
       if (!suppressPassing) {
         const retried = (view.attempts ?? 1) > 1 && view.record.options?.repeats == null;
         const suffix = retried ? ` (attempt ${view.attempts})` : "";
-        lines.push(`(pass) ${fullTestName(view.record)}${suffix}`);
+        lines.push(`(pass) ${fullTestName(view.record)}${suffix}${durationSuffix(view.record.durationMs)}`);
       }
     } else if (view.status === "fail") {
       for (const attemptError of (view.attemptErrors ?? []).slice(0, -1)) {
@@ -1508,6 +1567,7 @@ function reportResults() {
   const currentViews = tests
     .filter((record) => record.status && record.status !== "filtered")
     .map(snapshotRecordView);
+  const runDurationMs = currentViews.reduce((total, view) => total + (Number(view.record.durationMs) || 0), 0);
   const labelFilterMatchedNoTests = Boolean(testNamePattern) && currentViews.length === 0 &&
     failures.length === 0 && tests.length > 0;
   const runs = completedRuns.length > 0 ? [...completedRuns, currentViews] : [currentViews];
@@ -1598,7 +1658,7 @@ function reportResults() {
     lines.push(` ${assertionCount} expect() calls`);
   }
   const total = passedTests + skippedTests + todoTests + failedTests;
-  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.`);
+  lines.push(`Ran ${total} ${total === 1 ? "test" : "tests"} across ${testFileCount} ${testFileCount === 1 ? "file" : "files"}.${durationSuffix(runDurationMs)}`);
   console.error(lines.join("\n"));
 }
 
@@ -1669,6 +1729,7 @@ function resetForRerun() {
     suite.beforeRan = false;
     suite.afterRan = false;
     suite.beforeError = null;
+    suite.preloadBeforeErrorFile = null;
     for (const child of suite.children) {
       if (child.kind === "suite") resetSuite(child);
     }
@@ -1841,7 +1902,12 @@ export function before(fn, options = {}) {
   const execution = currentExecution();
   if (execution) execution.afterBodyHooks.unshift({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
   else {
-    currentSuite.beforeHooks.push({ fn, options, layer: globalThis.__cottontailTestRegistrationLayer ?? 0 });
+    currentSuite.beforeHooks.push({
+      fn,
+      options,
+      layer: globalThis.__cottontailTestRegistrationLayer ?? 0,
+      filePath: String(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? ""),
+    });
     currentSuite.beforeRan = false;
     scheduleRun();
   }

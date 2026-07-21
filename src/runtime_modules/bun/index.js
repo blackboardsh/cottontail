@@ -500,6 +500,7 @@ if (Error.prepareStackTrace === undefined) {
 // reporters) can remap bundle stack positions without importing this module.
 globalThis.__cottontailRemapStackString ??= ctRemapStackString;
 globalThis.__cottontailRemapPosition ??= remapBundlePosition;
+globalThis.__cottontailSourceContextForLocation ??= bundleSourceContextForLocation;
 
 if (typeof JSON.parse === "function" && !JSON.parse.__cottontailStackHeader) {
   const nativeJSONParse = JSON.parse;

@@ -861,6 +861,8 @@ fn runPmList(
     else
         try directDependencyAliases(allocator, graph.root_workspace, installed);
 
+    if (aliases.len == 0) return 0;
+
     if (options.all) {
         try stdout.print("{s} node_modules\n", .{project.root_dir});
     } else {
@@ -1410,6 +1412,7 @@ const Manager = struct {
         if (root != .object) return error.InvalidPackageJSON;
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
+        try manager.warnDuplicateDependencies(&root);
 
         if (manager.options.frozen_lockfile) {
             if (manager.options.command != .install) return error.FrozenLockfileChanged;
@@ -1432,6 +1435,10 @@ const Manager = struct {
         }
 
         try manager.discoverWorkspaces(&root);
+        var duplicate_warning_workspaces = manager.workspaces.iterator();
+        while (duplicate_warning_workspaces.next()) |entry| {
+            try manager.warnDuplicateDependencies(entry.value_ptr.package_json);
+        }
         try manager.validateLockfileWorkspaces();
         try manager.configureInstallFilters(&root);
         if (manager.options.command == .patch) return manager.preparePatchCommand();
@@ -1553,7 +1560,9 @@ const Manager = struct {
                 manager.options.positionals.len
             else
                 manager.installed_count;
-            if (manager.options.command == .remove) {
+            if (manager.options.command == .install and manager.options.dry_run) {
+                try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
+            } else if (manager.options.command == .remove) {
                 if (manager.direct_install_reports.items.len > 0) {
                     const count = manager.direct_install_reports.items.len;
                     try manager.stdout.print("\n{d} package{s} installed [{d:.2}ms]\nRemoved: {d}\n", .{
@@ -2254,6 +2263,7 @@ const Manager = struct {
         };
         if (bunfig) |source| {
             try manager.validateBunfigSyntax(bunfig_path, source);
+            try manager.loadBunfigInstallConfiguration(bunfig_path, source);
             if (registry == null) registry = parseTomlString(source, "registry");
             if (configured_linker == null) {
                 if (parseTomlString(source, "linker")) |value| {
@@ -2288,6 +2298,10 @@ const Manager = struct {
         }
 
         try manager.loadNpmrcConfiguration(&registry);
+        if (manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR")) |directory| {
+            manager.options.no_cache = false;
+            manager.cache_directory = try manager.allocator.dupe(u8, directory);
+        }
         if (!manager.options.no_cache and manager.cache_directory == null) {
             manager.cache_directory = try packageCachePath(manager.init_data, manager.allocator);
         }
@@ -2323,6 +2337,60 @@ const Manager = struct {
         if (log.hasErrors()) {
             try log.print(manager.stderr);
             return error.PackageManagerErrorReported;
+        }
+    }
+
+    fn loadBunfigInstallConfiguration(manager: *Manager, path: []const u8, source_text: []const u8) !void {
+        var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
+        var ast_scope = ast_memory_allocator.enter(manager.allocator);
+        defer ast_scope.exit();
+
+        var log = compiler.logger.Log.init(manager.allocator);
+        defer log.deinit();
+        const source = compiler.logger.Source.initPathString(path, source_text);
+        const root = try compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true);
+        const install = root.get("install") orelse return;
+        if (install.get("cache")) |cache| {
+            if (cache.asBool()) |enabled| {
+                if (!enabled) {
+                    manager.options.no_cache = true;
+                    manager.cache_directory = null;
+                }
+            } else if (cache.asString(manager.allocator)) |directory| {
+                manager.cache_directory = directory;
+            } else if (cache.data == .e_object) {
+                if (cache.get("disable")) |disable| {
+                    if (disable.asBool()) |disabled| manager.options.no_cache = disabled;
+                }
+                if (cache.get("dir")) |directory| {
+                    if (directory.asString(manager.allocator)) |value| manager.cache_directory = value;
+                }
+            }
+        }
+        const scopes = install.get("scopes") orelse return;
+        if (scopes.data != .e_object) return;
+
+        for (scopes.data.e_object.properties.slice()) |property| {
+            const raw_name = property.key.?.asString(manager.allocator) orelse continue;
+            if (raw_name.len == 0) continue;
+            const name = if (raw_name[0] == '@') raw_name[1..] else raw_name;
+            const value = property.value orelse continue;
+            var configured = std.mem.zeroes(compiler.schema.api.NpmRegistry);
+            switch (value.data) {
+                .e_string => configured.url = value.asString(manager.allocator) orelse continue,
+                .e_object => {
+                    if (value.get("url")) |field| configured.url = field.asString(manager.allocator) orelse "";
+                    if (value.get("token")) |field| configured.token = field.asString(manager.allocator) orelse "";
+                    if (value.get("username")) |field| configured.username = field.asString(manager.allocator) orelse "";
+                    if (value.get("password")) |field| configured.password = field.asString(manager.allocator) orelse "";
+                },
+                else => continue,
+            }
+            if (configured.url.len == 0) continue;
+            try manager.registry_scopes.put(try manager.allocator.dupe(u8, name), .{
+                .url = try normalizeRegistryUrl(manager.allocator, configured.url),
+                .authorization = try manager.authorizationForRegistry(configured),
+            });
         }
     }
 
@@ -2368,7 +2436,12 @@ const Manager = struct {
                 manager.registry_authorization = try manager.authorizationForRegistry(configured);
             }
         }
-        if (!manager.options.no_cache) manager.cache_directory = install.cache_directory;
+        if (install.disable_cache orelse false) {
+            manager.options.no_cache = true;
+            manager.cache_directory = null;
+        } else if (!manager.options.no_cache) {
+            if (install.cache_directory) |directory| manager.cache_directory = directory;
+        }
         if (install.link_workspace_packages) |value| manager.link_workspace_packages = value;
         if (install.exact) |value| manager.options.exact = value;
         if (install.ignore_scripts) |value| manager.options.ignore_scripts = value;
@@ -2668,6 +2741,21 @@ const Manager = struct {
         if (failed) return error.PackageManagerErrorReported;
     }
 
+    fn warnDuplicateDependencies(manager: *Manager, package_json: *const Value) !void {
+        if (manager.options.silent or package_json.* != .object) return;
+        const dependencies = package_json.object.get("dependencies") orelse return;
+        const dev_dependencies = package_json.object.get("devDependencies") orelse return;
+        if (dependencies != .object or dev_dependencies != .object) return;
+
+        for (dev_dependencies.object.keys()) |name| {
+            if (dependencies.object.get(name) == null) continue;
+            try manager.stderr.print(
+                "warn: Duplicate dependency: \"{s}\" specified in package.json\n",
+                .{name},
+            );
+        }
+    }
+
     fn validateManifestCatalogReferences(
         manager: *Manager,
         package_json: *const Value,
@@ -2949,7 +3037,8 @@ const Manager = struct {
                 std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
                 !manager.explicit_adds.contains(alias);
             if (should_report and
-                (manager.installed_count > installed_before or
+                (manager.options.dry_run or
+                    manager.installed_count > installed_before or
                     manager.options.command == .remove or
                     (workspace_display != null and manager.lock_graph == null)) and
                 !manager.options.silent)
@@ -2981,10 +3070,14 @@ const Manager = struct {
         }.lessThan);
         if (manager.rootLifecycleScriptsWillRun()) try manager.stdout.writeByte('\n');
         for (manager.direct_install_reports.items) |report| {
-            try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
-            if (report.latest_version) |latest| {
-                if (!std.mem.eql(u8, latest, report.display)) {
-                    try manager.stdout.print(" (v{s} available)", .{latest});
+            if (manager.options.dry_run) {
+                try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
+            } else {
+                try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
+                if (report.latest_version) |latest| {
+                    if (!std.mem.eql(u8, latest, report.display)) {
+                        try manager.stdout.print(" (v{s} available)", .{latest});
+                    }
                 }
             }
             try manager.stdout.writeByte('\n');
@@ -3228,6 +3321,8 @@ const Manager = struct {
             manager.options.os,
         );
         if (!platform_matches and (optional or manager.options.cpu_overridden or manager.options.os_overridden)) {
+            const previous_resolution_only = manager.setResolutionOnly(true);
+            defer manager.restoreResolutionOnly(previous_resolution_only);
             if (isTopLevelDestination(manager.root_dir, destination, alias)) {
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
             }
@@ -3252,9 +3347,6 @@ const Manager = struct {
             // package is not materialized on the current host. Its required
             // dependencies must still be resolvable when the same lockfile is
             // consumed on a matching platform.
-            const previous_lockfile_only = manager.options.lockfile_only;
-            manager.options.lockfile_only = true;
-            defer manager.options.lockfile_only = previous_lockfile_only;
             try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
             if (!manager.options.omit_optional) {
                 try manager.installDependencyObject(@constCast(resolved.metadata), "optionalDependencies", destination, false, true);
@@ -3448,6 +3540,8 @@ const Manager = struct {
             !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os) and
             (optional or manager.options.cpu_overridden or manager.options.os_overridden);
         if (skip_for_platform) {
+            const previous_resolution_only = manager.setResolutionOnly(true);
+            defer manager.restoreResolutionOnly(previous_resolution_only);
             if (isTopLevelDestination(manager.root_dir, selection.destination, alias)) {
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package.version);
             }
@@ -3810,8 +3904,9 @@ const Manager = struct {
     fn defaultTarballURL(manager: *Manager, name: []const u8, version_value: []const u8) ![]const u8 {
         const encoded_name = try encodePackageName(manager.allocator, name);
         const basename = if (std.mem.lastIndexOfScalar(u8, name, '/')) |slash| name[slash + 1 ..] else name;
+        const registry = manager.registryConfigForPackage(name);
         return std.fmt.allocPrint(manager.allocator, "{s}{s}/-/{s}-{s}.tgz", .{
-            manager.registry,
+            registry.url,
             encoded_name,
             basename,
             version_value,
@@ -5503,18 +5598,20 @@ const Manager = struct {
         return null;
     }
 
-    fn registryManifestCachePath(manager: *Manager, encoded_name: []const u8) !?[]const u8 {
+    fn registryManifestCachePath(manager: *Manager, registry_url: []const u8, encoded_name: []const u8) !?[]const u8 {
         const cache_dir = manager.cache_directory orelse return null;
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
-        const filename = try std.fmt.allocPrint(manager.allocator, "{s}.npm", .{encoded_name});
+        const registry_hash = std.hash.Wyhash.hash(0, registry_url);
+        const filename = try std.fmt.allocPrint(manager.allocator, "{x}-{s}.npm", .{ registry_hash, encoded_name });
         return try std.fs.path.join(manager.allocator, &.{ cache_dir, filename });
     }
 
-    fn registryArchiveCachePath(manager: *Manager, name: []const u8, version_value: []const u8) !?[]const u8 {
+    fn registryArchiveCachePath(manager: *Manager, name: []const u8, version_value: []const u8, tarball_url: []const u8) !?[]const u8 {
         const cache_dir = manager.cache_directory orelse return null;
         const package_cache = try std.fs.path.join(manager.allocator, &.{ cache_dir, name });
         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, package_cache);
-        const filename = try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{version_value});
+        const source_hash = std.hash.Wyhash.hash(0, tarball_url);
+        const filename = try std.fmt.allocPrint(manager.allocator, "{s}-{x}.tgz", .{ version_value, source_hash });
         return try std.fs.path.join(manager.allocator, &.{ package_cache, filename });
     }
 
@@ -5540,7 +5637,7 @@ const Manager = struct {
         const manifest = manager.registry_manifests.get(name) orelse blk: {
             const encoded_name = try encodePackageName(manager.allocator, name);
             const configured_registry = manager.registryConfigForPackage(name);
-            const cache_path = try manager.registryManifestCachePath(encoded_name);
+            const cache_path = try manager.registryManifestCachePath(configured_registry.url, encoded_name);
             if (cache_path) |path| {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                     if (try manager.parseRegistryManifest(cached)) |parsed| {
@@ -5831,7 +5928,8 @@ const Manager = struct {
             try queued.put(name, {});
 
             const encoded_name = try encodePackageName(manager.allocator, name);
-            const cache_path = try manager.registryManifestCachePath(encoded_name);
+            const configured_registry = manager.registryConfigForPackage(name);
+            const cache_path = try manager.registryManifestCachePath(configured_registry.url, encoded_name);
             if (cache_path) |path| {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                     if (try manager.parseRegistryManifest(cached)) |parsed| {
@@ -5841,8 +5939,6 @@ const Manager = struct {
                     std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
                 }
             }
-
-            const configured_registry = manager.registryConfigForPackage(name);
             try fetches.append(.{
                 .io = manager.init_data.io,
                 .name = name,
@@ -5883,7 +5979,7 @@ const Manager = struct {
         defer fetches.deinit();
 
         for (archives) |archive| {
-            const cache_path = (try manager.registryArchiveCachePath(archive.name, archive.version)) orelse continue;
+            const cache_path = (try manager.registryArchiveCachePath(archive.name, archive.version, archive.tarball)) orelse continue;
             if (queued.contains(cache_path)) continue;
             try queued.put(cache_path, {});
             try fetches.append(.{
@@ -6016,7 +6112,7 @@ const Manager = struct {
     }
 
     fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive) ![]const u8 {
-        const cache_path = try manager.registryArchiveCachePath(package.name, package.version);
+        const cache_path = try manager.registryArchiveCachePath(package.name, package.version, package.tarball);
 
         if (cache_path) |path| {
             if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_tarball_bytes)) |cached| {

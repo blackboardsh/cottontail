@@ -3459,7 +3459,7 @@ function wrapDoneCallback(callback) {
         else resolve();
       }
     };
-    const done = (error = undefined) => {
+    const done = (error) => {
       if (doneCalled || settled) return;
       doneCalled = true;
       const frame = doneContinuationFrame(error);
@@ -3733,9 +3733,7 @@ function makeEach(base) {
       const parsed = parseCallbackArgs([name, options, callback]);
       rows.forEach((row, index) => {
         const values = normalizeEachValues(row);
-        const testCallback = parsed.callback?.length > values.length
-          ? (done) => parsed.callback?.call(row, ...values, done)
-          : () => parsed.callback?.apply(row, values);
+        const testCallback = parsed.callback?.bind(row, ...values);
         base(formatBunEachLabel(parsed.name, values, index), parsed.options, testCallback);
       });
       return undefined;

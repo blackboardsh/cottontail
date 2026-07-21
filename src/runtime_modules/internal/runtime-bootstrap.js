@@ -1,5 +1,5 @@
 import { createWritableStdio } from "../node/stdio.js";
-import { remapStackString } from "../vendor/sourcemap.js";
+import { remapStackString, sourceContextForLocation } from "../vendor/sourcemap.js";
 
 const nodeCompatVersion = "24.11.1";
 const bunCompatVersion = "1.3.10";
@@ -7,6 +7,7 @@ const processStartNs = BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() *
 const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 
 globalThis.__cottontailRemapStackString ??= remapStackString;
+globalThis.__cottontailSourceContextForLocation ??= sourceContextForLocation;
 globalThis.__cottontailFormatUncaughtException ??= (error) => {
   if (error && typeof error.stack === "string") {
     const stack = remapStackString(error.stack);
