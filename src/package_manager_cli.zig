@@ -15,6 +15,7 @@ const PmWhy = @import("package_manager_pm_why.zig");
 const Isolated = @import("package_manager_isolated.zig");
 const Workspaces = @import("package_manager_workspaces.zig");
 const Analyzer = @import("package_manager_analyzer.zig");
+const Audit = @import("package_manager_audit.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -34,6 +35,7 @@ const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependenc
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
 
 const Command = enum {
+    audit,
     install,
     add,
     remove,
@@ -345,6 +347,7 @@ pub fn recognizes(command: []const u8) bool {
 }
 
 fn commandFromString(command: []const u8) ?Command {
+    if (std.mem.eql(u8, command, "audit")) return .audit;
     if (std.mem.eql(u8, command, "install") or std.mem.eql(u8, command, "i") or std.mem.eql(u8, command, "ci")) return .install;
     if (std.mem.eql(u8, command, "add") or std.mem.eql(u8, command, "a")) return .add;
     if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm") or std.mem.eql(u8, command, "uninstall")) return .remove;
@@ -381,6 +384,9 @@ pub fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "audit")) {
+        return Audit.run(init, args, stdout, stderr);
+    }
     const allocator = init.arena.allocator();
     const options = parseOptions(allocator, args) catch |err| {
         try stderr.print("error: {s}\n", .{@errorName(err)});
@@ -1767,7 +1773,7 @@ const Manager = struct {
             .link => try manager.addPackages(command_package_json, manager.invocation_package_dir),
             .unlink => unreachable,
             .patch, .patch_commit => unreachable,
-            .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
+            .audit, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
         if (security_resolution_output) |output_path| {
