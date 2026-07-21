@@ -1,8 +1,24 @@
 import { createWritableStdio } from "../node/stdio.js";
+import { remapStackString } from "../vendor/sourcemap.js";
 
 const nodeCompatVersion = "24.11.1";
 const bunCompatVersion = "1.3.10";
 const processStartNs = BigInt(Math.floor(cottontail.nanotime?.() ?? Date.now() * 1_000_000));
+const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
+
+globalThis.__cottontailRemapStackString ??= remapStackString;
+globalThis.__cottontailFormatUncaughtException ??= (error) => {
+  if (error && typeof error.stack === "string") {
+    const stack = remapStackString(error.stack);
+    let header = "";
+    try {
+      header = Error.prototype.toString.call(error);
+    } catch {}
+    return header && !stack.includes(header) ? `${header}\n${stack}` : stack;
+  }
+  if (error?.message) return `${error.name || "Error"}: ${error.message}`;
+  return String(error);
+};
 
 function installEmitter(target) {
   if (typeof target.on === "function" && typeof target.emit === "function") return;
@@ -144,13 +160,14 @@ bunObject.isMainThread ??= cottontail.isWorker?.() !== true;
 bunObject.version ??= bunCompatVersion;
 bunObject.revision ??= "cottontail";
 bunObject.version_with_sha ??= `v${bunCompatVersion} (cottontail)`;
-bunObject.gc ??= function gc() {
+bunObject.gc ??= function gc(force = false) {
+  void force;
   cottontail.gc?.();
   cottontail.drainJobs?.();
 };
 bunObject.sleep ??= function sleep(value) {
   const delay = value instanceof Date ? value.getTime() - Date.now() : Number(value);
-  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number.isFinite(delay) ? delay : 2 ** 31 - 1)));
+  return new Promise(resolve => bunSleepSetTimeout(resolve, Math.max(0, Number.isFinite(delay) ? delay : 2 ** 31 - 1)));
 };
 bunObject.sleepSync ??= function sleepSync(value) {
   const delay = Number(value);

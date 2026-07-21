@@ -1571,8 +1571,8 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     };
 
     // Cached runtime artifacts keep their external map beside the immutable
-    // generated source. Install the map data before evaluation so the stack
-    // remapper does not depend on a per-invocation temporary path.
+    // generated source. Install its stable path and let the stack remapper load
+    // the multi-megabyte map lazily only when a generated frame needs it.
     if (execution.embedded_source == null) {
         const source_map_path = std.mem.concat(
             execution.allocator,
@@ -1580,13 +1580,8 @@ fn runScriptExecution(execution: *ScriptExecution) void {
             &.{ execution.runnable_path, ".map" },
         ) catch null;
         if (source_map_path) |path| {
-            if (std.Io.Dir.cwd().readFileAlloc(
-                execution.io,
-                path,
-                execution.allocator,
-                .limited(64 * 1024 * 1024),
-            )) |source_map| {
-                js_runtime.setEmbeddedSourceMap(source_map, execution.runnable_path) catch {
+            if (std.Io.Dir.cwd().access(execution.io, path, .{})) {
+                js_runtime.setExternalSourceMap(path, execution.runnable_path) catch {
                     writeStderr(execution.io, "cottontail: failed to install generated source map\n", .{});
                     execution.exit_code = 1;
                     return;
@@ -2102,6 +2097,10 @@ fn buildRuntimeAliases(
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "isomorphic-fetch", "vendor/isomorphic-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "@vercel/fetch", "vendor/vercel-fetch.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "abort-controller", "vendor/abort-controller.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "utf-8-validate", "bun/utf-8-validate.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws", "vendor/ws.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "ws/lib/websocket", "vendor/ws.js");
+    try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "next/dist/compiled/ws", "vendor/ws.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "undici", "node/undici-public.js");
     try appendRuntimeAlias(ctx, &aliases, runtime_virtual_root, "node:undici", "node/undici-public.js");
 
@@ -2138,6 +2137,10 @@ fn isRuntimeAliasSpecifier(specifier: []const u8) bool {
         std.mem.eql(u8, specifier, "isomorphic-fetch") or
         std.mem.eql(u8, specifier, "@vercel/fetch") or
         std.mem.eql(u8, specifier, "abort-controller") or
+        std.mem.eql(u8, specifier, "utf-8-validate") or
+        std.mem.eql(u8, specifier, "ws") or
+        std.mem.eql(u8, specifier, "ws/lib/websocket") or
+        std.mem.eql(u8, specifier, "next/dist/compiled/ws") or
         std.mem.eql(u8, specifier, "undici") or
         std.mem.eql(u8, specifier, "node:undici");
 }

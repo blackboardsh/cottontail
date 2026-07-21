@@ -36,6 +36,7 @@ import { parse as parseJSON5, stringify as stringifyJSON5 } from "./json5.js";
 import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
 import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
+import wsBuiltin from "../vendor/ws.js";
 import {
   remapErrorPosition as remapBundleErrorPosition,
   remapPosition as remapBundlePosition,
@@ -50,7 +51,6 @@ import { color as bunColor } from "./color.js";
 import * as bunTestModule from "./test.js";
 import * as bunJscModule from "./jsc.js";
 import * as bunInternalForTestingModule from "./internal-for-testing.js";
-import { jest as bunJest } from "./test.js";
 import { captureV8HeapSnapshot } from "../node/internal/heap_snapshot.js";
 import {
   assertBunAbortSignal,
@@ -3617,7 +3617,7 @@ function isCurrentCottontailExecutable(file) {
   return execPath.length > 0 && String(file) === execPath;
 }
 
-function prepareNativeSpawnOptions(file, nativeOptions) {
+function prepareNativeSpawnOptions(file, nativeOptions, args = []) {
   if (isCurrentCottontailExecutable(file)) {
     // COTTONTAIL-COMPAT: spawn argv0 - Cottontail children use this internal
     // override; arbitrary executables still need the native hooks to set
@@ -3626,6 +3626,8 @@ function prepareNativeSpawnOptions(file, nativeOptions) {
       ? withoutElectrobunHostEnv(currentProcessEnv())
       : { ...nativeOptions.env };
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
+    // JSC reads heap sizing before Cottontail's CLI can inspect --smol.
+    if (args.some(arg => String(arg) === "--smol")) env.JSC_largeHeapSize = "1048576";
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
     if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
     return {
@@ -4039,6 +4041,7 @@ export function spawnSync(command, maybeArgsOrOptions = {}, maybeOptions = undef
   const nativeOptions = prepareNativeSpawnOptions(
     file,
     normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "pipe" }, true),
+    args,
   );
   const signalState = abortSignalState.get(nativeOptions.signal);
   if (!nativeOptions.signal?.aborted && signalState?.timeoutDeadline != null) {
@@ -4477,6 +4480,7 @@ class ProcessWritable {
     if (this._draining || this.destroyed) return;
     this._draining = true;
     const drain = async () => {
+      let bytesSinceYield = 0;
       try {
         while (this._queue.length > 0) {
           const item = this._queue[0];
@@ -4488,7 +4492,10 @@ class ProcessWritable {
             const count = end - item.offset;
             item.offset = end;
             this._queuedBytes -= count;
-            if (item.offset < item.bytes.byteLength || this._queue.length > 1) {
+            bytesSinceYield += count;
+            if (bytesSinceYield >= 1024 * 1024 &&
+                (item.offset < item.bytes.byteLength || this._queue.length > 1)) {
+              bytesSinceYield = 0;
               await new Promise((resolve) => setTimeout(resolve, 0));
             }
           }
@@ -4602,6 +4609,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   const nativeOptions = prepareNativeSpawnOptions(
     file,
     normalizeSpawnOptions(options, { stdin: "ignore", stdout: "pipe", stderr: "inherit" }, false),
+    args,
   );
   const readableInput = prepareReadableSpawnInput(nativeOptions.input);
   const listeners = new Map();
@@ -4733,6 +4741,12 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     }
   }
 
+  function finishOutput(stream) {
+    if (!stream || stream._ended) return;
+    stream.emit("end");
+    stream.emit("close");
+  }
+
   let spawnFile = file;
   let spawnArgs = args;
   if (
@@ -4837,14 +4851,8 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
         }
         if (nativeOptions.stdoutBuffer != null) writeOutputBuffer(nativeOptions.stdoutBuffer, stdoutBytes);
         if (nativeOptions.stderrBuffer != null) writeOutputBuffer(nativeOptions.stderrBuffer, stderrBytes);
-        if (child.stdout) {
-          child.stdout.emit("end");
-          child.stdout.emit("close");
-        }
-        if (child.stderr) {
-          child.stderr.emit("end");
-          child.stderr.emit("close");
-        }
+        finishOutput(child.stdout);
+        finishOutput(child.stderr);
         const exitedValue = exitCode ?? (resultSignalNumber > 0 ? 128 + resultSignalNumber : null);
         resolve(exitedValue);
         if (typeof nativeOptions.onExit === "function") {
@@ -4868,7 +4876,9 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       if (event.type === "stdout") {
         const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
         if (chunk.length > 0) {
-          stdoutChunks.push(chunk);
+          // COTTONTAIL-COMPAT: A piped ProcessReadable owns its unread chunks.
+          // Keep a second copy only for output modes that write on process exit.
+          if (nativeOptions.stdoutFilePath != null || nativeOptions.stdoutBuffer != null) stdoutChunks.push(chunk);
           stdoutLength += chunk.byteLength;
           child.stdout?.emit("data", chunk);
           enforceMaxBuffer();
@@ -4878,11 +4888,19 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       if (event.type === "stderr") {
         const chunk = asBuffer(event.data ?? new ArrayBuffer(0));
         if (chunk.length > 0) {
-          stderrChunks.push(chunk);
+          if (nativeOptions.stderrFilePath != null || nativeOptions.stderrBuffer != null) stderrChunks.push(chunk);
           stderrLength += chunk.byteLength;
           child.stderr?.emit("data", chunk);
           enforceMaxBuffer();
         }
+        return;
+      }
+      if (event.type === "stdout_end") {
+        finishOutput(child.stdout);
+        return;
+      }
+      if (event.type === "stderr_end") {
+        finishOutput(child.stderr);
         return;
       }
       if (event.type === "ipc") {
@@ -4948,8 +4966,11 @@ function bytesFromData(data) {
   return new TextEncoder().encode(String(data));
 }
 
+const fetchBodyStartSymbol = Symbol("cottontail.fetchBodyStart");
+
 async function bytesFromBody(body) {
   if (body == null) return new Uint8Array(0);
+  body?.[fetchBodyStartSymbol]?.();
   const sharedCopy = sharedArrayBufferBytes(body);
   if (sharedCopy) return sharedCopy;
   if (body instanceof Uint8Array) return body;
@@ -5465,6 +5486,14 @@ const wellKnownHeaderNames = new Set([
 
 // Header validation is deliberately regex-free: user code can sabotage
 // RegExp.prototype.exec (which `.test()` consults) and Headers must still work.
+const invalidHeaderErrorSymbol = Symbol("cottontail.invalidHeader");
+
+function invalidHeaderError(message) {
+  const error = new TypeError(message);
+  Object.defineProperty(error, invalidHeaderErrorSymbol, { value: true });
+  return error;
+}
+
 function headerNameToString(name) {
   if (typeof name === "symbol") throw new TypeError("Header name must be a string");
   return String(name);
@@ -5492,11 +5521,11 @@ function isHeaderTokenCode(code) {
 
 function validateHeaderName(nameText) {
   if (nameText.length === 0) {
-    throw new TypeError(`Invalid header name: '${nameText}'`);
+    throw invalidHeaderError(`Invalid header name: '${nameText}'`);
   }
   for (let index = 0; index < nameText.length; index += 1) {
     if (!isHeaderTokenCode(nameText.charCodeAt(index))) {
-      throw new TypeError(`Invalid header name: '${nameText}'`);
+      throw invalidHeaderError(`Invalid header name: '${nameText}'`);
     }
   }
 }
@@ -5518,7 +5547,7 @@ function validateHeaderValue(valueText, nameText) {
   for (let index = 0; index < valueText.length; index += 1) {
     const code = valueText.charCodeAt(index);
     if (code === 0x00 || code === 0x0a || code === 0x0d || code > 0xff) {
-      throw new TypeError(`Header value is not valid. Header '${nameText}' has invalid value: '${valueText}'`);
+      throw invalidHeaderError(`Header value is not valid. Header '${nameText}' has invalid value: '${valueText}'`);
     }
   }
 }
@@ -5677,6 +5706,57 @@ function isURLSearchParamsLike(value) {
   return typeof GlobalURLSearchParams === "function" && value instanceof GlobalURLSearchParams;
 }
 
+function toWellFormedBodyString(input) {
+  const value = String(input);
+  let output = null;
+  let segmentStart = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1;
+        continue;
+      }
+    }
+    if (code < 0xd800 || code > 0xdfff) continue;
+    output ??= "";
+    output += `${value.slice(segmentStart, index)}\ufffd`;
+    segmentStart = index + 1;
+  }
+  return output == null ? value : output + value.slice(segmentStart);
+}
+
+function formUrlEncodeComponent(value) {
+  const text = String(value);
+  // COTTONTAIL-COMPAT: Avoid copying large ASCII form fields when every byte is
+  // already in the application/x-www-form-urlencoded percent-encode set.
+  if (/^[A-Za-z0-9*._-]*$/.test(text)) return text;
+  let encoded = encodeURIComponent(toWellFormedBodyString(text)).replaceAll("%20", "+");
+  if (/[!'()~]/.test(encoded)) {
+    encoded = encoded.replace(/[!'()~]/g, (character) =>
+      `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+  }
+  return encoded;
+}
+
+(function patchURLSearchParamsSerialization() {
+  const proto = URLSearchParams?.prototype;
+  const entries = proto?.entries;
+  if (!proto || typeof entries !== "function" || proto.toString?.__cottontailFastFormEncoding) return;
+  const toString = function toString() {
+    let output = "";
+    for (const [name, value] of entries.call(this)) {
+      if (output !== "") output += "&";
+      output += `${formUrlEncodeComponent(name)}=${formUrlEncodeComponent(value)}`;
+    }
+    return output;
+  };
+  toString.__cottontailFastFormEncoding = true;
+  Object.defineProperty(proto, "toString", { value: toString, writable: true, configurable: true });
+})();
+
 function parseBodyJson(text) {
   try {
     return JSON.parse(text);
@@ -5742,6 +5822,17 @@ async function encodeMultipartFormData(formData) {
 
 function stripUtf8BOMText(text) {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+function blobTypeFromBodyHeaders(headers) {
+  const type = headers.get("content-type") ?? "";
+  if (/^(?:text\/|application\/json(?:;|$))/i.test(type)) {
+    return `${type.split(";", 1)[0]};charset=utf-8`;
+  }
+  if (/^application\/(?:xml|javascript|x-www-form-urlencoded)$/i.test(type)) {
+    return `${type};charset=utf-8`;
+  }
+  return type;
 }
 
 // Reinterpret latin1-decoded bytes as UTF-8 when that produces valid text.
@@ -5858,10 +5949,11 @@ export class Request {
       keepaliveExplicit: Object.prototype.hasOwnProperty.call(init, "keepalive") ||
         (input instanceof Request && requestState.get(input)?.keepaliveExplicit === true),
     });
-    this._body = Object.prototype.hasOwnProperty.call(init, "body")
+    const body = Object.prototype.hasOwnProperty.call(init, "body")
       ? init.body
       : input?._body ?? input?.body ?? null;
-    setDefaultBodyContentType(headers, this._body);
+    setDefaultBodyContentType(headers, body);
+    this._body = isURLSearchParamsLike(body) ? String(body) : body;
     if (this._body?.locked) throw new TypeError(init.keepalive ? "keepalive" : "ReadableStream is locked");
     if (init.keepalive === true && typeof this._body?.getReader === "function") {
       throw new TypeError("keepalive");
@@ -5888,6 +5980,7 @@ export class Request {
       this._bodyStream = bodyReadableStream(this._body);
       const getReader = this._bodyStream?.getReader?.bind(this._bodyStream);
       if (getReader) this._bodyStream.getReader = (...args) => {
+        this._body?.[fetchBodyStartSymbol]?.();
         let reader;
         try {
           reader = getReader(...args);
@@ -5939,17 +6032,17 @@ export class Request {
     return body;
   }
   async arrayBuffer() {
-    return arrayBufferFromBytes(await bytesFromBody(this._takeBody()));
+    const body = this._takeBody();
+    if (body instanceof Blob) return body.arrayBuffer();
+    return arrayBufferFromBytes(await bytesFromBody(body));
   }
   async bytes() {
-    return asBuffer(await bytesFromBody(this._takeBody()));
+    const body = this._takeBody();
+    if (body instanceof Blob && typeof body.bytes === "function") return asBuffer(await body.bytes());
+    return asBuffer(await bytesFromBody(body));
   }
   async blob() {
-    let type = this.headers.get("content-type") ?? "";
-    // Bun appends the default charset to textual media types on blob().
-    if (/^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded)$)/i.test(type) && !type.includes(";")) {
-      type = `${type};charset=utf-8`;
-    }
+    const type = blobTypeFromBodyHeaders(this.headers);
     const body = this._takeBody();
     if (body instanceof Blob && (!type || body.type === type)) return body;
     return cachedBlobForBytes(await bytesFromBody(body), type);
@@ -5961,9 +6054,13 @@ export class Request {
     if (body != null) this._bodyUsed = true;
     if (body == null) return Promise.resolve("");
     if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
+    if (body instanceof Blob) return body.text().then(stripUtf8BOMText);
     return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
+    if (this._body instanceof Blob && typeof this._body.json === "function") {
+      return this._takeBody().json();
+    }
     return parseBodyJson(await this.text());
   }
   formData() {
@@ -6067,7 +6164,7 @@ export class Response {
     if (body?.locked) throw new TypeError("ReadableStream is locked");
     setDefaultBodyContentType(this.headers, body);
     if (body instanceof FormData) assertFormDataFilesExist(body);
-    this._body = body;
+    this._body = isURLSearchParamsLike(body) ? String(body) : body;
     this._bodyStream = undefined;
     this._bodyUsed = false;
     this._bodyConsumedBytes = 0;
@@ -6142,17 +6239,17 @@ export class Response {
     return body;
   }
   async arrayBuffer() {
-    return arrayBufferFromBytes(await bytesFromBody(this._takeBody()));
+    const body = this._takeBody();
+    if (body instanceof Blob) return body.arrayBuffer();
+    return arrayBufferFromBytes(await bytesFromBody(body));
   }
   async bytes() {
-    return asBuffer(await bytesFromBody(this._takeBody()));
+    const body = this._takeBody();
+    if (body instanceof Blob && typeof body.bytes === "function") return asBuffer(await body.bytes());
+    return asBuffer(await bytesFromBody(body));
   }
   async blob() {
-    let type = this.headers.get("content-type") ?? "";
-    // Bun appends the default charset to textual media types on blob().
-    if (/^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded)$)/i.test(type) && !type.includes(";")) {
-      type = `${type};charset=utf-8`;
-    }
+    const type = blobTypeFromBodyHeaders(this.headers);
     const body = this._takeBody();
     if (body instanceof Blob && (!type || body.type === type)) return body;
     return cachedBlobForBytes(await bytesFromBody(body), type);
@@ -6164,9 +6261,13 @@ export class Response {
     if (body != null) this._bodyUsed = true;
     if (body == null) return Promise.resolve("");
     if (typeof body === "string") return Promise.resolve(stripUtf8BOMText(body));
+    if (body instanceof Blob) return body.text().then(stripUtf8BOMText);
     return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
+    if (this._body instanceof Blob && typeof this._body.json === "function") {
+      return this._takeBody().json();
+    }
     return parseBodyJson(await this.text());
   }
   formData() {
@@ -6181,6 +6282,7 @@ export class Response {
       this._bodyStream = bodyReadableStream(this._body);
       const getReader = this._bodyStream?.getReader?.bind(this._bodyStream);
       if (getReader) this._bodyStream.getReader = (...args) => {
+        this._body?.[fetchBodyStartSymbol]?.();
         let reader;
         try {
           reader = getReader(...args);
@@ -6200,6 +6302,12 @@ export class Response {
           return result;
         });
         return reader;
+      };
+      const asyncIterator = this._bodyStream?.[Symbol.asyncIterator]?.bind(this._bodyStream);
+      if (asyncIterator) this._bodyStream[Symbol.asyncIterator] = (...args) => {
+        this._body?.[fetchBodyStartSymbol]?.();
+        this._bodyUsed = true;
+        return asyncIterator(...args);
       };
     }
     return this._bodyStream;
@@ -6285,7 +6393,7 @@ function activeServerForFetchUrl(urlText) {
     const direct = activeServeOrigins.get(`${url.protocol}//${authority}`);
     if (direct) return direct;
     if (url.hostname === "localhost") return activeServeOrigins.get(`${url.protocol}//127.0.0.1:${url.port}`);
-    if (hostname === "0.0.0.0" || hostname === "[::]") {
+    if (hostname === "0.0.0.0" || hostname === "[::]" || hostname === "[::1]") {
       return activeServeOrigins.get(`${url.protocol}//127.0.0.1:${url.port}`)
         ?? activeServeOrigins.get(`${url.protocol}//localhost:${url.port}`);
     }
@@ -6533,6 +6641,15 @@ function applyDefaultFetchHeaders(request, keepalive = fetchUsesKeepalive(reques
       headers.set("Host", `${url.hostname}${url.port ? `:${url.port}` : ""}`);
     } catch {}
   }
+  if (!headers.has("content-length") && !headers.has("transfer-encoding") &&
+      request._body != null && request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS") {
+    const body = request._body;
+    let length = null;
+    if (typeof body === "string" || isURLSearchParamsLike(body)) length = Buffer.byteLength(String(body));
+    else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) length = body.byteLength;
+    else if (typeof body?.size === "number" && Number.isFinite(body.size)) length = Number(body.size);
+    if (length != null) headers.set("Content-Length", String(length));
+  }
 }
 
 function fetchPoolKey(urlText, tlsConfig = undefined) {
@@ -6603,7 +6720,18 @@ async function fetchFromNodeHttp(request, redirectMode = "follow", depth = 0, re
     const nextIsLocal = isLoopbackHttpUrl(nextUrl) || isLoopbackHttpsUrl(nextUrl) || activeServerForFetchUrl(nextUrl);
     if (!nextIsLocal) return fetchImpl(nextRequest, { redirect: redirectMode });
     const nextActive = new URL(nextUrl).protocol === "http:" ? activeServerForFetchUrl(nextUrl) : null;
-    if (nextActive) return fetchFromActiveServer(nextActive, nextRequest, redirectMode, depth + 1, true);
+    if (nextActive) {
+      return fetchFromActiveServer(
+        nextActive,
+        nextRequest,
+        redirectMode,
+        depth + 1,
+        true,
+        nextTransport.decompress !== false,
+        "http",
+        nextTransport,
+      );
+    }
   }
   return fetchFromNodeHttp(nextRequest, redirectMode, depth + 1, true, nextTransport);
 }
@@ -6704,15 +6832,41 @@ function headersFromIncomingMessage(message) {
   return headers;
 }
 
-function incomingMessageBodyStream(message, signal) {
-  let controller;
+const abandonedFetchBodyCleanupSymbol = Symbol("cottontail.abandonedFetchBodyCleanup");
+const abandonedFetchBodyFinalizerStates = new WeakMap();
+const abandonedFetchBodyFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((held) => {
+      try {
+        if (held?.consumed) return;
+        if (typeof held?.cleanup === "function") held.cleanup();
+        else if (typeof held === "function") held();
+        else {
+          const cancellation = held?.cancel?.();
+          cancellation?.catch?.(() => {});
+        }
+      } catch {}
+    })
+  : null;
+
+function registerFetchResponseBodyFinalizer(response, body) {
+  if (response && body && typeof body.cancel === "function") {
+    const state = {
+      cleanup: body[abandonedFetchBodyCleanupSymbol] ?? body,
+      consumed: false,
+    };
+    abandonedFetchBodyFinalizerStates.set(body, state);
+    abandonedFetchBodyFinalizer?.register(response, state);
+  }
+}
+
+function markFetchResponseBodyConsumed(body) {
+  const state = body && abandonedFetchBodyFinalizerStates.get(body);
+  if (state) state.consumed = true;
+}
+
+function createIncomingMessageBodyTransport(message, signal, expectedBytes) {
   let done = false;
-  let paused = false;
-  let receivedBytes = 0;
-  const contentLengthText = message.headers?.["content-length"];
-  const expectedBytes = contentLengthText != null && /^\d+$/.test(String(contentLengthText))
-    ? Number(contentLengthText)
-    : null;
+  let streamState = null;
   const cleanup = () => {
     message.off?.("data", onData);
     message.off?.("end", onEnd);
@@ -6724,21 +6878,32 @@ function incomingMessageBodyStream(message, signal) {
     if (done) return;
     done = true;
     cleanup();
-    callback();
+    const state = streamState;
+    if (state) {
+      state.done = true;
+      callback(state);
+    }
+    streamState = null;
   };
   const onData = chunk => {
     if (done) return;
-    receivedBytes += Number(chunk?.byteLength ?? chunk?.length ?? 0);
-    controller.enqueue(Buffer.from(chunk));
-    if (controller.desiredSize <= 0) {
-      paused = true;
+    const state = streamState;
+    if (!state) {
+      abandon();
+      return;
+    }
+    state.receivedBytes += Number(chunk?.byteLength ?? chunk?.length ?? 0);
+    state.controller.enqueue(Buffer.from(chunk));
+    if (state.controller.desiredSize <= 0) {
+      state.paused = true;
       message.pause?.();
     }
   };
-  const onEnd = () => finish(() => controller.close());
-  const onError = error => finish(() => controller.error(normalizeFetchNetworkError(error)));
+  const onEnd = () => finish(state => state.controller.close());
+  const onError = error => finish(state => state.controller.error(normalizeFetchNetworkError(error)));
   const onAborted = () => {
-    if (expectedBytes != null && receivedBytes >= expectedBytes) {
+    const state = streamState;
+    if (expectedBytes != null && state && state.receivedBytes >= expectedBytes) {
       onEnd();
       return;
     }
@@ -6748,13 +6913,32 @@ function incomingMessageBodyStream(message, signal) {
   };
   const onAbort = () => {
     const reason = normalizedFetchAbortReason(signal);
-    finish(() => controller.error(reason));
+    finish(state => state.controller.error(reason));
     message.on?.("error", () => {});
     message.destroy?.(reason);
   };
-  return new globalThis.ReadableStream({
-    start(streamController) {
-      controller = streamController;
+  const abandon = (reason = undefined) => {
+    if (done) return;
+    done = true;
+    streamState = null;
+    cleanup();
+    const request = message.req;
+    const socket = message.socket;
+    // COTTONTAIL-COMPAT: A completed response can outlive its agent lease.
+    // Only destroy the transport while this response still owns the socket.
+    if (!message.complete && request?.res === message && socket?._httpMessage === request) {
+      socket._destroyImmediately?.();
+    }
+    request?._destroyForFetchAbandon?.();
+    message.req = null;
+    message.socket = null;
+    message.connection = null;
+  };
+  return {
+    abandon,
+    start(state) {
+      if (done) return;
+      streamState = state;
       message.on?.("data", onData);
       message.once?.("end", onEnd);
       message.once?.("error", onError);
@@ -6763,20 +6947,44 @@ function incomingMessageBodyStream(message, signal) {
       if (signal?.aborted) onAbort();
       else message.resume?.();
     },
+  };
+}
+
+function incomingMessageBodyStream(message, signal) {
+  const contentLengthText = message.headers?.["content-length"];
+  const expectedBytes = contentLengthText != null && /^\d+$/.test(String(contentLengthText))
+    ? Number(contentLengthText)
+    : null;
+  const state = { controller: null, done: false, paused: false, receivedBytes: 0, started: false };
+  const transport = createIncomingMessageBodyTransport(message, signal, expectedBytes);
+  const startTransport = () => {
+    if (state.started || state.done) return;
+    state.started = true;
+    transport.start(state);
+  };
+  const startBodyConsumption = () => {
+    markFetchResponseBodyConsumed(stream);
+    startTransport();
+  };
+  const stream = new globalThis.ReadableStream({
+    start(streamController) {
+      state.controller = streamController;
+    },
     pull() {
-      if (!done && paused) {
-        paused = false;
+      if (!state.started) return startTransport();
+      if (!state.done && state.paused) {
+        state.paused = false;
         message.resume?.();
       }
     },
     cancel(reason) {
-      if (done) return;
-      done = true;
-      cleanup();
-      message.on?.("error", () => {});
-      message.destroy?.(reason);
+      state.done = true;
+      transport.abandon(reason);
     },
-  }, new ByteLengthQueuingStrategy({ highWaterMark: 64 * 1024 }));
+  }, new ByteLengthQueuingStrategy({ highWaterMark: 0 }));
+  Object.defineProperty(stream, fetchBodyStartSymbol, { value: startBodyConsumption });
+  Object.defineProperty(stream, abandonedFetchBodyCleanupSymbol, { value: transport.abandon });
+  return stream;
 }
 
 function prepareNodeFetchBody(request) {
@@ -6825,21 +7033,20 @@ function waitForFetchRequestDrain(request) {
   });
 }
 
-async function writeNodeFetchBody(clientRequest, body) {
+function writeNodeFetchBody(clientRequest, body) {
   if (body.bytes) {
     clientRequest.end(body.bytes);
-    return;
+    return null;
   }
   if (!body.stream) {
     clientRequest.end();
-    return;
+    return null;
   }
   clientRequest.flushHeaders?.();
-  await consumeStreamingBody(body.stream, async chunk => {
+  return consumeStreamingBody(body.stream, async chunk => {
     if (clientRequest.destroyed) throw new Error("The socket connection was closed unexpectedly.");
     if (!clientRequest.write(Buffer.from(asBuffer(chunk)))) await waitForFetchRequestDrain(clientRequest);
-  });
-  clientRequest.end();
+  }).then(() => clientRequest.end());
 }
 
 function proxyAuthorization(proxyUrl) {
@@ -6958,14 +7165,36 @@ function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepaliv
   return agent;
 }
 
-async function fetchOnceUsingNodeClient(request, redirected = false, transport = {}) {
-  const url = new URL(request.url);
-  const keepalive = fetchUsesKeepalive(request);
-  applyDefaultFetchHeaders(request, keepalive);
-  const preparedBody = prepareNodeFetchBody(request);
-  const body = preparedBody && typeof preparedBody.then === "function"
-    ? await preparedBody
-    : preparedBody;
+function fetchOnceUsingNodeClient(request, redirected = false, transport = {}, onResponse = null) {
+  // COTTONTAIL-COMPAT: A pending fetch remains referenced while body
+  // preparation and node:net address fallback have no active socket handle.
+  const livenessTimer = setTimeout(() => {}, 0x7fffffff);
+  const release = value => {
+    clearTimeout(livenessTimer);
+    return value;
+  };
+  try {
+    const url = new URL(request.url);
+    const keepalive = fetchUsesKeepalive(request);
+    applyDefaultFetchHeaders(request, keepalive);
+    const preparedBody = prepareNodeFetchBody(request);
+    const pending = preparedBody && typeof preparedBody.then === "function"
+      ? preparedBody.then(body => dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body))
+      : dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, preparedBody);
+    return Promise.resolve(pending).then(
+      release,
+      error => {
+        clearTimeout(livenessTimer);
+        throw error;
+      },
+    );
+  } catch (error) {
+    clearTimeout(livenessTimer);
+    throw error;
+  }
+}
+
+function dispatchNodeFetchRequest(request, redirected, transport, onResponse, url, keepalive, body) {
   if (body.length != null && !request.headers.has("content-length") && !request.headers.has("transfer-encoding")) {
     request.headers.set("Content-Length", String(body.length));
   }
@@ -7001,10 +7230,15 @@ async function fetchOnceUsingNodeClient(request, redirected = false, transport =
     let responseReceived = false;
     let clientRequest;
     const signal = request.signal;
+    const absorbResponseTransportError = () => {};
+    const onRequestError = error => {
+      signal?.removeEventListener?.("abort", onAbort);
+      if (!responseReceived) reject?.(normalizeFetchNetworkError(error));
+    };
     const onAbort = () => {
       const reason = normalizedFetchAbortReason(signal);
       clientRequest?.destroy?.(reason);
-      if (!responseReceived) reject(reason);
+      if (!responseReceived) reject?.(reason);
     };
     if (signal?.aborted) {
       reject(normalizedFetchAbortReason(signal));
@@ -7024,7 +7258,13 @@ async function fetchOnceUsingNodeClient(request, redirected = false, transport =
         ...((client === nodeHttps || url.protocol === "https:") ? tlsOptions : {}),
       }, incoming => {
         responseReceived = true;
+        const resolveResponse = resolve;
+        const rejectResponse = reject;
+        resolve = null;
+        reject = null;
         signal?.removeEventListener?.("abort", onAbort);
+        clientRequest.off?.("error", onRequestError);
+        clientRequest.once?.("error", absorbResponseTransportError);
         const headers = headersFromIncomingMessage(incoming);
         const stream = incomingMessageBodyStream(incoming, signal);
         const response = new Response(stream, {
@@ -7034,54 +7274,83 @@ async function fetchOnceUsingNodeClient(request, redirected = false, transport =
           url: request.url,
           redirected,
         });
+        registerFetchResponseBodyFinalizer(response, stream);
         Object.defineProperty(response, "trailers", {
           get: () => incoming.complete ? incoming.trailers : {},
           configurable: true,
         });
-        resolve(response);
+        try {
+          resolveResponse(typeof onResponse === "function" ? onResponse(response) : response);
+        } catch (error) {
+          rejectResponse(error);
+        }
       });
-      clientRequest.once("error", error => {
-        signal?.removeEventListener?.("abort", onAbort);
-        if (!responseReceived) reject(normalizeFetchNetworkError(error));
-      });
-      writeNodeFetchBody(clientRequest, body).catch(error => {
+      clientRequest.once("error", onRequestError);
+      const bodyWrite = writeNodeFetchBody(clientRequest, body);
+      bodyWrite?.catch?.(error => {
         if (!clientRequest.destroyed) clientRequest.destroy(error);
-        if (!responseReceived) reject(normalizeFetchNetworkError(error));
+        if (!responseReceived) reject?.(normalizeFetchNetworkError(error));
       });
     } catch (error) {
       signal?.removeEventListener?.("abort", onAbort);
-      reject(normalizeFetchNetworkError(error));
+      reject?.(normalizeFetchNetworkError(error));
     }
   });
 }
 
-async function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}) {
-  throwIfAborted(request.signal);
-  if (depth > 20) throw new TypeError("redirect count exceeded");
-  const response = await fetchOnceUsingNodeClient(request, redirected, transport);
+function settleNodeFetchResponse(request, response, redirectMode, depth, transport) {
   if (redirectMode === "manual" || !isRedirectStatus(response.status)) {
     return decodeFetchResponse(response, transport.decompress !== false);
   }
+  const cancelBody = () => {
+    try {
+      return Promise.resolve(response.body?.cancel?.()).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  };
   if (redirectMode === "error") {
-    try { await response.body?.cancel?.(); } catch {}
-    throw unexpectedRedirectError();
+    return cancelBody().then(() => { throw unexpectedRedirectError(); });
   }
   const location = response.headers.get("location");
   if (!location) return decodeFetchResponse(response, transport.decompress !== false);
-  try { await response.body?.cancel?.(); } catch {}
-  const nextRequest = redirectedFetchRequest(request, response, location);
-  let nextTransport = transport;
-  if (transport.socketPath) {
-    try {
-      if (new URL(nextRequest.url).origin !== new URL(request.url).origin) nextTransport = { ...transport, socketPath: undefined };
-    } catch {
-      nextTransport = { ...transport, socketPath: undefined };
+  return cancelBody().then(() => {
+    const nextRequest = redirectedFetchRequest(request, response, location);
+    let nextTransport = transport;
+    if (transport.socketPath) {
+      try {
+        if (new URL(nextRequest.url).origin !== new URL(request.url).origin) nextTransport = { ...transport, socketPath: undefined };
+      } catch {
+        nextTransport = { ...transport, socketPath: undefined };
+      }
     }
-  }
-  const nextUrl = new URL(nextRequest.url);
-  const activeServer = nextUrl.protocol === "http:" && !nextTransport.proxy?.active && activeServerForFetchUrl(nextRequest.url);
-  if (activeServer) return fetchFromActiveServer(activeServer, nextRequest, redirectMode, depth + 1, true, nextTransport.decompress !== false);
-  return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, nextTransport);
+    const nextUrl = new URL(nextRequest.url);
+    const activeServer = nextUrl.protocol === "http:" && !nextTransport.proxy?.active && activeServerForFetchUrl(nextRequest.url);
+    if (activeServer) {
+      return fetchFromActiveServer(
+        activeServer,
+        nextRequest,
+        redirectMode,
+        depth + 1,
+        true,
+        nextTransport.decompress !== false,
+        "http",
+        nextTransport,
+      );
+    }
+    return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, nextTransport);
+  });
+}
+
+function fetchFromNodeClient(request, redirectMode = "follow", depth = 0, redirected = false, transport = {}) {
+  throwIfAborted(request.signal);
+  if (depth > 20) throw new TypeError("redirect count exceeded");
+  return fetchOnceUsingNodeClient(
+    request,
+    redirected,
+    transport,
+    response => settleNodeFetchResponse(request, response, redirectMode, depth, transport),
+  );
 }
 
 // Minimal streaming HTTP/1.1 client used for loopback and unix-socket fetch.
@@ -7327,6 +7596,13 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
           cleanup();
         },
       }, new ByteLengthQueuingStrategy({ highWaterMark: 4 * 1024 * 1024 }));
+      Object.defineProperty(stream, abandonedFetchBodyCleanupSymbol, {
+        value() {
+          if (streamDone) return;
+          streamDone = true;
+          cleanup();
+        },
+      });
       settled = true;
       const response = new Response(stream, {
         headers,
@@ -7335,6 +7611,7 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
         url: request.url,
         redirected,
       });
+      registerFetchResponseBodyFinalizer(response, stream);
       resolve(decodeFetchResponse(response, transport.decompress !== false));
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
@@ -7525,7 +7802,7 @@ function prepareFetchRequest(input, init = {}) {
   return { request, upgradeStreamBody };
 }
 
-async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
+function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   if (
     upgradeStreamBody == null &&
     (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") &&
@@ -7536,7 +7813,12 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   if (request.signal?.aborted) {
     const reason = normalizedFetchAbortReason(request.signal);
     if (typeof request._body?.cancel === "function" && !request._body.locked) {
-      try { await request._body.cancel(reason); } catch {}
+      try {
+        return Promise.resolve(request._body.cancel(reason)).then(
+          () => { throw reason; },
+          () => { throw reason; },
+        );
+      } catch {}
     }
     throw reason;
   }
@@ -7572,23 +7854,23 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
       return reader;
     };
   }
-  if (request.url.startsWith("data:")) return responseFromDataUrl(request.url);
+  if (request.url.startsWith("data:")) return Promise.resolve(responseFromDataUrl(request.url));
   if (request.url.startsWith("blob:")) {
     const blob = globalThis.__cottontailObjectURLRegistry?.get(request.url);
     if (!blob) throw new TypeError("fetch failed: unknown blob URL");
-    return new Response(blob, {
+    return Promise.resolve(new Response(blob, {
       status: 200,
       headers: blob.type ? { "content-type": blob.type } : {},
       url: request.url,
-    });
+    }));
   }
   if (request.url.startsWith("file:")) {
     const body = file(nodeFileURLToPath(request.url));
-    return new Response(body, {
+    return Promise.resolve(new Response(body, {
       status: 200,
       headers: body.type ? { "content-type": body.type } : {},
       url: request.url,
-    });
+    }));
   }
   const parsedUrl = new URL(request.url);
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
@@ -7613,7 +7895,7 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   const decompress = (init?.decompression ?? init?.decompress) !== false;
   if (proxy.explicit) {
     const activeProxy = activeServerForFetchUrl(proxy.explicit);
-    if (activeProxy) return await fetchFromActiveProxy(activeProxy, proxy.explicit, request);
+    if (activeProxy) return fetchFromActiveProxy(activeProxy, proxy.explicit, request);
   }
   // Requests that want a protocol upgrade must use a real socket so the
   // 101 handshake and post-upgrade byte stream work; skip the in-process
@@ -7631,23 +7913,27 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   if (localHttpPath || localTlsKeepalivePath) {
     applyDefaultFetchHeaders(request, usesKeepalive);
     const peerKey = localTlsKeepalivePath ? `tls:${fetchTlsSessionKey(customTlsConfig)}` : "http";
-    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress, peerKey);
+    return fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress, peerKey, {
+      tlsConfig: customTlsConfig ?? undefined,
+      proxy,
+      decompress,
+    });
   }
   if (wantsUpgrade) {
-    return await fetchFromNodeHttp(request, redirectMode, 0, false, {
+    return fetchFromNodeHttp(request, redirectMode, 0, false, {
       streamBody: upgradeStreamBody,
       rejectUnauthorized: customTlsConfig?.rejectUnauthorized,
       tlsConfig: customTlsConfig ?? undefined,
     });
   }
   if (!proxy.active && hasPreconnectedFetchSocket(request.url, customTlsConfig ?? undefined)) {
-    return await fetchFromNodeHttp(request, redirectMode, 0, false, {
+    return fetchFromNodeHttp(request, redirectMode, 0, false, {
       tlsConfig: customTlsConfig ?? undefined,
       rejectUnauthorized: customTlsConfig?.rejectUnauthorized,
       pooled: fetchUsesKeepalive(request),
     });
   }
-  return await fetchFromNodeClient(request, redirectMode, 0, false, {
+  return fetchFromNodeClient(request, redirectMode, 0, false, {
     socketPath: unixSocketPath ?? undefined,
     tlsConfig: customTlsConfig ?? undefined,
     proxy,
@@ -7674,6 +7960,7 @@ export function fetch(input, init = {}) {
     }
     return fetchImpl(prepared.request, preparedInit, prepared.upgradeStreamBody);
   } catch (error) {
+    if (error?.[invalidHeaderErrorSymbol]) throw error;
     return handledRejectedPromise(error);
   }
 }
@@ -7970,7 +8257,16 @@ function raceWithAbortSignal(promise, signal) {
   });
 }
 
-async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected, decompress = true, logicalPeerKey = "http") {
+async function fetchFromActiveServer(
+  activeServer,
+  request,
+  redirectMode,
+  depth,
+  redirected,
+  decompress = true,
+  logicalPeerKey = "http",
+  transport = {},
+) {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
   // Bun's HTTP server normalizes duplicate leading slashes in the request
@@ -8030,8 +8326,19 @@ async function fetchFromActiveServer(activeServer, request, redirectMode, depth,
   const nextActiveServer = new URL(nextRequest.url).protocol === "http:"
     ? activeServerForFetchUrl(nextRequest.url)
     : null;
-  if (nextActiveServer) return fetchFromActiveServer(nextActiveServer, nextRequest, redirectMode, depth + 1, true, decompress);
-  return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, { decompress });
+  if (nextActiveServer) {
+    return fetchFromActiveServer(
+      nextActiveServer,
+      nextRequest,
+      redirectMode,
+      depth + 1,
+      true,
+      decompress,
+      logicalPeerKey,
+      transport,
+    );
+  }
+  return fetchFromNodeClient(nextRequest, redirectMode, depth + 1, true, { ...transport, decompress });
 }
 
 function parseHeadersText(text) {
@@ -9977,6 +10284,33 @@ function serveNodeBacked(options, context) {
   nodeServer.on("request", (message, nodeResponse) => {
     server.pendingRequests += 1;
     const { request, controller } = requestFromNodeIncoming(message, protocol, fallbackHost);
+    const prepareResponse = (response) => {
+      const requestBody = request._body;
+      // COTTONTAIL-COMPAT: Bun.serve drains an unread upload after the handler
+      // returns so request backpressure cannot stall or reset the response.
+      if (!message.complete && response?._body !== requestBody && requestBody?.locked !== true) {
+        return new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            message.off?.("end", finish);
+            message.off?.("aborted", finish);
+            message.off?.("close", finish);
+            message.off?.("error", finish);
+            resolve(response);
+          };
+          message.once?.("end", finish);
+          message.once?.("aborted", finish);
+          message.once?.("close", finish);
+          message.once?.("error", finish);
+          message._dump?.();
+          message.socket?.resume?.();
+          if (message.complete || message.aborted) finish();
+        });
+      }
+      return response;
+    };
     const socket = message.socket;
     if (socket) {
       serveRequestSockets.set(request, socket);
@@ -9999,8 +10333,10 @@ function serveNodeBacked(options, context) {
     }
     Promise.resolve(handled)
       .then(
-        (response) => writeNodeResponse(nodeResponse, response, request),
+        (response) => Promise.resolve(prepareResponse(response))
+          .then((prepared) => writeNodeResponse(nodeResponse, prepared, request)),
         (error) => Promise.resolve(serveErrorResponse(activeOptions, error))
+          .then(prepareResponse)
           .then((response) => writeNodeResponse(nodeResponse, response, request)),
       )
       .then(finalize, (error) => {
@@ -10638,7 +10974,14 @@ export function file(path, options = undefined) {
   let sizeWasRead = false;
   const currentStat = () => isFd ? cottontail.fstatSync(filePath) : cottontail.statSync(filePath, true);
   const currentSize = () => {
-    try { return Number(currentStat()?.size ?? 0); } catch { return 0; }
+    try {
+      const stat = currentStat();
+      const mode = Number(stat?.mode ?? 0);
+      if (stat?.isFIFO === true || (mode & 0o170000) === 0o010000) return Infinity;
+      return Number(stat?.size ?? 0);
+    } catch {
+      return 0;
+    }
   };
   const invalidateCache = () => {
     cachedBytes = null;
@@ -10654,6 +10997,12 @@ export function file(path, options = undefined) {
     cachedMtime = mtime;
     cachedSize = size;
     return cachedBytes;
+  };
+  const assertWithinSyntheticAllocationLimit = () => {
+    const limit = Number(globalThis.__cottontailSyntheticAllocationLimit);
+    if (Number.isFinite(limit) && limit > 0 && currentSize() > limit) {
+      throw new Error("Out of memory");
+    }
   };
   const readRange = (start, end) => {
     const length = Math.max(0, end - start);
@@ -10714,6 +11063,7 @@ export function file(path, options = undefined) {
     write(data, writeOptions = undefined) {
       let bytes = null;
       if (data?._bytes instanceof Uint8Array) bytes = data._bytes;
+      else if (typeof data?._getBytes === "function") bytes = data._getBytes();
       else if (typeof data === "string" || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) bytes = asBuffer(data);
       if (bytes == null) return write(result, data, writeOptions);
       if (!isFd) {
@@ -10738,6 +11088,7 @@ export function file(path, options = undefined) {
     },
     async text() {
       if (isFd) throw new TypeError("Cannot read Bun.file(fd) as text");
+      assertWithinSyntheticAllocationLimit();
       try {
         return new TextDecoder().decode(readBytes());
       } catch (error) {
@@ -10746,6 +11097,7 @@ export function file(path, options = undefined) {
     },
     async json() {
       if (isFd) throw new TypeError("Cannot read Bun.file(fd) as JSON");
+      assertWithinSyntheticAllocationLimit();
       try {
         return JSON.parse(new TextDecoder().decode(readBytes()));
       } catch (error) {
@@ -10755,6 +11107,7 @@ export function file(path, options = undefined) {
     },
     async bytes() {
       if (isFd) throw new TypeError("Cannot read Bun.file(fd) as bytes");
+      assertWithinSyntheticAllocationLimit();
       try {
         return readBytes();
       } catch (error) {
@@ -10904,11 +11257,12 @@ function makeBunWriteError(error, path, syscall = "open") {
   const normalizedPath = String(path);
   const source = String(error?.message ?? error ?? "");
   const isNoEntry = source.includes("No such file or directory") || source.includes("ENOENT") || source.includes("FileNotFound");
-  const code = isNoEntry ? "ENOENT" : String(error?.code ?? "EIO");
-  const reason = isNoEntry ? "no such file or directory" : source || code;
+  const isPermission = error?.code === "EACCES" || /permission denied/i.test(source);
+  const code = isNoEntry ? "ENOENT" : isPermission ? "EACCES" : String(error?.code ?? "EIO");
+  const reason = isNoEntry ? "no such file or directory" : isPermission ? "permission denied" : source || code;
   const out = new Error(`${code}: ${reason}, ${syscall} '${normalizedPath}'`);
   out.code = code;
-  out.errno = code === "ENOENT" ? -2 : -5;
+  out.errno = code === "ENOENT" ? -2 : code === "EACCES" ? -13 : -5;
   out.syscall = syscall;
   out.path = normalizedPath;
   return out;
@@ -11376,9 +11730,16 @@ export const stderr = globalThis.process?.stderr;
 export { SQL };
 export const sql = SQLiteDatabase;
 export function jest(_source = undefined) {
+  const inTestRunner = globalThis.__cottontailRegisteringTestFile != null ||
+    globalThis.__cottontailCurrentTestFile?.() != null ||
+    globalThis.__cottontailCurrentTestToken?.() != null;
+  if (inTestRunner && typeof _source !== "string") {
+    throw new Error("Bun.jest() expects a string filename");
+  }
   return bunTestModule.default ?? bunTestModule;
 }
-Object.assign(jest, bunJest);
+
+const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 
 export function sleep(ms) {
   const duration = ms instanceof Date ? ms.getTime() - Date.now() : Number(ms);
@@ -11386,7 +11747,8 @@ export function sleep(ms) {
   // Real bun schedules a timer even for sleep(0): resolution is a macrotask
   // that runs after pending microtasks (tests depend on this ordering).
   const delay = !(duration > 0) ? 0 : (Number.isFinite(duration) ? Math.min(duration, maxTimeout) : maxTimeout);
-  return new Promise((resolve) => setTimeout(resolve, delay));
+  // Bun.sleep is a runtime timer, so bun:test fake timers must not intercept it.
+  return new Promise((resolve) => bunSleepSetTimeout(resolve, delay));
 }
 
 export function sleepSync(ms) {
@@ -11402,8 +11764,8 @@ export function nanoseconds() {
   return bigintNs != null ? Number(bigintNs) : Math.floor((performance?.now?.() ?? Date.now()) * 1_000_000);
 }
 
-function bunForceGc() {
-  cottontail.gc?.();
+function bunForceGc(force = false) {
+  cottontail.gc?.(Boolean(force));
   cottontail.drainJobs?.();
 }
 export { bunForceGc as gc };
@@ -12786,16 +13148,36 @@ export function readableStreamToArray(stream) {
   });
 }
 
+const blobStreamSources = globalThis.__cottontailBlobStreamSources;
+
+function consumeBlobStreamFastPath(stream) {
+  const source = blobStreamSources?.get(stream);
+  if (!source || source.bytes.byteLength === 0 || stream.locked || stream._disturbed === true) return null;
+
+  blobStreamSources.delete(stream);
+  const reader = stream.getReader();
+  reader.read();
+  reader.read();
+  reader.releaseLock();
+  return source;
+}
+
 export function readableStreamToBytes(stream) {
+  const source = consumeBlobStreamFastPath(stream);
+  if (source) return Promise.resolve(source.bytes.slice());
   return internalThen(readableStreamToArray(stream), (chunks) => concatManyBuffers(chunks));
 }
 
 export function readableStreamToArrayBuffer(stream) {
+  const source = consumeBlobStreamFastPath(stream);
+  if (source) return Promise.resolve(source.bytes.slice().buffer);
   suppressUserPromiseThenForInternalAwait();
   return internalThen(readableStreamToBytes(stream), (bytes) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
 }
 
 export function readableStreamToText(stream) {
+  const source = consumeBlobStreamFastPath(stream);
+  if (source) return Promise.resolve(stripUtf8BOMText(new TextDecoder().decode(source.bytes)));
   return internalThen(readableStreamToBytes(stream), (bytes) => stripUtf8BOMText(new TextDecoder().decode(bytes)));
 }
 
@@ -12804,6 +13186,8 @@ export function readableStreamToJSON(stream) {
 }
 
 export function readableStreamToBlob(stream) {
+  const source = consumeBlobStreamFastPath(stream);
+  if (source) return Promise.resolve(new Blob([source.bytes], { type: source.type }));
   return internalThen(readableStreamToArrayBuffer(stream), (buffer) => new Blob([buffer]));
 }
 
@@ -13073,6 +13457,8 @@ function isPromiseForPeek(value) {
 
 export function peek(value) {
   if (!isPromiseForPeek(value)) return value;
+  const nativeStatus = cottontail.promiseStatus?.(value);
+  if (nativeStatus === 1 || nativeStatus === 2) return cottontail.promiseResult(value);
   const state = promisePeekStates.get(value);
   if (!state) return value;
   return state.value;
@@ -13080,6 +13466,9 @@ export function peek(value) {
 
 peek.status = function(value) {
   if (!isPromiseForPeek(value)) return "fulfilled";
+  const nativeStatus = cottontail.promiseStatus?.(value);
+  if (nativeStatus === 1) return "fulfilled";
+  if (nativeStatus === 2) return "rejected";
   return promisePeekStates.get(value)?.status ?? "pending";
 };
 
@@ -13100,6 +13489,9 @@ export function mmap(path, options = undefined) {
 }
 
 export function openInEditor(path) {
+  if (arguments.length === 0 || path === undefined || path === null || String(path).length === 0) {
+    throw new Error("No file path specified");
+  }
   return spawn(["open", String(path)], { stdout: "ignore", stderr: "ignore" });
 }
 
@@ -13609,8 +14001,13 @@ export function listen(options = {}) {
   return listener;
 }
 
-export async function udpSocket(options = {}) {
+export function udpSocket(options) {
+  if (arguments.length === 0) throw new TypeError("Missing argument");
   if (options == null || typeof options !== "object") throw new TypeError("udpSocket options must be an object");
+  return createUdpSocket(options);
+}
+
+async function createUdpSocket(options) {
   const dgram = await import("../node/dgram.js");
   const requestedHostname = String(options.hostname ?? (String(options.connect?.hostname ?? "").includes(":") ? "::" : "0.0.0.0"));
   const type = options.type ?? (requestedHostname.includes(":") ? "udp6" : "udp4");
@@ -14979,7 +15376,14 @@ function validateHTMLRewriterSelector(selector) {
 function runHTMLRewriterHandler(handler, ...args) {
   const result = handler(...args);
   if (result == null || typeof result.then !== "function") return result;
-  const status = cottontail.promiseStatus(result);
+  let status = cottontail.promiseStatus(result);
+  if (status === 0) {
+    // COTTONTAIL-COMPAT: Attach the rejection observer before pumping the
+    // event loop so a synchronously rethrown handler error is not also
+    // reported as an unhandled rejection by bun:test.
+    result.catch(() => {});
+    status = cottontail.waitForPromise(result);
+  }
   if (status === 2) {
     const reason = cottontail.promiseResult(result);
     result.catch(() => {});
@@ -15074,6 +15478,531 @@ function rewriteTextChunks(inner, handler, liveStates) {
   return output;
 }
 
+const HTML_REWRITER_VOID_ELEMENTS = new Set([
+  "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame",
+  "hr", "img", "input", "keygen", "link", "meta", "param", "source",
+  "track", "wbr",
+]);
+
+function findHTMLRewriterTagEnd(html, start) {
+  let quote = "";
+  for (let index = start + 1; index < html.length; index += 1) {
+    const char = html[index];
+    if (quote) {
+      if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") quote = char;
+    else if (char === ">") return index;
+  }
+  return -1;
+}
+
+function parseHTMLRewriterAttributes(source) {
+  const attributes = [];
+  let index = 0;
+  while (index < source.length) {
+    const rawStart = index;
+    while (index < source.length && /\s/.test(source[index])) index += 1;
+    if (index >= source.length || source[index] === "/") break;
+    const nameStart = index;
+    while (index < source.length && !/[\s=/>]/.test(source[index])) index += 1;
+    if (index === nameStart) {
+      index += 1;
+      continue;
+    }
+    const name = source.slice(nameStart, index);
+    while (index < source.length && /\s/.test(source[index])) index += 1;
+    let value = "";
+    let hadValue = false;
+    if (source[index] === "=") {
+      hadValue = true;
+      index += 1;
+      while (index < source.length && /\s/.test(source[index])) index += 1;
+      const quote = source[index] === "\"" || source[index] === "'" ? source[index++] : "";
+      const valueStart = index;
+      if (quote) {
+        while (index < source.length && source[index] !== quote) index += 1;
+        value = source.slice(valueStart, index);
+        if (source[index] === quote) index += 1;
+      } else {
+        while (index < source.length && !/[\s>]/.test(source[index])) index += 1;
+        value = source.slice(valueStart, index);
+      }
+    }
+    attributes.push({
+      name,
+      normalizedName: name.toLowerCase(),
+      value,
+      hadValue,
+      raw: source.slice(rawStart, index),
+      changed: false,
+      removed: false,
+    });
+  }
+  return attributes;
+}
+
+function parseHTMLRewriterTree(html) {
+  const root = { type: "root", children: [], parent: null };
+  const stack = [root];
+  let index = 0;
+  const append = (node) => {
+    const parent = stack[stack.length - 1];
+    node.parent = parent;
+    parent.children.push(node);
+  };
+
+  while (index < html.length) {
+    if (html.startsWith("<!--", index)) {
+      const end = html.indexOf("-->", index + 4);
+      const stop = end < 0 ? html.length : end + 3;
+      append({
+        type: "comment",
+        text: html.slice(index + 4, end < 0 ? html.length : end),
+        raw: html.slice(index, stop),
+        before: [],
+        after: [],
+        replacement: null,
+        removed: false,
+      });
+      index = stop;
+      continue;
+    }
+    if (html[index] !== "<") {
+      const next = html.indexOf("<", index);
+      const stop = next < 0 ? html.length : next;
+      append({ type: "text", raw: html.slice(index, stop) });
+      index = stop;
+      continue;
+    }
+
+    const end = findHTMLRewriterTagEnd(html, index);
+    if (end < 0) {
+      append({ type: "text", raw: html.slice(index) });
+      break;
+    }
+    const raw = html.slice(index, end + 1);
+    const closing = /^<\s*\/\s*([^\s>]+)/.exec(raw);
+    if (closing) {
+      const tagName = closing[1].toLowerCase();
+      let matchIndex = stack.length - 1;
+      while (matchIndex > 0 && stack[matchIndex].tagName !== tagName) matchIndex -= 1;
+      if (matchIndex > 0) {
+        stack[matchIndex].closeRaw = raw;
+        stack.length = matchIndex;
+      } else {
+        append({ type: "raw", raw });
+      }
+      index = end + 1;
+      continue;
+    }
+    if (/^<\s*!|^<\s*\?/.test(raw)) {
+      append({ type: "raw", raw });
+      index = end + 1;
+      continue;
+    }
+
+    const opening = /^<\s*([^\s/>]+)/.exec(raw);
+    if (!opening) {
+      append({ type: "raw", raw });
+      index = end + 1;
+      continue;
+    }
+    const originalTagName = opening[1];
+    const tagName = originalTagName.toLowerCase();
+    const explicitSelfClosing = /\/\s*>$/.test(raw);
+    const parent = stack[stack.length - 1];
+    const parentNamespace = parent.type === "element" ? parent.namespace : "html";
+    const namespace = tagName === "svg" || (parentNamespace === "svg" && tagName !== "foreignobject")
+      ? "svg"
+      : "html";
+    const attributeEnd = raw.length - 1 - (explicitSelfClosing ? raw.slice(0, -1).match(/\/\s*$/)?.[0].length ?? 0 : 0);
+    const attributeSource = raw.slice(opening[0].length, attributeEnd);
+    const node = {
+      type: "element",
+      tagName,
+      originalTagName,
+      namespace,
+      startRaw: raw,
+      closeRaw: "",
+      attributes: parseHTMLRewriterAttributes(attributeSource),
+      attrsChanged: false,
+      tagChanged: false,
+      selfClosing: explicitSelfClosing,
+      isVoid: HTML_REWRITER_VOID_ELEMENTS.has(tagName),
+      children: [],
+      before: [],
+      after: [],
+      prepend: [],
+      append: [],
+      innerOverride: null,
+      replacement: null,
+      removed: false,
+      keepContent: false,
+    };
+    append(node);
+    if (!node.isVoid && !node.selfClosing) stack.push(node);
+    index = end + 1;
+  }
+  return root;
+}
+
+function splitHTMLRewriterSelectorList(selector) {
+  const selectors = [];
+  let start = 0;
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < selector.length; index += 1) {
+    const char = selector[index];
+    if (quote) {
+      if (char === quote && selector[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") quote = char;
+    else if (char === "[" || char === "(") depth += 1;
+    else if (char === "]" || char === ")") depth -= 1;
+    else if (char === "," && depth === 0) {
+      selectors.push(selector.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  selectors.push(selector.slice(start).trim());
+  return selectors.filter(Boolean);
+}
+
+function parseHTMLRewriterSelectorChain(selector) {
+  const compounds = [];
+  const combinators = [];
+  let buffer = "";
+  let depth = 0;
+  let quote = "";
+  let pendingSpace = false;
+  const flush = () => {
+    const value = buffer.trim();
+    if (value) compounds.push(value);
+    buffer = "";
+  };
+  for (let index = 0; index < selector.length; index += 1) {
+    const char = selector[index];
+    if (quote) {
+      buffer += char;
+      if (char === quote && selector[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      if (pendingSpace && compounds.length > combinators.length) combinators.push(" ");
+      pendingSpace = false;
+      quote = char;
+      buffer += char;
+      continue;
+    }
+    if (char === "[" || char === "(") depth += 1;
+    else if (char === "]" || char === ")") depth -= 1;
+    if (depth === 0 && char === ">") {
+      flush();
+      if (combinators.length === compounds.length) combinators[combinators.length - 1] = ">";
+      else combinators.push(">");
+      pendingSpace = false;
+      continue;
+    }
+    if (depth === 0 && /\s/.test(char)) {
+      flush();
+      pendingSpace = true;
+      continue;
+    }
+    if (pendingSpace) {
+      if (compounds.length > combinators.length) combinators.push(" ");
+      pendingSpace = false;
+    }
+    buffer += char;
+  }
+  flush();
+  return { compounds, combinators };
+}
+
+function HTMLRewriterElementSiblings(node) {
+  return node.parent?.children?.filter((child) => child.type === "element") ?? [];
+}
+
+function matchesHTMLRewriterAttribute(node, source) {
+  const match = /^\s*([^\s~|^$*=\]]+)\s*(?:(~=|\|=|\^=|\$=|\*=|=)\s*(?:"([^"]*)"|'([^']*)'|([^\s]+))\s*([iIsS])?)?\s*$/.exec(source);
+  if (!match) return false;
+  const name = match[1].toLowerCase();
+  const operation = match[2];
+  const expectedRaw = match[3] ?? match[4] ?? match[5] ?? "";
+  const insensitive = String(match[6] ?? "").toLowerCase() === "i";
+  const attributes = node.attributes.filter((attribute) => !attribute.removed && attribute.normalizedName === name);
+  if (!operation) return attributes.length > 0;
+  return attributes.some((attribute) => {
+    let actual = attribute.value;
+    let expected = expectedRaw;
+    if (insensitive) {
+      actual = actual.toLowerCase();
+      expected = expected.toLowerCase();
+    }
+    if (operation === "=") return actual === expected;
+    if (operation === "~=") return actual.split(/\s+/).includes(expected);
+    if (operation === "|=") return actual === expected || actual.startsWith(`${expected}-`);
+    if (operation === "^=") return actual.startsWith(expected);
+    if (operation === "$=") return actual.endsWith(expected);
+    return actual.includes(expected);
+  });
+}
+
+function matchesHTMLRewriterCompound(node, compound) {
+  const notSelectors = [];
+  let source = compound.replace(/:not\(([^()]*)\)/g, (_match, selector) => {
+    notSelectors.push(selector);
+    return "";
+  });
+  const attributes = [];
+  source = source.replace(/\[([^\]]*)\]/g, (_match, attribute) => {
+    attributes.push(attribute);
+    return "";
+  });
+  const pseudos = [];
+  source = source.replace(/:(first-child|first-of-type|nth-child\(\s*\d+\s*\)|nth-of-type\(\s*\d+\s*\))/g, (_match, pseudo) => {
+    pseudos.push(pseudo);
+    return "";
+  });
+  const tag = /^(\*|[A-Za-z][\w:-]*)/.exec(source)?.[1];
+  if (tag && tag !== "*" && node.tagName !== tag.toLowerCase()) return false;
+  for (const id of source.matchAll(/#([\w-]+)/g)) {
+    if (!node.attributes.some((attribute) => !attribute.removed && attribute.normalizedName === "id" && attribute.value === id[1])) return false;
+  }
+  for (const className of source.matchAll(/\.([\w-]+)/g)) {
+    const matched = node.attributes.some((attribute) =>
+      !attribute.removed && attribute.normalizedName === "class" && attribute.value.split(/\s+/).includes(className[1]));
+    if (!matched) return false;
+  }
+  for (const attribute of attributes) {
+    if (!matchesHTMLRewriterAttribute(node, attribute)) return false;
+  }
+  const siblings = HTMLRewriterElementSiblings(node);
+  const childIndex = siblings.indexOf(node);
+  const sameType = siblings.filter((sibling) => sibling.tagName === node.tagName);
+  const typeIndex = sameType.indexOf(node);
+  for (const pseudo of pseudos) {
+    if (pseudo === "first-child" && childIndex !== 0) return false;
+    if (pseudo === "first-of-type" && typeIndex !== 0) return false;
+    const nthChild = /^nth-child\(\s*(\d+)\s*\)$/.exec(pseudo);
+    if (nthChild && childIndex + 1 !== Number(nthChild[1])) return false;
+    const nthType = /^nth-of-type\(\s*(\d+)\s*\)$/.exec(pseudo);
+    if (nthType && typeIndex + 1 !== Number(nthType[1])) return false;
+  }
+  for (const notSelector of notSelectors) {
+    if (matchesHTMLRewriterCompound(node, notSelector)) return false;
+  }
+  return true;
+}
+
+function matchesHTMLRewriterSelectorChain(node, chain, compoundIndex = chain.compounds.length - 1) {
+  if (compoundIndex < 0 || !matchesHTMLRewriterCompound(node, chain.compounds[compoundIndex])) return false;
+  if (compoundIndex === 0) return true;
+  const combinator = chain.combinators[compoundIndex - 1] ?? " ";
+  if (combinator === ">") {
+    return node.parent?.type === "element" && matchesHTMLRewriterSelectorChain(node.parent, chain, compoundIndex - 1);
+  }
+  let parent = node.parent;
+  while (parent?.type === "element") {
+    if (matchesHTMLRewriterSelectorChain(parent, chain, compoundIndex - 1)) return true;
+    parent = parent.parent;
+  }
+  return false;
+}
+
+function parseHTMLRewriterSelector(selector) {
+  return splitHTMLRewriterSelectorList(selector).map(parseHTMLRewriterSelectorChain);
+}
+
+function matchesHTMLRewriterSelector(node, selector) {
+  return selector.some((chain) => matchesHTMLRewriterSelectorChain(node, chain));
+}
+
+function HTMLRewriterContent(content, options) {
+  const text = String(content);
+  return options?.html ? text : escapeHTML(text);
+}
+
+function makeHTMLRewriterElement(node) {
+  const element = {
+    get tagName() { return node.tagName; },
+    set tagName(value) {
+      node.tagName = String(value).toLowerCase();
+      node.tagChanged = true;
+    },
+    get namespaceURI() {
+      return node.namespace === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
+    },
+    get attributes() {
+      return node.attributes.filter((attribute) => !attribute.removed).map((attribute) => [attribute.name, attribute.value]);
+    },
+    get removed() { return node.removed; },
+    get selfClosing() { return node.selfClosing; },
+    get canHaveContent() { return !node.isVoid && !(node.namespace !== "html" && node.selfClosing); },
+    getAttribute(name) {
+      const normalized = String(name).toLowerCase();
+      return node.attributes.find((attribute) => !attribute.removed && attribute.normalizedName === normalized)?.value ?? null;
+    },
+    hasAttribute(name) {
+      const normalized = String(name).toLowerCase();
+      return node.attributes.some((attribute) => !attribute.removed && attribute.normalizedName === normalized);
+    },
+    setAttribute(name, value) {
+      const nameText = String(name);
+      const normalized = nameText.toLowerCase();
+      const existing = node.attributes.find((attribute) => !attribute.removed && attribute.normalizedName === normalized);
+      if (existing) {
+        existing.value = String(value);
+        existing.hadValue = true;
+        existing.changed = true;
+      } else {
+        node.attributes.push({ name: nameText, normalizedName: normalized, value: String(value), hadValue: true, raw: "", changed: true, removed: false });
+      }
+      node.attrsChanged = true;
+      return element;
+    },
+    removeAttribute(name) {
+      const normalized = String(name).toLowerCase();
+      for (const attribute of node.attributes) {
+        if (attribute.normalizedName === normalized) attribute.removed = true;
+      }
+      node.attrsChanged = true;
+      return element;
+    },
+    before(content, options) {
+      node.before.push(HTMLRewriterContent(content, options));
+      return element;
+    },
+    after(content, options) {
+      node.after.unshift(HTMLRewriterContent(content, options));
+      return element;
+    },
+    prepend(content, options) {
+      node.prepend.unshift(HTMLRewriterContent(content, options));
+      return element;
+    },
+    append(content, options) {
+      node.append.push(HTMLRewriterContent(content, options));
+      return element;
+    },
+    replace(content, options) {
+      node.replacement = HTMLRewriterContent(content, options);
+      node.removed = false;
+      return element;
+    },
+    setInnerContent(content, options) {
+      node.innerOverride = HTMLRewriterContent(content, options);
+      return element;
+    },
+    remove() {
+      node.removed = true;
+      node.keepContent = false;
+      return element;
+    },
+    removeAndKeepContent() {
+      node.removed = true;
+      node.keepContent = true;
+      return element;
+    },
+  };
+  return element;
+}
+
+function runHTMLRewriterCommentHandler(node, handler) {
+  const comment = {
+    get text() { return node.text; },
+    set text(value) { node.text = String(value); },
+    get removed() { return node.removed; },
+    before(content, options) { node.before.push(HTMLRewriterContent(content, options)); return comment; },
+    after(content, options) { node.after.unshift(HTMLRewriterContent(content, options)); return comment; },
+    replace(content, options) { node.replacement = HTMLRewriterContent(content, options); node.removed = false; return comment; },
+    remove() { node.removed = true; return comment; },
+  };
+  runHTMLRewriterHandler(handler, comment);
+}
+
+function serializeHTMLRewriterStartTag(node) {
+  if (!node.attrsChanged && !node.tagChanged) return node.startRaw;
+  let output = `<${node.tagName}`;
+  for (const attribute of node.attributes) {
+    if (attribute.removed) continue;
+    if (!attribute.changed && attribute.raw) output += attribute.raw;
+    else output += ` ${attribute.name}="${escapeHTML(attribute.value)}"`;
+  }
+  return `${output}${node.selfClosing ? " /" : ""}>`;
+}
+
+function serializeHTMLRewriterNode(node) {
+  if (node.type === "text" || node.type === "raw") return node.raw;
+  if (node.type === "comment") {
+    const body = node.removed ? "" : node.replacement ?? `<!--${node.text}-->`;
+    return node.before.join("") + body + node.after.join("");
+  }
+  if (node.type === "root") return node.children.map(serializeHTMLRewriterNode).join("");
+  const content = node.innerOverride ?? node.children.map(serializeHTMLRewriterNode).join("");
+  const inner = node.prepend.join("") + content + node.append.join("");
+  let body;
+  if (node.replacement != null) body = node.replacement;
+  else if (node.removed) body = node.keepContent ? inner : "";
+  else body = serializeHTMLRewriterStartTag(node) + (node.isVoid || node.selfClosing ? "" : inner + node.closeRaw);
+  return node.before.join("") + body + node.after.join("");
+}
+
+function rewriteHTMLRewriterElements(html, registrations, documentHandlers, liveTextStates) {
+  if (registrations.length === 0 && documentHandlers.length === 0) return html;
+  const parsedRegistrations = registrations.map((registration) => ({
+    ...registration,
+    parsedSelector: parseHTMLRewriterSelector(registration.selector),
+  }));
+  const root = parseHTMLRewriterTree(html);
+  const documentCommentHandlers = documentHandlers.flatMap((handlers) =>
+    typeof handlers.comments === "function" ? [handlers.comments.bind(handlers)] : []);
+  const documentTextHandlers = documentHandlers.flatMap((handlers) =>
+    typeof handlers.text === "function" ? [handlers.text.bind(handlers)] : []);
+
+  const visit = (node, commentHandlers, textHandlers) => {
+    if (node.type === "comment") {
+      for (const handler of commentHandlers) runHTMLRewriterCommentHandler(node, handler);
+      return;
+    }
+    if (node.type === "text") {
+      for (const handler of textHandlers) node.raw = rewriteTextChunks(node.raw, handler, liveTextStates);
+      return;
+    }
+    if (node.type !== "element" && node.type !== "root") return;
+    let childCommentHandlers = commentHandlers;
+    let childTextHandlers = textHandlers;
+    if (node.type === "element") {
+      const matches = parsedRegistrations.filter((registration) => matchesHTMLRewriterSelector(node, registration.parsedSelector));
+      for (const registration of matches) {
+        if (typeof registration.handlers?.element === "function") {
+          runHTMLRewriterHandler(registration.handlers.element.bind(registration.handlers), makeHTMLRewriterElement(node));
+        }
+      }
+      const scopedComments = matches.flatMap((registration) =>
+        typeof registration.handlers?.comments === "function" ? [registration.handlers.comments.bind(registration.handlers)] : []);
+      const scopedText = matches.flatMap((registration) =>
+        typeof registration.handlers?.text === "function" ? [registration.handlers.text.bind(registration.handlers)] : []);
+      if (scopedComments.length > 0) childCommentHandlers = [...commentHandlers, ...scopedComments];
+      if (scopedText.length > 0) childTextHandlers = [...textHandlers, ...scopedText];
+      if (node.innerOverride != null) return;
+    }
+    for (const child of node.children) visit(child, childCommentHandlers, childTextHandlers);
+  };
+  visit(root, documentCommentHandlers, documentTextHandlers);
+  let output = serializeHTMLRewriterNode(root);
+  for (const handlers of documentHandlers) {
+    if (typeof handlers.end !== "function") continue;
+    const additions = [];
+    const end = { append(content, options) { additions.push(HTMLRewriterContent(content, options)); return end; } };
+    runHTMLRewriterHandler(handlers.end.bind(handlers), end);
+    output += additions.join("");
+  }
+  return output;
+}
+
 export class HTMLRewriter {
   constructor() {
     this._elementHandlers = [];
@@ -15101,6 +16030,9 @@ export class HTMLRewriter {
   }
   transform(response) {
     if (response === null || response === undefined) {
+      throw new TypeError("Expected Response or Body");
+    }
+    if (typeof response === "symbol" || (response instanceof Response && typeof response._body === "symbol")) {
       throw new TypeError("Expected Response or Body");
     }
     if (typeof response === "string") return this._transformText(response);
@@ -15165,69 +16097,7 @@ export class HTMLRewriter {
         });
       }
     }
-    for (const { selector, handlers } of this._elementHandlers) {
-      if (!/^[A-Za-z][\w:-]*$/.test(selector)) continue;
-      const hasElement = typeof handlers?.element === "function";
-      const hasText = typeof handlers?.text === "function";
-      if (!hasElement && !hasText) continue;
-      const tag = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`<(${tag})(\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "gi");
-      html = html.replace(pattern, (match, name, attrs = "", inner = "") => {
-        const state = { inner, replaceInner: false, html: false, attrs: attrs ?? "", attrsChanged: false };
-        let mutated = false;
-        if (hasElement) {
-          const element = {
-            tagName: String(name).toLowerCase(),
-            setInnerContent(value, options = {}) {
-              state.inner = String(value);
-              state.replaceInner = true;
-              state.html = Boolean(options?.html);
-              mutated = true;
-            },
-            getAttribute(attributeName) {
-              const found = new RegExp(`[\\s]${String(attributeName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*("([^"]*)"|'([^']*)'|[^\\s>]*)`, "i").exec(` ${state.attrs}`);
-              if (!found) return null;
-              return found[2] ?? found[3] ?? found[1] ?? "";
-            },
-            hasAttribute(attributeName) {
-              return element.getAttribute(attributeName) !== null;
-            },
-            setAttribute(attributeName, value) {
-              const nameText = String(attributeName);
-              const valueText = String(value);
-              const attrPattern = new RegExp(`(\\s)${nameText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]*)`, "i");
-              const withSpace = ` ${state.attrs.trimStart()}`;
-              if (attrPattern.test(withSpace)) {
-                state.attrs = withSpace.replace(attrPattern, `$1${nameText}="${escapeHTML(valueText)}"`);
-              } else {
-                state.attrs = `${state.attrs ?? ""} ${nameText}="${escapeHTML(valueText)}"`;
-              }
-              state.attrsChanged = true;
-              mutated = true;
-              return element;
-            },
-            removeAttribute(attributeName) {
-              const attrPattern = new RegExp(`\\s${String(attributeName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]*))?`, "i");
-              state.attrs = ` ${state.attrs.trimStart()}`.replace(attrPattern, "");
-              state.attrsChanged = true;
-              mutated = true;
-              return element;
-            },
-          };
-          runHTMLRewriterHandler(handlers.element.bind(handlers), element);
-        }
-        let nextInner = state.replaceInner
-          ? (state.html ? state.inner : escapeHTML(state.inner))
-          : inner;
-        if (hasText) {
-          const rewritten = rewriteTextChunks(nextInner, handlers.text, liveTextStates);
-          if (rewritten !== nextInner) mutated = true;
-          nextInner = rewritten;
-        }
-        if (!mutated) return match;
-        return `<${name}${state.attrs ?? ""}>${nextInner}</${name}>`;
-      });
-    }
+    html = rewriteHTMLRewriterElements(html, this._elementHandlers, this._documentHandlers, liveTextStates);
     for (const state of liveTextStates) state.valid = false;
     return html;
   }
@@ -16298,6 +17168,11 @@ class CottontailDOMException extends Error {
   }
 }
 
+Object.defineProperty(CottontailDOMException, "name", {
+  value: "DOMException",
+  configurable: true,
+});
+
 {
   const domExceptionLegacyConstants = {
     INDEX_SIZE_ERR: 1,
@@ -17074,6 +17949,7 @@ function makeDataCloneError(message) {
 
 function blobBytesSync(value) {
   if (value?._bytes instanceof Uint8Array) return value._bytes.slice();
+  if (typeof value?._getBytes === "function") return value._getBytes();
   return new Uint8Array(0);
 }
 
@@ -17295,19 +18171,72 @@ BunObject.zstdCompressSync = zstdCompressSync;
 BunObject.zstdDecompress = zstdDecompress;
 BunObject.zstdDecompressSync = zstdDecompressSync;
 if (typeof globalThis.WebAssembly === "object" && typeof globalThis.WebAssembly.compileStreaming !== "function") {
+  const invalidWasmStreamingSource = (source) => {
+    let received;
+    if (source !== null && (typeof source === "object" || typeof source === "function")) {
+      received = `an instance of ${source.constructor?.name ?? "Object"}`;
+    } else if (source === null) {
+      received = "null";
+    } else {
+      received = `type ${typeof source} (${String(source)})`;
+    }
+    return new TypeError(
+      `The "source" argument must be an instance of Response or an Promise resolving to Response. Received ${received}`,
+    );
+  };
+
+  const invalidWasmStreamingChunk = new TypeError("chunk must be an ArrayBufferView or an ArrayBuffer");
+  const detachedWasmStreamingChunk = new TypeError(
+    "Underlying ArrayBuffer has been detached from the view or out-of-bounds",
+  );
+
+  const wasmBytesFromBodyStream = async (response) => {
+    const body = response.body;
+    if (body == null) return new ArrayBuffer(0);
+    const reader = body.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        let bytes;
+        if (value instanceof ArrayBuffer) {
+          if (value.detached === true) {
+            try { await reader.cancel(detachedWasmStreamingChunk); } catch {}
+            throw detachedWasmStreamingChunk;
+          }
+          bytes = new Uint8Array(value);
+        } else if (ArrayBuffer.isView(value)) {
+          if (value.buffer?.detached === true) {
+            try { await reader.cancel(detachedWasmStreamingChunk); } catch {}
+            throw detachedWasmStreamingChunk;
+          }
+          bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        } else {
+          try { await reader.cancel(invalidWasmStreamingChunk); } catch {}
+          throw invalidWasmStreamingChunk;
+        }
+        chunks.push(bytes);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+    return arrayBufferFromBytes(concatManyBuffers(chunks));
+  };
+
   const wasmBytesFromResponseSource = async (source) => {
     const response = await source;
-    if (!(response instanceof Response) && typeof response?.arrayBuffer !== "function") {
-      throw new TypeError("WebAssembly streaming compile requires a Response");
-    }
+    if (!(response instanceof Response)) throw invalidWasmStreamingSource(response);
     const type = String(response.headers?.get?.("content-type") ?? "").split(";")[0].trim().toLowerCase();
     if (type !== "application/wasm") {
       throw new TypeError(`WebAssembly response has unsupported MIME type '${type}'`);
     }
     if (response.status != null && (response.status < 200 || response.status >= 300)) {
-      throw new TypeError(`WebAssembly response has status ${response.status}`);
+      throw new TypeError(`WebAssembly response has status code ${response.status}`);
     }
-    return await response.arrayBuffer();
+    if (response.bodyUsed) throw new TypeError("WebAssembly response body has already been used");
+    return await wasmBytesFromBodyStream(response);
   };
   // The host's async WebAssembly.compile/instantiate promises never settle;
   // back all of these with the synchronous Module/Instance constructors.
@@ -18216,16 +19145,12 @@ if (cottontail.isWorker?.()) {
 if (typeof globalThis.Worker === "function" && globalThis.Worker.prototype && typeof cottontail.workerPostMessageTo === "function") {
   const workerPrototype = globalThis.Worker.prototype;
   workerPrototype.postMessage = function postMessage(message, transferOrOptions = undefined) {
-    cottontail.workerPostMessageTo(this.id, encodeWorkerWebMessage(message, transferOrOptions, { workerId: this.id }));
+    const encoded = encodeWorkerWebMessage(message, transferOrOptions, { workerId: this.id });
+    if (typeof this._postSerialized === "function") return this._postSerialized(encoded);
+    return cottontail.workerPostMessageTo(this.id, encoded);
   };
-  workerPrototype.ref = function ref() {
-    this._reffed = true;
-    return this;
-  };
-  workerPrototype.unref = function unref() {
-    this._reffed = false;
-    return this;
-  };
+  workerPrototype.ref ??= function ref() { return this; };
+  workerPrototype.unref ??= function unref() { return this; };
 }
 
 // -- Global installs ------------------------------------------------------------
@@ -18298,6 +19223,7 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
     win32: "Windows",
   })[globalThis.process?.platform] ?? String(globalThis.process?.platform ?? "unknown");
   globalThis.reportError ??= function reportError(error) {
+    if (globalThis.__cottontailCurrentTestToken?.() != null) return;
     const event = new CottontailErrorEvent("error", {
       message: error instanceof globalThis.Error ? String(error.message ?? "") : String(error),
       error,
@@ -18650,6 +19576,9 @@ nodeSetBuiltinModules({
   "bun:ffi": FFI.default ?? FFI,
   "bun:sqlite": { Database: SQLiteDatabase, default: SQLiteDatabase },
   "bun:internal-for-testing": bunInternalForTestingModule,
+  ws: wsBuiltin,
+  "ws/lib/websocket": wsBuiltin,
+  "next/dist/compiled/ws": wsBuiltin,
   undici: undiciBuiltin,
   "node:undici": undiciBuiltin,
 });

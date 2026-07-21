@@ -51,6 +51,7 @@ function isBlockList(value) {
 
 function bunFileBytes(value) {
   if (value?._bytes instanceof Uint8Array) return value._bytes.slice();
+  if (typeof value?._getBytes === "function") return value._getBytes();
   let bytes = new Uint8Array(Math.max(0, Number(value?.size) || 0));
   if (typeof value?._bunFilePath === "string") {
     try { bytes = new Uint8Array(cottontail.readFileBuffer(value._bunFilePath)); } catch {}
@@ -130,7 +131,9 @@ function encodeValue(value, state = { ids: new WeakMap(), nextId: 1, forStorage:
     };
   }
   if (typeof globalThis.Blob === "function" && value instanceof globalThis.Blob) {
-    const bytes = value._bytes instanceof Uint8Array ? value._bytes : new Uint8Array(0);
+    const bytes = value._bytes instanceof Uint8Array
+      ? value._bytes
+      : typeof value._getBytes === "function" ? value._getBytes() : new Uint8Array(0);
     if (typeof globalThis.File === "function" && value instanceof globalThis.File) {
       return {
         type: "File",

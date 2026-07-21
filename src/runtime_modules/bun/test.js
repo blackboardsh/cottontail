@@ -2148,12 +2148,11 @@ class Expectation {
         },
       );
 
-      // Attach the mode handlers before draining. Waiting on the original
-      // promise first lets JSC report a rejection as unhandled even though an
-      // expect(...).rejects matcher consumes it in the same test turn.
-      if (promise instanceof Promise && typeof globalThis.cottontail?.waitForPromise === "function") {
+      // Attach a rejection handler in the same turn, then let the test
+      // runner's pending-promise queue await asynchronous I/O. A nested
+      // blocking wait here prevents fd events from completing network bodies.
+      if (promise instanceof Promise) {
         result.catch(() => {});
-        globalThis.cottontail.waitForPromise(result);
         const state = nativePromiseState(result);
         if (state?.status === 2) {
           throw state.value;
@@ -2445,6 +2444,7 @@ class Expectation {
           (expected instanceof RegExp ? expected.test(String(thrown.message ?? thrown)) :
             typeof expected === "function" ? thrown instanceof expected :
               matcherName(expected) ? matchesExpected(thrown, expected) :
+              expected instanceof Error ? String(thrown?.message ?? thrown) === expected.message :
               expected && typeof expected === "object" ? objectMatches(expected) :
               String(thrown.message ?? thrown).includes(String(expected))));
         const receivedMessage = didThrow ? String(thrown?.message ?? thrown) : undefined;
@@ -2471,6 +2471,11 @@ class Expectation {
       }
       if (didThrow) return checkThrown(true, thrown);
       if (isPromiseLike(result)) {
+        const isAsyncFunction = Object.prototype.toString.call(actual) === "[object AsyncFunction]";
+        if (!isAsyncFunction) {
+          result.catch?.(() => {});
+          return checkThrown(false, undefined);
+        }
         const settled = result.then(
           () => this._check(false, "Expected function to throw"),
           (error) => checkThrown(true, error),
@@ -3339,6 +3344,9 @@ export function setSystemTime(value = Date.now()) {
 }
 
 export function setDefaultTimeout(_timeout) {
+  if (typeof _timeout !== "number") {
+    throw new Error("setTimeout() expects a number (milliseconds)");
+  }
   nodeSetDefaultTimeout(_timeout);
 }
 
@@ -3536,7 +3544,9 @@ function wrapTestCallback(callback) {
 }
 
 export function onTestFinished(callback) {
-  if (typeof callback !== "function") throw new TypeError("onTestFinished requires a callback");
+  if (typeof callback !== "function") {
+    throw new Error("onTestFinished() expects a function as the first argument");
+  }
   nodeOnTestFinished(wrapDoneCallback(callback));
 }
 
@@ -3734,15 +3744,15 @@ function makeEach(base) {
 }
 
 function makeBunTestFunction(base) {
-  const register = (args, extraOptions = {}, requireCallback = false) => {
+  const register = (args, extraOptions = {}, apiName = "test") => {
     globalThis.__cottontailBunTestUsed = true;
     if (extraOptions.only) assertOnlyAllowed();
-    const registrationSuite = bunRegistrationSuite();
     const parsed = parseCallbackArgs(args);
-    if (requireCallback && typeof parsed.callback !== "function") {
-      throw new TypeError("test.failing expects a function as the second argument");
-    }
     const options = validateBunTestOptions({ ...parsed.options, ...extraOptions });
+    if (typeof parsed.callback !== "function" && !options.skip && !options.todo) {
+      throw new Error(`${apiName} expects a function as the second argument`);
+    }
+    const registrationSuite = bunRegistrationSuite();
     const name = normalizeTestName(parsed.name);
     let registrationLine = captureTestRegistrationLine(
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
@@ -3760,39 +3770,44 @@ function makeBunTestFunction(base) {
       wrapTestCallback(parsed.callback),
     ));
   };
-  const variant = (extraOptions, requireCallback = false) => {
-    const result = (...args) => register(args, extraOptions, requireCallback);
+  const variant = (extraOptions, apiName) => {
+    const result = (...args) => register(args, extraOptions, apiName);
     result.each = makeEach(result);
-    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, requireCallback) : result;
-    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, requireCallback) : result;
-    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, requireCallback);
-    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, requireCallback) });
-    Object.defineProperty(result, "failing", { get: () => variant({ ...extraOptions, failing: true }, true) });
-    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, requireCallback) });
-    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, requireCallback) });
-    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, requireCallback) });
-    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, requireCallback) });
+    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, `${apiName}.skip`) : result;
+    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, `${apiName}.todo`) : result;
+    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, `${apiName}.skip`);
+    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, `${apiName}.only`) });
+    Object.defineProperty(result, "failing", { get: () => variant({ ...extraOptions, failing: true }, `${apiName}.failing`) });
+    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, `${apiName}.skip`) });
+    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, `${apiName}.todo`) });
+    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, `${apiName}.concurrent`) });
+    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, `${apiName}.serial`) });
     return result;
   };
-  const fn = (...args) => register(args);
+  const fn = (...args) => register(args, {}, "test");
   fn.each = makeEach(fn);
-  fn.only = variant({ only: true });
-  fn.failing = variant({ failing: true }, true);
-  fn.skip = variant({ skip: true });
-  fn.todo = variant({ todo: true });
+  fn.only = variant({ only: true }, "test.only");
+  fn.failing = variant({ failing: true }, "test.failing");
+  fn.skip = variant({ skip: true }, "test.skip");
+  fn.todo = variant({ todo: true }, "test.todo");
   fn.skipIf = (condition) => condition ? fn.skip : fn;
   fn.todoIf = (condition) => condition ? fn.todo : fn;
   fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = variant({ concurrent: true });
-  fn.serial = variant({ serial: true });
+  fn.concurrent = variant({ concurrent: true }, "test.concurrent");
+  fn.serial = variant({ serial: true }, "test.serial");
   return fn;
 }
 
 function makeBunDescribe(base) {
-  const fn = (...args) => {
+  const register = (args, extraOptions = {}, apiName = "describe") => {
     globalThis.__cottontailBunTestUsed = true;
-    const registrationSuite = bunRegistrationSuite();
+    if (extraOptions.only) assertOnlyAllowed();
     const parsed = parseDescribeArgs(args);
+    const options = { ...parsed.options, ...extraOptions };
+    if (typeof parsed.callback !== "function" && !options.skip && !options.todo) {
+      throw new Error(`${apiName} expects a function as the second argument`);
+    }
+    const registrationSuite = bunRegistrationSuite();
     const name = normalizeTestName(parsed.name);
     const registrationLine = captureTestRegistrationLine(
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
@@ -3806,53 +3821,33 @@ function makeBunDescribe(base) {
     };
     return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
       name,
-      applyBunFileConcurrency({ ...parsed.options, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
+      applyBunFileConcurrency({ ...options, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
       wrapBunDescribeCallback(parsed.callback, suite),
     ));
   };
+  const fn = (...args) => register(args);
   fn.each = makeEach(fn);
-  const variant = (extraOptions) => {
-    const result = (...args) => {
-      globalThis.__cottontailBunTestUsed = true;
-      if (extraOptions.only) assertOnlyAllowed();
-      const registrationSuite = bunRegistrationSuite();
-      const parsed = parseDescribeArgs(args);
-      const name = normalizeTestName(parsed.name);
-      const registrationLine = captureTestRegistrationLine(
-        globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
-      );
-      const suite = {
-        name,
-        parent: registrationSuite,
-        matchingTestCount: 0,
-        totalTestCount: 0,
-        orderScope: createBunTestOrderScope(registrationSuite.orderScope),
-      };
-      return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
-        name,
-        applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
-        wrapBunDescribeCallback(parsed.callback, suite),
-      ));
-    };
+  const variant = (extraOptions, apiName) => {
+    const result = (...args) => register(args, extraOptions, apiName);
     result.each = makeEach(result);
-    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }) : result;
-    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }) : result;
-    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true });
-    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }) });
-    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }) });
-    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }) });
-    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }) });
-    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }) });
+    result.skipIf = (condition) => condition ? variant({ ...extraOptions, skip: true }, `${apiName}.skip`) : result;
+    result.todoIf = (condition) => condition ? variant({ ...extraOptions, todo: true }, `${apiName}.todo`) : result;
+    result.if = (condition) => condition ? result : variant({ ...extraOptions, skip: true }, `${apiName}.skip`);
+    Object.defineProperty(result, "only", { get: () => variant({ ...extraOptions, only: true }, `${apiName}.only`) });
+    Object.defineProperty(result, "skip", { get: () => variant({ ...extraOptions, skip: true }, `${apiName}.skip`) });
+    Object.defineProperty(result, "todo", { get: () => variant({ ...extraOptions, todo: true }, `${apiName}.todo`) });
+    Object.defineProperty(result, "concurrent", { get: () => variant({ ...extraOptions, concurrent: true }, `${apiName}.concurrent`) });
+    Object.defineProperty(result, "serial", { get: () => variant({ ...extraOptions, serial: true }, `${apiName}.serial`) });
     return result;
   };
-  fn.only = variant({ only: true });
-  fn.skip = variant({ skip: true });
-  fn.todo = variant({ todo: true });
+  fn.only = variant({ only: true }, "describe.only");
+  fn.skip = variant({ skip: true }, "describe.skip");
+  fn.todo = variant({ todo: true }, "describe.todo");
   fn.skipIf = (condition) => condition ? fn.skip : fn;
   fn.todoIf = (condition) => condition ? fn.todo : fn;
   fn.if = (condition) => condition ? fn : fn.skip;
-  fn.concurrent = variant({ concurrent: true });
-  fn.serial = variant({ serial: true });
+  fn.concurrent = variant({ concurrent: true }, "describe.concurrent");
+  fn.serial = variant({ serial: true }, "describe.serial");
   return fn;
 }
 
@@ -3886,24 +3881,28 @@ function assertOnlyAllowed() {
 
 export const beforeAll = (callback, options = {}) => {
   markBunTestUsed();
+  if (typeof callback !== "function") throw new Error("beforeAll() expects a function as the first argument");
   const suite = bunRegistrationSuite();
   const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeBefore(hook, options));
 };
 export const afterAll = (callback, options = {}) => {
   markBunTestUsed();
+  if (typeof callback !== "function") throw new Error("afterAll() expects a function as the first argument");
   const suite = bunRegistrationSuite();
   const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeAfter(hook, options));
 };
 export const beforeEach = (callback, options = {}) => {
   markBunTestUsed();
+  if (typeof callback !== "function") throw new Error("beforeEach() expects a function as the first argument");
   const suite = bunRegistrationSuite();
   const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeBeforeEach(hook, options));
 };
 export const afterEach = (callback, options = {}) => {
   markBunTestUsed();
+  if (typeof callback !== "function") throw new Error("afterEach() expects a function as the first argument");
   const suite = bunRegistrationSuite();
   const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeAfterEach(hook, options));

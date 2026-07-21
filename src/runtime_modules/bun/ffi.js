@@ -1080,19 +1080,58 @@ const canonicalUtf8BlobTypes = new Set([
   "text/plain",
 ]);
 
+const blobStreamSources = g.__cottontailBlobStreamSources ?? new WeakMap();
+if (g.__cottontailBlobStreamSources == null) {
+  Object.defineProperty(g, "__cottontailBlobStreamSources", {
+    value: blobStreamSources,
+    configurable: true,
+  });
+}
+
 function normalizeBlobType(type = "") {
   const source = String(type);
   if (/[^\x20-\x7e]/.test(source)) return "";
   return canonicalUtf8BlobTypes.has(source) ? `${source};charset=utf-8` : source.toLowerCase();
 }
 
-function bytesFromBlobPart(part) {
-  if (part == null) return new Uint8Array(0);
-  if (typeof part === "string") return bytesFromString(part);
-  if (part instanceof ArrayBuffer) return new Uint8Array(part);
-  if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
-  if (part?._bytes instanceof Uint8Array) return new Uint8Array(part._bytes);
-  return bytesFromString(String(part));
+function snapshotBlobPart(part, snapshots) {
+  if (part == null) return [new Uint8Array(0)];
+  if (Array.isArray(part?._blobChunks)) return part._blobChunks;
+  if (typeof part === "string") return [bytesFromString(part)];
+  if (part instanceof ArrayBuffer) {
+    let snapshot = snapshots.get(part);
+    if (!snapshot) {
+      snapshot = new Uint8Array(part).slice();
+      snapshots.set(part, snapshot);
+    }
+    return [snapshot];
+  }
+  if (ArrayBuffer.isView(part)) {
+    const backing = part.buffer;
+    let snapshot = snapshots.get(backing);
+    if (!snapshot) {
+      snapshot = new Uint8Array(backing).slice();
+      snapshots.set(backing, snapshot);
+    }
+    return [snapshot.subarray(part.byteOffset, part.byteOffset + part.byteLength)];
+  }
+  if (part?._bytes instanceof Uint8Array) return [part._bytes.slice()];
+  return [bytesFromString(String(part))];
+}
+
+function concatBlobChunks(chunks, size) {
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function exceedsSyntheticBlobAllocationLimit(size) {
+  const limit = Number(g.__cottontailSyntheticAllocationLimit);
+  return Number.isFinite(limit) && limit > 0 && size > limit;
 }
 
 function relativeBlobIndex(value, size, fallback) {
@@ -1109,49 +1148,81 @@ function installBlobGlobals() {
         if (typeof parts === "string" || parts == null) throw new TypeError("Blob parts must be an iterable object");
         const sourceParts = parts instanceof ArrayBuffer || ArrayBuffer.isView(parts) ? [parts] : parts;
         if (typeof sourceParts[Symbol.iterator] !== "function") throw new TypeError("Blob parts must be iterable");
-        const chunks = Array.from(sourceParts, bytesFromBlobPart);
-        const size = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-        this._bytes = new Uint8Array(size);
-        let offset = 0;
-        for (const chunk of chunks) {
-          this._bytes.set(chunk, offset);
-          offset += chunk.byteLength;
+        // COTTONTAIL-COMPAT: Blob snapshots each backing store once and keeps
+        // repeated parts shared until a contiguous representation is requested.
+        const snapshots = new WeakMap();
+        this._blobChunks = [];
+        this._size = 0;
+        for (const part of sourceParts) {
+          for (const chunk of snapshotBlobPart(part, snapshots)) {
+            this._blobChunks.push(chunk);
+            this._size += chunk.byteLength;
+          }
         }
+        this._bytes = null;
         this.type = normalizeBlobType(options?.type);
       }
 
       get size() {
-        return this._bytes.byteLength;
+        return this._size;
+      }
+
+      _getBytes() {
+        return concatBlobChunks(this._blobChunks, this._size);
       }
 
       async arrayBuffer() {
-        return this._bytes.slice().buffer;
+        return this._getBytes().buffer;
       }
 
       async bytes() {
-        return this._bytes.slice();
+        if (exceedsSyntheticBlobAllocationLimit(this._size)) throw new Error("Out of memory");
+        return this._getBytes();
       }
 
       async text() {
-        return stringFromBytes(this._bytes);
+        if (exceedsSyntheticBlobAllocationLimit(this._size)) {
+          throw new RangeError("Cannot create a string longer than 2^32-1 characters");
+        }
+        return stringFromBytes(this._getBytes());
+      }
+
+      async json() {
+        if (exceedsSyntheticBlobAllocationLimit(this._size)) {
+          throw new RangeError("Cannot parse a JSON string longer than 2^32-1 characters");
+        }
+        return JSON.parse(await this.text());
       }
 
       slice(start = 0, end = this.size, type = "") {
         const relativeStart = relativeBlobIndex(start, this.size, 0);
         const relativeEnd = relativeBlobIndex(end, this.size, this.size);
-        return new g.Blob([this._bytes.slice(relativeStart, Math.max(relativeStart, relativeEnd))], { type });
+        const rangeEnd = Math.max(relativeStart, relativeEnd);
+        const parts = [];
+        let offset = 0;
+        for (const chunk of this._blobChunks) {
+          const chunkEnd = offset + chunk.byteLength;
+          const partStart = Math.max(relativeStart, offset);
+          const partEnd = Math.min(rangeEnd, chunkEnd);
+          if (partEnd > partStart) parts.push(chunk.subarray(partStart - offset, partEnd - offset));
+          offset = chunkEnd;
+          if (offset >= rangeEnd) break;
+        }
+        return new g.Blob(parts, { type });
       }
 
       stream() {
-        const bytes = this._bytes.slice();
+        const bytes = this._getBytes();
         if (typeof g.ReadableStream === "function") {
-          return new g.ReadableStream({
+          const stream = new g.ReadableStream({
             start(controller) {
               // An empty blob closes without enqueuing an empty chunk.
               if (bytes.byteLength > 0) controller.enqueue(bytes);
               controller.close();
             },
           });
+          blobStreamSources.set(stream, { bytes, type: this.type });
+          return stream;
         }
         return {
           async *[Symbol.asyncIterator]() {
@@ -1443,6 +1514,36 @@ function makeBufferView(bytes, start = 0, end = bytes.length) {
   return view;
 }
 
+function fillBufferPattern(target, pattern, start, stop) {
+  const length = stop - start;
+  if (length <= 0) return target;
+  if (pattern.length === 0) {
+    Uint8Array.prototype.fill.call(target, 0, start, stop);
+    return target;
+  }
+  if (pattern.length === 1) {
+    Uint8Array.prototype.fill.call(target, pattern[0], start, stop);
+    return target;
+  }
+
+  let filled = Math.min(pattern.length, length);
+  Uint8Array.prototype.set.call(
+    target,
+    Uint8Array.prototype.subarray.call(pattern, 0, filled),
+    start,
+  );
+  while (filled < length) {
+    const copyLength = Math.min(filled, length - filled);
+    Uint8Array.prototype.set.call(
+      target,
+      Uint8Array.prototype.subarray.call(target, start, start + copyLength),
+      start + filled,
+    );
+    filled += copyLength;
+  }
+  return target;
+}
+
 function installBufferMethods(bytes) {
   bytes.toString = function toString(encoding = "utf8", start = 0, end = this.length) {
     return stringFromBytesWithEncoding(this, encoding, start, end);
@@ -1512,8 +1613,7 @@ function installBufferMethods(bytes) {
       Uint8Array.prototype.fill.call(this, 0, start, stop);
       return this;
     }
-    for (let index = start; index < stop; index += 1) this[index] = pattern[(index - start) % pattern.length];
-    return this;
+    return fillBufferPattern(this, pattern, start, stop);
   };
   return bytes;
 }
@@ -1538,7 +1638,7 @@ CottontailBuffer.alloc = function alloc(size, fill = 0, encoding = "utf8") {
   const bytes = makeBuffer(new Uint8Array(Number(size) || 0));
   if (fill != null && fill !== 0) {
     const fillBytes = typeof fill === "number" ? new Uint8Array([fill & 0xff]) : CottontailBuffer.from(fill, encoding);
-    for (let index = 0; index < bytes.length; index += 1) bytes[index] = fillBytes[index % fillBytes.length] ?? 0;
+    fillBufferPattern(bytes, fillBytes, 0, bytes.length);
   }
   return bytes;
 };
@@ -1775,7 +1875,10 @@ function installTimers() {
     entry.destroyed = true;
     timers.delete(key);
   };
-  g.requestAnimationFrame ??= (callback) => g.setTimeout(() => callback(timerNow()), 16);
+  g.requestAnimationFrame ??= (callback) => {
+    if (typeof callback !== "function") throw new TypeError('The "callback" argument must be of type function');
+    return g.setTimeout(() => callback(timerNow()), 16);
+  };
   g.cancelAnimationFrame ??= g.clearTimeout;
   Object.defineProperty(g.setTimeout, promisifyCustom, {
     value: (ms = 1, value = undefined, options = undefined) => new Promise((resolve, reject) => {
@@ -1894,6 +1997,96 @@ function serializeWorkerMessage(message) {
   });
 }
 
+const workerWireViewConstructors = {
+  Int8Array,
+  Uint8Array,
+  Uint8ClampedArray,
+  Int16Array,
+  Uint16Array,
+  Int32Array,
+  Uint32Array,
+  Float32Array,
+  Float64Array,
+  BigInt64Array,
+  BigUint64Array,
+};
+
+function decodeWorkerWireValue(encoded, refs = new Map()) {
+  const remember = value => {
+    if (encoded?.id != null) refs.set(encoded.id, value);
+    return value;
+  };
+  switch (encoded?.t) {
+    case "Ref": return refs.get(encoded.id);
+    case "undefined": return undefined;
+    case "null": return null;
+    case "boolean":
+    case "string": return encoded.v;
+    case "number":
+      if (encoded.v === "NaN") return NaN;
+      if (encoded.v === "Infinity") return Infinity;
+      if (encoded.v === "-Infinity") return -Infinity;
+      if (encoded.v === "-0") return -0;
+      return Number(encoded.v);
+    case "bigint": return BigInt(encoded.v);
+    case "Date": return remember(new Date(Number(encoded.v)));
+    case "RegExp": return remember(new RegExp(encoded.source, encoded.flags));
+    case "ArrayBuffer": return remember(new Uint8Array(encoded.bytes ?? []).buffer);
+    case "View": {
+      const bytes = new Uint8Array(encoded.bytes ?? []);
+      if (encoded.name === "Buffer" && typeof g.Buffer === "function") return remember(g.Buffer.from(bytes));
+      if (encoded.name === "DataView") return remember(new DataView(bytes.buffer));
+      const Constructor = workerWireViewConstructors[encoded.name] ?? Uint8Array;
+      return remember(new Constructor(bytes.buffer));
+    }
+    case "Map": {
+      const map = remember(new Map());
+      for (const [key, value] of encoded.v ?? []) {
+        map.set(decodeWorkerWireValue(key, refs), decodeWorkerWireValue(value, refs));
+      }
+      return map;
+    }
+    case "Set": {
+      const set = remember(new Set());
+      for (const value of encoded.v ?? []) set.add(decodeWorkerWireValue(value, refs));
+      return set;
+    }
+    case "Array": {
+      const array = remember([]);
+      for (let index = 0; index < (encoded.v ?? []).length; index += 1) {
+        array[index] = decodeWorkerWireValue(encoded.v[index], refs);
+      }
+      if (encoded.length != null) array.length = encoded.length;
+      return array;
+    }
+    case "Error": {
+      const error = remember(new Error(encoded.message));
+      if (encoded.name) error.name = encoded.name;
+      if (encoded.stack) error.stack = encoded.stack;
+      return error;
+    }
+    case "Blob": return remember(new g.Blob([new Uint8Array(encoded.bytes ?? [])], { type: encoded.type ?? "" }));
+    case "File": return remember(new g.File([new Uint8Array(encoded.bytes ?? [])], encoded.name ?? "", {
+      type: encoded.type ?? "",
+      lastModified: encoded.lastModified,
+    }));
+    case "Object": {
+      const object = remember({});
+      for (const [key, value] of encoded.v ?? []) object[key] = decodeWorkerWireValue(value, refs);
+      return object;
+    }
+    default: return undefined;
+  }
+}
+
+function decodeIncomingWorkerMessage(data, worker) {
+  if (typeof g.__cottontailWebDecodeIncoming === "function") {
+    return g.__cottontailWebDecodeIncoming(data, worker);
+  }
+  if (data?.__cottontailWebWire === 1) return decodeWorkerWireValue(data.data);
+  return data;
+}
+
 function installWorkerGlobal() {
   if (!cottontail.isWorker?.()) {
     // Bun exposes postMessage on the main global for Web-compatible shape,
@@ -1922,7 +2115,7 @@ function pollWorkerGlobalMessages() {
       data = JSON.parse(item);
     } catch {}
     if (g.__cottontailWebInterceptWorkerMessage?.(data, null)) continue;
-    data = g.__cottontailWebDecodeIncoming?.(data, null) ?? data;
+    data = decodeIncomingWorkerMessage(data, null);
     const event = g.__cottontailMakeMessageEvent?.("message", data) ?? { data };
     emitWorkerEvent(g, "message", event);
   }
@@ -1942,10 +2135,14 @@ function installWorkerNativeEventHandler() {
     const worker = workerInstances.get(Number(event?.id));
     if (!worker) return;
     if (event?.type === "exit") {
+      const code = Number(event?.code ?? 0) || 0;
       worker._refed = false;
+      worker._terminated = true;
+      worker.threadId = -1;
       workerInstances.delete(worker.id);
       if (worker._pollTimer != null) clearInterval(worker._pollTimer);
-      worker._emit("exit", { code: 0 });
+      worker._emit("exit", { type: "exit", code, target: worker });
+      worker._emit("close", { type: "close", code, target: worker });
       return;
     }
     if (event?.type === "error") {
@@ -1994,6 +2191,13 @@ g.__cottontailHasActiveHandles = () => {
   return false;
 };
 
+g.__cottontailEventLoopHandleStats = () => ({
+  workers: Array.from(workerInstances.values()).filter((worker) => worker.hasRef()).length,
+  timers: Array.from(timers.values()).filter((timer) => timer.ref !== false).length,
+  spawns: Array.from(spawnEventListeners.values()).filter((entry) => entry.ref !== false).length,
+  web: Boolean(g.__cottontailWebHasActiveHandles?.()),
+});
+
 g.__cottontailRunLoopTick = () => {
   pollWorkerGlobalMessages();
   const now = timerNow();
@@ -2018,8 +2222,28 @@ g.__cottontailRunLoopTick = () => {
 
 function normalizeWorkerScriptPath(scriptPath) {
   const text = String(scriptPath);
-  if (text.startsWith("file://")) return decodeURIComponent(new URL(text).pathname);
+  if (text.startsWith("file:")) {
+    try {
+      return decodeURIComponent(new URL(text).pathname);
+    } catch {
+      throw new TypeError("Invalid file URL");
+    }
+  }
   return text;
+}
+
+function normalizeWorkerPreloads(options) {
+  if (options?.preload == null) return [];
+  const values = Array.isArray(options.preload) ? options.preload : [options.preload];
+  return values.map(value => normalizeWorkerScriptPath(value));
+}
+
+function workerStringEnvironment(source) {
+  const result = {};
+  for (const key of Object.keys(source ?? {})) {
+    if (source[key] !== undefined) result[key] = String(source[key]);
+  }
+  return result;
 }
 
 function rewriteWorkerNamedImports(spec) {
@@ -2045,10 +2269,28 @@ function workerTempDir() {
   return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
 }
 
+function canUseBareWorkerScript(target, options, hasWorkerOptions) {
+  if (options?.[preparedWorkerScript] === true || hasWorkerOptions) return false;
+  if (typeof g.__cottontailWebDecodeIncoming === "function") return false;
+  if (!/\.(?:c?js|mjs)$/i.test(String(target))) return false;
+  let source;
+  try {
+    source = String(cottontail.readFile(target));
+  } catch {
+    return false;
+  }
+  return !/(?:^|\n)\s*(?:import|export)\b|import\.meta|\b(?:Bun|process|Buffer|require|fetch|setTimeout|setInterval|clearTimeout|clearInterval|queueMicrotask|structuredClone|MessageChannel|MessagePort|BroadcastChannel|Worker|URL|Blob|File|crypto|performance)\b/.test(source);
+}
+
 function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const cacheKey = normalizeWorkerScriptPath(scriptPath);
+  const preloads = normalizeWorkerPreloads(options);
+  const hasWorkerOptions = preloads.length > 0 ||
+    Object.prototype.hasOwnProperty.call(options ?? {}, "env") ||
+    Object.prototype.hasOwnProperty.call(options ?? {}, "argv") ||
+    Object.prototype.hasOwnProperty.call(options ?? {}, "execArgv");
   let target = cacheKey;
-  const cached = workerBundleCache.get(cacheKey);
+  const cached = hasWorkerOptions ? undefined : workerBundleCache.get(cacheKey);
   if (cached && cottontail.existsSync?.(cached)) return cached;
   const tempDir = workerTempDir();
   cottontail.mkdirSync?.(tempDir, true);
@@ -2064,6 +2306,10 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
     const dataPath = `${tempDir}/bun-worker-data-${nonce}.js`;
     cottontail.writeFile(dataPath, source);
     target = dataPath;
+  }
+  if (canUseBareWorkerScript(target, options, hasWorkerOptions)) {
+    workerBundleCache.set(cacheKey, target);
+    return target;
   }
   const wrapperPath = `${tempDir}/bun-worker-entry-${nonce}.mjs`;
   const bundledPath = `${tempDir}/bun-worker-${nonce}.js`;
@@ -2088,9 +2334,47 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
     return bundledPath;
   }
   try {
+    const imports = [`import ${JSON.stringify(runtimeEntry)};`];
+    if (hasWorkerOptions || !options?.[preparedWorkerScript]) {
+      const parentArgv = Array.from(globalThis.process?.argv ?? [], String);
+      const argv = [
+        String(parentArgv[0] ?? globalThis.process?.execPath ?? "cottontail"),
+        slashTarget,
+        ...Array.from(options?.argv ?? [], String),
+      ];
+      const execArgv = options?.execArgv == null
+        ? Array.from(globalThis.process?.execArgv ?? [], String)
+        : Array.from(options.execArgv, String);
+      const optionsPath = `${tempDir}/bun-worker-options-${nonce}.mjs`;
+      const optionSource = [
+        `const __ctWorkerArgv = ${JSON.stringify(argv)};`,
+        `const __ctWorkerExecArgv = ${JSON.stringify(execArgv)};`,
+        `if (globalThis.process) {`,
+        `  globalThis.process.argv = __ctWorkerArgv;`,
+        `  globalThis.process.execArgv = __ctWorkerExecArgv;`,
+        `}`,
+        `if (globalThis.Bun) globalThis.Bun.argv = __ctWorkerArgv;`,
+      ];
+      if (Object.prototype.hasOwnProperty.call(options ?? {}, "env")) {
+        const environment = workerStringEnvironment(options?.env);
+        optionSource.push(
+          `if (globalThis.process) {`,
+          `  const __ctWorkerEnv = globalThis.process.env ?? {};`,
+          `  for (const __ctKey of Object.keys(__ctWorkerEnv)) delete __ctWorkerEnv[__ctKey];`,
+          `  Object.assign(__ctWorkerEnv, ${JSON.stringify(environment)});`,
+          `  globalThis.process.env = __ctWorkerEnv;`,
+          `}`,
+        );
+      }
+      cottontail.writeFile(optionsPath, optionSource.join("\n"));
+      imports.push(`import ${JSON.stringify(optionsPath.replace(/\\/g, "/"))};`);
+    }
+    for (const preload of preloads) {
+      imports.push(`import ${JSON.stringify(String(preload).replace(/\\/g, "/"))};`);
+    }
+    imports.push(`import ${JSON.stringify(slashTarget)};`);
     cottontail.writeFile(wrapperPath, [
-      `import ${JSON.stringify(runtimeEntry)};`,
-      `import ${JSON.stringify(slashTarget)};`,
+      ...imports,
     ].join("\n"));
     const bundled = cottontail.bundleNative(wrapperPath, cottontail.cwd(), JSON.stringify({
       format: "esm",
@@ -2099,7 +2383,7 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
       inlineImportMetaProperties: true,
     }));
     cottontail.writeFile(bundledPath, bundled);
-    workerBundleCache.set(cacheKey, bundledPath);
+    if (!hasWorkerOptions) workerBundleCache.set(cacheKey, bundledPath);
     return bundledPath;
   } catch {}
 
@@ -2136,19 +2420,89 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   return bundledPath;
 }
 
+function blobWorkerExtension(blob) {
+  const nameMatch = /\.(?:[cm]?[jt]sx?)$/i.exec(String(blob?.name ?? ""));
+  if (nameMatch) return nameMatch[0].toLowerCase();
+  return /typescript/i.test(String(blob?.type ?? "")) ? ".ts" : ".js";
+}
+
+function blobWorkerLoadError(url) {
+  return String(url).startsWith("blob:nodedata:")
+    ? "BuildMessage: Blob URL is missing"
+    : `BuildMessage: ModuleNotFound resolving ${JSON.stringify(String(url))} (entry point)`;
+}
+
+function workerErrorEvent(worker, message) {
+  if (typeof g.ErrorEvent === "function") {
+    return new g.ErrorEvent("error", { message, error: null });
+  }
+  return { type: "error", message, error: null, target: worker };
+}
+
 g.Worker ??= class Worker {
   constructor(scriptPath, options = undefined) {
-    this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
-    this.handle = cottontail.spawnWorker(this.scriptPath, options?.[workerEvalSource]);
-    this.id = this.handle.id;
+    this.scriptPath = normalizeWorkerScriptPath(scriptPath);
+    this.handle = null;
+    this.id = 0;
+    this.threadId = 0;
     this.onmessage = null;
     this.onerror = null;
     this._listeners = new Map();
-    this._refed = typeof cottontail.workerHasRef === "function"
-      ? Boolean(cottontail.workerHasRef(this.id))
-      : true;
+    this._refed = true;
+    this._terminated = false;
+    this._pendingMessages = [];
+
+    if (this.scriptPath.startsWith("blob:")) {
+      queueMicrotask(() => void this._startBlobWorker(this.scriptPath, options));
+      this._queueProcessWorkerEvent(options);
+      return;
+    }
+    this._startWorker(this.scriptPath, options);
+    this._queueProcessWorkerEvent(options);
+  }
+  _queueProcessWorkerEvent(options) {
+    if (options?.[preparedWorkerScript] === true) return;
+    queueMicrotask(() => globalThis.process?.emit?.("worker", this));
+  }
+  _startWorker(scriptPath, options) {
+    if (this._terminated) return;
+    this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
+    this.handle = cottontail.spawnWorker(this.scriptPath, options?.[workerEvalSource]);
+    this.id = this.handle.id;
+    this.threadId = this.id;
+    if (typeof cottontail.workerHasRef === "function") {
+      const nativeRef = Boolean(cottontail.workerHasRef(this.id));
+      if (!this._refed) cottontail.workerSetRef?.(this.id, false);
+      else this._refed = nativeRef;
+    }
     workerInstances.set(this.id, this);
     this._pollTimer = installWorkerNativeEventHandler() ? null : setInterval(() => this._poll(), 16);
+    for (const message of this._pendingMessages.splice(0)) {
+      cottontail.workerPostMessageTo(this.id, message);
+    }
+  }
+  async _startBlobWorker(url, options) {
+    try {
+      const blob = g.__cottontailObjectURLRegistry?.get(url);
+      if (!blob) throw new Error(blobWorkerLoadError(url));
+      const source = blob?._bytes instanceof Uint8Array
+        ? stringFromBytes(blob._bytes)
+        : String(await blob.text());
+      if (this._terminated) return;
+      const tempDir = workerTempDir();
+      cottontail.mkdirSync?.(tempDir, true);
+      const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+      const sourcePath = `${tempDir}/bun-worker-blob-${nonce}${blobWorkerExtension(blob)}`;
+      cottontail.writeFile(sourcePath, source);
+      this._startWorker(sourcePath, options);
+    } catch (error) {
+      if (this._terminated) return;
+      this._terminated = true;
+      this._refed = false;
+      this._pendingMessages.length = 0;
+      const message = error?.message ?? String(error);
+      this._emit("error", workerErrorEvent(this, message));
+    }
   }
   _add(name, handler) {
     if (typeof handler !== "function") return this;
@@ -2163,35 +2517,47 @@ g.Worker ??= class Worker {
     for (const handler of this._listeners.get(name) ?? []) handler.call(this, event);
   }
   _poll() {
+    if (!this.handle) return;
     for (const item of cottontail.workerPollMessages(this.id)) {
       let data = item;
       try {
         data = JSON.parse(item);
       } catch {}
       if (g.__cottontailWebInterceptWorkerMessage?.(data, this)) continue;
-      data = g.__cottontailWebDecodeIncoming?.(data, this) ?? data;
+      data = decodeIncomingWorkerMessage(data, this);
       const event = g.__cottontailMakeMessageEvent?.("message", data) ?? { data };
       this._emit("message", event);
     }
   }
+  _postSerialized(serialized) {
+    if (!this.handle) {
+      if (!this._terminated) this._pendingMessages.push(serialized);
+      return;
+    }
+    cottontail.workerPostMessageTo(this.id, serialized);
+  }
   postMessage(message) {
-    cottontail.workerPostMessageTo(this.id, serializeWorkerMessage(message));
+    return this._postSerialized(serializeWorkerMessage(message));
   }
   terminate() {
     if (this._pollTimer != null) clearInterval(this._pollTimer);
+    this._terminated = true;
     this._refed = false;
-    workerInstances.delete(this.id);
-    cottontail.workerTerminate(this.id);
+    this._pendingMessages.length = 0;
+    if (this.handle) {
+      workerInstances.delete(this.id);
+      cottontail.workerTerminate(this.id);
+    }
   }
   ref() {
-    this._refed = typeof cottontail.workerSetRef === "function"
+    this._refed = this.handle && typeof cottontail.workerSetRef === "function"
       ? Boolean(cottontail.workerSetRef(this.id, true))
       : true;
     if (this._refed) this._pollTimer?.ref?.();
     return this;
   }
   unref() {
-    if (typeof cottontail.workerSetRef === "function") {
+    if (this.handle && typeof cottontail.workerSetRef === "function") {
       cottontail.workerSetRef(this.id, false);
     }
     this._refed = false;
@@ -2199,7 +2565,7 @@ g.Worker ??= class Worker {
     return this;
   }
   hasRef() {
-    if (typeof cottontail.workerHasRef === "function") {
+    if (this.handle && typeof cottontail.workerHasRef === "function") {
       this._refed = Boolean(cottontail.workerHasRef(this.id));
     }
     return this._refed;

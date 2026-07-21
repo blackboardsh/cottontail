@@ -680,6 +680,7 @@ function makeWorkerWrapper(input, options = {}) {
     `  globalThis.process.env = __ctWorkerEnv;`,
     `}`,
     `globalThis.__cottontailConfigureWorkerStdio?.();`,
+    `globalThis.__cottontailWorkerThreadsNotifyReady?.();`,
     `try {`,
     workerRunSource(input),
     `} catch (__ctWorkerError) {`,
@@ -836,16 +837,19 @@ export class Worker extends EventEmitter {
     if (this.stdout) this.stdout._read = () => {};
     if (this.stderr) this.stderr._read = () => {};
     this._running = true;
+    this._input = input;
     this._emptyEvalSource = emptyEvalSource;
     this._exitEmitted = false;
     this._exitCode = undefined;
     this._reportedExitCode = undefined;
     this._onlineEmitted = false;
+    this._bootstrapReady = false;
     this._refed = true;
     this._controlRequests = new Map();
     this._terminationPromise = null;
     this._terminationResolve = null;
     this._terminationFallback = null;
+    this._terminationDeferred = false;
 
     this._worker = new globalThis.Worker(wrapper, {
       [Symbol.for("cottontail.worker.prepared-script")]: true,
@@ -870,7 +874,9 @@ export class Worker extends EventEmitter {
 
     this._worker.onmessage = (event) => this._handleMessage(event);
     this._worker.onerror = (event) => {
-      this._emitWorkerError(event?.error ?? new Error(String(event?.message ?? event)));
+      this._emitWorkerError(this._normalizeWorkerError(
+        event?.error ?? new Error(String(event?.message ?? event)),
+      ));
     };
     this._worker.addEventListener?.("open", () => this._emitOnline());
     this._worker.addEventListener?.("exit", (event) => {
@@ -903,6 +909,13 @@ export class Worker extends EventEmitter {
     queueMicrotask(() => this.emit("error", error));
   }
 
+  _normalizeWorkerError(error) {
+    if (this._input?.kind !== "eval" && /Cannot find module|ModuleNotFound/.test(String(error?.message ?? error))) {
+      return new Error(`BuildMessage: ModuleNotFound resolving ${JSON.stringify(this._input.filename)} (entry point)`);
+    }
+    return error;
+  }
+
   _handleMessage(event) {
     let message;
     try {
@@ -921,11 +934,23 @@ export class Worker extends EventEmitter {
     if (handleWorkerControl(control)) return;
 
     if (control.type === "error") {
-      this._emitWorkerError(deserializeWorkerError(control.error));
+      this._emitWorkerError(this._normalizeWorkerError(deserializeWorkerError(control.error)));
       return;
     }
     if (control.type === "exitCode") {
       this._reportedExitCode = Number(control.code) || 0;
+      return;
+    }
+    if (control.type === "ready") {
+      this._bootstrapReady = true;
+      if (this._terminationDeferred) {
+        this._terminationDeferred = false;
+        if (this._terminationFallback !== null) clearTimeout(this._terminationFallback);
+        this._terminationFallback = setTimeout(() => {
+          this._terminationFallback = null;
+          this._sendTerminationControl();
+        }, 25);
+      }
       return;
     }
     if (control.type === "stdio") {
@@ -1009,6 +1034,35 @@ export class Worker extends EventEmitter {
     this._worker.postMessage(JSON.parse(encoded));
   }
 
+  _forceTerminate() {
+    if (!this._running) return;
+    if (typeof cottontail.workerTerminate === "function") {
+      cottontail.workerTerminate(this._nativeThreadId);
+    } else {
+      this._worker.terminate();
+      queueMicrotask(() => this._emitExit(0));
+    }
+  }
+
+  _armTerminationFallback(delay) {
+    if (this._terminationFallback !== null) clearTimeout(this._terminationFallback);
+    this._terminationFallback = setTimeout(() => {
+      this._terminationFallback = null;
+      this._forceTerminate();
+    }, delay);
+  }
+
+  _sendTerminationControl() {
+    if (!this._running) return;
+    try {
+      this._postControl({ type: "terminate" });
+    } catch {
+      this._forceTerminate();
+      return;
+    }
+    this._armTerminationFallback(1000);
+  }
+
   terminate(callback = undefined) {
     if (callback !== undefined && typeof callback !== "function") {
       throw invalidArgumentType("callback", "function", callback);
@@ -1029,19 +1083,15 @@ export class Worker extends EventEmitter {
       this._terminationPromise = new Promise(resolve => {
         this._terminationResolve = resolve;
       });
-      try {
-        this._postControl({ type: "terminate" });
-      } catch {}
-      this._terminationFallback = setTimeout(() => {
-        this._terminationFallback = null;
-        if (!this._running) return;
-        if (typeof cottontail.workerTerminate === "function") {
-          cottontail.workerTerminate(this._nativeThreadId);
-        } else {
-          this._worker.terminate();
-          queueMicrotask(() => this._emitExit(0));
-        }
-      }, 1000);
+      if (!this._onlineEmitted && typeof cottontail.workerTerminate === "function") {
+        this._forceTerminate();
+        this._armTerminationFallback(1000);
+      } else if (!this._bootstrapReady) {
+        this._terminationDeferred = true;
+        this._armTerminationFallback(5000);
+      } else {
+        this._sendTerminationControl();
+      }
     }
     if (callback) this._terminationPromise.then(code => callback(null, code));
     return this._terminationPromise;
@@ -2011,6 +2061,7 @@ if (!isMainThread) {
 
   globalThis.parentPort ??= parentPort;
   globalThis.workerData ??= workerData;
+  globalThis.__cottontailWorkerThreadsNotifyReady = () => sendParentControl({ type: "ready" });
 
   if (typeof globalThis.process?.exit === "function") {
     const processExit = globalThis.process.exit;

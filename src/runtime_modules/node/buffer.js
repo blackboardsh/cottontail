@@ -60,6 +60,7 @@ const originalBufferIsEncoding = Buffer.isEncoding.bind(Buffer);
 const originalBufferToString = Buffer.prototype.toString;
 const originalBufferWrite = Buffer.prototype.write;
 const originalBufferFill = Buffer.prototype.fill;
+const utf8TextDecoder = typeof TextDecoder === "function" ? new TextDecoder() : null;
 const customInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
 const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
 const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === "function"
@@ -259,6 +260,47 @@ function validateHexFill(value) {
   }
 }
 
+function fillBufferPattern(target, pattern, start, end) {
+  const length = end - start;
+  if (length <= 0) return target;
+  if (pattern.length === 1) {
+    Uint8Array.prototype.fill.call(target, pattern[0], start, end);
+    return target;
+  }
+
+  let filled = Math.min(pattern.length, length);
+  Uint8Array.prototype.set.call(target, pattern.subarray(0, filled), start);
+  while (filled < length) {
+    const copyLength = Math.min(filled, length - filled);
+    Uint8Array.prototype.set.call(target, target.subarray(start, start + copyLength), start + filled);
+    filled += copyLength;
+  }
+  return target;
+}
+
+function tryFastBufferFill(target, value, start, end, encoding) {
+  if (typeof value === "number" || typeof value === "boolean" || value == null) {
+    Uint8Array.prototype.fill.call(target, Number(value) & 0xff, start, end);
+    return true;
+  }
+
+  let pattern;
+  if (typeof value === "string") {
+    if (value.length === 0) {
+      Uint8Array.prototype.fill.call(target, 0, start, end);
+      return true;
+    }
+    pattern = originalBufferFrom(value, encoding);
+  } else if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) {
+    pattern = value;
+  } else {
+    return false;
+  }
+  if (pattern.length === 0) return false;
+  fillBufferPattern(target, pattern, start, end);
+  return true;
+}
+
 Buffer.alloc = function alloc(size, fill = undefined, encoding = undefined) {
   validateBufferSize(size);
   if (fill !== undefined) {
@@ -273,7 +315,9 @@ Buffer.alloc = function alloc(size, fill = undefined, encoding = undefined) {
       throw nodeError(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'value' is invalid. Received an empty Buffer");
     }
   }
-  return fill === undefined ? originalBufferAlloc(size) : originalBufferAlloc(size, fill, encoding);
+  const output = originalBufferAlloc(size);
+  if (fill === undefined || tryFastBufferFill(output, fill, 0, output.length, encoding)) return output;
+  return originalBufferAlloc(size, fill, encoding);
 };
 
 Buffer.allocUnsafe = function allocUnsafe(size) {
@@ -295,6 +339,10 @@ Buffer.byteLength = function byteLength(value, encoding) {
   }
   if (typeof value === "string" && isBase64UrlEncoding(encoding)) {
     return originalBufferByteLength(normalizeBase64Url(value), "base64");
+  }
+  if ((encoding == null || encoding === "" || /^(?:utf8|utf-8)$/i.test(String(encoding))) &&
+      /^[\x00-\x7f]*$/.test(value)) {
+    return value.length;
   }
   return originalBufferByteLength(value, encoding);
 };
@@ -343,6 +391,12 @@ Buffer.prototype.toString = function toString(encoding, start, end) {
   }
   if (isBase64UrlEncoding(encoding)) {
     return base64UrlFromBase64(originalBufferToString.call(this, "base64", start, end));
+  }
+  if (utf8TextDecoder != null && start === undefined && end === undefined &&
+      (encoding === undefined || encoding.toLowerCase() === "utf8" || encoding.toLowerCase() === "utf-8")) {
+    const nativeDecoded = globalThis.cottontail?.icuDecode?.("UTF-8", this, false);
+    if (nativeDecoded !== null && nativeDecoded !== undefined) return nativeDecoded;
+    return utf8TextDecoder.decode(this);
   }
   return originalBufferToString.call(this, encoding, start, end);
 };
@@ -584,6 +638,7 @@ Buffer.prototype.fill = function fill(value, start = 0, end = this.length, encod
   if (Buffer.isBuffer(value) && value.length === 0) {
     throw nodeError(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'value' is invalid. Received an empty Buffer");
   }
+  if (tryFastBufferFill(this, value, start, end, encoding)) return this;
   return originalBufferFill.call(this, value, start, end, encoding);
 };
 

@@ -2380,6 +2380,10 @@
       "status": "enabled",
       "reason": "Bare ESM Undici imports and request behavior pass all 9 copied upstream cases (19 assertions) against Cottontail's shared built-in dispatcher."
     },
+    "test/js/first_party/utf-8-validate/utf-8-validate.test.ts": {
+      "status": "enabled",
+      "reason": "Bun's built-in utf-8-validate package replacement passes the copied valid and invalid UTF-8 cases through Buffer.isUtf8 (1 bun:test case, 2 assertions)."
+    },
     "test/js/junit-reporter/junit.test.js": {
       "status": "enabled",
       "reason": "Bun's nested JUnit XML reporter passes source-line, retry, skip/todo, assertion, duration, ordering, escaping, and CI-property coverage (4 bun:test cases, 97 assertions)."
@@ -3516,6 +3520,14 @@
       "status": "enabled",
       "reason": "Structured cloning and bun:jsc serialization pass primitive, collection, Blob/File, BlockList, transfer, and cross-process coverage."
     },
+    "test/js/web/workers/worker_blob.test.ts": {
+      "status": "enabled",
+      "reason": "Blob-backed JavaScript and TypeScript Workers, missing Blob errors, URL revocation timing, and post-load revocation behavior pass upstream coverage (5 tests, 7 assertions)."
+    },
+    "test/js/web/workers/worker.test.ts": {
+      "status": "enabled",
+      "reason": "Web Worker and node:worker_threads preload, environment, argv, messaging, liveness, process events, exit codes, termination, and eval behavior pass all 23 active cases; one forceful-interruption case remains an upstream todo."
+    },
     "test/js/web/abort/abort.test.ts": {
       "status": "enabled",
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (5 bun:test cases, 12 assertions)."
@@ -3548,6 +3560,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 13 assertions)."
     },
+    "test/js/web/fetch/blob-oom.test.ts": {
+      "status": "enabled",
+      "reason": "Lazy Blob backing stores and operation-specific synthetic allocation limits pass all copied Blob, Request, Response, and Bun.file OOM cases (16 bun:test cases, 16 assertions)."
+    },
     "test/js/web/fetch/blob.test.ts": {
       "status": "enabled",
       "reason": "Blob construction, slicing, object URLs, TypeScript imports, source-enriched stacks, and name semantics pass the copied upstream file (14 bun:test cases, 112 assertions)."
@@ -3573,8 +3589,11 @@
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (0 bun:test cases, 0 assertions)."
     },
     "test/js/web/fetch/body.test.ts": {
-      "status": "expected-failure",
-      "reason": "339/346 cases pass, including the complete SharedArrayBuffer matrix after normalizing vanilla JSC instanceof semantics. The remaining fetch-stream cases require external example.com access, which has no DNS in the current environment; one resulting unhandled rejection contaminates the adjacent Bun.spawn stream case."
+      "status": "enabled",
+      "reason": "All 340 runnable local body cases pass, including SharedArrayBuffer, FormData, ReadableStream, Bun.spawn output, cloning, and every body-consumption method. Four cases are skipped upstream; the two example.com fetch fixtures are filtered because this test environment has no external DNS.",
+      "args": [
+        "--test-name-pattern=^(?!.*fetch[(][)] stream).*$"
+      ]
     },
     "test/js/web/fetch/chunked-trailing.test.js": {
       "status": "enabled",
@@ -3620,6 +3639,12 @@
       "status": "enabled",
       "reason": "Fetch keepalive completes against the copied upstream server fixture (1 bun:test case, 3 assertions)."
     },
+    "test/js/web/fetch/fetch-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Fetch response ownership, compressed and 36 MB response disposal, TLS client contexts, seven request-body types, abort loops, and readable-stream consumption pass the copied leak coverage with every child workload completing normally.",
+      "args": ["--max-concurrency=1", "--timeout=120000"],
+      "timeoutMs": 300000
+    },
     "test/js/web/fetch/fetch-preconnect.test.ts": {
       "status": "enabled",
       "reason": "fetch.preconnect pooling, closed-socket recovery, validation, and --fetch-preconnect startup behavior pass the copied suite (12 bun:test cases, 16 assertions)."
@@ -3633,8 +3658,8 @@
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (2 bun:test cases, 2 assertions)."
     },
     "test/js/web/fetch/fetch-tls-abortsignal-timeout.test.ts": {
-      "status": "expected-failure",
-      "reason": "2/6 concurrent TLS timeout cases pass. AbortSignal produces the correct TimeoutError, but repeated custom-CA setup delays the shorter deadlines beyond the upstream +/-50ms timing window."
+      "status": "enabled",
+      "reason": "All 6 concurrent TLS AbortSignal.timeout cases pass after TLS server shutdown was made to wake its native accept thread immediately."
     },
     "test/js/web/fetch/fetch-tcp-stress.test.ts": {
       "status": "enabled",
@@ -3658,12 +3683,22 @@
       "reason": "Passes with Bun.serve websocket/TLS support and the streaming fetch client (1 bun:test cases, 6 assertions)."
     },
     "test/js/web/fetch/fetch.tls.test.ts": {
-      "status": "expected-failure",
-      "reason": "10/16 concurrent cases pass after expired-certificate normalization and failed-handshake race handling. The remaining cases exceed per-case deadlines under concurrent TLS/process load; invalid NODE_EXTRA_CA_CERTS diagnostics also still need Node-compatible warning and error-code text."
+      "status": "enabled",
+      "reason": "Concurrent TLS fetch, verification overrides, timeout cancellation, and NODE_EXTRA_CA_CERTS behavior pass (16 bun:test cases, 45 assertions)."
     },
     "test/js/web/fetch/fetch.tls.wildcard.test.ts": {
       "status": "enabled",
       "reason": "TLS wildcard hostname verification passes valid single-label matches and rejects bare, multi-label, and deep-subdomain mismatches (7 bun:test cases, 14 assertions)."
+    },
+    "test/js/web/fetch/fetch.test.ts": {
+      "status": "enabled",
+      "reason": "Fetch, Request, Response, Headers, Blob, Bun.file, redirects, framing, duplex uploads, aborts, and response lifecycle ownership pass all 341 copied cases with 7,390 assertions. A 10-second test timeout covers cold native compilation of the two --smol lifecycle child fixtures.",
+      "args": ["--timeout=10000"]
+    },
+    "test/js/web/fetch/fetch.stream.test.ts": {
+      "status": "enabled",
+      "reason": "Streaming fetch, response body consumption, keep-alive reuse, compression, truncation, socket-close, and pending-chunk behavior pass (109 active cases, 373 assertions, 5 upstream todos).",
+      "args": ["--max-concurrency=8"]
     },
     "test/js/web/fetch/fetch_headers.test.js": {
       "status": "enabled",
@@ -3694,16 +3729,16 @@
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
     },
     "test/js/web/fetch/stream-fast-path.test.ts": {
-      "status": "expected-failure",
-      "reason": "6/18 cases pass. Blob body results are correct, but 12 cases require Bun.peek to report synchronously fulfilled promise state for non-empty Blob text, json, arrayBuffer, bytes, and formData fast paths."
+      "status": "enabled",
+      "reason": "Blob-backed readable stream conversions consume synchronously and return already-fulfilled promises while preserving bytes, text, ArrayBuffer, and Blob type behavior (18 tests, 32 assertions)."
     },
     "test/js/web/fetch/utf8-bom.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (21 bun:test cases, 23 assertions)."
     },
     "test/js/web/fetch/wasm-streaming.test.ts": {
-      "status": "expected-failure",
-      "reason": "The copied WebAssembly streaming file currently exceeds the 30-second focused-file timeout."
+      "status": "enabled",
+      "reason": "WebAssembly streaming response validation, body consumption, chunk handling, error propagation, compilation, and instantiation pass all 20 upstream tests."
     },
     "test/js/web/html/URLSearchParams.test.ts": {
       "status": "enabled",
@@ -3712,6 +3747,12 @@
     "test/js/web/request/request-method-getter.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (6 bun:test cases, 6 assertions)."
+    },
+    "test/js/web/request/request-clone-leak.test.ts": {
+      "status": "enabled",
+      "reason": "Request construction and cloning retain less than Bun's 30 MB ceiling across all 12 copied million-allocation stress cases.",
+      "args": ["--max-concurrency=1", "--timeout=120000"],
+      "timeoutMs": 300000
     },
     "test/js/web/request/request.test.ts": {
       "status": "enabled",
@@ -3796,6 +3837,10 @@
         "--timeout=120000"
       ],
       "timeoutMs": 120000
+    },
+    "test/js/workerd/html-rewriter.test.js": {
+      "status": "enabled",
+      "reason": "HTMLRewriter input validation, synchronous and asynchronous handlers, selector matching, element/text/comment mutation, attributes, streaming fetch bodies, and HTTP/TLS response rewriting pass all 41 active copied cases; 2 upstream todos remain unchanged (146 assertions)."
     },
     "test/napi/napi-value-ffi.test.ts": {
       "status": "enabled",

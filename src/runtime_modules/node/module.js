@@ -111,6 +111,10 @@ const runtimePackageReplacements = new Map([
     const namespace = require("../vendor/vercel-fetch.js");
     return namespace.default ?? namespace;
   })],
+  ["utf-8-validate", lazyBuiltin(() => {
+    const namespace = require("../bun/utf-8-validate.js");
+    return namespace.default ?? namespace;
+  })],
 ]);
 
 function hasRuntimePackageReplacement(name) {
@@ -2751,9 +2755,12 @@ export function createRequire(basePath, parentModule = null) {
     const requestText = String(request);
     if (requestText.startsWith("blob:")) {
       const blob = globalThis.__cottontailObjectURLRegistry?.get(requestText);
-      if (blob?._bytes instanceof Uint8Array) {
+      const bytes = blob?._bytes instanceof Uint8Array
+        ? blob._bytes
+        : typeof blob?._getBytes === "function" ? blob._getBytes() : null;
+      if (bytes instanceof Uint8Array) {
         try {
-          return executeDynamicImportSource(requestText, Buffer.from(blob._bytes).toString("utf8"), "module");
+          return executeDynamicImportSource(requestText, Buffer.from(bytes).toString("utf8"), "module");
         } catch (error) {
           const buildError = new BuildMessage(error?.message ?? String(error));
           buildError.cause = error;

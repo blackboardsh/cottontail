@@ -1057,48 +1057,17 @@ if (testCliModeEnabled()) {
   installUnhandledRejectionCapture();
 }
 
-function settlesBeforeNextTurn(promise) {
-  return new Promise((resolve) => {
-    let settled = false;
-    promiseThen(promise, () => {
-      if (settled) return;
-      settled = true;
-      resolve(true);
-    });
-    let remainingMicrotasks = 32;
-    const check = () => {
-      if (settled) return;
-      if (remainingMicrotasks-- > 0) runnerQueueMicrotask(check);
-      else {
-        settled = true;
-        resolve(false);
-      }
-    };
-    runnerQueueMicrotask(check);
-  });
-}
-
 async function runConcurrentRecords(records) {
+  const batchSize = Number.isFinite(maxConcurrency)
+    ? Math.max(1, maxConcurrency)
+    : Math.max(1, records.length);
   let cursor = 0;
   while (cursor < records.length && !bailReached()) {
-    const first = execute(records[cursor++]);
-    if (await settlesBeforeNextTurn(first)) continue;
-    if (maxConcurrency === 1) {
-      await first;
-      continue;
+    const batch = [];
+    while (cursor < records.length && batch.length < batchSize) {
+      batch.push(execute(records[cursor++]));
     }
-    const workers = [];
-    const worker = async () => {
-      while (cursor < records.length && !bailReached()) {
-        const record = records[cursor++];
-        await execute(record);
-      }
-    };
-    const workerCount = Number.isFinite(maxConcurrency)
-      ? Math.min(Math.max(0, maxConcurrency - 1), records.length - cursor)
-      : records.length - cursor;
-    for (let index = 0; index < workerCount; index += 1) workers.push(worker());
-    await runnerPromiseAll([promiseThen(first, worker), ...workers]);
+    await runnerPromiseAll(batch);
   }
 }
 

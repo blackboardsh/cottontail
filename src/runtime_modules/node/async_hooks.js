@@ -816,6 +816,7 @@ function patchGlobalAsyncSchedulers() {
     if (setName === "setImmediate") {
       const nativeClear = typeof global[clearName] === "function" ? global[clearName].bind(global) : undefined;
       const wrappedScheduler = (callback, ...args) => {
+        if (typeof callback !== "function") return nativeSet(callback, ...args);
         const snapshot = captureStorageSnapshot();
         const asyncId = ++nextAsyncId;
         const trigger = currentAsyncId;

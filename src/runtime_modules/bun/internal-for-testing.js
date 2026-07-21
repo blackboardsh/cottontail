@@ -976,7 +976,19 @@ export function structuredCloneAdvanced(
     : cloned;
 }
 
-export const getEventLoopStats = unimplementedInternal("getEventLoopStats");
+export function getEventLoopStats() {
+  const taskState = globalThis[Symbol.for("cottontail.eventLoopTaskState")];
+  const handles = globalThis.__cottontailEventLoopHandleStats?.() ?? {};
+  const hasActiveHandles = globalThis.__cottontailHasActiveHandles?.() === true;
+  const activeTasks = Math.max(0, Number(taskState?.activeTasks) || 0);
+  const concurrentRef = Math.max(0, Number(taskState?.concurrentRef) || Number(handles.workers) || 0);
+  const knownPolls = (Number(handles.timers) || 0) + (Number(handles.spawns) || 0) + (handles.web ? 1 : 0);
+  return {
+    activeTasks,
+    concurrentRef,
+    numPolls: Math.max(knownPolls, hasActiveHandles ? 1 : 0),
+  };
+}
 export const install_test_helpers = {
   parseLockfile(cwd) {
     return JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));

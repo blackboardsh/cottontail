@@ -701,7 +701,8 @@ class SocketImpl extends EventEmitter {
       return this;
     }
     const fdWatchListeners = installFdWatchDispatcher();
-    const watch = cottontail.fdWatchStart(this.fd, 1024 * 1024, this._refed, this._paused);
+    const readSize = Math.max(1, Math.min(this.readableHighWaterMark, 1024 * 1024));
+    const watch = cottontail.fdWatchStart(this.fd, readSize, this._refed, this._paused);
     this._watchId = Number(watch?.id || 0);
     if (!this._watchId) return this;
     const watchId = this._watchId;
@@ -784,7 +785,7 @@ class SocketImpl extends EventEmitter {
           const reason = this._abortReason;
           this.destroy(reason != null && typeof reason === "object" ? reason : new Error(String(reason)));
         }
-      }, 0);
+      }, 10);
       return;
     }
     const onAbort = () => abort();
@@ -1013,7 +1014,7 @@ class SocketImpl extends EventEmitter {
           this.emit("connectionAttemptTimeout", address, port, family);
           startNext();
         }, attemptTimeout);
-        timeoutTimer.unref?.();
+        if (!this._refed) timeoutTimer.unref?.();
         this._connectAttemptTimers.add(timeoutTimer);
       }
     };
@@ -1201,6 +1202,14 @@ class SocketImpl extends EventEmitter {
   }
 
   destroy(error) {
+    return this._destroySocket(error, false);
+  }
+
+  _destroyImmediately(error) {
+    return this._destroySocket(error, true);
+  }
+
+  _destroySocket(error, immediate) {
     if (this._tlsOwner) {
       const tlsOwner = this._tlsOwner;
       this._tlsOwner = null;
@@ -1251,7 +1260,7 @@ class SocketImpl extends EventEmitter {
         this._closeEmitted = true;
         this.emit("close", true);
       }
-    } else if (fd != null && this._watchId) {
+    } else if (!immediate && fd != null && this._watchId) {
       // Keep the read watcher alive for one poll turn after SHUT_WR. This lets
       // the kernel consume data that raced with destroy(), avoiding an
       // artificial RST for an otherwise graceful Node socket close.
@@ -1262,7 +1271,7 @@ class SocketImpl extends EventEmitter {
         const finalize = this._destroyFinalize;
         this._destroyFinalize = null;
         finalize?.();
-      }, 10);
+      }, 0);
       if (!this._refed) this._destroyCloseTimer.unref?.();
     } else {
       emitClose();

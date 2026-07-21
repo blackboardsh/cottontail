@@ -25,6 +25,7 @@ class BoxedScalar {
 function viewBytes(input) {
   if (input == null) return null;
   if (input._bytes instanceof Uint8Array) return input._bytes;
+  if (typeof input._getBytes === "function") return input._getBytes();
   if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer === "function" && input instanceof SharedArrayBuffer)) {
     return new Uint8Array(input);
   }

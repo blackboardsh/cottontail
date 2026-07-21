@@ -28,6 +28,39 @@ Object.defineProperty(Stream, "promises", { value: promises, enumerable: false, 
 export const _isUint8Array = Stream._isUint8Array;
 export const _uint8ArrayToBuffer = Stream._uint8ArrayToBuffer;
 
+const readableFrom = Readable.from;
+Object.defineProperty(Readable, "from", {
+  value: function from(...args) {
+    const readable = readableFrom.apply(this, args);
+    const destroy = readable?._destroy;
+    if (typeof destroy === "function" && Object.prototype.hasOwnProperty.call(readable, "_destroy")) {
+      readable._destroy = function destroyFromIterable(error, callback) {
+        if (typeof callback !== "function") {
+          throw new TypeError('The "callback" argument must be of type function.');
+        }
+        return destroy.call(this, error, callback);
+      };
+    }
+    return readable;
+  },
+  writable: true,
+  configurable: true,
+});
+
+// readable-stream queues its end callback before touching an invalid pipe
+// destination. Node rejects first, without leaving a delayed dest.end().
+const readablePipe = Readable.prototype.pipe;
+Object.defineProperty(Readable.prototype, "pipe", {
+  value(destination, options) {
+    if (destination == null || typeof destination.on !== "function") {
+      throw new TypeError("Cannot read properties of undefined (reading 'on')");
+    }
+    return readablePipe.call(this, destination, options);
+  },
+  writable: true,
+  configurable: true,
+});
+
 export function _isArrayBufferView(value) {
   return ArrayBuffer.isView(value);
 }

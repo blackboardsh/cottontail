@@ -1,7 +1,7 @@
 import { EventEmitter } from "./events.js";
 import { Readable, Writable } from "./stream.js";
 import { Buffer } from "./buffer.js";
-import { connect as netConnect, createServer as createNetServer } from "./net.js";
+import { connect as netConnect, createServer as createNetServer, isIP } from "./net.js";
 import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
 import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
@@ -11,6 +11,22 @@ const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
 const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
 const freeSocketErrorSymbol = Symbol("cottontail.http.freeSocketError");
+const clientSocketCleanupSymbol = Symbol("cottontail.http.clientSocketCleanup");
+const eventLoopTaskStateSymbol = Symbol.for("cottontail.eventLoopTaskState");
+const httpResponseTaskRefSymbol = Symbol("cottontail.http.responseTaskRef");
+const eventLoopTaskState = globalThis[eventLoopTaskStateSymbol] ??= { activeTasks: 0, concurrentRef: 0 };
+
+function refHttpResponseTask(response) {
+  if (response?.[httpResponseTaskRefSymbol]) return;
+  Object.defineProperty(response, httpResponseTaskRefSymbol, { value: true, writable: true });
+  eventLoopTaskState.activeTasks += 1;
+}
+
+function unrefHttpResponseTask(response) {
+  if (!response?.[httpResponseTaskRefSymbol]) return;
+  response[httpResponseTaskRefSymbol] = false;
+  eventLoopTaskState.activeTasks = Math.max(0, eventLoopTaskState.activeTasks - 1);
+}
 
 function createWebHeaders(init = undefined) {
   const HeadersCtor = globalThis.Headers;
@@ -990,7 +1006,7 @@ export function parseWebSocketFrames(buffer) {
     if (mask) {
       for (let index = 0; index < payload.byteLength; index += 1) payload[index] ^= mask[index % 4];
     }
-    frames.push({ fin, rsv1, rsv2, rsv3, opcode, payload });
+    frames.push({ fin, rsv1, rsv2, rsv3, opcode, masked, payload });
   }
   return { frames, remaining: buffer.subarray(offset) };
 }
@@ -1121,7 +1137,6 @@ export class IncomingMessage extends Readable {
   _pushIncomingChunk(chunk) {
     if (this.complete || this.aborted || chunk == null || chunk.byteLength === 0) return true;
     const body = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    this._incomingBodyChunks.push(body);
     return this._dumped ? true : this.push(body);
   }
 
@@ -1131,9 +1146,7 @@ export class IncomingMessage extends Readable {
     this.trailers = trailers;
     this.rawTrailers = rawTrailers;
     this._trailersDistinct = null;
-    this._incomingBody = this._incomingBodyChunks.length === 0
-      ? kEmptyBuffer
-      : this._incomingBodyChunks.length === 1 ? this._incomingBodyChunks[0] : Buffer.concat(this._incomingBodyChunks);
+    this._incomingBody = kEmptyBuffer;
     this._incomingBodyChunks = [];
     this.push(null);
   }
@@ -1883,14 +1896,20 @@ class AgentImpl extends EventEmitter {
     this._watchedSockets = new WeakSet();
   }
 
-  createConnection(options = {}, callback = undefined) {
+  createConnection(options, callback = undefined) {
+    if (arguments.length === 0 || options == null) {
+      throw nodeError(TypeError, "ERR_MISSING_ARGS", 'The "options" or "port" or "path" argument must be specified');
+    }
     const connectOptions = { ...this.options, ...options };
     if (connectOptions.socketPath != null) connectOptions.path = connectOptions.socketPath;
     else delete connectOptions.path;
     return netConnect(connectOptions, callback);
   }
 
-  createSocket(request, options = {}, callback = undefined) {
+  createSocket(request, options, callback = undefined) {
+    if (request == null || options == null) {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" and "options" arguments are required.');
+    }
     const connectOptions = { ...options, ...this.options };
     if (connectOptions.socketPath != null) connectOptions.path = connectOptions.socketPath;
     else delete connectOptions.path;
@@ -1970,6 +1989,9 @@ class AgentImpl extends EventEmitter {
   }
 
   addRequest(request, options = {}) {
+    if (request == null || typeof request.emit !== "function" || typeof request.onSocket !== "function") {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "request" argument must be an instance of ClientRequest.');
+    }
     options = { ...options, ...this.options };
     const name = options._agentName ?? this.getName(options);
     options._agentName = name;
@@ -2044,6 +2066,10 @@ class AgentImpl extends EventEmitter {
   _releaseSocket(socket, options = {}) {
     const name = options._agentName ?? this.getName(options);
     this.removeSocket(socket, { ...options, _agentName: name });
+    // Response backpressure may leave the transport watcher paused after the
+    // body has completed. A pooled socket must remain readable for reuse and
+    // for a peer FIN while it is idle.
+    socket.resume?.();
     markSocketAsyncFree(socket);
     const queued = this._takeQueuedRequest(name);
     if (queued) {
@@ -2142,6 +2168,7 @@ export class ClientRequest extends OutgoingMessage {
     this._options = requestOptions;
     this._socket = null;
     this.socket = null;
+    this[clientSocketCleanupSymbol] = null;
     this._agentOptions = null;
     this.agent = agent;
     this.reusedSocket = false;
@@ -2318,6 +2345,12 @@ export class ClientRequest extends OutgoingMessage {
     if (this._continueTimer != null) clearTimeout(this._continueTimer);
     this._continueTimer = null;
     this.res?._dump?.();
+    if (this._socket) {
+      const absorbLateSocketError = () => {};
+      this._socket.on?.("error", absorbLateSocketError);
+      this._socket.once?.("close", () => this._socket?.off?.("error", absorbLateSocketError));
+    }
+    this[clientSocketCleanupSymbol]?.();
     if (this._socket) this._socket.destroy();
     if (error) this.emit("error", error);
     this._emitClose();
@@ -2495,7 +2528,9 @@ export class ClientRequest extends OutgoingMessage {
       socket.off?.("end", onEnd);
       socket.off?.("error", onError);
       socket.off?.("drain", onDrain);
+      if (this[clientSocketCleanupSymbol] === cleanup) this[clientSocketCleanupSymbol] = null;
     };
+    this[clientSocketCleanupSymbol] = cleanup;
     const releaseOrClose = (parsed) => {
       if (completed) return;
       const lowerConnection = String(parsed?.message?.headers?.connection ?? "").toLowerCase();
@@ -2943,9 +2978,11 @@ export function _attachHttpConnection(server, socket) {
     response._keepAlive = keepAlive && !(server.maxRequestsPerSocket > 0 && response._requestCount >= server.maxRequestsPerSocket);
     response.shouldKeepAlive = response._keepAlive;
     response.assignSocket(socket);
+    refHttpResponseTask(response);
     active = response;
     response._onFinishFlushed = () => {
       if (active !== response) return;
+      unrefHttpResponseTask(response);
       active = null;
       response.detachSocket(socket);
       queueMicrotask(() => {
@@ -3190,6 +3227,10 @@ export function _attachHttpConnection(server, socket) {
     }
   });
   socket.on("close", () => {
+    if (active) {
+      unrefHttpResponseTask(active);
+      active = null;
+    }
     req?.message?._abortIncoming?.();
     clearParserTimers();
     clearKeepAliveTimer();
@@ -3412,6 +3453,12 @@ function websocketNoProxyMatches(hostname, port) {
   return false;
 }
 
+function websocketTlsServername(hostname) {
+  const value = String(hostname);
+  const address = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+  return isIP(address) ? undefined : value;
+}
+
 // Wraps an established byte stream (e.g. an HTTP CONNECT tunnel) in a TLS
 // client session using the shared memory-BIO Duplex transport.
 function websocketTlsOverStream(stream, options, callback, onError) {
@@ -3555,7 +3602,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
           ? tlsConnect({
               host,
               port,
-              servername: host,
+              servername: websocketTlsServername(host),
               rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
               ca: tlsOptions.ca,
             })
@@ -3597,7 +3644,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
         ? tlsConnect({
             host: proxyHost,
             port: proxyPort,
-            servername: proxyHost,
+            servername: websocketTlsServername(proxyHost),
             rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
             ca: tlsOptions.ca,
           })
@@ -3639,7 +3686,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       websocketTlsOverStream(
         socket,
         {
-          servername: host,
+          servername: websocketTlsServername(host),
           rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
           ca: tlsOptions.ca,
         },
@@ -3894,6 +3941,17 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
           this._flushWriteFrames();
           this._socket?.write?.(websocketFrame(0xA, frame.payload));
         }
+        const data = this.binaryType === "arraybuffer"
+          ? frame.payload.buffer.slice(frame.payload.byteOffset, frame.payload.byteOffset + frame.payload.byteLength)
+          : frame.payload;
+        this.dispatchEvent(new MessageEvent("ping", { data, origin: this.url, source: this }));
+        return;
+      }
+      if (frame.opcode === 0xA) {
+        const data = this.binaryType === "arraybuffer"
+          ? frame.payload.buffer.slice(frame.payload.byteOffset, frame.payload.byteOffset + frame.payload.byteLength)
+          : frame.payload;
+        this.dispatchEvent(new MessageEvent("pong", { data, origin: this.url, source: this }));
         return;
       }
       return;
@@ -3980,6 +4038,8 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
   _close(code = 1000, reason = "", wasClean = true) {
     if (this.readyState === WebSocket.CLOSED) return;
     this.readyState = WebSocket.CLOSED;
+    if (this._closeTimer != null) clearTimeout(this._closeTimer);
+    this._closeTimer = null;
     try { this._socket?.destroy?.(); } catch {}
     this.dispatchEvent(new CloseEvent("close", { code, reason, wasClean }));
   }
@@ -4033,6 +4093,26 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     return this._queueWriteFrame(frame);
   }
 
+  ping(data = undefined) {
+    if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
+    let payload = data == null ? Buffer.alloc(0) : Buffer.from(bytesFromBody(data));
+    if (payload.byteLength > 125) payload = payload.subarray(0, 125);
+    return this._queueWriteFrame(websocketFrame(0x9, payload));
+  }
+
+  pong(data = undefined) {
+    if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
+    let payload = data == null ? Buffer.alloc(0) : Buffer.from(bytesFromBody(data));
+    if (payload.byteLength > 125) payload = payload.subarray(0, 125);
+    return this._queueWriteFrame(websocketFrame(0xA, payload));
+  }
+
+  terminate() {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this._aborted = true;
+    this._close(1006, "", false);
+  }
+
   close(code = 1000, reason = "") {
     if (this.readyState === WebSocket.CLOSED || this.readyState === WebSocket.CLOSING) return;
     if (this.readyState === WebSocket.CONNECTING) {
@@ -4048,7 +4128,8 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     payload.set(Buffer.from(String(reason)), 2);
     this._flushWriteFrames();
     this._socket?.write?.(websocketFrame(0x8, payload));
-    this._socket?.end?.();
+    this._closeTimer = setTimeout(() => this._close(1006, "", false), 30_000);
+    this._closeTimer?.unref?.();
   }
 };
 
