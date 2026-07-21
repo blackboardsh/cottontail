@@ -1560,7 +1560,9 @@ const Manager = struct {
                 manager.options.positionals.len
             else
                 manager.installed_count;
-            if (manager.options.command == .remove) {
+            if (manager.options.command == .install and manager.options.dry_run) {
+                try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
+            } else if (manager.options.command == .remove) {
                 if (manager.direct_install_reports.items.len > 0) {
                     const count = manager.direct_install_reports.items.len;
                     try manager.stdout.print("\n{d} package{s} installed [{d:.2}ms]\nRemoved: {d}\n", .{
@@ -3035,7 +3037,8 @@ const Manager = struct {
                 std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
                 !manager.explicit_adds.contains(alias);
             if (should_report and
-                (manager.installed_count > installed_before or
+                (manager.options.dry_run or
+                    manager.installed_count > installed_before or
                     manager.options.command == .remove or
                     (workspace_display != null and manager.lock_graph == null)) and
                 !manager.options.silent)
@@ -3067,10 +3070,14 @@ const Manager = struct {
         }.lessThan);
         if (manager.rootLifecycleScriptsWillRun()) try manager.stdout.writeByte('\n');
         for (manager.direct_install_reports.items) |report| {
-            try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
-            if (report.latest_version) |latest| {
-                if (!std.mem.eql(u8, latest, report.display)) {
-                    try manager.stdout.print(" (v{s} available)", .{latest});
+            if (manager.options.dry_run) {
+                try manager.stdout.print(" {s}@{s}", .{ report.alias, report.display });
+            } else {
+                try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
+                if (report.latest_version) |latest| {
+                    if (!std.mem.eql(u8, latest, report.display)) {
+                        try manager.stdout.print(" (v{s} available)", .{latest});
+                    }
                 }
             }
             try manager.stdout.writeByte('\n');
@@ -3314,6 +3321,8 @@ const Manager = struct {
             manager.options.os,
         );
         if (!platform_matches and (optional or manager.options.cpu_overridden or manager.options.os_overridden)) {
+            const previous_resolution_only = manager.setResolutionOnly(true);
+            defer manager.restoreResolutionOnly(previous_resolution_only);
             if (isTopLevelDestination(manager.root_dir, destination, alias)) {
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
             }
@@ -3338,9 +3347,6 @@ const Manager = struct {
             // package is not materialized on the current host. Its required
             // dependencies must still be resolvable when the same lockfile is
             // consumed on a matching platform.
-            const previous_lockfile_only = manager.options.lockfile_only;
-            manager.options.lockfile_only = true;
-            defer manager.options.lockfile_only = previous_lockfile_only;
             try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
             if (!manager.options.omit_optional) {
                 try manager.installDependencyObject(@constCast(resolved.metadata), "optionalDependencies", destination, false, true);
@@ -3534,6 +3540,8 @@ const Manager = struct {
             !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os) and
             (optional or manager.options.cpu_overridden or manager.options.os_overridden);
         if (skip_for_platform) {
+            const previous_resolution_only = manager.setResolutionOnly(true);
+            defer manager.restoreResolutionOnly(previous_resolution_only);
             if (isTopLevelDestination(manager.root_dir, selection.destination, alias)) {
                 try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package.version);
             }
