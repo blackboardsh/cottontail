@@ -1714,7 +1714,8 @@ pub const LinkerContext = struct {
 
         // HTML files can reference non-JS/CSS assets (favicons, images, etc.)
         // via .url kind import records. Follow all import records for HTML files
-        // so these assets are marked live and included in the manifest.
+        // so these assets are marked live and included in the manifest. Continue
+        // below so the normal entry-point part is also marked live.
         if (c.parse_graph.input_files.items(.loader)[source_index] == .html) {
             for (import_records[source_index].slice()) |*record| {
                 if (record.source_index.isValid()) {
@@ -1728,7 +1729,6 @@ pub const LinkerContext = struct {
                     );
                 }
             }
-            return;
         }
 
         for (parts[source_index].slice(), 0..) |part, part_index| {

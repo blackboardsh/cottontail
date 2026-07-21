@@ -5091,6 +5091,7 @@ fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, extension, ".toml")) return "toml";
     if (std.mem.eql(u8, extension, ".yaml") or std.mem.eql(u8, extension, ".yml")) return "yaml";
     if (std.mem.eql(u8, extension, ".txt")) return "text";
+    if (std.mem.eql(u8, extension, ".html") or std.mem.eql(u8, extension, ".htm")) return "html";
     if (std.mem.eql(u8, extension, ".cjs")) return "js";
     if (std.mem.eql(u8, extension, ".js") or
         std.mem.eql(u8, extension, ".jsx") or
@@ -5219,7 +5220,7 @@ fn appendDynamicTargetFactory(
         \\    const __ctRaw = {s};
         \\    if (__ctType === "text") return {{ default: __ctRaw }};
         \\    if (__ctType === "file" || __ctType === "css") return {{ default: __ctPath{d} }};
-        \\    if (__ctType === "html") return {{ default: {{ index: __ctPath{d} }} }};
+        \\    if (__ctType === "html") return {{ default: {{ index: __ctPath{d}, files: null }} }};
         \\    if (__ctType === "json") return __ctLoaderNamespace(JSON.parse(__ctRaw));
         \\    if (__ctType === "jsonc") return __ctLoaderNamespace(__ctParseJSONC(__ctRaw));
         \\    if (__ctType === "json5") return __ctLoaderNamespace(__ctParseJSON5(__ctRaw));

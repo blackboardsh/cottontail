@@ -248,7 +248,8 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
     installNativeProcessIpcReader = () => {
       let ipcBuffer = "";
       const pollIpc = () => {
-        if (!g.process.connected) return;
+        if (!g.process.connected) return 0;
+        let messageCount = 0;
         try {
           for (;;) {
             const event = cottontail.ipcRecv(nativeIpcFd, 64 * 1024);
@@ -264,14 +265,17 @@ if (Number.isInteger(nativeIpcFd) && nativeIpcFd > 2 &&
               const line = ipcBuffer.slice(0, newlineIndex).replace(/\r$/, "");
               ipcBuffer = ipcBuffer.slice(newlineIndex + 1);
               if (!line.startsWith(ipcPrefix)) continue;
+              messageCount += 1;
               g.process.emit("message", JSON.parse(line.slice(ipcPrefix.length)));
             }
           }
         } catch (error) {
           g.process.emit("error", error);
         }
+        return messageCount;
       };
-      const ipcTimer = g.setInterval(pollIpc, 4);
+      g.__cottontailPollProcessIpc = pollIpc;
+      const ipcTimer = g.setInterval(pollIpc, 1);
       ipcTimer.unref?.();
     };
   }

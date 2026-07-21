@@ -423,6 +423,136 @@ fn cliBunEntrypointExists(io: std.Io, allocator: std.mem.Allocator, path: []cons
     return false;
 }
 
+fn isHtmlEntrypoint(path: []const u8) bool {
+    const extension = std.fs.path.extension(path);
+    return std.ascii.eqlIgnoreCase(extension, ".html") or std.ascii.eqlIgnoreCase(extension, ".htm");
+}
+
+fn wildcardPathMatch(pattern: []const u8, path: []const u8) bool {
+    var pattern_index: usize = 0;
+    var path_index: usize = 0;
+    var star_index: ?usize = null;
+    var star_path_index: usize = 0;
+    while (path_index < path.len) {
+        if (pattern_index < pattern.len and (pattern[pattern_index] == '?' or pattern[pattern_index] == path[path_index])) {
+            pattern_index += 1;
+            path_index += 1;
+        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star_index = pattern_index;
+            pattern_index += 1;
+            star_path_index = path_index;
+        } else if (star_index) |star| {
+            pattern_index = star + 1;
+            star_path_index += 1;
+            path_index = star_path_index;
+        } else {
+            return false;
+        }
+    }
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
+}
+
+fn appendHtmlEntrypointPattern(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    requested: []const u8,
+    entries: *std.ArrayList([:0]const u8),
+) !void {
+    if (std.mem.indexOfAny(u8, requested, "*?") == null) {
+        if (isHtmlEntrypoint(requested) and cliPathExists(init.io, requested)) {
+            try entries.append(allocator, try allocator.dupeZ(u8, requested));
+        }
+        return;
+    }
+
+    const directory_path = std.fs.path.dirname(requested) orelse ".";
+    const name_pattern = std.fs.path.basename(requested);
+    var directory = if (std.fs.path.isAbsolute(directory_path))
+        std.Io.Dir.openDirAbsolute(init.io, directory_path, .{ .iterate = true }) catch return
+    else
+        std.Io.Dir.cwd().openDir(init.io, directory_path, .{ .iterate = true }) catch return;
+    defer directory.close(init.io);
+    var iterator = directory.iterate();
+    var matches: std.ArrayList([:0]const u8) = .empty;
+    while (try iterator.next(init.io)) |entry| {
+        if (entry.kind != .file or !wildcardPathMatch(name_pattern, entry.name) or !isHtmlEntrypoint(entry.name)) continue;
+        const path = if (std.mem.eql(u8, directory_path, "."))
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fs.path.join(allocator, &.{ directory_path, entry.name });
+        try matches.append(allocator, try allocator.dupeZ(u8, path));
+    }
+    std.mem.sort([:0]const u8, matches.items, {}, struct {
+        fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+    try entries.appendSlice(allocator, matches.items);
+}
+
+fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
+    if (invocation.mode != .script or
+        (!isHtmlEntrypoint(invocation.payload) and std.mem.indexOfAny(u8, invocation.payload, "*?") == null)) return null;
+
+    const allocator = init.arena.allocator();
+    var entries: std.ArrayList([:0]const u8) = .empty;
+    try appendHtmlEntrypointPattern(init, allocator, invocation.payload, &entries);
+    for (invocation.args) |arg| {
+        if (std.mem.startsWith(u8, arg, "-")) continue;
+        if (!isHtmlEntrypoint(arg) and std.mem.indexOfAny(u8, arg, "*?") == null) continue;
+        try appendHtmlEntrypointPattern(init, allocator, arg, &entries);
+    }
+    if (entries.items.len == 0) return null;
+
+    var port: []const u8 = "3000";
+    var index: usize = 0;
+    while (index < invocation.args.len) : (index += 1) {
+        const arg = invocation.args[index];
+        if (std.mem.startsWith(u8, arg, "--port=")) {
+            const value = arg["--port=".len..];
+            if (std.fmt.parseUnsigned(u16, value, 10)) |_| port = value else |_| {}
+        } else if (std.mem.eql(u8, arg, "--port") and index + 1 < invocation.args.len) {
+            const value = invocation.args[index + 1];
+            if (std.fmt.parseUnsigned(u16, value, 10)) |_| port = value else |_| {}
+            index += 1;
+        }
+    }
+
+    var source: std.ArrayList(u8) = .empty;
+    try source.appendSlice(allocator,
+        \\const server = Bun.serve({
+        \\  development: process.env.NODE_ENV !== "production",
+        \\  port:
+    );
+    try source.appendSlice(allocator, port);
+    try source.appendSlice(allocator, ",\n  routes: {\n");
+    for (entries.items) |entry| {
+        const basename = std.fs.path.basename(entry);
+        const extension = std.fs.path.extension(basename);
+        const stem = basename[0 .. basename.len - extension.len];
+        const route = if (std.ascii.eqlIgnoreCase(stem, "index"))
+            "/"
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{stem});
+        const route_json = try std.json.Stringify.valueAlloc(allocator, route, .{});
+        const entry_json = try std.json.Stringify.valueAlloc(allocator, entry, .{});
+        try source.appendSlice(allocator, "    ");
+        try source.appendSlice(allocator, route_json);
+        try source.appendSlice(allocator, ": ");
+        try source.appendSlice(allocator, entry_json);
+        try source.appendSlice(allocator, ",\n");
+    }
+    try source.appendSlice(allocator,
+        \\  },
+        \\});
+        \\console.log(`Started development server: ${server.url}`);
+        \\
+    );
+    const source_z = try allocator.dupeZ(u8, source.items);
+    return try script_runner.runEval(init, source_z, &.{}, invocation.exec_args, false);
+}
+
 const PackageScripts = struct {
     dir: []const u8,
     pre: ?[]const u8,
@@ -2512,6 +2642,11 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(node_exit);
         }
+        return;
+    }
+
+    if (try runHtmlEntrypoints(init, invocation)) |html_exit| {
+        if (html_exit != 0) std.process.exit(html_exit);
         return;
     }
 

@@ -395,6 +395,10 @@ pub noinline fn computeChunks(
     const kinds = this.graph.files.items(.entry_point_kind);
     const output_paths = this.graph.entry_points.items(.output_path);
     const bv2: *bundler.BundleV2 = @fieldParentPtr("linker", this);
+    const entry_naming = bv2.transpiler.options.entry_naming;
+    const uses_default_entry_naming = entry_naming.len == 0 or
+        strings.eqlComptime(entry_naming, "[dir]/[name].[ext]") or
+        strings.eqlComptime(entry_naming, "./[dir]/[name].[ext]");
     for (chunks, 0..) |*chunk, chunk_id| {
         // Assign a unique key to each chunk. This key encodes the index directly so
         // we can easily recover it later without needing to look it up in a map. The
@@ -404,10 +408,21 @@ pub noinline fn computeChunks(
             this.unique_key_prefix = chunk.unique_key[0..std.fmt.count("{f}", .{bun.fmt.hexIntLower(unique_key)})];
 
         if (chunk.entry_point.is_entry_point and
-            (chunk.content == .html or (kinds[chunk.entry_point.source_index] == .user_specified and !chunk.flags.has_html_chunk)))
+            (chunk.content == .html or
+                (kinds[chunk.entry_point.source_index] == .user_specified and
+                    (!chunk.flags.has_html_chunk or has_server_html_imports))))
         {
-            // Use fileWithTarget template if there are HTML imports and user hasn't manually set naming
-            if (has_server_html_imports and bv2.transpiler.options.entry_naming.len == 0) {
+            if (has_server_html_imports and
+                chunk.flags.is_browser_chunk_from_server_build and
+                uses_default_entry_naming)
+            {
+                chunk.template = PathTemplate.file;
+                chunk.template.data = if (chunk.content == .html)
+                    "./[name].[ext]"
+                else
+                    "./[name]-[hash].[ext]";
+            } else if (has_server_html_imports and entry_naming.len == 0) {
+                // Preserve Bun's target-aware layout for callers that leave naming entirely unset.
                 chunk.template = PathTemplate.fileWithTarget;
             } else {
                 chunk.template = PathTemplate.file;
@@ -483,6 +498,7 @@ const std = @import("std");
 const bun = @import("bun");
 const BabyList = bun.BabyList;
 const SourceMap = bun.SourceMap;
+const strings = bun.strings;
 const options = bun.options;
 const AutoBitSet = bun.bit_set.AutoBitSet;
 
