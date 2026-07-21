@@ -2,6 +2,7 @@
 // userland extraction of the Node.js core streams implementation).
 // See ./stream/readable-stream.js (generated bundle; MIT licensed).
 import Stream from "./stream/readable-stream.js";
+import { _wrapAsyncCallback } from "./async_hooks.js";
 
 export const Readable = Stream.Readable;
 export const Writable = Stream.Writable;
@@ -11,7 +12,23 @@ export const PassThrough = Stream.PassThrough;
 export const addAbortSignal = Stream.addAbortSignal;
 export const compose = Stream.compose;
 export const destroy = Stream.destroy;
-export const finished = Stream.finished;
+const streamFinished = Stream.finished;
+export function finished(stream, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+
+  const wrappedCallback = _wrapAsyncCallback(callback);
+  return options === undefined
+    ? streamFinished(stream, wrappedCallback)
+    : streamFinished(stream, options, wrappedCallback);
+}
+
+for (const key of Object.getOwnPropertySymbols(streamFinished)) {
+  Object.defineProperty(finished, key, Object.getOwnPropertyDescriptor(streamFinished, key));
+}
+Stream.finished = finished;
 export const getDefaultHighWaterMark = Stream.getDefaultHighWaterMark;
 export const setDefaultHighWaterMark = Stream.setDefaultHighWaterMark;
 export const isDestroyed = Stream.isDestroyed;
