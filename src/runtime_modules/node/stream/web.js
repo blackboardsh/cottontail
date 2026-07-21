@@ -272,6 +272,46 @@ export const ReadableStream = new Proxy(whatwg.ReadableStream, {
   },
 });
 
+function readerReleaseError(error) {
+  if (!(error instanceof TypeError) || !/reader was released|released reader/i.test(error.message)) return error;
+  const releaseError = new Error("Reader was released");
+  releaseError.name = "AbortError";
+  releaseError.code = "ERR_STREAM_RELEASE_LOCK";
+  return releaseError;
+}
+
+// Bun exposes a Node-style AbortError when releaseLock() rejects pending reads.
+// The WHATWG polyfill uses TypeError, so translate only those release failures
+// while retaining its lock transition and pending-request machinery.
+{
+  const prototype = whatwg.ReadableStreamDefaultReader.prototype;
+  const readDescriptor = Object.getOwnPropertyDescriptor(prototype, "read");
+  const closedDescriptor = Object.getOwnPropertyDescriptor(prototype, "closed");
+  const closedPromises = new WeakMap();
+  Object.defineProperty(prototype, "read", {
+    ...readDescriptor,
+    value: function read() {
+      return readDescriptor.value.call(this).catch(error => {
+        throw readerReleaseError(error);
+      });
+    },
+  });
+  Object.defineProperty(prototype, "closed", {
+    ...closedDescriptor,
+    get() {
+      const original = closedDescriptor.get.call(this);
+      let translated = closedPromises.get(original);
+      if (translated === undefined) {
+        translated = original.catch(error => {
+          throw readerReleaseError(error);
+        });
+        closedPromises.set(original, translated);
+      }
+      return translated;
+    },
+  });
+}
+
 // Bun extension: reader.readMany() drains every synchronously available
 // chunk in one call.
 if (typeof whatwg.ReadableStreamDefaultReader.prototype.readMany !== "function") {
