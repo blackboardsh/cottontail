@@ -30,6 +30,7 @@ const bun_compat_version = "1.3.10";
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
 const completion_commands = [_][]const u8{ "run", "test", "build", "repl", "x", "exec", "getcompletes" };
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn testRunnerDisplayVersion(init: std.process.Init) []const u8 {
     return init.environ_map.get("COTTONTAIL_UPSTREAM_VERSION") orelse bun_compat_version;
@@ -1763,18 +1764,27 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
             }
         }
     }
-    std.mem.sort([:0]const u8, test_files.items, {}, struct {
-        fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
-            return std.mem.order(u8, left, right) == .lt;
-        }
-    }.lessThan);
+    if (expanded_directory) {
+        std.mem.sort([:0]const u8, test_files.items, {}, struct {
+            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+    }
     const entrypoint_count = test_files.items.len;
     if (entrypoint_count == 0) {
         return try writeNoTestsDiagnostic(init, args, positionals.items);
     }
     const generated_entrypoint = positionals.items.len == 1 and isGeneratedTestEntrypoint(positionals.items[0]);
     if (entrypoint_count == 1 and !expanded_directory and
-        (generated_entrypoint or !isGithubTestReporting(init.environ_map))) return null;
+        (generated_entrypoint or !isGithubTestReporting(init.environ_map)))
+    {
+        if (!generated_entrypoint) {
+            try init.environ_map.put("COTTONTAIL_TEST_FILE_COUNT", "1");
+            _ = setenv("COTTONTAIL_TEST_FILE_COUNT", "1", 1);
+        }
+        return null;
+    }
 
     if (entrypoint_count > 1) {
         if (testBailLimit(args)) |bail_limit| {

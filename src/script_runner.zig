@@ -3762,7 +3762,7 @@ fn writeMinimalRuntimeEntryWrapper(
         process_import,
         process_install,
         bundle_map_literal,
-        try jsonStringLiteral(ctx, runtime_virtual_root),
+        try jsonStringLiteral(ctx, ctx.project_root),
         try jsonStringLiteral(ctx, script_abs),
         try jsonStringLiteral(ctx, script_dir),
         test_header_signal,
@@ -6040,7 +6040,7 @@ fn writeCommonJsEntryWrapper(
         const bundle_map_path = try std.fs.path.join(ctx.allocator, &.{ tmp_dir, "script.bundle.mjs.map" });
         break :blk try jsonStringLiteral(ctx, bundle_map_path);
     };
-    const bundle_source_root_literal = try jsonStringLiteral(ctx, runtime_virtual_root);
+    const bundle_source_root_literal = try jsonStringLiteral(ctx, ctx.project_root);
     const test_header_signal = if (test_cli_execution)
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
