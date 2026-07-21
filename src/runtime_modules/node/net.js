@@ -6,6 +6,45 @@ const kSocketAddressState = new WeakMap();
 const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
 
+const heapObjectRefs = globalThis.__cottontailHeapObjectRefs ??= new Map();
+const heapObjectCountProviders = globalThis.__cottontailHeapObjectCountProviders ??= new Map();
+const heapObjectFinalizer = globalThis.__cottontailHeapObjectFinalizer ??= typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry(({ refs, ref }) => refs.delete(ref))
+  : null;
+
+function trackedHeapObjectCount(type) {
+  const refs = heapObjectRefs.get(type);
+  if (refs == null) return 0;
+  let count = 0;
+  for (const ref of refs) {
+    const value = ref.deref();
+    if (value == null) {
+      refs.delete(ref);
+      continue;
+    }
+    const active = type === "Listener"
+      ? value.listening === true || value._fd != null
+      : value.connecting === true || value.fd != null || value._tlsId != null || value._watchId !== 0;
+    if (active) count += 1;
+  }
+  return count;
+}
+
+function trackHeapObject(type, value) {
+  if (typeof WeakRef !== "function") return;
+  let refs = heapObjectRefs.get(type);
+  if (refs == null) heapObjectRefs.set(type, refs = new Set());
+  const ref = new WeakRef(value);
+  refs.add(ref);
+  heapObjectFinalizer?.register(value, { refs, ref }, ref);
+}
+
+for (const type of ["Listener", "TCPSocket", "TLSSocket"]) {
+  if (!heapObjectCountProviders.has(type)) {
+    heapObjectCountProviders.set(type, () => trackedHeapObjectCount(type));
+  }
+}
+
 function makeNodeError(ErrorType, message, code, details = undefined) {
   const error = new ErrorType(message);
   error.code = code;
@@ -180,6 +219,7 @@ function connectionException(rawError, options, host, port) {
 class SocketImpl extends EventEmitter {
   constructor(options = {}) {
     super();
+    trackHeapObject(new.target?.name === "TLSSocket" ? "TLSSocket" : "TCPSocket", this);
     if (options == null) options = {};
     if (typeof options !== "object") throw invalidArgType("options", "of type object", options);
     for (const name of ["objectMode", "readableObjectMode", "writableObjectMode"]) {
@@ -1316,6 +1356,8 @@ class SocketImpl extends EventEmitter {
     this._refed = true;
     this._timeoutTimer?.ref?.();
     this._writeRetryTimer?.ref?.();
+    this._destroyCloseTimer?.ref?.();
+    for (const timer of this._connectAttemptTimers) timer.ref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, true);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, true);
     return this;
@@ -1324,6 +1366,8 @@ class SocketImpl extends EventEmitter {
     this._refed = false;
     this._timeoutTimer?.unref?.();
     this._writeRetryTimer?.unref?.();
+    this._destroyCloseTimer?.unref?.();
+    for (const timer of this._connectAttemptTimers) timer.unref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, false);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, false);
     return this;
@@ -1392,6 +1436,7 @@ export const Socket = new Proxy(SocketImpl, {
 class ServerImpl extends EventEmitter {
   constructor(options = {}, connectionListener = undefined) {
     super();
+    trackHeapObject("Listener", this);
     if (typeof options === "function") {
       connectionListener = options;
       options = {};
@@ -1411,6 +1456,7 @@ class ServerImpl extends EventEmitter {
     this._isPipe = false;
     this._ownsPipePath = false;
     this._acceptTimer = null;
+    this._activeSockets = new Set();
     this._unref = false;
     this._usingWorkers = false;
     this.workers = [];
@@ -1624,7 +1670,11 @@ class ServerImpl extends EventEmitter {
       socket.server = this;
       socket.isServer = true;
       this._incrementConnections();
-      socket.once("close", () => this._decrementConnections());
+      this._activeSockets.add(socket);
+      socket.once("close", () => {
+        this._activeSockets.delete(socket);
+        this._decrementConnections();
+      });
       this.emit("connection", socket);
       if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
     }
@@ -1656,6 +1706,10 @@ class ServerImpl extends EventEmitter {
     this._address = null;
     this._emitCloseIfDrained();
     return this;
+  }
+
+  _closeActiveConnections() {
+    for (const socket of Array.from(this._activeSockets)) socket.destroy();
   }
 
   address() {

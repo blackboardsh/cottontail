@@ -16,6 +16,17 @@ const nativeHeapStats = cottontail.jscMemoryUsage;
 function normalizeHeapStats(stats) {
   stats.objectTypeCounts ??= {};
   stats.protectedObjectTypeCounts ??= {};
+  const providers = globalThis.__cottontailHeapObjectCountProviders;
+  if (providers instanceof Map) {
+    for (const [type, count] of providers) {
+      try {
+        stats.objectTypeCounts[type] = Math.max(
+          Number(stats.objectTypeCounts[type]) || 0,
+          Math.max(0, Number(count()) || 0),
+        );
+      } catch {}
+    }
+  }
   return stats;
 }
 

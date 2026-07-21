@@ -13322,6 +13322,23 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
   return { socket, call };
 }
 
+function callBunSocketOpen(attached, closeOnError = true) {
+  let result;
+  try {
+    result = attached.call("open", attached.socket);
+  } catch (error) {
+    if (closeOnError) attached.socket.destroy();
+    throw error;
+  }
+  if (result instanceof Error) {
+    if (closeOnError) attached.socket.destroy(result);
+    else attached.call("error", attached.socket, result);
+  } else if (result?.[bunSocketCallbackError] && closeOnError) {
+    attached.socket.destroy();
+  }
+  return result;
+}
+
 function normalizeBunSocketOptions(options) {
   if (options === null || typeof options !== "object") throw new TypeError("Bun socket options must be an object");
   let unix = options.unix ? coerceServeOptionString(options.unix, "unix") : "";
@@ -13376,7 +13393,7 @@ function completeBunTlsHandshake(attached) {
   if (typeof attached.handlers?.handshake === "function") {
     attached.call("handshake", socket, true, authorizationError);
   } else {
-    attached.call("open", socket);
+    callBunSocketOpen(attached, false);
   }
 }
 
@@ -13429,7 +13446,7 @@ export function connect(options = {}) {
         resolve(socket);
       };
       const onTransportOpen = () => {
-        if (typeof handlers.handshake === "function") attached.call("open", socket);
+        if (typeof handlers.handshake === "function") callBunSocketOpen(attached);
         settle();
         if (!normalized.unix) {
           const host = normalized.hostname.includes(":") ? `[${normalized.hostname}]` : normalized.hostname;
@@ -13455,11 +13472,8 @@ export function connect(options = {}) {
       if (state.failed) return;
       state.connecting = false;
       state.opened = true;
-      const result = attached.call("open", socket);
-      if (result instanceof Error) {
-        attached.call("error", socket, result);
-      }
       resolve(socket);
+      callBunSocketOpen(attached);
     };
     if (options.fd != null) {
       socket = new nodeNet.Socket();
@@ -13533,9 +13547,9 @@ export function listen(options = {}) {
     attached.handlers = activeOptions.socket ?? handlers;
     if (useTls) {
       tlsConnections.set(socket, attached);
-      if (typeof attached.handlers?.handshake === "function") attached.call("open", socket);
+      if (typeof attached.handlers?.handshake === "function") callBunSocketOpen(attached);
     } else {
-      attached.call("open", socket);
+      callBunSocketOpen(attached);
     }
   });
   if (useTls) {
@@ -13550,18 +13564,17 @@ export function listen(options = {}) {
     hostname: normalized.unix ? undefined : String(address?.address ?? normalized.hostname),
     port: normalized.unix ? undefined : Number(address?.port ?? normalized.port),
     unix: normalized.unix || undefined,
-    stop() {
+    stop(closeActiveConnections = false) {
       if (stopped) return;
       stopped = true;
       server.close();
+      if (closeActiveConnections === true) server._closeActiveConnections?.();
     },
     ref() {
       server.ref();
-      return listener;
     },
     unref() {
       server.unref();
-      return listener;
     },
     reload(nextOptions = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
@@ -13585,10 +13598,10 @@ export function listen(options = {}) {
       return undefined;
     },
     [Symbol.dispose]() {
-      listener.stop();
+      listener.stop(true);
     },
     [Symbol.asyncDispose]() {
-      listener.stop();
+      listener.stop(true);
       return Promise.resolve();
     },
   };
