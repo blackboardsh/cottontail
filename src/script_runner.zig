@@ -2750,7 +2750,11 @@ fn nativeBundleFailure(
         defer native_bundler.ct_bundle_string_free(message);
         const text = decodeBundleDiagnostic(ctx, std.mem.span(message));
         if (ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null) {
-            reportTestBundleError(ctx, script_abs, text);
+            const display_text = if (runtime_execution)
+                (runtimeLinkDiagnostic(ctx, script_abs, text) catch null) orelse text
+            else
+                text;
+            reportTestBundleError(ctx, script_abs, display_text);
             cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
             std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
             return error.TestBundleFailed;
@@ -2883,13 +2887,19 @@ fn bundleScriptNative(
     else
         try runtimeEntrypointIdentity(ctx, script_entry_abs, script_abs);
 
-    const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args);
+    const bunfig_preload_imports = try buildBunfigTestPreloadImports(
+        ctx,
+        script_abs,
+        is_test_cli_execution,
+        exec_args,
+        script_args,
+    );
+    const cli_preload_imports = try buildCliPreloadImports(ctx, script_abs, exec_args, true);
     const test_preload_imports = if (is_test_cli_execution)
-        try buildCliPreloadImports(ctx, script_abs, script_args)
+        try buildCliPreloadImports(ctx, script_abs, script_args, false)
     else
         "";
-    const bunfig_preload_imports = try buildBunfigTestPreloadImports(ctx, script_abs, is_test_cli_execution);
-    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ cli_preload_imports, test_preload_imports, bunfig_preload_imports });
+    const preload_imports = try std.mem.concat(ctx.allocator, u8, &.{ bunfig_preload_imports, cli_preload_imports, test_preload_imports });
     const is_common_js_entrypoint = !is_wasm_entrypoint and try shouldBundleCommonJsEntrypoint(ctx, script_abs);
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if ((build_options == null or standalone_compile) and
@@ -2900,7 +2910,8 @@ fn bundleScriptNative(
         .full;
     const use_selective_runtime = runtime_bootstrap_mode != .full;
     const has_custom_conditions = hasCustomConditions(exec_args) or hasCustomConditions(script_args);
-    const tsconfig_override = try tsconfigOverridePath(ctx, exec_args);
+    const tsconfig_override = (try tsconfigOverridePath(ctx, exec_args)) orelse
+        try tsconfigOverridePath(ctx, script_args);
     var features: std.ArrayList([]const u8) = .empty;
     if (build_options) |provided| try features.appendSlice(ctx.allocator, provided.features);
     try collectFeatures(ctx.allocator, &features, exec_args);
@@ -3722,7 +3733,9 @@ fn hasCustomConditions(cli_args: []const [:0]const u8) bool {
 }
 
 fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !bool {
-    if (std.mem.endsWith(u8, script_abs, ".cjs") or std.mem.endsWith(u8, script_abs, ".cts")) return true;
+    if (std.mem.endsWith(u8, script_abs, ".cjs") or std.mem.endsWith(u8, script_abs, ".cts")) {
+        return !try entrypointHasTopLevelAwait(ctx, script_abs);
+    }
     if (std.mem.endsWith(u8, script_abs, ".mjs") or std.mem.endsWith(u8, script_abs, ".mts")) return false;
     if (!std.mem.endsWith(u8, script_abs, ".js")) {
         if (std.fs.path.extension(script_abs).len == 0) {
@@ -3736,6 +3749,25 @@ fn shouldBundleCommonJsEntrypoint(ctx: *const Context, script_abs: []const u8) !
 
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     return !(try nearestPackageTypeIsModule(ctx, script_dir));
+}
+
+fn entrypointHasTopLevelAwait(ctx: *const Context, script_abs: []const u8) !bool {
+    const loader = transpilerLoaderForPath(script_abs) orelse return false;
+    const source = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        script_abs,
+        ctx.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch return false;
+    const syntax_json = native_transpiler.scanModuleSyntaxJson(source, loader) catch return false;
+    defer std.heap.c_allocator.free(syntax_json);
+    const ModuleSyntax = struct {
+        hasTopLevelAwait: bool,
+        exportsKind: []const u8,
+    };
+    const parsed = std.json.parseFromSlice(ModuleSyntax, ctx.allocator, syntax_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value.hasTopLevelAwait;
 }
 
 fn extensionlessEntrypointLooksCommonJs(ctx: *const Context, script_abs: []const u8) !bool {
@@ -4116,8 +4148,8 @@ fn isTestAggregateEntrypointPath(path: []const u8) bool {
 }
 
 fn shouldLoadBunfigTestPreloads(path: []const u8, test_cli_execution: bool) bool {
-    return test_cli_execution and
-        (isTestEntrypointPath(path) or isTestAggregateEntrypointPath(path));
+    _ = path;
+    return test_cli_execution;
 }
 
 /// Append every quoted ("..." or '...') segment in `text` to `list`,
@@ -4147,7 +4179,7 @@ fn appendQuotedStrings(
 /// multi-line), tolerates comments, and ignores everything else.
 fn parseBunfigTestPreloads(allocator: std.mem.Allocator, toml: []const u8, include_test_section: bool) ![]const []const u8 {
     var preloads: std.ArrayList([]const u8) = .empty;
-    var in_active_section = true;
+    var in_active_section = !include_test_section;
     var in_preload_array = false;
     var lines = std.mem.splitScalar(u8, toml, '\n');
     while (lines.next()) |raw_line| {
@@ -4159,7 +4191,7 @@ fn parseBunfigTestPreloads(allocator: std.mem.Allocator, toml: []const u8, inclu
         }
         if (line.len == 0 or line[0] == '#') continue;
         if (line[0] == '[') {
-            in_active_section = include_test_section and std.mem.startsWith(u8, line, "[test]");
+            in_active_section = include_test_section and std.mem.eql(u8, line, "[test]");
             continue;
         }
         if (!in_active_section) continue;
@@ -4182,8 +4214,26 @@ fn buildBunfigTestPreloadImports(
     ctx: *const Context,
     script_abs: []const u8,
     test_cli_execution: bool,
+    exec_args: []const [:0]const u8,
+    script_args: []const [:0]const u8,
 ) ![]const u8 {
     const include_test_section = shouldLoadBunfigTestPreloads(script_abs, test_cli_execution);
+    const explicit_config = configPathFromArgs(exec_args) orelse configPathFromArgs(script_args);
+    if (explicit_config) |configured| {
+        const bunfig_path = if (std.fs.path.isAbsolute(configured))
+            configured
+        else
+            try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, configured });
+        const contents = std.Io.Dir.cwd().readFileAlloc(
+            ctx.io,
+            bunfig_path,
+            ctx.allocator,
+            .limited(1024 * 1024),
+        ) catch return "";
+        const config_dir = std.fs.path.dirname(bunfig_path) orelse ctx.project_root;
+        return buildBunfigPreloadImports(ctx, contents, config_dir, include_test_section);
+    }
+
     var dir: ?[]const u8 = std.fs.path.dirname(script_abs);
     while (dir) |current| : (dir = std.fs.path.dirname(current)) {
         const bunfig_path = try std.fs.path.join(ctx.allocator, &.{ current, "bunfig.toml" });
@@ -4195,38 +4245,108 @@ fn buildBunfigTestPreloadImports(
         ) catch continue;
 
         // The nearest bunfig.toml wins, matching bun's discovery.
-        const preloads = try parseBunfigTestPreloads(ctx.allocator, contents, include_test_section);
-        var imports: std.ArrayList(u8) = .empty;
-        for (preloads) |preload| {
-            const preload_abs = if (std.fs.path.isAbsolute(preload))
-                preload
-            else
-                try std.fs.path.join(ctx.allocator, &.{ current, preload });
-            if (!pathExists(ctx.io, preload_abs)) {
-                try imports.appendSlice(ctx.allocator, "console.error('error: preload not found ' + ");
-                try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload));
-                try imports.appendSlice(ctx.allocator, "); globalThis.process?.exit?.(1);\n");
-                continue;
-            }
-            try imports.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
-            try imports.appendSlice(ctx.allocator, "await import(");
-            try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload_abs));
-            try imports.appendSlice(ctx.allocator, ");\n");
-        }
-        return try imports.toOwnedSlice(ctx.allocator);
+        return buildBunfigPreloadImports(ctx, contents, current, include_test_section);
     }
     return "";
 }
 
-fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args: []const [:0]const u8) ![]const u8 {
+fn configPathFromArgs(args: []const [:0]const u8) ?[]const u8 {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.startsWith(u8, arg, "--config=")) return arg["--config=".len..];
+        if (std.mem.startsWith(u8, arg, "-c=")) return arg["-c=".len..];
+        if ((std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) and index + 1 < args.len) {
+            return args[index + 1];
+        }
+    }
+    return null;
+}
+
+fn buildBunfigPreloadImports(
+    ctx: *const Context,
+    contents: []const u8,
+    config_dir: []const u8,
+    include_test_section: bool,
+) ![]const u8 {
+    const preloads = try parseBunfigTestPreloads(ctx.allocator, contents, include_test_section);
+    var imports: std.ArrayList(u8) = .empty;
+    for (preloads) |preload| {
+        const preload_abs = if (std.fs.path.isAbsolute(preload))
+            preload
+        else
+            try std.fs.path.join(ctx.allocator, &.{ config_dir, preload });
+        if (!pathExists(ctx.io, preload_abs)) {
+            try imports.appendSlice(ctx.allocator, "console.error('error: preload not found ' + ");
+            try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload));
+            try imports.appendSlice(ctx.allocator, "); globalThis.process?.exit?.(1);\n");
+            continue;
+        }
+        try imports.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
+        try imports.appendSlice(ctx.allocator, "await import(");
+        try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload_abs));
+        try imports.appendSlice(ctx.allocator, ");\n");
+    }
+    return try imports.toOwnedSlice(ctx.allocator);
+}
+
+const PreloadArgumentKind = enum { preload, require, import };
+
+fn appendCliPreloadKind(
+    ctx: *const Context,
+    output: *std.ArrayList(u8),
+    args: []const [:0]const u8,
+    kind: PreloadArgumentKind,
+) !void {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        var specifier: ?[]const u8 = null;
+        switch (kind) {
+            .preload => {
+                if (std.mem.eql(u8, arg, "--preload") and index + 1 < args.len) {
+                    index += 1;
+                    specifier = args[index];
+                } else if (std.mem.startsWith(u8, arg, "--preload=")) {
+                    specifier = arg["--preload=".len..];
+                }
+            },
+            .require => {
+                if ((std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--require")) and index + 1 < args.len) {
+                    index += 1;
+                    specifier = args[index];
+                } else if (std.mem.startsWith(u8, arg, "--require=")) {
+                    specifier = arg["--require=".len..];
+                }
+            },
+            .import => {
+                if (std.mem.eql(u8, arg, "--import") and index + 1 < args.len) {
+                    index += 1;
+                    specifier = args[index];
+                } else if (std.mem.startsWith(u8, arg, "--import=")) {
+                    specifier = arg["--import=".len..];
+                }
+            },
+        }
+        if (specifier) |raw_specifier| {
+            const resolved_specifier = if (std.mem.startsWith(u8, raw_specifier, "."))
+                try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, raw_specifier })
+            else
+                raw_specifier;
+            try output.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\nawait import(");
+            try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, resolved_specifier));
+            try output.appendSlice(ctx.allocator, ");\n");
+        }
+    }
+}
+
+fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args: []const [:0]const u8, include_inspect_preload: bool) ![]const u8 {
     var output: std.ArrayList(u8) = .empty;
-    const script_literal = try jsonStringLiteral(ctx, script_abs);
+    _ = script_abs;
     var index: usize = 0;
     while (index < exec_args.len) : (index += 1) {
         const arg = exec_args[index];
         var preconnect_url: ?[]const u8 = null;
-        var specifier: ?[]const u8 = null;
-        var use_import = false;
 
         if (std.mem.eql(u8, arg, "--fetch-preconnect")) {
             if (index + 1 < exec_args.len) {
@@ -4235,24 +4355,6 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
             }
         } else if (std.mem.startsWith(u8, arg, "--fetch-preconnect=")) {
             preconnect_url = arg["--fetch-preconnect=".len..];
-        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--require") or std.mem.eql(u8, arg, "--preload")) {
-            if (index + 1 < exec_args.len) {
-                index += 1;
-                specifier = exec_args[index];
-                use_import = std.mem.eql(u8, arg, "--preload");
-            }
-        } else if (std.mem.eql(u8, arg, "--import")) {
-            if (index + 1 < exec_args.len) {
-                index += 1;
-                specifier = exec_args[index];
-                use_import = true;
-            }
-        } else inline for (.{ "--require=", "--preload=", "--import=" }) |prefix| {
-            if (std.mem.startsWith(u8, arg, prefix)) {
-                specifier = arg[prefix.len..];
-                use_import = std.mem.eql(u8, prefix, "--import=") or std.mem.eql(u8, prefix, "--preload=");
-                break;
-            }
         }
 
         if (preconnect_url) |url| {
@@ -4260,25 +4362,17 @@ fn buildCliPreloadImports(ctx: *const Context, script_abs: []const u8, exec_args
             try output.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, url));
             try output.appendSlice(ctx.allocator, ");\n");
         }
-
-        if (specifier) |raw_specifier| {
-            const resolved_specifier = if (std.mem.startsWith(u8, raw_specifier, "."))
-                try std.fs.path.join(ctx.allocator, &.{ ctx.project_root, raw_specifier })
-            else
-                raw_specifier;
-            const specifier_literal = try jsonStringLiteral(ctx, resolved_specifier);
-            try output.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
-            if (use_import) {
-                try output.appendSlice(ctx.allocator, "await import(");
-                try output.appendSlice(ctx.allocator, specifier_literal);
-                try output.appendSlice(ctx.allocator, ");\n");
-            } else {
-                try output.appendSlice(ctx.allocator, "moduleModule.createRequire(");
-                try output.appendSlice(ctx.allocator, script_literal);
-                try output.appendSlice(ctx.allocator, ")(");
-                try output.appendSlice(ctx.allocator, specifier_literal);
-                try output.appendSlice(ctx.allocator, ");\n");
-            }
+    }
+    try appendCliPreloadKind(ctx, &output, exec_args, .preload);
+    try appendCliPreloadKind(ctx, &output, exec_args, .require);
+    try appendCliPreloadKind(ctx, &output, exec_args, .import);
+    if (include_inspect_preload) {
+        if (ctx.environ_map.get("BUN_INSPECT_PRELOAD")) |inspect_preload| {
+            const inspect_args = [_][:0]const u8{
+                "--import",
+                try ctx.allocator.dupeZ(u8, inspect_preload),
+            };
+            try appendCliPreloadKind(ctx, &output, &inspect_args, .import);
         }
     }
     return try output.toOwnedSlice(ctx.allocator);
@@ -4835,6 +4929,10 @@ fn writeBunCompatTransformedSource(
         }
     }
     const has_bun_transpiled_pragma = hasBunTranspiledPragma(source);
+    const cjs_top_level_await = (std.mem.endsWith(u8, script_abs, ".cjs") or
+        std.mem.endsWith(u8, script_abs, ".cts")) and
+        try entrypointHasTopLevelAwait(ctx, script_abs);
+    if (cjs_top_level_await) changed = true;
     if (bunCjsFactorySource(source)) |factory| {
         transformed_source = try std.mem.concat(ctx.allocator, u8, &.{
             "const __ctBunCjsFactory = ",
@@ -4898,7 +4996,14 @@ fn writeBunCompatTransformedSource(
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const ext = blk: {
         const value = std.fs.path.extension(script_abs);
-        break :blk if (has_bun_transpiled_pragma) ".js" else if (value.len == 0) ".ts" else value;
+        break :blk if (has_bun_transpiled_pragma)
+            ".js"
+        else if (cjs_top_level_await)
+            if (std.mem.eql(u8, value, ".cts")) ".mts" else ".mjs"
+        else if (value.len == 0)
+            ".ts"
+        else
+            value;
     };
     var invocation_bytes: [8]u8 = undefined;
     ctx.io.random(&invocation_bytes);
