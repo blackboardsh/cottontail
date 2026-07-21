@@ -102,12 +102,14 @@ function installProcess() {
   }
   const inheritedSpawnExecPath = target.env.COTTONTAIL_SPAWN_EXEC_PATH;
   if (inheritedSpawnExecPath != null) {
+    const displayExecPath = String(inheritedSpawnExecPath);
     Object.defineProperty(target, "execPath", {
-      value: String(inheritedSpawnExecPath),
+      value: displayExecPath,
       writable: true,
       enumerable: true,
       configurable: true,
     });
+    if (Array.isArray(target.argv) && target.argv.length > 0) target.argv[0] = displayExecPath;
     try { delete target.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
   }
   target.platform ??= cottontail.platform();
