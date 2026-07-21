@@ -165,9 +165,12 @@ function normalizeCottontailStackFrames(stack) {
   let sawAsyncFrame = false;
   return stack.split("\n").flatMap((line) => {
     const isFrame = /^\s*at\b/.test(line) || /^[^@]*@.+:\d+:\d+$/.test(line);
-    if (isFrame && (line.includes("/.cottontail-embedded-runtime/") ||
-        line.includes("/src/runtime_modules/") ||
-        line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
+    if (isFrame && (line.includes("/.cottontail-embedded-runtime/") || line.includes("/src/runtime_modules/"))) {
+      const nodeFrame = /^(.*?)@.*?\/(?:\.cottontail-embedded-runtime|src\/runtime_modules)\/node\/(.+?)\.js:(\d+):(\d+)$/.exec(line);
+      if (nodeFrame) return [`${nodeFrame[1]}@node:${nodeFrame[2]}:${nodeFrame[3]}:${nodeFrame[4]}`];
+      return [];
+    }
+    if (isFrame && (line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
     const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
     if (jscFrame) {
       if (jscFrame[1].startsWith("async ")) sawAsyncFrame = true;
@@ -374,7 +377,7 @@ class CottontailCallSite {
         : "<anonymous>";
       const name = this.functionName
         ? `${this.constructorFrame ? "new " : ""}${this.functionName}`
-        : "<anonymous>";
+        : "unknown";
       return `${name} (${location})`;
     }
     get [Symbol.toStringTag]() { return "CallSite"; }

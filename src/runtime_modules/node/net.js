@@ -1157,6 +1157,10 @@ class SocketImpl extends EventEmitter {
   }
 
   write(chunk, encoding = undefined, callback = undefined) {
+    return this._write(chunk, encoding, callback);
+  }
+
+  _write(chunk, encoding = undefined, callback = undefined) {
     if (typeof encoding === "function") {
       callback = encoding;
       encoding = undefined;
