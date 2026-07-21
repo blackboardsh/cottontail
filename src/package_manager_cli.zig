@@ -15,6 +15,9 @@ const PmWhy = @import("package_manager_pm_why.zig");
 const Isolated = @import("package_manager_isolated.zig");
 const Workspaces = @import("package_manager_workspaces.zig");
 const Analyzer = @import("package_manager_analyzer.zig");
+const Audit = @import("package_manager_audit.zig");
+const MinimumReleaseAge = @import("package_manager_minimum_release_age.zig");
+const Pack = @import("package_manager_pack.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
@@ -25,6 +28,7 @@ const Value = std.json.Value;
 // identifies the Bun contract separately from the Cottontail release.
 const bun_compat_version = "1.3.10";
 const manifest_accept = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+const extended_manifest_accept = "application/json";
 const default_registry = "https://registry.npmjs.org/";
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_tarball_bytes = 512 * 1024 * 1024;
@@ -34,6 +38,7 @@ const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependenc
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
 
 const Command = enum {
+    audit,
     install,
     add,
     remove,
@@ -81,6 +86,7 @@ const Options = struct {
     silent: bool = false,
     no_summary: bool = false,
     no_cache: bool = false,
+    verbose: bool = false,
     verify_integrity: bool = true,
     latest: bool = false,
     save_text_lockfile: bool = false,
@@ -105,6 +111,11 @@ const Options = struct {
     os_overridden: bool = false,
     invalid_cpu: ?[]const u8 = null,
     invalid_os: ?[]const u8 = null,
+    minimum_release_age_ms: ?f64 = null,
+    minimum_release_age_cli: bool = false,
+    pack_destination: ?[]const u8 = null,
+    pack_filename: ?[]const u8 = null,
+    pack_gzip_level: ?[]const u8 = null,
 };
 
 const PackageSpec = struct {
@@ -172,6 +183,7 @@ const RegistryManifestFetch = struct {
     url: []const u8,
     authorization: ?[]const u8,
     cache_path: ?[]const u8,
+    accept: []const u8,
     bytes: ?[]u8 = null,
     failure: ?anyerror = null,
 
@@ -188,7 +200,7 @@ const RegistryManifestFetch = struct {
 
         var headers: [2]std.http.Header = undefined;
         var header_count: usize = 0;
-        headers[header_count] = .{ .name = "accept", .value = manifest_accept };
+        headers[header_count] = .{ .name = "accept", .value = fetch_state.accept };
         header_count += 1;
         if (fetch_state.authorization) |authorization| {
             headers[header_count] = .{ .name = "authorization", .value = authorization };
@@ -345,6 +357,7 @@ pub fn recognizes(command: []const u8) bool {
 }
 
 fn commandFromString(command: []const u8) ?Command {
+    if (std.mem.eql(u8, command, "audit")) return .audit;
     if (std.mem.eql(u8, command, "install") or std.mem.eql(u8, command, "i") or std.mem.eql(u8, command, "ci")) return .install;
     if (std.mem.eql(u8, command, "add") or std.mem.eql(u8, command, "a")) return .add;
     if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm") or std.mem.eql(u8, command, "uninstall")) return .remove;
@@ -381,6 +394,9 @@ pub fn run(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "audit")) {
+        return Audit.run(init, args, stdout, stderr);
+    }
     const allocator = init.arena.allocator();
     const options = parseOptions(allocator, args) catch |err| {
         try stderr.print("error: {s}\n", .{@errorName(err)});
@@ -562,11 +578,38 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.force = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             options.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--destination")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_destination = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--destination=")) {
+            options.pack_destination = arg["--destination=".len..];
+        } else if (std.mem.eql(u8, arg, "--filename")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_filename = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--filename=")) {
+            options.pack_filename = arg["--filename=".len..];
+        } else if (std.mem.eql(u8, arg, "--gzip-level")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.pack_gzip_level = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--gzip-level=")) {
+            options.pack_gzip_level = arg["--gzip-level=".len..];
         } else if (std.mem.eql(u8, arg, "--silent") or std.mem.eql(u8, arg, "--quiet")) {
             options.silent = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
-            // bunx forwards this to `add`; the current package manager has no
-            // additional verbose-only diagnostics, but accepts the Bun flag.
+            options.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--minimum-release-age")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.minimum_release_age_ms = try parseMinimumReleaseAge(args[index]);
+            options.minimum_release_age_cli = true;
+        } else if (std.mem.startsWith(u8, arg, "--minimum-release-age=")) {
+            const value = arg["--minimum-release-age=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.minimum_release_age_ms = try parseMinimumReleaseAge(value);
+            options.minimum_release_age_cli = true;
         } else if (std.mem.eql(u8, arg, "--no-summary")) {
             options.no_summary = true;
         } else if (std.mem.eql(u8, arg, "--dev") or std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "-D") or std.mem.eql(u8, arg, "--development")) {
@@ -686,6 +729,14 @@ fn applyOmit(options: *Options, value: []const u8) !void {
     }
 }
 
+fn parseMinimumReleaseAge(value: []const u8) !f64 {
+    const seconds = std.fmt.parseFloat(f64, value) catch return error.InvalidMinimumReleaseAge;
+    if (!std.math.isFinite(seconds) or seconds < 0) return error.InvalidMinimumReleaseAge;
+    const milliseconds = seconds * std.time.ms_per_s;
+    if (!std.math.isFinite(milliseconds)) return error.InvalidMinimumReleaseAge;
+    return milliseconds;
+}
+
 fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
     try writer.print(
         \\Usage: cottontail {s} [packages...] [flags]
@@ -741,6 +792,25 @@ fn runPm(
         return 0;
     }
     if (std.mem.eql(u8, subcommand, "migrate")) return runPmMigrate(init, options, stdout, stderr);
+    if (std.mem.eql(u8, subcommand, "pack")) {
+        const invocation_dir = try absolutePath(init.io, init.arena.allocator(), ".");
+        const project = try findInstallProject(init.io, init.arena.allocator(), invocation_dir);
+        return Pack.run(
+            init,
+            project.root_dir,
+            project.package_dir,
+            .{
+                .destination = options.pack_destination,
+                .filename = options.pack_filename,
+                .gzip_level = options.pack_gzip_level,
+                .dry_run = options.dry_run,
+                .ignore_scripts = options.ignore_scripts,
+                .quiet = options.silent,
+            },
+            stdout,
+            stderr,
+        );
+    }
     if (std.mem.eql(u8, subcommand, "pkg")) {
         const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
         return PmPkg.run(
@@ -1528,7 +1598,9 @@ const Manager = struct {
     lock_graph: ?Lockfile.Graph = null,
     manifest_policy: ?Manifest.Policy = null,
     security_scanner: ?[]const u8 = null,
+    minimum_release_age_excludes: []const []const u8 = &.{},
     script_queue: Scripts.Queue,
+    started_wall_ms: f64,
 
     fn init(
         init_data: std.process.Init,
@@ -1569,6 +1641,10 @@ const Manager = struct {
             .peer_conflict_warnings = std.StringHashMap(void).init(allocator),
             .script_queue = Scripts.Queue.init(allocator),
             .started_ns = std.Io.Clock.awake.now(init_data.io).nanoseconds,
+            .started_wall_ms = @floatFromInt(@divTrunc(
+                std.Io.Clock.real.now(init_data.io).nanoseconds,
+                std.time.ns_per_ms,
+            )),
         };
     }
 
@@ -1767,7 +1843,7 @@ const Manager = struct {
             .link => try manager.addPackages(command_package_json, manager.invocation_package_dir),
             .unlink => unreachable,
             .patch, .patch_commit => unreachable,
-            .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
+            .audit, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
         if (security_resolution_output) |output_path| {
@@ -2796,6 +2872,8 @@ const Manager = struct {
         if (registry == null) registry = manager.init_data.environ_map.get("BUN_CONFIG_REGISTRY");
         if (registry == null) registry = manager.init_data.environ_map.get("npm_config_registry");
         if (registry == null) registry = manager.init_data.environ_map.get("NPM_CONFIG_REGISTRY");
+        const registry_explicit = registry != null;
+        const linker_explicit = configured_linker != null;
         if (manager.init_data.environ_map.get("BUN_CONFIG_HTTP_RETRY_COUNT")) |value| {
             manager.max_retry_count = std.fmt.parseInt(u16, value, 10) catch manager.max_retry_count;
         }
@@ -2813,6 +2891,13 @@ const Manager = struct {
             }
         }
 
+        try manager.loadGlobalBunfigInstallConfiguration(
+            &registry,
+            &configured_linker,
+            registry_explicit,
+            linker_explicit,
+        );
+
         const bunfig_path = manager.options.config_path orelse "bunfig.toml";
         const bunfig: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(
             manager.init_data.io,
@@ -2826,8 +2911,10 @@ const Manager = struct {
         if (bunfig) |source| {
             try manager.validateBunfigSyntax(bunfig_path, source);
             try manager.loadBunfigInstallConfiguration(bunfig_path, source);
-            if (registry == null) registry = parseTomlString(source, "registry");
-            if (configured_linker == null) {
+            if (!registry_explicit) {
+                if (parseTomlString(source, "registry")) |value| registry = value;
+            }
+            if (!linker_explicit) {
                 if (parseTomlString(source, "linker")) |value| {
                     configured_linker = Isolated.Linker.parse(value) orelse return error.UnsupportedPackageManagerLinker;
                 }
@@ -2878,6 +2965,30 @@ const Manager = struct {
             try std.fmt.allocPrint(manager.allocator, "{s}/", .{selected});
     }
 
+    fn loadGlobalBunfigInstallConfiguration(
+        manager: *Manager,
+        registry: *?[]const u8,
+        configured_linker: *?Isolated.Linker,
+        registry_explicit: bool,
+        linker_explicit: bool,
+    ) !void {
+        const config_home = manager.init_data.environ_map.get("XDG_CONFIG_HOME") orelse
+            manager.init_data.environ_map.get("HOME") orelse
+            return;
+        const path = try std.fs.path.join(manager.allocator, &.{ config_home, ".bunfig.toml" });
+        const source = (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) orelse return;
+        try manager.validateBunfigSyntax(path, source);
+        try manager.loadBunfigInstallConfiguration(path, source);
+        if (!registry_explicit) {
+            if (parseTomlString(source, "registry")) |value| registry.* = value;
+        }
+        if (!linker_explicit) {
+            if (parseTomlString(source, "linker")) |value| {
+                configured_linker.* = Isolated.Linker.parse(value) orelse return error.UnsupportedPackageManagerLinker;
+            }
+        }
+    }
+
     fn validateBunfigSyntax(manager: *Manager, path: []const u8, source_text: []const u8) !void {
         var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
         var ast_scope = ast_memory_allocator.enter(manager.allocator);
@@ -2912,6 +3023,43 @@ const Manager = struct {
         const source = compiler.logger.Source.initPathString(path, source_text);
         const root = try compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true);
         const install = root.get("install") orelse return;
+        if (install.get("minimumReleaseAge")) |minimum_age| {
+            switch (minimum_age.data) {
+                .e_number => |seconds| {
+                    const milliseconds = seconds.value * std.time.ms_per_s;
+                    if (!std.math.isFinite(seconds.value) or seconds.value < 0 or !std.math.isFinite(milliseconds)) {
+                        try manager.stderr.print("{s}: Expected positive number of seconds for minimumReleaseAge\n", .{path});
+                        return error.PackageManagerErrorReported;
+                    }
+                    if (!manager.options.minimum_release_age_cli) {
+                        manager.options.minimum_release_age_ms = milliseconds;
+                    }
+                },
+                else => {
+                    try manager.stderr.print("{s}: Expected number of seconds for minimumReleaseAge\n", .{path});
+                    return error.PackageManagerErrorReported;
+                },
+            }
+        }
+        if (install.get("minimumReleaseAgeExcludes")) |exclusions| {
+            switch (exclusions.data) {
+                .e_array => |array| {
+                    const raw = array.items.slice();
+                    const values = try manager.allocator.alloc([]const u8, raw.len);
+                    for (raw, 0..) |item, index| {
+                        values[index] = item.asString(manager.allocator) orelse {
+                            try manager.stderr.print("{s}: Expected strings in minimumReleaseAgeExcludes\n", .{path});
+                            return error.PackageManagerErrorReported;
+                        };
+                    }
+                    manager.minimum_release_age_excludes = values;
+                },
+                else => {
+                    try manager.stderr.print("{s}: Expected array for minimumReleaseAgeExcludes\n", .{path});
+                    return error.PackageManagerErrorReported;
+                },
+            }
+        }
         if (install.get("cache")) |cache| {
             if (cache.asBool()) |enabled| {
                 if (!enabled) {
@@ -3856,6 +4004,14 @@ const Manager = struct {
         }
 
         const resolved = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| {
+            if (err == error.TooRecentVersion or err == error.AllVersionsTooRecent) {
+                const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;
+                try manager.stderr.print(
+                    "error: No version matching \"{s}\" found for specifier \"{s}\" (blocked by minimum-release-age: {d} seconds)\n",
+                    .{ registry_name, registry_spec, minimum_age_seconds },
+                );
+                return error.PackageManagerErrorReported;
+            }
             if (err == error.NoMatchingVersion and
                 manager.link_workspace_packages and
                 Semver.Version.isTaggedVersionOnly(registry_spec) and
@@ -3864,6 +4020,13 @@ const Manager = struct {
                 const fallback_spec = try std.fmt.allocPrint(manager.allocator, "workspace:{s}@{s}", .{ registry_name, registry_spec });
                 const workspace = try manager.resolveWorkspaceDependency(alias, fallback_spec, parent_dir);
                 return manager.installResolvedWorkspace(alias, workspace, parent_dir, direct, protocol_patch_paths);
+            }
+            if (err == error.NoMatchingVersion) {
+                try manager.stderr.print(
+                    "error: No version matching \"{s}\" found for specifier \"{s}\"\n",
+                    .{ registry_name, registry_spec },
+                );
+                return error.PackageManagerErrorReported;
             }
             return err;
         };
@@ -6068,8 +6231,12 @@ const Manager = struct {
         direct: bool,
         protocol_patch_paths: []const []const u8,
     ) !?[]const u8 {
+        const registry_name, const registry_spec = parseNpmAlias(alias, spec);
+        // Dist-tags are manifest pointers, not semver ranges. An already
+        // installed version cannot satisfy one without resolving the current
+        // manifest first.
+        if (Semver.Version.isTaggedVersionOnly(registry_spec)) return null;
         if (manager.node_linker == .isolated) {
-            const registry_name, const registry_spec = parseNpmAlias(alias, spec);
             for (manager.records.items) |record| {
                 if (record.kind != .npm or
                     !std.mem.eql(u8, record.name, registry_name) or
@@ -6125,7 +6292,6 @@ const Manager = struct {
         for (candidates) |base| {
             const destination = try packageDestination(manager.allocator, base, alias);
             const destination_key = try manager.lockKeyForDestination(destination);
-            const registry_name, const registry_spec = parseNpmAlias(alias, spec);
             for (manager.records.items) |record| {
                 if (record.kind != .npm or
                     !std.mem.eql(u8, record.alias, alias) or
@@ -6151,7 +6317,7 @@ const Manager = struct {
             if (value.* != .object) continue;
             const version_value = value.object.get("version") orelse continue;
             if (version_value != .string) continue;
-            if (semverSatisfies(manager.allocator, spec, version_value.string)) {
+            if (semverSatisfies(manager.allocator, registry_spec, version_value.string)) {
                 const package_name = jsonString(value, "name") orelse alias;
                 const patch_paths = try manager.packagePatchPaths(package_name, version_value.string, protocol_patch_paths);
                 if (!try manager.packagePatchStateMatches(destination, patch_paths)) continue;
@@ -6195,6 +6361,21 @@ const Manager = struct {
         return parsed;
     }
 
+    fn needsExtendedRegistryManifest(manager: *const Manager) bool {
+        return if (manager.options.minimum_release_age_ms) |minimum_age| minimum_age > 0 else false;
+    }
+
+    fn registryManifestAccept(manager: *const Manager) []const u8 {
+        return if (manager.needsExtendedRegistryManifest()) extended_manifest_accept else manifest_accept;
+    }
+
+    fn cachedRegistryManifestIsUsable(manager: *const Manager, manifest: *const Value) bool {
+        if (!manager.needsExtendedRegistryManifest()) return true;
+        if (manifest.* != .object) return false;
+        const time = manifest.object.get("time") orelse return false;
+        return time == .object;
+    }
+
     fn registryConfigForPackage(manager: *Manager, name: []const u8) RegistryConfig {
         if (name.len > 1 and name[0] == '@') {
             if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
@@ -6212,8 +6393,10 @@ const Manager = struct {
             if (cache_path) |path| {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                     if (try manager.parseRegistryManifest(cached)) |parsed| {
-                        try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
-                        break :blk parsed;
+                        if (manager.cachedRegistryManifestIsUsable(parsed)) {
+                            try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                            break :blk parsed;
+                        }
                     }
                     std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
                 }
@@ -6231,7 +6414,6 @@ const Manager = struct {
         const versions_value = manifest.object.get("versions") orelse return error.PackageNotFound;
         if (versions_value != .object) return error.InvalidRegistryManifest;
 
-        var selected_version: ?[]const u8 = null;
         var latest_version: ?[]const u8 = null;
         if (manifest.object.get("dist-tags")) |dist_tags| {
             if (dist_tags == .object) {
@@ -6240,29 +6422,25 @@ const Manager = struct {
                 }
             }
         }
-        if (versions_value.object.get(spec) != null) {
-            selected_version = spec;
-        } else if (manifest.object.get("dist-tags")) |dist_tags| {
-            if (dist_tags == .object) {
-                if (dist_tags.object.get(spec)) |tag_value| {
-                    if (tag_value == .string) selected_version = tag_value.string;
-                } else if (std.mem.eql(u8, spec, "") or std.mem.eql(u8, spec, "*")) {
-                    if (dist_tags.object.get("latest")) |latest| if (latest == .string) {
-                        selected_version = latest.string;
-                    };
-                } else if (!Semver.Version.isTaggedVersionOnly(spec)) {
-                    if (dist_tags.object.get("latest")) |latest| {
-                        if (latest == .string and semverSatisfies(manager.allocator, spec, latest.string)) {
-                            selected_version = latest.string;
-                        }
-                    }
-                }
+        const selection = try MinimumReleaseAge.selectVersion(
+            manager.allocator,
+            manifest,
+            name,
+            spec,
+            manager.options.minimum_release_age_ms,
+            manager.minimum_release_age_excludes,
+            manager.started_wall_ms,
+        );
+        if (manager.options.verbose) {
+            if (selection.newest_filtered) |newest_filtered| {
+                const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;
+                try manager.stderr.print(
+                    "[minimum-release-age] {s}@{s} selected {s} instead of {s} due to {d}-second filter\n",
+                    .{ name, spec, selection.version, newest_filtered, minimum_age_seconds },
+                );
             }
         }
-        if (selected_version == null and !Semver.Version.isTaggedVersionOnly(spec)) {
-            selected_version = bestMatchingVersion(manager.allocator, &versions_value.object, spec);
-        }
-        const version_value = selected_version orelse return error.NoMatchingVersion;
+        const version_value = selection.version;
         const metadata = versions_value.object.getPtr(version_value) orelse return error.NoMatchingVersion;
         if (metadata.* != .object) return error.InvalidRegistryManifest;
         const dist = metadata.object.get("dist") orelse return error.InvalidRegistryManifest;
@@ -6504,8 +6682,10 @@ const Manager = struct {
             if (cache_path) |path| {
                 if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
                     if (try manager.parseRegistryManifest(cached)) |parsed| {
-                        try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
-                        continue;
+                        if (manager.cachedRegistryManifestIsUsable(parsed)) {
+                            try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                            continue;
+                        }
                     }
                     std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
                 }
@@ -6516,6 +6696,7 @@ const Manager = struct {
                 .url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name }),
                 .authorization = configured_registry.authorization,
                 .cache_path = cache_path,
+                .accept = manager.registryManifestAccept(),
             });
         }
 
@@ -6605,7 +6786,7 @@ const Manager = struct {
         var headers_buffer: [2]std.http.Header = undefined;
         var header_count: usize = 0;
         if (manifest) {
-            headers_buffer[header_count] = .{ .name = "accept", .value = manifest_accept };
+            headers_buffer[header_count] = .{ .name = "accept", .value = manager.registryManifestAccept() };
             header_count += 1;
         }
         if (authorization) |value| {
@@ -8288,9 +8469,9 @@ fn verifyIntegrity(bytes: []const u8, integrity: ?[]const u8) !void {
     if (!std.mem.startsWith(u8, value, "sha512-")) return;
     const encoded = value["sha512-".len..];
     var expected: [64]u8 = undefined;
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.IntegrityCheckFailed;
-    if (decoded_len != expected.len) return error.IntegrityCheckFailed;
-    _ = std.base64.standard.Decoder.decode(&expected, encoded) catch return error.IntegrityCheckFailed;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return;
+    if (decoded_len != expected.len) return;
+    _ = std.base64.standard.Decoder.decode(&expected, encoded) catch return;
     var actual: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(bytes, &actual, .{});
     if (!std.crypto.timing_safe.eql([64]u8, expected, actual)) return error.IntegrityCheckFailed;
