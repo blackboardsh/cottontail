@@ -198,6 +198,29 @@ pub fn runWithExecArgv(
     return runWithExecArgvDisplay(init, script_path, null, script_args, exec_args);
 }
 
+pub fn bunEntrypointFallbackExtensions(path: []const u8) []const []const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.mem.eql(u8, extension, ".mjs")) return &.{".mts"};
+    if (std.mem.eql(u8, extension, ".js") or std.mem.eql(u8, extension, ".jsx")) return &.{ ".ts", ".tsx", ".mts" };
+    return &.{};
+}
+
+fn resolveBunEntrypointFallback(ctx: *const Context, script_path: []const u8) ![]const u8 {
+    const absolute = try absolutePathForCwd(ctx.io, ctx.allocator, script_path);
+    if (realPathIfFile(ctx, absolute)) |resolved| return resolved;
+
+    const extension = std.fs.path.extension(absolute);
+    const replacements = bunEntrypointFallbackExtensions(absolute);
+    if (replacements.len == 0) return absolute;
+
+    const stem = absolute[0 .. absolute.len - extension.len];
+    for (replacements) |replacement| {
+        const candidate = try std.mem.concat(ctx.allocator, u8, &.{ stem, replacement });
+        if (realPathIfFile(ctx, candidate)) |resolved| return resolved;
+    }
+    return absolute;
+}
+
 pub fn runWithExecArgvDisplay(
     init: std.process.Init,
     script_path: [:0]const u8,
@@ -207,10 +230,11 @@ pub fn runWithExecArgvDisplay(
 ) !u8 {
     const allocator = init.arena.allocator();
     const ctx = try makeContext(init);
+    const entrypoint_path = try resolveBunEntrypointFallback(&ctx, script_path);
 
-    if (try rejectInvalidBunCjsPragma(&ctx, script_path)) return 1;
+    if (try rejectInvalidBunCjsPragma(&ctx, entrypoint_path)) return 1;
 
-    const runnable_path = bundleScriptNative(&ctx, script_path, exec_args, script_args, null, null, null, false) catch |err| {
+    const runnable_path = bundleScriptNative(&ctx, entrypoint_path, exec_args, script_args, null, null, null, false) catch |err| {
         if (err == error.TestBundleFailed) return 1;
         if (err == error.SyntaxError) {
             ctx.writeStderr("error: Syntax Error\n", .{});
@@ -222,7 +246,8 @@ pub fn runWithExecArgvDisplay(
 
     const runnable_path_z = try allocator.dupeZ(u8, runnable_path);
     const process_args = try allocator.alloc([:0]const u8, script_args.len + 1);
-    const canonical_script_path = try resolvePathForCwd(ctx.io, allocator, script_path);
+    const canonical_script_path = resolvePathForCwd(ctx.io, allocator, script_path) catch
+        try absolutePathForCwd(ctx.io, allocator, script_path);
     process_args[0] = display_path orelse try allocator.dupeZ(u8, canonical_script_path);
     for (script_args, 0..) |arg, index| {
         process_args[index + 1] = arg;
@@ -6124,6 +6149,12 @@ fn osTempBase(ctx: *const Context) []const u8 {
 
 fn resolvePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
+fn absolutePathForCwd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return try allocator.dupe(u8, path);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+    return try std.fs.path.join(allocator, &.{ cwd, path });
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {

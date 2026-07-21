@@ -896,6 +896,7 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #if __has_include(<openssl/thread.h>)
 #include <openssl/thread.h>
 #endif
@@ -11076,19 +11077,26 @@ static const char *ct_tls_verify_error_code(long verify_error) {
 }
 
 static long ct_tls_effective_verify_error(SSL *ssl, long verify_error) {
-    if (ssl == NULL || verify_error == X509_V_OK ||
-        verify_error == X509_V_ERR_CERT_HAS_EXPIRED ||
-        verify_error == X509_V_ERR_CERT_NOT_YET_VALID) {
-        return verify_error;
-    }
+    if (ssl == NULL || verify_error == X509_V_OK) return verify_error;
     X509 *peer = SSL_get_peer_certificate(ssl);
     if (peer == NULL) return verify_error;
-    const ASN1_TIME *not_before = X509_get0_notBefore(peer);
-    const ASN1_TIME *not_after = X509_get0_notAfter(peer);
-    if (not_after != NULL && X509_cmp_current_time(not_after) < 0) {
-        verify_error = X509_V_ERR_CERT_HAS_EXPIRED;
-    } else if (not_before != NULL && X509_cmp_current_time(not_before) > 0) {
-        verify_error = X509_V_ERR_CERT_NOT_YET_VALID;
+    BASIC_CONSTRAINTS *constraints = X509_get_ext_d2i(peer, NID_basic_constraints, NULL, NULL);
+    const bool peer_is_explicit_ca = constraints != NULL && constraints->ca;
+    BASIC_CONSTRAINTS_free(constraints);
+    if (peer_is_explicit_ca) {
+        const ASN1_TIME *not_before = X509_get0_notBefore(peer);
+        const ASN1_TIME *not_after = X509_get0_notAfter(peer);
+        if (not_after != NULL && X509_cmp_current_time(not_after) < 0) {
+            verify_error = X509_V_ERR_CERT_HAS_EXPIRED;
+        } else if (not_before != NULL && X509_cmp_current_time(not_before) > 0) {
+            verify_error = X509_V_ERR_CERT_NOT_YET_VALID;
+        }
+    } else if ((verify_error == X509_V_ERR_CERT_HAS_EXPIRED ||
+                verify_error == X509_V_ERR_CERT_NOT_YET_VALID) &&
+               X509_NAME_cmp(X509_get_subject_name(peer), X509_get_issuer_name(peer)) == 0) {
+        /* BoringSSL reports a self-issued end-entity as an unverifiable leaf;
+         * OpenSSL may leave its later validity error as the final result. */
+        verify_error = X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE;
     }
     X509_free(peer);
     return verify_error;
@@ -11865,7 +11873,7 @@ static JSObjectRef ct_tls_connection_result(JSContextRef ctx, CtTlsConnection *c
     if (peer_cert != NULL) X509_free(peer_cert);
     const char *servername = SSL_get_servername(connection->ssl, TLSEXT_NAMETYPE_host_name);
     ct_set_property(ctx, result, "servername", servername != NULL ? ct_make_string(ctx, servername) : JSValueMakeNull(ctx), exception);
-    long verify_error = SSL_get_verify_result(connection->ssl);
+    long verify_error = ct_tls_effective_verify_error(connection->ssl, SSL_get_verify_result(connection->ssl));
     ct_set_property(ctx, result, "authorized", JSValueMakeBoolean(ctx, verify_error == X509_V_OK), exception);
     if (verify_error != X509_V_OK) {
         const char *verify_message = X509_verify_cert_error_string(verify_error);
@@ -12173,7 +12181,11 @@ static void *ct_tls_read_thread(void *opaque) {
                 break;
             }
             if (ssl_error == SSL_ERROR_SYSCALL && read_errno != 0) {
-                ct_queue_fd_error(connection->runtime, connection->id, read_errno, NULL);
+                if (connection->server_side && read_errno == ECONNRESET) {
+                    ct_queue_fd_simple(connection->runtime, connection->id, "end", NULL);
+                } else {
+                    ct_queue_fd_error(connection->runtime, connection->id, read_errno, NULL);
+                }
                 terminal = true;
                 break;
             }

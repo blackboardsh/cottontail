@@ -912,6 +912,10 @@ export class TLSSocket extends Socket {
         if (!this._refed) this._tlsHandshakeTimer.unref?.();
       } catch (error) {
         error = normalizeTlsError(error);
+        if (this.isServer && error.code === "UNABLE_TO_GET_ISSUER_CERT_LOCALLY" && this._secureContext?.context?.ca != null) {
+          error.code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+          error.message = "unable to verify the first certificate";
+        }
         this.authorized = false;
         this.authorizationError = error?.message ?? String(error);
         this.connecting = false;
@@ -1538,11 +1542,10 @@ export function connect(...args) {
   const host = options.host ?? options.hostname ?? parentSocket?._host ?? parentSocket?.remoteAddress ?? "localhost";
   const defaultServername = isIP(String(host)) ? "" : String(host);
   const servername = options.servername ?? defaultServername;
-  socket.servername = servername || undefined;
+  socket.servername = options.servername || undefined;
   socket._host = String(host);
-  socket._identityHostname = options.servername ??
-    (options.checkServerIdentity != null && isIP(String(host)) ? "localhost" : String(host));
-  socket._skipServerIdentity = options.servername == null && options.checkServerIdentity == null && isIP(String(host)) !== 0;
+  socket._identityHostname = options.servername;
+  socket._skipServerIdentity = options.servername == null;
   if (options.timeout != null) socket.setTimeout(options.timeout);
   socket[bunTlsConnectOptions] = {
     serverName: options.servername ?? String(host),
@@ -1675,11 +1678,10 @@ export function _connectMemoryTransport(parentSocket, options = {}) {
   const host = options.host ?? options.hostname ?? parentSocket?._host ?? parentSocket?.remoteAddress ?? "localhost";
   const defaultServername = isIP(String(host)) ? "" : String(host);
   const servername = options.servername ?? defaultServername;
-  socket.servername = servername || undefined;
+  socket.servername = options.servername || undefined;
   socket._host = String(host);
-  socket._identityHostname = options.servername ??
-    (options.checkServerIdentity != null && isIP(String(host)) ? "localhost" : String(host));
-  socket._skipServerIdentity = options.servername == null && options.checkServerIdentity == null && isIP(String(host)) !== 0;
+  socket._identityHostname = options.servername;
+  socket._skipServerIdentity = options.servername == null;
   if (options.timeout != null) socket.setTimeout(options.timeout);
   socket[bunTlsConnectOptions] = {
     serverName: options.servername ?? String(host),

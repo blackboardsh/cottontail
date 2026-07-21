@@ -409,6 +409,20 @@ fn cliPathExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+fn cliBunEntrypointExists(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !bool {
+    if (cliPathExists(io, path)) return true;
+    const extension = std.fs.path.extension(path);
+    const replacements = script_runner.bunEntrypointFallbackExtensions(path);
+    if (replacements.len == 0) return false;
+
+    const stem = path[0 .. path.len - extension.len];
+    for (replacements) |replacement| {
+        const candidate = try std.mem.concat(allocator, u8, &.{ stem, replacement });
+        if (cliPathExists(io, candidate)) return true;
+    }
+    return false;
+}
+
 const PackageScripts = struct {
     dir: []const u8,
     pre: ?[]const u8,
@@ -2501,7 +2515,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (invocation.mode == .script and !std.mem.eql(u8, arg, "test") and !cliPathExists(init.io, invocation.payload)) {
+    if (invocation.mode == .script and !std.mem.eql(u8, arg, "test") and
+        !(try cliBunEntrypointExists(init.io, init.arena.allocator(), invocation.payload)))
+    {
         const payload = invocation.payload;
         const path_like = std.mem.indexOfScalar(u8, payload, '/') != null or
             std.mem.indexOfScalar(u8, payload, '\\') != null;
