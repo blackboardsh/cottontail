@@ -184,9 +184,9 @@ function getOwnNonIndexProperties(object, filter) {
 }
 
 function getPromiseDetails(promise) {
-  if (!(promise instanceof Promise)) return undefined;
-  // Best effort: cottontail has no native promise-state introspection. The
-  // Bun global patches Promise.resolve/reject to record states here.
+  if (!typesModule.isPromise(promise)) return undefined;
+  // Promise state/result tracking remains best effort. The Bun global patches
+  // Promise.resolve/reject to record states here.
   const state = promisePeekStates.get(promise);
   if (state === undefined) return [utilBindingConstants.kPending];
   if (state.status === "fulfilled") return [utilBindingConstants.kFulfilled, state.value];
@@ -438,7 +438,7 @@ const bindings = {
   },
   types: {
     isNativeError: (value) => typesModule.isNativeError(value),
-    isPromise: (value) => value instanceof Promise,
+    isPromise: (value) => typesModule.isPromise(value),
   },
   string_decoder: { encodings: stringDecoderEncodings },
   trace_events: {

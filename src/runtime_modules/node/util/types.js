@@ -454,11 +454,11 @@ export function isNumberObject(value) {
 }
 
 export function isPromise(value) {
-  if (value instanceof Promise) return true;
-  // Recognize promises whose prototype was tampered with, as long as they
-  // went through the tracked Promise.resolve/reject paths.
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  const promiseStatus = globalThis.cottontail?.promiseStatus;
+  if (typeof promiseStatus === "function") return promiseStatus(value) >= 0;
   const peekStates = globalThis.__cottontailPromisePeekStates;
-  return peekStates !== undefined && typeof value === "object" && value !== null && peekStates.has(value);
+  return value instanceof Promise || (peekStates !== undefined && peekStates.has(value));
 }
 
 export function isProxy(value) {
