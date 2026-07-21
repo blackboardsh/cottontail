@@ -1253,6 +1253,8 @@ typedef struct {
     size_t script_source_len;
     char *eval_source;
     size_t eval_source_len;
+    char *thread_name;
+    size_t stack_size;
     CtWorker *worker;
 } CtWorkerStart;
 
@@ -19570,6 +19572,34 @@ static JSValueRef ct_worker_poll_messages(JSContextRef ctx, JSObjectRef function
     return ct_worker_drain_queue(ctx, worker, false, exception);
 }
 
+static void ct_worker_set_current_thread_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return;
+#if defined(_WIN32)
+    typedef HRESULT (WINAPI *CtSetThreadDescription)(HANDLE, PCWSTR);
+    HMODULE kernel = GetModuleHandleW(L"Kernel32.dll");
+    CtSetThreadDescription set_description = kernel != NULL
+        ? (CtSetThreadDescription)(void *)GetProcAddress(kernel, "SetThreadDescription")
+        : NULL;
+    if (set_description != NULL) {
+        WCHAR *wide = ct_windows_utf8_to_wide(name);
+        if (wide != NULL) {
+            set_description(GetCurrentThread(), wide);
+            free(wide);
+        }
+    }
+#elif defined(__APPLE__)
+    char truncated[64];
+    snprintf(truncated, sizeof(truncated), "%s", name);
+    pthread_setname_np(truncated);
+#elif defined(__linux__)
+    char truncated[16];
+    snprintf(truncated, sizeof(truncated), "%s", name);
+    pthread_setname_np(pthread_self(), truncated);
+#else
+    (void)name;
+#endif
+}
+
 static JSValueRef ct_worker_terminate(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -19581,6 +19611,7 @@ static JSValueRef ct_worker_terminate(JSContextRef ctx, JSObjectRef function, JS
     pthread_mutex_lock(&worker->mutex);
     worker->terminated = true;
     worker->referenced = false;
+    worker->exit_code = 1;
     if (!worker->exit_event_sent) {
         worker->exit_event_sent = true;
         ct_worker_queue_parent_event_locked(worker, "exit", NULL);
@@ -19688,11 +19719,13 @@ static void ct_worker_finish(CtWorkerStart *start, CtJscRuntime *runtime, const 
     free(start->script_path);
     free(start->script_source);
     free(start->eval_source);
+    free(start->thread_name);
     free(start);
 }
 
 static void *ct_worker_entry(void *opaque) {
     CtWorkerStart *start = (CtWorkerStart *)opaque;
+    ct_worker_set_current_thread_name(start->thread_name);
     uint64_t initial_active_started_ns = ct_timer_now_ns();
     pthread_mutex_lock(&start->worker->mutex);
     start->worker->performance_started_ns = initial_active_started_ns;
@@ -19772,6 +19805,13 @@ static void *ct_worker_entry(void *opaque) {
         return NULL;
     }
     runtime->worker = start->worker;
+    pthread_mutex_lock(&start->worker->mutex);
+    bool terminated_after_runtime_start = start->worker->terminated;
+    pthread_mutex_unlock(&start->worker->mutex);
+    if (terminated_after_runtime_start) {
+        ct_worker_finish(start, runtime, NULL);
+        return NULL;
+    }
     ct_signal_watchers_stop(runtime);
 
     JSStringRef bootstrap = ct_js_string(worker_bootstrap_source);
@@ -19819,8 +19859,17 @@ static void *ct_worker_entry(void *opaque) {
     start->script_source_len = 0;
 
     if (ct_jsc_runtime_eval(runtime, (const uint8_t *)source, source_len, start->script_path, &error) != 0) {
-        fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
-        ct_worker_finish(start, runtime, error != NULL ? error : "cottontail: worker script failed");
+        pthread_mutex_lock(&start->worker->mutex);
+        bool terminated_during_eval = start->worker->terminated;
+        pthread_mutex_unlock(&start->worker->mutex);
+        if (!terminated_during_eval) {
+            fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker script failed");
+        }
+        ct_worker_finish(
+            start,
+            runtime,
+            terminated_during_eval ? NULL : (error != NULL ? error : "cottontail: worker script failed")
+        );
         free(error);
         free(source);
         return NULL;
@@ -19846,8 +19895,15 @@ static void *ct_worker_entry(void *opaque) {
         uint64_t active_started_ns = ct_timer_now_ns();
         int delay_ms = 16;
         if (ct_jsc_runtime_tick_with_delay(runtime, &delay_ms, &error) != 0) {
-            fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker tick failed");
-            terminal_error = error != NULL ? error : ct_duplicate_string("cottontail: worker tick failed");
+            pthread_mutex_lock(&start->worker->mutex);
+            bool terminated_during_tick = start->worker->terminated;
+            pthread_mutex_unlock(&start->worker->mutex);
+            if (!terminated_during_tick) {
+                fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker tick failed");
+                terminal_error = error != NULL ? error : ct_duplicate_string("cottontail: worker tick failed");
+            } else {
+                free(error);
+            }
             error = NULL;
             break;
         }
@@ -19901,6 +19957,23 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         ct_throw_message(ctx, exception, "Out of memory preparing worker eval source");
         return JSValueMakeUndefined(ctx);
     }
+    char *thread_name = argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2])
+        ? ct_value_to_string_copy(ctx, argv[2])
+        : NULL;
+    if (argc >= 3 && !JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2]) && thread_name == NULL) {
+        free(script_path);
+        free(script_source);
+        free(eval_source);
+        ct_throw_message(ctx, exception, "Out of memory preparing worker thread name");
+        return JSValueMakeUndefined(ctx);
+    }
+    size_t stack_size = 0;
+    if (argc >= 4 && JSValueIsNumber(ctx, argv[3])) {
+        double requested_stack_size = ct_value_to_number(ctx, argv[3]);
+        if (isfinite(requested_stack_size) && requested_stack_size > 0 && requested_stack_size <= (double)SIZE_MAX) {
+            stack_size = (size_t)requested_stack_size;
+        }
+    }
 
     CtWorker *worker = (CtWorker *)calloc(1, sizeof(CtWorker));
     CtWorkerStart *start = (CtWorkerStart *)calloc(1, sizeof(CtWorkerStart));
@@ -19910,6 +19983,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         free(script_path);
         free(script_source);
         free(eval_source);
+        free(thread_name);
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
     }
@@ -19928,11 +20002,14 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     start->script_source_len = script_source_len;
     start->eval_source = eval_source;
     start->eval_source_len = eval_source_len;
+    start->thread_name = thread_name;
+    start->stack_size = stack_size;
     start->worker = worker;
 
     pthread_t thread;
 #if defined(_WIN32)
-    int create_status = ct_windows_thread_create(&thread, CT_WORKER_STACK_SIZE, ct_worker_entry, start);
+    size_t worker_stack_size = start->stack_size > 0 ? start->stack_size : CT_WORKER_STACK_SIZE;
+    int create_status = ct_windows_thread_create(&thread, worker_stack_size, ct_worker_entry, start);
 #else
     pthread_attr_t attr;
     int attr_status = pthread_attr_init(&attr);
@@ -19943,12 +20020,20 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         free(start->script_path);
         free(start->script_source);
         free(start->eval_source);
+        free(start->thread_name);
         free(start);
         ct_throw_message(ctx, exception, "failed to initialize worker thread attributes");
         return JSValueMakeUndefined(ctx);
     }
 
-    attr_status = pthread_attr_setstacksize(&attr, CT_WORKER_STACK_SIZE);
+    size_t worker_stack_size = start->stack_size > 0 ? start->stack_size : CT_WORKER_STACK_SIZE;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) {
+        size_t alignment = (size_t)page_size;
+        worker_stack_size = ((worker_stack_size + alignment - 1) / alignment) * alignment;
+    }
+    if (worker_stack_size < (size_t)PTHREAD_STACK_MIN) worker_stack_size = (size_t)PTHREAD_STACK_MIN;
+    attr_status = pthread_attr_setstacksize(&attr, worker_stack_size);
     if (attr_status != 0) {
         pthread_attr_destroy(&attr);
         pthread_mutex_lock(&worker->mutex);
@@ -19957,6 +20042,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         free(start->script_path);
         free(start->script_source);
         free(start->eval_source);
+        free(start->thread_name);
         free(start);
         ct_throw_message(ctx, exception, "failed to set worker thread stack size");
         return JSValueMakeUndefined(ctx);
@@ -19972,6 +20058,7 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         free(start->script_path);
         free(start->script_source);
         free(start->eval_source);
+        free(start->thread_name);
         free(start);
         ct_throw_message(ctx, exception, "failed to create worker thread");
         return JSValueMakeUndefined(ctx);
