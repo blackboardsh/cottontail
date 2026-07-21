@@ -161,8 +161,7 @@ bunObject.version ??= bunCompatVersion;
 bunObject.revision ??= "cottontail";
 bunObject.version_with_sha ??= `v${bunCompatVersion} (cottontail)`;
 bunObject.gc ??= function gc(force = false) {
-  void force;
-  cottontail.gc?.();
+  cottontail.gc?.(Boolean(force));
   cottontail.drainJobs?.();
 };
 bunObject.sleep ??= function sleep(value) {

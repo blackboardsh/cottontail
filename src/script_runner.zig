@@ -2389,6 +2389,74 @@ fn decodeBundleDiagnostic(ctx: *const Context, wire: []const u8) []const u8 {
     return decoded;
 }
 
+const runtime_native_addon_public_path = "/__cottontail_native_addons__/";
+
+fn isRuntimeNativeAddonOutput(file: *const native_bundler.GraphOutputFile) bool {
+    return file.kind == .asset and
+        (file.loader == .napi or
+            std.mem.endsWith(u8, file.path, ".node") or
+            std.mem.endsWith(u8, file.source_path, ".node"));
+}
+
+const RuntimeNativeAddons = struct {
+    code: []const u8,
+};
+
+fn rewriteRuntimeNativeAddonReference(
+    ctx: *const Context,
+    code: []const u8,
+    public_path: []const u8,
+    output_name: []const u8,
+    source_path: []const u8,
+) ![]const u8 {
+    const source_absolute = try resolvePathForCwd(ctx.io, ctx.allocator, source_path);
+    const destination = try std.mem.replaceOwned(u8, ctx.allocator, source_absolute, "\\", "/");
+    var rewritten = code;
+    var found = false;
+    var search_from: usize = 0;
+
+    while (std.mem.indexOfPos(u8, rewritten, search_from, public_path)) |path_start| {
+        const path_end = std.mem.indexOfScalarPos(u8, rewritten, path_start, '"') orelse
+            return error.InvalidNativeAddonReference;
+        const specifier = rewritten[path_start..path_end];
+        search_from = path_end + 1;
+        if (!std.mem.endsWith(u8, specifier, output_name)) continue;
+
+        found = true;
+        if (std.mem.eql(u8, specifier, destination)) continue;
+        rewritten = try std.mem.replaceOwned(u8, ctx.allocator, rewritten, specifier, destination);
+        search_from = path_start + destination.len;
+    }
+    if (!found) return error.MissingNativeAddonReference;
+    return rewritten;
+}
+
+fn prepareRuntimeNativeAddons(
+    ctx: *const Context,
+    public_path: []const u8,
+    code: []const u8,
+    files: []const native_bundler.GraphOutputFile,
+) !RuntimeNativeAddons {
+    var result: RuntimeNativeAddons = .{ .code = code };
+    for (files) |*file| {
+        if (!isRuntimeNativeAddonOutput(file)) continue;
+
+        const name = std.fs.path.basename(file.path);
+        if (name.len == 0 or !std.mem.endsWith(u8, name, ".node")) {
+            return error.InvalidNativeAddonOutputPath;
+        }
+        if (file.source_path.len == 0) return error.MissingNativeAddonSourcePath;
+        result.code = try rewriteRuntimeNativeAddonReference(
+            ctx,
+            result.code,
+            public_path,
+            name,
+            file.source_path,
+        );
+    }
+    return result;
+}
+
 fn bundleScriptNative(
     ctx: *const Context,
     script_path: []const u8,
@@ -2516,6 +2584,12 @@ fn bundleScriptNative(
     options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
     options.inline_import_meta_properties = true;
+    if (build_options == null and graph_out == null) {
+        // Runtime execution can load the original addon directly. A fixed
+        // prefix makes the compiler-emitted asset reference unambiguous so it
+        // can be replaced after the graph exposes the addon's source path.
+        options.public_path = runtime_native_addon_public_path;
+    }
     var runtime_define_keys: std.ArrayList([]const u8) = .empty;
     var runtime_define_values: std.ArrayList([]const u8) = .empty;
     try runtime_define_keys.appendSlice(ctx.allocator, options.define_keys);
@@ -2590,7 +2664,7 @@ fn bundleScriptNative(
         return bundle_path;
     }
 
-    var output = native_bundler.bundleEntryPointWithOptionsAndSourceMap(
+    var output = native_bundler.bundleEntryPointGraphWithOptions(
         wrapped_entry,
         bundle_working_dir,
         options,
@@ -2604,35 +2678,41 @@ fn bundleScriptNative(
         error_message,
         err,
     );
-    defer output.deinitInputFiles();
-    defer native_bundler.ct_bundle_free(output.code.ptr, output.code.len);
-    defer if (output.source_map) |source_map| native_bundler.ct_bundle_free(source_map.ptr, source_map.len);
+    defer output.deinit();
+    const entry = output.entryPoint() orelse return error.MissingRuntimeEntryPoint;
+    const output_source_map: ?[]const u8 = if (entry.source_map) |source_map| source_map.contents else null;
+    const native_addons: RuntimeNativeAddons = if (build_options == null)
+        try prepareRuntimeNativeAddons(ctx, options.public_path, entry.contents, output.files)
+    else
+        .{ .code = entry.contents };
     const runtime_code = if (build_options == null)
-        try rewriteRuntimeEntrypointCode(ctx, output.code, script_entry_abs, script_identity_abs)
+        try rewriteRuntimeEntrypointCode(ctx, native_addons.code, script_entry_abs, script_identity_abs)
     else
-        output.code;
-    const runtime_source_map = if (build_options == null and output.source_map != null)
-        try rewriteRuntimeEntrypointSourceMap(ctx, output.source_map.?, script_entry_abs, script_identity_abs)
+        entry.contents;
+    const runtime_source_map = if (build_options == null and output_source_map != null)
+        try rewriteRuntimeEntrypointSourceMap(ctx, output_source_map.?, script_entry_abs, script_identity_abs)
     else
-        output.source_map;
+        output_source_map;
     try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = bundle_path, .data = runtime_code });
     if (runtime_source_map) |source_map| {
         const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ bundle_path, ".map" });
         try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = source_map_path, .data = source_map });
     }
     if (launcher_cache) |cache| {
-        const cached_bundle_path = installLauncherCache(
-            ctx,
-            &cache,
-            wrapped_entry,
-            script_entry_abs,
-            if (use_esm_bundle_cache) script_abs else null,
-            runtime_code,
-            runtime_source_map,
-            output.input_files,
-        ) catch return bundle_path;
-        std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
-        return cached_bundle_path;
+        if (cache.can_install) {
+            const cached_bundle_path = installLauncherCache(
+                ctx,
+                &cache,
+                wrapped_entry,
+                script_entry_abs,
+                if (use_esm_bundle_cache) script_abs else null,
+                runtime_code,
+                runtime_source_map,
+                output.input_files,
+            ) catch return bundle_path;
+            std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
+            return cached_bundle_path;
+        }
     }
     return bundle_path;
 }
@@ -2643,6 +2723,7 @@ const LauncherCache = struct {
     manifest_path: []const u8,
     key: [64]u8,
     lock_file: std.Io.File,
+    can_install: bool,
 };
 
 const launcher_cache_magic = "CTLCACH2";
@@ -2675,7 +2756,7 @@ fn acquireLauncherCache(
     key_material_path: ?[]const u8,
 ) !?LauncherCache {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("cottontail-launcher-v2\x00");
+    hasher.update("cottontail-launcher-v3\x00");
     hasher.update(cache_name);
     hasher.update("\x00");
     hasher.update(ctx.executable_stamp);
@@ -2716,9 +2797,16 @@ fn acquireLauncherCache(
     const lock_file = std.Io.Dir.cwd().createFile(ctx.io, lock_path, .{
         .read = true,
         .truncate = false,
-        .lock = .exclusive,
     }) catch return null;
     errdefer lock_file.close(ctx.io);
+    const can_install = lock_file.tryLock(ctx.io, .exclusive) catch {
+        lock_file.close(ctx.io);
+        return null;
+    };
+    if (!can_install) lock_file.lock(ctx.io, .shared) catch {
+        lock_file.close(ctx.io);
+        return null;
+    };
 
     return .{
         .cache_root = cache_root,
@@ -2726,6 +2814,7 @@ fn acquireLauncherCache(
         .manifest_path = try std.fs.path.join(ctx.allocator, &.{ cache_root, try std.fmt.allocPrint(ctx.allocator, "{s}.manifest", .{cache_name}) }),
         .key = std.fmt.bytesToHex(digest, .lower),
         .lock_file = lock_file,
+        .can_install = can_install,
     };
 }
 

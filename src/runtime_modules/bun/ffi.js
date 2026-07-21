@@ -208,12 +208,13 @@ if (typeof cottontail.gc === "function" &&
     exposedGc = (0, eval)("typeof gc === 'function' ? gc : undefined");
   } catch {}
   Object.defineProperty(g, "gc", {
-    value: exposedGc ?? ((options = undefined) => {
-      const result = cottontail.gc();
+    value: (options = undefined) => {
+      exposedGc?.();
+      const result = cottontail.gc(true);
       globalThis.__cottontailAsyncHooksOnGc?.();
       if (options && typeof options === "object" && options.execution === "async") return Promise.resolve(result);
       return result;
-    }),
+    },
     configurable: true,
     writable: true,
   });

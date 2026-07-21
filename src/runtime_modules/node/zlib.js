@@ -562,6 +562,66 @@ export function crc32(data, value = 0) {
 const decompressModes = new Set(["inflate", "inflateRaw", "gunzip", "unzip", "brotliDecompress", "zstdDecompress"]);
 const concatenatedDecompressModes = new Set(["gunzip", "unzip", "zstdDecompress"]);
 
+// Older native consumers implement synchronous transforms by driving the
+// binding handle directly. The host exposes one-shot transforms, so retain
+// the transformed bytes and drain them through the same writeSync contract.
+class OneShotZlibHandle {
+  constructor(stream) {
+    this._stream = stream;
+    this.reset();
+  }
+
+  writeSync(flushFlag, input, inputOffset, inputLength, output, outputOffset, outputLength) {
+    if (this._closed) throw new Error("zlib binding closed");
+
+    let availableInput = Number(inputLength) || 0;
+    if (!this._processed) {
+      try {
+        const inputBytes = bytesFromData(input).subarray(inputOffset, inputOffset + availableInput);
+        const result = transformSync(this._stream._mode, inputBytes, {
+          ...this._stream._transformOptions(),
+          finishFlush: flushFlag,
+        });
+        this._output = result instanceof Uint8Array ? result : new Uint8Array(result);
+        this._stream._inputBytes += availableInput;
+        this._processed = true;
+        availableInput = 0;
+      } catch (error) {
+        this._stream._hadError = true;
+        this._stream.emit("error", error);
+        return this._updateWriteState(availableInput, outputLength);
+      }
+    }
+
+    const remaining = this._output.byteLength - this._outputOffset;
+    const written = Math.min(remaining, outputLength);
+    if (written > 0) {
+      output.set(this._output.subarray(this._outputOffset, this._outputOffset + written), outputOffset);
+      this._outputOffset += written;
+    }
+    return this._updateWriteState(availableInput, outputLength - written);
+  }
+
+  _updateWriteState(availableInput, availableOutput) {
+    this._stream._writeState[0] = availableInput;
+    this._stream._writeState[1] = availableOutput;
+    return this._stream._writeState;
+  }
+
+  close() {
+    this._closed = true;
+    this._output = new Uint8Array(0);
+    this._outputOffset = 0;
+  }
+
+  reset() {
+    this._closed = false;
+    this._processed = false;
+    this._output = new Uint8Array(0);
+    this._outputOffset = 0;
+  }
+}
+
 class Zlib extends Transform {
   constructor(mode, options = {}) {
     super();
@@ -580,6 +640,19 @@ class Zlib extends Transform {
     this._readableCompleted = false;
     this._emittedMember = false;
     this._brotliEncoder = mode === "brotliCompress" ? createBrotliEncoder(this._options) : null;
+    const requestedChunkSize = Number(this._options.chunkSize);
+    this._chunkSize = Number.isInteger(requestedChunkSize) && requestedChunkSize > 0
+      ? requestedChunkSize
+      : constants.Z_DEFAULT_CHUNK;
+    this._offset = 0;
+    this._buffer = bufferModule.Buffer.allocUnsafe(this._chunkSize);
+    this._outOffset = this._offset;
+    this._outBuffer = this._buffer;
+    this._finishFlushFlag = this._options.finishFlush ?? constants.Z_FINISH;
+    this._flushFlag = this._options.flush ?? constants.Z_NO_FLUSH;
+    this._hadError = false;
+    this._writeState = [0, this._chunkSize];
+    this._handle = new OneShotZlibHandle(this);
   }
 
   // Node's zlib streams expose bytesWritten as the number of input bytes the
@@ -899,6 +972,8 @@ class Zlib extends Transform {
 
   close(callback = undefined) {
     this._closeBrotliEncoder();
+    this._handle?.close();
+    this._handle = null;
     callback?.();
     this.emit("close");
   }
@@ -911,6 +986,8 @@ class Zlib extends Transform {
 
   _destroy(error, callback) {
     this._closeBrotliEncoder();
+    this._handle?.close();
+    this._handle = null;
     callback(error);
   }
 
@@ -926,6 +1003,15 @@ class Zlib extends Transform {
     this._readableCompleted = false;
     this._emittedMember = false;
     this._brotliEncoder = this._mode === "brotliCompress" ? createBrotliEncoder(this._options) : null;
+    this._offset = 0;
+    this._buffer = bufferModule.Buffer.allocUnsafe(this._chunkSize);
+    this._outOffset = this._offset;
+    this._outBuffer = this._buffer;
+    this._hadError = false;
+    if (this._handle === null) this._handle = new OneShotZlibHandle(this);
+    else this._handle.reset();
+    this._writeState[0] = 0;
+    this._writeState[1] = this._chunkSize;
   }
 }
 
@@ -940,7 +1026,11 @@ class Zstd extends Zlib {}
 function makeCallableZlibConstructor(name, Parent, mode) {
   const Constructor = {
     [name]: function(options = {}) {
-      return Reflect.construct(Parent, [mode, options], new.target ?? Constructor);
+      const instance = Reflect.construct(Parent, [mode, options], new.target ?? Constructor);
+      if (new.target || this == null || this === globalThis) return instance;
+      Object.defineProperties(this, Object.getOwnPropertyDescriptors(instance));
+      this._handle._stream = this;
+      return this;
     },
   }[name];
   Object.setPrototypeOf(Constructor, Parent);
