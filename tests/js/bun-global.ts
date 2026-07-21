@@ -8,6 +8,9 @@ if (Bun.version !== "1.3.10" || process.versions.bun !== Bun.version) {
 if (process.versions.cottontail !== String(cottontail.processInfo("version"))) {
   throw new Error(`Cottontail product version mismatch: ${process.versions.cottontail}`);
 }
+if (Object.prototype.toString.call(process) !== "[object process]") {
+  throw new Error("process Symbol.toStringTag branding mismatch");
+}
 
 if (typeof globalThis.crypto?.randomUUID !== "function") {
   throw new Error("global crypto.randomUUID was not installed");

@@ -175,6 +175,53 @@ test("native Bun.serve streams response chunks before the body completes", async
   expect(await completed).toBe("firstsecond");
 });
 
+test("native Bun.serve reports stream errors without replacing started headers", async () => {
+  let errorHandlerCalls = 0;
+  const diagnostics = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => diagnostics.push(args.map(String).join(" "));
+  try {
+    using server = Bun.serve({
+      port: 0,
+      error() {
+        errorHandlerCalls += 1;
+        return new Response("replacement", { status: 555 });
+      },
+      fetch() {
+        return new Response(new ReadableStream({
+          pull() {
+            throw new Error("focused stream failure");
+          },
+        }), {
+          status: 402,
+          headers: { "x-started": "true" },
+        });
+      },
+    });
+
+    const result = await new Promise((resolve, reject) => {
+      const request = http.get(server.url, response => {
+        const chunks = [];
+        response.on("data", chunk => chunks.push(Buffer.from(chunk)));
+        response.once("end", () => resolve({
+          status: response.statusCode,
+          started: response.headers["x-started"],
+          body: Buffer.concat(chunks).toString(),
+        }));
+        response.once("error", reject);
+      });
+      request.setTimeout(3000, () => request.destroy(new Error("stream error response timed out")));
+      request.once("error", reject);
+    });
+
+    expect(result).toEqual({ status: 402, started: "true", body: "" });
+    expect(errorHandlerCalls).toBe(0);
+    expect(diagnostics.some(line => line.includes("error: focused stream failure"))).toBe(true);
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
 test("in-process fetch enforces maxRequestBodySize before dispatch", async () => {
   let calls = 0;
   using server = Bun.serve({

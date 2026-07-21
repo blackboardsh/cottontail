@@ -75,6 +75,7 @@ pub fn convertStmtsForChunk(
                     // "import * as ns from 'path'"
                     // "import {foo} from 'path'"
                     if (try c.shouldRemoveImportExportStmt(
+                        source_index,
                         stmts,
                         stmt.loc,
                         s.namespace_ref,
@@ -95,6 +96,7 @@ pub fn convertStmtsForChunk(
                     // "export * as ns from 'path'"
                     if (s.alias) |alias| {
                         if (try c.shouldRemoveImportExportStmt(
+                            source_index,
                             stmts,
                             stmt.loc,
                             s.namespace_ref,
@@ -295,6 +297,7 @@ pub fn convertStmtsForChunk(
                 .s_export_from => |s| {
                     // "export {foo} from 'path'"
                     if (try c.shouldRemoveImportExportStmt(
+                        source_index,
                         stmts,
                         stmt.loc,
                         s.namespace_ref,

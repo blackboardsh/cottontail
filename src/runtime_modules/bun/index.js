@@ -74,6 +74,15 @@ import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shel
 const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
 const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
 
+if (globalThis.process && Object.prototype.toString.call(globalThis.process) !== "[object process]") {
+  Object.defineProperty(globalThis.process, Symbol.toStringTag, {
+    value: "process",
+    writable: true,
+    enumerable: false,
+    configurable: false,
+  });
+}
+
 installInheritedNodeIpc(cottontail);
 
 const inheritedSpawnArgv0 = globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0;
@@ -11176,10 +11185,15 @@ export function serve(options) {
       });
       cottontail.httpServerResponseEnd(native.id, item.id);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!stopped) console.error(`error: ${message}`);
       try {
-        cottontail.httpServerResponseAbort(native.id, item.id);
-      } catch {}
-      if (!stopped) throw error;
+        cottontail.httpServerResponseEnd(native.id, item.id);
+      } catch {
+        try {
+          cottontail.httpServerResponseAbort(native.id, item.id);
+        } catch {}
+      }
     }
   };
 

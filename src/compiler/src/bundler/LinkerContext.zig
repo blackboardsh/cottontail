@@ -1180,6 +1180,7 @@ pub const LinkerContext = struct {
 
     pub fn shouldRemoveImportExportStmt(
         c: *LinkerContext,
+        source_index: u32,
         stmts: *StmtList,
         loc: Logger.Loc,
         namespace_ref: Ref,
@@ -1282,7 +1283,11 @@ pub const LinkerContext = struct {
                     ),
                 }, loc);
 
-                if (other_flags.is_async_or_has_async_dependency) {
+                // The imported module is already suspended in import(current).
+                // Awaiting its initializer here would deadlock the cycle.
+                if (other_flags.is_async_or_has_async_dependency and
+                    !c.isDynamicImportBackEdge(source_index, record.source_index.get()))
+                {
                     try stmts.inside_wrapper_prefix.appendAsyncDependency(init_call, c.promise_all_runtime_ref);
                 } else {
                     try stmts.inside_wrapper_prefix.appendSyncDependency(init_call);
@@ -1291,6 +1296,18 @@ pub const LinkerContext = struct {
         }
 
         return true;
+    }
+
+    fn isDynamicImportBackEdge(c: *LinkerContext, source_index: u32, imported_source_index: u32) bool {
+        for (c.graph.ast.items(.import_records)[imported_source_index].sliceConst()) |record| {
+            if (record.kind == .dynamic and
+                record.source_index.isValid() and
+                record.source_index.get() == source_index)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub const convertStmtsForChunk = @import("./linker_context/convertStmtsForChunk.zig").convertStmtsForChunk;
