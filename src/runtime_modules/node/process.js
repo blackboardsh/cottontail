@@ -987,6 +987,70 @@ processObject.env ??= cottontail.env();
 {
   const environment = processObject.env;
   let warnedAboutNonStringEnvValue = false;
+  const timeZoneAliasStateKey = Symbol.for("cottontail.intl.default-time-zone");
+  let timeZoneAliasState = globalThis[timeZoneAliasStateKey];
+  if (timeZoneAliasState == null) {
+    const DateTimeFormat = Intl.DateTimeFormat;
+    const defaultTimeZoneInstances = new WeakSet();
+    const resolvedOptions = DateTimeFormat.prototype.resolvedOptions;
+    timeZoneAliasState = { requested: undefined };
+
+    Object.defineProperty(DateTimeFormat.prototype, "resolvedOptions", {
+      value: function resolvedOptionsWithDefaultAlias() {
+        const options = resolvedOptions.call(this);
+        if (
+          defaultTimeZoneInstances.has(this) &&
+          timeZoneAliasState.requested === "Etc/UTC" &&
+          options.timeZone === "UTC"
+        ) {
+          return { ...options, timeZone: "Etc/UTC" };
+        }
+        return options;
+      },
+      writable: true,
+      configurable: true,
+    });
+
+    let wrappedDateTimeFormat;
+    const trackDefaultTimeZone = (instance, args) => {
+      if (args[1]?.timeZone === undefined) defaultTimeZoneInstances.add(instance);
+      return instance;
+    };
+    wrappedDateTimeFormat = new Proxy(DateTimeFormat, {
+      apply(target, thisArg, args) {
+        return trackDefaultTimeZone(Reflect.apply(target, thisArg, args), args);
+      },
+      construct(target, args, newTarget) {
+        return trackDefaultTimeZone(
+          Reflect.construct(target, args, newTarget === wrappedDateTimeFormat ? target : newTarget),
+          args,
+        );
+      },
+    });
+    const constructorDescriptor = Object.getOwnPropertyDescriptor(DateTimeFormat.prototype, "constructor");
+    Object.defineProperty(DateTimeFormat.prototype, "constructor", {
+      ...constructorDescriptor,
+      value: wrappedDateTimeFormat,
+    });
+    Object.defineProperty(Intl, "DateTimeFormat", {
+      ...Object.getOwnPropertyDescriptor(Intl, "DateTimeFormat"),
+      value: wrappedDateTimeFormat,
+    });
+    Object.defineProperty(globalThis, timeZoneAliasStateKey, {
+      value: timeZoneAliasState,
+      configurable: true,
+    });
+  }
+
+  const bootTimeZone = environment.TZ || "Etc/UTC";
+  if (typeof cottontail.jscSetTimeZone === "function") {
+    try {
+      cottontail.jscSetTimeZone(bootTimeZone);
+      timeZoneAliasState.requested = bootTimeZone;
+    } catch {
+      // Preserve the host timezone when TZ was explicitly set to an unsupported value.
+    }
+  }
   let initialTimeZone;
   try {
     initialTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -997,6 +1061,7 @@ processObject.env ??= cottontail.env();
     if (value == null || value === "") return;
     try {
       cottontail.jscSetTimeZone(String(value));
+      timeZoneAliasState.requested = String(value);
     } catch {
       // COTTONTAIL-COMPAT: process.env accepts unsupported TZ values even when JSC rejects them.
     }
