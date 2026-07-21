@@ -656,16 +656,29 @@ extern "C" int ct_jsc_promise_status(JSValueRef value)
 {
     if (value == nullptr)
         return -1;
-    // JSPromise extends JSObject (two pointers) with two encoded internal
-    // fields. Field zero is an int32 whose low two bits are the promise state.
-    // This layout is pinned to WebKit-7624.2.5.10.6 alongside CallFrame above.
+
+    // On 64-bit JSC, cells are the only JSValues with neither NumberTag nor
+    // OtherTag set. JSPromiseType is 0x51 in WebKit-7624.2.5.10.6 and lives
+    // at byte five of JSCell's header. Validate both before reading the two
+    // JSPromise internal fields below; this bridge is pinned to that build.
+    constexpr uint64_t not_cell_mask = 0xfffe000000000002ULL;
+    const auto encoded = std::bit_cast<uint64_t>(value);
+    if ((encoded & not_cell_mask) != 0)
+        return -1;
+    const auto* cell = reinterpret_cast<const uint8_t*>(value);
+    constexpr uint8_t js_promise_type = 0x51;
+    if (cell[5] != js_promise_type)
+        return -1;
+
+    // JSPromise extends JSObject (two words) with two encoded fields. Field
+    // zero contains an int32 whose low two bits are the promise state.
     const auto* fields = reinterpret_cast<const uint64_t*>(value) + 2;
     return static_cast<int>(static_cast<uint32_t>(fields[0]) & 0x3);
 }
 
 extern "C" JSValueRef ct_jsc_promise_result(JSValueRef value)
 {
-    if (value == nullptr)
+    if (ct_jsc_promise_status(value) < 0)
         return nullptr;
     const auto* fields = reinterpret_cast<const uint64_t*>(value) + 2;
     return std::bit_cast<JSValueRef>(fields[1]);

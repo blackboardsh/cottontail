@@ -24,6 +24,9 @@ const runnerSetInterval = globalThis.setInterval;
 const runnerSetImmediate = globalThis.setImmediate;
 const runnerQueueMicrotask = globalThis.queueMicrotask;
 const runnerNextTick = globalThis.process?.nextTick?.bind(globalThis.process);
+const runnerProcessCwd = typeof globalThis.process?.cwd === "function"
+  ? globalThis.process.cwd.bind(globalThis.process)
+  : () => ".";
 const runnerPromiseThen = globalThis.Promise.prototype.then;
 const runnerPromiseResolve = globalThis.Promise.resolve.bind(globalThis.Promise);
 const runnerPromiseReject = globalThis.Promise.reject.bind(globalThis.Promise);
@@ -48,6 +51,14 @@ let finalizePromise = null;
 let resultsReported = false;
 let hasOnly = false;
 let selectionDirty = true;
+
+function runnerCwd() {
+  try {
+    return String(runnerProcessCwd());
+  } catch {
+    return ".";
+  }
+}
 let defaultTimeout = 5000;
 let passedTests = 0;
 let failedTests = 0;
@@ -91,7 +102,7 @@ function configuredDefaultTimeout() {
 
 function bunfigOnlyFailures() {
   try {
-    const source = String(readFileSync(`${globalThis.process?.cwd?.() ?? "."}/bunfig.toml`, "utf8"));
+    const source = String(readFileSync(`${runnerCwd()}/bunfig.toml`, "utf8"));
     return /\bonlyFailures\s*=\s*true\b/.test(source);
   } catch {
     return false;
@@ -144,7 +155,7 @@ let dotsDetailFile = "";
 
 function testFileLabel(filePath = undefined) {
   let file = String(filePath ?? globalThis.process?.argv?.[1] ?? "test");
-  const cwd = String(globalThis.process?.cwd?.() ?? ".").replace(/[\\/]+$/, "");
+  const cwd = runnerCwd().replace(/[\\/]+$/, "");
   if (file.startsWith(`${cwd}/`) || file.startsWith(`${cwd}\\`)) file = file.slice(cwd.length + 1);
   return file.replace(/^\.[\\/]+/, "");
 }
@@ -200,7 +211,7 @@ const agentQuietMode = isTruthyEnvValue(globalThis.process?.env?.CLAUDECODE) &&
 
 function bunfigTestSection() {
   try {
-    const source = String(readFileSync(`${globalThis.process?.cwd?.() ?? "."}/bunfig.toml`, "utf8"));
+    const source = String(readFileSync(`${runnerCwd()}/bunfig.toml`, "utf8"));
     const match = /(?:^|\n)\[test\]([^]*?)(?=\n\[|$)/.exec(source);
     return match ? match[1] : "";
   } catch {
@@ -1511,7 +1522,7 @@ function appendRunRecords(lines, views, extraFailures = []) {
 
 function displayTestFile(filePath = undefined) {
   let file = String(filePath ?? globalThis.process?.argv?.[1] ?? "test").replaceAll("\\", "/");
-  const cwd = String(globalThis.process?.cwd?.() ?? ".").replaceAll("\\", "/").replace(/[\/]+$/, "");
+  const cwd = runnerCwd().replaceAll("\\", "/").replace(/[\/]+$/, "");
   if (file.startsWith(`${cwd}/`)) file = file.slice(cwd.length + 1);
   return file.replace(/^\.\//, "");
 }

@@ -269,7 +269,7 @@ class SocketImpl extends EventEmitter {
     this._pendingWrites = [];
     this._outboundWrites = [];
     this._writeRetryTimer = null;
-    this._destroyCloseTimer = null;
+    this._destroyCloseImmediate = null;
     this._destroyFinalize = null;
     this._drainQueued = false;
     this._ending = false;
@@ -495,9 +495,9 @@ class SocketImpl extends EventEmitter {
     const finalize = this._destroyFinalize;
     if (finalize == null) return;
     this._destroyFinalize = null;
-    if (this._destroyCloseTimer != null) {
-      clearTimeout(this._destroyCloseTimer);
-      this._destroyCloseTimer = null;
+    if (this._destroyCloseImmediate != null) {
+      clearImmediate(this._destroyCloseImmediate);
+      this._destroyCloseImmediate = null;
     }
     finalize();
   }
@@ -708,8 +708,6 @@ class SocketImpl extends EventEmitter {
     const watchId = this._watchId;
     fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
       if (this.destroyed) {
-        // A clean destroy keeps the watcher around briefly so this native read
-        // can drain data that raced with shutdown. Close as soon as it does.
         if (this._destroyFinalize != null) this._finishDeferredDestroy();
         return;
       }
@@ -1293,18 +1291,17 @@ class SocketImpl extends EventEmitter {
         this.emit("close", true);
       }
     } else if (!immediate && fd != null && this._watchId) {
-      // Keep the read watcher alive for one poll turn after SHUT_WR. This lets
-      // the kernel consume data that raced with destroy(), avoiding an
-      // artificial RST for an otherwise graceful Node socket close.
+      // Match Bun's deferred handle close: let one poll turn drain bytes that
+      // raced with destroy(), then close even if the peer stays open.
       try { cottontail.tcpSocketShutdown?.(fd); } catch {}
       this._destroyFinalize = emitClose;
-      this._destroyCloseTimer = setTimeout(() => {
-        this._destroyCloseTimer = null;
+      this._destroyCloseImmediate = setImmediate(() => {
+        this._destroyCloseImmediate = null;
         const finalize = this._destroyFinalize;
         this._destroyFinalize = null;
         finalize?.();
-      }, 0);
-      if (!this._refed) this._destroyCloseTimer.unref?.();
+      });
+      if (!this._refed) this._destroyCloseImmediate.unref?.();
     } else {
       emitClose();
     }
@@ -1397,7 +1394,7 @@ class SocketImpl extends EventEmitter {
     this._refed = true;
     this._timeoutTimer?.ref?.();
     this._writeRetryTimer?.ref?.();
-    this._destroyCloseTimer?.ref?.();
+    this._destroyCloseImmediate?.ref?.();
     for (const timer of this._connectAttemptTimers) timer.ref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, true);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, true);
@@ -1407,7 +1404,7 @@ class SocketImpl extends EventEmitter {
     this._refed = false;
     this._timeoutTimer?.unref?.();
     this._writeRetryTimer?.unref?.();
-    this._destroyCloseTimer?.unref?.();
+    this._destroyCloseImmediate?.unref?.();
     for (const timer of this._connectAttemptTimers) timer.unref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, false);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, false);
