@@ -873,6 +873,22 @@ fn runStandaloneIfPresent(
     );
 }
 
+fn runBakeProductionBuild(init: std.process.Init, entrypoint: []const u8, outdir: []const u8) !u8 {
+    const allocator = init.arena.allocator();
+    var source: std.ArrayList(u8) = .empty;
+    try source.appendSlice(allocator,
+        \\const __ctBuildBakeProduction = globalThis[Symbol.for("cottontail.internal.buildBakeProduction")];
+        \\if (typeof __ctBuildBakeProduction !== "function") throw new Error("Bake production builder is unavailable");
+        \\await __ctBuildBakeProduction({ entrypoint:
+    );
+    try appendJavaScriptStringLiteral(allocator, &source, entrypoint);
+    try source.appendSlice(allocator, ", outdir: ");
+    try appendJavaScriptStringLiteral(allocator, &source, outdir);
+    try source.appendSlice(allocator, " });\n");
+    const source_z = try allocator.dupeZ(u8, source.items);
+    return script_runner.runEval(init, source_z, &.{}, &.{}, false);
+}
+
 fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     const allocator = init.arena.allocator();
     var stdout_buffer: [1024]u8 = undefined;
@@ -898,11 +914,14 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     var metafile_json_path: ?[]const u8 = null;
     var metafile_markdown_path: ?[]const u8 = null;
     var compile = false;
+    var app = false;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         const arg: []const u8 = args[index];
         if (std.mem.eql(u8, arg, "--compile")) {
             compile = true;
+        } else if (std.mem.eql(u8, arg, "--app")) {
+            app = true;
         } else if (std.mem.eql(u8, arg, "--no-bundle")) {
             options.transform_only = true;
         } else if (std.mem.eql(u8, arg, "--bytecode")) {
@@ -1099,6 +1118,14 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         } else if (std.mem.eql(u8, arg, "--asset-naming") and index + 1 < args.len) {
             index += 1;
             options.asset_naming = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--tsconfig-override=")) {
+            options.tsconfig_override = arg["--tsconfig-override=".len..];
+        } else if (std.mem.eql(u8, arg, "--tsconfig-override") and index + 1 < args.len) {
+            index += 1;
+            options.tsconfig_override = args[index];
+        } else if (std.mem.eql(u8, arg, "--entrypoints") and index + 1 < args.len) {
+            index += 1;
+            try entries.append(allocator, args[index]);
         } else if (std.mem.startsWith(u8, arg, "--format=")) {
             options.output_format = cottontail_compiler.options.Format.fromString(arg["--format=".len..]) orelse {
                 try stderr.print("error: invalid build format \"{s}\"\n", .{arg["--format=".len..]});
@@ -1146,7 +1173,7 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stderr.flush();
         return 1;
     }
-    if (outfile != null and entries.items.len != 1) {
+    if (outfile != null and entries.items.len != 1 and !compile) {
         try stderr.print("error: --outfile requires exactly one entrypoint\n", .{});
         try stderr.flush();
         return 1;
@@ -1163,17 +1190,38 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     options.conditions = conditions.items;
     options.define_keys = define_keys.items;
     options.define_values = define_values.items;
+    if (app) {
+        if (entries.items.len != 1) {
+            try stderr.writeAll("error: --app requires exactly one entrypoint\n");
+            try stderr.flush();
+            return 1;
+        }
+        return runBakeProductionBuild(init, entries.items[0], outdir orelse "dist");
+    }
+    const compile_to_standalone_html = compile and options.target == .browser and blk: {
+        for (entries.items) |entry| {
+            const extension = std.fs.path.extension(entry);
+            if (!std.ascii.eqlIgnoreCase(extension, ".html") and !std.ascii.eqlIgnoreCase(extension, ".htm")) {
+                break :blk false;
+            }
+        }
+        break :blk entries.items.len > 0;
+    };
+    if (compile_to_standalone_html) {
+        if (options.code_splitting) {
+            try stderr.writeAll("error: cannot use --compile --target browser with --splitting\n");
+            try stderr.flush();
+            return 1;
+        }
+        options.compile_to_standalone_html = true;
+        compile = false;
+    }
     if (options.bytecode) {
         try stderr.writeAll("error: Bun build bytecode requires a JavaScriptCore cached-bytecode API\n");
         try stderr.flush();
         return 1;
     }
     if (compile) {
-        if (entries.items.len != 1) {
-            try stderr.print("error: --compile requires exactly one entrypoint\n", .{});
-            try stderr.flush();
-            return 1;
-        }
         options.target = .bun;
         options.output_format = .esm;
         const requested_source_map = options.source_map;
@@ -1254,6 +1302,8 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         .features = options.features,
         .publicPath = options.public_path,
         .bundle = !options.transform_only,
+        .compileToStandaloneHtml = options.compile_to_standalone_html,
+        .tsconfig = options.tsconfig_override,
         .env = env_option,
         .naming = NamingRequest{
             .entry = if (outfile) |path| std.fs.path.basename(path) else options.entry_naming,
@@ -1342,6 +1392,23 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         }
     }
 
+    if (result.get("logs")) |logs| {
+        if (logs == .array) for (logs.array.items) |log| {
+            if (log != .object) continue;
+            const level = log.object.get("level") orelse continue;
+            const message = log.object.get("message") orelse continue;
+            if (level != .string or message != .string or !std.mem.eql(u8, level.string, "warning")) continue;
+            try stderr.print("warn: {s}\n", .{message.string});
+        };
+        try stderr.flush();
+    }
+
+    const BuildReportEntry = struct {
+        name: []const u8,
+        size: usize,
+        kind: []const u8,
+    };
+    var report_entries: std.ArrayList(BuildReportEntry) = .empty;
     if (result.get("outputs")) |outputs| {
         if (outputs == .array) for (outputs.array.items) |output| {
             if (output != .object) continue;
@@ -1366,7 +1433,20 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
                 null;
             if (destination) |path| {
                 try writeBuildFile(init.io, path, decoded);
-                try stdout.print("{s}\n", .{path});
+                const report_kind = if (output_kind != null and output_kind.? == .string)
+                    if (std.mem.eql(u8, output_kind.?.string, "entry-point"))
+                        "entry point"
+                    else if (std.mem.eql(u8, output_kind.?.string, "sourcemap"))
+                        "source map"
+                    else
+                        output_kind.?.string
+                else
+                    "output";
+                try report_entries.append(allocator, .{
+                    .name = try allocator.dupe(u8, std.fs.path.basename(path)),
+                    .size = decoded.len,
+                    .kind = report_kind,
+                });
             } else if (is_entry) {
                 try stdout.writeAll(decoded);
                 if (decoded.len == 0 or decoded[decoded.len - 1] != '\n') try stdout.writeByte('\n');
@@ -1383,6 +1463,32 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         if (result.get("metafileMarkdown")) |metafile| {
             if (metafile == .string) try writeBuildFile(init.io, path, metafile.string);
         }
+    }
+    if (report_entries.items.len > 0) {
+        var max_name_len: usize = 0;
+        var max_size_width: usize = 1;
+        for (report_entries.items) |entry| {
+            max_name_len = @max(max_name_len, entry.name.len);
+            var size = entry.size;
+            var width: usize = 1;
+            while (size >= 10) : (size /= 10) width += 1;
+            max_size_width = @max(max_size_width, width);
+        }
+        try stdout.print("Bundled {d} module{s} in 0ms\n\n", .{
+            entries.items.len,
+            if (entries.items.len == 1) "" else "s",
+        });
+        for (report_entries.items) |entry| {
+            try stdout.writeAll("  ");
+            try stdout.writeAll(entry.name);
+            try stdout.splatByteAll(' ', max_name_len - entry.name.len + 2);
+            var size = entry.size;
+            var size_width: usize = 1;
+            while (size >= 10) : (size /= 10) size_width += 1;
+            try stdout.splatByteAll(' ', max_size_width - size_width);
+            try stdout.print("{d} bytes  ({s})\n", .{ entry.size, entry.kind });
+        }
+        try stdout.writeByte('\n');
     }
     try stdout.flush();
     return 0;
@@ -2326,9 +2432,11 @@ pub fn main(init: std.process.Init) !void {
     }
     var args = try argsWithBunOptions(allocator, process_args, init.environ_map);
 
-    if (try runStandaloneIfPresent(init, args)) |exit_code| {
-        if (exit_code != 0) std.process.exit(exit_code);
-        return;
+    if (init.environ_map.get("BUN_BE_BUN") == null) {
+        if (try runStandaloneIfPresent(init, args)) |exit_code| {
+            if (exit_code != 0) std.process.exit(exit_code);
+            return;
+        }
     }
     args = try normalizeLeadingTestRuntimeFlags(allocator, args);
     args = try normalizeLeadingPackageManagerConfig(allocator, args);

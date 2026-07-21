@@ -2872,6 +2872,21 @@ async function buildWithPlugins(options, plugins) {
     if (record.shadowPath) sourceByShadowPath.set(nodePathResolve(record.shadowPath), record.path);
   }
 
+  const compile = ctNormalizeCompileOptions(options);
+  if (compile && errors.length === 0) {
+    return ctRunCompiledBuild(
+      {
+        ...options,
+        files: undefined,
+        plugins: undefined,
+        root: shadowRoot,
+        entrypoints: shadowEntries,
+      },
+      compile,
+      { setupPromises: [], onStart: [], onEnd: onEndCallbacks },
+    );
+  }
+
   const driverResult = runBuildDriver({
     ...options,
     files: undefined,
@@ -3203,6 +3218,12 @@ function ctNormalizeCompileOptions(options) {
   return compile;
 }
 
+function ctIsStandaloneHtmlCompile(options, compile) {
+  return !!compile &&
+    (options?.target ?? "browser") === "browser" &&
+    options.entrypoints.every(entrypoint => /\.html?$/i.test(String(entrypoint)));
+}
+
 function ctCompiledOutputPath(options, compile, cwd) {
   const entry = String(options.entrypoints[0]);
   const entryName = nodePathBasename(entry);
@@ -3385,7 +3406,14 @@ export function build(options) {
   if (options.target != null && !["browser", "bun", "node"].includes(options.target)) {
     throw new TypeError(`Invalid "target" value in Bun.build: ${String(options.target)}`);
   }
-  const compile = ctNormalizeCompileOptions(options);
+  let compile = ctNormalizeCompileOptions(options);
+  if (ctIsStandaloneHtmlCompile(options, compile)) {
+    if (options.splitting === true) {
+      throw new TypeError("Cannot use compile with target 'browser' and splitting for standalone HTML");
+    }
+    options = { ...options, compile: undefined, compileToStandaloneHtml: true };
+    compile = null;
+  }
   const sourcemap = options.sourcemap;
   if (sourcemap != null && typeof sourcemap !== "boolean"
       && !["none", "linked", "inline", "external"].includes(sourcemap)) {

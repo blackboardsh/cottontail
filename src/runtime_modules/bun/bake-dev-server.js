@@ -1,5 +1,5 @@
 import path from "../node/path.js";
-import { readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { Bun, serve } from "./index.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
@@ -57,16 +57,31 @@ const socketUrl = new URL("/_bun/hmr", location.href);
 socketUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
 const socket = new WebSocket(socketUrl);
 socket.binaryType = "arraybuffer";
+let versionSeen = false;
 socket.addEventListener("open", () => {
   console.info("[Bun] Hot-module-reloading socket connected, waiting for changes...");
-  socket.send("she");
+  socket.send("n");
 });
 socket.addEventListener("message", event => {
   const data = event.data;
-  const id = typeof data === "string"
-    ? data.charCodeAt(0)
-    : new Uint8Array(data)[0];
-  if (id === 117) window.location.reload();
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+  const id = bytes[0];
+  if (id === 86) {
+    if (versionSeen) window.location.reload();
+    versionSeen = true;
+    return;
+  }
+  if (id !== 117) return;
+  if (bytes.length <= 17) {
+    window.location.reload();
+    return;
+  }
+  try {
+    (0, eval)(new TextDecoder().decode(bytes.subarray(17)));
+  } catch (error) {
+    console.error(error);
+    window.location.reload();
+  }
 });
 </script>`;
 
@@ -487,7 +502,8 @@ function routeFiles(route) {
 }
 
 function executeCommonJSArtifact(source, filename) {
-  const factory = (0, eval)(source);
+  const sourceUrl = pathToFileURL(filename).href.replaceAll("\n", "");
+  const factory = (0, eval)(`${source}\n//# sourceURL=${sourceUrl}`);
   if (typeof factory !== "function") throw new TypeError("Bake's server bundle did not produce a CommonJS factory");
   const module = { exports: {} };
   factory(module.exports, globalThis.require, module, filename, path.dirname(filename));
@@ -911,6 +927,170 @@ function trackLifecycle(server) {
   };
   return server;
 }
+
+function productionPageFiles(root) {
+  const files = [];
+  const visit = directory => {
+    let entries;
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolute);
+      } else if (entry.isFile() && /\.(?:[cm]?[jt]sx?)$/i.test(entry.name)) {
+        files.push(absolute);
+      }
+    }
+  };
+  visit(root);
+  return files.sort();
+}
+
+function resolveProductionImport(importer, specifier) {
+  if (!specifier.startsWith(".") && !specifier.startsWith("/")) return null;
+  const base = specifier.startsWith("/") ? specifier : path.resolve(path.dirname(importer), specifier);
+  const candidates = [
+    base,
+    ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"].map(extension => base + extension),
+    ...[".tsx", ".ts", ".jsx", ".js"].map(extension => path.join(base, `index${extension}`)),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+function productionClientEntries(page) {
+  const clients = new Set();
+  const visited = new Set();
+  const visit = filename => {
+    filename = path.resolve(filename);
+    if (visited.has(filename)) return;
+    visited.add(filename);
+    let source;
+    try {
+      source = readFileSync(filename, "utf8");
+    } catch {
+      return;
+    }
+    if (/^\s*["']use client["'];?/m.test(source)) clients.add(filename);
+    const pattern = /(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g;
+    for (const match of source.matchAll(pattern)) {
+      const resolved = resolveProductionImport(filename, match[1]);
+      if (resolved) visit(resolved);
+    }
+  };
+  visit(page);
+  return [...clients];
+}
+
+function productionRouteInfo(pagesRoot, page) {
+  const relative = path.relative(pagesRoot, page).replaceAll(path.sep, "/").replace(/\.[^.]+$/, "");
+  const segments = relative.split("/");
+  if (segments.at(-1) === "index") segments.pop();
+  const catchAll = segments.findIndex(segment => /^\[\.\.\.[^\]]+\]$/.test(segment));
+  return {
+    segments,
+    catchAll,
+    parameter: catchAll >= 0 ? segments[catchAll].slice(4, -1) : null,
+  };
+}
+
+async function loadProductionPage(page) {
+  const result = await Bun.build({
+    entrypoints: [page],
+    target: "bun",
+    format: "cjs",
+    packages: "external",
+    sourcemap: "inline",
+    inlineImportMetaProperties: true,
+    minify: false,
+  });
+  const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+  if (!artifact) throw new Error(`Bake production build did not emit ${page}`);
+  return executeCommonJSArtifact(await artifact.text(), page);
+}
+
+async function productionClientScripts(entries, outdir) {
+  if (entries.length === 0) return [];
+  const result = await Bun.build({
+    entrypoints: entries,
+    target: "browser",
+    format: "esm",
+    outdir,
+    minify: false,
+    naming: { entry: "[hash].[ext]" },
+  });
+  return result.outputs
+    .filter(output => output.kind === "entry-point" && ["js", "jsx", "ts", "tsx"].includes(output.loader))
+    .map(output => `/_bun/${path.basename(output.path)}`);
+}
+
+function productionDocument(markup, scripts) {
+  const tags = scripts.map(source => `<script type="module" src="${source}"></script>`).join("");
+  return `<!DOCTYPE html>${markup}${tags}`;
+}
+
+export async function buildProductionApp({ outdir = "dist" } = {}) {
+  const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const pagesRoot = path.join(projectRoot, "pages");
+  const outputRoot = path.resolve(projectRoot, outdir);
+  const clientRoot = path.join(outputRoot, "_bun");
+  mkdirSync(clientRoot, { recursive: true });
+
+  const reactModule = globalThis.require("react");
+  const React = reactModule.default ?? reactModule;
+  const { renderToStaticMarkup } = globalThis.require("react-dom/server");
+  for (const page of productionPageFiles(pagesRoot)) {
+    const source = readFileSync(page, "utf8");
+    if (!/^\s*["']use client["'];?/m.test(source) &&
+        /\bimport\s*\{[^}]*\buseState\b[^}]*\}\s*from\s*["']react["']/.test(source)) {
+      throw new Error(
+        '"useState" is not available in a server component. If you need interactivity, consider converting part of this to a Client Component (by adding `"use client";` to the top of the file).',
+      );
+    }
+
+    const pageModule = await loadProductionPage(page);
+    const Page = pageModule.default ?? pageModule;
+    if (typeof Page !== "function") continue;
+    const route = productionRouteInfo(pagesRoot, page);
+    let variants = [{ params: {} }];
+    if (route.catchAll >= 0 && typeof pageModule.getStaticPaths === "function") {
+      const paths = await pageModule.getStaticPaths();
+      variants = Array.isArray(paths?.paths) ? paths.paths : [];
+    }
+
+    const clients = productionClientEntries(page);
+    const scripts = await productionClientScripts(clients, clientRoot);
+    for (const variant of variants) {
+      const params = variant?.params ?? {};
+      const segments = [...route.segments];
+      if (route.catchAll >= 0) {
+        const value = params[route.parameter];
+        const replacement = Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)];
+        segments.splice(route.catchAll, 1, ...replacement);
+      }
+      const destination = path.join(outputRoot, ...segments, "index.html");
+      mkdirSync(path.dirname(destination), { recursive: true });
+      const markup = renderToStaticMarkup(React.createElement(Page, { params }));
+      writeFileSync(destination, productionDocument(markup, scripts));
+    }
+  }
+}
+
+Object.defineProperty(globalThis, Symbol.for("cottontail.internal.buildBakeProduction"), {
+  configurable: true,
+  enumerable: false,
+  value: buildProductionApp,
+  writable: false,
+});
 
 export function startDefaultApp(entryNamespace) {
   const config = entryNamespace?.default;

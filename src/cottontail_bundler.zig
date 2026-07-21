@@ -22,6 +22,9 @@ pub const BundleOptions = struct {
     features: []const []const u8 = &.{},
     public_path: []const u8 = "",
     transform_only: bool = false,
+    /// Bun.build({ compile: true, target: "browser" }) with HTML entries
+    /// emits one self-contained HTML artifact instead of an executable.
+    compile_to_standalone_html: bool = false,
     env_behavior: compiler.schema.api.DotEnvBehavior = .disable,
     env_prefix: []const u8 = "",
     bytecode: bool = false,
@@ -43,6 +46,8 @@ pub const BundleOptions = struct {
     /// original identifier makes Function.prototype.toString() output usable
     /// with `new Function("require", ...)`, matching Bun's module transpiler.
     preserve_external_require_name: bool = false,
+    /// Test bundles enable Bun's built-in @jest/globals and vitest aliases.
+    rewrite_jest_for_tests: bool = false,
     inline_import_meta_properties: bool = false,
     minify_whitespace: bool = false,
     minify_identifiers: bool = false,
@@ -779,6 +784,7 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.options.footer = options.footer;
     transpiler.options.public_path = options.public_path;
     transpiler.options.transform_only = options.transform_only;
+    transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
     transpiler.options.bytecode = options.bytecode;
@@ -815,6 +821,7 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.options.externalize_runtime_require_resolve = options.externalize_runtime_require_resolve;
     transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths or options.include_runtime_modules;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
+    transpiler.options.rewrite_jest_for_tests = options.rewrite_jest_for_tests;
     transpiler.options.server_components = options.server_components;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
@@ -1128,6 +1135,14 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     }
     if (object.get("bundle")) |value| {
         if (value == .bool) options.transform_only = !value.bool;
+    }
+    if (object.get("compileToStandaloneHtml")) |value| {
+        if (value == .bool) options.compile_to_standalone_html = value.bool;
+    }
+    if (object.get("tsconfig")) |value| {
+        if (value == .string) options.tsconfig_override = value.string;
+    } else if (object.get("tsconfigOverride")) |value| {
+        if (value == .string) options.tsconfig_override = value.string;
     }
     if (object.get("env")) |value| switch (value) {
         .null => {},
@@ -1666,7 +1681,7 @@ fn runCssInternalsRequest(
 fn buildLogFromMessage(allocator: std.mem.Allocator, message: *const compiler.logger.Msg) !BuildLogJson {
     var entry = BuildLogJson{
         .name = if (message.metadata == .resolve) "ResolveMessage" else "BuildMessage",
-        .level = message.kind.string(),
+        .level = if (message.kind == .warn) "warning" else message.kind.string(),
         .message = try allocator.dupe(u8, message.data.text),
     };
     if (message.data.location) |location| {
@@ -1861,6 +1876,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.footer = options.footer;
     transpiler.options.public_path = options.public_path;
     transpiler.options.transform_only = options.transform_only;
+    transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
     transpiler.options.bytecode = options.bytecode;
@@ -1868,6 +1884,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
     transpiler.options.keep_names = options.keep_names;
+    transpiler.options.rewrite_jest_for_tests = options.rewrite_jest_for_tests;
     transpiler.options.no_macros = options.no_macros;
     transpiler.options.allow_unresolved = if (options.allow_unresolved) |patterns|
         compiler.options.AllowUnresolved.fromStrings(patterns)
