@@ -11,6 +11,7 @@ const package_manager_bunx = @import("package_manager_bunx.zig");
 const package_manager_cli = @import("package_manager_cli.zig");
 const repl = @import("repl.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
+const completions = @import("completions.zig");
 const host = @import("host.zig");
 const script_runner = @import("script_runner.zig");
 
@@ -29,7 +30,7 @@ const bun_compat_version = "1.3.10";
 // Build-metadata suffix reported by `--revision` (`<version>+<suffix>`),
 // mirroring how bun reports `<version>+<git sha>`.
 const revision_suffix = "cottontail";
-const completion_commands = [_][]const u8{ "run", "test", "build", "repl", "x", "exec", "getcompletes" };
+const completion_commands = [_][]const u8{ "run", "test", "build", "repl", "x", "exec", "completions", "getcompletes" };
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn testRunnerDisplayVersion(init: std.process.Init) []const u8 {
@@ -399,6 +400,12 @@ fn childExitCode(term: std.process.Child.Term) u8 {
 
 fn isBunShellScript(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".sh");
+}
+
+fn unsupportedEntrypointLoader(path: []const u8) ?[]const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".css")) return "css";
+    return null;
 }
 
 fn cliPathExists(io: std.Io, path: []const u8) bool {
@@ -2389,6 +2396,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, arg, "completions")) {
+        const exit_code = try completions.run(init, args[2..], stderr);
+        try stderr.flush();
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
+
     if (std.mem.eql(u8, arg, "getcompletes")) {
         // Mirrors `bun getcompletes`: emit completion candidates (builtin
         // commands plus package.json scripts), one per line.
@@ -2523,6 +2537,18 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(node_exit);
         }
         return;
+    }
+
+    if (invocation.mode == .script) {
+        if (unsupportedEntrypointLoader(invocation.payload)) |loader| {
+            if (cliPathExists(init.io, invocation.payload)) {
+                try stderr.print("error: Cannot run \"{s}\" with the \"{s}\" loader\n", .{ invocation.payload, loader });
+            } else {
+                try stderr.print("error: File not found \"{s}\"\n", .{invocation.payload});
+            }
+            try stderr.flush();
+            std.process.exit(1);
+        }
     }
 
     if (invocation.mode == .script and !std.mem.eql(u8, arg, "test") and
