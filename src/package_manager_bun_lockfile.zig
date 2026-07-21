@@ -304,6 +304,31 @@ pub fn writeYarnFromBinary(allocator: std.mem.Allocator, binary: []const u8, wri
     try compiler.install.YarnLockfilePrinter.print(&view, *std.Io.Writer, writer);
 }
 
+pub fn writeYarnFromText(allocator: std.mem.Allocator, text: []const u8, writer: *std.Io.Writer) !void {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const lockfile_allocator = arena.allocator();
+    var log = compiler.logger.Log.init(lockfile_allocator);
+    defer deinitLog(&log, lockfile_allocator);
+
+    const source = compiler.logger.Source.initPathString("bun.lock", text);
+    compiler.install.initializeStore();
+    const json = try compiler.json.parsePackageJSONUTF8(&source, &log, lockfile_allocator);
+    var lockfile: BunLockfile = undefined;
+    try compiler.install.TextLockfile.parseIntoBinaryLockfile(
+        &lockfile,
+        lockfile_allocator,
+        json,
+        &source,
+        &log,
+        null,
+    );
+    defer lockfile.deinit();
+
+    var view = struct { lockfile: *BunLockfile }{ .lockfile = &lockfile };
+    try compiler.install.YarnLockfilePrinter.print(&view, *std.Io.Writer, writer);
+}
+
 fn deinitLog(log: *compiler.logger.Log, allocator: std.mem.Allocator) void {
     _ = allocator;
     log.deinit();
