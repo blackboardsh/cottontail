@@ -7909,16 +7909,20 @@ async function fetchSocketAttempt(request, redirected, transport, usePool) {
           cleanup();
         },
       });
-      settled = true;
+      // The public Response constructor intentionally rejects informational
+      // statuses, but a network fetch can still receive a 101 response.
       const response = new Response(stream, {
         headers,
-        status,
+        status: status === 101 ? 200 : status,
         statusText,
         url: request.url,
         redirected,
       });
+      if (status === 101) response.status = 101;
       registerFetchResponseBodyFinalizer(response, stream);
-      resolve(decodeFetchResponse(response, transport.decompress !== false));
+      const decodedResponse = decodeFetchResponse(response, transport.decompress !== false);
+      settled = true;
+      resolve(decodedResponse);
       if (bodyMode === "none" || (bodyMode === "length" && bodyRemaining === 0)) {
         if (initialChunk.byteLength > 0) {
           // Ignore pipelined data.
@@ -9952,7 +9956,7 @@ function terminateServerWebSocket(state) {
   finalizeServerWebSocket(state, 1006, "");
 }
 
-function publishToWebSocketTopic(serverState, topic, data, opcode, excludeState) {
+function publishToWebSocketTopic(serverState, topic, data, opcode, excludeState, compress = false) {
   const topicName = String(topic ?? "");
   if (topicName.length === 0) return 0;
   const subscribers = serverState.topics.get(topicName);
@@ -9962,7 +9966,7 @@ function publishToWebSocketTopic(serverState, topic, data, opcode, excludeState)
   let delivered = false;
   for (const subscriber of Array.from(subscribers)) {
     if (subscriber === excludeState) continue;
-    const result = sendServerWebSocketFrame(subscriber, resolvedOpcode, payload);
+    const result = sendServerWebSocketFrame(subscriber, resolvedOpcode, payload, compress);
     if (result !== 0) delivered = true;
   }
   if (!delivered) return 0;
@@ -10065,19 +10069,19 @@ class ServerWebSocket {
   publish(topic, data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "publish");
     const excludeSelf = !this._state.config.publishToSelf;
-    return publishToWebSocketTopic(this._state.serverState, topic, data, undefined, excludeSelf ? this._state : null);
+    return publishToWebSocketTopic(this._state.serverState, topic, data, undefined, excludeSelf ? this._state : null, compress === true);
   }
 
   publishText(topic, data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "publishText");
     const excludeSelf = !this._state.config.publishToSelf;
-    return publishToWebSocketTopic(this._state.serverState, topic, String(data), 0x1, excludeSelf ? this._state : null);
+    return publishToWebSocketTopic(this._state.serverState, topic, String(data), 0x1, excludeSelf ? this._state : null, compress === true);
   }
 
   publishBinary(topic, data, compress = undefined) {
     assertWebSocketCompressFlag(compress, "publishBinary");
     const excludeSelf = !this._state.config.publishToSelf;
-    return publishToWebSocketTopic(this._state.serverState, topic, data, 0x2, excludeSelf ? this._state : null);
+    return publishToWebSocketTopic(this._state.serverState, topic, data, 0x2, excludeSelf ? this._state : null, compress === true);
   }
 
   cork(callback) {
@@ -10766,13 +10770,17 @@ function serveNodeBacked(options, context) {
       ];
       const extraHeaders = upgradeOptions?.headers;
       const seen = new Set();
+      for (const cookie of request._cookies?.toSetCookieHeaders?.() ?? []) {
+        lines.push(`Set-Cookie: ${cookie}`);
+      }
       if (extraHeaders != null) {
         const entries = typeof extraHeaders.entries === "function"
           ? extraHeaders.entries()
           : Object.entries(extraHeaders);
         for (const [name, value] of entries) {
           seen.add(String(name).toLowerCase());
-          lines.push(`${name}: ${value}`);
+          const values = Array.isArray(value) ? value : [value];
+          for (const entry of values) lines.push(`${name}: ${entry}`);
         }
       }
       if (!seen.has("sec-websocket-protocol")) {
@@ -10827,7 +10835,7 @@ function serveNodeBacked(options, context) {
     },
     publish(topic, data, compress = undefined) {
       assertWebSocketCompressFlag(compress, "publish");
-      return publishToWebSocketTopic(serverState, topic, data, undefined, null);
+      return publishToWebSocketTopic(serverState, topic, data, undefined, null, compress ?? true);
     },
     subscriberCount(topic) {
       const set = serverState.topics.get(String(topic ?? ""));
