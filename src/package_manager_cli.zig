@@ -90,6 +90,7 @@ const Options = struct {
     verify_integrity: bool = true,
     latest: bool = false,
     save_text_lockfile: bool = false,
+    save_yarn_lockfile: bool = false,
     omit_dev: bool = false,
     omit_optional: bool = false,
     omit_peer: bool = false,
@@ -654,6 +655,8 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.depth = std.fmt.parseInt(usize, arg["--depth=".len..], 10) catch return error.InvalidDepth;
         } else if (std.mem.eql(u8, arg, "--save-text-lockfile")) {
             options.save_text_lockfile = true;
+        } else if (std.mem.eql(u8, arg, "--yarn")) {
+            options.save_yarn_lockfile = true;
         } else if (std.mem.eql(u8, arg, "--commit")) {
             if (options.command != .patch) return error.InvalidPackageManagerOption;
             options.command = .patch_commit;
@@ -1077,7 +1080,7 @@ fn runPmMigrate(
     }
     try manager.discoverWorkspaces(&root);
     try manager.loadRecordsFromLockGraph();
-    try manager.writeTextLockfile(&root);
+    try manager.writeTextLockfile(&root, true);
     try stderr.print("migrated lockfile from {s}\n", .{migration.source.filename()});
     try stderr.flush();
     return 0;
@@ -1675,6 +1678,7 @@ const Manager = struct {
 
     fn execute(manager: *Manager) !u8 {
         const security_resolution_output = manager.init_data.environ_map.get(security_resolution_output_env);
+        const internal_bunx_install = manager.init_data.environ_map.get("BUN_INTERNAL_BUNX_INSTALL") != null;
         if (security_resolution_output != null) {
             manager.options.dry_run = true;
             manager.options.no_save = true;
@@ -1781,7 +1785,7 @@ const Manager = struct {
         if (manager.options.command == .patch_commit) {
             return manager.commitPatchCommand(&root, package_json_path, had_trailing_newline);
         }
-        if (!manager.options.silent) {
+        if (!manager.options.silent and !internal_bunx_install) {
             try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
                 @tagName(manager.options.command),
                 bun_compat_version,
@@ -1875,8 +1879,11 @@ const Manager = struct {
                 if (manager.options.command == .remove and manager.changed and had_lockfile and !manager.options.silent) {
                     try manager.stderr.writeAll("\npackage.json has no dependencies! Deleted empty lockfile\n");
                 }
-            } else if (manager.changed or !manager.hasExistingLockfile() or manager.lockfileNeedsRewrite()) {
-                try manager.writeTextLockfile(&root);
+            } else {
+                const save_bun_lockfile = manager.changed or !manager.hasExistingLockfile() or manager.lockfileNeedsRewrite();
+                if (save_bun_lockfile or manager.options.save_yarn_lockfile) {
+                    try manager.writeTextLockfile(&root, save_bun_lockfile);
+                }
             }
         }
 
@@ -2435,7 +2442,7 @@ const Manager = struct {
         try manager.installRoot(root, false);
         try manager.reconcileIsolatedPeerGraph();
         try manager.finalizeIsolatedNodeModules();
-        try manager.writeTextLockfile(root);
+        try manager.writeTextLockfile(root, true);
         if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
             try manager.script_queue.run(manager.init_data, manager.root_dir, manager.stderr);
         }
@@ -3593,7 +3600,13 @@ const Manager = struct {
 
             if (manager.options.only_missing and section.get(name) != null) continue;
             if (!isTarballSpec(requested) and !isGitSpec(requested)) {
-                resolved_version = try manager.installDependency(name, requested, parent_dir, true, false);
+                resolved_version = manager.installDependency(name, requested, parent_dir, true, false) catch |err| {
+                    if (std.mem.startsWith(u8, requested, "npm:")) {
+                        try manager.stderr.print("error: {s} failed to resolve\n", .{raw_spec});
+                        return error.PackageManagerErrorReported;
+                    }
+                    return err;
+                };
                 if (!isLocalSpec(requested)) {
                     display_resolution = (try manager.workspaceDisplayResolution(name, requested, parent_dir)) orelse resolved_version;
                 }
@@ -7732,9 +7745,14 @@ const Manager = struct {
         try writer.writeByte('}');
     }
 
-    fn writeTextLockfile(manager: *Manager, root: *Value) !void {
+    fn writeTextLockfile(manager: *Manager, root: *Value, save_bun_lockfile: bool) !void {
         if (manager.options.frozen_lockfile and manager.changed) return error.FrozenLockfileChanged;
-        if (manager.binary_lockfile_needs_migration and !manager.changed and !manager.shouldSaveTextLockfile()) {
+        if (save_bun_lockfile and
+            !manager.options.save_yarn_lockfile and
+            manager.binary_lockfile_needs_migration and
+            !manager.changed and
+            !manager.shouldSaveTextLockfile())
+        {
             const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
             const previous = try std.Io.Dir.cwd().readFileAlloc(
                 manager.init_data.io,
@@ -7826,34 +7844,47 @@ const Manager = struct {
             try manager.stderr.writeAll("--- end generated bun.lock ---\n");
         }
 
-        const save_text = manager.shouldSaveTextLockfile();
-        const text_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" });
-        const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
-        const binary = BunLockfile.textToBinaryAtRoot(
-            manager.allocator,
-            output.written(),
-            manager.init_data.io,
-            manager.root_dir,
-        ) catch |err| return err;
-        if (save_text) {
-            const canonical_text = try BunLockfile.binaryToText(manager.allocator, binary);
-            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = text_path, .data = canonical_text });
-            std.Io.Dir.cwd().deleteFile(manager.init_data.io, binary_path) catch {};
-        } else {
-            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = binary });
-            if (builtin.os.tag != .windows) {
-                const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
-                try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
+        if (save_bun_lockfile) {
+            const save_text = manager.shouldSaveTextLockfile();
+            const text_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" });
+            const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
+            const binary = BunLockfile.textToBinaryAtRoot(
+                manager.allocator,
+                output.written(),
+                manager.init_data.io,
+                manager.root_dir,
+            ) catch |err| return err;
+            if (save_text) {
+                const canonical_text = try BunLockfile.binaryToText(manager.allocator, binary);
+                try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = text_path, .data = canonical_text });
+                std.Io.Dir.cwd().deleteFile(manager.init_data.io, binary_path) catch {};
+            } else {
+                try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = binary });
+                if (builtin.os.tag != .windows) {
+                    const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
+                    try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
+                }
+                std.Io.Dir.cwd().deleteFile(manager.init_data.io, text_path) catch {};
             }
-            std.Io.Dir.cwd().deleteFile(manager.init_data.io, text_path) catch {};
+            if (!manager.options.silent and manager.options.command != .link) try manager.stderr.writeAll("Saved lockfile\n");
         }
-        if (!manager.options.silent and manager.options.command != .link) try manager.stderr.writeAll("Saved lockfile\n");
+        if (manager.options.save_yarn_lockfile) try manager.writeYarnLockfile(output.written());
     }
 
     fn shouldSaveTextLockfile(manager: *const Manager) bool {
         if (manager.loaded_text_lockfile) return true;
         if (manager.loaded_binary_lockfile) return manager.save_text_lockfile_configured and manager.save_text_lockfile;
         return manager.save_text_lockfile;
+    }
+
+    fn writeYarnLockfile(manager: *Manager, text_lockfile: []const u8) !void {
+        var output: std.Io.Writer.Allocating = .init(manager.allocator);
+        defer output.deinit();
+        try BunLockfile.writeYarnFromText(manager.allocator, text_lockfile, &output.writer);
+        try output.writer.flush();
+        const yarn_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "yarn.lock" });
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = yarn_path, .data = output.written() });
+        if (!manager.options.silent) try manager.stderr.writeAll("Saved yarn.lock\n");
     }
 
     fn lockfileNeedsRewrite(manager: *const Manager) bool {

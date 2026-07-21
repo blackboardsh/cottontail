@@ -67,22 +67,29 @@ fn packages(
         while (i < package_count) : (i += 1) {
             alphabetized_names[i - 1] = i;
 
-            var resolutions = resolutions_buffer;
-            var dependencies = dependencies_buffer;
-
-            var j: PackageID = 0;
+            var requested_version_count: usize = 0;
             var requested_version_start = all_requested_versions;
-            while (std.mem.indexOfScalar(PackageID, resolutions, i)) |k| {
-                j += 1;
+            for (dependencies_buffer, resolutions_buffer) |dependency, resolution_id| {
+                // COTTONTAIL-COMPAT: Standalone text-lock parsing can leave a
+                // workspace edge unresolved even though both records are present.
+                const workspace_request = strings.hasPrefixComptime(dependency.version.literal.slice(string_buf), "workspace:");
+                const has_workspace_resolution = resolution_id < package_count and resolved[resolution_id].tag == .workspace;
+                const unresolved_workspace_edge = workspace_request and
+                    !has_workspace_resolution and
+                    resolved[i].tag == .workspace and
+                    strings.eqlLong(dependency.name.slice(string_buf), names[i].slice(string_buf), true);
+                const matches_package = if (workspace_request)
+                    (resolution_id == i and has_workspace_resolution) or unresolved_workspace_edge
+                else
+                    resolution_id == i;
+                if (!matches_package) continue;
 
-                all_requested_versions[0] = dependencies[k].version;
+                requested_version_count += 1;
+                all_requested_versions[0] = dependency.version;
                 all_requested_versions = all_requested_versions[1..];
-
-                dependencies = dependencies[k + 1 ..];
-                resolutions = resolutions[k + 1 ..];
             }
 
-            const dependency_versions = requested_version_start[0..j];
+            const dependency_versions = requested_version_start[0..requested_version_count];
             if (dependency_versions.len > 1) std.sort.insertion(Dependency.Version, dependency_versions, string_buf, Dependency.Version.isLessThanWithTag);
             try requested_versions.put(i, dependency_versions);
         }
@@ -121,7 +128,11 @@ fn packages(
             for (dependency_versions) |*dependency_version| {
                 if (needs_comma) {
                     if (prev_dependency_version) |*prev| {
-                        if (prev.eql(dependency_version, string_buf, string_buf)) {
+                        if (strings.eqlLong(
+                            prev.literal.slice(string_buf),
+                            dependency_version.literal.slice(string_buf),
+                            true,
+                        )) {
                             continue;
                         }
                     }
