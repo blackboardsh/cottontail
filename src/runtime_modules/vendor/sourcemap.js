@@ -19,6 +19,8 @@ let cachedMapPath;
 let cachedMapData;
 let cachedBundlePath;
 let cachedState; // undefined = never attempted for cachedMapPath, null = load failed
+const adjacentBundleStates = new Map();
+const virtualSourceMappings = new WeakMap();
 
 function normalizePath(path) {
   const isAbsolute = path.startsWith("/");
@@ -195,6 +197,124 @@ function getState() {
   return cachedState;
 }
 
+function getAdjacentBundleState(bundlePath) {
+  if (adjacentBundleStates.has(bundlePath)) return adjacentBundleStates.get(bundlePath);
+  const state = buildState(`${bundlePath}.map`, null, bundlePath);
+  adjacentBundleStates.set(bundlePath, state);
+  return state;
+}
+
+function decodeOriginalPath(lines) {
+  const marker = lines?.[0]?.match(/^\/\*@cottontail-original-path-base64:([A-Za-z0-9+/=]+)\*\//);
+  if (!marker) return null;
+  try {
+    if (typeof globalThis.Buffer?.from === "function") {
+      return globalThis.Buffer.from(marker[1], "base64").toString("utf8");
+    }
+    const binary = globalThis.atob(marker[1]);
+    return new TextDecoder().decode(Uint8Array.from(binary, character => character.charCodeAt(0)));
+  } catch {
+    return null;
+  }
+}
+
+function virtualSourceMapping(state, sourceIndex) {
+  let mappings = virtualSourceMappings.get(state);
+  if (!mappings) virtualSourceMappings.set(state, mappings = new Map());
+  if (mappings.has(sourceIndex)) return mappings.get(sourceIndex);
+
+  const transformedLines = state.sourceLines[sourceIndex];
+  const source = decodeOriginalPath(transformedLines);
+  if (!source || !Array.isArray(transformedLines)) {
+    mappings.set(sourceIndex, null);
+    return null;
+  }
+  let originalLines;
+  try {
+    const originalText = readMapText(source);
+    if (typeof originalText === "string") originalLines = originalText.split(/\r?\n/);
+  } catch {}
+  if (!Array.isArray(originalLines)) {
+    mappings.set(sourceIndex, null);
+    return null;
+  }
+
+  const originalLocations = new Map();
+  for (let index = 0; index < originalLines.length; index += 1) {
+    const text = originalLines[index].trim();
+    if (text.length < 8) continue;
+    const locations = originalLocations.get(text) ?? [];
+    locations.push(index);
+    originalLocations.set(text, locations);
+  }
+  const transformedCounts = new Map();
+  for (const line of transformedLines) {
+    const text = line.trim();
+    if (text.length >= 8) transformedCounts.set(text, (transformedCounts.get(text) ?? 0) + 1);
+  }
+  const anchors = [];
+  let lastOriginal = -1;
+  for (let index = 0; index < transformedLines.length; index += 1) {
+    const text = transformedLines[index].trim();
+    const locations = originalLocations.get(text);
+    if (transformedCounts.get(text) !== 1 || locations?.length !== 1 || locations[0] <= lastOriginal) continue;
+    lastOriginal = locations[0];
+    anchors.push([index, lastOriginal]);
+  }
+  const mapping = { source, transformedLines, originalLines, anchors };
+  mappings.set(sourceIndex, mapping);
+  return mapping;
+}
+
+function remapVirtualSourceFrame(state, file, line, column) {
+  const cacheMarker = "/cache/";
+  const cacheIndex = file.lastIndexOf(cacheMarker);
+  const runMatch = /\/run\/[0-9a-f]+\/(.+)$/.exec(file);
+  const relativeSource = cacheIndex >= 0
+    ? normalizePath(file.slice(cacheIndex + cacheMarker.length))
+    : runMatch ? normalizePath(runMatch[1]) : null;
+  if (!relativeSource) return null;
+  const entrySource = typeof globalThis.__filename === "string"
+    ? normalizePath(globalThis.__filename)
+    : null;
+  const matchesEntry = entrySource &&
+    (entrySource === relativeSource || entrySource.endsWith(`/${relativeSource}`));
+  const sourceIndex = state.sources.findIndex(candidate => {
+    const normalized = normalizePath(candidate);
+    return normalized === relativeSource || normalized.endsWith(`/${relativeSource}`);
+  });
+  const mapping = sourceIndex < 0 ? null : virtualSourceMapping(state, sourceIndex);
+  if (!mapping || mapping.anchors.length === 0) {
+    return matchesEntry
+      ? { source: entrySource, line: Number(line), column: Number(column) }
+      : null;
+  }
+
+  let target = Math.max(0, Number(line) - 1);
+  let mappedColumn = Number(column);
+  for (let index = target; index >= Math.max(0, target - 1); index -= 1) {
+    const constructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(
+      mapping.transformedLines[index] ?? "",
+    );
+    if (!constructor) continue;
+    target = index;
+    mappedColumn = constructor.index + constructor[0].lastIndexOf(constructor[1]) + 1;
+    break;
+  }
+  let best = mapping.anchors[0];
+  let bestDistance = Math.abs(best[0] - target);
+  for (const anchor of mapping.anchors) {
+    const distance = Math.abs(anchor[0] - target);
+    if (distance > bestDistance && anchor[0] > target) break;
+    if (distance <= bestDistance) {
+      best = anchor;
+      bestDistance = distance;
+    }
+  }
+  const mappedLine = Math.max(0, Math.min(mapping.originalLines.length - 1, target + best[1] - best[0]));
+  return { source: mapping.source, line: mappedLine + 1, column: mappedColumn };
+}
+
 function lookup(state, line, column) {
   if (!Number.isFinite(line) || !Number.isFinite(column) || line < 1 || column < 1) return null;
   const segments = state.lines[line - 1];
@@ -254,7 +374,28 @@ export function sourceContextForLocation(source, line, column) {
   const state = getState();
   if (!state || typeof source !== "string") return null;
   const normalized = normalizePath(source.startsWith("file://") ? source.slice("file://".length) : source);
-  const sourceIndex = state.sources.findIndex(candidate => normalizePath(candidate) === normalized);
+  let sourceIndex = state.sources.findIndex(candidate => normalizePath(candidate) === normalized);
+  const entrySource = typeof globalThis.__filename === "string"
+    ? normalizePath(globalThis.__filename)
+    : null;
+  if (sourceIndex < 0 && normalized === entrySource) {
+    const entryParts = normalized.split("/");
+    let bestIndex = -1;
+    let bestSuffix = 1;
+    for (let index = 0; index < state.sources.length; index += 1) {
+      const candidateParts = normalizePath(state.sources[index]).split("/");
+      let suffix = 0;
+      while (suffix < entryParts.length && suffix < candidateParts.length &&
+          entryParts[entryParts.length - suffix - 1] === candidateParts[candidateParts.length - suffix - 1]) {
+        suffix += 1;
+      }
+      if (suffix > bestSuffix) {
+        bestSuffix = suffix;
+        bestIndex = index;
+      }
+    }
+    sourceIndex = bestIndex;
+  }
   if (sourceIndex < 0 || !state.sourceLines[sourceIndex]) return null;
   return {
     source: state.sources[sourceIndex],
@@ -305,30 +446,59 @@ export function remapStackString(stack) {
   const configuredBundlePath = globalThis.__cottontailBundlePath;
   const hasMapPath = typeof mapPath === "string" && mapPath !== "";
   const hasMapData = typeof mapData === "string" && mapData !== "";
-  if (!hasMapPath && !hasMapData) return stack;
+  if (!hasMapPath && !hasMapData) return remapAdjacentBundleFrames(stack);
   const expectedBundlePath = typeof configuredBundlePath === "string" && configuredBundlePath !== ""
     ? configuredBundlePath
     : hasMapPath && mapPath.endsWith(".map")
       ? mapPath.slice(0, -4)
       : null;
-  if (expectedBundlePath && !stack.includes(expectedBundlePath)) return stack;
+  if (expectedBundlePath && !stack.includes(expectedBundlePath) &&
+      !stack.includes("/cache/") && !stack.includes("/run/")) {
+    return remapAdjacentBundleFrames(stack);
+  }
   const state = getState();
-  if (!state || !state.bundleRegExp || !stack.includes(state.bundlePath)) return stack;
-  state.bundleRegExp.lastIndex = 0;
-  const remapped = stack.replace(state.bundleRegExp, (match, lineText, columnText) => {
+  let remapped = stack;
+  if (state?.bundleRegExp && stack.includes(state.bundlePath)) {
+    state.bundleRegExp.lastIndex = 0;
+    remapped = remapped.replace(state.bundleRegExp, (match, lineText, columnText) => {
+      const line = Number(lineText);
+      const column = Number(columnText);
+      const initial = lookup(state, line, column);
+      const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
+      return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
+    });
+  }
+  if (state && (remapped.includes("/cache/") || remapped.includes("/run/"))) {
+    remapped = remapped.replace(
+      /((?:file:\/\/)?(?:[A-Za-z]:)?\/[^@\s()]*(?:\/cache\/|\/run\/[0-9a-f]+\/)[^@\s()]*):(\d+):(\d+)/g,
+      (match, file, lineText, columnText) => {
+        const mapped = remapVirtualSourceFrame(state, file, Number(lineText), Number(columnText));
+        return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
+      },
+    );
+  }
+  remapped = remapAdjacentBundleFrames(remapped);
+  const activeBundlePath = state?.bundlePath;
+  return remapped
+    .split("\n")
+    .filter((line) => {
+      if (!activeBundlePath) return true;
+      const isFrame = /^\s*at\b/.test(line) || line.includes(`@${activeBundlePath}:`);
+      return !(isFrame && line.includes(activeBundlePath));
+    })
+    .join("\n");
+}
+
+function remapAdjacentBundleFrames(stack) {
+  return String(stack).replace(/((?:file:\/\/)?(?:[A-Za-z]:)?\/[^@\s()]*\/script\.bundle\.mjs):(\d+):(\d+)/g, (match, file, lineText, columnText) => {
+    const state = getAdjacentBundleState(file);
+    if (!state) return match;
     const line = Number(lineText);
     const column = Number(columnText);
     const initial = lookup(state, line, column);
     const mapped = initial ? preferConstructedErrorCallSite(state, line, column, initial) : null;
     return mapped ? `${mapped.source}:${mapped.line}:${mapped.column}` : match;
   });
-  return remapped
-    .split("\n")
-    .filter((line) => {
-      const isFrame = /^\s*at\b/.test(line) || line.includes(`@${state.bundlePath}:`);
-      return !(isFrame && line.includes(state.bundlePath));
-    })
-    .join("\n");
 }
 
 export default { remapErrorPosition, remapPosition, remapStackString, sourceContextForLocation };

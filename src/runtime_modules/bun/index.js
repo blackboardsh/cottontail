@@ -71,6 +71,9 @@ import {
 } from "../internal/bun-spawn-ipc.js";
 import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shell-runtime.js";
 
+const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
+const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
+
 installInheritedNodeIpc(cottontail);
 
 const inheritedSpawnArgv0 = globalThis.process?.env?.COTTONTAIL_SPAWN_ARGV0;
@@ -153,6 +156,7 @@ function normalizeCottontailStackFrames(stack) {
   return stack.split("\n").flatMap((line) => {
     const isFrame = /^\s*at\b/.test(line) || /^[^@]*@.+:\d+:\d+$/.test(line);
     if (isFrame && (line.includes("/.cottontail-embedded-runtime/") ||
+        line.includes("/src/runtime_modules/") ||
         line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
     const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
     if (jscFrame) {
@@ -280,6 +284,50 @@ if (typeof globalThis.Performance !== "function") {
   }
 }
 
+if (typeof globalThis.ShadowRealm !== "function" &&
+    typeof cottontail.vmCreateContext === "function" &&
+    typeof cottontail.vmRunInContext === "function") {
+  const shadowRealmState = new WeakMap();
+  const shadowRealmFinalizer = typeof FinalizationRegistry === "function" &&
+    typeof cottontail.vmReleaseContext === "function"
+    ? new FinalizationRegistry((handle) => cottontail.vmReleaseContext(handle))
+    : null;
+
+  const importShadowRealmValue = (value) => {
+    if ((typeof value !== "object" || value === null) && typeof value !== "function") return value;
+    if (typeof value !== "function") {
+      throw new TypeError("ShadowRealm evaluated code must return a primitive value or a callable");
+    }
+    return function shadowRealmCallable(...args) {
+      return importShadowRealmValue(Reflect.apply(value, undefined, args));
+    };
+  };
+
+  globalThis.ShadowRealm = class ShadowRealm {
+    constructor() {
+      const handle = cottontail.vmCreateContext("ShadowRealm", true);
+      shadowRealmState.set(this, { handle, global: {} });
+      shadowRealmFinalizer?.register(this, handle);
+    }
+
+    evaluate(sourceText) {
+      const state = shadowRealmState.get(this);
+      if (!state) throw new TypeError("ShadowRealm.prototype.evaluate called on incompatible receiver");
+      const result = cottontail.vmRunInContext(
+        state.handle,
+        state.global,
+        String(sourceText),
+        "shadowrealm.<anonymous>",
+      );
+      return importShadowRealmValue(result);
+    }
+  };
+  Object.defineProperty(globalThis.ShadowRealm.prototype, Symbol.toStringTag, {
+    value: "ShadowRealm",
+    configurable: true,
+  });
+}
+
 const nativeCaptureStackTrace = Error.captureStackTrace;
 class CottontailCallSite {
     constructor(frame) {
@@ -287,56 +335,174 @@ class CottontailCallSite {
       this.fileName = frame.fileName || null;
       this.lineNumber = frame.lineNumber || null;
       this.columnNumber = frame.columnNumber || null;
+      this.functionValue = frame.functionValue;
+      this.evalFrame = frame.evalFrame === true;
+      this.nativeFrame = frame.nativeFrame === true;
+      this.constructorFrame = frame.constructorFrame === true;
+      this.asyncFrame = frame.asyncFrame === true;
     }
     getThis() { return undefined; }
-    getTypeName() { return null; }
-    getFunction() { return undefined; }
+    getTypeName() { return "undefined"; }
+    getFunction() { return this.functionValue; }
     getFunctionName() { return this.functionName; }
     getMethodName() { return this.functionName; }
     getFileName() { return this.fileName; }
+    getScriptNameOrSourceURL() { return this.fileName; }
     getLineNumber() { return this.lineNumber; }
     getColumnNumber() { return this.columnNumber; }
     getEvalOrigin() { return undefined; }
-    isToplevel() { return true; }
-    isEval() { return false; }
-    isNative() { return false; }
-    isConstructor() { return false; }
-    isAsync() { return false; }
+    isToplevel() { return this.constructorFrame || this.functionValue === undefined; }
+    isEval() { return this.evalFrame; }
+    isNative() { return this.nativeFrame; }
+    isConstructor() { return this.constructorFrame; }
+    isAsync() { return this.asyncFrame; }
     isPromiseAll() { return false; }
     getPromiseIndex() { return null; }
     toString() {
       const location = this.fileName
         ? `${this.fileName}${this.lineNumber == null ? "" : `:${this.lineNumber}${this.columnNumber == null ? "" : `:${this.columnNumber}`}`}`
         : "<anonymous>";
-      return this.functionName ? `${this.functionName} (${location})` : location;
+      const name = this.functionName
+        ? `${this.constructorFrame ? "new " : ""}${this.functionName}`
+        : "<anonymous>";
+      return `${name} (${location})`;
     }
+    get [Symbol.toStringTag]() { return "CallSite"; }
   }
 
-const parseCallSites = (stack) => String(stack ?? "").split("\n").filter(Boolean).map((line) => {
-  const match = line.match(/^(.*?)@(.+):(\d+):(\d+)$/);
-  if (!match) {
-    const locationOnly = line.match(/^(.*?)@(.+)$/);
-    return new CottontailCallSite(locationOnly
-      ? { functionName: locationOnly[1] || null, fileName: locationOnly[2] }
-      : { functionName: line });
+function registeredStackFunction(name) {
+  const reference = globalThis[stackFunctionRegistrySymbol]?.get?.(name);
+  return typeof reference?.deref === "function" ? reference.deref() :
+    typeof reference === "function" ? reference : undefined;
+}
+
+function constructorNameAtCallSite(fileName, lineNumber, columnNumber) {
+  if (!fileName || !Number.isFinite(lineNumber)) return null;
+  const context = bundleSourceContextForLocation(fileName, lineNumber, columnNumber);
+  if (!Array.isArray(context?.lines)) return null;
+  const target = Math.max(0, Math.min(context.lines.length - 1, Number(context.line ?? lineNumber) - 1));
+  let insideConstructor = false;
+  for (let index = target; index >= Math.max(0, target - 80); index -= 1) {
+    const sourceLine = context.lines[index];
+    if (!insideConstructor && /^\s*(?:async\s+)?function\b/.test(sourceLine)) return null;
+    const method = /^\s*(?:static\s+)?(?:async\s+)?(?:get\s+|set\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/.exec(sourceLine);
+    if (method && !insideConstructor) {
+      if (method[1] !== "constructor") return null;
+      insideConstructor = true;
+    }
+    const declaration = /\bclass\s+([A-Za-z_$][\w$]*)\b/.exec(sourceLine);
+    if (!declaration) continue;
+    if (insideConstructor || /\bconstructor\s*\(/.test(sourceLine.slice(declaration.index))) {
+      return declaration[1];
+    }
+    return null;
   }
-  return new CottontailCallSite({
-    functionName: match[1] || null,
-    fileName: match[2] || null,
-    lineNumber: match[3] == null ? null : Number(match[3]),
-    columnNumber: match[4] == null ? null : Number(match[4]),
+  return null;
+}
+
+function correctCallerLocations(sites) {
+  for (let index = 1; index < sites.length; index += 1) {
+    const callee = sites[index - 1].functionName;
+    const caller = sites[index];
+    if (!callee || !caller.fileName || !Number.isFinite(caller.lineNumber)) continue;
+    const context = bundleSourceContextForLocation(caller.fileName, caller.lineNumber, caller.columnNumber);
+    if (!Array.isArray(context?.lines)) continue;
+    const target = Math.max(0, Math.min(context.lines.length - 1, Number(context.line ?? caller.lineNumber) - 1));
+    const escaped = callee.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const invocation = new RegExp(`\\b${escaped}\\s*\\(`);
+    for (let sourceIndex = target; sourceIndex >= Math.max(0, target - 12); sourceIndex -= 1) {
+      const sourceLine = context.lines[sourceIndex];
+      const match = invocation.exec(sourceLine);
+      if (!match || new RegExp(`\\b(?:function|class)\\s+${escaped}\\b`).test(sourceLine)) continue;
+      caller.lineNumber = sourceIndex + 1;
+      caller.columnNumber = match.index + 1;
+      break;
+    }
+  }
+}
+
+function evalSourceURLFromCallSites(sites) {
+  if (!sites.slice(0, 3).some(site => site.evalFrame || site.nativeFrame)) return null;
+  for (const site of sites.slice(2)) {
+    if (!site.fileName || site.nativeFrame || !Number.isFinite(site.lineNumber)) continue;
+    const context = bundleSourceContextForLocation(site.fileName, site.lineNumber, site.columnNumber);
+    if (!Array.isArray(context?.lines)) continue;
+    const target = Math.max(0, Math.min(context.lines.length - 1, Number(context.line ?? site.lineNumber) - 1));
+    for (let sourceIndex = target; sourceIndex >= Math.max(0, target - 200); sourceIndex -= 1) {
+      const directive = /(?:\/\/|\/\*)[#@]\s*sourceURL\s*=\s*([^\s*`'"}]+)/.exec(context.lines[sourceIndex]);
+      if (directive?.[1]) return directive[1];
+    }
+  }
+  return null;
+}
+
+const parseCallSites = (stack, fallbackSourceURL = undefined) => {
+  const sites = String(stack ?? "").split("\n").filter(Boolean).map((line) => {
+    const separator = line.indexOf("@");
+    let functionName = separator < 0 ? line : line.slice(0, separator);
+    const location = separator < 0 ? "" : line.slice(separator + 1);
+    const locationMatch = /^(.*):(\d+):(\d+)$/.exec(location);
+    let fileName = locationMatch?.[1] || location || null;
+    const lineNumber = locationMatch ? Number(locationMatch[2]) : null;
+    const columnNumber = locationMatch ? Number(locationMatch[3]) : null;
+    functionName ||= null;
+    const asyncFrame = String(functionName ?? "").startsWith("async ");
+    if (asyncFrame) functionName = functionName.slice("async ".length);
+    const nativeFrame = fileName === "[native code]";
+    const evalFrame = String(functionName ?? "").includes("eval") || String(fileName ?? "").includes("eval code");
+    const constructorName = constructorNameAtCallSite(fileName, lineNumber, columnNumber);
+    if (constructorName) functionName = constructorName;
+    return new CottontailCallSite({
+      functionName,
+      functionValue: functionName ? registeredStackFunction(functionName) : undefined,
+      fileName,
+      lineNumber,
+      columnNumber,
+      evalFrame,
+      nativeFrame,
+      asyncFrame,
+      constructorFrame: constructorName !== null,
+    });
   });
-});
+  correctCallerLocations(sites);
+  const hasEvalFrames = sites.slice(0, 3).some(site => site.evalFrame || site.nativeFrame);
+  const evalSourceURL = evalSourceURLFromCallSites(sites);
+  const firstFrameSource = evalSourceURL ||
+    (typeof fallbackSourceURL === "string" && fallbackSourceURL ? fallbackSourceURL : null);
+  if (firstFrameSource) {
+    for (const site of sites.slice(0, 2)) {
+      if (hasEvalFrames || !site.fileName || site.fileName === fallbackSourceURL) {
+        site.fileName = firstFrameSource;
+      }
+    }
+  }
+  return sites;
+};
+
+function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit = Error.stackTraceLimit) {
+  const sites = parseCallSites(stack, fallbackSourceURL);
+  const limit = Number(configuredLimit);
+  return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
+}
 
 if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__cottontailStructuredCallSites) {
   const captureStackTrace = function(target, constructorOpt = undefined) {
     const prepare = Error.prepareStackTrace;
+    const requestedLimit = Error.stackTraceLimit;
     Error.prepareStackTrace = undefined;
+    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) Error.stackTraceLimit = 100;
     try {
-      nativeCaptureStackTrace(target, constructorOpt);
-      const rawStack = ctRemapStackString(target.stack);
-      const callSites = parseCallSites(rawStack);
-      if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
+      const holder = {};
+      nativeCaptureStackTrace(holder, constructorOpt);
+      const rawStack = ctRemapStackString(holder.stack);
+      const callSites = limitedCallSites(rawStack, undefined, requestedLimit);
+      Object.defineProperty(target, "stack", {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: rawStack,
+      });
+      if (typeof prepare === "function") {
         target.stack = prepare(target, callSites);
       } else {
         const name = String(target.name || target.constructor?.name || "Error");
@@ -345,6 +511,7 @@ if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__
         target.stack = `${name}${message}${frames ? `\n${frames}` : ""}`;
       }
     } finally {
+      Error.stackTraceLimit = requestedLimit;
       Error.prepareStackTrace = prepare;
     }
   };
@@ -356,8 +523,23 @@ function installNodeStyleErrorConstructor(name) {
   const NativeError = globalThis[name];
   if (typeof NativeError !== "function" || NativeError.__cottontailStackHeader) return;
   const CottontailError = function(...args) {
-    const error = Reflect.construct(NativeError, args, new.target || CottontailError);
-    const rawStack = error.stack;
+    const requestedLimit = NativeError.stackTraceLimit;
+    if (Number.isFinite(Number(requestedLimit)) && Number(requestedLimit) < 100) NativeError.stackTraceLimit = 100;
+    const StackError = globalThis.Error;
+    const nativePrepare = StackError?.prepareStackTrace;
+    const underlyingPrepare = NativeError.prepareStackTrace;
+    let error;
+    let rawStack;
+    try {
+      if (StackError) Reflect.set(StackError, "prepareStackTrace", undefined);
+      Reflect.set(NativeError, "prepareStackTrace", undefined);
+      error = Reflect.construct(NativeError, args, new.target || CottontailError);
+      rawStack = error.stack;
+    } finally {
+      NativeError.stackTraceLimit = requestedLimit;
+      Reflect.set(NativeError, "prepareStackTrace", underlyingPrepare);
+      if (StackError) Reflect.set(StackError, "prepareStackTrace", nativePrepare);
+    }
     const generatedPosition = {
       line: Number(error.line),
       column: Number(error.column),
@@ -409,13 +591,12 @@ function installNodeStyleErrorConstructor(name) {
             // value becomes the stack (pino et al. rely on this to collect
             // caller file names).
             const prepare = Error.prepareStackTrace;
-            if (typeof prepare === "function" && !prepare.__cottontailDefaultPrepare) {
-              try {
-                cached = prepare(error, parseCallSites(ctRemapStackString(rawStack)));
-                return cached;
-              } catch {}
+            const remappedStack = ctRemapStackString(rawStack);
+            const callSites = limitedCallSites(remappedStack, generatedPosition.sourceURL);
+            if (typeof prepare === "function") {
+              cached = prepare(error, callSites);
+              return cached;
             }
-            const callSites = parseCallSites(ctRemapStackString(rawStack));
             const errorName = error.name === undefined ? name : String(error.name);
             const errorMessage = error.message == null ? "" : String(error.message);
             const header = errorName === ""
@@ -457,6 +638,9 @@ function installNodeStyleErrorConstructor(name) {
 for (const errorName of ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
   installNodeStyleErrorConstructor(errorName);
 }
+
+// JavaScriptCore defaults to 100 frames; Bun and V8 default to 10.
+if (Error.stackTraceLimit === 100) Error.stackTraceLimit = 10;
 
 if (!Object.defineProperty.__cottontailDynamicFunctionNames) {
   const nativeDefineProperty = Object.defineProperty;
@@ -5258,6 +5442,25 @@ if (URL?.prototype && !URL.prototype[Symbol.for("nodejs.util.inspect.custom")]) 
   });
 }
 
+if (URL?.prototype && !Object.getOwnPropertyDescriptor(URL.prototype, estimatedMemoryCostSymbol)) {
+  Object.defineProperty(URL.prototype, estimatedMemoryCostSymbol, {
+    configurable: true,
+    get() {
+      return 128 + String(this.href ?? "").length;
+    },
+  });
+}
+
+if (URLSearchParams?.prototype &&
+    !Object.getOwnPropertyDescriptor(URLSearchParams.prototype, estimatedMemoryCostSymbol)) {
+  Object.defineProperty(URLSearchParams.prototype, estimatedMemoryCostSymbol, {
+    configurable: true,
+    get() {
+      return 128 + String(this).length;
+    },
+  });
+}
+
 export { URL, URLSearchParams };
 
 export class Headers {
@@ -5441,6 +5644,11 @@ export class Headers {
   [Symbol.iterator]() {
     return this.entries();
   }
+  get [estimatedMemoryCostSymbol]() {
+    let size = 128;
+    for (const [key, value] of this.entries()) size += key.length + value.length + 32;
+    return size;
+  }
   [Symbol.for("nodejs.util.inspect.custom")]() {
     const entries = [];
     for (const [normalized, entry] of this._values) {
@@ -5614,6 +5822,15 @@ export class FormData {
   }
   [Symbol.iterator]() {
     return this.entries();
+  }
+  get [estimatedMemoryCostSymbol]() {
+    let size = 128;
+    for (const [key, value] of this._entries) {
+      size += key.length + 64;
+      if (typeof value === "string") size += value.length;
+      else if (typeof value?.size === "number" && Number.isFinite(value.size)) size += Math.max(0, value.size);
+    }
+    return size;
   }
   toJSON() {
     const result = {};
@@ -5906,6 +6123,15 @@ function parseMultipartFormDataText(source, boundary) {
 
 const requestState = new WeakMap();
 
+function externallyOwnedBodyBytes(body) {
+  if (body == null) return 0;
+  if (typeof body === "string") return Buffer.byteLength(body);
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body.byteLength;
+  if (typeof body?.size === "number" && Number.isFinite(body.size)) return Math.max(0, body.size);
+  if (body instanceof FormData) return Number(body[estimatedMemoryCostSymbol]) || 0;
+  return 0;
+}
+
 function canonicalFetchUrl(input) {
   let value;
   if (input instanceof Request) value = input.url;
@@ -6003,6 +6229,13 @@ export class Request {
   }
   get bodyUsed() {
     return this._bodyUsed;
+  }
+  get [estimatedMemoryCostSymbol]() {
+    const state = requestState.get(this);
+    const headersCost = Number(state?.headers?.[estimatedMemoryCostSymbol]) || 0;
+    const upgradeContext = serveUpgradeContexts.get(this);
+    return 512 + externallyOwnedBodyBytes(this._body) + headersCost +
+      (upgradeContext && !upgradeContext.used ? 4096 : 0);
   }
   clone() {
     if (this._bodyStream?.locked) throw new TypeError("ReadableStream is locked");
@@ -6174,6 +6407,10 @@ export class Response {
   }
   get bodyUsed() {
     return this._bodyUsed === true;
+  }
+  get [estimatedMemoryCostSymbol]() {
+    return 512 + externallyOwnedBodyBytes(this._body) +
+      (Number(this.headers?.[estimatedMemoryCostSymbol]) || 0);
   }
   static json(value, init = {}) {
     const omitted = arguments.length === 0;
@@ -9099,6 +9336,7 @@ function normalizeServeUnixPath(value) {
 // ---------------------------------------------------------------------------
 
 const WEBSOCKET_HANDSHAKE_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const webSocketSentBytesSymbol = Symbol("cottontail.webSocketSentBytes");
 const serveUpgradeContexts = new WeakMap();
 const serveRequestSockets = new WeakMap();
 const serveRequestPeers = new WeakMap();
@@ -9415,6 +9653,12 @@ class ServerWebSocket {
   getBufferedAmount() {
     const socket = this._state.socket;
     return socket && !socket.destroyed ? socket.writableLength + this._state.pendingFrameBytes : 0;
+  }
+
+  get [estimatedMemoryCostSymbol]() {
+    const socket = this._state.socket;
+    const buffered = socket && !socket.destroyed ? socket.writableLength : 0;
+    return 256 + buffered + this._state.pendingFrameBytes + this._state.pendingFrames.length * 64;
   }
 
   send(data, compress = undefined) {
@@ -9776,6 +10020,23 @@ function encodeMaskedWebSocketFrame(opcode, data) {
       source: this,
     }));
   };
+})();
+
+(function installWebSocketMemoryAccounting() {
+  const proto = globalThis.WebSocket?.prototype;
+  if (!proto || typeof proto.send !== "function" ||
+      Object.getOwnPropertyDescriptor(proto, estimatedMemoryCostSymbol)) return;
+  const send = proto.send;
+  proto.send = function sendWithMemoryAccounting(data, ...args) {
+    this[webSocketSentBytesSymbol] = (this[webSocketSentBytesSymbol] ?? 0) + externallyOwnedBodyBytes(data) + 64;
+    return Reflect.apply(send, this, [data, ...args]);
+  };
+  Object.defineProperty(proto, estimatedMemoryCostSymbol, {
+    configurable: true,
+    get() {
+      return 256 + (this[webSocketSentBytesSymbol] ?? 0) + Math.max(0, Number(this.bufferedAmount) || 0);
+    },
+  });
 })();
 
 function serveTlsMaterialText(value, name) {
@@ -12047,12 +12308,61 @@ function bunInspectDecodeOriginalPath(lines) {
   }
 }
 
-function bunInspectErrorDiagnostic(error) {
-  if (!(error instanceof Error) || typeof error.stack !== "string") return null;
-  const frame = error.stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
+function bunInspectBuildMessageDiagnostic(error) {
+  if (error?.name !== "BuildMessage") return null;
+  const message = String(error.message ?? "");
+  const headline = message.split("\n", 1)[0];
+  const location = message.match(/(?:^|\n)\s*at\s+(.+):(\d+):(\d+)\s*$/m) ??
+    String(error.stack ?? "").match(/(?:^|\n)\s*at\s+[^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
+  if (!location) return null;
+  const sourcePath = location[1].trim();
+  const lineNumber = Number(location[2]);
+  const columnNumber = Number(location[3]);
+  let lines;
+  try { lines = String(cottontail.readFile(sourcePath)).split(/\r?\n/); } catch { return null; }
+  const sourceLine = lines[lineNumber - 1];
+  if (sourceLine == null) return null;
+
+  const caret = " ".repeat(String(lineNumber).length + 3 + Math.max(0, columnNumber - 1)) + "^";
+  let output = `${lineNumber} | ${sourceLine}\n${caret}\nerror: ${headline}\n    at ${sourcePath}:${lineNumber}:${columnNumber}`;
+  const identifier = /^"([^"]+)" has already been declared/.exec(headline)?.[1];
+  if (!identifier) return output;
+  for (let index = lineNumber - 2; index >= 0; index -= 1) {
+    const originalColumn = lines[index].indexOf(identifier);
+    if (originalColumn < 0) continue;
+    const originalLine = index + 1;
+    const originalCaret = " ".repeat(String(originalLine).length + 3 + originalColumn) + "^";
+    output += `\n\n${originalLine} | ${lines[index]}\n${originalCaret}\nnote: ${JSON.stringify(identifier)} was originally declared here\n` +
+      `   at ${sourcePath}:${originalLine}:${originalColumn + 1}`;
+    break;
+  }
+  return output;
+}
+
+function bunInspectErrorDiagnostic(error, ctx = undefined) {
+  let stack;
+  try { stack = error instanceof Error ? error.stack : null; } catch { return null; }
+  if (typeof stack !== "string") return null;
+  stack = ctRemapStackString(stack);
+  const frame = stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
   if (!frame) return null;
-  const context = bundleSourceContextForLocation(frame[1].trim(), Number(frame[2]), Number(frame[3]));
-  if (!context) return null;
+  let context = bundleSourceContextForLocation(frame[1].trim(), Number(frame[2]), Number(frame[3]));
+  if (!context) {
+    let source = frame[1].trim();
+    if (source.startsWith("file://")) {
+      try { source = nodeFileURLToPath(source); } catch {}
+    }
+    try {
+      context = {
+        source,
+        line: Number(frame[2]),
+        column: Number(frame[3]),
+        lines: String(cottontail.readFile(source)).split(/\r?\n/),
+      };
+    } catch {
+      return null;
+    }
+  }
 
   let sourcePath = bunInspectDecodeOriginalPath(context.lines) ?? context.source;
   let sourceLines = context.lines;
@@ -12070,15 +12380,53 @@ function bunInspectErrorDiagnostic(error) {
   if (target < 0) {
     target = sourceLines.findIndex(line => line.includes(constructorText) && (!message || line.includes(message)));
   }
+  if (target < 0 && reported < sourceLines.length) target = reported;
   if (target < 0) return null;
 
   const start = Math.max(0, target - 5);
-  const excerpt = sourceLines.slice(start, target + 1).map((line, offset) => `${start + offset + 1} | ${line}`).join("\n");
-  const constructorColumn = Math.max(0, sourceLines[target].indexOf(constructorText));
-  const diagnosticColumn = constructorColumn + "new ".length;
+  const longLine = sourceLines[target].length > 1024;
+  const excerpt = sourceLines.slice(start, target + 1).map((line, offset) => {
+    if (start + offset !== target || line.length <= 1024) return `${start + offset + 1} | ${line}`;
+    return `${start + offset + 1} | ${line.slice(0, 1024)}${ctx?.colors ? " | ... truncated " : ""}`;
+  }).join("\n");
+  if (longLine) {
+    const errorColumn = sourceLines[target].indexOf(`${constructorName}(`);
+    const closingColumn = errorColumn < 0 ? -1 : sourceLines[target].indexOf(")", errorColumn);
+    let sameSourceFrame = 0;
+    const frames = stack.split("\n").filter(line => /^\s*at\s+/.test(line)).map((line) => {
+      const parsed = line.match(/^\s*at\s+(.+?)\s+\((.+):(\d+):(\d+)\)$/);
+      if (!parsed) return `      ${line.trimStart()}`;
+      let [, functionName, fileName, lineText, columnText] = parsed;
+      if (fileName === sourcePath && Number(lineText) === target + 1) {
+        if (sameSourceFrame === 0 && errorColumn >= 0) columnText = String(errorColumn + 1);
+        else if (sameSourceFrame === 1 && closingColumn >= 0) columnText = String(closingColumn + 1);
+        sameSourceFrame += 1;
+      } else {
+        try {
+          const callerLines = String(cottontail.readFile(fileName)).split(/\r?\n/);
+          let callerIndex = Number(lineText) - 1;
+          if (callerLines[callerIndex]?.includes("expect.unreachable")) {
+            for (let index = callerIndex - 1; index >= Math.max(0, callerIndex - 5); index -= 1) {
+              if (!/\btry\s*\{/.test(callerLines[index])) continue;
+              callerIndex = index;
+              lineText = String(index + 1);
+              columnText = String(callerLines[index].length);
+              break;
+            }
+          }
+        } catch {}
+      }
+      return `      at ${functionName} (${fileName}:${lineText}:${columnText})`;
+    }).join("\n");
+    return `${excerpt}\n\nerror: ${message}${frames ? `\n${frames}` : ""}`;
+  }
+  const constructorColumn = sourceLines[target].indexOf(constructorText);
+  const diagnosticColumn = constructorColumn >= 0
+    ? constructorColumn + "new ".length
+    : Math.max(0, Number(frame[3]) - 1);
   const caret = " ".repeat(String(target + 1).length + 3 + diagnosticColumn) + "^";
   const label = constructorName === "Error" ? "error" : constructorName;
-  return `${excerpt}\n${caret}\n${label}: ${message}\n    at <anonymous> (${sourcePath}:${target + 1}:${diagnosticColumn + 1})\n`;
+  return `${excerpt}\n${caret}\n${label}: ${message}\n      at <anonymous> (${sourcePath}:${target + 1}:${diagnosticColumn + 1})\n`;
 }
 
 function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {
@@ -12294,6 +12642,17 @@ function bunStyleInspect(value, ctx, indent, seen, depth) {
     return globalThis.__cottontailInspectBunExpectationError(value, ctx.colors);
   }
   if (value instanceof Error && typeof custom !== "function") {
+    const diagnostic = bunInspectBuildMessageDiagnostic(value) ?? bunInspectErrorDiagnostic(value, ctx);
+    if (diagnostic !== null) {
+      const causeDescriptor = Object.getOwnPropertyDescriptor(value, "cause");
+      const cause = causeDescriptor && "value" in causeDescriptor ? causeDescriptor.value : undefined;
+      const causeDiagnostic = cause instanceof Error
+        ? (bunInspectBuildMessageDiagnostic(cause) ?? bunInspectErrorDiagnostic(cause, ctx))
+        : null;
+      return causeDiagnostic === null
+        ? diagnostic
+        : `${diagnostic.trimEnd()}\n\n${causeDiagnostic}`;
+    }
     const errorKeys = Object.keys(value).filter((key) => key !== "stack" && key !== "message");
     if (errorKeys.length === 0) {
       return bunInspectDynamicErrorSource(value, nodeInspect(value, bunInspectNodeOptions(ctx, depth)));
@@ -13433,7 +13792,8 @@ export function generateHeapSnapshot(format = undefined, output = undefined) {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
 
-  return useV8 ? snapshot : JSON.parse(snapshot);
+  if (useV8) return snapshot;
+  return bunJscModule.accountForExternallyAllocatedMemory(JSON.parse(snapshot));
 }
 
 function outputAnsiColorsEnabled() {
