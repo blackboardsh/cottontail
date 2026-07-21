@@ -5922,12 +5922,20 @@ export class FormData {
   }
   static from(data, boundary = undefined) {
     let text;
+    let blobBytes = data?._bytes instanceof Uint8Array ? data._bytes : null;
+    if (blobBytes === null && data instanceof Blob && typeof data._getBytes === "function") {
+      const bytes = data._getBytes();
+      if (bytes instanceof Uint8Array) blobBytes = bytes;
+      else if (ArrayBuffer.isView(bytes)) {
+        blobBytes = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      }
+    }
     const byteLength = data instanceof ArrayBuffer
       ? data.byteLength
       : ArrayBuffer.isView(data)
         ? data.byteLength
-        : data?._bytes instanceof Uint8Array
-          ? data._bytes.byteLength
+        : blobBytes !== null
+          ? blobBytes.byteLength
           : typeof data === "string" ? data.length : 0;
     const allocationLimit = globalThis.__cottontailSyntheticAllocationLimit ?? 0x7fffffff;
     if (byteLength > allocationLimit) {
@@ -5936,7 +5944,7 @@ export class FormData {
     if (typeof data === "string") text = data;
     else if (data instanceof ArrayBuffer) text = stringLatin1FromBytes(new Uint8Array(data));
     else if (ArrayBuffer.isView(data)) text = stringLatin1FromBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-    else if (data?._bytes instanceof Uint8Array) text = stringLatin1FromBytes(data._bytes);
+    else if (blobBytes !== null) text = stringLatin1FromBytes(blobBytes);
     else text = String(data);
     if (boundary != null) return parseMultipartFormDataText(text, String(boundary));
     const result = new FormData();
