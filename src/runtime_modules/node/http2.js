@@ -109,6 +109,10 @@ export class Http2ServerRequest extends IncomingMessage {
     });
   }
 
+  _read() {
+    this.stream?.resume?.();
+  }
+
   setTimeout(msecs, callback = undefined) {
     this.stream?.setTimeout(msecs, callback);
     return this;
@@ -2776,6 +2780,15 @@ class Http2Server extends EventEmitter {
     if (typeof listener === "function") this.on("request", listener);
   }
 
+  emit(event, ...args) {
+    if (event === "connection" && args[0] != null) this._acceptSocket(args[0]);
+    return super.emit(event, ...args);
+  }
+
+  _emitForwardedConnection(socket) {
+    return super.emit("connection", socket);
+  }
+
   _acceptSocket(socket, alreadySecure = !this._secure) {
     if (this._secure && !alreadySecure && socket?.encrypted !== true) {
       let secureSocket;
@@ -2916,7 +2929,7 @@ class Http2Server extends EventEmitter {
       this._server.addContext?.(hostname, context);
     }
     this._server.once("error", (error) => this.emit("error", error));
-    this._server.on?.("connection", socket => this.emit("connection", socket));
+    this._server.on?.("connection", socket => this._emitForwardedConnection(socket));
     this._server.on?.("secureConnection", socket => this.emit("secureConnection", socket));
     this._server.on?.("tlsClientError", (error, socket) => this.emit("tlsClientError", error, socket));
     this._server.listen(...args, () => {
