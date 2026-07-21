@@ -995,6 +995,19 @@ typedef struct {
     bool exited_due_to_timeout;
     bool exited_due_to_max_buffer;
     uint32_t memfd_count;
+    bool resource_usage_present;
+    uint64_t user_cpu_time;
+    uint64_t system_cpu_time;
+    uint64_t max_rss;
+    uint64_t shared_memory_size;
+    uint64_t swapped_out;
+    uint64_t fs_read;
+    uint64_t fs_write;
+    uint64_t ipc_sent;
+    uint64_t ipc_received;
+    uint64_t signals_count;
+    uint64_t voluntary_context_switches;
+    uint64_t involuntary_context_switches;
 } CtHostSpawnResult;
 
 extern void ct_host_string_free(char *value);
@@ -16432,6 +16445,22 @@ static JSValueRef ct_spawn_result_to_js(JSContextRef ctx, const CtHostSpawnResul
                     exception);
     ct_set_property(ctx, response, "exitedDueToTimeout", JSValueMakeBoolean(ctx, result->exited_due_to_timeout), exception);
     ct_set_property(ctx, response, "exitedDueToMaxBuffer", JSValueMakeBoolean(ctx, result->exited_due_to_max_buffer), exception);
+    if (result->resource_usage_present) {
+        JSObjectRef usage = ct_make_object(ctx);
+        ct_set_property(ctx, usage, "userCPUTime", JSValueMakeNumber(ctx, (double)result->user_cpu_time), exception);
+        ct_set_property(ctx, usage, "systemCPUTime", JSValueMakeNumber(ctx, (double)result->system_cpu_time), exception);
+        ct_set_property(ctx, usage, "maxRSS", JSValueMakeNumber(ctx, (double)result->max_rss), exception);
+        ct_set_property(ctx, usage, "sharedMemorySize", JSValueMakeNumber(ctx, (double)result->shared_memory_size), exception);
+        ct_set_property(ctx, usage, "swappedOut", JSValueMakeNumber(ctx, (double)result->swapped_out), exception);
+        ct_set_property(ctx, usage, "fsRead", JSValueMakeNumber(ctx, (double)result->fs_read), exception);
+        ct_set_property(ctx, usage, "fsWrite", JSValueMakeNumber(ctx, (double)result->fs_write), exception);
+        ct_set_property(ctx, usage, "ipcSent", JSValueMakeNumber(ctx, (double)result->ipc_sent), exception);
+        ct_set_property(ctx, usage, "ipcReceived", JSValueMakeNumber(ctx, (double)result->ipc_received), exception);
+        ct_set_property(ctx, usage, "signalsCount", JSValueMakeNumber(ctx, (double)result->signals_count), exception);
+        ct_set_property(ctx, usage, "voluntaryContextSwitches", JSValueMakeNumber(ctx, (double)result->voluntary_context_switches), exception);
+        ct_set_property(ctx, usage, "involuntaryContextSwitches", JSValueMakeNumber(ctx, (double)result->involuntary_context_switches), exception);
+        ct_set_property(ctx, response, "resourceUsage", usage, exception);
+    }
     return response;
 }
 

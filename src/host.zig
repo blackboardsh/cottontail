@@ -47,6 +47,19 @@ pub const CtHostSpawnResult = extern struct {
     exited_due_to_timeout: bool,
     exited_due_to_max_buffer: bool,
     memfd_count: u32,
+    resource_usage_present: bool,
+    user_cpu_time: u64,
+    system_cpu_time: u64,
+    max_rss: u64,
+    shared_memory_size: u64,
+    swapped_out: u64,
+    fs_read: u64,
+    fs_write: u64,
+    ipc_sent: u64,
+    ipc_received: u64,
+    signals_count: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
 };
 
 const SpawnStdio = enum(c_int) {
@@ -661,22 +674,80 @@ fn pollPosixChild(child: *std.process.Child, control: *SpawnControl) !?std.proce
     defer control.mutex.unlock(control.io);
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var usage: std.posix.rusage = undefined;
     while (true) {
         const rc = std.posix.system.wait4(
             child.id.?,
             &status,
             @intCast(std.posix.W.NOHANG),
-            null,
+            if (child.request_resource_usage_statistics) &usage else null,
         );
         switch (std.posix.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
+                if (child.request_resource_usage_statistics) {
+                    child.resource_usage_statistics.rusage = usage;
+                }
                 control.alive = false;
                 child.id = null;
                 return statusToTerm(@bitCast(status));
             },
             .INTR => continue,
             else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn nonnegativeSpawnUsage(value: anytype) u64 {
+    return if (value > 0) @intCast(value) else 0;
+}
+
+fn spawnCpuTimeMicros(value: std.posix.timeval) u64 {
+    return nonnegativeSpawnUsage(value.sec) * 1_000_000 + nonnegativeSpawnUsage(value.usec);
+}
+
+fn populateSpawnResourceUsage(result: *CtHostSpawnResult, child: *const std.process.Child) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (child.resource_usage_statistics.getMaxRss()) |max_rss| {
+            result.resource_usage_present = true;
+            result.max_rss = @intCast(max_rss);
+        }
+        return;
+    }
+
+    const supports_rusage = switch (builtin.os.tag) {
+        .dragonfly,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .illumos,
+        .linux,
+        .serenity,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        => true,
+        else => false,
+    };
+    if (comptime supports_rusage) {
+        if (child.resource_usage_statistics.rusage) |usage| {
+            result.resource_usage_present = true;
+            result.user_cpu_time = spawnCpuTimeMicros(usage.utime);
+            result.system_cpu_time = spawnCpuTimeMicros(usage.stime);
+            result.max_rss = @intCast(child.resource_usage_statistics.getMaxRss() orelse 0);
+            result.shared_memory_size = nonnegativeSpawnUsage(usage.ixrss);
+            result.swapped_out = nonnegativeSpawnUsage(usage.nswap);
+            result.fs_read = nonnegativeSpawnUsage(usage.inblock);
+            result.fs_write = nonnegativeSpawnUsage(usage.oublock);
+            result.ipc_sent = nonnegativeSpawnUsage(usage.msgsnd);
+            result.ipc_received = nonnegativeSpawnUsage(usage.msgrcv);
+            result.signals_count = nonnegativeSpawnUsage(usage.nsignals);
+            result.voluntary_context_switches = nonnegativeSpawnUsage(usage.nvcsw);
+            result.involuntary_context_switches = nonnegativeSpawnUsage(usage.nivcsw);
         }
     }
 }
@@ -878,6 +949,19 @@ export fn ct_host_spawn_sync(
         .exited_due_to_timeout = false,
         .exited_due_to_max_buffer = false,
         .memfd_count = 0,
+        .resource_usage_present = false,
+        .user_cpu_time = 0,
+        .system_cpu_time = 0,
+        .max_rss = 0,
+        .shared_memory_size = 0,
+        .swapped_out = 0,
+        .fs_read = 0,
+        .fs_write = 0,
+        .ipc_sent = 0,
+        .ipc_received = 0,
+        .signals_count = 0,
+        .voluntary_context_switches = 0,
+        .involuntary_context_switches = 0,
     };
 
     const gpa = std.heap.c_allocator;
@@ -1105,6 +1189,7 @@ export fn ct_host_spawn_sync(
     }
     result_out.exited_due_to_timeout = control.termination_reason == .timeout;
     result_out.exited_due_to_max_buffer = control.max_buffer_exceeded;
+    populateSpawnResourceUsage(result_out, &child);
 
     if (options.stdout_mode == @intFromEnum(SpawnStdio.pipe)) {
         result_out.stdout_ptr = allocBuffer(stdout_context.output.items) orelse {
