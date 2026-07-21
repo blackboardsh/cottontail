@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +40,172 @@ extern "C" JSStringRef ct_jsc_string_create_external_utf16(
     void*);
 extern "C" void* ct_jsc_microtask_delay_begin(JSContextGroupRef);
 extern "C" void ct_jsc_microtask_delay_end(void*);
+
+// COTTONTAIL-COMPAT: A native weak handle can clear during the current job;
+// JavaScript WeakRef intentionally keeps its target alive until the job ends.
+typedef const struct OpaqueJSWeak* CtJSWeakRef;
+extern "C" CtJSWeakRef JSWeakCreate(JSContextGroupRef, JSObjectRef);
+extern "C" void JSWeakRelease(JSContextGroupRef, CtJSWeakRef);
+extern "C" JSObjectRef JSWeakGetObject(CtJSWeakRef);
+
+namespace v8 {
+template<typename T>
+class Local {
+public:
+    Local() = default;
+    explicit Local(uintptr_t* location)
+        : location(location)
+    {
+    }
+    template<typename U>
+    Local(const Local<U>& other)
+        : location(other.location)
+    {
+    }
+    bool IsEmpty() const { return !location; }
+    T* operator->() const { return reinterpret_cast<T*>(location); }
+
+    uintptr_t* location { nullptr };
+};
+
+template<typename T>
+class MaybeLocal {
+public:
+    MaybeLocal() = default;
+    explicit MaybeLocal(Local<T> value)
+        : value(value)
+    {
+    }
+
+    Local<T> value;
+};
+
+template<typename T>
+class Maybe {
+public:
+    Maybe() = default;
+    explicit Maybe(T value)
+        : has_value(true)
+        , value(value)
+    {
+    }
+
+    bool has_value { false };
+    T value {};
+};
+
+class Context;
+class Value;
+class Object;
+class String;
+class Function;
+class FunctionTemplate;
+class Signature;
+class CFunction;
+
+template<typename T>
+class FunctionCallbackInfo {
+public:
+    void* implicit_args { nullptr };
+    uintptr_t* values { nullptr };
+    int length { 0 };
+};
+
+using FunctionCallback = void (*)(const FunctionCallbackInfo<Value>&);
+
+enum class NewStringType {
+    kNormal,
+    kInternalized,
+};
+
+enum class ConstructorBehavior {
+    kThrow,
+    kAllow,
+};
+
+enum class SideEffectType {
+    kHasSideEffect,
+    kHasNoSideEffect,
+    kHasSideEffectToReceiver,
+};
+
+class Isolate {
+public:
+    static Isolate* GetCurrent();
+    Local<Context> GetCurrentContext();
+};
+
+class HandleScope {
+public:
+    explicit HandleScope(Isolate*);
+    ~HandleScope();
+
+private:
+    void* storage[3] {};
+};
+
+class Value { };
+class Context : public Value { };
+
+class String : public Value {
+public:
+    static MaybeLocal<String> NewFromUtf8(Isolate*, const char*, NewStringType, int length = -1);
+};
+
+class Object : public Value {
+public:
+    Maybe<bool> Set(Local<Context>, Local<Value>, Local<Value>);
+};
+
+class Function : public Object {
+public:
+    void SetName(Local<String>);
+};
+
+class FunctionTemplate : public Value {
+public:
+    static Local<FunctionTemplate> New(
+        Isolate*,
+        FunctionCallback = nullptr,
+        Local<Value> = Local<Value>(),
+        Local<Signature> = Local<Signature>(),
+        int = 0,
+        ConstructorBehavior = ConstructorBehavior::kAllow,
+        SideEffectType = SideEffectType::kHasSideEffect,
+        const CFunction* = nullptr,
+        uint16_t = 0,
+        uint16_t = 0,
+        uint16_t = 0);
+    MaybeLocal<Function> GetFunction(Local<Context>);
+};
+
+namespace api_internal {
+void ToLocalEmpty();
+void FromJustIsNothing();
+}
+}
+
+namespace node {
+using addon_register_func = void (*)(v8::Local<v8::Object>, v8::Local<v8::Value>, void*);
+using addon_context_register_func = void (*)(v8::Local<v8::Object>, v8::Local<v8::Value>, v8::Local<v8::Context>, void*);
+
+struct node_module {
+    int nm_version;
+    unsigned int nm_flags;
+    void* nm_dso_handle;
+    const char* nm_filename;
+    addon_register_func nm_register_func;
+    addon_context_register_func nm_context_register_func;
+    const char* nm_modname;
+    void* nm_priv;
+    node_module* nm_link;
+};
+
+void AddEnvironmentCleanupHook(v8::Isolate*, void (*)(void*), void*);
+void RemoveEnvironmentCleanupHook(v8::Isolate*, void (*)(void*), void*);
+}
+
+extern "C" void node_module_register(void*);
 
 struct napi_handle_scope__ {
     NapiEnv* env { nullptr };
@@ -81,16 +248,21 @@ struct napi_deferred__ {
 };
 
 struct napi_async_context__ {
-    uint64_t id { 0 };
+    NapiEnv* env { nullptr };
+    JSObjectRef record { nullptr };
+    CtJSWeakRef resource { nullptr };
 };
 
 struct napi_callback_scope__ {
     NapiEnv* env { nullptr };
+    JSObjectRef token { nullptr };
+    bool had_pending_exception { false };
 };
 
 struct napi_async_work__ {
     NapiEnv* env { nullptr };
     uv_work_t request {};
+    napi_async_context async_context { nullptr };
     napi_async_execute_callback execute { nullptr };
     napi_async_complete_callback complete { nullptr };
     void* data { nullptr };
@@ -135,6 +307,7 @@ struct NapiPostedFinalizer {
     napi_finalize callback { nullptr };
     void* data { nullptr };
     void* hint { nullptr };
+    bool is_finalizer { true };
 };
 
 struct NapiBufferFinalizer {
@@ -189,6 +362,7 @@ struct NapiEnv {
     std::unordered_set<NapiFinalizerData*> finalizers;
     std::unordered_set<NapiBufferFinalizer*> buffer_finalizers;
     std::unordered_set<napi_async_work__*> async_work;
+    std::unordered_set<napi_async_context__*> async_contexts;
     std::unordered_set<napi_threadsafe_function__*> thread_safe_functions;
     std::vector<NapiCleanupHook> cleanup_hooks;
     std::vector<napi_async_cleanup_hook_handle__*> async_cleanup_hooks;
@@ -208,8 +382,11 @@ struct NapiEnv {
     std::string module_filename;
     std::string wrap_key;
     uint64_t finalizer_key { 1 };
+    JSObjectRef wrap_map { nullptr };
+    JSObjectRef logically_detached_buffers { nullptr };
     std::thread::id owner_thread;
     bool destroying { false };
+    bool in_finalizer { false };
     bool in_basic_finalizer { false };
 };
 
@@ -244,6 +421,53 @@ constexpr const char* error_messages[] = {
 
 static thread_local NapiEnv* loading_env;
 static thread_local napi_module* loading_module;
+static thread_local node::node_module* loading_legacy_module;
+static thread_local NapiEnv* active_env;
+static unsigned char empty_external_buffer_sentinel;
+
+struct LegacyV8Handle {
+    uintptr_t raw { 0 };
+    JSValueRef protected_value { nullptr };
+    void* owned_value { nullptr };
+    void (*destroy_owned)(void*) { nullptr };
+};
+
+struct LegacyV8ScopeData {
+    NapiEnv* env { nullptr };
+    LegacyV8ScopeData* previous { nullptr };
+    std::deque<LegacyV8Handle> handles;
+};
+
+struct LegacyV8FunctionTemplateData {
+    v8::FunctionCallback callback { nullptr };
+    JSValueRef data { nullptr };
+};
+
+struct LegacyV8FunctionData {
+    NapiEnv* env { nullptr };
+    JSGlobalContextRef context { nullptr };
+    v8::FunctionCallback callback { nullptr };
+    JSValueRef data { nullptr };
+};
+
+static thread_local LegacyV8ScopeData* legacy_v8_scope;
+
+class ActiveEnvScope {
+public:
+    explicit ActiveEnvScope(NapiEnv* env)
+        : previous(active_env)
+    {
+        active_env = env;
+    }
+
+    ~ActiveEnvScope()
+    {
+        active_env = previous;
+    }
+
+private:
+    NapiEnv* previous;
+};
 
 struct RegisteredModule {
     napi_addon_register_func callback { nullptr };
@@ -252,12 +476,15 @@ struct RegisteredModule {
 
 static std::mutex registered_modules_mutex;
 static std::unordered_map<std::string, RegisteredModule> registered_modules;
+static std::unordered_map<std::string, node::node_module*> registered_legacy_modules;
 
 static JSClassRef function_class;
 static JSClassRef external_class;
 static JSClassRef finalizer_class;
 static JSClassRef type_tag_class;
+static JSClassRef legacy_v8_function_class;
 static std::once_flag classes_once;
+static std::once_flag legacy_v8_classes_once;
 
 static JSValueRef call_napi_function(
     JSContextRef,
@@ -479,8 +706,21 @@ static void check_basic_finalizer_safety(NapiEnv* env)
     std::fprintf(stderr, "The finalizers are run directly from GC and must not affect GC state.\n");
     std::fprintf(stderr, "Use `node_api_post_finalizer` from inside of the finalizer to work around this issue.\n");
     std::fprintf(stderr, "It schedules the call as a new task in the event loop.\n");
+    std::fprintf(stderr, "panic(main thread): N-API finalizer attempted a GC-unsafe operation\n");
     std::fflush(stderr);
     std::abort();
+}
+
+static napi_status ensure_can_run_js(NapiEnv* env)
+{
+    if (!env)
+        return napi_invalid_arg;
+    check_basic_finalizer_safety(env);
+    if (env->in_finalizer)
+        return finish(env, napi_cannot_run_js);
+    if (env->pending_exception)
+        return finish(env, napi_pending_exception);
+    return napi_ok;
 }
 
 static void protect_pending(NapiEnv* env, JSValueRef exception)
@@ -619,6 +859,24 @@ static JSValueRef call_method(
     return JSObjectCallAsFunction(env->context, method, receiver, argc, argv, exception);
 }
 
+static JSValueRef call_global_function(
+    NapiEnv* env,
+    const char* name,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef* exception
+)
+{
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+    JSValueRef function_value = get_property(env, global, name, exception);
+    if (*exception || !function_value || !JSValueIsObject(env->context, function_value))
+        return nullptr;
+    JSObjectRef function = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(function_value));
+    if (!JSObjectIsFunction(env->context, function))
+        return nullptr;
+    return JSObjectCallAsFunction(env->context, function, global, argc, argv, exception);
+}
+
 static JSObjectRef load_builtin_module(NapiEnv* env, const char* name, JSValueRef* exception)
 {
     JSObjectRef global = JSContextGetGlobalObject(env->context);
@@ -658,6 +916,42 @@ static bool mark_array_buffer_untransferable(NapiEnv* env, JSObjectRef array_buf
     JSValueRef argument = array_buffer;
     call_method(env, worker_threads, "markAsUntransferable", 1, &argument, exception);
     return !*exception;
+}
+
+static JSObjectRef ensure_logically_detached_buffers(NapiEnv* env, JSValueRef* exception)
+{
+    NapiEnv* root = root_env(env);
+    if (root->logically_detached_buffers)
+        return root->logically_detached_buffers;
+    JSObjectRef constructor = global_constructor(root, "WeakSet", exception);
+    JSObjectRef buffers = *exception || !constructor
+        ? nullptr
+        : JSObjectCallAsConstructor(root->context, constructor, 0, nullptr, exception);
+    if (*exception || !buffers)
+        return nullptr;
+    root->logically_detached_buffers = buffers;
+    JSValueProtect(root->context, buffers);
+    return buffers;
+}
+
+static bool mark_logically_detached(NapiEnv* env, JSObjectRef array_buffer, JSValueRef* exception)
+{
+    JSObjectRef buffers = ensure_logically_detached_buffers(env, exception);
+    if (*exception || !buffers)
+        return false;
+    JSValueRef argument = array_buffer;
+    call_method(env, buffers, "add", 1, &argument, exception);
+    return !*exception;
+}
+
+static bool is_logically_detached(NapiEnv* env, JSObjectRef array_buffer, JSValueRef* exception)
+{
+    NapiEnv* root = root_env(env);
+    if (!root->logically_detached_buffers)
+        return false;
+    JSValueRef argument = array_buffer;
+    JSValueRef result = call_method(env, root->logically_detached_buffers, "has", 1, &argument, exception);
+    return !*exception && result && JSValueToBoolean(env->context, result);
 }
 
 static void scope_open(NapiEnv* env, napi_handle_scope__* scope, bool escapable)
@@ -701,22 +995,27 @@ private:
 
 class BasicFinalizerScope {
 public:
-    BasicFinalizerScope(NapiEnv* env, bool active)
+    BasicFinalizerScope(NapiEnv* env, bool basic, bool is_finalizer = true)
         : m_env(env)
-        , m_previous(env->in_basic_finalizer)
+        , m_previous_finalizer(env->in_finalizer)
+        , m_previous_basic(env->in_basic_finalizer)
     {
-        if (active)
+        if (is_finalizer)
+            env->in_finalizer = true;
+        if (is_finalizer && basic)
             env->in_basic_finalizer = true;
     }
 
     ~BasicFinalizerScope()
     {
-        m_env->in_basic_finalizer = m_previous;
+        m_env->in_finalizer = m_previous_finalizer;
+        m_env->in_basic_finalizer = m_previous_basic;
     }
 
 private:
     NapiEnv* m_env;
-    bool m_previous;
+    bool m_previous_finalizer;
+    bool m_previous_basic;
 };
 
 class MicrotaskDelayScope {
@@ -735,6 +1034,24 @@ public:
 private:
     void* m_scope;
 };
+
+static bool is_reserved_function_name(const char* name, size_t length)
+{
+    static constexpr const char* reserved[] = {
+        "arguments", "await", "break", "case", "catch", "class", "const",
+        "continue", "debugger", "default", "delete", "do", "else", "enum",
+        "eval", "export", "extends", "false", "finally", "for", "function",
+        "if", "implements", "import", "in", "instanceof", "interface", "let",
+        "new", "null", "package", "private", "protected", "public", "return",
+        "static", "super", "switch", "this", "throw", "true", "try", "typeof",
+        "var", "void", "while", "with", "yield",
+    };
+    for (const char* candidate : reserved) {
+        if (std::strlen(candidate) == length && std::memcmp(candidate, name, length) == 0)
+            return true;
+    }
+    return false;
+}
 
 static JSObjectRef make_napi_function(
     NapiEnv* env,
@@ -759,11 +1076,29 @@ static JSObjectRef make_napi_function(
             JSObjectSetPrototype(env->context, dispatcher, prototype);
     }
 
+    size_t function_name_length = 0;
+    if (name)
+        function_name_length = length == NAPI_AUTO_LENGTH ? std::strlen(name) : length;
+    bool can_embed_name = function_name_length > 0;
+    for (size_t index = 0; can_embed_name && index < function_name_length; ++index) {
+        const unsigned char byte = static_cast<unsigned char>(name[index]);
+        const bool valid = index == 0
+            ? (std::isalpha(byte) || byte == '_' || byte == '$')
+            : (std::isalnum(byte) || byte == '_' || byte == '$');
+        can_embed_name = valid;
+    }
+    if (can_embed_name && is_reserved_function_name(name, function_name_length))
+        can_embed_name = false;
+    std::string function_source = "\"use strict\"; return function";
+    if (can_embed_name) {
+        function_source.push_back(' ');
+        function_source.append(name, function_name_length);
+    }
+    function_source += "() { return dispatch(this, new.target, arguments); };";
+
     JSStringRef factory_name = JSStringCreateWithUTF8CString("createNapiFunction");
     JSStringRef parameter = JSStringCreateWithUTF8CString("dispatch");
-    JSStringRef body = JSStringCreateWithUTF8CString(
-        "\"use strict\"; return function(...args) { return dispatch(this, new.target, args); };"
-    );
+    JSStringRef body = make_utf8_string(function_source.data(), function_source.size());
     JSObjectRef factory = *exception ? nullptr : JSObjectMakeFunction(env->context, factory_name, 1, &parameter, body, nullptr, 1, exception);
     JSStringRelease(body);
     JSStringRelease(parameter);
@@ -809,6 +1144,7 @@ static JSValueRef invoke_napi_callback(
     if (!metadata || !metadata->env || !metadata->callback)
         return JSValueMakeUndefined(metadata && metadata->env ? metadata->env->context : nullptr);
     NapiEnv* env = metadata->env;
+    ActiveEnvScope active_scope(env);
     AutomaticScope scope(env);
     napi_callback_info__ info { env, argc, argv, this_value, new_target, metadata->data };
     napi_value returned = metadata->callback(reinterpret_cast<napi_env>(env), reinterpret_cast<napi_callback_info>(&info));
@@ -962,6 +1298,17 @@ static napi_status require_object(NapiEnv* env, napi_value value, JSObjectRef* r
     return *result ? napi_ok : finish(env, napi_object_expected);
 }
 
+static napi_status require_property_target(NapiEnv* env, napi_value value, JSObjectRef* result)
+{
+    if (!env || !value || !result)
+        return invalid(env);
+    JSValueRef exception = nullptr;
+    *result = JSValueToObject(env->context, to_js(value), &exception);
+    if (exception)
+        return caught(env, exception);
+    return *result ? napi_ok : finish(env, napi_object_expected);
+}
+
 static JSObjectRef create_error_object(NapiEnv* env, const char* constructor_name, napi_value code, napi_value message, JSValueRef* exception)
 {
     if (!message || !JSValueIsString(env->context, to_js(message)))
@@ -1029,7 +1376,266 @@ static std::string path_to_file_uri(const char* path)
     return result;
 }
 
+static uintptr_t* legacy_v8_add_handle(uintptr_t raw, JSValueRef protected_value = nullptr, void* owned_value = nullptr, void (*destroy_owned)(void*) = nullptr)
+{
+    if (!legacy_v8_scope)
+        return nullptr;
+    if (protected_value)
+        JSValueProtect(legacy_v8_scope->env->context, protected_value);
+    legacy_v8_scope->handles.push_back({ raw, protected_value, owned_value, destroy_owned });
+    return &legacy_v8_scope->handles.back().raw;
+}
+
+static uintptr_t* legacy_v8_add_js_handle(JSValueRef value)
+{
+    return value ? legacy_v8_add_handle(reinterpret_cast<uintptr_t>(value), value) : nullptr;
+}
+
+template<typename T>
+static JSValueRef legacy_v8_js_value(v8::Local<T> value)
+{
+    return value.location ? reinterpret_cast<JSValueRef>(*value.location) : nullptr;
+}
+
+static void legacy_v8_function_finalize(JSObjectRef function)
+{
+    auto* data = static_cast<LegacyV8FunctionData*>(JSObjectGetPrivate(function));
+    if (!data)
+        return;
+    if (data->data && data->context)
+        JSValueUnprotect(data->context, data->data);
+    delete data;
+}
+
+struct LegacyV8ImplicitArgs {
+    void* unused { nullptr };
+    v8::Isolate* isolate { nullptr };
+    void* context { nullptr };
+    uintptr_t return_value { 0 };
+    uintptr_t target { 0 };
+    void* new_target { nullptr };
+};
+
+static JSValueRef legacy_v8_function_call(
+    JSContextRef context,
+    JSObjectRef function,
+    JSObjectRef this_object,
+    size_t argc,
+    const JSValueRef argv[],
+    JSValueRef* exception)
+{
+    auto* data = static_cast<LegacyV8FunctionData*>(JSObjectGetPrivate(function));
+    if (!data || !data->env || !data->callback)
+        return JSValueMakeUndefined(context);
+    ActiveEnvScope active_scope(data->env);
+    v8::HandleScope handle_scope(reinterpret_cast<v8::Isolate*>(data->env));
+    std::vector<uintptr_t> arguments(argc + 1);
+    arguments[0] = reinterpret_cast<uintptr_t>(this_object ? static_cast<JSValueRef>(this_object) : JSContextGetGlobalObject(context));
+    for (size_t index = 0; index < argc; ++index)
+        arguments[index + 1] = reinterpret_cast<uintptr_t>(argv[index]);
+    LegacyV8ImplicitArgs implicit_args {
+        nullptr,
+        reinterpret_cast<v8::Isolate*>(data->env),
+        data->env->context,
+        0,
+        reinterpret_cast<uintptr_t>(function),
+        nullptr,
+    };
+    v8::FunctionCallbackInfo<v8::Value> info;
+    info.implicit_args = &implicit_args;
+    info.values = arguments.data() + 1;
+    info.length = static_cast<int>(argc);
+    data->callback(info);
+    if (data->env->pending_exception) {
+        *exception = data->env->pending_exception;
+        JSValueUnprotect(data->env->context, data->env->pending_exception);
+        data->env->pending_exception = nullptr;
+        return JSValueMakeUndefined(context);
+    }
+    return implicit_args.return_value
+        ? reinterpret_cast<JSValueRef>(implicit_args.return_value)
+        : JSValueMakeUndefined(context);
+}
+
+static void initialize_legacy_v8_classes()
+{
+    JSClassDefinition definition = kJSClassDefinitionEmpty;
+    definition.className = "LegacyV8Function";
+    definition.callAsFunction = legacy_v8_function_call;
+    definition.finalize = legacy_v8_function_finalize;
+    legacy_v8_function_class = JSClassCreate(&definition);
+}
+
 } // namespace
+
+v8::Isolate* v8::Isolate::GetCurrent()
+{
+    NapiEnv* env = active_env ? active_env : loading_env;
+    return reinterpret_cast<v8::Isolate*>(env);
+}
+
+v8::Local<v8::Context> v8::Isolate::GetCurrentContext()
+{
+    auto* env = reinterpret_cast<NapiEnv*>(this);
+    return env ? v8::Local<v8::Context>(legacy_v8_add_js_handle(JSContextGetGlobalObject(env->context))) : v8::Local<v8::Context>();
+}
+
+v8::HandleScope::HandleScope(v8::Isolate* isolate)
+{
+    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    auto* scope = new LegacyV8ScopeData { env, legacy_v8_scope, {} };
+    storage[0] = scope;
+    legacy_v8_scope = scope;
+}
+
+v8::HandleScope::~HandleScope()
+{
+    auto* scope = static_cast<LegacyV8ScopeData*>(storage[0]);
+    if (!scope)
+        return;
+    legacy_v8_scope = scope->previous;
+    for (auto& handle : scope->handles) {
+        if (handle.protected_value)
+            JSValueUnprotect(scope->env->context, handle.protected_value);
+        if (handle.destroy_owned)
+            handle.destroy_owned(handle.owned_value);
+    }
+    delete scope;
+    storage[0] = nullptr;
+}
+
+v8::MaybeLocal<v8::String> v8::String::NewFromUtf8(v8::Isolate* isolate, const char* data, v8::NewStringType, int signed_length)
+{
+    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    if (!env || !data || signed_length < -1)
+        return v8::MaybeLocal<v8::String>();
+    size_t length = signed_length < 0 ? NAPI_AUTO_LENGTH : static_cast<size_t>(signed_length);
+    JSStringRef string = make_utf8_string(data, length);
+    if (!string)
+        return v8::MaybeLocal<v8::String>();
+    JSValueRef value = JSValueMakeString(env->context, string);
+    JSStringRelease(string);
+    uintptr_t* handle = legacy_v8_add_js_handle(value);
+    return handle ? v8::MaybeLocal<v8::String>(v8::Local<v8::String>(handle)) : v8::MaybeLocal<v8::String>();
+}
+
+v8::Local<v8::FunctionTemplate> v8::FunctionTemplate::New(
+    v8::Isolate*,
+    v8::FunctionCallback callback,
+    v8::Local<v8::Value> data,
+    v8::Local<v8::Signature>,
+    int,
+    v8::ConstructorBehavior,
+    v8::SideEffectType,
+    const v8::CFunction*,
+    uint16_t,
+    uint16_t,
+    uint16_t)
+{
+    auto* function_template = new (std::nothrow) LegacyV8FunctionTemplateData { callback, legacy_v8_js_value(data) };
+    if (!function_template)
+        return v8::Local<v8::FunctionTemplate>();
+    uintptr_t* handle = legacy_v8_add_handle(
+        reinterpret_cast<uintptr_t>(function_template),
+        nullptr,
+        function_template,
+        [](void* value) { delete static_cast<LegacyV8FunctionTemplateData*>(value); });
+    if (!handle) {
+        delete function_template;
+        return v8::Local<v8::FunctionTemplate>();
+    }
+    return v8::Local<v8::FunctionTemplate>(handle);
+}
+
+v8::MaybeLocal<v8::Function> v8::FunctionTemplate::GetFunction(v8::Local<v8::Context>)
+{
+    auto* env = active_env ? active_env : loading_env;
+    auto* function_template = reinterpret_cast<LegacyV8FunctionTemplateData*>(*reinterpret_cast<uintptr_t*>(this));
+    if (!env || !function_template || !function_template->callback)
+        return v8::MaybeLocal<v8::Function>();
+    std::call_once(legacy_v8_classes_once, initialize_legacy_v8_classes);
+    auto* data = new (std::nothrow) LegacyV8FunctionData {
+        env,
+        env->context,
+        function_template->callback,
+        function_template->data,
+    };
+    if (!data)
+        return v8::MaybeLocal<v8::Function>();
+    if (data->data)
+        JSValueProtect(data->context, data->data);
+    JSObjectRef function = JSObjectMake(env->context, legacy_v8_function_class, data);
+    uintptr_t* handle = legacy_v8_add_js_handle(function);
+    if (!handle)
+        return v8::MaybeLocal<v8::Function>();
+    return v8::MaybeLocal<v8::Function>(v8::Local<v8::Function>(handle));
+}
+
+v8::Maybe<bool> v8::Object::Set(v8::Local<v8::Context>, v8::Local<v8::Value> key, v8::Local<v8::Value> value)
+{
+    auto* env = active_env ? active_env : loading_env;
+    JSValueRef object_value = reinterpret_cast<JSValueRef>(*reinterpret_cast<uintptr_t*>(this));
+    JSValueRef key_value = legacy_v8_js_value(key);
+    JSValueRef assigned_value = legacy_v8_js_value(value);
+    if (!env || !object_value || !key_value || !assigned_value || !JSValueIsObject(env->context, object_value))
+        return v8::Maybe<bool>();
+    JSValueRef exception = nullptr;
+    JSObjectSetPropertyForKey(
+        env->context,
+        const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(object_value)),
+        key_value,
+        assigned_value,
+        kJSPropertyAttributeNone,
+        &exception);
+    if (exception) {
+        caught(env, exception);
+        return v8::Maybe<bool>();
+    }
+    return v8::Maybe<bool>(true);
+}
+
+void v8::Function::SetName(v8::Local<v8::String> name)
+{
+    auto* env = active_env ? active_env : loading_env;
+    JSValueRef function_value = reinterpret_cast<JSValueRef>(*reinterpret_cast<uintptr_t*>(this));
+    JSValueRef name_value = legacy_v8_js_value(name);
+    if (!env || !function_value || !name_value || !JSValueIsObject(env->context, function_value))
+        return;
+    JSValueRef exception = nullptr;
+    set_property(
+        env,
+        const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(function_value)),
+        "name",
+        name_value,
+        kJSPropertyAttributeDontEnum,
+        &exception);
+    if (exception)
+        caught(env, exception);
+}
+
+void v8::api_internal::ToLocalEmpty()
+{
+    std::abort();
+}
+
+void v8::api_internal::FromJustIsNothing()
+{
+    std::abort();
+}
+
+void node::AddEnvironmentCleanupHook(v8::Isolate* isolate, void (*callback)(void*), void* data)
+{
+    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    if (env && callback)
+        (void)napi_add_env_cleanup_hook(reinterpret_cast<napi_env>(env), callback, data);
+}
+
+void node::RemoveEnvironmentCleanupHook(v8::Isolate* isolate, void (*callback)(void*), void* data)
+{
+    auto* env = reinterpret_cast<NapiEnv*>(isolate);
+    if (env && callback)
+        (void)napi_remove_env_cleanup_hook(reinterpret_cast<napi_env>(env), callback, data);
+}
 
 static void napi_uv_work_execute(uv_work_t* request)
 {
@@ -1132,6 +1738,7 @@ extern "C" CtNapiEnv* ct_napi_env_create(
 
 static void destroy_single_env(NapiEnv* env)
 {
+    ActiveEnvScope active_scope(env);
     for (;;) {
         auto sync = std::max_element(env->cleanup_hooks.begin(), env->cleanup_hooks.end(), [](const auto& left, const auto& right) {
             return left.order < right.order;
@@ -1184,6 +1791,7 @@ static void destroy_single_env(NapiEnv* env)
         auto callback = env->instance_finalizer;
         env->instance_finalizer = nullptr;
         callback(reinterpret_cast<napi_env>(env), env->instance_data, env->instance_hint);
+        std::fflush(nullptr);
     }
 
     auto finalizers = env->finalizers;
@@ -1227,6 +1835,7 @@ static void destroy_single_env(NapiEnv* env)
                 finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
         }
         for (const auto& finalizer : posted) {
+            BasicFinalizerScope finalizer_scope(env, false, finalizer.is_finalizer);
             if (finalizer.callback)
                 finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
         }
@@ -1248,10 +1857,24 @@ static void destroy_single_env(NapiEnv* env)
         delete work;
     }
 
+    auto async_contexts = env->async_contexts;
+    for (auto* context : async_contexts) {
+        if (context->record)
+            JSValueUnprotect(env->context, context->record);
+        if (context->resource)
+            JSWeakRelease(JSContextGetGroup(env->context), context->resource);
+        delete context;
+    }
+    env->async_contexts.clear();
+
     if (env->pending_exception)
         JSValueUnprotect(env->context, env->pending_exception);
     if (env->function_call)
         JSValueUnprotect(env->context, env->function_call);
+    if (env->wrap_map)
+        JSValueUnprotect(env->context, env->wrap_map);
+    if (env->logically_detached_buffers)
+        JSValueUnprotect(env->context, env->logically_detached_buffers);
     delete env;
 }
 
@@ -1335,6 +1958,18 @@ extern "C" void napi_module_register(napi_module* module)
     }
 }
 
+extern "C" void node_module_register(void* opaque_module)
+{
+    auto* module = static_cast<node::node_module*>(opaque_module);
+    if (!module)
+        return;
+    loading_legacy_module = module;
+    if (loading_env && !loading_env->module_filename.empty()) {
+        std::lock_guard lock(registered_modules_mutex);
+        registered_legacy_modules[loading_env->module_filename] = module;
+    }
+}
+
 static JSValueRef make_loader_error(NapiEnv* env, const std::string& message)
 {
     JSStringRef string = make_utf8_string(message.data(), message.size());
@@ -1343,6 +1978,54 @@ static JSValueRef make_loader_error(NapiEnv* env, const std::string& message)
     JSValueRef exception = nullptr;
     JSObjectRef error = JSObjectMakeError(env->context, 1, &argument, &exception);
     return exception ? exception : error;
+}
+
+static JSValueRef invoke_legacy_module(NapiEnv* env, node::node_module* module, JSObjectRef exports, JSValueRef* exception)
+{
+    constexpr int node_module_version = 137;
+    const char* module_name = module && module->nm_modname ? module->nm_modname : "unknown";
+    if (!module)
+        return nullptr;
+    if (module->nm_version != node_module_version) {
+        *exception = make_loader_error(
+            env,
+            std::string("The module '") + module_name
+                + "' was compiled against a different Node.js ABI version using NODE_MODULE_VERSION "
+                + std::to_string(module->nm_version)
+                + ". This version of Cottontail requires NODE_MODULE_VERSION "
+                + std::to_string(node_module_version) + ". Please try re-compiling or re-installing the module.");
+        return nullptr;
+    }
+    if (!module->nm_context_register_func && !module->nm_register_func) {
+        *exception = make_loader_error(env, std::string("The module '") + module_name + "' has no declared entry point.");
+        return nullptr;
+    }
+    if (!exports)
+        exports = JSObjectMake(env->context, nullptr, nullptr);
+    JSObjectRef module_object = JSObjectMake(env->context, nullptr, nullptr);
+    set_property(env, module_object, "exports", exports, kJSPropertyAttributeNone, exception);
+    if (*exception)
+        return nullptr;
+
+    ActiveEnvScope active_scope(env);
+    AutomaticScope automatic_scope(env);
+    v8::HandleScope handle_scope(reinterpret_cast<v8::Isolate*>(env));
+    v8::Local<v8::Object> local_exports(legacy_v8_add_js_handle(exports));
+    v8::Local<v8::Value> local_module(legacy_v8_add_js_handle(module_object));
+    v8::Local<v8::Context> context = reinterpret_cast<v8::Isolate*>(env)->GetCurrentContext();
+    if (module->nm_context_register_func)
+        module->nm_context_register_func(local_exports, local_module, context, module->nm_priv);
+    else
+        module->nm_register_func(local_exports, local_module, module->nm_priv);
+
+    if (env->pending_exception) {
+        *exception = env->pending_exception;
+        JSValueUnprotect(env->context, env->pending_exception);
+        env->pending_exception = nullptr;
+        return nullptr;
+    }
+    JSValueRef result = get_property(env, module_object, "exports", exception);
+    return *exception ? nullptr : result;
 }
 
 extern "C" JSValueRef ct_napi_load_addon(
@@ -1366,9 +2049,12 @@ extern "C" JSValueRef ct_napi_load_addon(
     env->module_filename = path_to_file_uri(path);
     loading_env = env;
     loading_module = nullptr;
+    loading_legacy_module = nullptr;
     dlerror();
     void* handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
     const char* open_error = handle ? nullptr : dlerror();
+    node::node_module* legacy_module = loading_legacy_module;
+    loading_legacy_module = nullptr;
     loading_env = nullptr;
     if (!handle) {
         *exception = make_loader_error(env, std::string("dlopen(") + path + ") failed: " + (open_error ? open_error : "unknown error"));
@@ -1384,26 +2070,32 @@ extern "C" JSValueRef ct_napi_load_addon(
     napi_addon_register_func register_callback = direct_register;
     if (!register_callback && loading_module)
         register_callback = loading_module->nm_register_func;
-    if (!register_callback) {
+    if (!register_callback && !legacy_module) {
         std::lock_guard lock(registered_modules_mutex);
         auto iterator = registered_modules.find(env->module_filename);
         if (iterator != registered_modules.end())
             register_callback = iterator->second.callback;
+        auto legacy_iterator = registered_legacy_modules.find(env->module_filename);
+        if (!register_callback && legacy_iterator != registered_legacy_modules.end())
+            legacy_module = legacy_iterator->second;
     }
-    if (!register_callback) {
+    if (!register_callback && !legacy_module) {
         if (loading_module && !loading_module->nm_register_func)
             *exception = make_loader_error(env, "Module has no declared entry point.");
         else
-            *exception = make_loader_error(env, std::string("Native addon ") + path + " does not export a Node-API module initializer");
+            *exception = make_loader_error(env, std::string("Native addon ") + path + " does not export a Node-API or V8 module initializer");
         destroy_single_env(env);
         dlclose(handle);
         return nullptr;
     }
 
     root->addon_envs.push_back(env);
+    if (legacy_module)
+        return invoke_legacy_module(env, legacy_module, exports, exception);
     if (!exports)
         exports = JSObjectMake(env->context, nullptr, nullptr);
     AutomaticScope scope(env);
+    ActiveEnvScope active_scope(env);
     napi_value result = register_callback(reinterpret_cast<napi_env>(env), to_napi(exports));
     if (env->pending_exception) {
         *exception = env->pending_exception;
@@ -1835,13 +2527,16 @@ extern "C" napi_status napi_coerce_to_number(napi_env opaque_env, napi_value val
 extern "C" napi_status napi_coerce_to_string(napi_env opaque_env, napi_value value, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     if (!env || !value || !result)
         return invalid(env);
     JSValueRef exception = nullptr;
     JSStringRef string = JSValueToStringCopy(env->context, to_js(value), &exception);
     if (exception)
         return caught(env, exception);
-    napi_status status = output(env, result, JSValueMakeString(env->context, string));
+    status = output(env, result, JSValueMakeString(env->context, string));
     JSStringRelease(string);
     return status;
 }
@@ -1870,7 +2565,7 @@ extern "C" napi_status napi_set_property(napi_env opaque_env, napi_value object,
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    napi_status status = require_property_target(env, object, &target);
     if (status != napi_ok || !key || !value)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1882,7 +2577,7 @@ extern "C" napi_status napi_has_property(napi_env opaque_env, napi_value object,
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    napi_status status = require_property_target(env, object, &target);
     if (status != napi_ok || !key || !result)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1894,7 +2589,7 @@ extern "C" napi_status napi_get_property(napi_env opaque_env, napi_value object,
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    napi_status status = require_property_target(env, object, &target);
     if (status != napi_ok || !key || !result)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1905,8 +2600,11 @@ extern "C" napi_status napi_get_property(napi_env opaque_env, napi_value object,
 extern "C" napi_status napi_delete_property(napi_env opaque_env, napi_value object, napi_value key, bool* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_property_target(env, object, &target);
     if (status != napi_ok || !key)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1919,8 +2617,11 @@ extern "C" napi_status napi_delete_property(napi_env opaque_env, napi_value obje
 extern "C" napi_status napi_has_own_property(napi_env opaque_env, napi_value object, napi_value key, bool* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_property_target(env, object, &target);
     if (status != napi_ok || !key || !result)
         return status != napi_ok ? status : invalid(env);
     if (!JSValueIsString(env->context, to_js(key)) && !JSValueIsSymbol(env->context, to_js(key)))
@@ -1947,8 +2648,11 @@ extern "C" napi_status napi_has_own_property(napi_env opaque_env, napi_value obj
 extern "C" napi_status napi_set_named_property(napi_env opaque_env, napi_value object, const char* name, napi_value value)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_property_target(env, object, &target);
     if (status != napi_ok || !name || !value)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1960,7 +2664,7 @@ extern "C" napi_status napi_has_named_property(napi_env opaque_env, napi_value o
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    napi_status status = require_property_target(env, object, &target);
     if (status != napi_ok || !name || !result)
         return status != napi_ok ? status : invalid(env);
     JSStringRef key_string = property_name(name);
@@ -1974,8 +2678,11 @@ extern "C" napi_status napi_has_named_property(napi_env opaque_env, napi_value o
 extern "C" napi_status napi_get_named_property(napi_env opaque_env, napi_value object, const char* name, napi_value* result)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_property_target(env, object, &target);
     if (status != napi_ok || !name || !result)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -1986,8 +2693,11 @@ extern "C" napi_status napi_get_named_property(napi_env opaque_env, napi_value o
 extern "C" napi_status napi_set_element(napi_env opaque_env, napi_value object, uint32_t index, napi_value value)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_property_target(env, object, &target);
     if (status != napi_ok || !value)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -2006,7 +2716,7 @@ extern "C" napi_status napi_get_element(napi_env opaque_env, napi_value object, 
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    napi_status status = require_property_target(env, object, &target);
     if (status != napi_ok || !result)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
@@ -2028,6 +2738,10 @@ extern "C" napi_status napi_delete_element(napi_env opaque_env, napi_value objec
 
 extern "C" napi_status napi_get_property_names(napi_env opaque_env, napi_value object, napi_value* result)
 {
+    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     return napi_get_all_property_names(
         opaque_env,
         object,
@@ -2081,6 +2795,9 @@ extern "C" napi_status napi_create_function(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     if (!env || !callback)
         return invalid(env);
     JSValueRef exception = nullptr;
@@ -2100,6 +2817,9 @@ extern "C" napi_status napi_call_function(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     if (!env || !receiver || !function || (argc && !argv))
         return invalid(env);
     JSObjectRef callable = as_object(env, function);
@@ -2286,8 +3006,11 @@ extern "C" napi_status napi_define_properties(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     JSObjectRef target = nullptr;
-    napi_status status = require_object(env, object, &target);
+    status = require_object(env, object, &target);
     if (status != napi_ok || (property_count && !properties))
         return status != napi_ok ? status : invalid(env);
     for (size_t index = 0; index < property_count; ++index) {
@@ -2373,7 +3096,9 @@ extern "C" napi_status node_api_create_syntax_error(napi_env env, napi_value cod
 extern "C" napi_status napi_throw(napi_env opaque_env, napi_value error)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    check_basic_finalizer_safety(env);
+    napi_status status = ensure_can_run_js(env);
+    if (status != napi_ok)
+        return status;
     if (!env || !error)
         return invalid(env);
     protect_pending(env, to_js(error));
@@ -2452,6 +3177,19 @@ extern "C" napi_status napi_get_and_clear_last_exception(napi_env opaque_env, na
     return finish(env, napi_ok);
 }
 
+static bool handle_uncaught_exception(NapiEnv* env, JSValueRef error, JSValueRef* exception)
+{
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+    JSValueRef handler_value = get_property(env, global, "__cottontailHandleUncaughtException", exception);
+    if (*exception || !handler_value || !JSValueIsObject(env->context, handler_value))
+        return false;
+    JSObjectRef handler = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(handler_value));
+    if (!JSObjectIsFunction(env->context, handler))
+        return false;
+    JSValueRef handled = JSObjectCallAsFunction(env->context, handler, global, 1, &error, exception);
+    return !*exception && handled && JSValueToBoolean(env->context, handled);
+}
+
 extern "C" napi_status napi_fatal_exception(napi_env opaque_env, napi_value error)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
@@ -2462,22 +3200,11 @@ extern "C" napi_status napi_fatal_exception(napi_env opaque_env, napi_value erro
     if (!is_instance_of_global(env, error, "Error", &exception))
         return exception ? caught(env, exception) : finish(env, napi_invalid_arg);
 
-    JSObjectRef global = JSContextGetGlobalObject(env->context);
-    JSValueRef handler_value = get_property(env, global, "__cottontailHandleUncaughtException", &exception);
-    if (exception)
-        return caught(env, exception);
-    if (handler_value && JSValueIsObject(env->context, handler_value)) {
-        JSObjectRef handler = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(handler_value));
-        if (JSObjectIsFunction(env->context, handler)) {
-            JSValueRef argument = to_js(error);
-            JSValueRef handled = JSObjectCallAsFunction(env->context, handler, global, 1, &argument, &exception);
-            if (exception) {
-                protect_pending(env, exception);
-                return finish(env, napi_ok);
-            }
-            if (handled && JSValueToBoolean(env->context, handled))
-                return finish(env, napi_ok);
-        }
+    if (handle_uncaught_exception(env, to_js(error), &exception))
+        return finish(env, napi_ok);
+    if (exception) {
+        protect_pending(env, exception);
+        return finish(env, napi_ok);
     }
 
     protect_pending(env, to_js(error));
@@ -2615,7 +3342,7 @@ extern "C" napi_status napi_get_value_external(napi_env opaque_env, napi_value v
     return finish(env, napi_ok);
 }
 
-static NapiFinalizerData* wrapped_finalizer(NapiEnv* env, JSObjectRef object, const char* key, JSValueRef* exception)
+static NapiFinalizerData* property_finalizer(NapiEnv* env, JSObjectRef object, const char* key, JSValueRef* exception)
 {
     JSValueRef holder_value = get_property(env, object, key, exception);
     if (*exception || !holder_value || !JSValueIsObjectOfClass(env->context, holder_value, finalizer_class))
@@ -2635,7 +3362,7 @@ static napi_status attach_finalizer(
 {
     std::call_once(classes_once, initialize_classes);
     JSValueRef exception = nullptr;
-    if (wrapped_finalizer(env, object, key, &exception))
+    if (property_finalizer(env, object, key, &exception))
         return finish(env, napi_invalid_arg);
     if (exception)
         return caught(env, exception);
@@ -2644,6 +3371,68 @@ static napi_status attach_finalizer(
         return finish(env, napi_generic_failure);
     JSObjectRef holder = JSObjectMake(env->context, finalizer_class, finalizer);
     set_property(env, object, key, holder, kJSPropertyAttributeDontEnum, &exception);
+    if (exception) {
+        env->finalizers.erase(finalizer);
+        finalizer->active = false;
+        finalizer->env = nullptr;
+        return caught(env, exception);
+    }
+    return finish(env, napi_ok);
+}
+
+static JSObjectRef ensure_wrap_map(NapiEnv* env, JSValueRef* exception)
+{
+    NapiEnv* root = root_env(env);
+    if (root->wrap_map)
+        return root->wrap_map;
+    JSObjectRef constructor = global_constructor(root, "WeakMap", exception);
+    if (*exception || !constructor)
+        return nullptr;
+    JSObjectRef map = JSObjectCallAsConstructor(root->context, constructor, 0, nullptr, exception);
+    if (*exception || !map)
+        return nullptr;
+    root->wrap_map = map;
+    JSValueProtect(root->context, map);
+    return map;
+}
+
+static NapiFinalizerData* wrapped_finalizer(NapiEnv* env, JSObjectRef object, JSValueRef* exception)
+{
+    JSObjectRef map = ensure_wrap_map(env, exception);
+    if (*exception || !map)
+        return nullptr;
+    JSValueRef key = object;
+    JSValueRef holder_value = call_method(env, map, "get", 1, &key, exception);
+    if (*exception || !holder_value || !JSValueIsObjectOfClass(env->context, holder_value, finalizer_class))
+        return nullptr;
+    return static_cast<NapiFinalizerData*>(JSObjectGetPrivate(const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(holder_value))));
+}
+
+static napi_status attach_wrap_finalizer(
+    NapiEnv* env,
+    JSObjectRef object,
+    void* data,
+    napi_finalize callback,
+    void* hint
+)
+{
+    std::call_once(classes_once, initialize_classes);
+    JSValueRef exception = nullptr;
+    JSObjectRef map = ensure_wrap_map(env, &exception);
+    if (exception)
+        return caught(env, exception);
+    if (!map)
+        return finish(env, napi_generic_failure);
+    if (wrapped_finalizer(env, object, &exception))
+        return finish(env, napi_invalid_arg);
+    if (exception)
+        return caught(env, exception);
+    auto* finalizer = create_finalizer(env, data, callback, hint, false, false);
+    if (!finalizer)
+        return finish(env, napi_generic_failure);
+    JSObjectRef holder = JSObjectMake(env->context, finalizer_class, finalizer);
+    JSValueRef arguments[] = { object, holder };
+    call_method(env, map, "set", 2, arguments, &exception);
     if (exception) {
         env->finalizers.erase(finalizer);
         finalizer->active = false;
@@ -2667,7 +3456,7 @@ extern "C" napi_status napi_wrap(
     napi_status status = require_object(env, object, &target);
     if (status != napi_ok)
         return status;
-    status = attach_finalizer(env, target, env->wrap_key.c_str(), native_object, finalize_callback, finalize_hint, false);
+    status = attach_wrap_finalizer(env, target, native_object, finalize_callback, finalize_hint);
     if (status != napi_ok)
         return status;
     if (result) {
@@ -2675,9 +3464,11 @@ extern "C" napi_status napi_wrap(
         if (status != napi_ok)
             return status;
         JSValueRef exception = nullptr;
-        auto* finalizer = wrapped_finalizer(env, target, env->wrap_key.c_str(), &exception);
+        auto* finalizer = wrapped_finalizer(env, target, &exception);
         if (exception)
             return caught(env, exception);
+        if (!finalizer)
+            return finish(env, napi_generic_failure);
         auto* reference = reinterpret_cast<napi_ref__*>(*result);
         finalizer->wrap_ref = reference;
         reference->owner_finalizer = finalizer;
@@ -2693,7 +3484,7 @@ extern "C" napi_status napi_unwrap(napi_env opaque_env, napi_value object, void*
     if (status != napi_ok || !result)
         return status != napi_ok ? status : invalid(env);
     JSValueRef exception = nullptr;
-    auto* finalizer = wrapped_finalizer(env, target, env->wrap_key.c_str(), &exception);
+    auto* finalizer = wrapped_finalizer(env, target, &exception);
     if (exception)
         return caught(env, exception);
     if (!finalizer)
@@ -2710,7 +3501,7 @@ extern "C" napi_status napi_remove_wrap(napi_env opaque_env, napi_value object, 
     if (status != napi_ok)
         return status;
     JSValueRef exception = nullptr;
-    auto* finalizer = wrapped_finalizer(env, target, env->wrap_key.c_str(), &exception);
+    auto* finalizer = wrapped_finalizer(env, target, &exception);
     if (exception)
         return caught(env, exception);
     if (!finalizer)
@@ -2718,10 +3509,14 @@ extern "C" napi_status napi_remove_wrap(napi_env opaque_env, napi_value object, 
     if (result)
         *result = finalizer->data;
     finalizer->active = false;
-    invalidate_wrap_reference(finalizer);
-    JSStringRef key = property_name(env->wrap_key.c_str());
-    JSObjectDeleteProperty(env->context, target, key, &exception);
-    JSStringRelease(key);
+    if (finalizer->wrap_ref) {
+        finalizer->wrap_ref->owner_finalizer = nullptr;
+        finalizer->wrap_ref = nullptr;
+    }
+    JSObjectRef map = ensure_wrap_map(env, &exception);
+    JSValueRef key = target;
+    if (!exception && map)
+        call_method(env, map, "delete", 1, &key, &exception);
     return exception ? caught(env, exception) : finish(env, napi_ok);
 }
 
@@ -2762,7 +3557,7 @@ extern "C" napi_status node_api_post_finalizer(
         return invalid(env);
     {
         std::lock_guard lock(env->async_mutex);
-        env->posted_finalizers.push_back({ finalize_callback, finalize_data, finalize_hint });
+        env->posted_finalizers.push_back({ finalize_callback, finalize_data, finalize_hint, false });
     }
     wake(env);
     return finish(env, napi_ok);
@@ -2954,11 +3749,11 @@ static bool is_buffer_value(NapiEnv* env, napi_value value, JSValueRef* exceptio
 {
     if (!value || !JSValueIsObject(env->context, to_js(value)))
         return false;
-    JSObjectRef buffer_constructor = global_constructor(env, "Buffer", exception);
-    if (*exception || !buffer_constructor)
+    JSObjectRef array_buffer_constructor = global_constructor(env, "ArrayBuffer", exception);
+    if (*exception || !array_buffer_constructor)
         return false;
     JSValueRef argument = to_js(value);
-    JSValueRef result = call_method(env, buffer_constructor, "isBuffer", 1, &argument, exception);
+    JSValueRef result = call_method(env, array_buffer_constructor, "isView", 1, &argument, exception);
     return !*exception && result && JSValueToBoolean(env->context, result);
 }
 
@@ -3019,7 +3814,10 @@ extern "C" napi_status napi_create_external_arraybuffer(
         env->buffer_finalizers.insert(finalizer);
     }
     JSValueRef exception = nullptr;
-    JSObjectRef array_buffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, external_data, byte_length, buffer_deallocator, finalizer, &exception);
+    void* backing_data = external_data ? external_data : &empty_external_buffer_sentinel;
+    JSObjectRef array_buffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, backing_data, byte_length, buffer_deallocator, finalizer, &exception);
+    if (!exception && !external_data && byte_length == 0)
+        mark_logically_detached(env, array_buffer, &exception);
     if (!exception)
         mark_array_buffer_untransferable(env, array_buffer, &exception);
     return exception ? caught(env, exception) : output(env, result, array_buffer);
@@ -3187,6 +3985,16 @@ extern "C" napi_status napi_create_dataview(
     JSValueRef exception = nullptr;
     if (!is_array_buffer(env, arraybuffer, &exception))
         return exception ? caught(env, exception) : finish(env, napi_arraybuffer_expected);
+    size_t buffer_length = JSObjectGetArrayBufferByteLength(env->context, as_object(env, arraybuffer), &exception);
+    if (exception)
+        return caught(env, exception);
+    if (byte_offset > buffer_length || length > buffer_length - byte_offset) {
+        napi_status status = napi_throw_range_error(
+            opaque_env,
+            "ERR_NAPI_INVALID_DATAVIEW_ARGS",
+            "byte_offset + byte_length should be less than or equal to the size in bytes of the array passed in");
+        return status == napi_ok ? finish(env, napi_pending_exception) : status;
+    }
     JSObjectRef constructor = global_constructor(env, "DataView", &exception);
     JSValueRef arguments[] = { to_js(arraybuffer), JSValueMakeNumber(env->context, byte_offset), JSValueMakeNumber(env->context, length) };
     JSObjectRef view = exception || !constructor ? nullptr : JSObjectCallAsConstructor(env->context, constructor, 3, arguments, &exception);
@@ -3274,7 +4082,7 @@ extern "C" napi_status napi_create_external_buffer(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !data || !result)
+    if (!env || (!data && length) || !result)
         return invalid(env);
     auto* finalizer = new (std::nothrow) NapiBufferFinalizer { env, data, finalize_hint, finalize_callback, false, false };
     if (!finalizer)
@@ -3284,13 +4092,16 @@ extern "C" napi_status napi_create_external_buffer(
         env->buffer_finalizers.insert(finalizer);
     }
     JSValueRef exception = nullptr;
-    JSObjectRef buffer = JSObjectMakeTypedArrayWithBytesNoCopy(env->context, kJSTypedArrayTypeUint8Array, data, length, buffer_deallocator, finalizer, &exception);
+    void* backing_data = data ? data : &empty_external_buffer_sentinel;
+    JSObjectRef buffer = JSObjectMakeTypedArrayWithBytesNoCopy(env->context, kJSTypedArrayTypeUint8Array, backing_data, length, buffer_deallocator, finalizer, &exception);
     if (exception)
         return caught(env, exception);
     apply_buffer_prototype(env, buffer, &exception);
     JSValueRef array_buffer = exception ? nullptr : get_property(env, buffer, "buffer", &exception);
     if (!exception && array_buffer && JSValueIsObject(env->context, array_buffer)) {
         auto object = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(array_buffer));
+        if (!data && length == 0)
+            mark_logically_detached(env, object, &exception);
         mark_array_buffer_untransferable(env, object, &exception);
     }
     return exception ? caught(env, exception) : output(env, result, buffer);
@@ -3475,6 +4286,30 @@ extern "C" napi_status napi_run_script(napi_env opaque_env, napi_value script, n
         return caught(env, exception);
     JSValueRef value = JSEvaluateScript(env->context, source, nullptr, nullptr, 1, &exception);
     JSStringRelease(source);
+    if (exception && JSValueIsObject(env->context, exception)) {
+        JSValueRef ignored_exception = nullptr;
+        auto error = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(exception));
+        JSValueRef name_value = get_property(env, error, "name", &ignored_exception);
+        JSValueRef message_value = ignored_exception ? nullptr : get_property(env, error, "message", &ignored_exception);
+        if (!ignored_exception && name_value && message_value
+            && JSValueIsString(env->context, name_value) && JSValueIsString(env->context, message_value)) {
+            JSStringRef name_string = JSValueToStringCopy(env->context, name_value, &ignored_exception);
+            JSStringRef message_string = ignored_exception ? nullptr : JSValueToStringCopy(env->context, message_value, &ignored_exception);
+            const std::string name = ignored_exception ? std::string() : copy_js_string(name_string);
+            const std::string message = ignored_exception ? std::string() : copy_js_string(message_string);
+            if (name_string)
+                JSStringRelease(name_string);
+            if (message_string)
+                JSStringRelease(message_string);
+            constexpr std::string_view prefix = "Can't find variable: ";
+            if (!ignored_exception && name == "ReferenceError" && message.starts_with(prefix)) {
+                std::string normalized = message.substr(prefix.size()) + " is not defined";
+                JSStringRef normalized_string = JSStringCreateWithUTF8CString(normalized.c_str());
+                set_property(env, error, "message", JSValueMakeString(env->context, normalized_string), kJSPropertyAttributeNone, &ignored_exception);
+                JSStringRelease(normalized_string);
+            }
+        }
+    }
     return exception ? caught(env, exception) : output(env, result, value);
 }
 
@@ -3502,7 +4337,8 @@ extern "C" napi_status napi_get_version(napi_env opaque_env, uint32_t* result)
 
 extern "C" napi_status napi_get_node_version(napi_env opaque_env, const napi_node_version** result)
 {
-    static const napi_node_version version { 24, 0, 0, "cottontail" };
+    // COTTONTAIL-COMPAT: Keep this synchronized with nodeCompatVersion in node/process.js.
+    static const napi_node_version version { 24, 11, 1, "node" };
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !result)
         return invalid(env);
@@ -3561,7 +4397,7 @@ extern "C" napi_status napi_create_bigint_words(
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !result || !words || (sign_bit != 0 && sign_bit != 1))
+    if (!env || !result || !words)
         return invalid(env);
     if (word_count > std::numeric_limits<unsigned>::max())
         return finish(env, napi_invalid_arg);
@@ -3834,14 +4670,70 @@ extern "C" napi_status node_api_create_external_string_utf16(
     return status;
 }
 
-extern "C" napi_status napi_async_init(napi_env opaque_env, napi_value, napi_value resource_name, napi_async_context* result)
+extern "C" napi_status napi_async_init(
+    napi_env opaque_env,
+    napi_value resource,
+    napi_value resource_name,
+    napi_async_context* result
+)
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !resource_name || !result)
         return invalid(env);
-    auto* context = new (std::nothrow) napi_async_context__ { env->next_async_id++ };
-    if (!context)
+
+    JSContextGroupRef context_group = JSContextGetGroup(env->context);
+    JSObjectRef resource_object = resource && JSValueIsObject(env->context, to_js(resource))
+        ? as_object(env, resource)
+        : nullptr;
+    CtJSWeakRef weak_resource = resource_object
+        ? JSWeakCreate(context_group, resource_object)
+        : nullptr;
+    if (resource_object && !weak_resource)
         return finish(env, napi_generic_failure);
+
+    JSValueRef exception = nullptr;
+    JSValueRef arguments[] = {
+        resource ? to_js(resource) : JSValueMakeUndefined(env->context),
+        to_js(resource_name),
+        JSValueMakeBoolean(env->context, weak_resource != nullptr),
+    };
+    JSValueRef record_value = call_global_function(
+        env,
+        "__cottontailNapiAsyncInit",
+        std::size(arguments),
+        arguments,
+        &exception);
+    if (exception) {
+        if (weak_resource)
+            JSWeakRelease(context_group, weak_resource);
+        return caught(env, exception);
+    }
+    if (!record_value || !JSValueIsObject(env->context, record_value)) {
+        if (weak_resource)
+            JSWeakRelease(context_group, weak_resource);
+        return finish(env, napi_generic_failure);
+    }
+
+    auto* context = new (std::nothrow) napi_async_context__ {
+        env,
+        const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(record_value)),
+        weak_resource,
+    };
+    if (!context) {
+        if (weak_resource)
+            JSWeakRelease(context_group, weak_resource);
+        return finish(env, napi_generic_failure);
+    }
+    JSValueProtect(env->context, context->record);
+    try {
+        env->async_contexts.insert(context);
+    } catch (...) {
+        JSValueUnprotect(env->context, context->record);
+        if (context->resource)
+            JSWeakRelease(context_group, context->resource);
+        delete context;
+        return finish(env, napi_generic_failure);
+    }
     *result = reinterpret_cast<napi_async_context>(context);
     return finish(env, napi_ok);
 }
@@ -3851,13 +4743,31 @@ extern "C" napi_status napi_async_destroy(napi_env opaque_env, napi_async_contex
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !opaque_context)
         return invalid(env);
-    delete reinterpret_cast<napi_async_context__*>(opaque_context);
-    return finish(env, napi_ok);
+    auto* context = reinterpret_cast<napi_async_context__*>(opaque_context);
+    if (context->env != env || !env->async_contexts.contains(context))
+        return invalid(env);
+
+    JSValueRef exception = nullptr;
+    JSValueRef argument = context->record;
+    JSValueRef returned = call_global_function(
+        env,
+        "__cottontailNapiAsyncDestroy",
+        1,
+        &argument,
+        &exception);
+    env->async_contexts.erase(context);
+    JSValueUnprotect(env->context, context->record);
+    if (context->resource)
+        JSWeakRelease(JSContextGetGroup(env->context), context->resource);
+    delete context;
+    if (exception)
+        return caught(env, exception);
+    return returned ? finish(env, napi_ok) : finish(env, napi_generic_failure);
 }
 
 extern "C" napi_status napi_make_callback(
-    napi_env env,
-    napi_async_context,
+    napi_env opaque_env,
+    napi_async_context opaque_context,
     napi_value receiver,
     napi_value function,
     size_t argc,
@@ -3865,22 +4775,93 @@ extern "C" napi_status napi_make_callback(
     napi_value* result
 )
 {
-    return napi_call_function(env, receiver, function, argc, argv, result);
+    auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
+    if (!env || !receiver || !function || (argc && !argv))
+        return invalid(env);
+    auto* context = reinterpret_cast<napi_async_context__*>(opaque_context);
+    if (context && (context->env != env || !env->async_contexts.contains(context)))
+        return invalid(env);
+    JSObjectRef callable = as_object(env, function);
+    if (!callable || !JSObjectIsFunction(env->context, callable))
+        return finish(env, napi_function_expected);
+
+    std::vector<JSValueRef> js_arguments(argc);
+    for (size_t index = 0; index < argc; ++index)
+        js_arguments[index] = to_js(argv[index]);
+    JSValueRef exception = nullptr;
+    JSObjectRef argument_array = JSObjectMakeArray(
+        env->context,
+        argc,
+        js_arguments.empty() ? nullptr : js_arguments.data(),
+        &exception);
+    JSObjectRef async_resource = context && context->resource
+        ? JSWeakGetObject(context->resource)
+        : nullptr;
+    JSValueRef host_arguments[] = {
+        context ? static_cast<JSValueRef>(context->record) : JSValueMakeNull(env->context),
+        to_js(receiver),
+        callable,
+        argument_array,
+        async_resource ? static_cast<JSValueRef>(async_resource) : JSValueMakeUndefined(env->context),
+    };
+    JSValueRef returned = exception
+        ? nullptr
+        : call_global_function(
+            env,
+            "__cottontailNapiMakeCallback",
+            std::size(host_arguments),
+            host_arguments,
+            &exception);
+    if (exception)
+        return caught(env, exception);
+    if (!returned)
+        return finish(env, napi_generic_failure);
+    if (process_is_exiting(env, &exception))
+        return finish(env, napi_pending_exception);
+    if (exception)
+        return caught(env, exception);
+    return result ? output(env, result, returned) : finish(env, napi_ok);
 }
 
 extern "C" napi_status napi_open_callback_scope(
     napi_env opaque_env,
     napi_value,
-    napi_async_context,
+    napi_async_context opaque_context,
     napi_callback_scope* result
 )
 {
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
-    if (!env || !result)
+    auto* context = reinterpret_cast<napi_async_context__*>(opaque_context);
+    if (!env || !context || !result || context->env != env || !env->async_contexts.contains(context))
         return invalid(env);
-    auto* scope = new (std::nothrow) napi_callback_scope__ { env };
+
+    JSValueRef exception = nullptr;
+    JSObjectRef async_resource = context->resource
+        ? JSWeakGetObject(context->resource)
+        : nullptr;
+    JSValueRef arguments[] = {
+        context->record,
+        async_resource ? static_cast<JSValueRef>(async_resource) : JSValueMakeUndefined(env->context),
+    };
+    JSValueRef token_value = call_global_function(
+        env,
+        "__cottontailNapiOpenCallbackScope",
+        std::size(arguments),
+        arguments,
+        &exception);
+    if (exception)
+        return caught(env, exception);
+    if (!token_value || !JSValueIsObject(env->context, token_value))
+        return finish(env, napi_generic_failure);
+    auto token = const_cast<JSObjectRef>(reinterpret_cast<const OpaqueJSValue*>(token_value));
+    auto* scope = new (std::nothrow) napi_callback_scope__ {
+        env,
+        token,
+        env->pending_exception != nullptr,
+    };
     if (!scope)
         return finish(env, napi_generic_failure);
+    JSValueProtect(env->context, token);
     *result = reinterpret_cast<napi_callback_scope>(scope);
     return finish(env, napi_ok);
 }
@@ -3891,13 +4872,48 @@ extern "C" napi_status napi_close_callback_scope(napi_env opaque_env, napi_callb
     auto* scope = reinterpret_cast<napi_callback_scope__*>(opaque_scope);
     if (!env || !scope || scope->env != env)
         return finish(env, napi_callback_scope_mismatch);
+
+    const bool had_pending_exception = scope->had_pending_exception;
+    const bool failed = !had_pending_exception && env->pending_exception != nullptr;
+    JSValueRef close_exception = nullptr;
+    JSValueRef arguments[] = {
+        scope->token,
+        JSValueMakeBoolean(env->context, failed),
+    };
+    JSValueRef returned = call_global_function(
+        env,
+        "__cottontailNapiCloseCallbackScope",
+        std::size(arguments),
+        arguments,
+        &close_exception);
+    JSValueUnprotect(env->context, scope->token);
     delete scope;
+
+    if (close_exception)
+        protect_pending(env, close_exception);
+    if (!returned && !close_exception)
+        return finish(env, napi_generic_failure);
+
+    if (!had_pending_exception && env->pending_exception) {
+        JSValueRef pending = env->pending_exception;
+        env->pending_exception = nullptr;
+        JSValueRef handler_exception = nullptr;
+        const bool handled = handle_uncaught_exception(env, pending, &handler_exception);
+        if (handler_exception) {
+            JSValueUnprotect(env->context, pending);
+            protect_pending(env, handler_exception);
+        } else if (handled) {
+            JSValueUnprotect(env->context, pending);
+        } else {
+            env->pending_exception = pending;
+        }
+    }
     return finish(env, napi_ok);
 }
 
 extern "C" napi_status napi_create_async_work(
     napi_env opaque_env,
-    napi_value,
+    napi_value resource,
     napi_value resource_name,
     napi_async_execute_callback execute,
     napi_async_complete_callback complete,
@@ -3915,9 +4931,23 @@ extern "C" napi_status napi_create_async_work(
     work->execute = execute;
     work->complete = complete;
     work->data = data;
-    {
+    napi_status context_status = napi_async_init(
+        opaque_env,
+        resource,
+        resource_name,
+        &work->async_context);
+    if (context_status != napi_ok) {
+        delete work;
+        return context_status;
+    }
+    try {
         std::lock_guard lock(env->async_mutex);
         env->async_work.insert(work);
+    } catch (...) {
+        napi_async_context context = std::exchange(work->async_context, nullptr);
+        (void)napi_async_destroy(opaque_env, context);
+        delete work;
+        return finish(env, napi_generic_failure);
     }
     *result = reinterpret_cast<napi_async_work>(work);
     return finish(env, napi_ok);
@@ -3965,9 +4995,16 @@ extern "C" napi_status napi_delete_async_work(napi_env opaque_env, napi_async_wo
         return finish(env, napi_generic_failure);
     work->delete_requested.store(true);
     if (state == 0 || state == 5) {
+        napi_status context_status = napi_ok;
+        if (work->async_context) {
+            napi_async_context context = std::exchange(work->async_context, nullptr);
+            context_status = napi_async_destroy(opaque_env, context);
+        }
         std::lock_guard lock(env->async_mutex);
         env->async_work.erase(work);
         delete work;
+        if (context_status != napi_ok)
+            return context_status;
     }
     return finish(env, napi_ok);
 }
@@ -3986,6 +5023,10 @@ extern "C" napi_status napi_add_env_cleanup_hook(napi_env opaque_env, void (*cal
     auto* env = reinterpret_cast<NapiEnv*>(opaque_env);
     if (!env || !callback)
         return invalid(env);
+    for (const auto& hook : env->cleanup_hooks) {
+        if (hook.callback == callback && hook.data == data)
+            std::abort();
+    }
     env->cleanup_hooks.push_back({ callback, data, env->next_cleanup_order++ });
     return finish(env, napi_ok);
 }
@@ -4210,6 +5251,12 @@ extern "C" napi_status napi_is_detached_arraybuffer(napi_env opaque_env, napi_va
     if (!is_array_buffer(env, value, &exception))
         return exception ? caught(env, exception) : finish(env, napi_arraybuffer_expected);
     JSObjectRef array_buffer = as_object(env, value);
+    if (is_logically_detached(env, array_buffer, &exception)) {
+        *result = true;
+        return finish(env, napi_ok);
+    }
+    if (exception)
+        return caught(env, exception);
     JSValueRef detached = get_property(env, array_buffer, "detached", &exception);
     if (exception)
         return caught(env, exception);
@@ -4451,6 +5498,7 @@ static bool take_pending_exception(NapiEnv* env, JSValueRef* exception)
 
 static bool drain_finalizer_queue(NapiEnv* env, bool basic, JSValueRef* exception)
 {
+    ActiveEnvScope active_scope(env);
     std::deque<NapiPostedFinalizer> finalizers;
     {
         std::lock_guard lock(env->async_mutex);
@@ -4459,7 +5507,7 @@ static bool drain_finalizer_queue(NapiEnv* env, bool basic, JSValueRef* exceptio
     while (!finalizers.empty()) {
         NapiPostedFinalizer finalizer = finalizers.front();
         finalizers.pop_front();
-        BasicFinalizerScope finalizer_scope(env, basic);
+        BasicFinalizerScope finalizer_scope(env, basic, finalizer.is_finalizer);
         AutomaticScope scope(env);
         if (finalizer.callback)
             finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
@@ -4487,10 +5535,24 @@ static bool drain_completed_work(NapiEnv* root, JSValueRef* exception)
         napi_async_work__* work = completed.front();
         completed.pop_front();
         NapiEnv* env = work->env;
+        ActiveEnvScope active_scope(env);
         AutomaticScope scope(env);
         napi_status status = work->state.load() == 4 ? napi_cancelled : napi_ok;
+        napi_callback_scope callback_scope = nullptr;
+        if (work->complete && work->async_context)
+            (void)napi_open_callback_scope(
+                reinterpret_cast<napi_env>(env),
+                nullptr,
+                work->async_context,
+                &callback_scope);
         if (work->complete)
             work->complete(reinterpret_cast<napi_env>(env), status, work->data);
+        if (callback_scope)
+            (void)napi_close_callback_scope(reinterpret_cast<napi_env>(env), callback_scope);
+        if (work->async_context) {
+            napi_async_context context = std::exchange(work->async_context, nullptr);
+            (void)napi_async_destroy(reinterpret_cast<napi_env>(env), context);
+        }
         work->state.store(5);
         if (work->delete_requested.load()) {
             std::lock_guard lock(env->async_mutex);
@@ -4511,6 +5573,7 @@ static bool drain_completed_work(NapiEnv* root, JSValueRef* exception)
 
 static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
 {
+    ActiveEnvScope active_scope(env);
     constexpr size_t max_dispatch_iterations = 999;
     std::vector<napi_threadsafe_function__*> thread_safe_functions;
     {
@@ -4519,6 +5582,7 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
     }
     for (auto* function : thread_safe_functions) {
         size_t dispatch_iterations = 0;
+        bool dispatched_call = false;
         for (;;) {
             JSValueRef exit_exception = nullptr;
             if (process_is_exiting(env, &exit_exception)) {
@@ -4547,10 +5611,12 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                     has_call = true;
                 }
                 should_finalize = function->closing && function->queue.empty() && !function->thread_count && !function->finalized;
-                if (should_finalize)
-                    function->finalized = true;
             }
             function->space_available.notify_all();
+            if (should_finalize && dispatched_call) {
+                wake(env);
+                break;
+            }
             if (has_call) {
                 if (function->aborting) {
                     if (function->call_js)
@@ -4567,8 +5633,13 @@ static bool drain_threadsafe_functions(NapiEnv* env, JSValueRef* exception)
                 }
                 if (take_pending_exception(env, exception))
                     return false;
+                dispatched_call = true;
             }
             if (should_finalize) {
+                {
+                    std::lock_guard lock(function->mutex);
+                    function->finalized = true;
+                }
                 if (function->finalize_callback)
                     function->finalize_callback(reinterpret_cast<napi_env>(env), function->finalize_data, function->context);
                 if (function->callback)

@@ -48,7 +48,38 @@ pub const DepSorter = struct {
     }
 };
 
-pub const Stream = std.io.FixedBufferStream([]u8);
+pub const Stream = struct {
+    buffer: []u8,
+    pos: usize = 0,
+
+    pub fn getPos(stream: *const Stream) !usize {
+        return stream.pos;
+    }
+
+    pub fn reader(stream: *Stream) Reader {
+        return .{ .stream = stream };
+    }
+
+    pub const Reader = struct {
+        stream: *Stream,
+
+        pub fn readAll(reader_: *Reader, destination: []u8) !usize {
+            const available = reader_.stream.buffer.len -| reader_.stream.pos;
+            const count = @min(available, destination.len);
+            @memcpy(destination[0..count], reader_.stream.buffer[reader_.stream.pos..][0..count]);
+            reader_.stream.pos += count;
+            return count;
+        }
+
+        pub fn readInt(reader_: *Reader, comptime T: type, endian: std.builtin.Endian) !T {
+            const end = reader_.stream.pos + @sizeOf(T);
+            if (end > reader_.stream.buffer.len) return error.EndOfStream;
+            const value = std.mem.readInt(T, reader_.stream.buffer[reader_.stream.pos..end][0..@sizeOf(T)], endian);
+            reader_.stream.pos = end;
+            return value;
+        }
+    };
+};
 pub const default_filename = "bun.lockb";
 
 pub const Scripts = struct {
@@ -370,6 +401,14 @@ pub fn loadFromDir(
 }
 
 pub fn loadFromBytes(this: *Lockfile, pm: ?*PackageManager, buf: []u8, allocator: Allocator, log: *logger.Log) LoadResult {
+    return loadFromBytesImpl(this, pm, buf, allocator, log);
+}
+
+pub fn loadFromBytesStandalone(this: *Lockfile, buf: []u8, allocator: Allocator, log: *logger.Log) LoadResult {
+    return loadFromBytesImpl(this, null, buf, allocator, log);
+}
+
+fn loadFromBytesImpl(this: *Lockfile, pm: anytype, buf: []u8, allocator: Allocator, log: *logger.Log) LoadResult {
     var stream = Stream{ .buffer = buf, .pos = 0 };
 
     this.format = FormatVersion.current;
@@ -381,9 +420,14 @@ pub fn loadFromBytes(this: *Lockfile, pm: ?*PackageManager, buf: []u8, allocator
     this.catalogs = .{};
     this.patched_dependencies = .{};
 
-    const load_result = Lockfile.Serializer.load(this, &stream, allocator, log, pm) catch |err| {
+    const load_result = (if (comptime @TypeOf(pm) == @TypeOf(null))
+        Lockfile.Serializer.loadStandalone(this, &stream, allocator, log)
+    else
+        Lockfile.Serializer.load(this, &stream, allocator, log, pm)) catch |err| {
         return LoadResult{ .err = .{ .step = .parse_file, .value = err, .lockfile_path = "bun.lockb", .format = .binary } };
     };
+
+    this.hydrateWorkspaceDependencyVersions();
 
     if (Environment.allow_assert) {
         this.verifyData() catch @panic("lockfile data is corrupt");
@@ -397,6 +441,17 @@ pub fn loadFromBytes(this: *Lockfile, pm: ?*PackageManager, buf: []u8, allocator
             .format = .binary,
         },
     };
+}
+
+fn hydrateWorkspaceDependencyVersions(this: *Lockfile) void {
+    const package_resolutions = this.packages.items(.resolution);
+    for (this.buffers.dependencies.items, this.buffers.resolutions.items) |*dependency, package_id| {
+        if (package_id == invalid_package_id or package_id >= package_resolutions.len) continue;
+        const resolution = package_resolutions[package_id];
+        if (resolution.tag != .workspace) continue;
+        dependency.version.tag = .workspace;
+        dependency.version.value = .{ .workspace = resolution.value.workspace };
+    }
 }
 
 pub const InstallResult = struct {
@@ -1928,6 +1983,19 @@ pub fn hasMetaHashChanged(this: *Lockfile, print_name_version_string: bool, pack
     return !strings.eqlLong(&previous_meta_hash, &this.meta_hash, false);
 }
 pub fn generateMetaHash(this: *Lockfile, print_name_version_string: bool, packages_len: usize) !MetaHash {
+    return this.generateMetaHashImpl(print_name_version_string, null, packages_len);
+}
+
+pub fn generateMetaHashToWriter(this: *Lockfile, writer: *std.Io.Writer, packages_len: usize) !MetaHash {
+    return this.generateMetaHashImpl(false, writer, packages_len);
+}
+
+fn generateMetaHashImpl(
+    this: *Lockfile,
+    print_name_version_string: bool,
+    output_writer: ?*std.Io.Writer,
+    packages_len: usize,
+) !MetaHash {
     if (packages_len <= 1)
         return zero_hash;
 
@@ -2016,7 +2084,9 @@ pub fn generateMetaHash(this: *Lockfile, print_name_version_string: bool, packag
     string_builder.len += hash_suffix.len;
 
     const alphabetized_name_version_string = string_builder.ptr.?[0..string_builder.len];
-    if (print_name_version_string) {
+    if (output_writer) |writer| {
+        try writer.writeAll(alphabetized_name_version_string);
+    } else if (print_name_version_string) {
         Output.flush();
         Output.disableBuffering();
         Output.writer().writeAll(alphabetized_name_version_string) catch unreachable;
@@ -2024,7 +2094,9 @@ pub fn generateMetaHash(this: *Lockfile, print_name_version_string: bool, packag
     }
 
     var digest = zero_hash;
-    Crypto.SHA512_256.hash(alphabetized_name_version_string, &digest);
+    // COTTONTAIL-COMPAT: Zig distinguishes standardized SHA-512/256 from
+    // truncating SHA-512 to 256 bits. Bun's SHA512_256 uses the former.
+    std.crypto.hash.sha2.Sha512_256.hash(alphabetized_name_version_string, &digest, .{});
 
     return digest;
 }

@@ -227,12 +227,12 @@ try {
   makeLocalProject(binary, ["alpha"]);
   fs.writeFileSync(path.join(binary, "bunfig.toml"), "[install]\nsaveTextLockfile = false\n");
   const binaryResult = install(binary);
-  assert.equal(binaryResult.status, 1);
-  assert.match(binaryResult.stderr, /writing bun\.lockb requires Bun's packed Lockfile\.Buffers/);
+  expectSuccess(binaryResult);
   assert.equal(fs.existsSync(path.join(binary, "bun.lock")), false);
-  assert.equal(fs.existsSync(path.join(binary, "bun.lockb")), false);
+  assert.equal(fs.existsSync(path.join(binary, "bun.lockb")), true);
   expectSuccess(install(binary, ["--save-text-lockfile"]));
   assert.equal(fs.existsSync(path.join(binary, "bun.lock")), true);
+  assert.equal(fs.existsSync(path.join(binary, "bun.lockb")), false);
   expectSuccess(install(binary));
 
   const binaryRead = path.join(scratch, "binary-read-boundary");
@@ -240,7 +240,7 @@ try {
   fs.writeFileSync(path.join(binaryRead, "bun.lockb"), "not a lockfile");
   const binaryReadResult = install(binaryRead);
   assert.equal(binaryReadResult.status, 1);
-  assert.match(binaryReadResult.stderr, /reading bun\.lockb requires Bun's packed Lockfile\.Buffers/);
+  assert.match(binaryReadResult.stderr, /InvalidLockfile/);
 
   const npmV1 = path.join(scratch, "npm-v1-boundary");
   writeJson(npmV1, "package.json", { name: "npm-v1" });

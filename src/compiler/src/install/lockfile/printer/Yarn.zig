@@ -1,7 +1,7 @@
 const Yarn = @This();
 
 pub fn print(
-    this: *Printer,
+    this: anytype,
     comptime Writer: type,
     writer: *std.Io.Writer,
 ) !void {
@@ -37,7 +37,7 @@ pub fn print(
 }
 
 fn packages(
-    this: *Printer,
+    this: anytype,
     comptime Writer: type,
     writer: Writer,
 ) !void {
@@ -232,4 +232,3 @@ const Dependency = bun.install.Dependency;
 const Behavior = Dependency.Behavior;
 
 const Lockfile = bun.install.Lockfile;
-const Printer = bun.install.Lockfile.Printer;

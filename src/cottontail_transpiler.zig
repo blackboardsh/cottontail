@@ -12,6 +12,7 @@ const Operation = enum(c_int) {
     transform = 0,
     scan = 1,
     scan_imports = 2,
+    scan_import_ranges = 3,
 };
 
 const TransformConfig = struct {
@@ -107,6 +108,13 @@ fn exportReplacementValue(
 const ImportResult = struct {
     path: []const u8,
     kind: []const u8,
+};
+
+const ImportRangeResult = struct {
+    path: []const u8,
+    kind: []const u8,
+    start: i32,
+    end: i32,
 };
 
 const ScanResult = struct {
@@ -453,7 +461,7 @@ fn process(
         .ast => |ast| ast,
         .already_bundled => {
             if (operation == .transform) return try c_allocator.dupe(u8, source_code);
-            const json = if (operation == .scan_imports) "[]" else "{\"imports\":[],\"exports\":[]}";
+            const json = if (operation == .scan_imports or operation == .scan_import_ranges) "[]" else "{\"imports\":[],\"exports\":[]}";
             return try c_allocator.dupe(u8, json);
         },
         .cached => {
@@ -464,6 +472,21 @@ fn process(
     defer ast.deinit();
 
     if (operation != .transform) {
+        if (operation == .scan_import_ranges) {
+            var imports = std.ArrayList(ImportRangeResult).empty;
+            for (ast.import_records.slice()) |record| {
+                if (record.flags.is_internal or record.flags.is_unused) continue;
+                try imports.append(temporary_allocator, .{
+                    .path = record.path.text,
+                    .kind = record.kind.label(),
+                    .start = record.range.loc.start,
+                    .end = record.range.loc.start + record.range.len,
+                });
+            }
+            const json = try std.json.Stringify.valueAlloc(temporary_allocator, imports.items, .{});
+            return try c_allocator.dupe(u8, json);
+        }
+
         var imports = std.ArrayList(ImportResult).empty;
         for (ast.import_records.slice()) |record| {
             if (record.flags.is_internal) continue;
@@ -552,6 +575,12 @@ pub fn scanImportsJson(source_code: []const u8, loader: []const u8) ![]u8 {
     var error_message: ?[*:0]u8 = null;
     defer if (error_message) |message| ct_transpiler_string_free(message);
     return process(.scan_imports, source_code, "", loader, &error_message);
+}
+
+pub fn scanImportRangesJson(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.scan_import_ranges, source_code, "", loader, &error_message);
 }
 
 pub fn scanImportsJsonWithError(

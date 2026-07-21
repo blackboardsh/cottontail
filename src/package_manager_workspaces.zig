@@ -269,7 +269,7 @@ fn matchesPatterns(patterns: []const Pattern, relative_path: []const u8) bool {
     return included;
 }
 
-fn globMatch(pattern: []const u8, path: []const u8) bool {
+pub fn globMatch(pattern: []const u8, path: []const u8) bool {
     return globMatchAt(pattern, 0, path, 0);
 }
 
@@ -452,7 +452,9 @@ fn isIgnoredDirectory(name: []const u8) bool {
 }
 
 fn looksLikeWorkspacePath(value: []const u8) bool {
-    return std.mem.startsWith(u8, value, "./") or
+    return std.mem.eql(u8, value, ".") or
+        std.mem.eql(u8, value, "..") or
+        std.mem.startsWith(u8, value, "./") or
         std.mem.startsWith(u8, value, "../") or
         (!std.mem.startsWith(u8, value, "@") and std.mem.indexOfScalar(u8, value, '/') != null);
 }

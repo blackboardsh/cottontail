@@ -20,14 +20,16 @@ import {
 const textEncoder = new TextEncoder();
 
 function bytesFromChunk(chunk) {
-  if (chunk == null) return new Uint8Array(0);
-  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk.slice(0));
+  if (chunk instanceof String) chunk = String(chunk);
+  if (chunk instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && chunk instanceof SharedArrayBuffer)) {
+    return new Uint8Array(chunk.slice(0));
+  }
   if (ArrayBuffer.isView(chunk)) {
     return new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
   }
   if (typeof chunk === "string") return textEncoder.encode(chunk);
-  if (typeof chunk === "number") return textEncoder.encode(String(chunk));
-  return textEncoder.encode(String(chunk));
+  throw new TypeError("write() expects a string, ArrayBufferView, or ArrayBuffer");
 }
 
 function concatBytes(chunks) {
@@ -62,11 +64,19 @@ export const CountQueuingStrategy = whatwg.CountQueuingStrategy;
 // ---------------------------------------------------------------------------
 class HTTPResponseSink {
   #controller;
+  #underlyingSource;
   #active = true;
   #buffered = [];
+  #bufferedByteLength = 0;
+  #insidePull = false;
+  #deferredFlush = false;
+  #deferredClose = false;
+  #deferredCloseReason;
+  #sourceFinished = false;
 
-  constructor(controller) {
+  constructor(controller, underlyingSource) {
     this.#controller = controller;
+    this.#underlyingSource = underlyingSource;
   }
 
   #assertActive() {
@@ -83,46 +93,98 @@ class HTTPResponseSink {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
     this.#assertActive();
     const bytes = bytesFromChunk(chunk);
-    if (bytes.byteLength > 0) this.#buffered.push(bytes);
+    if (bytes.byteLength > 0) {
+      this.#buffered.push(bytes);
+      this.#bufferedByteLength += bytes.byteLength;
+    }
     return bytes.byteLength;
   }
 
   #flushBuffered() {
     if (this.#buffered.length === 0) return 0;
+    const byteLength = this.#bufferedByteLength;
     const bytes = concatBytes(this.#buffered);
     this.#buffered = [];
-    try {
-      this.#controller.enqueue(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
-    } catch {
-      // already closed or errored
-    }
-    return bytes.byteLength;
+    this.#bufferedByteLength = 0;
+    this.#controller.enqueue(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    return byteLength;
   }
 
   flush() {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
     this.#assertActive();
+    if (this.#insidePull) {
+      this.#deferredFlush = true;
+      return this.#bufferedByteLength;
+    }
     return this.#flushBuffered();
   }
 
-  end(chunk = undefined) {
+  end(reason = undefined) {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
     this.#assertActive();
-    if (chunk !== undefined) this.write(chunk);
-    this._finish();
-    return Promise.resolve();
+    this.#requestClose(reason);
   }
 
-  close() {
+  close(reason = undefined) {
     if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
     this.#assertActive();
-    this._finish();
+    this.#requestClose(reason);
   }
 
-  _finish() {
+  error(error = undefined) {
+    if (!(this instanceof HTTPResponseSink)) throw new TypeError("Expected HTTPResponseSink");
+    this.#assertActive();
+    this._error(error);
+  }
+
+  #requestClose(reason) {
+    if (this.#insidePull) {
+      this.#deferredClose = true;
+      this.#deferredCloseReason = reason;
+      return;
+    }
+    this._finish(reason, "close");
+  }
+
+  #finishSource(method, reason) {
+    if (this.#sourceFinished) return undefined;
+    this.#sourceFinished = true;
+    const callback = this.#underlyingSource?.[method];
+    if (typeof callback !== "function") return undefined;
+    try {
+      return callback.call(this.#underlyingSource, reason);
+    } catch {
+      return undefined;
+    }
+  }
+
+  _beginPull() {
+    this.#insidePull = true;
+  }
+
+  _endPull() {
+    this.#insidePull = false;
+    if (!this.#active) return;
+    if (this.#deferredClose) {
+      const reason = this.#deferredCloseReason;
+      this.#deferredClose = false;
+      this.#deferredCloseReason = undefined;
+      this.#deferredFlush = false;
+      this._finish(reason, "close");
+      return;
+    }
+    if (this.#deferredFlush) {
+      this.#deferredFlush = false;
+      this.#flushBuffered();
+    }
+  }
+
+  _finish(reason = undefined, sourceMethod = "cancel") {
     if (!this.#active) return;
     this.#flushBuffered();
     this.#active = false;
+    this.#finishSource(sourceMethod, reason);
     try {
       this.#controller.close();
     } catch {
@@ -134,6 +196,11 @@ class HTTPResponseSink {
     if (!this.#active) return;
     this.#active = false;
     this.#buffered = [];
+    this.#bufferedByteLength = 0;
+    this.#deferredFlush = false;
+    this.#deferredClose = false;
+    this.#deferredCloseReason = undefined;
+    this.#finishSource("close", error);
     try {
       this.#controller.error(error);
     } catch {
@@ -141,31 +208,38 @@ class HTTPResponseSink {
     }
   }
 
-  _deactivate() {
+  _cancel(reason) {
+    if (!this.#active) return undefined;
     this.#active = false;
+    this.#buffered = [];
+    this.#bufferedByteLength = 0;
+    this.#deferredFlush = false;
+    this.#deferredClose = false;
+    this.#deferredCloseReason = undefined;
+    return this.#finishSource("cancel", reason);
   }
 }
 
 function directUnderlyingSource(underlyingSource) {
   const pullFn = underlyingSource.pull;
-  const cancelFn = underlyingSource.cancel;
-  const startFn = underlyingSource.start;
   let sink;
   let pulled = false;
   return {
     start(controller) {
-      sink = new HTTPResponseSink(controller);
-      if (typeof startFn === "function") return startFn.call(underlyingSource, sink);
+      sink = new HTTPResponseSink(controller, underlyingSource);
     },
     pull() {
       if (pulled) return undefined;
       pulled = true;
       let result;
+      sink._beginPull();
       try {
         result = typeof pullFn === "function" ? pullFn.call(underlyingSource, sink) : undefined;
       } catch (error) {
         sink._error(error);
         throw error;
+      } finally {
+        sink._endPull();
       }
       return Promise.resolve(result).then(
         () => {
@@ -178,9 +252,7 @@ function directUnderlyingSource(underlyingSource) {
       );
     },
     cancel(reason) {
-      sink._deactivate();
-      if (typeof cancelFn === "function") return cancelFn.call(underlyingSource, reason);
-      return undefined;
+      return sink._cancel(reason);
     },
   };
 }

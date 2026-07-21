@@ -33,6 +33,18 @@ export function _isArrayBufferView(value) {
 }
 Stream._isArrayBufferView ??= _isArrayBufferView;
 
+// Node's stream constructors preallocate common event keys with undefined
+// values. The shared EventEmitter counts only installed listeners but returns
+// every own key, so filter the placeholders for stream instances.
+Object.defineProperty(Stream.prototype, "eventNames", {
+  value() {
+    if (!this._events || this._eventsCount === 0) return [];
+    return Reflect.ownKeys(this._events).filter((name) => this._events[name] !== undefined);
+  },
+  writable: true,
+  configurable: true,
+});
+
 // ---------------------------------------------------------------------------
 // Compatibility: several runtime modules (fs, http, net, crypto, http2, ...)
 // were written against the previous permissive stream shim and assign to
@@ -68,8 +80,8 @@ for (const ctor of [Stream, Readable, Writable, Duplex, Transform, PassThrough])
 // old shim stored it as a plain property). Routing that through the real
 // setter marks _readableState/_writableState destroyed immediately, which
 // suppresses pending 'readable'/'end' delivery. Shadow truthy assignments
-// with an own property instead; real destroy() writes stream state directly
-// and is unaffected.
+// with an own property instead; the vendored destroy path recognizes that
+// explicit marker without suppressing data that was already buffered.
 for (const proto of [Readable.prototype, Writable.prototype, Duplex.prototype]) {
   const descriptor = Object.getOwnPropertyDescriptor(proto, "destroyed");
   if (!descriptor?.get || !descriptor.configurable) continue;

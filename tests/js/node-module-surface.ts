@@ -99,7 +99,7 @@ constructed._compile("module.exports = { compiled: true };", modulePath);
 assert(constructed.exports.compiled === true, "Module#_compile mismatch");
 
 const sourceMap = new SourceMap({ version: 3, sources: [], mappings: "" });
-assert(sourceMap.findEntry(1, 2).generatedLine === 1, "SourceMap findEntry mismatch");
+assert(Object.keys(sourceMap.findEntry(1, 2)).length === 0, "SourceMap findEntry mismatch");
 assert(findSourceMap(modulePath) === undefined, "findSourceMap should be undefined without maps");
 const mappedPath = join(root, "mapped.cjs");
 const inlineMap = Buffer.from(JSON.stringify({ version: 3, sources: ["original.ts"], names: [], mappings: "AAAA" })).toString("base64");
@@ -158,9 +158,9 @@ flushCompileCache();
 const cacheManifest = JSON.parse(readFileSync(join(getCompileCacheDir(), "manifest.json"), "utf8"));
 assert(cacheManifest.entries.some((entry: any) => entry.filename === cachedModulePath), "compile cache manifest missing module");
 
-setSourceMapsSupport({ nodeModules: true, generatedCode: true });
+setSourceMapsSupport(true, { nodeModules: true, generatedCode: true });
 const support = getSourceMapsSupport();
-assert(support.nodeModules === true && support.generatedCode === true, "source maps support mismatch");
+assert(support.enabled === true && support.nodeModules === true && support.generatedCode === true, "source maps support mismatch");
 assert(globalPaths.length > 0, "globalPaths missing");
 
 const stripSource = "const x: number = 1;\nexport type Foo = { value: string };\n";

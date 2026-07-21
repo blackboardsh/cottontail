@@ -1,10 +1,11 @@
+import { getCounters } from "bun:internal-for-testing";
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
 const executable = process.execPath;
-const isWindows = process.platform === "win32";
-const killSignal = isWindows ? 9 : 1;
+const killSignal = 9;
 
 const timeoutStarted = Date.now();
 const timeoutResult = cottontail.spawnSync(
@@ -66,6 +67,7 @@ assert(maxBufferResult.stdout.startsWith("y\n".repeat(128)), "maxBuffer partial 
 assert(maxBufferElapsed < 1500, `maxBuffer elapsed ${maxBufferElapsed}ms`);
 
 const input = new TextEncoder().encode("input-through-pipe");
+const countersBeforeInput = getCounters();
 const inputResult = cottontail.spawnSync(
   executable,
   ["-e", `process.stdin.pipe(process.stdout);`],
@@ -76,9 +78,20 @@ const inputResult = cottontail.spawnSync(
     input,
   },
 );
+const countersAfterInput = getCounters();
 assert(inputResult.status === 0, `piped input child failed: ${inputResult.status}`);
 assert(inputResult.stdout === "input-through-pipe", `piped input mismatch: ${inputResult.stdout}`);
 assert(inputResult.stderr === undefined, "ignored stderr should be absent");
+assert(
+  countersAfterInput.spawnSync_blocking > countersBeforeInput.spawnSync_blocking,
+  "native spawnSync blocking counter did not advance",
+);
+if (process.platform === "linux") {
+  assert(
+    countersAfterInput.spawn_memfd > countersBeforeInput.spawn_memfd,
+    "Linux spawnSync memfd counter did not advance",
+  );
+}
 
 const largeInput = new Uint8Array(512 * 1024).fill("i".charCodeAt(0));
 const duplexResult = cottontail.spawnSync(

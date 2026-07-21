@@ -1,8 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compiler = @import("cottontail_compiler");
 const c = @cImport({
     @cInclude("stdlib.h");
 });
+
+const Semver = compiler.Semver;
+const HostedGitInfo = compiler.install.HostedGitInfo;
+const BunLockfile = compiler.install.Lockfile;
+const PackageManagerBunLockfile = @import("package_manager_bun_lockfile.zig");
 
 pub const CtHostEnvEntry = extern struct {
     name: [*:0]const u8,
@@ -40,6 +46,7 @@ pub const CtHostSpawnResult = extern struct {
     stderr_present: bool,
     exited_due_to_timeout: bool,
     exited_due_to_max_buffer: bool,
+    memfd_count: u32,
 };
 
 const SpawnStdio = enum(c_int) {
@@ -72,6 +79,11 @@ pub fn forceLink() void {
     _ = &ct_host_unlink;
     _ = &ct_host_chmod;
     _ = &ct_host_spawn_sync;
+    _ = &ct_semver_order;
+    _ = &ct_semver_satisfies;
+    _ = &ct_hosted_git_info_parse_url;
+    _ = &ct_hosted_git_info_from_url;
+    _ = &ct_package_manager_parse_lockfile;
 }
 
 pub fn getIo() std.Io {
@@ -80,6 +92,14 @@ pub fn getIo() std.Io {
 
 fn setErrorOut(error_out: *?[*:0]u8, message: []const u8) void {
     error_out.* = allocCString(message);
+}
+
+fn setFormattedErrorOut(error_out: *?[*:0]u8, comptime format: []const u8, args: anytype) void {
+    const message = std.fmt.allocPrintSentinel(std.heap.c_allocator, format, args, 0) catch {
+        error_out.* = null;
+        return;
+    };
+    error_out.* = message.ptr;
 }
 
 fn windowsPathAttributes(sub_path: []const u8) ?std.os.windows.FILE.ATTRIBUTE {
@@ -172,6 +192,246 @@ fn allocBuffer(bytes: []const u8) ?[*]u8 {
     return ptr;
 }
 
+export fn ct_semver_order(
+    left_ptr: [*]const u8,
+    left_len: usize,
+    right_ptr: [*]const u8,
+    right_len: usize,
+    result_out: *c_int,
+    error_out: *?[*:0]u8,
+) c_int {
+    error_out.* = null;
+    const left = left_ptr[0..left_len];
+    const right = right_ptr[0..right_len];
+
+    if (!compiler.strings.isAllASCII(left) or !compiler.strings.isAllASCII(right)) {
+        result_out.* = 0;
+        return 0;
+    }
+
+    const left_result = Semver.Version.parse(Semver.SlicedString.init(left, left));
+    if (!left_result.valid) {
+        setFormattedErrorOut(error_out, "Invalid SemVer: {s}\n", .{left});
+        return -1;
+    }
+
+    const right_result = Semver.Version.parse(Semver.SlicedString.init(right, right));
+    if (!right_result.valid) {
+        setFormattedErrorOut(error_out, "Invalid SemVer: {s}\n", .{right});
+        return -1;
+    }
+
+    result_out.* = switch (left_result.version.max().orderWithoutBuild(right_result.version.max(), left, right)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+    return 0;
+}
+
+export fn ct_semver_satisfies(
+    version_ptr: [*]const u8,
+    version_len: usize,
+    range_ptr: [*]const u8,
+    range_len: usize,
+    result_out: *bool,
+    error_out: *?[*:0]u8,
+) c_int {
+    error_out.* = null;
+    const version = version_ptr[0..version_len];
+    const range = range_ptr[0..range_len];
+
+    if (!compiler.strings.isAllASCII(version) or !compiler.strings.isAllASCII(range)) {
+        result_out.* = false;
+        return 0;
+    }
+
+    const version_result = Semver.Version.parse(Semver.SlicedString.init(version, version));
+    if (version_result.wildcard != .none) {
+        result_out.* = false;
+        return 0;
+    }
+    const parsed_version = version_result.version.min();
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    var stack_fallback = std.heap.stackFallback(512, arena.allocator());
+    const parsed_range = Semver.Query.parse(
+        stack_fallback.get(),
+        range,
+        Semver.SlicedString.init(range, range),
+    ) catch {
+        setErrorOut(error_out, "Out of memory");
+        return -1;
+    };
+    defer parsed_range.deinit();
+
+    if (parsed_range.getExactVersion()) |exact| {
+        result_out.* = parsed_version.eql(exact);
+        return 0;
+    }
+
+    result_out.* = parsed_range.satisfies(parsed_version, range, version);
+    return 0;
+}
+
+export fn ct_hosted_git_info_parse_url(
+    input_ptr: [*]const u8,
+    input_len: usize,
+    output_len: *usize,
+    error_out: *?[*:0]u8,
+) ?[*]u8 {
+    output_len.* = 0;
+    error_out.* = null;
+
+    const parsed = HostedGitInfo.parseUrl(std.heap.c_allocator, input_ptr[0..input_len]) catch |err| {
+        setFormattedErrorOut(error_out, "Invalid Git URL: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer parsed.url.deinit();
+
+    output_len.* = parsed.url.backing.len;
+    return allocBuffer(parsed.url.backing) orelse {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+}
+
+export fn ct_hosted_git_info_from_url(
+    input_ptr: [*]const u8,
+    input_len: usize,
+    output_len: *usize,
+    error_out: *?[*:0]u8,
+) ?[*]u8 {
+    output_len.* = 0;
+    error_out.* = null;
+
+    const maybe_info = HostedGitInfo.HostedGitInfo.fromUrl(
+        std.heap.c_allocator,
+        input_ptr[0..input_len],
+    ) catch |err| {
+        setFormattedErrorOut(error_out, "Invalid Git URL: {s}", .{@errorName(err)});
+        return null;
+    };
+    var info = maybe_info orelse return null;
+    defer info.deinit();
+
+    const Response = struct {
+        type: []const u8,
+        domain: []const u8,
+        project: []const u8,
+        user: ?[]const u8,
+        committish: ?[]const u8,
+        default: []const u8,
+    };
+    const json = std.json.Stringify.valueAlloc(std.heap.c_allocator, Response{
+        .type = info.host_provider.typeStr(),
+        .domain = info.host_provider.domain(),
+        .project = info.project,
+        .user = info.user,
+        .committish = info.committish,
+        .default = @tagName(info.default_representation),
+    }, .{}) catch {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+    defer std.heap.c_allocator.free(json);
+
+    output_len.* = json.len;
+    return allocBuffer(json) orelse {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+}
+
+export fn ct_package_manager_parse_lockfile(
+    cwd_ptr: [*]const u8,
+    cwd_len: usize,
+    output_len: *usize,
+    error_out: *?[*:0]u8,
+) ?[*]u8 {
+    output_len.* = 0;
+    error_out.* = null;
+
+    const allocator = std.heap.c_allocator;
+    const cwd = cwd_ptr[0..cwd_len];
+    const binary_path = std.fs.path.join(allocator, &.{ cwd, "bun.lockb" }) catch {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+    defer allocator.free(binary_path);
+
+    const binary = std.Io.Dir.cwd().readFileAlloc(
+        getIo(),
+        binary_path,
+        allocator,
+        .limited(256 * 1024 * 1024),
+    ) catch |err| binary: {
+        if (err != error.FileNotFound) {
+            setFormattedErrorOut(error_out, "failed to load lockfile: {s}, '{s}'", .{ @errorName(err), binary_path });
+            return null;
+        }
+        const text_path = std.fs.path.join(allocator, &.{ cwd, "bun.lock" }) catch {
+            setErrorOut(error_out, "Out of memory");
+            return null;
+        };
+        defer allocator.free(text_path);
+        const text_lockfile = std.Io.Dir.cwd().readFileAlloc(
+            getIo(),
+            text_path,
+            allocator,
+            .limited(256 * 1024 * 1024),
+        ) catch |text_err| {
+            setFormattedErrorOut(error_out, "failed to load lockfile: {s}, '{s}'", .{ @errorName(text_err), text_path });
+            return null;
+        };
+        defer allocator.free(text_lockfile);
+        break :binary PackageManagerBunLockfile.textToBinaryAtRoot(
+            allocator,
+            text_lockfile,
+            getIo(),
+            cwd,
+        ) catch |convert_err| {
+            setFormattedErrorOut(error_out, "failed to load lockfile: {s}, '{s}'", .{ @errorName(convert_err), text_path });
+            return null;
+        };
+    };
+    defer allocator.free(binary);
+
+    var log = compiler.logger.Log.init(allocator);
+    defer log.deinit();
+    var lockfile: BunLockfile = undefined;
+    const load_result = lockfile.loadFromBytesStandalone(binary, allocator, &log);
+    switch (load_result) {
+        .ok => {},
+        .err => |failure| {
+            setFormattedErrorOut(error_out, "failed to load lockfile: {s}, '{s}'", .{ @errorName(failure.value), binary_path });
+            return null;
+        },
+        .not_found => {
+            setFormattedErrorOut(error_out, "lockfile not found: '{s}'", .{binary_path});
+            return null;
+        },
+    }
+    defer lockfile.deinit();
+
+    const json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(lockfile, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = true,
+        .emit_nonportable_numbers_as_strings = true,
+    })}) catch {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+    defer allocator.free(json);
+
+    output_len.* = json.len;
+    return allocBuffer(json) orelse {
+        setErrorOut(error_out, "Out of memory");
+        return null;
+    };
+}
+
 fn termToExitCode(term: std.process.Child.Term) c_int {
     return switch (term) {
         .exited => |code| @as(c_int, code),
@@ -201,6 +461,19 @@ fn spawnStdioOption(mode: c_int) std.process.SpawnOptions.StdIo {
         .inherit => .inherit,
         .ignore => .ignore,
     };
+}
+
+fn createSpawnMemfd(name: []const u8) ?std.Io.File {
+    if (comptime builtin.os.tag != .linux) return null;
+    const fd = std.posix.memfd_create(name, 0) catch return null;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+fn readSpawnMemfd(file: std.Io.File, io: std.Io, output: *std.ArrayList(u8)) !void {
+    const length = try file.length(io);
+    if (length > std.math.maxInt(usize)) return error.FileTooBig;
+    try output.resize(std.heap.c_allocator, @intCast(length));
+    output.items.len = try file.readPositionalAll(io, output.items, 0);
 }
 
 fn shouldCreateNoWindow(stdin_mode: c_int, stdout_mode: c_int, stderr_mode: c_int) bool {
@@ -604,6 +877,7 @@ export fn ct_host_spawn_sync(
         .stderr_present = false,
         .exited_due_to_timeout = false,
         .exited_due_to_max_buffer = false,
+        .memfd_count = 0,
     };
 
     const gpa = std.heap.c_allocator;
@@ -648,13 +922,51 @@ export fn ct_host_spawn_sync(
     const env_map_ptr = if (env_map) |*map| map else null;
     const child_cwd = cwdOption(options.cwd);
 
+    const input: []const u8 = if (options.input_ptr) |ptr| ptr[0..options.input_len] else &.{};
+    var stdin_memfd: ?std.Io.File = null;
+    var stdout_memfd: ?std.Io.File = null;
+    var stderr_memfd: ?std.Io.File = null;
+    if (comptime builtin.os.tag == .linux) {
+        if (options.stdin_mode == @intFromEnum(SpawnStdio.pipe) and options.input_present) {
+            stdin_memfd = createSpawnMemfd("spawn_stdio_stdin");
+            if (stdin_memfd) |file_handle| {
+                file_handle.writePositionalAll(io, input, 0) catch {
+                    file_handle.close(io);
+                    stdin_memfd = null;
+                };
+            }
+        }
+        if (!options.max_buffer_enabled and options.stdout_mode == @intFromEnum(SpawnStdio.pipe)) {
+            stdout_memfd = createSpawnMemfd("spawn_stdio_stdout");
+        }
+        if (!options.max_buffer_enabled and options.stderr_mode == @intFromEnum(SpawnStdio.pipe)) {
+            stderr_memfd = createSpawnMemfd("spawn_stdio_stderr");
+        }
+    }
+    defer if (stdin_memfd) |file_handle| file_handle.close(io);
+    defer if (stdout_memfd) |file_handle| file_handle.close(io);
+    defer if (stderr_memfd) |file_handle| file_handle.close(io);
+
+    const stdin_option: std.process.SpawnOptions.StdIo = if (stdin_memfd) |file_handle|
+        .{ .file = file_handle }
+    else
+        spawnStdioOption(options.stdin_mode);
+    const stdout_option: std.process.SpawnOptions.StdIo = if (stdout_memfd) |file_handle|
+        .{ .file = file_handle }
+    else
+        spawnStdioOption(options.stdout_mode);
+    const stderr_option: std.process.SpawnOptions.StdIo = if (stderr_memfd) |file_handle|
+        .{ .file = file_handle }
+    else
+        spawnStdioOption(options.stderr_mode);
+
     var child = std.process.spawn(io, .{
         .argv = argv.items,
         .cwd = child_cwd,
         .environ_map = env_map_ptr,
-        .stdin = spawnStdioOption(options.stdin_mode),
-        .stdout = spawnStdioOption(options.stdout_mode),
-        .stderr = spawnStdioOption(options.stderr_mode),
+        .stdin = stdin_option,
+        .stdout = stdout_option,
+        .stderr = stderr_option,
         .request_resource_usage_statistics = true,
         .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
     }) catch |err| {
@@ -663,6 +975,10 @@ export fn ct_host_spawn_sync(
     };
     defer child.kill(io);
 
+    result_out.memfd_count = @intFromBool(stdin_memfd != null) +
+        @intFromBool(stdout_memfd != null) +
+        @intFromBool(stderr_memfd != null);
+
     result_out.pid = processId(child.id.?);
     var control = SpawnControl{
         .io = io,
@@ -670,7 +986,6 @@ export fn ct_host_spawn_sync(
         .kill_signal = options.kill_signal,
     };
 
-    const input: []const u8 = if (options.input_ptr) |ptr| ptr[0..options.input_len] else &.{};
     var stdin_context = SpawnWriteContext{
         .io = io,
         .control = &control,
@@ -759,6 +1074,19 @@ export fn ct_host_spawn_sync(
     joinThread(stdin_thread);
     joinThread(stdout_thread);
     joinThread(stderr_thread);
+
+    if (stdout_memfd) |file_handle| {
+        readSpawnMemfd(file_handle, io, &stdout_context.output) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+    }
+    if (stderr_memfd) |file_handle| {
+        readSpawnMemfd(file_handle, io, &stderr_context.output) catch |err| {
+            setErrorOut(error_out, @errorName(err));
+            return -1;
+        };
+    }
 
     if (stdin_context.error_name orelse stdout_context.error_name orelse stderr_context.error_name) |error_name| {
         setErrorOut(error_out, error_name);

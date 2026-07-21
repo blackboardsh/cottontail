@@ -81,41 +81,114 @@ export function abortReason(signal) {
   return error;
 }
 
+const abortableTasks = new WeakMap();
+let pendingAbortableTasks = [];
+let abortableTaskDrainScheduled = false;
+
+function scheduleAbortableTurn(callback) {
+  const nextTick = globalThis.process?.nextTick;
+  if (typeof nextTick === "function") nextTick(callback);
+  else queueMicrotask(callback);
+}
+
+function drainAbortableTasks() {
+  abortableTaskDrainScheduled = false;
+  const tasks = pendingAbortableTasks;
+  pendingAbortableTasks = [];
+  for (const task of tasks) runAbortableTask(task);
+}
+
+function armAbortableTaskDrain() {
+  scheduleAbortableTurn(drainAbortableTasks);
+}
+
+function queueAbortableTask(task) {
+  pendingAbortableTasks.push(task);
+  if (abortableTaskDrainScheduled) return;
+  abortableTaskDrainScheduled = true;
+  // COTTONTAIL-COMPAT: process.nextTick callbacks drain JSC jobs before they
+  // return. Two queue stages let a next-tick abort run before fs settlement
+  // without resuming the caller inside the abort callback's async frame.
+  scheduleAbortableTurn(armAbortableTaskDrain);
+}
+
+function finishAbortableTask(task, callback, value) {
+  if (task.settled) return;
+  task.settled = true;
+
+  const signal = task.signal;
+  const tasks = signal && abortableTasks.get(signal);
+  if (tasks) {
+    tasks.delete(task);
+    if (tasks.size === 0) {
+      abortableTasks.delete(signal);
+      signal.removeEventListener("abort", onAbortableSignalAbort);
+    }
+  }
+
+  task.signal = null;
+  task.operation = null;
+  task.resolve = null;
+  task.reject = null;
+  callback(value);
+}
+
+function onAbortableSignalAbort(event) {
+  const signal = event?.currentTarget ?? event?.target ?? this;
+  const tasks = abortableTasks.get(signal);
+  if (!tasks) return;
+  const reason = abortReason(signal);
+  for (const task of tasks) {
+    task.aborted = true;
+    task.abortedWith = reason;
+  }
+}
+
+function runAbortableTask(task) {
+  if (task.settled) return;
+  const signal = task.signal;
+  if (task.aborted || signal?.aborted) {
+    finishAbortableTask(task, task.reject, task.aborted ? task.abortedWith : abortReason(signal));
+    return;
+  }
+  try {
+    finishAbortableTask(task, task.resolve, task.operation());
+  } catch (error) {
+    finishAbortableTask(task, task.reject, error);
+  }
+}
+
 // COTTONTAIL-COMPAT: Bun's native fs task checks the signal before dispatch
-// and again when the task completes. Preserve that lifecycle and listener
-// cleanup here; the host syscall itself is still synchronous.
+// and again when the task completes. The host syscall is synchronous, so task
+// records and one shared listener avoid retaining a closure graph per request.
 export function runAbortable(operation, signal = null) {
   signal = validateAbortSignal(signal);
+  if (signal == null) return Promise.resolve().then(operation);
   if (signal?.aborted) return Promise.reject(abortReason(signal));
 
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (callback, value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", onAbort);
-      callback(value);
-    };
-    const onAbort = () => finish(reject, abortReason(signal));
-    signal?.addEventListener("abort", onAbort, { once: true });
+  const deferred = Promise.withResolvers();
+  const task = {
+    aborted: false,
+    abortedWith: undefined,
+    operation,
+    reject: deferred.reject,
+    resolve: deferred.resolve,
+    settled: false,
+    signal,
+  };
 
-    queueMicrotask(() => {
-      if (settled) return;
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-      try {
-        const result = operation();
-        Promise.resolve(result).then(
-          value => finish(resolve, value),
-          error => finish(reject, error),
-        );
-      } catch (error) {
-        finish(reject, error);
-      }
-    });
-  });
+  if (signal) {
+    let tasks = abortableTasks.get(signal);
+    if (!tasks) {
+      tasks = new Set();
+      abortableTasks.set(signal, tasks);
+      signal.addEventListener("abort", onAbortableSignalAbort, { once: true });
+    }
+    tasks.add(task);
+  }
+
+  queueAbortableTask(task);
+  return deferred.promise;
 }
 
 export function validateInteger(value, name, minimum = Number.MIN_SAFE_INTEGER, maximum = Number.MAX_SAFE_INTEGER) {

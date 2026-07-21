@@ -1,6 +1,7 @@
 import { resolve as pathResolve } from "./path.js";
 import { Buffer } from "./buffer.js";
 import { toASCII, toUnicode } from "./punycode.js";
+import { parse as querystringParse, stringify as querystringStringify } from "./querystring.js";
 
 // Import the vendor implementation directly: globalThis.URL is only assigned
 // by bun/index.js after this module has already been evaluated, so grabbing
@@ -249,14 +250,7 @@ function invalidArgTypeError(name, expected, actual) {
 }
 
 function searchParamsToObject(queryText) {
-  const out = { __proto__: null };
-  for (const [key, value] of new URLSearchParams(queryText)) {
-    const existing = out[key];
-    if (existing === undefined) out[key] = value;
-    else if (Array.isArray(existing)) existing.push(value);
-    else out[key] = [existing, value];
-  }
-  return out;
+  return querystringParse(queryText);
 }
 
 export function Url() {
@@ -526,7 +520,7 @@ Url.prototype.parse = function parse(url, parseQueryString, slashesDenoteHost) {
   } else if (parseQueryString) {
     // no query string, but parseQueryString still requested
     this.search = null;
-    this.query = {};
+    this.query = Object.create(null);
   }
   if (rest) {
     this.pathname = rest;
@@ -605,7 +599,7 @@ Url.prototype.format = function format() {
   }
 
   if (this.query && typeof this.query === "object" && Object.keys(this.query).length) {
-    query = new URLSearchParams(this.query).toString();
+    query = querystringStringify(this.query);
   }
 
   let search = this.search || (query && `?${query}`) || "";
@@ -1026,10 +1020,21 @@ function encodePathChars(filepath) {
     .replace(tildeRegEx, "%7E");
 }
 
+// Avoid rebuilding the same large absolute string in repeated pathToFileURL calls.
+let lastFilePathInput;
+let lastFilePathCwd;
+let lastResolvedFilePath;
+
 function resolvePathForFileURL(filepath) {
   if (filepath.length > 0 && filepath !== "." && filepath !== ".." && filepath.indexOf("/") === -1) {
     const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-    return cwd.endsWith("/") ? `${cwd}${filepath}` : `${cwd}/${filepath}`;
+    if (filepath === lastFilePathInput && cwd === lastFilePathCwd) return lastResolvedFilePath;
+
+    const resolved = cwd.endsWith("/") ? `${cwd}${filepath}` : `${cwd}/${filepath}`;
+    lastFilePathInput = filepath;
+    lastFilePathCwd = cwd;
+    lastResolvedFilePath = resolved;
+    return resolved;
   }
   return pathResolve(filepath);
 }

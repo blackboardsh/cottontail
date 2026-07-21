@@ -7,6 +7,9 @@ import { parseShell } from "../../src/runtime_modules/internal/bun-shell-parser.
 
 const root = mkdtempSync(join(tmpdir(), "cottontail-shell-source-"));
 const shell = (source: string) => $`${{ raw: source }}`.cwd(root).quiet().nothrow();
+// COTTONTAIL-COMPAT: Vendored JSC startup can exceed Bun's 5s test default
+// when one shell assertion launches multiple nested Cottontail processes.
+const nestedRuntimeTimeout = 30_000;
 
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
@@ -117,10 +120,92 @@ test("conditional expressions support logical and file operators", async () => {
   expect(output.stdout.toString()).toBe("accepted\n");
 });
 
-test("background lists preserve Bun's unsupported syntax diagnostic", () => {
-  expect(() => shell("echo background & echo foreground; wait")).toThrow(
-    'Background commands "&" are not supported yet.',
+test("background lists execute concurrently and wait joins their output", async () => {
+  const delayed = "await Bun.sleep(30); console.log('background')";
+  const output = await $`
+    ${process.execPath} -e ${delayed} &
+    echo foreground
+    wait
+    echo joined
+  `.cwd(root).quiet().nothrow();
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("foreground\nbackground\njoined\n");
+  expect(output.stderr.toString()).toBe("");
+});
+
+test("background pipelines preserve list ordering and final shell joins", async () => {
+  const delayed = "await Bun.sleep(30); console.log('pipeline')";
+  const output = await $`
+    ${process.execPath} -e ${delayed} | cat &
+    echo foreground
+  `.cwd(root).quiet().nothrow();
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("foreground\npipeline\n");
+  expect(output.stderr.toString()).toBe("");
+});
+
+test("background commands compose with boolean lists and command substitution", async () => {
+  const delayed = "await Bun.sleep(30); console.log('background')";
+  const booleanList = await $`
+    echo prefix && ${process.execPath} -e ${delayed} &
+    echo foreground
+    wait
+  `.cwd(root).quiet().nothrow();
+  const substitution = await $`
+    echo $(${process.execPath} -e ${delayed} & echo foreground)
+  `.cwd(root).quiet().nothrow();
+
+  expect(booleanList.exitCode).toBe(0);
+  expect(booleanList.stdout.toString()).toBe("prefix\nforeground\nbackground\n");
+  expect(substitution.exitCode).toBe(0);
+  expect(substitution.stdout.toString()).toBe("foreground background\n");
+}, nestedRuntimeTimeout);
+
+test("background conditions and nested compounds share the shell job queue", async () => {
+  const delayed = "await Bun.sleep(30); console.log('condition')";
+  const condition = await $`
+    if ${process.execPath} -e ${delayed} & then echo consequent; fi
+    wait
+  `.cwd(root).quiet().nothrow();
+  const compounds = await shell(`
+    VALUE=outer
+    { echo grouped & wait; VALUE=grouped; }
+    (echo nested & wait; VALUE=nested)
+    echo "$VALUE"
+  `);
+  const compactCondition = await shell("if echo foo&then wait;fi; if echo foo;then echo bar&fi;wait");
+
+  expect(condition.exitCode).toBe(0);
+  expect(condition.stdout.toString()).toBe("consequent\ncondition\n");
+  expect(compounds.exitCode).toBe(0);
+  expect(compounds.stdout.toString()).toBe("grouped\nnested\ngrouped\n");
+  expect(compactCondition.exitCode).toBe(0);
+  expect(compactCondition.stdout.toString()).toBe("foo\nfoo\nbar\n");
+});
+
+test("background operators retain quoting and reject invalid binary placement", async () => {
+  expect(await shell("echo '&' \\&").then(output => output.stdout.toString())).toBe("& &\n");
+  expect(() => shell("echo background & && echo unreachable")).toThrow(
+    '"&" is not allowed on the left-hand side of "&&"',
   );
+});
+
+test("wait reports the last background status", async () => {
+  const output = await shell("true & false & wait");
+
+  expect(output.exitCode).toBe(1);
+  expect(output.stdout.toString()).toBe("");
+  expect(output.stderr.toString()).toBe("");
+});
+
+test("background redirections complete before the shell promise resolves", async () => {
+  const output = await shell("echo background > background.txt & echo foreground");
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("foreground\n");
+  expect(readFileSync(join(root, "background.txt"), "utf8")).toBe("background\n");
 });
 
 test("deep brace groups flatten while independently escaped braces stay literal", async () => {
@@ -152,7 +237,7 @@ test("command-local assignments remain separate from shell expansion state", asy
 
   expect(output.exitCode).toBe(0);
   expect(output.stdout.toString()).toBe("inner\ninner\nouter\n");
-});
+}, nestedRuntimeTimeout);
 
 test("redirections open in source order before a compound body runs", async () => {
   const output = await shell(`
@@ -183,6 +268,20 @@ test("repeated redirections release their descriptors deterministically", async 
   expect(after).toBeLessThanOrEqual(before + 1);
 });
 
+test("subshell redirections preserve state isolation and descriptor flow", async () => {
+  const output = await shell(`
+    VALUE=outer
+    (VALUE=inner; echo "$VALUE"; echo error >&2) > subshell.txt 2>&1
+    (cat) < subshell.txt
+    echo "$VALUE"
+  `);
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("inner\nerror\nouter\n");
+  expect(output.stderr.toString()).toBe("");
+  expect(readFileSync(join(root, "subshell.txt"), "utf8")).toBe("inner\nerror\n");
+});
+
 test("ANSI-C quotes decode complete escape sequences exactly once", async () => {
   const output = await shell("printf '%s' $'A\\n\\x42\\103'");
 
@@ -210,6 +309,47 @@ test("pipeline consumers cancel input-ignoring producers", async () => {
   expect(output.exitCode).toBe(0);
   expect(output.stdout.toString()).toBe("destination\n");
   expect(output.stderr.toString()).toBe("");
+});
+
+test.skipIf(process.platform === "win32")("external producers tolerate an input-ignoring pipeline consumer", async () => {
+  const yes = Bun.which("yes");
+  expect(yes).not.toBeNull();
+
+  const output = await $`${yes!} source | echo destination`.cwd(root).quiet().nothrow();
+
+  expect(output.exitCode).toBe(0);
+  expect(output.stdout.toString()).toBe("destination\n");
+  expect(output.stderr.toString()).toBe("");
+});
+
+test.skipIf(process.platform === "win32")("large builtin output streams through external pipeline stages", async () => {
+  const payload = "bun!".repeat(256 * 1024);
+  const cat = Bun.which("cat");
+  expect(cat).not.toBeNull();
+
+  expect(await $`echo ${payload} | ${cat}`.text()).toBe(`${payload}\n`);
+});
+
+test("builtin edge cases match Bun 1.3.10", async () => {
+  const output = await shell("basename /; seq -w");
+
+  expect(output.exitCode).toBe(1);
+  expect(output.stdout.toString()).toBe("/\n");
+  expect(output.stderr.toString()).toBe(
+    "usage: seq [-w] [-f format] [-s string] [-t string] [first [incr]] last\n",
+  );
+});
+
+test("rm -d removes only empty directories", async () => {
+  mkdirSync(join(root, "rm-empty"));
+  mkdirSync(join(root, "rm-full"));
+  writeFileSync(join(root, "rm-full", "file.txt"), "payload");
+
+  const output = await shell("rm -d rm-empty rm-full");
+  expect(output.exitCode).toBe(1);
+  expect(output.stderr.toString()).toBe("rm: rm-full: Directory not empty\n");
+  expect(existsSync(join(root, "rm-empty"))).toBe(false);
+  expect(existsSync(join(root, "rm-full"))).toBe(true);
 });
 
 test("parser diagnostics preserve Bun's public syntax errors", () => {

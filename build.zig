@@ -106,41 +106,6 @@ fn jscVendorPlatformKey(target: std.Target) ?[]const u8 {
     };
 }
 
-fn rustTargetTriple(target: std.Target) ?[]const u8 {
-    return switch (target.os.tag) {
-        .macos => switch (target.cpu.arch) {
-            .aarch64 => "aarch64-apple-darwin",
-            .x86_64 => "x86_64-apple-darwin",
-            else => null,
-        },
-        .linux => switch (target.cpu.arch) {
-            .aarch64 => "aarch64-unknown-linux-gnu",
-            .x86_64 => "x86_64-unknown-linux-gnu",
-            else => null,
-        },
-        .windows => switch (target.cpu.arch) {
-            .x86_64 => "x86_64-pc-windows-msvc",
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn buildLolHtml(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
-    const triple = rustTargetTriple(target.result) orelse {
-        std.debug.print(
-            "error: no LOLHTML Rust target for {s}-{s}\n",
-            .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) },
-        );
-        std.process.exit(1);
-    };
-    const command = b.addSystemCommand(&.{"node"});
-    command.addFileArg(b.path("scripts/build-lolhtml.js"));
-    const output = command.addOutputFileArg(if (target.result.os.tag == .windows) "lolhtml.lib" else "liblolhtml.a");
-    command.addArg(triple);
-    return output;
-}
-
 fn embedRuntimeModules(b: *std.Build) std.Build.LazyPath {
     const command = b.addSystemCommand(&.{"node"});
     command.addFileArg(b.path("scripts/embed-runtime-modules.js"));
@@ -181,7 +146,21 @@ fn createCompilerModule(b: *std.Build, target: std.Build.ResolvedTarget, root_op
         .target = target,
         .optimize = optimize,
     });
+    const html_rewriter_root = "vendors/zig-html-rewriter/src/root.zig";
+    std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(html_rewriter_root), .{}) catch {
+        std.debug.print(
+            "error: zig-html-rewriter is not vendored; run `node scripts/setup-zig-html-rewriter.js` first\n",
+            .{},
+        );
+        std.process.exit(1);
+    };
+    const html_rewriter_module = b.createModule(.{
+        .root_source_file = b.path(html_rewriter_root),
+        .target = target,
+        .optimize = optimize,
+    });
     compiler_module.addImport("build_options", build_options_module);
+    compiler_module.addImport("html_rewriter", html_rewriter_module);
     const zlib_internal_module = b.createModule(.{
         .root_source_file = b.path(if (target.result.os.tag == .windows)
             "src/compiler/src/zlib_sys/win32.zig"
@@ -306,7 +285,7 @@ fn configureLibuv(step: *std.Build.Step.Compile, b: *std.Build) void {
     }
 }
 
-fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build.LazyPath) void {
+fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.rdynamic = true;
     // Static JSC uses indirectly referenced LLInt/JIT entry points that the
     // release linker otherwise discards, producing SIGBUS at runtime.
@@ -431,7 +410,6 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build, lolhtml: std.Build
             });
         }
     }
-    step.root_module.addObjectFile(lolhtml);
     step.root_module.addCSourceFile(.{
         .file = b.path("src/compiler/src/jsc/bindings/sqlite/sqlite3.c"),
         .flags = &[_][]const u8{
@@ -547,8 +525,8 @@ fn requireJscFile(b: *std.Build, vendor_dir: []const u8, relative_path: []const 
 pub fn build(b: *std.Build) void {
     // The Windows release is x86-64 MSVC even when the host is Windows ARM.
     // Make both the architecture and ABI explicit so Zig does not derive a
-    // native CPU model from the CI host. The vendored JSC, Rust static library,
-    // Visual Studio SDK, and vcpkg dependencies all use this same target.
+    // native CPU model from the CI host. The vendored JSC, Visual Studio SDK,
+    // and vcpkg dependencies all use this same target.
     const target = b.standardTargetOptions(.{
         .default_target = if (builtin.os.tag == .windows) .{
             .cpu_arch = .x86_64,
@@ -557,7 +535,11 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
-    const lolhtml = buildLolHtml(b, target);
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only compile Zig tests whose names match a filter",
+    ) orelse &[0][]const u8{};
     const runtime_modules_blob = embedRuntimeModules(b);
 
     const exe = b.addExecutable(.{
@@ -571,7 +553,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, optimize));
     exe.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
-    configureJsc(exe, b, lolhtml);
+    configureJsc(exe, b);
 
     b.installArtifact(exe);
 
@@ -584,7 +566,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run cottontail");
     run_step.dependOn(&run_cmd.step);
 
-    // Linking vendored JSC, ICU, SQLite, lol-html, and libuv into a Debug test
+    // Linking vendored JSC, ICU, SQLite, and libuv into a Debug test
     // executable exceeds the Linux CI runner's memory limit. ReleaseSafe keeps
     // runtime safety checks without the Debug link's memory-heavy metadata.
     const test_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseSafe else optimize;
@@ -594,11 +576,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = test_optimize,
         }),
+        .filters = test_filters,
     });
     unit_tests.root_module.addImport("cottontail_compiler", createCompilerModule(b, target, test_optimize));
     unit_tests.root_module.addAnonymousImport("runtime_modules_blob", .{ .root_source_file = runtime_modules_blob });
 
-    configureJsc(unit_tests, b, lolhtml);
+    configureJsc(unit_tests, b);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

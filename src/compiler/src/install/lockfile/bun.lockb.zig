@@ -11,7 +11,7 @@ const has_overrides_tag: u64 = @bitCast(@as([8]u8, "oVeRriDs".*));
 const has_catalogs_tag: u64 = @bitCast(@as([8]u8, "cAtAlOgS".*));
 const has_config_version_tag: u64 = @bitCast(@as([8]u8, "cNfGvRsN".*));
 
-pub fn save(this: *Lockfile, options: *const PackageManager.Options, bytes: *std.array_list.Managed(u8), total_size: *usize, end_pos: *usize) !void {
+pub fn save(this: *Lockfile, options: anytype, bytes: *std.Io.Writer.Allocating, total_size: *usize, end_pos: *usize) !void {
 
     // we clone packages with the z_allocator to make sure bytes are zeroed.
     // TODO: investigate if we still need this now that we have `padding_checker.zig`
@@ -19,19 +19,19 @@ pub fn save(this: *Lockfile, options: *const PackageManager.Options, bytes: *std
     this.packages = try this.packages.clone(z_allocator);
     old_packages_list.deinit(this.allocator);
 
-    var writer = bytes.writer();
+    const writer = &bytes.writer;
     try writer.writeAll(header_bytes);
     try writer.writeInt(u32, @intFromEnum(this.format), .little);
 
     try writer.writeAll(&this.meta_hash);
 
-    end_pos.* = bytes.items.len;
+    end_pos.* = bytes.written().len;
     try writer.writeInt(u64, 0, .little);
 
     const StreamType = struct {
-        bytes: *std.array_list.Managed(u8),
+        bytes: *std.Io.Writer.Allocating,
         pub inline fn getPos(s: @This()) anyerror!usize {
-            return s.bytes.items.len;
+            return s.bytes.written().len;
         }
 
         pub fn pwrite(
@@ -39,7 +39,7 @@ pub fn save(this: *Lockfile, options: *const PackageManager.Options, bytes: *std
             data: []const u8,
             index: usize,
         ) usize {
-            @memcpy(s.bytes.items[index..][0..data.len], data);
+            @memcpy(s.bytes.written()[index..][0..data.len], data);
             return data.len;
         }
     };
@@ -268,6 +268,25 @@ pub fn load(
     log: *logger.Log,
     manager: ?*PackageManager,
 ) !SerializerLoadResult {
+    return loadImpl(lockfile, stream, allocator, log, manager);
+}
+
+pub fn loadStandalone(
+    lockfile: *Lockfile,
+    stream: *Stream,
+    allocator: Allocator,
+    log: *logger.Log,
+) !SerializerLoadResult {
+    return loadImpl(lockfile, stream, allocator, log, null);
+}
+
+fn loadImpl(
+    lockfile: *Lockfile,
+    stream: *Stream,
+    allocator: Allocator,
+    log: *logger.Log,
+    manager: anytype,
+) !SerializerLoadResult {
     var res = SerializerLoadResult{};
     var reader = stream.reader();
     var header_buf_: [header_bytes.len]u8 = undefined;
@@ -315,13 +334,12 @@ pub fn load(
     res.packages_need_update = packages_load_result.needs_update;
     res.migrated_from_lockb_v2 = migrate_from_v2;
 
-    lockfile.buffers = try Lockfile.Buffers.load(
-        stream,
-        allocator,
-        log,
-        manager,
-    );
-    if ((try stream.reader().readInt(u64, .little)) != 0) {
+    lockfile.buffers = if (comptime @TypeOf(manager) == @TypeOf(null))
+        try Lockfile.Buffers.loadStandalone(stream, allocator, log)
+    else
+        try Lockfile.Buffers.load(stream, allocator, log, manager);
+    var trailing_reader = stream.reader();
+    if ((try trailing_reader.readInt(u64, .little)) != 0) {
         return error.@"Lockfile is malformed (expected 0 at the end)";
     }
 
@@ -460,12 +478,19 @@ pub fn load(
                     allocator,
                     std.ArrayListUnmanaged(Dependency.External),
                 );
-                const context: Dependency.Context = .{
-                    .allocator = allocator,
-                    .log = log,
-                    .buffer = lockfile.buffers.string_bytes.items,
-                    .package_manager = manager,
-                };
+                const context = if (comptime @TypeOf(manager) == @TypeOf(null))
+                    Dependency.StandaloneContext{
+                        .allocator = allocator,
+                        .log = log,
+                        .buffer = lockfile.buffers.string_bytes.items,
+                    }
+                else
+                    Dependency.Context{
+                        .allocator = allocator,
+                        .log = log,
+                        .buffer = lockfile.buffers.string_bytes.items,
+                        .package_manager = manager,
+                    };
                 for (overrides_name_hashes.items, override_versions_external.items) |name, value| {
                     map.putAssumeCapacity(name, Dependency.toDependency(value, context));
                 }
@@ -524,12 +549,19 @@ pub fn load(
 
                 try lockfile.catalogs.default.ensureTotalCapacity(allocator, default_deps.items.len);
 
-                const context: Dependency.Context = .{
-                    .allocator = allocator,
-                    .log = log,
-                    .buffer = lockfile.buffers.string_bytes.items,
-                    .package_manager = manager,
-                };
+                const context = if (comptime @TypeOf(manager) == @TypeOf(null))
+                    Dependency.StandaloneContext{
+                        .allocator = allocator,
+                        .log = log,
+                        .buffer = lockfile.buffers.string_bytes.items,
+                    }
+                else
+                    Dependency.Context{
+                        .allocator = allocator,
+                        .log = log,
+                        .buffer = lockfile.buffers.string_bytes.items,
+                        .package_manager = manager,
+                    };
 
                 for (default_dep_names.items, default_deps.items) |dep_name, dep| {
                     lockfile.catalogs.default.putAssumeCapacityContext(dep_name, Dependency.toDependency(dep, context), String.arrayHashContext(lockfile, null));

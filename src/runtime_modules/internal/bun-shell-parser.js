@@ -140,6 +140,30 @@ function operatorAt(source, index, atWordStart) {
   return null;
 }
 
+function isShellWhitespaceCode(code) {
+  return (code >= 0x09 && code <= 0x0d)
+    || code === 0x20
+    || code === 0xa0
+    || code === 0x1680
+    || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x2028
+    || code === 0x2029
+    || code === 0x202f
+    || code === 0x205f
+    || code === 0x3000
+    || code === 0xfeff;
+}
+
+function wordBoundaryAt(source, index) {
+  const code = source.charCodeAt(index);
+  if (isShellWhitespaceCode(code)) return true;
+  if (code === 0x3b || code === 0x7c || code === 0x28 || code === 0x29 || code === 0x3c || code === 0x3e || code === 0x26) {
+    return true;
+  }
+  if (code === 0x30) return source[index + 1] === "<" || source[index + 1] === ">";
+  return (code === 0x31 || code === 0x32) && source[index + 1] === ">";
+}
+
 export function lexShell(source) {
   source = String(source);
   const tokens = [];
@@ -170,7 +194,7 @@ export function lexShell(source) {
     const raw = [];
     while (index < source.length) {
       const current = source[index];
-      if (/\s/.test(current) || operatorAt(source, index, false)) break;
+      if (wordBoundaryAt(source, index)) break;
       if (current === "\\") {
         if (source[index + 1] === "\n") {
           index += 2;
@@ -283,7 +307,7 @@ export function lexShell(source) {
       const chunkStart = index;
       while (index < source.length) {
         const chunkCharacter = source[index];
-        if (/\s/.test(chunkCharacter) || operatorAt(source, index, false)) break;
+        if (wordBoundaryAt(source, index)) break;
         if (chunkCharacter === "\\" || chunkCharacter === "'" || chunkCharacter === '"' || chunkCharacter === "`") break;
         if (chunkCharacter === "$" && (source[index + 1] === "'" || source[index + 1] === "(")) break;
         index += 1;
@@ -477,7 +501,44 @@ class Parser {
   }
 }
 
+function terminalBareRedirect(source) {
+  let end = source.length;
+  while (end > 0 && isShellWhitespaceCode(source.charCodeAt(end - 1))) end -= 1;
+  if (end === 0 || (source[end - 1] !== ">" && source[end - 1] !== "<")) return -1;
+  if ("<>&012".includes(source[end - 2] ?? "") || source.includes("#") || source.includes("$(") || source.includes("`")) {
+    return -1;
+  }
+
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < end; index += 1) {
+    if (index === end - 1) return quote == null && !escaped ? index : -1;
+    const character = source[index];
+    if (quote === "'") {
+      if (character === "'") quote = null;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') quote = character;
+  }
+  return -1;
+}
+
 export function parseShell(source) {
+  source = String(source);
+  const redirect = terminalBareRedirect(source);
+  if (redirect >= 0) throw syntax("Redirection with no file", redirect);
   const parser = new Parser(lexShell(source));
   const script = parser.parse();
   if (parser.peek().type !== "eof") {

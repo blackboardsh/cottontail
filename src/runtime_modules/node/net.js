@@ -3,6 +3,7 @@ import { _wrapAsyncCallback } from "./async_hooks.js";
 
 const kConnectionCount = Symbol("connectionCount");
 const kSocketAddressState = new WeakMap();
+const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
 
 function makeNodeError(ErrorType, message, code, details = undefined) {
@@ -228,6 +229,8 @@ class SocketImpl extends EventEmitter {
     this._pendingWrites = [];
     this._outboundWrites = [];
     this._writeRetryTimer = null;
+    this._destroyCloseTimer = null;
+    this._destroyFinalize = null;
     this._drainQueued = false;
     this._ending = false;
     this._endEmitted = false;
@@ -355,15 +358,13 @@ class SocketImpl extends EventEmitter {
     this._applySocketOptions();
     if (emitConnect) {
       this.connecting = false;
-      queueMicrotask(() => {
-        if (this.destroyed) return;
-        this._flushPendingWrites();
-        this.emit("connect");
-        this._readyEmitted = true;
-        this.emit("ready");
-        this._startRead();
-        this._refreshTimeout();
-      });
+      if (this.destroyed) return this;
+      this._flushPendingWrites();
+      this._startRead();
+      this.emit("connect");
+      this._readyEmitted = true;
+      this.emit("ready");
+      this._refreshTimeout();
       return this;
     }
     if (!this._paused) this._startRead();
@@ -448,6 +449,17 @@ class SocketImpl extends EventEmitter {
     if (this._unregisterWatch) this._unregisterWatch();
     this._unregisterWatch = null;
     if (watchId) cottontail.fdWatchStop?.(watchId);
+  }
+
+  _finishDeferredDestroy() {
+    const finalize = this._destroyFinalize;
+    if (finalize == null) return;
+    this._destroyFinalize = null;
+    if (this._destroyCloseTimer != null) {
+      clearTimeout(this._destroyCloseTimer);
+      this._destroyCloseTimer = null;
+    }
+    finalize();
   }
 
   _detachFdForTls() {
@@ -654,7 +666,12 @@ class SocketImpl extends EventEmitter {
     if (!this._watchId) return this;
     const watchId = this._watchId;
     fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
-      if (this.destroyed) return;
+      if (this.destroyed) {
+        // A clean destroy keeps the watcher around briefly so this native read
+        // can drain data that raced with shutdown. Close as soon as it does.
+        if (this._destroyFinalize != null) this._finishDeferredDestroy();
+        return;
+      }
       if (event.type === "data") {
         if (this._onread) {
           this._deliverOnread(event.data ?? new ArrayBuffer(0));
@@ -706,13 +723,14 @@ class SocketImpl extends EventEmitter {
     if (signal == null || typeof signal !== "object" || this._abortSignal === signal) return;
     if (typeof signal.addEventListener !== "function") return;
     this._abortSignal = signal;
+    const abortReason = () => signal.reason !== undefined ? signal.reason : (() => {
+      const err = new Error("The operation was aborted");
+      err.name = "AbortError";
+      err.code = "ABORT_ERR";
+      return err;
+    })();
     const abort = () => {
-      const reason = signal.reason !== undefined ? signal.reason : (() => {
-        const err = new Error("The operation was aborted");
-        err.name = "AbortError";
-        err.code = "ABORT_ERR";
-        return err;
-      })();
+      const reason = abortReason();
       this._abortReason = reason;
       if (!this.destroyed) {
         this.destroy(reason != null && typeof reason === "object" ? reason : new Error(String(reason)));
@@ -720,7 +738,13 @@ class SocketImpl extends EventEmitter {
     };
     if (signal.aborted) {
       // Node destroys asynchronously so callers can attach "error" listeners.
-      setTimeout(abort, 0);
+      this._abortReason = abortReason();
+      setTimeout(() => {
+        if (!this.destroyed) {
+          const reason = this._abortReason;
+          this.destroy(reason != null && typeof reason === "object" ? reason : new Error(String(reason)));
+        }
+      }, 0);
       return;
     }
     const onAbort = () => abort();
@@ -977,6 +1001,7 @@ class SocketImpl extends EventEmitter {
         throw outOfRange("options.autoSelectFamilyAttemptTimeout", ">= 1", options.autoSelectFamilyAttemptTimeout);
       }
     }
+    this._finishDeferredDestroy();
     this._cancelConnectAttempts();
     const port = options.path == null && options.fd === undefined ? validatePort(options.port) : undefined;
     if (callback) this.once("connect", callback);
@@ -1008,45 +1033,55 @@ class SocketImpl extends EventEmitter {
       this._hadError = false;
       this._readyEmitted = false;
     }
-    // Use a macrotask: connect errors emitted from swallowed microtask
-    // exceptions would not crash the process, and Node never connects
-    // synchronously either.
-    setTimeout(() => {
-      if (this.destroyed) return;
-      let host = options.host ?? "localhost";
-      this._host = String(host);
-      this._port = port;
-      try {
-        if (options.fd !== undefined) {
-          this._attachFd(Number(options.fd), options.local, options.remote, true);
-          return;
-        }
-        if (options.path != null) {
-          const result = cottontail.unixSocketConnect(String(options.path));
-          this._isPipe = true;
-          this._path = options.path;
-          this._attachFd(result.fd, result.local, result.remote, true);
-          return;
-        }
-        // Connecting to a wildcard address targets the corresponding loopback.
-        if (host === "0.0.0.0") host = "127.0.0.1";
-        else if (host === "::") host = "::1";
-        this._resolveConnectAddresses(String(host), options, (error, addresses) => {
-          if (this.destroyed || !this.connecting) return;
-          if (error) {
-            this.connecting = false;
-            this.destroy(connectionException(error, options, host, port));
-            return;
-          }
-          this._attemptConnectAddresses(options, String(host), port, addresses);
-        });
-      } catch (rawError) {
+    if (this._abortReason !== undefined) return this;
+    let host = options.host ?? "localhost";
+    this._host = String(host);
+    this._port = port;
+    const failConnect = (rawError) => {
+      const error = connectionException(rawError, options, host, port);
+      queueMicrotask(() => {
+        if (this.destroyed || !this.connecting || this._abortReason !== undefined) return;
         this.connecting = false;
-        if (this.destroyed) return;
-        if (this._abortReason !== undefined) return;
-        this.destroy(connectionException(rawError, options, host, port));
+        this.destroy(error);
+      });
+    };
+    const attachConnected = (result) => {
+      queueMicrotask(() => {
+        if (this.destroyed || !this.connecting) {
+          if (result?.fd != null && options.fd === undefined) {
+            try { cottontail.closeFd?.(result.fd); } catch {}
+          }
+          return;
+        }
+        this._attachFd(result.fd, result.local, result.remote, true);
+      });
+    };
+    try {
+      if (options.fd !== undefined) {
+        attachConnected({ fd: Number(options.fd), local: options.local, remote: options.remote });
+        return this;
       }
-    }, 0);
+      if (options.path != null) {
+        const result = cottontail.unixSocketConnect(String(options.path));
+        this._isPipe = true;
+        this._path = options.path;
+        attachConnected(result);
+        return this;
+      }
+      // Connecting to a wildcard address targets the corresponding loopback.
+      if (host === "0.0.0.0") host = "127.0.0.1";
+      else if (host === "::") host = "::1";
+      this._resolveConnectAddresses(String(host), options, (error, addresses) => {
+        if (this.destroyed || !this.connecting) return;
+        if (error) {
+          failConnect(error);
+          return;
+        }
+        this._attemptConnectAddresses(options, String(host), port, addresses);
+      });
+    } catch (rawError) {
+      failConnect(rawError);
+    }
     return this;
   }
 
@@ -1144,7 +1179,6 @@ class SocketImpl extends EventEmitter {
     this.writable = false;
     this._hadError = Boolean(error);
     this._clearTimeoutTimer();
-    this._stopRead();
     this._flushPendingWrites(error ?? new Error("Socket is closed"));
     if (this._writeRetryTimer != null) {
       clearTimeout(this._writeRetryTimer);
@@ -1155,14 +1189,43 @@ class SocketImpl extends EventEmitter {
       if (typeof entry.callback === "function") queueMicrotask(() => entry.callback(writeError));
     }
     this.writableLength = 0;
-    if (this.fd != null) {
-      try { cottontail.closeFd?.(this.fd); } catch {}
-      this.fd = null;
-    }
-    if (error) this.emit("error", error);
-    if (!this._closeEmitted) {
-      this._closeEmitted = true;
-      this.emit("close", Boolean(error));
+    const fd = this.fd;
+    this.fd = null;
+    const emitClose = () => {
+      this._stopRead();
+      if (fd != null) {
+        try { cottontail.closeFd?.(fd); } catch {}
+      }
+      if (!this._closeEmitted) {
+        this._closeEmitted = true;
+        this.emit("close", Boolean(error));
+      }
+    };
+    if (error) {
+      this._stopRead();
+      if (fd != null) {
+        try { cottontail.closeFd?.(fd); } catch {}
+      }
+      this.emit("error", error);
+      if (!this._closeEmitted) {
+        this._closeEmitted = true;
+        this.emit("close", true);
+      }
+    } else if (fd != null && this._watchId) {
+      // Keep the read watcher alive for one poll turn after SHUT_WR. This lets
+      // the kernel consume data that raced with destroy(), avoiding an
+      // artificial RST for an otherwise graceful Node socket close.
+      try { cottontail.tcpSocketShutdown?.(fd); } catch {}
+      this._destroyFinalize = emitClose;
+      this._destroyCloseTimer = setTimeout(() => {
+        this._destroyCloseTimer = null;
+        const finalize = this._destroyFinalize;
+        this._destroyFinalize = null;
+        finalize?.();
+      }, 10);
+      if (!this._refed) this._destroyCloseTimer.unref?.();
+    } else {
+      emitClose();
     }
     return this;
   }
@@ -1280,6 +1343,14 @@ class SocketImpl extends EventEmitter {
     if (this.readable) return "readOnly";
     if (this.writable) return "writeOnly";
     return "closed";
+  }
+
+  [ensureAsyncDisposeSymbol()]() {
+    if (this._closeEmitted) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.once("close", resolve);
+      this.destroy();
+    });
   }
 
   async *[Symbol.asyncIterator]() {
@@ -1926,7 +1997,15 @@ export class SocketAddress {
     const flowlabel = options.flowlabel === undefined ? 0 : options.flowlabel;
     if (typeof flowlabel !== "number") throw invalidArgType("options.flowlabel", "of type number", flowlabel);
     if (!Number.isInteger(flowlabel) || flowlabel < 0 || flowlabel > 0xffffffff) throw outOfRange("options.flowlabel", ">= 0 && <= 4294967295", flowlabel);
-    kSocketAddressState.set(this, { ...record, address, port, flowlabel: family === "ipv6" ? flowlabel : 0 });
+    const state = { ...record, address, port, flowlabel: family === "ipv6" ? flowlabel : 0 };
+    const socketAddress = new Proxy(this, {
+      set(target, property, value, receiver) {
+        if (kSocketAddressReadonlyProperties.has(property)) throw new TypeError(`Cannot assign to read only property '${String(property)}'`);
+        return Reflect.set(target, property, value, receiver);
+      },
+    });
+    kSocketAddressState.set(socketAddress, state);
+    return socketAddress;
   }
 
   static isSocketAddress(value) {

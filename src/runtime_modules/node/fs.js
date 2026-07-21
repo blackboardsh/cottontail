@@ -250,6 +250,17 @@ function makeBuffer(arrayBufferOrView) {
 function bytesFromData(data, encoding = "utf8") {
   if (data == null) return new Uint8Array(0);
   if (typeof data === "string") {
+    if (String(encoding).toLowerCase() === "hex") {
+      const bytes = new Uint8Array(Math.floor(data.length / 2));
+      let length = 0;
+      for (let index = 0; index + 1 < data.length; index += 2) {
+        const high = Number.parseInt(data[index], 16);
+        const low = Number.parseInt(data[index + 1], 16);
+        if (!Number.isFinite(high) || !Number.isFinite(low)) break;
+        bytes[length++] = (high << 4) | low;
+      }
+      return bytes.subarray(0, length);
+    }
     if (globalThis.Buffer?.from) return globalThis.Buffer.from(data, encoding);
     return encoder.encode(data);
   }
@@ -1047,7 +1058,13 @@ export function unlinkSync(path) {
   try {
     cottontail.unlinkSync(normalizedPath);
   } catch (error) {
-    throw makeFsError(error, normalizedPath, "unlink");
+    const out = makeFsError(error, normalizedPath, "unlink");
+    if (out.code === "EISDIR" && globalThis.process?.platform !== "linux") {
+      out.code = "EPERM";
+      out.errno = -(Number(constantsObject.EPERM) || 1);
+      out.message = `EPERM: operation not permitted, unlink '${normalizedPath}'`;
+    }
+    throw out;
   }
 }
 

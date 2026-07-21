@@ -197,6 +197,13 @@ function getPromiseDetails(promise) {
 function getProxyDetails(proxy, fullProxy = true) {
   const details = proxyDetails.get(proxy);
   if (details === undefined) return undefined;
+  // The runtime installs a Proxy around Date to provide V8-compatible date
+  // parsing. It is an implementation detail, not a user-observable proxy.
+  if (proxy === globalThis.Date &&
+      typeof details.target === "function" &&
+      details.target.name === "Date") {
+    return undefined;
+  }
   if (details.revoked) return fullProxy !== false ? [null, null] : null;
   return fullProxy !== false ? [details.target, details.handler] : details.target;
 }
@@ -263,20 +270,44 @@ const privateSymbols = new Proxy({}, {
 
 function parseEnvNative(content) {
   const result = {};
-  for (const rawLine of String(content).split(/\r?\n/)) {
+  const lines = String(content).split(/\r\n|\n|\r/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
     let line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
-    if (line.startsWith("export ")) line = line.slice(7).trim();
+    if (/^export\s/.test(line)) line = line.replace(/^export\s+/, "");
     const eq = line.indexOf("=");
     if (eq < 0) continue;
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
-    if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")) || (value.startsWith("`") && value.endsWith("`")))) {
+    if (value.startsWith("\"") || value.startsWith("'") || value.startsWith("`")) {
       const quote = value[0];
-      value = value.slice(1, -1);
-      if (quote === "\"") value = value.replace(/\\n/g, "\n");
+      const sameLineEnd = value.indexOf(quote, 1);
+      let closed = false;
+      if (sameLineEnd !== -1) {
+        value = value.slice(1, sameLineEnd);
+        closed = true;
+      } else {
+        const parts = [value.slice(1)];
+        let closingLine = -1;
+        for (let next = index + 1; next < lines.length; next += 1) {
+          const end = lines[next].indexOf(quote);
+          if (end !== -1) {
+            parts.push(lines[next].slice(0, end));
+            closingLine = next;
+            break;
+          }
+          parts.push(lines[next]);
+        }
+        if (closingLine !== -1) {
+          value = parts.join("\n");
+          index = closingLine;
+          closed = true;
+        }
+      }
+      if (quote === "\"" && closed) value = value.replace(/\\n/g, "\n");
     } else {
-      const hash = value.indexOf(" #");
+      const hash = value.indexOf("#");
       if (hash !== -1) value = value.slice(0, hash).trim();
     }
     if (key) result[key] = value;
@@ -286,9 +317,13 @@ function parseEnvNative(content) {
 
 function nativeGetCallSites(frameCount = 10) {
   const limitBefore = Error.stackTraceLimit;
-  Error.stackTraceLimit = frameCount + 16;
-  const stack = String(new Error().stack ?? "");
-  Error.stackTraceLimit = limitBefore;
+  let stack;
+  try {
+    Error.stackTraceLimit = frameCount + 16;
+    stack = String(new Error().stack ?? "");
+  } finally {
+    Error.stackTraceLimit = limitBefore;
+  }
   const lines = stack.split("\n").filter((line) => /:\d+:\d+\)?$|native code/.test(line));
   const sites = [];
   for (const line of lines) {
@@ -296,16 +331,21 @@ function nativeGetCallSites(frameCount = 10) {
     let match = text.match(/^(.*?)\s*\((.*):(\d+):(\d+)\)$/) || text.match(/^()(.+):(\d+):(\d+)$/);
     if (!match) match = text.match(/^(?:(.*?)@)?(.*):(\d+):(\d+)$/);
     if (!match) continue;
-    const scriptName = match[2] ?? "";
-    // Skip frames belonging to this loader / util internals.
-    sites.push({
-      functionName: match[1] ?? "",
+    let scriptName = match[2] ?? "";
+    const functionName = match[1] ?? "";
+    if (functionName === "nativeGetCallSites" || functionName === "getCallSites" ||
+        /[/\\]node[/\\]util[/\\]internal[/\\](?:loader\.js|vendor[/\\]util\.js)$/.test(scriptName)) {
+      continue;
+    }
+    if (/(?:^|[/\\])\[eval\]$/.test(scriptName)) scriptName = "[eval]";
+    sites.push(Object.assign(Object.create(null), {
+      functionName,
       scriptId: "0",
       scriptName,
       lineNumber: Number(match[3] ?? 0),
       column: Number(match[4] ?? 0),
       columnNumber: Number(match[4] ?? 0),
-    });
+    }));
   }
   return sites.slice(0, frameCount);
 }
@@ -730,16 +770,33 @@ function makeCallableEventEmitter() {
 }
 
 function staticEventsOn(emitter, event, options = {}) {
+  if (options === null || typeof options !== "object") {
+    const { codes } = internalRequire("internal/errors");
+    throw new codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+  }
   const signal = options?.signal;
-  if (signal?.aborted) throw signal.reason ?? new Error("The operation was aborted");
+  const { AbortError, codes } = internalRequire("internal/errors");
+  if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+    throw new codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+  }
+  if (signal?.aborted) throw new AbortError(undefined, { cause: signal.reason });
   const kFirstEventParam = internalRequire("internal/events/symbols").kFirstEventParam;
   const firstParamOnly = Boolean(options?.[kFirstEventParam]);
   const closeEvents = options?.close ?? [];
+  const highWaterMark = options?.highWaterMark ?? options?.highWatermark ?? Number.MAX_SAFE_INTEGER;
+  const lowWaterMark = options?.lowWaterMark ?? options?.lowWatermark ?? 1;
+  if (!Number.isInteger(highWaterMark) || highWaterMark < 1) {
+    throw new codes.ERR_OUT_OF_RANGE("options.highWaterMark", ">= 1", highWaterMark);
+  }
+  if (!Number.isInteger(lowWaterMark) || lowWaterMark < 1) {
+    throw new codes.ERR_OUT_OF_RANGE("options.lowWaterMark", ">= 1", lowWaterMark);
+  }
 
   const unconsumed = [];
   const pending = [];
   let finished = false;
   let failure = null;
+  let paused = false;
 
   const settleDone = () => {
     while (pending.length > 0) {
@@ -751,10 +808,17 @@ function staticEventsOn(emitter, event, options = {}) {
   const eventHandler = (...args) => {
     const value = firstParamOnly ? args[0] : args;
     if (pending.length > 0) pending.shift().resolve({ value, done: false });
-    else unconsumed.push(value);
+    else {
+      unconsumed.push(value);
+      if (!paused && unconsumed.length > highWaterMark) {
+        paused = true;
+        emitter.pause();
+      }
+    }
   };
   const errorHandler = (err) => {
-    failure = err;
+    if (pending.length > 0) pending.shift().reject(err);
+    else failure = err;
     finished = true;
     cleanup();
     settleDone();
@@ -765,7 +829,7 @@ function staticEventsOn(emitter, event, options = {}) {
     settleDone();
   };
   const abortHandler = () => {
-    errorHandler(signal.reason ?? new Error("The operation was aborted"));
+    errorHandler(new AbortError(undefined, { cause: signal.reason }));
   };
 
   function cleanup() {
@@ -782,7 +846,14 @@ function staticEventsOn(emitter, event, options = {}) {
 
   return {
     next() {
-      if (unconsumed.length > 0) return Promise.resolve({ value: unconsumed.shift(), done: false });
+      if (unconsumed.length > 0) {
+        const value = unconsumed.shift();
+        if (paused && unconsumed.length < lowWaterMark) {
+          paused = false;
+          emitter.resume();
+        }
+        return Promise.resolve({ value, done: false });
+      }
       if (failure !== null) {
         const err = failure;
         failure = null;
@@ -798,13 +869,19 @@ function staticEventsOn(emitter, event, options = {}) {
       return Promise.resolve({ value: undefined, done: true });
     },
     throw(err) {
-      finished = true;
-      cleanup();
-      settleDone();
-      return Promise.reject(err);
+      if (!(err instanceof Error)) {
+        throw new codes.ERR_INVALID_ARG_TYPE("EventEmitter.AsyncIterator", "Error", err);
+      }
+      errorHandler(err);
     },
     [Symbol.asyncIterator]() {
       return this;
+    },
+    [Symbol.for("nodejs.watermarkData")]: {
+      get size() { return unconsumed.length; },
+      get low() { return lowWaterMark; },
+      get high() { return highWaterMark; },
+      get isPaused() { return paused; },
     },
   };
 }

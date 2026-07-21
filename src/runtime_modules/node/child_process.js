@@ -4,6 +4,10 @@ import { deserialize, serialize } from "./v8.js";
 import { Server as NetServer, Socket as NetSocket } from "./net.js";
 import { Readable as ReadableStreamClass, Writable as WritableStreamClass } from "./stream.js";
 import { accessSync, statSync, writeSync, constants as fsConstants } from "./fs.js";
+import { isAbsolute as pathIsAbsolute, resolve as pathResolve } from "./path.js";
+
+const Promise = globalThis.Promise;
+const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 
 export class ChildProcess extends EventEmitter {
   constructor() {
@@ -235,10 +239,10 @@ function checkExecSyncResult(result, args = undefined, command = undefined) {
   return error;
 }
 
-// Classify one spawnSync stdout/stderr stdio entry. Arbitrary descriptors and
+// Classify one spawnSync stdio entry. Arbitrary descriptors and
 // stream objects still need capture-and-forward; pipe/inherit/ignore are sent
 // directly to the native per-fd spawner.
-function classifySyncOutputStdio(value, parentFd) {
+function classifySyncStdio(value, parentFd) {
   if (value === undefined || value === null || value === "pipe" || value === "overlapped") {
     return { capture: true };
   }
@@ -254,7 +258,7 @@ function classifySyncOutputStdio(value, parentFd) {
   return { capture: true };
 }
 
-function nativeSyncOutputMode(target, parentFd) {
+function nativeSyncStdioMode(target, parentFd) {
   if (target.capture) return "pipe";
   if (target.targetFd === parentFd) return "inherit";
   if (target.targetFd != null || target.targetStream) return "pipe";
@@ -284,8 +288,9 @@ export function spawnSync(file, args = [], options = {}) {
     : typeof stdioOption === "string"
       ? [stdioOption, stdioOption, stdioOption]
       : [];
-  const stdoutTarget = classifySyncOutputStdio(stdioArray[1], 1);
-  const stderrTarget = classifySyncOutputStdio(stdioArray[2], 2);
+  const stdinTarget = classifySyncStdio(stdioArray[0], 0);
+  const stdoutTarget = classifySyncStdio(stdioArray[1], 1);
+  const stderrTarget = classifySyncStdio(stdioArray[2], 2);
   const input = prepareSyncInput(normalized.options.input, normalized.options.encoding);
   const timeout = validateSyncTimeout(normalized.options.timeout);
   const maxBuffer = validateSyncMaxBuffer(normalized.options.maxBuffer ?? DEFAULT_SYNC_MAX_BUFFER);
@@ -293,9 +298,9 @@ export function spawnSync(file, args = [], options = {}) {
   let result;
   try {
     result = cottontail.spawnSync(command.file, command.args, {
-      stdin: input != null ? "pipe" : (stdioArray[0] ?? "pipe"),
-      stdout: nativeSyncOutputMode(stdoutTarget, 1),
-      stderr: nativeSyncOutputMode(stderrTarget, 2),
+      stdin: input != null ? "pipe" : nativeSyncStdioMode(stdinTarget, 0),
+      stdout: nativeSyncStdioMode(stdoutTarget, 1),
+      stderr: nativeSyncStdioMode(stderrTarget, 2),
       cwd: normalizeCwdOption(normalized.options.cwd),
       env: nativeOptions.env,
       clearEnv: nativeOptions.clearEnv,
@@ -415,7 +420,17 @@ function normalizeSpawnArgs(args, options) {
 }
 
 function normalizeSpawnCommand(file, args = [], options = {}) {
-  if (!options.shell) return { file: String(file), args: Array.from(args ?? [], String) };
+  if (!options.shell) {
+    const text = String(file);
+    const cwd = normalizeCwdOption(options.cwd);
+    const hasPathSeparator = cottontail.platform() === "win32"
+      ? text.includes("/") || text.includes("\\")
+      : text.includes("/");
+    const resolvedFile = cwd != null && hasPathSeparator && !pathIsAbsolute(text)
+      ? pathResolve(cwd, text)
+      : text;
+    return { file: resolvedFile, args: Array.from(args ?? [], String) };
+  }
   const argList = Array.from(args ?? [], String);
   // Node joins file and args verbatim (no quoting) when a shell is requested.
   const command = argList.length === 0
@@ -477,7 +492,11 @@ function normalizeStdio(value, fallback) {
 // spawn syscall's checks for direct paths before handing off to the native
 // spawner.
 function spawnPreflightError(resolvedFile, spawnargs, originalFile) {
-  if (!String(resolvedFile).includes("/")) return null;
+  const text = String(resolvedFile);
+  const hasPathSeparator = cottontail.platform() === "win32"
+    ? text.includes("/") || text.includes("\\")
+    : text.includes("/");
+  if (!hasPathSeparator) return null;
   const makeError = (code, errno) => {
     const error = new Error(`spawn ${originalFile} ${code}`);
     error.code = code;
@@ -554,9 +573,10 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   stdoutMode = normalizeStdio(options.stdout, stdoutMode);
   stderrMode = normalizeStdio(options.stderr, stderrMode);
   const ipcRequested = options.ipc === true || (Array.isArray(options.stdio) && options.stdio.some((item) => item === "ipc"));
+  const nodeIpcProtocol = options.__nodeIpcProtocol === true;
 
   const nativeOptions = prepareNativeOptions(command.file, options);
-  const deferStart = command.file === globalThis.process?.execPath;
+  const deferStart = command.file === globalThis.process?.execPath || options.__deferStart === true;
   let native = { id: -1, pid: 0, ipcFd: null };
   let startReleased = !deferStart;
 
@@ -598,6 +618,7 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
     fd,
     _encoding: null,
     _readableBuffer: [],
+    readableEnded: false,
     destroyed: false,
     writableEnded: false,
     writableFinished: false,
@@ -608,6 +629,76 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       if (chunks.length === 1) return chunks[0];
       if (typeof chunks[0] === "string") return chunks.join("");
       return Buffer.concat(chunks);
+    },
+    [Symbol.asyncIterator]() {
+      const stream = this;
+      const chunks = stream._readableBuffer.splice(0);
+      let ended = stream.readableEnded || stream.destroyed;
+      let failure = null;
+      let pending = null;
+
+      const cleanup = () => {
+        stream.off("data", onData);
+        stream.off("end", onEnd);
+        stream.off("close", onClose);
+        stream.off("error", onError);
+      };
+      const settle = () => {
+        if (pending == null) return;
+        const { resolve, reject } = pending;
+        pending = null;
+        if (chunks.length > 0) resolve({ value: chunks.shift(), done: false });
+        else if (failure != null) reject(failure);
+        else if (ended) resolve({ value: undefined, done: true });
+      };
+      const onData = (chunk) => {
+        chunks.push(chunk);
+        settle();
+      };
+      const onEnd = () => {
+        ended = true;
+        cleanup();
+        settle();
+      };
+      const onClose = () => {
+        ended = true;
+        cleanup();
+        settle();
+      };
+      const onError = (error) => {
+        failure = error;
+        ended = true;
+        cleanup();
+        settle();
+      };
+
+      if (!ended) {
+        stream.on("data", onData);
+        stream.on("end", onEnd);
+        stream.on("close", onClose);
+        stream.on("error", onError);
+      }
+
+      return {
+        next() {
+          if (chunks.length > 0) return Promise.resolve({ value: chunks.shift(), done: false });
+          if (failure != null) return Promise.reject(failure);
+          if (ended) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve, reject) => {
+            pending = { resolve, reject };
+          });
+        },
+        return() {
+          ended = true;
+          chunks.length = 0;
+          cleanup();
+          settle();
+          return Promise.resolve({ value: undefined, done: true });
+        },
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      };
     },
     writableHighWaterMark: Number(options.highWaterMark || 16 * 1024),
     writableLength: 0,
@@ -830,11 +921,13 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
       // listener has been unregistered.
       setTimeout(() => {
         if (child.stdout) {
+          child.stdout.readableEnded = true;
           child.stdout.destroyed = true;
           emitFrom(stdoutListeners, "end");
           emitFrom(stdoutListeners, "close");
         }
         if (child.stderr) {
+          child.stderr.readableEnded = true;
           child.stderr.destroyed = true;
           emitFrom(stderrListeners, "end");
           emitFrom(stderrListeners, "close");
@@ -853,7 +946,7 @@ function spawnInternal(file, args = [], options = {}, target = undefined) {
   });
 
   if (ipcRequested && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {
-    installParentIpcChannel(child, options.serialization);
+    installParentIpcChannel(child, options.serialization, nodeIpcProtocol);
   }
 
   if (preflightError) {
@@ -1262,7 +1355,7 @@ function emitChildProcessError(child, error) {
   });
 }
 
-function installParentIpcChannel(child, serialization = undefined) {
+function installParentIpcChannel(child, serialization = undefined, nodeProtocol = false) {
   child.connected = true;
   child.serialization = serialization === "advanced" ? "advanced" : "json";
   const channel = {
@@ -1295,11 +1388,16 @@ function installParentIpcChannel(child, serialization = undefined) {
         child._ipcBuffer = child._ipcBuffer.slice(newlineIndex + 1);
         const frameFd = nativeIpcPendingFd;
         nativeIpcPendingFd = undefined;
-        if (!line.startsWith(ipcPrefix)) {
+        let frame;
+        if (line.startsWith(ipcPrefix)) {
+          frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
+        } else if (nodeProtocol && line.trim() !== "") {
+          frame = { message: JSON.parse(line), handle: undefined };
+          if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
+        } else {
           if (Number.isInteger(frameFd) && frameFd >= 0) cottontail.closeFd?.(frameFd);
           continue;
         }
-        const frame = decodeNativeIpcPayload(line.slice(ipcPrefix.length), frameFd);
         if (frame != null) emitChildMessage(child, frame.message, "message", frame.handle);
       }
     } catch (error) {
@@ -1333,8 +1431,16 @@ function installParentIpcChannel(child, serialization = undefined) {
     }
     let ok = false;
     try {
-      ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
-        sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
+      if (nodeProtocol) {
+        if (normalizedSend.sendHandle != null) {
+          throw new Error("IPC handle passing to external runtimes is not available");
+        }
+        ok = cottontail.ipcSend?.(Number(child._ipcFd), `${JSON.stringify(message)}\n`, -1) === true;
+        if (sendCallback) queueMicrotask(() => sendCallback(ok ? null : new Error("write failed")));
+      } else {
+        ok = writeNativeIpc(child._ipcFd, message, child.serialization, normalizedSend.sendHandle,
+          sendCallback ? () => sendCallback(ok ? null : new Error("write failed")) : undefined);
+      }
     } catch (error) {
       if (sendCallback) queueMicrotask(() => sendCallback(error));
       else emitChildProcessError(child, error);
@@ -1372,19 +1478,34 @@ export function fork(modulePath, args = [], options = {}) {
     throw invalidArgTypeError("options", "object", options);
   }
 
+  if (options.execPath != null && typeof options.execPath !== "string") {
+    throw invalidArgTypeError("options.execPath", "string", options.execPath);
+  }
+  const execPath = options.execPath ?? process.execPath;
+  const nodeIpcProtocol = execPath !== process.execPath;
+  const serialization = options.serialization === "advanced" ? "advanced" : "json";
+
   const env = withoutElectrobunHostEnv({
     ...process.env,
     ...(options.env ?? {}),
     COTTONTAIL_IPC_STDIO: "1",
     COTTONTAIL_IPC_BOOTSTRAP: "node",
-    COTTONTAIL_IPC_SERIALIZATION: options.serialization === "advanced" ? "advanced" : "json",
+    COTTONTAIL_IPC_SERIALIZATION: serialization,
+    ...(nodeIpcProtocol ? {
+      NODE_CHANNEL_FD: "3",
+      NODE_CHANNEL_SERIALIZATION_MODE: serialization,
+    } : {}),
   });
   const execArgv = Array.from(options.execArgv ?? process.execArgv ?? [], String);
-  const child = spawn(process.execPath, [...execArgv, String(modulePath), ...Array.from(args ?? [], String)], {
+  const child = spawn(execPath, [...execArgv, String(modulePath), ...Array.from(args ?? [], String)], {
     ...options,
     env,
     ipc: true,
     stdio: ["pipe", "pipe", options.silent ? "pipe" : "inherit"],
+    // The native start gate is a private Cottontail CLI argument. External
+    // runtimes cannot consume it, and their fd 3 IPC channel is ready at exec.
+    __deferStart: !nodeIpcProtocol,
+    __nodeIpcProtocol: nodeIpcProtocol,
   });
 
   if (typeof child.send === "function" && Number.isInteger(child._ipcFd) && child._ipcFd >= 0) {

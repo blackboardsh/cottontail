@@ -22,16 +22,12 @@ const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
-const bunSnapshotArtifactNames = new Set([
-  'app',
-  'app.exe',
-  'app.map',
-  'entry',
-  'entry.map',
-  'nosourcemap_entry',
-  'a.txt',
-  'b.txt',
-  'append_output.txt',
+const bunSnapshotSourceNames = new Set([
+  'LICENSE.md',
+  'manifest.json',
+  'src',
+  'status.json',
+  'test',
 ]);
 
 function removeTemp(path) {
@@ -52,14 +48,10 @@ function removeSnapshotArtifacts(snapshotRoot, runtime) {
         name === '.cottontail-compile-cache' ||
         name.startsWith('.cottontail-eval-') ||
         name.startsWith('.cottontail-compat-') ||
+        name === '.verdaccio-db.json' ||
         name.startsWith('fstest') ||
         /^Heap\.\d+\.heapsnapshot$/.test(name) ||
-        (current === snapshotRoot && runtime === 'bun' && (
-          bunSnapshotArtifactNames.has(name) ||
-          /^chunk-[^.]+\.js\.map$/u.test(name) ||
-          name === 'myapp.db' ||
-          /^test.*file\.db$/u.test(name)
-        ));
+        (current === snapshotRoot && runtime === 'bun' && !bunSnapshotSourceNames.has(name));
       if (generated) {
         try { rmSync(path, { recursive: true, force: true }); } catch {}
         continue;
@@ -115,7 +107,7 @@ function usage() {
     '  --include-expected-failures  Run tests marked expected-failure and require them to fail.',
     '  --case <regexp>              Select generated itBundled case IDs within a split file.',
     '  --jobs <n>                   Run independent Bun files/cases concurrently (default: up to 4).',
-    '  --list                       Print status counts without running tests.',
+    '  --list                       Print status counts and any filtered selection without running tests.',
     '  --max-failures <n>           Stop after this many unexpected results.',
     '  --max-tests <n>              Run at most this many selected tests.',
     '  --match <regexp>             Select tests whose relative path matches.',
@@ -336,12 +328,13 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
     }];
   }
   let entries;
+  const includeExpectedFailures = options.includeExpectedFailures || options.onlyStatus === 'expected-failure';
   if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
     entries = discoverRunnableFiles(snapshotRoot, runtime)
       .map((path) => statusEntryForPath(status, path, status.defaultStatus === 'enabled' ? 'enabled' : 'not-enabled'))
       .filter((entry) =>
         entry.status === 'enabled' ||
-        (options.includeExpectedFailures && entry.status === 'expected-failure') ||
+        (includeExpectedFailures && entry.status === 'expected-failure') ||
         (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
       );
   } else {
@@ -349,7 +342,7 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
       .map(([path, entry]) => ({ path, ...entry }))
       .filter((entry) =>
         entry.status === 'enabled' ||
-        (options.includeExpectedFailures && entry.status === 'expected-failure') ||
+        (includeExpectedFailures && entry.status === 'expected-failure') ||
         (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
       );
   }
@@ -808,7 +801,14 @@ for (const name of runtimeTargets(runtime, targets)) {
   console.log(`  expected-failure: ${counts.expectedFailure}`);
   console.log(`  disabled: ${counts.disabled}`);
   console.log(`  not-enabled: ${counts.notEnabled} (unclassified runnable files)`);
-  if (options.list) continue;
+  if (options.list) {
+    if (options.test || options.match || options.onlyStatus) {
+      const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
+      console.log(`  selected: ${entries.length}`);
+      for (const entry of entries) console.log(`    ${entry.status}\t${entry.path}`);
+    }
+    continue;
+  }
 
   const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
   const results = name === 'node'

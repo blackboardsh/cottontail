@@ -175,6 +175,187 @@ export class AsyncResource {
   }
 }
 
+function napiAsyncContextResource(context, nativeResource = undefined) {
+  if (context.nativeWeakResource) {
+    if (nativeResource !== undefined) return nativeResource;
+    context.nativeWeakResource = false;
+    context.externallyManaged = false;
+    context.resource = {};
+    return context.resource;
+  }
+  if (!context.externallyManaged) return context.resource;
+  const resource = context.resourceRef?.deref();
+  if (resource !== undefined) return resource;
+  context.externallyManaged = false;
+  context.resourceRef = null;
+  context.resource = {};
+  return context.resource;
+}
+
+function napiAsyncInit(resource, type, nativeWeakResource = false) {
+  const externallyManaged = resource !== undefined && resource !== null;
+  const resourceObject = externallyManaged ? Object(resource) : {};
+  const context = {
+    asyncId: ++nextAsyncId,
+    destroyed: false,
+    externallyManaged,
+    nativeWeakResource: externallyManaged && nativeWeakResource,
+    resource: externallyManaged ? null : resourceObject,
+    resourceRef: externallyManaged && !nativeWeakResource ? new WeakRef(resourceObject) : null,
+    storageSnapshot: captureStorageSnapshot(),
+    triggerAsyncId: currentAsyncId,
+  };
+  emitHook("init", context.asyncId, String(type), context.triggerAsyncId, resourceObject);
+  return context;
+}
+
+function napiAsyncDestroy(context) {
+  if (!context || context.destroyed) return;
+  context.destroyed = true;
+  emitHook("destroy", context.asyncId);
+}
+
+function napiCallbackDomain(context, receiver, nativeResource = undefined) {
+  const resource = context ? napiAsyncContextResource(context, nativeResource) : receiver;
+  const domain = resource?.domain;
+  return domain && typeof domain.enter === "function" && typeof domain.exit === "function"
+    ? domain
+    : null;
+}
+
+function pushNapiStorageSnapshot(snapshot) {
+  const frames = [];
+  const context = { frames, dependencies: new Set() };
+  for (const entry of snapshot ?? []) {
+    const [storage, enabled, store, hasStore, generation] = entry;
+    if ((storage._disableGeneration ?? 0) !== generation) continue;
+    const frame = {
+      storage,
+      enabled,
+      store,
+      hasStore,
+      generation,
+      prevEnabled: storage.enabled,
+      prevStore: storage._store,
+      prevHasStore: storage._hasStore,
+      prevHiddenContext: storage._hiddenContext,
+    };
+    frames.push(frame);
+    storage.enabled = enabled;
+    storage._store = store;
+    storage._hasStore = hasStore;
+    storage._hiddenContext = null;
+    storageStack.push({ context, frame });
+  }
+  return { context, frames };
+}
+
+function popNapiStorageSnapshot(token) {
+  const { frames } = token;
+  if (frames.length > 0) storageStack.splice(-frames.length, frames.length);
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    const { storage } = frame;
+    if ((storage._disableGeneration ?? 0) !== frame.generation) continue;
+    if (storage.enabled !== frame.enabled || storage._store !== frame.store ||
+        storage._hasStore !== frame.hasStore || storage._hiddenContext != null) continue;
+    storage.enabled = frame.prevEnabled;
+    storage._store = frame.prevStore;
+    storage._hasStore = frame.prevHasStore;
+    storage._hiddenContext = frame.prevHiddenContext;
+  }
+}
+
+function enterNapiCallbackScope(context, nativeResource = undefined) {
+  if (!context || context.destroyed) throw new TypeError("Invalid N-API async context");
+  const token = {
+    closed: false,
+    context,
+    domain: null,
+    previousAsyncId: currentAsyncId,
+    previousResource: currentResource,
+    previousTriggerAsyncId: currentTriggerAsyncId,
+    storage: null,
+  };
+  currentAsyncId = context.asyncId;
+  currentTriggerAsyncId = context.triggerAsyncId;
+  currentResource = napiAsyncContextResource(context, nativeResource);
+  continuationResource = null;
+  token.storage = pushNapiStorageSnapshot(context.storageSnapshot);
+  try {
+    emitHook("before", context.asyncId);
+    token.domain = napiCallbackDomain(context, null, nativeResource);
+    token.domain?.enter();
+    return token;
+  } catch (error) {
+    popNapiStorageSnapshot(token.storage);
+    currentAsyncId = token.previousAsyncId;
+    currentTriggerAsyncId = token.previousTriggerAsyncId;
+    currentResource = token.previousResource;
+    throw error;
+  }
+}
+
+function leaveNapiCallbackScope(token, failed = false) {
+  if (!token || token.closed) throw new TypeError("Invalid N-API callback scope");
+  token.closed = true;
+  try {
+    if (!failed) {
+      token.domain?.exit();
+      emitHook("after", token.context.asyncId);
+    }
+  } finally {
+    popNapiStorageSnapshot(token.storage);
+    currentAsyncId = token.previousAsyncId;
+    currentTriggerAsyncId = token.previousTriggerAsyncId;
+    currentResource = token.previousResource;
+  }
+}
+
+function napiMakeCallback(context, receiver, callback, args, nativeResource = undefined) {
+  if (typeof callback !== "function") throw new TypeError("N-API callback must be a function");
+  if (context?.destroyed) throw new TypeError("Invalid N-API async context");
+  const previousAsyncId = currentAsyncId;
+  const previousTriggerAsyncId = currentTriggerAsyncId;
+  const previousResource = currentResource;
+  const domain = napiCallbackDomain(context, receiver, nativeResource);
+  let succeeded = false;
+  if (context) {
+    currentAsyncId = context.asyncId;
+    currentTriggerAsyncId = context.triggerAsyncId;
+    currentResource = napiAsyncContextResource(context, nativeResource);
+    continuationResource = null;
+  }
+  try {
+    if (context) emitHook("before", context.asyncId);
+    domain?.enter();
+    const invoke = () => Reflect.apply(callback, receiver, Array.from(args ?? []));
+    const result = context
+      ? runWithStorageSnapshot(context.storageSnapshot, invoke, undefined, [])
+      : invoke();
+    succeeded = true;
+    return result;
+  } finally {
+    if (succeeded) {
+      domain?.exit();
+      if (context) emitHook("after", context.asyncId);
+    }
+    currentAsyncId = previousAsyncId;
+    currentTriggerAsyncId = previousTriggerAsyncId;
+    currentResource = previousResource;
+  }
+}
+
+for (const [name, value] of [
+  ["__cottontailNapiAsyncInit", napiAsyncInit],
+  ["__cottontailNapiAsyncDestroy", napiAsyncDestroy],
+  ["__cottontailNapiMakeCallback", napiMakeCallback],
+  ["__cottontailNapiOpenCallbackScope", enterNapiCallbackScope],
+  ["__cottontailNapiCloseCallbackScope", leaveNapiCallbackScope],
+]) {
+  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+}
+
 Object.defineProperty(globalThis, "__cottontailAsyncHooksOnGc", {
   value: () => {
   for (const asyncId of [...gcTrackedAsyncResourceIds]) {
@@ -233,7 +414,11 @@ function finishDeferredContext(context) {
 
 function attachDeferredDependency(context, dependency) {
   context.deferredPending += 1;
+  let finished = false;
   const settled = () => {
+    if (finished) return;
+    finished = true;
+    context.dependencies.delete(dependency);
     context.deferredPending -= 1;
     finishDeferredContext(context);
   };

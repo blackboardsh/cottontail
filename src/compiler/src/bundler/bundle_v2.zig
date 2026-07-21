@@ -3070,6 +3070,20 @@ pub const BundleV2 = struct {
                 import_record.tag = .bun;
             }
 
+            // Dynamic builtin imports must observe the live runtime namespace.
+            // Linking an alias into the bundle snapshots its statically-known
+            // exports and loses properties added to CommonJS-style builtins.
+            if (runtime_alias != null and
+                import_record.kind == .dynamic and
+                this.transpiler.options.externalize_runtime_require_resolve and
+                !is_embedded_runtime_module)
+            {
+                import_record.source_index = Index.invalid;
+                import_record.flags.is_external_without_side_effects = true;
+                import_record.flags.use_runtime_dynamic_import = true;
+                continue;
+            }
+
             if (ctx.target.isBun() and runtime_alias == null) {
                 if (jsc.ModuleLoader.HardcodedModule.Alias.get(import_record.path.text, .bun, .{ .rewrite_jest_for_tests = this.transpiler.options.rewrite_jest_for_tests })) |replacement| skip_hardcoded: {
                     // Cottontail runtime bundles: real Bun overrides some npm

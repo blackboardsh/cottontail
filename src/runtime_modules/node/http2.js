@@ -1792,12 +1792,22 @@ class Http2Session extends EventEmitter {
   }
 
   _writeBufferedFrame(buffer, callback = undefined) {
+    const socket = this._socket;
+    if (this.destroyed || socket == null || socket.destroyed) {
+      if (typeof callback === "function") {
+        const error = codedError("ERR_HTTP2_INVALID_SESSION", "The HTTP/2 session has been destroyed");
+        queueMicrotask(() => callback(error));
+      }
+      return false;
+    }
     try {
-      if (typeof callback === "function") this._socket.write(buffer, callback);
-      else this._socket.write(buffer);
+      if (typeof callback === "function") socket.write(buffer, callback);
+      else socket.write(buffer);
+      return true;
     } catch (error) {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       else this.emit("error", error);
+      return false;
     }
   }
 
@@ -2026,6 +2036,7 @@ class Http2Session extends EventEmitter {
   }
 
   _receive(chunk) {
+    if (this.destroyed || this._socket == null) return;
     this._buffer = Buffer.concat([this._buffer, Buffer.from(chunk)]);
     if (this.isServer && !this._prefaceSeen) {
       if (this._buffer.byteLength < clientPreface.byteLength) return;
@@ -2102,6 +2113,7 @@ class Http2Session extends EventEmitter {
   }
 
   _handleFrame(frame) {
+    if (this.destroyed || this._socket == null) return;
     if (this._pendingHeaderBlock && frame.type !== frameTypes.CONTINUATION) {
       this._sessionError(constants.NGHTTP2_PROTOCOL_ERROR);
       return;
@@ -2650,7 +2662,7 @@ class Http2Session extends EventEmitter {
     if (this._closeScheduled) return;
     this._closeScheduled = true;
     setTimeout(() => {
-      try { this._socket.end?.(); } catch {}
+      try { this._socket?.end?.(); } catch {}
       if (error) this.emit("error", error);
       this._emitClose();
     }, 0);

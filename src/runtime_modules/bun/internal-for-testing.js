@@ -1,6 +1,9 @@
 import Module, { _resolveFilename } from "../node/module.js";
 import { BlockList } from "../node/net.js";
+import { readFileSync } from "../node/fs.js";
 import { serializeShellLex, serializeShellParse } from "../internal/bun-shell-parser.js";
+import { frameworkRouterInternals } from "./bake-framework-router.js";
+import { getDevServerDeinitCount as getBakeDevServerDeinitCount } from "./bake-dev-server.js";
 
 export const jscInternals = {
   isLatin1String(value) {
@@ -10,6 +13,10 @@ export const jscInternals = {
     return !this.isLatin1String(value);
   },
 };
+
+export function getCounters() {
+  return cottontail.getCounters();
+}
 
 function internalUnavailable(name) {
   return () => {
@@ -372,6 +379,77 @@ export const patchInternals = {
   parse: parsePatchDiff,
 };
 
+function expandNpmrcEnvironment(value, providedEnvironment) {
+  const environment = { ...(globalThis.process?.env ?? {}), ...(providedEnvironment ?? {}) };
+  return String(value).replace(/\$\{([^{}]+)\}/g, (match, name) =>
+    Object.prototype.hasOwnProperty.call(environment, name) ? String(environment[name] ?? "") : match
+  );
+}
+
+function npmrcRegistryOptionMatches(registryPart, registryUrl) {
+  try {
+    const parsed = new URL(registryUrl);
+    const configuredPath = String(registryPart).replace(/^\/+|\/+$/g, "");
+    const registryPath = `${parsed.host}${parsed.pathname}`.replace(/^\/+|\/+$/g, "");
+    return configuredPath === registryPath;
+  } catch {
+    return false;
+  }
+}
+
+function loadNpmrc(source, providedEnvironment) {
+  const entries = [];
+  for (const rawLine of String(source).replace(/^\ufeff/, "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    const equals = line.indexOf("=");
+    const key = (equals < 0 ? line : line.slice(0, equals)).trim();
+    const rawValue = equals < 0 ? "true" : line.slice(equals + 1).trim();
+    entries.push([key, expandNpmrcEnvironment(rawValue, providedEnvironment)]);
+  }
+
+  let defaultRegistryUrl = "https://registry.npmjs.org/";
+  for (const [key, value] of entries) {
+    if (key === "registry") defaultRegistryUrl = value.endsWith("/") ? value : `${value}/`;
+  }
+
+  const result = {
+    default_registry_url: defaultRegistryUrl,
+    default_registry_token: "",
+    default_registry_username: "",
+    default_registry_password: "",
+    default_registry_email: "",
+  };
+  for (const [key, value] of entries) {
+    const match = /^\/\/(.+):(_authToken|username|_password|_auth|email)$/.exec(key);
+    if (!match || !npmrcRegistryOptionMatches(match[1], defaultRegistryUrl)) continue;
+    switch (match[2]) {
+      case "_authToken":
+        result.default_registry_token = value;
+        break;
+      case "username":
+        result.default_registry_username = value;
+        break;
+      case "_password":
+        result.default_registry_password = Buffer.from(value, "base64").toString();
+        break;
+      case "_auth": {
+        const decoded = Buffer.from(value, "base64").toString();
+        const colon = decoded.indexOf(":");
+        if (colon >= 0) {
+          result.default_registry_username = decoded.slice(0, colon);
+          result.default_registry_password = decoded.slice(colon + 1);
+        }
+        break;
+      }
+      case "email":
+        result.default_registry_email = value;
+        break;
+    }
+  }
+  return result;
+}
+
 export const iniInternals = {
   parse(source) {
     const result = {};
@@ -399,6 +477,7 @@ export const iniInternals = {
     }
     return result;
   },
+  loadNpmrc,
 };
 
 function isQuotedIniScalar(value) {
@@ -709,7 +788,7 @@ export function isArchitectureMatch(architectures) {
     if (entry.startsWith("!")) {
       if (entry.slice(1) === current) return false;
       matched = true;
-    } else if (entry === current || entry === "none") {
+    } else if (entry === current || entry === "any") {
       matched = true;
     }
   }
@@ -724,7 +803,7 @@ export function isOperatingSystemMatch(platforms) {
     if (entry.startsWith("!")) {
       if (entry.slice(1) === current) return false;
       matched = true;
-    } else if (entry === current || entry === "none") {
+    } else if (entry === current || entry === "any") {
       matched = true;
     }
   }
@@ -807,7 +886,7 @@ export class Dequeue {
 }
 
 export function getDevServerDeinitCount() {
-  return 0;
+  return getBakeDevServerDeinitCount();
 }
 
 export function memfd_create() {
@@ -898,12 +977,45 @@ export function structuredCloneAdvanced(
 }
 
 export const getEventLoopStats = unimplementedInternal("getEventLoopStats");
-export const install_test_helpers = unimplementedInternal("install_test_helpers");
+export const install_test_helpers = {
+  parseLockfile(cwd) {
+    return JSON.parse(cottontail.packageManagerParseLockfile(String(cwd)));
+  },
+};
+export const npm_manifest_test_helpers = {
+  parseManifest(path, _registryUrl) {
+    const manifest = JSON.parse(readFileSync(String(path), "utf8"));
+    return {
+      ...manifest,
+      versions: Object.values(manifest.versions ?? {}),
+    };
+  },
+};
 export const upgrade_test_helpers = unimplementedInternal("upgrade_test_helpers");
 export const crash_handler = unimplementedInternal("crash_handler");
 export const bindgen = unimplementedInternal("bindgen");
-export const frameworkRouterInternals = unimplementedInternal("frameworkRouterInternals");
-export const hostedGitInfo = unimplementedInternal("hostedGitInfo");
+export { frameworkRouterInternals };
+export const hostedGitInfo = {
+  parseUrl(value) {
+    if (arguments.length !== 1) {
+      throw new Error("hostedGitInfo.prototype.parseUrl takes exactly 1 argument");
+    }
+    if (typeof value !== "string") {
+      throw new Error("hostedGitInfo.prototype.parseUrl takes a string as its first argument");
+    }
+    return cottontail.hostedGitInfoParseUrl(value);
+  },
+  fromUrl(value) {
+    if (arguments.length !== 1) {
+      throw new Error("hostedGitInfo.prototype.fromUrl takes exactly 1 argument");
+    }
+    if (typeof value !== "string") {
+      throw new Error("hostedGitInfo.prototype.fromUrl takes a string as its first argument");
+    }
+    const result = cottontail.hostedGitInfoFromUrl(value);
+    return result === null ? null : JSON.parse(result);
+  },
+};
 export const readTarball = unimplementedInternal("readTarball");
 
 export default {
@@ -930,6 +1042,7 @@ export default {
   isOperatingSystemMatch,
   jscInternals,
   nativeFrameForTesting,
+  npm_manifest_test_helpers,
   patchInternals,
   readTarball,
   setSocketOptions,

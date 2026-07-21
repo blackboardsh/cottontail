@@ -679,7 +679,7 @@ pub const ConfigIterator = struct {
                 const len = bun.base64.decodeLen(this.value);
                 var slice = try allocator.alloc(u8, len);
                 const result = bun.base64.decode(slice[0..], this.value);
-                if (result.status != .success) {
+                if (!result.isSuccessful()) {
                     try log.addErrorFmtOpts(
                         allocator,
                         "{s} is not valid base64",
@@ -873,6 +873,33 @@ pub fn loadNpmrc(
     source: *const bun.logger.Source,
     configs: *std.array_list.Managed(ConfigIterator.Item),
 ) OOM!void {
+    return loadNpmrcImpl(allocator, install, env, npmrc_path, log, source, configs, true);
+}
+
+// Cottontail owns hoist matching in package_manager_isolated.zig. Reuse Bun's
+// full npmrc registry/auth parser without constructing its JSC-backed matcher.
+pub fn loadNpmrcWithoutMatchers(
+    allocator: std.mem.Allocator,
+    install: *bun.schema.api.BunInstall,
+    env: *bun.DotEnv.Loader,
+    npmrc_path: [:0]const u8,
+    log: *bun.logger.Log,
+    source: *const bun.logger.Source,
+    configs: *std.array_list.Managed(ConfigIterator.Item),
+) OOM!void {
+    return loadNpmrcImpl(allocator, install, env, npmrc_path, log, source, configs, false);
+}
+
+fn loadNpmrcImpl(
+    allocator: std.mem.Allocator,
+    install: *bun.schema.api.BunInstall,
+    env: *bun.DotEnv.Loader,
+    npmrc_path: [:0]const u8,
+    log: *bun.logger.Log,
+    source: *const bun.logger.Source,
+    configs: *std.array_list.Managed(ConfigIterator.Item),
+    comptime load_matchers: bool,
+) OOM!void {
     var parser = bun.ini.Parser.init(allocator, npmrc_path, source.contents, env);
     defer parser.deinit();
     try parser.parse(parser.arena.allocator());
@@ -1038,34 +1065,36 @@ pub fn loadNpmrc(
         }
     }
 
-    if (out.get("public-hoist-pattern")) |public_hoist_pattern_expr| {
-        install.public_hoist_pattern = bun.install.PnpmMatcher.fromExpr(
-            allocator,
-            public_hoist_pattern_expr,
-            log,
-            source,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => |oom| return oom,
-            error.InvalidRegExp, error.UnexpectedExpr => patterns: {
-                log.reset();
-                break :patterns null;
-            },
-        };
-    }
+    if (comptime load_matchers) {
+        if (out.get("public-hoist-pattern")) |public_hoist_pattern_expr| {
+            install.public_hoist_pattern = bun.install.PnpmMatcher.fromExpr(
+                allocator,
+                public_hoist_pattern_expr,
+                log,
+                source,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => |oom| return oom,
+                error.InvalidRegExp, error.UnexpectedExpr => patterns: {
+                    log.reset();
+                    break :patterns null;
+                },
+            };
+        }
 
-    if (out.get("hoist-pattern")) |hoist_pattern_expr| {
-        install.hoist_pattern = bun.install.PnpmMatcher.fromExpr(
-            allocator,
-            hoist_pattern_expr,
-            log,
-            source,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => |oom| return oom,
-            error.InvalidRegExp, error.UnexpectedExpr => patterns: {
-                log.reset();
-                break :patterns null;
-            },
-        };
+        if (out.get("hoist-pattern")) |hoist_pattern_expr| {
+            install.hoist_pattern = bun.install.PnpmMatcher.fromExpr(
+                allocator,
+                hoist_pattern_expr,
+                log,
+                source,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => |oom| return oom,
+                error.InvalidRegExp, error.UnexpectedExpr => patterns: {
+                    log.reset();
+                    break :patterns null;
+                },
+            };
+        }
     }
 
     var registry_map = install.scoped orelse bun.schema.api.NpmRegistryMap{};
@@ -1127,14 +1156,14 @@ pub fn loadNpmrc(
 
         if (count == 0) break :out;
 
-        const default_registry_url: bun.URL = brk: {
+        const default_registry_url: URL = brk: {
             if (install.default_registry) |dr|
-                break :brk bun.URL.parse(dr.url);
+                break :brk URL.parse(dr.url);
 
-            break :brk bun.URL.parse(Registry.default_url);
+            break :brk URL.parse(Registry.default_url);
         };
 
-        // I don't like having to do this but we'll need a mapping of scope -> bun.URL
+        // I don't like having to do this but we'll need a mapping of scope -> URL
         // Because we need to check different parts of the URL, for instance in this
         // example .npmrc:
         _ =
@@ -1149,11 +1178,11 @@ pub fn loadNpmrc(
         // The line that sets the auth token should only apply to the @myorg scope
         // The line that sets the username would apply to both @myorg and @another
         var url_map = url_map: {
-            var url_map = bun.StringArrayHashMap(bun.URL).init(parser.arena.allocator());
+            var url_map = bun.StringArrayHashMap(URL).init(parser.arena.allocator());
             try url_map.ensureTotalCapacity(registry_map.scopes.keys().len);
 
             for (registry_map.scopes.keys(), registry_map.scopes.values()) |*k, *v| {
-                const url = bun.URL.parse(v.url);
+                const url = URL.parse(v.url);
                 try url_map.put(k.*, url);
             }
 
@@ -1200,7 +1229,7 @@ pub fn loadNpmrc(
         }
 
         for (configs.items) |conf_item| {
-            const conf_item_url = bun.URL.parse(conf_item.registry_url);
+            const conf_item_url = URL.parse(conf_item.registry_url);
 
             if (std.mem.eql(u8, bun.strings.withoutTrailingSlash(default_registry_url.host), bun.strings.withoutTrailingSlash(conf_item_url.host)) and
                 std.mem.eql(u8, bun.strings.withoutTrailingSlash(default_registry_url.pathname), bun.strings.withoutTrailingSlash(conf_item_url.pathname)))
@@ -1355,3 +1384,4 @@ const js_ast = bun.ast;
 const E = bun.ast.E;
 const Expr = bun.ast.Expr;
 const Rope = js_ast.E.Object.Rope;
+const URL = @import("../url/url.zig").URL;

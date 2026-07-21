@@ -29,6 +29,11 @@ test.skipIf(process.platform === "win32")("preserves interpolation quote context
   const builtinRedirect = await $`echo answer > ${stdout}`.quiet();
   expect(builtinRedirect.stdout.byteLength).toBe(0);
   expect(stdout.subarray(0, 7).toString()).toBe("answer\n");
+
+  const subshellStdout = Buffer.alloc(16);
+  const subshellRedirect = await $`(echo nested) > ${subshellStdout}`.quiet();
+  expect(subshellRedirect.stdout.byteLength).toBe(0);
+  expect(subshellStdout.subarray(0, 7).toString()).toBe("nested\n");
 });
 
 test.skipIf(process.platform === "win32")("preserves Blob and typed-array stdin as binary data", async () => {
@@ -44,6 +49,10 @@ test("parses structured object references eagerly", () => {
   expect(() => $`${output} | cat`).toThrow('expected a command or assignment but got: "JSObjRef"');
 });
 
+test("accepts falsy raw shell interpolation values", async () => {
+  expect(await $`echo $${{ raw: 0 }}`.text()).toBe(`${process.argv[0]}\n`);
+});
+
 test("constructs ShellError with Bun's lazy initialization semantics", () => {
   const error = new $.ShellError();
   expect(error).toBeInstanceOf(Error);
@@ -53,6 +62,32 @@ test("constructs ShellError with Bun's lazy initialization semantics", () => {
   expect(error.exitCode).toBeUndefined();
 });
 
+test("ShellOutput snapshots caller-owned byte arrays", () => {
+  const source = new Uint8Array([65, 66, 67]);
+  const output = new $.ShellOutput({ stdout: source });
+  source[0] = 90;
+  expect(output.stdout).toBeInstanceOf(Buffer);
+  expect(output.stdout.toString()).toBe("ABC");
+});
+
+test("large raw interpolation diagnostics are cached by value", () => {
+  const parse = (raw: string) => {
+    try {
+      $`${{ raw }} <!INVALID ==== SYNTAX!>`;
+    } catch (error) {
+      return error;
+    }
+    throw new Error("expected shell interpolation to fail");
+  };
+  const first = parse("A".repeat(300 * 1024));
+  const repeated = parse("A".repeat(300 * 1024));
+  const changed = parse("B".repeat(320 * 1024));
+  expect(repeated).not.toBe(first);
+  expect(repeated.message).toBe(first.message);
+  expect(repeated.position).toBe(first.position);
+  expect(changed.position).not.toBe(first.position);
+});
+
 test.skipIf(process.platform === "win32")("shell execution does not block the JavaScript event loop", async () => {
   let timerRan = false;
   const pending = $`sleep 0.05; echo complete`.text();
@@ -60,6 +95,27 @@ test.skipIf(process.platform === "win32")("shell execution does not block the Ja
   await new Promise((resolve) => setTimeout(resolve, 10));
   expect(timerRan).toBe(true);
   expect(await pending).toBe("complete\n");
+});
+
+test("ShellError preserves the original eval callsite", () => {
+  const code = `import { $ } from "bun";
+
+$.throws(true);
+
+async function fail() {
+  await $\`command-that-does-not-exist-cottontail\`;
+}
+
+await fail();`;
+  const line = code.split("\n").findIndex(value => value.includes("command-that-does-not-exist")) + 1;
+  const child = Bun.spawnSync([process.execPath, "-e", code], {
+    env: { ...process.env, BUN_DEBUG_QUIET_LOGS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  expect(child.exitCode).toBe(1);
+  expect(child.stderr.toString()).toContain(`[eval]:${line}`);
 });
 
 test.skipIf(process.platform === "win32")("ported cp builtin participates in command lists", async () => {

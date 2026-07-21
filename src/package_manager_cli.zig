@@ -7,11 +7,18 @@ const Manifest = @import("package_manager_manifest.zig");
 const Scripts = @import("package_manager_scripts.zig");
 const Git = @import("package_manager_git.zig");
 const Patch = @import("package_manager_patch.zig");
+const BunLockfile = @import("package_manager_bun_lockfile.zig");
+const PmPkg = @import("package_manager_pm_pkg.zig");
+const PmInfo = @import("package_manager_pm_info.zig");
+const PmVersion = @import("package_manager_pm_version.zig");
+const PmWhy = @import("package_manager_pm_why.zig");
 const Isolated = @import("package_manager_isolated.zig");
 const Workspaces = @import("package_manager_workspaces.zig");
+const Analyzer = @import("package_manager_analyzer.zig");
 
 const version = @import("version.zig").version;
 const Semver = compiler.Semver;
+const Npm = compiler.install.Npm;
 const Value = std.json.Value;
 
 // Keep this aligned with compat/upstream/targets.json. Package-manager output
@@ -30,9 +37,15 @@ const Command = enum {
     add,
     remove,
     update,
+    link,
+    unlink,
     patch,
     patch_commit,
     pm,
+    pm_list,
+    pm_info,
+    pm_whoami,
+    pm_why,
 };
 
 const DependencySection = enum {
@@ -51,6 +64,7 @@ const Options = struct {
     positionals: []const []const u8,
     cwd: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
+    filters: []const []const u8 = &.{},
     registry: ?[]const u8 = null,
     production: bool = false,
     ignore_scripts: bool = false,
@@ -59,10 +73,12 @@ const Options = struct {
     no_save: bool = false,
     exact: bool = false,
     only_missing: bool = false,
+    analyze: bool = false,
     force: bool = false,
     dry_run: bool = false,
     silent: bool = false,
     no_summary: bool = false,
+    no_cache: bool = false,
     verify_integrity: bool = true,
     latest: bool = false,
     save_text_lockfile: bool = false,
@@ -70,9 +86,23 @@ const Options = struct {
     omit_optional: bool = false,
     omit_peer: bool = false,
     help: bool = false,
+    all: bool = false,
+    json_output: bool = false,
+    git_tag_version: bool = true,
+    allow_same_version: bool = false,
+    message: ?[]const u8 = null,
+    preid: []const u8 = "",
+    top_only: bool = false,
+    depth: ?usize = null,
     patches_dir: []const u8 = "patches",
     linker: ?Isolated.Linker = null,
     section: DependencySection = .dependencies,
+    cpu: Npm.Architecture = .current,
+    os: Npm.OperatingSystem = .current,
+    cpu_overridden: bool = false,
+    os_overridden: bool = false,
+    invalid_cpu: ?[]const u8 = null,
+    invalid_os: ?[]const u8 = null,
 };
 
 const PackageSpec = struct {
@@ -95,12 +125,159 @@ const GitPackage = struct {
     package_json: *Value,
 };
 
+const GitCheckoutResult = struct {
+    checkout: Git.Checkout,
+    integrity: []const u8 = "",
+    resolved_name: []const u8 = "",
+};
+
 const RegistryPackage = struct {
+    name: []const u8,
+    version: []const u8,
+    latest_version: ?[]const u8,
+    tarball: []const u8,
+    integrity: ?[]const u8,
+    metadata: *const Value,
+    authorization: ?[]const u8 = null,
+
+    fn archive(package: RegistryPackage) RegistryArchive {
+        return .{
+            .name = package.name,
+            .version = package.version,
+            .tarball = package.tarball,
+            .integrity = package.integrity,
+            .authorization = package.authorization,
+        };
+    }
+};
+
+const RegistryArchive = struct {
     name: []const u8,
     version: []const u8,
     tarball: []const u8,
     integrity: ?[]const u8,
-    metadata: *const Value,
+    authorization: ?[]const u8 = null,
+};
+
+const RegistryConfig = struct {
+    url: []const u8,
+    authorization: ?[]const u8 = null,
+};
+
+const RegistryManifestFetch = struct {
+    io: std.Io,
+    name: []const u8,
+    url: []const u8,
+    authorization: ?[]const u8,
+    cache_path: ?[]const u8,
+    bytes: ?[]u8 = null,
+    failure: ?anyerror = null,
+
+    fn run(fetch_state: *RegistryManifestFetch) std.Io.Cancelable!void {
+        fetch_state.fetch() catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            fetch_state.failure = err;
+        };
+    }
+
+    fn fetch(fetch_state: *RegistryManifestFetch) !void {
+        var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
+        defer client.deinit();
+
+        var headers: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+        headers[header_count] = .{ .name = "accept", .value = manifest_accept };
+        header_count += 1;
+        if (fetch_state.authorization) |authorization| {
+            headers[header_count] = .{ .name = "authorization", .value = authorization };
+            header_count += 1;
+        }
+
+        var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+        defer output.deinit();
+        const result = try client.fetch(.{
+            .location = .{ .url = fetch_state.url },
+            .response_writer = &output.writer,
+            .extra_headers = headers[0..header_count],
+        });
+        const status: u16 = @intFromEnum(result.status);
+        if (status < 200 or status >= 300) return error.RegistryManifestRequestFailed;
+        if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
+        fetch_state.bytes = try output.toOwnedSlice();
+    }
+};
+
+const RegistryArchiveFetch = struct {
+    io: std.Io,
+    url: []const u8,
+    authorization: ?[]const u8,
+    integrity: ?[]const u8,
+    verify_integrity: bool,
+    cache_path: []const u8,
+    failure: ?anyerror = null,
+
+    fn run(fetch_state: *RegistryArchiveFetch) std.Io.Cancelable!void {
+        fetch_state.fetch() catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            fetch_state.failure = err;
+        };
+    }
+
+    fn fetch(fetch_state: *RegistryArchiveFetch) !void {
+        if (std.Io.Dir.cwd().readFileAlloc(
+            fetch_state.io,
+            fetch_state.cache_path,
+            std.heap.smp_allocator,
+            .limited(max_tarball_bytes),
+        ) catch null) |cached| {
+            defer std.heap.smp_allocator.free(cached);
+            const valid = if (fetch_state.verify_integrity) blk: {
+                verifyIntegrity(cached, fetch_state.integrity) catch break :blk false;
+                break :blk true;
+            } else true;
+            if (valid) return;
+            std.Io.Dir.cwd().deleteFile(fetch_state.io, fetch_state.cache_path) catch {};
+        }
+
+        var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
+        defer client.deinit();
+
+        var headers: [1]std.http.Header = undefined;
+        const header_count: usize = if (fetch_state.authorization) |authorization| blk: {
+            headers[0] = .{ .name = "authorization", .value = authorization };
+            break :blk 1;
+        } else 0;
+
+        var output: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+        defer output.deinit();
+        const result = try client.fetch(.{
+            .location = .{ .url = fetch_state.url },
+            .response_writer = &output.writer,
+            .extra_headers = headers[0..header_count],
+        });
+        const status: u16 = @intFromEnum(result.status);
+        if (status < 200 or status >= 300) return error.RegistryArchiveRequestFailed;
+        if (output.written().len > max_tarball_bytes) return error.ResponseTooLarge;
+        if (fetch_state.verify_integrity) try verifyIntegrity(output.written(), fetch_state.integrity);
+        try std.Io.Dir.cwd().writeFile(fetch_state.io, .{
+            .sub_path = fetch_state.cache_path,
+            .data = output.written(),
+        });
+    }
+};
+
+const RegistryDependencyRequest = struct {
+    name: []const u8,
+    spec: []const u8,
+    optional: bool,
+};
+
+const DirectInstallReport = struct {
+    alias: []const u8,
+    display: []const u8,
+    latest_version: ?[]const u8,
+    section_priority: u8,
+    sequence: usize,
 };
 
 const PackageRecord = struct {
@@ -114,6 +291,7 @@ const PackageRecord = struct {
     resolution: []const u8 = "",
     kind: Lockfile.Kind = .npm,
     metadata: ?*const Value = null,
+    git_resolved: []const u8 = "",
     peer_hash: u64 = 0,
     install_dir: []const u8 = "",
 };
@@ -169,9 +347,15 @@ fn commandFromString(command: []const u8) ?Command {
     if (std.mem.eql(u8, command, "add") or std.mem.eql(u8, command, "a")) return .add;
     if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm") or std.mem.eql(u8, command, "uninstall")) return .remove;
     if (std.mem.eql(u8, command, "update") or std.mem.eql(u8, command, "up")) return .update;
+    if (std.mem.eql(u8, command, "link")) return .link;
+    if (std.mem.eql(u8, command, "unlink")) return .unlink;
     if (std.mem.eql(u8, command, "patch")) return .patch;
     if (std.mem.eql(u8, command, "patch-commit")) return .patch_commit;
     if (std.mem.eql(u8, command, "pm")) return .pm;
+    if (std.mem.eql(u8, command, "list")) return .pm_list;
+    if (std.mem.eql(u8, command, "info")) return .pm_info;
+    if (std.mem.eql(u8, command, "whoami")) return .pm_whoami;
+    if (std.mem.eql(u8, command, "why")) return .pm_why;
     return null;
 }
 
@@ -188,6 +372,17 @@ pub fn run(
         return 1;
     };
 
+    if (options.invalid_cpu) |value| {
+        try stderr.print("error: Invalid CPU architecture: '{s}'. Valid values are: *, any, arm, arm64, ia32, mips, mipsel, ppc, ppc64, s390, s390x, x32, x64. Use !name to negate.\n", .{value});
+        try stderr.flush();
+        return 1;
+    }
+    if (options.invalid_os) |value| {
+        try stderr.print("error: Invalid operating system: '{s}'. Valid values are: *, any, aix, darwin, freebsd, linux, openbsd, sunos, win32, android. Use !name to negate.\n", .{value});
+        try stderr.flush();
+        return 1;
+    }
+
     if (options.help) {
         try printPackageManagerHelp(options.command, stdout);
         try stdout.flush();
@@ -202,13 +397,16 @@ pub fn run(
         };
     }
 
-    if (options.command == .pm) {
+    if (options.command == .pm or options.command == .pm_list or options.command == .pm_info or options.command == .pm_whoami or options.command == .pm_why) {
         return try runPm(init, options, stdout, stderr);
     }
 
     var manager = Manager.init(init, options, stdout, stderr);
     defer manager.deinit();
     return manager.execute() catch |err| {
+        if (init.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+        }
         if (err == error.FrozenLockfileChanged or err == error.FrozenLockfilePackageMissing) {
             try stderr.writeAll("error: lockfile had changes, but lockfile is frozen\n");
         } else if (err == error.FrozenLockfileNotFound) {
@@ -244,6 +442,9 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
         .frozen_lockfile = std.mem.eql(u8, args[1], "ci"),
     };
     var positionals = std.array_list.Managed([]const u8).init(allocator);
+    var filters = std.array_list.Managed([]const u8).init(allocator);
+    var cpu_override = Npm.Architecture.none.negatable();
+    var os_override = Npm.OperatingSystem.none.negatable();
 
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
@@ -269,12 +470,42 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.config_path = args[index];
         } else if (std.mem.startsWith(u8, arg, "--config=")) {
             options.config_path = arg["--config=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-c=")) {
+            options.config_path = arg["-c=".len..];
+        } else if (std.mem.eql(u8, arg, "--filter")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            try filters.append(args[index]);
+        } else if (std.mem.startsWith(u8, arg, "--filter=")) {
+            const value = arg["--filter=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            try filters.append(value);
         } else if (std.mem.eql(u8, arg, "--registry")) {
             index += 1;
             if (index >= args.len) return error.MissingRegistry;
             options.registry = args[index];
         } else if (std.mem.startsWith(u8, arg, "--registry=")) {
             options.registry = arg["--registry=".len..];
+        } else if (std.mem.eql(u8, arg, "--cpu")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.cpu_overridden = true;
+            if (!applyPlatformOverride(Npm.Architecture, &cpu_override, args[index])) options.invalid_cpu = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--cpu=")) {
+            const value = arg["--cpu=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.cpu_overridden = true;
+            if (!applyPlatformOverride(Npm.Architecture, &cpu_override, value)) options.invalid_cpu = value;
+        } else if (std.mem.eql(u8, arg, "--os")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.os_overridden = true;
+            if (!applyPlatformOverride(Npm.OperatingSystem, &os_override, args[index])) options.invalid_os = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--os=")) {
+            const value = arg["--os=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.os_overridden = true;
+            if (!applyPlatformOverride(Npm.OperatingSystem, &os_override, value)) options.invalid_os = value;
         } else if (std.mem.eql(u8, arg, "--production") or std.mem.eql(u8, arg, "--prod") or std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "-P")) {
             options.production = true;
         } else if (std.mem.eql(u8, arg, "--ignore-scripts")) {
@@ -291,6 +522,10 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.exact = true;
         } else if (std.mem.eql(u8, arg, "--only-missing")) {
             options.only_missing = true;
+        } else if (std.mem.eql(u8, arg, "--analyze") or
+            (std.mem.eql(u8, arg, "-a") and (options.command == .add or options.command == .install)))
+        {
+            options.analyze = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
             options.force = true;
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -312,6 +547,36 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.verify_integrity = false;
         } else if (std.mem.eql(u8, arg, "--latest")) {
             options.latest = true;
+        } else if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "-A")) {
+            options.all = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            options.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--no-git-tag-version") or std.mem.eql(u8, arg, "--git-tag-version=false")) {
+            options.git_tag_version = false;
+        } else if (std.mem.eql(u8, arg, "--git-tag-version=true")) {
+            options.git_tag_version = true;
+        } else if (std.mem.eql(u8, arg, "--allow-same-version")) {
+            options.allow_same_version = true;
+        } else if (std.mem.eql(u8, arg, "--message") or std.mem.eql(u8, arg, "-m")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.message = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--message=")) {
+            options.message = arg["--message=".len..];
+        } else if (std.mem.eql(u8, arg, "--preid")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.preid = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--preid=")) {
+            options.preid = arg["--preid=".len..];
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            options.top_only = true;
+        } else if (std.mem.eql(u8, arg, "--depth")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.depth = std.fmt.parseInt(usize, args[index], 10) catch return error.InvalidDepth;
+        } else if (std.mem.startsWith(u8, arg, "--depth=")) {
+            options.depth = std.fmt.parseInt(usize, arg["--depth=".len..], 10) catch return error.InvalidDepth;
         } else if (std.mem.eql(u8, arg, "--save-text-lockfile")) {
             options.save_text_lockfile = true;
         } else if (std.mem.eql(u8, arg, "--commit")) {
@@ -340,9 +605,10 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.linker = Isolated.Linker.parse(args[index]) orelse return error.UnsupportedPackageManagerLinker;
         } else if (std.mem.startsWith(u8, arg, "--linker=")) {
             options.linker = Isolated.Linker.parse(arg["--linker=".len..]) orelse return error.UnsupportedPackageManagerLinker;
-        } else if (std.mem.eql(u8, arg, "--no-cache") or std.mem.eql(u8, arg, "--no-progress")) {
-            // Cottontail's current installer is uncached and has no progress UI,
-            // so these flags already describe its execution mode.
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            options.no_cache = true;
+        } else if (std.mem.eql(u8, arg, "--no-progress")) {
+            // The package manager has no progress UI.
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             options.help = true;
         } else {
@@ -350,10 +616,30 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
         }
     }
     options.positionals = try positionals.toOwnedSlice();
+    options.filters = try filters.toOwnedSlice();
+    if (options.cpu_overridden) options.cpu = cpu_override.combine();
+    if (options.os_overridden) options.os = os_override.combine();
     if ((options.command == .patch or options.command == .patch_commit) and options.positionals.len == 0) {
         return error.MissingPatchTarget;
     }
     return options;
+}
+
+fn applyPlatformOverride(comptime T: type, override: *Npm.Negatable(T), value: []const u8) bool {
+    if (value.len == 0) return false;
+    const name = if (value[0] == '!') value[1..] else value;
+    const recognized = std.mem.eql(u8, name, "*") or
+        std.mem.eql(u8, name, "any") or
+        std.mem.eql(u8, name, "none") or
+        T.NameMap.get(name) != null;
+    if (!recognized) return false;
+    if (std.mem.eql(u8, value, "*")) {
+        override.had_wildcard = true;
+        override.had_unrecognized_values = false;
+    } else {
+        override.apply(value);
+    }
+    return true;
 }
 
 fn applyOmit(options: *Options, value: []const u8) !void {
@@ -374,6 +660,8 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\
         \\  --cwd <path>             Set the working directory
         \\  --registry <url>         Override the package registry
+        \\  --cpu <architecture>     Override target CPU (repeatable; * selects all)
+        \\  --os <operating-system>  Override target OS (repeatable; * selects all)
         \\  -p, --production         Omit devDependencies
         \\  --omit <kind>            Omit dev, optional, or peer dependencies
         \\  --ignore-scripts         Skip project lifecycle scripts
@@ -393,7 +681,16 @@ fn runPm(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
-    const subcommand = if (options.positionals.len > 0) options.positionals[0] else "";
+    const subcommand = switch (options.command) {
+        .pm_list => "ls",
+        .pm_info => "view",
+        .pm_whoami => "whoami",
+        .pm_why => "why",
+        else => if (options.positionals.len > 0) options.positionals[0] else "",
+    };
+    if (std.mem.eql(u8, subcommand, "ls") or std.mem.eql(u8, subcommand, "list")) {
+        return runPmList(init, options, stdout, stderr);
+    }
     if (std.mem.eql(u8, subcommand, "bin")) {
         const absolute = try absolutePath(init.io, init.arena.allocator(), "node_modules/.bin");
         try stdout.print("{s}\n", .{absolute});
@@ -406,15 +703,520 @@ fn runPm(
             std.Io.Dir.cwd().deleteTree(init.io, cache_path) catch {};
             try stdout.writeAll("Cleared 'bun install' cache\n");
         } else {
-            try stdout.print("{s}\n", .{cache_path});
+            try stdout.writeAll(cache_path);
         }
         try stdout.flush();
         return 0;
     }
-
+    if (std.mem.eql(u8, subcommand, "migrate")) return runPmMigrate(init, options, stdout, stderr);
+    if (std.mem.eql(u8, subcommand, "pkg")) {
+        const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
+        return PmPkg.run(
+            init.io,
+            init.arena.allocator(),
+            options.positionals[1..],
+            options.json_output,
+            cwd,
+            stdout,
+            stderr,
+        );
+    }
+    if (std.mem.eql(u8, subcommand, "version")) {
+        const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
+        return PmVersion.run(
+            init,
+            options.positionals[1..],
+            .{
+                .git_tag_version = options.git_tag_version,
+                .allow_same_version = options.allow_same_version,
+                .force = options.force,
+                .ignore_scripts = options.ignore_scripts,
+                .message = options.message,
+                .preid = options.preid,
+            },
+            cwd,
+            stdout,
+            stderr,
+        );
+    }
+    if (std.mem.eql(u8, subcommand, "view")) {
+        const info_args = if (options.command == .pm_info) options.positionals else options.positionals[1..];
+        return runPmInfo(init, options, info_args, stdout, stderr);
+    }
+    if (std.mem.eql(u8, subcommand, "why")) {
+        const cwd = try absolutePath(init.io, init.arena.allocator(), ".");
+        const why_args = if (options.command == .pm_why) options.positionals else options.positionals[1..];
+        return PmWhy.run(
+            init,
+            why_args,
+            .{ .top_only = options.top_only, .depth = options.depth },
+            cwd,
+            stdout,
+            stderr,
+        );
+    }
+    if (std.mem.eql(u8, subcommand, "hash") or std.mem.eql(u8, subcommand, "hash-print")) {
+        return runPmHash(init, stdout, stderr);
+    }
+    if (std.mem.eql(u8, subcommand, "hash-string")) {
+        return runPmHashString(init, stdout, stderr);
+    }
+    if (std.mem.eql(u8, subcommand, "whoami")) return runPmWhoami(init, options, stdout, stderr);
     try stderr.writeAll("error: unsupported package-manager utility\n");
     try stderr.flush();
     return 1;
+}
+
+fn runPmInfo(
+    init: std.process.Init,
+    options: Options,
+    args: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var manager_options = options;
+    manager_options.command = .install;
+    manager_options.positionals = &.{};
+    var manager = Manager.init(init, manager_options, stdout, stderr);
+    defer manager.deinit();
+
+    manager.invocation_dir = try absolutePath(init.io, manager.allocator, ".");
+    manager.root_dir = manager.invocation_dir;
+    manager.invocation_package_dir = manager.invocation_dir;
+    if (findInstallProject(init.io, manager.allocator, manager.invocation_dir)) |project| {
+        manager.root_dir = project.root_dir;
+        manager.invocation_package_dir = project.package_dir;
+    } else |_| {}
+    try manager.loadConfiguration();
+    manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
+
+    var raw_spec = if (args.len > 0) args[0] else ".";
+    if (raw_spec.len == 0 or std.mem.eql(u8, raw_spec, ".")) {
+        raw_spec = try packageNameForInfo(
+            init.io,
+            manager.allocator,
+            manager.invocation_package_dir,
+            manager.invocation_dir,
+        );
+    }
+    const parsed = splitPackageSpec(raw_spec);
+    const package_name = parsed.name orelse raw_spec;
+    const property_path = if (args.len > 1) args[1] else null;
+    const encoded_name = try encodePackageName(manager.allocator, package_name);
+    const url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ manager.registry, encoded_name });
+    const source = (try manager.fetchInfoManifest(url)) orelse return 1;
+    return PmInfo.render(
+        manager.allocator,
+        source,
+        package_name,
+        parsed.spec,
+        property_path,
+        options.json_output,
+        stdout,
+        stderr,
+    );
+}
+
+fn packageNameForInfo(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    package_dir: []const u8,
+    fallback_dir: []const u8,
+) ![]const u8 {
+    const package_json_path = try std.fs.path.join(allocator, &.{ package_dir, "package.json" });
+    if (try readOptionalFile(io, allocator, package_json_path, 4 * 1024 * 1024)) |source| {
+        const package_json = std.json.parseFromSliceLeaky(Value, allocator, source, .{}) catch null;
+        if (package_json) |value| {
+            if (jsonString(&value, "name")) |name| {
+                if (name.len > 0) return name;
+            }
+        }
+    }
+    return std.fs.path.basename(fallback_dir);
+}
+
+fn runPmList(
+    init: std.process.Init,
+    options: Options,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const invocation_dir = try absolutePath(init.io, allocator, ".");
+    const project = findInstallProject(init.io, allocator, invocation_dir) catch |err| {
+        try stderr.print("error: unable to find package.json: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        return 1;
+    };
+    var graph = loadPmLockGraph(init.io, allocator, project.root_dir) catch |err| {
+        try stderr.print("error: unable to load lockfile: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        return 1;
+    };
+    defer graph.deinit();
+
+    const installed = try rootInstalledAliases(init.io, allocator, project.root_dir);
+    const aliases = if (options.all)
+        installed
+    else
+        try directDependencyAliases(allocator, graph.root_workspace, installed);
+
+    if (options.all) {
+        try stdout.print("{s} node_modules\n", .{project.root_dir});
+    } else {
+        try stdout.print("{s} node_modules ({d})\n", .{ project.root_dir, installed.len });
+    }
+    for (aliases, 0..) |alias, index| {
+        const connector = if (index + 1 == aliases.len) "└──" else "├──";
+        const resolution = try pmDisplayResolution(init.io, allocator, project.root_dir, &graph, alias);
+        try stdout.print("{s} {s}@{s}\n", .{ connector, alias, resolution });
+    }
+    try stdout.flush();
+    return 0;
+}
+
+fn runPmMigrate(
+    init: std.process.Init,
+    options: Options,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const invocation_dir = try absolutePath(init.io, allocator, ".");
+    const project = try findInstallProject(init.io, allocator, invocation_dir);
+    const text_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lock" });
+    const binary_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lockb" });
+    if (!options.force and (fileExists(init.io, text_path) or fileExists(init.io, binary_path))) {
+        try stderr.writeAll("error: bun.lock already exists\nrun with --force to overwrite\n");
+        try stderr.flush();
+        return 1;
+    }
+    if (options.force) {
+        std.Io.Dir.cwd().deleteFile(init.io, text_path) catch {};
+        std.Io.Dir.cwd().deleteFile(init.io, binary_path) catch {};
+    }
+
+    const package_json_path = try std.fs.path.join(allocator, &.{ project.root_dir, "package.json" });
+    const package_source = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        package_json_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    );
+    var root: Value = if (std.mem.trim(u8, package_source, " \t\r\n").len == 0)
+        .{ .object = .empty }
+    else
+        try std.json.parseFromSliceLeaky(Value, allocator, package_source, .{});
+    var install_options = options;
+    install_options.command = .install;
+    install_options.positionals = &.{};
+    install_options.silent = true;
+    install_options.no_summary = true;
+    install_options.lockfile_only = true;
+    install_options.force = false;
+    var manager = Manager.init(init, install_options, stdout, stderr);
+    defer manager.deinit();
+    manager.omit_pnpm_workspace_versions = true;
+    manager.invocation_dir = invocation_dir;
+    manager.root_dir = project.root_dir;
+    manager.invocation_package_dir = project.package_dir;
+    if (!std.mem.eql(u8, invocation_dir, project.root_dir)) {
+        try std.process.setCurrentPath(init.io, project.root_dir);
+    }
+    try manager.loadConfiguration();
+    manager.root_package_json = &root;
+    manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
+
+    const npm_path = try std.fs.path.join(allocator, &.{ project.root_dir, LockfileMigration.Source.npm.filename() });
+    if (try readOptionalFile(init.io, allocator, npm_path, 256 * 1024 * 1024)) |npm_source| {
+        const binary = try BunLockfile.migrateNpmToBinary(allocator, npm_source, npm_path, manager.registry);
+        try writeMigratedLockfile(&manager, text_path, binary_path, binary);
+        try stderr.print("migrated lockfile from {s}\n", .{LockfileMigration.Source.npm.filename()});
+        try stderr.flush();
+        return 0;
+    }
+
+    const migration = switch (try LockfileMigration.detect(init.io, allocator, project.root_dir, &root)) {
+        .migrated => |migration| migration,
+        .not_found => {
+            try stderr.writeAll("error: could not find any other lockfile\n");
+            try stderr.flush();
+            return 1;
+        },
+        .ignored => |ignored| {
+            if (ignored.reason == .pnpm_lockfile_too_old) {
+                try stderr.writeAll("error: pnpm-lock.yaml version is too old\nPlease upgrade using 'pnpm install' before migrating\n");
+                try stderr.flush();
+                return 1;
+            }
+            try stderr.print("error: unable to migrate {s}\n", .{ignored.source.filename()});
+            try stderr.flush();
+            return 1;
+        },
+    };
+
+    manager.lockfile_config_version = migration.graph.config_version orelse .v0;
+    manager.lock_graph = migration.graph;
+    try manager.enrichMigratedLockMetadata();
+    if (manager.lock_graph.?.provenance == .pnpm) {
+        manager.manifest_policy.?.deinit();
+        manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
+        if (manager.lock_graph.?.package_json_changed) {
+            try writePackageJSON(
+                manager.init_data.io,
+                manager.allocator,
+                package_json_path,
+                root,
+                package_source.len > 0 and package_source[package_source.len - 1] == '\n',
+            );
+        }
+    }
+    try manager.discoverWorkspaces(&root);
+    try manager.loadRecordsFromLockGraph();
+    try manager.writeTextLockfile(&root);
+    try stderr.print("migrated lockfile from {s}\n", .{migration.source.filename()});
+    try stderr.flush();
+    return 0;
+}
+
+fn writeMigratedLockfile(
+    manager: *Manager,
+    text_path: []const u8,
+    binary_path: []const u8,
+    binary: []const u8,
+) !void {
+    if (manager.shouldSaveTextLockfile()) {
+        const text = try BunLockfile.binaryToText(manager.allocator, binary);
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = text_path, .data = text });
+        std.Io.Dir.cwd().deleteFile(manager.init_data.io, binary_path) catch {};
+        return;
+    }
+
+    try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = binary });
+    if (builtin.os.tag != .windows) {
+        const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
+        try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
+    }
+    std.Io.Dir.cwd().deleteFile(manager.init_data.io, text_path) catch {};
+}
+
+fn runPmHash(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+    const allocator = init.arena.allocator();
+    const invocation_dir = try absolutePath(init.io, allocator, ".");
+    const project = try findInstallProject(init.io, allocator, invocation_dir);
+    const text_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lock" });
+    if (try readOptionalFile(init.io, allocator, text_path, 256 * 1024 * 1024)) |text| {
+        try BunLockfile.writeTextMetaHash(allocator, text, stdout);
+        try stdout.flush();
+        return 0;
+    }
+
+    const binary_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lockb" });
+    if (try readOptionalFile(init.io, allocator, binary_path, 256 * 1024 * 1024)) |binary| {
+        try BunLockfile.writeBinaryMetaHash(allocator, binary, stdout);
+        try stdout.flush();
+        return 0;
+    }
+
+    try stderr.writeAll("error: lockfile not found\n");
+    try stderr.flush();
+    return 1;
+}
+
+fn runPmHashString(
+    init: std.process.Init,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const allocator = init.arena.allocator();
+    const invocation_dir = try absolutePath(init.io, allocator, ".");
+    const project = try findInstallProject(init.io, allocator, invocation_dir);
+    const text_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lock" });
+    if (try readOptionalFile(init.io, allocator, text_path, 256 * 1024 * 1024)) |text| {
+        try BunLockfile.writeTextMetaHashString(allocator, text, stdout);
+        try stdout.flush();
+        return 0;
+    }
+
+    const binary_path = try std.fs.path.join(allocator, &.{ project.root_dir, "bun.lockb" });
+    if (try readOptionalFile(init.io, allocator, binary_path, 256 * 1024 * 1024)) |binary| {
+        try BunLockfile.writeBinaryMetaHashString(allocator, binary, stdout);
+        try stdout.flush();
+        return 0;
+    }
+
+    try stderr.writeAll("error: lockfile not found\n");
+    try stderr.flush();
+    return 1;
+}
+
+fn runPmWhoami(
+    init: std.process.Init,
+    options: Options,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    var manager_options = options;
+    manager_options.command = .install;
+    manager_options.positionals = &.{};
+    var manager = Manager.init(init, manager_options, stdout, stderr);
+    defer manager.deinit();
+    manager.invocation_dir = try absolutePath(init.io, manager.allocator, ".");
+    manager.root_dir = manager.invocation_dir;
+    manager.invocation_package_dir = manager.invocation_dir;
+    try manager.loadConfiguration();
+    manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
+
+    if (manager.registry_authorization == null) {
+        try stderr.writeAll("error: missing authentication (run `bunx npm login`)\n");
+        try stderr.flush();
+        return 1;
+    }
+    const url = try std.fmt.allocPrint(manager.allocator, "{s}-/whoami", .{manager.registry});
+    const response = manager.fetchBytes(url, false, 1024 * 1024) catch return 1;
+    const value = std.json.parseFromSliceLeaky(Value, manager.allocator, response, .{}) catch {
+        try stderr.writeAll("error: failed to parse '/-/whoami' response body as JSON\n");
+        try stderr.flush();
+        return 1;
+    };
+    const username = jsonString(&value, "username") orelse {
+        try stderr.print("error: failed to authenticate with registry '{s}'\n", .{manager.registry});
+        try stderr.flush();
+        return 1;
+    };
+    try stdout.print("{s}\n", .{username});
+    try stdout.flush();
+    return 0;
+}
+
+fn loadPmLockGraph(io: std.Io, allocator: std.mem.Allocator, root_dir: []const u8) !Lockfile.Graph {
+    const text_path = try std.fs.path.join(allocator, &.{ root_dir, "bun.lock" });
+    if (try readOptionalFile(io, allocator, text_path, 256 * 1024 * 1024)) |text| {
+        return Lockfile.parseText(allocator, text);
+    }
+
+    const binary_path = try std.fs.path.join(allocator, &.{ root_dir, "bun.lockb" });
+    const binary = try std.Io.Dir.cwd().readFileAlloc(io, binary_path, allocator, .limited(256 * 1024 * 1024));
+    return Lockfile.parseText(allocator, try BunLockfile.binaryToText(allocator, binary));
+}
+
+fn rootInstalledAliases(io: std.Io, allocator: std.mem.Allocator, root_dir: []const u8) ![]const []const u8 {
+    const modules_path = try std.fs.path.join(allocator, &.{ root_dir, "node_modules" });
+    var modules = std.Io.Dir.cwd().openDir(io, modules_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    defer modules.close(io);
+    var aliases = std.array_list.Managed([]const u8).init(allocator);
+    var iterator = modules.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (entry.name[0] != '@') {
+            try aliases.append(try allocator.dupe(u8, entry.name));
+            continue;
+        }
+        var scope = modules.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        var scope_iterator = scope.iterate();
+        while (try scope_iterator.next(io)) |child| {
+            if (child.name.len == 0 or child.name[0] == '.') continue;
+            try aliases.append(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, child.name }));
+        }
+        scope.close(io);
+    }
+    std.sort.pdq([]const u8, aliases.items, {}, lessString);
+    return aliases.toOwnedSlice();
+}
+
+fn directDependencyAliases(
+    allocator: std.mem.Allocator,
+    workspace: *const Value,
+    installed: []const []const u8,
+) ![]const []const u8 {
+    var aliases = std.array_list.Managed([]const u8).init(allocator);
+    for (all_dependency_sections) |section_name| {
+        if (workspace.* != .object) continue;
+        const section = workspace.object.get(section_name) orelse continue;
+        if (section != .object) continue;
+        for (section.object.keys()) |alias| {
+            if (!containsString(installed, alias) or containsString(aliases.items, alias)) continue;
+            try aliases.append(alias);
+        }
+    }
+    std.sort.pdq([]const u8, aliases.items, {}, lessString);
+    return aliases.toOwnedSlice();
+}
+
+fn pmDisplayResolution(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    graph: *const Lockfile.Graph,
+    alias: []const u8,
+) ![]const u8 {
+    if (graph.get(alias)) |package| {
+        const info_version = if (package.info) |info| jsonString(info, "version") else null;
+        return switch (package.kind) {
+            .npm => package.version,
+            .folder, .symlink => if (package.source.len > 0) std.fs.path.basename(package.source) else package.name,
+            .workspace => info_version orelse if (package.source.len > 0) std.fs.path.basename(package.source) else package.name,
+            .local_tarball, .remote_tarball, .git, .github => info_version orelse package.source,
+            .root => package.name,
+        };
+    }
+    const package_json_path = try std.fs.path.join(allocator, &.{ root_dir, "node_modules", alias, "package.json" });
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, package_json_path, allocator, .limited(4 * 1024 * 1024));
+    const package_json = try std.json.parseFromSliceLeaky(Value, allocator, source, .{});
+    return jsonString(&package_json, "version") orelse jsonString(&package_json, "name") orelse "unknown";
+}
+
+fn lessString(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn packageFetchConcurrency() usize {
+    return @min(@as(usize, 16), @max(@as(usize, 4), (std.Thread.getCpuCount() catch 2) * 2));
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn readOptionalFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    limit: usize,
+) !?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(limit)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn decodeConfigText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, raw, "\xef\xbb\xbf")) return raw[3..];
+    const endian: ?std.builtin.Endian = if (std.mem.startsWith(u8, raw, "\xff\xfe"))
+        .little
+    else if (std.mem.startsWith(u8, raw, "\xfe\xff"))
+        .big
+    else
+        null;
+    if (endian) |byte_order| {
+        const bytes = raw[2..];
+        if (bytes.len % 2 != 0) return error.InvalidConfigEncoding;
+        const units = try allocator.alloc(u16, bytes.len / 2);
+        for (units, 0..) |*unit, index| {
+            unit.* = std.mem.readInt(u16, bytes[index * 2 ..][0..2], byte_order);
+        }
+        return std.unicode.utf16LeToUtf8Alloc(allocator, units);
+    }
+    return raw;
+}
+
+fn normalizeRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, url, "/")) return allocator.dupe(u8, url);
+    return std.fmt.allocPrint(allocator, "{s}/", .{url});
 }
 
 const Manager = struct {
@@ -428,8 +1230,13 @@ const Manager = struct {
     invocation_package_dir: []const u8 = "",
     registry: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
+    registry_scopes: std.StringHashMap(RegistryConfig),
+    cache_directory: ?[]const u8 = null,
     save_text_lockfile: bool = true,
+    save_text_lockfile_configured: bool = false,
     loaded_text_lockfile: bool = false,
+    loaded_binary_lockfile: bool = false,
+    binary_lockfile_needs_migration: bool = false,
     lockfile_config_version: Lockfile.ConfigVersion = .current,
     linker_configured: bool = false,
     max_retry_count: u16 = 5,
@@ -438,13 +1245,26 @@ const Manager = struct {
     workspaces: std.StringHashMap(Workspace),
     root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
+    registry_manifests: std.StringHashMap(*Value),
     direct_bins: std.array_list.Managed([]const u8),
+    explicit_adds: std.StringHashMap(void),
+    direct_install_reports: std.array_list.Managed(DirectInstallReport),
+    removed_materialized_names: std.array_list.Managed([]const u8),
+    latest_versions: std.StringHashMap([]const u8),
     installed_workspaces: std.StringHashMap(void),
+    filtered_workspaces: std.StringHashMap(void),
+    resolution_only_records: std.StringHashMap(void),
+    install_filter_active: bool = false,
+    root_selected: bool = true,
+    filter_resolution_only: bool = false,
     report_direct_installs: bool = false,
     link_workspace_packages: bool = true,
     started_ns: i128,
     installed_count: usize = 0,
+    removed_count: usize = 0,
     changed: bool = false,
+    patch_policy_changed: bool = false,
+    omit_pnpm_workspace_versions: bool = false,
     root_package_json: ?*Value = null,
     node_linker: Isolated.Linker = .hoisted,
     public_hoist_pattern: ?Isolated.HoistPattern = null,
@@ -480,8 +1300,16 @@ const Manager = struct {
             .workspaces = std.StringHashMap(Workspace).init(allocator),
             .root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
+            .registry_manifests = std.StringHashMap(*Value).init(allocator),
+            .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
+            .explicit_adds = std.StringHashMap(void).init(allocator),
+            .direct_install_reports = std.array_list.Managed(DirectInstallReport).init(allocator),
+            .removed_materialized_names = std.array_list.Managed([]const u8).init(allocator),
+            .latest_versions = std.StringHashMap([]const u8).init(allocator),
             .installed_workspaces = std.StringHashMap(void).init(allocator),
+            .filtered_workspaces = std.StringHashMap(void).init(allocator),
+            .resolution_only_records = std.StringHashMap(void).init(allocator),
             .isolated_parent_modules = std.StringHashMap([]const u8).init(allocator),
             .isolated_parent_keys = std.StringHashMap([]const u8).init(allocator),
             .isolated_package_metadata = std.StringHashMap(*const Value).init(allocator),
@@ -497,7 +1325,15 @@ const Manager = struct {
     }
 
     fn deinit(manager: *Manager) void {
+        manager.registry_scopes.deinit();
+        manager.registry_manifests.deinit();
+        manager.resolution_only_records.deinit();
+        manager.filtered_workspaces.deinit();
         manager.installed_workspaces.deinit();
+        manager.latest_versions.deinit();
+        manager.removed_materialized_names.deinit();
+        manager.direct_install_reports.deinit();
+        manager.explicit_adds.deinit();
         manager.peer_conflict_warnings.deinit();
         manager.script_queue.deinit();
         manager.isolated_public_hoists.deinit();
@@ -534,6 +1370,20 @@ const Manager = struct {
         try manager.loadConfiguration();
         manager.client.initDefaultProxies(manager.allocator, manager.init_data.environ_map) catch {};
 
+        if (manager.options.command == .link and manager.options.positionals.len == 0) {
+            return manager.registerGlobalLink();
+        }
+        if (manager.options.command == .unlink) {
+            if (manager.options.positionals.len != 0) {
+                try manager.stderr.writeAll("error: bun unlink <package> is not implemented by Bun\n");
+                return error.PackageManagerErrorReported;
+            }
+            return manager.unregisterGlobalLink();
+        }
+        if (manager.options.command == .link) {
+            manager.options.positionals = try manager.globalLinkPackageSpecs();
+        }
+
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
         const package_source = blk: {
             break :blk std.Io.Dir.cwd().readFileAlloc(
@@ -553,7 +1403,10 @@ const Manager = struct {
             };
         };
         const had_trailing_newline = package_source.len > 0 and package_source[package_source.len - 1] == '\n';
-        var root = try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
+        var root: Value = if (std.mem.trim(u8, package_source, " \t\r\n").len == 0)
+            .{ .object = .empty }
+        else
+            try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
         if (root != .object) return error.InvalidPackageJSON;
         manager.root_package_json = &root;
         manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
@@ -562,16 +1415,42 @@ const Manager = struct {
             if (manager.options.command != .install) return error.FrozenLockfileChanged;
         }
         try manager.loadLockfile(&root);
+        if (manager.lock_graph) |*graph| {
+            if (graph.provenance == .pnpm) {
+                manager.manifest_policy.?.deinit();
+                manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
+                if (graph.package_json_changed and !manager.options.dry_run and !manager.options.no_save) {
+                    try writePackageJSON(
+                        manager.init_data.io,
+                        manager.allocator,
+                        package_json_path,
+                        root,
+                        had_trailing_newline,
+                    );
+                }
+            }
+        }
 
         try manager.discoverWorkspaces(&root);
         try manager.validateLockfileWorkspaces();
+        try manager.configureInstallFilters(&root);
         if (manager.options.command == .patch) return manager.preparePatchCommand();
         if (manager.options.command == .patch_commit) {
             return manager.commitPatchCommand(&root, package_json_path, had_trailing_newline);
         }
         if (!manager.options.silent) {
-            try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n\n", .{ @tagName(manager.options.command), bun_compat_version, version });
+            try manager.stdout.print("bun {s} v{s} (cottontail v{s})\n{s}", .{
+                @tagName(manager.options.command),
+                bun_compat_version,
+                version,
+                if (manager.options.command == .link or
+                    manager.options.command == .remove or
+                    manager.rootLifecycleScriptsWillRun()) "" else "\n",
+            });
             try manager.stdout.flush();
+            if (manager.options.command == .install and manager.patch_policy_changed) {
+                try manager.stderr.writeAll("Resolving dependencies\n");
+            }
         }
 
         var command_package_json = &root;
@@ -593,23 +1472,43 @@ const Manager = struct {
             command_package_json_had_trailing_newline = command_source.len > 0 and command_source[command_source.len - 1] == '\n';
         }
 
+        if (manager.options.command == .add and manager.options.analyze) {
+            manager.options.positionals = try Analyzer.scan(
+                manager.allocator,
+                manager.init_data.io,
+                manager.options.positionals,
+                manager.invocation_package_dir,
+                manager.stderr,
+            );
+            manager.options.only_missing = true;
+        }
+
+        try manager.validateCatalogReferences(&root);
         try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
+        if (manager.options.command == .install) {
+            // Network prefetch is opportunistic. The normal resolver remains the
+            // source of diagnostics and retries if a speculative request fails.
+            manager.prefetchInstallNetwork(&root) catch {};
+        }
 
         switch (manager.options.command) {
             .install => try manager.installRoot(&root, true),
             .add => try manager.addPackages(command_package_json, manager.invocation_package_dir),
             .remove => try manager.removePackages(command_package_json, manager.invocation_package_dir),
             .update => try manager.updatePackages(command_package_json, manager.invocation_package_dir),
+            .link => try manager.addPackages(command_package_json, manager.invocation_package_dir),
+            .unlink => unreachable,
             .patch, .patch_commit => unreachable,
-            .pm => unreachable,
+            .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
         try manager.reconcileIsolatedPeerGraph();
         try manager.finalizeIsolatedNodeModules();
         try manager.pruneStaleHoistedWorkspaceLinks();
+        try manager.relinkNativeDependencyBins(&root);
 
-        if ((manager.options.command == .add or manager.options.command == .remove or manager.options.command == .update) and
+        if ((manager.options.command == .add or manager.options.command == .remove or manager.options.command == .update or manager.options.command == .link) and
             !manager.options.no_save and !manager.options.dry_run)
         {
             try writePackageJSON(
@@ -623,35 +1522,192 @@ const Manager = struct {
 
         if (!manager.options.dry_run and !manager.options.no_save) {
             if (manager.records.items.len == 0 and !hasAnyDependencies(&root)) {
+                const had_lockfile = manager.hasExistingLockfile();
                 manager.deleteLockfiles();
-            } else if (manager.changed or !manager.hasExistingLockfile()) {
+                if (manager.options.command == .remove and manager.changed and had_lockfile and !manager.options.silent) {
+                    try manager.stderr.writeAll("\npackage.json has no dependencies! Deleted empty lockfile\n");
+                }
+            } else if (manager.changed or !manager.hasExistingLockfile() or manager.lockfileNeedsRewrite()) {
                 try manager.writeTextLockfile(&root);
             }
         }
 
         if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
             try manager.script_queue.run(manager.init_data, manager.root_dir, manager.stderr);
-            if (manager.options.command == .install) {
+            if (manager.options.command == .install and manager.root_selected) {
                 try Scripts.runRoot(manager.init_data, manager.root_dir, &root, manager.stderr);
             }
         }
 
         if (!manager.options.silent and manager.options.lockfile_only and !manager.options.no_save and !manager.options.dry_run) {
-            try manager.stdout.writeAll("Saved bun.lock");
+            try manager.stdout.print("Saved {s} ({d} packages)", .{
+                if (manager.shouldSaveTextLockfile()) "bun.lock" else "bun.lockb",
+                manager.lockfilePackageCount(),
+            });
         } else if (!manager.options.silent and !manager.options.no_summary and
             !(manager.options.only_missing and manager.installed_count == 0))
         {
             const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
             const elapsed_ms = @as(f64, @floatFromInt(finished_ns - manager.started_ns)) / std.time.ns_per_ms;
-            if (manager.installed_count == 1) {
-                try manager.stdout.print("\n1 package installed [{d:.2}ms]\n", .{elapsed_ms});
+            const reported_installed_count = if (manager.options.command == .link)
+                manager.options.positionals.len
+            else
+                manager.installed_count;
+            if (manager.options.command == .remove) {
+                if (manager.direct_install_reports.items.len > 0) {
+                    const count = manager.direct_install_reports.items.len;
+                    try manager.stdout.print("\n{d} package{s} installed [{d:.2}ms]\nRemoved: {d}\n", .{
+                        count,
+                        if (count == 1) "" else "s",
+                        elapsed_ms,
+                        manager.removed_count,
+                    });
+                } else if (manager.removed_materialized_names.items.len > 0) {
+                    for (manager.removed_materialized_names.items) |name| {
+                        try manager.stdout.print("- {s}\n", .{name});
+                    }
+                    const count = manager.removed_materialized_names.items.len;
+                    try manager.stdout.print("{d} package{s} removed [{d:.2}ms]\n", .{
+                        count,
+                        if (count == 1) "" else "s",
+                        elapsed_ms,
+                    });
+                } else if (manager.removed_count > 0) {
+                    try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
+                }
+            } else if (manager.options.command == .install and reported_installed_count == 0) {
+                const checked_installs = manager.records.items.len;
+                if (checked_installs == 0) {
+                    try manager.stdout.print("Done! Checked {d} packages (no changes) [{d:.2}ms]\n", .{ manager.lockfilePackageCount(), elapsed_ms });
+                } else {
+                    try manager.stdout.print("Checked {d} install{s} across {d} packages (no changes) [{d:.2}ms]\n", .{
+                        checked_installs,
+                        if (checked_installs == 1) "" else "s",
+                        manager.lockfilePackageCount(),
+                        elapsed_ms,
+                    });
+                }
+            } else if (manager.options.command == .add and reported_installed_count == 0) {
+                try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
+            } else if (reported_installed_count == 1) {
+                try manager.stdout.print("{s}1 package installed [{d:.2}ms]\n", .{
+                    manager.installSummarySeparator(),
+                    elapsed_ms,
+                });
             } else {
-                try manager.stdout.print("\n{d} packages installed [{d:.2}ms]\n", .{ manager.installed_count, elapsed_ms });
+                try manager.stdout.print("{s}{d} packages installed [{d:.2}ms]\n", .{
+                    manager.installSummarySeparator(),
+                    reported_installed_count,
+                    elapsed_ms,
+                });
             }
         }
         try manager.stdout.flush();
         try manager.stderr.flush();
         return 0;
+    }
+
+    fn globalLinkPackageSpecs(manager: *Manager) ![]const []const u8 {
+        const specs = try manager.allocator.alloc([]const u8, manager.options.positionals.len);
+        for (manager.options.positionals, specs) |name, *spec| {
+            if (!isValidGlobalLinkName(name)) {
+                try manager.stderr.print("error: Invalid package name \"{s}\"\n", .{name});
+                return error.PackageManagerErrorReported;
+            }
+            spec.* = try std.fmt.allocPrint(manager.allocator, "{s}@link:{s}", .{ name, name });
+        }
+        return specs;
+    }
+
+    fn registerGlobalLink(manager: *Manager) !u8 {
+        const package_json = try manager.readLinkPackageJSON();
+        const name = jsonString(package_json, "name") orelse {
+            try manager.stderr.writeAll("error: package.json missing \"name\"\n");
+            return error.PackageManagerErrorReported;
+        };
+        if (!isValidGlobalLinkName(name)) {
+            try manager.stderr.print("error: invalid package.json name \"{s}\"\n", .{name});
+            return error.PackageManagerErrorReported;
+        }
+
+        if (!manager.options.silent) {
+            try manager.stdout.print("bun link v{s} (cottontail v{s})\n\n", .{ bun_compat_version, version });
+        }
+        if (!manager.options.dry_run) {
+            const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
+            const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
+            try manager.linkDirectoryAt(destination, manager.invocation_package_dir);
+
+            const bin_dir = try globalBinPath(manager.init_data, manager.allocator);
+            try manager.linkBinsInDirectory(name, manager.invocation_package_dir, package_json, false, bin_dir);
+        }
+
+        if (!manager.options.silent) {
+            try manager.stdout.print(
+                "Success! Registered \"{s}\"\n\nTo use {s} in a project, run:\n  bun link {s}\n\nOr add it in dependencies in your package.json file:\n  \"{s}\": \"link:{s}\"\n",
+                .{ name, name, name, name, name },
+            );
+            try manager.stdout.flush();
+        }
+        return 0;
+    }
+
+    fn unregisterGlobalLink(manager: *Manager) !u8 {
+        const package_json = try manager.readLinkPackageJSON();
+        const name = jsonString(package_json, "name") orelse {
+            try manager.stderr.writeAll("error: package.json missing \"name\"\n");
+            return error.PackageManagerErrorReported;
+        };
+        if (!isValidGlobalLinkName(name)) {
+            try manager.stderr.print("error: invalid package.json name \"{s}\"\n", .{name});
+            return error.PackageManagerErrorReported;
+        }
+
+        if (!manager.options.silent) {
+            try manager.stdout.print("bun unlink v{s} (cottontail v{s})\n\n", .{ bun_compat_version, version });
+        }
+        const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+        const destination = try std.fs.path.join(manager.allocator, &.{ node_modules, name });
+        const linked = std.Io.Dir.cwd().statFile(manager.init_data.io, destination, .{ .follow_symlinks = false }) catch null;
+        if (linked == null or linked.?.kind != .sym_link) {
+            if (!manager.options.silent) {
+                try manager.stdout.print("success: package \"{s}\" is not globally linked, so there's nothing to do.\n", .{name});
+                try manager.stdout.flush();
+            }
+            return 0;
+        }
+
+        if (!manager.options.dry_run) {
+            deletePath(manager.init_data.io, destination);
+            const bin_dir = try globalBinPath(manager.init_data, manager.allocator);
+            try manager.unlinkBinsInDirectory(name, package_json, bin_dir);
+        }
+        if (!manager.options.silent) {
+            try manager.stdout.print("success: unlinked package \"{s}\"\n", .{name});
+            try manager.stdout.flush();
+        }
+        return 0;
+    }
+
+    fn readLinkPackageJSON(manager: *Manager) !*Value {
+        const path = try std.fs.path.join(manager.allocator, &.{ manager.invocation_package_dir, "package.json" });
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            path,
+            manager.allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch |err| {
+            try manager.stderr.print("error: failed to read \"{s}\" for linking: {s}\n", .{ path, @errorName(err) });
+            return error.PackageManagerErrorReported;
+        };
+        const package_json = try manager.allocator.create(Value);
+        package_json.* = std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{}) catch {
+            try manager.stderr.print("error: invalid package.json in \"{s}\"\n", .{manager.invocation_package_dir});
+            return error.PackageManagerErrorReported;
+        };
+        if (package_json.* != .object) return error.InvalidPackageJSON;
+        return package_json;
     }
 
     fn preparePatchCommand(manager: *Manager) !u8 {
@@ -795,8 +1851,18 @@ const Manager = struct {
         while (iterator.next()) |entry| {
             const package = entry.value_ptr;
             if (!isPatchableResolution(package.kind) or !std.mem.eql(u8, package.name, target.name)) continue;
-            const destination = manager.patchDestinationForKey(package.key) catch continue;
-            const identity = manager.readInstalledPackageJSON(destination) catch continue;
+            const destination = manager.patchDestinationForKey(package.key) catch |err| {
+                if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+                    try manager.stderr.print("patch target skipped {s}: {s}\n", .{ package.key, @errorName(err) });
+                }
+                continue;
+            };
+            const identity = manager.readInstalledPackageJSON(destination) catch |err| {
+                if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+                    try manager.stderr.print("patch target missing {s} at {s}: {s}\n", .{ package.key, destination, @errorName(err) });
+                }
+                continue;
+            };
             const name = jsonString(identity, "name") orelse continue;
             const version_value = jsonString(identity, "version") orelse continue;
             if (!std.mem.eql(u8, name, target.name)) continue;
@@ -840,6 +1906,10 @@ const Manager = struct {
     fn patchDestinationForKey(manager: *Manager, key: []const u8) ![]const u8 {
         if (manager.node_linker == .isolated) {
             const package = manager.lock_graph.?.get(key) orelse return error.PackageNotFound;
+            const public_destination = try Patch.Spec.destinationForLockKey(manager.allocator, manager.root_dir, key);
+            const public_manifest = try std.fs.path.join(manager.allocator, &.{ public_destination, "package.json" });
+            if (manager.pathExists(public_manifest)) return public_destination;
+
             const placement = try manager.packagePlacementFromLock(package, .{});
             try manager.rememberIsolatedParent(placement, package.key);
             if (manager.pathExists(placement.package_dir)) return placement.package_dir;
@@ -970,14 +2040,32 @@ const Manager = struct {
 
     fn prepareNodeModules(manager: *Manager) !void {
         if (manager.options.lockfile_only or manager.options.dry_run) return;
+        if (manager.cache_directory) |install_cache| {
+            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, install_cache);
+        }
         const node_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
         if (manager.node_linker == .isolated) {
+            // Bun establishes the project cache before converting an add to
+            // isolated layout. Preserve that ordering so the migration leaves
+            // the same .old_modules-* holding directory on a first add.
+            if (manager.options.command == .add and !manager.pathExists(node_modules)) {
+                const initial_cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, initial_cache);
+            }
             try manager.isolated_managed_modules.put(try manager.allocator.dupe(u8, node_modules), {});
             const hidden_modules = try std.fs.path.join(manager.allocator, &.{ node_modules, ".bun", "node_modules" });
             try manager.isolated_managed_modules.put(try manager.allocator.dupe(u8, hidden_modules), {});
             try manager.prepareIsolatedNodeModules(node_modules);
         } else {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
+        }
+        const create_project_cache = if (manager.node_linker == .isolated)
+            manager.options.command == .add
+        else
+            manager.workspaces.count() == 0 and
+                (manager.options.command == .add or manager.options.command == .install or
+                    manager.options.cpu_overridden or manager.options.os_overridden);
+        if (create_project_cache) {
             const cache = try std.fs.path.join(manager.allocator, &.{ node_modules, ".cache" });
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
         }
@@ -1056,14 +2144,9 @@ const Manager = struct {
             }
         }
 
-        const root_modules = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules" });
-        var root_dir = std.Io.Dir.cwd().openDir(manager.init_data.io, root_modules, .{ .iterate = true }) catch return;
-        defer root_dir.close(manager.init_data.io);
-        var root_iterator = root_dir.iterate();
-        while (try root_iterator.next(manager.init_data.io)) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, ".old_modules-")) continue;
-            deletePath(manager.init_data.io, try std.fs.path.join(manager.allocator, &.{ root_modules, entry.name }));
-        }
+        // Bun intentionally preserves the migration holding directory. Apart
+        // from matching its observable layout, this leaves a recoverable copy
+        // of packages displaced while converting a hoisted tree to isolated.
     }
 
     fn pruneManagedModuleLinks(manager: *Manager, modules_dir: []const u8) !void {
@@ -1075,7 +2158,12 @@ const Manager = struct {
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             const path = try std.fs.path.join(manager.allocator, &.{ modules_dir, entry.name });
             if (manager.isManagedDirectoryLink(path, entry.kind)) {
-                if (!manager.isolated_live_links.contains(path)) try manager.removeManagedDirectoryLink(path);
+                if (!manager.isolated_live_links.contains(path)) {
+                    if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+                        try manager.stderr.print("isolated prune: {s}\n", .{path});
+                    }
+                    try manager.removeManagedDirectoryLink(path);
+                }
                 continue;
             }
             if (entry.kind != .directory or entry.name[0] != '@') continue;
@@ -1108,6 +2196,9 @@ const Manager = struct {
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             const path = try std.fs.path.join(manager.allocator, &.{ scope_dir, entry.name });
             if (manager.isManagedDirectoryLink(path, entry.kind) and !manager.isolated_live_links.contains(path)) {
+                if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+                    try manager.stderr.print("isolated prune: {s}\n", .{path});
+                }
                 try manager.removeManagedDirectoryLink(path);
             }
         }
@@ -1162,13 +2253,17 @@ const Manager = struct {
             break :blk null;
         };
         if (bunfig) |source| {
+            try manager.validateBunfigSyntax(bunfig_path, source);
             if (registry == null) registry = parseTomlString(source, "registry");
             if (configured_linker == null) {
                 if (parseTomlString(source, "linker")) |value| {
                     configured_linker = Isolated.Linker.parse(value) orelse return error.UnsupportedPackageManagerLinker;
                 }
             }
-            if (parseTomlBool(source, "saveTextLockfile")) |value| manager.save_text_lockfile = value;
+            if (parseTomlBool(source, "saveTextLockfile")) |value| {
+                manager.save_text_lockfile = value;
+                manager.save_text_lockfile_configured = true;
+            }
             if (parseTomlBool(source, "exact")) |value| manager.options.exact = value;
             if (parseTomlBool(source, "frozenLockfile")) |value| manager.options.frozen_lockfile = value;
             if (parseTomlBool(source, "linkWorkspacePackages")) |value| manager.link_workspace_packages = value;
@@ -1187,52 +2282,159 @@ const Manager = struct {
                 manager.hidden_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
             }
         }
-        if (manager.options.save_text_lockfile) manager.save_text_lockfile = true;
+        if (manager.options.save_text_lockfile) {
+            manager.save_text_lockfile = true;
+            manager.save_text_lockfile_configured = true;
+        }
 
-        if (std.Io.Dir.cwd().readFileAlloc(
-            manager.init_data.io,
-            ".npmrc",
-            manager.allocator,
-            .limited(1024 * 1024),
-        ) catch null) |npmrc| {
-            if (registry == null) registry = parseNpmrcValue(npmrc, "registry");
-            if (parseNpmrcValue(npmrc, "link-workspace-packages")) |value| {
-                if (std.ascii.eqlIgnoreCase(value, "true")) manager.link_workspace_packages = true;
-                if (std.ascii.eqlIgnoreCase(value, "false")) manager.link_workspace_packages = false;
-            }
-            if (manager.registry_authorization == null) {
-                if (parseNpmrcValue(npmrc, "_authToken")) |token| {
-                    manager.registry_authorization = try std.fmt.allocPrint(manager.allocator, "Bearer {s}", .{token});
-                } else if (parseNpmrcValue(npmrc, "_auth")) |auth| {
-                    manager.registry_authorization = try std.fmt.allocPrint(manager.allocator, "Basic {s}", .{auth});
-                }
-            }
-            if (manager.public_hoist_pattern == null) {
-                if (try parseNpmrcStringList(manager.allocator, npmrc, "public-hoist-pattern")) |patterns| {
-                    manager.public_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
-                }
-            }
-            if (manager.hidden_hoist_pattern == null) {
-                if (try parseNpmrcStringList(manager.allocator, npmrc, "hoist-pattern")) |patterns| {
-                    manager.hidden_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
-                }
-            }
+        try manager.loadNpmrcConfiguration(&registry);
+        if (!manager.options.no_cache and manager.cache_directory == null) {
+            manager.cache_directory = try packageCachePath(manager.init_data, manager.allocator);
         }
 
         manager.linker_configured = configured_linker != null;
-        manager.node_linker = configured_linker orelse linker: {
-            if (manager.options.command == .patch or manager.options.command == .patch_commit) {
-                const store = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bun" });
-                if (manager.pathExists(store)) break :linker .isolated;
-            }
-            break :linker .hoisted;
-        };
+        manager.node_linker = configured_linker orelse try manager.inferUnconfiguredLinker();
 
         const selected = registry orelse default_registry;
         manager.registry = if (std.mem.endsWith(u8, selected, "/"))
             try manager.allocator.dupe(u8, selected)
         else
             try std.fmt.allocPrint(manager.allocator, "{s}/", .{selected});
+    }
+
+    fn validateBunfigSyntax(manager: *Manager, path: []const u8, source_text: []const u8) !void {
+        var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
+        var ast_scope = ast_memory_allocator.enter(manager.allocator);
+        defer ast_scope.exit();
+
+        var log = compiler.logger.Log.init(manager.allocator);
+        defer log.deinit();
+        const source = compiler.logger.Source.initPathString(path, source_text);
+        _ = compiler.interchange.toml.TOML.parse(&source, &log, manager.allocator, true) catch {
+            if (!log.hasErrors()) {
+                try log.addErrorOpts("Failed to parse bunfig.toml", .{
+                    .source = &source,
+                    .redact_sensitive_information = true,
+                });
+            }
+            try log.print(manager.stderr);
+            return error.PackageManagerErrorReported;
+        };
+        if (log.hasErrors()) {
+            try log.print(manager.stderr);
+            return error.PackageManagerErrorReported;
+        }
+    }
+
+    fn loadNpmrcConfiguration(manager: *Manager, registry: *?[]const u8) !void {
+        var ast_memory_allocator: compiler.ast.ASTMemoryAllocator = undefined;
+        var ast_scope = ast_memory_allocator.enter(manager.allocator);
+        defer ast_scope.exit();
+
+        var env_map = compiler.DotEnv.Map.init(manager.allocator);
+        var env = compiler.DotEnv.Loader.init(&env_map, manager.allocator);
+        try env.loadProcess();
+        if (try readOptionalFile(manager.init_data.io, manager.allocator, ".env", 1024 * 1024)) |raw_env| {
+            const env_text = try decodeConfigText(manager.allocator, raw_env);
+            try env.loadFromString(env_text, false, true);
+        }
+
+        var install = std.mem.zeroes(compiler.schema.api.BunInstall);
+        if (registry.*) |url| {
+            install.default_registry = .{
+                .url = url,
+                .username = "",
+                .password = "",
+                .token = "",
+                .email = "",
+            };
+        }
+
+        var configs = std.array_list.Managed(compiler.ini.ConfigIterator.Item).init(manager.allocator);
+        defer {
+            for (configs.items) |*item| item.deinit(manager.allocator);
+            configs.deinit();
+        }
+
+        if (manager.init_data.environ_map.get("XDG_CONFIG_HOME") orelse manager.init_data.environ_map.get("HOME")) |home| {
+            const home_npmrc = try std.fs.path.join(manager.allocator, &.{ home, ".npmrc" });
+            try manager.loadNpmrcFile(&install, &env, &configs, home_npmrc, false);
+        }
+        try manager.loadNpmrcFile(&install, &env, &configs, ".npmrc", true);
+
+        if (install.default_registry) |configured| {
+            if (registry.* == null) registry.* = configured.url;
+            if (manager.registry_authorization == null) {
+                manager.registry_authorization = try manager.authorizationForRegistry(configured);
+            }
+        }
+        if (!manager.options.no_cache) manager.cache_directory = install.cache_directory;
+        if (install.link_workspace_packages) |value| manager.link_workspace_packages = value;
+        if (install.exact) |value| manager.options.exact = value;
+        if (install.ignore_scripts) |value| manager.options.ignore_scripts = value;
+
+        if (install.scoped) |scoped| {
+            for (scoped.scopes.keys(), scoped.scopes.values()) |scope, configured| {
+                const url = try normalizeRegistryUrl(manager.allocator, configured.url);
+                try manager.registry_scopes.put(try manager.allocator.dupe(u8, scope), .{
+                    .url = url,
+                    .authorization = try manager.authorizationForRegistry(configured),
+                });
+            }
+        }
+    }
+
+    fn loadNpmrcFile(
+        manager: *Manager,
+        install: *compiler.schema.api.BunInstall,
+        env: *compiler.DotEnv.Loader,
+        configs: *std.array_list.Managed(compiler.ini.ConfigIterator.Item),
+        path: []const u8,
+        apply_compat_options: bool,
+    ) !void {
+        const raw = (try readOptionalFile(manager.init_data.io, manager.allocator, path, 1024 * 1024)) orelse return;
+        const source_text = try decodeConfigText(manager.allocator, raw);
+        const source = compiler.logger.Source.initPathString(path, source_text);
+        const path_z = try manager.allocator.dupeZ(u8, path);
+
+        var log = compiler.logger.Log.init(manager.allocator);
+        defer log.deinit();
+        try compiler.ini.loadNpmrcWithoutMatchers(manager.allocator, install, env, path_z, &log, &source, configs);
+        if (log.hasErrors()) {
+            try manager.stderr.print("warn: Encountered {s} while reading {s}:\n\n", .{
+                if (log.errors == 1) "an error" else "errors",
+                path,
+            });
+            try log.print(manager.stderr);
+        }
+
+        if (!apply_compat_options) return;
+        if (parseNpmrcValue(source_text, "link-workspace-packages")) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "true")) manager.link_workspace_packages = true;
+            if (std.ascii.eqlIgnoreCase(value, "false")) manager.link_workspace_packages = false;
+        }
+        if (manager.public_hoist_pattern == null) {
+            if (try parseNpmrcStringList(manager.allocator, source_text, "public-hoist-pattern")) |patterns| {
+                manager.public_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
+            }
+        }
+        if (manager.hidden_hoist_pattern == null) {
+            if (try parseNpmrcStringList(manager.allocator, source_text, "hoist-pattern")) |patterns| {
+                manager.hidden_hoist_pattern = try Isolated.HoistPattern.init(manager.allocator, patterns);
+            }
+        }
+    }
+
+    fn authorizationForRegistry(manager: *Manager, configured: compiler.schema.api.NpmRegistry) !?[]const u8 {
+        if (configured.token.len > 0) {
+            return try std.fmt.allocPrint(manager.allocator, "Bearer {s}", .{configured.token});
+        }
+        if (configured.username.len == 0 or configured.password.len == 0) return null;
+        const credentials = try std.fmt.allocPrint(manager.allocator, "{s}:{s}", .{ configured.username, configured.password });
+        const encoded_len = std.base64.standard.Encoder.calcSize(credentials.len);
+        const encoded = try manager.allocator.alloc(u8, encoded_len);
+        _ = std.base64.standard.Encoder.encode(encoded, credentials);
+        return try std.fmt.allocPrint(manager.allocator, "Basic {s}", .{encoded});
     }
 
     fn reportPatternConfigurationError(manager: *Manager, err: anyerror) !void {
@@ -1259,26 +2461,43 @@ const Manager = struct {
             manager.lock_graph = try Lockfile.parseText(manager.allocator, text);
             manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
             if (manager.lock_graph.?.config_version == null) manager.changed = true;
+            manager.patch_policy_changed = !manager.manifest_policy.?.patchesMatchLockDocument(&manager.lock_graph.?.document);
             if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
                 !manager.manifest_policy.?.matchesLockDocument(&manager.lock_graph.?.document))
             {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
                 manager.changed = true;
             }
-            manager.selectAutomaticLinker(root);
+            try manager.selectAutomaticLinker(root);
             return;
         }
 
         const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
-        std.Io.Dir.cwd().access(manager.init_data.io, binary_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {},
+        const binary = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            binary_path,
+            manager.allocator,
+            .limited(256 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
             else => return err,
         };
-        if (manager.pathExists(binary_path)) {
-            // COTTONTAIL-COMPAT: bun.lockb embeds Bun's packed Package.Serializer,
-            // Lockfile.Buffers, and global string/semver stores. Those types do
-            // not currently have a standalone graph decoder.
-            return error.BinaryLockfileReadUnsupported;
+        if (binary) |bytes| {
+            const converted = try BunLockfile.binaryToTextWithMetadata(manager.allocator, bytes);
+            manager.loaded_binary_lockfile = true;
+            manager.binary_lockfile_needs_migration = converted.migrated_from_v2;
+            manager.lock_graph = try Lockfile.parseText(manager.allocator, converted.text);
+            manager.lockfile_config_version = manager.lock_graph.?.config_version orelse .v0;
+            if (manager.lock_graph.?.config_version == null) manager.changed = true;
+            manager.patch_policy_changed = !manager.manifest_policy.?.patchesMatchLockDocument(&manager.lock_graph.?.document);
+            if (!manager.lock_graph.?.rootMatchesPackageJSON(root) or
+                !manager.manifest_policy.?.matchesLockDocument(&manager.lock_graph.?.document))
+            {
+                if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
+                manager.changed = true;
+            }
+            try manager.selectAutomaticLinker(root);
+            return;
         }
 
         const detection = try LockfileMigration.detect(
@@ -1295,6 +2514,7 @@ const Manager = struct {
             .migrated => |migration| {
                 manager.lock_graph = migration.graph;
                 manager.lockfile_config_version = migration.graph.config_version orelse .v0;
+                try manager.enrichMigratedLockMetadata();
                 manager.changed = true;
                 if (!manager.options.silent) {
                     try manager.stderr.print("migrated lockfile from {s}\n", .{migration.source.filename()});
@@ -1303,16 +2523,25 @@ const Manager = struct {
             .ignored => |ignored| {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileNotFound;
                 manager.lockfile_config_version = .current;
-                if (!manager.options.silent and ignored.reason == .pnpm_not_implemented) {
-                    try manager.stderr.writeAll("warning: pnpm-lock.yaml migration requires Bun's YAML lockfile parser; continuing with a fresh install\n");
+                if (!manager.options.silent and ignored.reason == .pnpm_lockfile_too_old) {
+                    try manager.stderr.writeAll("warning: pnpm-lock.yaml version is too old (< v7); continuing with a fresh install\n");
                 }
             },
         }
-        manager.selectAutomaticLinker(root);
+        try manager.selectAutomaticLinker(root);
     }
 
-    fn selectAutomaticLinker(manager: *Manager, root: *const Value) void {
+    fn inferUnconfiguredLinker(manager: *Manager) !Isolated.Linker {
+        const store = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".bun" });
+        return if (manager.pathExists(store)) .isolated else .hoisted;
+    }
+
+    fn selectAutomaticLinker(manager: *Manager, root: *const Value) !void {
         if (manager.linker_configured) return;
+        if (try manager.inferUnconfiguredLinker() == .isolated) {
+            manager.node_linker = .isolated;
+            return;
+        }
         const npm_migration = if (manager.lock_graph) |*graph| graph.provenance == .npm else false;
         manager.node_linker = if (manager.lockfile_config_version == .v1 and
             !npm_migration and packageJSONHasWorkspaces(root))
@@ -1341,22 +2570,172 @@ const Manager = struct {
         }
     }
 
-    fn installRoot(manager: *Manager, root: *Value, report_direct: bool) !void {
-        const previous_report_direct = manager.report_direct_installs;
-        manager.report_direct_installs = report_direct and !manager.options.lockfile_only;
-        defer manager.report_direct_installs = previous_report_direct;
-        try manager.installDependencyObject(root, "dependencies", manager.root_dir, true, false);
+    fn filterPatternMatches(
+        manager: *Manager,
+        raw_pattern: []const u8,
+        name: []const u8,
+        relative_path: []const u8,
+    ) !bool {
+        var pattern = std.mem.trim(u8, raw_pattern, " \t\r\n");
+        if (pattern.len > 0 and pattern[0] == '!') pattern = pattern[1..];
+        pattern = std.mem.trim(u8, pattern, " \t\r\n");
+
+        if (std.mem.startsWith(u8, pattern, "./") or std.mem.eql(u8, pattern, ".")) {
+            while (std.mem.startsWith(u8, pattern, "./")) pattern = pattern[2..];
+            while (pattern.len > 0 and (pattern[pattern.len - 1] == '/' or pattern[pattern.len - 1] == '\\')) {
+                pattern = pattern[0 .. pattern.len - 1];
+            }
+            const normalized = try manager.allocator.dupe(u8, pattern);
+            std.mem.replaceScalar(u8, normalized, '\\', '/');
+            return Workspaces.globMatch(normalized, relative_path);
+        }
+        return Workspaces.globMatch(pattern, name);
+    }
+
+    fn filterSelects(
+        manager: *Manager,
+        name: []const u8,
+        relative_path: []const u8,
+    ) !bool {
+        var has_positive = false;
+        for (manager.options.filters) |raw_pattern| {
+            const pattern = std.mem.trim(u8, raw_pattern, " \t\r\n");
+            if (pattern.len == 0 or pattern[0] != '!') has_positive = true;
+        }
+
+        var selected = !has_positive;
+        for (manager.options.filters) |raw_pattern| {
+            const pattern = std.mem.trim(u8, raw_pattern, " \t\r\n");
+            if (pattern.len == 0) continue;
+            if (try manager.filterPatternMatches(pattern, name, relative_path)) {
+                selected = pattern[0] != '!';
+            }
+        }
+        return selected;
+    }
+
+    fn includeWorkspaceFilterClosure(
+        manager: *Manager,
+        package_json: *const Value,
+        parent_dir: []const u8,
+    ) !void {
+        if (package_json.* != .object) return;
+        for (all_dependency_sections) |section_name| {
+            const section = package_json.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec_value| {
+                if (spec_value != .string or !manager.isWorkspaceDependency(alias, spec_value.string)) continue;
+                const workspace = try manager.resolveWorkspaceDependency(alias, spec_value.string, parent_dir);
+                const entry = try manager.filtered_workspaces.getOrPut(workspace.name);
+                if (!entry.found_existing) {
+                    try manager.includeWorkspaceFilterClosure(workspace.package_json, workspace.path);
+                }
+            }
+        }
+    }
+
+    fn configureInstallFilters(manager: *Manager, root: *const Value) !void {
+        if (manager.options.command != .install or manager.options.filters.len == 0) return;
+        manager.install_filter_active = true;
+        const root_name = jsonString(root, "name") orelse "";
+        manager.root_selected = try manager.filterSelects(root_name, "");
+
+        var workspaces = manager.workspaces.iterator();
+        while (workspaces.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            if (try manager.filterSelects(workspace.name, workspace.relative_path)) {
+                const selected = try manager.filtered_workspaces.getOrPut(workspace.name);
+                if (!selected.found_existing) {
+                    try manager.includeWorkspaceFilterClosure(workspace.package_json, workspace.path);
+                }
+            }
+        }
+
+        if (manager.root_selected) try manager.includeWorkspaceFilterClosure(root, manager.root_dir);
+    }
+
+    fn workspaceSelected(manager: *const Manager, workspace: Workspace) bool {
+        return !manager.install_filter_active or manager.filtered_workspaces.contains(workspace.name);
+    }
+
+    fn validateCatalogReferences(manager: *Manager, root: *const Value) !void {
+        var failed = false;
+        try manager.validateManifestCatalogReferences(root, &failed);
+        var workspaces = manager.workspaces.iterator();
+        while (workspaces.next()) |entry| {
+            try manager.validateManifestCatalogReferences(entry.value_ptr.package_json, &failed);
+        }
+        if (failed) return error.PackageManagerErrorReported;
+    }
+
+    fn validateManifestCatalogReferences(
+        manager: *Manager,
+        package_json: *const Value,
+        failed: *bool,
+    ) !void {
+        if (package_json.* != .object) return;
+        for (all_dependency_sections) |section_name| {
+            const section = package_json.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec| {
+                if (spec != .string) continue;
+                const workspace_package = manager.isWorkspaceDependency(alias, spec.string);
+                _ = manager.manifest_policy.?.resolveDependency(alias, spec.string, workspace_package) catch |err| {
+                    if (err != error.CatalogDependencyNotFound and err != error.InvalidCatalogDependency) return err;
+                    try manager.stderr.print("error: {s}@{s} failed to resolve\n", .{ alias, spec.string });
+                    failed.* = true;
+                    continue;
+                };
+            }
+        }
+    }
+
+    fn installImporterDependencies(
+        manager: *Manager,
+        package_json: *Value,
+        parent_dir: []const u8,
+        direct: bool,
+    ) !void {
+        try manager.installDependencyObject(package_json, "dependencies", parent_dir, direct, false);
         if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(root, "optionalDependencies", manager.root_dir, true, true);
+            try manager.installDependencyObject(package_json, "optionalDependencies", parent_dir, direct, true);
         }
         if (!manager.options.production and !manager.options.omit_dev) {
-            try manager.installDependencyObject(root, "devDependencies", manager.root_dir, true, false);
+            try manager.installDependencyObject(package_json, "devDependencies", parent_dir, direct, false);
         }
         if (!manager.options.omit_peer) {
-            try manager.installDependencyObject(root, "peerDependencies", manager.root_dir, true, false);
+            try manager.installDependencyObject(package_json, "peerDependencies", parent_dir, direct, false);
+        }
+    }
+
+    fn setResolutionOnly(manager: *Manager, enabled: bool) struct { bool, bool } {
+        const previous = .{ manager.options.lockfile_only, manager.filter_resolution_only };
+        manager.options.lockfile_only = manager.options.lockfile_only or enabled;
+        manager.filter_resolution_only = manager.filter_resolution_only or enabled;
+        return previous;
+    }
+
+    fn restoreResolutionOnly(manager: *Manager, previous: struct { bool, bool }) void {
+        manager.options.lockfile_only = previous[0];
+        manager.filter_resolution_only = previous[1];
+    }
+
+    fn installRoot(manager: *Manager, root: *Value, report_direct: bool) !void {
+        const previous_report_direct = manager.report_direct_installs;
+        manager.report_direct_installs = report_direct and
+            manager.root_selected and
+            (manager.options.command == .install or manager.options.command == .add or manager.options.command == .remove) and
+            !manager.options.lockfile_only;
+        defer manager.report_direct_installs = previous_report_direct;
+        if (manager.root_selected) {
+            try manager.installImporterDependencies(root, manager.root_dir, true);
+        } else {
+            const previous = manager.setResolutionOnly(true);
+            defer manager.restoreResolutionOnly(previous);
+            try manager.installImporterDependencies(root, manager.root_dir, true);
         }
         try manager.installWorkspaceDependencies();
-        try manager.relinkNativeDependencyBins(root);
+        try manager.emitDirectInstallReports();
     }
 
     fn addPackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
@@ -1380,7 +2759,7 @@ const Manager = struct {
                 const git = try manager.installGit(alias, requested, parent_dir, true, false, null, &.{});
                 alias = git.alias;
                 resolved_version = git.version;
-                display_resolution = git.source;
+                display_resolution = try displayGitResolution(manager.allocator, git.source);
             } else if (isTarballSpec(requested)) {
                 const tarball = try manager.installTarball(alias, requested, parent_dir, true, false, &.{});
                 alias = tarball.alias;
@@ -1388,23 +2767,31 @@ const Manager = struct {
                 display_resolution = requested;
             } else if (isLocalSpec(requested)) {
                 const local = manager.resolveLocalPackage(requested, parent_dir) catch |err| {
+                    if (err == error.MissingPackageJSON and isGlobalLinkSpec(requested) and manager.options.command == .link) {
+                        try manager.stderr.print("error: Package \"{s}\" is not linked\n", .{localSpecPath(requested)});
+                        return error.PackageManagerErrorReported;
+                    }
                     try manager.stderr.print("note: error occurred while resolving {s}\n", .{requested});
                     return err;
                 };
                 alias = alias orelse local.name;
-                requested = try manager.normalizeLocalSpec(requested, local.path);
-                display_resolution = localSpecPath(requested);
+                display_resolution = localSpecPath(try manager.normalizeLocalSpec(requested, local.path));
+                requested = try manager.normalizeLocalSpecFrom(requested, local.path, parent_dir);
+                if (isGlobalLinkSpec(requested)) display_resolution = requested;
             } else if (alias == null) {
                 return error.InvalidPackageName;
             }
             const name = alias.?;
+            try manager.explicit_adds.put(try manager.allocator.dupe(u8, name), {});
             const target_section = manager.sectionForAdd(package_json, name);
             const section = try ensureObjectProperty(manager.allocator, &package_json.object, target_section.key());
 
             if (manager.options.only_missing and section.get(name) != null) continue;
             if (!isTarballSpec(requested) and !isGitSpec(requested)) {
                 resolved_version = try manager.installDependency(name, requested, parent_dir, true, false);
-                if (!isLocalSpec(requested)) display_resolution = resolved_version;
+                if (!isLocalSpec(requested)) {
+                    display_resolution = (try manager.workspaceDisplayResolution(name, requested, parent_dir)) orelse resolved_version;
+                }
             }
             const saved_spec = if (isTarballSpec(requested) or isGitSpec(requested) or isLocalSpec(requested) or std.mem.startsWith(u8, requested, "workspace:"))
                 requested
@@ -1426,10 +2813,11 @@ const Manager = struct {
                 }
             }
         }
-        const installed_before_reconcile = manager.installed_count;
         try manager.installRoot(manager.root_package_json.?, true);
         if (!manager.options.silent) {
-            if (manager.installed_count > installed_before_reconcile and added_output.written().len > 0) {
+            if ((manager.options.command == .link or manager.direct_install_reports.items.len > 0) and
+                added_output.written().len > 0)
+            {
                 try manager.stdout.writeByte('\n');
             }
             try manager.stdout.writeAll(added_output.written());
@@ -1437,13 +2825,12 @@ const Manager = struct {
     }
 
     fn sectionForAdd(manager: *Manager, root: *Value, name: []const u8) DependencySection {
-        if (manager.options.section != .dependencies) return manager.options.section;
         const candidates = [_]DependencySection{ .dependencies, .devDependencies, .optionalDependencies, .peerDependencies };
         for (candidates) |candidate| {
             const section = root.object.get(candidate.key()) orelse continue;
             if (section == .object and section.object.get(name) != null) return candidate;
         }
-        return .dependencies;
+        return manager.options.section;
     }
 
     fn removeDependencyFromOtherSections(manager: *Manager, root: *Value, name: []const u8, keep: DependencySection) void {
@@ -1459,12 +2846,22 @@ const Manager = struct {
 
     fn removePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
         if (manager.options.positionals.len == 0) return error.MissingPackageName;
+        if (!hasAnyDependencies(package_json)) {
+            manager.options.no_summary = true;
+            if (!manager.options.silent) {
+                try manager.stderr.writeAll("package.json doesn't have dependencies, there's nothing to remove!\n");
+            }
+            return;
+        }
+        if (!manager.options.silent) try manager.stdout.writeByte('\n');
+
         var removed: usize = 0;
         for (manager.options.positionals) |name| {
+            var name_removed = false;
             for (all_dependency_sections) |section_name| {
                 if (package_json.object.getPtr(section_name)) |section| {
                     if (section.* == .object and section.object.orderedRemove(name)) {
-                        removed += 1;
+                        name_removed = true;
                         manager.changed = true;
                     }
                     if (section.* == .object and section.object.count() == 0) {
@@ -1476,10 +2873,16 @@ const Manager = struct {
                 try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), name })
             else
                 try packageDestination(manager.allocator, manager.root_dir, name);
+            if (name_removed) {
+                removed += 1;
+                if (manager.pathExists(path)) {
+                    try manager.removed_materialized_names.append(try manager.allocator.dupe(u8, name));
+                }
+            }
             if (!manager.options.dry_run) deletePath(manager.init_data.io, path);
         }
+        manager.removed_count += removed;
         try manager.installRoot(manager.root_package_json.?, true);
-        if (!manager.options.silent and removed > 0) try manager.stdout.print("Removed: {d}\n", .{removed});
     }
 
     fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
@@ -1523,26 +2926,85 @@ const Manager = struct {
         for (dependencies.object.keys(), dependencies.object.values()) |alias, spec_value| {
             if (spec_value != .string) continue;
             if (std.mem.eql(u8, key, "dependencies") and objectSectionContains(package_json, "optionalDependencies", alias)) continue;
+            if (std.mem.eql(u8, key, "dependencies") and packageDependencyIsBundled(package_json, alias)) continue;
             if (std.mem.eql(u8, key, "peerDependencies") and
                 (objectSectionContains(package_json, "dependencies", alias) or
-                    objectSectionContains(package_json, "optionalDependencies", alias))) continue;
-            const edge_optional = optional or
-                (std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias));
+                    objectSectionContains(package_json, "optionalDependencies", alias) or
+                    (!manager.options.production and !manager.options.omit_dev and
+                        objectSectionContains(package_json, "devDependencies", alias)))) continue;
+            const optional_peer = std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias);
+            if (optional_peer) continue;
+            const edge_optional = optional;
             const installed_before = manager.installed_count;
             const resolved_version = manager.installDependency(alias, spec_value.string, parent_dir, direct, edge_optional) catch |err| {
+                if (manager.options.command == .link and !direct and err == error.MissingPackageJSON) continue;
                 if (edge_optional) continue;
                 return err;
             };
-            if (direct and manager.report_direct_installs and manager.installed_count > installed_before and !manager.options.silent) {
+            const workspace_display = if (manager.report_direct_installs)
+                try manager.workspaceDisplayResolution(alias, spec_value.string, parent_dir)
+            else
+                null;
+            const should_report = manager.report_direct_installs and
+                std.mem.eql(u8, parent_dir, manager.invocation_package_dir) and
+                !manager.explicit_adds.contains(alias);
+            if (should_report and
+                (manager.installed_count > installed_before or
+                    manager.options.command == .remove or
+                    (workspace_display != null and manager.lock_graph == null)) and
+                !manager.options.silent)
+            {
                 const display = if (isTarballSpec(spec_value.string))
                     spec_value.string
                 else if (isLocalSpec(spec_value.string))
-                    localSpecPath(spec_value.string)
+                    if (isGlobalLinkSpec(spec_value.string)) spec_value.string else localSpecPath(spec_value.string)
                 else
-                    resolved_version;
-                try manager.stdout.print("+ {s}@{s}\n", .{ alias, display });
+                    workspace_display orelse resolved_version;
+                try manager.direct_install_reports.append(.{
+                    .alias = alias,
+                    .display = display,
+                    .latest_version = manager.latest_versions.get(alias),
+                    .section_priority = directInstallSectionPriority(key),
+                    .sequence = manager.direct_install_reports.items.len,
+                });
             }
         }
+    }
+
+    fn emitDirectInstallReports(manager: *Manager) !void {
+        if (manager.direct_install_reports.items.len == 0) return;
+        std.sort.pdq(DirectInstallReport, manager.direct_install_reports.items, {}, struct {
+            fn lessThan(_: void, left: DirectInstallReport, right: DirectInstallReport) bool {
+                if (left.section_priority != right.section_priority) return left.section_priority < right.section_priority;
+                return left.sequence < right.sequence;
+            }
+        }.lessThan);
+        if (manager.rootLifecycleScriptsWillRun()) try manager.stdout.writeByte('\n');
+        for (manager.direct_install_reports.items) |report| {
+            try manager.stdout.print("+ {s}@{s}", .{ report.alias, report.display });
+            if (report.latest_version) |latest| {
+                if (!std.mem.eql(u8, latest, report.display)) {
+                    try manager.stdout.print(" (v{s} available)", .{latest});
+                }
+            }
+            try manager.stdout.writeByte('\n');
+        }
+    }
+
+    fn rootLifecycleScriptsWillRun(manager: *const Manager) bool {
+        return manager.options.command == .install and
+            manager.root_selected and
+            !manager.options.ignore_scripts and
+            !manager.options.lockfile_only and
+            !manager.options.dry_run and
+            Scripts.rootHasLifecycleScripts(manager.root_package_json.?);
+    }
+
+    fn installSummarySeparator(manager: *const Manager) []const u8 {
+        if (manager.options.command == .install and
+            manager.direct_install_reports.items.len == 0 and
+            !manager.rootLifecycleScriptsWillRun()) return "";
+        return "\n";
     }
 
     fn installDependency(
@@ -1568,26 +3030,41 @@ const Manager = struct {
             break :blk protocol.base_spec;
         } else effective_spec;
 
-        if (direct) {
+        const explicit_global_link = manager.options.command == .link and direct;
+        const refresh_direct_registry = manager.options.command == .add and
+            direct and
+            !manager.report_direct_installs and
+            !workspace_package and
+            !isGitSpec(resolution_spec) and
+            !isTarballSpec(resolution_spec) and
+            !isLocalSpec(resolution_spec);
+
+        if (direct and !refresh_direct_registry) {
+            const direct_key = if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir)) blk: {
+                const destination = try packageDestination(manager.allocator, parent_dir, alias);
+                break :blk try manager.lockKeyForDestination(destination);
+            } else alias;
             for (manager.records.items) |record| {
-                if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, record.key, alias)) return record.version;
+                if (std.mem.eql(u8, record.alias, alias) and std.mem.eql(u8, recordLogicalKey(record), direct_key)) return record.version;
             }
         }
 
-        if (try manager.findLockedSelection(alias, parent_dir)) |selection| {
-            if (try manager.lockedPackageMatches(selection.package, alias, resolution_spec, parent_dir)) {
-                const cycle_key = try std.fmt.allocPrint(manager.allocator, "lock:{s}", .{selection.package.key});
-                if (manager.resolving.contains(cycle_key)) {
-                    try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
-                    return selection.package.version;
+        if (!refresh_direct_registry) {
+            if (try manager.findLockedSelection(alias, parent_dir)) |selection| {
+                if (try manager.lockedPackageMatches(selection.package, alias, resolution_spec, parent_dir)) {
+                    const cycle_key = try std.fmt.allocPrint(manager.allocator, "lock:{s}", .{selection.package.key});
+                    if (manager.resolving.contains(cycle_key)) {
+                        try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
+                        return selection.package.version;
+                    }
+                    try manager.resolving.put(cycle_key, {});
+                    defer _ = manager.resolving.remove(cycle_key);
+                    return manager.installLockedPackage(selection, alias, parent_dir, direct, optional, protocol_patch_paths);
                 }
-                try manager.resolving.put(cycle_key, {});
-                defer _ = manager.resolving.remove(cycle_key);
-                return manager.installLockedPackage(selection, alias, parent_dir, direct, optional, protocol_patch_paths);
+                if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
+            } else if (manager.options.frozen_lockfile) {
+                return error.FrozenLockfilePackageMissing;
             }
-            if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
-        } else if (manager.options.frozen_lockfile) {
-            return error.FrozenLockfilePackageMissing;
         }
 
         if (workspace_package) {
@@ -1608,6 +3085,10 @@ const Manager = struct {
         if (isLocalSpec(resolution_spec)) {
             if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
             const local = try manager.resolveLocalPackage(resolution_spec, parent_dir);
+            if (isGlobalLinkSpec(resolution_spec) and !manager.options.lockfile_only and !manager.options.dry_run) {
+                const cache = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache);
+            }
             const kind: Lockfile.Kind = if (std.mem.startsWith(u8, resolution_spec, "link:")) .symlink else .folder;
             const placement_kind: Lockfile.Kind = if (std.mem.eql(u8, local.path, manager.root_dir)) .root else kind;
             const normalized_source = try manager.normalizeLocalSpec(resolution_spec, local.path);
@@ -1623,6 +3104,10 @@ const Manager = struct {
                     direct,
                     peer_context,
                 )
+            else if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir))
+                try packageDestination(manager.allocator, parent_dir, alias)
+            else if (!std.mem.eql(u8, parent_dir, manager.root_dir) and manager.root_versions.contains(alias))
+                try packageDestination(manager.allocator, parent_dir, alias)
             else
                 try packageDestination(manager.allocator, manager.root_dir, alias);
             const newly_installed = !manager.pathExists(destination);
@@ -1636,7 +3121,7 @@ const Manager = struct {
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, destination);
                 } else {
-                    try manager.linkDirectory(alias, local.path);
+                    try manager.linkDirectoryAt(destination, local.path);
                 }
                 try manager.linkBins(alias, destination, local.package_json, direct, parent_dir);
             }
@@ -1704,7 +3189,7 @@ const Manager = struct {
         try manager.resolving.put(cycle_key, {});
         defer _ = manager.resolving.remove(cycle_key);
 
-        if (!manager.options.force) {
+        if (!manager.options.force and !refresh_direct_registry) {
             if (try manager.findInstalledVersion(alias, resolution_spec, parent_dir, direct, protocol_patch_paths)) |installed| return installed;
         }
 
@@ -1720,6 +3205,11 @@ const Manager = struct {
             }
             return err;
         };
+        if (resolved.latest_version) |latest| {
+            if (!std.mem.eql(u8, latest, resolved.version)) {
+                try manager.latest_versions.put(try manager.allocator.dupe(u8, alias), latest);
+            }
+        }
         const peer_context = try manager.peerContextForPackage(resolved.metadata, parent_dir, true);
         const destination = try manager.packageInstallDestinationWithPeerContext(
             alias,
@@ -1731,26 +3221,74 @@ const Manager = struct {
             direct,
             peer_context,
         );
+        const package_metadata: *const Value = resolved.metadata;
+        const platform_matches = packageSupportsPlatform(
+            resolved.metadata,
+            manager.options.cpu,
+            manager.options.os,
+        );
+        if (!platform_matches and (optional or manager.options.cpu_overridden or manager.options.os_overridden)) {
+            if (isTopLevelDestination(manager.root_dir, destination, alias)) {
+                try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
+            }
+            try manager.addRecord(.{
+                .key = if (manager.node_linker == .isolated)
+                    try manager.dependencyLockKey(parent_dir, alias)
+                else
+                    try manager.lockKeyForDestination(destination),
+                .alias = alias,
+                .name = resolved.name,
+                .version = resolved.version,
+                .tarball = resolved.tarball,
+                .integrity = resolved.integrity orelse "",
+                .metadata = resolved.metadata,
+                .peer_hash = peer_context.hash,
+                .install_dir = destination,
+            });
+            try manager.rememberPackageMetadata(destination, resolved.metadata);
+            manager.changed = true;
+
+            // Keep the lockfile graph cross-platform even though this optional
+            // package is not materialized on the current host. Its required
+            // dependencies must still be resolvable when the same lockfile is
+            // consumed on a matching platform.
+            const previous_lockfile_only = manager.options.lockfile_only;
+            manager.options.lockfile_only = true;
+            defer manager.options.lockfile_only = previous_lockfile_only;
+            try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
+            if (!manager.options.omit_optional) {
+                try manager.installDependencyObject(@constCast(resolved.metadata), "optionalDependencies", destination, false, true);
+            }
+            try manager.installOrLinkPeerDependencies(resolved.metadata, destination, destination, parent_dir);
+            return resolved.version;
+        }
+        var installed = false;
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
-            const archive = try manager.fetchBytes(resolved.tarball, false, max_tarball_bytes);
-            if (manager.options.verify_integrity) try verifyIntegrity(archive, resolved.integrity);
-            deletePath(manager.init_data.io, destination);
-            try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
-            var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
-            defer destination_dir.close(manager.init_data.io);
-            try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
-            try manager.applyPackagePatch(resolved.name, resolved.version, destination, protocol_patch_paths);
+            installed = !manager.options.force and
+                try manager.installedPackageMatches(destination, resolved.name, resolved.version) and
+                try manager.packagePatchStateMatches(destination, protocol_patch_paths);
+            if (!installed) {
+                const archive = try manager.fetchRegistryArchive(resolved.archive());
+                deletePath(manager.init_data.io, destination);
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
+                var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
+                defer destination_dir.close(manager.init_data.io);
+                try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+                try manager.applyPackagePatch(resolved.name, resolved.version, destination, protocol_patch_paths);
+            }
             try manager.ensureIsolatedLinks(alias, parent_dir, destination);
-            const bin_metadata = (try manager.metadataForInstalledPackage(destination, resolved.metadata)).?;
-            try manager.linkBins(alias, destination, bin_metadata, direct, parent_dir);
+            try manager.linkBins(alias, destination, package_metadata, direct, parent_dir);
         }
 
-        try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
+        if (manager.node_linker == .isolated or isTopLevelDestination(manager.root_dir, destination, alias)) {
+            try manager.root_versions.put(try manager.allocator.dupe(u8, alias), resolved.version);
+        }
+        const record_key = if (manager.node_linker == .isolated)
+            try manager.dependencyLockKey(parent_dir, alias)
+        else
+            try manager.lockKeyForDestination(destination);
         try manager.addRecord(.{
-            .key = if (manager.node_linker == .isolated)
-                try manager.dependencyLockKey(parent_dir, alias)
-            else
-                try manager.lockKeyForDestination(destination),
+            .key = record_key,
             .alias = alias,
             .name = resolved.name,
             .version = resolved.version,
@@ -1760,16 +3298,17 @@ const Manager = struct {
             .peer_hash = peer_context.hash,
             .install_dir = destination,
         });
-        try manager.rememberPackageMetadata(destination, resolved.metadata);
-        manager.installed_count += 1;
+        try manager.rememberPackageMetadata(destination, package_metadata);
+        try manager.registerBundledPackages(record_key, package_metadata, destination);
+        if (!installed) manager.installed_count += 1;
         manager.changed = true;
 
-        try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
+        try manager.installDependencyObject(@constCast(package_metadata), "dependencies", destination, false, false);
         if (!manager.options.omit_optional) {
-            try manager.installDependencyObject(@constCast(resolved.metadata), "optionalDependencies", destination, false, true);
+            try manager.installDependencyObject(@constCast(package_metadata), "optionalDependencies", destination, false, true);
         }
-        try manager.installOrLinkPeerDependencies(resolved.metadata, destination, destination, parent_dir);
-        try manager.queuePackageScripts(resolved.name, resolved.version, destination, .npm, optional, true);
+        try manager.installOrLinkPeerDependencies(package_metadata, destination, destination, parent_dir);
+        try manager.queuePackageScripts(resolved.name, resolved.version, destination, .npm, optional, !installed);
         return resolved.version;
     }
 
@@ -1781,7 +3320,12 @@ const Manager = struct {
         const graph = if (manager.lock_graph) |*value| value else return null;
         if (manager.node_linker == .isolated) {
             const logical_key = try manager.dependencyLockKey(parent_dir, alias);
-            const package = graph.get(logical_key) orelse graph.get(alias) orelse return null;
+            const package = graph.get(logical_key) orelse blk: {
+                if (try manager.workspaceDependencyLockKey(parent_dir, alias)) |workspace_key| {
+                    if (graph.get(workspace_key)) |workspace_package| break :blk workspace_package;
+                }
+                break :blk graph.get(alias) orelse return null;
+            };
             const peer_context = if (package.kind == .workspace)
                 Isolated.PeerContext{}
             else
@@ -1790,7 +3334,7 @@ const Manager = struct {
                 try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
             else blk: {
                 const placement = try manager.packagePlacementFromLock(package, peer_context);
-                try manager.rememberIsolatedParent(placement, package.key);
+                try manager.rememberIsolatedParent(placement, logical_key);
                 break :blk placement.package_dir;
             };
             return .{
@@ -1802,6 +3346,9 @@ const Manager = struct {
         var base = parent_dir;
         while (true) {
             const destination = try packageDestination(manager.allocator, base, alias);
+            if (try manager.workspaceLockKeyForDestination(destination)) |workspace_key| {
+                if (graph.get(workspace_key)) |package| return .{ .package = package, .destination = destination };
+            }
             if (manager.lockKeyForDestination(destination) catch null) |key| {
                 if (graph.get(key)) |package| return .{ .package = package, .destination = destination };
             }
@@ -1827,14 +3374,26 @@ const Manager = struct {
                     semverSatisfies(manager.allocator, registry_spec, package.version);
             },
             .workspace => {
-                if (!workspace_dependency) return false;
-                const workspace = try manager.resolveWorkspaceDependency(alias, spec, parent_dir);
-                return std.mem.eql(u8, workspace.name, package.name);
+                if (workspace_dependency) {
+                    const workspace = try manager.resolveWorkspaceDependency(alias, spec, parent_dir);
+                    return std.mem.eql(u8, workspace.name, package.name);
+                }
+                const workspace = manager.workspaces.get(package.name) orelse return false;
+                if (package.source.len > 0 and
+                    !std.mem.eql(u8, package.source, workspace.relative_path)) return false;
+                const registry_name, const registry_range = parseNpmAlias(alias, spec);
+                if (std.mem.startsWith(u8, spec, "npm:") and
+                    !std.mem.eql(u8, registry_name, package.name)) return false;
+                return manager.workspaceMatchesRange(workspace, registry_range);
             },
             .folder, .symlink => {
                 if (!isLocalSpec(spec)) return false;
-                const requested = try absolutePathFrom(manager.allocator, parent_dir, localSpecPath(spec));
-                const locked = try absolutePathFrom(manager.allocator, manager.root_dir, package.source);
+                const requested = try manager.localPackagePath(spec, parent_dir);
+                const locked_spec = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{
+                    if (package.kind == .symlink) "link:" else "file:",
+                    package.source,
+                });
+                const locked = try manager.localPackagePath(locked_spec, manager.root_dir);
                 return std.mem.eql(u8, requested, locked);
             },
             .local_tarball => {
@@ -1876,14 +3435,42 @@ const Manager = struct {
         protocol_patch_paths: []const []const u8,
     ) anyerror![]const u8 {
         const package = selection.package;
+        const record_key = if (manager.node_linker == .isolated)
+            try manager.dependencyLockKey(parent_dir, alias)
+        else
+            package.key;
         if (manager.node_linker == .isolated and package.kind != .workspace) {
             try manager.trackIsolatedPlacement(try manager.packagePlacementFromLock(package, selection.peer_context));
             _ = try manager.peerContextForPackage(package.info, parent_dir, true);
+        }
+        const skip_for_platform = package.kind == .npm and
+            package.info != null and
+            !packageSupportsPlatform(package.info.?, manager.options.cpu, manager.options.os) and
+            (optional or manager.options.cpu_overridden or manager.options.os_overridden);
+        if (skip_for_platform) {
+            if (isTopLevelDestination(manager.root_dir, selection.destination, alias)) {
+                try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package.version);
+            }
+            try manager.addRecord(.{
+                .key = record_key,
+                .alias = alias,
+                .name = package.name,
+                .version = package.version,
+                .tarball = package.source,
+                .git_resolved = package.git_resolved,
+                .integrity = package.integrity,
+                .metadata = package.info,
+                .peer_hash = selection.peer_context.hash,
+                .install_dir = selection.destination,
+            });
+            try manager.rememberPackageMetadata(selection.destination, package.info);
+            return package.version;
         }
         switch (package.kind) {
             .npm => {
                 const patch_paths = try manager.packagePatchPaths(package.name, package.version, protocol_patch_paths);
                 var installed = false;
+                const package_metadata = package.info;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     installed = !manager.options.force and
                         try manager.installedPackageMatches(selection.destination, package.name, package.version) and
@@ -1893,10 +3480,13 @@ const Manager = struct {
                             package.source
                         else
                             try manager.defaultTarballURL(package.name, package.version);
-                        const archive = try manager.fetchBytes(tarball_url, false, max_tarball_bytes);
-                        if (manager.options.verify_integrity) {
-                            try verifyIntegrity(archive, if (package.integrity.len > 0) package.integrity else null);
-                        }
+                        const archive = try manager.fetchRegistryArchive(.{
+                            .name = package.name,
+                            .version = package.version,
+                            .tarball = tarball_url,
+                            .integrity = if (package.integrity.len > 0) package.integrity else null,
+                            .authorization = manager.authorizationForURL(tarball_url),
+                        });
                         deletePath(manager.init_data.io, selection.destination);
                         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination);
                         var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, selection.destination, .{});
@@ -1906,7 +3496,9 @@ const Manager = struct {
                         manager.installed_count += 1;
                     }
                     try manager.ensureIsolatedLinks(alias, parent_dir, selection.destination);
-                    if (try manager.metadataForInstalledPackage(selection.destination, package.info)) |info| {
+                    if (package.info) |info| {
+                        try manager.linkBins(alias, selection.destination, info, direct, parent_dir);
+                    } else if (try manager.metadataForInstalledPackage(selection.destination, null)) |info| {
                         try manager.linkBins(alias, selection.destination, info, direct, parent_dir);
                     }
                 }
@@ -1915,7 +3507,7 @@ const Manager = struct {
                     try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package.version);
                 }
                 try manager.addRecord(.{
-                    .key = package.key,
+                    .key = record_key,
                     .alias = alias,
                     .name = package.name,
                     .version = package.version,
@@ -1925,8 +3517,15 @@ const Manager = struct {
                     .peer_hash = selection.peer_context.hash,
                     .install_dir = selection.destination,
                 });
-                try manager.rememberPackageMetadata(selection.destination, package.info);
-                try manager.installLockedDependencies(package, selection.destination, selection.destination, parent_dir);
+                try manager.rememberPackageMetadata(selection.destination, package_metadata);
+                if (package_metadata) |info| {
+                    try manager.registerBundledPackages(record_key, info, selection.destination);
+                    try manager.installDependencyObject(@constCast(info), "dependencies", selection.destination, false, false);
+                    if (!manager.options.omit_optional) {
+                        try manager.installDependencyObject(@constCast(info), "optionalDependencies", selection.destination, false, true);
+                    }
+                    try manager.installOrLinkPeerDependencies(info, selection.destination, selection.destination, parent_dir);
+                }
                 try manager.queuePackageScripts(package.name, package.version, selection.destination, .npm, optional, !installed);
                 return package.version;
             },
@@ -1940,7 +3539,7 @@ const Manager = struct {
                         try manager.linkDirectoryAt(selection.destination, workspace.path);
                 }
                 try manager.addRecord(.{
-                    .key = package.key,
+                    .key = record_key,
                     .alias = alias,
                     .name = workspace.name,
                     .version = workspace.version,
@@ -1963,10 +3562,17 @@ const Manager = struct {
             },
             .folder, .symlink => {
                 if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
-                const spec = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{
-                    if (package.kind == .symlink) "link:" else "file:",
-                    package.source,
-                });
+                const spec = spec: {
+                    if (package.kind == .symlink) {
+                        if (manager.rootDependencySpec(alias)) |root_spec| {
+                            if (isGlobalLinkSpec(root_spec)) break :spec root_spec;
+                        }
+                    }
+                    break :spec try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{
+                        if (package.kind == .symlink) "link:" else "file:",
+                        package.source,
+                    });
+                };
                 const local = try manager.resolveLocalPackage(spec, manager.root_dir);
                 const newly_installed = !manager.pathExists(selection.destination);
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
@@ -1984,7 +3590,7 @@ const Manager = struct {
                     try manager.linkBins(alias, selection.destination, package.info orelse local.package_json, direct, parent_dir);
                 }
                 try manager.addRecord(.{
-                    .key = package.key,
+                    .key = record_key,
                     .alias = alias,
                     .name = local.name,
                     .version = local.version,
@@ -2044,7 +3650,7 @@ const Manager = struct {
                     try manager.linkBins(alias, selection.destination, bin_metadata, direct, parent_dir);
                 }
                 try manager.addRecord(.{
-                    .key = package.key,
+                    .key = record_key,
                     .alias = alias,
                     .name = name,
                     .version = version_value,
@@ -2075,7 +3681,7 @@ const Manager = struct {
                     try manager.linkBins(alias, selection.destination, metadata, direct, parent_dir);
                 }
                 try manager.addRecord(.{
-                    .key = package.key,
+                    .key = record_key,
                     .alias = alias,
                     .name = package_name,
                     .version = package_version,
@@ -2150,7 +3756,7 @@ const Manager = struct {
             manager.root_dir,
             package_dir,
             patch_paths,
-        ) catch |err| return manager.patchFailure(err, patch_paths);
+        ) catch |err| return manager.patchFailure(err, patch_paths, null);
     }
 
     fn applyPackagePatch(
@@ -2169,17 +3775,28 @@ const Manager = struct {
         package_dir: []const u8,
         patch_paths: []const []const u8,
     ) !void {
+        var diagnostic: ?Patch.ApplyDiagnostic = null;
         Patch.apply(
             manager.allocator,
             manager.init_data.io,
             manager.root_dir,
             package_dir,
             patch_paths,
-        ) catch |err| return manager.patchFailure(err, patch_paths);
+            &diagnostic,
+        ) catch |err| return manager.patchFailure(err, patch_paths, diagnostic);
     }
 
-    fn patchFailure(manager: *Manager, err: anyerror, patch_paths: []const []const u8) anyerror {
+    fn patchFailure(
+        manager: *Manager,
+        err: anyerror,
+        patch_paths: []const []const u8,
+        diagnostic: ?Patch.ApplyDiagnostic,
+    ) anyerror {
         const path = if (patch_paths.len > 0) patch_paths[0] else "";
+        if (diagnostic) |detail| {
+            // COTTONTAIL-COMPAT: Bun reports the concrete I/O failure before the patchfile summary.
+            manager.stderr.print("error: failed applying patch file: {f}\n", .{detail}) catch {};
+        }
         switch (err) {
             error.PatchFileNotFound => manager.stderr.print("error: Couldn't find patch file: '{s}'\n", .{path}) catch {},
             error.EmptyPatchFile => manager.stderr.print("error: patchfile '{s}' is empty, please restore or delete it.\n", .{path}) catch {},
@@ -2202,6 +3819,9 @@ const Manager = struct {
     }
 
     fn lockKeyForDestination(manager: *Manager, destination: []const u8) ![]const u8 {
+        if (manager.node_linker == .hoisted) {
+            if (try manager.workspaceLockKeyForDestination(destination)) |workspace_key| return workspace_key;
+        }
         if (!pathHasPrefix(destination, manager.root_dir)) return error.PackageOutsideInstallRoot;
         var output: std.Io.Writer.Allocating = .init(manager.allocator);
         var components = std.mem.tokenizeAny(u8, destination[manager.root_dir.len..], "/\\");
@@ -2212,6 +3832,38 @@ const Manager = struct {
         }
         if (output.written().len == 0) return error.InvalidPackageDestination;
         return output.toOwnedSlice();
+    }
+
+    fn workspaceDependencyLockKey(manager: *Manager, parent_dir: []const u8, alias: []const u8) !?[]const u8 {
+        var workspaces = manager.workspaces.iterator();
+        while (workspaces.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            if (!std.mem.eql(u8, workspace.path, parent_dir)) continue;
+            const key: []const u8 = try std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ workspace.name, alias });
+            return key;
+        }
+        return null;
+    }
+
+    fn workspaceLockKeyForDestination(manager: *Manager, destination: []const u8) !?[]const u8 {
+        var selected: ?Workspace = null;
+        var workspaces = manager.workspaces.iterator();
+        while (workspaces.next()) |entry| {
+            const workspace = entry.value_ptr.*;
+            if (!pathHasPrefix(destination, workspace.path)) continue;
+            if (selected == null or workspace.path.len > selected.?.path.len) selected = workspace;
+        }
+        const workspace = selected orelse return null;
+
+        var output: std.Io.Writer.Allocating = .init(manager.allocator);
+        try output.writer.writeAll(workspace.name);
+        var components = std.mem.tokenizeAny(u8, destination[workspace.path.len..], "/\\");
+        while (components.next()) |component| {
+            if (std.mem.eql(u8, component, "node_modules")) continue;
+            try output.writer.writeByte('/');
+            try output.writer.writeAll(component);
+        }
+        return try output.toOwnedSlice();
     }
 
     fn dependencyLockKey(manager: *Manager, parent_dir: []const u8, alias: []const u8) ![]const u8 {
@@ -2227,10 +3879,7 @@ const Manager = struct {
         while (workspaces.next()) |entry| {
             const workspace = entry.value_ptr.*;
             if (!std.mem.eql(u8, parent_dir, workspace.path)) continue;
-            return std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{
-                try manager.relativeLockPath(workspace.path),
-                alias,
-            });
+            return std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ workspace.name, alias });
         }
         const destination = try packageDestination(manager.allocator, parent_dir, alias);
         return manager.lockKeyForDestination(destination);
@@ -2527,7 +4176,7 @@ const Manager = struct {
         var workspaces = manager.workspaces.iterator();
         while (workspaces.next()) |entry| {
             const workspace = entry.value_ptr.*;
-            if (std.mem.eql(u8, workspace.path, parent_dir)) return manager.relativeLockPath(workspace.path);
+            if (std.mem.eql(u8, workspace.path, parent_dir)) return workspace.name;
         }
         return "";
     }
@@ -2645,7 +4294,7 @@ const Manager = struct {
             for (peers.object.keys(), peers.object.values()) |alias, range_value| {
                 if (range_value != .string or packageHasRuntimeDependency(metadata, alias)) continue;
                 try appendUniqueName(&own_peers[index], alias);
-                if (manager.providerRecordIndex(&record_indices, logicalParentKey(record), alias)) |provider_index| {
+                if (manager.providerRecordIndex(&record_indices, logicalParentKey(record), alias, range_value.string)) |provider_index| {
                     try appendUniqueIndex(&children[index], provider_index);
                 }
             }
@@ -2666,7 +4315,8 @@ const Manager = struct {
             var resolutions = std.array_list.Managed(Isolated.PeerResolution).init(manager.allocator);
             defer resolutions.deinit();
             for (leak_set.names) |name| {
-                const provider_index = manager.providerRecordIndex(&record_indices, recordLogicalKey(record), name) orelse continue;
+                const range = if (record.metadata) |metadata| peerDependencySpec(metadata, name) else null;
+                const provider_index = manager.providerRecordIndex(&record_indices, recordLogicalKey(record), name, range) orelse continue;
                 const provider = manager.records.items[provider_index];
                 try resolutions.append(.{
                     .name = provider.name,
@@ -2707,13 +4357,15 @@ const Manager = struct {
         if (!manager.options.lockfile_only and !manager.options.dry_run) {
             var materialized = std.StringHashMap(void).init(manager.allocator);
             defer materialized.deinit();
-            for (reconciled) |result| {
+            for (manager.records.items, reconciled) |record, result| {
+                if (manager.recordResolutionOnly(record)) continue;
                 const placement = result.placement orelse continue;
                 if (std.mem.eql(u8, result.old_package_dir, result.package_dir) and manager.pathExists(result.package_dir)) {
                     try materialized.put(placement.store_key, {});
                 }
             }
-            for (reconciled) |result| {
+            for (manager.records.items, reconciled) |record, result| {
+                if (manager.recordResolutionOnly(record)) continue;
                 const placement = result.placement orelse continue;
                 if (materialized.contains(placement.store_key)) continue;
                 if (!manager.options.force and manager.pathExists(result.package_dir)) {
@@ -2741,7 +4393,13 @@ const Manager = struct {
         for (manager.records.items, reconciled) |*record, result| {
             record.peer_hash = result.context.hash;
             record.install_dir = result.package_dir;
-            if (result.placement) |placement| try manager.trackIsolatedPlacement(placement);
+            if (manager.recordResolutionOnly(record.*)) continue;
+            if (result.placement) |placement| {
+                try manager.trackIsolatedPlacement(placement);
+                if (record.kind == .root or record.kind == .symlink) {
+                    try manager.isolated_live_links.put(try manager.allocator.dupe(u8, result.package_dir), {});
+                }
+            }
             try manager.isolated_managed_modules.put(try manager.allocator.dupe(u8, result.modules_dir), {});
             try manager.isolated_parent_modules.put(
                 try manager.allocator.dupe(u8, result.package_dir),
@@ -2757,18 +4415,41 @@ const Manager = struct {
         if (manager.options.lockfile_only or manager.options.dry_run) return;
 
         for (manager.records.items, reconciled) |record, result| {
+            if (manager.recordResolutionOnly(record)) continue;
             const parent_key = logicalParentKey(record);
-            const consumer_modules = try manager.modulesForLogicalImporter(&record_indices, reconciled, parent_key);
+            if (record.kind == .workspace and
+                parent_key.len == 0 and
+                manager.rootDependencySpec(record.alias) == null)
+            {
+                continue;
+            }
+            var consumer_modules = try manager.modulesForLogicalImporter(&record_indices, reconciled, parent_key);
+            const direct_root_dependency = parent_key.len == 0 and manager.rootDependencySpec(record.alias) != null;
+            if (parent_key.len == 0 and !direct_root_dependency) {
+                consumer_modules = try std.fs.path.join(manager.allocator, &.{
+                    manager.root_dir,
+                    "node_modules",
+                    ".bun",
+                    "node_modules",
+                });
+            }
+            if (record_indices.get(parent_key)) |parent_index| {
+                const parent_record = manager.records.items[parent_index];
+                if (std.mem.eql(u8, record.alias, parent_record.name)) {
+                    consumer_modules = try std.fs.path.join(manager.allocator, &.{ reconciled[parent_index].package_dir, "node_modules" });
+                }
+            }
             try manager.ensureIsolatedLinksInModules(
                 record.alias,
                 consumer_modules,
-                parent_key.len == 0,
+                direct_root_dependency,
                 result.package_dir,
             );
             if (record.metadata) |metadata| {
+                const public_package_dir = try std.fs.path.join(manager.allocator, &.{ consumer_modules, record.alias });
                 try manager.linkBinsInDirectory(
                     record.alias,
-                    result.package_dir,
+                    public_package_dir,
                     metadata,
                     false,
                     try std.fs.path.join(manager.allocator, &.{ consumer_modules, ".bin" }),
@@ -2785,7 +4466,7 @@ const Manager = struct {
             const parent_key = logicalParentKey(record);
             for (peers.object.keys(), peers.object.values()) |alias, range_value| {
                 if (range_value != .string or packageHasRuntimeDependency(metadata, alias)) continue;
-                const provider_index = manager.providerRecordIndex(&record_indices, parent_key, alias) orelse continue;
+                const provider_index = manager.providerRecordIndex(&record_indices, parent_key, alias, range_value.string) orelse continue;
                 const provider_record = manager.records.items[provider_index];
                 const provider = try manager.peerProviderFromRecord(provider_record);
                 try manager.maybeWarnPeerConflict(range_value.string, provider);
@@ -2794,6 +4475,9 @@ const Manager = struct {
                     try manager.linkRelativeDirectory(destination, provider.destination, true);
                 }
             }
+        }
+        if (manager.root_package_json) |root| {
+            try manager.linkPeerDependencies(root, manager.root_dir, manager.root_dir);
         }
     }
 
@@ -2823,18 +4507,29 @@ const Manager = struct {
         record_indices: *const std.StringHashMap(usize),
         initial_importer_key: []const u8,
         alias: []const u8,
+        range: ?[]const u8,
     ) ?usize {
         var importer_key = initial_importer_key;
         while (true) {
-            const edge_key = logicalDependencyKey(manager.allocator, importer_key, alias) catch return null;
+            const edge_key = logicalDependencyKey(manager.allocator, importer_key, alias) catch break;
             if (record_indices.get(edge_key)) |index| return index;
-            if (importer_key.len == 0) return null;
+            if (importer_key.len == 0) break;
             if (record_indices.get(importer_key)) |importer_index| {
                 importer_key = logicalParentKey(manager.records.items[importer_index]);
             } else {
                 importer_key = "";
             }
         }
+
+        for (manager.records.items, 0..) |record, index| {
+            if (!std.mem.eql(u8, record.alias, alias)) continue;
+            if (range) |wanted| if (!manager.peerProviderSatisfies(record, wanted)) continue;
+            return index;
+        }
+        for (manager.records.items, 0..) |record, index| {
+            if (std.mem.eql(u8, record.alias, alias)) return index;
+        }
+        return null;
     }
 
     fn modulesForLogicalImporter(
@@ -3038,7 +4733,14 @@ const Manager = struct {
         package_dir: []const u8,
     ) !void {
         if (manager.node_linker != .isolated or manager.options.lockfile_only or manager.options.dry_run) return;
-        const consumer_modules = try manager.isolatedConsumerModules(parent_dir);
+        var consumer_modules = try manager.isolatedConsumerModules(parent_dir);
+        const parent_metadata = manager.isolated_package_metadata.get(parent_dir) orelse
+            (manager.readInstalledPackageJSON(parent_dir) catch null);
+        if (parent_metadata) |metadata| {
+            if (jsonString(metadata, "name")) |parent_name| if (std.mem.eql(u8, alias, parent_name)) {
+                consumer_modules = try std.fs.path.join(manager.allocator, &.{ parent_dir, "node_modules" });
+            };
+        }
         return manager.ensureIsolatedLinksInModules(
             alias,
             consumer_modules,
@@ -3087,15 +4789,47 @@ const Manager = struct {
                 } else {
                     _ = manager.isolated_public_hoists.remove(alias);
                 }
+            } else if (try manager.sharedWorkspaceDependencyShouldHoist(alias, package_dir)) {
+                const root_modules = try manager.isolatedConsumerModules(manager.root_dir);
+                const public_link = try std.fs.path.join(manager.allocator, &.{ root_modules, alias });
+                try manager.linkRelativeDirectory(public_link, package_dir, true);
             } else {
                 _ = manager.isolated_public_hoists.remove(alias);
             }
         }
     }
 
+    fn sharedWorkspaceDependencyShouldHoist(
+        manager: *Manager,
+        alias: []const u8,
+        package_dir: []const u8,
+    ) !bool {
+        if (manager.rootDependencySpec(alias) != null) return false;
+        const metadata = manager.readInstalledPackageJSON(package_dir) catch return false;
+        const package_name = jsonString(metadata, "name") orelse alias;
+        const package_version = jsonString(metadata, "version") orelse return false;
+
+        var matches: usize = 0;
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| {
+            const spec = ownedDependencySpec(entry.value_ptr.package_json, alias) orelse continue;
+            if (isGitSpec(spec) or isTarballSpec(spec) or isLocalSpec(spec) or
+                std.mem.startsWith(u8, spec, "workspace:")) continue;
+            const requested_name, const requested_range = parseNpmAlias(alias, spec);
+            if (!std.mem.eql(u8, requested_name, package_name) or
+                !semverSatisfies(manager.allocator, requested_range, package_version)) continue;
+            matches += 1;
+            if (matches >= 2) return true;
+        }
+        return false;
+    }
+
     fn linkRelativeDirectory(manager: *Manager, destination: []const u8, target: []const u8, replace: bool) !void {
         if (manager.node_linker == .isolated) {
             try manager.isolated_live_links.put(try manager.allocator.dupe(u8, destination), {});
+            if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+                try manager.stderr.print("isolated link: {s} -> {s}\n", .{ destination, target });
+            }
         }
         if (replace) deletePath(manager.init_data.io, destination);
         if (std.fs.path.dirname(destination)) |parent| {
@@ -3143,6 +4877,11 @@ const Manager = struct {
         var final_destination = destination;
         var peer_context = if (locked_selection) |selection| selection.peer_context else Isolated.PeerContext{};
         var installed = false;
+        var archive_integrity: []const u8 = if (locked_selection) |selection|
+            if (manager.lock_graph.?.provenance == .bun_text) selection.package.integrity else ""
+        else
+            "";
+        var git_resolved_name: []const u8 = if (locked_selection) |selection| selection.package.git_resolved else "";
 
         if (locked_selection != null and !manager.options.force and destination.len > 0) {
             const package_json_path = try std.fs.path.join(manager.allocator, &.{ destination, "package.json" });
@@ -3165,18 +4904,37 @@ const Manager = struct {
                 cache_dir,
                 std.fs.path.sep,
                 std.hash.Wyhash.hash(0, requested),
-                manager.records.items.len,
+                manager.started_ns,
             });
-            const checkout = Git.checkout(
-                manager.allocator,
-                manager.init_data.io,
-                manager.init_data.environ_map,
-                spec,
-                checkout_path,
-            ) catch |err| {
-                try manager.stderr.print("error: git dependency {s} failed to resolve\n", .{requested});
-                return err;
-            };
+            const checkout_result: GitCheckoutResult = if (spec.kind == .github)
+                try manager.checkoutGithubArchive(
+                    spec,
+                    checkout_path,
+                    if (archive_integrity.len > 0) archive_integrity else null,
+                )
+            else
+                .{
+                    .checkout = Git.checkout(
+                        manager.allocator,
+                        manager.init_data.io,
+                        manager.init_data.environ_map,
+                        spec,
+                        checkout_path,
+                    ) catch |err| {
+                        try manager.stderr.print("error: git dependency {s} failed to resolve\n", .{requested});
+                        return err;
+                    },
+                };
+            const checkout = checkout_result.checkout;
+            if (checkout_result.integrity.len > 0) {
+                if (archive_integrity.len == 0) manager.changed = true;
+                archive_integrity = checkout_result.integrity;
+            }
+            if (checkout_result.resolved_name.len > 0) {
+                git_resolved_name = checkout_result.resolved_name;
+            } else if (git_resolved_name.len == 0) {
+                git_resolved_name = try manager.allocator.dupe(u8, checkout.commit);
+            }
             defer deletePath(manager.init_data.io, checkout.path);
 
             metadata = manager.readInstalledPackageJSON(checkout.path) catch |err| blk: {
@@ -3185,11 +4943,34 @@ const Manager = struct {
                 empty.* = .{ .object = .empty };
                 break :blk empty;
             };
-            package_name = jsonString(metadata, "name") orelse alias_hint orelse return error.InvalidPackageName;
+            package_name = blk: {
+                if (jsonString(metadata, "name")) |name| {
+                    if (name.len > 0) break :blk name;
+                }
+                break :blk alias_hint orelse gitRepositoryName(spec) orelse return error.InvalidPackageName;
+            };
             package_version = jsonString(metadata, "version") orelse "0.0.0";
             const alias = alias_hint orelse package_name;
             commit = checkout.commit;
             resolved_source = try spec.resolvedSource(manager.allocator, commit);
+            var install_source_path = checkout.path;
+            if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                const project_cache_dir = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
+                try std.Io.Dir.cwd().createDirPath(manager.init_data.io, project_cache_dir);
+                const cache_name = try gitCacheFolderName(manager.allocator, spec, requested, commit);
+                const project_cache_path = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, cache_name });
+                const bun_tag_path = try std.fs.path.join(manager.allocator, &.{ checkout.path, ".bun-tag" });
+                try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = bun_tag_path, .data = commit });
+                deletePath(manager.init_data.io, project_cache_path);
+                try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, project_cache_path);
+                if (!std.mem.eql(u8, alias, package_name)) {
+                    const alias_cache_dir = try std.fs.path.join(manager.allocator, &.{ project_cache_dir, alias });
+                    try std.Io.Dir.cwd().createDirPath(manager.init_data.io, alias_cache_dir);
+                    const alias_cache_link = try std.fs.path.join(manager.allocator, &.{ alias_cache_dir, gitCacheAliasName(cache_name) });
+                    try manager.linkDirectoryAt(alias_cache_link, project_cache_path);
+                }
+                install_source_path = project_cache_path;
+            }
             if (locked_selection == null) {
                 peer_context = try manager.peerContextForPackage(metadata, parent_dir, true);
             } else {
@@ -3209,12 +4990,29 @@ const Manager = struct {
                     peer_context,
                 );
 
-            if (!manager.options.lockfile_only and !manager.options.dry_run) {
-                deletePath(manager.init_data.io, final_destination);
-                try copyDirectoryTree(manager.init_data.io, manager.allocator, checkout.path, final_destination);
-                try manager.applyPackagePatch(package_name, package_version, final_destination, protocol_patch_paths);
+            if (!manager.options.force and !manager.options.lockfile_only and !manager.options.dry_run) {
+                const existing_tag_path = try std.fs.path.join(manager.allocator, &.{ final_destination, ".bun-tag" });
+                const existing_tag = std.Io.Dir.cwd().readFileAlloc(
+                    manager.init_data.io,
+                    existing_tag_path,
+                    manager.allocator,
+                    .limited(128),
+                ) catch null;
+                if (existing_tag) |tag| {
+                    const patch_paths = try manager.packagePatchPaths(package_name, package_version, protocol_patch_paths);
+                    installed = std.mem.eql(u8, std.mem.trim(u8, tag, " \t\r\n"), commit) and
+                        try manager.packagePatchStateMatches(final_destination, patch_paths);
+                }
             }
-            manager.installed_count += 1;
+
+            if (!installed) {
+                if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                    deletePath(manager.init_data.io, final_destination);
+                    try copyDirectoryTree(manager.init_data.io, manager.allocator, install_source_path, final_destination);
+                    try manager.applyPackagePatch(package_name, package_version, final_destination, protocol_patch_paths);
+                }
+                manager.installed_count += 1;
+            }
         }
 
         if (installed) _ = try manager.peerContextForPackage(metadata, parent_dir, true);
@@ -3227,16 +5025,17 @@ const Manager = struct {
         }
         try manager.root_versions.put(try manager.allocator.dupe(u8, alias), package_version);
         try manager.addRecord(.{
-            .key = if (locked_selection) |selection|
-                selection.package.key
-            else if (manager.node_linker == .isolated)
+            .key = if (manager.node_linker == .isolated)
                 try manager.dependencyLockKey(parent_dir, alias)
+            else if (locked_selection) |selection|
+                selection.package.key
             else
                 try manager.lockKeyForDestination(final_destination),
             .alias = alias,
             .name = package_name,
             .version = package_version,
-            .integrity = commit,
+            .integrity = archive_integrity,
+            .git_resolved = git_resolved_name,
             .resolution = resolved_source,
             .kind = if (spec.kind == .github) .github else .git,
             .metadata = metadata,
@@ -3250,7 +5049,9 @@ const Manager = struct {
         if (!manager.options.omit_optional) {
             try manager.installDependencyObject(metadata, "optionalDependencies", final_destination, false, true);
         }
-        try manager.installOrLinkPeerDependencies(metadata, final_destination, final_destination, parent_dir);
+        if (manager.node_linker == .isolated) {
+            try manager.linkPeerDependencies(metadata, final_destination, parent_dir);
+        }
         try manager.queuePackageScripts(alias, package_version, final_destination, .git, optional, !installed);
         return .{
             .alias = alias,
@@ -3258,6 +5059,59 @@ const Manager = struct {
             .version = package_version,
             .source = resolved_source,
             .package_json = metadata,
+        };
+    }
+
+    fn checkoutGithubArchive(
+        manager: *Manager,
+        spec: Git.Spec,
+        destination: []const u8,
+        expected_integrity: ?[]const u8,
+    ) !GitCheckoutResult {
+        const repository = Git.githubRepositoryPath(spec) orelse return error.InvalidGitDependency;
+        var reference = spec.committish;
+        if (reference.len == 0) {
+            const api_base = std.mem.trimEnd(u8, manager.init_data.environ_map.get("GITHUB_API_URL") orelse "https://api.github.com", "/");
+            const metadata_url = try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}", .{ api_base, repository });
+            const metadata_bytes = try manager.fetchBytes(metadata_url, true, 4 * 1024 * 1024);
+            const metadata = std.json.parseFromSliceLeaky(Value, manager.allocator, metadata_bytes, .{}) catch
+                return error.InvalidGitMetadata;
+            reference = jsonString(&metadata, "default_branch") orelse "HEAD";
+        }
+        const abbreviated = reference[0..@min(reference.len, 7)];
+        const repository_slug = try manager.allocator.dupe(u8, repository);
+        std.mem.replaceScalar(u8, repository_slug, '/', '-');
+        const resolved_name = try std.fmt.allocPrint(manager.allocator, "{s}-{s}", .{
+            repository_slug,
+            abbreviated,
+        });
+        const cache_dir = try packageCachePath(manager.init_data, manager.allocator);
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
+        const archive_path = try std.fs.path.join(manager.allocator, &.{ cache_dir, try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{resolved_name}) });
+        const archive = (try readOptionalFile(manager.init_data.io, manager.allocator, archive_path, max_tarball_bytes)) orelse blk: {
+            const archive_url = if (manager.init_data.environ_map.get("GITHUB_API_URL")) |configured_api|
+                try std.fmt.allocPrint(manager.allocator, "{s}/repos/{s}/tarball/{s}", .{ std.mem.trimEnd(u8, configured_api, "/"), repository, reference })
+            else
+                try std.fmt.allocPrint(manager.allocator, "https://codeload.github.com/{s}/tar.gz/{s}", .{ repository, reference });
+            const downloaded = try manager.fetchBytes(archive_url, false, max_tarball_bytes);
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = archive_path, .data = downloaded });
+            break :blk downloaded;
+        };
+        if (manager.options.verify_integrity) try verifyIntegrity(archive, expected_integrity);
+        const integrity = try sha512Integrity(manager.allocator, archive);
+
+        deletePath(manager.init_data.io, destination);
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
+        var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
+        defer destination_dir.close(manager.init_data.io);
+        try extractTarballArchive(manager.init_data.io, manager.allocator, destination_dir, archive);
+        return .{
+            .checkout = .{
+                .path = destination,
+                .commit = try manager.allocator.dupe(u8, reference),
+            },
+            .integrity = integrity,
+            .resolved_name = resolved_name,
         };
     }
 
@@ -3282,6 +5136,106 @@ const Manager = struct {
     ) !?*const Value {
         const installed = manager.readInstalledPackageJSON(package_dir) catch return fallback;
         return installed;
+    }
+
+    fn registerBundledPackages(
+        manager: *Manager,
+        parent_key: []const u8,
+        parent_metadata: *const Value,
+        parent_dir: []const u8,
+    ) !void {
+        if (!packageHasBundledDependencies(parent_metadata)) return;
+        const modules_dir = try std.fs.path.join(manager.allocator, &.{ parent_dir, "node_modules" });
+        try manager.scanBundledModulesDirectory(parent_key, parent_metadata, modules_dir);
+    }
+
+    fn scanBundledModulesDirectory(
+        manager: *Manager,
+        parent_key: []const u8,
+        owner_metadata: *const Value,
+        modules_dir: []const u8,
+    ) anyerror!void {
+        var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, modules_dir, .{ .iterate = true }) catch return;
+        defer directory.close(manager.init_data.io);
+        var iterator = directory.iterate();
+        while (try iterator.next(manager.init_data.io)) |entry| {
+            if (entry.kind != .directory or entry.name.len == 0 or entry.name[0] == '.') continue;
+            if (entry.name[0] == '@') {
+                const scope_dir_path = try std.fs.path.join(manager.allocator, &.{ modules_dir, entry.name });
+                var scope_dir = std.Io.Dir.cwd().openDir(manager.init_data.io, scope_dir_path, .{ .iterate = true }) catch continue;
+                defer scope_dir.close(manager.init_data.io);
+                var scope_iterator = scope_dir.iterate();
+                while (try scope_iterator.next(manager.init_data.io)) |package_entry| {
+                    if (package_entry.kind != .directory or package_entry.name.len == 0 or package_entry.name[0] == '.') continue;
+                    const alias = try std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ entry.name, package_entry.name });
+                    const package_dir = try std.fs.path.join(manager.allocator, &.{ scope_dir_path, package_entry.name });
+                    try manager.registerBundledPackage(parent_key, owner_metadata, alias, package_dir);
+                }
+                continue;
+            }
+            const package_dir = try std.fs.path.join(manager.allocator, &.{ modules_dir, entry.name });
+            try manager.registerBundledPackage(parent_key, owner_metadata, entry.name, package_dir);
+        }
+    }
+
+    fn registerBundledPackage(
+        manager: *Manager,
+        parent_key: []const u8,
+        owner_metadata: *const Value,
+        alias: []const u8,
+        package_dir: []const u8,
+    ) anyerror!void {
+        const owned_alias = try manager.allocator.dupe(u8, alias);
+        const metadata = manager.readInstalledPackageJSON(package_dir) catch return;
+        const package_name = jsonString(metadata, "name") orelse owned_alias;
+        const package_version = jsonString(metadata, "version") orelse "0.0.0";
+        const lock_key = try std.fmt.allocPrint(manager.allocator, "{s}/{s}", .{ parent_key, owned_alias });
+        const directly_bundled = packageDependencyIsBundled(owner_metadata, owned_alias);
+        if (directly_bundled) {
+            try metadata.object.put(manager.allocator, try manager.allocator.dupe(u8, "bundled"), .{ .bool = true });
+        }
+
+        var tarball: []const u8 = "";
+        var integrity: []const u8 = "";
+        if (manager.lock_graph) |*graph| {
+            if (graph.get(lock_key)) |locked| {
+                if (locked.kind == .npm) {
+                    tarball = locked.source;
+                    integrity = locked.integrity;
+                }
+            }
+        }
+        if (tarball.len == 0) {
+            for (manager.records.items) |record| {
+                if (record.kind != .npm or
+                    !std.mem.eql(u8, record.name, package_name) or
+                    !std.mem.eql(u8, record.version, package_version) or
+                    record.tarball.len == 0) continue;
+                tarball = record.tarball;
+                integrity = record.integrity;
+                break;
+            }
+        }
+        if (tarball.len == 0) {
+            const resolved = try manager.resolveRegistryPackage(package_name, package_version);
+            tarball = resolved.tarball;
+            integrity = resolved.integrity orelse "";
+        }
+
+        try manager.addRecord(.{
+            .key = lock_key,
+            .alias = owned_alias,
+            .name = package_name,
+            .version = package_version,
+            .tarball = tarball,
+            .integrity = integrity,
+            .metadata = metadata,
+            .install_dir = package_dir,
+        });
+        try manager.rememberPackageMetadata(package_dir, metadata);
+
+        const nested_modules = try std.fs.path.join(manager.allocator, &.{ package_dir, "node_modules" });
+        try manager.scanBundledModulesDirectory(lock_key, metadata, nested_modules);
     }
 
     fn installTarball(
@@ -3419,7 +5373,7 @@ const Manager = struct {
                 }
             }
         }
-        if (direct or manager.root_versions.get(alias) == null) {
+        if ((direct and std.mem.eql(u8, parent_dir, manager.root_dir)) or manager.root_versions.get(alias) == null) {
             return packageDestination(manager.allocator, manager.root_dir, alias);
         }
         if (manager.root_versions.get(alias)) |existing| {
@@ -3504,6 +5458,21 @@ const Manager = struct {
         const candidates = [_][]const u8{ parent_dir, manager.root_dir };
         for (candidates) |base| {
             const destination = try packageDestination(manager.allocator, base, alias);
+            const destination_key = try manager.lockKeyForDestination(destination);
+            const registry_name, const registry_spec = parseNpmAlias(alias, spec);
+            for (manager.records.items) |record| {
+                if (record.kind != .npm or
+                    !std.mem.eql(u8, record.alias, alias) or
+                    !std.mem.eql(u8, record.name, registry_name) or
+                    !std.mem.eql(u8, recordLogicalKey(record), destination_key) or
+                    !semverSatisfies(manager.allocator, registry_spec, record.version)) continue;
+                if (!manager.options.lockfile_only and !manager.options.dry_run) {
+                    const patch_paths = try manager.packagePatchPaths(record.name, record.version, protocol_patch_paths);
+                    if (!try manager.packagePatchStateMatches(destination, patch_paths)) continue;
+                }
+                return record.version;
+            }
+            if (manager.pathIsWorkspace(destination)) continue;
             const package_json = try std.fs.path.join(manager.allocator, &.{ destination, "package.json" });
             const source = std.Io.Dir.cwd().readFileAlloc(
                 manager.init_data.io,
@@ -3534,16 +5503,75 @@ const Manager = struct {
         return null;
     }
 
+    fn registryManifestCachePath(manager: *Manager, encoded_name: []const u8) !?[]const u8 {
+        const cache_dir = manager.cache_directory orelse return null;
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, cache_dir);
+        const filename = try std.fmt.allocPrint(manager.allocator, "{s}.npm", .{encoded_name});
+        return try std.fs.path.join(manager.allocator, &.{ cache_dir, filename });
+    }
+
+    fn registryArchiveCachePath(manager: *Manager, name: []const u8, version_value: []const u8) !?[]const u8 {
+        const cache_dir = manager.cache_directory orelse return null;
+        const package_cache = try std.fs.path.join(manager.allocator, &.{ cache_dir, name });
+        try std.Io.Dir.cwd().createDirPath(manager.init_data.io, package_cache);
+        const filename = try std.fmt.allocPrint(manager.allocator, "{s}.tgz", .{version_value});
+        return try std.fs.path.join(manager.allocator, &.{ package_cache, filename });
+    }
+
+    fn parseRegistryManifest(manager: *Manager, bytes: []const u8) !?*Value {
+        const parsed = try manager.allocator.create(Value);
+        parsed.* = std.json.parseFromSliceLeaky(Value, manager.allocator, bytes, .{}) catch return null;
+        if (parsed.* != .object) return null;
+        const versions = parsed.object.get("versions") orelse return null;
+        if (versions != .object) return null;
+        return parsed;
+    }
+
+    fn registryConfigForPackage(manager: *Manager, name: []const u8) RegistryConfig {
+        if (name.len > 1 and name[0] == '@') {
+            if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+                if (manager.registry_scopes.get(name[1..slash])) |configured| return configured;
+            }
+        }
+        return .{ .url = manager.registry, .authorization = manager.registry_authorization };
+    }
+
     fn resolveRegistryPackage(manager: *Manager, name: []const u8, spec: []const u8) !RegistryPackage {
-        const encoded_name = try encodePackageName(manager.allocator, name);
-        const manifest_url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ manager.registry, encoded_name });
-        const bytes = try manager.fetchBytes(manifest_url, true, max_manifest_bytes);
-        const manifest = try std.json.parseFromSliceLeaky(Value, manager.allocator, bytes, .{});
-        if (manifest != .object) return error.InvalidRegistryManifest;
+        const manifest = manager.registry_manifests.get(name) orelse blk: {
+            const encoded_name = try encodePackageName(manager.allocator, name);
+            const configured_registry = manager.registryConfigForPackage(name);
+            const cache_path = try manager.registryManifestCachePath(encoded_name);
+            if (cache_path) |path| {
+                if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
+                    if (try manager.parseRegistryManifest(cached)) |parsed| {
+                        try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                        break :blk parsed;
+                    }
+                    std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
+                }
+            }
+            const manifest_url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name });
+            const bytes = try manager.fetchBytesWithAuthorization(manifest_url, true, max_manifest_bytes, configured_registry.authorization);
+            const parsed = (try manager.parseRegistryManifest(bytes)) orelse return error.InvalidRegistryManifest;
+            if (cache_path) |path| {
+                try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes });
+            }
+            try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+            break :blk parsed;
+        };
+        if (manifest.* != .object) return error.InvalidRegistryManifest;
         const versions_value = manifest.object.get("versions") orelse return error.PackageNotFound;
         if (versions_value != .object) return error.InvalidRegistryManifest;
 
         var selected_version: ?[]const u8 = null;
+        var latest_version: ?[]const u8 = null;
+        if (manifest.object.get("dist-tags")) |dist_tags| {
+            if (dist_tags == .object) {
+                if (dist_tags.object.get("latest")) |latest| {
+                    if (latest == .string) latest_version = latest.string;
+                }
+            }
+        }
         if (versions_value.object.get(spec) != null) {
             selected_version = spec;
         } else if (manifest.object.get("dist-tags")) |dist_tags| {
@@ -3554,14 +5582,18 @@ const Manager = struct {
                     if (dist_tags.object.get("latest")) |latest| if (latest == .string) {
                         selected_version = latest.string;
                     };
-                } else if (dist_tags.object.get("latest")) |latest| {
-                    if (latest == .string and semverSatisfies(manager.allocator, spec, latest.string)) {
-                        selected_version = latest.string;
+                } else if (!Semver.Version.isTaggedVersionOnly(spec)) {
+                    if (dist_tags.object.get("latest")) |latest| {
+                        if (latest == .string and semverSatisfies(manager.allocator, spec, latest.string)) {
+                            selected_version = latest.string;
+                        }
                     }
                 }
             }
         }
-        if (selected_version == null) selected_version = bestMatchingVersion(manager.allocator, &versions_value.object, spec);
+        if (selected_version == null and !Semver.Version.isTaggedVersionOnly(spec)) {
+            selected_version = bestMatchingVersion(manager.allocator, &versions_value.object, spec);
+        }
         const version_value = selected_version orelse return error.NoMatchingVersion;
         const metadata = versions_value.object.getPtr(version_value) orelse return error.NoMatchingVersion;
         if (metadata.* != .object) return error.InvalidRegistryManifest;
@@ -3573,27 +5605,345 @@ const Manager = struct {
             if (value == .string) value.string else null
         else
             null;
+        const configured_registry = manager.registryConfigForPackage(name);
         return .{
             .name = if (metadata.object.get("name")) |value| if (value == .string) value.string else name else name,
             .version = version_value,
+            .latest_version = latest_version,
             .tarball = tarball_value.string,
             .integrity = integrity,
             .metadata = metadata,
+            .authorization = configured_registry.authorization,
         };
     }
 
+    fn prefetchInstallNetwork(manager: *Manager, root: *Value) !void {
+        if (manager.lock_graph != null) {
+            return manager.prefetchLockedRegistryArchives();
+        }
+        return manager.prefetchRegistryDependencyGraph(root);
+    }
+
+    fn prefetchLockedRegistryArchives(manager: *Manager) !void {
+        if (manager.options.lockfile_only or manager.options.dry_run or manager.cache_directory == null) return;
+        const graph = if (manager.lock_graph) |*value| value else return;
+        var archives = std.array_list.Managed(RegistryArchive).init(manager.allocator);
+        defer archives.deinit();
+
+        var packages = graph.packages.iterator();
+        while (packages.next()) |entry| {
+            const package = entry.value_ptr;
+            if (package.kind != .npm or package.name.len == 0 or package.version.len == 0) continue;
+            const tarball = if (package.source.len > 0)
+                package.source
+            else
+                try manager.defaultTarballURL(package.name, package.version);
+            try archives.append(.{
+                .name = package.name,
+                .version = package.version,
+                .tarball = tarball,
+                .integrity = if (package.integrity.len > 0) package.integrity else null,
+                .authorization = manager.authorizationForURL(tarball),
+            });
+        }
+        try manager.prefetchRegistryArchives(archives.items);
+    }
+
+    fn prefetchRegistryDependencyGraph(manager: *Manager, root: *Value) !void {
+        var pending = std.array_list.Managed(RegistryDependencyRequest).init(manager.allocator);
+        defer pending.deinit();
+        var next = std.array_list.Managed(RegistryDependencyRequest).init(manager.allocator);
+        defer next.deinit();
+        var manifest_names = std.array_list.Managed([]const u8).init(manager.allocator);
+        defer manifest_names.deinit();
+        var wave_requests = std.array_list.Managed(RegistryDependencyRequest).init(manager.allocator);
+        defer wave_requests.deinit();
+        var archives = std.array_list.Managed(RegistryArchive).init(manager.allocator);
+        defer archives.deinit();
+        var seen = std.StringHashMap(void).init(manager.allocator);
+        defer seen.deinit();
+
+        try manager.appendRegistryDependencySection(&pending, root, "dependencies", false);
+        if (!manager.options.omit_optional) {
+            try manager.appendRegistryDependencySection(&pending, root, "optionalDependencies", true);
+        }
+        if (!manager.options.production and !manager.options.omit_dev) {
+            try manager.appendRegistryDependencySection(&pending, root, "devDependencies", false);
+        }
+        if (!manager.options.omit_peer) {
+            try manager.appendRegistryDependencySection(&pending, root, "peerDependencies", false);
+        }
+
+        while (pending.items.len > 0) {
+            manifest_names.clearRetainingCapacity();
+            wave_requests.clearRetainingCapacity();
+            next.clearRetainingCapacity();
+            for (pending.items) |request| {
+                const request_key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{d}", .{
+                    request.name,
+                    request.spec,
+                    @intFromBool(request.optional),
+                });
+                if (seen.contains(request_key)) continue;
+                try seen.put(request_key, {});
+                try manifest_names.append(request.name);
+                try wave_requests.append(request);
+            }
+
+            try manager.prefetchRegistryManifests(manifest_names.items);
+            for (wave_requests.items) |request| {
+                if (!manager.registry_manifests.contains(request.name)) continue;
+                const resolved = manager.resolveRegistryPackage(request.name, request.spec) catch continue;
+                if (request.optional and !packageSupportsPlatform(
+                    resolved.metadata,
+                    manager.options.cpu,
+                    manager.options.os,
+                )) continue;
+
+                try archives.append(resolved.archive());
+                try manager.appendRegistryDependencySection(&next, resolved.metadata, "dependencies", false);
+                if (!manager.options.omit_optional) {
+                    try manager.appendRegistryDependencySection(&next, resolved.metadata, "optionalDependencies", true);
+                }
+                if (!manager.options.omit_peer and manager.node_linker == .hoisted) {
+                    try manager.appendRegistryDependencySection(&next, resolved.metadata, "peerDependencies", true);
+                }
+            }
+
+            pending.clearRetainingCapacity();
+            std.mem.swap(
+                std.array_list.Managed(RegistryDependencyRequest),
+                &pending,
+                &next,
+            );
+        }
+
+        if (!manager.options.lockfile_only and !manager.options.dry_run) {
+            try manager.prefetchRegistryArchives(archives.items);
+        }
+    }
+
+    fn appendRegistryDependencySection(
+        manager: *Manager,
+        requests: *std.array_list.Managed(RegistryDependencyRequest),
+        package_json: *const Value,
+        key: []const u8,
+        optional: bool,
+    ) !void {
+        if (package_json.* != .object) return;
+        const dependencies = package_json.object.get(key) orelse return;
+        if (dependencies != .object) return;
+
+        for (dependencies.object.keys(), dependencies.object.values()) |alias, spec_value| {
+            if (spec_value != .string) continue;
+            if (std.mem.eql(u8, key, "dependencies") and
+                (objectSectionContains(package_json, "optionalDependencies", alias) or
+                    packageDependencyIsBundled(package_json, alias))) continue;
+            if (std.mem.eql(u8, key, "peerDependencies") and
+                (objectSectionContains(package_json, "dependencies", alias) or
+                    objectSectionContains(package_json, "optionalDependencies", alias) or
+                    (!manager.options.production and !manager.options.omit_dev and
+                        objectSectionContains(package_json, "devDependencies", alias)))) continue;
+            if (std.mem.eql(u8, key, "peerDependencies") and peerDependencyIsOptional(package_json, alias)) continue;
+
+            var workspace_package = manager.isWorkspaceDependency(alias, spec_value.string);
+            const effective_spec = manager.manifest_policy.?.resolveDependency(
+                alias,
+                spec_value.string,
+                workspace_package,
+            ) catch continue;
+            if (!workspace_package) workspace_package = manager.isWorkspaceDependency(alias, effective_spec);
+            const resolution_spec = if (Patch.Spec.parseProtocol(manager.allocator, alias, effective_spec) catch null) |protocol|
+                protocol.base_spec
+            else
+                effective_spec;
+            if (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
+                isLocalSpec(resolution_spec) or std.mem.startsWith(u8, resolution_spec, "http://") or
+                std.mem.startsWith(u8, resolution_spec, "https://")) continue;
+
+            const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
+            try requests.append(.{
+                .name = registry_name,
+                .spec = registry_spec,
+                .optional = optional,
+            });
+        }
+    }
+
+    fn enrichMigratedLockMetadata(manager: *Manager) !void {
+        const graph = if (manager.lock_graph) |*value| value else return;
+        if (graph.provenance != .yarn and graph.provenance != .pnpm) return;
+
+        try manager.prefetchMigratedManifests(graph);
+
+        var packages = graph.packages.iterator();
+        while (packages.next()) |entry| {
+            const package = entry.value_ptr;
+            if (package.kind != .npm or package.name.len == 0 or package.version.len == 0) continue;
+            const manifest = manager.registry_manifests.get(package.name) orelse continue;
+            if (manifest.* != .object) continue;
+            const versions = manifest.object.get("versions") orelse continue;
+            if (versions != .object) continue;
+            const resolved_metadata = versions.object.getPtr(package.version) orelse continue;
+            if (resolved_metadata.* != .object) continue;
+            if (graph.provenance == .pnpm and !manager.omit_pnpm_workspace_versions) {
+                if (resolved_metadata.object.get("dist")) |dist| {
+                    if (dist == .object) {
+                        if (jsonString(&dist, "tarball")) |tarball| package.source = tarball;
+                    }
+                }
+            }
+            const metadata = if (package.info) |value| @constCast(value) else continue;
+            if (metadata.* != .object) continue;
+            const fields: []const []const u8 = if (graph.provenance == .pnpm)
+                &.{"bin"}
+            else
+                &.{ "bin", "os", "cpu" };
+            for (fields) |field| {
+                const value = resolved_metadata.object.get(field) orelse continue;
+                if (!std.mem.eql(u8, field, "bin") and metadata.object.get(field) != null) continue;
+                try metadata.object.put(manager.allocator, field, value);
+            }
+        }
+    }
+
+    fn prefetchMigratedManifests(manager: *Manager, graph: *const Lockfile.Graph) !void {
+        var names = std.array_list.Managed([]const u8).init(manager.allocator);
+        defer names.deinit();
+
+        var packages = graph.packages.iterator();
+        while (packages.next()) |entry| {
+            const package = entry.value_ptr;
+            if (package.kind != .npm or package.name.len == 0 or package.version.len == 0) continue;
+            try names.append(package.name);
+        }
+        try manager.prefetchRegistryManifests(names.items);
+    }
+
+    fn prefetchRegistryManifests(manager: *Manager, names: []const []const u8) !void {
+        var queued = std.StringHashMap(void).init(manager.allocator);
+        defer queued.deinit();
+        var fetches = std.array_list.Managed(RegistryManifestFetch).init(manager.allocator);
+        defer fetches.deinit();
+
+        for (names) |name| {
+            if (manager.registry_manifests.contains(name) or queued.contains(name)) continue;
+            try queued.put(name, {});
+
+            const encoded_name = try encodePackageName(manager.allocator, name);
+            const cache_path = try manager.registryManifestCachePath(encoded_name);
+            if (cache_path) |path| {
+                if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
+                    if (try manager.parseRegistryManifest(cached)) |parsed| {
+                        try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                        continue;
+                    }
+                    std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
+                }
+            }
+
+            const configured_registry = manager.registryConfigForPackage(name);
+            try fetches.append(.{
+                .io = manager.init_data.io,
+                .name = name,
+                .url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name }),
+                .authorization = configured_registry.authorization,
+                .cache_path = cache_path,
+            });
+        }
+
+        const concurrency = packageFetchConcurrency();
+        var offset: usize = 0;
+        while (offset < fetches.items.len) {
+            const end = @min(offset + concurrency, fetches.items.len);
+            const batch = fetches.items[offset..end];
+            var group: std.Io.Group = .init;
+            defer group.cancel(manager.init_data.io);
+            for (batch) |*fetch| try group.concurrent(manager.init_data.io, RegistryManifestFetch.run, .{fetch});
+            try group.await(manager.init_data.io);
+
+            for (batch) |*fetch| {
+                const bytes = fetch.bytes orelse continue;
+                defer std.heap.smp_allocator.free(bytes);
+                const parsed = (try manager.parseRegistryManifest(bytes)) orelse continue;
+                try manager.registry_manifests.put(try manager.allocator.dupe(u8, fetch.name), parsed);
+                if (fetch.cache_path) |path| {
+                    std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes }) catch {};
+                }
+            }
+            offset = end;
+        }
+    }
+
+    fn prefetchRegistryArchives(manager: *Manager, archives: []const RegistryArchive) !void {
+        if (manager.cache_directory == null) return;
+        var queued = std.StringHashMap(void).init(manager.allocator);
+        defer queued.deinit();
+        var fetches = std.array_list.Managed(RegistryArchiveFetch).init(manager.allocator);
+        defer fetches.deinit();
+
+        for (archives) |archive| {
+            const cache_path = (try manager.registryArchiveCachePath(archive.name, archive.version)) orelse continue;
+            if (queued.contains(cache_path)) continue;
+            try queued.put(cache_path, {});
+            try fetches.append(.{
+                .io = manager.init_data.io,
+                .url = archive.tarball,
+                .authorization = archive.authorization,
+                .integrity = archive.integrity,
+                .verify_integrity = manager.options.verify_integrity,
+                .cache_path = cache_path,
+            });
+        }
+
+        const concurrency = packageFetchConcurrency();
+        var offset: usize = 0;
+        while (offset < fetches.items.len) {
+            const end = @min(offset + concurrency, fetches.items.len);
+            const batch = fetches.items[offset..end];
+            var group: std.Io.Group = .init;
+            defer group.cancel(manager.init_data.io);
+            for (batch) |*fetch| try group.concurrent(manager.init_data.io, RegistryArchiveFetch.run, .{fetch});
+            try group.await(manager.init_data.io);
+            offset = end;
+        }
+    }
+
     fn fetchBytes(manager: *Manager, url: []const u8, manifest: bool, limit: usize) ![]const u8 {
+        return manager.fetchBytesWithAuthorization(url, manifest, limit, manager.authorizationForURL(url));
+    }
+
+    fn authorizationForURL(manager: *Manager, url: []const u8) ?[]const u8 {
+        var authorization: ?[]const u8 = null;
+        if (std.mem.startsWith(u8, url, manager.registry)) authorization = manager.registry_authorization;
+        if (authorization == null) {
+            var scopes = manager.registry_scopes.valueIterator();
+            while (scopes.next()) |configured| {
+                if (std.mem.startsWith(u8, url, configured.url)) {
+                    authorization = configured.authorization;
+                    break;
+                }
+            }
+        }
+        return authorization;
+    }
+
+    fn fetchBytesWithAuthorization(
+        manager: *Manager,
+        url: []const u8,
+        manifest: bool,
+        limit: usize,
+        authorization: ?[]const u8,
+    ) ![]const u8 {
         var headers_buffer: [2]std.http.Header = undefined;
         var header_count: usize = 0;
         if (manifest) {
             headers_buffer[header_count] = .{ .name = "accept", .value = manifest_accept };
             header_count += 1;
         }
-        if (manager.registry_authorization) |authorization| {
-            if (std.mem.startsWith(u8, url, manager.registry)) {
-                headers_buffer[header_count] = .{ .name = "authorization", .value = authorization };
-                header_count += 1;
-            }
+        if (authorization) |value| {
+            headers_buffer[header_count] = .{ .name = "authorization", .value = value };
+            header_count += 1;
         }
         const headers = headers_buffer[0..header_count];
         var attempt: usize = 0;
@@ -3624,6 +5974,69 @@ const Manager = struct {
         unreachable;
     }
 
+    fn fetchInfoManifest(manager: *Manager, url: []const u8) !?[]const u8 {
+        var headers_buffer: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+        headers_buffer[header_count] = .{ .name = "accept", .value = "application/json" };
+        header_count += 1;
+        if (manager.registry_authorization) |authorization| {
+            if (std.mem.startsWith(u8, url, manager.registry)) {
+                headers_buffer[header_count] = .{ .name = "authorization", .value = authorization };
+                header_count += 1;
+            }
+        }
+
+        var attempt: usize = 0;
+        while (attempt <= manager.max_retry_count) : (attempt += 1) {
+            var output: std.Io.Writer.Allocating = .init(manager.allocator);
+            const result = manager.client.fetch(.{
+                .location = .{ .url = url },
+                .response_writer = &output.writer,
+                .extra_headers = headers_buffer[0..header_count],
+            }) catch |err| {
+                if (attempt == manager.max_retry_count) {
+                    try manager.stderr.print("error: GET {s} - {s}\n", .{ url, @errorName(err) });
+                    try manager.stderr.flush();
+                    return null;
+                }
+                continue;
+            };
+            const status: u16 = @intFromEnum(result.status);
+            if (status >= 200 and status < 300) {
+                if (output.written().len > max_manifest_bytes) return error.ResponseTooLarge;
+                return try output.toOwnedSlice();
+            }
+            output.deinit();
+            if (status >= 500 and attempt < manager.max_retry_count) continue;
+            try manager.stderr.print("error: {s}\n", .{result.status.phrase() orelse @tagName(result.status)});
+            try manager.stderr.flush();
+            return null;
+        }
+        unreachable;
+    }
+
+    fn fetchRegistryArchive(manager: *Manager, package: RegistryArchive) ![]const u8 {
+        const cache_path = try manager.registryArchiveCachePath(package.name, package.version);
+
+        if (cache_path) |path| {
+            if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_tarball_bytes)) |cached| {
+                const valid = if (manager.options.verify_integrity) blk: {
+                    verifyIntegrity(cached, package.integrity) catch break :blk false;
+                    break :blk true;
+                } else true;
+                if (valid) return cached;
+                std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
+            }
+        }
+
+        const archive = try manager.fetchBytesWithAuthorization(package.tarball, false, max_tarball_bytes, package.authorization);
+        if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
+        if (cache_path) |path| {
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = archive });
+        }
+        return archive;
+    }
+
     const LocalPackage = struct {
         name: []const u8,
         version: []const u8,
@@ -3632,15 +6045,32 @@ const Manager = struct {
     };
 
     fn resolveLocalPackage(manager: *Manager, spec: []const u8, parent_dir: []const u8) !LocalPackage {
-        const raw_path = localSpecPath(spec);
-        const path = try absolutePathFrom(manager.allocator, parent_dir, raw_path);
+        const path = try manager.localPackagePath(spec, parent_dir);
+        if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+            try manager.stderr.print("local package: {s} from {s} -> {s}\n", .{ spec, parent_dir, path });
+        }
         const package_json_path = try std.fs.path.join(manager.allocator, &.{ path, "package.json" });
         const source = std.Io.Dir.cwd().readFileAlloc(
             manager.init_data.io,
             package_json_path,
             manager.allocator,
             .limited(16 * 1024 * 1024),
-        ) catch return error.MissingPackageJSON;
+        ) catch {
+            if (isGlobalLinkSpec(spec)) {
+                const package_name = localSpecPath(spec);
+                if (manager.options.command == .link) {
+                    return error.MissingPackageJSON;
+                } else {
+                    try manager.stderr.print("error: FileNotFound: failed linking dependency/workspace to node_modules for package {s}\n", .{package_name});
+                    const finished_ns = std.Io.Clock.awake.now(manager.init_data.io).nanoseconds;
+                    const elapsed_ms = @as(f64, @floatFromInt(finished_ns - manager.started_ns)) / std.time.ns_per_ms;
+                    try manager.stdout.print("Failed to install 1 package\n[{d:.2}ms] done\n", .{elapsed_ms});
+                    try manager.stdout.flush();
+                }
+                return error.PackageManagerErrorReported;
+            }
+            return error.MissingPackageJSON;
+        };
         const package_json = try manager.allocator.create(Value);
         package_json.* = try std.json.parseFromSliceLeaky(Value, manager.allocator, source, .{});
         if (package_json.* != .object) return error.InvalidPackageJSON;
@@ -3653,13 +6083,27 @@ const Manager = struct {
         };
     }
 
+    fn localPackagePath(manager: *Manager, spec: []const u8, parent_dir: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, spec, "link:")) return manager.allocator.dupe(u8, manager.root_dir);
+        if (isGlobalLinkSpec(spec)) {
+            const node_modules = try globalLinkNodeModulesPath(manager.init_data, manager.allocator);
+            return std.fs.path.join(manager.allocator, &.{ node_modules, localSpecPath(spec) });
+        }
+        return absolutePathFrom(manager.allocator, parent_dir, localSpecPath(spec));
+    }
+
     fn normalizeLocalSpec(manager: *Manager, spec: []const u8, path: []const u8) ![]const u8 {
+        return manager.normalizeLocalSpecFrom(spec, path, manager.root_dir);
+    }
+
+    fn normalizeLocalSpecFrom(manager: *Manager, spec: []const u8, path: []const u8, base_dir: []const u8) ![]const u8 {
+        if (isGlobalLinkSpec(spec)) return manager.allocator.dupe(u8, spec);
         const prefix = if (std.mem.startsWith(u8, spec, "link:")) "link:" else "file:";
         const relative = try std.fs.path.relative(
             manager.allocator,
             manager.root_dir,
             manager.init_data.environ_map,
-            manager.root_dir,
+            base_dir,
             path,
         );
         const normalized = try manager.allocator.dupe(u8, relative);
@@ -3691,11 +6135,19 @@ const Manager = struct {
         parent_dir: []const u8,
     ) !void {
         if (metadata.* != .object) return;
+        const consumer_modules = if (manager.node_linker == .isolated)
+            try manager.isolatedConsumerModules(parent_dir)
+        else
+            "";
         const bin_dir = if (manager.node_linker == .isolated)
-            try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), ".bin" })
+            try std.fs.path.join(manager.allocator, &.{ consumer_modules, ".bin" })
         else
             try manager.binDirectoryForPackage(package_dir);
-        return manager.linkBinsInDirectory(alias, package_dir, metadata, report_direct, bin_dir);
+        const target_package_dir = if (manager.node_linker == .isolated and report_direct)
+            try std.fs.path.join(manager.allocator, &.{ consumer_modules, alias })
+        else
+            package_dir;
+        return manager.linkBinsInDirectory(alias, target_package_dir, metadata, report_direct, bin_dir);
     }
 
     fn linkBinsInDirectory(
@@ -3737,6 +6189,44 @@ const Manager = struct {
             if (try manager.linkBin(bin_dir, normalizedBinName(entry.name), package_dir, relative_target)) {
                 if (report_direct) try manager.direct_bins.append(normalizedBinName(entry.name));
             }
+        }
+    }
+
+    fn unlinkBinsInDirectory(
+        manager: *Manager,
+        alias: []const u8,
+        metadata: *const Value,
+        bin_dir: []const u8,
+    ) !void {
+        if (metadata.* != .object) return;
+        if (metadata.object.get("bin")) |bin_value| {
+            if (bin_value == .string) {
+                manager.unlinkBin(bin_dir, normalizedBinName(alias));
+            } else if (bin_value == .object) {
+                for (bin_value.object.keys()) |name| manager.unlinkBin(bin_dir, normalizedBinName(name));
+            }
+            return;
+        }
+
+        const directories = metadata.object.get("directories") orelse return;
+        if (directories != .object) return;
+        const directory_value = directories.object.get("bin") orelse return;
+        if (directory_value != .string) return;
+        const directory_path = try std.fs.path.join(manager.allocator, &.{ manager.invocation_package_dir, directory_value.string });
+        var directory = std.Io.Dir.cwd().openDir(manager.init_data.io, directory_path, .{ .iterate = true }) catch return;
+        defer directory.close(manager.init_data.io);
+        var iterator = directory.iterate();
+        while (try iterator.next(manager.init_data.io)) |entry| {
+            if (entry.kind == .file) manager.unlinkBin(bin_dir, normalizedBinName(entry.name));
+        }
+    }
+
+    fn unlinkBin(manager: *Manager, bin_dir: []const u8, name: []const u8) void {
+        const destination = std.fs.path.join(manager.allocator, &.{ bin_dir, name }) catch return;
+        deletePath(manager.init_data.io, destination);
+        if (builtin.os.tag == .windows) {
+            const command_path = std.fmt.allocPrint(manager.allocator, "{s}.cmd", .{destination}) catch return;
+            deletePath(manager.init_data.io, command_path);
         }
     }
 
@@ -3829,7 +6319,10 @@ const Manager = struct {
             const candidate = manager.findRecord(candidate_name) orelse continue;
             const candidate_metadata = candidate.metadata orelse continue;
             if (!platformMatches(candidate_metadata)) continue;
-            const candidate_dir = try packageDestination(manager.allocator, manager.root_dir, candidate.alias);
+            const candidate_dir = if (candidate.install_dir.len > 0)
+                candidate.install_dir
+            else
+                try packageDestination(manager.allocator, manager.root_dir, candidate.alias);
             try manager.linkBins(main_record.alias, candidate_dir, metadata, true, manager.root_dir);
             return;
         }
@@ -3909,6 +6402,26 @@ const Manager = struct {
             }
         }
         return null;
+    }
+
+    fn pathIsWorkspace(manager: *Manager, path: []const u8) bool {
+        var iterator = manager.workspaces.iterator();
+        while (iterator.next()) |entry| {
+            if (pathsEquivalent(manager.init_data.io, manager.allocator, entry.value_ptr.path, path) catch false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn workspaceHasRecord(manager: *Manager, workspace: Workspace) bool {
+        for (manager.records.items) |record| {
+            if (record.kind != .workspace or record.local_path.len == 0) continue;
+            if (pathsEquivalent(manager.init_data.io, manager.allocator, record.local_path, workspace.path) catch false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn resolveWorkspaceDependency(
@@ -4001,10 +6514,22 @@ const Manager = struct {
     fn isWorkspaceDependency(manager: *Manager, alias: []const u8, spec: []const u8) bool {
         const request = Workspaces.parseRequest(alias, spec);
         if (request.explicit) return true;
+        if (isLocalSpec(spec)) return false;
         if (!manager.link_workspace_packages) return false;
         const registry_name, const registry_range = parseNpmAlias(alias, spec);
         const workspace = manager.workspaces.get(registry_name) orelse return false;
         return manager.workspaceMatchesRange(workspace, registry_range);
+    }
+
+    fn workspaceDisplayResolution(
+        manager: *Manager,
+        alias: []const u8,
+        spec: []const u8,
+        parent_dir: []const u8,
+    ) !?[]const u8 {
+        if (!manager.isWorkspaceDependency(alias, spec)) return null;
+        const workspace = try manager.resolveWorkspaceDependency(alias, spec, parent_dir);
+        return try std.fmt.allocPrint(manager.allocator, "workspace:{s}", .{workspace.relative_path});
     }
 
     fn workspaceMatchesRange(manager: *Manager, workspace: Workspace, range: []const u8) bool {
@@ -4053,6 +6578,8 @@ const Manager = struct {
         }.lessThan);
 
         for (workspaces.items) |workspace| {
+            const previous = manager.setResolutionOnly(!manager.workspaceSelected(workspace));
+            defer manager.restoreResolutionOnly(previous);
             try manager.rememberPackageMetadata(workspace.path, workspace.package_json);
             _ = try manager.peerContextForPackage(workspace.package_json, workspace.path, true);
             if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
@@ -4072,23 +6599,31 @@ const Manager = struct {
                     .metadata = workspace.package_json,
                     .install_dir = workspace.path,
                 });
+            } else if (manager.node_linker == .isolated) {
+                try manager.addRecord(.{
+                    .key = workspace.name,
+                    .alias = workspace.name,
+                    .name = workspace.name,
+                    .version = workspace.version,
+                    .local_path = workspace.path,
+                    .resolution = workspace.path,
+                    .kind = .workspace,
+                    .metadata = workspace.package_json,
+                    .install_dir = workspace.path,
+                });
             }
         }
 
         for (workspaces.items) |workspace| {
+            const previous = manager.setResolutionOnly(!manager.workspaceSelected(workspace));
+            defer manager.restoreResolutionOnly(previous);
             try manager.installDependencyObject(workspace.package_json, "dependencies", workspace.path, false, false);
             if (!manager.options.omit_optional) {
                 try manager.installDependencyObject(workspace.package_json, "optionalDependencies", workspace.path, false, true);
             }
             try manager.installOrLinkPeerDependencies(workspace.package_json, workspace.path, workspace.path, workspace.path);
             if (!manager.options.production) try manager.installDependencyObject(workspace.package_json, "devDependencies", workspace.path, false, false);
-            try manager.script_queue.add(.{
-                .name = workspace.name,
-                .version = workspace.version,
-                .cwd = workspace.path,
-                .kind = .workspace,
-                .optional = false,
-            });
+            try manager.queuePackageScripts(workspace.name, workspace.version, workspace.path, .workspace, false, true);
         }
     }
 
@@ -4101,6 +6636,7 @@ const Manager = struct {
             var retained = false;
             for (manager.records.items) |record| {
                 const key = if (record.key.len > 0) record.key else record.alias;
+                if (manager.recordResolutionOnly(record)) continue;
                 if (std.mem.eql(u8, key, entry.key_ptr.*)) {
                     retained = true;
                     break;
@@ -4147,16 +6683,67 @@ const Manager = struct {
         return true;
     }
 
+    fn recordResolutionOnly(manager: *const Manager, record: PackageRecord) bool {
+        return manager.resolution_only_records.contains(recordLogicalKey(record));
+    }
+
     fn addRecord(manager: *Manager, record: PackageRecord) !void {
+        const record_key = if (record.key.len > 0) record.key else record.alias;
+        if (manager.filter_resolution_only) {
+            try manager.resolution_only_records.put(try manager.allocator.dupe(u8, record_key), {});
+        } else {
+            _ = manager.resolution_only_records.remove(record_key);
+        }
         for (manager.records.items, 0..) |existing, index| {
             const existing_key = if (existing.key.len > 0) existing.key else existing.alias;
-            const record_key = if (record.key.len > 0) record.key else record.alias;
             if (std.mem.eql(u8, existing_key, record_key)) {
                 manager.records.items[index] = record;
                 return;
             }
         }
         try manager.records.append(record);
+    }
+
+    fn loadRecordsFromLockGraph(manager: *Manager) !void {
+        var iterator = manager.lock_graph.?.packages.iterator();
+        while (iterator.next()) |entry| {
+            const package = entry.value_ptr.*;
+            const alias = try lockAliasFromKey(manager.allocator, package.key);
+            const version_value = if (package.version.len > 0)
+                package.version
+            else if (package.info) |info|
+                jsonString(info, "version") orelse "0.0.0"
+            else
+                "0.0.0";
+            try manager.addRecord(.{
+                .key = package.key,
+                .alias = alias,
+                .name = package.name,
+                .version = version_value,
+                .tarball = package.source,
+                .git_resolved = package.git_resolved,
+                .integrity = package.integrity,
+                .local_path = package.source,
+                .resolution = package.source,
+                .kind = package.kind,
+                .metadata = package.info,
+            });
+        }
+    }
+
+    fn lockfilePackageCount(manager: *const Manager) usize {
+        var count: usize = 1;
+        for (manager.records.items, 0..) |record, index| {
+            var duplicate = false;
+            for (manager.records.items[0..index]) |previous| {
+                if (packageRecordsHaveSameIdentity(record, previous)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) count += 1;
+        }
+        return count;
     }
 
     fn linkRecordMetadata(manager: *Manager, writer: *std.Io.Writer, record: PackageRecord) !void {
@@ -4169,11 +6756,9 @@ const Manager = struct {
                 try writer.writeAll(", ");
                 try writeJSONString(writer, record.tarball);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata);
-                if (record.integrity.len > 0) {
-                    try writer.writeAll(", ");
-                    try writeJSONString(writer, record.integrity);
-                }
+                try manager.writePackageInfo(writer, record.metadata, false);
+                try writer.writeAll(", ");
+                try writeJSONString(writer, record.integrity);
             },
             .workspace => {
                 const relative = try manager.relativeLockPath(if (record.local_path.len > 0) record.local_path else record.resolution);
@@ -4189,14 +6774,27 @@ const Manager = struct {
                 });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata);
+                try manager.writePackageInfo(writer, record.metadata, false);
             },
-            .local_tarball, .remote_tarball, .git, .github => {
+            .local_tarball, .remote_tarball => {
                 const source = if (record.resolution.len > 0) record.resolution else record.tarball;
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ record.name, source });
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata);
+                try manager.writePackageInfo(writer, record.metadata, false);
+                if (record.integrity.len > 0) {
+                    try writer.writeAll(", ");
+                    try writeJSONString(writer, record.integrity);
+                }
+            },
+            .git, .github => {
+                const source = if (record.resolution.len > 0) record.resolution else record.tarball;
+                const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@{s}", .{ record.name, source });
+                try writeJSONString(writer, resolution);
+                try writer.writeAll(", ");
+                try manager.writePackageInfo(writer, record.metadata, true);
+                try writer.writeAll(", ");
+                try writeJSONString(writer, record.git_resolved);
                 if (record.integrity.len > 0) {
                     try writer.writeAll(", ");
                     try writeJSONString(writer, record.integrity);
@@ -4206,7 +6804,7 @@ const Manager = struct {
                 const resolution = try std.fmt.allocPrint(manager.allocator, "{s}@root:", .{record.name});
                 try writeJSONString(writer, resolution);
                 try writer.writeAll(", ");
-                try manager.writePackageInfo(writer, record.metadata);
+                try manager.writePackageInfo(writer, record.metadata, false);
             },
         }
         try writer.writeByte(']');
@@ -4228,7 +6826,12 @@ const Manager = struct {
         return normalized;
     }
 
-    fn writePackageInfo(manager: *Manager, writer: *std.Io.Writer, metadata: ?*const Value) !void {
+    fn writePackageInfo(
+        manager: *Manager,
+        writer: *std.Io.Writer,
+        metadata: ?*const Value,
+        all_peers_optional: bool,
+    ) !void {
         const value = metadata orelse {
             try writer.writeAll("{}");
             return;
@@ -4239,11 +6842,8 @@ const Manager = struct {
         }
         const fields = [_][]const u8{
             "dependencies",
-            "devDependencies",
             "optionalDependencies",
             "peerDependencies",
-            "peerDependenciesMeta",
-            "optionalPeers",
             "os",
             "cpu",
             "libc",
@@ -4259,24 +6859,65 @@ const Manager = struct {
             first = false;
             try writeJSONString(writer, field);
             try writer.writeAll(": ");
-            try writeCanonicalJSON(manager.allocator, writer, field_value);
+            if (std.mem.eql(u8, field, "bin")) {
+                try writeCompactPackageJSON(writer, field_value);
+            } else {
+                try writeCanonicalJSON(manager.allocator, writer, field_value);
+            }
+        }
+        const optional_peers = if (all_peers_optional) blk: {
+            const peers = value.object.get("peerDependencies") orelse break :blk try manager.allocator.alloc([]const u8, 0);
+            if (peers != .object) break :blk try manager.allocator.alloc([]const u8, 0);
+            break :blk try manager.allocator.dupe([]const u8, peers.object.keys());
+        } else try optionalPeerNames(manager.allocator, value);
+        defer manager.allocator.free(optional_peers);
+        if (optional_peers.len > 0) {
+            if (!first) try writer.writeAll(", ");
+            try writeJSONString(writer, "optionalPeers");
+            try writer.writeAll(": [");
+            for (optional_peers, 0..) |name, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeJSONString(writer, name);
+            }
+            try writer.writeByte(']');
         }
         try writer.writeByte('}');
     }
 
     fn writeTextLockfile(manager: *Manager, root: *Value) !void {
         if (manager.options.frozen_lockfile and manager.changed) return error.FrozenLockfileChanged;
-        if (!manager.loaded_text_lockfile and !manager.save_text_lockfile) return error.BinaryLockfileWriteUnsupported;
+        if (manager.binary_lockfile_needs_migration and !manager.changed and !manager.shouldSaveTextLockfile()) {
+            const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
+            const previous = try std.Io.Dir.cwd().readFileAlloc(
+                manager.init_data.io,
+                binary_path,
+                manager.allocator,
+                .limited(256 * 1024 * 1024),
+            );
+            const upgraded = try BunLockfile.upgradeBinaryFormat(manager.allocator, previous);
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = upgraded });
+            if (builtin.os.tag != .windows) {
+                const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
+                try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
+            }
+            if (!manager.options.silent and manager.options.command != .link) try manager.stderr.writeAll("Saved lockfile\n");
+            return;
+        }
         var output: std.Io.Writer.Allocating = .init(manager.allocator);
         const writer = &output.writer;
         try writer.print("{{\n  \"lockfileVersion\": 1,\n  \"configVersion\": {d},\n  \"workspaces\": {{\n    \"\": ", .{
             @intFromEnum(manager.lockfile_config_version),
         });
-        try manager.writeWorkspaceInfo(writer, root, true);
+        try manager.writeWorkspaceInfo(writer, root, true, "");
+        try writer.writeByte(',');
         var sorted_workspaces = std.array_list.Managed(Workspace).init(manager.allocator);
         defer sorted_workspaces.deinit();
         var workspace_iterator = manager.workspaces.iterator();
-        while (workspace_iterator.next()) |entry| try sorted_workspaces.append(entry.value_ptr.*);
+        while (workspace_iterator.next()) |entry| {
+            if (manager.workspaceHasRecord(entry.value_ptr.*)) {
+                try sorted_workspaces.append(entry.value_ptr.*);
+            }
+        }
         std.sort.pdq(Workspace, sorted_workspaces.items, {}, struct {
             fn lessThan(_: void, left: Workspace, right: Workspace) bool {
                 return std.mem.order(u8, left.path, right.path) == .lt;
@@ -4284,16 +6925,25 @@ const Manager = struct {
         }.lessThan);
         for (sorted_workspaces.items) |workspace| {
             const path = try manager.relativeLockPath(workspace.path);
-            try writer.writeAll(",\n\n    ");
+            try writer.writeAll("\n    ");
             try writeJSONString(writer, path);
             try writer.writeAll(": ");
-            try manager.writeWorkspaceInfo(writer, workspace.package_json, false);
+            try manager.writeWorkspaceInfo(writer, workspace.package_json, false, path);
+            try writer.writeByte(',');
         }
         try writer.writeAll("\n  }");
         try manager.manifest_policy.?.writeLockFields(writer);
         try writer.writeAll(",\n  \"packages\": {");
         const records = try manager.allocator.dupe(PackageRecord, manager.records.items);
         defer manager.allocator.free(records);
+        for (records, 0..) |*record, index| {
+            const alias_is_unique = lockRecordAliasIsUnique(records, index);
+            if (alias_is_unique and
+                (record.kind == .workspace or !packageRecordIsBundled(record.*)))
+            {
+                record.key = record.alias;
+            }
+        }
         std.sort.pdq(PackageRecord, records, {}, struct {
             fn lessThan(_: void, left: PackageRecord, right: PackageRecord) bool {
                 const left_key = if (left.key.len > 0) left.key else left.alias;
@@ -4307,19 +6957,60 @@ const Manager = struct {
                 return std.mem.order(u8, left.version, right.version) == .lt;
             }
         }.lessThan);
+        var written_records: usize = 0;
         for (records, 0..) |record, index| {
-            try writer.writeAll(if (index == 0) "\n    " else ",\n\n    ");
+            if (index > 0 and
+                std.mem.eql(u8, recordLogicalKey(record), recordLogicalKey(records[index - 1])) and
+                packageRecordsHaveSameIdentity(record, records[index - 1]))
+            {
+                continue;
+            }
+            try writer.writeAll(if (written_records == 0) "\n    " else ",\n\n    ");
             try manager.linkRecordMetadata(writer, record);
+            written_records += 1;
         }
-        if (records.len > 0) try writer.writeByte(',');
+        if (written_records > 0) try writer.writeByte(',');
         try writer.writeAll("\n  }\n}\n");
 
-        // COTTONTAIL-COMPAT: Cottontail owns the text format end-to-end. Binary
-        // bun.lockb serialization remains isolated in the vendored Bun source
-        // until its lockfile graph can be shared without Bun's global state.
-        const lockfile_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" });
-        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = lockfile_path, .data = output.written() });
-        if (!manager.options.silent) try manager.stderr.writeAll("Saved lockfile\n");
+        if (manager.init_data.environ_map.get("COTTONTAIL_PM_ERROR_TRACE") != null) {
+            try manager.stderr.writeAll("--- generated bun.lock ---\n");
+            try manager.stderr.writeAll(output.written());
+            try manager.stderr.writeAll("--- end generated bun.lock ---\n");
+        }
+
+        const save_text = manager.shouldSaveTextLockfile();
+        const text_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" });
+        const binary_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" });
+        const binary = BunLockfile.textToBinaryAtRoot(
+            manager.allocator,
+            output.written(),
+            manager.init_data.io,
+            manager.root_dir,
+        ) catch |err| return err;
+        if (save_text) {
+            const canonical_text = try BunLockfile.binaryToText(manager.allocator, binary);
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = text_path, .data = canonical_text });
+            std.Io.Dir.cwd().deleteFile(manager.init_data.io, binary_path) catch {};
+        } else {
+            try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = binary_path, .data = binary });
+            if (builtin.os.tag != .windows) {
+                const permissions: std.Io.File.Permissions = @enumFromInt(0o755);
+                try std.Io.Dir.cwd().setFilePermissions(manager.init_data.io, binary_path, permissions, .{});
+            }
+            std.Io.Dir.cwd().deleteFile(manager.init_data.io, text_path) catch {};
+        }
+        if (!manager.options.silent and manager.options.command != .link) try manager.stderr.writeAll("Saved lockfile\n");
+    }
+
+    fn shouldSaveTextLockfile(manager: *const Manager) bool {
+        if (manager.loaded_text_lockfile) return true;
+        if (manager.loaded_binary_lockfile) return manager.save_text_lockfile_configured and manager.save_text_lockfile;
+        return manager.save_text_lockfile;
+    }
+
+    fn lockfileNeedsRewrite(manager: *const Manager) bool {
+        return manager.binary_lockfile_needs_migration or
+            (manager.loaded_binary_lockfile and manager.shouldSaveTextLockfile());
     }
 
     fn writeWorkspaceInfo(
@@ -4327,35 +7018,93 @@ const Manager = struct {
         writer: *std.Io.Writer,
         package_json: *const Value,
         is_root: bool,
+        lock_path: []const u8,
     ) !void {
         try writer.writeByte('{');
-        var first = true;
-        if (jsonString(package_json, "name")) |name| {
+        var wrote_field = false;
+        const workspace_json = if (manager.lock_graph) |*graph|
+            if (graph.provenance == .pnpm and manager.omit_pnpm_workspace_versions)
+                graph.workspaces.get(lock_path) orelse package_json
+            else
+                package_json
+        else
+            package_json;
+        const name = if (is_root and manager.lock_graph != null and manager.lock_graph.?.provenance == .bun_text)
+            jsonString(manager.lock_graph.?.root_workspace, "name") orelse jsonString(package_json, "name")
+        else
+            jsonString(workspace_json, "name");
+        if (name) |workspace_name| {
             try writer.writeAll("\n      \"name\": ");
-            try writeJSONString(writer, name);
-            first = false;
+            try writeJSONString(writer, workspace_name);
+            try writer.writeByte(',');
+            wrote_field = true;
         }
-        if (package_json.* == .object) {
+        if (workspace_json.* == .object) {
             if (!is_root) {
                 for ([_][]const u8{ "version", "bin", "binDir" }) |field| {
-                    const field_value = package_json.object.get(field) orelse continue;
-                    if (!first) try writer.writeByte(',');
+                    if (std.mem.eql(u8, field, "version") and
+                        manager.omit_pnpm_workspace_versions) continue;
+                    const field_value = workspace_json.object.get(field) orelse continue;
                     try writer.print("\n      \"{s}\": ", .{field});
                     try writeCanonicalJSON(manager.allocator, writer, field_value);
-                    first = false;
+                    try writer.writeByte(',');
+                    wrote_field = true;
+                }
+                if (workspace_json.object.get("binDir") == null) {
+                    if (workspace_json.object.get("directories")) |directories| {
+                        if (directories == .object) {
+                            if (directories.object.get("bin")) |bin_dir| {
+                                if (bin_dir == .string) {
+                                    try writer.writeAll("\n      \"binDir\": ");
+                                    try writeJSONString(writer, bin_dir.string);
+                                    try writer.writeByte(',');
+                                    wrote_field = true;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             for (all_dependency_sections) |section_name| {
-                const section = package_json.object.get(section_name) orelse continue;
+                const section = workspace_json.object.get(section_name) orelse continue;
                 if (section != .object or section.object.count() == 0) continue;
-                if (!first) try writer.writeByte(',');
-                try writer.print("\n      \"{s}\": ", .{section_name});
-                try writeCanonicalJSON(manager.allocator, writer, section);
-                first = false;
+                try writer.print("\n      \"{s}\": {{", .{section_name});
+                const sort_keys = is_root and manager.lock_graph != null and manager.lock_graph.?.provenance == .pnpm;
+                const keys = if (sort_keys) blk: {
+                    const sorted = try manager.allocator.dupe([]const u8, section.object.keys());
+                    std.mem.sort([]const u8, sorted, {}, struct {
+                        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                            return std.mem.order(u8, left, right) == .lt;
+                        }
+                    }.lessThan);
+                    break :blk sorted;
+                } else section.object.keys();
+                for (keys) |key| {
+                    const value = section.object.get(key) orelse continue;
+                    if (value != .string) continue;
+                    try writer.writeAll("\n        ");
+                    try writeJSONString(writer, key);
+                    try writer.writeAll(": ");
+                    try writeJSONString(writer, value.string);
+                    try writer.writeByte(',');
+                }
+                try writer.writeAll("\n      },");
+                wrote_field = true;
+            }
+            const optional_peers = try optionalPeerNames(manager.allocator, workspace_json);
+            defer manager.allocator.free(optional_peers);
+            if (optional_peers.len > 0) {
+                try writer.writeAll("\n      \"optionalPeers\": [");
+                for (optional_peers) |peer_name| {
+                    try writer.writeAll("\n        ");
+                    try writeJSONString(writer, peer_name);
+                    try writer.writeByte(',');
+                }
+                try writer.writeAll("\n      ],");
+                wrote_field = true;
             }
         }
-        if (!first) try writer.writeByte('\n');
-        try writer.writeAll("    }");
+        if (wrote_field) try writer.writeAll("\n    }") else try writer.writeByte('}');
     }
 
     fn deleteLockfiles(manager: *Manager) void {
@@ -4367,8 +7116,9 @@ const Manager = struct {
 
     fn hasExistingLockfile(manager: *Manager) bool {
         const text_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lock" }) catch return false;
-        std.Io.Dir.cwd().access(manager.init_data.io, text_path, .{}) catch return false;
-        return true;
+        if (std.Io.Dir.cwd().access(manager.init_data.io, text_path, .{})) |_| return true else |_| {}
+        const binary_path = std.fs.path.join(manager.allocator, &.{ manager.root_dir, "bun.lockb" }) catch return false;
+        if (std.Io.Dir.cwd().access(manager.init_data.io, binary_path, .{})) |_| return true else |_| return false;
     }
 };
 
@@ -4409,6 +7159,22 @@ fn isLocalSpec(spec: []const u8) bool {
         std.fs.path.isAbsolute(spec);
 }
 
+fn isGlobalLinkSpec(spec: []const u8) bool {
+    if (!std.mem.startsWith(u8, spec, "link:")) return false;
+    const target = spec["link:".len..];
+    return target.len > 0 and
+        !std.mem.eql(u8, target, ".") and
+        !std.mem.startsWith(u8, target, "./") and
+        !std.mem.startsWith(u8, target, "../") and
+        !std.mem.startsWith(u8, target, ".\\") and
+        !std.mem.startsWith(u8, target, "..\\") and
+        !std.fs.path.isAbsolute(target);
+}
+
+fn isValidGlobalLinkName(name: []const u8) bool {
+    return compiler.strings.isNPMPackageName(name);
+}
+
 fn localSpecPath(spec: []const u8) []const u8 {
     if (std.mem.startsWith(u8, spec, "file:")) {
         const raw = spec["file:".len..];
@@ -4435,17 +7201,88 @@ fn isRemoteTarballSpec(spec: []const u8) bool {
 
 fn isGitSpec(spec: []const u8) bool {
     if (std.mem.startsWith(u8, spec, "github:") or
+        std.mem.startsWith(u8, spec, "bitbucket:") or
+        std.mem.startsWith(u8, spec, "gitlab:") or
+        std.mem.startsWith(u8, spec, "gist:") or
+        std.mem.startsWith(u8, spec, "sourcehut:") or
         std.mem.startsWith(u8, spec, "git+") or
         std.mem.startsWith(u8, spec, "git://") or
         std.mem.startsWith(u8, spec, "ssh://") or
         std.mem.startsWith(u8, spec, "git@")) return true;
     if (std.mem.indexOf(u8, spec, "github.com/") != null and std.mem.indexOf(u8, spec, "/tarball/") == null) return true;
+    if (std.mem.indexOfScalar(u8, spec, ':')) |colon| {
+        const authority = spec[0..colon];
+        const path = spec[colon + 1 ..];
+        if (authority.len > 0 and
+            path.len > 0 and
+            std.mem.indexOfScalar(u8, authority, '/') == null and
+            (std.mem.indexOfScalar(u8, authority, '@') != null or std.mem.indexOfScalar(u8, authority, '.') != null) and
+            std.mem.indexOfScalar(u8, path, '/') != null)
+        {
+            return true;
+        }
+    }
     if (spec.len == 0 or spec[0] == '@' or std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) return false;
     const without_fragment = if (std.mem.indexOfScalar(u8, spec, '#')) |hash| spec[0..hash] else spec;
     const slash = std.mem.indexOfScalar(u8, without_fragment, '/') orelse return false;
     return slash > 0 and slash + 1 < without_fragment.len and
         std.mem.indexOfScalarPos(u8, without_fragment, slash + 1, '/') == null and
+        std.mem.indexOfScalar(u8, without_fragment, '@') == null and
         std.mem.indexOfScalar(u8, without_fragment, ':') == null;
+}
+
+fn displayGitResolution(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    const hash = std.mem.lastIndexOfScalar(u8, source, '#') orelse return source;
+    const commit = source[hash + 1 ..];
+    if (commit.len <= 7) return source;
+    for (commit) |byte| if (!std.ascii.isHex(byte)) return source;
+    return std.fmt.allocPrint(allocator, "{s}#{s}", .{ source[0..hash], commit[0..7] });
+}
+
+fn gitRepositoryName(spec: Git.Spec) ?[]const u8 {
+    var source = std.mem.trimEnd(u8, spec.lock_prefix, "/");
+    const separator = std.mem.lastIndexOfAny(u8, source, "/:") orelse return null;
+    if (separator + 1 >= source.len) return null;
+    source = source[separator + 1 ..];
+    if (std.mem.endsWith(u8, source, ".git")) source = source[0 .. source.len - ".git".len];
+    return if (source.len > 0) source else null;
+}
+
+fn gitCacheFolderName(allocator: std.mem.Allocator, spec: Git.Spec, requested: []const u8, commit: []const u8) ![]const u8 {
+    const abbreviated = commit[0..@min(commit.len, 7)];
+    if (spec.kind == .github) {
+        const prefix = "https://github.com/";
+        if (std.mem.startsWith(u8, spec.clone_url, prefix)) {
+            var path = spec.clone_url[prefix.len..];
+            if (std.mem.endsWith(u8, path, ".git")) path = path[0 .. path.len - ".git".len];
+            if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
+                return std.fmt.allocPrint(allocator, "@GH@{s}-{s}-{s}@@@1", .{
+                    path[0..slash],
+                    path[slash + 1 ..],
+                    abbreviated,
+                });
+            }
+        }
+    }
+    var clone_identity = if (std.mem.indexOfScalar(u8, requested, '#')) |fragment| requested[0..fragment] else requested;
+    if (std.mem.startsWith(u8, clone_identity, "git+ssh://")) {
+        const scp_identity = clone_identity["git+ssh://".len..];
+        if (std.mem.indexOfScalar(u8, scp_identity, '@') != null and
+            std.mem.indexOfScalar(u8, scp_identity, ':') != null)
+        {
+            clone_identity = scp_identity;
+        }
+    }
+    var hasher = compiler.Wyhash11.init(0);
+    hasher.update(clone_identity);
+    const task_id = (@as(u64, 4) << 61) | @as(u64, @as(u61, @truncate(hasher.final())));
+    return std.fmt.allocPrint(allocator, "{x}.git", .{task_id});
+}
+
+fn gitCacheAliasName(cache_name: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, cache_name, "@GH@")) return cache_name["@GH@".len..];
+    if (std.mem.startsWith(u8, cache_name, "@G@")) return cache_name["@G@".len..];
+    return cache_name;
 }
 
 fn isGitCommitish(value: []const u8) bool {
@@ -4597,6 +7434,42 @@ fn platformMatches(metadata: *const Value) bool {
     return platformFieldMatches(os, os_name) and platformFieldMatches(cpu, cpu_name);
 }
 
+fn packageSupportsPlatform(
+    metadata: *const Value,
+    cpu_target: Npm.Architecture,
+    os_target: Npm.OperatingSystem,
+) bool {
+    if (metadata.* != .object) return true;
+    if (metadata.object.get("os")) |os| {
+        if (!platformSetFromJson(Npm.OperatingSystem, os).isMatch(os_target)) return false;
+    }
+    if (metadata.object.get("cpu")) |cpu| {
+        if (!platformSetFromJson(Npm.Architecture, cpu).isMatch(cpu_target)) return false;
+    }
+    return true;
+}
+
+fn platformSetFromJson(comptime T: type, value: Value) T {
+    var result = T.none.negatable();
+    switch (value) {
+        .string => |entry| applyPlatformMetadataEntry(T, &result, entry),
+        .array => |entries| for (entries.items) |entry| {
+            if (entry == .string) applyPlatformMetadataEntry(T, &result, entry.string);
+        },
+        else => {},
+    }
+    return result.combine();
+}
+
+fn applyPlatformMetadataEntry(comptime T: type, result: *Npm.Negatable(T), value: []const u8) void {
+    if (std.mem.eql(u8, value, "*")) {
+        result.had_wildcard = true;
+        result.had_unrecognized_values = false;
+    } else {
+        result.apply(value);
+    }
+}
+
 fn platformFieldMatches(value: Value, target: []const u8) bool {
     if (value == .string) return platformEntryMatches(value.string, target);
     if (value != .array) return false;
@@ -4655,9 +7528,39 @@ fn absolutePathFrom(allocator: std.mem.Allocator, base: []const u8, path: []cons
 
 fn packageCachePath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
     if (init.environ_map.get("BUN_INSTALL_CACHE_DIR")) |cache| return allocator.dupe(u8, cache);
+    if (try readOptionalFile(init.io, allocator, ".npmrc", 1024 * 1024)) |raw| {
+        const source = try decodeConfigText(allocator, raw);
+        if (parseNpmrcValue(source, "cache")) |cache| return allocator.dupe(u8, cache);
+    }
     if (init.environ_map.get("XDG_CACHE_HOME")) |home| return std.fs.path.join(allocator, &.{ home, ".bun", "install", "cache" });
     if (init.environ_map.get("HOME")) |home| return std.fs.path.join(allocator, &.{ home, ".bun", "install", "cache" });
     return absolutePath(init.io, allocator, "node_modules/.cache");
+}
+
+fn globalLinkRootPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("BUN_INSTALL_GLOBAL_DIR")) |path| return allocator.dupe(u8, path);
+    if (init.environ_map.get("BUN_INSTALL")) |home| return std.fs.path.join(allocator, &.{ home, "install", "global" });
+    if (init.environ_map.get("XDG_CACHE_HOME") orelse init.environ_map.get("HOME")) |home| {
+        return std.fs.path.join(allocator, &.{ home, ".bun", "install", "global" });
+    }
+    if (init.environ_map.get("USERPROFILE")) |home| {
+        return std.fs.path.join(allocator, &.{ home, ".bun", "install", "global" });
+    }
+    return error.MissingGlobalLinkDirectory;
+}
+
+fn globalLinkNodeModulesPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ try globalLinkRootPath(init, allocator), "node_modules" });
+}
+
+fn globalBinPath(init: std.process.Init, allocator: std.mem.Allocator) ![]const u8 {
+    if (init.environ_map.get("BUN_INSTALL_BIN")) |path| return allocator.dupe(u8, path);
+    if (init.environ_map.get("BUN_INSTALL")) |home| return std.fs.path.join(allocator, &.{ home, "bin" });
+    if (init.environ_map.get("XDG_CACHE_HOME") orelse init.environ_map.get("HOME")) |home| {
+        return std.fs.path.join(allocator, &.{ home, ".bun", "bin" });
+    }
+    if (init.environ_map.get("USERPROFILE")) |home| return std.fs.path.join(allocator, &.{ home, ".bun", "bin" });
+    return error.MissingGlobalBinDirectory;
 }
 
 fn encodePackageName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
@@ -4772,6 +7675,7 @@ fn extractTarballArchive(
                 try file_writer.interface.flush();
             },
             .sym_link => {
+                if (!tarSymlinkTargetIsSafe(path, entry.link_name)) continue;
                 try removeTarDestination(io, destination, path);
                 if (std.fs.path.dirname(path)) |parent| try destination.createDirPath(io, parent);
                 try destination.symLink(io, entry.link_name, path, .{});
@@ -4786,6 +7690,38 @@ fn extractTarballArchive(
         .unable_to_create_sym_link => |info| return info.code,
         .unsupported_file_type => return error.TarUnsupportedHeader,
     };
+}
+
+fn tarSymlinkTargetIsSafe(path: []const u8, target: []const u8) bool {
+    if (target.len == 0 or target[0] == '/' or target[0] == '\\') return false;
+    if (target.len >= 2 and std.ascii.isAlphabetic(target[0]) and target[1] == ':') return false;
+
+    var depth: usize = 0;
+    const parent = if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| path[0..slash] else "";
+    var parent_parts = std.mem.splitScalar(u8, parent, '/');
+    while (parent_parts.next()) |component| {
+        if (component.len > 0 and !std.mem.eql(u8, component, ".")) depth += 1;
+    }
+
+    var target_parts = std.mem.splitAny(u8, target, "/\\");
+    while (target_parts.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (depth == 0) return false;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    return true;
+}
+
+test "tar symlink targets stay inside the extracted package" {
+    try std.testing.expect(tarSymlinkTargetIsSafe("package/link", "src"));
+    try std.testing.expect(tarSymlinkTargetIsSafe("package/src/link", "../index.js"));
+    try std.testing.expect(!tarSymlinkTargetIsSafe("package/link", "../../../tmp"));
+    try std.testing.expect(!tarSymlinkTargetIsSafe("package/link", "/tmp"));
+    try std.testing.expect(!tarSymlinkTargetIsSafe("package/link", "C:\\tmp"));
 }
 
 fn ensureTarDirectory(io: std.Io, directory: std.Io.Dir, path: []const u8) !void {
@@ -4860,8 +7796,74 @@ fn objectSectionContains(value: *const Value, section_name: []const u8, key: []c
     return section == .object and section.object.get(key) != null;
 }
 
+fn packageHasBundledDependencies(value: *const Value) bool {
+    if (value.* != .object) return false;
+    for ([_][]const u8{ "bundleDependencies", "bundledDependencies" }) |field_name| {
+        const field = value.object.get(field_name) orelse continue;
+        if (field == .bool and field.bool) return true;
+        if (field == .array and field.array.items.len > 0) return true;
+    }
+    return false;
+}
+
+fn packageDependencyIsBundled(value: *const Value, alias: []const u8) bool {
+    if (value.* != .object) return false;
+    for ([_][]const u8{ "bundleDependencies", "bundledDependencies" }) |field_name| {
+        const field = value.object.get(field_name) orelse continue;
+        if (field == .bool and field.bool) return true;
+        if (field != .array) continue;
+        for (field.array.items) |entry| {
+            if (entry == .string and std.mem.eql(u8, entry.string, alias)) return true;
+        }
+    }
+    return false;
+}
+
+fn directInstallSectionPriority(section: []const u8) u8 {
+    if (std.mem.eql(u8, section, "devDependencies")) return 0;
+    if (std.mem.eql(u8, section, "optionalDependencies")) return 1;
+    if (std.mem.eql(u8, section, "dependencies")) return 2;
+    return 3;
+}
+
 fn recordLogicalKey(record: PackageRecord) []const u8 {
     return if (record.key.len > 0) record.key else record.alias;
+}
+
+fn lockRecordAliasIsUnique(records: []const PackageRecord, candidate_index: usize) bool {
+    const candidate = records[candidate_index];
+    for (records, 0..) |record, index| {
+        if (index != candidate_index and
+            std.mem.eql(u8, record.alias, candidate.alias) and
+            !packageRecordsHaveSameIdentity(record, candidate)) return false;
+    }
+    return true;
+}
+
+fn packageRecordIsBundled(record: PackageRecord) bool {
+    const metadata = record.metadata orelse return false;
+    if (metadata.* != .object) return false;
+    const bundled = metadata.object.get("bundled") orelse return false;
+    return bundled == .bool and bundled.bool;
+}
+
+fn packageRecordsHaveSameIdentity(left: PackageRecord, right: PackageRecord) bool {
+    if (left.kind != right.kind or
+        !std.mem.eql(u8, left.name, right.name) or
+        !std.mem.eql(u8, left.version, right.version)) return false;
+    return switch (left.kind) {
+        .npm => std.mem.eql(u8, left.tarball, right.tarball),
+        .workspace, .folder, .symlink, .root => std.mem.eql(
+            u8,
+            if (left.local_path.len > 0) left.local_path else left.resolution,
+            if (right.local_path.len > 0) right.local_path else right.resolution,
+        ),
+        .local_tarball, .remote_tarball, .git, .github => std.mem.eql(
+            u8,
+            if (left.resolution.len > 0) left.resolution else left.tarball,
+            if (right.resolution.len > 0) right.resolution else right.tarball,
+        ),
+    };
 }
 
 fn logicalParentKey(record: PackageRecord) []const u8 {
@@ -4884,6 +7886,14 @@ fn ownedDependencySpec(value: *const Value, alias: []const u8) ?[]const u8 {
 
 fn runtimeDependencySpec(value: *const Value, alias: []const u8) ?[]const u8 {
     return dependencySpec(value, alias, &runtime_dependency_sections);
+}
+
+fn peerDependencySpec(value: *const Value, alias: []const u8) ?[]const u8 {
+    if (value.* != .object) return null;
+    const peers = value.object.get("peerDependencies") orelse return null;
+    if (peers != .object) return null;
+    const spec = peers.object.get(alias) orelse return null;
+    return if (spec == .string) spec.string else null;
 }
 
 fn dependencySpec(value: *const Value, alias: []const u8, sections: []const []const u8) ?[]const u8 {
@@ -4926,6 +7936,25 @@ fn peerDependencyIsOptional(value: *const Value, alias: []const u8) bool {
     return false;
 }
 
+fn optionalPeerNames(allocator: std.mem.Allocator, value: *const Value) ![][]const u8 {
+    if (value.* != .object) return allocator.alloc([]const u8, 0);
+    const peers = value.object.get("peerDependencies") orelse return allocator.alloc([]const u8, 0);
+    if (peers != .object) return allocator.alloc([]const u8, 0);
+
+    var names = std.array_list.Managed([]const u8).init(allocator);
+    errdefer names.deinit();
+    for (peers.object.keys()) |name| {
+        if (!peerDependencyIsOptional(value, name)) continue;
+        try names.append(name);
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
+        }
+    }.lessThan);
+    return names.toOwnedSlice();
+}
+
 fn ensureObjectProperty(
     allocator: std.mem.Allocator,
     object: *std.json.ObjectMap,
@@ -4950,6 +7979,21 @@ fn hasAnyDependencies(root: *const Value) bool {
 fn containsString(values: []const []const u8, needle: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
     return false;
+}
+
+fn lockAliasFromKey(allocator: std.mem.Allocator, key: []const u8) ![]const u8 {
+    var alias: []const u8 = key;
+    var components = std.mem.splitScalar(u8, key, '/');
+    while (components.next()) |component| {
+        if (component.len == 0) return error.InvalidPackageKey;
+        if (component[0] == '@') {
+            const package = components.next() orelse return error.InvalidPackageKey;
+            alias = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ component, package });
+        } else {
+            alias = component;
+        }
+    }
+    return alias;
 }
 
 fn appendUniqueName(list: *std.array_list.Managed([]const u8), name: []const u8) !void {
@@ -5128,9 +8172,62 @@ fn writePackageJSON(
     trailing_newline: bool,
 ) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
-    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &output.writer);
+    try writePrettyPackageJSON(&output.writer, value, 0);
     if (trailing_newline) try output.writer.writeByte('\n');
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = output.written() });
+}
+
+fn writePrettyPackageJSON(writer: *std.Io.Writer, value: Value, depth: usize) !void {
+    switch (value) {
+        .object => |object| {
+            try writer.writeByte('{');
+            for (object.keys(), object.values(), 0..) |key, item, index| {
+                try writer.writeAll(if (index == 0) "\n" else ",\n");
+                try writer.splatByteAll(' ', (depth + 1) * 2);
+                try writeJSONString(writer, key);
+                try writer.writeAll(": ");
+                try writePrettyPackageJSON(writer, item, depth + 1);
+            }
+            if (object.count() > 0) {
+                try writer.writeByte('\n');
+                try writer.splatByteAll(' ', depth * 2);
+            }
+            try writer.writeByte('}');
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeCompactPackageJSON(writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
+}
+
+fn writeCompactPackageJSON(writer: *std.Io.Writer, value: Value) !void {
+    switch (value) {
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeCompactPackageJSON(writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |object| {
+            try writer.writeByte('{');
+            for (object.keys(), object.values(), 0..) |key, item, index| {
+                if (index > 0) try writer.writeAll(", ");
+                try writeJSONString(writer, key);
+                try writer.writeAll(": ");
+                try writeCompactPackageJSON(writer, item);
+            }
+            try writer.writeByte('}');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
 }
 
 fn writeJSONString(writer: *std.Io.Writer, value: []const u8) !void {

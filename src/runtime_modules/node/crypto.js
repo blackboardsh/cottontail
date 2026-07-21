@@ -477,6 +477,46 @@ function asn1Read(bytes, offset = 0) {
   };
 }
 
+function asn1EncodeLength(length) {
+  if (length < 0x80) return new Uint8Array([length]);
+  const bytes = [];
+  for (let value = length; value > 0; value = Math.floor(value / 256)) bytes.unshift(value & 0xff);
+  return new Uint8Array([0x80 | bytes.length, ...bytes]);
+}
+
+function asn1Encode(tag, value) {
+  const bytes = bytesFromData(value);
+  return concatBytes([new Uint8Array([tag]), asn1EncodeLength(bytes.byteLength), bytes]);
+}
+
+function asn1EncodeSequence(...values) {
+  return asn1Encode(0x30, concatBytes(values));
+}
+
+function asn1EncodeIntegerNumber(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError("ASN.1 integer is out of range");
+  let bytes = bytesFromBigint(BigInt(value));
+  if ((bytes[0] & 0x80) !== 0) bytes = concatBytes([new Uint8Array([0]), bytes]);
+  return asn1Encode(0x02, bytes);
+}
+
+function asn1EncodeOid(oid) {
+  const parts = String(oid).split(".").map(Number);
+  if (parts.length < 2 || parts[0] < 0 || parts[0] > 2 || parts[1] < 0 || (parts[0] < 2 && parts[1] > 39)) {
+    throw new TypeError(`Invalid ASN.1 object identifier: ${oid}`);
+  }
+  const bytes = [];
+  for (const part of [parts[0] * 40 + parts[1], ...parts.slice(2)]) {
+    if (!Number.isSafeInteger(part) || part < 0) throw new TypeError(`Invalid ASN.1 object identifier: ${oid}`);
+    const encoded = [part & 0x7f];
+    for (let value = Math.floor(part / 128); value > 0; value = Math.floor(value / 128)) {
+      encoded.unshift(0x80 | (value & 0x7f));
+    }
+    bytes.push(...encoded);
+  }
+  return asn1Encode(0x06, new Uint8Array(bytes));
+}
+
 function asn1Children(node) {
   const children = [];
   let offset = 0;
@@ -1371,6 +1411,166 @@ function rawNativeExportKey(keyObject, options = {}) {
   return format === "pem" ? String(exported) : bufferFromBytes(new Uint8Array(exported));
 }
 
+const pkcs8EncryptionOids = {
+  pbes2: "1.2.840.113549.1.5.13",
+  pbkdf2: "1.2.840.113549.1.5.12",
+  hmacSha1: "1.2.840.113549.2.7",
+  hmacSha256: "1.2.840.113549.2.9",
+};
+const pkcs8CipherOids = {
+  "aes-128-cbc": "2.16.840.1.101.3.4.1.2",
+  "aes-192-cbc": "2.16.840.1.101.3.4.1.22",
+  "aes-256-cbc": "2.16.840.1.101.3.4.1.42",
+};
+const pkcs8CipherNames = Object.fromEntries(Object.entries(pkcs8CipherOids).map(([name, oid]) => [oid, name]));
+const pkcs8PrfNames = {
+  [pkcs8EncryptionOids.hmacSha1]: "sha1",
+  [pkcs8EncryptionOids.hmacSha256]: "sha256",
+};
+
+function nativeExportAsymmetricKey(keyObject, options) {
+  if (keyObject.asymmetricKeyType === "rsa") return rsaNativeExportKey(keyObject, options);
+  if (keyObject.asymmetricKeyType === "ec") return ecNativeExportKey(keyObject, options);
+  if (keyObject.asymmetricKeyType === "ed25519" || rawKeyInfo[keyObject.asymmetricKeyType]) {
+    return rawNativeExportKey(keyObject, options);
+  }
+  throw new TypeError(`Unsupported asymmetric key type: ${keyObject.asymmetricKeyType}`);
+}
+
+function privateKeyEncryptionOptions(keyObject, options, format) {
+  const hasCipher = options.cipher != null;
+  const hasPassphrase = options.passphrase != null;
+  if (!hasCipher && !hasPassphrase) return undefined;
+  if (keyObject.type !== "private") throw new TypeError("Encryption is only supported for private keys");
+  if (format === "jwk") throw new TypeError("JWK key export does not support encryption");
+  if (!hasCipher) throw new TypeError("The property 'options.cipher' is invalid. Received undefined");
+  if (!hasPassphrase) throw new TypeError("The property 'options.passphrase' is invalid. Received undefined");
+  const cipher = normalizeCipherName(options.cipher);
+  const info = cipherInfoForName(cipher);
+  if (!info || info.mode !== "cbc" || !pkcs8CipherOids[cipher]) {
+    throw new TypeError(`The property 'options.cipher' is invalid. Received '${options.cipher}'`);
+  }
+  return { cipher, info, passphrase: bytesFromData(options.passphrase) };
+}
+
+function evpBytesToKey(passphrase, iv, keyLength) {
+  const salt = bytesFromData(iv).slice(0, 8);
+  const pass = bytesFromData(passphrase);
+  let key = new Uint8Array(0);
+  let previous = new Uint8Array(0);
+  while (key.byteLength < keyLength) {
+    previous = digestBytes("md5", concatBytes([previous, pass, salt]));
+    key = concatBytes([key, previous]);
+  }
+  return key.slice(0, keyLength);
+}
+
+function encryptTraditionalPem(pem, encryption) {
+  const match = String(pem).match(/^-----BEGIN ([A-Z0-9 ]+)-----\r?\n([\s\S]*?)-----END \1-----\r?\n?$/);
+  if (!match) throw new TypeError("Invalid private key PEM encoding");
+  const iv = bytesFromData(randomBytes(encryption.info.ivLength));
+  const key = evpBytesToKey(encryption.passphrase, iv, encryption.info.keyLength);
+  const plaintext = bytesFromData(match[2].replace(/\s+/g, ""), "base64");
+  const cipher = createCipheriv(encryption.cipher, key, iv);
+  const encrypted = concatBytes([bytesFromData(cipher.update(plaintext)), bytesFromData(cipher.final())]);
+  const base64 = Buffer.from(encrypted).toString("base64");
+  const lines = [];
+  for (let index = 0; index < base64.length; index += 64) lines.push(base64.slice(index, index + 64));
+  return `-----BEGIN ${match[1]}-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: ${encryption.cipher.toUpperCase()},${hexFromBytes(iv).toUpperCase()}\n\n${lines.join("\n")}\n-----END ${match[1]}-----\n`;
+}
+
+function encryptPkcs8Der(privateKeyDer, encryption) {
+  const salt = bytesFromData(randomBytes(16));
+  const iv = bytesFromData(randomBytes(encryption.info.ivLength));
+  const iterations = 2048;
+  const key = bytesFromData(pbkdf2Sync(encryption.passphrase, salt, iterations, encryption.info.keyLength, "sha256"));
+  const cipher = createCipheriv(encryption.cipher, key, iv);
+  const encrypted = concatBytes([bytesFromData(cipher.update(privateKeyDer)), bytesFromData(cipher.final())]);
+  const prf = asn1EncodeSequence(asn1EncodeOid(pkcs8EncryptionOids.hmacSha256), asn1Encode(0x05, new Uint8Array(0)));
+  const kdfParameters = asn1EncodeSequence(
+    asn1Encode(0x04, salt),
+    asn1EncodeIntegerNumber(iterations),
+    asn1EncodeIntegerNumber(encryption.info.keyLength),
+    prf,
+  );
+  const kdf = asn1EncodeSequence(asn1EncodeOid(pkcs8EncryptionOids.pbkdf2), kdfParameters);
+  const scheme = asn1EncodeSequence(asn1EncodeOid(pkcs8CipherOids[encryption.cipher]), asn1Encode(0x04, iv));
+  const pbes2 = asn1EncodeSequence(asn1EncodeOid(pkcs8EncryptionOids.pbes2), asn1EncodeSequence(kdf, scheme));
+  return asn1EncodeSequence(pbes2, asn1Encode(0x04, encrypted));
+}
+
+function exportEncryptedPrivateKey(keyObject, options, encryption) {
+  const format = nativeExportFormat(options);
+  const type = String(options.type ?? "pkcs8").toLowerCase();
+  if (type === "pkcs8") {
+    const der = bytesFromData(nativeExportAsymmetricKey(keyObject, { format: "der", type: "pkcs8" }));
+    const encrypted = encryptPkcs8Der(der, encryption);
+    return format === "pem" ? pemFromDer("ENCRYPTED PRIVATE KEY", encrypted) : bufferFromBytes(encrypted);
+  }
+  const traditionalType = keyObject.asymmetricKeyType === "rsa" ? "pkcs1" : "sec1";
+  if (type !== traditionalType || format !== "pem") {
+    throw new TypeError(`Encrypted ${type.toUpperCase()} key export requires PEM format`);
+  }
+  const pem = nativeExportAsymmetricKey(keyObject, { format: "pem", type });
+  return encryptTraditionalPem(pem, encryption);
+}
+
+function decryptPkcs8Der(encryptedDer, passphrase) {
+  if (passphrase == null) {
+    const error = new Error("Passphrase required for encrypted key");
+    error.code = "ERR_MISSING_PASSPHRASE";
+    throw error;
+  }
+  const root = asn1Read(bytesFromData(encryptedDer));
+  const [algorithm, encryptedData] = asn1Children(root);
+  const [algorithmOid, parameters] = asn1Children(algorithm);
+  if (asn1Oid(algorithmOid) !== pkcs8EncryptionOids.pbes2 || encryptedData?.tag !== 0x04) {
+    throw new Error("Unsupported encrypted PKCS#8 key");
+  }
+  const [kdf, scheme] = asn1Children(parameters);
+  const [kdfOid, kdfParameters] = asn1Children(kdf);
+  if (asn1Oid(kdfOid) !== pkcs8EncryptionOids.pbkdf2) throw new Error("Unsupported encrypted PKCS#8 key derivation function");
+  const pbkdf2Parameters = asn1Children(kdfParameters);
+  const salt = pbkdf2Parameters[0]?.value;
+  const iterations = Number(bigintFromBytes(asn1IntegerBytes(pbkdf2Parameters[1])));
+  let keyLength;
+  let prf = "sha1";
+  let parameterIndex = 2;
+  if (pbkdf2Parameters[parameterIndex]?.tag === 0x02) {
+    keyLength = Number(bigintFromBytes(asn1IntegerBytes(pbkdf2Parameters[parameterIndex++])));
+  }
+  if (pbkdf2Parameters[parameterIndex]?.tag === 0x30) {
+    const [prfOid] = asn1Children(pbkdf2Parameters[parameterIndex]);
+    prf = pkcs8PrfNames[asn1Oid(prfOid)];
+    if (!prf) throw new Error("Unsupported encrypted PKCS#8 PBKDF2 digest");
+  }
+  const [cipherOid, cipherParameters] = asn1Children(scheme);
+  const cipherName = pkcs8CipherNames[asn1Oid(cipherOid)];
+  const info = cipherName == null ? undefined : cipherInfoForName(cipherName);
+  if (!info || cipherParameters?.tag !== 0x04) throw new Error("Unsupported encrypted PKCS#8 cipher");
+  const derivedLength = keyLength ?? info.keyLength;
+  const key = pbkdf2Sync(passphrase, salt, iterations, derivedLength, prf);
+  try {
+    const decipher = createDecipheriv(cipherName, key, cipherParameters.value);
+    return concatBytes([bytesFromData(decipher.update(encryptedData.value)), bytesFromData(decipher.final())]);
+  } catch {
+    const error = new Error("error:1C800064:Provider routines::bad decrypt");
+    error.code = "ERR_OSSL_EVP_BAD_DECRYPT";
+    error.reason = "bad decrypt";
+    throw error;
+  }
+}
+
+function isEncryptedPkcs8Der(bytes) {
+  try {
+    const [algorithm, encryptedData] = asn1Children(asn1Read(bytesFromData(bytes)));
+    const [algorithmOid] = asn1Children(algorithm);
+    return asn1Oid(algorithmOid) === pkcs8EncryptionOids.pbes2 && encryptedData?.tag === 0x04;
+  } catch {
+    return false;
+  }
+}
+
 function rsaPartsFromNativeKey(nativeKey) {
   const parts = {
     n: bigintFromBytes(bytesFromData(nativeKey.n)),
@@ -1437,16 +1637,8 @@ function decryptTraditionalPem(pem, passphrase) {
     err.code = "ERR_OSSL_UNSUPPORTED";
     throw err;
   }
-  // OpenSSL derives the key via EVP_BytesToKey(MD5, salt = first 8 IV bytes).
-  const salt = new Uint8Array(iv.subarray(0, 8));
-  const pass = bytesFromData(passphrase);
-  let key = new Uint8Array(0);
-  let previous = new Uint8Array(0);
-  while (key.length < keyLength) {
-    previous = digestBytes("md5", concatBytes([previous, pass, salt]));
-    key = concatBytes([key, previous]);
-  }
-  key = key.slice(0, keyLength);
+  // OpenSSL traditional PEM uses EVP_BytesToKey(MD5, salt = first 8 IV bytes).
+  const key = evpBytesToKey(passphrase, iv, keyLength);
   let decrypted;
   try {
     const decipher = createDecipheriv(cipherName.toLowerCase(), key, iv);
@@ -1470,7 +1662,12 @@ function keyObjectFromEncodedInput(input, requestedType = undefined) {
     const pemText = Buffer.from(keyBytes).toString("utf8");
     if (/Proc-Type: 4,ENCRYPTED/.test(pemText)) {
       keyBytes = new Uint8Array(Buffer.from(decryptTraditionalPem(pemText, options.passphrase), "utf8"));
+    } else if (/-----BEGIN ENCRYPTED PRIVATE KEY-----/.test(pemText)) {
+      const encryptedDer = derFromPemOrBytes(pemText, "ENCRYPTED PRIVATE KEY");
+      keyBytes = new Uint8Array(Buffer.from(pemFromDer("PRIVATE KEY", decryptPkcs8Der(encryptedDer, options.passphrase)), "utf8"));
     }
+  } else if (isEncryptedPkcs8Der(keyBytes)) {
+    keyBytes = decryptPkcs8Der(keyBytes, options.passphrase);
   }
   const isPem = keyBytes.length >= 11 && String.fromCharCode(...keyBytes.subarray(0, 11)) === "-----BEGIN ";
   const format = String(options.format ?? (isPem ? "pem" : "der")).toLowerCase();
@@ -2301,8 +2498,13 @@ export function Hmac(algorithm, key, options = undefined) {
 }
 Hmac.prototype = HmacImpl.prototype;
 
+const keyObjectConstructionToken = Symbol("cottontail.crypto.KeyObject");
+
 export class KeyObject {
-  constructor(type, data, options = {}) {
+  constructor(type, data, options = {}, constructionToken = undefined) {
+    if (constructionToken !== keyObjectConstructionToken) {
+      throw new TypeError("KeyObject cannot be constructed directly");
+    }
     const normalizedType = String(type);
     if (normalizedType !== "secret" && normalizedType !== "public" && normalizedType !== "private") {
       throw new TypeError("KeyObject type must be secret, public, or private");
@@ -2367,8 +2569,39 @@ export class KeyObject {
     return this.type === "secret" ? this.bytes.byteLength : undefined;
   }
 
+  get [Symbol.toStringTag]() {
+    return "KeyObject";
+  }
+
+  static from(key) {
+    if (!(key instanceof CryptoKey)) {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        `The "key" argument must be an instance of CryptoKey. Received ${describeReceivedValue(key)}`,
+      );
+    }
+    if (key.material instanceof KeyObject) return key.material;
+    if (key.type === "secret") return createSecretKey(key.material);
+    throw new TypeError("CryptoKey does not contain key material supported by KeyObject");
+  }
+
   export(options = undefined) {
+    if (this.type !== "secret" && (options == null || typeof options !== "object")) {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        `The "options" argument must be of type object. Received ${describeReceivedValue(options)}`,
+      );
+    }
     const format = options?.format == null ? undefined : String(options.format).toLowerCase();
+    if (this.type !== "secret") {
+      const encryption = privateKeyEncryptionOptions(this, options, format);
+      if (encryption != null) return exportEncryptedPrivateKey(this, options, encryption);
+    }
+    if (this.type === "secret" && format === "jwk") {
+      return { kty: "oct", k: base64UrlFromBytes(this.bytes) };
+    }
     if (this.type !== "secret" && this.asymmetricKeyType === "ed25519" && format === "jwk") return ed25519JwkFromKey(this);
     if (this.type !== "secret" && rawKeyInfo[this.asymmetricKeyType] && format === "jwk") return rawJwkFromKey(this);
     if (this.type !== "secret" && this.asymmetricKeyType === "rsa" && format === "jwk") return rsaJwkFromKey(this);
@@ -2384,7 +2617,13 @@ export class KeyObject {
   }
 
   equals(otherKeyObject) {
-    if (!(otherKeyObject instanceof KeyObject)) return false;
+    if (!(otherKeyObject instanceof KeyObject)) {
+      throw nodeCryptoError(
+        TypeError,
+        "ERR_INVALID_ARG_TYPE",
+        `The "otherKeyObject" argument must be an instance of KeyObject. Received ${describeReceivedValue(otherKeyObject)}`,
+      );
+    }
     if (this.type !== otherKeyObject.type) return false;
     if (this.type !== "secret") {
       const left = this.export({ format: "jwk" });
@@ -2401,11 +2640,11 @@ function ecKeyOptions() {
 }
 
 function createEcPrivateKey(privateKey) {
-  return new KeyObject("private", privateKey, ecKeyOptions());
+  return new KeyObject("private", privateKey, ecKeyOptions(), keyObjectConstructionToken);
 }
 
 function createEcPublicKey(publicPoint) {
-  return new KeyObject("public", publicPoint, ecKeyOptions());
+  return new KeyObject("public", publicPoint, ecKeyOptions(), keyObjectConstructionToken);
 }
 
 function nativeEcKeyOptions(namedCurve) {
@@ -2413,19 +2652,19 @@ function nativeEcKeyOptions(namedCurve) {
 }
 
 function createNativeEcPrivateKey(namedCurve, privateKey, publicKey = undefined) {
-  return new KeyObject("private", { privateKey, publicKey }, nativeEcKeyOptions(namedCurve));
+  return new KeyObject("private", { privateKey, publicKey }, nativeEcKeyOptions(namedCurve), keyObjectConstructionToken);
 }
 
 function createNativeEcPublicKey(namedCurve, publicKey) {
-  return new KeyObject("public", publicKey, nativeEcKeyOptions(namedCurve));
+  return new KeyObject("public", publicKey, nativeEcKeyOptions(namedCurve), keyObjectConstructionToken);
 }
 
 function createRsaPrivateKey(parts) {
-  return new KeyObject("private", parts, rsaKeyOptions(parts));
+  return new KeyObject("private", parts, rsaKeyOptions(parts), keyObjectConstructionToken);
 }
 
 function createRsaPublicKey(parts) {
-  return new KeyObject("public", parts, rsaKeyOptions(parts));
+  return new KeyObject("public", parts, rsaKeyOptions(parts), keyObjectConstructionToken);
 }
 
 function ed25519KeyOptions() {
@@ -2433,11 +2672,11 @@ function ed25519KeyOptions() {
 }
 
 function createEd25519PrivateKey(privateKey, publicKey = undefined) {
-  return new KeyObject("private", { privateKey, publicKey }, ed25519KeyOptions());
+  return new KeyObject("private", { privateKey, publicKey }, ed25519KeyOptions(), keyObjectConstructionToken);
 }
 
 function createEd25519PublicKey(publicKey) {
-  return new KeyObject("public", publicKey, ed25519KeyOptions());
+  return new KeyObject("public", publicKey, ed25519KeyOptions(), keyObjectConstructionToken);
 }
 
 function rawKeyOptions(type) {
@@ -2445,11 +2684,11 @@ function rawKeyOptions(type) {
 }
 
 function createRawPrivateKey(type, privateKey, publicKey = undefined) {
-  return new KeyObject("private", { privateKey, publicKey }, rawKeyOptions(type));
+  return new KeyObject("private", { privateKey, publicKey }, rawKeyOptions(type), keyObjectConstructionToken);
 }
 
 function createRawPublicKey(type, publicKey) {
-  return new KeyObject("public", publicKey, rawKeyOptions(type));
+  return new KeyObject("public", publicKey, rawKeyOptions(type), keyObjectConstructionToken);
 }
 
 function keyObjectFromJwk(jwk, type = undefined) {
@@ -2518,11 +2757,7 @@ function normalizeDsaEncoding(options = undefined) {
   const value = options && typeof options === "object" ? options.dsaEncoding : undefined;
   if (value == null || value === "der") return "der";
   if (value === "ieee-p1363") return "ieee-p1363";
-  throw new TypeError(`Invalid dsaEncoding: ${value}`);
-}
-
-function keyInputFromSignOptions(options) {
-  return options && typeof options === "object" && options.key != null ? options.key : options;
+  throw new TypeError(`The property 'options.dsaEncoding' is invalid. Received '${value}'`);
 }
 
 function signaturePadding(options = undefined, fallback = constantsObject.RSA_PKCS1_PADDING) {
@@ -3031,7 +3266,7 @@ export class Sign extends Writable {
   sign(privateKey, outputEncoding = undefined) {
     const dsaEncoding = normalizeDsaEncoding(privateKey);
     const options = privateKey && typeof privateKey === "object" && privateKey.key != null ? privateKey : undefined;
-    const key = keyObjectFromInput(keyInputFromSignOptions(privateKey), "private");
+    const key = keyObjectFromInput(privateKey, "private");
     if (key.asymmetricKeyType === "ed25519") throwEd25519StreamError();
     if (key.asymmetricKeyType === "rsa") {
       const nativeSignature = rsaNativeSignData(this.algorithm, concatBytes(this.chunks), key, options);
@@ -3066,7 +3301,7 @@ export class Verify extends Writable {
   verify(publicKey, signature, signatureEncoding = undefined) {
     const dsaEncoding = normalizeDsaEncoding(publicKey);
     const options = publicKey && typeof publicKey === "object" && publicKey.key != null ? publicKey : undefined;
-    const key = keyObjectFromInput(keyInputFromSignOptions(publicKey), "public");
+    const key = keyObjectFromInput(publicKey, "public");
     if (resolvePublicKeyObject(key).asymmetricKeyType === "ed25519") throwEd25519StreamError();
     const signatureBytes = typeof signature === "string" ? bytesFromData(signature, signatureEncoding) : bytesFromData(signature);
     if (resolvePublicKeyObject(key).asymmetricKeyType === "rsa") {
@@ -3080,9 +3315,13 @@ export class Verify extends Writable {
   }
 }
 
+const x509CertificateBrand = new WeakSet();
+const kX509CertificatePredicate = Symbol.for("cottontail.internal.crypto.isX509Certificate");
+
 export class X509Certificate {
   constructor(buffer) {
     const parsed = parseX509Certificate(buffer);
+    x509CertificateBrand.add(this);
     this.raw = bufferFromBytes(parsed.raw);
     this.subject = parsed.subject.text || undefined;
     this.subjectObject = parsed.subject.object;
@@ -3205,6 +3444,13 @@ export class X509Certificate {
   }
 }
 
+Object.defineProperty(X509Certificate, kX509CertificatePredicate, {
+  value: (value) => x509CertificateBrand.has(value),
+  configurable: false,
+  enumerable: false,
+  writable: false,
+});
+
 export function createHash(algorithm, options = undefined) {
   return new Hash(algorithm, options);
 }
@@ -3268,7 +3514,7 @@ export function getHashes() {
 }
 
 export function createSecretKey(key, encoding = undefined) {
-  return new KeyObject("secret", key, { encoding });
+  return new KeyObject("secret", key, { encoding }, keyObjectConstructionToken);
 }
 
 export function hkdfSync(digest, ikm, salt, info, keylen) {
@@ -3496,12 +3742,28 @@ export function createDecipheriv(algorithm, key, iv, options = undefined) {
 }
 
 export function createPrivateKey(key) {
+  if (key instanceof KeyObject) {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      "The \"key\" argument must be of type string or an instance of Buffer, TypedArray, DataView, or object. Received an instance of KeyObject",
+    );
+  }
   const privateKey = keyObjectFromInput(key, "private");
-  if (privateKey.type !== "private") throw new TypeError("createPrivateKey requires private key material");
+  if (privateKey.type !== "private") {
+    throw new Error("error:06000066:public key routines:OPENSSL_internal:DECODE_ERROR");
+  }
   return privateKey;
 }
 
 export function createPublicKey(key) {
+  if (key instanceof KeyObject && key.type !== "private") {
+    throw nodeCryptoError(
+      TypeError,
+      "ERR_INVALID_ARG_TYPE",
+      "The \"key\" argument must be of type string or an instance of Buffer, TypedArray, DataView, or KeyObject. Received an instance of KeyObject",
+    );
+  }
   return resolvePublicKeyObject(key);
 }
 
@@ -3724,7 +3986,7 @@ export function publicEncrypt(publicKey, buffer) {
 export function sign(algorithm, data, key) {
   const dsaEncoding = normalizeDsaEncoding(key);
   const options = key && typeof key === "object" && key.key != null ? key : undefined;
-  const privateKey = keyObjectFromInput(keyInputFromSignOptions(key), "private");
+  const privateKey = keyObjectFromInput(key, "private");
   const input = bytesFromData(data);
   if (privateKey.asymmetricKeyType === "ed25519") return ed25519SignData(algorithm, input, privateKey);
   if (rawKeyInfo[privateKey.asymmetricKeyType]?.sign) return rawSignData(algorithm, input, privateKey);
@@ -3748,7 +4010,7 @@ export function verify(algorithm, data, key, signature) {
   }
   const dsaEncoding = normalizeDsaEncoding(key);
   const options = key && typeof key === "object" && key.key != null ? key : undefined;
-  const publicKey = keyObjectFromInput(keyInputFromSignOptions(key), "public");
+  const publicKey = keyObjectFromInput(key, "public");
   const input = bytesFromData(data);
   const signatureBytes = bytesFromData(signature);
   if (resolvePublicKeyObject(publicKey).asymmetricKeyType === "ed25519") return ed25519VerifyData(algorithm, input, publicKey, signatureBytes);

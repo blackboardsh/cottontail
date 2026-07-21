@@ -4,6 +4,7 @@ import {
   MessageChannel,
   SHARE_ENV,
   Worker,
+  locks,
   moveMessagePortToContext,
 } from "node:worker_threads";
 import { createContext, runInContext } from "node:vm";
@@ -38,10 +39,17 @@ test("moving a MessagePort into a shared-realm vm context keeps it functional", 
   expect(await received).toBe("moved");
 });
 
-test.todo("COTTONTAIL-COMPAT: Worker.ref/unref needs a native parent-loop keepalive hook", async () => {
-  const worker = new Worker(`setTimeout(() => {}, 1000);`, { eval: true });
-  worker.unref();
-  expect(await once(worker, "exit")).toBeDefined();
+test("Worker ref state follows native startup and exit lifecycle", async () => {
+  const worker = new Worker(`setTimeout(() => {}, 80);`, { eval: true });
+  expect(worker.hasRef()).toBe(true);
+  expect(worker.unref()).toBe(worker);
+  expect(worker.hasRef()).toBe(false);
+  expect(worker.ref()).toBe(worker);
+  expect(worker.hasRef()).toBe(true);
+  await once(worker, "exit");
+  expect(worker.hasRef()).toBe(false);
+  expect(worker.ref()).toBe(worker);
+  expect(worker.hasRef()).toBe(false);
 });
 
 test.todo("COTTONTAIL-COMPAT: resourceLimits needs native JSC heap and thread-stack enforcement", async () => {
@@ -60,21 +68,30 @@ test.todo("COTTONTAIL-COMPAT: SHARE_ENV needs a process-wide live environment bi
   expect(process.env.CT_SHARE_ENV_PROBE).toBe("worker");
 });
 
-test.todo("COTTONTAIL-COMPAT: BroadcastChannel needs a process-wide cross-isolate registry", async () => {
+test("BroadcastChannel delivers across worker isolates", async () => {
   const channel = new BroadcastChannel("worker-native-boundary");
+  const message = new Promise(resolve => { channel.onmessage = event => resolve(event.data); });
   const worker = new Worker(
     `const { BroadcastChannel } = require("node:worker_threads");
      new BroadcastChannel("worker-native-boundary").postMessage("worker");`,
     { eval: true },
   );
-  const message = new Promise(resolve => { channel.onmessage = event => resolve(event.data); });
   expect(await message).toBe("worker");
+  channel.close();
   await worker.terminate();
 });
 
-test.todo("COTTONTAIL-COMPAT: natural process.exitCode and beforeExit need native worker-exit propagation", async () => {
-  const worker = new Worker(`process.exitCode = 23;`, { eval: true });
-  expect((await once(worker, "exit"))[0]).toBe(23);
+test("natural worker exit emits beforeExit and propagates process.exitCode", async () => {
+  const worker = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     process.once("beforeExit", code => parentPort.postMessage({ type: "beforeExit", code }));
+     process.exitCode = 23;`,
+    { eval: true },
+  );
+  const message = once(worker, "message");
+  const exit = once(worker, "exit");
+  expect((await message)[0]).toEqual({ type: "beforeExit", code: 23 });
+  expect((await exit)[0]).toBe(23);
 });
 
 test.todo("COTTONTAIL-COMPAT: hard termination needs a native JSC interrupt for non-cooperative JavaScript", async () => {
@@ -82,8 +99,121 @@ test.todo("COTTONTAIL-COMPAT: hard termination needs a native JSC interrupt for 
   expect(await worker.terminate()).toBe(1);
 });
 
-test.todo("COTTONTAIL-COMPAT: postMessageToThread needs native destination-listener acknowledgement and timeout", () => {});
+test("postMessageToThread rejects when the destination has no listener", async () => {
+  const { postMessageToThread } = await import("node:worker_threads");
+  const missing = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     parentPort.once("message", () => {});
+     parentPort.postMessage("ready");`,
+    { eval: true },
+  );
+  await once(missing, "message");
+  await expect(postMessageToThread(missing.threadId, "missing")).rejects.toMatchObject({
+    code: "ERR_WORKER_MESSAGING_FAILED",
+  });
+  await missing.terminate();
+});
 
-test.todo("COTTONTAIL-COMPAT: worker_threads.locks needs a process-wide native registry across isolates", () => {});
+test("postMessageToThread reports destination handler errors", async () => {
+  const { postMessageToThread } = await import("node:worker_threads");
+  const throwing = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     process.on("workerMessage", () => { throw new Error("worker-message-handler"); });
+     parentPort.once("message", () => {});
+     parentPort.postMessage("ready");`,
+    { eval: true },
+  );
+  await once(throwing, "message");
+  await expect(postMessageToThread(throwing.threadId, "throw")).rejects.toMatchObject({
+    code: "ERR_WORKER_MESSAGING_ERRORED",
+  });
+  await throwing.terminate();
+});
+
+test("postMessageToThread times out while the destination event loop is blocked", async () => {
+  const { postMessageToThread } = await import("node:worker_threads");
+  const blocked = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     process.on("workerMessage", () => {});
+     parentPort.postMessage("ready");
+     const end = Date.now() + 250;
+     while (Date.now() < end) {}`,
+    { eval: true },
+  );
+  const exit = once(blocked, "exit");
+  await once(blocked, "message");
+  await expect(postMessageToThread(blocked.threadId, "timeout", 25)).rejects.toMatchObject({
+    code: "ERR_WORKER_MESSAGING_TIMEOUT",
+  });
+  await exit;
+});
+
+test("worker_threads.locks coordinates ownership across isolates", async () => {
+  const name = `worker-lock-${Date.now()}`;
+  const worker = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     navigator.locks.request(${JSON.stringify(name)}, async lock => {
+       const state = await navigator.locks.query();
+       const held = state.held.find(item => item.name === lock.name);
+       parentPort.postMessage({ type: "acquired", mode: lock.mode, clientId: held.clientId });
+       await new Promise(resolve => parentPort.once("message", resolve));
+     }).then(
+       () => parentPort.postMessage({ type: "released" }),
+       error => parentPort.postMessage({ type: "error", name: error.name, message: error.message }),
+     );`,
+    { eval: true },
+  );
+  const exit = once(worker, "exit");
+  const [acquired] = await once(worker, "message");
+  expect(acquired).toMatchObject({ type: "acquired", mode: "exclusive" });
+  expect(typeof acquired.clientId).toBe("string");
+
+  const unavailable = await locks.request(name, { ifAvailable: true }, lock => lock === null);
+  expect(unavailable).toBe(true);
+  expect((await locks.query()).held.some(lock => lock.name === name)).toBe(true);
+
+  worker.postMessage("release");
+  expect((await once(worker, "message"))[0]).toEqual({ type: "released" });
+  await exit;
+  expect(await locks.request(name, lock => lock.name)).toBe(name);
+});
+
+test("worker_threads.locks supports shared queues, pending abort, and steal", async () => {
+  const sharedName = `worker-shared-lock-${Date.now()}`;
+  const shared = await locks.request(sharedName, { mode: "shared" }, async first => {
+    return locks.request(sharedName, { mode: "shared" }, second => [first.mode, second.mode]);
+  });
+  expect(shared).toEqual(["shared", "shared"]);
+
+  const abortName = `worker-abort-lock-${Date.now()}`;
+  let releaseAbortHolder: () => void;
+  let markAbortAcquired: () => void;
+  const abortAcquired = new Promise<void>(resolve => { markAbortAcquired = resolve; });
+  const abortHolder = locks.request(abortName, async () => {
+    markAbortAcquired();
+    await new Promise<void>(resolve => { releaseAbortHolder = resolve; });
+  });
+  await abortAcquired;
+  const controller = new AbortController();
+  const pending = locks.request(abortName, { signal: controller.signal }, () => "unreachable");
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  releaseAbortHolder!();
+  await abortHolder;
+
+  const stealName = `worker-steal-lock-${Date.now()}`;
+  let releaseStolenHolder: () => void;
+  let markStealAcquired: () => void;
+  const stealAcquired = new Promise<void>(resolve => { markStealAcquired = resolve; });
+  const original = locks.request(stealName, async () => {
+    markStealAcquired();
+    await new Promise<void>(resolve => { releaseStolenHolder = resolve; });
+    return "original";
+  });
+  await stealAcquired;
+  expect(await locks.request(stealName, { steal: true }, () => "stolen")).toBe("stolen");
+  await expect(original).rejects.toMatchObject({ name: "AbortError" });
+  releaseStolenHolder!();
+});
 
 test.todo("COTTONTAIL-COMPAT: exact worker stdio backpressure and fd writes need native worker pipe hooks", () => {});

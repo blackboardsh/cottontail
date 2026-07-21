@@ -2454,9 +2454,12 @@ pub const LinkerContext = struct {
             };
         }
 
-        // Missing re-exports in TypeScript files are indistinguishable from types
+        // Missing re-exports between TypeScript files are indistinguishable
+        // from types. A JavaScript importer has no type-erasure semantics, so
+        // it must retain the missing-export linkage error.
         const other_loader = c.parse_graph.input_files.items(.loader)[other_id];
-        if (named_import.is_exported and other_loader.isTypeScript()) {
+        const importing_loader = c.parse_graph.input_files.items(.loader)[id];
+        if (named_import.is_exported and importing_loader.isTypeScript() and other_loader.isTypeScript()) {
             return .{
                 .value = .{},
                 .status = .probably_typescript_type,

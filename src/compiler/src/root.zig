@@ -1,5 +1,10 @@
 const std = @import("std");
 
+// COTTONTAIL-COMPAT: Lockfile conversion runs without Bun's runtime package
+// manager. Generated lockfiles contain explicit registry URLs, and binary
+// decoding does not need Bun's alias-resolution side table.
+pub const standalone_lockfile_conversion = true;
+
 pub const Environment = @import("bun_core/env.zig");
 pub const windows = @import("sys/windows/windows.zig");
 pub const deprecated = @import("bun_core/deprecated.zig");
@@ -270,6 +275,7 @@ pub const analytics = struct {
         pub var tsconfig_paths: usize = 0;
         pub var dotenv: usize = 0;
         pub var yaml_parse: usize = 0;
+        pub var lockfile_migration_from_package_lock: usize = 0;
         pub var todo_panic: usize = 0;
     };
 };
@@ -454,11 +460,41 @@ pub const jsc = struct {
                 default_allocator.destroy(self);
                 return null;
             };
-            self.* = .{ .backing = backing, .parsed = @import("url/url.zig").URL.parse(backing) };
+            const ParsedURL = @import("url/url.zig").URL;
+            const colon = std.mem.indexOfScalar(u8, backing, ':');
+            const is_opaque = if (colon) |index|
+                index > 0 and (index + 2 >= backing.len or backing[index + 1] != '/' or backing[index + 2] != '/')
+            else
+                false;
+            const parsed = if (is_opaque) opaque_url: {
+                const protocol_end = colon.?;
+                const resource = backing[protocol_end + 1 ..];
+                const hash_offset = std.mem.indexOfScalar(u8, resource, '#') orelse resource.len;
+                const query_offset = std.mem.indexOfScalar(u8, resource[0..hash_offset], '?') orelse hash_offset;
+                break :opaque_url ParsedURL{
+                    .href = backing,
+                    .origin = backing[0 .. protocol_end + 1],
+                    .protocol = backing[0..protocol_end],
+                    .pathname = resource[0..query_offset],
+                    .path = resource[0..query_offset],
+                    .search = if (query_offset < hash_offset) resource[query_offset..hash_offset] else "",
+                    .hash = if (hash_offset < resource.len) resource[hash_offset..] else "",
+                };
+            } else ParsedURL.parse(backing);
+            self.* = .{ .backing = backing, .parsed = parsed };
+
+            // WHATWG URL parsing rejects non-numeric and out-of-range ports.
+            // hosted_git_info relies on that rejection to retry scp-style
+            // addresses after replacing the host/path colon with a slash.
+            if (!is_opaque and self.parsed.port.len > 0 and self.parsed.getPort() == null) {
+                default_allocator.free(backing);
+                default_allocator.destroy(self);
+                return null;
+            }
             if (self.parsed.protocol.len == 0) {
-                if (std.mem.indexOfScalar(u8, backing, ':')) |colon| {
+                if (std.mem.indexOfScalar(u8, backing, ':')) |fallback_colon| {
                     const slash = std.mem.indexOfScalar(u8, backing, '/') orelse backing.len;
-                    if (colon < slash) self.parsed.protocol = backing[0..colon];
+                    if (fallback_colon < slash) self.parsed.protocol = backing[0..fallback_colon];
                 }
             }
             return self;
@@ -871,7 +907,7 @@ pub const allocators = struct {
                 return owned;
             }
 
-            pub fn print(self: *Self, comptime format_string: []const u8, args: anytype) ![]const u8 {
+            pub fn print(self: *Self, comptime format_string: []const u8, args: anytype) std.mem.Allocator.Error![]const u8 {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 const owned = try std.fmt.allocPrint(self.allocator, format_string, args);
@@ -1103,6 +1139,8 @@ pub const allocators = struct {
         }
     };
 };
+
+pub const z_allocator = allocators.z_allocator;
 pub const isSliceInBuffer = allocators.isSliceInBuffer;
 pub const isSliceInBufferT = allocators.isSliceInBufferT;
 
@@ -1152,11 +1190,21 @@ pub const sys = struct {
         SUCCESS = 0,
         NOENT = 2,
         AGAIN = 11,
+        NOTDIR = 20,
+        NAMETOOLONG = 63,
         _,
     };
 
+    pub const E = SystemErrno;
+    pub const Tag = enum {
+        open,
+        read,
+        renameat,
+        stat,
+    };
+
     pub const Error = struct {
-        errno: SystemErrno = .SUCCESS,
+        errno: i32 = @intFromEnum(SystemErrno.SUCCESS),
         syscall: []const u8 = "",
         path: []const u8 = "",
         /// The concrete zig error that produced this failure, when known.
@@ -1168,32 +1216,52 @@ pub const sys = struct {
         zig_error: anyerror = error.SystemError,
 
         pub fn fromZigErr(err_value: anyerror, syscall_name: []const u8, pathname: []const u8) Error {
+            const code: E = switch (err_value) {
+                error.FileNotFound => .NOENT,
+                error.NotDir => .NOTDIR,
+                error.NameTooLong => .NAMETOOLONG,
+                else => .SUCCESS,
+            };
             return .{
-                .errno = if (err_value == error.FileNotFound) .NOENT else .SUCCESS,
+                .errno = @intFromEnum(code),
                 .syscall = syscall_name,
                 .path = pathname,
                 .zig_error = err_value,
             };
         }
 
+        pub fn fromCode(errno: E, syscall_tag: Tag) Error {
+            return .{
+                .errno = @intFromEnum(errno),
+                .syscall = @tagName(syscall_tag),
+            };
+        }
+
+        pub fn withPath(self: Error, pathname: []const u8) Error {
+            var result = self;
+            result.path = pathname;
+            return result;
+        }
+
         pub fn toSystemError(self: Error) Error {
             return self;
         }
 
-        pub fn getErrno(self: Error) SystemErrno {
-            return self.errno;
+        pub fn getErrno(self: Error) E {
+            return @enumFromInt(self.errno);
         }
 
         pub fn getErrorCodeTagName(self: *const Error) ?struct { [:0]const u8, SystemErrno } {
-            if (self.errno == .SUCCESS) return null;
-            return .{ @tagName(self.errno), self.errno };
+            if (self.errno == @intFromEnum(SystemErrno.SUCCESS)) return null;
+            const code: SystemErrno = @enumFromInt(self.errno);
+            return .{ @tagName(code), code };
         }
 
         pub fn format(self: Error, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             if (self.path.len > 0) {
-                try writer.print("{s}: {s} ({s})", .{ self.syscall, self.path, @tagName(self.errno) });
+                try writer.print("{s}: {s} ({s})", .{ self.syscall, self.path, @tagName(self.getErrno()) });
             } else {
-                try writer.print("{s} ({s})", .{ self.syscall, @tagName(self.errno) });
+                try writer.print("{s} ({s})", .{ self.syscall, @tagName(self.getErrno()) });
             }
         }
     };
@@ -1213,6 +1281,30 @@ pub const sys = struct {
             result: Type,
             err: Error,
 
+            pub const success: @This() = .{ .result = {} };
+
+            pub fn asErr(self: *const @This()) ?Error {
+                return switch (self.*) {
+                    .err => |value| value,
+                    .result => null,
+                };
+            }
+
+            pub fn asValue(self: *const @This()) ?Type {
+                return switch (self.*) {
+                    .result => |value| value,
+                    .err => null,
+                };
+            }
+
+            pub fn isErr(self: *const @This()) bool {
+                return self.* == .err;
+            }
+
+            pub fn isOk(self: *const @This()) bool {
+                return self.* == .result;
+            }
+
             pub fn unwrap(self: @This()) !Type {
                 return switch (self) {
                     .result => |value| value,
@@ -1220,6 +1312,10 @@ pub const sys = struct {
                 };
             }
         };
+    }
+
+    pub fn Maybe(comptime Type: type) type {
+        return SysMaybe(Type);
     }
 
     pub fn openA(pathname: []const u8, flags: i32, _: Mode) SysMaybe(FD) {
@@ -1248,6 +1344,24 @@ pub const sys = struct {
         else
             dirfd.stdDir().openFile(io_instance, pathname, .{ .mode = if (flags & O.WRONLY != 0) .write_only else .read_only }) catch |err| return .{ .err = .fromZigErr(err, "openat", pathname) };
         return .{ .result = FD.fromStdFile(file) };
+    }
+
+    pub fn fstatat(dirfd: FD, pathname: [:0]const u8) SysMaybe(Stat) {
+        const stat_value = dirfd.stdDir().statFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            pathname,
+            .{ .follow_symlinks = true },
+        ) catch |err| return .{ .err = .fromZigErr(err, "fstatat", pathname) };
+        return .{ .result = stat_value };
+    }
+
+    pub fn lstatat(dirfd: FD, pathname: [:0]const u8) SysMaybe(Stat) {
+        const stat_value = dirfd.stdDir().statFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            pathname,
+            .{ .follow_symlinks = false },
+        ) catch |err| return .{ .err = .fromZigErr(err, "lstatat", pathname) };
+        return .{ .result = stat_value };
     }
 
     pub fn openDirAtWindowsA(dirfd: FD, pathname: []const u8, open_options_input: anytype) SysMaybe(FD) {
@@ -1303,13 +1417,23 @@ pub const sys = struct {
     pub const File = struct {
         handle: FD = .invalid,
 
+        pub fn toSource(pathname: anytype, allocator: std.mem.Allocator, _: anytype) SysMaybe(logger.Source) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(
+                std.Io.Threaded.global_single_threaded.io(),
+                pathname,
+                allocator,
+                .unlimited,
+            ) catch return .{ .err = .{ .errno = @intFromEnum(E.NOENT) } };
+            return .{ .result = logger.Source.initPathString(pathname, bytes) };
+        }
+
         pub fn readFrom(_: FD, pathname: []const u8, allocator: std.mem.Allocator) SysMaybe([]u8) {
             const bytes = std.Io.Dir.cwd().readFileAlloc(
                 std.Io.Threaded.global_single_threaded.io(),
                 pathname,
                 allocator,
                 .unlimited,
-            ) catch return .{ .err = .{ .errno = .NOENT, .path = pathname } };
+            ) catch return .{ .err = .{ .errno = @intFromEnum(E.NOENT), .path = pathname } };
             return .{ .result = bytes };
         }
 
@@ -1328,7 +1452,7 @@ pub const sys = struct {
             std.Io.Threaded.global_single_threaded.io(),
             pathname,
             .{},
-        ) catch return .{ .err = .{ .errno = .NOENT, .path = pathname } };
+        ) catch return .{ .err = .{ .errno = @intFromEnum(E.NOENT), .path = pathname } };
         return .{ .result = value };
     }
 };
@@ -1441,6 +1565,10 @@ pub const mimalloc = struct {
 
 pub const Global = struct {
     pub const user_agent = "Cottontail";
+    // Bake embeds this in its browser protocol. It must match Bun.version,
+    // not the independently vendored compiler source version.
+    pub const package_json_version = "1.3.10";
+    pub const package_json_version_with_canary = package_json_version;
 
     pub fn mimalloc_cleanup(_: bool) void {}
 
@@ -1464,10 +1592,20 @@ pub const bake = struct {
     pub const HmrRuntime = struct {
         code: [:0]const u8,
         line_count: u32,
+
+        fn init(code: [:0]const u8) HmrRuntime {
+            return .{
+                .code = code,
+                .line_count = @intCast(std.mem.count(u8, code, "\n")),
+            };
+        }
     };
 
-    pub fn getHmrRuntime(_: Side) HmrRuntime {
-        unreachable;
+    pub fn getHmrRuntime(side: Side) HmrRuntime {
+        return switch (side) {
+            .client => .init(@embedFile("bake/bake-codegen/bake.client.js")),
+            .server => .init(@embedFile("bake/bake-codegen/bake.server.js")),
+        };
     }
 
     pub const Framework = struct {
@@ -1583,6 +1721,8 @@ pub const Output = struct {
     }
 
     pub fn flush() void {}
+    pub fn disableBuffering() void {}
+    pub fn enableBuffering() void {}
     pub fn initTest() void {}
 
     pub fn print(comptime fmt_text: []const u8, args: anytype) void {
@@ -1666,6 +1806,7 @@ pub const fmt = @import("bun_core/fmt.zig");
 pub const env_var = @import("bun_core/env_var.zig");
 pub const feature_flag = env_var.feature_flag;
 pub const logger = @import("logger/logger.zig");
+pub const ini = @import("ini/ini.zig");
 pub const meta = @import("meta/meta.zig");
 pub const bits = @import("meta/bits.zig");
 pub const schema = @import("options_types/schema.zig");
@@ -2547,43 +2688,27 @@ pub const base64 = struct {
 };
 
 pub const glob = struct {
-    pub const MatchResult = struct {
-        matched: bool,
+    pub const walk = @import("glob/GlobWalker.zig");
+    pub const GlobWalker = walk.GlobWalker_;
+    pub const match = @import("glob/matcher.zig").match;
 
-        pub fn matches(self: MatchResult) bool {
-            return self.matched;
-        }
-    };
+    pub fn detectGlobSyntax(potential_pattern: []const u8) bool {
+        if (potential_pattern.len > 0 and potential_pattern[0] == '!') return true;
 
-    pub fn match(pattern: []const u8, text: []const u8) MatchResult {
-        return .{ .matched = wildcardMatch(pattern, text) };
-    }
-
-    fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
-        var p: usize = 0;
-        var t: usize = 0;
-        var star: ?usize = null;
-        var match_index: usize = 0;
-
-        while (t < text.len) {
-            if (p < pattern.len and (pattern[p] == text[t] or pattern[p] == '?')) {
-                p += 1;
-                t += 1;
-            } else if (p < pattern.len and pattern[p] == '*') {
-                star = p;
-                match_index = t;
-                p += 1;
-            } else if (star) |star_index| {
-                p = star_index + 1;
-                match_index += 1;
-                t = match_index;
-            } else {
-                return false;
+        inline for ([_]u8{ '*', '{', '[', '?' }) |token| {
+            var slice = potential_pattern;
+            while (slice.len > 0) {
+                const index = std.mem.indexOfScalar(u8, slice, token) orelse break;
+                var cursor = index;
+                var backslashes: u16 = 0;
+                while (cursor > 0 and slice[cursor - 1] == '\\') : (cursor -= 1) {
+                    backslashes += 1;
+                }
+                if (backslashes % 2 == 0) return true;
+                slice = slice[index + 1 ..];
             }
         }
-
-        while (p < pattern.len and pattern[p] == '*') p += 1;
-        return p == pattern.len;
+        return false;
     }
 };
 
@@ -2759,6 +2884,10 @@ pub const FD = struct {
             self.value != std.os.windows.INVALID_HANDLE_VALUE
         else
             self.value >= 0;
+    }
+
+    pub fn eql(self: FD, other: FD) bool {
+        return self.value == other.value;
     }
 
     pub fn unwrapValid(self: FD) ?FD {

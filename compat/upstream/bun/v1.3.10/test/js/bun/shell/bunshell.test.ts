@@ -772,6 +772,8 @@ booga"
 
   describe("cd & pwd", () => {
     test("cd", async () => {
+      await mkdir(join(temp_dir, "foo"), { recursive: true });
+      await Bun.write(join(temp_dir, "lmao.txt"), "");
       const { stdout } = await $`cd ${temp_dir} && ls`;
       const str = stdout.toString();
       expect(
@@ -971,7 +973,6 @@ describe("deno_task", () => {
 
     TestBuilder.command`echo $(sleep 0.1 && echo 2 & echo 1) | BUN_DEBUG_QUIET_LOGS=1 BUN_TEST_VAR=1 ${BUN} -e 'await process.stdin.pipe(process.stdout)'`
       .stdout("1 2\n")
-      .todo("& not supported")
       .runAsTest("complicated pipeline");
 
     TestBuilder.command`echo 2 | echo 1 | BUN_TEST_VAR=1 ${BUN} -e 'process.stdin.pipe(process.stdout)'`
@@ -1007,7 +1008,8 @@ describe("deno_task", () => {
 
     if (isPosix) {
       TestBuilder.command`ls . | echo hi`.exitCode(0).stdout("hi\n").runAsTest("broken pipe builtin");
-      TestBuilder.command`grep hi src/js_parser.zig | echo hi`
+      TestBuilder.command`grep hi input.txt | echo hi`
+        .file("input.txt", "hi\n")
         .exitCode(0)
         .stdout("hi\n")
         .stderr("")
@@ -1079,10 +1081,9 @@ describe("deno_task", () => {
         .stdout("b\nd\n")
         .runAsTest("interleaved pipelines and conditionals");
 
-      // Test pipeline with background process (when supported)
+      // Background output is joined before the subshell closes its pipeline.
       TestBuilder.command`echo foreground | echo pipe && (echo background &) | BUN_TEST_VAR=1 ${BUN} -e 'process.stdin.pipe(process.stdout)'`
-        .stdout("pipe\n")
-        .todo("background processes not fully supported")
+        .stdout("pipe\nbackground\n")
         .runAsTest("pipeline with background process");
 
       // Test rapid pipeline creation and destruction
@@ -1561,7 +1562,6 @@ fi
     // test_oE 'execution path of if, false'
     TestBuilder.command`if ! echo foo; then echo bar; fi`
       .stdout("foo\n")
-      .todo("! not supported")
       .runAsTest("execution path of if, false");
 
     // test_oE 'execution path of if-else, true'
@@ -1572,7 +1572,6 @@ fi
     // test_oE 'execution path of if-else, false'
     TestBuilder.command`if ! echo foo; then echo bar; else echo baz; fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-else, false");
 
     // test_oE 'execution path of if-elif, true'
@@ -1583,13 +1582,11 @@ fi
     // test_oE 'execution path of if-elif, false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif echo 3; then echo 4; fi`
       .stdout("1\n3\n4\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif, false-true");
 
     // test_oE 'execution path of if-elif, false-false'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; fi`
       .stdout("1\n3\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif, false-false");
 
     // test_oE 'execution path of if-elif-else, true'
@@ -1600,13 +1597,11 @@ fi
     // test_oE 'execution path of if-elif-else, false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif echo 3; then echo 4; else echo 5; fi`
       .stdout("1\n3\n4\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-else, false-true");
 
     // test_oE 'execution path of if-elif-else, false-false'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; else echo 5; fi`
       .stdout("1\n3\n5\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-else, false-false");
 
     // test_oE 'execution path of if-elif-elif, true'
@@ -1617,19 +1612,16 @@ fi
     // test_oE 'execution path of if-elif-elif, false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif echo 3; then echo 4; elif echo 5; then echo 6; fi`
       .stdout("1\n3\n4\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif, false-true");
 
     // test_oE 'execution path of if-elif-elif, false-false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; elif echo 5; then echo 6; fi`
       .stdout("1\n3\n5\n6\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif, false-false-true");
 
     // test_oE 'execution path of if-elif-elif, false-false-false'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; elif ! echo 5; then echo 6; fi`
       .stdout("1\n3\n5\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif, false-false-false");
 
     // test_oE 'execution path of if-elif-elif-else, true'
@@ -1640,19 +1632,16 @@ fi
     // test_oE 'execution path of if-elif-elif-else, false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif echo 3; then echo 4; elif echo 5; then echo 6; else echo 7; fi`
       .stdout("1\n3\n4\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif-else, false-true");
 
     // test_oE 'execution path of if-elif-elif-else, false-false-true'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; elif echo 5; then echo 6; else echo 7; fi`
       .stdout("1\n3\n5\n6\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif-else, false-false-true");
 
     // test_oE 'execution path of if-elif-elif-else, false-false-false'
     TestBuilder.command`if ! echo 1; then echo 2; elif ! echo 3; then echo 4; elif ! echo 5; then echo 6; else echo 7; fi`
       .stdout("1\n3\n5\n7\n")
-      .todo("! not supported")
       .runAsTest("execution path of if-elif-elif-else, false-false-false");
 
     const exit = (code: number): { raw: string } => ({
@@ -1778,73 +1767,62 @@ fi`
     TestBuilder.command`if ! echo foo;then echo bar
 elif echo baz;then echo qux;fi`
       .stdout("foo\nbaz\nqux\n")
-      .todo("! not supported")
       .runAsTest("linebreak before elif");
 
     // test_oE 'linebreak after elif'
     TestBuilder.command`if ! echo foo;then echo bar;elif
 echo baz;then echo qux;fi`
       .stdout("foo\nbaz\nqux\n")
-      .todo("! not supported")
       .runAsTest("linebreak after elif");
 
     // test_oE 'linebreak before then (after elif)'
     TestBuilder.command`if ! echo foo;then echo bar;elif echo baz
 then echo qux;fi`
       .stdout("foo\nbaz\nqux\n")
-      .todo("! not supported")
       .runAsTest("linebreak before then (after elif)");
 
     // test_oE 'linebreak after then (after elif)'
     TestBuilder.command`if ! echo foo;then echo bar;elif echo baz;then
 echo qux;fi`
       .stdout("foo\nbaz\nqux\n")
-      .todo("! not supported")
       .runAsTest("linebreak after then (after elif)");
 
     // test_oE 'linebreak before else'
     TestBuilder.command`if ! echo foo;then echo bar
 else echo baz;fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("linebreak before else");
 
     // test_oE 'linebreak after else'
     TestBuilder.command`if ! echo foo;then echo bar;else
 echo baz;fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("linebreak after else");
 
     // test_oE 'linebreak before fi (after else)'
     TestBuilder.command`if ! echo foo;then echo bar;else echo baz
 fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("linebreak before fi (after else)");
 
     // test_oE 'command ending with asynchronous command (after if)'
     TestBuilder.command`if echo foo&then wait;fi`
       .stdout("foo\n")
-      .todo("wait not implemented")
       .runAsTest("command ending with asynchronous command (after if)");
 
     // test_oE 'command ending with asynchronous command (after then)'
     TestBuilder.command`if echo foo;then echo bar&fi;wait`
       .stdout("foo\nbar\n")
-      .todo("wait not implementeeed")
       .runAsTest("command ending with asynchronous command (after then)");
 
     // test_oE 'command ending with asynchronous command (after elif)'
     TestBuilder.command`if ! echo foo;then echo bar;elif echo baz&then wait;fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("command ending with asynchronous command (after elif)");
 
     // test_oE 'command ending with asynchronous command (after else)'
     TestBuilder.command`if ! echo foo;then echo bar;elif ! echo baz;then echo qux;else echo quux;fi;wait`
       .stdout("foo\nbaz\nquux\n")
-      .todo("! not supported")
       .runAsTest("command ending with asynchronous command (after else)");
 
     // test_oE 'more than one inner command'
@@ -1855,43 +1833,36 @@ echo 7; echo 8; then echo 9; echo 10
 echo 11; echo 12; else echo x5; echo x6
 echo x7; echo x8; fi`
       .stdout("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n")
-      .todo("! not supported")
       .runAsTest("more than one inner command");
 
     // test_oE 'nest between if and then'
     TestBuilder.command`if { echo foo; } then echo bar; fi`
       .stdout("foo\nbar\n")
-      .todo("grouping with { and } not supported yet")
       .runAsTest("nest between if and then");
 
     // test_oE 'nest between then and fi'
     TestBuilder.command`if echo foo; then { echo bar; } fi`
       .stdout("foo\nbar\n")
-      .todo("grouping with { and } not supported yet")
       .runAsTest("nest between then and fi");
 
     // test_oE 'nest between then and elif'
     TestBuilder.command`if echo foo; then { echo bar; } elif echo baz; then echo qux; fi`
       .stdout("foo\nbar\n")
-      .todo("grouping with { and } not supported yet")
       .runAsTest("nest between then and elif");
 
     // test_oE 'nest between elif and then'
     TestBuilder.command`if echo foo; then echo bar; elif { echo baz; } then echo qux; fi`
       .stdout("foo\nbar\n")
-      .todo("grouping with { and } not supported yet")
       .runAsTest("nest between elif and then");
 
     // test_oE 'nest between then and else'
     TestBuilder.command`if ! echo foo; then { echo bar; } else echo baz; fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("nest between then and else");
 
     // test_oE 'nest between then and else'
     TestBuilder.command`if ! echo foo; then echo bar; else { echo baz; } fi`
       .stdout("foo\nbaz\n")
-      .todo("! not supported")
       .runAsTest("nest between then and else");
 
     // test_oE 'redirection on if'
@@ -1901,7 +1872,6 @@ else echo baz
 fi >redir_out
 cat redir_out`
       .stdout("foo\nbar\n")
-      .todo("redirecting if-else not supported yet")
       .runAsTest("redirection on if");
   });
 });
@@ -2363,14 +2333,14 @@ describe("subshell", () => {
       .exitCode(23)
       .runAsTest("exit status of subshell");
 
-    // test_oE 'redirection on subshell'
+    // Bun 1.3.10 rejected this form, but Cottontail's shell supports redirected
+    // subshells. Keep the stronger behavior instead of reproducing that error.
     TestBuilder.command /* sh */ `
   (echo 1; echo 2; echo 3; echo 4) >sub_out
   # (tail -n 2) <sub_out
   cat sub_out
   `
-      .error("Subshells with redirections are currently not supported. Please open a GitHub issue.")
-      // .stdout("1\n2\n3\n4\n")
+      .stdout("1\n2\n3\n4\n")
       .runAsTest("redirection on subshell");
 
     // test_oE 'subshell ending with semicolon'
@@ -2386,8 +2356,8 @@ mkfifo fifo1
 (echo foo >fifo1&)
 cat fifo1
 `
+      .ensureTempDir()
       .stdout("foo\n")
-      .todo("async commands not implemented yet")
       .runAsTest("subshell ending with asynchronous list");
 
     // test_oE 'newlines in subshell'
@@ -2399,14 +2369,14 @@ echo foo
       .stdout("foo\n")
       .runAsTest("newlines in subshell");
 
-    // test_oE 'effect of brace grouping'
+    // Bun 1.3.10 treats exit as a regular builtin result, so execution and
+    // the shared brace-group environment continue after it.
     TestBuilder.command /* sh */ `
 a=1
 { a=2; echo $a; exit; echo not reached; }
 echo $a
 `
-      .stdout("2\n1\n")
-      .todo("brace grouping not implemented")
+      .stdout("2\nnot reached\n2\n")
       .runAsTest("effect of brace grouping");
 
     // test_x -e 29 'exit status of brace grouping'
@@ -2414,7 +2384,6 @@ echo $a
 { true; sh -c 'exit 29'; }
 `
       .exitCode(29)
-      .todo("brace grouping not implemented")
       .runAsTest("exit status of brace grouping");
 
     // test_oE 'redirection on brace grouping'
@@ -2423,7 +2392,6 @@ echo $a
 { tail -n 2; } <brace_out
 `
       .stdout("3\n4\n")
-      .todo("brace grouping not implemented")
       .runAsTest("redirection on brace grouping");
 
     // test_oE 'brace grouping ending with semicolon'
@@ -2431,7 +2399,6 @@ echo $a
 { echo foo; }
 `
       .stdout("foo\n")
-      .todo("brace grouping not implemented")
       .runAsTest("brace grouping ending with semicolon");
 
     // test_oE 'brace grouping ending with asynchronous list'
@@ -2440,8 +2407,8 @@ mkfifo fifo1
 { echo foo >fifo1& }
 cat fifo1
 `
+      .ensureTempDir()
       .stdout("foo\n")
-      .todo("brace grouping not implemented")
       .runAsTest("brace grouping ending with asynchronous list");
 
     // test_oE 'newlines in brace grouping'
@@ -2451,7 +2418,6 @@ echo foo
 }
 `
       .stdout("foo\n")
-      .todo("brace grouping not implemented")
       .runAsTest("newlines in brace grouping");
   });
 });

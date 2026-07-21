@@ -10,6 +10,7 @@ typedef struct CtJscRuntime CtJscRuntime;
 CtJscRuntime *ct_jsc_runtime_create(void);
 CtJscRuntime *ct_jsc_runtime_create_with_stack_size(size_t stack_size);
 void ct_jsc_runtime_destroy(CtJscRuntime *runtime);
+int ct_jsc_runtime_set_exit_cleanup_path(CtJscRuntime *runtime, const char *path);
 int ct_jsc_runtime_set_args(
     CtJscRuntime *runtime,
     size_t argc,

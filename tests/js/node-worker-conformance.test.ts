@@ -45,6 +45,21 @@ test("worker eval can load runtime builtins and reports typed errors", async () 
   await throwing.terminate();
 });
 
+test("worker eval reports Bun-compatible module and syntax diagnostics", async () => {
+  const missing = new Worker(`require("./cottontail-worker-missing-fixture.js")`, { eval: true });
+  const [missingError] = await onceEvent(missing, "error");
+  expect(String(missingError)).toContain(
+    "error: Cannot find module './cottontail-worker-missing-fixture.js' from 'blob:",
+  );
+  expect(missingError.code).toBe("MODULE_NOT_FOUND");
+  await missing.terminate();
+
+  const invalid = new Worker(`postMessage(throw new Error("boom"))`, { eval: true });
+  const [syntaxError] = await onceEvent(invalid, "error");
+  expect(String(syntaxError)).toContain("error: Unexpected throw");
+  await invalid.terminate();
+});
+
 test("workerData transfers MessagePort identity and messages", async () => {
   const { port1, port2 } = new MessageChannel();
   const worker = new Worker(

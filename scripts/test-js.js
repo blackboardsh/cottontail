@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { spawnSync } from 'child_process';
 import os from 'os';
 import { join } from 'path';
 
 const rootDir = process.cwd();
-const packageVersion = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')).version;
 const binaryPath = join(
   rootDir,
   'zig-out',
@@ -95,6 +94,36 @@ try {
       stdoutIncludes: ['module imports passed'],
     },
     {
+      name: 'bun-narrow-import-installs-web-globals',
+      scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'bun-narrow-import-globals.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['bun narrow import globals passed'],
+    },
+    {
+      name: 'builtin-dynamic-import-default-identity',
+      scriptPath: join(rootDir, 'tests', 'js', 'fixtures', 'builtin-dynamic-import-default-identity.mjs'),
+      expectExitCode: 0,
+      stdoutIncludes: ['builtin dynamic import identity passed'],
+    },
+    {
+      name: 'bundled-dynamic-import-default-identity',
+      argv: ['test', join(rootDir, 'tests', 'js', 'builtin-dynamic-import-default-identity.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['1 pass', '0 fail'],
+    },
+    {
+      name: 'runtime-bootstrap-startup-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'runtime-bootstrap-startup.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['9 pass', '0 fail'],
+    },
+    {
+      name: 'cli-version-identity-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'cli-version-identity.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['3 pass', '0 fail'],
+    },
+    {
       name: 'module-syntax-in-multiline-string',
       scriptPath: join(rootDir, 'tests', 'js', 'module-syntax-in-multiline-string.js'),
       expectExitCode: 0,
@@ -172,7 +201,7 @@ try {
       cwd: tempDir,
       argv: ['test', 'plain.test.js'],
       expectExitCode: 0,
-      stdoutIncludes: [`bun test ${packageVersion} (cottontail)`, 'plain-test-body'],
+      stdoutIncludes: ['bun test v1.3.10 (cottontail)', 'plain-test-body'],
     },
     {
       name: 'cli-wasi-entrypoint',
@@ -232,6 +261,33 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'bun-global.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['bun global passed'],
+    },
+    {
+      name: 'bun-semver',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-semver.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun semver passed'],
+    },
+    {
+      name: 'bun-package-manager-internals',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-package-manager-internals.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun package manager internals passed'],
+    },
+    {
+      name: 'bun-package-manager-link',
+      scriptPath: join(rootDir, 'tests', 'js', 'bun-package-manager-link.ts'),
+      env: {
+        COTTONTAIL_TMP_DIR: tempDir,
+      },
+      expectExitCode: 0,
+      stdoutIncludes: ['bun package manager link passed'],
     },
     {
       name: 'bun-sqlite',
@@ -423,6 +479,12 @@ try {
       scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-fork.ts'),
       expectExitCode: 0,
       stdoutIncludes: ['node child_process fork passed'],
+    },
+    {
+      name: 'node-child-process-external-fork',
+      scriptPath: join(rootDir, 'tests', 'js', 'node-child-process-external-fork.ts'),
+      expectExitCode: 0,
+      stdoutIncludes: ['node child_process external fork passed'],
     },
     {
       name: 'node-os',

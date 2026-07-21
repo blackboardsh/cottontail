@@ -22,6 +22,7 @@ const OUT = process.argv[2] ?? path.join(HERE, "readable-stream.js");
 // Entry: readable-stream's full custom stream (Node core port) + promises.
 const entrySource = `
 import Stream from ${JSON.stringify(path.join(PKG, "lib/stream.js"))};
+Stream._isArrayBufferView ??= ArrayBuffer.isView;
 export default Stream;
 `;
 
@@ -89,9 +90,20 @@ const banner = `// Vendored from readable-stream@4.7.0 (https://github.com/nodej
 //   configurable so node/stream.js can install compat setters.
 // - Readable constructor: legacy push-style sources (no _read, overridden
 //   pause/resume) start in flowing mode with a no-op _read.
+// - byte-mode readable/writable streams accept every ArrayBufferView.
 // - Writable object-mode writes of non-string chunks report encoding
 //   undefined (Bun behavior).
+// - byte-mode streams use Node's current 64 KiB default high-water mark.
+// - Readable/Writable validate defaultEncoding during construction.
+// - Writable implements Symbol.asyncDispose.
+// - stream constructors preallocate Node's common event slots.
+// - successful Writable end callbacks receive null.
+// - Duplex uses Writable's destroy path so buffered write callbacks settle.
+// - destroy() honors an explicit public destroyed=true compatibility marker.
 // - end-of-stream: a 'close' after EOF (state.ended) is not premature.
+// - end-of-stream waits for queued writable callbacks and pending EOF events.
+// - internally-started async work is rejection-observed immediately.
+// - compose retains tail error forwarding through post-input async failures.
 // - async iterator consults _readableState.destroyed (legacy modules shadow
 //   stream.destroyed with an own property).
 // - endReadableNT emits the EOF null-'readable' when a legacy eager source
@@ -104,6 +116,235 @@ import { StringDecoder as __ct_StringDecoder } from "../string_decoder.js";
 
 // Text patches applied to vendored sources (documented in bundle header).
 const patches = [
+  {
+    // Current Node preallocates common event slots in this order. The shared
+    // EventEmitter preserves the object and increments _eventsCount only when
+    // a real listener replaces an undefined slot.
+    file: /internal\/streams\/readable\.js$/,
+    find: `function Readable(options) {
+  if (!(this instanceof Readable)) return new Readable(options)`,
+    replace: `function Readable(options) {
+  if (!(this instanceof Readable)) return new Readable(options)
+  if (this._events == null) {
+    this._events = {
+      __proto__: null,
+      close: undefined,
+      error: undefined,
+      data: undefined,
+      end: undefined,
+      readable: undefined
+    }
+  }`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `function Writable(options) {
+  // Writable ctor is applied to Duplexes, too.`,
+    replace: `function Writable(options) {
+  if (this._events == null) {
+    this._events = {
+      __proto__: null,
+      close: undefined,
+      error: undefined,
+      prefinish: undefined,
+      finish: undefined,
+      drain: undefined
+    }
+  }
+  // Writable ctor is applied to Duplexes, too.`,
+  },
+  {
+    file: /internal\/streams\/duplex\.js$/,
+    find: `function Duplex(options) {
+  if (!(this instanceof Duplex)) return new Duplex(options)`,
+    replace: `function Duplex(options) {
+  if (!(this instanceof Duplex)) return new Duplex(options)
+  if (this._events == null) {
+    this._events = {
+      __proto__: null,
+      close: undefined,
+      error: undefined,
+      prefinish: undefined,
+      finish: undefined,
+      drain: undefined,
+      data: undefined,
+      end: undefined,
+      readable: undefined
+    }
+  }`,
+  },
+  {
+    // Current Node accepts all typed-array and DataView chunks, converting
+    // them to Buffer in byte mode while preserving them in object mode.
+    file: /internal\/streams\/(?:readable|writable)\.js$/,
+    find: `Stream._isUint8Array(chunk)`,
+    replace: `Stream._isArrayBufferView(chunk)`,
+  },
+  {
+    // A destination async generator can throw after consuming its final input.
+    // The pipeline may already have completed its source-side bookkeeping and
+    // removed its listener, so compose must retain its own forwarding path.
+    file: /internal\/streams\/compose\.js$/,
+    find: `  d = new Duplex({
+    // TODO (ronag): highWaterMark?
+    writableObjectMode: !!(head !== null && head !== undefined && head.writableObjectMode),
+    readableObjectMode: !!(tail !== null && tail !== undefined && tail.readableObjectMode),
+    writable,
+    readable
+  })`,
+    replace: `  d = new Duplex({
+    // TODO (ronag): highWaterMark?
+    writableObjectMode: !!(head !== null && head !== undefined && head.writableObjectMode),
+    readableObjectMode: !!(tail !== null && tail !== undefined && tail.readableObjectMode),
+    writable,
+    readable
+  })
+  if (isNodeStream(tail)) {
+    tail.on('error', (err) => d.destroy(err))
+  }`,
+  },
+  {
+    // Internal async iteration is intentionally fire-and-drive: stream events
+    // carry its failure. Observe a defensive rejection from the driver
+    // immediately so Cottontail does not classify it as top-level unhandled.
+    file: /internal\/streams\/from\.js$/,
+    find: `      reading = true
+      next()`,
+    replace: `      reading = true
+      PromisePrototypeThen(next(), undefined, (err) => readable.destroy(err))`,
+  },
+  {
+    // The promise returned by the user function can reject before _final gets
+    // a chance to await it. This observer marks it handled without changing
+    // the original promise consumed by _final.
+    file: /internal\/streams\/duplexify\.js$/,
+    find: `const { FunctionPrototypeCall } = require('../../ours/primordials')`,
+    replace: `const { FunctionPrototypeCall, PromisePrototypeCatch } = require('../../ours/primordials')`,
+  },
+  {
+    file: /internal\/streams\/duplexify\.js$/,
+    find: `      )
+      return (d = new Duplexify({`,
+    replace: `      )
+      PromisePrototypeCatch(promise, () => {})
+      return (d = new Duplexify({`,
+  },
+  {
+    // Duplex inherits Readable.destroy, but writable teardown must also fail
+    // corked and buffered write callbacks. Current Node explicitly installs
+    // Writable's destroy implementation after mixing in writable methods.
+    file: /internal\/streams\/duplex\.js$/,
+    find: `}
+function Duplex(options) {`,
+    replace: `}
+Duplex.prototype.destroy = Writable.prototype.destroy
+function Duplex(options) {`,
+  },
+  {
+    // node/stream.js lets legacy modules shadow the destroyed accessor without
+    // mutating stream state. Public destroy() must still honor that explicit
+    // marker, as Node does for an assigned destroyed=true value.
+    file: /internal\/streams\/destroy\.js$/,
+    find: `  if ((w !== null && w !== undefined && w.destroyed) || (r !== null && r !== undefined && r.destroyed)) {`,
+    replace: `  if (this.destroyed || (w !== null && w !== undefined && w.destroyed) || (r !== null && r !== undefined && r.destroyed)) {`,
+  },
+  {
+    // Node changed the byte-stream default from 16 KiB to 64 KiB. Keep the
+    // object-mode default at 16.
+    file: /internal\/streams\/state\.js$/,
+    find: `let defaultHighWaterMarkBytes = 16 * 1024`,
+    replace: `let defaultHighWaterMarkBytes = 64 * 1024`,
+  },
+  {
+    // Current Node rejects an invalid default encoding at construction time,
+    // before the stream has accepted any chunks.
+    file: /internal\/streams\/readable\.js$/,
+    find: `    ERR_STREAM_PUSH_AFTER_EOF,
+    ERR_STREAM_UNSHIFT_AFTER_END_EVENT`,
+    replace: `    ERR_STREAM_PUSH_AFTER_EOF,
+    ERR_STREAM_UNSHIFT_AFTER_END_EVENT,
+    ERR_UNKNOWN_ENCODING`,
+  },
+  {
+    file: /internal\/streams\/readable\.js$/,
+    find: `  this.defaultEncoding = (options && options.defaultEncoding) || 'utf8'`,
+    replace: `  this.defaultEncoding = (options && options.defaultEncoding) || 'utf8'
+  if (!Buffer.isEncoding(this.defaultEncoding)) throw new ERR_UNKNOWN_ENCODING(String(this.defaultEncoding))`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `  this.defaultEncoding = (options && options.defaultEncoding) || 'utf8'`,
+    replace: `  this.defaultEncoding = (options && options.defaultEncoding) || 'utf8'
+  if (!Buffer.isEncoding(this.defaultEncoding)) throw new ERR_UNKNOWN_ENCODING(String(this.defaultEncoding))`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `      errorOrDestroy(stream, err !== null && err !== undefined ? err : ERR_MULTIPLE_CALLBACK())`,
+    replace: `      errorOrDestroy(stream, err !== null && err !== undefined ? err : new ERR_MULTIPLE_CALLBACK())`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `  if (!Buffer.isEncoding(encoding)) throw new ERR_UNKNOWN_ENCODING(encoding)
+  this._writableState.defaultEncoding = encoding`,
+    replace: `  if (!Buffer.isEncoding(encoding)) throw new ERR_UNKNOWN_ENCODING(String(encoding))
+  this._writableState.defaultEncoding = encoding`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `  for (let i = 0; i < onfinishCallbacks.length; i++) {
+    onfinishCallbacks[i]()
+  }`,
+    replace: `  for (let i = 0; i < onfinishCallbacks.length; i++) {
+    onfinishCallbacks[i](null)
+  }`,
+  },
+  {
+    // readable-stream@4.7 predates Writable's async-dispose implementation.
+    file: /internal\/streams\/writable\.js$/,
+    find: `  ObjectSetPrototypeOf,
+  StringPrototypeToLowerCase,
+  Symbol,
+  SymbolHasInstance`,
+    replace: `  ObjectSetPrototypeOf,
+  Promise,
+  StringPrototypeToLowerCase,
+  Symbol,
+  SymbolAsyncDispose,
+  SymbolHasInstance`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `const {
+  ERR_INVALID_ARG_TYPE,`,
+    replace: `const { AbortError } = require('../../ours/errors')
+const {
+  ERR_INVALID_ARG_TYPE,`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `const { addAbortSignal } = require('./add-abort-signal')`,
+    replace: `const { addAbortSignal } = require('./add-abort-signal')
+const eos = require('./end-of-stream')`,
+  },
+  {
+    file: /internal\/streams\/writable\.js$/,
+    find: `Writable.prototype[EE.captureRejectionSymbol] = function (err) {
+  this.destroy(err)
+}`,
+    replace: `Writable.prototype[EE.captureRejectionSymbol] = function (err) {
+  this.destroy(err)
+}
+Writable.prototype[SymbolAsyncDispose] = function () {
+  let error
+  if (!this.destroyed) {
+    error = this.writableFinished ? null : new AbortError()
+    this.destroy(error)
+  }
+  return new Promise((resolve, reject) =>
+    eos(this, (err) => (err && err.name !== 'AbortError' ? reject(err) : resolve(null)))
+  )
+}`,
+  },
   {
     // Make prototype accessor properties configurable so node/stream.js can
     // install permissive setters for legacy runtime-module subclasses.
@@ -142,6 +383,7 @@ const patches = [
     this._read === Readable.prototype._read &&
     (this.resume !== Readable.prototype.resume || this.pause !== Readable.prototype.pause)
   ) {
+    this._readableState.ctLegacyEager = true
     this._readableState.flowing = true
     this._read = function () {}
   }
@@ -151,15 +393,26 @@ const patches = [
     // Cottontail compat: legacy sources (fs.ReadStream, ...) emit 'close'
     // manually right after push(null), before 'end' has been delivered.
     // Once EOF has been signalled (state.ended), a close is not premature.
+    // fs.ReadStream also exposes readableEnded before its buffered final chunk
+    // has drained, whereas the standard Readable getter waits for 'end'.
     file: /internal\/streams\/end-of-stream\.js$/,
     find: `    if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
       if (!isReadableFinished(stream, false)) return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE())
     }`,
     replace: `    if (readable && !readableFinished && isReadableNodeStream(stream, true)) {
+      const rEndedState = stream._readableState
+      // Legacy Cottontail sources can emit close immediately after push(null).
+      // EOF is queued, but the already-registered end listener must complete
+      // eos so callers observe all preceding end listeners first.
+      if (
+        rEndedState &&
+        rEndedState.ended === true &&
+        rEndedState.endEmitted !== true &&
+        rEndedState.destroyed !== true &&
+        (rEndedState.length === 0 || stream.readableEnded === true)
+      ) return
       if (!isReadableFinished(stream, false)) {
-        const rEndedState = stream._readableState
-        if (!rEndedState || rEndedState.ended !== true)
-          return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE())
+        return callback.call(stream, new ERR_STREAM_PREMATURE_CLOSE())
       }
     }`,
   },
@@ -188,6 +441,17 @@ const patches = [
   },
 ];
 
+patches.push({
+  // Ending a writable makes isWritable() false before its queued callbacks
+  // have run. Do not report completion until those callbacks are drained.
+  file: /internal\/streams\/end-of-stream\.js$/,
+  find: `    (writableFinished || isWritable(stream) === false)
+  ) {`,
+  replace: `    (writableFinished || isWritable(stream) === false) &&
+    (!wState || wState.pendingcb === undefined || wState.pendingcb === 0)
+  ) {`,
+});
+
 patches.push(
   {
     // Cottontail compat: legacy eager sources push EOF while data is still
@@ -212,7 +476,7 @@ patches.push(
     state.endEmitted = true
     stream.emit('end')`,
     replace: `  if (!state.errored && !state.closeEmitted && !state.endEmitted && state.length === 0) {
-    if (state.readableListening && !state.ctNullReadableEmitted && !state.destroyed) {
+    if (state.ctLegacyEager && state.readableListening && !state.ctNullReadableEmitted && !state.destroyed) {
       state.ctNullReadableEmitted = true
       stream.emit('readable')
       if (state.endEmitted) return
@@ -273,6 +537,12 @@ const result = await Bun.build({
   entrypoints: ["ct-entry"],
   bundle: true,
   format: "esm",
+  keepNames: true,
+  minify: {
+    identifiers: false,
+    syntax: true,
+    whitespace: true,
+  },
   target: "browser",
   plugins: [shimPlugin],
 });

@@ -5,6 +5,12 @@ export let active = null;
 
 function setActive(domain) {
   active = domain ?? _stack[_stack.length - 1] ?? null;
+  if (globalThis.process) globalThis.process.domain = active;
+}
+
+function clearDomainStack() {
+  _stack.length = 0;
+  setActive(null);
 }
 
 export class Domain extends EventEmitter {
@@ -21,7 +27,7 @@ export class Domain extends EventEmitter {
 
   exit() {
     const index = _stack.lastIndexOf(this);
-    if (index >= 0) _stack.splice(index, 1);
+    if (index >= 0) _stack.splice(index);
     setActive(null);
     return this;
   }
@@ -46,7 +52,13 @@ export class Domain extends EventEmitter {
 
   bind(callback) {
     if (typeof callback !== "function") throw new TypeError("domain.bind requires a function");
-    return (...args) => this.run(callback, ...args);
+    const domain = this;
+    return function bound(...args) {
+      domain.enter();
+      const result = callback.apply(this, args);
+      domain.exit();
+      return result;
+    };
   }
 
   intercept(callback) {
@@ -62,14 +74,37 @@ export class Domain extends EventEmitter {
 
   run(callback, ...args) {
     this.enter();
+    const result = callback(...args);
+    this.exit();
+    return result;
+  }
+
+  _errorHandler(error) {
     try {
-      return callback(...args);
-    } catch (error) {
-      this.emit("error", error);
-      return undefined;
-    } finally {
-      this.exit();
+      if ((typeof error === "object" && error !== null) || typeof error === "function") {
+        Object.defineProperties(error, {
+          domain: { value: this, configurable: true, writable: true },
+          domainThrown: { value: true, configurable: true, writable: true },
+        });
+      }
+    } catch {}
+
+    while (active === this) this.exit();
+    let caught = false;
+    if (this.listenerCount("error") > 0) {
+      try {
+        caught = this.emit("error", error);
+      } catch (nextError) {
+        const parent = active;
+        if (parent && parent !== this && typeof parent._errorHandler === "function") {
+          return parent._errorHandler(nextError);
+        }
+        clearDomainStack();
+        throw nextError;
+      }
     }
+    clearDomainStack();
+    return caught;
   }
 
   dispose() {

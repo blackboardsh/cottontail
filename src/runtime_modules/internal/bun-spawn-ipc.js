@@ -1,21 +1,138 @@
-const ipcPrefix = "__COTTONTAIL_IPC__";
+import { deserialize, serialize } from "../node/v8.js";
 
-export function encodeBunSpawnIpc(message, nodeProtocol = false) {
-  // COTTONTAIL-COMPAT: Bun.spawn advanced IPC - JSON-compatible values use
-  // this shared framing today. Cycles, BigInt, typed arrays, transfer handles,
-  // and Bun's structured-clone tags need a binary serializer in the IPC hook.
-  const payload = JSON.stringify(message);
-  if (payload === undefined) throw new TypeError("IPC message cannot be serialized");
-  return nodeProtocol ? `${payload}\n` : `${ipcPrefix}${payload}\n`;
+const ipcPrefix = "__COTTONTAIL_IPC__";
+const advancedPrefix = "A:";
+const jsonPrefix = "J:";
+const advancedEnvelopeKey = "__cottontailBunSpawnIpcAdvanced";
+
+function invalidIpcMessage(message) {
+  if (message === undefined) {
+    const error = new TypeError('The "message" argument must be specified');
+    error.code = "ERR_MISSING_ARGS";
+    return error;
+  }
+  const type = typeof message;
+  const received = type === "bigint"
+    ? `type bigint (${String(message)}n)`
+    : `type ${type} (${String(message)})`;
+  const error = new TypeError(
+    'The "message" argument must be one of type string, object, number, or boolean. ' +
+      `Received ${received}`,
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function validateBunIpcMessage(message) {
+  if (message === undefined || typeof message === "bigint" || typeof message === "symbol") {
+    throw invalidIpcMessage(message);
+  }
+}
+
+function encodeAdvancedMessage(message) {
+  try {
+    return serialize(message).toString("base64");
+  } catch (error) {
+    if (!String(error?.message ?? error).includes("Unserializable value")) throw error;
+    const cloneError = new Error("The object can not be cloned.");
+    cloneError.name = "DataCloneError";
+    throw cloneError;
+  }
+}
+
+function advancedEnvelope(message) {
+  return {
+    [advancedEnvelopeKey]: 1,
+    data: encodeAdvancedMessage(message),
+  };
+}
+
+function decodeAdvancedEnvelope(message) {
+  if (message == null || typeof message !== "object" || message[advancedEnvelopeKey] !== 1 ||
+      typeof message.data !== "string") {
+    return message;
+  }
+  return deserialize(Buffer.from(message.data, "base64"));
+}
+
+export function encodeBunSpawnIpc(message, nodeProtocol = false, serialization = undefined) {
+  validateBunIpcMessage(message);
+  const mode = serialization ?? (nodeProtocol ? "json" : "advanced");
+  if (mode !== "json" && mode !== "advanced") {
+    throw new TypeError('serialization must be "json" or "advanced"');
+  }
+
+  if (nodeProtocol) {
+    // Node's JSON channel is newline-delimited without Cottontail framing.
+    return `${JSON.stringify(message)}\n`;
+  }
+  if (mode === "advanced") {
+    // Keep the outer frame valid JSON because Cottontail's earliest process
+    // bootstrap owns the inherited fd before Bun's full IPC codec is loaded.
+    return `${ipcPrefix}${JSON.stringify(advancedEnvelope(message))}\n`;
+  }
+  return `${ipcPrefix}${jsonPrefix}${JSON.stringify(message)}\n`;
 }
 
 export function decodeBunSpawnIpc(line) {
-  const text = String(line);
-  return JSON.parse(text.startsWith(ipcPrefix) ? text.slice(ipcPrefix.length) : text);
+  let text = String(line);
+  if (text.startsWith(ipcPrefix)) text = text.slice(ipcPrefix.length);
+  if (text.startsWith(advancedPrefix)) {
+    return deserialize(Buffer.from(text.slice(advancedPrefix.length), "base64"));
+  }
+  if (text.startsWith(jsonPrefix)) text = text.slice(jsonPrefix.length);
+  return decodeAdvancedEnvelope(JSON.parse(text));
 }
 
 export function isCottontailIpcFrame(line) {
   return String(line).startsWith(ipcPrefix);
+}
+
+// bun/ffi.js installs a minimal JSON process channel before bun/index.js and
+// this module are evaluated. Upgrade that channel in place: the original fd
+// reader remains the sole reader, while advanced envelopes are decoded before
+// user message listeners run and process.send emits matching envelopes.
+export function installInheritedBunIpcCodec(host, processObject = globalThis.process) {
+  if (processObject == null || processObject.env?.COTTONTAIL_IPC_BOOTSTRAP === "node") return false;
+  const fd = Number(processObject.env?.COTTONTAIL_IPC_FD);
+  if (!Number.isInteger(fd) || fd <= 2 || typeof host?.ipcSend !== "function" ||
+      typeof processObject.emit !== "function") {
+    return false;
+  }
+  if (processObject.send?.__cottontailAdvancedBunIpc === true) return true;
+
+  const originalEmit = processObject.emit;
+  processObject.emit = function emit(name, ...args) {
+    if (name === "message" && args.length > 0) args[0] = decodeAdvancedEnvelope(args[0]);
+    return originalEmit.call(this, name, ...args);
+  };
+
+  const send = function send(message, sendHandleOrCallback = undefined, optionsOrCallback = undefined, callback = undefined) {
+    validateNodeIpcMessage(message, arguments.length);
+    if (typeof sendHandleOrCallback === "function") callback = sendHandleOrCallback;
+    else if (typeof optionsOrCallback === "function") callback = optionsOrCallback;
+    if (processObject.connected === false) {
+      const error = new Error("Channel closed");
+      error.code = "ERR_IPC_CHANNEL_CLOSED";
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      else queueMicrotask(() => processObject.emit?.("error", error));
+      return false;
+    }
+
+    let ok = false;
+    try {
+      ok = host.ipcSend(fd, encodeBunSpawnIpc(message)) === true;
+    } catch (error) {
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      else queueMicrotask(() => processObject.emit?.("error", error));
+      return false;
+    }
+    if (typeof callback === "function") queueMicrotask(() => callback(ok ? null : new Error("write failed")));
+    return ok;
+  };
+  Object.defineProperty(send, "__cottontailAdvancedBunIpc", { value: true });
+  processObject.send = send;
+  return true;
 }
 
 function validateNodeIpcMessage(message, argumentCount) {
@@ -45,12 +162,14 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   }
 
   // COTTONTAIL-COMPAT: Node advanced IPC uses V8's binary ValueSerializer
-  // framing. This portable bridge implements the complete JSON channel; the
-  // native process hook must expose Node's binary framing for advanced mode.
+  // framing. The inherited bridge remains JSON-compatible; the native process
+  // hook must expose Node's binary framing for cross-runtime advanced mode.
   const serialization = processObject.env?.NODE_CHANNEL_SERIALIZATION_MODE === "advanced" ? "advanced" : "json";
   let connected = true;
   let buffer = "";
   let timer = null;
+  const decoder = new TextDecoder();
+  const channelEvents = new Set(["message", "disconnect", "internalMessage"]);
 
   const channel = {
     ref() {
@@ -87,7 +206,7 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           close();
           return;
         }
-        buffer += new TextDecoder().decode(event.data ?? new ArrayBuffer(0));
+        buffer += decoder.decode(event.data ?? new ArrayBuffer(0), { stream: true });
         for (;;) {
           const newline = buffer.indexOf("\n");
           if (newline < 0) break;
@@ -99,6 +218,7 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
           const message = decodeBunSpawnIpc(line);
           if (message?.cmd?.startsWith?.("NODE_")) processObject.emit?.("internalMessage", message);
           else processObject.emit?.("message", message);
+          updateChannelRef();
         }
       }
     } catch (error) {
@@ -137,13 +257,27 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
 
   timer = setInterval(poll, 1);
   channel.unref();
-  const channelEvents = new Set(["message", "disconnect", "internalMessage"]);
+  const updateChannelRef = () => {
+    let count = 0;
+    for (const name of channelEvents) count += Number(processObject.listenerCount?.(name) ?? 0);
+    if (count > 0) channel.ref();
+    else channel.unref();
+  };
   for (const methodName of ["on", "addListener", "once", "prependListener", "prependOnceListener"]) {
     const original = processObject[methodName];
     if (typeof original !== "function") continue;
     processObject[methodName] = function (name, ...args) {
       const result = original.call(this, name, ...args);
       if (channelEvents.has(name)) channel.ref();
+      return result;
+    };
+  }
+  for (const methodName of ["off", "removeListener", "removeAllListeners"]) {
+    const original = processObject[methodName];
+    if (typeof original !== "function") continue;
+    processObject[methodName] = function (name, ...args) {
+      const result = original.call(this, name, ...args);
+      if (name === undefined || channelEvents.has(name)) updateChannelRef();
       return result;
     };
   }
@@ -155,3 +289,5 @@ export function installInheritedNodeIpc(host, processObject = globalThis.process
   processObject.channel.serializationMode = serialization;
   return true;
 }
+
+installInheritedBunIpcCodec(globalThis.cottontail, globalThis.process);

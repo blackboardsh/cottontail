@@ -1852,6 +1852,17 @@ fn NewPrinter(
 
             p.printSpaceBeforeIdentifier();
 
+            if (record.flags.use_runtime_dynamic_import) {
+                p.print("globalThis.__cottontailImportModule(");
+                p.printImportRecordPath(record);
+                if (!import_options.isMissing()) {
+                    p.print(",void 0,");
+                    p.printExpr(import_options, .comma, .{});
+                }
+                p.print(")");
+                return;
+            }
+
             // Wrap with __toESM if importing a CommonJS module
             const wrap_with_to_esm = record.flags.wrap_with_to_esm;
 

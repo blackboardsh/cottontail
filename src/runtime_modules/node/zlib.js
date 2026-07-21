@@ -2,6 +2,8 @@ import * as zlibConstants from "./zlib/constants.js";
 import bufferModule from "./buffer.js";
 import { Transform } from "./stream.js";
 
+const arrayBufferTransfer = ArrayBuffer.prototype.transfer;
+
 export {
   BROTLI_DECODE,
   BROTLI_ENCODE,
@@ -218,6 +220,24 @@ function bytesFromData(data) {
 }
 
 function asBuffer(value) {
+  if (value instanceof ArrayBuffer) {
+    const bytes = new Uint8Array(value);
+    const output = globalThis.Buffer?.from
+      ? globalThis.Buffer.from(bytes)
+      : bytes.slice();
+
+    // Brotli and Zstd one-shot transforms return malloc-backed ArrayBuffers.
+    // The Buffer must own a copy before detaching so the native allocation is
+    // released now instead of accumulating until an eventual JSC finalizer.
+    if (typeof arrayBufferTransfer === "function") {
+      try {
+        arrayBufferTransfer.call(value, 0);
+      } catch {
+        // Older JSC builds can expose transfer() for non-detachable buffers.
+      }
+    }
+    return output;
+  }
   const bytes = ArrayBuffer.isView(value)
     ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
     : new Uint8Array(value);
@@ -491,8 +511,14 @@ function decodeCompletedInput(mode, input, options) {
     let consumed = 0;
     while (consumed < input.byteLength) {
       const frameLength = zstdFrameLength(input, consumed);
-      if (frameLength == null) return null;
-      if (frameLength < 0) break;
+      if (frameLength == null) {
+        return parts.length === 0 ? null : { bytes: combineBytes(parts), consumed };
+      }
+      if (frameLength < 0) {
+        return parts.length === 0
+          ? null
+          : { bytes: combineBytes(parts), consumed, trailingInvalid: true };
+      }
       const output = transformSync(mode, input.subarray(consumed, consumed + frameLength), strictOptions);
       parts.push(output instanceof Uint8Array ? output : new Uint8Array(output));
       consumed += frameLength;
@@ -534,6 +560,7 @@ export function crc32(data, value = 0) {
 }
 
 const decompressModes = new Set(["inflate", "inflateRaw", "gunzip", "unzip", "brotliDecompress", "zstdDecompress"]);
+const concatenatedDecompressModes = new Set(["gunzip", "unzip", "zstdDecompress"]);
 
 class Zlib extends Transform {
   constructor(mode, options = {}) {
@@ -544,6 +571,7 @@ class Zlib extends Transform {
       : options ?? {};
     this._chunks = [];
     this._inputBytes = 0;
+    this._completedInputBytes = 0;
     this._consumedBytes = null;
     this._finalInput = null;
     this._finalOutput = null;
@@ -562,7 +590,7 @@ class Zlib extends Transform {
     if (!this._isDecompress) return this._inputBytes;
     if (this._consumedBytes !== null) return this._consumedBytes;
     if (this._finalInput === null) return this._inputBytes;
-    this._consumedBytes = this._computeConsumed(this._finalInput, this._finalOutput);
+    this._consumedBytes = this._completedInputBytes + this._computeConsumed(this._finalInput, this._finalOutput);
     this._finalInput = null;
     this._finalOutput = null;
     return this._consumedBytes;
@@ -570,6 +598,7 @@ class Zlib extends Transform {
 
   set bytesWritten(value) {
     this._inputBytes = value;
+    this._completedInputBytes = 0;
     this._consumedBytes = null;
     this._finalInput = null;
   }
@@ -632,6 +661,27 @@ class Zlib extends Transform {
 
   _tryCompleteDecompressor() {
     if (!this._isDecompress || this._readableCompleted || this._chunks.length === 0) return;
+    if (concatenatedDecompressModes.has(this._mode)) {
+      while (this._chunks.length > 0) {
+        const input = this._peekChunks();
+        const completed = decodeCompletedInput(this._mode, input, this._transformOptions());
+        if (completed === null || completed.consumed <= 0 || completed.consumed > input.byteLength) return;
+        this._chunks = !completed.trailingInvalid && completed.consumed < input.byteLength
+          ? [input.slice(completed.consumed)]
+          : [];
+        this._completedInputBytes += completed.consumed;
+        this._consumedBytes = this._completedInputBytes;
+        this._finalInput = null;
+        this._finalOutput = null;
+        this._pushOutput(completed.bytes);
+        if (completed.trailingInvalid) {
+          this._readableCompleted = true;
+          this.push(null);
+          return;
+        }
+      }
+      return;
+    }
     const input = this._peekChunks();
     const completed = decodeCompletedInput(this._mode, input, this._transformOptions());
     if (completed === null) return;
@@ -661,7 +711,7 @@ class Zlib extends Transform {
       if (completed !== null) {
         this._finalInput = null;
         this._finalOutput = null;
-        this._consumedBytes = completed.consumed;
+        this._consumedBytes = this._completedInputBytes + completed.consumed;
       } else {
         this._finalInput = input;
         this._finalOutput = bytes;
@@ -669,7 +719,7 @@ class Zlib extends Transform {
       }
       // gzip members and zstd frames concatenate; Node's decompressors keep
       // decoding subsequent members, so loop over the remaining input.
-      if (this._mode === "gunzip" || this._mode === "unzip" || this._mode === "zstdDecompress") {
+      if (concatenatedDecompressModes.has(this._mode)) {
         let consumed = this._computeConsumed(input, bytes);
         if (consumed > 0 && consumed < input.byteLength) {
           const parts = [bytes];
@@ -702,7 +752,7 @@ class Zlib extends Transform {
           bytes = combined;
           this._finalInput = null;
           this._finalOutput = null;
-          this._consumedBytes = totalConsumed;
+          this._consumedBytes = this._completedInputBytes + totalConsumed;
         }
       }
     }
@@ -868,6 +918,7 @@ class Zlib extends Transform {
     this._closeBrotliEncoder();
     this._chunks = [];
     this._inputBytes = 0;
+    this._completedInputBytes = 0;
     this._consumedBytes = null;
     this._finalInput = null;
     this._finalOutput = null;
@@ -988,7 +1039,7 @@ export const brotliDecompress = callbackifySync(brotliDecompressSync);
 export const zstdCompress = callbackifySync(zstdCompressSync);
 export const zstdDecompress = callbackifySync(zstdDecompressSync);
 
-// COTTONTAIL-COMPAT: node:zlib native stream state - incremental zlib flush semantics and one-shot native allocation reuse are still required for Bun's RSS leak thresholds.
+// COTTONTAIL-COMPAT: node:zlib native stream state - incremental zlib flush semantics are still required.
 
 export default {
   BrotliCompress,

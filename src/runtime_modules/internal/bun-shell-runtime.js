@@ -2,17 +2,20 @@ import { closeSync, lstatSync, openSync, readFileSync, readdirSync, statSync, wr
 import { basename, dirname, isAbsolute, join, resolve } from "../node/path.js";
 import picomatch from "../vendor/picomatch.js";
 import { createShellBuiltins } from "./bun-shell-builtins.js";
-import { parseShell } from "./bun-shell-parser.js";
+import { lexShell, parseShell } from "./bun-shell-parser.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const INPUT_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>"]);
+const SHELL_REDIRECTS = new Set(["<", "<<", "0<", "0<<", "0>", "0>>", ">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>", "2>&1", "1>&2", ">&2", ">&1"]);
+const COMMAND_BOUNDARY_OPERATORS = new Set([";", "&&", "||", "|", "!", "(", "{"]);
+const COMMAND_BOUNDARY_WORDS = new Set(["if", "then", "elif", "else"]);
 
 function bytes(value = "") {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  return globalThis.Buffer?.from ? Buffer.from(String(value)) : encoder.encode(String(value));
+  return encoder.encode(String(value));
 }
 
 function concat(chunks) {
@@ -20,7 +23,7 @@ function concat(chunks) {
   if (values.length === 0) return bytes();
   if (values.length === 1) return values[0];
   const length = values.reduce((total, value) => total + value.byteLength, 0);
-  const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
+  const output = new Uint8Array(length);
   let offset = 0;
   for (const value of values) {
     output.set(value, offset);
@@ -72,7 +75,214 @@ function validateOutputReferences(source, outputTargets) {
   }
 }
 
-function cloneContext(context, { preserveCommandEnv = false } = {}) {
+function shellSyntax(message, position) {
+  const error = new SyntaxError(message);
+  error.position = position;
+  return error;
+}
+
+function commandPosition(tokens, index) {
+  if (index === 0) return true;
+  const previous = tokens[index - 1];
+  if (previous.type === "op") return COMMAND_BOUNDARY_OPERATORS.has(previous.value);
+  return previous.type === "word" && COMMAND_BOUNDARY_WORDS.has(previous.raw);
+}
+
+function rewriteSubshellRedirects(source) {
+  if (!source.includes("(")) return source;
+  const tokens = lexShell(source);
+  const stack = [];
+  const ranges = [];
+  let conditionalDepth = 0;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.type === "word" && token.raw === "[[") {
+      conditionalDepth += 1;
+      continue;
+    }
+    if (token.type === "word" && token.raw === "]]" && conditionalDepth > 0) {
+      conditionalDepth -= 1;
+      continue;
+    }
+    if (conditionalDepth > 0 || token.type !== "op") continue;
+    if (token.value === "(") {
+      stack.push({ position: token.position, command: commandPosition(tokens, index) });
+      continue;
+    }
+    if (token.value !== ")" || stack.length === 0) continue;
+    const open = stack.pop();
+    const next = tokens[index + 1];
+    if (open.command && next?.type === "op" && SHELL_REDIRECTS.has(next.value)) {
+      ranges.push({ start: open.position, end: token.position + 1 });
+    }
+  }
+
+  if (ranges.length === 0) return source;
+  const edits = [];
+  for (const range of ranges) {
+    edits.push({ position: range.start, text: "{ " });
+    edits.push({ position: range.end, text: "; }" });
+  }
+  edits.sort((left, right) => right.position - left.position || right.text.length - left.text.length);
+  let rewritten = source;
+  for (const edit of edits) {
+    rewritten = `${rewritten.slice(0, edit.position)}${edit.text}${rewritten.slice(edit.position)}`;
+  }
+  return rewritten;
+}
+
+function markerCommand(node, markers) {
+  return node?.type === "command"
+    && (node.redirects?.length ?? 0) === 0
+    && node.words?.length === 1
+    && markers.has(node.words[0].raw);
+}
+
+function markRightmostAsync(node) {
+  if (node?.type === "binary") return { ...node, right: markRightmostAsync(node.right) };
+  return { type: "async", command: node };
+}
+
+function transformBackgroundMarkers(node, markers) {
+  if (node == null || typeof node !== "object") return node;
+  if (node.type === "script") {
+    const items = node.items.map(item => transformBackgroundMarkers(item, markers));
+    for (let index = 0; index < items.length;) {
+      if (!markerCommand(items[index], markers)) {
+        index += 1;
+        continue;
+      }
+      if (index === 0) throw shellSyntax('Unexpected "&"', 0);
+      items[index - 1] = markRightmostAsync(items[index - 1]);
+      items.splice(index, 1);
+    }
+    return { ...node, items };
+  }
+  if (node.type === "binary") {
+    return {
+      ...node,
+      left: transformBackgroundMarkers(node.left, markers),
+      right: transformBackgroundMarkers(node.right, markers),
+    };
+  }
+  if (node.type === "pipeline") {
+    return { ...node, items: node.items.map(item => transformBackgroundMarkers(item, markers)) };
+  }
+  if (node.type === "negate") return { ...node, command: transformBackgroundMarkers(node.command, markers) };
+  if (node.type === "async") return { ...node, command: transformBackgroundMarkers(node.command, markers) };
+  if (node.type === "subshell" || node.type === "group") {
+    return { ...node, script: transformBackgroundMarkers(node.script, markers) };
+  }
+  if (node.type === "if") {
+    return {
+      ...node,
+      branches: node.branches.map(branch => ({
+        condition: transformBackgroundMarkers(branch.condition, markers),
+        consequent: transformBackgroundMarkers(branch.consequent, markers),
+      })),
+      alternate: transformBackgroundMarkers(node.alternate, markers),
+    };
+  }
+  if (node.type === "assignmentPrefix") {
+    return { ...node, command: transformBackgroundMarkers(node.command, markers) };
+  }
+  return node;
+}
+
+function rewriteBackgroundLists(source) {
+  if (!source.includes("&")) return { source, markers: new Set() };
+  const tokens = lexShell(source);
+  const background = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.type !== "op" || token.value !== "&") continue;
+    const next = tokens[index + 1];
+    if (next?.type === "op" && ["&&", "||", "|", "&"].includes(next.value)) {
+      throw shellSyntax(`"&" is not allowed on the left-hand side of "${next.value}"`, token.position);
+    }
+    background.push(token);
+  }
+  if (background.length === 0) return { source, markers: new Set() };
+
+  let markerPrefix = "__cottontail_shell_async__";
+  while (source.includes(markerPrefix)) markerPrefix += "_";
+  const markers = new Set();
+  let rewritten = source;
+  for (let index = background.length - 1; index >= 0; index -= 1) {
+    const token = background[index];
+    const marker = `${markerPrefix}${index}`;
+    markers.add(marker);
+    rewritten = `${rewritten.slice(0, token.position)}; ${marker};${rewritten.slice(token.position + 1)}`;
+  }
+  return { source: rewritten, markers };
+}
+
+const shellParseCache = new Map();
+const shellParseCacheEntryLimit = 32;
+const shellParseCacheSourceLimit = 8 * 1024 * 1024;
+let shellParseCacheSourceLength = 0;
+
+function cacheShellParse(source, entry) {
+  if (source.length > shellParseCacheSourceLimit) return;
+  const existing = shellParseCache.get(source);
+  if (existing) {
+    shellParseCacheSourceLength -= source.length;
+    shellParseCache.delete(source);
+  }
+  shellParseCache.set(source, entry);
+  shellParseCacheSourceLength += source.length;
+  while (shellParseCache.size > shellParseCacheEntryLimit || shellParseCacheSourceLength > shellParseCacheSourceLimit) {
+    const oldestSource = shellParseCache.keys().next().value;
+    if (oldestSource === undefined) break;
+    shellParseCache.delete(oldestSource);
+    shellParseCacheSourceLength -= oldestSource.length;
+  }
+}
+
+function cachedShellParseError(error) {
+  return {
+    name: String(error?.name ?? "Error"),
+    message: String(error?.message ?? error),
+    position: error?.position,
+    code: error?.code,
+  };
+}
+
+function throwCachedShellParseError(cached) {
+  const error = cached.name === "SyntaxError"
+    ? new SyntaxError(cached.message)
+    : new Error(cached.message);
+  error.name = cached.name;
+  if (cached.position !== undefined) error.position = cached.position;
+  if (cached.code !== undefined) error.code = cached.code;
+  throw error;
+}
+
+export function parseBunShellSource(source) {
+  // Public Bun.$ execution accepts async lists and redirected subshells while
+  // the testing serializer keeps Bun v1.3.10's parser diagnostics unchanged.
+  source = String(source);
+  const cached = shellParseCache.get(source);
+  if (cached) {
+    shellParseCache.delete(source);
+    shellParseCache.set(source, cached);
+    if (cached.error) throwCachedShellParseError(cached.error);
+    return cached.value;
+  }
+  try {
+    const redirected = rewriteSubshellRedirects(source);
+    const rewritten = rewriteBackgroundLists(redirected);
+    const value = transformBackgroundMarkers(parseShell(rewritten.source), rewritten.markers);
+    cacheShellParse(source, { value });
+    return value;
+  } catch (error) {
+    cacheShellParse(source, { error: cachedShellParseError(error) });
+    throw error;
+  }
+}
+
+function cloneContext(context, { preserveCommandEnv = false, isolateBackground = false } = {}) {
   return {
     cwd: context.cwd,
     env: { ...context.env },
@@ -84,10 +294,21 @@ function cloneContext(context, { preserveCommandEnv = false } = {}) {
     status: context.status,
     argv: [...context.argv],
     outputTargets: context.outputTargets,
-    background: context.background,
+    background: isolateBackground ? [] : context.background,
     openRedirects: context.openRedirects,
     pid: context.pid,
     concat,
+  };
+}
+
+async function joinBackground(context, output) {
+  const pending = context.background.splice(0);
+  if (pending.length === 0) return output;
+  const completed = await Promise.all(pending);
+  return {
+    ...output,
+    stdout: concat([output.stdout, ...completed.map(item => item.stdout)]),
+    stderr: concat([output.stderr, ...completed.map(item => item.stderr)]),
   };
 }
 
@@ -380,7 +601,11 @@ async function expandText(text, context, execute, quoted) {
         cursor += 1;
       }
       const script = text.slice(index + 2, cursor);
-      const substitution = await execute(parseShell(script), cloneContext(context), bytes());
+      const substitutionContext = cloneContext(context, { isolateBackground: true });
+      const substitution = await joinBackground(
+        substitutionContext,
+        await execute(parseBunShellSource(script), substitutionContext, bytes()),
+      );
       output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
       context.status = substitution.exitCode;
@@ -397,7 +622,11 @@ async function expandText(text, context, execute, quoted) {
         cursor += 1;
       }
       const script = text.slice(index + 1, cursor).replace(/\\`/g, "`");
-      const substitution = await execute(parseShell(script), cloneContext(context), bytes());
+      const substitutionContext = cloneContext(context, { isolateBackground: true });
+      const substitution = await joinBackground(
+        substitutionContext,
+        await execute(parseBunShellSource(script), substitutionContext, bytes()),
+      );
       output.push(commandSubstitutionText(decoder.decode(substitution.stdout), quoted));
       if (substitution.stderr.byteLength) context.expansionStderr?.push(substitution.stderr);
       context.status = substitution.exitCode;
@@ -421,7 +650,9 @@ async function expandText(text, context, execute, quoted) {
       index = close + 1;
       continue;
     }
-    const match = /^(?:[A-Za-z_][A-Za-z0-9_]*|[?*@#$!\-]|\d+)/.exec(text.slice(index + 1));
+    // Bun tokenizes unbraced positional parameters one digit at a time, so
+    // `$10` expands as `$1` followed by the literal `0`.
+    const match = /^(?:[A-Za-z_][A-Za-z0-9_]*|[?*@#$!\-]|\d)/.exec(text.slice(index + 1));
     if (!match) { output.push("$"); index += 1; continue; }
     output.push(parameterValue(match[0], context));
     index += match[0].length + 1;
@@ -467,6 +698,20 @@ function appendExpandedSegment(fields, text, split, globEligible, preserveEmpty)
 }
 
 async function expandWord(word, context, execute, { assignment = false, redirect = false } = {}) {
+  if (word.parts.length === 1 && word.parts[0].quote === "unquoted") {
+    const literal = word.parts[0].text;
+    if (literal !== ""
+      && literal[0] !== "~"
+      && !literal.includes("$")
+      && !literal.includes("`")
+      && !literal.includes("{")
+      && !literal.includes("*")
+      && !literal.includes("?")
+      && !literal.includes("[")
+      && !literal.includes(PROTECTED)) {
+      return [literal];
+    }
+  }
   const quoted = word.parts.some(part => part.quote !== "unquoted");
   const braceEligible = word.parts.some(part => part.quote === "unquoted" && part.text.includes("{") && part.text.includes(","));
   const tildeEligible = word.parts[0]?.quote === "unquoted" && word.parts[0].text.startsWith("~");
@@ -698,6 +943,14 @@ async function applyRedirects(commandResult, redirects) {
 }
 
 const pipelineInputChannels = new WeakMap();
+const PIPELINE_CHUNK_SIZE = 16 * 1024;
+
+function yieldPipelineIO() {
+  return new Promise(resolveReady => {
+    if (typeof globalThis.setImmediate === "function") globalThis.setImmediate(resolveReady);
+    else globalThis.setTimeout(resolveReady, 0);
+  });
+}
 
 function createPipelineChannel() {
   let controller;
@@ -728,19 +981,22 @@ function createPipelineChannel() {
     async write(value) {
       const chunk = bytes(value);
       if (chunk.byteLength === 0) return !cancelled;
-      while (!cancelled && !closed && controller.desiredSize != null && controller.desiredSize <= 0) {
-        await new Promise(resolveReady => ready.push(resolveReady));
+      for (let offset = 0; offset < chunk.byteLength; offset += PIPELINE_CHUNK_SIZE) {
+        while (!cancelled && !closed && controller.desiredSize != null && controller.desiredSize <= 0) {
+          await new Promise(resolveReady => ready.push(resolveReady));
+        }
+        if (cancelled || closed) return false;
+        try {
+          controller.enqueue(chunk.subarray(offset, Math.min(offset + PIPELINE_CHUNK_SIZE, chunk.byteLength)));
+        } catch {
+          cancelled = true;
+          closed = true;
+          wake();
+          return false;
+        }
+        if (offset + PIPELINE_CHUNK_SIZE < chunk.byteLength) await yieldPipelineIO();
       }
-      if (cancelled || closed) return false;
-      try {
-        controller.enqueue(chunk);
-        return true;
-      } catch {
-        cancelled = true;
-        closed = true;
-        wake();
-        return false;
-      }
+      return true;
     },
     close() {
       if (closed) return;
@@ -988,9 +1244,9 @@ export function createBunShellRuntime(host) {
     }
 
     if (node.type === "async") {
-      const commandContext = cloneContext(context);
-      const promise = Promise.resolve()
-        .then(() => execute(node.command, commandContext, input))
+      const commandContext = cloneContext(context, { isolateBackground: true });
+      const promise = new Promise(resolve => setTimeout(resolve, 0))
+        .then(async () => joinBackground(commandContext, await execute(node.command, commandContext, input)))
         .then(output => ({ ...output, shellExit: false }));
       context.background.push(promise);
       return result();
@@ -998,7 +1254,9 @@ export function createBunShellRuntime(host) {
 
     if (node.type === "subshell") {
       return executeCompound(node, context, input, "subshell", async redirectedInputBytes => {
-        const output = await execute(node.script, cloneContext(context), redirectedInputBytes);
+        const subshellContext = cloneContext(context, { isolateBackground: true });
+        const output = await execute(node.script, subshellContext, redirectedInputBytes);
+        context.background.push(...subshellContext.background.splice(0));
         return { ...output, shellExit: false };
       });
     }
@@ -1118,7 +1376,7 @@ export function createBunShellRuntime(host) {
         scriptContext.exported = Object.fromEntries(Object.keys(scriptContext.env).map(key => [key, true]));
         scriptContext.externalEnv = {};
         scriptContext.argv = [scriptPath, ...args.slice(2)];
-        commandResult = await execute(parseShell(decoder.decode(bytes(readFileSync(scriptPath)))), scriptContext, input);
+        commandResult = await execute(parseBunShellSource(decoder.decode(bytes(readFileSync(scriptPath)))), scriptContext, input);
         commandResult.shellExit = false;
       } catch (error) {
         commandResult = result(1, "", fileReason(error, args[1]));
@@ -1130,7 +1388,7 @@ export function createBunShellRuntime(host) {
       if (args.length === 0) {
         commandResult = result(0, 'Usage: bun exec <script>\n\nExecute a shell script directly from Bun.\n\nNote: If executing this from a shell, make sure to escape the string!\n\nExamples:\n  bun exec "echo hi"\n  bun exec "echo \\"hey friends\\"!"\n');
       } else {
-        commandResult = await execute(parseShell(args.join(" ")), commandContext, input);
+        commandResult = await execute(parseBunShellSource(args.join(" ")), commandContext, input);
       }
     }
 
@@ -1175,14 +1433,14 @@ export function createBunShellRuntime(host) {
       concat,
     };
     try {
-      const output = await execute(parseShell(source), context, bytes(options.input ?? ""));
-      const background = context.background.splice(0);
-      if (background.length === 0) return { status: output.exitCode, stdout: output.stdout, stderr: output.stderr };
-      const completed = await Promise.all(background);
+      const output = await joinBackground(
+        context,
+        await execute(parseBunShellSource(source), context, bytes(options.input ?? "")),
+      );
       return {
         status: output.exitCode,
-        stdout: concat([output.stdout, ...completed.map(item => item.stdout)]),
-        stderr: concat([output.stderr, ...completed.map(item => item.stderr)]),
+        stdout: output.stdout,
+        stderr: output.stderr,
       };
     } catch (error) {
       if (error?.code === "BUN_SHELL_NO_MATCH") return { status: 1, stdout: bytes(), stderr: bytes(`${error.message}\n`) };

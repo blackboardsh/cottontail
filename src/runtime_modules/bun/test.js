@@ -1,5 +1,6 @@
 import nodeAssert from "../node/assert.js";
-import { existsSync as nodeExistsSync } from "../node/fs.js";
+import { existsSync as nodeExistsSync, readFileSync as nodeReadFileSync } from "../node/fs.js";
+import { AsyncLocalStorage } from "../node/async_hooks.js";
 import { applyBunFileConcurrency } from "../internal/bun-test-concurrency.js";
 import { formatBunEachLabel, validateBunEachTable } from "../internal/bun-test-each.js";
 import { captureTestRegistrationLine } from "../internal/bun-test-junit.js";
@@ -29,7 +30,62 @@ import {
   test as nodeTest,
 } from "../node/test.js";
 
+// Test orchestration must not depend on userland replacing the global constructor.
+const Promise = globalThis.Promise;
+const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
+
 restoreBunTestFilterArgument();
+
+function safeUncaughtDescriptorValue(object, name) {
+  const descriptor = Object.getOwnPropertyDescriptor(object, name);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function formatUncaughtPlainObject(value) {
+  const entries = [];
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || typeof key !== "string") continue;
+    let rendered;
+    if (!("value" in descriptor)) rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
+    else if (typeof descriptor.value === "string") rendered = JSON.stringify(descriptor.value);
+    else rendered = String(descriptor.value);
+    entries.push(`  ${key}: ${rendered},`);
+  }
+  return `{\n${entries.join("\n")}\n}`;
+}
+
+function uncaughtRuntimeTrailer() {
+  const version = globalThis.Bun?.version_with_sha ?? globalThis.Bun?.version ?? "unknown";
+  return `\n\nBun v${version}`;
+}
+
+globalThis.__cottontailFormatUncaughtException ??= (value) => {
+  if (!value || typeof value !== "object") return null;
+  const code = safeUncaughtDescriptorValue(value, "code");
+  const syscall = safeUncaughtDescriptorValue(value, "syscall");
+  const errno = safeUncaughtDescriptorValue(value, "errno");
+  const path = safeUncaughtDescriptorValue(value, "path");
+  const message = safeUncaughtDescriptorValue(value, "message");
+  if (typeof code === "string" && typeof syscall === "string" && typeof errno === "number" && typeof message === "string") {
+    const fields = [
+      ...(path === undefined ? [] : [["path", JSON.stringify(path)]]),
+      ["syscall", JSON.stringify(syscall)],
+      ["errno", String(errno)],
+      ["code", JSON.stringify(code)],
+    ];
+    return `${message}\n${fields.map(([key, field], index) =>
+      `${key.padStart(8)}: ${field}${index + 1 === fields.length ? "" : ","}`
+    ).join("\n")}${uncaughtRuntimeTrailer()}`;
+  }
+  const sourceURL = safeUncaughtDescriptorValue(value, "sourceURL") ?? safeUncaughtDescriptorValue(value, "fileName");
+  const line = safeUncaughtDescriptorValue(value, "line") ?? safeUncaughtDescriptorValue(value, "lineNumber");
+  if (typeof message === "string" && (sourceURL != null || line != null)) {
+    const location = `${sourceURL == null ? "<script>" : String(sourceURL)}${line == null ? "" : `:${line}`}`;
+    return `error: ${message}\n${formatUncaughtPlainObject(value)}\n      at ${location}${uncaughtRuntimeTrailer()}`;
+  }
+  return null;
+};
 
 const mocks = new Set();
 const restores = [];
@@ -41,6 +97,7 @@ const snapshotCounters = new Map();
 const snapshotFiles = new Map();
 const inlineSnapshotFiles = new Map();
 const snapshotFileHeader = "// Bun Snapshot v1, https://bun.sh/docs/test/snapshots\n";
+const snapshotReporter = { added: 0, passed: 0, failed: 0, reported: false };
 let fakeSystemTime = null;
 let fakeTimersEnabled = false;
 let fakeNow = Date.now();
@@ -193,10 +250,62 @@ function deepEqual(left, right) {
   }
 }
 
+const objectPrototypeToString = Object.prototype.toString;
+const mapSizeGetter = Object.getOwnPropertyDescriptor(Map.prototype, "size")?.get;
+const setSizeGetter = Object.getOwnPropertyDescriptor(Set.prototype, "size")?.get;
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")?.get;
+const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === "function"
+  ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")?.get
+  : undefined;
+const regexpSourceGetter = Object.getOwnPropertyDescriptor(RegExp.prototype, "source")?.get;
+const dateGetTime = Date.prototype.getTime;
+
+function hasIntrinsicSlot(getter, value) {
+  if (typeof getter !== "function" || value === null || (typeof value !== "object" && typeof value !== "function")) {
+    return false;
+  }
+  try {
+    getter.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isMapValue(value) {
+  return hasIntrinsicSlot(mapSizeGetter, value);
+}
+
+function isSetValue(value) {
+  return hasIntrinsicSlot(setSizeGetter, value);
+}
+
+function isDateValue(value) {
+  return hasIntrinsicSlot(dateGetTime, value);
+}
+
+function isRegExpValue(value) {
+  return hasIntrinsicSlot(regexpSourceGetter, value);
+}
+
+function isErrorValue(value) {
+  if (typeof Error.isError === "function") return Error.isError(value);
+  return objectPrototypeToString.call(value) === "[object Error]";
+}
+
+function binaryBufferKind(value) {
+  if (value === null || typeof value !== "object") return null;
+  const tag = objectPrototypeToString.call(value);
+  if (tag === "[object SharedArrayBuffer]" || hasIntrinsicSlot(sharedArrayBufferByteLengthGetter, value)) {
+    return "shared";
+  }
+  return hasIntrinsicSlot(arrayBufferByteLengthGetter, value) ? "array" : null;
+}
+
 function plainObjectEntries(value) {
   if (!isObject(value) || Array.isArray(value)) return null;
-  if (value instanceof Date || value instanceof RegExp || value instanceof Map || value instanceof Set) return null;
-  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return null;
+  if (isDateValue(value) || isRegExpValue(value) || isMapValue(value) || isSetValue(value)) return null;
+  if (ArrayBuffer.isView(value) || binaryBufferKind(value) !== null) return null;
   const proto = Object.getPrototypeOf(value);
   const keys = Reflect.ownKeys(value);
   if (proto !== Object.prototype && proto !== null && keys.length > 0) return null;
@@ -211,8 +320,7 @@ const binaryHashCache = new WeakMap();
 
 function bytesForBinaryValue(value) {
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) return new Uint8Array(value);
+  if (binaryBufferKind(value) !== null) return new Uint8Array(value);
   return null;
 }
 
@@ -267,8 +375,10 @@ function bunDeepEqual(actual, expected, seen = new WeakMap()) {
     if (!ArrayBuffer.isView(actual) || !ArrayBuffer.isView(expected)) return false;
     return binaryEqual(actual, expected);
   }
-  if (actual instanceof ArrayBuffer || expected instanceof ArrayBuffer) {
-    if (!(actual instanceof ArrayBuffer) || !(expected instanceof ArrayBuffer)) return false;
+  const actualBufferKind = binaryBufferKind(actual);
+  const expectedBufferKind = binaryBufferKind(expected);
+  if (actualBufferKind !== null || expectedBufferKind !== null) {
+    if (actualBufferKind !== expectedBufferKind) return false;
     return binaryEqual(actual, expected);
   }
   if (!isObject(actual) || !isObject(expected)) return false;
@@ -544,24 +654,28 @@ function matchesExpectedObject(actual, expected, state, strict) {
     return binaryEqual(actual, expected);
   }
 
-  const actualArrayBuffer = actual instanceof ArrayBuffer;
-  const expectedArrayBuffer = expected instanceof ArrayBuffer;
-  const actualSharedBuffer = typeof SharedArrayBuffer === "function" && actual instanceof SharedArrayBuffer;
-  const expectedSharedBuffer = typeof SharedArrayBuffer === "function" && expected instanceof SharedArrayBuffer;
-  if (actualArrayBuffer || expectedArrayBuffer || actualSharedBuffer || expectedSharedBuffer) {
-    if (actualArrayBuffer !== expectedArrayBuffer || actualSharedBuffer !== expectedSharedBuffer) return false;
+  const actualBufferKind = binaryBufferKind(actual);
+  const expectedBufferKind = binaryBufferKind(expected);
+  if (actualBufferKind !== null || expectedBufferKind !== null) {
+    if (actualBufferKind !== expectedBufferKind) return false;
     return binaryEqual(actual, expected);
   }
 
-  if (actual instanceof Date || expected instanceof Date) {
-    return actual instanceof Date && expected instanceof Date && actual.getTime() === expected.getTime();
+  const actualDate = isDateValue(actual);
+  const expectedDate = isDateValue(expected);
+  if (actualDate || expectedDate) {
+    return actualDate && expectedDate && dateGetTime.call(actual) === dateGetTime.call(expected);
   }
-  if (actual instanceof RegExp || expected instanceof RegExp) {
-    return actual instanceof RegExp && expected instanceof RegExp &&
+  const actualRegExp = isRegExpValue(actual);
+  const expectedRegExp = isRegExpValue(expected);
+  if (actualRegExp || expectedRegExp) {
+    return actualRegExp && expectedRegExp &&
       actual.source === expected.source && actual.flags === expected.flags;
   }
-  if (actual instanceof Error || expected instanceof Error) {
-    if (!(actual instanceof Error) || !(expected instanceof Error)) return false;
+  const actualError = isErrorValue(actual);
+  const expectedError = isErrorValue(expected);
+  if (actualError || expectedError) {
+    if (!actualError || !expectedError) return false;
     if (actual.name !== expected.name || actual.message !== expected.message) return false;
     if (strict && Object.hasOwn(actual, "cause") !== Object.hasOwn(expected, "cause")) return false;
     if (!matchesExpected(actual.cause, expected.cause, state, strict)) return false;
@@ -593,15 +707,19 @@ function matchesExpectedObject(actual, expected, state, strict) {
     if (actualTag !== expectedTag || !Object.is(actual.valueOf(), expected.valueOf())) return false;
   }
 
-  if (actual instanceof Map || expected instanceof Map) {
-    if (!(actual instanceof Map) || !(expected instanceof Map) || actual.size !== expected.size) return false;
+  const actualMap = isMapValue(actual);
+  const expectedMap = isMapValue(expected);
+  if (actualMap || expectedMap) {
+    if (!actualMap || !expectedMap || actual.size !== expected.size) return false;
     return matchUnordered(Array.from(expected.entries()), Array.from(actual.entries()), ([actualKey, actualValue], [expectedKey, expectedValue]) => {
       const keyMatch = matchesExpected(actualKey, expectedKey, state, strict);
       return mapMatchResult(keyMatch, (keyMatched) => keyMatched && matchesExpected(actualValue, expectedValue, state, strict));
     });
   }
-  if (actual instanceof Set || expected instanceof Set) {
-    if (!(actual instanceof Set) || !(expected instanceof Set) || actual.size !== expected.size) return false;
+  const actualSet = isSetValue(actual);
+  const expectedSet = isSetValue(expected);
+  if (actualSet || expectedSet) {
+    if (!actualSet || !expectedSet || actual.size !== expected.size) return false;
     return matchUnordered(Array.from(expected.values()), Array.from(actual.values()),
       (actualValue, expectedValue) => matchesExpected(actualValue, expectedValue, state, strict));
   }
@@ -705,8 +823,8 @@ function matchesObjectSubset(actual, expected, seen = new WeakMap()) {
     return everyMatch(expectedKeys, (key) => matchesObjectSubset(actual[key], expected[key], seen));
   }
 
-  if (expected instanceof Date || expected instanceof RegExp || expected instanceof Map || expected instanceof Set ||
-    ArrayBuffer.isView(expected) || expected instanceof ArrayBuffer) {
+  if (isDateValue(expected) || isRegExpValue(expected) || isMapValue(expected) || isSetValue(expected) ||
+    ArrayBuffer.isView(expected) || binaryBufferKind(expected) !== null) {
     return matchesExpected(actual, expected);
   }
 
@@ -810,9 +928,9 @@ function snapshotSerialize(value, seen = new Set()) {
   if (typeof value === "bigint") return `${value}n`;
   if (value === null || typeof value === "boolean") return String(value);
   if (typeof value === "number") return Object.is(value, -0) ? "-0" : String(value);
-  if (value instanceof Date) return value.toISOString();
-  if (value instanceof RegExp) return String(value);
-  if (value instanceof Error) return value.message ? `[${value.name || "Error"}: ${value.message}]` : `[${value.name || "Error"}]`;
+  if (isDateValue(value)) return value.toISOString();
+  if (isRegExpValue(value)) return String(value);
+  if (isErrorValue(value)) return value.message ? `[${value.name || "Error"}: ${value.message}]` : `[${value.name || "Error"}]`;
   if (typeof Promise === "function" && value instanceof Promise) return "Promise {}";
   if (typeof WeakMap === "function" && value instanceof WeakMap) return "WeakMap {}";
   if (typeof WeakSet === "function" && value instanceof WeakSet) return "WeakSet {}";
@@ -823,11 +941,12 @@ function snapshotSerialize(value, seen = new Set()) {
     if (typeof globalThis.Buffer?.isBuffer === "function" && globalThis.Buffer.isBuffer(value)) {
       return snapshotObjectBody({ type: "Buffer", data: Array.from(value) }, "", seen);
     }
-    if (value instanceof ArrayBuffer) {
+    if (binaryBufferKind(value) !== null) {
       const bytes = Array.from(new Uint8Array(value));
+      const name = binaryBufferKind(value) === "shared" ? "SharedArrayBuffer" : "ArrayBuffer";
       return bytes.length === 0
-        ? "ArrayBuffer []"
-        : `ArrayBuffer [\n${bytes.map((item) => `  ${item},`).join("\n")}\n]`;
+        ? `${name} []`
+        : `${name} [\n${bytes.map((item) => `  ${item},`).join("\n")}\n]`;
     }
     if (value instanceof DataView) {
       const bytes = Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
@@ -842,7 +961,7 @@ function snapshotSerialize(value, seen = new Set()) {
         ? `${name} []`
         : `${name} [\n${items.map((item) => `  ${snapshotSerialize(item, seen)},`).join("\n")}\n]`;
     }
-    if (value instanceof Map) {
+    if (isMapValue(value)) {
       if (value.size === 0) return "Map {}";
       return [
         "Map {",
@@ -853,7 +972,7 @@ function snapshotSerialize(value, seen = new Set()) {
         "}",
       ].join("\n");
     }
-    if (value instanceof Set) {
+    if (isSetValue(value)) {
       if (value.size === 0) return "Set {}";
       return [
         "Set {",
@@ -894,8 +1013,8 @@ function isEmptyValue(value) {
   if (value instanceof String) return String(value).length === 0;
   if (Array.isArray(value)) return value.length === 0;
   if (ArrayBuffer.isView(value)) return value.byteLength === 0;
-  if (value instanceof ArrayBuffer) return value.byteLength === 0;
-  if (value instanceof Map || value instanceof Set) return value.size === 0;
+  if (binaryBufferKind(value) !== null) return value.byteLength === 0;
+  if (isMapValue(value) || isSetValue(value)) return value.size === 0;
   if (typeof Headers !== "undefined" && value instanceof Headers) return iterableIsEmpty(value);
   if (typeof URLSearchParams !== "undefined" && value instanceof URLSearchParams) return iterableIsEmpty(value);
   if (typeof FormData !== "undefined" && value instanceof FormData) return iterableIsEmpty(value);
@@ -916,7 +1035,7 @@ function isEmptyValue(value) {
 function isEmptyObjectValue(value) {
   if (Array.isArray(value)) return value.length === 0;
   if (!value || typeof value !== "object") return false;
-  if (value instanceof Map || value instanceof Set || value instanceof Date || value instanceof RegExp) return false;
+  if (isMapValue(value) || isSetValue(value) || isDateValue(value) || isRegExpValue(value)) return false;
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) return false;
   return Object.keys(value).length === 0;
@@ -945,14 +1064,23 @@ function inlineSnapshotMatches(received, wanted) {
   return received.replace(/\\(["\\])/g, "$1") === wanted;
 }
 
-function nextSnapshotIdentity(hint = undefined) {
+function captureSnapshotContext(token = globalThis.__cottontailCurrentTestToken?.()) {
   const activeFile = typeof globalThis.__cottontailCurrentTestFile === "function"
     ? globalThis.__cottontailCurrentTestFile()
     : "";
-  const file = activeFile || globalThis.process?.argv?.[1] || "<script>";
   const testName = typeof globalThis.__cottontailCurrentTestName === "function"
     ? globalThis.__cottontailCurrentTestName().replace(/ > /g, " ")
     : "";
+  return {
+    token,
+    file: activeFile || globalThis.__cottontailRegisteringTestFile || globalThis.__filename ||
+      globalThis.process?.argv?.[1] || "<script>",
+    testName,
+  };
+}
+
+function nextSnapshotIdentity(hint = undefined, context = undefined) {
+  const { file, testName } = context ?? captureSnapshotContext();
   const scope = testName ? `${file}:${testName}` : file;
   const base = hint != null ? `${scope}:${String(hint)}` : scope;
   const current = snapshotCounters.get(base) ?? 0;
@@ -1010,7 +1138,7 @@ function snapshotFileState(testFile) {
   } else {
     exists = nodeExistsSync(path);
   }
-  state = { path, values, update, exists, dirty: false };
+  state = { path, values, update, exists, dirty: false, pendingAdded: 0 };
   snapshotFiles.set(path, state);
   return state;
 }
@@ -1226,8 +1354,9 @@ function inlineSnapshotCaller(kind) {
   throw new Error(`Failed to update inline snapshot: Could not find '${kind}' here`);
 }
 
-function inlineSnapshotTestFile() {
+function inlineSnapshotTestFile(context = undefined) {
   return normalizeInlineSnapshotPath(
+    context?.file ||
     globalThis.__cottontailCurrentTestFile?.() ||
     globalThis.__cottontailRegisteringTestFile ||
     globalThis.__filename ||
@@ -1368,16 +1497,16 @@ function inlineSnapshotEdit(state, call, value, hasMatchers, existingValue) {
   return { start: second.start, end: second.end, replacement };
 }
 
-function queueInlineSnapshot(kind, value, hasMatchers, existingValue) {
-  const caller = inlineSnapshotCaller(kind);
-  const testFile = inlineSnapshotTestFile();
+function queueInlineSnapshot(kind, value, hasMatchers, existingValue, context = undefined, caller = undefined) {
+  caller ??= inlineSnapshotCaller(kind);
+  const testFile = inlineSnapshotTestFile(context);
   if (caller.file !== testFile) {
     throw new Error(
       `Inline snapshot matchers must be called from the test file: expected ${testFile}, called from ${caller.file}`,
     );
   }
   const state = inlineSnapshotFileState(testFile);
-  const scope = globalThis.__cottontailCurrentTestToken?.() ?? "<module>";
+  const scope = context?.token ?? globalThis.__cottontailCurrentTestToken?.() ?? "<module>";
   const call = resolveInlineSnapshotCall(state, caller, scope);
   const previous = state.edits.get(call.identifierStart);
   if (previous) {
@@ -1388,28 +1517,54 @@ function queueInlineSnapshot(kind, value, hasMatchers, existingValue) {
     return;
   }
   const edit = inlineSnapshotEdit(state, call, value, hasMatchers, existingValue);
-  state.edits.set(call.identifierStart, { ...edit, call, value });
+  state.edits.set(call.identifierStart, {
+    ...edit,
+    call,
+    value,
+    isAdded: existingValue === undefined,
+    additionReported: false,
+  });
   state.dirty = true;
   globalThis.__cottontailBunTestUsed = true;
 }
 
-function matchOrQueueInlineSnapshot(kind, actual, expected, hasMatchers) {
+function matchOrQueueInlineSnapshot(kind, actual, expected, hasMatchers, context = undefined, caller = undefined) {
   const value = snapshotText(actual);
   const received = normalizeSnapshotText(value);
   const wanted = normalizeSnapshotText(expected);
   if (expected === undefined) {
     if (snapshotCreationDisabledInCI() && !snapshotUpdateRequested()) {
-      throw new Error("Inline snapshot creation is disabled in CI environments unless --update-snapshots is used");
+      throw new Error([
+        "Inline snapshot creation is disabled in CI environments unless --update-snapshots is used",
+        `Received: ${received}`,
+      ].join("\n"));
     }
-    queueInlineSnapshot(kind, value, hasMatchers, expected);
+    queueInlineSnapshot(kind, value, hasMatchers, expected, context, caller);
     return { pass: true, received, wanted };
   }
   const pass = inlineSnapshotMatches(received, wanted);
+  if (pass) snapshotReporter.passed += 1;
   if (!pass && snapshotUpdateRequested()) {
-    queueInlineSnapshot(kind, value, hasMatchers, expected);
+    snapshotReporter.passed += 1;
+    queueInlineSnapshot(kind, value, hasMatchers, expected, context, caller);
     return { pass: true, received, wanted };
   }
+  if (!pass) snapshotReporter.failed += 1;
   return { pass, received, wanted };
+}
+
+function reportSnapshotSummary() {
+  if (snapshotReporter.reported || (snapshotReporter.added === 0 && snapshotReporter.failed === 0)) return;
+  const parts = [];
+  if (snapshotReporter.passed > 0) parts.push(`${snapshotReporter.passed} passed`);
+  if (snapshotReporter.added > 0) parts.push(`+${snapshotReporter.added} added`);
+  if (snapshotReporter.failed > 0) parts.push(`${snapshotReporter.failed} failed`);
+  console.error(`snapshots: ${parts.join(", ")}`);
+  snapshotReporter.reported = true;
+
+  // The Node-backed reporter prints the compact snapshot total. Bun prints
+  // expect() calls separately whenever the detailed snapshot line is used.
+  globalThis.__cottontailTestSnapshotCount = 0;
 }
 
 function flushSnapshotFiles() {
@@ -1420,6 +1575,8 @@ function flushSnapshotFiles() {
     cottontail.writeFile(state.path, renderSnapshotFile(state.values));
     state.dirty = false;
     state.exists = true;
+    snapshotReporter.added += state.pendingAdded;
+    state.pendingAdded = 0;
   }
   for (const state of inlineSnapshotFiles.values()) {
     if (!state.dirty || state.invalid) continue;
@@ -1439,38 +1596,55 @@ function flushSnapshotFiles() {
     cottontail.writeFile(state.path, output);
     state.source = output;
     state.dirty = false;
+    for (const edit of edits) {
+      if (!edit.isAdded || edit.additionReported) continue;
+      snapshotReporter.added += 1;
+      edit.additionReported = true;
+    }
   }
+  reportSnapshotSummary();
 }
 
 globalThis.__cottontailHasPendingSnapshots = () =>
   Array.from(snapshotFiles.values()).some((state) => state.dirty) ||
   Array.from(inlineSnapshotFiles.values()).some((state) => state.dirty && !state.invalid);
 
-function compareSnapshot(actual, expected = undefined, hint = undefined) {
+function compareSnapshot(actual, expected = undefined, hint = undefined, context = undefined) {
   const text = snapshotText(actual);
   if (expected != null) {
     return text === normalizeSnapshotText(expected);
   }
-  const identity = nextSnapshotIdentity(hint);
+  const identity = nextSnapshotIdentity(hint, context);
   const state = snapshotFileState(identity.file);
   const existing = state.values.get(identity.exportKey);
   if (existing === undefined) {
     if (snapshotCreationDisabledInCI() && !state.update) {
-      throw new Error(`Snapshot ${identity.exportKey} does not exist and snapshot creation is disabled in CI`);
+      throw new Error([
+        "Snapshot creation is disabled in CI environments",
+        `Snapshot name: ${JSON.stringify(identity.exportKey)}`,
+        `Received: ${text}`,
+      ].join("\n"));
     }
     state.values.set(identity.exportKey, text);
     state.dirty = true;
+    state.pendingAdded += 1;
     snapshots.set(identity.key, text);
     return true;
   }
   if (existing !== text && state.update) {
     state.values.set(identity.exportKey, text);
     state.dirty = true;
+    snapshotReporter.passed += 1;
     snapshots.set(identity.key, text);
     return true;
   }
   snapshots.set(identity.key, existing);
-  return existing === text;
+  if (existing === text) {
+    snapshotReporter.passed += 1;
+    return true;
+  }
+  snapshotReporter.failed += 1;
+  return false;
 }
 
 function assertPropertyMatchers(actual, propertyMatchers) {
@@ -1911,13 +2085,17 @@ class Expectation {
     rejectedValue = false,
     testToken = globalThis.__cottontailCurrentTestToken?.(),
   ) {
-    this.actual = actual;
-    this._negate = negate;
-    this._promiseMode = promiseMode;
-    this._label = label;
-    this._rejectedValue = rejectedValue;
-    this._testToken = testToken;
+    Object.defineProperties(this, {
+      actual: { configurable: true, writable: true, value: actual },
+      _negate: { configurable: true, writable: true, value: negate },
+      _promiseMode: { configurable: true, writable: true, value: promiseMode },
+      _label: { configurable: true, writable: true, value: label },
+      _rejectedValue: { configurable: true, writable: true, value: rejectedValue },
+      _testToken: { configurable: true, writable: true, value: testToken },
+    });
   }
+
+  get [Symbol.toStringTag]() { return "Expect"; }
 
   get not() {
     return new Expectation(this.actual, !this._negate, this._promiseMode, this._label, this._rejectedValue, this._testToken);
@@ -1950,16 +2128,6 @@ class Expectation {
         new Expectation(actual, this._negate, null, this._label, mode === "rejects", this._testToken),
         actual,
       );
-      const state = nativePromiseState(promise);
-      if (state?.status === 1 || state?.status === 2) {
-        if (state.status === 2) promise.catch(() => {});
-        const matchedMode = (mode === "resolves") === (state.status === 1);
-        if (!matchedMode) throw promiseModeError(mode, state.value);
-        const result = runCheck(state.value);
-        if (isPromiseLike(result)) globalThis.__cottontailRegisterTestPendingPromise?.(result);
-        return undefined;
-      }
-
       const result = Promise.resolve(promise).then(
         (value) => {
           if (mode === "rejects") throw promiseModeError(mode, value);
@@ -1970,6 +2138,20 @@ class Expectation {
           return runCheck(error);
         },
       );
+
+      // Attach the mode handlers before draining. Waiting on the original
+      // promise first lets JSC report a rejection as unhandled even though an
+      // expect(...).rejects matcher consumes it in the same test turn.
+      if (promise instanceof Promise && typeof globalThis.cottontail?.waitForPromise === "function") {
+        result.catch(() => {});
+        globalThis.cottontail.waitForPromise(result);
+        const state = nativePromiseState(result);
+        if (state?.status === 2) {
+          throw state.value;
+        }
+        if (state?.status === 1) return undefined;
+      }
+
       globalThis.__cottontailRegisterTestPendingPromise?.(result);
       return undefined;
     }
@@ -2033,10 +2215,22 @@ class Expectation {
   toBeFalse() { return this._wrap((actual) => this._check(actual === false, "Expected value to be false")); }
   toBeNaN() { return this._wrap((actual) => this._check(Number.isNaN(actual), "Expected value to be NaN")); }
   toBeFinite() { return this._wrap((actual) => this._check(Number.isFinite(actual), "Expected value to be finite")); }
-  toBeTypeOf(type) { return this._wrap((actual) => this._check(typeof actual === String(type), `Expected type ${type}`)); }
+  toBeTypeOf(type) {
+    const validTypes = ["function", "object", "bigint", "boolean", "number", "string", "symbol", "undefined"];
+    if (typeof type !== "string") throw new TypeError("toBeTypeOf() requires a string argument");
+    if (!validTypes.includes(type)) {
+      throw new TypeError("toBeTypeOf() requires a valid type string argument ('function', 'object', 'bigint', 'boolean', 'number', 'string', 'symbol', 'undefined')");
+    }
+    return this._wrap((actual) => this._check(typeof actual === type, `Expected type ${type}`));
+  }
   toBeInstanceOf(type) { return this._wrap((actual) => this._check(actual instanceof type, `Expected instance of ${type?.name ?? type}`)); }
   toBeArray() { return this._wrap((actual) => this._check(Array.isArray(actual), "Expected value to be an array")); }
-  toBeArrayOfSize(size) { return this._wrap((actual) => this._check(Array.isArray(actual) && actual.length === Number(size), `Expected array size ${size}`)); }
+  toBeArrayOfSize(size) {
+    if (typeof size !== "number" || !Number.isInteger(size) || Object.is(size, -0)) {
+      throw new Error("toBeArrayOfSize() requires the first argument to be a number");
+    }
+    return this._wrap((actual) => this._check(Array.isArray(actual) && actual.length === size, `Expected array size ${size}`));
+  }
   toBeObject() { return this._wrap((actual) => this._check(isObjectLike(actual), "Expected value to be an object")); }
   toBeFunction() { return this._wrap((actual) => this._check(typeof actual === "function", "Expected value to be a function")); }
   toBeString() { return this._wrap((actual) => this._check(typeof actual === "string" || actual instanceof String, "Expected value to be a string")); }
@@ -2070,7 +2264,7 @@ class Expectation {
   }
   toBeNegative() {
     return this._wrap((actual) => this._check(
-      typeof actual === "number" && Number.isFinite(actual) && Math.round(actual) < 0,
+      typeof actual === "number" && Number.isFinite(actual) && actual < 0 && Math.round(-actual) > 0,
       "Expected negative number",
     ));
   }
@@ -2078,7 +2272,17 @@ class Expectation {
   toBeGreaterThanOrEqual(expected) { return this._wrap((actual) => this._check(actual >= expected, `Expected >= ${expected}`)); }
   toBeLessThan(expected) { return this._wrap((actual) => this._check(actual < expected, `Expected < ${expected}`)); }
   toBeLessThanOrEqual(expected) { return this._wrap((actual) => this._check(actual <= expected, `Expected <= ${expected}`)); }
-  toBeCloseTo(expected, precision = 2) { return this._wrap((actual) => this._check(Math.abs(Number(actual) - Number(expected)) < 10 ** -Number(precision) / 2, `Expected close to ${expected}`)); }
+  toBeCloseTo(expected, precision = 2) {
+    if (typeof expected !== "number") throw new TypeError("Expected expected to be a number for 'toBeCloseTo'.");
+    if (typeof precision !== "number") throw new TypeError("Expected precision to be a number for 'toBeCloseTo'.");
+    return this._wrap((actual) => {
+      if (typeof actual !== "number") throw new TypeError("Expected received to be a number for 'expect'.");
+      const bothInfinite = !Number.isNaN(actual) && !Number.isFinite(actual) &&
+        !Number.isNaN(expected) && !Number.isFinite(expected);
+      const pass = bothInfinite || Math.abs(actual - expected) < 10 ** -precision / 2;
+      this._check(pass, `Expected close to ${expected}`);
+    });
+  }
   toBeWithin(min, max) {
     if (arguments.length < 2) throw new TypeError("toBeWithin() requires 2 arguments");
     if (typeof min !== "number") throw new TypeError("toBeWithin() requires the first argument to be a number");
@@ -2092,7 +2296,17 @@ class Expectation {
 
   toContain(expected) {
     return this._wrap((actual) => {
-      const pass = typeof actual === "string" ? actual.includes(String(expected)) : Array.from(actual ?? []).some((value) => matchesExpected(value, expected));
+      if (typeof actual === "string") {
+        if (typeof expected !== "string") {
+          throw new Error("Received value must be an array type, or both received and expected values must be strings.");
+        }
+        this._check(actual.includes(expected), `Expected ${formatValue(actual)} to contain ${formatValue(expected)}`);
+        return;
+      }
+      if (actual == null || typeof actual[Symbol.iterator] !== "function") {
+        throw new Error("Received value must be an array type, or both received and expected values must be strings.");
+      }
+      const pass = Array.from(actual).some((value) => Object.is(value, expected));
       this._check(pass, `Expected ${formatValue(actual)} to contain ${formatValue(expected)}`);
     });
   }
@@ -2130,9 +2344,12 @@ class Expectation {
     });
   }
   toHaveLength(length) {
+    if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0) {
+      throw new Error(`Expected value must be a non-negative integer: ${formatValue(length)}`);
+    }
     return this._wrap((actual) => {
       let actualLength = actual?.length;
-      if (actualLength == null && (actual instanceof ArrayBuffer || ArrayBuffer.isView(actual))) actualLength = actual.byteLength;
+      if (actualLength == null && (binaryBufferKind(actual) !== null || ArrayBuffer.isView(actual))) actualLength = actual.byteLength;
       if (actualLength == null && typeof Headers === "function" && actual instanceof Headers) actualLength = Array.from(actual.keys()).length;
       if (actualLength == null && typeof FormData === "function" && actual instanceof FormData) actualLength = Array.from(actual.keys()).length;
       if (actualLength == null && typeof URLSearchParams === "function" && actual instanceof URLSearchParams) actualLength = Array.from(actual.keys()).length;
@@ -2262,6 +2479,36 @@ class Expectation {
     });
   }
 
+  toThrowWithCode(cls, code) {
+    return this._wrap((actual) => {
+      let didThrow = false;
+      let thrown;
+      try {
+        actual();
+      } catch (error) {
+        didThrow = true;
+        thrown = error;
+      }
+
+      let pass = false;
+      let message;
+      if (!didThrow) {
+        message = () => "Received function did not throw";
+      } else if (!(thrown instanceof cls)) {
+        message = () => `Expected error to be instanceof ${cls.name}; got ${thrown.__proto__.constructor.name}`;
+      } else if (!("code" in thrown)) {
+        message = () => `Expected error to have property 'code'; got ${thrown}`;
+      } else if (thrown.code !== code) {
+        message = () => `Expected error to have code '${code}'; got ${thrown.code}`;
+      } else {
+        pass = true;
+      }
+
+      this._check(pass, message ?? (() => "No message was specified for this matcher."));
+      return this;
+    });
+  }
+
   toThrowError(expected = undefined) { return this.toThrow(expected); }
   toThrowErrorMatchingSnapshot(hint = undefined) {
     countSnapshotAssertion();
@@ -2273,11 +2520,15 @@ class Expectation {
     if (!currentTest || currentTest !== this._testToken) {
       throw new Error("Snapshot matchers cannot be used outside of a test");
     }
+    const snapshotContext = captureSnapshotContext(currentTest);
     return this._wrap((actual) => {
       const checkThrown = (didThrow, thrown) => {
         if (!didThrow) return this._check(false, "Matcher error: Received function did not throw");
         const value = thrown instanceof Error ? thrown.message : undefined;
-        return this._check(compareSnapshot(value, undefined, hint), "Expected thrown error to match snapshot");
+        return this._check(
+          compareSnapshot(value, undefined, hint, snapshotContext),
+          "Expected thrown error to match snapshot",
+        );
       };
       if (typeof actual !== "function") return checkThrown(this._rejectedValue || actual instanceof Error, actual);
       let result;
@@ -2309,7 +2560,9 @@ class Expectation {
     if ((currentTest && currentTest !== this._testToken) || (!currentTest && !globalThis.__cottontailRegisteringTestFile)) {
       throw new Error("Snapshot matchers cannot be used outside of a test");
     }
-    nextSnapshotIdentity();
+    const snapshotContext = captureSnapshotContext(currentTest);
+    const snapshotCaller = inlineSnapshotCaller("toThrowErrorMatchingInlineSnapshot");
+    nextSnapshotIdentity(undefined, snapshotContext);
     return this._wrap((actual) => {
       const checkThrown = (didThrow, thrown) => {
         if (!didThrow) {
@@ -2324,6 +2577,8 @@ class Expectation {
           value,
           inlineSnapshot,
           false,
+          snapshotContext,
+          snapshotCaller,
         );
         return this._check(
           result.pass,
@@ -2361,6 +2616,7 @@ class Expectation {
         !globalThis.__cottontailCurrentTestHasOwnConcurrency?.()) {
       throw new Error("Snapshot matchers are not supported in concurrent tests");
     }
+    const snapshotContext = captureSnapshotContext(currentTest);
     // Bun validates argument order: with two arguments the first must be a
     // property-matcher object and the second a string hint.
     if (arguments.length >= 2) {
@@ -2376,7 +2632,10 @@ class Expectation {
       } else if (propertyMatchers && typeof propertyMatchers === "object") {
         assertPropertyMatchers(actual, propertyMatchers);
       }
-      this._check(compareSnapshot(actual, undefined, snapshotHint), "Expected value to match snapshot");
+      this._check(
+        compareSnapshot(actual, undefined, snapshotHint, snapshotContext),
+        "Expected value to match snapshot",
+      );
     });
   }
   toMatchInlineSnapshot(propertyMatchers = undefined, inlineSnapshot = undefined) {
@@ -2387,17 +2646,15 @@ class Expectation {
         (!currentTest && !globalThis.__cottontailRegisteringTestFile && !globalThis.__cottontailLoadingTestModules)) {
       throw new Error("Snapshot matchers cannot be used outside of a test");
     }
-    if (globalThis.__cottontailCurrentTestIsConcurrent?.() &&
-        !globalThis.__cottontailCurrentTestHasOwnConcurrency?.()) {
-      throw new Error("Snapshot matchers are not supported in concurrent tests");
-    }
+    const snapshotContext = captureSnapshotContext(currentTest);
+    const snapshotCaller = inlineSnapshotCaller("toMatchInlineSnapshot");
     if (arguments.length >= 2 && !isObject(propertyMatchers)) {
       throw new Error("Matcher error: Expected properties must be an object");
     }
     if (arguments.length === 1 && typeof propertyMatchers !== "string" && !isObject(propertyMatchers)) {
       throw new Error("Matcher error: Expected first argument to be a string or object");
     }
-    nextSnapshotIdentity();
+    nextSnapshotIdentity(undefined, snapshotContext);
     return this._wrap((actual) => {
       let expected = inlineSnapshot;
       let hasMatchers = false;
@@ -2407,7 +2664,14 @@ class Expectation {
         hasMatchers = true;
         assertPropertyMatchers(actual, propertyMatchers);
       }
-      const result = matchOrQueueInlineSnapshot("toMatchInlineSnapshot", actual, expected, hasMatchers);
+      const result = matchOrQueueInlineSnapshot(
+        "toMatchInlineSnapshot",
+        actual,
+        expected,
+        hasMatchers,
+        snapshotContext,
+        snapshotCaller,
+      );
       this._check(
         result.pass,
         `Expected value to match inline snapshot\nExpected: ${JSON.stringify(result.wanted)}\nReceived: ${JSON.stringify(result.received)}`,
@@ -2752,7 +3016,7 @@ expect.hasAssertions = () => {
   currentAssertionState().required = true;
 };
 expect.extend = installCustomMatchers;
-expect.addSnapshotSerializer = (_serializer) => undefined;
+expect.addSnapshotSerializer = (_serializer) => { throw new Error("Not implemented"); };
 expect.unreachable = (message = "reached unreachable code") => { throw new nodeAssert.AssertionError({ message }); };
 
 function normalizeMockImplementation(implementation, provided = true) {
@@ -3069,6 +3333,86 @@ export function setDefaultTimeout(_timeout) {
   nodeSetDefaultTimeout(_timeout);
 }
 
+const doneSchedulerStorage = new AsyncLocalStorage();
+const previousDoneFrames = new Map();
+
+function normalizeDoneFramePath(path) {
+  let normalized = String(path ?? "").replaceAll("\\", "/");
+  if (normalized.startsWith("file://")) normalized = normalized.slice("file://".length);
+  return normalized.replace(/[?#].*$/, "");
+}
+
+function doneContinuationFrame(error) {
+  let stack = "";
+  try {
+    stack = String(error?.stack ?? new Error().stack ?? "");
+  } catch {}
+  const currentFile = normalizeDoneFramePath(globalThis.__cottontailCurrentTestFile?.());
+  for (const line of stack.split("\n")) {
+    const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
+    const v8Frame = /^\s*at\s+(?:(.*?)\s+\()?(.+):([0-9]+):([0-9]+)\)?$/.exec(line);
+    const filePath = normalizeDoneFramePath(jscFrame?.[2] ?? v8Frame?.[2]);
+    const lineNumber = Number(jscFrame?.[3] ?? v8Frame?.[3]);
+    if (!filePath || !Number.isFinite(lineNumber) || (currentFile && filePath !== currentFile)) continue;
+    let column = Number(jscFrame?.[4] ?? v8Frame?.[4]);
+    try {
+      const sourceLine = String(nodeReadFileSync(filePath, "utf8")).split(/\r?\n/)[lineNumber - 1] ?? "";
+      const constructorIndex = sourceLine.search(/\bnew\s+(?:[A-Za-z_$][\w$]*Error|Error)\b/);
+      const prefix = constructorIndex >= 0 ? sourceLine.slice(0, constructorIndex) : sourceLine;
+      const calls = [...prefix.matchAll(/\b[A-Za-z_$][\w$]*\s*\(/g)];
+      if (calls.length > 0) column = calls[calls.length - 1].index + 1;
+    } catch {}
+    return { functionName: "<anonymous>", filePath, line: lineNumber, column };
+  }
+  return null;
+}
+
+function runDoneCallbackWithSchedulerTracking(callback, done) {
+  const restorations = [];
+  const replace = (owner, property, replacement) => {
+    const original = owner?.[property];
+    if (typeof original !== "function") return;
+    try {
+      owner[property] = replacement(original);
+      restorations.push([owner, property, owner[property], original]);
+    } catch {}
+  };
+  const wrapCallback = (kind, callbackValue) => typeof callbackValue !== "function"
+    ? callbackValue
+    : function doneScheduledCallback(...args) {
+      return doneSchedulerStorage.run(kind, () => Reflect.apply(callbackValue, this, args));
+    };
+
+  replace(Promise.prototype, "then", (original) => function then(onFulfilled, onRejected) {
+    return Reflect.apply(original, this, [
+      wrapCallback("promise", onFulfilled),
+      wrapCallback("promise", onRejected),
+    ]);
+  });
+  for (const [name, kind] of [
+    ["queueMicrotask", "microtask"],
+    ["setTimeout", "timeout"],
+    ["setInterval", "timeout"],
+    ["setImmediate", "immediate"],
+  ]) {
+    replace(globalThis, name, (original) => function scheduleDoneCallback(callbackValue, ...args) {
+      return Reflect.apply(original, this, [wrapCallback(kind, callbackValue), ...args]);
+    });
+  }
+  replace(globalThis.process, "nextTick", (original) => function nextTick(callbackValue, ...args) {
+    return Reflect.apply(original, this, [wrapCallback("nextTick", callbackValue), ...args]);
+  });
+
+  try {
+    return doneSchedulerStorage.run("sync", () => callback(done));
+  } finally {
+    for (let index = restorations.length - 1; index >= 0; index -= 1) {
+      const [owner, property, replacement, original] = restorations[index];
+      if (owner[property] === replacement) owner[property] = original;
+    }
+  }
+}
+
 function wrapDoneCallback(callback) {
   if (typeof callback !== "function" || callback.length === 0) return callback;
   return () => new Promise((resolve, reject) => {
@@ -3101,11 +3445,22 @@ function wrapDoneCallback(callback) {
     const done = (error = undefined) => {
       if (doneCalled || settled) return;
       doneCalled = true;
+      const frame = doneContinuationFrame(error);
+      const scheduler = doneSchedulerStorage.getStore();
+      const previousFrame = frame && previousDoneFrames.get(frame.filePath);
+      if (error instanceof Error && previousFrame &&
+          (scheduler === "promise" || scheduler === "microtask" || scheduler === "nextTick")) {
+        Object.defineProperty(error, "__cottontailBunAsyncParentFrames", {
+          configurable: true,
+          value: [previousFrame],
+        });
+      }
+      if (frame) previousDoneFrames.set(frame.filePath, frame);
       if (error !== undefined && error !== null) doneError = error;
       finish();
     };
     try {
-      const result = callback(done);
+      const result = runDoneCallbackWithSchedulerTracking(callback, done);
       returnedPromise = result && typeof result.then === "function" ? result : null;
       returnedPromiseSettled = returnedPromise === null;
       callbackReturned = true;
@@ -3258,10 +3613,44 @@ const bunRootSuite = {
   totalTestCount: 0,
   orderScope: createBunTestOrderScope(),
 };
+// Grouped runs share one JS realm, so use unnamed suites to retain Bun's
+// per-file lifecycle boundaries without changing visible test names.
+const bunFileSuites = new Map();
 let currentBunSuite = bunRootSuite;
 
-const startNodeTestRun = globalThis.__cottontailStartTestRun;
-globalThis.__cottontailStartTestRun = () => {
+function bunRegistrationSuite() {
+  if (currentBunSuite !== bunRootSuite) return currentBunSuite;
+  const registeringFile = globalThis.__cottontailRegisteringTestFile;
+  if (!registeringFile) return bunRootSuite;
+  const file = normalizeInlineSnapshotPath(registeringFile);
+  let suite = bunFileSuites.get(file);
+  if (suite) return suite;
+
+  suite = {
+    name: "",
+    parent: bunRootSuite,
+    matchingTestCount: 0,
+    totalTestCount: 0,
+    orderScope: createBunTestOrderScope(bunRootSuite.orderScope),
+  };
+  beginBunTestCollection(suite.orderScope);
+  bunFileSuites.set(file, suite);
+  const registrationLine = captureTestRegistrationLine(registeringFile);
+  enqueueBunTestEntry(bunRootSuite.orderScope, () => nodeDescribe(
+    "",
+    {
+      __bunDeferredDefinition: true,
+      __bunRegistrationLine: registrationLine,
+      __bunTest: true,
+    },
+    wrapBunDescribeCallback(() => {}, suite),
+  ));
+  return suite;
+}
+
+const startNodeTestRunSymbol = Symbol.for("cottontail.internal.startTestRun");
+const startNodeTestRun = globalThis[startNodeTestRunSymbol];
+globalThis[startNodeTestRunSymbol] = () => {
   flushBunTestOrderScope(bunRootSuite.orderScope);
   reportBunTestRandomizationSeed();
   return startNodeTestRun?.();
@@ -3276,9 +3665,9 @@ function bunSuiteNames(suite) {
   return names.reverse();
 }
 
-function noteBunTestSelection(name) {
+function noteBunTestSelection(name, registrationSuite = currentBunSuite) {
   const matches = bunTestNameMatches(bunSuiteNames(currentBunSuite), name);
-  for (let suite = currentBunSuite; suite; suite = suite.parent) {
+  for (let suite = registrationSuite; suite; suite = suite.parent) {
     suite.totalTestCount += 1;
     if (matches) suite.matchingTestCount += 1;
   }
@@ -3308,10 +3697,10 @@ function wrapBunDescribeCallback(callback, suite) {
   };
 }
 
-function wrapBunLifecycleHook(callback) {
+function wrapBunLifecycleHook(callback, suite) {
   const wrapped = wrapDoneCallback(callback);
-  if (!bunTestFilterIsActive() || typeof wrapped !== "function") return wrapped;
-  const suite = currentBunSuite;
+  if (typeof wrapped !== "function") return wrapped;
+  if (!bunTestFilterIsActive()) return wrapped;
   return function bunFilteredLifecycleHook(...args) {
     if (suite.matchingTestCount === 0) return undefined;
     return Reflect.apply(wrapped, this, args);
@@ -3339,6 +3728,7 @@ function makeBunTestFunction(base) {
   const register = (args, extraOptions = {}, requireCallback = false) => {
     globalThis.__cottontailBunTestUsed = true;
     if (extraOptions.only) assertOnlyAllowed();
+    const registrationSuite = bunRegistrationSuite();
     const parsed = parseCallbackArgs(args);
     if (requireCallback && typeof parsed.callback !== "function") {
       throw new TypeError("test.failing expects a function as the second argument");
@@ -3349,8 +3739,8 @@ function makeBunTestFunction(base) {
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
     );
     if (options.todo && typeof parsed.callback !== "function") registrationLine = Math.max(0, registrationLine - 1);
-    noteBunTestSelection(name);
-    return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+    noteBunTestSelection(name, registrationSuite);
+    return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
       name,
       applyBunFileConcurrency({
         ...options,
@@ -3392,6 +3782,7 @@ function makeBunTestFunction(base) {
 function makeBunDescribe(base) {
   const fn = (...args) => {
     globalThis.__cottontailBunTestUsed = true;
+    const registrationSuite = bunRegistrationSuite();
     const parsed = parseDescribeArgs(args);
     const name = normalizeTestName(parsed.name);
     const registrationLine = captureTestRegistrationLine(
@@ -3399,12 +3790,12 @@ function makeBunDescribe(base) {
     );
     const suite = {
       name,
-      parent: currentBunSuite,
+      parent: registrationSuite,
       matchingTestCount: 0,
       totalTestCount: 0,
-      orderScope: createBunTestOrderScope(currentBunSuite.orderScope),
+      orderScope: createBunTestOrderScope(registrationSuite.orderScope),
     };
-    return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+    return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
       name,
       applyBunFileConcurrency({ ...parsed.options, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
       wrapBunDescribeCallback(parsed.callback, suite),
@@ -3415,6 +3806,7 @@ function makeBunDescribe(base) {
     const result = (...args) => {
       globalThis.__cottontailBunTestUsed = true;
       if (extraOptions.only) assertOnlyAllowed();
+      const registrationSuite = bunRegistrationSuite();
       const parsed = parseDescribeArgs(args);
       const name = normalizeTestName(parsed.name);
       const registrationLine = captureTestRegistrationLine(
@@ -3422,12 +3814,12 @@ function makeBunDescribe(base) {
       );
       const suite = {
         name,
-        parent: currentBunSuite,
+        parent: registrationSuite,
         matchingTestCount: 0,
         totalTestCount: 0,
-        orderScope: createBunTestOrderScope(currentBunSuite.orderScope),
+        orderScope: createBunTestOrderScope(registrationSuite.orderScope),
       };
-      return enqueueBunTestEntry(currentBunSuite.orderScope, () => base(
+      return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
         name,
         applyBunFileConcurrency({ ...parsed.options, ...extraOptions, __bunRegistrationLine: registrationLine, __bunDeferredDefinition: true, __bunTest: true }),
         wrapBunDescribeCallback(parsed.callback, suite),
@@ -3485,26 +3877,26 @@ function assertOnlyAllowed() {
 
 export const beforeAll = (callback, options = {}) => {
   markBunTestUsed();
-  const suite = currentBunSuite;
-  const hook = wrapBunLifecycleHook(callback);
+  const suite = bunRegistrationSuite();
+  const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeBefore(hook, options));
 };
 export const afterAll = (callback, options = {}) => {
   markBunTestUsed();
-  const suite = currentBunSuite;
-  const hook = wrapBunLifecycleHook(callback);
+  const suite = bunRegistrationSuite();
+  const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeAfter(hook, options));
 };
 export const beforeEach = (callback, options = {}) => {
   markBunTestUsed();
-  const suite = currentBunSuite;
-  const hook = wrapBunLifecycleHook(callback);
+  const suite = bunRegistrationSuite();
+  const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeBeforeEach(hook, options));
 };
 export const afterEach = (callback, options = {}) => {
   markBunTestUsed();
-  const suite = currentBunSuite;
-  const hook = wrapBunLifecycleHook(callback);
+  const suite = bunRegistrationSuite();
+  const hook = wrapBunLifecycleHook(callback, suite);
   return enqueueBunTestHook(suite.orderScope, () => nodeAfterEach(hook, options));
 };
 export const test = makeBunTestFunction(nodeTest);

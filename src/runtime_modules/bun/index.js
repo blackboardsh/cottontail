@@ -4,7 +4,12 @@ import * as nodeDns from "../node/dns.js";
 import * as nodeHttp from "../node/http.js";
 import * as nodeHttps from "../node/https.js";
 import * as nodeNet from "../node/net.js";
-import { connect as nodeTlsConnect } from "../node/tls.js";
+import { Readable as NodeReadable } from "../node/stream.js";
+import {
+  _connectMemoryTransport as nodeTlsConnectMemoryTransport,
+  connect as nodeTlsConnect,
+  createServer as nodeTlsCreateServer,
+} from "../node/tls.js";
 import * as zlib from "../node/zlib.js";
 import { createUndiciModule } from "../node/undici.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
@@ -31,6 +36,7 @@ import { parse as parseTOML, stringify as stringifyTOML } from "./toml.js";
 import { parse as parseYAML, stringify as stringifyYAML } from "./yaml.js";
 import picomatch from "../vendor/picomatch.js";
 import {
+  remapErrorPosition as remapBundleErrorPosition,
   remapPosition as remapBundlePosition,
   remapStackString as remapBundleStack,
   sourceContextForLocation as bundleSourceContextForLocation,
@@ -62,8 +68,7 @@ import {
   installInheritedNodeIpc,
   isCottontailIpcFrame,
 } from "../internal/bun-spawn-ipc.js";
-import { parseShell } from "../internal/bun-shell-parser.js";
-import { createBunShellRuntime } from "../internal/bun-shell-runtime.js";
+import { createBunShellRuntime, parseBunShellSource } from "../internal/bun-shell-runtime.js";
 
 installInheritedNodeIpc(cottontail);
 
@@ -87,12 +92,143 @@ if (inheritedSpawnExecPath != null) {
   });
   try { delete globalThis.process.env.COTTONTAIL_SPAWN_EXEC_PATH; } catch {}
 }
+const inheritedFileBackedStdin = globalThis.process?.env?.COTTONTAIL_SPAWN_STDIN_FILE === "1";
+if (inheritedFileBackedStdin) {
+  const stream = globalThis.process?.stdin;
+  for (const method of ["ref", "unref"]) {
+    try {
+      delete stream?.[method];
+      if (typeof stream?.[method] === "function") {
+        Object.defineProperty(stream, method, { value: undefined, configurable: true });
+      }
+    } catch {}
+  }
+  try { delete globalThis.process.env.COTTONTAIL_SPAWN_STDIN_FILE; } catch {}
+}
+
+let ctEvalOffsetMap;
+let ctEvalLineOffset;
+const ctDynamicFunctionNames = [];
+
+function evalBootstrapLineOffset() {
+  const map = globalThis.__cottontailBundleSourceMap ?? globalThis.__cottontailBundleSourceMapData;
+  if (map == null) return 0;
+  if (ctEvalOffsetMap === map) return ctEvalLineOffset ?? 0;
+  ctEvalOffsetMap = map;
+  ctEvalLineOffset = 0;
+  const cwd = globalThis.process?.cwd?.();
+  if (typeof cwd !== "string") return 0;
+  const source = nodePathResolve(cwd, "[eval]").replaceAll("\\", "/");
+  const context = bundleSourceContextForLocation(source, 1, 1);
+  const lines = context?.lines;
+  if (!Array.isArray(lines)) return 0;
+  const boundary = lines.findIndex((line, index) =>
+    index > 0 && line.startsWith("}") && lines[index - 1]?.trim() === "});"
+  );
+  if (boundary >= 0) ctEvalLineOffset = boundary;
+  return ctEvalLineOffset;
+}
+
+function remapEvalStackLines(stack) {
+  if (typeof stack !== "string" || !stack.includes("[eval]:")) return stack;
+  const offset = evalBootstrapLineOffset();
+  if (offset <= 0) return stack;
+  return stack.replace(/\[eval\]:(\d+):(\d+)/g, (match, lineText, columnText) => {
+    const line = Number(lineText);
+    return line > offset ? `[eval]:${line - offset}:${columnText}` : match;
+  });
+}
 
 function ctRemapStackString(stack) {
   let remapped = remapBundleStack(stack);
   const moduleRemapper = globalThis.__cottontailRemapModuleStackString;
   if (typeof moduleRemapper === "function") remapped = moduleRemapper(remapped);
-  return remapped;
+  return remapDynamicFunctionNames(normalizeCottontailStackFrames(remapEvalStackLines(remapped)));
+}
+
+function normalizeCottontailStackFrames(stack) {
+  if (typeof stack !== "string") return stack;
+  let sawAsyncFrame = false;
+  return stack.split("\n").flatMap((line) => {
+    const isFrame = /^\s*at\b/.test(line) || /^[^@]*@.+:\d+:\d+$/.test(line);
+    if (isFrame && (line.includes("/.cottontail-embedded-runtime/") ||
+        line.includes("/.cottontail-tmp/") || line.includes("/script.bundle.mjs:"))) return [];
+    const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
+    if (jscFrame) {
+      if (jscFrame[1].startsWith("async ")) sawAsyncFrame = true;
+      else if (sawAsyncFrame && jscFrame[1] === "") {
+        sawAsyncFrame = false;
+        return [`async <anonymous>@${jscFrame[2]}:${jscFrame[3]}:${jscFrame[4]}`];
+      }
+    }
+    return [line];
+  }).join("\n");
+}
+
+function dynamicFunctionNameAtLocation(name, file, line, column) {
+  const asyncPrefix = name.startsWith("async ") ? "async " : "";
+  const originalName = asyncPrefix ? name.slice(6) : name;
+  const context = bundleSourceContextForLocation(file, Number(line), Number(column));
+  const frameLine = Number(line);
+  if (!context || !Number.isFinite(frameLine)) return name;
+  for (let index = ctDynamicFunctionNames.length - 1; index >= 0; index -= 1) {
+    const entry = ctDynamicFunctionNames[index];
+    if (entry.originalName === originalName && entry.source === context.source &&
+        frameLine >= entry.declarationLine && frameLine <= entry.renameLine) {
+      return `${asyncPrefix}${entry.replacement}`;
+    }
+  }
+  return name;
+}
+
+function remapDynamicFunctionNames(stack) {
+  if (typeof stack !== "string" || ctDynamicFunctionNames.length === 0) return stack;
+  return stack.split("\n").map((line) => {
+    const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
+    if (jscFrame) {
+      const name = dynamicFunctionNameAtLocation(jscFrame[1], jscFrame[2], jscFrame[3], jscFrame[4]);
+      return `${name}@${jscFrame[2]}:${jscFrame[3]}:${jscFrame[4]}`;
+    }
+    const v8Frame = /^(\s*at\s+)(.*?)\s+\((.+):([0-9]+):([0-9]+)\)$/.exec(line);
+    if (!v8Frame) return line;
+    const name = dynamicFunctionNameAtLocation(v8Frame[2], v8Frame[3], v8Frame[4], v8Frame[5]);
+    return `${v8Frame[1]}${name} (${v8Frame[3]}:${v8Frame[4]}:${v8Frame[5]})`;
+  }).join("\n");
+}
+
+function captureDynamicFunctionRename(originalName, replacement) {
+  if (typeof nativeCaptureStackTrace !== "function") return;
+  const holder = {};
+  try {
+    nativeCaptureStackTrace(holder, Object.defineProperty);
+  } catch {
+    return;
+  }
+  const stack = ctRemapStackString(holder.stack);
+  for (const line of String(stack ?? "").split("\n")) {
+    const jscFrame = /^([^@]*)@(.+):([0-9]+):([0-9]+)$/.exec(line);
+    const v8Frame = /^\s*at(?:\s+.*?)?\s*\(?(.+):([0-9]+):([0-9]+)\)?$/.exec(line);
+    const file = jscFrame?.[2] ?? v8Frame?.[1];
+    const lineNumber = Number(jscFrame?.[3] ?? v8Frame?.[2]);
+    const columnNumber = Number(jscFrame?.[4] ?? v8Frame?.[3]);
+    if (!file || !Number.isFinite(lineNumber)) continue;
+    const context = bundleSourceContextForLocation(file, lineNumber, columnNumber);
+    const lines = context?.lines;
+    if (!Array.isArray(lines)) continue;
+    const escaped = originalName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const declaration = new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`);
+    for (let index = Math.min(lines.length - 1, lineNumber - 1); index >= Math.max(0, lineNumber - 200); index -= 1) {
+      if (!declaration.test(lines[index])) continue;
+      ctDynamicFunctionNames.push({
+        originalName,
+        replacement,
+        source: context.source,
+        declarationLine: index + 1,
+        renameLine: lineNumber,
+      });
+      return;
+    }
+  }
 }
 
 // The generated __toESM helper strictly honors the __esModule marker:
@@ -221,6 +357,40 @@ function installNodeStyleErrorConstructor(name) {
   const CottontailError = function(...args) {
     const error = Reflect.construct(NativeError, args, new.target || CottontailError);
     const rawStack = error.stack;
+    const generatedPosition = {
+      line: Number(error.line),
+      column: Number(error.column),
+      sourceURL: error.sourceURL,
+    };
+    let positionComputed = false;
+    const applyMappedPosition = () => {
+      if (positionComputed) return;
+      positionComputed = true;
+      const mappedPosition = remapBundleErrorPosition(generatedPosition.line, generatedPosition.column);
+      Object.defineProperties(error, {
+        line: { configurable: true, writable: true, value: mappedPosition?.line ?? generatedPosition.line },
+        column: { configurable: true, writable: true, value: mappedPosition?.column ?? generatedPosition.column },
+        ...(mappedPosition ? {
+          originalLine: { configurable: true, writable: true, value: mappedPosition.originalLine },
+          originalColumn: { configurable: true, writable: true, value: mappedPosition.originalColumn },
+        } : {}),
+        sourceURL: { configurable: true, writable: true, value: mappedPosition?.source ?? generatedPosition.sourceURL },
+      });
+    };
+    for (const property of ["line", "column", "originalLine", "originalColumn", "sourceURL"]) {
+      Object.defineProperty(error, property, {
+        configurable: true,
+        enumerable: false,
+        get() {
+          applyMappedPosition();
+          return error[property];
+        },
+        set(value) {
+          applyMappedPosition();
+          error[property] = value;
+        },
+      });
+    }
     if (typeof rawStack === "string") {
       // Remap lazily: parsing the bundle source map costs ~200ms on first use,
       // which must not be paid at Error construction time.
@@ -232,6 +402,7 @@ function installNodeStyleErrorConstructor(name) {
         get() {
           if (!computed) {
             computed = true;
+            applyMappedPosition();
             // V8/bun semantics: Error.prepareStackTrace (checked lazily at
             // first .stack access) receives (error, callSites) and its return
             // value becomes the stack (pino et al. rely on this to collect
@@ -244,9 +415,13 @@ function installNodeStyleErrorConstructor(name) {
               } catch {}
             }
             const callSites = parseCallSites(ctRemapStackString(rawStack));
-            const message = error.message == null || error.message === "" ? "" : `: ${String(error.message)}`;
+            const errorName = error.name === undefined ? name : String(error.name);
+            const errorMessage = error.message == null ? "" : String(error.message);
+            const header = errorName === ""
+              ? errorMessage
+              : errorMessage === "" ? errorName : `${errorName}: ${errorMessage}`;
             const frames = callSites.map((site) => `    at ${site.toString()}`).join("\n");
-            cached = `${error.name || name}${message}${frames ? `\n${frames}` : ""}`;
+            cached = `${header}${frames ? `\n${frames}` : ""}`;
           }
           return cached;
         },
@@ -261,12 +436,40 @@ function installNodeStyleErrorConstructor(name) {
   Object.defineProperty(CottontailError, "name", { value: name });
   Object.defineProperty(CottontailError, "__cottontailStackHeader", { value: true });
   Object.setPrototypeOf(CottontailError, NativeError);
+  const stackTraceLimit = Object.getOwnPropertyDescriptor(NativeError, "stackTraceLimit");
+  if (stackTraceLimit) {
+    Object.defineProperty(CottontailError, "stackTraceLimit", {
+      configurable: stackTraceLimit.configurable,
+      enumerable: stackTraceLimit.enumerable,
+      get() {
+        return NativeError.stackTraceLimit;
+      },
+      set(value) {
+        NativeError.stackTraceLimit = value;
+      },
+    });
+  }
   CottontailError.prototype = NativeError.prototype;
   globalThis[name] = CottontailError;
 }
 
 for (const errorName of ["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "AggregateError"]) {
   installNodeStyleErrorConstructor(errorName);
+}
+
+if (!Object.defineProperty.__cottontailDynamicFunctionNames) {
+  const nativeDefineProperty = Object.defineProperty;
+  const defineProperty = function defineProperty(target, property, descriptor) {
+    const previousName = typeof target === "function" && property === "name" ? target.name : undefined;
+    const result = Reflect.apply(nativeDefineProperty, Object, [target, property, descriptor]);
+    if (typeof previousName === "string" && previousName &&
+        typeof descriptor?.value === "string" && descriptor.value !== previousName) {
+      captureDynamicFunctionRename(previousName, descriptor.value);
+    }
+    return result;
+  };
+  nativeDefineProperty(defineProperty, "__cottontailDynamicFunctionNames", { value: true });
+  Object.defineProperty = defineProperty;
 }
 
 // Bun ships a default Error.prepareStackTrace (unlike Node, where it is
@@ -669,7 +872,7 @@ function appendShellInterpolation(out, value, state) {
   }
 
   if (value && typeof value === "object" &&
-    Object.prototype.hasOwnProperty.call(value, "raw") && value.raw) {
+    Object.prototype.hasOwnProperty.call(value, "raw")) {
     const raw = String(value.raw);
     validateNoNullByte(raw, "shell argument");
     scanShellQuoteState(state, raw);
@@ -767,8 +970,67 @@ function interpolateShellCommand(strings, values) {
     }
   }
   const command = out.trimEnd();
-  parseShell(command);
+  parseBunShellSource(command);
   return { command, outputBuffer, outputFd, outputTargets, inputBody };
+}
+
+const largeShellInterpolationCache = new WeakMap();
+const largeShellInterpolationThreshold = 256 * 1024;
+const shellTransientAllocationBudget = 32 * 1024 * 1024;
+let shellTransientAllocationBytes = 0;
+let shellTransientCollectionQueued = false;
+
+function accountShellTransientAllocation(byteLength) {
+  shellTransientAllocationBytes += Number(byteLength) || 0;
+  if (shellTransientAllocationBytes < shellTransientAllocationBudget) return;
+  shellTransientAllocationBytes = 0;
+  if (shellTransientCollectionQueued) return;
+  shellTransientCollectionQueued = true;
+  queueMicrotask(() => {
+    shellTransientCollectionQueued = false;
+    cottontail.gc?.();
+  });
+}
+
+function largeRawInterpolationSignature(strings, values) {
+  if ((typeof strings !== "object" && typeof strings !== "function") || strings === null) return null;
+  const signature = [];
+  let length = 0;
+  for (const value of values) {
+    if (value == null || typeof value !== "object" ||
+        !Object.prototype.hasOwnProperty.call(value, "raw")) return null;
+    const raw = String(value.raw);
+    signature.push(raw);
+    length += raw.length;
+  }
+  return length >= largeShellInterpolationThreshold ? signature : null;
+}
+
+function sameShellInterpolationSignature(left, right) {
+  if (left?.length !== right?.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+function shellInterpolationError(error) {
+  return {
+    name: String(error?.name ?? "Error"),
+    message: String(error?.message ?? error),
+    position: error?.position,
+    code: error?.code,
+  };
+}
+
+function throwShellInterpolationError(cached) {
+  const error = cached.name === "SyntaxError"
+    ? new SyntaxError(cached.message)
+    : new Error(cached.message);
+  error.name = cached.name;
+  if (cached.position !== undefined) error.position = cached.position;
+  if (cached.code !== undefined) error.code = cached.code;
+  throw error;
 }
 
 const shellDefaults = {
@@ -778,12 +1040,23 @@ const shellDefaults = {
   quiet: false,
 };
 
+const internalShellOutput = Symbol("Cottontail.internalShellOutput");
+
+function shellOutputBuffer(value, copy) {
+  const output = asBuffer(value);
+  if (!globalThis.Buffer?.from) return output;
+  if (copy) return Buffer.from(output);
+  if (Buffer.isBuffer?.(output)) return output;
+  return Buffer.from(output.buffer, output.byteOffset, output.byteLength);
+}
+
 export class ShellOutput {
-  constructor(result = {}) {
+  constructor(result = {}, ownership = undefined) {
     const stdout = asBuffer(result.stdout ?? "");
     const stderr = asBuffer(result.stderr ?? "");
-    this.stdout = globalThis.Buffer?.from ? Buffer.from(stdout) : stdout;
-    this.stderr = globalThis.Buffer?.from ? Buffer.from(stderr) : stderr;
+    const copy = ownership !== internalShellOutput;
+    this.stdout = shellOutputBuffer(stdout, copy);
+    this.stderr = shellOutputBuffer(stderr, copy);
     this.exitCode = Number(result.exitCode ?? result.status ?? 0);
     this.status = this.exitCode;
     this.success = this.exitCode === 0;
@@ -1633,7 +1906,8 @@ async function runShell(command, options = {}) {
     exitCode,
     stdout,
     stderr,
-  });
+  }, internalShellOutput);
+  accountShellTransientAllocation(output.stdout.byteLength + output.stderr.byteLength);
   if (output.exitCode !== 0 && options.throws !== false) {
     throw new ShellError().initialize(output, output.exitCode);
   }
@@ -1807,7 +2081,24 @@ export class Shell {
 Object.setPrototypeOf(Shell.prototype, Function.prototype);
 
 export function $(strings, ...values) {
-  const interpolation = interpolateShellCommand(strings, values);
+  const signature = largeRawInterpolationSignature(strings, values);
+  const cached = signature == null ? null : largeShellInterpolationCache.get(strings);
+  let interpolation;
+  if (cached && sameShellInterpolationSignature(cached.signature, signature)) {
+    if (cached.error) throwShellInterpolationError(cached.error);
+    interpolation = cached.interpolation;
+  } else {
+    try {
+      interpolation = interpolateShellCommand(strings, values);
+      if (signature != null) largeShellInterpolationCache.set(strings, { signature, interpolation });
+    } catch (error) {
+      if (signature != null) {
+        largeShellInterpolationCache.set(strings, { signature, error: shellInterpolationError(error) });
+        accountShellTransientAllocation(signature.reduce((length, value) => length + value.length, 0));
+      }
+      throw error;
+    }
+  }
   return new ShellPromise(interpolation.command, {
     ...shellDefaults,
     outputBuffer: interpolation.outputBuffer,
@@ -3195,13 +3486,15 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
   if (options == null || typeof options !== "object") options = {};
   validateBunSpawnCallbacks(options, sync);
   assertBunAbortSignal(options.signal);
+  let terminal;
   if (!sync && !isEmptyBunSpawnOption(options.terminal)) {
     if (typeof options.terminal !== "object") {
       throw new TypeError("terminal must be a Terminal object or options object");
     }
-    // COTTONTAIL-COMPAT: Bun.spawn terminal - PTY/ConPTY creation, resize,
-    // slave-fd stdio wiring, and terminal lifetime require a native host hook.
-    throw new Error("Bun.spawn terminal requires native PTY support");
+    terminal = options.terminal instanceof Terminal
+      ? options.terminal
+      : new Terminal(options.terminal);
+    if (terminal.closed) throw new Error("terminal is closed");
   }
 
   const details = {};
@@ -3227,9 +3520,10 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
   }
 
   let input = options.input ?? details.input;
+  const stdinFileBacked = input != null && isBunFileLike(input) && typeof input._bunFilePath === "string";
   // Bun.file(...) as stdin: read the file contents and feed them as input,
   // matching bun's behavior of wiring the file to the child's stdin.
-  if (input != null && isBunFileLike(input) && typeof input._bunFilePath === "string") {
+  if (stdinFileBacked) {
     try {
       input = asBuffer(cottontail.readFileBuffer ? cottontail.readFileBuffer(input._bunFilePath) : cottontail.readFile(input._bunFilePath));
     } catch {
@@ -3272,6 +3566,7 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     stderrFilePath: details.stderrFilePath,
     stdoutBuffer: details.stdoutBuffer,
     stderrBuffer: details.stderrBuffer,
+    stdinFileBacked,
     input: input != null && input !== "pipe" && input !== "inherit" && input !== "ignore" ? input : undefined,
     killSignal: killSignalNumber,
     maxBuffer,
@@ -3289,6 +3584,7 @@ function normalizeSpawnOptions(options = {}, defaults = {}, sync = false) {
     onExit: isEmptyBunSpawnOption(options.onExit) ? undefined : _wrapAsyncCallback(options.onExit),
     onDisconnect: isEmptyBunSpawnOption(options.onDisconnect) ? undefined : _wrapAsyncCallback(options.onDisconnect),
     ipcCallback: typeof options.ipc === "function" ? _wrapAsyncCallback(options.ipc) : undefined,
+    terminal,
   };
 }
 
@@ -3330,6 +3626,7 @@ function prepareNativeSpawnOptions(file, nativeOptions) {
       : { ...nativeOptions.env };
     env.COTTONTAIL_SPAWN_EXEC_PATH = nodePathResolve(String(file));
     if (nativeOptions.argv0 !== undefined) env.COTTONTAIL_SPAWN_ARGV0 = nativeOptions.argv0;
+    if (nativeOptions.stdinFileBacked) env.COTTONTAIL_SPAWN_STDIN_FILE = "1";
     return {
       ...nativeOptions,
       env,
@@ -3844,6 +4141,21 @@ function prepareReadableSpawnInput(input) {
   const reader = input.getReader();
   let finished = false;
   let cancelled = false;
+
+  const writeChunk = async (write, value) => {
+    const bytes = asBuffer(value);
+    // The host write hook is synchronous. Bound each write and return to the
+    // event loop so stdout/stderr events can drain while a child echoes input.
+    const chunkSize = 16 * 1024;
+    for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+      if (write(bytes.subarray(offset, Math.min(offset + chunkSize, bytes.byteLength))) !== true) return false;
+      if (offset + chunkSize < bytes.byteLength) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    return true;
+  };
+
   return {
     get finished() {
       return finished;
@@ -3856,8 +4168,7 @@ function prepareReadableSpawnInput(input) {
             finished = true;
             return null;
           }
-          const bytes = asBuffer(value);
-          if (bytes.byteLength > 0 && write(bytes) !== true) {
+          if (await writeChunk(write, value) !== true) {
             await this.cancel(new Error("Subprocess stdin closed"));
             return null;
           }
@@ -3884,6 +4195,7 @@ class ProcessReadable {
     this._readRequests = [];
     this._ended = false;
     this._locked = false;
+    this._emptyReadClaimed = false;
   }
   get locked() {
     return this._locked;
@@ -3955,6 +4267,10 @@ class ProcessReadable {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
   }
   async bytes() {
+    if (this._locked && this._ended && this._chunks.length === 0 && !this._emptyReadClaimed) {
+      this._emptyReadClaimed = true;
+      return new Uint8Array(0);
+    }
     const reader = this.getReader();
     const chunks = [];
     try {
@@ -3964,7 +4280,11 @@ class ProcessReadable {
         chunks.push(asBuffer(value));
       }
     } finally {
-      reader.releaseLock();
+      if (chunks.length === 0 && this._ended) {
+        this._emptyReadClaimed = true;
+      } else {
+        reader.releaseLock();
+      }
     }
     return concatManyBuffers(chunks);
   }
@@ -4059,6 +4379,15 @@ class ProcessWritable {
   constructor(processId) {
     this._processId = processId;
     this._listeners = new Map();
+    this._queue = [];
+    this._draining = false;
+    this._endRequested = false;
+    this._endWaiters = [];
+    this._flushWaiters = [];
+    this._queuedBytes = 0;
+    this._unflushedBytes = 0;
+    this._syncBytes = 0;
+    this._syncResetTimer = null;
     this.writable = true;
     this.writableEnded = false;
     this.writableFinished = false;
@@ -4104,6 +4433,78 @@ class ProcessWritable {
     for (const handler of this._listeners.get(String(name)) ?? []) handler(...args);
     return this.listenerCount(name) > 0;
   }
+  _scheduleSyncReset() {
+    if (this._syncResetTimer != null) return;
+    this._syncResetTimer = setTimeout(() => {
+      this._syncResetTimer = null;
+      this._syncBytes = 0;
+    }, 0);
+  }
+  _closeAfterDrain() {
+    if (!this._endRequested || this._draining || this._queue.length > 0 || this.destroyed) return;
+    cottontail.spawnCloseStdin?.(this._processId);
+    this.writableFinished = true;
+    this.destroyed = true;
+    this.emit("finish");
+    this.emit("close");
+    const waiters = this._endWaiters.splice(0);
+    for (const { resolve, callback, flushed } of waiters) {
+      resolve(flushed);
+      if (typeof callback === "function") callback();
+    }
+  }
+  _settleFlushWaiters() {
+    if (this._draining || this._queue.length > 0) return;
+    const waiters = this._flushWaiters.splice(0);
+    for (const { resolve, flushed } of waiters) resolve(flushed);
+  }
+  _failWrites(error) {
+    const pending = this._queue.splice(0);
+    this._queuedBytes = 0;
+    for (const item of pending) {
+      item.reject(error);
+      if (typeof item.callback === "function") item.callback(error);
+    }
+    for (const waiter of this._flushWaiters.splice(0)) waiter.reject(error);
+    for (const waiter of this._endWaiters.splice(0)) {
+      waiter.reject(error);
+      if (typeof waiter.callback === "function") waiter.callback(error);
+    }
+    if (this.listenerCount("error") > 0) this.emit("error", error);
+  }
+  _startDrain() {
+    if (this._draining || this.destroyed) return;
+    this._draining = true;
+    const drain = async () => {
+      try {
+        while (this._queue.length > 0) {
+          const item = this._queue[0];
+          while (item.offset < item.bytes.byteLength) {
+            const end = Math.min(item.offset + 16 * 1024, item.bytes.byteLength);
+            if (cottontail.spawnWrite?.(this._processId, item.bytes.subarray(item.offset, end)) !== true) {
+              throw new Error("write failed");
+            }
+            const count = end - item.offset;
+            item.offset = end;
+            this._queuedBytes -= count;
+            if (item.offset < item.bytes.byteLength || this._queue.length > 1) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
+          this._queue.shift();
+          item.resolve(item.bytes.byteLength);
+          if (typeof item.callback === "function") item.callback(null);
+        }
+      } catch (error) {
+        this._failWrites(error);
+      } finally {
+        this._draining = false;
+        this._settleFlushWaiters();
+        this._closeAfterDrain();
+      }
+    };
+    void drain();
+  }
   write(chunk, encoding = undefined, callback = undefined) {
     if (typeof encoding === "function") {
       callback = encoding;
@@ -4115,12 +4516,35 @@ class ProcessWritable {
       else if (this.listenerCount("error") > 0) this.emit("error", error);
       return false;
     }
-    const ok = cottontail.spawnWrite?.(this._processId, chunk) === true;
-    if (typeof callback === "function") callback(ok ? null : new Error("write failed"));
-    return ok;
+    const bytes = typeof chunk === "string" && typeof encoding === "string" && globalThis.Buffer?.from
+      ? globalThis.Buffer.from(chunk, encoding)
+      : asBuffer(chunk);
+    if (!this._draining && this._queue.length === 0 && bytes.byteLength <= 16 * 1024 &&
+        this._syncBytes + bytes.byteLength <= 64 * 1024) {
+      const ok = cottontail.spawnWrite?.(this._processId, bytes) === true;
+      if (ok) {
+        this._syncBytes += bytes.byteLength;
+        this._unflushedBytes += bytes.byteLength;
+        this._scheduleSyncReset();
+      }
+      if (typeof callback === "function") callback(ok ? null : new Error("write failed"));
+      return ok ? bytes.byteLength : 0;
+    }
+
+    const promise = new Promise((resolve, reject) => {
+      this._queue.push({ bytes, offset: 0, resolve, reject, callback });
+      this._queuedBytes += bytes.byteLength;
+    });
+    this._startDrain();
+    return promise;
   }
   flush() {
-    return undefined;
+    const flushed = this._unflushedBytes + this._queuedBytes;
+    this._unflushedBytes = 0;
+    if (!this._draining && this._queue.length === 0) return flushed;
+    return new Promise((resolve, reject) => {
+      this._flushWaiters.push({ resolve, reject, flushed });
+    });
   }
   end(chunk = undefined, encoding = undefined, callback = undefined) {
     if (typeof chunk === "function") {
@@ -4129,18 +4553,32 @@ class ProcessWritable {
     } else if (typeof encoding === "function") {
       callback = encoding;
     }
-    if (chunk != null) this.write(chunk);
-    cottontail.spawnCloseStdin?.(this._processId);
+    if (chunk != null) this.write(chunk, encoding);
     this.writable = false;
     this.writableEnded = true;
-    this.writableFinished = true;
-    this.emit("finish");
-    this.emit("close");
-    this.destroyed = true;
-    if (typeof callback === "function") callback();
+    this._endRequested = true;
+    const flushed = this._unflushedBytes + this._queuedBytes;
+    this._unflushedBytes = 0;
+    if (!this._draining && this._queue.length === 0) {
+      this._closeAfterDrain();
+      if (typeof callback === "function") callback();
+      return flushed;
+    }
+    return new Promise((resolve, reject) => {
+      this._endWaiters.push({ resolve, reject, callback, flushed });
+      this._closeAfterDrain();
+    });
   }
   destroy(error = undefined) {
     if (this.destroyed) return this;
+    this._endRequested = false;
+    if (this._syncResetTimer != null) {
+      clearTimeout(this._syncResetTimer);
+      this._syncResetTimer = null;
+    }
+    if (this._queue.length > 0 || this._flushWaiters.length > 0 || this._endWaiters.length > 0) {
+      this._failWrites(error ?? new Error("Subprocess stdin destroyed"));
+    }
     cottontail.spawnCloseStdin?.(this._processId);
     this.writable = false;
     this.writableEnded = true;
@@ -4183,16 +4621,17 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   let disconnected = false;
   let disconnectNotified = false;
   let nodeIpcProtocol = false;
+  const terminal = nativeOptions.terminal;
 
   const child = {
     pid: 0,
-    stdin: undefined,
-    stdout: nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
+    stdin: terminal ? null : undefined,
+    stdout: terminal ? null : nativeOptions.stdout === "pipe" && nativeOptions.stdoutFilePath == null && nativeOptions.stdoutBuffer == null
       ? new ProcessReadable(
         () => cottontail.spawnCloseOutput?.(child._id, 1),
       )
       : undefined,
-    stderr: nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
+    stderr: terminal ? null : nativeOptions.stderr === "pipe" && nativeOptions.stderrFilePath == null && nativeOptions.stderrBuffer == null
       ? new ProcessReadable(
         () => cottontail.spawnCloseOutput?.(child._id, 2),
       )
@@ -4206,7 +4645,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
     get stdio() {
       return [null, null, null];
     },
-    terminal: undefined,
+    terminal,
     get exitCode() {
       return exitCode;
     },
@@ -4312,6 +4751,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       ...nativeOptions,
       argv0: nativeOptions.argv0,
       detached: nativeOptions.detached,
+      terminalFd: terminalSpawnFd(terminal),
     });
   } catch (error) {
     if (readableInput != null && !readableInput.finished) void readableInput.cancel(error);
@@ -4320,7 +4760,9 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
   child._id = native.id;
   child._ipcFd = native.ipcFd == null ? -1 : Number(native.ipcFd);
   child.pid = native.pid;
-  child.stdin = readableInput != null
+  child.stdin = terminal
+    ? null
+    : readableInput != null
     ? nativeOptions.input
     : nativeOptions.stdin === "pipe" && nativeOptions.input === undefined
       ? new ProcessWritable(native.id)
@@ -4382,6 +4824,7 @@ export function spawn(command, maybeArgsOrOptions = {}, maybeOptions = undefined
       killed = result.killed === true || (killRequested && resultSignalNumber > 0);
       resourceUsage = normalizeSpawnResourceUsage(result.resourceUsage);
       try {
+        terminalProcessExited(terminal, exitCode, signalCode);
         if (readableInput != null && !readableInput.finished) void readableInput.cancel(new Error("Subprocess exited"));
         const stdoutBytes = concatManyBuffers(stdoutChunks);
         const stderrBytes = concatManyBuffers(stderrChunks);
@@ -5233,6 +5676,14 @@ function isURLSearchParamsLike(value) {
   return typeof GlobalURLSearchParams === "function" && value instanceof GlobalURLSearchParams;
 }
 
+function parseBodyJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new SyntaxError("Failed to parse JSON");
+  }
+}
+
 // Fill in the fetch-spec default Content-Type for bodies that imply one.
 function setDefaultBodyContentType(headers, body) {
   if (body == null || headers.has("content-type")) return;
@@ -5388,12 +5839,16 @@ export class Request {
     // particular, a throwing input.toString() must win over init.headers.
     const url = canonicalFetchUrl(input);
     const headers = new Headers(init.headers ?? input?.headers);
+    const inputRequestState = input instanceof Request ? requestState.get(input) : null;
+    const signalExplicit = init.signal != null || inputRequestState?.signalExplicit === true ||
+      (!(input instanceof Request) && input?.signal != null);
     requestState.set(this, {
       url,
       method: String(init.method ?? input?.method ?? "GET").toUpperCase(),
       headers,
       params: init.params ?? input?.params ?? {},
       signal: init.signal ?? input?.signal ?? new AbortController().signal,
+      signalExplicit,
       redirect: init.redirect ?? input?.redirect ?? "follow",
       cache: init.cache ?? input?.cache ?? "default",
       mode: init.mode ?? input?.mode ?? "cors",
@@ -5469,6 +5924,8 @@ export class Request {
       credentials: this.credentials,
       keepalive: this.keepalive,
     });
+    const clonedState = requestState.get(cloned);
+    if (clonedState) clonedState.signalExplicit = requestState.get(this)?.signalExplicit === true;
     cloned._body = teeClonedBody(this);
     if (this._cookies) cloned._cookies = cloneCookieMap(this._cookies);
     return cloned;
@@ -5506,7 +5963,7 @@ export class Request {
     return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
-    return JSON.parse(await this.text());
+    return parseBodyJson(await this.text());
   }
   formData() {
     if (!(this instanceof Request)) {
@@ -5563,11 +6020,30 @@ function normalizeRequestUrl(value) {
   const text = String(value);
   try {
     const url = new URL(text);
-    const pathname = String(url.pathname || "/").replace(/^\/+/, "/") || "/";
+    const pathname = String(url.pathname || "/") || "/";
     return `${url.origin}${pathname}${url.search}${url.hash}`;
   } catch {
     return text;
   }
+}
+
+function normalizeServeDispatchUrl(value) {
+  const normalized = normalizeRequestUrl(value);
+  try {
+    const url = new URL(normalized);
+    const pathname = String(url.pathname || "/").replace(/^\/+/, "/") || "/";
+    return `${url.origin}${pathname}${url.search}${url.hash}`;
+  } catch {
+    return normalized;
+  }
+}
+
+function normalizeResponseBody(body) {
+  if (!Array.isArray(body)) return body;
+  for (const part of body) {
+    if (!(part instanceof Uint8Array)) return body;
+  }
+  return concatManyBuffers(body);
 }
 
 export class Response {
@@ -5576,6 +6052,7 @@ export class Response {
     else if (typeof init !== "object" && typeof init !== "function") {
       throw new TypeError("Failed to construct 'Response': the second argument must be an object");
     }
+    body = normalizeResponseBody(body);
     let status = 200;
     if (init.status !== undefined) {
       status = Number(init.status);
@@ -5689,7 +6166,7 @@ export class Response {
     return bytesFromBody(body).then((bytes) => stripUtf8BOMText(cachedTextForBytes(bytes)));
   }
   async json() {
-    return JSON.parse(await this.text());
+    return parseBodyJson(await this.text());
   }
   formData() {
     if (this._bodyStream?.locked) return handledRejectedPromise(new TypeError("ReadableStream is locked"));
@@ -5786,6 +6263,17 @@ function formatInspectBodyByteSize(size, emptyAsKilobytes) {
 
 const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map();
 const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= new WeakMap();
+const activeServeAbortControllers = globalThis.__cottontailActiveServeAbortControllers ??= new WeakMap();
+const activeServeRequestBodyStateSymbol = Symbol("cottontail.activeServeRequestBodyState");
+
+function abortActiveServeRequests(server) {
+  const controllers = activeServeAbortControllers.get(server);
+  if (controllers == null) return;
+  const error = new Error("The socket connection was closed unexpectedly.");
+  error.code = "ECONNRESET";
+  for (const controller of controllers) controller.abort(error);
+  controllers.clear();
+}
 
 function activeServerForFetchUrl(urlText) {
   try {
@@ -5819,7 +6307,22 @@ function fetchProxyConfiguration(urlText, init = {}) {
       return { active: false, explicit: null, environment: null, disabled: true, headers: null };
     }
     if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) value = `http://${value}`;
-    try { value = new URL(value).href; } catch { throw new TypeError("fetch() proxy URL is invalid"); }
+    let parsedProxy;
+    try { parsedProxy = new URL(value); } catch { throw new TypeError("fetch() proxy URL is invalid"); }
+    if (parsedProxy.protocol !== "http:" && parsedProxy.protocol !== "https:") {
+      const error = new Error(
+        `UnsupportedProxyProtocol fetching "${urlText}". For more information, pass \`verbose: true\` in the second argument to fetch()`,
+      );
+      error.code = "UnsupportedProxyProtocol";
+      error.path = urlText;
+      error.errno = 0;
+      throw error;
+    }
+    const env = globalThis.process?.env ?? {};
+    if (noProxyMatches(urlText, env.NO_PROXY ?? env.no_proxy ?? "")) {
+      return { active: false, explicit: null, environment: null, disabled: true, headers: null };
+    }
+    value = parsedProxy.href;
     return {
       active: true,
       explicit: value,
@@ -6151,6 +6654,10 @@ function normalizedFetchAbortReason(signal) {
 
 function normalizeFetchNetworkError(error) {
   if (error?.name === "AbortError" || error?.name === "TimeoutError") return error;
+  if (typeof error?.message === "string" && /^self-signed certificate\b/i.test(error.message)) {
+    error.message = error.message.replace(/^self-signed certificate/i, "self signed certificate");
+    return error;
+  }
   if (["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"].includes(error?.code)) {
     const normalized = new Error("Unable to connect. Is the computer able to access the url?");
     normalized.code = "ConnectionRefused";
@@ -6200,6 +6707,11 @@ function incomingMessageBodyStream(message, signal) {
   let controller;
   let done = false;
   let paused = false;
+  let receivedBytes = 0;
+  const contentLengthText = message.headers?.["content-length"];
+  const expectedBytes = contentLengthText != null && /^\d+$/.test(String(contentLengthText))
+    ? Number(contentLengthText)
+    : null;
   const cleanup = () => {
     message.off?.("data", onData);
     message.off?.("end", onEnd);
@@ -6215,6 +6727,7 @@ function incomingMessageBodyStream(message, signal) {
   };
   const onData = chunk => {
     if (done) return;
+    receivedBytes += Number(chunk?.byteLength ?? chunk?.length ?? 0);
     controller.enqueue(Buffer.from(chunk));
     if (controller.desiredSize <= 0) {
       paused = true;
@@ -6224,6 +6737,10 @@ function incomingMessageBodyStream(message, signal) {
   const onEnd = () => finish(() => controller.close());
   const onError = error => finish(() => controller.error(normalizeFetchNetworkError(error)));
   const onAborted = () => {
+    if (expectedBytes != null && receivedBytes >= expectedBytes) {
+      onEnd();
+      return;
+    }
     const error = new Error("The socket connection was closed unexpectedly.");
     error.code = "ECONNRESET";
     onError(error);
@@ -6342,13 +6859,18 @@ function fetchTlsOptions(url, config = null) {
   if (options.rejectUnauthorized == null) {
     options.rejectUnauthorized = String(globalThis.process?.env?.NODE_TLS_REJECT_UNAUTHORIZED ?? "1") !== "0";
   }
-  options.servername = config?.serverName ?? config?.servername ?? (nodeNet.isIP(hostname) ? "" : hostname);
+  const configuredServername = config?.serverName ?? config?.servername ?? hostname;
+  options.servername = nodeNet.isIP(String(configuredServername).replace(/^\[|\]$/g, ""))
+    ? ""
+    : String(configuredServername);
   delete options.serverName;
   if (options.rejectUnauthorized === false) delete options.checkServerIdentity;
   return options;
 }
 
 const reusableFetchHttpsAgents = new Map();
+const reusableCustomFetchHttpsAgents = new Map();
+const MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS = 64;
 
 function defaultFetchHttpsAgent(tlsOptions, keepalive) {
   if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
@@ -6361,11 +6883,32 @@ function defaultFetchHttpsAgent(tlsOptions, keepalive) {
   return agent;
 }
 
+function customFetchHttpsAgent(tlsOptions, tlsConfig, keepalive) {
+  if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
+  const key = fetchTlsSessionKey(tlsConfig);
+  let agent = reusableCustomFetchHttpsAgents.get(key);
+  if (agent) {
+    reusableCustomFetchHttpsAgents.delete(key);
+    reusableCustomFetchHttpsAgents.set(key, agent);
+    return agent;
+  }
+
+  agent = new nodeHttps.Agent({ ...tlsOptions, keepAlive: true });
+  reusableCustomFetchHttpsAgents.set(key, agent);
+  if (reusableCustomFetchHttpsAgents.size > MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS) {
+    const oldestKey = reusableCustomFetchHttpsAgents.keys().next().value;
+    const oldestAgent = reusableCustomFetchHttpsAgents.get(oldestKey);
+    reusableCustomFetchHttpsAgents.delete(oldestKey);
+    oldestAgent?.destroy?.();
+  }
+  return agent;
+}
+
 function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepalive) {
   const agent = new nodeHttps.Agent({ ...tlsOptions, keepAlive: keepalive });
   agent.createConnection = function createConnection(options, callback) {
     const proxyClient = proxy.protocol === "https:" ? nodeHttps : nodeHttp;
-    const headers = new Headers(proxyHeaders);
+    const headers = new Headers(proxyHeaders ?? undefined);
     headers.set("Host", `${target.hostname}:${target.port || 443}`);
     headers.set("Proxy-Connection", keepalive ? "Keep-Alive" : "close");
     const authorization = proxyAuthorization(proxy);
@@ -6384,6 +6927,10 @@ function httpsProxyTunnelAgent(target, proxy, proxyHeaders, tlsOptions, keepaliv
       path: `${target.hostname}:${target.port || 443}`,
       headers: nodeFetchHeaders(headers),
       agent: keepalive ? undefined : false,
+      ...(proxy.protocol === "https:" ? {
+        ...tlsOptions,
+        servername: nodeNet.isIP(String(proxy.hostname).replace(/^\[|\]$/g, "")) ? "" : proxy.hostname,
+      } : {}),
     });
     tunnel.once("connect", (response, socket, head) => {
       if (response.statusCode !== 200) {
@@ -6445,7 +6992,7 @@ async function fetchOnceUsingNodeClient(request, redirected = false, transport =
     }
   } else if (url.protocol === "https:") {
     agent = transport.tlsConfig
-      ? new nodeHttps.Agent({ ...tlsOptions, keepAlive: keepalive })
+      ? customFetchHttpsAgent(tlsOptions, transport.tlsConfig, keepalive)
       : defaultFetchHttpsAgent(tlsOptions, keepalive);
   }
 
@@ -7072,12 +7619,18 @@ async function fetchImpl(request, init = {}, upgradeStreamBody = null) {
   // fast path for them.
   const wantsUpgrade = upgradeStreamBody != null ||
     String(request.headers.get("connection") ?? "").toLowerCase().split(",").some((token) => token.trim() === "upgrade");
-  // Custom TLS configs must exercise real sockets so per-config connection
-  // separation and requestIP() are observable (#27358).
+  const usesKeepalive = fetchUsesKeepalive(request);
+  // Explicitly insecure loopback TLS requests can use the in-process dispatch.
+  // A logical peer per TLS config preserves observable connection separation.
+  const localTlsKeepalivePath = activeServer != null && parsedUrl.protocol === "https:" &&
+    customTlsConfig?.rejectUnauthorized === false && usesKeepalive && !proxy.active && !wantsUpgrade;
   const customTlsSocketPath = customTlsConfig != null && isLoopbackHttpsUrl(request.url);
-  if (activeServer && parsedUrl.protocol === "http:" && !proxy.active && !wantsUpgrade && !customTlsSocketPath) {
-    applyDefaultFetchHeaders(request, fetchUsesKeepalive(request));
-    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress);
+  const localHttpPath = activeServer != null && parsedUrl.protocol === "http:" &&
+    !proxy.active && !wantsUpgrade && !customTlsSocketPath;
+  if (localHttpPath || localTlsKeepalivePath) {
+    applyDefaultFetchHeaders(request, usesKeepalive);
+    const peerKey = localTlsKeepalivePath ? `tls:${fetchTlsSessionKey(customTlsConfig)}` : "http";
+    return await fetchFromActiveServer(activeServer, request, redirectMode, 0, false, decompress, peerKey);
   }
   if (wantsUpgrade) {
     return await fetchFromNodeHttp(request, redirectMode, 0, false, {
@@ -7175,7 +7728,10 @@ function redirectedFetchRequest(request, response, location) {
   };
   if (state?.keepaliveExplicit) init.keepalive = request.keepalive;
   if (body !== undefined && method !== "GET" && method !== "HEAD") init.body = body;
-  return new Request(nextUrl, init);
+  const redirected = new Request(nextUrl, init);
+  const redirectedState = requestState.get(redirected);
+  if (redirectedState) redirectedState.signalExplicit = state?.signalExplicit === true;
+  return redirected;
 }
 
 function decompressionError(encoding, cause) {
@@ -7313,8 +7869,90 @@ function decodeFetchResponse(response, decompress = true) {
   return new Response(decodedFetchBodyStream(response.body, encoding), init);
 }
 
+function activeServeRequestBody(body) {
+  let controller;
+  const state = {
+    byteSize: requestBodyByteSize(body),
+    settled: false,
+    started: false,
+    pending: null,
+    stream: null,
+    abort(reason) {
+      if (state.settled) return;
+      state.settled = true;
+      try { controller.error(reason); } catch {}
+      if (typeof body?.cancel === "function") {
+        try { Promise.resolve(body.cancel(reason)).catch(() => {}); } catch {}
+      }
+    },
+  };
+  const stream = new globalThis.ReadableStream({
+    start(value) {
+      controller = value;
+    },
+    pull() {
+      if (state.started) return state.pending;
+      state.started = true;
+      state.pending = new Promise((resolve) => setTimeout(resolve, 0))
+        .then(() => bytesFromBody(body))
+        .then(
+          (bytes) => {
+            if (state.settled) return;
+            if (bytes.byteLength > 0) controller.enqueue(bytes);
+            state.settled = true;
+            controller.close();
+          },
+          (error) => {
+            if (state.settled) return;
+            state.settled = true;
+            controller.error(error);
+          },
+        );
+      return state.pending;
+    },
+    cancel(reason) {
+      state.settled = true;
+      if (typeof body?.cancel !== "function") return undefined;
+      try { return body.cancel(reason); } catch { return undefined; }
+    },
+  });
+  state.stream = stream;
+  Object.defineProperty(stream, activeServeRequestBodyStateSymbol, { value: state });
+  return stream;
+}
+
+let activeServeUnreadBodyAbortError;
+
+function finishActiveServeRequestBody(request, response) {
+  const body = request?._body;
+  const state = body?.[activeServeRequestBodyStateSymbol];
+  if (!state || state.settled || response?._body === body) return;
+  state.abort(activeServeUnreadBodyAbortError);
+}
+
+async function armActiveFetchResponseAbort(response, signal) {
+  const body = response?._body;
+  if (!signal || !isStreamingBody(body)) return;
+  let aborted = false;
+  const onAbort = () => {
+    aborted = true;
+    if (typeof body?.cancel === "function") {
+      try { Promise.resolve(body.cancel(normalizedFetchAbortReason(signal))).catch(() => {}); } catch {}
+    }
+  };
+  signal.addEventListener?.("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+
+  // A real HTTP client does not resolve fetch before the server has had a
+  // chance to start the response stream. This task boundary also lets an
+  // abort issued by the handler's first timer reject fetch and cancel it.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (aborted || signal.aborted) throw normalizedFetchAbortReason(signal);
+}
+
 function raceWithAbortSignal(promise, signal) {
   if (!signal || typeof signal.addEventListener !== "function") return promise;
+  if (signal.aborted) return Promise.reject(normalizedFetchAbortReason(signal));
   return new Promise((resolve, reject) => {
     const onAbort = () => reject(normalizedFetchAbortReason(signal));
     signal.addEventListener("abort", onAbort, { once: true });
@@ -7331,31 +7969,56 @@ function raceWithAbortSignal(promise, signal) {
   });
 }
 
-async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected, decompress = true) {
+async function fetchFromActiveServer(activeServer, request, redirectMode, depth, redirected, decompress = true, logicalPeerKey = "http") {
   throwIfAborted(request.signal);
   if (depth > 20) throw new TypeError("redirect count exceeded");
   // Bun's HTTP server normalizes duplicate leading slashes in the request
   // path before routing, while the client-visible response.url keeps the raw
   // request URL text.
-  let dispatchRequest = request;
-  const normalizedDispatchUrl = normalizeRequestUrl(request.url);
-  if (normalizedDispatchUrl !== request.url) {
-    dispatchRequest = new Request(normalizedDispatchUrl, {
-      method: request.method,
-      headers: new Headers(request.headers),
-      signal: request.signal,
-      redirect: request.redirect,
-    });
-    dispatchRequest._body = request._body;
+  const forceStopController = new AbortController();
+  const dispatchSignal = requestState.get(request)?.signalExplicit === true
+    ? globalThis.AbortSignal.any([request.signal, forceStopController.signal])
+    : forceStopController.signal;
+  let dispatchRequest;
+  let normalizedDispatchUrl = normalizeServeDispatchUrl(request.url);
+  const host = request.headers.get("host");
+  if (host) {
+    try {
+      const parsed = new URL(normalizedDispatchUrl);
+      normalizedDispatchUrl = normalizeServeDispatchUrl(`${parsed.protocol}//${host}${parsed.pathname}${parsed.search}${parsed.hash}`);
+    } catch {}
   }
+  dispatchRequest = new Request(normalizedDispatchUrl, {
+    method: request.method,
+    headers: new Headers(request.headers),
+    signal: dispatchSignal,
+    redirect: request.redirect,
+  });
+  dispatchRequest._body = request._body == null || request.method === "GET" || request.method === "HEAD"
+    ? request._body
+    : activeServeRequestBody(request._body);
+  const peer = activeServeLogicalPeer(activeServer, logicalPeerKey);
+  // COTTONTAIL-COMPAT: The in-process fetch fast path has no OS client fd;
+  // retain the stable loopback peer identity that its keepalive connection represents.
+  serveRequestPeers.set(dispatchRequest, peer);
   const dispatch = activeServeDispatches.get(activeServer);
-  const response = await raceWithAbortSignal(
-    dispatch ? dispatch(dispatchRequest) : activeServer.fetch(dispatchRequest),
-    request.signal,
-  );
+  let controllers = activeServeAbortControllers.get(activeServer);
+  if (controllers == null) activeServeAbortControllers.set(activeServer, controllers = new Set());
+  controllers.add(forceStopController);
+  let response;
+  try {
+    response = await raceWithAbortSignal(
+      dispatch ? dispatch(dispatchRequest) : activeServer.fetch(dispatchRequest),
+      dispatchSignal,
+    );
+    await armActiveFetchResponseAbort(response, dispatchSignal);
+  } finally {
+    controllers.delete(forceStopController);
+  }
   throwIfAborted(request.signal);
   response.url = request.url;
   response.redirected = Boolean(redirected || response.redirected);
+  if (!response.statusText) response.statusText = nodeHttp.STATUS_CODES[response.status] ?? "";
   if (redirectMode === "manual" || !isRedirectStatus(response.status)) return decodeFetchResponse(response, decompress);
   if (redirectMode === "error") throw unexpectedRedirectError();
 
@@ -7381,10 +8044,13 @@ function parseHeadersText(text) {
   return headers;
 }
 
-function headersToText(headers) {
+function headersToText(headers, preserveFraming = false) {
   let out = "";
   const normalized = new Headers(headers);
-  normalized.delete("content-length");
+  if (!preserveFraming) {
+    normalized.delete("content-length");
+    normalized.delete("transfer-encoding");
+  }
   normalized.delete("connection");
   for (const key of [...normalized._values.keys()].sort()) {
     const entry = normalized._values.get(key);
@@ -7606,6 +8272,20 @@ function isStreamingBody(body) {
 
 const serveResponseCache = new WeakMap();
 
+function bunFileSliceMetadata(body) {
+  if (!body || typeof body !== "object" || typeof body._bunFilePath !== "string") return null;
+  const start = Number(body._bunFileStart);
+  const end = Number(body._bunFileEnd);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  try {
+    const size = Number(cottontail.statSync(body._bunFilePath, true)?.size ?? 0);
+    if (!Number.isFinite(size) || size < 0) return null;
+    return { start, end, size };
+  } catch {
+    return null;
+  }
+}
+
 function ifModifiedSinceNotModified(headerValue, lastModified) {
   if (!headerValue || !lastModified) return false;
   const requestTime = Date.parse(String(headerValue));
@@ -7630,7 +8310,9 @@ async function prepareServeResponse(value, request, options = {}) {
   const body = cached ? cached.body : sourceResponse._body;
   const method = String(request.method || "GET").toUpperCase();
   const isFile = isBunFileLike(body);
-  const streaming = !cached && method !== "HEAD" && isStreamingBody(body);
+  const fileSlice = bunFileSliceMetadata(body);
+  const sourceStreaming = !cached && isStreamingBody(body);
+  const streaming = method !== "HEAD" && sourceStreaming;
 
   if (options.allowFileFallback && isFile && typeof body.exists === "function" && !(await body.exists())) {
     return null;
@@ -7641,6 +8323,8 @@ async function prepareServeResponse(value, request, options = {}) {
   if (statusAllowsBody(status)) {
     if (!cached && method === "HEAD" && isFile && Number.isFinite(Number(body.size))) {
       bytes = { byteLength: Number(body.size) };
+    } else if (!cached && method === "HEAD" && sourceStreaming) {
+      bytes = { byteLength: 0 };
     } else if (!cached && !streaming) {
       try {
         bytes = await bytesFromBody(body);
@@ -7663,6 +8347,13 @@ async function prepareServeResponse(value, request, options = {}) {
     const lastModified = bodyLastModified(body);
     if (lastModified) headers.set("Last-Modified", lastModified);
   }
+  if (fileSlice && status === 200 && !options.preserveFileSliceStatus && (fileSlice.start > 0 || fileSlice.end < fileSlice.size)) {
+    status = 206;
+    if (!headers.has("content-range")) {
+      const rangeEnd = Math.max(fileSlice.start, fileSlice.end) - 1;
+      headers.set("Content-Range", `bytes ${fileSlice.start}-${rangeEnd}/${fileSlice.size}`);
+    }
+  }
   if (isFile && status === 200 && bytes.byteLength === 0) status = 204;
 
   if ((method === "GET" || method === "HEAD") && status === 200 && ifModifiedSinceNotModified(request.headers.get("if-modified-since"), headers.get("last-modified"))) {
@@ -7674,7 +8365,11 @@ async function prepareServeResponse(value, request, options = {}) {
     }), request);
   }
 
-  if (statusAllowsBody(status) && !streaming) {
+  if (statusAllowsBody(status) && sourceStreaming) {
+    if (!headers.has("content-length") && !headers.has("transfer-encoding")) {
+      headers.set("Transfer-Encoding", "chunked");
+    }
+  } else if (statusAllowsBody(status)) {
     if (!headers.has("content-length")) headers.set("Content-Length", String(bytes.byteLength));
   } else {
     headers.delete("content-length");
@@ -7720,7 +8415,7 @@ function prepareServeResponseSync(value, request, options = {}) {
   if (sourceResponse.status === 200 && (request.headers.get("if-modified-since") || request.headers.get("if-none-match"))) return null;
   const headers = new Headers(sourceResponse.headers);
   let status = sourceResponse.status;
-  const bytes = statusAllowsBody(status) && method !== "HEAD" ? bytesFromData(body) : new Uint8Array(0);
+  const bytes = statusAllowsBody(status) ? bytesFromData(body) : new Uint8Array(0);
   if (!headers.has("content-type")) {
     const type = bodyType(body);
     if (type) headers.set("Content-Type", type);
@@ -7746,7 +8441,17 @@ function prepareServeResponseResult(value, request, options = {}) {
 
 function runFetchFallback(options, request, server) {
   if (typeof options.fetch === "function") {
-    return prepareServeResponseResult(options.fetch(request, server), request);
+    const value = options.fetch(request, server);
+    const prepare = (resolved) => prepareServeResponseResult(
+      resolved instanceof Response
+        ? resolved
+        : new Response("Welcome to Bun! To get started, return a Response object.", {
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        }),
+      request,
+    );
+    return isPromiseLike(value) ? value.then(prepare) : prepare(value);
   }
   return prepareServeResponse(new Response("Not Found", { status: 404 }), request);
 }
@@ -7764,6 +8469,82 @@ function normalizedServeDispatchRequest(request) {
   return normalized;
 }
 
+function serveResponseWithIdleTimeout(response, idleTimeoutSeconds) {
+  const timeoutMs = Number(idleTimeoutSeconds) * 1000;
+  const body = response?._body;
+  if (!(timeoutMs > 0) || !isStreamingBody(body) || typeof body?.getReader !== "function") return response;
+
+  const reader = body.getReader();
+  let controller;
+  let timer = null;
+  let settled = false;
+  let pendingRead = null;
+  const clearTimer = () => {
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+  };
+  const fail = () => {
+    if (settled) return;
+    settled = true;
+    timer = null;
+    const error = new Error("The socket connection was closed unexpectedly.");
+    error.code = "ECONNRESET";
+    try { controller.error(error); } catch {}
+    try { Promise.resolve(reader.cancel(error)).catch(() => {}); } catch {}
+  };
+  const armTimer = () => {
+    clearTimer();
+    timer = setTimeout(fail, timeoutMs);
+  };
+  const stream = new globalThis.ReadableStream({
+    start(value) {
+      controller = value;
+      armTimer();
+    },
+    pull() {
+      if (settled) return undefined;
+      if (pendingRead != null) return pendingRead;
+      pendingRead = Promise.resolve(reader.read()).then(
+        (result) => {
+          if (settled) return;
+          if (result.done) {
+            settled = true;
+            clearTimer();
+            controller.close();
+            return;
+          }
+          controller.enqueue(result.value);
+          armTimer();
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimer();
+          controller.error(error);
+        },
+      ).finally(() => {
+        pendingRead = null;
+      });
+      return pendingRead;
+    },
+    cancel(reason) {
+      if (settled) return undefined;
+      settled = true;
+      clearTimer();
+      return reader.cancel(reason);
+    },
+  });
+  const timedResponse = new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+    url: response.url,
+    redirected: response.redirected,
+    type: response.type,
+  });
+  return timedResponse;
+}
+
 async function dispatchServeFetch(options, server, input, init = {}) {
   const request = input instanceof Request ? input : new Request(String(input), init);
   const dispatchRequest = normalizedServeDispatchRequest(request);
@@ -7771,9 +8552,16 @@ async function dispatchServeFetch(options, server, input, init = {}) {
   try {
     response = await runServeHandler(options, dispatchRequest, server);
   } catch (error) {
-    if (typeof options.error !== "function") throw error;
-    response = await serveErrorResponse(options, error);
+    if (typeof options.error !== "function") {
+      finishActiveServeRequestBody(dispatchRequest, null);
+      reportServeHandlerError(error);
+      response = serveErrorResponse(options, error);
+    } else {
+      response = await serveErrorResponse(options, error);
+    }
   }
+  finishActiveServeRequestBody(dispatchRequest, response);
+  response = serveResponseWithIdleTimeout(response, options.idleTimeout);
   response.url = request.url;
   return response;
 }
@@ -7801,6 +8589,8 @@ function serveErrorResponse(options, error) {
 
 function requestBodyByteSize(body) {
   if (body == null) return 0;
+  const activeState = body?.[activeServeRequestBodyStateSymbol];
+  if (activeState?.byteSize != null) return activeState.byteSize;
   if (typeof body === "string") return new TextEncoder().encode(body).byteLength;
   if (body instanceof ArrayBuffer) return body.byteLength;
   if (ArrayBuffer.isView(body)) return body.byteLength;
@@ -7837,6 +8627,7 @@ function runServeHandler(options, request, server) {
     }
     const prepared = prepareServeResponseResult(response, request, {
       allowFileFallback: true,
+      preserveFileSliceStatus: typeof route !== "function",
       staticTextContentType: typeof route !== "function",
     });
     return isPromiseLike(prepared)
@@ -8002,6 +8793,35 @@ function normalizeServeUnixPath(value) {
 const WEBSOCKET_HANDSHAKE_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const serveUpgradeContexts = new WeakMap();
 const serveRequestSockets = new WeakMap();
+const serveRequestPeers = new WeakMap();
+const activeServeLogicalPeers = new WeakMap();
+let nextActiveServeClientPort = 49152;
+
+function activeServeLogicalPeer(server, key = "http") {
+  let peers = activeServeLogicalPeers.get(server);
+  if (!peers) {
+    peers = new Map();
+    activeServeLogicalPeers.set(server, peers);
+  }
+  const normalizedKey = String(key);
+  let peer = peers.get(normalizedKey);
+  if (peer) return peer;
+
+  let address = String(server.hostname ?? "127.0.0.1").replace(/^\[|\]$/g, "");
+  if (address === "localhost" || address === "0.0.0.0") address = "127.0.0.1";
+  else if (address === "::") address = "::1";
+  peer = {
+    address,
+    family: address.includes(":") ? "IPv6" : "IPv4",
+    port: nextActiveServeClientPort,
+  };
+  nextActiveServeClientPort = nextActiveServeClientPort >= 65535 ? 49152 : nextActiveServeClientPort + 1;
+  peers.set(normalizedKey, peer);
+  if (peers.size > MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS) {
+    peers.delete(peers.keys().next().value);
+  }
+  return peer;
+}
 
 function websocketAcceptKeyForServe(key) {
   return createHash("sha1").update(`${key}${WEBSOCKET_HANDSHAKE_GUID}`).digest("base64");
@@ -8075,7 +8895,26 @@ function decodeWebSocketFrames(buffer) {
   return { frames, remaining: buffer.subarray(offset) };
 }
 
+function serveHandlerErrorDiagnostic(error) {
+  if (!(error instanceof Error) || typeof error.stack !== "string") return null;
+  const frame = error.stack.match(/(?:^|\n)\s*at [^\n]*?\(?([^()\n]+):(\d+):(\d+)\)?/);
+  if (!frame) return null;
+  let sourcePath = frame[1].trim();
+  if (sourcePath.startsWith("file://")) {
+    try { sourcePath = nodeFileURLToPath(sourcePath); } catch {}
+  }
+  const lineNumber = Number(frame[2]);
+  if (!Number.isInteger(lineNumber) || lineNumber < 1) return null;
+  let sourceLine;
+  try { sourceLine = String(cottontail.readFile(sourcePath)).split(/\r?\n/)[lineNumber - 1]; } catch { return null; }
+  if (sourceLine == null) return null;
+  const column = Math.max(1, Number(frame[3]) || 1);
+  return `${lineNumber} | ${sourceLine}\n${" ".repeat(String(lineNumber).length + 3 + column - 1)}^`;
+}
+
 function reportServeHandlerError(error) {
+  const diagnostic = serveHandlerErrorDiagnostic(error);
+  if (diagnostic != null) console.error(diagnostic);
   setTimeout(() => { throw error; }, 0);
 }
 
@@ -8099,6 +8938,25 @@ function assertWebSocketCompressFlag(compress, name) {
   }
 }
 
+function flushServerWebSocketFrames(state) {
+  state.frameFlushScheduled = false;
+  if (state.pendingFrames.length === 0) return;
+  const frames = state.pendingFrames;
+  const byteLength = state.pendingFrameBytes;
+  state.pendingFrames = [];
+  state.pendingFrameBytes = 0;
+  const socket = state.socket;
+  if (!socket || socket.destroyed || !socket.writable || state.finalized) return;
+  const output = frames.length === 1 ? frames[0] : Buffer.concat(frames, byteLength);
+  const ok = socket.write(output, () => {
+    if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
+  });
+  if (!ok || socket.writableLength > state.config.backpressureLimit) {
+    state.wantDrain = true;
+    if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
+  }
+}
+
 function sendServerWebSocketFrame(state, opcode, data, compress = false) {
   if (state.readyState !== 1) return 0;
   const socket = state.socket;
@@ -8115,16 +8973,19 @@ function sendServerWebSocketFrame(state, opcode, data, compress = false) {
   }
   const limit = state.config.backpressureLimit;
   if (state.wantDrain) return 0;
-  if (socket.writableLength > limit) {
+  if (socket.writableLength + state.pendingFrameBytes > limit) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
   }
   const frame = encodeServerWebSocketFrame(opcode, payload, rsv1);
-  const ok = socket.write(frame, () => {
-    if (state.wantDrain && socket.writableLength === 0) scheduleServerWebSocketDrain(state);
-  });
-  if (!ok || socket.writableLength > limit) {
+  state.pendingFrames.push(frame);
+  state.pendingFrameBytes += frame.byteLength;
+  if (!state.frameFlushScheduled) {
+    state.frameFlushScheduled = true;
+    queueMicrotask(() => flushServerWebSocketFrames(state));
+  }
+  if (socket.writableLength + state.pendingFrameBytes > limit) {
     state.wantDrain = true;
     if (state.config.closeOnBackpressureLimit) terminateServerWebSocket(state);
     return -1;
@@ -8181,6 +9042,7 @@ function closeServerWebSocket(state, code, reason) {
     payload[0] = (code >> 8) & 0xff;
     payload[1] = code & 0xff;
     payload.set(reasonBytes, 2);
+    flushServerWebSocketFrames(state);
     try { socket.write(encodeServerWebSocketFrame(0x8, payload)); } catch {}
     try { socket.end(); } catch {}
   }
@@ -8190,6 +9052,8 @@ function closeServerWebSocket(state, code, reason) {
 function terminateServerWebSocket(state) {
   if (state.readyState === 3 && state.finalized) return;
   state.readyState = 3;
+  state.pendingFrames = [];
+  state.pendingFrameBytes = 0;
   try { state.socket?.destroy?.(); } catch {}
   finalizeServerWebSocket(state, 1006, "");
 }
@@ -8242,7 +9106,7 @@ class ServerWebSocket {
 
   getBufferedAmount() {
     const socket = this._state.socket;
-    return socket && !socket.destroyed ? socket.writableLength : 0;
+    return socket && !socket.destroyed ? socket.writableLength + this._state.pendingFrameBytes : 0;
   }
 
   send(data, compress = undefined) {
@@ -8350,6 +9214,9 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     fragmentOpcode: 0,
     fragmentCompressed: false,
     wantDrain: false,
+    pendingFrames: [],
+    pendingFrameBytes: 0,
+    frameFlushScheduled: false,
     finalized: false,
     opened: false,
     remoteAddress: socket.remoteAddress,
@@ -8378,6 +9245,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
       const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
       if (state.readyState === 1) {
         state.readyState = 2;
+        flushServerWebSocketFrames(state);
         try { socket.write(encodeServerWebSocketFrame(0x8, frame.payload)); } catch {}
       }
       try { socket.end(); } catch {}
@@ -8386,6 +9254,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
     }
     if (frame.opcode === 0x9) {
       if (state.readyState === 1) {
+        flushServerWebSocketFrames(state);
         try { socket.write(encodeServerWebSocketFrame(0xA, frame.payload)); } catch {}
       }
       invokeWebSocketHandler(state, "ping", ws, convertWebSocketBinary(state, frame.payload));
@@ -8634,30 +9503,43 @@ function assertValidServePem(text, name) {
 
 function validateServeTls(tls) {
   if (tls == null || tls === false) return null;
-  if (typeof tls !== "object") throw new TypeError("Bun.serve tls option must be an object");
+  if (typeof tls !== "object") throw new TypeError("TLSOptions must be an object");
   const isArray = Array.isArray(tls);
   const list = isArray ? tls : [tls];
   if (list.length === 0) return null;
+  if (isArray) {
+    for (let index = 1; index < list.length; index += 1) {
+      const entry = list[index];
+      if (entry == null || typeof entry !== "object") throw new TypeError("TLSOptions must be an object");
+      if (typeof entry.serverName !== "string" || entry.serverName.length === 0) {
+        throw new TypeError("SNI tls object must have a serverName");
+      }
+    }
+  }
   const configs = [];
   for (const entry of list) {
     if (entry == null || typeof entry !== "object") {
-      throw new TypeError("Bun.serve tls option must be an object");
+      throw new TypeError("TLSOptions must be an object");
+    }
+    for (const name of ["requestCert", "rejectUnauthorized", "lowMemoryMode"]) {
+      if (entry[name] != null && typeof entry[name] !== "boolean") {
+        throw new TypeError(`TLSOptions.${name} must be a boolean`);
+      }
     }
     const key = serveTlsMaterialText(entry.key, "key");
     const cert = serveTlsMaterialText(entry.cert, "cert");
     if (key != null) assertValidServePem(key, "key");
     if (cert != null) assertValidServePem(cert, "cert");
-    if (isArray && list.length > 1) {
-      if (typeof entry.serverName !== "string" || entry.serverName.length === 0) {
-        throw new TypeError("SNI tls object must have a serverName");
-      }
-    }
     configs.push({
       key,
       cert,
       ca: entry.ca == null ? null : serveTlsMaterialText(entry.ca, "ca"),
       serverName: entry.serverName,
       passphrase: entry.passphrase,
+      requestCert: entry.requestCert === true,
+      rejectUnauthorized: entry.rejectUnauthorized !== false,
+      lowMemoryMode: entry.lowMemoryMode === true,
+      ciphers: entry.ciphers,
     });
   }
   if (!configs.some((config) => config.key != null || config.cert != null)) return null;
@@ -8715,9 +9597,44 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
   const request = new Request(url, init);
   if (method !== "GET" && method !== "HEAD") {
     const body = message._incomingBody;
-    if (body != null && body.byteLength > 0) request._body = asBuffer(body);
+    if (message.complete && body != null && body.byteLength > 0) {
+      request._body = asBuffer(body);
+    } else {
+      const contentLength = Number(message.headers?.["content-length"] ?? 0);
+      const hasStreamingBody = message.headers?.["transfer-encoding"] != null || contentLength > 0;
+      if (hasStreamingBody) request._body = NodeReadable.toWeb(message);
+    }
   }
   return { request, controller };
+}
+
+const bunTlsServerEventIdBase = 0x80000000;
+
+function installBunTlsServerEvent(serverId, callback) {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const id = Number(event?.id);
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(id);
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const fdListener = globalThis.__cottontailFdWatchListeners?.get?.(id);
+      if (typeof fdListener === "function") {
+        fdListener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(id);
+      if (typeof tlsListener === "function") tlsListener(event);
+    });
+  }
+  const eventId = (bunTlsServerEventIdBase | (Number(serverId) & 0x7fffffff)) >>> 0;
+  listeners.set(eventId, (event) => {
+    if (event?.type === "tlsAccept") callback();
+  });
+  return eventId;
 }
 
 function serveNodeBacked(options, context) {
@@ -8730,11 +9647,12 @@ function serveNodeBacked(options, context) {
   let publicUrl = null;
 
   let nodeServer;
+  let tlsAcceptEventId = 0;
   let boundHostname = hostname;
   let boundPort = 0;
   if (useTls) {
     if (isUnix) throw new TypeError("Bun.serve does not support tls with unix sockets yet");
-    const primary = tlsConfigs.find((config) => config.key != null && config.cert != null) ?? tlsConfigs[0];
+    const primary = tlsConfigs[0];
     nodeServer = new nodeHttps.Server({});
     const listenHost = hostname === "localhost" ? "127.0.0.1" : hostname;
     let native;
@@ -8745,8 +9663,30 @@ function serveNodeBacked(options, context) {
         String(primary.cert ?? ""),
         String(primary.key ?? ""),
         primary.passphrase,
+        undefined,
+        primary.ca,
+        primary.requestCert,
+        primary.rejectUnauthorized,
+        primary.ciphers,
       );
+      for (let index = 1; index < tlsConfigs.length; index += 1) {
+        const config = tlsConfigs[index];
+        cottontail.tlsServerAddContext(
+          native.id,
+          config.serverName,
+          String(config.cert ?? ""),
+          String(config.key ?? ""),
+          config.ca,
+          config.passphrase,
+          config.requestCert,
+          config.rejectUnauthorized,
+          config.ciphers,
+        );
+      }
     } catch (rawError) {
+      if (native != null) {
+        try { cottontail.tlsServerClose(native.id); } catch {}
+      }
       const error = rawError instanceof Error ? rawError : new Error(String(rawError));
       if (error.code == null && /(in use|EADDRINUSE)/i.test(String(error.message))) error.code = "EADDRINUSE";
       throw error;
@@ -8757,7 +9697,8 @@ function serveNodeBacked(options, context) {
     nodeServer._tlsServerId = Number(native.id);
     nodeServer._tlsAddress = native.address ?? null;
     nodeServer.listening = true;
-    nodeServer._tlsAcceptTimer = setInterval(() => nodeServer._acceptTls(), 1);
+    tlsAcceptEventId = installBunTlsServerEvent(native.id, () => nodeServer._acceptTls());
+    nodeServer._tlsAcceptTimer = setInterval(() => nodeServer._acceptTls(), 1000);
     boundPort = Number(native.address?.port ?? 0);
   } else {
     nodeServer = new nodeHttp.Server();
@@ -8834,10 +9775,15 @@ function serveNodeBacked(options, context) {
       stopped = true;
       for (const origin of originKeys) activeServeOrigins.delete(origin);
       if (force) {
+        abortActiveServeRequests(server);
         for (const state of Array.from(serverState.websockets)) {
           terminateServerWebSocket(state);
           serverState.websockets.delete(state);
         }
+      }
+      if (tlsAcceptEventId !== 0) {
+        globalThis.__cottontailFdWatchListeners?.delete?.(tlsAcceptEventId);
+        tlsAcceptEventId = 0;
       }
       nodeServer.close();
       if (force) nodeServer.closeAllConnections?.();
@@ -8868,6 +9814,8 @@ function serveNodeBacked(options, context) {
       return server;
     },
     requestIP(request) {
+      const peer = serveRequestPeers.get(request);
+      if (peer) return { ...peer };
       const socket = serveRequestSockets.get(request);
       if (!socket || socket.destroyed) return null;
       const address = socket.remoteAddress;
@@ -8978,8 +9926,14 @@ function serveNodeBacked(options, context) {
     if (response.statusText) nodeResponse.statusMessage = response.statusText;
     const setCookies = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie() : [];
     response.headers.forEach((value, name) => {
-      if (String(name).toLowerCase() === "set-cookie") return;
-      try { nodeResponse.setHeader(name, value); } catch {}
+      const lowerName = String(name).toLowerCase();
+      if (lowerName === "set-cookie") return;
+      const outputName = lowerName === "content-length"
+        ? "Content-Length"
+        : lowerName === "content-type"
+          ? "Content-Type"
+          : name;
+      try { nodeResponse.setHeader(outputName, value); } catch {}
     });
     if (setCookies.length > 0) {
       try { nodeResponse.setHeader("Set-Cookie", setCookies); } catch {}
@@ -9064,9 +10018,7 @@ function serveNodeBacked(options, context) {
     socket.on("error", () => {});
     let result;
     try {
-      result = typeof activeOptions.fetch === "function"
-        ? activeOptions.fetch(request, server)
-        : undefined;
+      result = runServeHandler(activeOptions, request, server);
     } catch (error) {
       reportServeHandlerError(error);
       socket.destroy?.();
@@ -9106,7 +10058,10 @@ function serveNodeBacked(options, context) {
   return server;
 }
 
-export function serve(options = {}) {
+export function serve(options) {
+  if (options === undefined || options === null || typeof options !== "object") {
+    throw new TypeError("Bun.serve expects an object");
+  }
   const wrappedWebSocket = options.websocket && typeof options.websocket === "object"
     ? { ...options.websocket }
     : options.websocket;
@@ -9145,7 +10100,9 @@ export function serve(options = {}) {
     throw new TypeError("Expected websocket to be an object");
   }
   const tlsConfigs = validateServeTls(options.tls);
-  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
+  const configuredMaxRequestBodySize = Number(options.maxRequestBodySize ?? 128 * 1024 * 1024);
+  const needsStreamingRequestBody = configuredMaxRequestBodySize > 128 * 1024 * 1024;
+  if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":") || needsStreamingRequestBody) {
     return serveNodeBacked(options, { hostname, unixPath, tlsConfigs });
   }
 
@@ -9174,6 +10131,7 @@ export function serve(options = {}) {
   let pumping = false;
   let interval = null;
   let publicUrl = null;
+  const maxConcurrentNativeRequests = 256;
   const originKeys = isUnix ? [] : [
     requestOrigin,
     ...(native.hostname === "0.0.0.0" ? [`http://127.0.0.1:${native.port}`, `http://localhost:${native.port}`] : []),
@@ -9191,9 +10149,10 @@ export function serve(options = {}) {
       publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
       return publicUrl;
     },
-    stop() {
+    stop(force = false) {
       if (stopped) return;
       stopped = true;
+      if (force) abortActiveServeRequests(server);
       if (interval != null) clearInterval(interval);
       for (const origin of originKeys) activeServeOrigins.delete(origin);
       cottontail.httpServerStop(native.id);
@@ -9215,13 +10174,16 @@ export function serve(options = {}) {
       return dispatchServeFetch(activeOptions, server, input, init);
     },
     ref() {
+      interval?.ref?.();
       return server;
     },
     unref() {
+      interval?.unref?.();
       return server;
     },
-    requestIP() {
-      return null;
+    requestIP(request) {
+      const peer = serveRequestPeers.get(request);
+      return peer ? { ...peer } : null;
     },
     timeout() {},
     upgrade() {
@@ -9259,11 +10221,31 @@ export function serve(options = {}) {
     return response.arrayBuffer();
   };
 
+  const sendStreamingResponse = async (item, response, status, headers) => {
+    response._bodyUsed = true;
+    cottontail.httpServerResponseStart(native.id, item.id, status, headers);
+    try {
+      await consumeStreamingBody(response._body, (chunk) => {
+        const bytes = bytesFromData(chunk);
+        if (bytes.byteLength > 0) cottontail.httpServerResponseWrite(native.id, item.id, bytes);
+      });
+      cottontail.httpServerResponseEnd(native.id, item.id);
+    } catch (error) {
+      try {
+        cottontail.httpServerResponseAbort(native.id, item.id);
+      } catch {}
+      if (!stopped) throw error;
+    }
+  };
+
   const sendResponse = (item, response, statusOverride = undefined) => {
     normalizeServeDateHeader(response.headers);
-    const body = responseBody(response);
     const status = statusOverride ?? response.status;
-    const headers = headersToText(response.headers);
+    const headers = headersToText(response.headers, String(item.method).toUpperCase() === "HEAD");
+    if (isStreamingBody(response._body)) {
+      return sendStreamingResponse(item, response, status, headers);
+    }
+    const body = responseBody(response);
     if (isPromiseLike(body)) {
       return body.then(
         (resolvedBody) => respond(item, status, headers, resolvedBody),
@@ -9279,40 +10261,47 @@ export function serve(options = {}) {
   };
 
   const handleError = (item, error) => {
-    const message = error instanceof Error ? error.stack || error.message : String(error);
+    const fallbackResponse = (cause) => new Response(
+      cause instanceof Error ? cause.stack || cause.message : String(cause),
+      {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      },
+    );
     let response;
     if (typeof activeOptions.error === "function") {
       try {
         response = normalizeResponseResult(activeOptions.error(error));
       } catch (nextError) {
-        response = new Response(nextError instanceof Error ? nextError.stack || nextError.message : String(nextError), {
-          status: 500,
-          headers: { "content-type": "text/plain; charset=utf-8" },
-        });
+        response = fallbackResponse(nextError);
       }
     } else {
-      response = new Response(message, {
-        status: 500,
-        headers: { "content-type": "text/plain; charset=utf-8" },
-      });
+      response = fallbackResponse(error);
     }
 
     if (isPromiseLike(response)) {
-      return response.then((resolvedResponse) => sendResponse(item, resolvedResponse, 500));
+      return response.then(
+        (resolvedResponse) => sendResponse(item, resolvedResponse),
+        (nextError) => sendResponse(item, fallbackResponse(nextError)),
+      );
     }
-    return sendResponse(item, response, 500);
+    return sendResponse(item, response);
   };
 
   const handle = (item) => {
+    const requestHeaders = parseHeadersText(item.headersText);
     const requestInit = {
       method: item.method,
-      headers: parseHeadersText(item.headersText),
+      headers: requestHeaders,
     };
     if (String(item.method).toUpperCase() !== "GET" && String(item.method).toUpperCase() !== "HEAD") {
       requestInit.body = item.body;
     }
-    const requestUrl = normalizeRequestUrl(/^https?:\/\//i.test(String(item.url)) ? String(item.url) : `${requestOrigin}${item.url}`);
+    const host = requestHeaders.get("host");
+    const requestBase = host ? `http://${host}` : requestOrigin;
+    const requestUrl = normalizeRequestUrl(/^https?:\/\//i.test(String(item.url)) ? String(item.url) : `${requestBase}${item.url}`);
     const request = new Request(requestUrl, requestInit);
+    if (item.remote) serveRequestPeers.set(request, item.remote);
     try {
       const response = runServeHandler(activeOptions, request, server);
       if (isPromiseLike(response)) {
@@ -9329,21 +10318,23 @@ export function serve(options = {}) {
   const pump = () => {
     if (stopped || pumping) return;
     pumping = true;
-    while (!stopped) {
+    while (!stopped && server.pendingRequests < maxConcurrentNativeRequests) {
       const item = cottontail.httpServerPoll(native.id);
       if (!item) break;
       server.pendingRequests += 1;
       const handled = handle(item);
       if (isPromiseLike(handled)) {
-        handled.then(
-          () => {},
-          (error) => console.error(error instanceof Error ? error.stack || error.message : error),
-        ).then(() => {
-          server.pendingRequests -= 1;
-          pumping = false;
-          pump();
-        });
-        return;
+        Promise.resolve(handled).then(
+          () => {
+            server.pendingRequests -= 1;
+            pump();
+          },
+          (error) => {
+            console.error(error instanceof Error ? error.stack || error.message : error);
+            server.pendingRequests -= 1;
+            pump();
+          },
+        );
       } else {
         server.pendingRequests -= 1;
       }
@@ -9643,7 +10634,11 @@ export function file(path, options = undefined) {
   let cachedBytes = null;
   let cachedMtime = -1;
   let cachedSize = -1;
+  let sizeWasRead = false;
   const currentStat = () => isFd ? cottontail.fstatSync(filePath) : cottontail.statSync(filePath, true);
+  const currentSize = () => {
+    try { return Number(currentStat()?.size ?? 0); } catch { return 0; }
+  };
   const invalidateCache = () => {
     cachedBytes = null;
     cachedMtime = -1;
@@ -9687,10 +10682,8 @@ export function file(path, options = undefined) {
       return `${label} {\n  type: ${JSON.stringify(String(type))}\n}`;
     },
     get size() {
-      if (isFd) {
-        try { return Number(cottontail.fstatSync(filePath)?.size ?? 0); } catch { return 0; }
-      }
-      try { return Number(cottontail.statSync(filePath, true)?.size ?? 0); } catch { return 0; }
+      sizeWasRead = true;
+      return currentSize();
     },
     get lastModified() {
       try {
@@ -9809,21 +10802,25 @@ export function file(path, options = undefined) {
         }
       })());
     },
-    slice(start = 0, end = this.size, type = "") {
+    slice(start = 0, end = undefined, type = "") {
       if (isFd) throw new TypeError("Cannot slice Bun.file(fd)");
+      const hadKnownSize = sizeWasRead;
+      const size = currentSize();
       if (typeof start === "string") {
         type = start;
         start = 0;
-        end = this.size;
+        end = size;
       } else if (typeof end === "string") {
         type = end;
-        end = this.size;
+        end = size;
       }
       if (typeof start !== "number" || Number.isNaN(start)) start = 0;
-      if (typeof end !== "number") end = this.size;
+      if (typeof end !== "number") end = size;
       else if (Number.isNaN(end)) end = 0;
-      const rangeStart = start < 0 ? Math.max(this.size + start, 0) : Math.min(start, this.size);
-      const rangeEnd = end < 0 ? Math.max(this.size + end, 0) : Math.min(end, this.size);
+      const rangeStart = start < 0
+        ? (hadKnownSize ? Math.max(size + start, 0) : size)
+        : Math.min(start, size);
+      const rangeEnd = end < 0 ? Math.max(size + end, 0) : Math.min(end, size);
       const blob = new Blob([readRange(rangeStart, rangeEnd)], { type: String(type || this.type || "") });
       Object.defineProperties(blob, {
         _bunFilePath: { value: String(filePath), configurable: true },
@@ -10167,8 +11164,13 @@ export class CryptoHasher {
 
   digest(encoding = undefined) {
     if (this._finished) throw new Error("Digest already called");
-    this._finished = true;
-    return nodeDigest(this.algorithm, this._chunks, encoding, this._key);
+    const output = nodeDigest(this.algorithm, this._chunks, encoding, this._key);
+    if (this._key === undefined) {
+      this._chunks = [];
+    } else {
+      this._finished = true;
+    }
+    return output;
   }
 
   copy() {
@@ -10300,11 +11302,12 @@ export const cwd = cottontail.cwd();
 export const main = globalThis.process?.argv?.[1] ?? "";
 export const origin = "";
 export const isMainThread = cottontail.isWorker?.() !== true;
-export const version = String(cottontail.processInfo("version"));
+export const version = "1.3.10";
 export const revision = "cottontail";
-export const version_with_sha = `${version} (${revision})`;
+export const version_with_sha = `v${version} (${revision})`;
 if (globalThis.process) {
   globalThis.process.versions ??= {};
+  globalThis.process.versions.cottontail = String(cottontail.processInfo("version"));
   globalThis.process.versions.bun = version;
   globalThis.process.revision = revision;
 }
@@ -11870,22 +12873,74 @@ export function readableStreamToFormData(stream, boundaryOrFormData = undefined)
 }
 
 function bunDnsFamily(family) {
-  if (family == null || family === "any") return 0;
-  if (family === "IPv4") return 4;
-  if (family === "IPv6") return 6;
+  if (family == null || family === "" || family === "any" || (typeof family === "number" && Number.isNaN(family))) return 0;
+  if (family === "IPv4" || family === "ipv4") return 4;
+  if (family === "IPv6" || family === "ipv6") return 6;
   if (family === 0 || family === 4 || family === 6) return family;
   throw new Error("Invalid options passed to lookup(): InvalidFamily");
 }
 
 function bunDnsLookupOptions(options) {
-  // Bun treats non-object options as an empty options object rather than as
-  // Node's numeric family shorthand.
-  if (options == null || typeof options !== "object") return { family: 0, all: true };
-  const backend = options.backend;
-  if (backend != null && backend !== "system" && backend !== "libc" && backend !== "c-ares") {
+  const optionType = typeof options;
+  if (optionType === "string" || optionType === "symbol" || optionType === "bigint") {
+    throw new Error("Invalid options passed to lookup(): InvalidOptions");
+  }
+  if (options == null || (optionType !== "object" && optionType !== "function")) {
+    return { family: 0, all: true };
+  }
+
+  let backend = options.backend;
+  if (backend === "cares") backend = "c-ares";
+  if (backend == null || backend === "") backend = undefined;
+  if (backend !== undefined && backend !== "system" && backend !== "libc" && backend !== "c-ares" && backend !== "getaddrinfo") {
     throw new Error("Invalid options passed to lookup(): InvalidBackend");
   }
-  return { ...options, family: bunDnsFamily(options.family), all: true };
+
+  let socketType = options.socketType;
+  if (socketType == null || socketType === "" || socketType === 0 || (typeof socketType === "number" && Number.isNaN(socketType))) {
+    socketType = undefined;
+  } else if (socketType === 1) {
+    socketType = "udp";
+  } else if (socketType === 2) {
+    socketType = "tcp";
+  } else if (socketType !== "udp" && socketType !== "tcp") {
+    throw new Error("Invalid options passed to lookup(): InvalidSocketType");
+  }
+
+  let flags = options.flags;
+  if (flags === undefined || (typeof flags === "number" && Number.isNaN(flags))) flags = 0;
+  const validFlags = nodeDns.ADDRCONFIG | nodeDns.V4MAPPED | nodeDns.ALL;
+  if (typeof flags !== "number" || !Number.isFinite(flags) || !Number.isInteger(flags) || flags < 0 || flags > validFlags || (flags & ~validFlags) !== 0) {
+    const error = new TypeError(`The "flags" argument is invalid. Received ${flags === null ? "undefined" : typeof flags === "number" ? `type number (${flags})` : `type ${typeof flags} (${String(flags)})`}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+
+  let port = options.port;
+  if (port != null) {
+    if (typeof port !== "number" || Number.isNaN(port)) {
+      const error = new RangeError("Invalid port number");
+      error.code = "ERR_SOCKET_BAD_PORT";
+      throw error;
+    }
+    const normalizedPort = Math.trunc(port);
+    if (!Number.isFinite(port) || normalizedPort < 0 || normalizedPort > 65535) {
+      const displayed = port === Infinity ? 9223372036854775807 : port === -Infinity ? -9223372036854775808 : normalizedPort;
+      const error = new RangeError(`Port number out of range: ${displayed}`);
+      error.code = "ERR_SOCKET_BAD_PORT";
+      throw error;
+    }
+    port = normalizedPort;
+  }
+
+  return {
+    family: bunDnsFamily(options.family),
+    all: true,
+    hints: flags,
+    backend,
+    socketType,
+    port,
+  };
 }
 
 function bunDnsError(error) {
@@ -11909,10 +12964,17 @@ function bunDnsError(error) {
 }
 
 function bunDnsLookup(hostname, options = {}) {
+  if (typeof hostname !== "string") {
+    const error = new TypeError("Expected hostname to be a string for 'lookup'.");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (hostname.length === 0) {
+    const error = new TypeError("Expected hostname to be a non-empty string for 'lookup'.");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
   const lookupOptions = bunDnsLookupOptions(options);
-  // COTTONTAIL-COMPAT: all accepted Bun backends currently use Cottontail's
-  // stock-JSC host resolver hook; c-ares-specific transport selection needs a
-  // distinct native hook, while result and error contracts remain identical.
   return new Promise((resolve, reject) => {
     nodeDns.lookup(hostname, lookupOptions, (error, records) => {
       if (error) {
@@ -11927,6 +12989,39 @@ function bunDnsLookup(hostname, options = {}) {
     });
   });
 }
+
+const bunDnsResolverHookKey = Symbol.for("cottontail.runtime.bun-dns-resolver-hook");
+
+function installBunDnsResolverCache() {
+  if (globalThis[bunDnsResolverHookKey] != null || typeof cottontail.dnsLookup !== "function") return;
+
+  const cacheState = globalThis[Symbol.for("cottontail.runtime.dns-cache")];
+  if (typeof cacheState?.resolveForNetwork !== "function") return;
+
+  const state = {
+    nativeLookup: cottontail.dnsLookup,
+    resolving: 0,
+  };
+  globalThis[bunDnsResolverHookKey] = state;
+
+  cottontail.dnsLookup = function bunCachedDnsLookup(hostname, family = 0, nativeOptions = undefined) {
+    const normalizedFamily = Number(family) || 0;
+    if (state.resolving > 0 || nativeOptions !== undefined) {
+      return state.nativeLookup(hostname, normalizedFamily, nativeOptions);
+    }
+
+    state.resolving += 1;
+    try {
+      const records = cacheState.resolveForNetwork(String(hostname), 0, false);
+      if (normalizedFamily !== 4 && normalizedFamily !== 6) return records;
+      return records.filter((record) => Number(record.family) === normalizedFamily);
+    } finally {
+      state.resolving -= 1;
+    }
+  };
+}
+
+installBunDnsResolverCache();
 
 export const dns = {
   ...nodeDns,
@@ -12009,6 +13104,113 @@ export function openInEditor(path) {
 
 const bunSocketCallbackError = Symbol("cottontail.bunSocketCallbackError");
 
+function normalizeBunSocketCallbackError(error) {
+  if (!(error instanceof Error)) return error;
+  const missingVariable = /^Can't find variable: (.+)$/.exec(String(error.message));
+  if (missingVariable) error.message = `${missingVariable[1]} is not defined`;
+  return error;
+}
+
+function bunSocketTlsTransport(socket) {
+  const transport = {
+    get connecting() { return socket.connecting; },
+    get destroyed() { return socket.destroyed; },
+    get writable() { return socket.writable; },
+    get readable() { return socket.readable; },
+    get remoteAddress() { return socket.remoteAddress; },
+    get _host() { return socket._host; },
+    on(name, callback) {
+      socket.on(name, callback);
+      return transport;
+    },
+    once(name, callback) {
+      socket.once(name, callback);
+      return transport;
+    },
+    removeListener(name, callback) {
+      socket.removeListener(name, callback);
+      return transport;
+    },
+    write(chunk) {
+      const length = bytesFromData(chunk).byteLength;
+      const written = socket.write(chunk);
+      return typeof written === "number" ? written >= length : written !== false;
+    },
+    end(...args) {
+      socket.end(...args);
+      return transport;
+    },
+    destroy(error) {
+      socket.destroy(error);
+      return transport;
+    },
+    pause() {
+      socket.pause();
+      return transport;
+    },
+    resume() {
+      socket.resume();
+      return transport;
+    },
+    ref() {
+      socket.ref();
+      return transport;
+    },
+    unref() {
+      socket.unref();
+      return transport;
+    },
+  };
+  return transport;
+}
+
+function bunSocketUpgradeTlsError(error) {
+  if (!(error instanceof Error)) error = new Error(String(error));
+  if (error.code == null || /^ERR_(?:SSL|OSSL)/.test(String(error.code))) {
+    error.code = "ERR_BORINGSSL";
+  }
+  return error;
+}
+
+function upgradeBunSocketToTls(socket, options) {
+  if (socket.destroyed || socket.connecting || !socket.readable || !socket.writable) {
+    throw new TypeError("upgradeTLS requires an established socket");
+  }
+  if (options === null || typeof options !== "object") throw new TypeError("Expected options object");
+  const handlers = options.socket;
+  if (handlers === null || typeof handlers !== "object") throw new TypeError('Expected "socket" option');
+  const tls = options.tls;
+  if (tls !== true && (tls === null || typeof tls !== "object" || Object.keys(tls).length === 0)) {
+    throw new TypeError('Expected "tls" option');
+  }
+
+  const normalized = {
+    hostname: String(socket._host ?? socket.remoteAddress ?? "localhost"),
+    port: Number(socket.remotePort ?? 0),
+  };
+  const tlsOptions = bunSocketTlsOptions(tls, normalized);
+  const transport = bunSocketTlsTransport(socket);
+  let tlsSocket;
+  try {
+    tlsSocket = nodeTlsConnectMemoryTransport(transport, {
+      ...tlsOptions,
+      host: normalized.hostname,
+      port: normalized.port,
+    });
+  } catch (error) {
+    throw bunSocketUpgradeTlsError(error);
+  }
+
+  const attached = attachBunSocketHandlers(tlsSocket, handlers, options.data);
+  attached.handlers = handlers;
+  if (typeof handlers.handshake === "function") attached.call("open", tlsSocket);
+  tlsSocket.once("secureConnect", () => {
+    completeBunTlsHandshake(attached);
+    if (typeof handlers.drain === "function") queueMicrotask(() => attached.call("drain", tlsSocket));
+  });
+  return [socket, tlsSocket];
+}
+
 function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connectionState = undefined) {
   socket.data = data;
   if (!socket.__cottontailBunSocketMethods) {
@@ -12032,6 +13234,9 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
       return socket;
     };
     socket.timeout = timeout;
+    if (!socket.encrypted) {
+      socket.upgradeTLS = (options) => upgradeBunSocketToTls(socket, options);
+    }
   }
   const call = (name, ...args) => {
     const callback = handlers?.[name];
@@ -12039,6 +13244,7 @@ function attachBunSocketHandlers(socket, handlers = {}, data = undefined, connec
     try {
       return callback(...args);
     } catch (error) {
+      error = normalizeBunSocketCallbackError(error);
       if (name !== "error" && typeof handlers?.error === "function") {
         handlers.error(socket, error);
         return { [bunSocketCallbackError]: true, error };
@@ -12136,17 +13342,129 @@ function normalizeBunSocketOptions(options) {
   return { unix, hostname, port };
 }
 
+function bunSocketTlsOptions(value, normalized, isServer = false) {
+  const input = value === true ? {} : value;
+  const options = { ...(input ?? {}) };
+  if (options.servername == null && options.serverName != null) options.servername = options.serverName;
+  delete options.serverName;
+  if (!isServer) {
+    // Bun reports certificate verification through the handshake callback but
+    // does not abort an otherwise successful TLS handshake on verification.
+    options.rejectUnauthorized = false;
+    if (options.servername == null && !nodeNet.isIP(normalized.hostname)) {
+      options.servername = normalized.hostname;
+    }
+  }
+  return options;
+}
+
+function bunSocketAuthorizationError(socket) {
+  const code = socket.authorizationError;
+  if (code == null) return null;
+  const info = socket._currentTlsInfo?.();
+  const error = new Error(info?.verifyErrorMessage ?? String(code));
+  error.code = String(code);
+  return error;
+}
+
+function completeBunTlsHandshake(attached) {
+  const socket = attached.socket;
+  const authorizationError = bunSocketAuthorizationError(socket);
+  // Bun's `authorized` flag reflects transport handshake success. Certificate
+  // verification details remain available as the third callback argument.
+  socket.authorized = true;
+  if (typeof attached.handlers?.handshake === "function") {
+    attached.call("handshake", socket, true, authorizationError);
+  } else {
+    attached.call("open", socket);
+  }
+}
+
 export function connect(options = {}) {
   const normalized = normalizeBunSocketOptions(options);
   const handlers = options.socket ?? {};
   if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
-  return new Promise((resolve, reject) => {
+  const promise = new Promise((resolve, reject) => {
     const state = { connecting: true, opened: false, failed: false, reject };
     let socket;
     let attached;
+    const useTls = options.tls != null && options.tls !== false;
+    if (useTls) {
+      let transport;
+      if (options.fd != null) {
+        transport = new nodeNet.Socket();
+        try {
+          const fd = Number(options.fd);
+          if (!Number.isInteger(fd) || fd < 0) throw new Error("Bad file descriptor");
+          cottontail.fstatSync(fd);
+          transport._attachFd(fd, undefined, undefined, true);
+        } catch (error) {
+          state.connecting = false;
+          state.failed = true;
+          const connectError = new Error("Failed to connect");
+          connectError.code = error?.code ?? "EBADF";
+          connectError.errno = error?.errno ?? connectError.code;
+          reject(connectError);
+          return;
+        }
+      } else {
+        transport = nodeNet.connect(normalized.unix
+          ? { path: normalized.unix }
+          : { host: normalized.hostname, port: normalized.port });
+      }
+      socket = nodeTlsConnect({
+        ...bunSocketTlsOptions(options.tls, normalized),
+        socket: transport,
+        host: normalized.hostname,
+        port: normalized.port,
+      });
+      attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+      attached.handlers = handlers;
+      let settled = false;
+      const settle = () => {
+        if (settled || state.failed) return;
+        settled = true;
+        state.connecting = false;
+        state.opened = true;
+        resolve(socket);
+      };
+      const onTransportOpen = () => {
+        if (typeof handlers.handshake === "function") attached.call("open", socket);
+        settle();
+        if (!normalized.unix) {
+          const host = normalized.hostname.includes(":") ? `[${normalized.hostname}]` : normalized.hostname;
+          const plainHttpServer = activeServerForFetchUrl(`http://${host}:${normalized.port}/`);
+          if (plainHttpServer != null) {
+            // A plain HTTP listener rejects a TLS ClientHello. The native
+            // in-process listener cannot surface malformed pre-request bytes,
+            // so mirror the peer close instead of leaving the TLS socket open.
+            queueMicrotask(() => socket.destroy());
+          }
+        }
+      };
+      if (transport.connecting) transport.once("connect", onTransportOpen);
+      else queueMicrotask(onTransportOpen);
+      socket.once("secureConnect", () => {
+        if (state.failed) return;
+        completeBunTlsHandshake(attached);
+        settle();
+      });
+      return;
+    }
+    const onConnect = () => {
+      if (state.failed) return;
+      state.connecting = false;
+      state.opened = true;
+      const result = attached.call("open", socket);
+      if (result instanceof Error) {
+        attached.call("error", socket, result);
+      }
+      resolve(socket);
+    };
     if (options.fd != null) {
       socket = new nodeNet.Socket();
       attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+      socket.once("connect", onConnect);
       try {
         const fd = Number(options.fd);
         if (!Number.isInteger(fd) || fd < 0) throw new Error("Bad file descriptor");
@@ -12166,18 +13484,11 @@ export function connect(options = {}) {
         ? { path: normalized.unix }
         : { host: normalized.hostname, port: normalized.port });
       attached = attachBunSocketHandlers(socket, handlers, options.data, state);
+      socket.once("connect", onConnect);
     }
-    socket.once("connect", () => {
-      if (state.failed) return;
-      state.connecting = false;
-      state.opened = true;
-      const result = attached.call("open", socket);
-      if (result instanceof Error) {
-        attached.call("error", socket, result);
-      }
-      resolve(socket);
-    });
   });
+  if (typeof handlers.connectError === "function") promise.catch(() => {});
+  return promise;
 }
 
 export function listen(options = {}) {
@@ -12185,21 +13496,54 @@ export function listen(options = {}) {
   const handlers = options.socket ?? {};
   if (handlers === null || typeof handlers !== "object") throw new TypeError("socket must be an object");
 
-  const native = normalized.unix
-    ? cottontail.unixServerListen(normalized.unix, Number(options.backlog ?? 128))
-    : cottontail.tcpServerListen(normalized.port, normalized.hostname, normalized.hostname.includes(":") ? 6 : 4);
-  const address = normalized.unix ? { path: String(native.path ?? normalized.unix), family: "Unix" } : native.address;
-  const server = nodeNet.Server._fromFd(native.fd, {
-    pipe: Boolean(normalized.unix),
-    path: normalized.unix || undefined,
-  });
+  const useTls = options.tls != null && options.tls !== false;
+  let server;
+  let address;
+  if (useTls) {
+    const tlsList = Array.isArray(options.tls) ? options.tls : [options.tls];
+    if (tlsList.length === 0) throw new TypeError("TLSOptions must be an object");
+    server = nodeTlsCreateServer(bunSocketTlsOptions(tlsList[0], normalized, true));
+    for (let index = 1; index < tlsList.length; index += 1) {
+      const item = tlsList[index];
+      if (item == null || typeof item !== "object" || typeof item.serverName !== "string" || item.serverName.length === 0) {
+        throw new TypeError("SNI tls object must have a serverName");
+      }
+      server.addContext(item.serverName, bunSocketTlsOptions(item, normalized, true));
+    }
+    server.listen(normalized.unix
+      ? { path: normalized.unix, backlog: Number(options.backlog ?? 128) }
+      : { host: normalized.hostname, port: normalized.port, backlog: Number(options.backlog ?? 128) });
+    address = server.address();
+  } else {
+    const native = normalized.unix
+      ? cottontail.unixServerListen(normalized.unix, Number(options.backlog ?? 128))
+      : cottontail.tcpServerListen(normalized.port, normalized.hostname, normalized.hostname.includes(":") ? 6 : 4);
+    address = normalized.unix ? { path: String(native.path ?? normalized.unix), family: "Unix" } : native.address;
+    server = nodeNet.Server._fromFd(native.fd, {
+      pipe: Boolean(normalized.unix),
+      path: normalized.unix || undefined,
+    });
+  }
   let stopped = false;
   let activeOptions = options;
+  const tlsConnections = new WeakMap();
 
   server.on("connection", (socket) => {
     const attached = attachBunSocketHandlers(socket, activeOptions.socket ?? handlers, activeOptions.data);
-    attached.call("open", socket);
+    attached.handlers = activeOptions.socket ?? handlers;
+    if (useTls) {
+      tlsConnections.set(socket, attached);
+      if (typeof attached.handlers?.handshake === "function") attached.call("open", socket);
+    } else {
+      attached.call("open", socket);
+    }
   });
+  if (useTls) {
+    server.on("secureConnection", (socket) => {
+      const attached = tlsConnections.get(socket);
+      if (attached != null) completeBunTlsHandshake(attached);
+    });
+  }
 
   const listener = {
     data: options.data,
@@ -12223,6 +13567,10 @@ export function listen(options = {}) {
       activeOptions = { ...activeOptions, ...nextOptions };
       listener.data = activeOptions.data;
       return listener;
+    },
+    addServerName(serverName, tls) {
+      if (!useTls) throw new Error("addServerName requires SSL support");
+      server.addContext(String(serverName), bunSocketTlsOptions(tls, normalized, true));
     },
     getsockname(out) {
       if (out === null || typeof out !== "object") throw new TypeError("getsockname requires an object");
@@ -14041,7 +15389,270 @@ function matchFileSystemRoute(record, pathname) {
   return inputIndex === inputSegments.length ? params : null;
 }
 
-export class Terminal {}
+const terminalStates = new WeakMap();
+
+function terminalFdListeners() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const listener = listeners.get(Number(event?.id));
+      if (typeof listener === "function") listener(event);
+    });
+  }
+  return listeners;
+}
+
+function closeTerminalResource(resource) {
+  if (!resource || resource.closed) return;
+  resource.closed = true;
+  if (resource.watchId) {
+    terminalFdListeners().delete(resource.watchId);
+    cottontail.fdWatchStop?.(resource.watchId);
+    resource.watchId = 0;
+  }
+  const descriptors = new Set([resource.masterFd, resource.readFd, resource.writeFd, resource.slaveFd]);
+  for (const fd of descriptors) {
+    if (Number.isInteger(fd) && fd >= 0) {
+      try { cottontail.closeFd?.(fd); } catch {}
+    }
+  }
+  resource.masterFd = -1;
+  resource.readFd = -1;
+  resource.writeFd = -1;
+  resource.slaveFd = -1;
+}
+
+const terminalFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry(closeTerminalResource)
+  : null;
+
+function terminalState(value) {
+  const state = terminalStates.get(value);
+  if (!state) throw new TypeError("Expected a Terminal object");
+  return state;
+}
+
+function notifyTerminalExit(terminal, code = 0, signal = null) {
+  if (!terminal) return;
+  const state = terminalStates.get(terminal);
+  if (!state || state.exitNotified) return;
+  state.exitNotified = true;
+  if (typeof state.exit !== "function") return;
+  queueMicrotask(() => {
+    try {
+      state.exit(terminal, code, signal);
+    } catch (error) {
+      queueMicrotask(() => { throw error; });
+    }
+  });
+}
+
+function terminalSpawnFd(terminal) {
+  if (!terminal) return undefined;
+  const state = terminalState(terminal);
+  if (state.closed || state.resource.slaveFd < 0) throw new Error("terminal is closed");
+  return state.resource.slaveFd;
+}
+
+function terminalProcessExited(terminal, code, signal) {
+  notifyTerminalExit(terminal, code ?? 0, signal ?? null);
+}
+
+export class Terminal {
+  constructor(options) {
+    if (options == null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("Terminal constructor requires an options object");
+    }
+    if (typeof cottontail.terminalCreate !== "function") {
+      throw new Error("PTY not supported on this platform");
+    }
+
+    const cols = typeof options.cols === "number" && Number.isInteger(options.cols) && options.cols > 0 && options.cols <= 0xffff
+      ? options.cols
+      : 80;
+    const rows = typeof options.rows === "number" && Number.isInteger(options.rows) && options.rows > 0 && options.rows <= 0xffff
+      ? options.rows
+      : 24;
+    const name = typeof options.name === "string" && options.name.length > 0 ? options.name : "xterm-256color";
+    if (name.length > 128) throw new TypeError("Terminal name too long (max 128 characters)");
+
+    const native = cottontail.terminalCreate(cols, rows);
+    const resource = {
+      closed: false,
+      watchId: 0,
+      masterFd: Number(native?.masterFd ?? -1),
+      readFd: Number(native?.readFd ?? -1),
+      writeFd: Number(native?.writeFd ?? -1),
+      slaveFd: Number(native?.slaveFd ?? -1),
+    };
+    if ([resource.masterFd, resource.readFd, resource.writeFd, resource.slaveFd].some((fd) => !Number.isInteger(fd) || fd < 0)) {
+      closeTerminalResource(resource);
+      throw new Error("Failed to open PTY");
+    }
+
+    const state = {
+      resource,
+      closed: false,
+      referenced: true,
+      exitNotified: false,
+      name,
+      data: typeof options.data === "function" ? _wrapAsyncCallback(options.data) : undefined,
+      exit: typeof options.exit === "function" ? _wrapAsyncCallback(options.exit) : undefined,
+      drain: typeof options.drain === "function" ? _wrapAsyncCallback(options.drain) : undefined,
+    };
+    terminalStates.set(this, state);
+
+    try {
+      const watch = cottontail.fdWatchStart(resource.readFd, 64 * 1024, true, false);
+      resource.watchId = Number(watch?.id ?? 0);
+      if (!resource.watchId) throw new Error("Failed to start terminal reader");
+      terminalFdListeners().set(resource.watchId, (event) => {
+        if (state.closed) return;
+        if (event?.type === "data") {
+          if (typeof state.data !== "function") return;
+          const bytes = asBuffer(event.data ?? new ArrayBuffer(0));
+          if (bytes.byteLength === 0) return;
+          try {
+            state.data(this, bytes);
+          } catch (error) {
+            queueMicrotask(() => { throw error; });
+          }
+          return;
+        }
+        if (event?.type === "end" || event?.type === "error") {
+          terminalFdListeners().delete(resource.watchId);
+          resource.watchId = 0;
+          notifyTerminalExit(this, 0, null);
+        }
+      });
+      terminalFinalizer?.register(this, resource, resource);
+    } catch (error) {
+      terminalStates.delete(this);
+      closeTerminalResource(resource);
+      throw error;
+    }
+  }
+
+  get closed() {
+    return terminalState(this).closed;
+  }
+
+  set closed(_) {
+    throw new TypeError("Terminal.closed is read-only");
+  }
+
+  get inputFlags() {
+    const state = terminalState(this);
+    return state.closed ? 0 : Number(cottontail.terminalGetFlags?.(state.resource.masterFd, 0) ?? 0);
+  }
+
+  set inputFlags(value) {
+    this.#setFlags(0, value);
+  }
+
+  get outputFlags() {
+    const state = terminalState(this);
+    return state.closed ? 0 : Number(cottontail.terminalGetFlags?.(state.resource.masterFd, 1) ?? 0);
+  }
+
+  set outputFlags(value) {
+    this.#setFlags(1, value);
+  }
+
+  get localFlags() {
+    const state = terminalState(this);
+    return state.closed ? 0 : Number(cottontail.terminalGetFlags?.(state.resource.masterFd, 2) ?? 0);
+  }
+
+  set localFlags(value) {
+    this.#setFlags(2, value);
+  }
+
+  get controlFlags() {
+    const state = terminalState(this);
+    return state.closed ? 0 : Number(cottontail.terminalGetFlags?.(state.resource.masterFd, 3) ?? 0);
+  }
+
+  set controlFlags(value) {
+    this.#setFlags(3, value);
+  }
+
+  #setFlags(kind, value) {
+    const state = terminalState(this);
+    if (state.closed) return;
+    cottontail.terminalSetFlags?.(state.resource.masterFd, kind, Number(value));
+  }
+
+  write(data) {
+    const state = terminalState(this);
+    if (state.closed) throw new Error("Terminal is closed");
+    if (data == null || (typeof data !== "string" && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data))) {
+      throw new TypeError("write() argument must be a string or ArrayBuffer");
+    }
+    const bytes = typeof data === "string"
+      ? new TextEncoder().encode(data)
+      : data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (bytes.byteLength === 0) return 0;
+    const written = Number(cottontail.terminalWrite?.(state.resource.writeFd, bytes) ?? -1);
+    if (!Number.isInteger(written) || written < 0) throw new Error("Failed to write to terminal");
+    if (typeof state.drain === "function") {
+      queueMicrotask(() => {
+        try { state.drain(this); } catch (error) { queueMicrotask(() => { throw error; }); }
+      });
+    }
+    return written;
+  }
+
+  resize(cols, rows) {
+    const state = terminalState(this);
+    if (state.closed) throw new Error("Terminal is closed");
+    if (typeof cols !== "number" || !Number.isFinite(cols) || cols <= 0 || cols > 0xffff) {
+      throw new TypeError("resize() requires valid cols argument");
+    }
+    if (typeof rows !== "number" || !Number.isFinite(rows) || rows <= 0 || rows > 0xffff) {
+      throw new TypeError("resize() requires valid rows argument");
+    }
+    cottontail.terminalResize?.(state.resource.masterFd, Math.trunc(cols), Math.trunc(rows));
+  }
+
+  setRawMode(enabled) {
+    const state = terminalState(this);
+    if (state.closed) throw new Error("Terminal is closed");
+    cottontail.terminalSetRawMode?.(state.resource.masterFd, Boolean(enabled));
+  }
+
+  ref() {
+    const state = terminalState(this);
+    state.referenced = true;
+    if (state.resource.watchId) cottontail.fdWatchSetRef?.(state.resource.watchId, true);
+  }
+
+  unref() {
+    const state = terminalState(this);
+    state.referenced = false;
+    if (state.resource.watchId) cottontail.fdWatchSetRef?.(state.resource.watchId, false);
+  }
+
+  close() {
+    const state = terminalState(this);
+    if (state.closed) return;
+    state.closed = true;
+    closeTerminalResource(state.resource);
+    terminalFinalizer?.unregister(state.resource);
+    notifyTerminalExit(this, 0, null);
+  }
+
+  [Symbol.dispose]() {
+    this.close();
+  }
+
+  async [Symbol.asyncDispose]() {
+    this.close();
+  }
+}
 export class RedisClient {}
 export { S3Client, s3 };
 export const redis = null;
@@ -14226,84 +15837,14 @@ export const password = {
   verifySync: passwordVerifySync,
 };
 
-function parseSemverParts(value) {
-  return String(value)
-    .trim()
-    .replace(/^[^\d]*/, "")
-    .split(/[+-]/, 1)[0]
-    .split(".")
-    .map((part) => {
-      const match = String(part).match(/^\d+/);
-      return match ? Number(match[0]) : 0;
-    });
-}
-
-function compareSemver(left, right) {
-  const a = parseSemverParts(left);
-  const b = parseSemverParts(right);
-  for (let index = 0; index < Math.max(a.length, b.length, 3); index += 1) {
-    const diff = (a[index] || 0) - (b[index] || 0);
-    if (diff !== 0) return Math.sign(diff);
-  }
-  return 0;
-}
-
-function semverComparatorSatisfies(version, comparator) {
-  const text = String(comparator).trim();
-  if (!text || text === "*" || text.toLowerCase() === "x") return true;
-  const match = text.match(/^(<=|>=|<|>|=|==|!=|~\s*|\^\s*)?\s*([^\s]+)$/);
-  if (!match) return false;
-  const operator = (match[1] || "=").trim();
-  const target = match[2];
-  const order = compareSemver(version, target);
-  if (operator === "<") return order < 0;
-  if (operator === "<=") return order <= 0;
-  if (operator === ">") return order > 0;
-  if (operator === ">=") return order >= 0;
-  if (operator === "!=") return order !== 0;
-  if (operator === "^") {
-    const current = parseSemverParts(version);
-    const base = parseSemverParts(target);
-    const upper = [...base];
-    const majorIndex = base.findIndex((part) => part > 0);
-    const bumpIndex = majorIndex < 0 ? 0 : majorIndex;
-    upper[bumpIndex] = (upper[bumpIndex] || 0) + 1;
-    for (let index = bumpIndex + 1; index < Math.max(upper.length, 3); index += 1) upper[index] = 0;
-    return compareSemver(current.join("."), base.join(".")) >= 0 && compareSemver(current.join("."), upper.join(".")) < 0;
-  }
-  if (operator === "~") {
-    const base = parseSemverParts(target);
-    const upper = [...base];
-    const bumpIndex = base.length > 1 ? 1 : 0;
-    upper[bumpIndex] = (upper[bumpIndex] || 0) + 1;
-    for (let index = bumpIndex + 1; index < Math.max(upper.length, 3); index += 1) upper[index] = 0;
-    return compareSemver(version, base.join(".")) >= 0 && compareSemver(version, upper.join(".")) < 0;
-  }
-  return order === 0;
-}
-
-function semverComparators(range) {
-  const tokens = String(range).trim().split(/\s+/).filter(Boolean);
-  const comparators = [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    if (/^(?:<=|>=|<|>|=|==|!=|\^|~)$/.test(tokens[index]) && index + 1 < tokens.length) {
-      comparators.push(`${tokens[index]}${tokens[index + 1]}`);
-      index += 1;
-    } else {
-      comparators.push(tokens[index]);
-    }
-  }
-  return comparators;
-}
-
 export const semver = {
   order(left, right) {
-    return compareSemver(left, right);
+    if (arguments.length < 2) throw new TypeError("Expected two arguments");
+    return cottontail.semverOrder(left, right);
   },
   satisfies(version, range) {
-    return String(range)
-      .split("||")
-      .some((part) => semverComparators(part).every((comparator) => semverComparatorSatisfies(version, comparator)));
+    if (arguments.length < 2) throw new TypeError("Expected two arguments");
+    return cottontail.semverSatisfies(version, range);
   },
 };
 const markdownBooleanOptions = [
@@ -15870,6 +17411,7 @@ globalThis.SubtleCrypto ??= NodeSubtleCrypto;
 Object.defineProperty(CottontailURLPattern, "name", { value: "URLPattern", configurable: true });
 globalThis.URLPattern ??= CottontailURLPattern;
 globalThis.DOMException ??= CottontailDOMException;
+activeServeUnreadBodyAbortError = new globalThis.DOMException("The operation was aborted.", "AbortError");
 globalThis.Event ??= CottontailEvent;
 globalThis.EventTarget ??= CottontailEventTarget;
 globalThis.CustomEvent ??= CottontailCustomEvent;
@@ -16735,6 +18277,12 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
       configurable: true,
     });
   }
+  let reportErrorFooterRegistered = false;
+  const reportErrorPlatformName = () => ({
+    darwin: "macOS",
+    linux: "Linux",
+    win32: "Windows",
+  })[globalThis.process?.platform] ?? String(globalThis.process?.platform ?? "unknown");
   globalThis.reportError ??= function reportError(error) {
     const event = new CottontailErrorEvent("error", {
       message: error instanceof globalThis.Error ? String(error.message ?? "") : String(error),
@@ -16742,7 +18290,25 @@ globalThis.MessageEvent ??= CottontailMessageEvent;
       cancelable: true,
     });
     globalThis.dispatchEvent(event);
-    if (!event.defaultPrevented) console.error(error);
+    if (event.defaultPrevented) return;
+
+    if (!(error instanceof globalThis.Error)) {
+      const primitive = error === null || (typeof error !== "object" && typeof error !== "function");
+      const text = primitive ? String(error ?? "null") : "";
+      globalThis.process?.stderr?.write?.(`${text ? `error: ${text}` : "error"}\n`);
+    }
+    const reportErrorConsole = console?.[Symbol.for("cottontail.reportError.console")];
+    if (error instanceof globalThis.Error && typeof reportErrorConsole === "function") reportErrorConsole(error);
+    else console.error(error);
+    if (globalThis.process) globalThis.process.exitCode = 1;
+    if (!reportErrorFooterRegistered && typeof globalThis.process?.once === "function") {
+      reportErrorFooterRegistered = true;
+      globalThis.process.once("exit", () => {
+        const version = globalThis.Bun?.version ?? "0.0.0-cottontail";
+        const arch = globalThis.process?.arch ?? "unknown";
+        globalThis.process?.stderr?.write?.(`\nBun v${version} (${reportErrorPlatformName()} ${arch})\n`);
+      });
+    }
   };
 }
 
@@ -16975,6 +18541,20 @@ globalThis.File ??= BunFile;
 globalThis.AbortSignal ??= CottontailAbortSignal;
 globalThis.AbortController ??= CottontailAbortController;
 globalThis.structuredClone ??= cottontailStructuredClone;
+if (
+  typeof globalThis.SharedArrayBuffer === "function" &&
+  new globalThis.SharedArrayBuffer(0) instanceof globalThis.ArrayBuffer
+) {
+  const nativeHasInstance = globalThis.Function.prototype[Symbol.hasInstance];
+  Object.defineProperty(globalThis.ArrayBuffer, Symbol.hasInstance, {
+    configurable: true,
+    writable: true,
+    value(value) {
+      if (nativeHasInstance.call(globalThis.SharedArrayBuffer, value)) return false;
+      return nativeHasInstance.call(globalThis.ArrayBuffer, value);
+    },
+  });
+}
 if (globalThis.fetch == null) {
   Object.defineProperty(fetch, "name", { value: "fetch", configurable: true });
   globalThis.fetch = fetch;

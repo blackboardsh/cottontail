@@ -18,6 +18,7 @@ pub const Provenance = enum {
     bun_text,
     npm,
     yarn,
+    pnpm,
 };
 
 pub const ConfigVersion = enum(u32) {
@@ -39,6 +40,7 @@ pub const Package = struct {
     resolution: []const u8,
     version: []const u8 = "",
     source: []const u8 = "",
+    git_resolved: []const u8 = "",
     integrity: []const u8 = "",
     info: ?*const Value = null,
     kind: Kind,
@@ -59,6 +61,7 @@ pub const Graph = struct {
     root_workspace: *const Value,
     workspaces: std.StringHashMap(*const Value),
     packages: std.StringHashMap(Package),
+    package_json_changed: bool = false,
 
     pub fn deinit(graph: *Graph) void {
         graph.workspaces.deinit();
@@ -185,7 +188,8 @@ fn parsePackageEntry(key: []const u8, entry: *const Value) !Package {
         .git, .github => {
             package.source = split.resolution;
             package.info = objectAt(entry, 1);
-            package.integrity = stringAt(entry, 2) orelse "";
+            package.git_resolved = stringAt(entry, 2) orelse "";
+            package.integrity = stringAt(entry, 3) orelse "";
         },
         .root => {
             package.info = objectAt(entry, 1);
@@ -281,7 +285,7 @@ fn stringObjectEqual(left: *const Value, right: *const Value, key: []const u8) b
     return true;
 }
 
-fn normalizeJsonc(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+pub fn normalizeJsonc(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
     var without_comments = std.array_list.Managed(u8).init(allocator);
     try without_comments.ensureTotalCapacity(source.len);
 

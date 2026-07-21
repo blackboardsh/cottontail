@@ -2,7 +2,7 @@ import { EventEmitter } from "./events.js";
 import { resolve } from "./path.js";
 import { Readable, Writable } from "./stream.js";
 import { jscHeapSnapshotToV8 } from "./internal/heap_snapshot.js";
-import { format as formatValue } from "./util.js";
+import { format as formatValue, inspect as inspectValue } from "./util.js";
 import { isContext } from "./vm.js";
 import "../bun/ffi.js";
 
@@ -23,8 +23,11 @@ const typedArrayConstructors = {
 const environmentData = new Map();
 const markedUntransferable = new WeakSet();
 const markedUncloneable = new WeakSet();
+const broadcastChannelBrand = new WeakSet();
 const workerInstances = new Map();
 const broadcastChannels = new Map();
+const broadcastChannelIds = new Map();
+const broadcastSubscriptions = new Map();
 const transferredPortPeers = new Map();
 const transferredPortRoutes = new Map();
 const transferredPortTargets = new Map();
@@ -34,7 +37,10 @@ const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
 const messagePortBrand = Symbol.for("cottontail.worker_threads.MessagePort");
 const createMessagePortToken = {};
 let nextPortId = 1;
+let nextBroadcastChannelId = 1;
 let nextWorkerControlRequestId = 1;
+let nextThreadMessageRequestId = 1;
+const threadMessageRequests = new Map();
 const inheritedUncaughtExceptionListeners = new Set(globalThis.process?.listeners?.("uncaughtException") ?? []);
 let workerUserCaptureCallbackInstalled = false;
 
@@ -70,6 +76,9 @@ function clearWorkerNativeTimers() {
 
 if (!isMainThread && typeof globalThis.process?.setUncaughtExceptionCaptureCallback === "function") {
   const setCaptureCallback = globalThis.process.setUncaughtExceptionCaptureCallback;
+  if (globalThis.process.hasUncaughtExceptionCaptureCallback?.()) {
+    setCaptureCallback.call(globalThis.process, null);
+  }
   globalThis.process.setUncaughtExceptionCaptureCallback = function setUncaughtExceptionCaptureCallback(callback) {
     const result = setCaptureCallback.call(this, callback);
     workerUserCaptureCallbackInstalled = typeof callback === "function";
@@ -178,12 +187,16 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
     return { t: "number", v: value };
   }
   if (typeof value === "bigint") return { t: "bigint", v: value.toString() };
-  if (typeof value === "function" || typeof value === "symbol") throw dataCloneError("Value cannot be cloned");
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw dataCloneError(`${String(value)} could not be cloned.`);
+  }
   if (markedUncloneable.has(value)) throw dataCloneError("Object is marked as uncloneable");
   const existingId = state.ids.get(value);
   if (existingId != null) return { t: "Ref", id: existingId };
   if (value instanceof MessagePort) {
-    if (!state.transfers?.has(value)) throw dataCloneError("MessagePort must be listed in transferList");
+    if (!state.transfers?.has(value)) {
+      throw dataCloneError("Object that needs transfer was found in message but not listed in transferList");
+    }
     if (value._closed) throw dataCloneError("MessagePort is closed");
     const id = state.nextId++;
     state.ids.set(value, id);
@@ -497,6 +510,28 @@ function workerEvalFilename() {
   return `${String(cottontail.cwd()).replace(/\\/g, "/")}/[worker eval]`;
 }
 
+function workerFileKind(path, options) {
+  const lowerPath = path.toLowerCase();
+  if (lowerPath.endsWith(".cjs") || lowerPath.endsWith(".cts")) return "commonjs";
+  if (lowerPath.endsWith(".mjs") || lowerPath.endsWith(".mts")) return "module";
+  if (options.type === "commonjs" || options.type === "module") return options.type;
+
+  if (typeof cottontail.readFile === "function" && typeof cottontail.transpilerScan === "function") {
+    try {
+      const extension = lowerPath.slice(lowerPath.lastIndexOf(".") + 1);
+      const loader = ["js", "jsx", "ts", "tsx"].includes(extension) ? extension : "js";
+      const source = cottontail.readFile(path);
+      const scan = JSON.parse(cottontail.transpilerScan(String(source), "{}", loader));
+      if (scan.exports?.length > 0 || scan.imports?.some(item => item.kind === "import-statement")) {
+        return "module";
+      }
+      if (scan.imports?.some(item => item.kind === "require-call")) return "commonjs";
+    } catch {}
+  }
+
+  return "commonjs";
+}
+
 function normalizeWorkerInput(filename, options) {
   if (options.eval === true) {
     if (typeof filename !== "string") throw invalidArgumentType("filename", "string", filename);
@@ -525,7 +560,7 @@ function normalizeWorkerInput(filename, options) {
   if (text.startsWith("data:")) return { kind: "module", specifier: text, filename: text };
   const path = resolve(text);
   return {
-    kind: path.toLowerCase().endsWith(".cjs") ? "commonjs" : "module",
+    kind: workerFileKind(path, options),
     specifier: path.replace(/\\/g, "/"),
     filename: path,
   };
@@ -569,14 +604,24 @@ function workerRunSource(input) {
       `const __ctEvalModule = new __ctModule(${JSON.stringify(input.filename)}, null);`,
       `__ctEvalModule.filename = ${JSON.stringify(input.filename)};`,
       `__ctEvalModule.paths = __ctModule._nodeModulePaths?.(${JSON.stringify(cottontail.cwd())}) ?? [];`,
-      `__ctEvalModule._compile(${JSON.stringify(input.source)}, ${JSON.stringify(input.filename)});`,
+      `let __ctEvalSource = globalThis.__cottontailWorkerEvalSource;`,
+      `try {`,
+      `  try {`,
+      `    __ctEvalModule._compile(__ctEvalSource, ${JSON.stringify(input.filename)});`,
+      `  } catch (__ctEvalError) {`,
+      `    throw globalThis.__cottontailNormalizeWorkerEvalError?.(__ctEvalError) ?? __ctEvalError;`,
+      `  }`,
+      `} finally {`,
+      `  __ctEvalSource = undefined;`,
+      `  try { delete globalThis.__cottontailWorkerEvalSource; } catch { globalThis.__cottontailWorkerEvalSource = undefined; }`,
+      `}`,
     ].join("\n");
   }
   if (input.kind === "commonjs") {
     return [
       `const __ctModuleNamespace = await import("node:module");`,
-      `const __ctCreateRequire = __ctModuleNamespace.createRequire ?? __ctModuleNamespace.default?.createRequire;`,
-      `__ctCreateRequire(${JSON.stringify(input.filename)})(${JSON.stringify(input.filename)});`,
+      `const __ctRunMain = __ctModuleNamespace.runMain ?? __ctModuleNamespace.default?.runMain;`,
+      `__ctRunMain(${JSON.stringify(input.filename)});`,
     ].join("\n");
   }
   return [
@@ -618,7 +663,8 @@ function makeWorkerWrapper(input, options = {}) {
   };
   const dir = workerTempDir();
   cottontail.mkdirSync?.(dir, true);
-  const wrapperPath = `${dir}/worker-thread-${Date.now()}-${Math.floor(Math.random() * 1000000)}.mjs`;
+  const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+  const wrapperPath = `${dir}/worker-thread-${nonce}.mjs`;
   const source = [
     `globalThis.__cottontailWorkerBootstrap = ${JSON.stringify(bootstrap)};`,
     `if (globalThis.process) {`,
@@ -682,6 +728,28 @@ function workerNotRunningError() {
   return error;
 }
 
+function workerMessagingError(code, message, cause = undefined) {
+  const error = cause === undefined ? new Error(message) : new Error(message, { cause });
+  error.code = code;
+  return error;
+}
+
+function missingArgumentsError(...names) {
+  const quoted = names.map(name => `"${name}"`);
+  const expected = quoted.length === 1
+    ? `The ${quoted[0]} argument must be specified`
+    : `The ${quoted.slice(0, -1).join(", ")} and ${quoted.at(-1)} arguments must be specified`;
+  const error = new TypeError(expected);
+  error.code = "ERR_MISSING_ARGS";
+  return error;
+}
+
+function invalidThisError(name) {
+  const error = new TypeError(`Value of "this" must be of type ${name}`);
+  error.code = "ERR_INVALID_THIS";
+  return error;
+}
+
 function nativeBoundaryError(api) {
   const error = new Error(`${api} requires a native per-worker runtime hook`);
   error.code = "ERR_COTTONTAIL_NATIVE_BOUNDARY";
@@ -696,6 +764,7 @@ function deserializeWorkerError(payload) {
     : Error;
   const error = new Constructor(message);
   error.name = name;
+  if (payload?.code !== undefined) error.code = payload.code;
   if (typeof payload?.stack === "string") error.stack = payload.stack;
   return error;
 }
@@ -778,9 +847,15 @@ export class Worker extends EventEmitter {
     this._terminationResolve = null;
     this._terminationFallback = null;
 
-    this._worker = new globalThis.Worker(wrapper);
+    this._worker = new globalThis.Worker(wrapper, {
+      [Symbol.for("cottontail.worker.prepared-script")]: true,
+      [Symbol.for("cottontail.worker.eval-source")]: input.kind === "eval" ? input.source : undefined,
+    });
     this.threadId = Number(this._worker.id ?? this._worker.handle?.id ?? 0);
     this._nativeThreadId = this.threadId;
+    if (typeof cottontail.workerHasRef === "function") {
+      this._refed = Boolean(cottontail.workerHasRef(this._nativeThreadId));
+    }
     this.performance = new WorkerPerformance(this);
     this.stdin = options.stdin === true ? new WorkerStdin(this) : null;
 
@@ -843,12 +918,10 @@ export class Worker extends EventEmitter {
       return;
     }
 
+    if (handleWorkerControl(control)) return;
+
     if (control.type === "error") {
       this._emitWorkerError(deserializeWorkerError(control.error));
-      return;
-    }
-    if (control.type === "threadMessage") {
-      globalThis.process?.emit?.("workerMessage", control.value, Number(control.sourceThreadId));
       return;
     }
     if (control.type === "exitCode") {
@@ -877,8 +950,20 @@ export class Worker extends EventEmitter {
     if (this._exitEmitted) return;
     this._exitEmitted = true;
     this._running = false;
+    this._refed = false;
     this._exitCode = this._reportedExitCode ?? (Number(code) || 0);
     workerInstances.delete(this._nativeThreadId);
+    if (isMainThread) {
+      removeBroadcastSubscriptionsForThread(this._nativeThreadId);
+      cleanupBrokerLocksForThread(this._nativeThreadId);
+    }
+    else {
+      try {
+        sendControlToThread(0, { type: "broadcastOwnerExit", ownerThreadId: this._nativeThreadId });
+        sendControlToThread(0, { type: "lockOwnerExit", ownerThreadId: this._nativeThreadId });
+      } catch {}
+    }
+    rejectThreadMessageRequestsForTarget(this._nativeThreadId);
     this.threadId = -1;
     this.threadName = null;
     this.resourceLimits = {};
@@ -967,15 +1052,36 @@ export class Worker extends EventEmitter {
   }
 
   ref() {
-    this._refed = true;
+    if (!this._running) {
+      this._refed = false;
+      return this;
+    }
     this._worker.ref?.();
+    this._refed = typeof cottontail.workerSetRef === "function"
+      ? Boolean(cottontail.workerSetRef(this._nativeThreadId, true))
+      : true;
     return this;
   }
 
   unref() {
-    this._refed = false;
+    if (!this._running) {
+      this._refed = false;
+      return this;
+    }
     this._worker.unref?.();
+    if (typeof cottontail.workerSetRef === "function") {
+      cottontail.workerSetRef(this._nativeThreadId, false);
+    }
+    this._refed = false;
     return this;
+  }
+
+  hasRef() {
+    if (!this._running) return false;
+    if (typeof cottontail.workerHasRef === "function") {
+      this._refed = Boolean(cottontail.workerHasRef(this._nativeThreadId));
+    }
+    return this._refed;
   }
 
   getHeapStatistics() {
@@ -1246,40 +1352,163 @@ function initializeWorkerMetadata() {
 
 initializeWorkerMetadata();
 
+function assertBroadcastChannel(channel) {
+  if (!broadcastChannelBrand.has(channel)) throw invalidThisError("BroadcastChannel");
+}
+
+function makeMessageEvent(type, data, target, ports = []) {
+  let event;
+  try {
+    event = new globalThis.MessageEvent(type, { data, ports });
+  } catch {
+    event = { type, data, ports, origin: "", source: null };
+  }
+  for (const [key, value] of [["target", target], ["currentTarget", target]]) {
+    try {
+      Object.defineProperty(event, key, { configurable: true, value });
+    } catch {}
+  }
+  return event;
+}
+
+function broadcastSubscriptionState(name) {
+  let subscriptions = broadcastSubscriptions.get(name);
+  if (!subscriptions) {
+    subscriptions = new Map();
+    broadcastSubscriptions.set(name, subscriptions);
+  }
+  return subscriptions;
+}
+
+function registerBroadcastSubscription(name, channelId, ownerThreadId) {
+  if (!isMainThread) return;
+  broadcastSubscriptionState(String(name)).set(String(channelId), Number(ownerThreadId));
+}
+
+function unregisterBroadcastSubscription(name, channelId) {
+  if (!isMainThread) return;
+  const subscriptions = broadcastSubscriptions.get(String(name));
+  subscriptions?.delete(String(channelId));
+  if (subscriptions?.size === 0) broadcastSubscriptions.delete(String(name));
+}
+
+function removeBroadcastSubscriptionsForThread(ownerThreadId) {
+  if (!isMainThread) return;
+  for (const [name, subscriptions] of broadcastSubscriptions) {
+    for (const [channelId, subscriberThreadId] of subscriptions) {
+      if (subscriberThreadId === ownerThreadId) subscriptions.delete(channelId);
+    }
+    if (subscriptions.size === 0) broadcastSubscriptions.delete(name);
+  }
+}
+
+function publishBroadcast(name, sourceThreadId, sourceChannelId, valueWire) {
+  if (!isMainThread) return;
+  const localChannels = broadcastChannels.get(String(name)) ?? [];
+  for (const channel of localChannels) {
+    if (sourceThreadId === 0 && channel._id === sourceChannelId) continue;
+    channel._enqueueWire(valueWire);
+  }
+  for (const [targetChannelId, targetThreadId] of broadcastSubscriptions.get(String(name)) ?? []) {
+    if (targetThreadId === sourceThreadId && targetChannelId === sourceChannelId) continue;
+    try {
+      sendControlToThread(targetThreadId, {
+        type: "broadcastDeliver",
+        name: String(name),
+        targetChannelId,
+        valueWire,
+      });
+    } catch {
+      unregisterBroadcastSubscription(name, targetChannelId);
+    }
+  }
+}
+
 export class BroadcastChannel extends EventEmitter {
   constructor(name) {
+    if (arguments.length === 0) throw missingArgumentsError("name");
+    if (typeof name === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
     super();
-    this.name = String(name);
+    broadcastChannelBrand.add(this);
+    this._name = String(name);
+    this._id = `${threadId}:${nextBroadcastChannelId++}`;
     this.onmessage = null;
     this.onmessageerror = null;
     this._closed = false;
     this._refed = true;
+    this._queue = [];
+    this._dispatchScheduled = false;
     this._eventTargetListeners = new Map();
-    const channels = broadcastChannels.get(this.name) ?? new Set();
+    const channels = broadcastChannels.get(this._name) ?? new Set();
     channels.add(this);
-    broadcastChannels.set(this.name, channels);
+    broadcastChannels.set(this._name, channels);
+    broadcastChannelIds.set(this._id, this);
+    if (!isMainThread) {
+      sendControlToThread(0, {
+        type: "broadcastSubscribe",
+        name: this._name,
+        channelId: this._id,
+        ownerThreadId: threadId,
+      });
+    }
+  }
+
+  get name() {
+    assertBroadcastChannel(this);
+    return this._name;
   }
 
   postMessage(value) {
+    assertBroadcastChannel(this);
     if (this._closed) {
       const error = typeof globalThis.DOMException === "function"
         ? new DOMException("BroadcastChannel is closed", "InvalidStateError")
         : new Error("BroadcastChannel is closed");
       throw error;
     }
-    for (const channel of broadcastChannels.get(this.name) ?? []) {
-      if (channel === this || channel._closed) continue;
-      const cloned = cloneForMessage(value);
-      queueMicrotask(() => {
-        const event = { type: "message", data: cloned, origin: "", target: channel, currentTarget: channel };
-        channel.onmessage?.(event);
-        channel._dispatchEventTarget("message", event);
-        channel.emit("message", cloned);
-      });
+    if (arguments.length === 0) throw missingArgumentsError("message");
+    const valueWire = encodeWireMessage(value);
+    if (isMainThread) publishBroadcast(this._name, 0, this._id, valueWire);
+    else sendControlToThread(0, {
+      type: "broadcastPost",
+      name: this._name,
+      sourceThreadId: threadId,
+      sourceChannelId: this._id,
+      valueWire,
+    });
+  }
+
+  _enqueueWire(valueWire) {
+    if (this._closed) return;
+    try {
+      this._queue.push(decodeWireMessage(valueWire));
+    } catch (error) {
+      const event = makeMessageEvent("messageerror", error, this);
+      this.onmessageerror?.(event);
+      this._dispatchEventTarget("messageerror", event);
+      this.emit("messageerror", error);
+      return;
     }
+    this._scheduleDispatch();
+  }
+
+  _scheduleDispatch() {
+    if (this._dispatchScheduled || this._closed) return;
+    this._dispatchScheduled = true;
+    queueMicrotask(() => {
+      this._dispatchScheduled = false;
+      while (this._queue.length > 0 && !this._closed) {
+        const value = this._queue.shift();
+        const event = makeMessageEvent("message", value, this);
+        this.onmessage?.(event);
+        this._dispatchEventTarget("message", event);
+        this.emit("message", value);
+      }
+    });
   }
 
   addEventListener(name, handler, options = undefined) {
+    assertBroadcastChannel(this);
     if (typeof handler !== "function" && typeof handler?.handleEvent !== "function") return;
     const key = String(name);
     const byType = this._eventTargetListeners.get(key) ?? new Map();
@@ -1289,6 +1518,7 @@ export class BroadcastChannel extends EventEmitter {
   }
 
   removeEventListener(name, handler) {
+    assertBroadcastChannel(this);
     const key = String(name);
     const byType = this._eventTargetListeners.get(key);
     if (!byType?.has(handler)) return;
@@ -1307,20 +1537,43 @@ export class BroadcastChannel extends EventEmitter {
   }
 
   close() {
+    assertBroadcastChannel(this);
     if (this._closed) return;
     this._closed = true;
-    broadcastChannels.get(this.name)?.delete(this);
+    this._queue.length = 0;
+    broadcastChannels.get(this._name)?.delete(this);
+    if (broadcastChannels.get(this._name)?.size === 0) broadcastChannels.delete(this._name);
+    broadcastChannelIds.delete(this._id);
+    if (!isMainThread) {
+      sendControlToThread(0, {
+        type: "broadcastUnsubscribe",
+        name: this._name,
+        channelId: this._id,
+      });
+    }
     this._eventTargetListeners.clear();
   }
 
   ref() {
+    assertBroadcastChannel(this);
     this._refed = true;
     return this;
   }
 
   unref() {
+    assertBroadcastChannel(this);
     this._refed = false;
     return this;
+  }
+
+  hasRef() {
+    assertBroadcastChannel(this);
+    return this._refed;
+  }
+
+  [Symbol.for("nodejs.util.inspect.custom")](_depth, options = undefined) {
+    assertBroadcastChannel(this);
+    return `BroadcastChannel { name: ${inspectValue(this._name, options)}, active: ${!this._closed} }`;
   }
 }
 
@@ -1331,15 +1584,172 @@ Object.defineProperty(BroadcastChannel.prototype, Symbol.toStringTag, {
 
 globalThis.BroadcastChannel = BroadcastChannel;
 
+function sendControlToThread(targetThreadId, control) {
+  const target = Number(targetThreadId);
+  const routedControl = { ...control, destinationThreadId: target };
+  if (target === threadId) {
+    queueMicrotask(() => handleWorkerControl(routedControl));
+    return true;
+  }
+  const encoded = encodeWireMessage({ [workerControlEnvelopeKey]: routedControl });
+  if (target === 0) {
+    if (isMainThread) {
+      queueMicrotask(() => handleWorkerControl(routedControl));
+      return true;
+    }
+    if (typeof cottontail.workerPostMessage !== "function") throw new Error("main thread is unavailable");
+    return cottontail.workerPostMessage(encoded);
+  }
+  if (typeof cottontail.workerPostMessageTo !== "function") throw new Error("worker messaging is unavailable");
+  return cottontail.workerPostMessageTo(target, encoded);
+}
+
+function settleThreadMessageRequest(control) {
+  const request = threadMessageRequests.get(String(control.requestId));
+  if (!request) return;
+  threadMessageRequests.delete(String(control.requestId));
+  if (request.timer != null) clearTimeout(request.timer);
+  if (control.status === "ok") {
+    request.resolve(undefined);
+    return;
+  }
+  const code = String(control.code ?? "ERR_WORKER_MESSAGING_FAILED");
+  const message = String(control.message ?? "Cannot find the destination thread or listener");
+  const cause = control.error ? deserializeWorkerError(control.error) : undefined;
+  request.reject(workerMessagingError(code, message, cause));
+}
+
+function rejectThreadMessageRequestsForTarget(targetThreadId) {
+  for (const [requestId, request] of threadMessageRequests) {
+    if (request.targetThreadId !== targetThreadId) continue;
+    threadMessageRequests.delete(requestId);
+    if (request.timer != null) clearTimeout(request.timer);
+    request.reject(workerMessagingError(
+      "ERR_WORKER_MESSAGING_FAILED",
+      "Cannot find the destination thread or listener",
+    ));
+  }
+}
+
+function acknowledgeThreadMessage(control, status, code = undefined, message = undefined, error = undefined) {
+  if (control.requestId == null) return;
+  try {
+    sendControlToThread(Number(control.sourceThreadId), {
+      type: "threadMessageAck",
+      requestId: String(control.requestId),
+      status,
+      code,
+      message,
+      error,
+    });
+  } catch {}
+}
+
+function dispatchThreadMessage(control) {
+  try {
+    const emit = globalThis.process?.emit;
+    const listenerCount = Number(globalThis.process?.listenerCount?.("workerMessage") ?? 0);
+    if (typeof emit !== "function" || listenerCount === 0) {
+      acknowledgeThreadMessage(
+        control,
+        "error",
+        "ERR_WORKER_MESSAGING_FAILED",
+        "Cannot find the destination thread or listener",
+      );
+      return;
+    }
+    emit.call(globalThis.process, "workerMessage", control.value, Number(control.sourceThreadId));
+    acknowledgeThreadMessage(control, "ok");
+  } catch (error) {
+    acknowledgeThreadMessage(
+      control,
+      "error",
+      "ERR_WORKER_MESSAGING_ERRORED",
+      "The destination thread threw an error while processing the message",
+      workerErrorPayload(error),
+    );
+  }
+}
+
+function handleWorkerControl(control) {
+  const destinationThreadId = Number(control?.destinationThreadId);
+  if (Number.isInteger(destinationThreadId) && destinationThreadId >= 0 && destinationThreadId !== threadId) {
+    try {
+      sendControlToThread(destinationThreadId, control);
+    } catch {}
+    return true;
+  }
+  switch (control?.type) {
+    case "threadMessage":
+      dispatchThreadMessage(control);
+      return true;
+    case "threadMessageAck":
+      settleThreadMessageRequest(control);
+      return true;
+    case "broadcastSubscribe":
+      registerBroadcastSubscription(control.name, control.channelId, control.ownerThreadId);
+      return true;
+    case "broadcastUnsubscribe":
+      unregisterBroadcastSubscription(control.name, control.channelId);
+      return true;
+    case "broadcastOwnerExit":
+      removeBroadcastSubscriptionsForThread(Number(control.ownerThreadId));
+      return true;
+    case "broadcastPost":
+      publishBroadcast(
+        control.name,
+        Number(control.sourceThreadId),
+        String(control.sourceChannelId),
+        control.valueWire,
+      );
+      return true;
+    case "broadcastDeliver":
+      broadcastChannelIds.get(String(control.targetChannelId))?._enqueueWire(control.valueWire);
+      return true;
+    case "lockAcquire":
+    case "lockRelease":
+    case "lockCancel":
+    case "lockOwnerExit":
+    case "lockQuery":
+    case "lockGranted":
+    case "lockUnavailable":
+    case "lockRevoked":
+    case "lockQueryResult":
+      handleLockControl(control);
+      return true;
+    default:
+      return false;
+  }
+}
+
 function sendParentControl(control) {
   if (typeof cottontail.workerPostMessage !== "function") return;
   cottontail.workerPostMessage(encodeWireMessage({ [workerControlEnvelopeKey]: control }));
+}
+
+function normalizeWorkerEvalError(value) {
+  const message = String(value?.message ?? value);
+  const missingModule = message.match(/Cannot find module ['"]([^'"]+)['"]/);
+  if (missingModule) {
+    const id = globalThis.crypto?.randomUUID?.() ?? `${threadId}-${Date.now()}`;
+    const error = new Error(`error: Cannot find module '${missingModule[1]}' from 'blob:${id}'`);
+    if (value?.code !== undefined) error.code = value.code;
+    return error;
+  }
+  const unexpected = message.match(/Unexpected (?:keyword|token) ['"]([^'"]+)['"]/);
+  if (value?.name === "SyntaxError" && unexpected) {
+    const error = new Error(`error: Unexpected ${unexpected[1]}`);
+    if (value?.code !== undefined) error.code = value.code;
+    return error;
+  }
+  return value;
 }
 
 function workerErrorPayload(value) {
   let name = "Error";
   let message;
   let stack;
+  let code;
   try {
     if (typeof value?.name === "string") name = value.name;
   } catch {}
@@ -1348,6 +1758,9 @@ function workerErrorPayload(value) {
   } catch {}
   try {
     if (typeof value?.stack === "string") stack = value.stack;
+  } catch {}
+  try {
+    if (value?.code !== undefined) code = value.code;
   } catch {}
   if (message === undefined) {
     try {
@@ -1360,7 +1773,7 @@ function workerErrorPayload(value) {
       }
     }
   }
-  return { name, message, stack };
+  return { name, message, stack, code };
 }
 
 export const parentPort = isMainThread ? null : new class ParentPort extends MessagePort {
@@ -1393,6 +1806,7 @@ export const parentPort = isMainThread ? null : new class ParentPort extends Mes
   }
 
   _handleControl(control) {
+    if (handleWorkerControl(control)) return;
     if (control.type === "terminate") {
       globalThis.process.exitCode = 1;
       sendParentControl({ type: "exitCode", code: 1 });
@@ -1409,11 +1823,6 @@ export const parentPort = isMainThread ? null : new class ParentPort extends Mes
       }
       return;
     }
-    if (control.type === "threadMessage") {
-      globalThis.process?.emit?.("workerMessage", control.value, Number(control.sourceThreadId));
-      return;
-    }
-
     const respond = (type, value = undefined, error = undefined) => {
       sendParentControl({ type, requestId: control.requestId, value, error });
     };
@@ -1471,14 +1880,45 @@ export const parentPort = isMainThread ? null : new class ParentPort extends Mes
 }();
 
 if (!isMainThread) {
+  globalThis.__cottontailNormalizeWorkerEvalError = normalizeWorkerEvalError;
   const previousWebHasActiveHandles = globalThis.__cottontailWebHasActiveHandles;
   const previousWebPollAlways = globalThis.__cottontailWebPollAlways;
-  globalThis.__cottontailWebHasActiveHandles = () => {
+  let workerIdleEpochNotified = false;
+  let workerNaturalExitReported = false;
+  const hasWorkerVisibleHandles = () => {
     if (previousWebHasActiveHandles?.()) return true;
     if (parentPort?._keepsEventLoopAlive()) return true;
+    if (threadMessageRequests.size > 0) return true;
+    if (localLockRequests.size > 0 || localLockQueries.size > 0) return true;
+    for (const channels of broadcastChannels.values()) {
+      for (const channel of channels) {
+        if (!channel._closed && channel._refed) return true;
+      }
+    }
     for (const port of receivedMessagePorts.values()) {
       if (!port._closed && port._ref &&
           (port.listenerCount("message") > 0 || typeof port.onmessage === "function")) return true;
+    }
+    return false;
+  };
+  globalThis.__cottontailWebHasActiveHandles = () => {
+    if (hasWorkerVisibleHandles()) {
+      workerIdleEpochNotified = false;
+      workerNaturalExitReported = false;
+      return true;
+    }
+    if (!workerIdleEpochNotified) {
+      workerIdleEpochNotified = true;
+      const exitCode = Number(globalThis.process?.exitCode ?? 0) || 0;
+      globalThis.process?.emit?.("beforeExit", exitCode);
+      if (hasWorkerVisibleHandles()) {
+        workerIdleEpochNotified = false;
+        return true;
+      }
+    }
+    if (!workerNaturalExitReported) {
+      workerNaturalExitReported = true;
+      sendParentControl({ type: "exitCode", code: Number(globalThis.process?.exitCode ?? 0) || 0 });
     }
     return false;
   };
@@ -1615,46 +2055,94 @@ export function moveMessagePortToContext(port, contextifiedSandbox) {
 }
 
 export function receiveMessageOnPort(port) {
-  if (!(port instanceof MessagePort)) throw invalidArgumentType("port", "a MessagePort instance", port);
-  if (port._queue.length === 0 && isMainThread) {
+  if (!(port instanceof MessagePort) && !broadcastChannelBrand.has(port)) {
+    const error = new TypeError('The "port" argument must be a MessagePort instance');
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (port instanceof MessagePort && port._queue.length === 0 && isMainThread) {
     for (const worker of workerInstances.values()) worker._worker?._poll?.();
   }
   if (port._queue.length === 0) return undefined;
-  return { message: port._queue.shift().value };
+  const entry = port._queue.shift();
+  return { message: port instanceof MessagePort ? entry.value : entry };
 }
 
 export function postMessageToThread(targetThreadId, value, transferList = undefined, timeout = undefined) {
-  const target = Number(targetThreadId);
+  if (typeof transferList === "number" && timeout === undefined) {
+    timeout = transferList;
+    transferList = undefined;
+  }
+  let target;
+  try {
+    target = Number(targetThreadId);
+  } catch {
+    return Promise.reject(invalidArgumentType("threadId", "an integer", targetThreadId));
+  }
   if (!Number.isInteger(target) || target < 0) {
     return Promise.reject(invalidArgumentType("threadId", "an integer", targetThreadId));
   }
   if (target === threadId) {
-    const error = new Error("Cannot send a message to the same thread");
-    error.code = "ERR_WORKER_MESSAGING_SAME_THREAD";
-    return Promise.reject(error);
+    return Promise.reject(workerMessagingError(
+      "ERR_WORKER_MESSAGING_SAME_THREAD",
+      "Cannot send a message to the same thread",
+    ));
   }
   if (timeout !== undefined && (!Number.isFinite(Number(timeout)) || Number(timeout) < 0)) {
     return Promise.reject(invalidArgumentType("timeout", "a non-negative number", timeout));
   }
 
+  const requestId = `${threadId}:${nextThreadMessageRequestId++}`;
   let encoded;
   try {
     encoded = encodeWireMessage({
-      [workerControlEnvelopeKey]: { type: "threadMessage", sourceThreadId: threadId, value },
+      [workerControlEnvelopeKey]: {
+        type: "threadMessage",
+        destinationThreadId: target,
+        requestId,
+        sourceThreadId: threadId,
+        value,
+      },
     }, transferList, { threadId: target });
-    if (target === 0 && !isMainThread) cottontail.workerPostMessage(encoded);
-    else if (target > 0) cottontail.workerPostMessageTo(target, encoded);
-    else throw new Error("worker not found");
   } catch (cause) {
-    const error = new Error("Cannot find the destination thread or listener", { cause });
-    error.code = "ERR_WORKER_MESSAGING_FAILED";
-    return Promise.reject(error);
+    return Promise.reject(cause);
   }
-  return Promise.resolve(undefined);
+
+  return new Promise((resolve, reject) => {
+    const numericTimeout = timeout === undefined ? undefined : Number(timeout);
+    const request = { resolve, reject, targetThreadId: target, timer: null };
+    if (numericTimeout !== undefined) {
+      request.timer = setTimeout(() => {
+        threadMessageRequests.delete(requestId);
+        reject(workerMessagingError(
+          "ERR_WORKER_MESSAGING_TIMEOUT",
+          "Sending a message to another thread timed out",
+        ));
+      }, numericTimeout);
+      request.timer?.unref?.();
+    }
+    threadMessageRequests.set(requestId, request);
+    try {
+      if (target === 0 && !isMainThread) cottontail.workerPostMessage(encoded);
+      else if (target > 0) cottontail.workerPostMessageTo(target, encoded);
+      else throw new Error("worker not found");
+    } catch (cause) {
+      threadMessageRequests.delete(requestId);
+      if (request.timer != null) clearTimeout(request.timer);
+      reject(workerMessagingError(
+        "ERR_WORKER_MESSAGING_FAILED",
+        "Cannot find the destination thread or listener",
+        cause,
+      ));
+    }
+  });
 }
 
-const localLockStates = new Map();
-let nextLockClientId = 1;
+const lockBrokerStates = new Map();
+const localLockRequests = new Map();
+const localLockQueries = new Map();
+let nextLocalLockRequestId = 1;
+let nextLocalLockQueryId = 1;
 
 function lockAbortError() {
   if (typeof globalThis.DOMException === "function") return new DOMException("The operation was aborted", "AbortError");
@@ -1663,46 +2151,205 @@ function lockAbortError() {
   return error;
 }
 
-function lockState(name) {
-  let state = localLockStates.get(name);
+function lockBrokerState(name) {
+  let state = lockBrokerStates.get(name);
   if (!state) {
     state = { held: [], pending: [] };
-    localLockStates.set(name, state);
+    lockBrokerStates.set(name, state);
   }
   return state;
 }
 
-function canGrantLock(state, mode) {
-  return state.held.length === 0 || (mode === "shared" && state.held.every(lock => lock.mode === "shared"));
+function brokerCanGrantLock(state, request) {
+  return state.held.length === 0 ||
+    (request.mode === "shared" && state.held.every(lock => lock.mode === "shared"));
 }
 
-function releaseLockRequest(request) {
-  const state = lockState(request.name);
-  const index = state.held.indexOf(request);
-  if (index >= 0) state.held.splice(index, 1);
-  queueMicrotask(() => pumpLockQueue(request.name));
+function sendLockControl(ownerThreadId, control) {
+  sendControlToThread(ownerThreadId, control);
 }
 
-function grantLockRequest(request) {
-  const state = lockState(request.name);
+function brokerGrantLock(request) {
+  const state = lockBrokerState(request.name);
   state.held.push(request);
-  request.abortCleanup?.();
-  Promise.resolve()
-    .then(() => request.callback({ name: request.name, mode: request.mode }))
-    .then(request.resolve, request.reject)
-    .finally(() => releaseLockRequest(request));
+  sendLockControl(request.ownerThreadId, {
+    type: "lockGranted",
+    requestId: request.requestId,
+    name: request.name,
+    mode: request.mode,
+    clientId: request.clientId,
+  });
 }
 
-function pumpLockQueue(name) {
-  const state = lockState(name);
+function pumpBrokerLockQueue(name) {
+  const state = lockBrokerState(name);
   while (state.pending.length > 0) {
     const request = state.pending[0];
-    if (!canGrantLock(state, request.mode)) break;
+    if (!brokerCanGrantLock(state, request)) break;
     state.pending.shift();
-    grantLockRequest(request);
+    brokerGrantLock(request);
     if (request.mode === "exclusive") break;
   }
-  if (state.held.length === 0 && state.pending.length === 0) localLockStates.delete(name);
+  if (state.held.length === 0 && state.pending.length === 0) lockBrokerStates.delete(name);
+}
+
+function brokerAcquireLock(control) {
+  const request = {
+    requestId: String(control.requestId),
+    ownerThreadId: Number(control.ownerThreadId),
+    name: String(control.name),
+    mode: control.mode === "shared" ? "shared" : "exclusive",
+    clientId: `thread-${Number(control.ownerThreadId)}`,
+  };
+  const state = lockBrokerState(request.name);
+  if (control.steal === true) {
+    for (const held of state.held.splice(0)) {
+      sendLockControl(held.ownerThreadId, {
+        type: "lockRevoked",
+        requestId: held.requestId,
+      });
+    }
+    brokerGrantLock(request);
+    return;
+  }
+  const available = state.pending.length === 0 && brokerCanGrantLock(state, request);
+  if (control.ifAvailable === true && !available) {
+    sendLockControl(request.ownerThreadId, {
+      type: "lockUnavailable",
+      requestId: request.requestId,
+    });
+    return;
+  }
+  state.pending.push(request);
+  pumpBrokerLockQueue(request.name);
+}
+
+function brokerReleaseLock(control) {
+  const requestId = String(control.requestId);
+  for (const [name, state] of lockBrokerStates) {
+    const heldIndex = state.held.findIndex(request => request.requestId === requestId);
+    if (heldIndex < 0) continue;
+    state.held.splice(heldIndex, 1);
+    pumpBrokerLockQueue(name);
+    return;
+  }
+}
+
+function brokerCancelLock(control) {
+  const requestId = String(control.requestId);
+  for (const [name, state] of lockBrokerStates) {
+    const pendingIndex = state.pending.findIndex(request => request.requestId === requestId);
+    if (pendingIndex < 0) continue;
+    state.pending.splice(pendingIndex, 1);
+    pumpBrokerLockQueue(name);
+    return;
+  }
+}
+
+function cleanupBrokerLocksForThread(ownerThreadId) {
+  if (!isMainThread) return;
+  const affectedNames = [];
+  for (const [name, state] of lockBrokerStates) {
+    const heldLength = state.held.length;
+    const pendingLength = state.pending.length;
+    state.held = state.held.filter(request => request.ownerThreadId !== ownerThreadId);
+    state.pending = state.pending.filter(request => request.ownerThreadId !== ownerThreadId);
+    if (state.held.length !== heldLength || state.pending.length !== pendingLength) affectedNames.push(name);
+  }
+  for (const name of affectedNames) pumpBrokerLockQueue(name);
+}
+
+function brokerLockQuery(control) {
+  const held = [];
+  const pending = [];
+  for (const state of lockBrokerStates.values()) {
+    for (const lock of state.held) held.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
+    for (const lock of state.pending) pending.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
+  }
+  sendLockControl(Number(control.ownerThreadId), {
+    type: "lockQueryResult",
+    queryId: String(control.queryId),
+    value: { held, pending },
+  });
+}
+
+function finishLocalLockRequest(request, kind, value, release = false) {
+  if (request.settled) return;
+  request.settled = true;
+  request.abortCleanup?.();
+  localLockRequests.delete(request.requestId);
+  if (release) {
+    try {
+      sendControlToThread(0, { type: "lockRelease", requestId: request.requestId });
+    } catch {}
+  }
+  if (kind === "resolve") request.resolve(value);
+  else request.reject(value);
+}
+
+function runLocalLockCallback(request, lock, release) {
+  Promise.resolve()
+    .then(() => {
+      if (request.revoked) throw lockAbortError();
+      return request.callback(lock);
+    })
+    .then(
+      value => finishLocalLockRequest(request, "resolve", value, release),
+      error => finishLocalLockRequest(request, "reject", error, release),
+    );
+}
+
+function handleLockControl(control) {
+  switch (control.type) {
+    case "lockAcquire":
+      if (isMainThread) brokerAcquireLock(control);
+      return;
+    case "lockRelease":
+      if (isMainThread) brokerReleaseLock(control);
+      return;
+    case "lockCancel":
+      if (isMainThread) brokerCancelLock(control);
+      return;
+    case "lockOwnerExit":
+      if (isMainThread) cleanupBrokerLocksForThread(Number(control.ownerThreadId));
+      return;
+    case "lockQuery":
+      if (isMainThread) brokerLockQuery(control);
+      return;
+    case "lockGranted": {
+      const request = localLockRequests.get(String(control.requestId));
+      if (!request || request.settled) return;
+      request.granted = true;
+      request.abortCleanup?.();
+      request.abortCleanup = null;
+      runLocalLockCallback(request, {
+        name: String(control.name),
+        mode: control.mode === "shared" ? "shared" : "exclusive",
+      }, true);
+      return;
+    }
+    case "lockUnavailable": {
+      const request = localLockRequests.get(String(control.requestId));
+      if (!request || request.settled) return;
+      request.abortCleanup?.();
+      request.abortCleanup = null;
+      runLocalLockCallback(request, null, false);
+      return;
+    }
+    case "lockRevoked": {
+      const request = localLockRequests.get(String(control.requestId));
+      if (!request || request.settled) return;
+      request.revoked = true;
+      finishLocalLockRequest(request, "reject", lockAbortError(), false);
+      return;
+    }
+    case "lockQueryResult": {
+      const query = localLockQueries.get(String(control.queryId));
+      if (!query) return;
+      localLockQueries.delete(String(control.queryId));
+      query.resolve(control.value ?? { held: [], pending: [] });
+    }
+  }
 }
 
 export const locks = {
@@ -1713,62 +2360,100 @@ export const locks = {
     }
     if (typeof callback !== "function") throw invalidArgumentType("callback", "function", callback);
     if (options === null || typeof options !== "object") throw invalidArgumentType("options", "object", options);
+    if (typeof name === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
     const lockName = String(name);
+    if (lockName.startsWith("-")) {
+      if (typeof globalThis.DOMException === "function") throw new DOMException("Lock names must not start with '-'", "NotSupportedError");
+      const error = new Error("Lock names must not start with '-'");
+      error.name = "NotSupportedError";
+      throw error;
+    }
     const mode = options.mode ?? "exclusive";
     if (mode !== "exclusive" && mode !== "shared") {
       const error = new TypeError(`The provided value '${String(mode)}' is not a valid enum value of type LockMode.`);
       error.code = "ERR_INVALID_ARG_VALUE";
       throw error;
     }
+    if (options.steal === true && mode !== "exclusive") {
+      throw new TypeError("The 'steal' option may only be used with exclusive locks");
+    }
+    if (options.steal === true && options.ifAvailable === true) {
+      throw new TypeError("The 'steal' and 'ifAvailable' options cannot be used together");
+    }
     if (options.signal?.aborted) return Promise.reject(options.signal.reason ?? lockAbortError());
 
     return new Promise((resolve, reject) => {
-      const state = lockState(lockName);
+      const requestId = `${threadId}:lock:${nextLocalLockRequestId++}`;
       const request = {
+        requestId,
         name: lockName,
         mode,
-        clientId: String(nextLockClientId++),
         callback,
         resolve,
         reject,
         abortCleanup: null,
+        granted: false,
+        revoked: false,
+        settled: false,
       };
-      if (options.ifAvailable === true && !canGrantLock(state, mode)) {
-        Promise.resolve().then(() => callback(null)).then(resolve, reject);
-        return;
-      }
       if (options.signal?.addEventListener) {
         const abort = () => {
-          const index = state.pending.indexOf(request);
-          if (index >= 0) state.pending.splice(index, 1);
-          reject(options.signal.reason ?? lockAbortError());
+          if (request.granted || request.settled) return;
+          try {
+            sendControlToThread(0, { type: "lockCancel", requestId });
+          } catch {}
+          finishLocalLockRequest(request, "reject", options.signal.reason ?? lockAbortError(), false);
         };
         options.signal.addEventListener("abort", abort, { once: true });
         request.abortCleanup = () => options.signal.removeEventListener?.("abort", abort);
       }
-      state.pending.push(request);
-      pumpLockQueue(lockName);
+      localLockRequests.set(requestId, request);
+      try {
+        sendControlToThread(0, {
+          type: "lockAcquire",
+          requestId,
+          ownerThreadId: threadId,
+          name: lockName,
+          mode,
+          ifAvailable: options.ifAvailable === true,
+          steal: options.steal === true,
+        });
+      } catch (error) {
+        finishLocalLockRequest(request, "reject", error, false);
+      }
     });
   },
 
-  async query() {
-    const held = [];
-    const pending = [];
-    for (const state of localLockStates.values()) {
-      for (const lock of state.held) held.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
-      for (const lock of state.pending) pending.push({ name: lock.name, mode: lock.mode, clientId: lock.clientId });
-    }
-    return { held, pending };
+  query() {
+    const queryId = `${threadId}:lock-query:${nextLocalLockQueryId++}`;
+    return new Promise((resolve, reject) => {
+      localLockQueries.set(queryId, { resolve, reject });
+      try {
+        sendControlToThread(0, { type: "lockQuery", queryId, ownerThreadId: threadId });
+      } catch (error) {
+        localLockQueries.delete(queryId);
+        reject(error);
+      }
+    });
   },
 };
 
+try {
+  const navigatorObject = globalThis.navigator ?? {};
+  if (globalThis.navigator == null) globalThis.navigator = navigatorObject;
+  Object.defineProperty(navigatorObject, "locks", {
+    configurable: true,
+    enumerable: true,
+    value: locks,
+  });
+} catch {}
+
 // COTTONTAIL-COMPAT: node:worker_threads native boundaries - hard interruption of
-// running JSC, parent-loop ref/unref, resource-limit enforcement and OS thread
-// naming, per-thread CPU/profilers, live SHARE_ENV, process-wide BroadcastChannel
-// and Web Locks, postMessageToThread acknowledgement/timeouts,
-// natural exitCode/beforeExit propagation, and native stdio backpressure need host
-// support. The JavaScript implementation does not synthesize those measurements
-// or claim enforcement; focused boundary tests encode each remaining contract.
+// running JSC, resource-limit enforcement and OS thread
+// naming, per-thread CPU/profilers, live SHARE_ENV, and native stdio backpressure
+// need host support. The JavaScript implementation does
+// not synthesize those measurements or claim enforcement; focused boundary tests
+// encode each remaining contract.
 
 export default {
   BroadcastChannel,

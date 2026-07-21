@@ -89,6 +89,12 @@ assert(syncResult.stdout.toString() === "sync-out", "spawnSync stdout Buffer mis
 assert(syncResult.stderr.toString() === "sync-err", "spawnSync stderr Buffer mismatch");
 assert(syncResult.output[1].toString() === "sync-out", "spawnSync output stdout mismatch");
 
+const mixedStdioResult = spawnSync(process.execPath, ["-e", "process.stdout.write('mixed-stdio')"], {
+  stdio: [process.stdin, "pipe", process.stderr],
+});
+assert(mixedStdioResult.status === 0, `mixed spawnSync status mismatch: ${mixedStdioResult.status}`);
+assert(mixedStdioResult.stdout.toString() === "mixed-stdio", "spawnSync stream stdio mapping mismatch");
+
 const nestedOutput = execFileSync(
   process.execPath,
   ["-e", "process.stdout.write('nested-ok')"],

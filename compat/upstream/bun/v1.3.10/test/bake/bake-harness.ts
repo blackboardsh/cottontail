@@ -53,12 +53,12 @@ export const minimalFramework: Bake.Framework = {
     {
       root: "routes",
       style: "nextjs-pages",
-      serverEntryPoint: require.resolve("./minimal.server.ts"),
+      serverEntryPoint: path.join(import.meta.dir, "minimal.server.ts"),
     },
   ],
   serverComponents: {
     separateSSRGraph: false,
-    serverRuntimeImportSource: require.resolve("./minimal.server.ts"),
+    serverRuntimeImportSource: path.join(import.meta.dir, "minimal.server.ts"),
     serverRegisterClientReferenceExport: "registerClientReference",
   },
 };
@@ -861,7 +861,9 @@ export class Client extends EventEmitter {
       this.#proc.send({ type: "exit" });
     } catch (e) {}
     await this.#proc.exited;
-    if (this.exitCode !== null && this.exitCode !== "0") {
+    // COTTONTAIL-COMPAT: Cottontail reports a normal subprocess exit as the
+    // numeric code, while Bun's serialized callback reports it as a string.
+    if (this.exitCode !== null && this.exitCode !== 0 && this.exitCode !== "0") {
       let code;
       if (exitCodeMapStrings[this.exitCode]) {
         code = ": " + JSON.stringify(exitCodeMapStrings[this.exitCode]);
@@ -1842,6 +1844,8 @@ function testImpl<T extends DevServerTest>(
       },
     };
 
+    const cottontailBakeReady = Promise.withResolvers<number>();
+    const cottontailBakeReadyFile = path.join(root, ".cottontail-bake-ready");
     await using devProcess = Bun.spawn({
       cwd: root,
       cmd: [process.execPath, "./harness_start.ts"],
@@ -1851,6 +1855,7 @@ function testImpl<T extends DevServerTest>(
           FORCE_COLOR: "1",
           BUN_FEATURE_FLAG_INTERNAL_FOR_TESTING: "1",
           BUN_DEV_SERVER_TEST_RUNNER: "1",
+          BUN_DEV_SERVER_TEST_READY_FILE: cottontailBakeReadyFile,
           BUN_DUMP_STATE_ON_CRASH: "1",
           NODE_ENV,
           // BUN_DEBUG_QUIET_LOGS: "0",
@@ -1864,7 +1869,11 @@ function testImpl<T extends DevServerTest>(
       onExit: (subprocess, exitCode, signalCode, error) => {
         danglingProcesses.delete(subprocess);
       },
-      ipc(message, subprocess) {},
+      ipc(message, subprocess) {
+        if (message?.type === "cottontail-bake-ready") {
+          cottontailBakeReady.resolve(Number(message.port));
+        }
+      },
     });
     danglingProcesses.add(devProcess);
     if (interactive) {
@@ -1872,7 +1881,19 @@ function testImpl<T extends DevServerTest>(
     }
     using stream = new OutputLineStream("dev", devProcess.stdout, devProcess.stderr);
     devProcess.exited.then(exitCode => (stream.exitCode = exitCode));
-    const port = parseInt((await stream.waitForLine(/localhost:(\d+)/))[1], 10);
+    const logPort = stream.waitForLine(/localhost:(\d+)/).then(match => parseInt(match[1], 10));
+    const readyFilePort = new Promise<number>(resolve => {
+      const poll = () => {
+        try {
+          const port = parseInt(fs.readFileSync(cottontailBakeReadyFile, "utf8"), 10);
+          if (port > 0) return resolve(port);
+        } catch {}
+        setTimeout(poll, 1);
+      };
+      poll();
+    });
+    const port = await Promise.any([logPort, cottontailBakeReady.promise, readyFilePort]);
+    if (!port) throw new Error("Dev server did not report a bound port");
     const dev = new Dev(root, port, devProcess, stream, NODE_ENV, options);
     if (dev.nodeEnv === "development") {
       await dev.connectSocket();

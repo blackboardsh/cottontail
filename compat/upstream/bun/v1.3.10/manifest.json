@@ -8,6 +8,7 @@
   "copiedAt": "2026-07-10",
   "copiedPaths": [
     "test",
+    "packages/bun-error/runtime-error.ts",
     "LICENSE.md"
   ],
   "notes": [

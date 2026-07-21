@@ -234,7 +234,7 @@ export class Statement {
       while (pending.length > 0) {
         const value = pending.pop();
         if (typeof value === "bigint" && (value < -(1n << 63n) || value > (1n << 63n) - 1n)) {
-          throw new RangeError("BigInt value is outside SQLite's signed 64-bit integer range");
+          throw new RangeError(`BigInt value '${value}' is out of range`);
         }
         if (value != null && typeof value === "object") pending.push(...Object.values(value));
       }

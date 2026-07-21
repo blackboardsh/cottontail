@@ -83,11 +83,14 @@ assert(Number.isInteger(previousMask), "umask set should return old mask");
 process.umask(oldMask);
 
 let warningSeen = false;
-function warningListener(error: Error) {
-  warningSeen = error.name === "CottontailWarning" && error.message === "surface warning";
-}
-process.once("warning", warningListener);
+const warningDelivered = new Promise<void>((resolve) => {
+  process.once("warning", (error: Error) => {
+    warningSeen = error.name === "CottontailWarning" && error.message === "surface warning";
+    resolve();
+  });
+});
 process.emitWarning("surface warning", "CottontailWarning");
+await warningDelivered;
 assert(warningSeen, "emitWarning did not emit warning event");
 
 let customEventCount = 0;

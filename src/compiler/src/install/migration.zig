@@ -177,6 +177,46 @@ pub fn migrateNPMLockfile(
     data: string,
     abs_path: string,
 ) !LoadResult {
+    return migrateNPMLockfileWithManager(this, manager, manager, allocator, log, data, abs_path);
+}
+
+pub fn migrateNPMLockfileStandalone(
+    this: *Lockfile,
+    allocator: Allocator,
+    log: *logger.Log,
+    data: string,
+    abs_path: string,
+    registry_url: string,
+) !LoadResult {
+    const selected_registry = if (registry_url.len > 0) registry_url else Npm.Registry.default_url;
+    const parsed_registry = URL.parse(selected_registry);
+    var manager = StandaloneMigrationManager{
+        .scope = .{
+            .url = parsed_registry,
+            .url_hash = Npm.Registry.Scope.hash(strings.withoutTrailingSlash(parsed_registry.href)),
+        },
+    };
+    return migrateNPMLockfileWithManager(this, &manager, null, allocator, log, data, abs_path);
+}
+
+const StandaloneMigrationManager = struct {
+    workspace_package_json_cache: Install.PackageManager.WorkspacePackageJSONCache = .{},
+    scope: Npm.Registry.Scope,
+
+    pub fn scopeForPackageName(this: *const @This(), _: string) *const Npm.Registry.Scope {
+        return &this.scope;
+    }
+};
+
+fn migrateNPMLockfileWithManager(
+    this: *Lockfile,
+    manager: anytype,
+    dependency_manager: ?*Install.PackageManager,
+    allocator: Allocator,
+    log: *logger.Log,
+    data: string,
+    abs_path: string,
+) !LoadResult {
     debug("begin lockfile migration", .{});
 
     this.initEmpty(allocator);
@@ -769,7 +809,7 @@ pub fn migrateNPMLockfile(
                         sliced.slice,
                         &sliced,
                         log,
-                        manager,
+                        dependency_manager,
                     ) orelse {
                         return error.InvalidNPMLockfile;
                     };
@@ -850,7 +890,7 @@ pub fn migrateNPMLockfile(
                                                         tag,
                                                         &dep_resolved_sliced,
                                                         log,
-                                                        manager,
+                                                        dependency_manager,
                                                     ) orelse return error.InvalidNPMLockfile;
 
                                                     break :dep_resolved dep_resolved;
@@ -1112,6 +1152,7 @@ const string = []const u8;
 const Dependency = @import("./dependency.zig");
 const Install = @import("./install.zig");
 const Npm = @import("./npm.zig");
+const URL = @import("../url/url.zig").URL;
 const std = @import("std");
 const Bin = @import("./bin.zig").Bin;
 const Integrity = @import("./integrity.zig").Integrity;

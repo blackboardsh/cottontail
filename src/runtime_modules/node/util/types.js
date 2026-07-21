@@ -309,6 +309,9 @@ export function isArrayBufferView(value) {
 }
 
 const functionToString = Function.prototype.toString;
+const functionHasInstance = Function.prototype[Symbol.hasInstance];
+let resolveMessageConstructor;
+let buildMessageConstructor;
 
 function functionSource(value) {
   try {
@@ -420,8 +423,30 @@ export function isModuleNamespaceObject(value) {
 }
 
 export function isNativeError(value) {
-  if (typeof Error.isError === "function") return Error.isError(value);
-  return value instanceof Error && tag(value) === "[object Error]";
+  if (typeof Error.isError === "function") {
+    if (Error.isError(value)) return true;
+  } else if (value instanceof Error && tag(value) === "[object Error]") {
+    return true;
+  }
+
+  // Bun treats its resolver/compiler message objects as native errors even
+  // though they do not inherit from Error (oven-sh/bun#11780).
+  if (value === null || typeof value !== "object" || proxyRegistry.has(value)) return false;
+  if (resolveMessageConstructor === undefined && typeof globalThis.ResolveMessage === "function") {
+    resolveMessageConstructor = globalThis.ResolveMessage;
+  }
+  if (buildMessageConstructor === undefined && typeof globalThis.BuildMessage === "function") {
+    buildMessageConstructor = globalThis.BuildMessage;
+  }
+  for (const Constructor of [resolveMessageConstructor, buildMessageConstructor]) {
+    if (Constructor === undefined) continue;
+    try {
+      if (functionHasInstance.call(Constructor, value)) return true;
+    } catch {
+      // A damaged constructor/prototype must not make a predicate throw.
+    }
+  }
+  return false;
 }
 
 export function isNumberObject(value) {

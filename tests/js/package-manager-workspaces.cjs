@@ -129,7 +129,10 @@ try {
       catalog: { registryfoo: "1.0.0" },
     },
   });
-  fs.writeFileSync(path.join(monorepo, "bunfig.toml"), `[install]\nregistry = "${registry}"\n`);
+  fs.writeFileSync(
+    path.join(monorepo, "bunfig.toml"),
+    `[install]\nregistry = "${registry}"\nlinker = "hoisted"\n`,
+  );
   writeJson(monorepo, "packages/core/package.json", { name: "core", version: "1.2.3" });
   writeJson(monorepo, "packages/noversion/package.json", { name: "noversion" });
   writeJson(monorepo, "packages/replacement/package.json", { name: "replacement", version: "3.0.0" });
@@ -197,7 +200,10 @@ try {
 
   const conflict = path.join(scratch, "conflict");
   writeJson(conflict, "package.json", { name: "conflict-root", workspaces: ["packages/*"] });
-  fs.writeFileSync(path.join(conflict, "bunfig.toml"), `[install]\nregistry = "${registry}"\n`);
+  fs.writeFileSync(
+    path.join(conflict, "bunfig.toml"),
+    `[install]\nregistry = "${registry}"\nlinker = "hoisted"\n`,
+  );
   writeJson(conflict, "packages/bar/package.json", { name: "bar", version: "1.0.0" });
   writeJson(conflict, "packages/baz/package.json", {
     name: "baz",
@@ -225,7 +231,7 @@ try {
 
   fs.writeFileSync(
     path.join(conflict, "bunfig.toml"),
-    `[install]\nregistry = "${registry}"\nlinkWorkspacePackages = false\n`,
+    `[install]\nregistry = "${registry}"\nlinker = "hoisted"\nlinkWorkspacePackages = false\n`,
   );
   writeJson(conflict, "package.json", {
     name: "conflict-root",

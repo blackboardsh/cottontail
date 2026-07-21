@@ -2888,7 +2888,7 @@ pub const api = struct {
             }
 
             pub fn parseRegistryURLStringImpl(this: *Parser, str: []const u8) OOM!api.NpmRegistry {
-                const url = bun.URL.parse(str);
+                const url = URL.parse(str);
                 var registry = std.mem.zeroes(api.NpmRegistry);
 
                 // Token
@@ -3222,3 +3222,4 @@ const bun = @import("bun");
 const OOM = bun.OOM;
 const install = bun.install;
 const js_ast = bun.ast;
+const URL = @import("../url/url.zig").URL;

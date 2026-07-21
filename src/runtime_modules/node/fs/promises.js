@@ -505,13 +505,53 @@ export async function opendir(path, options = {}) {
   return opendirSync(path, options);
 }
 
-export async function readFile(path, options = undefined) {
-  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  return runAbortable(() => readFileSync(fileDescriptorFrom(path), options), signal);
+export function readFile(path, options = undefined) {
+  try {
+    const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
+    return runAbortable(() => readFileSync(fileDescriptorFrom(path), options), signal);
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
-export async function readdir(path, options = undefined) {
-  return readdirSync(path, options);
+// COTTONTAIL-COMPAT: The current host exposes a synchronous directory scanner.
+// Coalesce only simultaneously submitted recursive reads so promise-based
+// stress does not serialize hundreds of identical native walks.
+const pendingRecursiveReaddir = new Map();
+
+function cloneReaddirResult(result) {
+  return result.map((value) => {
+    if (value && typeof value === "object" && "_mode" in value && typeof value.isDirectory === "function") {
+      const clone = Object.assign(Object.create(Object.getPrototypeOf(value)), value);
+      if (ArrayBuffer.isView(clone.name)) clone.name = globalThis.Buffer?.from(clone.name) ?? clone.name.slice();
+      return clone;
+    }
+    if (ArrayBuffer.isView(value)) return globalThis.Buffer?.from(value) ?? value.slice();
+    return value;
+  });
+}
+
+export function readdir(path, options = undefined) {
+  if (!options || typeof options !== "object" || !options.recursive) {
+    return Promise.resolve().then(() => readdirSync(path, options));
+  }
+
+  const key = JSON.stringify([
+    path && typeof path === "object" && typeof path.href === "string" ? path.href : String(path),
+    Boolean(options.withFileTypes),
+    options.encoding ?? null,
+  ]);
+  let operation = pendingRecursiveReaddir.get(key);
+  if (!operation) {
+    operation = Promise.resolve().then(() => readdirSync(path, options));
+    pendingRecursiveReaddir.set(key, operation);
+    const clear = () => {
+      if (pendingRecursiveReaddir.get(key) === operation) pendingRecursiveReaddir.delete(key);
+    };
+    operation.then(clear, clear);
+  }
+  return operation.then(cloneReaddirResult);
 }
 
 export async function readlink(path, options = undefined) {
@@ -647,32 +687,37 @@ function writeChunkToFd(fd, chunk, encoding) {
   throw error;
 }
 
-export async function writeFile(path, data, options = undefined) {
-  const encoding = encodingFromOptions(options, "utf8");
-  const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
-  if (signal?.aborted) throw abortReason(signal);
-  if (isStreamLikeData(data)) {
-    const flag = (typeof options === "object" && options?.flag) || "w";
-    // Open before touching the iterator so path errors (e.g. EISDIR) surface
-    // without consuming the input, matching Node.
-    const fileHandleFd = path instanceof FileHandle
-      ? path._assertOpen("writeFile")
-      : path !== null && typeof path === "object" && typeof path.fd === "number"
-        ? path.fd
-        : null;
-    const fd = fileHandleFd ?? (typeof path === "number" ? path : openSync(path, flag, 0o666));
-    const ownsFd = fileHandleFd == null && typeof path !== "number";
-    try {
-      for await (const chunk of data) {
-        if (signal?.aborted) throw abortReason(signal);
-        writeChunkToFd(fd, chunk, encoding);
-      }
-    } finally {
-      if (ownsFd) closeSync(fd);
+async function writeFileIterable(path, data, options, encoding, signal) {
+  const flag = (typeof options === "object" && options?.flag) || "w";
+  // Open before touching the iterator so path errors (e.g. EISDIR) surface
+  // without consuming the input, matching Node.
+  const fileHandleFd = path instanceof FileHandle
+    ? path._assertOpen("writeFile")
+    : path !== null && typeof path === "object" && typeof path.fd === "number"
+      ? path.fd
+      : null;
+  const fd = fileHandleFd ?? (typeof path === "number" ? path : openSync(path, flag, 0o666));
+  const ownsFd = fileHandleFd == null && typeof path !== "number";
+  try {
+    for await (const chunk of data) {
+      if (signal?.aborted) throw abortReason(signal);
+      writeChunkToFd(fd, chunk, encoding);
     }
-    return;
+  } finally {
+    if (ownsFd) closeSync(fd);
   }
-  return runAbortable(() => writeFileSync(fileDescriptorFrom(path), data, options), signal);
+}
+
+export function writeFile(path, data, options = undefined) {
+  try {
+    const encoding = encodingFromOptions(options, "utf8");
+    const signal = validateAbortSignal(options && typeof options === "object" ? options.signal : null);
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
+    if (isStreamLikeData(data)) return writeFileIterable(path, data, options, encoding, signal);
+    return runAbortable(() => writeFileSync(fileDescriptorFrom(path), data, options), signal);
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 // Bun extends fs.promises with exists(); it never rejects.

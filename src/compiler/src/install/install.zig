@@ -247,10 +247,12 @@ pub const ExtractTarball = @import("./extract_tarball.zig");
 pub const NetworkTask = @import("./NetworkTask.zig");
 pub const TarballStream = @import("./TarballStream.zig");
 pub const Npm = @import("./npm.zig");
+pub const Migration = @import("./migration.zig");
 pub const PackageManager = @import("./PackageManager.zig");
 pub const PackageManifestMap = @import("./PackageManifestMap.zig");
 pub const Task = @import("./PackageManagerTask.zig");
 pub const TextLockfile = @import("./lockfile/bun.lock.zig");
+pub const YarnLockfilePrinter = @import("./lockfile/printer/Yarn.zig");
 pub const Bin = @import("./bin.zig").Bin;
 pub const FolderResolution = @import("./resolvers/folder_resolver.zig").FolderResolution;
 pub const LifecycleScriptSubprocess = @import("./lifecycle_script_runner.zig").LifecycleScriptSubprocess;
@@ -275,6 +277,7 @@ pub const VersionSlice = external.VersionSlice;
 
 pub const Integrity = @import("./integrity.zig").Integrity;
 pub const Dependency = @import("./dependency.zig");
+pub const HostedGitInfo = @import("./hosted_git_info.zig");
 pub const Behavior = @import("./dependency.zig").Behavior;
 
 pub const Lockfile = @import("./lockfile.zig");

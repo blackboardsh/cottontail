@@ -5,6 +5,13 @@ const c = @cImport({
     @cInclude("jsc_runner.h");
 });
 
+extern fn ct_jsc_runtime_emit_process_shutdown(
+    runtime: *c.CtJscRuntime,
+    include_before_exit: c_int,
+    error_out: [*c][*c]u8,
+) c_int;
+extern fn ct_jsc_runtime_had_fatal_exception(runtime: *c.CtJscRuntime) c_int;
+
 pub const Runtime = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -32,6 +39,12 @@ pub const Runtime = struct {
     pub fn setArgs(self: *Runtime, args: []const [:0]const u8) !void {
         const empty_exec_args: [0][:0]const u8 = .{};
         try self.setProcessArgs(args, if (args.len > 0) 1 else 0, empty_exec_args[0..]);
+    }
+
+    pub fn setExitCleanupPath(self: *Runtime, path: [:0]const u8) !void {
+        if (c.ct_jsc_runtime_set_exit_cleanup_path(self.handle, path.ptr) != 0) {
+            return error.ExitCleanupPathFailed;
+        }
     }
 
     pub fn setProcessArgs(
@@ -172,15 +185,21 @@ pub const Runtime = struct {
                 self.writeStderrLine("Unknown JavaScript exception");
             }
 
-            return 1;
+            const routed_fatal = ct_jsc_runtime_had_fatal_exception(self.handle) != 0;
+            const shutdown_status = self.emitProcessShutdown(false);
+            if (shutdown_status != 0) return shutdown_status;
+            const exit_code: u8 = @intCast(c.ct_jsc_runtime_exit_code(self.handle));
+            return if (routed_fatal or exit_code != 0) exit_code else 1;
         }
 
-        const shutdown_status = self.emitProcessShutdown();
+        const shutdown_status = self.emitProcessShutdown(true);
         if (shutdown_status != 0) return shutdown_status;
         return @intCast(c.ct_jsc_runtime_exit_code(self.handle));
     }
 
-    fn emitProcessShutdown(self: *Runtime) u8 {
+    fn emitProcessShutdown(self: *Runtime, include_before_exit: bool) u8 {
+        if (!include_before_exit) return self.emitNativeProcessShutdown(false);
+
         const shutdown_source =
             \\(() => {
             \\  const hiddenGlobals = [
@@ -212,14 +231,6 @@ pub const Runtime = struct {
             \\    clean.enumerable = false;
             \\    try { Object.defineProperty(globalThis, name, clean); } catch {}
             \\  }
-            \\  const process = globalThis.process;
-            \\  if (!process || typeof process.emit !== "function" || process.__cottontailShutdownEmitted) return;
-            \\  let code = Number(process.exitCode ?? 0) || 0;
-            \\  process.emit("beforeExit", code);
-            \\  code = Number(process.exitCode ?? 0) || 0;
-            \\  process._exiting = true;
-            \\  process.__cottontailShutdownEmitted = true;
-            \\  process.emit("exit", code);
             \\})();
         ;
         var eval_error: [*c]u8 = null;
@@ -235,6 +246,26 @@ pub const Runtime = struct {
             }
 
             return 1;
+        }
+        return self.emitNativeProcessShutdown(true);
+    }
+
+    fn emitNativeProcessShutdown(self: *Runtime, include_before_exit: bool) u8 {
+        var lifecycle_error: [*c]u8 = null;
+        if (ct_jsc_runtime_emit_process_shutdown(
+            self.handle,
+            @intFromBool(include_before_exit),
+            &lifecycle_error,
+        ) != 0) {
+            defer if (lifecycle_error != null) c.ct_jsc_string_free(lifecycle_error);
+            if (lifecycle_error != null) {
+                self.writeStderrLine(std.mem.span(lifecycle_error));
+            } else {
+                self.writeStderrLine("Unknown JavaScript exception during process shutdown");
+            }
+            const exit_code: u8 = @intCast(c.ct_jsc_runtime_exit_code(self.handle));
+            const routed_fatal = ct_jsc_runtime_had_fatal_exception(self.handle) != 0;
+            return if (routed_fatal or exit_code != 0) exit_code else 1;
         }
         return 0;
     }

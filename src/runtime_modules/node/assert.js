@@ -601,7 +601,7 @@ function assertOk(receiver, stackStartFn, args) {
   const generatedMessage = args.length === 0 || suppliedMessage == null;
   const message = args.length === 0
     ? "No value argument passed to `assert.ok()`"
-    : suppliedMessage;
+    : suppliedMessage ?? getAssertionSourceMessage();
   innerFail({
     actual: value,
     expected: true,
@@ -611,6 +611,127 @@ function assertOk(receiver, stackStartFn, args) {
     stackStartFn,
     diff: assertOptions(receiver)?.diff,
   });
+}
+
+const assertionControlCharacters = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
+
+function escapeAssertionSource(source) {
+  return source.replace(assertionControlCharacters, (character) =>
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+function assertionCallEnd(line, openParen) {
+  let depth = 0;
+  let quote;
+  let escaped = false;
+  for (let index = openParen; index < line.length; index += 1) {
+    const character = line[index];
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\"" || character === "'" || character === "`") {
+      quote = character;
+    } else if (character === "(") {
+      depth += 1;
+    } else if (character === ")" && --depth === 0) {
+      return index + 1;
+    }
+  }
+  return -1;
+}
+
+function assertionAliases(source) {
+  const aliases = new Set(["assert", "strict"]);
+  const identifier = "[$\\w\\u0080-\\uFFFF]+";
+  const requirePattern = new RegExp(
+    `(?:const|let|var)\\s+(${identifier})\\s*=\\s*require\\s*\\(\\s*[\"'](?:node:)?assert(?:/strict)?[\"']\\s*\\)`,
+    "g",
+  );
+  const importPattern = new RegExp(
+    `import\\s+(${identifier})\\s+from\\s+[\"'](?:node:)?assert(?:/strict)?[\"']`,
+    "g",
+  );
+  for (const pattern of [requirePattern, importPattern]) {
+    for (const match of source.matchAll(pattern)) aliases.add(match[1]);
+  }
+  return aliases;
+}
+
+function assertionExpressionOnLine(line, column, aliases) {
+  const callPattern = /(^|[^$\w\u0080-\uFFFF.])([$\w\u0080-\uFFFF]+(?:\.ok)?)\s*\(/g;
+  let best;
+  for (const match of line.matchAll(callPattern)) {
+    const name = match[2];
+    const base = name.endsWith(".ok") ? name.slice(0, -3) : name;
+    if (!aliases.has(base)) continue;
+    const start = match.index + match[1].length;
+    const openParen = line.indexOf("(", start + name.length);
+    const end = assertionCallEnd(line, openParen);
+    const source = end === -1
+      ? line.slice(start).replace(/\s*\/\/.*$/, "").trimEnd()
+      : line.slice(start, end);
+    const distance = Math.abs(start - Math.max(0, column - 1));
+    const score = (name.endsWith(".ok") ? 10000 : 1000) - distance;
+    if (best === undefined || score > best.score) best = { score, source };
+  }
+  return best;
+}
+
+function getAssertionSourceMessage() {
+  const previousLimit = Error.stackTraceLimit;
+  let stack;
+  try {
+    Error.stackTraceLimit = 16;
+    stack = String(new Error().stack ?? "");
+  } finally {
+    Error.stackTraceLimit = previousLimit;
+  }
+
+  let location;
+  for (const frame of stack.split("\n").slice(1)) {
+    const candidate = frame.match(/\((.*):(\d+):(\d+)\)$/) ||
+      frame.match(/(?:at\s+|@)((?:file:\/\/)?\/.*):(\d+):(\d+)$/);
+    if (candidate === null || /[/\\]node[/\\]assert\.js$/.test(candidate[1])) continue;
+    location = candidate;
+    break;
+  }
+  if (!location) return undefined;
+
+  let filename = location[1];
+  if (filename.startsWith("file://")) {
+    try {
+      filename = decodeURIComponent(new URL(filename).pathname);
+    } catch {
+      return undefined;
+    }
+  }
+
+  let source;
+  try {
+    source = internalRequire("fs").readFileSync(filename, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  const lines = source.split(/\r\n|\n|\r/);
+  const aliases = assertionAliases(source);
+  const reportedLine = Number(location[2]) - 1;
+  const column = Number(location[3]);
+  let best;
+  // CommonJS compilation adds five wrapper lines in this runtime.
+  for (const offset of [0, -5]) {
+    const line = lines[reportedLine + offset];
+    if (line === undefined) continue;
+    const candidate = assertionExpressionOnLine(line, column, aliases);
+    if (candidate === undefined) continue;
+    candidate.score -= Math.abs(offset) * 100;
+    if (best === undefined || candidate.score > best.score) best = candidate;
+  }
+  if (best === undefined) return undefined;
+  return `The expression evaluated to a falsy value:\n\n  ${escapeAssertionSource(best.source)}\n`;
 }
 
 export function ok(...args) {

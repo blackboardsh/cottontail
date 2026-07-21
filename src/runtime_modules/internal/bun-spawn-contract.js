@@ -37,6 +37,7 @@ const signalNames = [
 ];
 
 const signalNumbers = new Map(signalNames.flatMap((name, number) => name == null ? [] : [[name, number]]));
+const signalChoices = `${signalNames.slice(1, -1).map((name) => `'${name}'`).join(", ")} or '${signalNames.at(-1)}'`;
 
 export function isEmptyBunSpawnOption(value) {
   return value === undefined || value === null || value === "";
@@ -59,9 +60,14 @@ export function bunSignalNumber(value = "SIGTERM") {
     return value;
   }
   if (typeof value !== "string") throw new TypeError("Invalid signal: must be a string or an integer");
-  const number = signalNumbers.get(value.toUpperCase());
-  if (number == null) throw new TypeError("Unknown signal");
+  const number = signalNumbers.get(value);
+  if (number == null) throw new TypeError(`signal must be one of ${signalChoices}`);
   return number;
+}
+
+function bunSpawnString(value) {
+  if (typeof value === "symbol") throw new TypeError("Cannot convert a symbol to a string");
+  return String(value);
 }
 
 function commandArray(command) {
@@ -82,17 +88,11 @@ export function normalizeBunSpawnCommand(command, maybeArgsOrOptions = {}, maybe
     // Bun's object form is self-contained. The second argument is only read
     // when the first argument is the command array form.
     options = command;
-  } else if (typeof command === "string") {
-    // Cottontail historically accepted Node's (file, args, options) overload.
-    // Keep it as an additive extension without weakening Bun's array/object forms.
-    const args = Array.isArray(maybeArgsOrOptions) ? maybeArgsOrOptions : [];
-    cmd = [command, ...args];
-    options = (Array.isArray(maybeArgsOrOptions) ? maybeOptions : maybeArgsOrOptions) ?? {};
   } else {
     throw new TypeError("cmd must be an array");
   }
 
-  return [String(cmd[0]), cmd.slice(1).map(String), options];
+  return [bunSpawnString(cmd[0]), cmd.slice(1).map(bunSpawnString), options];
 }
 
 export function normalizeBunSpawnTimeout(value) {
@@ -101,6 +101,11 @@ export function normalizeBunSpawnTimeout(value) {
     throw new TypeError(`The "timeout" property must be of type number. Received ${typeof value}`);
   }
   if (Number.isNaN(value)) return undefined;
+  if (value === -Infinity) {
+    throw new RangeError(
+      `The value of "timeout" is out of range. It must be >= 0 and <= ${Number.MAX_SAFE_INTEGER}. Received -Infinity`,
+    );
+  }
   if (!Number.isInteger(value)) {
     throw new TypeError(`The "timeout" property must be of type integer. Received number`);
   }
@@ -119,9 +124,12 @@ export function normalizeBunSpawnMaxBuffer(value) {
 
 export function assertBunAbortSignal(signal) {
   if (isEmptyBunSpawnOption(signal)) return;
-  if (signal === null || typeof signal !== "object" || typeof signal.aborted !== "boolean" ||
-      typeof signal.addEventListener !== "function") {
-    throw new TypeError("signal must be an AbortSignal");
+  if (typeof globalThis.AbortSignal !== "function" || !(signal instanceof globalThis.AbortSignal)) {
+    const type = typeof signal;
+    const received = signal !== null && (type === "object" || type === "function")
+      ? `an instance of ${signal?.constructor?.name ?? "Object"}`
+      : `type ${type} (${String(signal)})`;
+    throw new TypeError(`The "signal" argument must be of type AbortSignal. Received ${received}`);
   }
 }
 
@@ -131,9 +139,13 @@ export function validateBunSpawnCallbacks(options, sync = false) {
       throw new TypeError(`${name} must be a function or undefined`);
     }
   }
-  if (typeof options.ipc === "function" && !isEmptyBunSpawnOption(options.serialization) &&
-      options.serialization !== "json" && options.serialization !== "advanced") {
-    throw new TypeError('serialization must be "json" or "advanced"');
+  if (!sync && typeof options.ipc === "function" && !isEmptyBunSpawnOption(options.serialization)) {
+    if (typeof options.serialization !== "string") {
+      throw new TypeError("Expected serialization to be a string for 'spawn'.");
+    }
+    if (options.serialization !== "json" && options.serialization !== "advanced") {
+      throw new TypeError('serialization must be "json" or "advanced"');
+    }
   }
   if (sync && !isEmptyBunSpawnOption(options.terminal)) {
     throw new TypeError("terminal option is only supported for Bun.spawn, not Bun.spawnSync");

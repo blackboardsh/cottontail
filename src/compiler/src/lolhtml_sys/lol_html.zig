@@ -1,4 +1,22 @@
+const std = @import("std");
+const bun = @import("bun");
+const native = @import("html_rewriter");
+
+const NativeRewriter = native.HtmlRewriter;
+const NativeElement = native.units.element.Element;
+const NativeEndTag = native.units.tokens.EndTag;
+const NativeTextChunk = native.units.tokens.TextChunk;
+const NativeComment = native.units.tokens.Comment;
+const NativeDocType = native.units.tokens.Doctype;
+const NativeDocEnd = native.units.document_end.DocumentEnd;
+const NativeAttribute = native.units.tokens.Attribute;
+const NativeElementHandlers = native.rewriter.content_handlers.ElementContentHandlers;
+const NativeDocumentHandlers = native.rewriter.content_handlers.DocumentContentHandlers;
+const NativeSelectorEntry = native.rewriter.api.SelectorHandlersEntry;
+const ContentType = native.ContentType;
+
 pub const Error = error{Fail};
+
 pub const MemorySettings = extern struct {
     preallocated_parsing_buffer_size: usize,
     max_allowed_memory_usage: usize,
@@ -9,131 +27,224 @@ pub const SourceLocationBytes = extern struct {
     end: usize,
 };
 
+const empty_bytes = [_]u8{0};
+threadlocal var last_error_buffer: [512]u8 = undefined;
+threadlocal var last_error_len: usize = 0;
+
 inline fn auto_disable() void {
-    if (comptime bun.FeatureFlags.disable_lolhtml)
-        unreachable;
+    if (comptime bun.FeatureFlags.disable_lolhtml) unreachable;
 }
 
-/// rust panics if the pointer itself is zero, even if the passed length is zero
-/// to work around that, we use a static null-terminated pointer
-/// https://github.com/oven-sh/bun/issues/2323
-fn ptrWithoutPanic(buf: []const u8) [*]const u8 {
-    const null_terminated_ptr = struct {
-        // we must use a static pointer so the lifetime of this pointer is long enough
-        const null_terminated_ptr: []const u8 = &[_]u8{0};
-    }.null_terminated_ptr;
-
-    if (buf.len == 0)
-        return null_terminated_ptr.ptr;
-
-    return buf.ptr;
+fn clearLastError() void {
+    last_error_len = 0;
 }
 
-pub const HTMLRewriter = opaque {
-    extern fn lol_html_rewriter_write(rewriter: *HTMLRewriter, chunk: [*]const u8, chunk_len: usize) c_int;
-    extern fn lol_html_rewriter_end(rewriter: *HTMLRewriter) c_int;
-    extern fn lol_html_rewriter_free(rewriter: *HTMLRewriter) void;
+fn setLastError(message: []const u8) void {
+    last_error_len = @min(message.len, last_error_buffer.len);
+    @memcpy(last_error_buffer[0..last_error_len], message[0..last_error_len]);
+}
 
-    pub fn write(rewriter: *HTMLRewriter, chunk: []const u8) Error!void {
-        auto_disable();
-        const ptr = ptrWithoutPanic(chunk);
-        const rc = rewriter.lol_html_rewriter_write(ptr, chunk.len);
-        if (rc < 0)
-            return error.Fail;
+fn captureError(err: anyerror) Error {
+    setLastError(@errorName(err));
+    return error.Fail;
+}
+
+fn contentType(is_html: bool) ContentType {
+    return if (is_html) .html else .text;
+}
+
+fn stopped() anyerror {
+    setLastError("The HTMLRewriter content handler stopped rewriting");
+    return error.ContentHandlerStopped;
+}
+
+pub const HTMLString = struct {
+    ptr: [*]const u8,
+    len: usize,
+
+    fn init(bytes: []const u8) HTMLString {
+        return .{
+            .ptr = if (bytes.len == 0) empty_bytes[0..].ptr else bytes.ptr,
+            .len = bytes.len,
+        };
     }
 
-    /// Completes rewriting and flushes the remaining output.
-    ///
-    /// Returns 0 in case of success and -1 otherwise. The actual error message
-    /// can be obtained using `lol_html_take_last_error` function.
-    ///
-    /// WARNING: after calling this function, further attempts to use the rewriter
-    /// (other than `lol_html_rewriter_free`) will cause a thread panic.
-    pub fn end(rewriter: *HTMLRewriter) Error!void {
-        auto_disable();
+    pub fn deinit(_: HTMLString) void {}
 
-        if (rewriter.lol_html_rewriter_end() < 0)
-            return error.Fail;
+    pub fn lastError() HTMLString {
+        auto_disable();
+        return init(last_error_buffer[0..last_error_len]);
+    }
+
+    pub fn slice(this: HTMLString) []const u8 {
+        return this.ptr[0..this.len];
+    }
+
+    pub fn toString(this: HTMLString) bun.String {
+        return bun.String.cloneUTF8(this.slice());
+    }
+
+    pub const toJS = @import("../runtime/api/lolhtml_jsc.zig").htmlStringToJS;
+};
+
+pub const Directive = enum(c_uint) {
+    @"continue" = 0,
+    stop = 1,
+};
+
+pub const lol_html_comment_handler_t = *const fn (*Comment, ?*anyopaque) callconv(.c) Directive;
+pub const lol_html_text_handler_handler_t = *const fn (*TextChunk, ?*anyopaque) callconv(.c) Directive;
+pub const lol_html_element_handler_t = *const fn (*Element, ?*anyopaque) callconv(.c) Directive;
+pub const lol_html_doc_end_handler_t = *const fn (*DocEnd, ?*anyopaque) callconv(.c) Directive;
+pub const lol_html_end_tag_handler_t = *const fn (*EndTag, ?*anyopaque) callconv(.c) Directive;
+
+const ElementRegistration = struct {
+    selector: []u8,
+    element_handler: ?lol_html_element_handler_t,
+    element_data: ?*anyopaque,
+    comment_handler: ?lol_html_comment_handler_t,
+    comment_data: ?*anyopaque,
+    text_handler: ?lol_html_text_handler_handler_t,
+    text_data: ?*anyopaque,
+};
+
+const DocumentRegistration = struct {
+    doctype_handler: ?DirectiveFunctionType(DocType),
+    doctype_data: ?*anyopaque,
+    comment_handler: ?lol_html_comment_handler_t,
+    comment_data: ?*anyopaque,
+    text_handler: ?lol_html_text_handler_handler_t,
+    text_data: ?*anyopaque,
+    end_handler: ?lol_html_doc_end_handler_t,
+    end_data: ?*anyopaque,
+};
+
+const ElementBridge = struct {
+    registration: ElementRegistration,
+
+    fn handleElement(ctx: ?*anyopaque, value: *NativeElement) anyerror!void {
+        const this: *ElementBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.element_handler orelse return;
+        var wrapped = Element{ .inner = value };
+        if (callback(&wrapped, this.registration.element_data) == .stop) return stopped();
+    }
+
+    fn handleComment(ctx: ?*anyopaque, value: *NativeComment) anyerror!void {
+        const this: *ElementBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.comment_handler orelse return;
+        var wrapped = Comment{ .inner = value };
+        if (callback(&wrapped, this.registration.comment_data) == .stop) return stopped();
+    }
+
+    fn handleText(ctx: ?*anyopaque, value: *NativeTextChunk) anyerror!void {
+        const this: *ElementBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.text_handler orelse return;
+        var wrapped = TextChunk{ .inner = value };
+        if (callback(&wrapped, this.registration.text_data) == .stop) return stopped();
+    }
+};
+
+const DocumentBridge = struct {
+    registration: DocumentRegistration,
+
+    fn handleDocType(ctx: ?*anyopaque, value: *NativeDocType) anyerror!void {
+        const this: *DocumentBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.doctype_handler orelse return;
+        var wrapped = DocType{ .inner = value };
+        if (callback(&wrapped, this.registration.doctype_data) == .stop) return stopped();
+    }
+
+    fn handleComment(ctx: ?*anyopaque, value: *NativeComment) anyerror!void {
+        const this: *DocumentBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.comment_handler orelse return;
+        var wrapped = Comment{ .inner = value };
+        if (callback(&wrapped, this.registration.comment_data) == .stop) return stopped();
+    }
+
+    fn handleText(ctx: ?*anyopaque, value: *NativeTextChunk) anyerror!void {
+        const this: *DocumentBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.text_handler orelse return;
+        var wrapped = TextChunk{ .inner = value };
+        if (callback(&wrapped, this.registration.text_data) == .stop) return stopped();
+    }
+
+    fn handleEnd(ctx: ?*anyopaque, value: *NativeDocEnd) anyerror!void {
+        const this: *DocumentBridge = @ptrCast(@alignCast(ctx.?));
+        const callback = this.registration.end_handler orelse return;
+        var wrapped = DocEnd{ .inner = value };
+        if (callback(&wrapped, this.registration.end_data) == .stop) return stopped();
+    }
+};
+
+const OutputBridge = struct {
+    ctx: *anyopaque,
+    write_fn: *const fn (*anyopaque, []const u8) void,
+    done_fn: *const fn (*anyopaque) void,
+
+    fn handleChunk(ctx: *anyopaque, chunk: []const u8) void {
+        const this: *OutputBridge = @ptrCast(@alignCast(ctx));
+        if (chunk.len == 0) {
+            this.done_fn(this.ctx);
+        } else {
+            this.write_fn(this.ctx, chunk);
+        }
+    }
+};
+
+pub const HTMLRewriter = struct {
+    inner: *NativeRewriter,
+    element_bridges: []ElementBridge,
+    document_bridges: []DocumentBridge,
+    selector_sources: [][]u8,
+    output: OutputBridge,
+
+    pub fn write(this: *HTMLRewriter, chunk: []const u8) Error!void {
+        auto_disable();
+        clearLastError();
+        this.inner.write(chunk) catch |err| return captureError(err);
+    }
+
+    pub fn end(this: *HTMLRewriter) Error!void {
+        auto_disable();
+        clearLastError();
+        this.inner.end() catch |err| return captureError(err);
     }
 
     pub fn deinit(this: *HTMLRewriter) void {
         auto_disable();
-        this.lol_html_rewriter_free();
+        this.inner.deinit();
+        for (this.selector_sources) |selector| {
+            bun.default_allocator.free(selector);
+        }
+        bun.default_allocator.free(this.selector_sources);
+        bun.default_allocator.free(this.element_bridges);
+        bun.default_allocator.free(this.document_bridges);
+        bun.default_allocator.destroy(this);
     }
 
-    pub const Builder = opaque {
-        extern fn lol_html_rewriter_builder_new() *HTMLRewriter.Builder;
-        extern fn lol_html_rewriter_builder_add_element_content_handlers(
-            builder: *HTMLRewriter.Builder,
-            selector: *const HTMLSelector,
-            element_handler: ?lol_html_element_handler_t,
-            element_handler_user_data: ?*anyopaque,
-            comment_handler: ?lol_html_comment_handler_t,
-            comment_handler_user_data: ?*anyopaque,
-            text_handler: ?lol_html_text_handler_handler_t,
-            text_handler_user_data: ?*anyopaque,
-        ) c_int;
-        extern fn lol_html_rewriter_builder_free(builder: *HTMLRewriter.Builder) void;
-        extern fn lol_html_rewriter_build(
-            builder: *HTMLRewriter.Builder,
-            encoding: [*]const u8,
-            encoding_len: usize,
-            memory_settings: MemorySettings,
-            output_sink: ?*const fn ([*]const u8, usize, *anyopaque) callconv(.c) void,
-            output_sink_user_data: *anyopaque,
-            strict: bool,
-        ) ?*HTMLRewriter;
-        extern fn unstable_lol_html_rewriter_build_with_esi_tags(
-            builder: *HTMLRewriter.Builder,
-            encoding: [*]const u8,
-            encoding_len: usize,
-            memory_settings: MemorySettings,
-            output_sink: ?*const fn ([*]const u8, usize, *anyopaque) callconv(.c) void,
-            output_sink_user_data: *anyopaque,
-            strict: bool,
-        ) ?*HTMLRewriter;
+    pub const Builder = struct {
+        element_registrations: std.ArrayList(ElementRegistration) = .empty,
+        document_registrations: std.ArrayList(DocumentRegistration) = .empty,
 
-        pub fn deinit(this: *HTMLRewriter.Builder) void {
+        pub fn init() *Builder {
             auto_disable();
-            this.lol_html_rewriter_builder_free();
+            const builder = bun.default_allocator.create(Builder) catch @panic("out of memory");
+            builder.* = .{};
+            return builder;
         }
 
-        extern fn lol_html_rewriter_builder_add_document_content_handlers(
-            builder: *HTMLRewriter.Builder,
-            doctype_handler: ?DirectiveFunctionType(DocType),
-            doctype_handler_user_data: ?*anyopaque,
-            comment_handler: ?lol_html_comment_handler_t,
-            comment_handler_user_data: ?*anyopaque,
-            text_handler: ?lol_html_text_handler_handler_t,
-            text_handler_user_data: ?*anyopaque,
-            doc_end_handler: ?lol_html_doc_end_handler_t,
-            doc_end_user_data: ?*anyopaque,
-        ) void;
-
-        pub fn init() *HTMLRewriter.Builder {
+        pub fn deinit(this: *Builder) void {
             auto_disable();
-            return lol_html_rewriter_builder_new();
+            for (this.element_registrations.items) |registration| {
+                bun.default_allocator.free(registration.selector);
+            }
+            this.element_registrations.deinit(bun.default_allocator);
+            this.document_registrations.deinit(bun.default_allocator);
+            bun.default_allocator.destroy(this);
         }
 
-        /// Adds document-level content handlers to the builder.
-        ///
-        /// If a particular handler is not required then NULL can be passed
-        /// instead. Don't use stub handlers in this case as this affects
-        /// performance - rewriter skips parsing of the content that doesn't
-        /// need to be processed.
-        ///
-        /// Each handler can optionally have associated user data which will be
-        /// passed to the handler on each invocation along with the rewritable
-        /// unit argument.
-        ///
-        /// If any of handlers return LOL_HTML_STOP directive then rewriting
-        /// stops immediately and `write()` or `end()` of the rewriter methods
-        /// return an error code.
-        ///
-        /// WARNING: Pointers passed to handlers are valid only during the
-        /// handler execution. So they should never be leaked outside of handlers.
         pub fn addDocumentContentHandlers(
-            builder: *HTMLRewriter.Builder,
+            builder: *Builder,
             comptime DocTypeHandler: type,
             comptime doctype_handler: ?DirectiveFunctionTypeForHandler(DocType, DocTypeHandler),
             doctype_handler_data: ?*DocTypeHandler,
@@ -144,60 +255,36 @@ pub const HTMLRewriter = opaque {
             comptime text_chunk_handler: ?DirectiveFunctionTypeForHandler(TextChunk, TextChunkHandler),
             text_chunk_handler_data: ?*TextChunkHandler,
             comptime DocEndHandler: type,
-            comptime end_tag_handler: ?DirectiveFunctionTypeForHandler(DocEnd, DocEndHandler),
-            end_tag_handler_data: ?*DocEndHandler,
+            comptime end_handler: ?DirectiveFunctionTypeForHandler(DocEnd, DocEndHandler),
+            end_handler_data: ?*DocEndHandler,
         ) void {
             auto_disable();
-
-            builder.lol_html_rewriter_builder_add_document_content_handlers(
-                if (doctype_handler_data != null)
+            builder.document_registrations.append(bun.default_allocator, .{
+                .doctype_handler = if (doctype_handler != null and doctype_handler_data != null)
                     DirectiveHandler(DocType, DocTypeHandler, doctype_handler.?)
                 else
                     null,
-                doctype_handler_data,
-                if (comment_handler_data != null)
+                .doctype_data = if (doctype_handler_data) |data| @ptrCast(data) else null,
+                .comment_handler = if (comment_handler != null and comment_handler_data != null)
                     DirectiveHandler(Comment, CommentHandler, comment_handler.?)
                 else
                     null,
-                comment_handler_data,
-                if (text_chunk_handler_data != null)
+                .comment_data = if (comment_handler_data) |data| @ptrCast(data) else null,
+                .text_handler = if (text_chunk_handler != null and text_chunk_handler_data != null)
                     DirectiveHandler(TextChunk, TextChunkHandler, text_chunk_handler.?)
                 else
                     null,
-                text_chunk_handler_data,
-                if (end_tag_handler_data != null)
-                    DirectiveHandler(DocEnd, DocEndHandler, end_tag_handler.?)
+                .text_data = if (text_chunk_handler_data) |data| @ptrCast(data) else null,
+                .end_handler = if (end_handler != null and end_handler_data != null)
+                    DirectiveHandler(DocEnd, DocEndHandler, end_handler.?)
                 else
                     null,
-                end_tag_handler_data,
-            );
+                .end_data = if (end_handler_data) |data| @ptrCast(data) else null,
+            }) catch @panic("out of memory");
         }
 
-        /// Adds element content handlers to the builder for the
-        /// given CSS selector.
-        ///
-        /// Selector should be a valid UTF8-string.
-        ///
-        /// If a particular handler is not required then NULL can be passed
-        /// instead. Don't use stub handlers in this case as this affects
-        /// performance - rewriter skips parsing of the content that doesn't
-        /// need to be processed.
-        ///
-        /// Each handler can optionally have associated user data which will be
-        /// passed to the handler on each invocation along with the rewritable
-        /// unit argument.
-        ///
-        /// If any of handlers return LOL_HTML_STOP directive then rewriting
-        /// stops immediately and `write()` or `end()` of the rewriter methods
-        /// return an error code.
-        ///
-        /// Returns 0 in case of success and -1 otherwise. The actual error message
-        /// can be obtained using `lol_html_take_last_error` function.
-        ///
-        /// WARNING: Pointers passed to handlers are valid only during the
-        /// handler execution. So they should never be leaked outside of handlers.
         pub fn addElementContentHandlers(
-            builder: *HTMLRewriter.Builder,
+            builder: *Builder,
             selector: *HTMLSelector,
             comptime ElementHandler: type,
             comptime element_handler: ?DirectiveFunctionTypeForHandler(Element, ElementHandler),
@@ -210,567 +297,458 @@ pub const HTMLRewriter = opaque {
             text_chunk_handler_data: ?*TextChunkHandler,
         ) Error!void {
             auto_disable();
-            return switch (builder.lol_html_rewriter_builder_add_element_content_handlers(
-                selector,
-                if (element_handler != null and element_handler_data != null)
+            const selector_copy = bun.default_allocator.dupe(u8, selector.source) catch |err| return captureError(err);
+            errdefer bun.default_allocator.free(selector_copy);
+            builder.element_registrations.append(bun.default_allocator, .{
+                .selector = selector_copy,
+                .element_handler = if (element_handler != null and element_handler_data != null)
                     DirectiveHandler(Element, ElementHandler, element_handler.?)
                 else
                     null,
-                element_handler_data,
-                if (comment_handler != null and comment_handler_data != null)
+                .element_data = if (element_handler_data) |data| @ptrCast(data) else null,
+                .comment_handler = if (comment_handler != null and comment_handler_data != null)
                     DirectiveHandler(Comment, CommentHandler, comment_handler.?)
                 else
                     null,
-                comment_handler_data,
-                if (text_chunk_handler != null and text_chunk_handler_data != null)
+                .comment_data = if (comment_handler_data) |data| @ptrCast(data) else null,
+                .text_handler = if (text_chunk_handler != null and text_chunk_handler_data != null)
                     DirectiveHandler(TextChunk, TextChunkHandler, text_chunk_handler.?)
                 else
                     null,
-                text_chunk_handler_data,
-            )) {
-                -1 => error.Fail,
-                0 => {},
-                else => unreachable,
-            };
+                .text_data = if (text_chunk_handler_data) |data| @ptrCast(data) else null,
+            }) catch |err| return captureError(err);
         }
 
         pub fn build(
-            builder: *HTMLRewriter.Builder,
+            builder: *Builder,
             encoding: Encoding,
             memory_settings: MemorySettings,
             strict: bool,
             comptime OutputSink: type,
             output_sink: *OutputSink,
-            comptime Writer: (fn (*OutputSink, bytes: []const u8) void),
-            comptime Done: (fn (*OutputSink) void),
+            comptime Writer: fn (*OutputSink, []const u8) void,
+            comptime Done: fn (*OutputSink) void,
         ) Error!*HTMLRewriter {
             auto_disable();
+            clearLastError();
+            _ = memory_settings;
+            if (encoding != .UTF8) {
+                setLastError("zig-html-rewriter accepts UTF-8 input only");
+                return error.Fail;
+            }
 
-            const encoding_ = Encoding.label.getAssertContains(encoding);
-            return builder.lol_html_rewriter_build(
-                encoding_.ptr,
-                encoding_.len,
-                memory_settings,
-                OutputSinkFunction(OutputSink, Writer, Done),
-                output_sink,
-                strict,
-            ) orelse return error.Fail;
-        }
-
-        fn OutputSinkFunction(
-            comptime OutputSinkType: type,
-            comptime Writer: (fn (*OutputSinkType, bytes: []const u8) void),
-            comptime Done: (fn (*OutputSinkType) void),
-        ) (fn ([*]const u8, usize, *anyopaque) callconv(.c) void) {
-            return struct {
-                fn writeChunk(ptr: [*]const u8, len: usize, user_data: *anyopaque) callconv(.c) void {
-                    auto_disable();
-
-                    @setRuntimeSafety(false);
-                    const this = @as(*OutputSinkType, @ptrCast(@alignCast(user_data)));
-                    switch (len) {
-                        0 => Done(this),
-                        else => Writer(this, ptr[0..len]),
-                    }
+            const allocator = bun.default_allocator;
+            const this = allocator.create(HTMLRewriter) catch |err| return captureError(err);
+            errdefer allocator.destroy(this);
+            const element_bridges = allocator.alloc(ElementBridge, builder.element_registrations.items.len) catch |err| return captureError(err);
+            errdefer allocator.free(element_bridges);
+            const document_bridges = allocator.alloc(DocumentBridge, builder.document_registrations.items.len) catch |err| return captureError(err);
+            errdefer allocator.free(document_bridges);
+            const selector_sources = allocator.alloc([]u8, element_bridges.len) catch |err| return captureError(err);
+            var selector_sources_initialized: usize = 0;
+            errdefer {
+                for (selector_sources[0..selector_sources_initialized]) |selector| {
+                    allocator.free(selector);
                 }
-            }.writeChunk;
+                allocator.free(selector_sources);
+            }
+            const selector_entries = allocator.alloc(NativeSelectorEntry, element_bridges.len) catch |err| return captureError(err);
+            defer allocator.free(selector_entries);
+            const document_entries = allocator.alloc(NativeDocumentHandlers, document_bridges.len) catch |err| return captureError(err);
+            defer allocator.free(document_entries);
+
+            for (builder.element_registrations.items, element_bridges, selector_entries, selector_sources) |registration, *bridge, *entry, *selector_source| {
+                selector_source.* = allocator.dupe(u8, registration.selector) catch |err| return captureError(err);
+                selector_sources_initialized += 1;
+                bridge.* = .{ .registration = registration };
+                bridge.registration.selector = selector_source.*;
+                entry.* = .{
+                    .selector = selector_source.*,
+                    .handlers = NativeElementHandlers{
+                        .element = if (registration.element_handler != null) .{
+                            .ctx = @ptrCast(bridge),
+                            .func = &ElementBridge.handleElement,
+                        } else null,
+                        .comments = if (registration.comment_handler != null) .{
+                            .ctx = @ptrCast(bridge),
+                            .func = &ElementBridge.handleComment,
+                        } else null,
+                        .text = if (registration.text_handler != null) .{
+                            .ctx = @ptrCast(bridge),
+                            .func = &ElementBridge.handleText,
+                        } else null,
+                    },
+                };
+            }
+            for (builder.document_registrations.items, document_bridges, document_entries) |registration, *bridge, *entry| {
+                bridge.* = .{ .registration = registration };
+                entry.* = .{
+                    .doctype = if (registration.doctype_handler != null) .{
+                        .ctx = @ptrCast(bridge),
+                        .func = &DocumentBridge.handleDocType,
+                    } else null,
+                    .comments = if (registration.comment_handler != null) .{
+                        .ctx = @ptrCast(bridge),
+                        .func = &DocumentBridge.handleComment,
+                    } else null,
+                    .text = if (registration.text_handler != null) .{
+                        .ctx = @ptrCast(bridge),
+                        .func = &DocumentBridge.handleText,
+                    } else null,
+                    .end = if (registration.end_handler != null) .{
+                        .ctx = @ptrCast(bridge),
+                        .func = &DocumentBridge.handleEnd,
+                    } else null,
+                };
+            }
+
+            this.* = .{
+                .inner = undefined,
+                .element_bridges = element_bridges,
+                .document_bridges = document_bridges,
+                .selector_sources = selector_sources,
+                .output = .{
+                    .ctx = @ptrCast(output_sink),
+                    .write_fn = &struct {
+                        fn call(ctx: *anyopaque, bytes: []const u8) void {
+                            Writer(@ptrCast(@alignCast(ctx)), bytes);
+                        }
+                    }.call,
+                    .done_fn = &struct {
+                        fn call(ctx: *anyopaque) void {
+                            Done(@ptrCast(@alignCast(ctx)));
+                        }
+                    }.call,
+                },
+            };
+            this.inner = NativeRewriter.init(
+                allocator,
+                .{
+                    .element_content_handlers = selector_entries,
+                    .document_content_handlers = document_entries,
+                    .strict = strict,
+                },
+                .{
+                    .ctx = @ptrCast(&this.output),
+                    .handle_chunk = &OutputBridge.handleChunk,
+                },
+            ) catch |err| return captureError(err);
+            return this;
         }
     };
 };
 
-pub const HTMLSelector = opaque {
-    extern fn lol_html_selector_parse(selector: [*]const u8, selector_len: usize) ?*HTMLSelector;
-    extern fn lol_html_selector_free(selector: *HTMLSelector) void;
+pub const HTMLSelector = struct {
+    source: []u8,
 
-    /// Frees the memory held by the parsed selector object.
-    pub fn deinit(selector: *HTMLSelector) void {
-        auto_disable();
-        selector.lol_html_selector_free();
-    }
-
-    /// Parses given CSS selector string.
-    ///
-    /// Returns NULL if parsing error occurs. The actual error message
-    /// can be obtained using `lol_html_take_last_error` function.
-    ///
-    /// WARNING: Selector SHOULD NOT be deallocated if there are any active rewriter
-    /// builders that accepted it as an argument to `lol_html_rewriter_builder_add_element_content_handlers()`
-    /// method. Deallocate all dependant rewriter builders first and then
-    /// use `lol_html_selector_free` function to free the selector.
     pub fn parse(selector: []const u8) Error!*HTMLSelector {
         auto_disable();
+        clearLastError();
+        var arena = std.heap.ArenaAllocator.init(bun.default_allocator);
+        defer arena.deinit();
+        _ = native.selectors.parser.parse(arena.allocator(), selector) catch |err| return captureError(err);
+        const result = bun.default_allocator.create(HTMLSelector) catch |err| return captureError(err);
+        errdefer bun.default_allocator.destroy(result);
+        result.* = .{
+            .source = bun.default_allocator.dupe(u8, selector) catch |err| return captureError(err),
+        };
+        return result;
+    }
 
-        if (lol_html_selector_parse(ptrWithoutPanic(selector), selector.len)) |ptr|
-            return ptr
-        else
-            return error.Fail;
+    pub fn deinit(selector: *HTMLSelector) void {
+        auto_disable();
+        bun.default_allocator.free(selector.source);
+        bun.default_allocator.destroy(selector);
     }
 };
-pub const TextChunk = opaque {
-    extern fn lol_html_text_chunk_content_get(chunk: *const TextChunk) TextChunk.Content;
-    extern fn lol_html_text_chunk_is_last_in_text_node(chunk: *const TextChunk) bool;
-    extern fn lol_html_text_chunk_before(chunk: *TextChunk, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_text_chunk_after(chunk: *TextChunk, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_text_chunk_replace(chunk: *TextChunk, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_text_chunk_remove(chunk: *TextChunk) void;
-    extern fn lol_html_text_chunk_is_removed(chunk: *const TextChunk) bool;
-    extern fn lol_html_text_chunk_user_data_set(chunk: *const TextChunk, user_data: ?*anyopaque) void;
-    extern fn lol_html_text_chunk_user_data_get(chunk: *const TextChunk) ?*anyopaque;
-    extern fn lol_html_text_chunk_source_location_bytes(chunk: *const TextChunk) SourceLocationBytes;
 
-    pub const Content = extern struct {
+pub const TextChunk = struct {
+    inner: *NativeTextChunk,
+
+    pub const Content = struct {
         ptr: [*]const u8,
         len: usize,
 
         pub fn slice(this: Content) []const u8 {
-            auto_disable();
             return this.ptr[0..this.len];
         }
     };
 
-    pub fn getContent(this: *const TextChunk) TextChunk.Content {
-        auto_disable();
-        return this.lol_html_text_chunk_content_get();
+    pub fn getContent(this: *const TextChunk) Content {
+        const bytes = this.inner.asStr();
+        return .{ .ptr = if (bytes.len == 0) empty_bytes[0..].ptr else bytes.ptr, .len = bytes.len };
     }
+
     pub fn isLastInTextNode(this: *const TextChunk) bool {
-        auto_disable();
-        return this.lol_html_text_chunk_is_last_in_text_node();
+        return this.inner.lastInTextNode();
     }
-    /// Inserts the content string before the text chunk either as raw text or as HTML.
-    ///
-    /// Content should be a valid UTF8-string.
-    ///
-    /// Returns 0 in case of success and -1 otherwise. The actual error message
-    /// can be obtained using `lol_html_take_last_error` function.
+
     pub fn before(this: *TextChunk, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        if (this.lol_html_text_chunk_before(ptrWithoutPanic(content), content.len, is_html) < 0)
-            return error.Fail;
+        this.inner.before(content, contentType(is_html)) catch |err| return captureError(err);
     }
-    /// Inserts the content string after the text chunk either as raw text or as HTML.
-    ///
-    /// Content should be a valid UTF8-string.
-    ///
-    /// Returns 0 in case of success and -1 otherwise. The actual error message
-    /// can be obtained using `lol_html_take_last_error` function.
+
     pub fn after(this: *TextChunk, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        if (this.lol_html_text_chunk_after(ptrWithoutPanic(content), content.len, is_html) < 0)
-            return error.Fail;
+        this.inner.after(content, contentType(is_html)) catch |err| return captureError(err);
     }
-    // Replace the text chunk with the content of the string which is interpreted
-    // either as raw text or as HTML.
-    //
-    // Content should be a valid UTF8-string.
-    //
-    // Returns 0 in case of success and -1 otherwise. The actual error message
-    // can be obtained using `lol_html_take_last_error` function.
+
     pub fn replace(this: *TextChunk, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        if (this.lol_html_text_chunk_replace(ptrWithoutPanic(content), content.len, is_html) < 0)
-            return error.Fail;
+        this.inner.replace(content, contentType(is_html)) catch |err| return captureError(err);
     }
-    /// Removes the text chunk.
+
     pub fn remove(this: *TextChunk) void {
-        auto_disable();
-        return this.lol_html_text_chunk_remove();
+        this.inner.remove();
     }
+
     pub fn isRemoved(this: *const TextChunk) bool {
-        auto_disable();
-        return this.lol_html_text_chunk_is_removed();
+        return this.inner.removed();
     }
+
     pub fn setUserData(this: *const TextChunk, comptime Type: type, value: ?*Type) void {
-        auto_disable();
-        return this.lol_html_text_chunk_user_data_set(value);
+        @constCast(this.inner).user_data = if (value) |ptr| @ptrCast(ptr) else null;
     }
+
     pub fn getUserData(this: *const TextChunk, comptime Type: type) ?*Type {
-        auto_disable();
-        return @as(?*Type, @ptrCast(@alignCast(this.lol_html_text_chunk_user_data_get())));
-    }
-    pub fn getSourceLocationBytes(this: *const TextChunk) SourceLocationBytes {
-        auto_disable();
-        return this.lol_html_text_chunk_source_location_bytes();
-    }
-};
-pub const Element = opaque {
-    extern fn lol_html_element_get_attribute(element: *const Element, name: [*]const u8, name_len: usize) HTMLString;
-    extern fn lol_html_element_has_attribute(element: *const Element, name: [*]const u8, name_len: usize) c_int;
-    extern fn lol_html_element_set_attribute(element: *Element, name: [*]const u8, name_len: usize, value: [*]const u8, value_len: usize) c_int;
-    extern fn lol_html_element_remove_attribute(element: *Element, name: [*]const u8, name_len: usize) c_int;
-    extern fn lol_html_element_before(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_prepend(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_append(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_after(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_set_inner_content(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_replace(element: *Element, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_element_remove(element: *const Element) void;
-    extern fn lol_html_element_remove_and_keep_content(element: *const Element) void;
-    extern fn lol_html_element_is_removed(element: *const Element) bool;
-    extern fn lol_html_element_is_self_closing(element: *const Element) bool;
-    extern fn lol_html_element_can_have_content(element: *const Element) bool;
-    extern fn lol_html_element_user_data_set(element: *const Element, user_data: ?*anyopaque) void;
-    extern fn lol_html_element_user_data_get(element: *const Element) ?*anyopaque;
-    extern fn lol_html_element_add_end_tag_handler(element: *Element, end_tag_handler: lol_html_end_tag_handler_t, user_data: ?*anyopaque) c_int;
-    extern fn lol_html_element_clear_end_tag_handlers(element: *Element) void;
-    extern fn lol_html_element_source_location_bytes(element: *const Element) SourceLocationBytes;
-
-    pub fn getAttribute(element: *const Element, name: []const u8) HTMLString {
-        auto_disable();
-        return lol_html_element_get_attribute(element, ptrWithoutPanic(name), name.len);
-    }
-    pub fn hasAttribute(element: *const Element, name: []const u8) Error!bool {
-        auto_disable();
-        return switch (lol_html_element_has_attribute(element, ptrWithoutPanic(name), name.len)) {
-            0 => false,
-            1 => true,
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn setAttribute(element: *Element, name: []const u8, value: []const u8) Error!void {
-        auto_disable();
-        return switch (lol_html_element_set_attribute(element, ptrWithoutPanic(name), name.len, ptrWithoutPanic(value), value.len)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn removeAttribute(element: *Element, name: []const u8) Error!void {
-        auto_disable();
-        return switch (lol_html_element_remove_attribute(element, ptrWithoutPanic(name), name.len)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn before(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_element_before(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn prepend(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_element_prepend(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn append(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_element_append(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn after(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_element_after(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn setInnerContent(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-
-        return switch (lol_html_element_set_inner_content(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    /// Replaces the element with the provided text or HTML content.
-    ///
-    /// Content should be a valid UTF8-string.
-    ///
-    /// Returns 0 in case of success and -1 otherwise. The actual error message
-    /// can be obtained using `lol_html_take_last_error` function.
-    pub fn replace(element: *Element, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_element_replace(element, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn remove(element: *const Element) void {
-        auto_disable();
-        lol_html_element_remove(element);
-    }
-    // Removes the element, but leaves its inner content intact.
-    pub fn removeAndKeepContent(element: *const Element) void {
-        auto_disable();
-        lol_html_element_remove_and_keep_content(element);
-    }
-    pub fn isRemoved(element: *const Element) bool {
-        auto_disable();
-        return lol_html_element_is_removed(element);
-    }
-    pub fn isSelfClosing(element: *const Element) bool {
-        auto_disable();
-        return lol_html_element_is_self_closing(element);
-    }
-    pub fn canHaveContent(element: *const Element) bool {
-        auto_disable();
-        return lol_html_element_can_have_content(element);
-    }
-    pub fn setUserData(element: *const Element, user_data: ?*anyopaque) void {
-        auto_disable();
-        lol_html_element_user_data_set(element, user_data);
-    }
-    pub fn getUserData(element: *const Element, comptime Type: type) ?*Type {
-        auto_disable();
-        return @as(?*Element, @ptrCast(@alignCast(lol_html_element_user_data_get(element))));
-    }
-    pub fn onEndTag(element: *Element, end_tag_handler: lol_html_end_tag_handler_t, user_data: ?*anyopaque) Error!void {
-        auto_disable();
-
-        lol_html_element_clear_end_tag_handlers(element);
-
-        return switch (lol_html_element_add_end_tag_handler(element, end_tag_handler, user_data)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+        return if (this.inner.user_data) |ptr| @ptrCast(@alignCast(ptr)) else null;
     }
 
-    extern fn lol_html_element_tag_name_get(element: *const Element) HTMLString;
-    extern fn lol_html_element_tag_name_set(element: *Element, name: [*]const u8, name_len: usize) c_int;
-    extern fn lol_html_element_namespace_uri_get(element: *const Element) [*:0]const u8;
-    extern fn lol_html_attributes_iterator_get(element: *const Element) ?*Attribute.Iterator;
-
-    pub fn tagName(element: *const Element) HTMLString {
-        return lol_html_element_tag_name_get(element);
-    }
-
-    pub fn setTagName(element: *Element, name: []const u8) Error!void {
-        return switch (lol_html_element_tag_name_set(element, ptrWithoutPanic(name), name.len)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-
-    pub fn namespaceURI(element: *const Element) [*:0]const u8 {
-        return lol_html_element_namespace_uri_get(element);
-    }
-
-    pub fn attributes(element: *const Element) ?*Attribute.Iterator {
-        return lol_html_attributes_iterator_get(element);
-    }
-
-    pub fn getSourceLocationBytes(element: *const Element) SourceLocationBytes {
-        auto_disable();
-        return lol_html_element_source_location_bytes(element);
+    pub fn getSourceLocationBytes(_: *const TextChunk) SourceLocationBytes {
+        // COTTONTAIL-COMPAT: The native port does not expose token spans yet.
+        return .{ .start = 0, .end = 0 };
     }
 };
 
-pub const HTMLString = extern struct {
-    ptr: [*]const u8,
-    len: usize,
+pub const Element = struct {
+    inner: *NativeElement,
 
-    extern fn lol_html_str_free(str: HTMLString) void;
-    pub fn deinit(this: HTMLString) void {
-        auto_disable();
-        // if (this.len > 0) {
-        lol_html_str_free(this);
-        // }
+    pub fn getAttribute(this: *const Element, name: []const u8) HTMLString {
+        const value = this.inner.getAttribute(name) catch |err| {
+            setLastError(@errorName(err));
+            return HTMLString.init(&.{});
+        };
+        return HTMLString.init(value orelse &.{});
     }
 
-    pub extern fn lol_html_take_last_error(...) HTMLString;
-
-    pub fn lastError() HTMLString {
-        auto_disable();
-        return lol_html_take_last_error();
+    pub fn hasAttribute(this: *const Element, name: []const u8) Error!bool {
+        return this.inner.hasAttribute(name) catch |err| return captureError(err);
     }
 
-    pub fn slice(this: HTMLString) []const u8 {
-        auto_disable();
-        @setRuntimeSafety(false);
-        return this.ptr[0..this.len];
+    pub fn setAttribute(this: *Element, name: []const u8, value: []const u8) Error!void {
+        this.inner.setAttribute(name, value) catch |err| return captureError(err);
     }
 
-    fn deinit_external(_: [*]u8, ptr: *anyopaque, len: u32) callconv(.c) void {
-        auto_disable();
-        lol_html_str_free(.{ .ptr = @as([*]const u8, @ptrCast(ptr)), .len = len });
+    pub fn removeAttribute(this: *Element, name: []const u8) Error!void {
+        this.inner.removeAttribute(name) catch |err| return captureError(err);
     }
 
-    pub fn toString(this: HTMLString) bun.String {
-        const bytes = this.slice();
-        if (bytes.len > 0 and bun.strings.isAllASCII(bytes)) {
-            return bun.String.createExternal([*]u8, bytes, true, @constCast(bytes.ptr), &deinit_external);
-        }
-        defer this.deinit();
-        return bun.String.cloneUTF8(bytes);
+    pub fn before(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.before(content, contentType(is_html)) catch |err| return captureError(err);
     }
 
-    pub const toJS = @import("../runtime/api/lolhtml_jsc.zig").htmlStringToJS;
+    pub fn prepend(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.prepend(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn append(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.append(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn after(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.after(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn setInnerContent(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.setInnerContent(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn replace(this: *Element, content: []const u8, is_html: bool) Error!void {
+        this.inner.replace(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn remove(this: *const Element) void {
+        @constCast(this.inner).remove();
+    }
+
+    pub fn removeAndKeepContent(this: *const Element) void {
+        @constCast(this.inner).removeAndKeepContent();
+    }
+
+    pub fn isRemoved(this: *const Element) bool {
+        return this.inner.removed();
+    }
+
+    pub fn isSelfClosing(this: *const Element) bool {
+        return this.inner.isSelfClosing();
+    }
+
+    pub fn canHaveContent(this: *const Element) bool {
+        return this.inner.canHaveContent();
+    }
+
+    pub fn setUserData(this: *const Element, user_data: ?*anyopaque) void {
+        @constCast(this.inner).user_data = user_data;
+    }
+
+    pub fn getUserData(this: *const Element, comptime Type: type) ?*Type {
+        return if (this.inner.user_data) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    }
+
+    pub fn onEndTag(this: *Element, callback: lol_html_end_tag_handler_t, user_data: ?*anyopaque) Error!void {
+        const bridge = this.inner.allocator.create(EndTagBridge) catch |err| return captureError(err);
+        bridge.* = .{ .callback = callback, .user_data = user_data };
+        this.inner.end_tag_handlers.clearRetainingCapacity();
+        this.inner.onEndTag(.{ .ctx = @ptrCast(bridge), .func = &EndTagBridge.handle }) catch |err| return captureError(err);
+    }
+
+    pub fn tagName(this: *const Element) HTMLString {
+        const value = this.inner.tagName(this.inner.allocator) catch |err| {
+            setLastError(@errorName(err));
+            return HTMLString.init(&.{});
+        };
+        return HTMLString.init(value);
+    }
+
+    pub fn setTagName(this: *Element, name: []const u8) Error!void {
+        this.inner.setTagName(name) catch |err| return captureError(err);
+    }
+
+    pub fn namespaceURI(this: *const Element) [*:0]const u8 {
+        return this.inner.namespaceUri().ptr;
+    }
+
+    pub fn attributes(this: *const Element) ?*Attribute.Iterator {
+        const iterator = bun.default_allocator.create(Attribute.Iterator) catch |err| {
+            setLastError(@errorName(err));
+            return null;
+        };
+        iterator.* = .{ .attributes = this.inner.attributes() };
+        return iterator;
+    }
+
+    pub fn getSourceLocationBytes(_: *const Element) SourceLocationBytes {
+        // COTTONTAIL-COMPAT: The native port does not expose token spans yet.
+        return .{ .start = 0, .end = 0 };
+    }
 };
 
-pub const EndTag = opaque {
-    extern fn lol_html_end_tag_before(end_tag: *EndTag, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_end_tag_after(end_tag: *EndTag, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_end_tag_remove(end_tag: *EndTag) void;
-    extern fn lol_html_end_tag_name_get(end_tag: *const EndTag) HTMLString;
-    extern fn lol_html_end_tag_name_set(end_tag: *EndTag, name: [*]const u8, name_len: usize) c_int;
-    extern fn lol_html_end_tag_source_location_bytes(end_tag: *const EndTag) SourceLocationBytes;
+const EndTagBridge = struct {
+    callback: lol_html_end_tag_handler_t,
+    user_data: ?*anyopaque,
 
-    pub fn before(end_tag: *EndTag, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_end_tag_before(end_tag, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-
-    pub fn after(end_tag: *EndTag, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_end_tag_after(end_tag, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-    pub fn remove(end_tag: *EndTag) void {
-        auto_disable();
-        lol_html_end_tag_remove(end_tag);
-    }
-
-    pub fn getName(end_tag: *const EndTag) HTMLString {
-        auto_disable();
-        return lol_html_end_tag_name_get(end_tag);
-    }
-
-    pub fn setName(end_tag: *EndTag, name: []const u8) Error!void {
-        auto_disable();
-        return switch (lol_html_end_tag_name_set(end_tag, ptrWithoutPanic(name), name.len)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
-    }
-
-    pub fn getSourceLocationBytes(end_tag: *const EndTag) SourceLocationBytes {
-        auto_disable();
-        return lol_html_end_tag_source_location_bytes(end_tag);
+    fn handle(ctx: ?*anyopaque, value: *NativeEndTag) anyerror!void {
+        const this: *EndTagBridge = @ptrCast(@alignCast(ctx.?));
+        var wrapped = EndTag{ .inner = value };
+        if (this.callback(&wrapped, this.user_data) == .stop) return stopped();
     }
 };
 
-pub const Attribute = opaque {
-    extern fn lol_html_attribute_name_get(attribute: *const Attribute) HTMLString;
-    extern fn lol_html_attribute_value_get(attribute: *const Attribute) HTMLString;
+pub const EndTag = struct {
+    inner: *NativeEndTag,
+
+    pub fn before(this: *EndTag, content: []const u8, is_html: bool) Error!void {
+        this.inner.before(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn after(this: *EndTag, content: []const u8, is_html: bool) Error!void {
+        this.inner.after(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn replace(this: *EndTag, content: []const u8, is_html: bool) Error!void {
+        this.inner.replace(content, contentType(is_html)) catch |err| return captureError(err);
+    }
+
+    pub fn remove(this: *EndTag) void {
+        this.inner.remove();
+    }
+
+    pub fn getName(this: *const EndTag) HTMLString {
+        const value = this.inner.name(this.inner.allocator) catch |err| {
+            setLastError(@errorName(err));
+            return HTMLString.init(&.{});
+        };
+        return HTMLString.init(value);
+    }
+
+    pub fn setName(this: *EndTag, name: []const u8) Error!void {
+        this.inner.setNameStr(name) catch |err| return captureError(err);
+    }
+
+    pub fn getSourceLocationBytes(_: *const EndTag) SourceLocationBytes {
+        // COTTONTAIL-COMPAT: The native port does not expose token spans yet.
+        return .{ .start = 0, .end = 0 };
+    }
+};
+
+pub const Attribute = struct {
+    inner: *const NativeAttribute,
+
     pub fn name(this: *const Attribute) HTMLString {
-        auto_disable();
-        return this.lol_html_attribute_name_get();
-    }
-    pub fn value(this: *const Attribute) HTMLString {
-        auto_disable();
-        return this.lol_html_attribute_value_get();
+        return HTMLString.init(this.inner.name);
     }
 
-    pub const Iterator = opaque {
-        extern fn lol_html_attributes_iterator_free(iterator: *Attribute.Iterator) void;
-        extern fn lol_html_attributes_iterator_next(iterator: *Attribute.Iterator) ?*const Attribute;
+    pub fn value(this: *const Attribute) HTMLString {
+        return HTMLString.init(this.inner.value);
+    }
+
+    pub const Iterator = struct {
+        attributes: []const NativeAttribute,
+        index: usize = 0,
+        current: Attribute = undefined,
 
         pub fn next(this: *Iterator) ?*const Attribute {
-            auto_disable();
-            return lol_html_attributes_iterator_next(this);
+            if (this.index >= this.attributes.len) return null;
+            this.current = .{ .inner = &this.attributes[this.index] };
+            this.index += 1;
+            return &this.current;
         }
 
         pub fn deinit(this: *Iterator) void {
-            auto_disable();
-            lol_html_attributes_iterator_free(this);
+            bun.default_allocator.destroy(this);
         }
     };
 };
 
-pub const Comment = opaque {
-    extern fn lol_html_comment_text_get(comment: *const Comment) HTMLString;
-    extern fn lol_html_comment_text_set(comment: *Comment, text: [*]const u8, text_len: usize) c_int;
-    extern fn lol_html_comment_before(comment: *Comment, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_comment_after(comment: *Comment, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_comment_replace(comment: *Comment, content: [*]const u8, content_len: usize, is_html: bool) c_int;
-    extern fn lol_html_comment_remove(comment: *Comment) void;
-    extern fn lol_html_comment_is_removed(comment: *const Comment) bool;
-    extern fn lol_html_comment_user_data_set(comment: *const Comment, user_data: ?*anyopaque) void;
-    extern fn lol_html_comment_user_data_get(comment: *const Comment) ?*anyopaque;
-    extern fn lol_html_comment_source_location_bytes(comment: *const Comment) SourceLocationBytes;
+pub const Comment = struct {
+    inner: *NativeComment,
 
-    pub fn getText(comment: *const Comment) HTMLString {
-        auto_disable();
-        return lol_html_comment_text_get(comment);
+    pub fn getText(this: *const Comment) HTMLString {
+        return HTMLString.init(this.inner.text());
     }
 
-    pub fn setText(comment: *Comment, text: []const u8) Error!void {
-        auto_disable();
-        return switch (lol_html_comment_text_set(comment, ptrWithoutPanic(text), text.len)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+    pub fn setText(this: *Comment, text: []const u8) Error!void {
+        this.inner.setText(text) catch |err| return captureError(err);
     }
 
-    pub fn before(comment: *Comment, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_comment_before(comment, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+    pub fn before(this: *Comment, content: []const u8, is_html: bool) Error!void {
+        this.inner.before(content, contentType(is_html)) catch |err| return captureError(err);
     }
 
-    pub fn replace(comment: *Comment, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_comment_before(comment, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+    pub fn replace(this: *Comment, content: []const u8, is_html: bool) Error!void {
+        this.inner.replace(content, contentType(is_html)) catch |err| return captureError(err);
     }
 
-    pub fn after(comment: *Comment, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_comment_after(comment, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+    pub fn after(this: *Comment, content: []const u8, is_html: bool) Error!void {
+        this.inner.after(content, contentType(is_html)) catch |err| return captureError(err);
     }
 
-    pub const isRemoved = lol_html_comment_is_removed;
-    pub const remove = lol_html_comment_remove;
+    pub fn remove(this: *Comment) void {
+        this.inner.remove();
+    }
 
-    pub fn getSourceLocationBytes(comment: *const Comment) SourceLocationBytes {
-        auto_disable();
-        return lol_html_comment_source_location_bytes(comment);
+    pub fn isRemoved(this: *const Comment) bool {
+        return this.inner.removed();
+    }
+
+    pub fn getSourceLocationBytes(_: *const Comment) SourceLocationBytes {
+        // COTTONTAIL-COMPAT: The native port does not expose token spans yet.
+        return .{ .start = 0, .end = 0 };
     }
 };
 
-pub const Directive = enum(c_uint) {
-    @"continue" = 0,
-    stop = 1,
-};
-pub const lol_html_comment_handler_t = *const fn (*Comment, ?*anyopaque) callconv(.c) Directive;
-pub const lol_html_text_handler_handler_t = *const fn (*TextChunk, ?*anyopaque) callconv(.c) Directive;
-pub const lol_html_element_handler_t = *const fn (*Element, ?*anyopaque) callconv(.c) Directive;
-pub const lol_html_doc_end_handler_t = *const fn (*DocEnd, ?*anyopaque) callconv(.c) Directive;
-pub const lol_html_end_tag_handler_t = *const fn (*EndTag, ?*anyopaque) callconv(.c) Directive;
-pub const DocEnd = opaque {
-    extern fn lol_html_doc_end_append(doc_end: ?*DocEnd, content: [*]const u8, content_len: usize, is_html: bool) c_int;
+pub const DocEnd = struct {
+    inner: *NativeDocEnd,
 
     pub fn append(this: *DocEnd, content: []const u8, is_html: bool) Error!void {
-        auto_disable();
-        return switch (lol_html_doc_end_append(this, ptrWithoutPanic(content), content.len, is_html)) {
-            0 => {},
-            -1 => error.Fail,
-            else => unreachable,
-        };
+        this.inner.append(content, contentType(is_html));
     }
 };
 
@@ -782,86 +760,131 @@ fn DirectiveFunctionTypeForHandler(comptime Container: type, comptime UserDataTy
     return *const fn (*UserDataType, *Container) bool;
 }
 
-fn DocTypeHandlerCallback(comptime UserDataType: type) type {
-    return *const fn (*DocType, *UserDataType) bool;
-}
-
-pub fn DirectiveHandler(comptime Container: type, comptime UserDataType: type, comptime Callback: (*const fn (this: *UserDataType, container: *Container) bool)) DirectiveFunctionType(Container) {
+pub fn DirectiveHandler(
+    comptime Container: type,
+    comptime UserDataType: type,
+    comptime Callback: *const fn (*UserDataType, *Container) bool,
+) DirectiveFunctionType(Container) {
     return struct {
         pub fn callback(this: *Container, user_data: ?*anyopaque) callconv(.c) Directive {
-            auto_disable();
-            return @as(
-                Directive,
-                @enumFromInt(@as(
-                    c_uint,
-                    @intFromBool(
-                        Callback(
-                            @as(
-                                *UserDataType,
-                                @ptrCast(@alignCast(
-                                    user_data.?,
-                                )),
-                            ),
-                            this,
-                        ),
-                    ),
-                )),
-            );
+            return if (Callback(@ptrCast(@alignCast(user_data.?)), this)) .stop else .@"continue";
         }
     }.callback;
 }
 
-pub const DocType = opaque {
-    extern fn lol_html_doctype_name_get(doctype: *const DocType) HTMLString;
-    extern fn lol_html_doctype_public_id_get(doctype: *const DocType) HTMLString;
-    extern fn lol_html_doctype_system_id_get(doctype: *const DocType) HTMLString;
-    extern fn lol_html_doctype_user_data_set(doctype: *const DocType, user_data: ?*anyopaque) void;
-    extern fn lol_html_doctype_user_data_get(doctype: *const DocType) ?*anyopaque;
-    extern fn lol_html_doctype_remove(doctype: *DocType) void;
-    extern fn lol_html_doctype_is_removed(doctype: *const DocType) bool;
-    extern fn lol_html_doctype_source_location_bytes(doctype: *const DocType) SourceLocationBytes;
+pub const DocType = struct {
+    inner: *NativeDocType,
 
     pub const Callback = *const fn (*DocType, ?*anyopaque) callconv(.c) Directive;
 
     pub fn getName(this: *const DocType) HTMLString {
-        auto_disable();
-        return this.lol_html_doctype_name_get();
+        const value = this.inner.name(this.inner.allocator) catch |err| {
+            setLastError(@errorName(err));
+            return HTMLString.init(&.{});
+        };
+        return HTMLString.init(value orelse &.{});
     }
+
     pub fn getPublicId(this: *const DocType) HTMLString {
-        auto_disable();
-        return this.lol_html_doctype_public_id_get();
+        return HTMLString.init(this.inner.publicId() orelse &.{});
     }
+
     pub fn getSystemId(this: *const DocType) HTMLString {
-        auto_disable();
-        return this.lol_html_doctype_system_id_get();
+        return HTMLString.init(this.inner.systemId() orelse &.{});
     }
+
     pub fn remove(this: *DocType) void {
-        auto_disable();
-        return this.lol_html_doctype_remove();
+        this.inner.remove();
     }
+
     pub fn isRemoved(this: *const DocType) bool {
-        auto_disable();
-        return this.lol_html_doctype_is_removed();
+        return this.inner.removed();
     }
-    pub fn getSourceLocationBytes(this: *const DocType) SourceLocationBytes {
-        auto_disable();
-        return this.lol_html_doctype_source_location_bytes();
+
+    pub fn getSourceLocationBytes(_: *const DocType) SourceLocationBytes {
+        // COTTONTAIL-COMPAT: The native port does not expose token spans yet.
+        return .{ .start = 0, .end = 0 };
     }
 };
 
 pub const Encoding = enum {
     UTF8,
     UTF16,
-
-    const Label = std.enums.EnumMap(Encoding, []const u8);
-    pub const label: Label = brk: {
-        var labels = Label{};
-        labels.put(.UTF8, "UTF-8");
-        labels.put(.UTF16, "UTF-16");
-
-        break :brk labels;
-    };
 };
 
-const bun = @import("bun");
-const std = @import("std");
+test "zig html rewriter compatibility adapter streams and mutates elements" {
+    const Handler = struct {
+        matched: usize = 0,
+
+        fn onElement(this: *@This(), element: *Element) bool {
+            this.matched += 1;
+            element.setAttribute("data-runtime", "cottontail") catch return true;
+            return false;
+        }
+    };
+    const Sink = struct {
+        output: std.ArrayList(u8) = .empty,
+        completed: bool = false,
+
+        fn write(this: *@This(), bytes: []const u8) void {
+            this.output.appendSlice(bun.default_allocator, bytes) catch @panic("out of memory");
+        }
+
+        fn done(this: *@This()) void {
+            this.completed = true;
+        }
+    };
+
+    const builder = HTMLRewriter.Builder.init();
+    var builder_live = true;
+    defer if (builder_live) builder.deinit();
+    const selector = try HTMLSelector.parse("*");
+    var selector_live = true;
+    defer if (selector_live) selector.deinit();
+
+    var handler: Handler = .{};
+    try builder.addElementContentHandlers(
+        selector,
+        Handler,
+        Handler.onElement,
+        &handler,
+        void,
+        null,
+        null,
+        void,
+        null,
+        null,
+    );
+
+    var sink: Sink = .{};
+    defer sink.output.deinit(bun.default_allocator);
+    const rewriter = try builder.build(
+        .UTF8,
+        .{
+            .preallocated_parsing_buffer_size = 0,
+            .max_allowed_memory_usage = 1024 * 1024,
+        },
+        true,
+        Sink,
+        &sink,
+        Sink.write,
+        Sink.done,
+    );
+    defer rewriter.deinit();
+
+    builder.deinit();
+    builder_live = false;
+    selector.deinit();
+    selector_live = false;
+
+    try rewriter.write("<main><p>cotton");
+    try rewriter.write("tail</p></main>");
+    try rewriter.end();
+
+    try std.testing.expectEqual(@as(usize, 2), handler.matched);
+    try std.testing.expect(sink.completed);
+    try std.testing.expectEqualStrings(
+        "<main data-runtime=\"cottontail\"><p data-runtime=\"cottontail\">cottontail</p></main>",
+        sink.output.items,
+    );
+}

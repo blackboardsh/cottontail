@@ -207,7 +207,16 @@ assert(response.date === "2020-01-02T03:04:05.000Z", "Worker reply date mismatch
 assert(response.cycle === true, "Worker reply cycle mismatch");
 assert(response.workerData.token === "abc", "Worker workerData mismatch");
 assert(response.env.count === 7n, "Worker environmentData mismatch");
-assert(await postMessageToThread(worker.threadId, { value: "post-to-thread" }) === undefined, "postMessageToThread mismatch");
+let workerMessagingError: any;
+try {
+  await postMessageToThread(worker.threadId, { value: "post-to-thread" });
+} catch (error) {
+  workerMessagingError = error;
+}
+assert(
+  workerMessagingError?.code === "ERR_WORKER_MESSAGING_FAILED",
+  "postMessageToThread should reject when the worker has no workerMessage listener",
+);
 
 const transferredChannel = new MessageChannel();
 const transferredPortReply = new Promise<any>((resolve, reject) => {

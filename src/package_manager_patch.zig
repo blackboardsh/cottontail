@@ -6,6 +6,16 @@ pub const Spec = @import("package_manager_patch_spec.zig");
 const patch_tag_prefix = ".bun-tag-";
 const max_patch_bytes = 256 * 1024 * 1024;
 
+pub const ApplyDiagnostic = struct {
+    cause: anyerror,
+    operation: []const u8,
+
+    pub fn format(diagnostic: ApplyDiagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const detail = systemErrorDetail(diagnostic.cause);
+        try writer.print("{s}: {s} ({s}())", .{ detail.code, detail.message, diagnostic.operation });
+    }
+};
+
 pub fn expectedHash(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -45,7 +55,9 @@ pub fn apply(
     root_dir: []const u8,
     package_dir: []const u8,
     patch_paths: []const []const u8,
+    diagnostic: *?ApplyDiagnostic,
 ) !void {
+    diagnostic.* = null;
     if (patch_paths.len == 0) {
         try clearPatchTags(allocator, io, package_dir);
         return;
@@ -61,7 +73,7 @@ pub fn apply(
         const parse_source = std.mem.trimEnd(u8, source, "\r\n");
         var patch_file = compiler.patch.parsePatchFile(parse_source) catch return error.InvalidPatchFile;
         defer patch_file.deinit(compiler.default_allocator);
-        try applyParsedPatch(allocator, io, package_dir, &patch_file);
+        try applyParsedPatch(allocator, io, package_dir, &patch_file, diagnostic);
     }
 
     try clearPatchTags(allocator, io, package_dir);
@@ -221,24 +233,27 @@ fn applyParsedPatch(
     io: std.Io,
     package_dir: []const u8,
     patch_file: *const compiler.patch.PatchFile,
+    diagnostic: *?ApplyDiagnostic,
 ) !void {
     for (patch_file.parts.items) |part| switch (part) {
         .file_deletion => |deletion| {
             const path = try safePatchPath(allocator, package_dir, deletion.path);
-            std.Io.Dir.cwd().deleteFile(io, path) catch return error.PatchApplyFailed;
+            std.Io.Dir.cwd().deleteFile(io, path) catch |err| return applyFailure(diagnostic, "unlink", err);
         },
         .file_rename => |rename| {
             const from = try safePatchPath(allocator, package_dir, rename.from_path);
             const to = try safePatchPath(allocator, package_dir, rename.to_path);
-            if (std.fs.path.dirname(to)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-            std.Io.Dir.cwd().rename(from, std.Io.Dir.cwd(), to, io) catch return error.PatchApplyFailed;
+            if (std.fs.path.dirname(to)) |parent| {
+                std.Io.Dir.cwd().createDirPath(io, parent) catch |err| return applyFailure(diagnostic, "mkdir", err);
+            }
+            std.Io.Dir.cwd().rename(from, std.Io.Dir.cwd(), to, io) catch |err| return applyFailure(diagnostic, "rename", err);
         },
-        .file_creation => |creation| try applyFileCreation(allocator, io, package_dir, creation),
-        .file_patch => |file_patch| try applyFilePatch(allocator, io, package_dir, file_patch),
+        .file_creation => |creation| try applyFileCreation(allocator, io, package_dir, creation, diagnostic),
+        .file_patch => |file_patch| try applyFilePatch(allocator, io, package_dir, file_patch, diagnostic),
         .file_mode_change => |mode_change| {
             const path = try safePatchPath(allocator, package_dir, mode_change.path);
             const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(mode_change.new_mode));
-            std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch return error.PatchApplyFailed;
+            std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch |err| return applyFailure(diagnostic, "chmod", err);
         },
     };
 }
@@ -248,9 +263,12 @@ fn applyFileCreation(
     io: std.Io,
     package_dir: []const u8,
     creation: *const compiler.patch.FileCreation,
+    diagnostic: *?ApplyDiagnostic,
 ) !void {
     const path = try safePatchPath(allocator, package_dir, creation.path);
-    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    if (std.fs.path.dirname(path)) |parent| {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch |err| return applyFailure(diagnostic, "mkdir", err);
+    }
     var contents: std.Io.Writer.Allocating = .init(allocator);
     if (creation.hunk) |hunk| {
         if (hunk.parts.items.len > 0) {
@@ -263,9 +281,11 @@ fn applyFileCreation(
             }
         }
     }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents.written() });
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents.written() }) catch |err|
+        return applyFailure(diagnostic, "write", err);
     const permissions: std.Io.File.Permissions = @enumFromInt(@intFromEnum(creation.mode));
-    std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch return error.PatchApplyFailed;
+    std.Io.Dir.cwd().setFilePermissions(io, path, permissions, .{}) catch |err|
+        return applyFailure(diagnostic, "chmod", err);
 }
 
 fn applyFilePatch(
@@ -273,11 +293,12 @@ fn applyFilePatch(
     io: std.Io,
     package_dir: []const u8,
     file_patch: *const compiler.patch.FilePatch,
+    diagnostic: *?ApplyDiagnostic,
 ) !void {
     const path = try safePatchPath(allocator, package_dir, file_patch.path);
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.PatchApplyFailed;
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024 * 1024)) catch
-        return error.PatchApplyFailed;
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| return applyFailure(diagnostic, "stat", err);
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024 * 1024)) catch |err|
+        return applyFailure(diagnostic, "read", err);
 
     var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     var iterator = std.mem.splitScalar(u8, source, '\n');
@@ -285,21 +306,21 @@ fn applyFilePatch(
 
     for (file_patch.hunks.items) |hunk| {
         var line_cursor: usize = hunk.header.patched.start -| 1;
-        if (line_cursor > lines.items.len) return error.PatchApplyFailed;
+        if (line_cursor > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
         for (hunk.parts.items) |part| switch (part.type) {
             .context => {
-                if (line_cursor + part.lines.items.len > lines.items.len) return error.PatchApplyFailed;
+                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
                 line_cursor += part.lines.items.len;
             },
             .insertion => {
-                if (line_cursor > lines.items.len) return error.PatchApplyFailed;
+                if (line_cursor > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
                 const inserted = try lines.addManyAt(allocator, line_cursor, part.lines.items.len);
                 @memcpy(inserted, part.lines.items);
                 line_cursor += part.lines.items.len;
                 if (part.no_newline_at_end_of_file and lines.items.len > 0) _ = lines.pop();
             },
             .deletion => {
-                if (line_cursor + part.lines.items.len > lines.items.len) return error.PatchApplyFailed;
+                if (line_cursor + part.lines.items.len > lines.items.len) return applyFailure(diagnostic, "patch", error.InvalidArgument);
                 try lines.replaceRange(allocator, line_cursor, part.lines.items.len, &.{});
                 if (part.no_newline_at_end_of_file) try lines.append(allocator, "");
             },
@@ -307,11 +328,35 @@ fn applyFilePatch(
     }
 
     const patched = try std.mem.join(allocator, "\n", lines.items);
-    try std.Io.Dir.cwd().writeFile(io, .{
+    std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = patched,
         .flags = .{ .permissions = stat.permissions },
-    });
+    }) catch |err| return applyFailure(diagnostic, "write", err);
+}
+
+fn applyFailure(diagnostic: *?ApplyDiagnostic, operation: []const u8, cause: anyerror) error{PatchApplyFailed} {
+    diagnostic.* = .{ .cause = cause, .operation = operation };
+    return error.PatchApplyFailed;
+}
+
+fn systemErrorDetail(cause: anyerror) struct { code: []const u8, message: []const u8 } {
+    return switch (cause) {
+        error.FileNotFound => .{ .code = "ENOENT", .message = "No such file or directory" },
+        error.AccessDenied => .{ .code = "EACCES", .message = "Permission denied" },
+        error.NotDir => .{ .code = "ENOTDIR", .message = "Not a directory" },
+        error.IsDir => .{ .code = "EISDIR", .message = "Is a directory" },
+        error.PathAlreadyExists => .{ .code = "EEXIST", .message = "File exists" },
+        error.NameTooLong => .{ .code = "ENAMETOOLONG", .message = "File name too long" },
+        error.NoSpaceLeft => .{ .code = "ENOSPC", .message = "No space left on device" },
+        error.ReadOnlyFileSystem => .{ .code = "EROFS", .message = "Read-only file system" },
+        error.FileTooBig => .{ .code = "EFBIG", .message = "File too large" },
+        error.InputOutput => .{ .code = "EIO", .message = "Input/output error" },
+        error.DeviceBusy => .{ .code = "EBUSY", .message = "Device or resource busy" },
+        error.InvalidArgument => .{ .code = "EINVAL", .message = "Invalid argument" },
+        error.BrokenPipe => .{ .code = "EPIPE", .message = "Broken pipe" },
+        else => .{ .code = @errorName(cause), .message = @errorName(cause) },
+    };
 }
 
 fn safePatchPath(allocator: std.mem.Allocator, package_dir: []const u8, relative: []const u8) ![]const u8 {

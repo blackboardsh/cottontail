@@ -16,6 +16,8 @@ import {
 
 const tests = [];
 const events = [];
+const Promise = globalThis.Promise;
+const queueMicrotask = globalThis.queueMicrotask.bind(globalThis);
 const runnerSetTimeout = globalThis.setTimeout;
 const runnerClearTimeout = globalThis.clearTimeout;
 const runnerSetInterval = globalThis.setInterval;
@@ -1222,6 +1224,17 @@ function failureStackFrames(error) {
         path.includes("/.cottontail-tmp/") || path.endsWith("/script.bundle.mjs")) continue;
     frames.push(frame);
   }
+  for (const frame of error?.__cottontailBunAsyncParentFrames ?? []) {
+    if (!frame?.filePath || !Number.isFinite(frame.line) || !Number.isFinite(frame.column)) continue;
+    if (frames.some((candidate) => candidate.filePath === frame.filePath &&
+        candidate.line === frame.line && candidate.column === frame.column)) continue;
+    frames.push({
+      functionName: frame.functionName || "<anonymous>",
+      filePath: normalizeDiagnosticPath(frame.filePath),
+      line: Number(frame.line),
+      column: Number(frame.column),
+    });
+  }
   return frames;
 }
 
@@ -1721,7 +1734,7 @@ function scheduleRun() {
     try {
       do {
         runAgain = false;
-        if (globalThis.__cottontailBunTestUsed && !globalThis.__cottontailBunTestHeaderPrinted) {
+        if (globalThis.__cottontailBunTestUsed && !testCliModeEnabled()) {
           globalThis.__cottontailBunTestHeaderPrinted = true;
           console.log(`bun test ${globalThis.Bun?.version_with_sha ?? "0.0.0-cottontail (cottontail)"}`);
         }
@@ -1751,7 +1764,7 @@ function scheduleRun() {
   });
 }
 
-globalThis.__cottontailStartTestRun = scheduleRun;
+globalThis[Symbol.for("cottontail.internal.startTestRun")] = scheduleRun;
 
 function normalizeCountOption(value, name) {
   const count = Number(value);

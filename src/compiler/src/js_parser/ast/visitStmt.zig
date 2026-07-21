@@ -629,7 +629,17 @@ pub fn VisitStmt(
                     }
                 }
 
-                if (!mark_as_dead and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
+                var has_static_name = false;
+                for (data.class.properties) |property| {
+                    if (!property.flags.contains(.is_static)) continue;
+                    const key = property.key orelse continue;
+                    if (key.data == .e_string and key.data.e_string.eqlComptime("name")) {
+                        has_static_name = true;
+                        break;
+                    }
+                }
+
+                if (!mark_as_dead and !has_static_name and p.options.features.minify_keep_names and !p.source.index.isRuntime()) {
                     try stmts.append(p.keepStmtSymbolName(name.loc, name_ref, original_name));
                 }
 

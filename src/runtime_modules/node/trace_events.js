@@ -5,20 +5,32 @@ function normalizeCategories(categories = []) {
   return Array.from(categories ?? [], String).filter(Boolean);
 }
 
+class Tracing {
+  constructor(categories) {
+    Object.defineProperty(this, "_categories", {
+      value: categories,
+      configurable: false,
+      enumerable: false,
+      writable: false,
+    });
+    this.categories = categories.join(",");
+  }
+
+  get enabled() {
+    return this._categories.some((category) => enabled.has(category));
+  }
+
+  enable() {
+    for (const category of this._categories) enabled.add(category);
+  }
+
+  disable() {
+    for (const category of this._categories) enabled.delete(category);
+  }
+}
+
 export function createTracing(options = {}) {
-  const categories = normalizeCategories(options.categories);
-  return {
-    categories: categories.join(","),
-    get enabled() {
-      return categories.some((category) => enabled.has(category));
-    },
-    enable() {
-      for (const category of categories) enabled.add(category);
-    },
-    disable() {
-      for (const category of categories) enabled.delete(category);
-    },
-  };
+  return new Tracing(normalizeCategories(options.categories));
 }
 
 export function getEnabledCategories() {

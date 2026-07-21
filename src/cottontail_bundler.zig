@@ -35,6 +35,10 @@ pub const BundleOptions = struct {
     /// directory so one compiled runtime graph is reusable across projects.
     runtime_virtual_root: ?[]const u8 = null,
     runtime_file_loader_paths: bool = false,
+    /// Runtime execution leaves user require()/require.resolve() calls for the
+    /// CommonJS loader. Build and standalone graphs keep this false so local
+    /// dependencies and emitted assets are included in the compiler graph.
+    externalize_runtime_require_resolve: bool = false,
     /// Runtime bundles execute with a global Node-style `require`. Keeping the
     /// original identifier makes Function.prototype.toString() output usable
     /// with `new Function("require", ...)`, matching Bun's module transpiler.
@@ -57,6 +61,9 @@ pub const BundleOptions = struct {
     /// `Bun.build({ reactFastRefresh: true })`: annotate JSX components with
     /// $RefreshReg$/$RefreshSig$ registration calls.
     react_fast_refresh: bool = false,
+    /// Bun CLI `build --server-components`: enable Bake's server-side parser
+    /// transforms, including the global Response import from `bun:app`.
+    server_components: bool = false,
     jsx_factory: ?[]const u8 = null,
     jsx_fragment: ?[]const u8 = null,
     jsx_runtime: ?compiler.schema.api.JsxRuntime = null,
@@ -89,9 +96,9 @@ pub const BundleOptions = struct {
 /// arena, which is what makes freeing that arena after each bundle safe.
 var shared_worker_pool: ?*compiler.ThreadPool = null;
 
-/// Dev-only (`COTTONTAIL_RUNTIME_MODULES_DIR`): populate the runtime module
-/// file map from a directory on disk instead of the embedded blob so that
-/// runtime module edits can be tested without rebuilding the binary.
+/// Dev-only (`COTTONTAIL_RUNTIME_MODULES_DIR`): overlay runtime modules from a
+/// directory on disk so edits can be tested without rebuilding the binary.
+/// Modules absent from the directory continue to use the embedded version.
 fn loadRuntimeModulesFromDisk(
     dir_path: []const u8,
     working_dir: []const u8,
@@ -720,7 +727,16 @@ pub fn bundleEntryPointGraphWithOptions(
 
     var loader_extensions: [1][]const u8 = undefined;
     var loader_values: [1]compiler.schema.api.Loader = undefined;
-    if (options.loader) |loader_name| {
+    if (options.loader_extensions.len > 0) {
+        if (options.loader_extensions.len != options.loader_values.len) {
+            setError(error_out, "Loader extension/value counts do not match", .{});
+            return error.InvalidLoader;
+        }
+        transform_options.loaders = .{
+            .extensions = options.loader_extensions,
+            .loaders = options.loader_values,
+        };
+    } else if (options.loader) |loader_name| {
         const loader = compiler.options.Loader.fromString(loader_name) orelse {
             setError(error_out, "Unsupported loader: {s}", .{loader_name});
             return error.InvalidLoader;
@@ -796,9 +812,10 @@ pub fn bundleEntryPointGraphWithOptions(
     // asset files must stay a runtime call returning the on-disk path instead
     // of becoming an additional output file (which single-output in-memory
     // bundles cannot emit).
-    transpiler.options.externalize_runtime_require_resolve = true;
+    transpiler.options.externalize_runtime_require_resolve = options.externalize_runtime_require_resolve;
     transpiler.options.runtime_file_loader_paths = options.runtime_file_loader_paths or options.include_runtime_modules;
     transpiler.options.preserve_external_require_name = options.preserve_external_require_name;
+    transpiler.options.server_components = options.server_components;
     // Cottontail's vendored JSC has no native `using` / `await using`
     // support; always lower them in bundles that run on this runtime.
     transpiler.options.force_lower_using = true;
@@ -880,25 +897,20 @@ pub fn bundleEntryPointGraphWithOptions(
     }
     if (options.include_runtime_modules) {
         const runtime_virtual_root = options.runtime_virtual_root orelse working_dir;
-        // Dev override: load runtime modules from a directory on disk instead
-        // of the embedded blob so module edits do not require a rebuild.
-        var used_override = false;
+        var iterator = try embedded_runtime_modules.Iterator.init();
+        while (try iterator.next()) |entry| {
+            const path = try embedded_runtime_modules.virtualPath(c_allocator, runtime_virtual_root, entry.path);
+            try runtime_file_keys.append(c_allocator, path);
+            try runtime_file_map.map.put(c_allocator, path, entry.contents);
+        }
+
+        // Dev override: replace only files present on disk. Keeping embedded
+        // fallbacks matters for generated modules that have no source-tree
+        // counterpart, such as the Buffer compatibility shims.
         if (std.c.getenv("COTTONTAIL_RUNTIME_MODULES_DIR")) |dir_pointer| {
             const dir_path = std.mem.span(dir_pointer);
             if (dir_path.len > 0) {
-                if (loadRuntimeModulesFromDisk(dir_path, runtime_virtual_root, &runtime_file_map, &runtime_file_keys)) {
-                    used_override = true;
-                } else |_| {
-                    // Fall back to the embedded blob on any error.
-                }
-            }
-        }
-        if (!used_override) {
-            var iterator = try embedded_runtime_modules.Iterator.init();
-            while (try iterator.next()) |entry| {
-                const path = try embedded_runtime_modules.virtualPath(c_allocator, runtime_virtual_root, entry.path);
-                try runtime_file_keys.append(c_allocator, path);
-                try runtime_file_map.map.put(c_allocator, path, entry.contents);
+                loadRuntimeModulesFromDisk(dir_path, runtime_virtual_root, &runtime_file_map, &runtime_file_keys) catch {};
             }
         }
     }
@@ -1258,6 +1270,14 @@ fn parseBuildOptions(options_json: []const u8, allocator: std.mem.Allocator) !Bu
     }
     if (object.get("reactFastRefresh")) |value| {
         if (value == .bool) options.react_fast_refresh = value.bool;
+    }
+    if (object.get("serverComponents")) |value| {
+        if (value == .bool) {
+            options.server_components = value.bool;
+            // Bun's BuildCommand enables syntax minification for this mode;
+            // server-component shadowing relies on its constant propagation.
+            if (value.bool) options.minify_syntax = true;
+        }
     }
     if (object.get("jsx")) |value| {
         if (value == .object) {
@@ -1861,6 +1881,7 @@ pub fn buildEntryPointsJson(
     // also determines source-map source paths and their deterministic debug ID.
     transpiler.options.root_dir = build_root;
     transpiler.options.react_fast_refresh = options.react_fast_refresh;
+    transpiler.options.server_components = options.server_components;
     transpiler.options.entry_naming = options.entry_naming;
     transpiler.options.chunk_naming = options.chunk_naming;
     transpiler.options.asset_naming = options.asset_naming;

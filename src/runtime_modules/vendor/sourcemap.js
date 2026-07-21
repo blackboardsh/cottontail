@@ -141,10 +141,35 @@ function buildState(mapPath, mapData, configuredBundlePath) {
       : effectiveMapPath.endsWith(".map")
         ? effectiveMapPath.slice(0, -".map".length)
         : null;
+    const lines = decodeMappings(map.mappings);
+    const firstGeneratedLines = new Int32Array(sources.length);
+    const firstExecutableGeneratedLines = new Int32Array(sources.length);
+    firstGeneratedLines.fill(-1);
+    firstExecutableGeneratedLines.fill(-1);
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const positionsBySource = new Map();
+      for (const segment of lines[lineIndex]) {
+        const sourceIndex = segment[1];
+        if (firstGeneratedLines[sourceIndex] === -1) firstGeneratedLines[sourceIndex] = lineIndex;
+        let positions = positionsBySource.get(sourceIndex);
+        if (!positions) positionsBySource.set(sourceIndex, positions = new Set());
+        positions.add(`${segment[2]}:${segment[3]}`);
+      }
+      for (const [sourceIndex, positions] of positionsBySource) {
+        // Bundler declarations and module wrappers usually carry one coarse
+        // mapping. A line with multiple source positions is the first emitted
+        // user statement and is the origin for Bun's originalLine metadata.
+        if (positions.size > 1 && firstExecutableGeneratedLines[sourceIndex] === -1) {
+          firstExecutableGeneratedLines[sourceIndex] = lineIndex;
+        }
+      }
+    }
     return {
       sources,
       sourceLines,
-      lines: decodeMappings(map.mappings),
+      lines,
+      firstGeneratedLines,
+      firstExecutableGeneratedLines,
       bundlePath,
       bundleRegExp: bundlePath ? new RegExp(`${escapeRegExp(bundlePath)}:(\\d+):(\\d+)`, "g") : null,
     };
@@ -191,7 +216,7 @@ function lookup(state, line, column) {
   const [, sourceIndex, sourceLine, sourceColumn] = segments[found];
   const source = state.sources[sourceIndex];
   if (source == null) return null;
-  return { source, line: sourceLine + 1, column: sourceColumn + 1, sourceIndex };
+  return { source, line: sourceLine + 1, column: sourceColumn + 1, sourceIndex, generatedLine: line };
 }
 
 export function remapPosition(line, column) {
@@ -199,6 +224,30 @@ export function remapPosition(line, column) {
   if (!state) return null;
   const mapped = lookup(state, Number(line), Number(column));
   return mapped && { source: mapped.source, line: mapped.line, column: mapped.column };
+}
+
+export function remapErrorPosition(line, column) {
+  const state = getState();
+  const generatedLine = Number(line);
+  const generatedColumn = Number(column);
+  if (!state) return null;
+  const initial = lookup(state, generatedLine, generatedColumn);
+  const mapped = initial ? preferConstructedErrorCallSite(state, generatedLine, generatedColumn, initial) : null;
+  if (!mapped) return null;
+  const firstExecutableGeneratedLine = state.firstExecutableGeneratedLines[mapped.sourceIndex];
+  const firstGeneratedLine = state.firstGeneratedLines[mapped.sourceIndex];
+  const mappedGeneratedLine = mapped.generatedLine ?? generatedLine;
+  return {
+    source: mapped.source,
+    line: mapped.line,
+    column: mapped.column,
+    originalLine: firstExecutableGeneratedLine >= 0
+      ? mappedGeneratedLine - firstExecutableGeneratedLine
+      : firstGeneratedLine >= 0
+        ? mappedGeneratedLine - firstGeneratedLine
+        : mappedGeneratedLine,
+    originalColumn: generatedColumn,
+  };
 }
 
 export function sourceContextForLocation(source, line, column) {
@@ -218,6 +267,27 @@ export function sourceContextForLocation(source, line, column) {
 function preferConstructedErrorCallSite(state, generatedLine, generatedColumn, mapped) {
   const sourceLines = state.sourceLines[mapped.sourceIndex];
   const currentSource = sourceLines?.[mapped.line - 1] ?? "";
+  if (/\.stack\b/.test(currentSource)) {
+    for (let line = generatedLine - 1; line >= Math.max(1, generatedLine - 8); line -= 1) {
+      const segments = state.lines[line - 1] ?? [];
+      for (const segment of segments) {
+        const [, sourceIndex, sourceLine, sourceColumn] = segment;
+        if (sourceIndex !== mapped.sourceIndex) continue;
+        const text = sourceLines?.[sourceLine] ?? "";
+        const constructor = /\bnew\s+((?:Aggregate|Eval|Range|Reference|Syntax|Type|URI)?Error)\b/.exec(text);
+        if (!constructor) continue;
+        const constructorColumn = constructor.index + constructor[0].lastIndexOf(constructor[1]);
+        if (sourceColumn !== constructorColumn) continue;
+        return {
+          source: state.sources[sourceIndex],
+          line: sourceLine + 1,
+          column: sourceColumn + 1,
+          sourceIndex,
+          generatedLine: line,
+        };
+      }
+    }
+  }
   if (!/^\s*[}\])]+(?:\s*,[^;]*)?;?\s*$/.test(currentSource)) return mapped;
   const previous = lookup(state, generatedLine - 1, generatedColumn);
   if (!previous || previous.sourceIndex !== mapped.sourceIndex || previous.line >= mapped.line) return mapped;
@@ -261,4 +331,4 @@ export function remapStackString(stack) {
     .join("\n");
 }
 
-export default { remapPosition, remapStackString, sourceContextForLocation };
+export default { remapErrorPosition, remapPosition, remapStackString, sourceContextForLocation };

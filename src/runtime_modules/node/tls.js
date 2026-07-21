@@ -637,6 +637,7 @@ export class TLSSocket extends Socket {
     this._tlsInfo = null;
     this._encoding = null;
     this._tlsListenerInstalled = false;
+    this._tlsReadEndTimer = null;
     this._tlsHandshakeTimer = null;
     this._memoryTransport = null;
     this._memoryTransportListeners = null;
@@ -658,6 +659,8 @@ export class TLSSocket extends Socket {
     this._requestOCSP = options?.requestOCSP === true;
     this._ocspResponseEmitted = false;
     this._checkServerIdentity = options?.checkServerIdentity ?? checkServerIdentity;
+    this._identityHostname = options?.identityHostname;
+    this._skipServerIdentity = options?.skipServerIdentity === true;
     this.isServer = options?.isServer === true;
     const handshakeTimeout = options.handshakeTimeout ?? (this.isServer ? 120000 : 10000);
     if (typeof handshakeTimeout !== "number" || !Number.isFinite(handshakeTimeout) || handshakeTimeout < 0) {
@@ -700,7 +703,7 @@ export class TLSSocket extends Socket {
 
   _attachMemoryTransport(native, transport, connectedEvent = "secureConnect") {
     this._tlsId = Number(native.id);
-    this.fd = -1;
+    this.fd = null;
     this._tlsInfo = native;
     this._memoryTransport = transport;
     this.destroyed = false;
@@ -838,11 +841,11 @@ export class TLSSocket extends Socket {
     let authorizationError = info.verifyErrorCode
       ? tlsError(info.verifyErrorMessage || info.verifyErrorCode, info.verifyErrorCode)
       : null;
-    if (!this.isServer && !authorizationError && typeof this._checkServerIdentity === "function") {
+    if (!this.isServer && !authorizationError && !this._skipServerIdentity && typeof this._checkServerIdentity === "function") {
       const certificate = legacyPeerCertificate(info);
       if (certificate?.raw) {
         try {
-          authorizationError = this._checkServerIdentity(this.servername || this._host || "localhost", certificate) || null;
+          authorizationError = this._checkServerIdentity(this._identityHostname || this.servername || this._host || "localhost", certificate) || null;
         } catch (error) {
           authorizationError = normalizeTlsError(error);
         }
@@ -944,18 +947,24 @@ export class TLSSocket extends Socket {
         return;
       }
       if (event.type === "end") {
-        this.readable = false;
+        if (this._tlsReadEndTimer != null) return;
         const tlsId = this._tlsId;
-        listeners.delete(tlsId);
-        this._tlsListenerInstalled = false;
-        this._emitEnd();
-        // A TLS close_notify ends both application-data directions. The
-        // native reader retains its connection until this acknowledgement so
-        // queued terminal events cannot race a freed SSL object.
-        if (this._tlsId === tlsId) {
-          try { cottontail.tlsConnectionClose(tlsId); } catch {}
-          this._tlsId = null;
-        }
+        this._tlsReadEndTimer = setTimeout(() => {
+          this._tlsReadEndTimer = null;
+          if (this.destroyed || this._tlsId !== tlsId) return;
+          this.readable = false;
+          listeners.delete(tlsId);
+          this._tlsListenerInstalled = false;
+          this._emitEnd();
+          // A TLS close_notify ends both application-data directions. The
+          // native reader retains its connection until this acknowledgement so
+          // queued terminal events cannot race a freed SSL object.
+          if (this._tlsId === tlsId) {
+            try { cottontail.tlsConnectionClose(tlsId); } catch {}
+            this._tlsId = null;
+          }
+        }, 0);
+        if (!this._refed) this._tlsReadEndTimer.unref?.();
         return;
       }
       if (event.type === "error") {
@@ -1106,6 +1115,10 @@ export class TLSSocket extends Socket {
     if (this._tlsHandshakeTimer != null) {
       clearTimeout(this._tlsHandshakeTimer);
       this._tlsHandshakeTimer = null;
+    }
+    if (this._tlsReadEndTimer != null) {
+      clearTimeout(this._tlsReadEndTimer);
+      this._tlsReadEndTimer = null;
     }
     const listeners = globalThis.__cottontailTlsListeners;
     this._removeMemoryTransportListeners();
@@ -1527,6 +1540,9 @@ export function connect(...args) {
   const servername = options.servername ?? defaultServername;
   socket.servername = servername || undefined;
   socket._host = String(host);
+  socket._identityHostname = options.servername ??
+    (options.checkServerIdentity != null && isIP(String(host)) ? "localhost" : String(host));
+  socket._skipServerIdentity = options.servername == null && options.checkServerIdentity == null && isIP(String(host)) !== 0;
   if (options.timeout != null) socket.setTimeout(options.timeout);
   socket[bunTlsConnectOptions] = {
     serverName: options.servername ?? String(host),
@@ -1559,7 +1575,7 @@ export function connect(...args) {
     parentSocket?.removeListener?.("close", onParentClose);
     try {
       const credentials = tlsCredentialOptions(options);
-      if (typeof parentSocket?._detachFdForTls === "function" && typeof cottontail.tlsClientConnectFd === "function") {
+      if (parentSocket?.encrypted !== true && typeof parentSocket?._detachFdForTls === "function" && typeof cottontail.tlsClientConnectFd === "function") {
         const fd = parentSocket._detachFdForTls();
         const native = cottontail.tlsClientConnectFd(
           fd,
@@ -1627,6 +1643,70 @@ export function connect(...args) {
   parentSocket.once("close", onParentClose);
   if (parentSocket.connecting) parentSocket.once("connect", upgrade);
   else queueMicrotask(upgrade);
+  return socket;
+}
+
+// Internal entry point for Bun's in-place Socket.upgradeTLS(). Unlike
+// connect(), validation and memory-BIO setup happen synchronously so invalid
+// TLS material can be reported from upgradeTLS() before it returns.
+export function _connectMemoryTransport(parentSocket, options = {}) {
+  if (parentSocket == null || typeof parentSocket !== "object" ||
+      typeof parentSocket.on !== "function" || typeof parentSocket.write !== "function") {
+    throw invalidArgType("parentSocket", "a Duplex stream", parentSocket);
+  }
+  if (options == null || typeof options !== "object") {
+    throw invalidArgType("options", "of type object", options);
+  }
+
+  validateCiphers(options.ciphers);
+  const protocolOptions = tlsProtocolOptions(options);
+  if (options.servername != null && typeof options.servername !== "string") {
+    throw invalidArgType("options.servername", "of type string", options.servername);
+  }
+  if (options.servername && isIP(options.servername)) {
+    throw invalidArgValue("options.servername", options.servername, "Setting the TLS ServerName to an IP address is not permitted");
+  }
+  if (options.checkServerIdentity != null && typeof options.checkServerIdentity !== "function") {
+    throw invalidArgType("options.checkServerIdentity", "of type function", options.checkServerIdentity);
+  }
+
+  const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
+  const socket = new TLSSocket(parentSocket, options);
+  const host = options.host ?? options.hostname ?? parentSocket?._host ?? parentSocket?.remoteAddress ?? "localhost";
+  const defaultServername = isIP(String(host)) ? "" : String(host);
+  const servername = options.servername ?? defaultServername;
+  socket.servername = servername || undefined;
+  socket._host = String(host);
+  socket._identityHostname = options.servername ??
+    (options.checkServerIdentity != null && isIP(String(host)) ? "localhost" : String(host));
+  socket._skipServerIdentity = options.servername == null && options.checkServerIdentity == null && isIP(String(host)) !== 0;
+  if (options.timeout != null) socket.setTimeout(options.timeout);
+  socket[bunTlsConnectOptions] = {
+    serverName: options.servername ?? String(host),
+    servername,
+    rejectUnauthorized: socket._rejectUnauthorized,
+    requestCert: options.requestCert !== false,
+    checkServerIdentity: options.checkServerIdentity ?? checkServerIdentity,
+    session: options.session ?? null,
+  };
+
+  const credentials = tlsCredentialOptions(options);
+  const native = cottontail.tlsClientConnectMemory(
+    servername,
+    socket._rejectUnauthorized,
+    credentials.ca,
+    credentials.cert,
+    credentials.key,
+    credentials.passphrase,
+    alpnProtocols,
+    options.ciphers,
+    protocolOptions.minVersion,
+    protocolOptions.maxVersion,
+    protocolOptions.secureOptions,
+    socket._session,
+    socket._requestOCSP,
+  );
+  socket._attachMemoryTransport(native, parentSocket, "secureConnect");
   return socket;
 }
 
@@ -1786,7 +1866,24 @@ function validatedCACertificates(certs) {
 }
 
 function warnExtraCA(path, reason) {
-  process._rawDebug?.(`Warning: ignoring extra certs from \`${path}\`, load failed: ${reason}`);
+  const message = `Warning: ignoring extra certs from \`${path}\`, load failed: ${reason}`;
+  if (typeof process._rawDebug === "function") process._rawDebug(message);
+  else cottontail.fdWrite?.(2, `${message}\n`);
+}
+
+function validateExtraCACertificate(certificate) {
+  const parsed = new X509Certificate(certificate);
+  const payload = String(certificate)
+    .replace(/-----BEGIN CERTIFICATE-----/, "")
+    .replace(/-----END CERTIFICATE-----/, "")
+    .replace(/\s/g, "");
+  const decoded = Buffer.from(payload, "base64");
+  const raw = Buffer.from(parsed.raw);
+  if (decoded.byteLength !== raw.byteLength || !decoded.equals(raw)) {
+    const error = new Error("PEM certificate contains invalid DER data");
+    error.code = "ERR_OSSL_PEM_BAD_BASE64_DECODE";
+    throw error;
+  }
 }
 
 function loadExtraCACertificates() {
@@ -1808,11 +1905,11 @@ function loadExtraCACertificates() {
   const certificates = [];
   for (const certificate of parsed) {
     try {
-      new X509Certificate(certificate);
+      validateExtraCACertificate(certificate);
       certificates.push(certificate);
     } catch (error) {
       warnExtraCA(path, error?.message || String(error));
-      break;
+      return [];
     }
   }
   return uniqueCertificates(certificates);

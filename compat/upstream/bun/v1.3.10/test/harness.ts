@@ -1917,6 +1917,8 @@ export function normalizeBunSnapshot(snapshot: string, optionalDir?: string) {
       // Handle version strings in error messages like "Bun v1.2.21+revision (platform arch)"
       // This needs to come before the other version replacements
       .replace(/Bun v[\d.]+(?:-[\w.]+)?(?:\+[\w]+)?(?:\s+\([^)]+\))?/g, "Bun v<bun-version>")
+      // COTTONTAIL-COMPAT: Package-manager banners report both the Bun contract and Cottontail release.
+      .replace(/v[\d.]+(?:-[\w.]+)? \(cottontail v[^)]+\)/g, "<version> (<revision>)")
       .replaceAll(Bun.version_with_sha, "<version> (<revision>)")
       .replaceAll(Bun.version, "<bun-version>")
       .replaceAll(Bun.revision, "<revision>")

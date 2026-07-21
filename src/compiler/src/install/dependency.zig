@@ -102,6 +102,12 @@ pub const Context = struct {
     package_manager: ?*PackageManager,
 };
 
+pub const StandaloneContext = struct {
+    allocator: std.mem.Allocator,
+    log: *logger.Log,
+    buffer: []const u8,
+};
+
 /// Get the name of the package as it should appear in a remote registry.
 pub inline fn realname(this: *const Dependency) String {
     return switch (this.version.tag) {
@@ -127,7 +133,7 @@ pub inline fn isAliased(this: *const Dependency, buf: []const u8) bool {
 
 pub fn toDependency(
     this: External,
-    ctx: Context,
+    ctx: anytype,
 ) Dependency {
     const name = String{
         .bytes = this[0..8].*,
@@ -332,11 +338,15 @@ pub const Version = struct {
         alias: String,
         alias_hash: PackageNameHash,
         bytes: Version.External,
-        ctx: Dependency.Context,
+        ctx: anytype,
     ) Dependency.Version {
         const slice = String{ .bytes = bytes[1..9].* };
         const tag = @as(Dependency.Version.Tag, @enumFromInt(bytes[0]));
         const sliced = &slice.sliced(ctx.buffer);
+        const package_manager = if (comptime @hasField(@TypeOf(ctx), "package_manager"))
+            ctx.package_manager
+        else
+            null;
         return Dependency.parseWithTag(
             ctx.allocator,
             alias,
@@ -345,7 +355,7 @@ pub const Version = struct {
             tag,
             sliced,
             ctx.log,
-            ctx.package_manager,
+            package_manager,
         ) orelse Dependency.Version.zeroed;
     }
 
@@ -902,12 +912,14 @@ pub fn parseWithTag(
             };
 
             if (is_alias) {
-                if (package_manager) |pm| {
-                    pm.known_npm_aliases.put(
-                        allocator,
-                        alias_hash.?,
-                        result,
-                    ) catch unreachable;
+                if (comptime !@hasDecl(bun, "standalone_lockfile_conversion")) {
+                    if (package_manager) |pm| {
+                        pm.known_npm_aliases.put(
+                            allocator,
+                            alias_hash.?,
+                            result,
+                        ) catch unreachable;
+                    }
                 }
             }
 

@@ -15,9 +15,9 @@ gate, but platform work should be debugged locally first.
 - Do not upload to R2 from a VM. Let the complete CircleCI matrix publish after
   all four targets pass.
 
-After pulling a new revision, remove neither `vendors/zig` nor `vendors/jsc`
-unless diagnosing setup itself. Their setup scripts validate their version and
-checksum stamps.
+After pulling a new revision, leave `vendors/zig`, `vendors/jsc`, and
+`vendors/zig-html-rewriter` in place unless diagnosing setup itself. Their
+setup scripts validate revision and checksum stamps.
 
 ## Linux
 
@@ -42,10 +42,6 @@ sudo apt-get install -y \
 
 curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt-get install -y nodejs
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable
-source "$HOME/.cargo/env"
 ```
 
 Open a fresh shell, then verify the tools:
@@ -53,8 +49,6 @@ Open a fresh shell, then verify the tools:
 ```bash
 node --version
 node -p 'process.platform + " " + process.arch'
-rustup show
-cargo --version
 g++ --version
 clang++ --version
 ```
@@ -67,6 +61,7 @@ Node must be version 24 and its architecture must match the VM.
 git pull --ff-only
 git rev-parse HEAD
 node scripts/setup.js
+node scripts/setup-zig-html-rewriter.js
 node scripts/setup-jsc.js
 ```
 
@@ -100,7 +95,6 @@ For linker failures, collect these with the build log:
 uname -a
 ldd --version | head -1
 node -p 'process.platform + " " + process.arch'
-rustc -vV
 g++ -print-file-name=libstdc++.so
 g++ -print-file-name=libgcc_s.so.1
 g++ -print-file-name=libresolv.a
@@ -115,8 +109,8 @@ or Cottontail behavior failure.
 ## Windows x64
 
 Use Windows 11 or Windows Server x64 when possible. On a Windows ARM VM, install
-and run the x64 editions of Node, Rust, and the shell so the built-in x64
-emulation exercises the artifact Cottontail will distribute. This command must
+and run the x64 editions of Node and the shell so the built-in x64 emulation
+exercises the artifact Cottontail will distribute. This command must
 report `win32 x64`:
 
 ```powershell
@@ -133,8 +127,7 @@ Install:
 
 1. Git for Windows.
 2. Node.js 24 LTS, x64.
-3. Rust through `rustup-init.exe` for the x86-64 MSVC host.
-4. Visual Studio 2022 Build Tools with the **Desktop development with C++**
+3. Visual Studio 2022 Build Tools with the **Desktop development with C++**
    workload and a current Windows SDK.
 
 The full Visual Studio IDE is not required. After installation, open **x64
@@ -145,15 +138,10 @@ Verify that all tools resolve in that shell:
 ```powershell
 node --version
 node -p "process.platform + ' ' + process.arch"
-rustup default stable
-rustup target add x86_64-pc-windows-msvc
-rustup run stable rustc -vV
-rustup run stable cargo -vV
-Get-Command node, rustup, cargo, rustc, cl, link | Format-Table Name, Source
+Get-Command node, cl, link | Format-Table Name, Source
 ```
 
-Both Rust commands must use the same `stable-x86_64-pc-windows-msvc`
-toolchain. `cl.exe` and `link.exe` must resolve from the Visual Studio tools.
+`cl.exe` and `link.exe` must resolve from the Visual Studio tools.
 
 ### Pull and set up
 
@@ -161,6 +149,7 @@ toolchain. `cl.exe` and `link.exe` must resolve from the Visual Studio tools.
 git pull --ff-only
 git rev-parse HEAD
 node scripts/setup.js
+node scripts/setup-zig-html-rewriter.js
 node scripts/setup-jsc.js
 ```
 
@@ -196,26 +185,14 @@ if ($LASTEXITCODE -ne 0) { throw "Windows packaging failed" }
 
 ### Windows diagnostics
 
-If Rust reports that it cannot find `core`, Cargo and Rustc are resolving
-through different rustup environments. Capture:
+For Windows toolchain or linker failures, capture:
 
 ```powershell
 node -p "process.platform + ' ' + process.arch"
 where.exe node
-where.exe rustup
-where.exe cargo
-where.exe rustc
-rustup show
-rustup target list --installed
-rustup run stable cargo -vV
-rustup run stable rustc --print sysroot
 Get-Command cl, link | Format-List Name, Source
 git status --short
 ```
-
-Use `rustup run stable cargo ...` for a direct Cargo reproduction. This keeps
-Cargo and the Rust compiler in the same selected toolchain even if the shell's
-`PATH` contains another Rust installation.
 
 ## Working loop
 

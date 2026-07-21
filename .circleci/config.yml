@@ -7,8 +7,8 @@ commands:
   setup-unix:
     steps:
       - run:
-          name: Vendor Zig and JavaScriptCore
-          command: node scripts/setup.js && node scripts/setup-jsc.js
+          name: Vendor Zig, HTML rewriter, and JavaScriptCore
+          command: node scripts/setup.js && node scripts/setup-zig-html-rewriter.js && node scripts/setup-jsc.js
   build-test-package-unix:
     steps:
       - run:
@@ -62,23 +62,20 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-macos-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-macos-arm64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
       - run:
           name: Install build dependencies
           command: |
             brew install node@24 libffi brotli
             brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            echo 'export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
+            echo 'export PATH="/opt/homebrew/opt/node@24/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-macos-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-macos-arm64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
           paths:
             - vendors/zig
             - vendors/jsc
-            - ~/.cargo
-            - ~/.rustup
-            - .zig-cache/lolhtml
+            - vendors/zig-html-rewriter
       - build-test-package-unix
 
   build-linux-x64:
@@ -89,24 +86,20 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-linux-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
               nodejs clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-x64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-linux-x64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
           paths:
             - vendors/zig
             - vendors/jsc
-            - ~/.cargo
-            - ~/.rustup
-            - .zig-cache/lolhtml
+            - vendors/zig-html-rewriter
       - build-test-package-unix
       - smoke-test-linux-icu-fallback
 
@@ -118,24 +111,20 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-linux-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-linux-arm64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
       - run:
           name: Install build dependencies
           command: |
             curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
             sudo apt-get install -y \
               nodejs clang g++ libbrotli-dev libffi-dev libssl-dev libzstd-dev zlib1g-dev
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
       - setup-unix
       - save_cache:
-          key: cottontail-linux-arm64-v4-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-linux-arm64-v5-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}
           paths:
             - vendors/zig
             - vendors/jsc
-            - ~/.cargo
-            - ~/.rustup
-            - .zig-cache/lolhtml
+            - vendors/zig-html-rewriter
       - build-test-package-unix
       - smoke-test-linux-icu-fallback
 
@@ -147,7 +136,7 @@ jobs:
       - checkout
       - restore_cache:
           keys:
-            - cottontail-windows-x64-v7-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+            - cottontail-windows-x64-v8-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}-{{ checksum "vcpkg.json" }}
       - run:
           name: Install build dependencies
           shell: powershell.exe
@@ -160,52 +149,27 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Node.js 24.18.0 installation failed through nvm" }
             nvm use 24.18.0 64
             if ($LASTEXITCODE -ne 0) { throw "Could not select Node.js 24.18.0 x64 through nvm" }
-            $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
-            $rustupUrl = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
-            curl.exe --proto '=https' --tlsv1.2 --fail --location --retry 3 --output $rustupInit $rustupUrl
-            if ($LASTEXITCODE -ne 0) { throw "Could not download the official x64 rustup installer" }
-            & $rustupInit -y --profile minimal --default-host x86_64-pc-windows-msvc --default-toolchain stable --no-modify-path
-            if ($LASTEXITCODE -ne 0) { throw "rustup installation failed" }
             $nodeIdentity = node -p "process.versions.node + ' ' + process.platform + ' ' + process.arch"
             if ($LASTEXITCODE -ne 0 -or $nodeIdentity.Trim() -ne "24.18.0 win32 x64") {
               throw "Expected Node 24.18.0 win32 x64, got '$nodeIdentity'"
             }
-            $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
-            $env:Path = "$cargoBin;$env:Path"
-            [Environment]::SetEnvironmentVariable("Path", "$cargoBin;" + [Environment]::GetEnvironmentVariable("Path", "User"), "User")
-            $rustup = Join-Path $cargoBin "rustup.exe"
-            & $rustup default stable
-            if ($LASTEXITCODE -ne 0) { throw "Could not select the stable Rust toolchain" }
-            & $rustup target add --toolchain stable x86_64-pc-windows-msvc
-            if ($LASTEXITCODE -ne 0) { throw "Could not install the x86_64-pc-windows-msvc Rust target" }
-            $installedTargets = & $rustup target list --toolchain stable --installed
-            if ($LASTEXITCODE -ne 0 -or $installedTargets -notcontains "x86_64-pc-windows-msvc") {
-              throw "Rust target x86_64-pc-windows-msvc was not installed by $rustup"
-            }
-            # Select Cargo and Rustc through the same rustup toolchain. A later
-            # CircleCI step does not inherit this step's process-level PATH.
-            & $rustup run stable cargo -vV
-            if ($LASTEXITCODE -ne 0) { throw "Cargo is unavailable in the stable Rust toolchain" }
-            Set-Content -Path "$env:TEMP\rust-probe.rs" -Value "fn main() {}"
-            & $rustup run stable rustc --target x86_64-pc-windows-msvc -o "$env:TEMP\rust-probe.exe" "$env:TEMP\rust-probe.rs"
-            if ($LASTEXITCODE -ne 0) { throw "Rust msvc target is present in metadata but cannot compile; toolchain is broken" }
       - run:
-          name: Vendor Zig and JavaScriptCore
+          name: Vendor Zig, HTML rewriter, and JavaScriptCore
           shell: powershell.exe
           command: |
             node scripts/setup.js
             if ($LASTEXITCODE -ne 0) { throw "Zig setup failed" }
+            node scripts/setup-zig-html-rewriter.js
+            if ($LASTEXITCODE -ne 0) { throw "HTML rewriter setup failed" }
             node scripts/setup-jsc.js
             if ($LASTEXITCODE -ne 0) { throw "JavaScriptCore setup failed" }
       - save_cache:
-          key: cottontail-windows-x64-v7-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "vcpkg.json" }}-{{ checksum "vendors/lol-html/c-api/Cargo.lock" }}
+          key: cottontail-windows-x64-v8-{{ checksum "scripts/zig-manifest.json" }}-{{ checksum "scripts/jsc-manifest.json" }}-{{ checksum "scripts/zig-html-rewriter-manifest.json" }}-{{ checksum "vcpkg.json" }}
           paths:
             - vendors/zig
             - vendors/jsc
+            - vendors/zig-html-rewriter
             - vendors/windows-deps
-            - ~/.cargo/registry
-            - ~/.cargo/git
-            - .zig-cache/lolhtml
       - run:
           name: Run Zig tests
           shell: powershell.exe

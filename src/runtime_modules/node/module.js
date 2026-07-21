@@ -123,6 +123,7 @@ function loadRuntimePackageReplacement(name) {
 
 function loadBuiltinOrReplacement(name) {
   const text = String(name);
+  if (text === "process" || text === "node:process") return currentProcessBuiltin();
   if (hasRuntimePackageReplacement(text)) return loadRuntimePackageReplacement(text);
   return unwrapBuiltin(builtinModuleMap.get(text) ?? builtinModuleMap.get(text.replace(/^node:/, "")));
 }
@@ -208,12 +209,18 @@ export const builtinModules = [
 
 const commonJsCache = new Map();
 const builtinModuleMap = new Map();
-const modulePathCache = Object.create(null);
+const builtinNamespaceEntries = new Set();
+let modulePathCache = Object.create(null);
 const moduleHooks = [];
 const moduleHookIdKey = Symbol("cottontail.moduleHooksId");
+const moduleParentKey = Symbol("cottontail.moduleParent");
+const hookResolvedFormats = new Map();
 const sourceMapCache = new Map();
 let nextModuleHookId = 0;
 let mainModule = null;
+let moduleParentWarningEmitted = false;
+let activeResolverConditions = null;
+let stripTypesWarningEmitted = false;
 
 globalThis.__cottontailApplyCommonJSModuleMock = (specifier, value) => {
   let resolved = String(specifier);
@@ -265,9 +272,15 @@ const kUnwrapDefaultBuiltins = new Set(["fs/promises", "node:fs/promises"]);
 export function __setBuiltinModules(modules) {
   const globalMap = globalThis.__cottontailBuiltinModules ??= new Map();
   for (let [name, value] of Object.entries(modules || {})) {
+    let isNamespace = value != null &&
+      (typeof value === "object" || typeof value === "function") &&
+      Object.hasOwn(value, "default");
     if (kUnwrapDefaultBuiltins.has(name) && value && typeof value === "object" && value.default) {
       value = value.default;
+      isNamespace = false;
     }
+    if (isNamespace) builtinNamespaceEntries.add(name);
+    else builtinNamespaceEntries.delete(name);
     builtinModuleMap.set(name, value);
     globalMap.set(name, value);
   }
@@ -382,6 +395,10 @@ function readPackageJson(path) {
   } catch {
     return null;
   }
+}
+
+function packageJsonValue(packageJson, key) {
+  return packageJson != null && Object.hasOwn(packageJson, key) ? packageJson[key] : undefined;
 }
 
 function parseJSONC(source) {
@@ -502,6 +519,9 @@ function resolveTsconfigPathsMapping(request, startDir) {
 
 function packageDirRealPath(candidate) {
   if (standaloneDirectoryExists(candidate)) return candidate;
+  const preserveSymlinks = (globalThis.process?.execArgv ?? []).includes("--preserve-symlinks") ||
+    globalThis.process?.env?.NODE_PRESERVE_SYMLINKS === "1";
+  if (preserveSymlinks) return candidate;
   try {
     // Store-based installs expose packages through node_modules symlinks. Do
     // not canonicalize ordinary package paths: on macOS that would also turn
@@ -524,10 +544,15 @@ function packageDirectoryExists(candidate) {
 
 function nodePathEntries() {
   const value = globalThis.process?.env?.NODE_PATH ?? processModule.env?.NODE_PATH;
-  if (typeof value !== "string" || value.length === 0) return [];
-  return value.split(path.delimiter || (globalThis.process?.platform === "win32" ? ";" : ":"))
-    .filter(Boolean)
-    .map((entry) => resolve(entry));
+  const delimiter = path.delimiter || (globalThis.process?.platform === "win32" ? ";" : ":");
+  const dynamicEntries = typeof value === "string"
+    ? value.split(delimiter).filter(Boolean).map((entry) => resolve(entry))
+    : [];
+  return [...new Set([...dynamicEntries, ...(Array.isArray(globalPaths) ? globalPaths : [])])];
+}
+
+function nodeModulesLookupDir(dir) {
+  return basename(dir).toLowerCase() === "node_modules" ? null : join(dir, "node_modules");
 }
 
 function packageRootFor(request, startDir) {
@@ -538,14 +563,17 @@ function packageRootFor(request, startDir) {
     if (modulePathExists(selfManifest)) {
       try {
         const packageJson = readPackageJson(selfManifest);
-        if (packageJson?.name === packageName && packageJson.exports != null) {
+        if (packageJsonValue(packageJson, "name") === packageName && packageJsonValue(packageJson, "exports") != null) {
           return packageDirRealPath(dir);
         }
       } catch {}
     }
 
-    const nodeModulesCandidate = join(dir, "node_modules", packageName);
-    if (packageDirectoryExists(nodeModulesCandidate)) return packageDirRealPath(nodeModulesCandidate);
+    const lookupDir = nodeModulesLookupDir(dir);
+    if (lookupDir != null) {
+      const nodeModulesCandidate = join(lookupDir, packageName);
+      if (packageDirectoryExists(nodeModulesCandidate)) return packageDirRealPath(nodeModulesCandidate);
+    }
 
     // A sibling directory that merely shares the package name is not a
     // package root (e.g. test fixtures at third_party/<name>/package.json);
@@ -555,7 +583,7 @@ function packageRootFor(request, startDir) {
     if (modulePathExists(directManifest)) {
       let manifestName;
       try {
-        manifestName = readPackageJson(directManifest)?.name;
+        manifestName = packageJsonValue(readPackageJson(directManifest), "name");
       } catch {
         manifestName = undefined;
       }
@@ -577,6 +605,25 @@ function packageRootFor(request, startDir) {
   return null;
 }
 
+function bareModuleFileFor(request, startDir) {
+  let dir = startDir;
+  while (true) {
+    const lookupDir = nodeModulesLookupDir(dir);
+    if (lookupDir != null) {
+      const resolved = resolveAsFile(join(lookupDir, request));
+      if (resolved) return resolved;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  for (const entry of nodePathEntries()) {
+    const resolved = resolveAsFile(join(entry, request));
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 function resolveAsFile(candidate) {
   if (isFile(candidate)) return candidate;
   // Extensionless require() follows the live Module._extensions registry.
@@ -593,17 +640,30 @@ function resolveAsDirectory(candidate, kind = "require") {
   if (!isDirectory(candidate)) return null;
   const packagePath = join(candidate, "package.json");
   const packageJson = isFile(packagePath) ? readPackageJson(packagePath) : null;
-  if (packageJson?.exports != null) {
+  if (packageJsonValue(packageJson, "exports") != null) {
     const exported = resolvePackageExports(candidate, packageJson, "", kind);
     if (exported) return exported;
   }
-  const mainField = packageJson && typeof packageJson.main === "string" ? packageJson.main : "";
+  const packageMain = packageJsonValue(packageJson, "main");
+  const mainField = typeof packageMain === "string" ? packageMain : "";
   if (mainField) {
     const mainCandidate = resolve(candidate, mainField);
     const mainResolved = resolveAsFile(mainCandidate) || resolveAsDirectory(mainCandidate, kind);
     if (mainResolved) return mainResolved;
   }
-  return resolveAsFile(join(candidate, "index"));
+  const indexResolved = resolveAsFile(join(candidate, "index"));
+  if (indexResolved && mainField) {
+    currentProcessBuiltin().emitWarning?.(
+      `Invalid 'main' field in '${packagePath}' of '${mainField}'. Please either fix that or report it to the module author`,
+      "DeprecationWarning",
+      "DEP0128",
+    );
+  }
+  return indexResolved;
+}
+
+function requestRequiresDirectory(request) {
+  return /[\\/]$/.test(request) || /(?:^|[\\/])\.{1,2}$/.test(request);
 }
 
 const packageTargetUndefined = Symbol("packageTargetUndefined");
@@ -626,7 +686,20 @@ function customResolverConditions() {
 }
 
 function resolverConditions(kind) {
+  if (activeResolverConditions !== null) return activeResolverConditions;
   return new Set(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
+}
+
+function conditionsFromHookContext(context, kind) {
+  if (context?.conditions === undefined) {
+    return new Set(["bun", "node", kind === "import" ? "import" : "require", ...customResolverConditions(), "default"]);
+  }
+  if (!Array.isArray(context.conditions) || context.conditions.some((condition) => typeof condition !== "string")) {
+    const error = new TypeError(`The property 'conditions' is invalid. Received ${formatInvalidValue(context.conditions)}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  return new Set([...context.conditions, "default"]);
 }
 
 // Ported from Bun's ESModule.resolveTarget: condition objects preserve
@@ -679,7 +752,7 @@ function packageMapPatternMatches(map, specifier) {
 }
 
 function resolvePackageExports(root, packageJson, suffix = "", kind = "require") {
-  const exportsField = packageJson?.exports;
+  const exportsField = packageJsonValue(packageJson, "exports");
   if (exportsField == null) return null;
   const subpath = suffix ? `./${suffix}` : ".";
   const conditions = resolverConditions(kind);
@@ -714,6 +787,66 @@ function isPromiseLike(value) {
 
 function invalidArgType(name, expected, value) {
   const error = new TypeError(`The "${name}" property must be of type ${expected}. Received type ${typeof value}`);
+  error.name = "TypeError [ERR_INVALID_ARG_TYPE]";
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function formatInvalidValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") return `'${value}'`;
+  if (typeof value === "object") {
+    const constructorName = value?.constructor?.name;
+    return `an instance of ${constructorName || "Object"}`;
+  }
+  return `type ${typeof value} (${String(value)})`;
+}
+
+function invalidRequestType(value) {
+  const error = new TypeError(`The "request" argument must be of type string. Received ${formatInvalidValue(value)}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function invalidModuleIdType(value) {
+  const error = new TypeError(`The "id" argument must be of type string. Received ${formatInvalidValue(value)}`);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function invalidEmptyModuleId() {
+  const error = new TypeError("The argument 'id' must be a non-empty string. Received ''");
+  error.code = "ERR_INVALID_ARG_VALUE";
+  return error;
+}
+
+function maybeWarnModuleParent() {
+  if (moduleParentWarningEmitted) return;
+  const process = currentProcessBuiltin();
+  const pending = (process.execArgv ?? []).includes("--pending-deprecation") ||
+    process.env?.NODE_PENDING_DEPRECATION === "1";
+  if (!pending) return;
+  moduleParentWarningEmitted = true;
+  process.emitWarning?.(
+    "module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.",
+    "DeprecationWarning",
+    "DEP0144",
+  );
+}
+
+function invalidResolvePaths(value) {
+  let received = formatInvalidValue(value);
+  if (value != null && typeof value === "object") {
+    try { received = JSON.stringify(value); } catch {}
+  }
+  const error = new TypeError(`The property 'options.paths' is invalid. Received ${received}`);
+  error.code = "ERR_INVALID_ARG_VALUE";
+  return error;
+}
+
+function invalidResolvePathEntries() {
+  const error = new TypeError('The "paths" argument must be array of strings. Received an instance of Array');
   error.code = "ERR_INVALID_ARG_TYPE";
   return error;
 }
@@ -739,7 +872,12 @@ function formatForResolved(resolved) {
   const { bare: text } = splitSpecifierSuffix(resolved);
   if (text.startsWith("node:") || builtinModuleMap.has(text) || hasRuntimePackageReplacement(text)) return "builtin";
   if (text.endsWith(".json")) return "json";
-  if (text.endsWith(".mjs")) return "module";
+  if (text.endsWith(".mjs") || text.endsWith(".mts")) return "module";
+  if (text.endsWith(".cjs") || text.endsWith(".cts")) return "commonjs";
+  if ((text.endsWith(".js") || text.endsWith(".ts")) && isAbsolute(text)) {
+    const scope = nearestPackageScope(text);
+    if (packageJsonValue(scope?.packageJson, "type") === "module") return "module";
+  }
   return "commonjs";
 }
 
@@ -776,8 +914,16 @@ function withSpecifierSuffix(path, suffix) {
   return suffix ? `${path}${suffix}` : path;
 }
 
-function moduleNotFoundError(request, resolveMessage = false) {
-  const error = new Error(`Cannot find module '${request}'`);
+function moduleNotFoundError(request, resolveMessage = false, basePath = undefined) {
+  let message = `Cannot find module '${request}'`;
+  if (!resolveMessage && basePath != null) {
+    let referrer = String(basePath);
+    if (referrer.startsWith("file:")) {
+      try { referrer = fileURLToPath(referrer); } catch {}
+    }
+    message += `\nRequire stack:\n- ${referrer}`;
+  }
+  const error = new Error(message);
   error.code = "MODULE_NOT_FOUND";
   if (resolveMessage) error.name = "ResolveMessage";
   return error;
@@ -809,7 +955,8 @@ function dynamicResolveMessage(message) {
   return error;
 }
 
-function packageNotFoundError(request, basePath) {
+function packageNotFoundError(request, basePath, resolveMessage = false) {
+  if (!resolveMessage) return moduleNotFoundError(request, false, basePath);
   let referrer = String(basePath || cottontail.cwd());
   if (referrer.startsWith("file:")) {
     try { referrer = fileURLToPath(referrer); } catch {}
@@ -876,7 +1023,7 @@ function packageImportNotDefinedError(specifier, basePath) {
 function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
   if (specifier === "#" || specifier.startsWith("#/")) throw packageImportNotDefinedError(specifier, basePath);
   const scope = nearestPackageScope(basePath);
-  const imports = scope?.packageJson?.imports;
+  const imports = packageJsonValue(scope?.packageJson, "imports");
   if (!imports || typeof imports !== "object" || Array.isArray(imports)) {
     throw packageImportNotDefinedError(specifier, basePath);
   }
@@ -913,19 +1060,35 @@ function resolvePackageImports(specifier, basePath, kind, seen = new Set()) {
   return resolveRequestCore(target, scope.packageJsonPath, kind, seen);
 }
 
-function normalizeResolveHookResult(result) {
+function invalidHookReturnProperty(property, hook, value) {
+  const error = new TypeError(
+    `Expected a valid value to be returned for the "${property}" from the "${hook}" hook but got ${formatInvalidValue(value)}.`,
+  );
+  error.code = "ERR_INVALID_RETURN_PROPERTY_VALUE";
+  return error;
+}
+
+function normalizeResolveHookResult(result, calledNext) {
   if (isPromiseLike(result)) throw new TypeError("module.registerHooks resolve hooks must return synchronously");
-  if (typeof result === "string") return { url: result };
   if (result == null || typeof result !== "object" || typeof result.url !== "string") {
-    throw new TypeError("module.registerHooks resolve hooks must return an object with a string url");
+    throw invalidHookReturnProperty("url", "resolve", result?.url);
   }
+  if (!calledNext && result.shortCircuit !== true) throw invalidHookReturnProperty("shortCircuit", "resolve", result.shortCircuit);
   return result;
 }
 
-function normalizeLoadHookResult(result) {
+function normalizeLoadHookResult(result, calledNext) {
   if (isPromiseLike(result)) throw new TypeError("module.registerHooks load hooks must return synchronously");
   if (result == null || typeof result !== "object") {
-    throw new TypeError("module.registerHooks load hooks must return an object");
+    throw invalidHookReturnProperty("source", "load", undefined);
+  }
+  if (!calledNext && result.shortCircuit !== true) throw invalidHookReturnProperty("shortCircuit", "load", result.shortCircuit);
+  const source = result.source;
+  const validSource = typeof source === "string" || source instanceof ArrayBuffer || ArrayBuffer.isView(source) ||
+    (source === null && result.format === "builtin");
+  if (!validSource) throw invalidHookReturnProperty("source", "load", source);
+  if (result.format !== undefined && typeof result.format !== "string") {
+    throw invalidHookReturnProperty("format", "load", result.format);
   }
   return result;
 }
@@ -939,8 +1102,7 @@ function unknownBuiltinError(request) {
 // Bun does not implement node:sqlite (bun:sqlite is its API); when running
 // the Bun compat profile, treat it as an unknown builtin so dynamic import
 // rejects with ERR_UNKNOWN_BUILTIN_MODULE like Bun does.
-function isBuiltinHiddenByCompatProfile(id) {
-  if (String(id).replace(/^node:/, "") !== "sqlite") return false;
+function isBunCompatProfile() {
   try {
     return globalThis.process?.env?.COTTONTAIL_UPSTREAM_RUNTIME === "bun";
   } catch {
@@ -948,8 +1110,14 @@ function isBuiltinHiddenByCompatProfile(id) {
   }
 }
 
+function isBuiltinHiddenByCompatProfile(id) {
+  if (String(id).replace(/^node:/, "") !== "sqlite") return false;
+  return isBunCompatProfile();
+}
+
 function resolveRequestCore(request, basePath, kind = "require", packageImportSeen = undefined) {
   const originalText = String(request);
+  if (originalText.includes("\0")) throw moduleNotFoundError(originalText);
   if (originalText.startsWith("#")) {
     return resolvePackageImports(originalText, basePath, kind, packageImportSeen ?? new Set());
   }
@@ -963,7 +1131,7 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
     }
     const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
     if (resolved) return withSpecifierSuffix(resolved, suffix);
-    throw moduleNotFoundError(originalText, Boolean(suffix));
+    throw moduleNotFoundError(originalText, Boolean(suffix), basePath);
   }
   const suffixIndex = specifierSuffixIndex(originalText);
   const lastSeparator = Math.max(originalText.lastIndexOf("/"), originalText.lastIndexOf("\\"));
@@ -973,39 +1141,49 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   )) {
     const exactStartDir = resolutionStartDir(basePath);
     const exactCandidate = isAbsolute(originalText)
-      ? originalText
+      ? resolve(originalText)
       : resolve(exactStartDir, originalText);
     const exact = resolveAsFile(exactCandidate) || resolveAsDirectory(exactCandidate, kind);
     if (exact) return exact;
   }
   const { bare: text, suffix } = splitSpecifierSuffix(originalText);
+  if (text.startsWith("node:")) {
+    const builtinName = text.slice(5);
+    if (builtinName.startsWith("internal/") || !isBuiltin(text)) {
+      throw unknownBuiltinError(text);
+    }
+    if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
+    return text;
+  }
   if (builtinModuleMap.has(text)) {
     if (isBuiltinHiddenByCompatProfile(text)) throw unknownBuiltinError(text);
     return text;
   }
-  if (text.startsWith("node:") && builtinModuleMap.has(text.slice(5))) return text.slice(5);
-  // Unknown "node:" specifiers can never resolve to files; both Node and Bun
-  // reject them with ERR_UNKNOWN_BUILTIN_MODULE.
-  if (text.startsWith("node:")) throw unknownBuiltinError(text);
   if (hasRuntimePackageReplacement(text)) return text;
 
   const startDir = resolutionStartDir(basePath);
   if (text.startsWith(".") || isAbsolute(text)) {
-    const candidate = isAbsolute(text) ? text : resolve(startDir, text);
-    const resolved = resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
+    const candidate = isAbsolute(text) ? resolve(text) : resolve(startDir, text);
+    const resolved = requestRequiresDirectory(text)
+      ? resolveAsDirectory(candidate, kind)
+      : resolveAsFile(candidate) || resolveAsDirectory(candidate, kind);
     if (resolved) return withSpecifierSuffix(resolved, suffix);
-    throw moduleNotFoundError(originalText, Boolean(suffix));
+    throw moduleNotFoundError(originalText, Boolean(suffix), basePath);
   }
 
   const tsMapped = resolveTsconfigPathsMapping(text, startDir);
   if (tsMapped) return withSpecifierSuffix(tsMapped, suffix);
 
   const root = packageRootFor(text, startDir);
-  if (!root) throw packageNotFoundError(originalText, basePath);
+  if (!root) {
+    const directFile = bareModuleFileFor(text, startDir);
+    if (directFile) return withSpecifierSuffix(directFile, suffix);
+    throw packageNotFoundError(originalText, basePath, kind === "import");
+  }
   const packageSuffix = text.startsWith("@") ? text.split("/").slice(2).join("/") : text.split("/").slice(1).join("/");
   const packageJsonPath = join(root, "package.json");
   const packageJson = modulePathExists(packageJsonPath) ? readPackageJson(packageJsonPath) : null;
-  if (packageJson?.exports != null) {
+  if (packageJsonValue(packageJson, "exports") != null) {
     let exported = resolvePackageExports(root, packageJson, packageSuffix, kind);
     // Bun permits package.json reads and TypeScript-style redundant .js
     // suffixes even when the exports map omits those spellings.
@@ -1025,7 +1203,7 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   }
   const resolved = resolveAsDirectory(root, kind);
   if (resolved) return withSpecifierSuffix(resolved, suffix);
-  throw moduleNotFoundError(originalText, Boolean(suffix));
+  throw moduleNotFoundError(originalText, Boolean(suffix), basePath);
 }
 
 function resolveRequest(request, basePath, useHooks = true, kind = "require") {
@@ -1052,23 +1230,39 @@ function resolveRequest(request, basePath, useHooks = true, kind = "require") {
     importAttributes: {},
     parentURL: parentURLForBase(basePath),
   };
-  let index = -1;
-  const nextResolve = (specifier, context = baseContext) => {
-    index += 1;
-    while (index < moduleHooks.length) {
+  const dispatchResolve = (index, specifier, context) => {
+    while (index >= 0) {
       const hook = moduleHooks[index];
       if (typeof hook.resolve === "function") {
-        return normalizeResolveHookResult(hook.resolve(String(specifier), context ?? baseContext, nextResolve));
+        let calledNext = false;
+        const nextResolve = (nextSpecifier = specifier, nextContext = undefined) => {
+          calledNext = true;
+          const mergedContext = nextContext === undefined
+            ? context
+            : { ...context, ...(nextContext ?? {}) };
+          return dispatchResolve(index - 1, String(nextSpecifier), mergedContext);
+        };
+        const result = hook.resolve(String(specifier), context, nextResolve);
+        return normalizeResolveHookResult(result, calledNext);
       }
-      index += 1;
+      index -= 1;
     }
 
     const parent = context?.parentURL ? fileURLToPath(context.parentURL) : basePath;
-    const resolved = resolveRequestCore(specifier, parent, kind);
-    return { url: resolvedToUrl(resolved), format: formatForResolved(resolved), shortCircuit: true };
+    const previousConditions = activeResolverConditions;
+    activeResolverConditions = conditionsFromHookContext(context, kind);
+    try {
+      const resolved = resolveRequestCore(specifier, parent, kind);
+      return { url: resolvedToUrl(resolved), format: formatForResolved(resolved), shortCircuit: true };
+    } finally {
+      activeResolverConditions = previousConditions;
+    }
   };
 
-  return urlToResolved(nextResolve(request, baseContext).url);
+  const result = dispatchResolve(moduleHooks.length - 1, request, baseContext);
+  const resolved = urlToResolved(result.url);
+  hookResolvedFormats.set(resolved, typeof result.format === "string" ? result.format : undefined);
+  return resolved;
 }
 
 function makeModule(filename, parent = null, isMain = false) {
@@ -1084,7 +1278,8 @@ function refreshModuleRequire(module) {
   const require = function require(request) {
     return Module.prototype.require.call(module, request);
   };
-  const helper = createRequire(module.filename || module.id || cottontail.cwd(), module);
+  const moduleBase = module.filename || (isAbsolute(module.id) ? module.id : cottontail.cwd());
+  const helper = createRequire(moduleBase, module);
   require.resolve = helper.resolve;
   require.cache = helper.cache;
   require.extensions = helper.extensions;
@@ -1101,6 +1296,179 @@ function refreshModuleRequire(module) {
 // Files reaching the CommonJS executor with ESM syntax must be transformed
 // first: `import x from "y"` inside new Function() is a parse error.
 const esmSyntaxPattern = /^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
+
+function codePositionMask(source) {
+  const text = String(source);
+  const mask = new Uint8Array(text.length);
+  mask.fill(1);
+  const clear = (start, end) => mask.fill(0, start, Math.min(end, text.length));
+
+  const scanQuoted = (start, quote) => {
+    let cursor = start + 1;
+    while (cursor < text.length) {
+      if (text[cursor] === "\\") cursor += 2;
+      else if (text[cursor++] === quote) break;
+    }
+    clear(start, cursor);
+    return cursor;
+  };
+
+  const scanLineComment = (start) => {
+    const end = text.indexOf("\n", start + 2);
+    const cursor = end < 0 ? text.length : end;
+    clear(start, cursor);
+    return cursor;
+  };
+
+  const scanBlockComment = (start) => {
+    const end = text.indexOf("*/", start + 2);
+    const cursor = end < 0 ? text.length : end + 2;
+    clear(start, cursor);
+    return cursor;
+  };
+
+  const isRegexStart = (start) => {
+    let cursor = start - 1;
+    while (cursor >= 0 && /\s/.test(text[cursor])) cursor -= 1;
+    if (cursor < 0 || /[({[=,:;!&|?+\-*%^~<>]/.test(text[cursor])) return true;
+    if (!/[A-Za-z_$]/.test(text[cursor])) return false;
+    const end = cursor + 1;
+    while (cursor >= 0 && /[\w$]/.test(text[cursor])) cursor -= 1;
+    return /^(?:await|case|delete|do|else|in|instanceof|of|return|throw|typeof|void|yield)$/.test(
+      text.slice(cursor + 1, end),
+    );
+  };
+
+  const scanRegex = (start) => {
+    let cursor = start + 1;
+    let inCharacterClass = false;
+    while (cursor < text.length) {
+      const char = text[cursor];
+      if (char === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (char === "[") inCharacterClass = true;
+      else if (char === "]") inCharacterClass = false;
+      else if (char === "/" && !inCharacterClass) {
+        cursor += 1;
+        while (cursor < text.length && /[A-Za-z]/.test(text[cursor])) cursor += 1;
+        break;
+      } else if (char === "\n" || char === "\r") {
+        break;
+      }
+      cursor += 1;
+    }
+    clear(start, cursor);
+    return cursor;
+  };
+
+  let scanCode;
+  const scanTemplate = (start) => {
+    let rawStart = start;
+    let cursor = start + 1;
+    while (cursor < text.length) {
+      if (text[cursor] === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (text[cursor] === "`") {
+        clear(rawStart, cursor + 1);
+        return cursor + 1;
+      }
+      if (text[cursor] === "$" && text[cursor + 1] === "{") {
+        clear(rawStart, cursor + 2);
+        const expressionEnd = scanCode(cursor + 2, true);
+        if (expressionEnd >= text.length) return text.length;
+        mask[expressionEnd] = 0;
+        rawStart = expressionEnd;
+        cursor = expressionEnd + 1;
+        continue;
+      }
+      cursor += 1;
+    }
+    clear(rawStart, text.length);
+    return text.length;
+  };
+
+  scanCode = (start, stopAtTemplateEnd = false) => {
+    let braces = 0;
+    let cursor = start;
+    while (cursor < text.length) {
+      const char = text[cursor];
+      if (char === "\"" || char === "'") {
+        cursor = scanQuoted(cursor, char);
+        continue;
+      }
+      if (char === "`") {
+        cursor = scanTemplate(cursor);
+        continue;
+      }
+      if (char === "/" && text[cursor + 1] === "/") {
+        cursor = scanLineComment(cursor);
+        continue;
+      }
+      if (char === "/" && text[cursor + 1] === "*") {
+        cursor = scanBlockComment(cursor);
+        continue;
+      }
+      if (char === "/" && isRegexStart(cursor)) {
+        cursor = scanRegex(cursor);
+        continue;
+      }
+      if (stopAtTemplateEnd) {
+        if (char === "{") braces += 1;
+        else if (char === "}") {
+          if (braces === 0) return cursor;
+          braces -= 1;
+        }
+      }
+      cursor += 1;
+    }
+    return cursor;
+  };
+
+  scanCode(0);
+  return mask;
+}
+
+function replaceCodePattern(source, pattern, replacer) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  return text.replace(pattern, (...args) => {
+    const offset = args[args.length - 2];
+    if (mask[offset] !== 1) return args[0];
+    return typeof replacer === "function" ? replacer(...args) : replacer;
+  });
+}
+
+function hasEsmSyntax(source) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  const matcher = new RegExp(esmSyntaxPattern.source, "gm");
+  let match;
+  while ((match = matcher.exec(text)) != null) {
+    if (mask[match.index] === 1) return true;
+  }
+  return false;
+}
+
+function hasCommonJsSyntax(source) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  const matcher = /\b(?:module\s*\.\s*exports|exports\s*(?:\.|\[))/g;
+  let match;
+  while ((match = matcher.exec(text)) != null) {
+    if (mask[match.index] === 1) return true;
+  }
+  return false;
+}
+
+function formatForHookSource(resolved, source) {
+  if (hasEsmSyntax(source)) return "module";
+  if (hasCommonJsSyntax(source)) return "commonjs";
+  return formatForResolved(resolved);
+}
 
 // TypeScript sources loaded through the JS module executor must have their
 // type syntax removed first; new Function() only parses JavaScript.
@@ -1146,6 +1514,7 @@ const FUNCTION_WRAPPER_LINE_OFFSET = 2;
 const CJS_FILENAME_BINDING = "__cottontailCjsFilename_4b86f6";
 const CJS_DIRNAME_BINDING = "__cottontailCjsDirname_4b86f6";
 const CJS_DYNAMIC_IMPORT_BINDING = "__cottontailCjsDynamicImport_4b86f6";
+const ESM_EXPORTS_BINDING = "__cottontailEsmNamespace_4b86f6";
 
 function markModuleCompileError(error, filename, source, lineOffset = FUNCTION_WRAPPER_LINE_OFFSET) {
   if (error instanceof SyntaxError || /syntax error/i.test(String(error?.message ?? error))) {
@@ -1174,12 +1543,33 @@ function compileModuleWrapper(args, source, filename) {
   }
 }
 
+function compilePublicCommonJsWrapper(source, filename) {
+  const activeWrapper = Module.wrapper ?? wrapper;
+  const prefix = String(activeWrapper?.[0]);
+  const suffix = String(activeWrapper?.[1]);
+  const internalArgs = [CJS_FILENAME_BINDING, CJS_DIRNAME_BINDING, CJS_DYNAMIC_IMPORT_BINDING];
+  const factorySource = `(function(${internalArgs.join(",")}) { return ${prefix}${source}${suffix}\n})`;
+  let createWrapper;
+  try {
+    createWrapper = typeof cottontail.compileFunction === "function"
+      ? cottontail.compileFunction(factorySource, filename)
+      : new Function(...internalArgs, `return ${prefix}${source}${suffix}`);
+  } catch (error) {
+    throw markModuleCompileError(error, filename, source, 1);
+  }
+  return createWrapper(
+    filename,
+    dirname(filename),
+    async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
+  );
+}
+
 function executeCommonJsSource(module, filename, source) {
-  if (esmSyntaxPattern.test(source)) {
+  if (hasEsmSyntax(source)) {
     const transformed = transformEsmSourceForDynamicImport(source);
     maybeRegisterSourceMap(filename, transformed);
     recordCompileCache(filename, transformed);
-    const run = compileModuleWrapper(["exports", "require", "module", "__ctImportMeta"], transformed, filename);
+    const run = compileModuleWrapper([ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta"], transformed, filename);
     try {
       run(module.exports, module.require, module, importMetaForModule(filename));
     } catch (error) {
@@ -1195,27 +1585,15 @@ function executeCommonJsSource(module, filename, source) {
   // the first statement in the CommonJS function body.
   let effectiveSource = source;
   if (/(?<![.\w$])import\s*\((?!\s*\))/.test(effectiveSource)) {
-    effectiveSource = effectiveSource.replace(
+    effectiveSource = replaceCodePattern(
+      effectiveSource,
       /(?<![.\w$])import\s*\((?!\s*\))/g,
       `${CJS_DYNAMIC_IMPORT_BINDING}(`,
     );
   }
   maybeRegisterSourceMap(filename, effectiveSource);
   recordCompileCache(filename, effectiveSource);
-  const wrapper = compileModuleWrapper(
-    [
-      "exports",
-      "require",
-      "module",
-      "__filename",
-      "__dirname",
-      CJS_FILENAME_BINDING,
-      CJS_DIRNAME_BINDING,
-      CJS_DYNAMIC_IMPORT_BINDING,
-    ],
-    effectiveSource,
-    filename,
-  );
+  const wrapper = compilePublicCommonJsWrapper(effectiveSource, filename);
   const moduleDirname = dirname(filename);
   try {
     wrapper(
@@ -1224,9 +1602,6 @@ function executeCommonJsSource(module, filename, source) {
       module,
       filename,
       moduleDirname,
-      filename,
-      moduleDirname,
-      async (specifier, options) => globalThis.__cottontailImportModule(String(specifier), filename, options),
     );
   } catch (error) {
     throw remapThrownModuleError(error, filename, FUNCTION_WRAPPER_LINE_OFFSET);
@@ -1235,9 +1610,17 @@ function executeCommonJsSource(module, filename, source) {
   return module.exports;
 }
 
-function transpileExtensionSource(filename, loader) {
+function transpileExtensionSource(filename, loader, forceTransform = false) {
   const source = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
   if (loader === "ts" && hasBunTranspiledPragma(source)) return source;
+  const extension = String(filename).toLowerCase().match(/\.[^.]+$/)?.[0];
+  const needsRuntimeTransform = /(?:^|[\n;{}])\s*@[A-Za-z_$([]/m.test(source);
+  // Plain CommonJS JavaScript is already valid input for JSC. Keeping its
+  // source layout intact preserves Node-compatible stack and source-map
+  // coordinates instead of rewriting every require() through the transpiler.
+  if (!forceTransform && loader === "js" && (extension === ".js" || extension === ".cjs") && !needsRuntimeTransform) {
+    return source;
+  }
   if (typeof cottontail.transpilerTransform !== "function") {
     return maybeTransformRuntimeSyntax(filename, maybeStripTypeScript(filename, source));
   }
@@ -1269,9 +1652,10 @@ function transpileExtensionSource(filename, loader) {
   }
 }
 
-function formatExtensionCompileSource(source) {
+function formatExtensionCompileSource(source, leadingNewline = false) {
   const body = String(source).trimEnd();
-  return body ? `\n${body}\n` : "\n";
+  if (!body) return leadingNewline ? "\n" : "";
+  return leadingNewline ? `\n${body}\n` : `${body}\n`;
 }
 
 function executeBundledCommonJsModule(module, filename) {
@@ -1303,25 +1687,54 @@ function executeBundledCommonJsModule(module, filename) {
     throw new TypeError(`Runtime bundle for '${filename}' did not produce a CommonJS wrapper`);
   }
   factory(module.exports, module.require, module, filename, dirname(filename));
+  if (module.exports != null &&
+      (typeof module.exports === "object" || typeof module.exports === "function") &&
+      Object.hasOwn(module.exports, "module.exports")) {
+    module.exports = module.exports["module.exports"];
+  }
   module.loaded = true;
   return module.exports;
 }
 
 function executeDefaultExtension(module, filename, loader) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  if (esmSyntaxPattern.test(originalSource) &&
+  if (hasEsmSyntax(originalSource) &&
       !standaloneFileEntry(filename).found &&
       typeof cottontail.bundleNative === "function") {
     return executeBundledCommonJsModule(module, filename);
   }
-  const source = transpileExtensionSource(filename, loader);
+  const compileOverridden = module._compile !== Module.prototype._compile;
+  const source = transpileExtensionSource(filename, loader, compileOverridden);
   // Bun's synchronous ESM path does not call an overridden module._compile.
-  if (esmSyntaxPattern.test(source)) return executeCommonJsSource(module, filename, source);
-  return module._compile(formatExtensionCompileSource(source), filename);
+  if (hasEsmSyntax(source)) return executeCommonJsSource(module, filename, source);
+  return module._compile(formatExtensionCompileSource(source, compileOverridden), filename);
+}
+
+function loaderExtensionFor(filename) {
+  const name = basename(String(filename));
+  let longest = "";
+  for (const extension of Object.keys(_extensions)) {
+    if (name !== extension && name.endsWith(extension) && extension.length > longest.length) {
+      longest = extension;
+    }
+  }
+  if (longest) return longest;
+  const lexical = name.match(/\.[^./\\]+$/)?.[0];
+  return lexical && lexical !== name ? lexical : ".js";
 }
 
 function executeCommonJsModule(module, filename) {
-  const extension = String(filename).toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ".js";
+  const extension = loaderExtensionFor(filename);
+  if (extension === ".mjs" && (globalThis.process?.execArgv ?? []).includes("--no-experimental-require-module")) {
+    const parent = module[moduleParentKey]?.filename;
+    const from = parent ? ` from ${parent}` : "";
+    const error = new Error(
+      `require() of ES Module ${filename}${from} not supported.\n` +
+      `Instead change the require of ${filename} to a dynamic import() which is available in all CommonJS modules.`,
+    );
+    error.code = "ERR_REQUIRE_ESM";
+    throw error;
+  }
   const loader = _extensions[extension] ?? _extensions[".js"];
   if (typeof loader !== "function") {
     const error = new TypeError(`Module._extensions['${extension}'] is not a function`);
@@ -1332,63 +1745,112 @@ function executeCommonJsModule(module, filename) {
   return module.exports;
 }
 
-function executeHookSource(resolved, source, format) {
-  const effectiveFormat = format ?? formatForResolved(resolved);
-  if (effectiveFormat === "builtin") return loadBuiltinOrReplacement(resolved);
-  if (effectiveFormat === "json" || String(resolved).endsWith(".json")) return JSON.parse(String(source ?? ""));
-  if (effectiveFormat === "module" || String(resolved).endsWith(".mjs")) {
-    throw new Error(`Cannot require ES module '${resolved}' from CommonJS`);
+function hookSourceText(source) {
+  if (typeof source === "string") return source;
+  if (source instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(source));
+  if (ArrayBuffer.isView(source)) {
+    return new TextDecoder().decode(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
   }
+  return String(source ?? "");
+}
+
+function hookRequireBase(resolved) {
+  const text = String(resolved);
+  if (text.startsWith("file:")) return fileURLToPath(text);
+  if (isAbsolute(text)) return text;
+  return join(cottontail.cwd(), "__cottontail-module-hook__.js");
+}
+
+function importMetaForHookModule(resolved, suffix = "") {
+  const text = String(resolved);
+  const requireBase = hookRequireBase(text);
+  const meta = importMetaForModule(requireBase, suffix);
+  if (requireBase !== text) meta.url = text + suffix;
+  return meta;
+}
+
+function executeHookSource(resolved, source, format) {
+  const sourceText = hookSourceText(source);
+  const effectiveFormat = format ?? (hasEsmSyntax(sourceText) ? "module" : formatForResolved(resolved));
+  if (effectiveFormat === "builtin") return loadBuiltinOrReplacement(resolved);
+  if (effectiveFormat === "json" || String(resolved).endsWith(".json")) return JSON.parse(sourceText);
   if (commonJsCache.has(resolved)) return commonJsCache.get(resolved).exports;
   const module = makeModule(resolved);
   commonJsCache.set(resolved, module);
-  maybeRegisterSourceMap(resolved, String(source ?? ""));
-  recordCompileCache(resolved, String(source ?? ""));
+  const executableSource = effectiveFormat === "module"
+    ? transformEsmSourceForDynamicImport(sourceText)
+    : replaceCodePattern(sourceText, /\bimport\.meta\b/g, "__ctImportMeta");
+  maybeRegisterSourceMap(resolved, executableSource);
+  recordCompileCache(resolved, executableSource);
   const wrapper = new Function(
-    "exports",
+    effectiveFormat === "module" ? ESM_EXPORTS_BINDING : "exports",
     "require",
     "module",
     "__filename",
     "__dirname",
-    `${String(source ?? "")}\n//# sourceURL=${resolved}`,
+    "__ctImportMeta",
+    `${executableSource}\n//# sourceURL=${resolved}`,
   );
-  wrapper(module.exports, createRequire(resolved), module, resolved, dirname(resolved));
+  wrapper(
+    module.exports,
+    createRequire(hookRequireBase(resolved)),
+    module,
+    resolved,
+    dirname(resolved),
+    importMetaForHookModule(resolved),
+  );
+  if (module.exports != null &&
+      (typeof module.exports === "object" || typeof module.exports === "function") &&
+      Object.hasOwn(module.exports, "module.exports")) {
+    module.exports = module.exports["module.exports"];
+  }
   module.loaded = true;
   return module.exports;
 }
 
 function defaultLoadForHooks(url) {
   const resolved = urlToResolved(url);
-  const format = formatForResolved(resolved);
+  const hookedFormat = hookResolvedFormats.get(resolved);
+  const format = hookedFormat ?? formatForResolved(resolved);
   if (format === "builtin") return { format, source: null, shortCircuit: true };
-  return { format, source: readModuleFile(resolved), shortCircuit: true };
+  const explicitFormat = hookedFormat === undefined && String(resolved).endsWith(".js") && format === "commonjs"
+    ? undefined
+    : format;
+  return { format: explicitFormat, source: readModuleFile(resolved), shortCircuit: true };
 }
 
 function runLoadHooks(resolved) {
   if (!moduleHooks.some((hook) => typeof hook.load === "function")) return undefined;
   const url = resolvedToUrl(resolved);
-  const baseContext = { format: formatForResolved(resolved), importAttributes: {} };
-  let index = -1;
-  const nextLoad = (nextUrl, context = baseContext) => {
-    index += 1;
-    while (index < moduleHooks.length) {
+  const baseContext = { format: hookResolvedFormats.get(resolved) ?? formatForResolved(resolved), importAttributes: {} };
+  const dispatchLoad = (index, nextUrl, context) => {
+    while (index >= 0) {
       const hook = moduleHooks[index];
       if (typeof hook.load === "function") {
-        return normalizeLoadHookResult(hook.load(String(nextUrl), context ?? baseContext, nextLoad));
+        let calledNext = false;
+        const nextLoad = (forwardedUrl = nextUrl, nextContext = undefined) => {
+          calledNext = true;
+          const mergedContext = nextContext === undefined
+            ? context
+            : { ...context, ...(nextContext ?? {}) };
+          return dispatchLoad(index - 1, String(forwardedUrl), mergedContext);
+        };
+        const result = hook.load(String(nextUrl), context, nextLoad);
+        return normalizeLoadHookResult(result, calledNext);
       }
-      index += 1;
+      index -= 1;
     }
     return defaultLoadForHooks(nextUrl);
   };
 
-  return nextLoad(url, baseContext);
+  return dispatchLoad(moduleHooks.length - 1, url, baseContext);
 }
 
 function applyLoadHooks(resolved) {
   const result = runLoadHooks(resolved);
   if (result === undefined) return null;
   if (result.source == null) return null;
-  return executeHookSource(resolved, result.source, result.format ?? formatForResolved(resolved));
+  return executeHookSource(resolved, result.source, result.format);
 }
 
 function namespaceFromCommonJs(value) {
@@ -1412,11 +1874,12 @@ function namespaceFromCommonJs(value) {
   return namespace;
 }
 
-function namespaceFromBuiltin(value) {
+function namespaceFromBuiltin(name, value) {
   const unwrapped = unwrapBuiltin(value);
-  // Builtins registered from ESM sources are already namespace objects. Do
-  // not apply CommonJS's extra default layer to dynamic import() results.
-  if (unwrapped && typeof unwrapped === "object" && Object.hasOwn(unwrapped, "default")) return unwrapped;
+  // Namespace identity is fixed when a builtin is registered. Inspecting the
+  // live value here would misclassify CommonJS-style builtins after user code
+  // assigns an ordinary `.default` property to them.
+  if (builtinNamespaceEntries.has(String(name))) return unwrapped;
   return namespaceFromCommonJs(unwrapped);
 }
 
@@ -1443,49 +1906,49 @@ function transformEsmSourceForDynamicImport(source) {
   // (matching ESM semantics, where imports are initialized before any module
   // code runs, even when the import statement appears at the bottom).
   const importDeclarations = [];
-  let output = String(source).replace(/\bimport\.meta\b/g, "__ctImportMeta");
+  let output = replaceCodePattern(source, /\bimport\.meta\b/g, "__ctImportMeta");
   // Static import declarations are rewritten to synchronous requires so the
   // source can run inside new Function() (where `import x from "..."` would
   // otherwise parse as a malformed dynamic import call).
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bimport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, name, spec) => {
       importDeclarations.push(`const ${name} = __ctStaticImport(${spec});`);
       return ";";
     },
   );
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, def, names, spec) => {
       importDeclarations.push(`const { default: ${def}, ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
       return ";";
     },
   );
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bimport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, names, spec) => {
       importDeclarations.push(`const { ${rewriteImportBindings(names)} } = __ctStaticImport(${spec});`);
       return ";";
     },
   );
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bimport\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, def, spec) => {
       importDeclarations.push(`const { default: ${def} } = __ctStaticImport(${spec});`);
       return ";";
     },
   );
-  output = output.replace(/\bimport\s*(['"][^'"]+['"])\s*;?/g, (_all, spec) => {
+  output = replaceCodePattern(output, /\bimport\s*(['"][^'"]+['"])\s*;?/g, (_all, spec) => {
     importDeclarations.push(`__ctStaticImport(${spec});`);
     return ";";
   });
   // Dynamic import() cannot execute inside new Function()-compiled code for
   // formats JSC's own loader cannot parse (e.g. TypeScript); route it through
   // the runtime module loader, which also consults the CommonJS cache.
-  output = output.replace(/\bimport\s*\(/g, "__ctDynamicImport(");
+  output = replaceCodePattern(output, /\bimport\s*\(/g, "__ctDynamicImport(");
   // Re-exports must be rewritten before the plain `export { ... }` handler
   // below, which would otherwise leave a dangling `from "..."` clause behind.
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bexport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])\s*;?/g,
     (_all, names, spec) => {
       const statements = [];
@@ -1495,39 +1958,39 @@ function transformEsmSourceForDynamicImport(source) {
         const pieces = trimmed.split(/\s+as\s+/);
         const local = pieces[0].trim();
         const exported = (pieces[1] ?? pieces[0]).trim();
-        statements.push(`exports.${exported} = __ctStaticImport(${spec}).${local};`);
+        statements.push(`${ESM_EXPORTS_BINDING}.${exported} = __ctStaticImport(${spec}).${local};`);
       }
       return statements.join(" ");
     },
   );
-  output = output.replace(
+  output = replaceCodePattern(output,
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])\s*;?/g,
-    (_all, spec) => `{ const __ctNs = __ctStaticImport(${spec}); for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") exports[__ctKey] = __ctNs[__ctKey]; } }`,
+    (_all, spec) => `{ const __ctNs = __ctStaticImport(${spec}); for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") ${ESM_EXPORTS_BINDING}[__ctKey] = __ctNs[__ctKey]; } }`,
   );
-  output = output.replace(/\bexport\s+default\s+/g, "exports.default = ");
-  output = output.replace(/\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
-    exportAssignments.push(`exports.${name} = ${name};`);
+  output = replaceCodePattern(output, /\bexport\s+default\s+/g, `${ESM_EXPORTS_BINDING}.default = `);
+  output = replaceCodePattern(output, /\bexport\s+(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g, (_all, kind, name) => {
+    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `${kind} ${name} =`;
   });
   // Declarations without initializer (e.g. the `export var ns;` emitted for
   // TypeScript namespaces by the type stripper).
-  output = output.replace(/\bexport\s+(let|var)\s+([A-Za-z_$][\w$]*)\s*;/g, (_all, kind, name) => {
-    exportAssignments.push(`exports.${name} = ${name};`);
+  output = replaceCodePattern(output, /\bexport\s+(let|var)\s+([A-Za-z_$][\w$]*)\s*;/g, (_all, kind, name) => {
+    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `${kind} ${name};`;
   });
-  output = output.replace(/\bexport\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
-    exportAssignments.push(`exports.${name} = ${name};`);
+  output = replaceCodePattern(output, /\bexport\s+async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `async function ${star}${name}(`;
   });
-  output = output.replace(/\bexport\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
-    exportAssignments.push(`exports.${name} = ${name};`);
+  output = replaceCodePattern(output, /\bexport\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(/g, (_all, star, name) => {
+    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `function ${star}${name}(`;
   });
-  output = output.replace(/\bexport\s+class\s+([A-Za-z_$][\w$]*)\s*/g, (_all, name) => {
-    exportAssignments.push(`exports.${name} = ${name};`);
+  output = replaceCodePattern(output, /\bexport\s+class\s+([A-Za-z_$][\w$]*)\s*/g, (_all, name) => {
+    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
     return `class ${name} `;
   });
-  output = output.replace(/\bexport\s*\{([^}]*)\}\s*;?/g, (_all, names) => {
+  output = replaceCodePattern(output, /\bexport\s*\{([^}]*)\}\s*;?/g, (_all, names) => {
     for (const part of String(names).split(",")) {
       const trimmed = part.trim();
       if (!trimmed) continue;
@@ -1539,7 +2002,7 @@ function transformEsmSourceForDynamicImport(source) {
         continue;
       }
       if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(exported)) {
-        exportAssignments.push(`exports.${exported} = ${local};`);
+        exportAssignments.push(`${ESM_EXPORTS_BINDING}.${exported} = ${local};`);
       }
     }
     return "";
@@ -1575,12 +2038,13 @@ function dynamicModuleErrorConstructor(filename, source) {
 
 function executeDynamicImportSource(resolved, source, format) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
-  const effectiveFormat = format ?? formatForResolved(resolvedPath);
+  const sourceText = String(source ?? "");
+  const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
   if (effectiveFormat === "builtin") {
-    return namespaceFromBuiltin(loadBuiltinOrReplacement(resolvedPath));
+    return namespaceFromBuiltin(resolvedPath, loadBuiltinOrReplacement(resolvedPath));
   }
   if (effectiveFormat === "json" || String(resolvedPath).endsWith(".json")) {
-    const jsonSource = String(source ?? "");
+    const jsonSource = sourceText;
     try {
       return { default: JSON.parse(jsonSource) };
     } catch (error) {
@@ -1589,35 +2053,42 @@ function executeDynamicImportSource(resolved, source, format) {
     }
   }
   if (effectiveFormat === "commonjs" || String(resolvedPath).endsWith(".cjs")) {
-    return namespaceFromCommonJs(executeHookSource(resolvedPath, String(source ?? "").replace(/\bimport\.meta\b/g, "__ctImportMeta"), "commonjs"));
+    return namespaceFromCommonJs(executeHookSource(
+      resolvedPath,
+      replaceCodePattern(source, /\bimport\.meta\b/g, "__ctImportMeta"),
+      "commonjs",
+    ));
   }
   const namespace = {};
-  const originalSource = String(source ?? "");
+  const originalSource = sourceText;
   const transformed = transformEsmSourceForDynamicImport(maybeStripTypeScript(resolvedPath, originalSource));
   maybeRegisterSourceMap(resolvedPath, transformed);
   recordCompileCache(resolvedPath, transformed);
   const body = `${transformed}\n//# sourceURL=${resolvedPath}${suffix}`;
   let run;
   try {
-    run = new Function("exports", "require", "__ctImportMeta", "Error", body);
+    run = new Function(ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error", body);
   } catch (error) {
     // Dynamically imported ES modules may use top-level await (e.g. Bun.build
     // outputs re-imported via blob: URLs). Preserve synchronous evaluation for
     // ordinary modules and only retry syntax containing await asynchronously.
     if (!(error instanceof SyntaxError) || !/(?<![.\w$])await\b/.test(transformed)) throw error;
     const AsyncFunction = (async () => {}).constructor;
-    const run = new AsyncFunction("exports", "require", "__ctImportMeta", "Error", body);
+    const run = new AsyncFunction(ESM_EXPORTS_BINDING, "require", "module", "__ctImportMeta", "Error", body);
+    const module = { exports: namespace };
     return run(
       namespace,
-      createRequire(resolvedPath),
-      importMetaForModule(resolvedPath, suffix),
+      createRequire(hookRequireBase(resolvedPath)),
+      module,
+      importMetaForHookModule(resolvedPath, suffix),
       dynamicModuleErrorConstructor(resolvedPath, originalSource),
     ).then(() => namespace);
   }
   run(
     namespace,
-    createRequire(resolvedPath),
-    importMetaForModule(resolvedPath, suffix),
+    createRequire(hookRequireBase(resolvedPath)),
+    { exports: namespace },
+    importMetaForHookModule(resolvedPath, suffix),
     dynamicModuleErrorConstructor(resolvedPath, originalSource),
   );
   return namespace;
@@ -1685,20 +2156,22 @@ export function __importModule(specifier, referrer = undefined, options = undefi
   }
   const resolvedMock = bunModuleMockFor(resolved);
   if (resolvedMock.found) return namespaceFromCommonJs(resolvedMock.value);
+  const resolvedByHook = hookResolvedFormats.has(resolved);
   const loadResult = runLoadHooks(resolved);
   if (loadResult !== undefined) {
-    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format ?? formatForResolved(resolved));
+    return executeDynamicImportSource(resolved, loadResult.source, loadResult.format);
   }
   if (builtinModuleMap.has(resolved) || hasRuntimePackageReplacement(resolved)) {
-    return namespaceFromBuiltin(loadBuiltinOrReplacement(resolved));
+    return namespaceFromBuiltin(resolved, loadBuiltinOrReplacement(resolved));
   }
   const resolvedPath = splitSpecifierSuffix(resolved).bare;
   const embedded = standaloneFileEntry(resolvedPath);
-  if (embedded.found && esmSyntaxPattern.test(embedded.value)) {
+  if (embedded.found && hasEsmSyntax(embedded.value)) {
     return executeDynamicImportSource(resolved, embedded.value, "module");
   }
-  if (formatForResolved(resolved) === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
-  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), formatForResolved(resolved));
+  const resolvedFormat = resolvedByHook ? hookResolvedFormats.get(resolved) : formatForResolved(resolved);
+  if (resolvedFormat === "commonjs") return namespaceFromCommonJs(loadCommonJsModule(resolved));
+  return executeDynamicImportSource(resolved, readModuleFile(resolvedPath), resolvedFormat);
 }
 
 // The native dynamic-import shim (cottontail.importModule) stringifies any
@@ -1723,7 +2196,7 @@ function executeQueriedModule(module, filename, suffix) {
   maybeRegisterSourceMap(filename, transformed);
   recordCompileCache(filename, transformed);
   const wrapper = new Function(
-    "exports",
+    ESM_EXPORTS_BINDING,
     "require",
     "module",
     "__filename",
@@ -1739,7 +2212,24 @@ function executeQueriedModule(module, filename, suffix) {
 function attachModuleChild(parent, child) {
   if (!parent || !child || !Array.isArray(parent.children)) return;
   if (!parent.children.includes(child)) parent.children.push(child);
-  if (child.parent == null) child.parent = parent;
+  if (child[moduleParentKey] == null) child[moduleParentKey] = parent;
+}
+
+function circularRequireExports(module) {
+  const exports = module.exports;
+  if (exports === null || typeof exports !== "object" || utilTypes.isProxy?.(exports)) return exports;
+  if (Object.getPrototypeOf(exports) !== Object.prototype || Object.hasOwn(exports, "__esModule")) return exports;
+  return new Proxy(exports, {
+    get(target, property, receiver) {
+      if (property !== "__esModule" && !Reflect.has(target, property)) {
+        const name = `'${String(property)}'`;
+        currentProcessBuiltin().emitWarning?.(
+          `Accessing non-existent property ${name} of module exports inside circular dependency`,
+        );
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
 }
 
 function loadCommonJsModule(resolved, parent = null, isMain = false) {
@@ -1755,16 +2245,12 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   if (commonJsCache.has(resolved)) {
     const cached = commonJsCache.get(resolved);
     attachModuleChild(parent, cached);
-    return cached.exports;
+    return cached.loaded === false ? circularRequireExports(cached) : cached.exports;
   }
   const hooked = applyLoadHooks(resolvedPath);
   if (hooked !== null) return hooked;
   if (builtinModuleMap.has(resolvedPath)) {
-    if (globalThis.__CT_DEBUG_FSP && resolvedPath === "fs/promises") {
-      const v = unwrapBuiltin(builtinModuleMap.get(resolvedPath));
-      console.log("[dbg] loadCommonJsModule fs/promises ownDefault:", Object.hasOwn(v, "default"));
-    }
-    return unwrapBuiltin(builtinModuleMap.get(resolvedPath));
+    return loadBuiltinOrReplacement(resolvedPath);
   }
   if (hasRuntimePackageReplacement(resolvedPath)) {
     return loadRuntimePackageReplacement(resolvedPath);
@@ -1784,21 +2270,63 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   }
 }
 
-export function createRequire(basePath = cottontail.cwd(), parentModule = null) {
-  let normalizedBasePath = String(basePath).startsWith("file:")
-    ? fileURLToPath(basePath)
-    : String(basePath);
-  // Only inspect the stack when the caller heuristic can actually apply
-  // (basePath is the bundled main-script path). Reading `new Error().stack`
-  // goes through the lazily-remapping stack getter, and the first remap
-  // decodes the multi-megabyte bundle source map (~200ms) — that cost must
-  // not be paid by every createRequire() call in spawned processes.
-  const callerPath = isBundledImportMetaBase(normalizedBasePath) ? bundledCallerPathFromStack() : null;
-  if (callerPath && callerPath !== normalizedBasePath) {
-    normalizedBasePath = callerPath;
+function invalidCreateRequireFilename(value) {
+  let received;
+  if (typeof value === "string") received = `'${value}'`;
+  else if (value === undefined) received = "undefined";
+  else {
+    try { received = JSON.stringify(value); } catch {}
+    received ??= String(value);
   }
+  const error = new TypeError(
+    "The argument 'filename' must be a file URL object, file URL string, or absolute path string. " +
+    `Received ${received}`,
+  );
+  error.code = "ERR_INVALID_ARG_VALUE";
+  return error;
+}
+
+export function createRequire(basePath, parentModule = null) {
+  let normalizedBasePath;
+  if (typeof basePath === "string") {
+    if (/^file:/i.test(basePath)) {
+      try {
+        normalizedBasePath = fileURLToPath(basePath);
+      } catch {
+        throw invalidCreateRequireFilename(basePath);
+      }
+    } else if (isAbsolute(basePath)) {
+      normalizedBasePath = basePath;
+    } else if (parentModule != null) {
+      // Module#_compile accepts synthetic relative filenames. Its private
+      // parent argument distinguishes this from public createRequire().
+      normalizedBasePath = basePath;
+    } else {
+      throw invalidCreateRequireFilename(basePath);
+    }
+  } else if (basePath != null && typeof basePath === "object" && typeof basePath.href === "string") {
+    try {
+      normalizedBasePath = fileURLToPath(basePath);
+    } catch {
+      throw invalidCreateRequireFilename(basePath);
+    }
+  } else {
+    throw invalidCreateRequireFilename(basePath);
+  }
+  // A generated entry wrapper installs one shared global require for bundled
+  // source modules. Resolve that require from its call site; explicit
+  // createRequire() instances and CommonJS module-local requires keep their
+  // fixed parent and avoid stack inspection entirely.
+  const resolveBundledCallerAtCallTime = parentModule == null && isBundledImportMetaBase(normalizedBasePath);
   const resolutionParent = parentModule ?? { filename: normalizedBasePath };
+  const resolutionParentForCall = () => {
+    if (!resolveBundledCallerAtCallTime) return resolutionParent;
+    const callerPath = bundledCallerPathFromStack();
+    return callerPath == null ? resolutionParent : { filename: callerPath };
+  };
   const require = (request) => {
+    if (typeof request !== "string") throw invalidModuleIdType(request);
+    if (request.length === 0) throw invalidEmptyModuleId();
     const directMock = bunModuleMockFor(request);
     if (directMock.found) return directMock.value;
     const requestText = String(request);
@@ -1814,34 +2342,43 @@ export function createRequire(basePath = cottontail.cwd(), parentModule = null) 
         }
       }
     }
-    const resolved = Module._resolveFilename(request, resolutionParent, false);
+    const resolved = Module._resolveFilename(request, resolutionParentForCall(), false);
     const resolvedMock = bunModuleMockFor(resolved);
     if (resolvedMock.found) return resolvedMock.value;
     return loadCommonJsModule(resolved, parentModule);
   };
   require.resolve = (request, options = undefined) => {
+    if (typeof request !== "string") throw invalidRequestType(request);
+    const activeParent = resolutionParentForCall();
     if (options !== undefined && options !== null && options.paths !== undefined) {
       // Route through Module._resolveFilename so user overrides and the
       // options.paths semantics both apply (matches Node).
-      return Module._resolveFilename(String(request), resolutionParent, false, options);
+      return Module._resolveFilename(request, activeParent, false, options);
     }
-    const text = String(request);
+    const text = request;
     if (text.startsWith("node:") && !builtinModuleMap.has(text) && !builtinModuleMap.has(text.slice(5))) {
       throw packageNotFoundError(text, normalizedBasePath);
     }
-    return Module._resolveFilename(text, resolutionParent, false);
+    return Module._resolveFilename(text, activeParent, false);
   };
   require.resolve.paths = (request) => {
-    const text = String(request);
-    if (builtinModuleMap.has(text) || (text.startsWith("node:") && builtinModuleMap.has(text.slice(5)))) return null;
-    if (text.startsWith("./") || text.startsWith("../") || isAbsolute(text)) {
-      return [normalizedBasePath.endsWith("/") ? normalizedBasePath.slice(0, -1) : dirname(normalizedBasePath)];
+    if (typeof request !== "string") throw invalidRequestType(request);
+    const text = request;
+    if (isBuiltin(text)) return null;
+    const activeBasePath = resolutionParentForCall().filename ?? normalizedBasePath;
+    if (text === "." || text === ".." || text.startsWith("./") || text.startsWith("../") || isAbsolute(text)) {
+      return [activeBasePath.endsWith("/") ? activeBasePath.slice(0, -1) : dirname(activeBasePath)];
     }
-    return _nodeModulePaths(normalizedBasePath.endsWith("/") ? normalizedBasePath : dirname(normalizedBasePath));
+    return _nodeModulePaths(activeBasePath.endsWith("/") ? activeBasePath : dirname(activeBasePath));
   };
   require.cache = commonJsCacheObject;
   require.extensions = extensionsForRequire(normalizedBasePath);
-  require.main = mainModule;
+  Object.defineProperty(require, "main", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: mainModule,
+  });
   return require;
 }
 
@@ -1913,10 +2450,12 @@ function isBundledImportMetaBase(path) {
 function bundledCallerPathFromStack() {
   const stack = String(new Error().stack || "");
   for (const line of stack.split("\n").slice(2)) {
-    const atIndex = line.indexOf("@");
-    if (atIndex <= 0) continue;
-    let frame = line.slice(0, atIndex).trim();
-    if (!/\.(?:cjs|mjs|js)$/.test(frame)) continue;
+    const trimmed = line.trim();
+    const match = trimmed.match(/\((.*):\d+:\d+\)$/) ??
+      trimmed.match(/(?:^|\s)at\s+(.*):\d+:\d+$/) ??
+      trimmed.match(/@(.*):\d+:\d+$/);
+    let frame = match?.[1];
+    if (!frame || !/\.(?:[cm]?[jt]s|[jt]sx)$/.test(frame)) continue;
     if (frame.startsWith("file://")) {
       try {
         frame = fileURLToPath(frame);
@@ -1925,6 +2464,7 @@ function bundledCallerPathFromStack() {
       }
     }
     const candidate = isAbsolute(frame) ? frame : resolve(cottontail.cwd(), frame);
+    if (/[\\/]node[\\/]module\.js$/.test(candidate)) continue;
     if (isFile(candidate)) return candidate;
   }
   return null;
@@ -1958,7 +2498,15 @@ function reportMainCompileError(error, info) {
 }
 
 export function __runMain(filename) {
-  const resolved = _resolveFilename(resolve(String(filename)), null, true);
+  let resolved = _resolveFilename(resolve(String(filename)), null, true);
+  // --preserve-symlinks applies to dependencies, not the entry point. Node
+  // only keeps the main module's symlink identity with its separate flag.
+  if (!(globalThis.process?.execArgv ?? []).includes("--preserve-symlinks-main")) {
+    try {
+      const real = cottontail.realpathSync(resolved);
+      if (typeof real === "string" && real.length > 0) resolved = real;
+    } catch {}
+  }
   const module = makeModule(resolved, null, true);
   mainModule = module;
   refreshModuleRequire(module);
@@ -1976,14 +2524,28 @@ export function __runMain(filename) {
 
 export class Module {
   constructor(id = "", parent = null) {
-    this.id = id;
-    this.path = id ? dirname(id) : "";
-    this.exports = {};
-    this.filename = null;
-    this.loaded = false;
-    this.children = [];
-    this.parent = parent;
-    this.paths = this.path ? _nodeModulePaths(this.path) : [];
+    Object.defineProperties(this, {
+      id: { configurable: true, enumerable: true, writable: true, value: id },
+      path: { configurable: true, enumerable: true, writable: true, value: id ? dirname(id) : "" },
+      exports: { configurable: true, enumerable: true, writable: true, value: {} },
+      filename: { configurable: true, enumerable: true, writable: true, value: null },
+      loaded: { configurable: true, enumerable: true, writable: true, value: false },
+      children: { configurable: true, enumerable: true, writable: true, value: [] },
+      paths: { configurable: true, enumerable: true, writable: true, value: id ? _nodeModulePaths(dirname(id)) : [] },
+    });
+    this[moduleParentKey] = parent;
+    Object.defineProperty(this, "parent", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        maybeWarnModuleParent();
+        return this[moduleParentKey];
+      },
+      set(value) {
+        maybeWarnModuleParent();
+        this[moduleParentKey] = value;
+      },
+    });
     refreshModuleRequire(this);
   }
 
@@ -1996,6 +2558,8 @@ export class Module {
   }
 
   require(request) {
+    if (typeof request !== "string") throw invalidModuleIdType(request);
+    if (request.length === 0) throw invalidEmptyModuleId();
     return Module._load(request, this, false);
   }
 
@@ -2021,8 +2585,25 @@ function sourceMapPayloadTypeText(payload) {
 
 function decodeSourceMapEntries(payload) {
   // 0-based entries in generated order (the format Node's SourceMap exposes).
+  if (Array.isArray(payload.sections)) {
+    const entries = [];
+    for (const section of payload.sections) {
+      if (section == null || typeof section !== "object" || section.map == null) continue;
+      const lineOffset = Number(section.offset?.line) || 0;
+      const columnOffset = Number(section.offset?.column) || 0;
+      for (const entry of decodeSourceMapEntries(section.map)) {
+        entries.push({
+          ...entry,
+          generatedLine: entry.generatedLine + lineOffset,
+          generatedColumn: entry.generatedColumn + (entry.generatedLine === 0 ? columnOffset : 0),
+        });
+      }
+    }
+    return entries.sort((left, right) =>
+      left.generatedLine - right.generatedLine || left.generatedColumn - right.generatedColumn);
+  }
   const mappings = String(payload.mappings ?? "");
-  const sources = Array.from(payload.sources ?? [], String);
+  const sources = Array.from(payload.sources ?? [], (source) => source === null ? null : String(source));
   const names = Array.from(payload.names ?? [], String);
   const sourceRoot = payload.sourceRoot ? String(payload.sourceRoot) : "";
   const entries = [];
@@ -2052,20 +2633,30 @@ function decodeSourceMapEntries(payload) {
       entries.push({
         generatedLine,
         generatedColumn,
-        originalSource: source === undefined ? undefined : `${sourceRoot}${source}`,
+        originalSource: source == null ? source : `${sourceRoot}${source}`,
         originalLine,
         originalColumn,
         name,
       });
     }
   }
-  return entries;
+  return entries.sort((left, right) =>
+    left.generatedLine - right.generatedLine || left.generatedColumn - right.generatedColumn);
+}
+
+function cloneSourceMapPayload(payload) {
+  if (Array.isArray(payload)) return payload.map(cloneSourceMapPayload);
+  if (payload == null || typeof payload !== "object") return payload;
+  const clone = {};
+  for (const key of Object.keys(payload)) clone[key] = cloneSourceMapPayload(payload[key]);
+  return clone;
 }
 
 export class SourceMap {
   #payload;
   #lineLengths;
   #entries;
+  #bunSemantics;
 
   constructor(payload, options = undefined) {
     if (payload === null || typeof payload !== "object") {
@@ -2073,9 +2664,12 @@ export class SourceMap {
       error.code = "ERR_INVALID_ARG_TYPE";
       throw error;
     }
-    this.#payload = payload;
-    this.#lineLengths = options?.lineLengths;
-    this.#entries = decodeSourceMapEntries(payload);
+    this.#bunSemantics = isBunCompatProfile();
+    this.#payload = this.#bunSemantics ? payload : cloneSourceMapPayload(payload);
+    this.#lineLengths = this.#bunSemantics
+      ? options?.lineLengths
+      : options?.lineLengths == null ? undefined : Array.from(options.lineLengths, Number);
+    this.#entries = decodeSourceMapEntries(this.#payload);
   }
 
   get payload() {
@@ -2107,16 +2701,7 @@ export class SourceMap {
 
   findEntry(lineNumber, columnNumber) {
     const entry = this.#findNearestEntry(Number(lineNumber), Number(columnNumber));
-    if (entry === undefined) {
-      return {
-        generatedLine: Number(lineNumber),
-        generatedColumn: Number(columnNumber),
-        originalSource: undefined,
-        originalLine: undefined,
-        originalColumn: undefined,
-        name: undefined,
-      };
-    }
+    if (entry === undefined) return {};
     return {
       generatedLine: entry.generatedLine,
       generatedColumn: entry.generatedColumn,
@@ -2128,17 +2713,23 @@ export class SourceMap {
   }
 
   findOrigin(lineNumber, columnNumber) {
-    const line = Number(lineNumber);
-    const column = Number(columnNumber);
+    const line = Number(lineNumber) - (this.#bunSemantics ? 0 : 1);
+    const column = Number(columnNumber) - (this.#bunSemantics ? 0 : 1);
     const entry = this.#findNearestEntry(line, column);
-    if (entry === undefined || entry.originalSource === undefined) {
-      return { fileName: this.#payload.sources?.[0], lineNumber: line, columnNumber: column };
+    if (entry === undefined || entry.originalSource === undefined) return {};
+    if (this.#bunSemantics) {
+      return {
+        name: entry.name,
+        fileName: entry.originalSource,
+        line: entry.originalLine + (line - entry.generatedLine),
+        column: entry.originalColumn + (column - entry.generatedColumn),
+      };
     }
     return {
-      fileName: entry.originalSource,
-      line: entry.originalLine + (line - entry.generatedLine),
-      column: entry.originalColumn + (column - entry.generatedColumn),
       name: entry.name,
+      fileName: entry.originalSource,
+      lineNumber: entry.originalLine + (line - entry.generatedLine) + 1,
+      columnNumber: entry.originalColumn + (column - entry.generatedColumn) + 1,
     };
   }
 }
@@ -2154,13 +2745,14 @@ function decodeVlq(segment) {
     const digit = sourceMapBase64Values.get(char);
     if (digit == null) throw new Error("Invalid source map VLQ digit");
     const continuation = (digit & 32) !== 0;
-    value += (digit & 31) << shift;
+    value += (digit & 31) * (2 ** shift);
     if (continuation) {
       shift += 5;
       continue;
     }
-    const negative = (value & 1) === 1;
-    values.push(negative ? -(value >> 1) : value >> 1);
+    const negative = value % 2 === 1;
+    const magnitude = Math.floor(value / 2);
+    values.push(negative ? (magnitude === 0 ? -2147483648 : -magnitude) : magnitude);
     value = 0;
     shift = 0;
   }
@@ -2169,7 +2761,7 @@ function decodeVlq(segment) {
 
 function decodeSourceMapMappings(payload = {}) {
   const mappings = String(payload.mappings ?? "");
-  const sources = Array.from(payload.sources ?? [], String);
+  const sources = Array.from(payload.sources ?? [], (source) => source === null ? null : String(source));
   const names = Array.from(payload.names ?? [], String);
   const entries = [];
   let sourceIndex = 0;
@@ -2237,7 +2829,10 @@ function readSourceMapPayload(filename, source) {
 function maybeRegisterSourceMap(filename, source) {
   try {
     const payload = readSourceMapPayload(filename, source);
-    if (payload) sourceMapCache.set(String(filename), new SourceMap(payload));
+    if (payload) {
+      const lineLengths = String(source).replace(/\n$/, "").split("\n").map((line) => line.length);
+      sourceMapCache.set(String(filename), new SourceMap(payload, { lineLengths }));
+    }
   } catch {}
 }
 
@@ -2366,7 +2961,7 @@ globalThis.__cottontailFormatUncaughtModuleError ??= error => {
 };
 
 export const _cache = commonJsCacheObject;
-export const _pathCache = modulePathCache;
+export let _pathCache = modulePathCache;
 export const wrapper = [
   "(function (exports, require, module, __filename, __dirname) { ",
   "\n});",
@@ -2383,7 +2978,7 @@ export const constants = {
 export let globalPaths = [];
 let compileCacheDir = undefined;
 const compileCacheEntries = new Map();
-let sourceMapsSupport = { nodeModules: false, generatedCode: false };
+let sourceMapsSupport = { enabled: false, nodeModules: false, generatedCode: false };
 
 function compileCacheKey(filename, source) {
   return crypto.createHash("sha256").update(`${filename}\0${source}`).digest("hex");
@@ -2433,7 +3028,12 @@ const moduleExtensionsTarget = {
       module.exports = JSON.parse(source);
     } catch (error) {
       if (/(^|[\\/])package\.json$/.test(String(filename))) module.exports = parseJSONC(source);
-      else throw error;
+      else {
+        if (error && (typeof error === "object" || typeof error === "function")) {
+          error.message = `${filename}: ${error.message ?? error}`;
+        }
+        throw error;
+      }
     }
     module.loaded = true;
   },
@@ -2478,7 +3078,9 @@ export function _nodeModulePaths(from) {
   const paths = [];
   let current = resolve(String(from || "."));
   while (true) {
-    paths.push(join(current, "node_modules"));
+    if (basename(current).toLowerCase() !== "node_modules") {
+      paths.push(join(current, "node_modules"));
+    }
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
@@ -2515,20 +3117,21 @@ export function _findPath(request, paths = [], isMain = false) {
 
 export function _resolveFilename(request, parent = undefined, isMain = false, options = undefined) {
   void isMain;
-  const text = String(request);
+  if (typeof request !== "string") throw invalidRequestType(request);
+  const text = request;
   if (options !== undefined && options !== null && options.paths !== undefined && !Array.isArray(options.paths)) {
-    const error = new TypeError('The "options.paths" property must be an instance of Array.' +
-      ` Received ${options.paths === null ? "null" : `type ${typeof options.paths}`}`);
-    error.code = "ERR_INVALID_ARG_TYPE";
-    throw error;
+    throw invalidResolvePaths(options.paths);
   }
   if (options !== undefined && options !== null && Array.isArray(options.paths)) {
+    if (options.paths.some((searchPath) => typeof searchPath !== "string")) {
+      throw invalidResolvePathEntries();
+    }
     // Node semantics: options.paths replaces the default lookup locations.
     // Relative requests resolve against each entry; bare specifiers search
     // node_modules starting from each entry.
     let lastError;
     for (const searchPath of options.paths) {
-      const baseDir = String(searchPath);
+      const baseDir = searchPath;
       try {
         return resolveRequest(text, baseDir.endsWith("/") ? baseDir : `${baseDir}/`);
       } catch (error) {
@@ -2561,7 +3164,12 @@ export function _initPaths() {
   const env = globalThis.process?.env ?? cottontail.env();
   const home = env.HOME || env.USERPROFILE;
   const prefix = dirname(dirname(cottontail.execPath?.() ?? ""));
+  const delimiter = path.delimiter || (globalThis.process?.platform === "win32" ? ";" : ":");
+  const nodePath = typeof env.NODE_PATH === "string"
+    ? env.NODE_PATH.split(delimiter).filter(Boolean).map((entry) => resolve(entry))
+    : [];
   globalPaths = [
+    ...nodePath,
     ...(home ? [join(home, ".node_modules"), join(home, ".node_libraries")] : []),
     join(prefix, "lib", "node"),
   ];
@@ -2592,7 +3200,13 @@ export function _readPackage(requestPath) {
     : join(String(requestPath), "package.json");
   const packageJson = readPackageJson(pjsonPath);
   if (!packageJson) return { exists: false, type: "none", pjsonPath };
-  return { exists: true, pjsonPath, main: packageJson.main, name: packageJson.name, type: packageJson.type ?? "none" };
+  return {
+    exists: true,
+    pjsonPath,
+    main: packageJsonValue(packageJson, "main"),
+    name: packageJsonValue(packageJson, "name"),
+    type: packageJsonValue(packageJson, "type") ?? "none",
+  };
 }
 
 export function runMain(main = globalThis.process?.argv?.[1]) {
@@ -2634,15 +3248,27 @@ export function getCompileCacheDir() {
 }
 
 export function getSourceMapsSupport() {
-  return { ...sourceMapsSupport };
+  return Object.assign(Object.create(null), sourceMapsSupport);
 }
 
-export function setSourceMapsSupport(enabled = true) {
-  if (typeof enabled === "object") {
-    sourceMapsSupport = { ...sourceMapsSupport, ...enabled };
-  } else {
-    sourceMapsSupport = { nodeModules: Boolean(enabled), generatedCode: Boolean(enabled) };
+export function setSourceMapsSupport(enabled, options = undefined) {
+  if (typeof enabled !== "boolean") throw invalidArgType("enabled", "boolean", enabled);
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    throw invalidArgType("options", "object", options);
   }
+  const nodeModules = options?.nodeModules;
+  const generatedCode = options?.generatedCode;
+  if (nodeModules !== undefined && typeof nodeModules !== "boolean") {
+    throw invalidArgType("options.nodeModules", "boolean", nodeModules);
+  }
+  if (generatedCode !== undefined && typeof generatedCode !== "boolean") {
+    throw invalidArgType("options.generatedCode", "boolean", generatedCode);
+  }
+  sourceMapsSupport = {
+    enabled,
+    nodeModules: nodeModules ?? false,
+    generatedCode: generatedCode ?? false,
+  };
 }
 
 export function findSourceMap(path, error = undefined) {
@@ -2655,9 +3281,65 @@ export function findSourceMap(path, error = undefined) {
   return sourceMapCache.get(key);
 }
 
-export function findPackageJSON(specifier, base = cottontail.cwd()) {
-  const root = packageRootFor(String(specifier), String(base));
-  return root ? join(root, "package.json") : undefined;
+function packageJsonPathFromFile(filename) {
+  let current = isDirectory(filename) ? filename : dirname(filename);
+  while (true) {
+    const packageJsonPath = join(current, "package.json");
+    if (isFile(packageJsonPath)) return path.toNamespacedPath?.(packageJsonPath) ?? packageJsonPath;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function findPackageLocation(value, name) {
+  if (typeof value === "string") return value;
+  if (value != null && typeof value === "object" && typeof value.href === "string") return value.href;
+  const error = new TypeError(
+    `The "${name}" argument must be of type string or an instance of URL. Received ${formatInvalidValue(value)}`,
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+}
+
+export function findPackageJSON(specifier, base = undefined) {
+  if (arguments.length === 0) {
+    const error = new TypeError('The "specifier" argument must be specified');
+    error.code = "ERR_MISSING_ARGS";
+    throw error;
+  }
+  const specifierText = findPackageLocation(specifier, "specifier");
+  const baseText = arguments.length < 2 || base === undefined
+    ? join(cottontail.cwd(), "__cottontail-find-package-json__.js")
+    : findPackageLocation(base, "base");
+  let basePath = baseText;
+  if (basePath.startsWith("file:")) basePath = fileURLToPath(basePath);
+
+  const isUrl = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(specifierText);
+  const isBare = !isUrl && !isAbsolute(specifierText) &&
+    specifierText !== "." && specifierText !== ".." &&
+    !specifierText.startsWith("./") && !specifierText.startsWith("../") &&
+    !specifierText.startsWith("#");
+  if (isBare) {
+    if (isBuiltin(specifierText)) return undefined;
+    const root = packageRootFor(specifierText, basePath);
+    const packageJsonPath = root == null ? undefined : join(root, "package.json");
+    return packageJsonPath && isFile(packageJsonPath)
+      ? (path.toNamespacedPath?.(packageJsonPath) ?? packageJsonPath)
+      : undefined;
+  }
+
+  let target;
+  if (specifierText.startsWith("file:")) {
+    target = fileURLToPath(splitSpecifierSuffix(specifierText).bare);
+  } else if (isUrl) {
+    return undefined;
+  } else {
+    target = isAbsolute(specifierText)
+      ? splitSpecifierSuffix(specifierText).bare
+      : resolve(resolutionStartDir(basePath), splitSpecifierSuffix(specifierText).bare);
+  }
+  return packageJsonPathFromFile(target);
 }
 
 class ModuleHooks {
@@ -2672,20 +3354,48 @@ class ModuleHooks {
 
   deregister() {
     const index = moduleHooks.indexOf(this);
-    if (index >= 0) moduleHooks.splice(index, 1);
+    if (index >= 0) {
+      moduleHooks.splice(index, 1);
+      hookResolvedFormats.clear();
+    }
   }
 }
 
 export function register(specifier, parentURL = undefined, options = undefined) {
-  const parent = parentURL == null ? cottontail.cwd() : fileURLToPath(String(parentURL));
-  const hooksModule = typeof specifier === "object" && specifier !== null
-    ? specifier
-    : createRequire(parent)(String(specifier));
+  let resolvedParentURL = parentURL;
+  let resolvedOptions = options;
+  if (parentURL != null && typeof parentURL === "object" && typeof parentURL.href !== "string") {
+    resolvedOptions = parentURL;
+    resolvedParentURL = parentURL.parentURL;
+  }
+  const parent = resolvedParentURL == null
+    ? join(cottontail.cwd(), "__cottontail-register__.js")
+    : fileURLToPath(String(resolvedParentURL));
+  const isHooksObject = typeof specifier === "object" && specifier !== null &&
+    typeof specifier.href !== "string" &&
+    (typeof specifier.resolve === "function" || typeof specifier.load === "function" ||
+      typeof specifier.initialize === "function");
+  let hooksModule;
+  if (isHooksObject) {
+    hooksModule = specifier;
+  } else {
+    const specifierText = String(specifier);
+    hooksModule = specifierText.startsWith("data:")
+      ? __importModule(specifierText, parent)
+      : createRequire(parent)(specifierText);
+    if (isPromiseLike(hooksModule)) {
+      throw new TypeError("Asynchronous module.register() hook modules require native loader support");
+    }
+  }
   const hooks = hooksModule?.resolve || hooksModule?.load ? hooksModule : hooksModule?.default;
   const registered = registerHooks(hooks ?? {});
-  if (typeof hooksModule?.initialize === "function") hooksModule.initialize(options?.data);
-  else if (typeof hooks?.initialize === "function") hooks.initialize(options?.data);
-  void registered;
+  try {
+    if (typeof hooksModule?.initialize === "function") hooksModule.initialize(resolvedOptions?.data);
+    else if (typeof hooks?.initialize === "function") hooks.initialize(resolvedOptions?.data);
+  } catch (error) {
+    registered.deregister();
+    throw error;
+  }
 }
 
 export function registerHooks(hooks = undefined) {
@@ -2940,27 +3650,55 @@ function stripTypeScriptTypesPreserveWhitespace(source) {
 
 export function stripTypeScriptTypes(source, options = undefined) {
   if (typeof source !== "string") {
-    throw new TypeError("module.stripTypeScriptTypes source must be a string");
+    const error = new TypeError(`The "code" argument must be of type string. Received ${formatInvalidValue(source)}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
   }
 
   let mode = "strip";
   let sourceMap = false;
   let sourceUrl = undefined;
-  if (options != null) {
-    if (typeof options !== "object") throw new TypeError("module.stripTypeScriptTypes options must be an object");
-    if (options.mode != null) mode = String(options.mode);
-    if (options.sourceMap != null) sourceMap = Boolean(options.sourceMap);
-    if (options.sourceUrl != null) sourceUrl = String(options.sourceUrl);
+  if (options !== undefined) {
+    if (options === null || typeof options !== "object") {
+      const error = new TypeError(`The "options" argument must be of type object. Received ${formatInvalidValue(options)}`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (options.mode !== undefined) mode = options.mode;
+    if (options.sourceMap !== undefined && typeof options.sourceMap !== "boolean") {
+      const error = new TypeError(`The "options.sourceMap" property must be of type boolean. Received ${formatInvalidValue(options.sourceMap)}`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    if (options.sourceUrl !== undefined && typeof options.sourceUrl !== "string") {
+      const error = new TypeError(`The "options.sourceUrl" property must be of type string. Received ${formatInvalidValue(options.sourceUrl)}`);
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    sourceMap = options.sourceMap ?? false;
+    sourceUrl = options.sourceUrl;
   }
 
   if (mode !== "strip" && mode !== "transform") {
-    throw new RangeError("module.stripTypeScriptTypes mode must be 'strip' or 'transform'");
+    const error = new TypeError(`The property 'options.mode' must be one of: 'strip', 'transform'. Received ${formatInvalidValue(mode)}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
   if (sourceMap && mode === "strip") {
-    throw new Error("module.stripTypeScriptTypes sourceMap cannot be used with mode 'strip'");
+    const error = new TypeError("The property 'options.sourceMap' must be one of: false, undefined. Received true");
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
   if (typeof cottontail.stripTypeScriptTypes !== "function") {
     throw new Error("module.stripTypeScriptTypes native parser is unavailable");
+  }
+
+  if (!stripTypesWarningEmitted) {
+    stripTypesWarningEmitted = true;
+    currentProcessBuiltin().emitWarning?.(
+      "stripTypeScriptTypes is an experimental feature and might change at any time",
+      "ExperimentalWarning",
+    );
   }
 
   let output = mode === "strip"
@@ -2976,7 +3714,15 @@ Module.Module = Module;
 Module.builtinModules = builtinModules;
 Module.createRequire = createRequire;
 Module._cache = _cache;
-Module._pathCache = _pathCache;
+Object.defineProperty(Module, "_pathCache", {
+  configurable: true,
+  enumerable: true,
+  get() { return modulePathCache; },
+  set(value) {
+    modulePathCache = value && typeof value === "object" ? value : Object.create(null);
+    _pathCache = modulePathCache;
+  },
+});
 Module._extensions = _extensions;
 Module.globalPaths = globalPaths;
 Module.wrapper = wrapper;
@@ -3036,14 +3782,17 @@ const assertBuiltin = assert.default ?? assert;
 const assertStrictBuiltin = assertStrict.default ?? assertStrict;
 const consoleBuiltin = consoleModule.default ?? consoleModule;
 const eventsBuiltin = events.default ?? events;
-const processBuiltin = processModule.default ?? processModule;
+function currentProcessBuiltin() {
+  return globalThis.process ?? processModule.default ?? processModule;
+}
+const processBuiltin = lazyBuiltin(currentProcessBuiltin);
 const streamBuiltin = stream.default ?? stream;
 const sysBuiltin = sys.default ?? sys;
 const pathBuiltin = path.default ?? path;
 const internalTestBindingBuiltin = {
   ...internalTestBinding,
   internalBinding(name) {
-    if (String(name) === "http_parser") return processBuiltin.binding("http_parser");
+    if (String(name) === "http_parser") return currentProcessBuiltin().binding("http_parser");
     return internalTestBinding.internalBinding(name);
   },
 };
@@ -3078,7 +3827,7 @@ const httpServerBuiltin = {
 const httpCommonBuiltin = lazyBuiltin(() => createHttpCommonBuiltin({
   http,
   incoming: httpIncomingBuiltin,
-  processObject: processBuiltin,
+  processObject: currentProcessBuiltin(),
 }));
 function translatePeerCertificate(certificate) {
   if (!certificate) return null;

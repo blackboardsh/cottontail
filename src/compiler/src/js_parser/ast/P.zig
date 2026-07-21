@@ -3983,8 +3983,10 @@ pub fn NewParser_(
 
         pub fn pathForImportMeta(p: *P) fs.Path {
             const generated_prefix = ".cottontail-compat-";
+            const eval_prefix = ".cottontail-eval-";
             const marker = "/*@cottontail-original-path-base64:";
-            if (!std.mem.startsWith(u8, p.source.path.name.filename, generated_prefix) or
+            if ((!std.mem.startsWith(u8, p.source.path.name.filename, generated_prefix) and
+                !std.mem.startsWith(u8, p.source.path.name.filename, eval_prefix)) or
                 !std.mem.startsWith(u8, p.source.contents, marker))
             {
                 return p.source.path;

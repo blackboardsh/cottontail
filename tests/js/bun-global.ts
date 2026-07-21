@@ -2,8 +2,22 @@ if (!globalThis.Bun?.spawnSync || !globalThis.Bun?.serve || !globalThis.Response
   throw new Error("Bun global runtime APIs were not installed");
 }
 
+if (Bun.version !== "1.3.10" || process.versions.bun !== Bun.version) {
+  throw new Error(`Bun compatibility version mismatch: ${Bun.version} / ${process.versions.bun}`);
+}
+if (process.versions.cottontail !== String(cottontail.processInfo("version"))) {
+  throw new Error(`Cottontail product version mismatch: ${process.versions.cottontail}`);
+}
+
 if (typeof globalThis.crypto?.randomUUID !== "function") {
   throw new Error("global crypto.randomUUID was not installed");
+}
+
+if (typeof SharedArrayBuffer === "function") {
+  const shared = new SharedArrayBuffer(1);
+  if (!(shared instanceof SharedArrayBuffer) || shared instanceof ArrayBuffer) {
+    throw new Error("SharedArrayBuffer constructor identity mismatch");
+  }
 }
 
 const uuid = globalThis.crypto.randomUUID();

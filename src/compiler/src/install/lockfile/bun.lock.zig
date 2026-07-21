@@ -27,10 +27,10 @@ pub const Stringifier = struct {
     //     _ = this;
     // }
 
-    pub fn saveFromBinary(allocator: std.mem.Allocator, lockfile: *BinaryLockfile, load_result: *const LoadResult, options: *const PackageManager.Options, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn saveFromBinary(allocator: std.mem.Allocator, lockfile: *BinaryLockfile, load_result: *const LoadResult, options: anytype, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         return bun.handleOom(saveFromBinary_inner(allocator, lockfile, load_result, options, writer));
     }
-    pub fn saveFromBinary_inner(allocator: std.mem.Allocator, lockfile: *BinaryLockfile, load_result: *const LoadResult, options: *const PackageManager.Options, writer: *std.Io.Writer) !void {
+    pub fn saveFromBinary_inner(allocator: std.mem.Allocator, lockfile: *BinaryLockfile, load_result: *const LoadResult, options: anytype, writer: *std.Io.Writer) !void {
         const buf = lockfile.buffers.string_bytes.items;
         const extern_strings = lockfile.buffers.extern_strings.items;
         const deps_buf = lockfile.buffers.dependencies.items;
@@ -43,9 +43,9 @@ pub const Stringifier = struct {
         const pkg_metas: []BinaryLockfile.Package.Meta = pkgs.items(.meta);
         const pkg_bins = pkgs.items(.bin);
 
-        var temp_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer temp_buf.deinit(allocator);
-        const temp_writer = temp_buf.writer(allocator);
+        var temp_buf = std.Io.Writer.Allocating.init(allocator);
+        defer temp_buf.deinit();
+        const temp_writer = &temp_buf.writer;
 
         var found_trusted_dependencies: std.AutoHashMapUnmanaged(u64, String) = .{};
         defer found_trusted_dependencies.deinit(allocator);
@@ -120,7 +120,7 @@ pub const Stringifier = struct {
                     &path_buf,
                 );
 
-                var workspace_sort_buf: std.ArrayListUnmanaged(PackageID) = .{};
+                var workspace_sort_buf: std.ArrayListUnmanaged(PackageID) = .empty;
                 defer workspace_sort_buf.deinit(allocator);
 
                 for (0..pkgs.len) |_pkg_id| {
@@ -190,7 +190,7 @@ pub const Stringifier = struct {
                 }
             };
 
-            var tree_sort_buf: std.ArrayListUnmanaged(TreeSortCtx.Item) = .{};
+            var tree_sort_buf: std.ArrayListUnmanaged(TreeSortCtx.Item) = .empty;
             defer tree_sort_buf.deinit(allocator);
 
             // find trusted and patched dependencies. also overrides
@@ -224,7 +224,7 @@ pub const Stringifier = struct {
                         }
                         defer temp_buf.clearRetainingCapacity();
 
-                        const name_and_version = temp_buf.items;
+                        const name_and_version = temp_buf.written();
                         const name_and_version_hash = String.Builder.stringHash(name_and_version);
 
                         if (lockfile.patched_dependencies.get(name_and_version_hash)) |patch| {
@@ -379,10 +379,10 @@ pub const Stringifier = struct {
                 try writer.writeAll("},\n");
             }
 
-            var tree_deps_sort_buf: std.ArrayListUnmanaged(DependencyID) = .{};
+            var tree_deps_sort_buf: std.ArrayListUnmanaged(DependencyID) = .empty;
             defer tree_deps_sort_buf.deinit(allocator);
 
-            var pkg_deps_sort_buf: std.ArrayListUnmanaged(DependencyID) = .{};
+            var pkg_deps_sort_buf: std.ArrayListUnmanaged(DependencyID) = .empty;
             defer pkg_deps_sort_buf.deinit(allocator);
 
             try writeIndent(writer, indent);
@@ -1172,7 +1172,7 @@ pub fn parseIntoBinaryLockfile(
         return error.InvalidLockfileVersion;
     };
 
-    const lockfile_version = std.meta.intToEnum(Version, lockfile_version_num) catch {
+    const lockfile_version = std.enums.fromInt(Version, lockfile_version_num) orelse {
         try log.addError(source, lockfile_version_expr.loc, "Unknown lockfile version");
         return error.UnknownLockfileVersion;
     };
@@ -1482,12 +1482,11 @@ pub fn parseIntoBinaryLockfile(
             const version_str = try string_buf.append(version_expr.asString(allocator).?);
 
             const parsed = Semver.Version.parse(version_str.sliced(string_buf.bytes.items));
-            if (!parsed.valid) {
-                try log.addError(source, version_expr.loc, "Invalid semver version");
-                return error.InvalidSemver;
+            if (parsed.valid) {
+                try lockfile.workspace_versions.put(allocator, name_hash, parsed.version.min());
             }
-
-            try lockfile.workspace_versions.put(allocator, name_hash, parsed.version.min());
+            // COTTONTAIL-COMPAT: Bun accepts arbitrary workspace version
+            // strings. Only valid semver values participate in range matching.
         }
     }
 
@@ -1728,17 +1727,37 @@ pub fn parseIntoBinaryLockfile(
 
                 if (registry_str.len == 0) {
                     // Use scope-specific registry if available, otherwise fall back to default
-                    const registry_url = if (manager) |mgr|
+                    const registry_url = if (comptime @hasDecl(bun, "standalone_lockfile_conversion"))
+                        Npm.Registry.default_url
+                    else if (manager) |mgr|
                         mgr.scopeForPackageName(name_str).url.href
                     else
                         Npm.Registry.default_url;
 
-                    const url = try ExtractTarball.buildURL(
-                        registry_url,
-                        strings.StringOrTinyString.init(name.slice(string_buf.bytes.items)),
-                        res.value.npm.version,
-                        string_buf.bytes.items,
-                    );
+                    const full_name = strings.StringOrTinyString.init(name.slice(string_buf.bytes.items));
+                    const url = if (comptime @hasDecl(bun, "standalone_lockfile_conversion"))
+                        try ExtractTarball.buildURLWithPrinter(
+                            registry_url,
+                            full_name,
+                            res.value.npm.version,
+                            string_buf.bytes.items,
+                            std.mem.Allocator,
+                            string,
+                            OOM,
+                            allocator,
+                            struct {
+                                fn print(context: std.mem.Allocator, comptime format: string, args: anytype) OOM!string {
+                                    return std.fmt.allocPrint(context, format, args);
+                                }
+                            }.print,
+                        )
+                    else
+                        try ExtractTarball.buildURL(
+                            registry_url,
+                            full_name,
+                            res.value.npm.version,
+                            string_buf.bytes.items,
+                        );
 
                     res.value.npm.url = try string_buf.append(url);
                 } else {
@@ -1935,6 +1954,14 @@ pub fn parseIntoBinaryLockfile(
 
             const entry = try pkg_map.getOrPut(pkg_path);
             if (entry.found_existing) {
+                const existing_resolutions = lockfile.packages.slice().items(.resolution);
+                if (existing_resolutions[entry.value_ptr.*].tag == .workspace) {
+                    // COTTONTAIL-COMPAT: A root npm dependency may shadow a
+                    // workspace with the same name while nested workspace aliases
+                    // continue to resolve to the workspace package ID.
+                    entry.value_ptr.* = pkg_id;
+                    continue;
+                }
                 try log.addError(source, key.loc, "Duplicate package path");
                 return error.InvalidPackageKey;
             }
@@ -2053,11 +2080,10 @@ pub fn parseIntoBinaryLockfile(
                         return error.InvalidPackageKey;
                     },
                     error.Unresolvable => {
-                        if (dep.behavior.optional) {
-                            continue :deps;
-                        }
-                        try dependencyResolutionFailure(dep, pkg_path, allocator, lockfile.buffers.string_bytes.items, source, log, key.loc);
-                        return error.InvalidPackageInfo;
+                        // Migrated npm and Yarn locks may retain advisory
+                        // package metadata for a transitive edge omitted by
+                        // the source lockfile. Root edges remain strict above.
+                        continue :deps;
                     },
                 };
 
@@ -2249,12 +2275,16 @@ fn parseAppendDependencies(
 
     const end = lockfile.buffers.dependencies.items.len;
 
-    std.sort.pdq(
-        Dependency,
-        lockfile.buffers.dependencies.items[off..],
-        buf.bytes.items,
-        Dependency.isLessThan,
-    );
+    // COTTONTAIL-COMPAT: Bun's migration snapshots preserve root package.json
+    // dependency order; nested package dependencies remain canonicalized.
+    if (comptime !is_root or !@hasDecl(bun, "standalone_lockfile_conversion")) {
+        std.sort.pdq(
+            Dependency,
+            lockfile.buffers.dependencies.items[off..],
+            buf.bytes.items,
+            Dependency.isLessThan,
+        );
+    }
 
     return .{ @intCast(off), @intCast(end - off) };
 }

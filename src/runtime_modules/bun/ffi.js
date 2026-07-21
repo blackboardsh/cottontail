@@ -483,6 +483,33 @@ const formatConsoleArrayTokens = (tokens, indent, prefix = "", multiline = false
   return `${prefix}[\n${lines.join("\n")}\n${" ".repeat(indent)}]`;
 };
 
+const formatConsoleErrorProperties = (error, seen, objectDepth, indent, options) => {
+  const keys = Reflect.ownKeys(error).filter((key) => {
+    if (key === "name" || key === "message" || key === "stack") return false;
+    return Object.getOwnPropertyDescriptor(error, key)?.enumerable === true;
+  });
+  if (keys.length === 0) return "";
+  const alreadySeen = seen.has(error);
+  if (!alreadySeen) seen.add(error);
+  try {
+    const pad = " ".repeat(indent + 2);
+    let out = " {\n";
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(error, key);
+      let rendered;
+      if (descriptor && !("value" in descriptor)) {
+        rendered = descriptor.get && descriptor.set ? "[Getter/Setter]" : descriptor.get ? "[Getter]" : "[Setter]";
+      } else {
+        rendered = formatConsoleValue(descriptor?.value, seen, objectDepth + 1, indent + 2, options);
+      }
+      out += `${pad}${formatConsoleKey(key)}: ${rendered},\n`;
+    }
+    return `${out}${" ".repeat(indent)}}`;
+  } finally {
+    if (!alreadySeen) seen.delete(error);
+  }
+};
+
 const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
   switch (typeof value) {
     case "string":
@@ -532,8 +559,8 @@ const formatConsoleValue = (value, seen, objectDepth, indent, options) => {
     const name = value.name ?? "Error";
     const header = value.message ? `${name}: ${value.message}` : String(name);
     const stack = typeof value.stack === "string" && value.stack.length > 0 ? value.stack : "";
-    if (!stack) return header;
-    return stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`;
+    const rendered = !stack ? header : stack.startsWith(name) ? stack : `${header}\n${stack.replace(/^/gm, "      ")}`;
+    return `${rendered}${formatConsoleErrorProperties(value, seen, objectDepth, indent, options)}`;
   }
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
@@ -775,21 +802,28 @@ const consoleErrorSource = (error) => {
   const line = lines[index];
   const plainError = String(error.name ?? "Error") === "Error";
   const columnIndex = plainError
-    ? Math.max(0, line.indexOf("Error("))
+    ? Math.max(0, line.lastIndexOf("Error("))
     : Math.max(0, line.indexOf("new "));
   return { filename, lines, lineIndex: index, column: columnIndex + 1, plainError };
 };
 
-const formatConsoleError = (error, level) => {
+const formatConsoleError = (error, level, separate = true) => {
   const source = consoleErrorSource(error);
   if (!source) return undefined;
   const name = String(error.name ?? "Error");
   const message = String(error.message ?? "");
   const lineNumber = source.lineIndex + 1;
   const stack = `      at ${source.filename}:${lineNumber}:${source.column}\n      at loadAndEvaluateModule (2:1)`;
+  const properties = formatConsoleErrorProperties(
+    error,
+    new Set(),
+    0,
+    0,
+    { depth: consoleDepth, customInspect: true },
+  );
   if (level === "warn") {
     const heading = source.plainError ? `warn: ${message}` : `${name}: ${message}`;
-    return `${consoleGroupIndent}${heading}\n${stack}\n`;
+    return `${consoleGroupIndent}${heading}\n${stack}${properties}\n`;
   }
 
   const firstLine = Math.max(0, source.lineIndex - 5);
@@ -800,7 +834,8 @@ const formatConsoleError = (error, level) => {
   }
   excerpt.push(" ".repeat(String(lineNumber).length + 3 + source.column - 1) + "^");
   excerpt.push(`${source.plainError ? "error" : name}: ${message}`);
-  excerpt.push(stack, "");
+  excerpt.push(`${stack}${properties}`);
+  if (separate) excerpt.push("");
   return excerpt.join("\n");
 };
 
@@ -812,13 +847,13 @@ const indentConsoleText = (text, indentLines = true) => {
   const rendered = String(text);
   return consoleGroupIndent + (indentLines ? rendered.replace(/\n/g, `\n${consoleGroupIndent}`) : rendered);
 };
-const writeConsole = (writer, args, substitutions = true, options = undefined, level = undefined) => {
+const writeConsole = (writer, args, substitutions = true, options = undefined, level = undefined, separateError = true) => {
   let isError = false;
   if (args.length === 1 && level) {
     try { isError = args[0] instanceof Error; } catch {}
   }
   if (isError) {
-    const renderedError = formatConsoleError(args[0], level);
+    const renderedError = formatConsoleError(args[0], level, separateError);
     if (renderedError !== undefined) {
       writer?.(renderedError);
       return;
@@ -839,6 +874,10 @@ const writeConsole = (writer, args, substitutions = true, options = undefined, l
 console.log = (...args) => writeConsole(nativeConsoleLog, args);
 console.error = (...args) => writeConsole(nativeConsoleError, args, true, undefined, "error");
 console.warn = (...args) => writeConsole(nativeConsoleWarn, args, true, undefined, "warn");
+Object.defineProperty(console, Symbol.for("cottontail.reportError.console"), {
+  value: error => writeConsole(nativeConsoleError, [error], true, undefined, "error", false),
+  configurable: true,
+});
 console.info = console.log;
 console.debug = console.log;
 {
@@ -1528,6 +1567,17 @@ CottontailBuffer.byteLength = function byteLength(value, encoding = "utf8") {
 };
 
 g.Buffer = typeof g.Buffer === "function" ? g.Buffer : CottontailBuffer;
+if (g.Buffer !== CottontailBuffer && typeof g.Buffer.from === "function" && !g.Buffer.from.__cottontailHexPatched) {
+  const existingBufferFrom = g.Buffer.from.bind(g.Buffer);
+  const patchedBufferFrom = function from(value, encodingOrOffset, length) {
+    if (typeof value === "string" && typeof encodingOrOffset === "string" && encodingOrOffset.toLowerCase() === "hex") {
+      return existingBufferFrom(hexDecode(value));
+    }
+    return existingBufferFrom(value, encodingOrOffset, length);
+  };
+  patchedBufferFrom.__cottontailHexPatched = true;
+  g.Buffer.from = patchedBufferFrom;
+}
 g.Buffer.from ??= CottontailBuffer.from;
 g.Buffer.alloc ??= CottontailBuffer.alloc;
 g.Buffer.allocUnsafe ??= CottontailBuffer.allocUnsafe;
@@ -1892,6 +1942,7 @@ function installWorkerNativeEventHandler() {
     const worker = workerInstances.get(Number(event?.id));
     if (!worker) return;
     if (event?.type === "exit") {
+      worker._refed = false;
       workerInstances.delete(worker.id);
       if (worker._pollTimer != null) clearInterval(worker._pollTimer);
       worker._emit("exit", { code: 0 });
@@ -1931,7 +1982,9 @@ g.__cottontailHasActiveHandles = () => {
     if (hasWorkerMessageListener()) return true;
     if (g.__cottontailWebHasActiveHandles?.()) return true;
   }
-  if (workerInstances.size > 0) return true;
+  for (const worker of workerInstances.values()) {
+    if (worker.hasRef()) return true;
+  }
   for (const timer of timers.values()) {
     if (timer.ref !== false) return true;
   }
@@ -1983,13 +2036,16 @@ function rewriteWorkerNamedImports(spec) {
 }
 
 const workerBundleCache = new Map();
+const workerRuntimePreludeCache = new Map();
+const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
+const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 
 function workerTempDir() {
   const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
   return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
 }
 
-function prepareWorkerScriptPath(scriptPath) {
+function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const cacheKey = normalizeWorkerScriptPath(scriptPath);
   let target = cacheKey;
   const cached = workerBundleCache.get(cacheKey);
@@ -2014,6 +2070,23 @@ function prepareWorkerScriptPath(scriptPath) {
   const slashCwd = String(cottontail.cwd()).replace(/\\/g, "/");
   const slashTarget = String(target).replace(/\\/g, "/");
   const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/index.js`;
+  if (options?.[preparedWorkerScript] === true) {
+    let runtimePrelude = workerRuntimePreludeCache.get(slashCwd);
+    if (runtimePrelude === undefined) {
+      const preludeEntry = `${tempDir}/bun-worker-runtime-${nonce}.mjs`;
+      cottontail.writeFile(preludeEntry, `import ${JSON.stringify(runtimeEntry)};`);
+      runtimePrelude = cottontail.bundleNative(preludeEntry, cottontail.cwd(), JSON.stringify({
+        format: "esm",
+        target: "bun",
+        includeRuntimeModules: true,
+        inlineImportMetaProperties: true,
+      }));
+      workerRuntimePreludeCache.set(slashCwd, runtimePrelude);
+    }
+    const source = cottontail.readFile(target);
+    cottontail.writeFile(bundledPath, `${runtimePrelude}\n${source}\n//# sourceURL=${slashTarget}`);
+    return bundledPath;
+  }
   try {
     cottontail.writeFile(wrapperPath, [
       `import ${JSON.stringify(runtimeEntry)};`,
@@ -2064,13 +2137,16 @@ function prepareWorkerScriptPath(scriptPath) {
 }
 
 g.Worker ??= class Worker {
-  constructor(scriptPath) {
-    this.scriptPath = prepareWorkerScriptPath(scriptPath);
-    this.handle = cottontail.spawnWorker(this.scriptPath);
+  constructor(scriptPath, options = undefined) {
+    this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
+    this.handle = cottontail.spawnWorker(this.scriptPath, options?.[workerEvalSource]);
     this.id = this.handle.id;
     this.onmessage = null;
     this.onerror = null;
     this._listeners = new Map();
+    this._refed = typeof cottontail.workerHasRef === "function"
+      ? Boolean(cottontail.workerHasRef(this.id))
+      : true;
     workerInstances.set(this.id, this);
     this._pollTimer = installWorkerNativeEventHandler() ? null : setInterval(() => this._poll(), 16);
   }
@@ -2103,8 +2179,30 @@ g.Worker ??= class Worker {
   }
   terminate() {
     if (this._pollTimer != null) clearInterval(this._pollTimer);
+    this._refed = false;
     workerInstances.delete(this.id);
     cottontail.workerTerminate(this.id);
+  }
+  ref() {
+    this._refed = typeof cottontail.workerSetRef === "function"
+      ? Boolean(cottontail.workerSetRef(this.id, true))
+      : true;
+    if (this._refed) this._pollTimer?.ref?.();
+    return this;
+  }
+  unref() {
+    if (typeof cottontail.workerSetRef === "function") {
+      cottontail.workerSetRef(this.id, false);
+    }
+    this._refed = false;
+    this._pollTimer?.unref?.();
+    return this;
+  }
+  hasRef() {
+    if (typeof cottontail.workerHasRef === "function") {
+      this._refed = Boolean(cottontail.workerHasRef(this.id));
+    }
+    return this._refed;
   }
   addEventListener(name, handler) {
     return this._add(String(name), handler);
@@ -2120,264 +2218,654 @@ g.Worker ??= class Worker {
 const pointerKeepalive = [];
 
 export const FFIType = {
-  void: "void",
-  bool: "bool",
-  u8: "u8",
-  i8: "i8",
-  u16: "u16",
-  i16: "i16",
-  int: "int",
-  u32: "u32",
-  i32: "i32",
-  u64: "u64",
-  i64: "i64",
-  f32: "f32",
-  f64: "f64",
-  ptr: "ptr",
-  pointer: "ptr",
-  cstring: "cstring",
-  function: "function",
+  0: 0,
+  1: 1,
+  2: 2,
+  3: 3,
+  4: 4,
+  5: 5,
+  6: 6,
+  7: 7,
+  8: 8,
+  9: 9,
+  10: 10,
+  11: 11,
+  12: 12,
+  13: 13,
+  14: 14,
+  15: 15,
+  16: 16,
+  17: 17,
+  bool: 11,
+  c_int: 5,
+  c_uint: 6,
+  char: 0,
+  "char*": 12,
+  double: 9,
+  f32: 10,
+  f64: 9,
+  float: 10,
+  i16: 3,
+  i32: 5,
+  i64: 7,
+  i8: 1,
+  int: 5,
+  int16_t: 3,
+  int32_t: 5,
+  int64_t: 7,
+  int8_t: 1,
+  isize: 7,
+  u16: 4,
+  u32: 6,
+  u64: 8,
+  u8: 2,
+  uint16_t: 4,
+  uint32_t: 6,
+  uint64_t: 8,
+  uint8_t: 2,
+  usize: 8,
+  "void*": 12,
+  ptr: 12,
+  pointer: 12,
+  void: 13,
+  cstring: 14,
+  i64_fast: 15,
+  u64_fast: 16,
+  function: 17,
+  callback: 17,
+  fn: 17,
+  napi_env: 18,
+  napi_value: 19,
+  buffer: 20,
 };
 
 export const suffix = platform() === "win32" ? "dll" : platform() === "darwin" ? "dylib" : "so";
 
-function normalizeType(type) {
-  if (type === FFIType.pointer) return FFIType.ptr;
-  if (type === "callback") return FFIType.function;
-  const name = String(type ?? FFIType.void);
-  if (name === "uint64_t" || name === "usize" || name === "size_t") return FFIType.u64;
-  if (name === "int64_t" || name === "isize" || name === "ssize_t") return FFIType.i64;
-  return name;
+const ffiNativeTypes = [
+  "i8",
+  "i8",
+  "u8",
+  "i16",
+  "u16",
+  "i32",
+  "u32",
+  "i64",
+  "u64",
+  "f64",
+  "f32",
+  "bool",
+  "ptr",
+  "void",
+  "cstring",
+  "i64",
+  "u64",
+  "function",
+  "napi_env",
+  "napi_value",
+  "ptr",
+];
+
+const ffiCTypeNames = [
+  "char",
+  "int8_t",
+  "uint8_t",
+  "int16_t",
+  "uint16_t",
+  "int32_t",
+  "uint32_t",
+  "int64_t",
+  "uint64_t",
+  "double",
+  "float",
+  "bool",
+  "void *",
+  "void",
+  "char *",
+  "int64_t",
+  "uint64_t",
+  "void *",
+  "napi_env",
+  "napi_value",
+  "void *",
+];
+
+const ffiTypeAliases = {
+  size_t: FFIType.usize,
+  ssize_t: FFIType.isize,
+};
+
+const supportedFFITypes = Object.keys(FFIType).filter((name) => !/^\d+$/.test(name)).sort().join(", ");
+
+function ffiTypeId(type, fallback = undefined) {
+  if (type == null && fallback !== undefined) return fallback;
+  if (typeof type === "number" && Number.isInteger(type) && type >= 0 && type < ffiNativeTypes.length) return type;
+  if (typeof type === "string") {
+    const value = Object.prototype.hasOwnProperty.call(FFIType, type) ? FFIType[type] : ffiTypeAliases[type];
+    if (typeof value === "number") return value;
+  }
+  throw new TypeError(`Unsupported type ${String(type)}. Must be one of: ${supportedFFITypes}`);
 }
 
 function normalizeLibraryPath(value) {
   if (value && typeof value === "object") {
-    if (typeof value._bunFilePath === "string") value = value._bunFilePath;
+    if (value instanceof URL) value = value.href;
+    else if (typeof value._bunFilePath === "string") value = value._bunFilePath;
     else if (typeof value.href === "string") value = value.href;
     else if (typeof value.name === "string") value = value.name;
   }
-  const path = String(value);
+  if (typeof value !== "string") throw new TypeError("Expected string");
+  const path = value;
   if (!path.startsWith("file:")) return path;
   const url = new URL(path);
   if (url.protocol !== "file:") return path;
-  return decodeURIComponent(url.pathname);
+  let pathname = decodeURIComponent(url.pathname);
+  if (platform() === "win32" && /^\/[A-Za-z]:/.test(pathname)) pathname = pathname.slice(1);
+  return pathname;
 }
 
-function toNumber(value) {
-  if (typeof value === "bigint") return Number(value);
-  if (typeof value === "number") return value;
-  if (value && typeof value.ptr === "number") return value.ptr;
-  return Number(value || 0);
+function invalidPointer(message) {
+  const error = new TypeError(message);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
 }
 
-export function ptr(value) {
-  if (value == null) return 0;
-  if (value instanceof JSCallback) return value.ptr;
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    pointerKeepalive.push(value);
-    if (pointerKeepalive.length > 4096) pointerKeepalive.splice(0, 1024);
+function isBufferSource(value) {
+  return value instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) ||
+    ArrayBuffer.isView(value);
+}
+
+function keepPointerAlive(value) {
+  pointerKeepalive.push(value);
+  if (pointerKeepalive.length > 4096) pointerKeepalive.splice(0, 1024);
+}
+
+export function ptr(value, byteOffset) {
+  if (!isBufferSource(value)) {
+    throw invalidPointer(`Expected ArrayBufferView but received ${value == null ? "null" : Object.prototype.toString.call(value)}`);
   }
-  return toNumber(cottontail.memoryAddress(value));
+  if (value.byteLength === 0) {
+    throw invalidPointer("ArrayBufferView must have a length > 0. A pointer to empty memory doesn't work");
+  }
+  let offset = 0;
+  if (byteOffset !== undefined && byteOffset !== null) {
+    if (typeof byteOffset !== "number" || !Number.isFinite(byteOffset)) {
+      throw invalidPointer("Expected number for byteOffset");
+    }
+    offset = Math.trunc(byteOffset);
+  }
+  if (offset > value.byteLength) throw invalidPointer("byteOffset out of bounds");
+  keepPointerAlive(value);
+  const address = Number(cottontail.memoryAddress(value)) + offset;
+  if (!Number.isFinite(address) || address <= 0) throw invalidPointer("Pointer must not be 0");
+  return address;
 }
 
-export function toArrayBuffer(pointer, offset = 0, length = 0) {
-  return cottontail.memoryView(pointer, offset, length);
+function pointerNumber(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw invalidPointer(value === 0
+      ? "ptr cannot be zero, that would segfault Bun :("
+      : "ptr must be a number.");
+  }
+  return value;
 }
 
-export function toBuffer(pointer, offset = 0, length = 0) {
-  return globalThis.Buffer.from(new Uint8Array(toArrayBuffer(pointer, offset, length)));
+function pointerOffset(value) {
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== "number" || !Number.isFinite(value)) throw invalidPointer("Expected number for byteOffset");
+  return Math.trunc(value);
+}
+
+function pointerLength(value, explicit) {
+  if (!explicit) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) throw invalidPointer("length must be a number.");
+  const length = Math.trunc(value);
+  if (length <= 0) throw invalidPointer("length must be > 0. This usually means a bug in your code.");
+  if (!Number.isSafeInteger(length)) {
+    throw invalidPointer("length exceeds max addressable memory. This usually means a bug in your code.");
+  }
+  return length;
+}
+
+function memoryUntilNul(pointer, offset = 0) {
+  const chunkSize = 4096;
+  const maxLength = 8 * 1024 * 1024;
+  for (let length = 0; length < maxLength; length += chunkSize) {
+    const chunk = new Uint8Array(cottontail.memoryView(pointer, offset + length, Math.min(chunkSize, maxLength - length)));
+    const nul = chunk.indexOf(0);
+    if (nul >= 0) return length + nul;
+  }
+  throw new RangeError("CString exceeds the 8 MiB safety limit");
+}
+
+const pointerViewFinalizers = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry(({ address, callback, context }) => {
+      try {
+        cottontail.nativeCallPointer(callback, "void", ["ptr", "ptr"], [address, context]);
+      } catch {}
+    })
+  : null;
+
+function finalizerPointer(value, label, allowNull = false) {
+  if (value instanceof JSCallback) value = value.ptr;
+  if (allowNull && (value === undefined || value === null)) return 0;
+  if ((typeof value !== "number" && typeof value !== "bigint") || !Number.isFinite(Number(value)) || Number(value) <= 0) {
+    throw new TypeError(`Expected ${label} to be a C pointer (number or BigInt)`);
+  }
+  return Number(value);
+}
+
+export function toArrayBuffer(pointer, byteOffset = undefined, byteLength = undefined, finalizationCtxOrPtr = undefined, finalizationCallback = undefined) {
+  const address = pointerNumber(pointer);
+  const offset = pointerOffset(byteOffset);
+  const explicitLength = arguments.length >= 3 && byteLength !== undefined && byteLength !== null;
+  const length = pointerLength(byteLength, explicitLength) ?? memoryUntilNul(address, offset);
+  const arrayBuffer = cottontail.memoryView(address, offset, length);
+  if (finalizationCtxOrPtr != null || finalizationCallback != null) {
+    if (!pointerViewFinalizers) throw new Error("FinalizationRegistry is unavailable in this JavaScriptCore build");
+    const callback = finalizerPointer(finalizationCallback ?? finalizationCtxOrPtr, "callback");
+    const context = finalizationCallback == null ? 0 : finalizerPointer(finalizationCtxOrPtr, "user data", true);
+    pointerViewFinalizers.register(arrayBuffer, { address: address + offset, callback, context });
+  }
+  return arrayBuffer;
+}
+
+export function toBuffer(pointer, byteOffset = undefined, byteLength = undefined, finalizationCtxOrPtr = undefined, finalizationCallback = undefined) {
+  const arrayBuffer = toArrayBuffer(pointer, byteOffset, byteLength, finalizationCtxOrPtr, finalizationCallback);
+  return globalThis.Buffer.from(arrayBuffer);
 }
 
 function dataView(pointer, byteLength, offset = 0) {
-  return new DataView(toArrayBuffer(pointer, offset, byteLength));
+  return new DataView(cottontail.memoryView(pointerNumber(pointer), pointerOffset(offset), byteLength));
 }
 
 export const read = {
   u8(pointer, offset = 0) { return dataView(pointer, 1, offset).getUint8(0); },
-  i8(pointer, offset = 0) { return dataView(pointer, 1, offset).getInt8(0); },
   u16(pointer, offset = 0) { return dataView(pointer, 2, offset).getUint16(0, true); },
-  i16(pointer, offset = 0) { return dataView(pointer, 2, offset).getInt16(0, true); },
   u32(pointer, offset = 0) { return dataView(pointer, 4, offset).getUint32(0, true); },
+  ptr(pointer, offset = 0) { return Number(dataView(pointer, 8, offset).getBigUint64(0, true)); },
+  i8(pointer, offset = 0) { return dataView(pointer, 1, offset).getInt8(0); },
+  i16(pointer, offset = 0) { return dataView(pointer, 2, offset).getInt16(0, true); },
   i32(pointer, offset = 0) { return dataView(pointer, 4, offset).getInt32(0, true); },
-  u64(pointer, offset = 0) { return dataView(pointer, 8, offset).getBigUint64(0, true); },
   i64(pointer, offset = 0) { return dataView(pointer, 8, offset).getBigInt64(0, true); },
-  ptr(pointer, offset = 0) {
-    const view = dataView(pointer, 8, offset);
-    return Number(view.getBigUint64(0, true));
-  },
-  intptr(pointer, offset = 0) {
-    const view = dataView(pointer, 8, offset);
-    return Number(view.getBigInt64(0, true));
-  },
+  u64(pointer, offset = 0) { return dataView(pointer, 8, offset).getBigUint64(0, true); },
+  intptr(pointer, offset = 0) { return Number(dataView(pointer, 8, offset).getBigInt64(0, true)); },
   f32(pointer, offset = 0) { return dataView(pointer, 4, offset).getFloat32(0, true); },
   f64(pointer, offset = 0) { return dataView(pointer, 8, offset).getFloat64(0, true); },
-  cstring(pointer, offset = 0) { return new CString(toNumber(pointer) + Number(offset)); },
 };
 
 function readCString(pointer) {
-  if (typeof pointer === "string") return pointer;
-  const address = toNumber(pointer);
-  if (!address) return "";
-  const chunks = [];
-  const maxLength = 8 * 1024 * 1024;
-  const chunkSize = 64 * 1024;
-  let totalLength = 0;
-  for (let offset = 0; offset < maxLength; offset += chunkSize) {
-    const view = new Uint8Array(cottontail.memoryView(address, offset, Math.min(chunkSize, maxLength - offset)));
-    const nulIndex = view.indexOf(0);
-    if (nulIndex >= 0) {
-      chunks.push(view.slice(0, nulIndex));
-      totalLength += nulIndex;
-      break;
-    }
-    chunks.push(view.slice());
-    totalLength += view.length;
-  }
-  const bytes = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return stringFromBytes(bytes);
+  const address = pointerNumber(pointer);
+  const length = memoryUntilNul(address);
+  return stringFromBytes(new Uint8Array(cottontail.memoryView(address, 0, length)));
 }
 
-// Callable with or without `new` (bun semantics, issue #25231): without
-// `new` it returns the decoded primitive string. Optional byteOffset and
-// byteLength narrow the read window; without byteLength the string is read
-// up to the first NUL byte.
-export function CString(value, byteOffset = undefined, byteLength = undefined) {
-  if (!new.target) {
-    return String(new CString(value, byteOffset, byteLength));
+const cstringArrayBuffers = new WeakMap();
+
+export class CString extends String {
+  constructor(value, byteOffset, byteLength) {
+    const pointer = value == null ? 0 : value;
+    let text = "";
+    if (pointer !== 0) {
+      const address = pointerNumber(pointer);
+      const offset = pointerOffset(byteOffset);
+      if (byteLength === undefined || byteLength === null) {
+        text = readCString(address + offset);
+      } else {
+        const length = pointerLength(byteLength, true);
+        text = stringFromBytes(new Uint8Array(cottontail.memoryView(address, offset, length)));
+      }
+    }
+    super(text);
+    this.ptr = typeof pointer === "number" ? pointer : 0;
+    this.byteOffset = byteOffset;
+    this.byteLength = byteLength;
   }
-  if (typeof value === "string") {
-    this.text = value;
-    this.buffer = bytesFromString(`${value}\0`);
-    this.ptr = ptr(this.buffer);
-    return;
-  }
-  const offset = Number(byteOffset ?? 0) || 0;
-  const address = toNumber(value) + offset;
-  this.ptr = toNumber(value);
-  this.byteOffset = offset;
-  if (byteLength === undefined || byteLength === null) {
-    this.text = readCString(address);
-  } else {
-    const length = Number(byteLength) || 0;
-    this.byteLength = length;
-    const view = new Uint8Array(cottontail.memoryView(address, 0, length));
-    this.text = stringFromBytes(view.slice());
+
+  get arrayBuffer() {
+    const cached = cstringArrayBuffers.get(this);
+    if (cached) return cached;
+    const arrayBuffer = !this.ptr
+      ? new ArrayBuffer(0)
+      : toArrayBuffer(this.ptr, this.byteOffset ?? 0, this.byteLength);
+    cstringArrayBuffers.set(this, arrayBuffer);
+    return arrayBuffer;
   }
 }
-CString.prototype.toString = function toString() {
-  return this.text;
-};
-Object.defineProperty(CString.prototype, "length", {
-  configurable: true,
-  get() {
-    return this.text.length;
-  },
-});
+
+const callbackState = new WeakMap();
 
 export class JSCallback {
-  constructor(fn, options = {}) {
-    this.fn = fn;
-    this.options = options;
-    this.args = (options.args || []).map(normalizeType);
-    this.returns = normalizeType(options.returns || FFIType.void);
-    this.threadsafe = Boolean(options.threadsafe);
-    this.ptr = cottontail.createCallback(fn, this.args, this.returns, this.threadsafe);
-  }
-  close() {
-    if (this.ptr) {
-      cottontail.closeCallback?.(this.ptr);
-      this.ptr = 0;
+  constructor(fn, options) {
+    if (typeof fn !== "function") throw new TypeError("Expected callback to be a function");
+    options ??= {};
+    if (options == null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("Expected callback options to be an object");
     }
+    const argIds = functionArgs(options.args);
+    const returnId = ffiTypeId(options.returns, FFIType.void);
+    const threadsafe = Boolean(options.threadsafe);
+    const callback = (...args) => {
+      const converted = args.map((value, index) => callbackValue(value, argIds[index] ?? FFIType.ptr));
+      return nativeArg(fn(...converted), returnId);
+    };
+    const pointer = cottontail.createCallback(callback, argIds.map((id) => ffiNativeTypes[id]), ffiNativeTypes[returnId], threadsafe);
+    if (typeof pointer !== "number" || pointer <= 0) throw new Error("failed to create FFI callback");
+    this.ptr = pointer;
+    callbackState.set(this, { callback, pointer, threadsafe });
   }
+
+  get threadsafe() {
+    return callbackState.get(this)?.threadsafe ?? false;
+  }
+
+  [Symbol.toPrimitive]() {
+    return typeof this.ptr === "number" ? this.ptr : 0;
+  }
+
+  close() {
+    const state = callbackState.get(this);
+    const pointer = this.ptr;
+    this.ptr = null;
+    if (!state || !pointer) return;
+    callbackState.delete(this);
+    cottontail.closeCallback?.(pointer);
+  }
+
+  [Symbol.dispose]() {
+    this.close();
+  }
+}
+
+function functionArgs(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new TypeError('Expected "args" to be an array');
+  return value.map((type) => ffiTypeId(type));
+}
+
+function exactNativeInteger(value) {
+  const text = value.toString();
+  return {
+    toString() { return text; },
+    [Symbol.toPrimitive](hint) {
+      if (hint === "number") throw new TypeError("exact 64-bit integer");
+      return text;
+    },
+  };
+}
+
+function nativeWord(value, bits, signed) {
+  let bigint;
+  try {
+    bigint = typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value) || 0));
+  } catch {
+    bigint = 0n;
+  }
+  const word = BigInt.asUintN(bits, bigint);
+  return word <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(word) : exactNativeInteger(word);
+}
+
+function pointerArgument(value, functionPointer = false) {
+  if (value == null) return null;
+  if (value instanceof JSCallback || value instanceof CString) value = value.ptr;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError(`Unable to convert ${String(value)} to a pointer`);
+    return value;
+  }
+  if (functionPointer && typeof value === "bigint") return Number(value);
+  if (ArrayBuffer.isView(value)) return value;
+  if (isBufferSource(value) && !ArrayBuffer.isView(value)) return ptr(value);
+  if (typeof value === "string") throw new TypeError("To convert a string to a pointer, encode it as a buffer");
+  if (functionPointer && value && (typeof value.ptr === "number" || typeof value.ptr === "bigint")) {
+    return Number(value.ptr);
+  }
+  throw new TypeError(functionPointer
+    ? "Expected function to be a JSCallback or a number"
+    : `Unable to convert ${String(value)} to a pointer`);
 }
 
 function nativeArg(value, type) {
-  if (type === FFIType.function && value instanceof JSCallback) return value.ptr;
-  if (value instanceof JSCallback) return value.ptr;
-  if (value instanceof CString) return value.ptr;
-  if (typeof value === "string" && type === FFIType.cstring) return new CString(value).ptr;
-  return value;
+  const id = typeof type === "number" ? type : ffiTypeId(type);
+  switch (id) {
+    case 0:
+    case 1:
+      return nativeWord(Number(value) | 0, 8, true);
+    case 2: {
+      const number = Number(value) || 0;
+      return number < 0 ? 0 : number >= 255 ? 255 : number | 0;
+    }
+    case 3: {
+      const number = Number(value) || 0;
+      return nativeWord(number <= -32768 ? -32768 : number >= 32768 ? 32768 : number | 0, 16, true);
+    }
+    case 4: {
+      const number = typeof value === "bigint" ? Number(value) : Number(value);
+      const integer = number | 0;
+      return integer <= 0 ? 0 : integer > 0xffff ? 0xffff : integer;
+    }
+    case 5:
+      return nativeWord(Number(value) | 0, 32, true);
+    case 6: {
+      const number = Number(value) || 0;
+      return number < 0 ? 0 : number > 0xffffffff ? 0xffffffff : number >>> 0;
+    }
+    case 7:
+      return nativeWord(value, 64, true);
+    case 8:
+      return nativeWord(typeof value === "bigint" ? value : Math.max(0, Number(value) || 0), 64, false);
+    case 9:
+      return typeof value === "bigint" ? Number(value) : Number(value) || 0;
+    case 10:
+      return Math.fround(Number(value) || 0);
+    case 11:
+      return Boolean(value);
+    case 12:
+    case 14:
+      return pointerArgument(value);
+    case 13:
+      return undefined;
+    case 15: {
+      if (typeof value === "bigint" && value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)) {
+        return nativeWord(Number(value), 64, true);
+      }
+      return nativeWord(value, 64, true);
+    }
+    case 16: {
+      if (typeof value === "bigint" && value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= 0n) {
+        return Number(value);
+      }
+      return nativeWord(typeof value === "bigint" ? value : Math.max(0, Number(value) || 0), 64, false);
+    }
+    case 17:
+      return pointerArgument(value, true);
+    case 18:
+    case 19:
+      return value;
+    case 20:
+      if (!ArrayBuffer.isView(value)) throw new TypeError("Expected a TypedArray");
+      return value;
+    default:
+      return value;
+  }
+}
+
+function callbackValue(value, type) {
+  switch (type) {
+    case 7:
+    case 8:
+      return typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value) || 0));
+    case 15:
+    case 16:
+      return value;
+    case 11:
+      return Boolean(value);
+    case 12:
+    case 17:
+      return value ? Number(value) : null;
+    default:
+      return value;
+  }
 }
 
 function returnForType(type, value) {
-  switch (normalizeType(type)) {
-    case FFIType.void:
+  const id = typeof type === "number" ? type : ffiTypeId(type);
+  switch (id) {
+    case 13:
       return undefined;
-    case FFIType.bool:
+    case 11:
       return Boolean(value);
-    case FFIType.cstring:
-      return value ? new CString(value) : null;
-    case "napi_value":
+    case 14:
+      return new CString(value || 0);
+    case 19:
       return value;
-    case FFIType.u64:
-    case FFIType.i64:
+    case 7:
+    case 8:
       return typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value || 0)));
+    case 15:
+    case 16:
+      if (typeof value !== "bigint") return Number(value || 0);
+      if (value <= BigInt(Number.MAX_SAFE_INTEGER) && (id === 15 || value >= 0n)) return Number(value);
+      return value;
+    case 12:
+    case 17:
+      return value ? Number(value) : null;
     default:
       return value == null ? 0 : Number(value);
   }
 }
 
+function validateSymbolOptions(symbols) {
+  if (symbols == null || typeof symbols !== "object" || Array.isArray(symbols)) {
+    throw new TypeError("Expected an options object with symbol names");
+  }
+  const entries = Object.entries(symbols);
+  if (entries.length === 0) throw new TypeError("Expected at least one symbol");
+  return entries;
+}
+
+function symbolSpec(name, value, requirePointer) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`Symbol "${name}" must be an object`);
+  }
+  const args = functionArgs(value.args);
+  const returns = ffiTypeId(value.returns, FFIType.void);
+  let pointer;
+  if (requirePointer) {
+    pointer = value.ptr ?? value.pointer;
+    if ((typeof pointer !== "number" && typeof pointer !== "bigint") || !Number.isFinite(Number(pointer)) || Number(pointer) <= 0) {
+      throw new TypeError(`Symbol "${name}" is missing a "ptr" field. When using linkSymbols() or CFunction(), you must provide a "ptr" field with the memory address of the native function.`);
+    }
+    pointer = Number(pointer);
+  }
+  return { args, returns, pointer };
+}
+
+function arityWrapper(call, count) {
+  switch (count) {
+    case 0: return function () { return call([]); };
+    case 1: return function (a) { return call([a]); };
+    case 2: return function (a, b) { return call([a, b]); };
+    case 3: return function (a, b, c) { return call([a, b, c]); };
+    case 4: return function (a, b, c, d) { return call([a, b, c, d]); };
+    case 5: return function (a, b, c, d, e) { return call([a, b, c, d, e]); };
+    case 6: return function (a, b, c, d, e, f) { return call([a, b, c, d, e, f]); };
+    case 7: return function (a, b, c, d, e, f, h) { return call([a, b, c, d, e, f, h]); };
+    case 8: return function (a, b, c, d, e, f, h, i) { return call([a, b, c, d, e, f, h, i]); };
+    default: return function (...args) { return call(args); };
+  }
+}
+
+function ffiCallable(name, spec, invoke) {
+  const call = (args) => {
+    const nativeArgs = spec.args.map((type, index) => nativeArg(args[index], type));
+    return returnForType(spec.returns, invoke(nativeArgs));
+  };
+  const nativeFunction = arityWrapper(call, spec.args.length);
+  const wrapped = spec.args.length > 0 || spec.returns === FFIType.cstring
+    ? arityWrapper(call, spec.args.length)
+    : nativeFunction;
+  Object.defineProperty(nativeFunction, "name", { value: name, configurable: true });
+  if (wrapped !== nativeFunction) Object.defineProperty(wrapped, "name", { value: name, configurable: true });
+  wrapped.native = nativeFunction;
+  nativeFunction.native = nativeFunction;
+  return wrapped;
+}
+
+function closeHandle() {
+  let closed = false;
+  return function close() {
+    if (closed) return undefined;
+    closed = true;
+    return undefined;
+  };
+}
+
+function wrapLibraryError(error, libraryPath, symbolName = undefined) {
+  const detail = String(error?.message ?? error);
+  if (/dlopen|failed to open|cannot open|no such file|image not found/i.test(detail)) {
+    throw new Error(`Failed to open library "${libraryPath}": ${detail}`);
+  }
+  if (symbolName) throw new Error(`Symbol "${symbolName}" not found in library "${libraryPath}": ${detail}`);
+  throw error;
+}
+
+function defineSymbol(target, name, value) {
+  Object.defineProperty(target, name, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
 export function dlopen(path, symbols) {
   const libraryPath = normalizeLibraryPath(path);
   const wrapped = {};
-  for (const [name, spec] of Object.entries(symbols || {})) {
-    const argTypes = (spec.args || []).map(normalizeType);
-    const returns = normalizeType(spec.returns || FFIType.void);
-    wrapped[name] = (...args) => {
-      const nativeArgs = args.map((arg, index) => nativeArg(arg, argTypes[index] || FFIType.ptr));
-      const result = cottontail.nativeCall(libraryPath, name, returns, argTypes, nativeArgs);
-      return returnForType(returns, result);
-    };
+  for (const [name, value] of validateSymbolOptions(symbols)) {
+    const spec = symbolSpec(name, value, false);
+    let pointer;
     try {
-      wrapped[name].ptr = cottontail.nativeSymbol(libraryPath, name);
+      pointer = Number(cottontail.nativeSymbol(libraryPath, name));
     } catch (error) {
-      const detail = String(error?.message ?? error);
-      if (/dlopen|failed to open|cannot open|no such file/i.test(detail)) {
-        throw new Error(`Failed to open library "${libraryPath}": ${detail}`);
-      }
-      throw new Error(`Symbol "${name}" not found in library "${libraryPath}": ${detail}`);
+      wrapLibraryError(error, libraryPath, name);
     }
-    wrapped[name].native = true;
+    const callable = ffiCallable(name, spec, (nativeArgs) =>
+      cottontail.nativeCall(libraryPath, name, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+    callable.ptr = pointer;
+    callable.native.ptr = pointer;
+    defineSymbol(wrapped, name, callable);
   }
-  return { symbols: wrapped, close() {} };
+  return { symbols: wrapped, close: closeHandle() };
 }
 
-export class CFunction {
-  constructor(pointerOrSpec, options = {}) {
-    const spec = pointerOrSpec && typeof pointerOrSpec === "object" && !(pointerOrSpec instanceof ArrayBuffer) && !ArrayBuffer.isView(pointerOrSpec)
-      ? pointerOrSpec
-      : { ptr: pointerOrSpec, ...options };
-    const pointerValue = ptr(spec.ptr ?? spec.pointer);
-    const argTypes = (spec.args || []).map(normalizeType);
-    const returns = normalizeType(spec.returns || FFIType.void);
-    const callable = (...args) => {
-      const nativeArgs = args.map((arg, index) => nativeArg(arg, argTypes[index] || FFIType.ptr));
-      return returnForType(returns, cottontail.nativeCallPointer(pointerValue, returns, argTypes, nativeArgs));
-    };
-    Object.setPrototypeOf(callable, new.target.prototype);
-    callable.ptr = pointerValue;
-    callable.options = spec;
-    callable.args = argTypes;
-    callable.returns = returns;
-    callable.native = true;
-    return callable;
-  }
+let cFunctionId = 0;
+
+export function CFunction(pointerOrSpec, options = {}) {
+  const value = pointerOrSpec && typeof pointerOrSpec === "object" && !(pointerOrSpec instanceof ArrayBuffer) && !ArrayBuffer.isView(pointerOrSpec)
+    ? pointerOrSpec
+    : { ptr: pointerOrSpec, ...options };
+  const name = `CFunction${cFunctionId++}`;
+  const spec = symbolSpec(name, value, true);
+  const callable = ffiCallable(name, spec, (nativeArgs) =>
+    cottontail.nativeCallPointer(spec.pointer, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+  callable.ptr = spec.pointer;
+  callable.native.ptr = spec.pointer;
+  callable.close = closeHandle();
+  callable[Symbol.dispose] = callable.close;
+  return callable;
 }
 
-export function linkSymbols(symbols = {}) {
+export function linkSymbols(symbols) {
   const wrapped = {};
-  for (const [name, spec] of Object.entries(symbols)) {
-    if (!spec || (typeof spec.ptr !== "number" && typeof spec.ptr !== "bigint") || Number(spec.ptr) === 0) {
-      throw new TypeError(`${name}: you must provide a "ptr" field with the memory address of the native function. This is required by linkSymbols() and CFunction.`);
-    }
-    wrapped[name] = new CFunction(spec);
+  for (const [name, value] of validateSymbolOptions(symbols)) {
+    const spec = symbolSpec(name, value, true);
+    const callable = ffiCallable(name, spec, (nativeArgs) =>
+      cottontail.nativeCallPointer(spec.pointer, ffiNativeTypes[spec.returns], spec.args.map((id) => ffiNativeTypes[id]), nativeArgs));
+    callable.ptr = spec.pointer;
+    callable.native.ptr = spec.pointer;
+    defineSymbol(wrapped, name, callable);
   }
-  return { symbols: wrapped, close() {} };
+  return { symbols: wrapped, close: closeHandle() };
 }
 
 function pathJoin(...parts) {
@@ -2401,22 +2889,34 @@ function compilerCommand() {
 }
 
 function sourcePathForCc(source) {
-  const text = String(source ?? "");
+  let text = source;
+  if (text && typeof text === "object") text = normalizeLibraryPath(text);
+  text = String(text ?? "");
+  if (text.startsWith("file:")) text = normalizeLibraryPath(text);
   if (cottontail.existsSync(text)) return text;
   const path = pathJoin(tmpRoot(), `source-${Date.now()}-${Math.floor(Math.random() * 1000000)}.c`);
   cottontail.writeFile(path, text);
   return path;
 }
 
-export function cc(options = {}) {
+function ccArguments(value) {
+  if (value == null) return [];
+  return (Array.isArray(value) ? value : [value]).map(String);
+}
+
+export function cc(options) {
+  if (options == null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("Expected options to be an object");
+  }
   const source = options.source ?? options.file ?? options.path;
   const symbols = options.symbols ?? options.exports;
-  if (source == null) throw new TypeError('Bun.cc requires a "source" file path or source string');
+  if (source == null) throw new TypeError("Expected source to be a string to a file path");
   if (symbols == null || typeof symbols !== "object") throw new TypeError('Bun.cc requires a "symbols" object');
 
   const dir = tmpRoot();
   const output = pathJoin(dir, `libcc-${Date.now()}-${Math.floor(Math.random() * 1000000)}.${suffix}`);
-  const sourcePath = sourcePathForCc(source);
+  const sourcePaths = (Array.isArray(source) ? source : [source]).map(sourcePathForCc);
+  if (sourcePaths.length === 0) throw new TypeError("Expected source to be a string to a file path");
   const compiler = compilerCommand();
   const platformName = platform();
   const sharedArgs = platformName === "darwin"
@@ -2425,7 +2925,16 @@ export function cc(options = {}) {
       ? ["-shared"]
       : ["-shared", "-fPIC"];
   const defines = Object.entries(options.define || {}).map(([name, value]) => `-D${name}=${value == null ? "1" : String(value)}`);
-  const args = [...compiler.prefix, sourcePath, ...sharedArgs, ...defines, "-o", output, ...(options.flags || []), ...(options.args || [])].map(String);
+  const args = [
+    ...compiler.prefix,
+    ...sourcePaths,
+    ...sharedArgs,
+    ...defines,
+    "-o",
+    output,
+    ...ccArguments(options.flags),
+    ...ccArguments(options.args),
+  ].map(String);
   const result = cottontail.spawnSync(compiler.file, args, { stdio: "pipe" });
   if (Number(result.status ?? 0) !== 0) {
     throw new Error(String(result.stderr || result.stdout || `Bun.cc failed with status ${result.status}`));
@@ -2440,13 +2949,50 @@ export function cc(options = {}) {
   }
 }
 
-export const native = {
-  dlopen,
-  callback: JSCallback,
+const nativeDlopen = function dlopen(path) {
+  return dlopen(path, arguments[1]);
 };
 
-export function viewSource(value) {
-  return String(value);
+export const native = {
+  dlopen: nativeDlopen,
+  callback() {
+    throw new Error("Deprecated. Use new JSCallback(options, fn) instead");
+  },
+};
+
+function cIdentifier(value) {
+  const identifier = String(value).replace(/[^A-Za-z0-9_]/g, "_");
+  return /^[0-9]/.test(identifier) ? `_${identifier}` : identifier;
+}
+
+function ffiSource(name, value, callback) {
+  const spec = symbolSpec(name, value, false);
+  const returnType = ffiCTypeNames[spec.returns];
+  const params = spec.args.length === 0
+    ? "void"
+    : spec.args.map((type, index) => `${ffiCTypeNames[type]} arg${index}`).join(", ");
+  const declaration = `${returnType} ${cIdentifier(name)}(${params});`;
+  return [
+    "/* Generated by Cottontail bun:ffi.viewSource(). */",
+    "#include <stdbool.h>",
+    "#include <stdint.h>",
+    "#include <stddef.h>",
+    "typedef void *napi_env;",
+    "typedef void *napi_value;",
+    callback ? "/* Callback ABI declaration used by the libffi closure. */" : "/* Dynamic-library symbol declaration used by libffi. */",
+    declaration,
+    "",
+  ].join("\n");
+}
+
+export function viewSource(value, isCallback = false) {
+  if (isCallback) {
+    if (value == null || typeof value !== "object" || Array.isArray(value)) {
+      throw new TypeError("Expected an object");
+    }
+    return ffiSource("my_callback_function", value, true);
+  }
+  return validateSymbolOptions(value).map(([name, spec]) => ffiSource(name, spec, false));
 }
 
 export default {

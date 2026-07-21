@@ -123,23 +123,29 @@ pub const SyscallAccessor = struct {
         }
 
         pub fn eql(this: Handle, other: Handle) bool {
-            return this.value == other.value;
+            // COTTONTAIL-COMPAT: Cottontail wraps native descriptors in FD,
+            // while Bun's original host represents them as scalar values.
+            return this.value.eql(other.value);
         }
     };
 
     const DirIter = struct {
-        value: DirIterator.WrappedIterator,
+        value: DirIterator.Iterator,
 
         pub inline fn next(self: *DirIter) Maybe(?DirIterator.IteratorResult) {
-            return self.value.next();
+            return switch (self.value.next()) {
+                .result => |entry| .{ .result = entry },
+                .err => |err| .{ .err = Syscall.Error.fromZigErr(err, "readdir", "") },
+            };
         }
 
         pub inline fn iterate(dir: Handle) DirIter {
-            return .{ .value = DirIterator.WrappedIterator.init(dir.value) };
+            return .{ .value = bun.iterateDir(dir.value) };
         }
 
-        pub inline fn setNameFilter(self: *DirIter, filter: ?[]const u16) void {
-            self.value.setNameFilter(filter);
+        pub inline fn setNameFilter(_: *DirIter, _: ?[]const u16) void {
+            // COTTONTAIL-COMPAT: Windows kernel name filtering is an optional
+            // optimization; the portable iterator applies matching in Zig.
         }
     };
 
@@ -341,7 +347,7 @@ pub fn GlobWalker_(
         end_byte_of_basename_excluding_special_syntax: u32 = 0,
         basename_excluding_special_syntax_component_idx: u32 = 0,
 
-        patternComponents: ArrayList(Component) = .{},
+        patternComponents: ArrayList(Component) = .empty,
         matchedPaths: MatchedMap = .{},
         i: u32 = 0,
 
@@ -355,7 +361,7 @@ pub fn GlobWalker_(
 
         pathBuf: bun.PathBuffer = undefined,
         // iteration state
-        workbuf: ArrayList(WorkItem) = ArrayList(WorkItem){},
+        workbuf: ArrayList(WorkItem) = .empty,
 
         /// Array hashmap used as a set (values are the keys)
         /// to store matched paths and prevent duplicates
@@ -699,7 +705,9 @@ pub fn GlobWalker_(
                             },
                             .result => |stat| stat,
                         };
-                        const matches = (bun.S.ISDIR(@intCast(stat_result.mode)) and !this.walker.only_files) or bun.S.ISREG(@intCast(stat_result.mode)) or !this.walker.only_files;
+                        // COTTONTAIL-COMPAT: std.Io.Stat exposes a portable kind;
+                        // avoid interpreting platform-specific mode bits here.
+                        const matches = (stat_result.kind == .directory and !this.walker.only_files) or stat_result.kind == .file or !this.walker.only_files;
                         if (matches) {
                             if (try this.walker.prepareMatchedPath(pathz, dir_path)) |path| {
                                 this.iter_state = .{ .matched = path };
@@ -941,7 +949,7 @@ pub fn GlobWalker_(
                                     const name_z = bun.handleOom(stfb.get().dupeZ(u8, entry_name));
                                     const stat_result = Accessor.lstatat(dir.fd, name_z);
                                     const real_kind = switch (stat_result) {
-                                        .result => |st| bun.sys.kindFromMode(@intCast(st.mode)),
+                                        .result => |st| st.kind,
                                         .err => continue,
                                     };
 
@@ -1834,7 +1842,7 @@ pub fn matchWildcardLiteral(literal: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, literal, path);
 }
 
-const DirIterator = @import("../runtime/node/dir_iterator.zig");
+const DirIterator = bun.DirIterator;
 const ResolvePath = @import("../paths/resolve_path.zig");
 
 const bun = @import("bun");

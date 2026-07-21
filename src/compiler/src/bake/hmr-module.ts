@@ -151,8 +151,23 @@ export class HMRModule {
   }
 
   get importMeta() {
+    const moduleUrl = side === "server"
+      ? new URL(this.id, import.meta.url)
+      : new URL(this.id, location.origin + "/");
+    let modulePath = decodeURIComponent(moduleUrl.pathname);
+    const windowsPath = side === "server" && process.platform === "win32";
+    if (windowsPath && /^\/[A-Za-z]:\//.test(modulePath)) {
+      modulePath = modulePath.slice(1).replaceAll("/", "\\");
+    }
+    const separator = windowsPath ? "\\" : "/";
+    const separatorIndex = modulePath.lastIndexOf(separator);
+    const directory = separatorIndex < 0 ? "" : modulePath.slice(0, separatorIndex);
     const importMeta = {
-      url: `${location.origin}/${this.id}`,
+      dir: directory,
+      dirname: directory,
+      file: separatorIndex < 0 ? modulePath : modulePath.slice(separatorIndex + 1),
+      path: modulePath,
+      url: moduleUrl.href.replaceAll("[", "%5B").replaceAll("]", "%5D"),
       main: false,
       require: this.require.bind(this),
       // transpiler rewrites `import.meta.hot.*` to access `HMRModule.*`

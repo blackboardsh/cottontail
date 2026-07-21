@@ -41,7 +41,7 @@ const sizes = blk: {
         elem.* = .{
             .size = @sizeOf(field_info.type),
             .name = field_info.name,
-            .alignment = if (@sizeOf(field_info.type) == 0) 1 else field_info.alignment,
+            .alignment = if (@sizeOf(field_info.type) == 0) 1 else field_info.alignment orelse @alignOf(field_info.type),
             .type = field_info.type.Slice,
         };
     }
@@ -131,12 +131,12 @@ pub fn readArray(stream: *Stream, allocator: Allocator, comptime ArrayList: type
         .capacity = 0,
     };
 
-    const misaligned = std.mem.bytesAsSlice(PointerType, stream.buffer[start_pos..end_pos]);
-
-    return ArrayList{
-        .items = try allocator.dupe(PointerType, @as([*]PointerType, @alignCast(misaligned.ptr))[0..misaligned.len]),
-        .capacity = misaligned.len,
-    };
+    if (byte_len % @sizeOf(PointerType) != 0) return error.CorruptLockfile;
+    const item_len = byte_len / @sizeOf(PointerType);
+    var result = try ArrayList.initCapacity(allocator, item_len);
+    result.items.len = item_len;
+    @memcpy(std.mem.sliceAsBytes(result.items), stream.buffer[start_pos..end_pos]);
+    return result;
 }
 
 pub fn writeArray(comptime StreamType: type, stream: StreamType, comptime Writer: type, writer: Writer, comptime ArrayList: type, array: ArrayList) !void {
@@ -180,7 +180,7 @@ pub fn writeArray(comptime StreamType: type, stream: StreamType, comptime Writer
 
 pub fn save(
     lockfile: *Lockfile,
-    options: *const PackageManager.Options,
+    options: anytype,
     allocator: Allocator,
     comptime StreamType: type,
     stream: StreamType,
@@ -288,8 +288,16 @@ pub fn legacyPackageToDependencyID(this: Buffers, dependency_visited: ?*Bitset, 
 }
 
 pub fn load(stream: *Stream, allocator: Allocator, log: *logger.Log, pm_: ?*PackageManager) !Buffers {
+    return loadImpl(stream, allocator, log, pm_);
+}
+
+pub fn loadStandalone(stream: *Stream, allocator: Allocator, log: *logger.Log) !Buffers {
+    return loadImpl(stream, allocator, log, null);
+}
+
+fn loadImpl(stream: *Stream, allocator: Allocator, log: *logger.Log, pm_: anytype) !Buffers {
     var this = Buffers{};
-    var external_dependency_list_: std.ArrayListUnmanaged(Dependency.External) = std.ArrayListUnmanaged(Dependency.External){};
+    var external_dependency_list_: std.ArrayListUnmanaged(Dependency.External) = .empty;
 
     inline for (sizes.names) |name| {
         const Type = @TypeOf(@field(this, name));
@@ -301,9 +309,11 @@ pub fn load(stream: *Stream, allocator: Allocator, log: *logger.Log, pm_: ?*Pack
 
         if (comptime Type == @TypeOf(this.dependencies)) {
             external_dependency_list_ = try readArray(stream, allocator, std.ArrayListUnmanaged(Dependency.External));
-            if (pm_) |pm| {
-                if (pm.options.log_level.isVerbose()) {
-                    Output.prettyErrorln("Loaded {d} {s}", .{ external_dependency_list_.items.len, name });
+            if (comptime !@hasDecl(bun, "standalone_lockfile_conversion")) {
+                if (pm_) |pm| {
+                    if (pm.options.log_level.isVerbose()) {
+                        Output.prettyErrorln("Loaded {d} {s}", .{ external_dependency_list_.items.len, name });
+                    }
                 }
             }
         } else if (comptime Type == @TypeOf(this.trees)) {
@@ -317,9 +327,11 @@ pub fn load(stream: *Stream, allocator: Allocator, log: *logger.Log, pm_: ?*Pack
             }
         } else {
             @field(this, name) = try readArray(stream, allocator, Type);
-            if (pm_) |pm| {
-                if (pm.options.log_level.isVerbose()) {
-                    Output.prettyErrorln("Loaded {d} {s}", .{ @field(this, name).items.len, name });
+            if (comptime !@hasDecl(bun, "standalone_lockfile_conversion")) {
+                if (pm_) |pm| {
+                    if (pm.options.log_level.isVerbose()) {
+                        Output.prettyErrorln("Loaded {d} {s}", .{ @field(this, name).items.len, name });
+                    }
                 }
             }
         }
@@ -334,12 +346,19 @@ pub fn load(stream: *Stream, allocator: Allocator, log: *logger.Log, pm_: ?*Pack
     // This is unfortunate. However, not using pointers for Semver Range's make the code a lot more complex.
     this.dependencies = try DependencyList.initCapacity(allocator, external_dependency_list.len);
     const string_buf = this.string_bytes.items;
-    const extern_context = Dependency.Context{
-        .log = log,
-        .allocator = allocator,
-        .buffer = string_buf,
-        .package_manager = pm_,
-    };
+    const extern_context = if (comptime @TypeOf(pm_) == @TypeOf(null))
+        Dependency.StandaloneContext{
+            .log = log,
+            .allocator = allocator,
+            .buffer = string_buf,
+        }
+    else
+        Dependency.Context{
+            .log = log,
+            .allocator = allocator,
+            .buffer = string_buf,
+            .package_manager = pm_,
+        };
 
     this.dependencies.expandToCapacity();
     this.dependencies.items.len = external_dependency_list.len;

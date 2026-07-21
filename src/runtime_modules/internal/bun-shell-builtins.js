@@ -11,6 +11,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -23,7 +24,7 @@ function bytes(value = "") {
   if (value instanceof Uint8Array) return value;
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  return globalThis.Buffer?.from ? Buffer.from(String(value)) : encoder.encode(String(value));
+  return encoder.encode(String(value));
 }
 
 function result(exitCode = 0, stdout = "", stderr = "") {
@@ -32,7 +33,7 @@ function result(exitCode = 0, stdout = "", stderr = "") {
 
 function concatBytes(chunks) {
   const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-  const output = globalThis.Buffer?.alloc ? Buffer.alloc(length) : new Uint8Array(length);
+  const output = new Uint8Array(length);
   let offset = 0;
   for (const chunk of chunks) {
     output.set(chunk, offset);
@@ -204,6 +205,7 @@ function printf(args) {
 }
 
 function sequence(args) {
+  const usage = "usage: seq [-w] [-f format] [-s string] [-t string] [first [incr]] last\n";
   let separator = "\n";
   let terminator = "";
   let index = 0;
@@ -226,8 +228,12 @@ function sequence(args) {
     } else if (option === "-w" || option === "--fixed-width") index += 1;
     else break;
   }
-  const values = args.slice(index).map(Number);
-  if (values.length < 1 || values.length > 3 || values.some(value => !Number.isFinite(value))) {
+  const operands = args.slice(index);
+  if (operands.length === 0) return result(1, "", usage);
+  // Bun's seq parser consumes at most three numeric operands and ignores the
+  // rest, matching the vendored SliceIterator implementation.
+  const values = operands.slice(0, 3).map(Number);
+  if (values.some(value => !Number.isFinite(value))) {
     return result(1, "", "seq: invalid argument\n");
   }
   let start = 1;
@@ -285,6 +291,15 @@ function catArguments(args) {
     return { error: `cat: illegal option -- ${flag}\n` };
   }
   return { operands: args.slice(index) };
+}
+
+function catNeedsExternalProcess(args, context) {
+  const parsed = catArguments(args);
+  if (parsed.error) return false;
+  return parsed.operands.some(path => {
+    try { return statSync(absolute(context, path)).isFIFO(); }
+    catch { return false; }
+  });
 }
 
 async function pipeCatInput(input, output) {
@@ -538,7 +553,8 @@ function remove(args, context) {
     const removed = [];
     if (verbose) collectRemoved(path, operand, recursive, removed);
     try {
-      rmSync(path, { recursive, force });
+      if (stat.isDirectory() && directory && !recursive) rmdirSync(path);
+      else rmSync(path, { recursive, force });
       if (verbose) stdout += removed.map(item => `${item}\n`).join("");
     } catch (error) {
       stderr += `rm: ${operand}: ${errorReason(error)}\n`;
@@ -594,7 +610,8 @@ export function createShellBuiltins(host) {
       case "echo": return echo(args);
       case "printf": return printf(args);
       case "seq": return sequence(args);
-      case "cat": return cat(args, context, input, pipelineOutput);
+      case "cat":
+        return catNeedsExternalProcess(args, context) ? null : cat(args, context, input, pipelineOutput);
       case "pwd":
         return args.length ? result(1, "", "pwd: too many arguments\n") : result(0, `${context.cwd}\n`);
       case "cd": {
@@ -647,7 +664,9 @@ export function createShellBuiltins(host) {
         };
       }
       case "basename":
-        return args.length ? result(0, `${args.map(value => basename(value)).join("\n")}\n`) : result(1, "", "usage: basename string\n");
+        return args.length
+          ? result(0, `${args.map(value => basename(value) || (/^\/+$/u.test(value) ? "/" : "")).join("\n")}\n`)
+          : result(1, "", "usage: basename string\n");
       case "dirname":
         return args.length ? result(0, `${args.map(value => dirname(value)).join("\n")}\n`) : result(1, "", "usage: dirname string\n");
       case "mkdir": return mkdir(args, context);

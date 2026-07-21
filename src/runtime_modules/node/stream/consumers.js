@@ -1,6 +1,11 @@
 async function chunksFrom(stream) {
   const chunks = [];
-  if (stream == null) return chunks;
+  if (stream == null) {
+    throw nodeTypeError("The stream argument must be an iterable or readable stream", "ERR_INVALID_ARG_TYPE");
+  }
+  if (stream.locked === true && typeof stream.getReader === "function") {
+    throw nodeTypeError("Invalid state: ReadableStream is locked", "ERR_INVALID_STATE");
+  }
   if (typeof stream[Symbol.asyncIterator] === "function") {
     for await (const chunk of stream) chunks.push(chunk);
     return chunks;
@@ -17,24 +22,18 @@ async function chunksFrom(stream) {
   });
 }
 
+function nodeTypeError(message, code) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
+}
+
 function bytesFrom(chunk) {
   if (chunk == null) return new Uint8Array(0);
   if (typeof chunk === "string") return new TextEncoder().encode(chunk);
   if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
   if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   return new TextEncoder().encode(String(chunk));
-}
-
-async function collectBytes(stream) {
-  const chunks = (await chunksFrom(stream)).map(bytesFrom);
-  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-  const out = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
 }
 
 class SimpleBlob {
@@ -54,16 +53,31 @@ class SimpleBlob {
 }
 
 export async function arrayBuffer(stream) {
-  return (await collectBytes(stream)).buffer;
+  return await (await blob(stream)).arrayBuffer();
 }
 
 export async function buffer(stream) {
-  const bytes = await collectBytes(stream);
+  const bytes = new Uint8Array(await arrayBuffer(stream));
   return globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes;
 }
 
 export async function text(stream) {
-  return new TextDecoder().decode(await collectBytes(stream));
+  const decoder = new TextDecoder();
+  let result = "";
+  for (const chunk of await chunksFrom(stream)) {
+    if (typeof chunk === "string") {
+      result += chunk;
+    } else if (chunk instanceof ArrayBuffer || ArrayBuffer.isView(chunk)) {
+      result += decoder.decode(bytesFrom(chunk), { stream: true });
+    } else {
+      throw nodeTypeError(
+        'The "input" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView',
+        "ERR_INVALID_ARG_TYPE",
+      );
+    }
+  }
+  result += decoder.decode();
+  return result;
 }
 
 export async function json(stream) {
@@ -72,7 +86,7 @@ export async function json(stream) {
 
 export async function blob(stream) {
   const BlobCtor = globalThis.Blob ?? SimpleBlob;
-  return new BlobCtor([await collectBytes(stream)]);
+  return new BlobCtor(await chunksFrom(stream));
 }
 
 export default { arrayBuffer, blob, buffer, json, text };

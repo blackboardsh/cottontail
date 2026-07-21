@@ -253,7 +253,7 @@ try {
   require("cottontail-package-that-does-not-exist");
   throw new Error("missing package require should throw");
 } catch (error) {
-  assert((error as Error).constructor.name === "ResolveMessage", "missing package error type mismatch");
+  assert((error as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND", "missing package error type mismatch");
 }
 
 const malformedModuleURL = URL.createObjectURL(new Blob(["export const = 1"]));

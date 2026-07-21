@@ -47,12 +47,58 @@ pub const Queue = struct {
     }
 
     pub fn run(queue: *Queue, process_init: std.process.Init, root_dir: []const u8, stderr: *std.Io.Writer) !void {
-        for (queue.tasks.items) |task| {
-            runPackage(process_init, root_dir, task, stderr) catch |err| {
-                if (task.optional) continue;
-                return err;
-            };
+        const concurrency = @max(1, (std.Thread.getCpuCount() catch 2) * 2);
+        var offset: usize = 0;
+        while (offset < queue.tasks.items.len) {
+            const end = @min(offset + concurrency, queue.tasks.items.len);
+            const tasks = queue.tasks.items[offset..end];
+            const states = try queue.allocator.alloc(RunState, tasks.len);
+            defer queue.allocator.free(states);
+
+            for (states, tasks) |*state, task| {
+                state.* = .{
+                    .process_init = process_init,
+                    .root_dir = root_dir,
+                    .task = task,
+                    .diagnostics = .init(process_init.gpa),
+                };
+            }
+            defer for (states) |*state| state.diagnostics.deinit();
+
+            var group: std.Io.Group = .init;
+            defer group.cancel(process_init.io);
+            for (states) |*state| {
+                try group.concurrent(process_init.io, RunState.run, .{state});
+            }
+            try group.await(process_init.io);
+
+            for (states) |*state| {
+                try stderr.writeAll(state.diagnostics.written());
+                if (state.failure) |err| {
+                    if (!state.task.optional) return err;
+                }
+            }
+            offset = end;
         }
+    }
+};
+
+const RunState = struct {
+    process_init: std.process.Init,
+    root_dir: []const u8,
+    task: Task,
+    diagnostics: std.Io.Writer.Allocating,
+    failure: ?anyerror = null,
+
+    fn run(state: *RunState) std.Io.Cancelable!void {
+        runPackage(
+            state.process_init,
+            state.root_dir,
+            state.task,
+            &state.diagnostics.writer,
+        ) catch |err| {
+            state.failure = err;
+        };
     }
 };
 
@@ -69,6 +115,35 @@ pub fn runRoot(
         .kind = .git,
         .optional = false,
     }, root, stderr);
+}
+
+pub fn rootHasLifecycleScripts(root: *const Value) bool {
+    const scripts = if (root.* == .object) root.object.get("scripts") orelse return false else return false;
+    if (scripts != .object) return false;
+    for ([_][]const u8{ "preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare" }) |stage| {
+        const command = scripts.object.get(stage) orelse continue;
+        if (command == .string and command.string.len > 0) return true;
+    }
+    return false;
+}
+
+pub fn runNamedStage(
+    init: std.process.Init,
+    root_dir: []const u8,
+    manifest: *const Value,
+    stage: []const u8,
+    stderr: *std.Io.Writer,
+) !void {
+    const scripts = if (manifest.* == .object) manifest.object.get("scripts") orelse return else return;
+    if (scripts != .object) return;
+    const task: Task = .{
+        .name = jsonString(manifest, "name") orelse "root",
+        .version = jsonString(manifest, "version") orelse "0.0.0",
+        .cwd = root_dir,
+        .kind = .git,
+        .optional = false,
+    };
+    try runStage(init, root_dir, task, &scripts, stage, stderr, .version);
 }
 
 fn runPackage(init: std.process.Init, root_dir: []const u8, task: Task, stderr: *std.Io.Writer) !void {
@@ -95,17 +170,19 @@ fn runManifestScripts(
     if (scripts != .object) return;
 
     const install_stages = [_][]const u8{ "preinstall", "install", "postinstall" };
-    for (install_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr);
+    for (install_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr, .install);
 
     switch (task.kind) {
         .npm, .local => {},
-        .workspace => try runStage(init, root_dir, task, &scripts, "prepare", stderr),
+        .workspace => try runStage(init, root_dir, task, &scripts, "prepare", stderr, .install),
         .git => {
             const prepare_stages = [_][]const u8{ "preprepare", "prepare", "postprepare" };
-            for (prepare_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr);
+            for (prepare_stages) |stage| try runStage(init, root_dir, task, &scripts, stage, stderr, .install);
         },
     }
 }
+
+const StageDiagnostic = enum { install, version };
 
 fn runStage(
     init: std.process.Init,
@@ -114,6 +191,7 @@ fn runStage(
     scripts: *const Value,
     stage: []const u8,
     stderr: *std.Io.Writer,
+    diagnostic: StageDiagnostic,
 ) !void {
     const value = scripts.object.get(stage) orelse return;
     if (value != .string or value.string.len == 0) return;
@@ -145,7 +223,10 @@ fn runStage(
     };
     if (exit_code == 0) return;
 
-    try stderr.print("error: {s} script from \"{s}\" exited with {d}\n", .{ stage, task.name, exit_code });
+    switch (diagnostic) {
+        .install => try stderr.print("error: {s} script from \"{s}\" exited with {d}\n", .{ stage, task.name, exit_code }),
+        .version => try stderr.print("error: script \"{s}\" exited with code {d}\n", .{ stage, exit_code }),
+    }
     try stderr.flush();
     return error.LifecycleScriptFailed;
 }

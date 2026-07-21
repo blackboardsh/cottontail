@@ -70,7 +70,7 @@ pub const Policy = struct {
 
     pub fn isTrusted(policy: *const Policy, package_name: []const u8, npm_package: bool) bool {
         if (policy.trusted_dependencies) |trusted| return trusted.contains(package_name);
-        return npm_package and isDefaultTrustedDependency(package_name);
+        return !npm_package or isDefaultTrustedDependency(package_name);
     }
 
     pub fn patchPath(policy: *const Policy, package_name: []const u8, version: []const u8) ?[]const u8 {
@@ -92,7 +92,7 @@ pub const Policy = struct {
     pub fn matchesLockDocument(policy: *const Policy, document: *const Value) bool {
         if (document.* != .object) return false;
         if (!stringMapMatchesValue(&policy.overrides, document.object.get("overrides"))) return false;
-        if (!stringMapMatchesValue(&policy.patched_dependencies, document.object.get("patchedDependencies"))) return false;
+        if (!policy.patchesMatchLockDocument(document)) return false;
         if (!stringMapMatchesValue(&policy.default_catalog, document.object.get("catalog"))) return false;
         if (!catalogGroupsMatchValue(&policy.catalog_groups, document.object.get("catalogs"))) return false;
 
@@ -104,6 +104,11 @@ pub const Policy = struct {
             if (entry != .string or !policy.trusted_dependencies.?.contains(entry.string)) return false;
         }
         return true;
+    }
+
+    pub fn patchesMatchLockDocument(policy: *const Policy, document: *const Value) bool {
+        if (document.* != .object) return false;
+        return stringMapMatchesValue(&policy.patched_dependencies, document.object.get("patchedDependencies"));
     }
 
     pub fn writeLockFields(policy: *const Policy, writer: *std.Io.Writer) !void {

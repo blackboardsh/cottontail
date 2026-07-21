@@ -176,7 +176,9 @@ pub const ImportRecord = struct {
         wrap_with_to_esm: bool = false,
         wrap_with_to_commonjs: bool = false,
 
-        _padding: u1 = 0,
+        /// Route a dynamic runtime alias through Cottontail's module registry
+        /// instead of statically collapsing it into the application bundle.
+        use_runtime_dynamic_import: bool = false,
     };
 
     pub const List = bun.BabyList(ImportRecord);

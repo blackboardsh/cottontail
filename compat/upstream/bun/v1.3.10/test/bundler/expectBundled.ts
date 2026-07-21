@@ -129,7 +129,9 @@ if (ESBUILD) {
   console.warn("NOTE: using esbuild for bun build tests");
 }
 
-export const ESBUILD_PATH = import.meta.resolveSync("esbuild/bin/esbuild");
+// COTTONTAIL-COMPAT: Bake imports this file for `dedent`; avoid requiring the
+// optional comparison tool unless the bundler suite explicitly enables it.
+export const ESBUILD_PATH = ESBUILD ? import.meta.resolveSync("esbuild/bin/esbuild") : "";
 
 export interface BundlerTestInput {
   /** Temporary flag to mark failing tests as skipped. */

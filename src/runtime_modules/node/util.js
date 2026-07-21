@@ -13,10 +13,11 @@ export const formatWithOptions = util.formatWithOptions;
 
 // Bun's styleText always applies the style regardless of whether stdout is a
 // TTY (Node only colors when the target stream supports it). Match Bun by
-// defaulting validateStream to false while keeping Node's argument checks.
+// defaulting validateStream to false. Explicit streams retain Node's validation.
 const vendoredStyleText = util.styleText;
 export function styleText(formatSpec, text, options = undefined) {
-  return vendoredStyleText(formatSpec, text, { validateStream: false, ...options });
+  const validateStream = options !== null && typeof options === "object" && "stream" in options;
+  return vendoredStyleText(formatSpec, text, { validateStream, ...options });
 }
 util.styleText = styleText;
 export const deprecate = util.deprecate;

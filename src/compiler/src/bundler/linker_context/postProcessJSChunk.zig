@@ -551,7 +551,14 @@ pub fn postProcessJSChunk(ctx: GenerateChunkCtx, worker: *ThreadPool.Worker, chu
             //     line_offset.advance(str);
             // }
             {
-                const str = "\n});";
+                // A direct internal_bake_dev build is an executable initial
+                // response, so give the embedded client runtime the same
+                // handshake metadata as Bake's IncrementalGraph output.
+                const str =
+                    ",\n  bun: \"" ++ bun.Global.package_json_version ++
+                    "\",\n  generation: \"00000000\"" ++
+                    ",\n  version: \"" ++ bun.Global.package_json_version ++
+                    "\",\n  console: false\n});";
                 j.pushStatic(str);
                 line_offset.advance(str);
             }

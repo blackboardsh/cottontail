@@ -6,6 +6,8 @@ vendors/zig/
 vendors/zig.zip
 vendors/zig-temp/
 vendors/esbuild/
+vendors/zig-html-rewriter/
+vendors/.zig-html-rewriter-*/
 .cottontail-tmp/
 .cottontail-eval-*
 fixtures/electrobun-cli/build/
@@ -17,11 +19,20 @@ vm-*-test.log
 vm-*-release.log
 
 # test-run artifacts inside the upstream snapshot
+# The copied Bun snapshot owns only these five entries at its root. Upstream
+# tests frequently write arbitrary filenames beside them.
+compat/upstream/bun/*/*
+!compat/upstream/bun/*/LICENSE.md
+!compat/upstream/bun/*/manifest.json
+!compat/upstream/bun/*/src/
+!compat/upstream/bun/*/status.json
+!compat/upstream/bun/*/test/
 compat/upstream/**/Heap.*.heapsnapshot
 compat/upstream/**/Heap-*.heapsnapshot
 compat/upstream/**/.cottontail-compat-*
 compat/upstream/**/.cottontail-compile-cache/
 compat/upstream/**/fstest*/
+compat/upstream/**/.verdaccio-db.json
 compat/upstream/bun/*/app
 compat/upstream/bun/*/app.exe
 compat/upstream/bun/*/a.txt

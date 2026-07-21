@@ -251,9 +251,9 @@ pub fn Builder(comptime method: BuilderMethod) type {
         // builder.resolutions[peer.dep_id] to the resolved pkg_id. A dependency ID set is used because there
         // can be multiple instances of the same package in the tree, so the same unresolved dependency ID
         // could be visited multiple times before it's resolved.
-        pending_optional_peers: std.AutoArrayHashMap(PackageNameHash, std.AutoArrayHashMap(DependencyID, void)),
+        pending_optional_peers: std.AutoHashMap(PackageNameHash, std.AutoHashMap(DependencyID, void)),
         manager: if (method == .filter) *const PackageManager else void,
-        sort_buf: std.ArrayListUnmanaged(DependencyID) = .{},
+        sort_buf: std.ArrayListUnmanaged(DependencyID) = .empty,
         workspace_filters: if (method == .filter) []const WorkspaceFilter else void = if (method == .filter) &.{},
         install_root_dependencies: if (method == .filter) bool else void,
         packages_to_install: if (method == .filter) ?[]const PackageID else void,
@@ -470,7 +470,7 @@ pub fn processSubtree(
             .id = @as(Id, @truncate(builder.list.len)),
             .dependency_id = dependency_id,
         },
-        .dependencies = .{},
+        .dependencies = .empty,
     });
 
     const list_slice = builder.list.slice();
@@ -590,10 +590,12 @@ pub fn processSubtree(
                     bun.debugAssert(!builder.pending_optional_peers.contains(dependency.name_hash));
                 }
 
-                if (builder.pending_optional_peers.fetchSwapRemove(dependency.name_hash)) |entry| {
+                if (builder.pending_optional_peers.fetchRemove(dependency.name_hash)) |entry| {
                     var peers = entry.value;
                     defer peers.deinit();
-                    for (peers.keys()) |unresolved_dep_id| {
+                    var peer_iterator = peers.keyIterator();
+                    while (peer_iterator.next()) |unresolved_dep_id_ptr| {
+                        const unresolved_dep_id = unresolved_dep_id_ptr.*;
                         // the dependency should be either unresolved or the same dependency as above
                         bun.debugAssert(unresolved_dep_id == dep_id or builder.resolutions[unresolved_dep_id] == invalid_package_id);
                         builder.resolutions[unresolved_dep_id] = res_id;
@@ -603,10 +605,12 @@ pub fn processSubtree(
             .resolve_replace => |replace| {
                 bun.debugAssert(pkg_id != invalid_package_id);
                 builder.resolutions[replace.dep_id] = pkg_id;
-                if (builder.pending_optional_peers.fetchSwapRemove(dependency.name_hash)) |entry| {
+                if (builder.pending_optional_peers.fetchRemove(dependency.name_hash)) |entry| {
                     var peers = entry.value;
                     defer peers.deinit();
-                    for (peers.keys()) |unresolved_dep_id| {
+                    var peer_iterator = peers.keyIterator();
+                    while (peer_iterator.next()) |unresolved_dep_id_ptr| {
+                        const unresolved_dep_id = unresolved_dep_id_ptr.*;
                         // the dependency should be either unresolved or the same dependency as above
                         bun.debugAssert(unresolved_dep_id == replace.dep_id or builder.resolutions[unresolved_dep_id] == invalid_package_id);
                         builder.resolutions[unresolved_dep_id] = pkg_id;

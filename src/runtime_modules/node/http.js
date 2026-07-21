@@ -5,13 +5,20 @@ import { connect as netConnect, createServer as createNetServer } from "./net.js
 import { connect as tlsConnect } from "./tls.js";
 import { createHash, randomBytes } from "./crypto.js";
 import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
-import { Headers } from "../bun/index.js";
 import { AsyncResource } from "./async_hooks.js";
 
 const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
 const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const socketAsyncResourceSymbol = Symbol("cottontail.http.socketAsyncResource");
 const freeSocketErrorSymbol = Symbol("cottontail.http.freeSocketError");
+
+function createWebHeaders(init = undefined) {
+  const HeadersCtor = globalThis.Headers;
+  if (typeof HeadersCtor !== "function") {
+    throw new ReferenceError("Headers is not defined");
+  }
+  return new HeadersCtor(init);
+}
 
 // Module evaluation order can reach this file before bun/index.js installs the
 // Symbol.dispose/asyncDispose polyfills, so ensure the shared symbol here.
@@ -108,6 +115,7 @@ export const STATUS_CODES = {
   303: "See Other",
   304: "Not Modified",
   305: "Use Proxy",
+  306: "Switch Proxy",
   307: "Temporary Redirect",
   308: "Permanent Redirect",
   400: "Bad Request",
@@ -204,7 +212,7 @@ function outgoingHeaderLength(input, init = undefined) {
     if (init.headers != null) source = init.headers;
   }
   if (!activeServerForUrl(url)) return 0;
-  const headers = new Headers(source ?? {});
+  const headers = createWebHeaders(source ?? {});
   let length = String(method).length + String(url).length + 12;
   headers.forEach((value, name) => {
     length += Buffer.byteLength(String(name), "latin1") + Buffer.byteLength(String(value), "latin1") + 4;
@@ -230,7 +238,7 @@ function rawFetchRequest(url, method, headers, body, signal) {
       message.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
       message.once("error", reject);
       message.once("end", () => {
-        const responseHeaders = new Headers();
+        const responseHeaders = createWebHeaders();
         for (let index = 0; index + 1 < message.rawHeaders.length; index += 2) {
           responseHeaders.append(message.rawHeaders[index], message.rawHeaders[index + 1]);
         }
@@ -1419,7 +1427,7 @@ export class OutgoingMessage extends Writable {
   }
 
   _headersForFetch() {
-    const headers = new Headers();
+    const headers = createWebHeaders();
     for (const entry of this._headerMap.values()) appendHeaderValue(headers, entry.name, entry.value);
     return headers;
   }
@@ -1450,6 +1458,10 @@ export class ServerResponse extends OutgoingMessage {
     this.strictContentLength = false;
     Object.defineProperty(this, "writableFinished", {
       get: () => this._finishEmitted,
+      configurable: true,
+    });
+    Object.defineProperty(this, "errored", {
+      get: () => this._errored ?? undefined,
       configurable: true,
     });
     this._keepAlive = true;
@@ -1815,6 +1827,8 @@ export class ServerResponse extends OutgoingMessage {
 
   destroy(error = undefined) {
     const socket = this.socket;
+    this._errored = error ?? null;
+    if (error != null && this._writableState) this._writableState.errored = error;
     this.detachSocket(socket ?? undefined);
     if (socket) queueMicrotask(() => socket.destroy?.(error));
     this.finished = true;
@@ -1826,6 +1840,12 @@ export class ServerResponse extends OutgoingMessage {
   _emitCloseOnce() {
     if (this._closeEmitted) return;
     this._closeEmitted = true;
+    this.destroyed = true;
+    this._closed = true;
+    if (this._writableState) {
+      this._writableState.closed = true;
+      this._writableState.closeEmitted = true;
+    }
     this.emit("close");
   }
 
@@ -2439,6 +2459,8 @@ export class ClientRequest extends OutgoingMessage {
     let completed = false;
     let connected = false;
     let parser = null;
+    let processingResponseData = false;
+    let pendingSocketEnd = false;
     const resetParser = () => {
       parser = {
         phase: "headers",
@@ -2488,7 +2510,15 @@ export class ClientRequest extends OutgoingMessage {
       const canKeepAlive = this.agent?.keepAlive && lowerConnection !== "close" && responseVersion !== "1.0" && this.method !== "CONNECT" && parsed?.message?.statusCode !== 101 && !parser.readToEof;
       if (!isTunnel) {
         if (canKeepAlive) this.agent._releaseSocket?.(socket, this._agentOptions ?? this._options);
-        else socket.end?.();
+        else {
+          // The parser no longer owns a completed one-shot socket, but FIN and
+          // peer RST delivery can race after cleanup. Keep an error owner until
+          // close so a late transport error does not become an uncaught event.
+          const absorbLateSocketError = () => {};
+          socket.on?.("error", absorbLateSocketError);
+          socket.once?.("close", () => socket.off?.("error", absorbLateSocketError));
+          socket.end?.();
+        }
       }
       if (socket._httpMessage === this) socket._httpMessage = null;
       this._emitClose();
@@ -2555,6 +2585,7 @@ export class ClientRequest extends OutgoingMessage {
     };
     const onData = (chunk) => {
       if (completed) return;
+      processingResponseData = true;
       this._installTimeout();
       let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       try {
@@ -2664,17 +2695,30 @@ export class ClientRequest extends OutgoingMessage {
           return;
         }
       } catch (error) {
+        if (this.destroyed) return;
+        this.destroyed = true;
         cleanup();
         socket.destroy?.();
         this.emit("error", error);
         this._emitClose();
+      } finally {
+        processingResponseData = false;
+        if (pendingSocketEnd) {
+          pendingSocketEnd = false;
+          onEnd();
+        }
       }
     };
     const onEnd = () => {
+      if (processingResponseData) {
+        pendingSocketEnd = true;
+        return;
+      }
       if (!completed && parser.phase === "body" && parser.readToEof && parser.message != null) {
         finishResponse(kEmptyBuffer);
       } else if (!completed && !this.destroyed && !this.aborted) {
         const error = nodeError(Error, "ECONNRESET", this._responseEmitted ? "aborted" : "socket hang up");
+        this.destroyed = true;
         parser.message?._abortIncoming?.();
         cleanup();
         socket.destroy?.();
@@ -2686,9 +2730,19 @@ export class ClientRequest extends OutgoingMessage {
       this._emitClose();
     };
     const onError = (error) => {
+      if (this.destroyed) return;
+      this.destroyed = true;
       cleanup();
       const failure = socketError(error, socket);
-      parser.message?.destroy?.(failure);
+      if (parser.message) {
+        // IncomingMessage emits "aborted" before readable-stream emits the
+        // destroy error. A body consumer may detach its error listener while
+        // handling "aborted", so retain an owner through the terminal close.
+        const absorbTerminalResponseError = () => {};
+        parser.message.on?.("error", absorbTerminalResponseError);
+        parser.message.once?.("close", () => parser.message?.off?.("error", absorbTerminalResponseError));
+        parser.message.destroy?.(failure);
+      }
       this.emit("error", failure);
       this._emitClose();
     };
@@ -2894,6 +2948,9 @@ export function _attachHttpConnection(server, socket) {
       if (active !== response) return;
       active = null;
       response.detachSocket(socket);
+      queueMicrotask(() => {
+        if (!message.readableEnded && !message.destroyed) message._dump?.();
+      });
       if (server._closing || !response._keepAlive) {
         if (socket._cottontailHttpDropPending !== true) socket.destroy?.();
         return;
@@ -2946,6 +3003,15 @@ export function _attachHttpConnection(server, socket) {
             req.headBuffer = req.headBuffer.byteLength === 0 ? buf : Buffer.concat([req.headBuffer, buf]);
           }
           buf = null;
+          const methodEnd = req.headBuffer.indexOf(0x20);
+          const methodPrefixLength = methodEnd < 0 ? req.headBuffer.byteLength : methodEnd;
+          if (methodPrefixLength === 0 ||
+              !tokenPattern.test(req.headBuffer.subarray(0, methodPrefixLength).toString("latin1"))) {
+            const error = new Error("Parse Error: Invalid method encountered");
+            error.code = "HPE_INVALID_METHOD";
+            fail(error);
+            return;
+          }
           const idx = findHeaderEnd(req.headBuffer, req.searchPos);
           if (idx < 0) {
             if (req.headBuffer.byteLength > (server.maxHeaderSize ?? getCurrentMaxHeaderSize())) {
@@ -3117,6 +3183,12 @@ export function _attachHttpConnection(server, socket) {
   };
   socket.on("error", onSocketError);
   socket.on("data", onData);
+  socket.on("end", () => {
+    if (req?.message && !req.message.complete) {
+      detachParser();
+      req.message._abortIncoming();
+    }
+  });
   socket.on("close", () => {
     req?.message?._abortIncoming?.();
     clearParserTimers();
@@ -3400,6 +3472,9 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this._messageCompressed = false;
     this._deflate = null;
     this._aborted = false;
+    this._pendingWriteFrames = [];
+    this._pendingWriteBytes = 0;
+    this._writeFlushScheduled = false;
     // Bun accepts an options object ({ headers, protocols, protocol, proxy,
     // tls, perMessageDeflate }) in place of the protocols argument.
     let options = null;
@@ -3786,6 +3861,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
     payload.writeUInt16BE(1002, 0);
     payload.set(Buffer.from(reason), 2);
+    this._flushWriteFrames();
     try { this._socket?.write?.(websocketFrame(0x8, payload)); } catch {}
     this._close(1002, reason, false);
   }
@@ -3806,12 +3882,18 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       if (frame.opcode === 0x8) {
         const code = frame.payload.byteLength >= 2 ? readUInt16BE(frame.payload, 0) : 1000;
         const reason = frame.payload.byteLength > 2 ? frame.payload.subarray(2).toString("utf8") : "";
-        if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0x8, frame.payload));
+        if (this.readyState === WebSocket.OPEN) {
+          this._flushWriteFrames();
+          this._socket?.write?.(websocketFrame(0x8, frame.payload));
+        }
         this._close(code, reason, true);
         return;
       }
       if (frame.opcode === 0x9) {
-        if (this.readyState === WebSocket.OPEN) this._socket?.write?.(websocketFrame(0xA, frame.payload));
+        if (this.readyState === WebSocket.OPEN) {
+          this._flushWriteFrames();
+          this._socket?.write?.(websocketFrame(0xA, frame.payload));
+        }
         return;
       }
       return;
@@ -3902,6 +3984,37 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     this.dispatchEvent(new CloseEvent("close", { code, reason, wasClean }));
   }
 
+  _queueWriteFrame(frame) {
+    this._pendingWriteFrames.push(frame);
+    this._pendingWriteBytes += frame.byteLength;
+    this.bufferedAmount += frame.byteLength;
+    if (!this._writeFlushScheduled) {
+      this._writeFlushScheduled = true;
+      queueMicrotask(() => this._flushWriteFrames());
+    }
+    const socket = this._socket;
+    return Boolean(socket && !socket.destroyed &&
+      socket.writableLength + this._pendingWriteBytes < socket.writableHighWaterMark);
+  }
+
+  _flushWriteFrames() {
+    this._writeFlushScheduled = false;
+    if (this._pendingWriteFrames.length === 0) return;
+    const frames = this._pendingWriteFrames;
+    const byteLength = this._pendingWriteBytes;
+    this._pendingWriteFrames = [];
+    this._pendingWriteBytes = 0;
+    const socket = this._socket;
+    if (!socket || socket.destroyed || !socket.writable) {
+      this.bufferedAmount = Math.max(0, this.bufferedAmount - byteLength);
+      return;
+    }
+    const output = frames.length === 1 ? frames[0] : Buffer.concat(frames, byteLength);
+    socket.write(output, () => {
+      this.bufferedAmount = Math.max(0, this.bufferedAmount - byteLength);
+    });
+  }
+
   send(data) {
     if (this.readyState !== WebSocket.OPEN) throw new Error("WebSocket is not open");
     const opcode = typeof data === "string" ? 0x1 : 0x2;
@@ -3917,11 +4030,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       }
     }
     const frame = websocketFrame(opcode, payload, true, rsv1);
-    this.bufferedAmount += frame.byteLength;
-    const ok = this._socket.write(frame, () => {
-      this.bufferedAmount = Math.max(0, this.bufferedAmount - frame.byteLength);
-    });
-    return ok;
+    return this._queueWriteFrame(frame);
   }
 
   close(code = 1000, reason = "") {
@@ -3937,6 +4046,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     payload[0] = (closeCode >> 8) & 0xff;
     payload[1] = closeCode & 0xff;
     payload.set(Buffer.from(String(reason)), 2);
+    this._flushWriteFrames();
     this._socket?.write?.(websocketFrame(0x8, payload));
     this._socket?.end?.();
   }

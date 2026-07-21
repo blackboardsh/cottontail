@@ -1,14 +1,17 @@
-// node:vm approximated on top of a single JSC realm.
-//
-// Real Node contexts are separate V8 realms. Without native support we
-// emulate isolation with a `with`-scope Proxy that traps every identifier
-// lookup: names resolve against the context object first, then a whitelist
-// of ECMAScript intrinsics (shared with the host realm), and never against
-// the host global object. Limitations that need native VM support:
-// - intrinsics (Object.prototype etc.) are shared with the host realm
-// - `var`/function declarations in scripts do not become context properties
-// - no bytecode caching (cachedData is emulated structurally)
-const contextMarker = Symbol("cottontail.vm.context");
+// Native contexts are sibling JSC globals in the main runtime's context
+// group. Values can cross the C API boundary without cloning while each
+// context retains its own ECMAScript intrinsics.
+const contexts = new WeakSet();
+const contextHandles = new WeakMap();
+const vmHost = globalThis.cottontail;
+const contextFinalizer = typeof FinalizationRegistry === "function" &&
+  typeof vmHost?.vmReleaseContext === "function"
+  ? new FinalizationRegistry(handle => {
+      try {
+        vmHost.vmReleaseContext(handle);
+      } catch {}
+    })
+  : undefined;
 
 const intrinsicNames = [
   "AggregateError", "Array", "ArrayBuffer", "Atomics", "BigInt", "BigInt64Array",
@@ -30,6 +33,7 @@ for (const name of intrinsicNames) {
 intrinsics.set("undefined", undefined);
 
 const contextCodeGeneration = new WeakMap();
+const contextObjectIntrinsics = new WeakMap();
 
 function throwCodeGenerationError() {
   throw new EvalError("Code generation from strings disallowed for this context");
@@ -68,8 +72,100 @@ function makeFilenameErrorConstructor(RealError, filename) {
   });
 }
 
-// Copy-on-write stand-in for Object.prototype handed to compileFunction()
-// scopes: reads fall through to the real prototype, but `with (Object.
+function sourceURLFromCode(code) {
+  const pattern = /^[\t ]*\/\/[#@][\t ]*sourceURL[\t ]*=[\t ]*([^\r\n]*)|\/\*[#@][\t ]*sourceURL[\t ]*=[\t ]*([^*]*?)[\t ]*\*\//gm;
+  let sourceURL;
+  for (let match; (match = pattern.exec(code)) !== null;) {
+    const candidate = (match[1] ?? match[2] ?? "").trim();
+    if (candidate) sourceURL = candidate;
+  }
+  return sourceURL;
+}
+
+function stackLocationValue(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.trunc(number) : fallback;
+}
+
+function callSiteWithSourceName(callSite, error, sourceName) {
+  const safeName = String(sourceName).replace(/[\r\n]/g, " ");
+  const line = stackLocationValue(error?.line, stackLocationValue(callSite?.getLineNumber?.(), 1));
+  const column = stackLocationValue(callSite?.getColumnNumber?.(), 1);
+  const location = `${safeName}:${line}:${column}`;
+
+  return new Proxy(callSite, {
+    get(target, key) {
+      if (key === "getFileName" || key === "getScriptNameOrSourceURL") return () => safeName;
+      if (key === "getLineNumber") return () => line;
+      if (key === "getColumnNumber") return () => column;
+      if (key === "getFunctionName" || key === "getMethodName" || key === "getTypeName") return () => null;
+      if (key === "isEval") return () => false;
+      if (key === "toString") return () => location;
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function defaultPrepareStackTrace(error, trace) {
+  let header;
+  try {
+    header = error == null ? String(error) : Error.prototype.toString.call(error);
+  } catch {
+    header = "<error>";
+  }
+  if (!Array.isArray(trace) || trace.length === 0) return header;
+  return `${header}\n    at ${trace.map(site => String(site)).join("\n    at ")}`;
+}
+
+function evaluateInThisContext(code, sourceName) {
+  const ErrorCtor = globalThis.Error;
+  const previousPrepareStackTrace = ErrorCtor.prepareStackTrace;
+  const prepareStackTrace = function prepareStackTrace(error, trace) {
+    let mappedTrace = trace;
+    if (Array.isArray(trace) && trace.length > 0) {
+      mappedTrace = trace.map(callSite => {
+        if (callSite == null || typeof callSite !== "object") return callSite;
+        let existingSource;
+        let text;
+        try {
+          existingSource = callSite.getFileName?.() ?? callSite.getScriptNameOrSourceURL?.();
+          text = String(callSite);
+        } catch {
+          return callSite;
+        }
+        if (existingSource == null && (text.endsWith("@") || text.includes("(<anonymous>)"))) {
+          return callSiteWithSourceName(callSite, error, sourceName);
+        }
+        return callSite;
+      });
+    }
+    if (typeof previousPrepareStackTrace === "function") {
+      return Reflect.apply(previousPrepareStackTrace, ErrorCtor, [error, mappedTrace]);
+    }
+    return defaultPrepareStackTrace(error, mappedTrace);
+  };
+
+  ErrorCtor.prepareStackTrace = prepareStackTrace;
+  try {
+    return (0, eval)(code);
+  } catch (error) {
+    // JSC formats stacks lazily. Materialize a thrown VM error while the
+    // filename-aware call-site adapter is installed.
+    try {
+      if (error instanceof intrinsics.get("Error")) void error.stack;
+    } catch {}
+    throw error;
+  } finally {
+    // Preserve an explicit prepareStackTrace assignment made by VM code.
+    if (ErrorCtor.prepareStackTrace === prepareStackTrace) {
+      ErrorCtor.prepareStackTrace = previousPrepareStackTrace;
+    }
+  }
+}
+
+// Copy-on-write stand-in for Object.prototype handed to VM context scopes:
+// reads fall through to the real prototype, but `with (Object.
 // prototype) { toString = ... }` style attacks create own properties on the
 // shadow instead of mutating the shared intrinsic.
 function makeShadowObjectIntrinsic() {
@@ -89,13 +185,20 @@ function makeShadowObjectIntrinsic() {
   });
 }
 
+function objectIntrinsicForContext(context) {
+  let intrinsic = contextObjectIntrinsics.get(context);
+  if (!intrinsic) {
+    intrinsic = makeShadowObjectIntrinsic();
+    contextObjectIntrinsics.set(context, intrinsic);
+  }
+  return intrinsic;
+}
+
 function makeScopeProxy(context, scopeOptions = undefined) {
   const codeGeneration = contextCodeGeneration.get(context);
   const stringsDisallowed = codeGeneration?.strings === false;
   const filename = scopeOptions?.filename;
-  const shadowPrototypes = scopeOptions?.shadowPrototypes === true;
   let patchedError;
-  let shadowObject;
   // The first `eval` lookup comes from our own runner bootstrapping the
   // script; subsequent lookups originate from the script itself.
   let evalBootstrapDone = false;
@@ -123,9 +226,7 @@ function makeScopeProxy(context, scopeOptions = undefined) {
       if (filename != null && key === "Error") {
         return (patchedError ??= makeFilenameErrorConstructor(intrinsics.get("Error"), filename));
       }
-      if (shadowPrototypes && key === "Object") {
-        return (shadowObject ??= makeShadowObjectIntrinsic());
-      }
+      if (key === "Object") return objectIntrinsicForContext(context);
       if (typeof key === "string" && intrinsics.has(key)) return intrinsics.get(key);
       return undefined;
     },
@@ -143,7 +244,15 @@ export function createContext(context = {}, options = undefined) {
     throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "contextObject" argument must be of type object.');
   }
   if (!isContext(context)) {
-    Object.defineProperty(context, contextMarker, { value: true, configurable: true });
+    if (typeof vmHost?.vmCreateContext === "function" && typeof vmHost?.vmRunInContext === "function") {
+      const handle = vmHost.vmCreateContext(
+        options?.name,
+        options?.codeGeneration?.strings !== false,
+      );
+      contextHandles.set(context, handle);
+      contextFinalizer?.register(context, handle);
+    }
+    contexts.add(context);
   }
   if (options?.codeGeneration !== undefined) {
     contextCodeGeneration.set(context, {
@@ -156,7 +265,7 @@ export function createContext(context = {}, options = undefined) {
 
 export function isContext(value) {
   return value !== null && (typeof value === "object" || typeof value === "function") &&
-    Boolean(value[contextMarker]);
+    contexts.has(value);
 }
 
 function normalizeRunOptions(options) {
@@ -168,12 +277,12 @@ function normalizeRunOptions(options) {
 
 function withSourceURL(code, filename) {
   const text = String(code);
-  if (!filename) return text;
+  if (!filename || sourceURLFromCode(text) !== undefined) return text;
   const safeName = String(filename).replace(/[\r\n]/g, " ");
   return `${text}\n//# sourceURL=${safeName}`;
 }
 
-function runCodeInContext(code, context, options = undefined) {
+function runCodeInContextFallback(code, context, options = undefined) {
   const { filename } = normalizeRunOptions(options);
   const scope = makeScopeProxy(context, { filename });
   // Scope chain seen by the eval'd code, innermost first:
@@ -201,18 +310,24 @@ function runCodeInContext(code, context, options = undefined) {
   return runner.call(context, scope, context);
 }
 
+function runCodeInContext(code, context, options = undefined) {
+  const handle = contextHandles.get(context);
+  if (handle !== undefined && typeof vmHost?.vmRunInContext === "function") {
+    const { filename } = normalizeRunOptions(options);
+    const source = String(code);
+    const sourceName = sourceURLFromCode(source) ?? filename ?? "evalmachine.<anonymous>";
+    return vmHost.vmRunInContext(handle, context, source, sourceName);
+  }
+  return runCodeInContextFallback(code, context, options);
+}
+
 export function runInThisContext(code, options = undefined) {
   const { filename } = normalizeRunOptions(options);
-  if (filename == null) return (0, eval)(withSourceURL(code, filename));
-  // Temporarily swap the global Error so stacks captured by the (synchronous)
-  // script show the requested filename; see makeFilenameErrorConstructor.
-  const RealError = globalThis.Error;
-  globalThis.Error = makeFilenameErrorConstructor(RealError, filename);
-  try {
-    return (0, eval)(withSourceURL(code, filename));
-  } finally {
-    globalThis.Error = RealError;
-  }
+  const source = String(code);
+  const sourceName = sourceURLFromCode(source) ?? filename;
+  const sourceWithURL = withSourceURL(source, filename);
+  if (sourceName == null) return (0, eval)(sourceWithURL);
+  return evaluateInThisContext(sourceWithURL, sourceName);
 }
 
 export function runInContext(code, contextifiedObject, options = undefined) {
@@ -342,7 +457,7 @@ export function compileFunction(code, params = [], options = {}) {
     scopeTarget = {};
   }
 
-  const scope = makeScopeProxy(scopeTarget, { shadowPrototypes: true });
+  const scope = makeScopeProxy(scopeTarget);
   // Extensions layer additional lookup objects over the context scope.
   let builder = `return function (${names.join(", ")}) {\n${code}\n}`;
   const extensionParams = contextExtensions.map((_, index) => `__cottontail_ext_${index}__`);
@@ -427,10 +542,9 @@ export const constants = {
   DONT_CONTEXTIFY: Symbol.for("vm_context_no_contextify"),
 };
 
-// COTTONTAIL-COMPAT: node:vm context isolation - code executes through JSC
-// eval/Function with proxied `with` scopes; full realm-level contextification
-// (separate intrinsics, var hoisting onto the context, bytecode caching,
-// SourceTextModule) requires native VM support.
+// COTTONTAIL-COMPAT: node:vm bytecode caching and SourceTextModule are still
+// structural implementations. Script contexts themselves are native JSC
+// realms with isolated intrinsics and context-global declaration semantics.
 
 export default {
   Script,
