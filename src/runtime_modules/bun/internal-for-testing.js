@@ -1,6 +1,8 @@
 import Module, { _resolveFilename } from "../node/module.js";
 import { BlockList } from "../node/net.js";
 import { readFileSync } from "../node/fs.js";
+import { createHash } from "../node/crypto.js";
+import { gunzipSync } from "../node/zlib.js";
 import { serializeShellLex, serializeShellParse } from "../internal/bun-shell-parser.js";
 import { frameworkRouterInternals } from "./bake-framework-router.js";
 import { getDevServerDeinitCount as getBakeDevServerDeinitCount } from "./bake-dev-server.js";
@@ -1028,7 +1030,138 @@ export const hostedGitInfo = {
     return result === null ? null : JSON.parse(result);
   },
 };
-export const readTarball = unimplementedInternal("readTarball");
+function tarString(bytes, start, length) {
+  let end = start;
+  const limit = Math.min(bytes.length, start + length);
+  while (end < limit && bytes[end] !== 0) end++;
+  return Buffer.from(bytes.subarray(start, end)).toString("utf8");
+}
+
+function tarNumber(bytes, start, length) {
+  const field = bytes.subarray(start, start + length);
+  if (field.length === 0) return 0;
+
+  // POSIX tar numbers are octal. GNU tar uses base-256 for values that do not
+  // fit in the fixed-width octal field.
+  if ((field[0] & 0x80) !== 0) {
+    let value = BigInt(field[0] & 0x7f);
+    for (let i = 1; i < field.length; i++) value = (value << 8n) | BigInt(field[i]);
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) throw new RangeError("tar entry number exceeds JavaScript's safe integer range");
+    return number;
+  }
+
+  const text = Buffer.from(field).toString("ascii").replace(/\0.*$/, "").trim();
+  if (text === "") return 0;
+  const value = Number.parseInt(text, 8);
+  if (!Number.isFinite(value)) throw new Error(`invalid tar numeric field: ${JSON.stringify(text)}`);
+  return value;
+}
+
+function parsePaxRecords(bytes) {
+  const records = Object.create(null);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const separator = bytes.indexOf(0x20, offset);
+    if (separator < 0) break;
+    const length = Number.parseInt(Buffer.from(bytes.subarray(offset, separator)).toString("ascii"), 10);
+    if (!Number.isSafeInteger(length) || length <= 0 || offset + length > bytes.length) break;
+    const record = Buffer.from(bytes.subarray(separator + 1, offset + length - 1)).toString("utf8");
+    const equals = record.indexOf("=");
+    if (equals >= 0) records[record.slice(0, equals)] = record.slice(equals + 1);
+    offset += length;
+  }
+  return records;
+}
+
+function tarKind(type) {
+  switch (type) {
+    case 0:
+    case 0x30:
+    case 0x37:
+      return "file";
+    case 0x31:
+      return "file";
+    case 0x32:
+      return "sym_link";
+    case 0x33:
+      return "character_device";
+    case 0x34:
+      return "block_device";
+    case 0x35:
+      return "directory";
+    case 0x36:
+      return "named_pipe";
+    default:
+      return "unknown";
+  }
+}
+
+export function readTarball(tarballPath) {
+  if (typeof tarballPath !== "string") throw new TypeError("expected tarball path string argument");
+
+  const compressed = readFileSync(tarballPath);
+  const archive = gunzipSync(compressed);
+  const entries = [];
+  let offset = 0;
+  let globalPax = Object.create(null);
+  let nextPax = null;
+  let nextLongPath = null;
+
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512);
+    offset += 512;
+
+    let allZero = true;
+    for (let i = 0; i < header.length; i++) {
+      if (header[i] !== 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) continue;
+
+    const size = tarNumber(header, 124, 12);
+    if (size < 0 || offset + size > archive.length) throw new Error("tar entry extends beyond the archive");
+    const contents = archive.subarray(offset, offset + size);
+    offset += Math.ceil(size / 512) * 512;
+
+    const type = header[156];
+    if (type === 0x67 || type === 0x78) {
+      const records = parsePaxRecords(contents);
+      if (type === 0x67) globalPax = { ...globalPax, ...records };
+      else nextPax = records;
+      continue;
+    }
+    if (type === 0x4c) {
+      nextLongPath = Buffer.from(contents).toString("utf8").replace(/\0.*$/, "");
+      continue;
+    }
+    if (type === 0x4b) continue;
+
+    const pax = nextPax === null ? globalPax : { ...globalPax, ...nextPax };
+    const name = tarString(header, 0, 100);
+    const prefix = tarString(header, 345, 155);
+    const pathname = pax.path ?? nextLongPath ?? (prefix ? `${prefix}/${name}` : name);
+    const kind = tarKind(type);
+    const entry = {
+      pathname,
+      kind,
+      perm: tarNumber(header, 100, 8),
+    };
+    if (kind === "file") entry.contents = Buffer.from(contents).toString("utf8");
+    entries.push(entry);
+    nextPax = null;
+    nextLongPath = null;
+  }
+
+  return {
+    entries,
+    size: compressed.length,
+    shasum: createHash("sha1").update(compressed).digest("hex"),
+    integrity: createHash("sha512").update(compressed).digest("base64"),
+  };
+}
 
 export default {
   Dequeue,
