@@ -279,6 +279,7 @@ fn runtimeFlagTakesValue(arg: []const u8) bool {
         "--experimental-default-type",
         "--inspect-publish-uid",
         "--icu-data-dir",
+        "--preload",
         "--env-file",
         "--env-file-if-exists",
         "--tsconfig-override",
@@ -318,6 +319,7 @@ fn testFlagTakesValue(arg: []const u8) bool {
         "--seed",
         "--test-name-pattern",
         "--timeout",
+        "--tsconfig-override",
     };
     for (value_flags) |candidate| {
         if (std.mem.eql(u8, arg, candidate)) return true;
@@ -2981,6 +2983,9 @@ test "test flags can precede the entrypoint" {
     const args = [_][:0]const u8{ "cottontail", "test", "--max-concurrency", "3", "suite.test.ts" };
     try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&args));
     try std.testing.expectEqual(@as(?usize, null), testEntrypointIndex(args[0..4]));
+
+    const tsconfig_args = [_][:0]const u8{ "cottontail", "test", "--tsconfig-override", "test-tsconfig.json", "suite.test.ts" };
+    try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&tsconfig_args));
 }
 
 test "test flag values are not treated as additional entrypoints" {

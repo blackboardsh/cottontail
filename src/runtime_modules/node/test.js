@@ -13,6 +13,7 @@ import {
   githubErrorAnnotation,
   githubTimeoutAnnotation,
 } from "../internal/bun-test-github.js";
+import { bunTestConfig } from "../internal/bun-test-config.js";
 
 const tests = [];
 const events = [];
@@ -218,7 +219,8 @@ function configuredRetry() {
 const defaultRetry = configuredRetry();
 
 function configuredRerunEach() {
-  const value = Number(cliOption("--rerun-each", 1));
+  const cliValue = cliOption("--rerun-each");
+  const value = Number(cliValue ?? bunTestConfig().rerunEach ?? 1);
   return Number.isFinite(value) && value > 1 ? Math.trunc(value) : 1;
 }
 

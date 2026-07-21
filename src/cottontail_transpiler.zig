@@ -13,6 +13,7 @@ const Operation = enum(c_int) {
     scan = 1,
     scan_imports = 2,
     scan_import_ranges = 3,
+    scan_module_syntax = 4,
 };
 
 const TransformConfig = struct {
@@ -121,6 +122,11 @@ const ImportRangeResult = struct {
 const ScanResult = struct {
     imports: []const ImportResult,
     exports: []const []const u8,
+};
+
+const ModuleSyntaxResult = struct {
+    hasTopLevelAwait: bool,
+    exportsKind: []const u8,
 };
 
 fn setError(error_out: *?[*:0]u8, comptime fmt: []const u8, args: anytype) void {
@@ -463,7 +469,11 @@ fn process(
         .ast => |ast| ast,
         .already_bundled => {
             if (operation == .transform) return try c_allocator.dupe(u8, source_code);
-            const json = if (operation == .scan_imports or operation == .scan_import_ranges) "[]" else "{\"imports\":[],\"exports\":[]}";
+            const json = switch (operation) {
+                .scan_imports, .scan_import_ranges => "[]",
+                .scan_module_syntax => "{\"hasTopLevelAwait\":false,\"exportsKind\":\"none\"}",
+                else => "{\"imports\":[],\"exports\":[]}",
+            };
             return try c_allocator.dupe(u8, json);
         },
         .cached => {
@@ -498,6 +508,15 @@ fn process(
     }
 
     if (operation != .transform) {
+        if (operation == .scan_module_syntax) {
+            const syntax = ModuleSyntaxResult{
+                .hasTopLevelAwait = !ast.top_level_await_keyword.isEmpty(),
+                .exportsKind = @tagName(ast.exports_kind),
+            };
+            const json = try std.json.Stringify.valueAlloc(temporary_allocator, syntax, .{});
+            return try c_allocator.dupe(u8, json);
+        }
+
         if (operation == .scan_import_ranges) {
             var imports = std.ArrayList(ImportRangeResult).empty;
             for (ast.import_records.slice()) |record| {
@@ -609,6 +628,12 @@ pub fn scanImportRangesJson(source_code: []const u8, loader: []const u8) ![]u8 {
     return process(.scan_import_ranges, source_code, "", loader, &error_message);
 }
 
+pub fn scanModuleSyntaxJson(source_code: []const u8, loader: []const u8) ![]u8 {
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_transpiler_string_free(message);
+    return process(.scan_module_syntax, source_code, "", loader, &error_message);
+}
+
 pub fn scanImportsJsonWithError(
     source_code: []const u8,
     loader: []const u8,
@@ -671,6 +696,8 @@ export fn ct_transpiler_process(
         0 => .transform,
         1 => .scan,
         2 => .scan_imports,
+        3 => .scan_import_ranges,
+        4 => .scan_module_syntax,
         else => {
             setError(error_out, "Unknown transpiler operation", .{});
             return null;
@@ -718,4 +745,24 @@ pub fn forceLink() void {
     _ = &ct_strip_typescript_types;
     _ = &ct_transpiler_free;
     _ = &ct_transpiler_string_free;
+}
+
+test "module syntax scan distinguishes top-level and nested await" {
+    const top_level_json = try scanModuleSyntaxJson("const value = await Promise.resolve(1);", "js");
+    defer c_allocator.free(top_level_json);
+    const nested_json = try scanModuleSyntaxJson("async function nested() { await Promise.resolve(1); }", "js");
+    defer c_allocator.free(nested_json);
+
+    const Syntax = struct {
+        hasTopLevelAwait: bool,
+        exportsKind: []const u8,
+    };
+    const top_level = try std.json.parseFromSlice(Syntax, std.testing.allocator, top_level_json, .{});
+    defer top_level.deinit();
+    const nested = try std.json.parseFromSlice(Syntax, std.testing.allocator, nested_json, .{});
+    defer nested.deinit();
+
+    try std.testing.expect(top_level.value.hasTopLevelAwait);
+    try std.testing.expectEqualStrings("esm", top_level.value.exportsKind);
+    try std.testing.expect(!nested.value.hasTopLevelAwait);
 }

@@ -3,7 +3,7 @@
 import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import os from 'os';
-import { join, relative, resolve } from 'path';
+import { delimiter, join, relative, resolve } from 'path';
 
 const rootDir = process.cwd();
 const targetsPath = join(rootDir, 'compat', 'upstream', 'targets.json');
@@ -353,9 +353,15 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
 }
 
 function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
+  const upstreamNodeModules = runtime === 'bun'
+    ? resolve(rootDir, target.snapshot, 'test', 'node_modules')
+    : null;
   return {
     ...process.env,
     ...(runtime === 'bun' ? { TZ: process.env.COTTONTAIL_UPSTREAM_TZ ?? 'Etc/UTC' } : {}),
+    ...(upstreamNodeModules ? {
+      NODE_PATH: [upstreamNodeModules, process.env.NODE_PATH].filter(Boolean).join(delimiter),
+    } : {}),
     COTTONTAIL_TMP_DIR: runTemp,
     TMPDIR: runTemp,
     TMP: runTemp,

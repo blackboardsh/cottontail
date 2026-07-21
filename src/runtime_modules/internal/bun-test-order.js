@@ -3,6 +3,8 @@
 // that runner starts so preload hooks, source order, filtering, and seeded
 // randomization observe Bun's collection semantics.
 
+import { bunTestConfig } from "./bun-test-config.js";
+
 const argv = Array.from(globalThis.process?.argv ?? []).slice(2).map(String);
 
 function cliOption(name) {
@@ -12,56 +14,70 @@ function cliOption(name) {
   return index >= 0 ? argv[index + 1] : undefined;
 }
 
-const configuredSeed = cliOption("--seed");
-const randomizationEnabled = argv.includes("--randomize") || argv.some((argument) => argument.startsWith("--randomize=")) ||
-  configuredSeed !== undefined;
+const testConfig = bunTestConfig();
+const cliSeed = cliOption("--seed");
+const configuredSeed = cliSeed ?? testConfig.seed;
+const cliRandomize = argv.includes("--randomize") || argv.some((argument) => argument.startsWith("--randomize="));
+if (cliSeed === undefined && testConfig.seed !== undefined && testConfig.randomize !== true) {
+  throw new Error('"seed" can only be used when "randomize" is true');
+}
+const randomizationEnabled = cliRandomize || testConfig.randomize === true || cliSeed !== undefined;
 const parsedSeed = Number(configuredSeed);
 const randomizationSeed = randomizationEnabled
   ? (Number.isFinite(parsedSeed) && configuredSeed !== "" ? Math.trunc(parsedSeed) >>> 0 : Math.floor(Math.random() * 0x100000000) >>> 0)
   : null;
 
-const perFileRandoms = new Map();
 let rootScope;
 let seedReported = false;
 
-function basename(path) {
-  const normalized = String(path ?? "").replaceAll("\\", "/");
-  return normalized.slice(normalized.lastIndexOf("/") + 1);
-}
+const u64Mask = (1n << 64n) - 1n;
 
-function hashString(value) {
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = Math.imul(hash ^ value.charCodeAt(index), 16777619);
-  }
-  return hash >>> 0;
+function rotateLeft64(value, amount) {
+  const bits = BigInt(amount);
+  return ((value << bits) | (value >> (64n - bits))) & u64Mask;
 }
 
 function createRandom(seed) {
-  let state = seed >>> 0;
-  if (state === 0) state = 0x6d2b79f5;
-  return () => {
-    state += 0x6d2b79f5;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 0x100000000;
+  let splitMixState = BigInt(seed) & u64Mask;
+  const splitMixNext = () => {
+    splitMixState = (splitMixState + 0x9e3779b97f4a7c15n) & u64Mask;
+    let value = splitMixState;
+    value = ((value ^ (value >> 30n)) * 0xbf58476d1ce4e5b9n) & u64Mask;
+    value = ((value ^ (value >> 27n)) * 0x94d049bb133111ebn) & u64Mask;
+    return (value ^ (value >> 31n)) & u64Mask;
+  };
+  const state = [splitMixNext(), splitMixNext(), splitMixNext(), splitMixNext()];
+  const next = () => {
+    const result = (rotateLeft64((state[0] + state[3]) & u64Mask, 23) + state[0]) & u64Mask;
+    const shifted = (state[1] << 17n) & u64Mask;
+    state[2] ^= state[0];
+    state[3] ^= state[1];
+    state[1] ^= state[2];
+    state[0] ^= state[3];
+    state[2] ^= shifted;
+    state[3] = rotateLeft64(state[3], 45);
+    return result;
+  };
+  return lessThan => {
+    const bound = BigInt(lessThan);
+    for (;;) {
+      const value = next();
+      const product = value * bound;
+      const low = product & u64Mask;
+      if (low < bound) {
+        const threshold = ((1n << 64n) - bound) % bound;
+        if (low < threshold) continue;
+      }
+      return Number(product >> 64n);
+    }
   };
 }
 
-function randomForFile(filePath) {
-  const path = String(filePath ?? "").replaceAll("\\", "/");
-  let random = perFileRandoms.get(path);
-  if (!random) {
-    random = createRandom((randomizationSeed + hashString(basename(path))) >>> 0);
-    perFileRandoms.set(path, random);
-  }
-  return random;
-}
+const randomizationRandom = randomizationEnabled ? createRandom(BigInt(randomizationSeed)) : null;
 
 function shuffle(values, random) {
-  for (let index = values.length - 1; index > 0; index -= 1) {
-    const target = Math.floor(random() * (index + 1));
+  for (let index = 0; index + 1 < values.length; index += 1) {
+    const target = index + random(values.length - index);
     [values[index], values[target]] = [values[target], values[index]];
   }
   return values;
@@ -108,7 +124,7 @@ function orderedEntries(scope) {
   if (!randomizationEnabled || entries.length < 2) return entries;
 
   if (scope !== rootScope) {
-    return shuffle(entries, randomForFile(entries[0]?.filePath));
+    return shuffle(entries, randomizationRandom);
   }
 
   const groupsByFile = new Map();
@@ -121,8 +137,8 @@ function orderedEntries(scope) {
     }
     group.push(entry);
   }
-  const groups = shuffle([...groupsByFile.values()], createRandom(randomizationSeed));
-  return groups.flatMap((group) => shuffle(group, randomForFile(group[0]?.filePath)));
+  const groups = shuffle([...groupsByFile.values()], randomizationRandom);
+  return groups.flatMap((group) => shuffle(group, randomizationRandom));
 }
 
 export function createBunTestOrderScope(parent = null) {
