@@ -252,16 +252,16 @@ fn isScpLikeGitResolution(resolution: []const u8) bool {
         std.mem.indexOfScalar(u8, source[colon + 1 ..], '/') != null;
 }
 
-fn optionalStringEqual(left: *const Value, right: *const Value, key: []const u8) bool {
+fn optionalLockStringMatchesManifest(left: *const Value, right: *const Value, key: []const u8) bool {
     const left_value = left.object.get(key);
+    if (left_value == null or left_value.? != .string) return true;
     const right_value = right.object.get(key);
-    if (left_value == null or left_value.? != .string) return right_value == null or right_value.? != .string;
     return right_value != null and right_value.? == .string and std.mem.eql(u8, left_value.?.string, right_value.?.string);
 }
 
 fn workspaceValueMatches(workspace: *const Value, package_json: *const Value) bool {
     if (package_json.* != .object or workspace.* != .object) return false;
-    if (!optionalStringEqual(workspace, package_json, "name")) return false;
+    if (!optionalLockStringMatchesManifest(workspace, package_json, "name")) return false;
     for (dependency_sections) |section| {
         if (!stringObjectEqual(workspace, package_json, section)) return false;
     }
@@ -413,8 +413,13 @@ test "frozen root comparison is order independent and exact" {
     const changed = try std.json.parseFromSliceLeaky(Value, allocator,
         \\{"name":"app","dependencies":{"a":"^2","b":"2"}}
     , .{});
+    var graph_without_locked_name = try parseText(allocator,
+        \\{"lockfileVersion":1,"workspaces":{"":{"dependencies":{"a":"^1","b":"2"}}},"packages":{}}
+    );
+    defer graph_without_locked_name.deinit();
     try std.testing.expect(graph.rootMatchesPackageJSON(&matching));
     try std.testing.expect(!graph.rootMatchesPackageJSON(&changed));
+    try std.testing.expect(graph_without_locked_name.rootMatchesPackageJSON(&matching));
 }
 
 test "parse scoped and non-registry resolutions" {
