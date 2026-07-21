@@ -1804,9 +1804,11 @@ function formatError(err, constructor, tag, ctx, keys) {
       for (let line of lines) {
         const core = RegExpPrototypeExec(coreModuleRegExp, line);
         if (
-          core !== null &&
-          (StringPrototypeStartsWith(core[1], "internal/") ||
-            ArrayPrototypeIncludes(require("node:module").builtinModules, core[1]))
+          StringPrototypeIncludes(line, "[native code]") ||
+          StringPrototypeStartsWith(line, "    at native") ||
+          (core !== null &&
+            (StringPrototypeStartsWith(core[1], "internal/") ||
+              ArrayPrototypeIncludes(require("node:module").builtinModules, core[1])))
         ) {
           newStack += `\n${ctx.stylize(line, "undefined")}`;
         } else {
