@@ -1278,6 +1278,7 @@ fn securityDependencyRequest(root: ?*const Value, name: []const u8) ?[]const u8 
 }
 
 const security_scanner_bridge =
+    \\import { readdirSync, readFileSync, realpathSync } from "node:fs";
     \\import { isAbsolute, resolve } from "node:path";
     \\import { pathToFileURL } from "node:url";
     \\
@@ -1318,6 +1319,91 @@ const security_scanner_bridge =
     \\  if (typeof scanner.scan !== "function") throw new Error("scanner.scan is not a function");
     \\
     \\  const payload = await Bun.file(payloadPath).json();
+    \\  const readManifest = path => {
+    \\    try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
+    \\  };
+    \\  const dependencyNames = manifest => {
+    \\    const names = new Set();
+    \\    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    \\      for (const name of Object.keys(manifest?.[section] ?? {})) names.add(name);
+    \\    }
+    \\    return [...names];
+    \\  };
+    \\  const installed = new Map();
+    \\  const visitedModules = new Set();
+    \\  const visitPackage = directory => {
+    \\    const manifest = readManifest(resolve(directory, "package.json"));
+    \\    if (!manifest?.name || !manifest?.version) return;
+    \\    if (!installed.has(manifest.name)) installed.set(manifest.name, { directory, manifest });
+    \\    visitModules(resolve(directory, "node_modules"));
+    \\  };
+    \\  const visitModules = directory => {
+    \\    let identity;
+    \\    try { identity = realpathSync(directory); } catch { return; }
+    \\    if (visitedModules.has(identity)) return;
+    \\    visitedModules.add(identity);
+    \\    let entries;
+    \\    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    \\    for (const entry of entries) {
+    \\      if (entry.name.startsWith(".")) continue;
+    \\      const entryPath = resolve(directory, entry.name);
+    \\      if (entry.name.startsWith("@")) {
+    \\        let scoped;
+    \\        try { scoped = readdirSync(entryPath, { withFileTypes: true }); } catch { continue; }
+    \\        for (const packageEntry of scoped) visitPackage(resolve(entryPath, packageEntry.name));
+    \\      } else {
+    \\        visitPackage(entryPath);
+    \\      }
+    \\    }
+    \\  };
+    \\  visitModules(resolve(root, "node_modules"));
+    \\  const rootManifest = readManifest(resolve(root, "package.json")) ?? {};
+    \\  const rootName = rootManifest.name ?? "root";
+    \\  const rootDependencies = new Map();
+    \\  for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    \\    for (const [name, range] of Object.entries(rootManifest[section] ?? {})) rootDependencies.set(name, String(range));
+    \\  }
+    \\  const existingPackages = new Set(payload.packages.map(pkg => `${pkg.name}\u0000${pkg.version}`));
+    \\  for (const [name, entry] of installed) {
+    \\    const key = `${name}\u0000${entry.manifest.version}`;
+    \\    if (existingPackages.has(key)) continue;
+    \\    payload.packages.push({
+    \\      name,
+    \\      version: entry.manifest.version,
+    \\      requestedRange: rootDependencies.get(name) ?? entry.manifest.version,
+    \\      tarball: pathToFileURL(entry.directory).href,
+    \\    });
+    \\  }
+    \\  const computedPaths = new Map((payload.paths ?? []).map(entry => [entry.name, entry.path]));
+    \\  const queue = [...rootDependencies.keys()].map(name => ({ name, path: `${rootName} \u203a ${name}` }));
+    \\  const expandedPaths = new Set();
+    \\  while (queue.length > 0) {
+    \\    const current = queue.shift();
+    \\    if (expandedPaths.has(current.name)) continue;
+    \\    expandedPaths.add(current.name);
+    \\    if (!computedPaths.has(current.name)) computedPaths.set(current.name, current.path);
+    \\    const entry = installed.get(current.name);
+    \\    if (!entry) continue;
+    \\    for (const child of dependencyNames(entry.manifest)) {
+    \\      if (!computedPaths.has(child)) queue.push({ name: child, path: `${current.path} \u203a ${child}` });
+    \\    }
+    \\  }
+    \\  const selected = new Set(payload.selectedPackages ?? []);
+    \\  if (selected.size > 0) {
+    \\    const allowed = new Set(selected);
+    \\    const selectedQueue = [...selected];
+    \\    while (selectedQueue.length > 0) {
+    \\      const entry = installed.get(selectedQueue.shift());
+    \\      if (!entry) continue;
+    \\      for (const child of dependencyNames(entry.manifest)) {
+    \\        if (allowed.has(child)) continue;
+    \\        allowed.add(child);
+    \\        selectedQueue.push(child);
+    \\      }
+    \\    }
+    \\    payload.packages = payload.packages.filter(pkg => allowed.has(pkg.name));
+    \\  }
+    \\  payload.paths = [...computedPaths].map(([name, path]) => ({ name, path }));
     \\  const started = performance.now();
     \\  const progress = setTimeout(() => {
     \\    const elapsed = Math.max(1, Math.round(performance.now() - started));
@@ -1982,7 +2068,20 @@ const Manager = struct {
                 });
             }
         }
-        const payload = .{ .packages = packages.items, .paths = package_paths.items };
+        var selected_packages = std.array_list.Managed([]const u8).init(manager.allocator);
+        if (manager.options.positionals.len > 0) switch (manager.options.command) {
+            .update => try selected_packages.appendSlice(manager.options.positionals),
+            .add, .link => for (manager.options.positionals) |raw_spec| {
+                const parsed = splitPackageSpec(raw_spec);
+                try selected_packages.append(parsed.name orelse raw_spec);
+            },
+            else => {},
+        };
+        const payload = .{
+            .packages = packages.items,
+            .paths = package_paths.items,
+            .selectedPackages = selected_packages.items,
+        };
         const json = try std.json.Stringify.valueAlloc(manager.allocator, payload, .{});
         try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = output_path, .data = json });
     }
