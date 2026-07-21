@@ -4,73 +4,93 @@ const sessions = new Set();
 const networkResources = new Map();
 let nextResourceId = 1;
 
-function inspectorCommandError(method) {
-  const error = new Error(`Inspector error -32601: '${method}' wasn't found`);
-  error.code = "ERR_INSPECTOR_COMMAND";
+function inspectorError(message, code = "ERR_INSPECTOR_COMMAND") {
+  const error = new Error(message);
+  error.code = code;
   return error;
 }
 
-function inactiveError() {
-  const error = new Error("Inspector is not active");
-  error.code = "ERR_INSPECTOR_NOT_ACTIVE";
+function unsupportedMethodError(method) {
+  const message = method.startsWith("Profiler.") && method.includes("Coverage")
+    ? "Coverage APIs are not supported"
+    : `Inspector method ${JSON.stringify(method)} is not supported`;
+  return inspectorError(message);
+}
+
+function notImplementedError() {
+  const error = new Error(
+    "node:inspector is not yet implemented in Bun. Track the status & thumbs up the issue: " +
+    "https://github.com/oven-sh/bun/issues/2445",
+  );
+  error.code = "ERR_NOT_IMPLEMENTED";
   return error;
-}
-
-function inspectorServerError() {
-  const error = new Error("Inspector server is not implemented in Cottontail yet");
-  error.code = "ERR_INSPECTOR_NOT_AVAILABLE";
-  return error;
-}
-
-function remoteObject(value) {
-  if (value === null) return { type: "object", subtype: "null", value: null, description: "null" };
-  const type = typeof value;
-  if (type === "undefined") return { type: "undefined" };
-  if (type === "number" || type === "boolean" || type === "string") return { type, value, description: String(value) };
-  if (type === "bigint") return { type: "bigint", unserializableValue: `${value}n`, description: `${value}n` };
-  if (type === "symbol") return { type: "symbol", description: String(value) };
-  if (type === "function") return { type: "function", description: value.name ? `function ${value.name}()` : "function" };
-  return {
-    type: "object",
-    className: value?.constructor?.name ?? "Object",
-    description: value?.constructor?.name ?? "Object",
-  };
-}
-
-function evaluateExpression(params = {}) {
-  const expression = String(params.expression ?? "undefined");
-  const evaluator = Function(`"use strict"; return (${expression});`);
-  const value = evaluator.call(globalThis);
-  return { result: remoteObject(value) };
 }
 
 function notification(method, params = {}) {
   for (const session of sessions) session.emit(method, { method, params });
 }
 
-function postResult(method, params = {}) {
+function profileResult(startTime) {
+  const endTime = performance.now() * 1000;
+  return {
+    profile: {
+      nodes: [{
+        id: 1,
+        callFrame: {
+          functionName: "(root)",
+          scriptId: "0",
+          url: "",
+          lineNumber: -1,
+          columnNumber: -1,
+        },
+        hitCount: 0,
+        children: [],
+      }],
+      startTime,
+      endTime: Math.max(startTime, endTime),
+      samples: [],
+      timeDeltas: [],
+    },
+  };
+}
+
+function postResult(session, method, params = {}) {
   switch (method) {
-    case "Runtime.evaluate":
-      return evaluateExpression(params);
-    case "Runtime.enable":
-    case "Console.enable":
-    case "HeapProfiler.enable":
-    case "HeapProfiler.takeHeapSnapshot":
     case "Profiler.enable":
+      session.profilerEnabled = true;
+      return {};
+    case "Profiler.disable":
+      session.profilerEnabled = false;
+      session.profilerRunning = false;
+      return {};
     case "Profiler.start":
+      if (!session.profilerEnabled) {
+        throw inspectorError("Profiler is not enabled. Call Profiler.enable first.");
+      }
+      if (!session.profilerRunning) {
+        session.profilerRunning = true;
+        session.profilerStartedAt = performance.now() * 1000;
+      }
+      return {};
     case "Profiler.stop":
+      if (!session.profilerRunning) {
+        throw inspectorError("Profiler is not started. Call Profiler.start first.");
+      }
+      session.profilerRunning = false;
+      return profileResult(session.profilerStartedAt);
+    case "Profiler.setSamplingInterval": {
+      if (session.profilerRunning) {
+        throw inspectorError("Cannot change sampling interval while profiler is running");
+      }
+      const interval = Number(params.interval);
+      if (!Number.isFinite(interval) || interval <= 0) {
+        throw inspectorError("Sampling interval must be a positive number");
+      }
+      session.samplingInterval = interval;
       return {};
-    case "Debugger.enable":
-      return { debuggerId: "cottontail-jsc-debugger" };
-    case "Network.enable":
-      return {};
-    case "Network.getResponseBody": {
-      const id = params.requestId ?? params.id;
-      const body = networkResources.get(id) ?? "";
-      return { body, base64Encoded: false };
     }
     default:
-      throw inspectorCommandError(method);
+      throw unsupportedMethodError(method);
   }
 }
 
@@ -78,9 +98,14 @@ export class Session extends EventEmitter {
   constructor() {
     super();
     this.connected = false;
+    this.profilerEnabled = false;
+    this.profilerRunning = false;
+    this.profilerStartedAt = 0;
+    this.samplingInterval = 1000;
   }
 
   connect() {
+    if (this.connected) throw inspectorError("Session is already connected");
     this.connected = true;
     sessions.add(this);
   }
@@ -94,30 +119,34 @@ export class Session extends EventEmitter {
       callback = params;
       params = undefined;
     }
-    if (!this.connected) this.connect();
+    const run = () => {
+      if (!this.connected) throw inspectorError("Session is not connected");
+      return postResult(this, String(method), params ?? {});
+    };
+    if (typeof callback !== "function") return run();
     queueMicrotask(() => {
-      try {
-        const result = postResult(String(method), params ?? {});
-        if (typeof callback === "function") callback(null, result);
-      } catch (error) {
-        if (typeof callback === "function") callback(error);
-        else this.emit("error", error);
-      }
+      let result;
+      try { result = run(); } catch (error) { callback(error); return; }
+      callback(null, result);
     });
+    return undefined;
   }
 
   disconnect() {
+    if (!this.connected) return;
     this.connected = false;
+    this.profilerEnabled = false;
+    this.profilerRunning = false;
     sessions.delete(this);
   }
 }
 
 export function close() {
-  for (const session of [...sessions]) session.disconnect();
+  throw notImplementedError();
 }
 
 export function open() {
-  throw inspectorServerError();
+  throw notImplementedError();
 }
 
 export function url() {
@@ -125,34 +154,10 @@ export function url() {
 }
 
 export function waitForDebugger() {
-  throw inactiveError();
+  throw notImplementedError();
 }
 
-export const console = {
-  debug: (...args) => globalThis.console.debug(...args),
-  error: (...args) => globalThis.console.error(...args),
-  info: (...args) => globalThis.console.info(...args),
-  log: (...args) => globalThis.console.log(...args),
-  warn: (...args) => globalThis.console.warn(...args),
-  dir: (...args) => globalThis.console.dir?.(...args),
-  dirxml: (...args) => globalThis.console.log(...args),
-  table: (...args) => globalThis.console.table?.(...args),
-  trace: (...args) => globalThis.console.trace?.(...args),
-  group: (...args) => globalThis.console.group?.(...args),
-  groupCollapsed: (...args) => globalThis.console.groupCollapsed?.(...args),
-  groupEnd: (...args) => globalThis.console.groupEnd?.(...args),
-  clear: () => globalThis.console.clear?.(),
-  count: (label) => globalThis.console.count?.(label),
-  countReset: (label) => globalThis.console.countReset?.(label),
-  assert: (value, ...args) => globalThis.console.assert?.(value, ...args),
-  profile: () => {},
-  profileEnd: () => {},
-  time: (label) => globalThis.console.time?.(label),
-  timeLog: (label, ...args) => globalThis.console.timeLog?.(label, ...args),
-  timeEnd: (label) => globalThis.console.timeEnd?.(label),
-  timeStamp: (label) => notification("Timeline.timeStamp", { label }),
-  context: () => console,
-};
+export const console = globalThis.console;
 
 export const Network = {
   requestWillBeSent: (params = {}) => notification("Network.requestWillBeSent", params),
@@ -174,7 +179,9 @@ export const NetworkResources = {
   },
 };
 
-// COTTONTAIL-COMPAT: node:inspector server - local Session protocol supports Runtime.evaluate and event delivery; DevTools WebSocket server/open(), debugger breakpoints, heap snapshots, and full domain coverage need JavaScriptCore inspector/runtime hooks.
+// COTTONTAIL-COMPAT: node:inspector server - Session implements Bun's local
+// profiler contract. DevTools transport and other protocol domains still need
+// JavaScriptCore inspector hooks.
 
 export default {
   Network,

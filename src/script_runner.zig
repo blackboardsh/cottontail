@@ -2359,6 +2359,12 @@ fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !Runtim
             const property = runtimeMemberProperty(tokens, index) orelse return .full;
             if (std.mem.eql(u8, property, "mainModule")) return .full;
             if (!minimalRuntimeProcessProperty(property)) mode = .process;
+        } else if (std.mem.eql(u8, token.text, "Error")) {
+            if (runtimeMemberProperty(tokens, index)) |property| {
+                if (std.mem.eql(u8, property, "captureStackTrace") or
+                    std.mem.eql(u8, property, "prepareStackTrace") or
+                    std.mem.eql(u8, property, "stackTraceLimit")) return .full;
+            }
         } else if (fullRuntimeGlobal(token.text)) {
             return .full;
         }

@@ -12,6 +12,10 @@ let timezone = "";
 let samplingProfilerActive = false;
 let samplingProfilerStartedAt = 0;
 const nativeHeapStats = cottontail.jscMemoryUsage;
+const estimatedMemoryCostSymbol = Symbol.for("cottontail.estimatedMemoryCost");
+const estimatedValues = new Set();
+const estimatedValueSet = new WeakSet();
+const stackFunctionRegistrySymbol = Symbol.for("cottontail.stackFunctionRegistry");
 
 function normalizeHeapStats(stats) {
   stats.objectTypeCounts ??= {};
@@ -50,11 +54,98 @@ function shallowSize(value) {
   if (typeof value === "object") {
     // Objects that own out-of-line storage (e.g. Performance's entry buffer)
     // report it through this hook, mirroring JSC's Structure::estimatedSize.
-    const reported = value[Symbol.for("cottontail.estimatedMemoryCost")];
+    const reported = value[estimatedMemoryCostSymbol];
     if (typeof reported === "number") return reported + Object.keys(value).length * 16;
     return Object.keys(value).length * 16;
   }
   return 0;
+}
+
+function trackEstimatedValue(value) {
+  if (value == null || (typeof value !== "object" && typeof value !== "function") ||
+      estimatedValueSet.has(value) || typeof WeakRef !== "function") return;
+  estimatedValueSet.add(value);
+  estimatedValues.add(new WeakRef(value));
+}
+
+function externalMemoryCost(value) {
+  if (value == null || (typeof value !== "object" && typeof value !== "function")) return 0;
+  try {
+    const cost = Number(value[estimatedMemoryCostSymbol]);
+    return Number.isFinite(cost) && cost > 0 ? cost : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function heapSnapshotClassName(value) {
+  try {
+    const name = value?.constructor?.name;
+    if (typeof name === "string" && name) return name;
+    return Object.prototype.toString.call(value).slice(8, -1);
+  } catch {
+    return "";
+  }
+}
+
+// JSC's C API heap snapshot does not know about storage owned by host-backed
+// JavaScript wrappers. Fold those wrappers' reported external bytes into the
+// matching cells, as native Bun does through its cell estimatedSize hooks.
+export function accountForExternallyAllocatedMemory(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.nodeClassNames)) return snapshot;
+
+  const costs = new Map();
+  const seen = new Set();
+  const collect = (value) => {
+    if (value == null || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) return;
+    seen.add(value);
+    const cost = externalMemoryCost(value);
+    const name = cost > 0 ? heapSnapshotClassName(value) : "";
+    if (name) costs.set(name, (costs.get(name) ?? 0) + cost);
+  };
+
+  for (const reference of Array.from(estimatedValues)) {
+    const value = reference.deref();
+    if (value === undefined) estimatedValues.delete(reference);
+    else collect(value);
+  }
+  for (const key of Reflect.ownKeys(globalThis)) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+    if (descriptor && "value" in descriptor) collect(descriptor.value);
+  }
+
+  if (costs.size === 0) return snapshot;
+  const stride = snapshot.type === "GCDebugging" ? 7 : 4;
+  const canonicalClassIndexes = new Map();
+  for (const className of costs.keys()) {
+    const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const aliasPattern = new RegExp(`^${escaped}\\d+$`);
+    const aliases = [];
+    for (let index = 0; index < snapshot.nodeClassNames.length; index += 1) {
+      const candidate = snapshot.nodeClassNames[index];
+      if (candidate === className || aliasPattern.test(candidate)) aliases.push(index);
+    }
+    if (aliases.length === 0) continue;
+    const canonical = aliases.find(index => snapshot.nodeClassNames[index] === className) ?? aliases[0];
+    const aliasSet = new Set(aliases);
+    snapshot.nodeClassNames[canonical] = className;
+    for (let offset = 0; offset + 2 < snapshot.nodes.length; offset += stride) {
+      if (aliasSet.has(snapshot.nodes[offset + 2])) snapshot.nodes[offset + 2] = canonical;
+    }
+    canonicalClassIndexes.set(className, canonical);
+  }
+  const firstNodeByClass = new Map();
+  for (let offset = 0; offset + 2 < snapshot.nodes.length; offset += stride) {
+    const className = snapshot.nodeClassNames[snapshot.nodes[offset + 2]];
+    if (!firstNodeByClass.has(className)) firstNodeByClass.set(className, offset);
+  }
+  for (const [className, cost] of costs) {
+    const canonical = canonicalClassIndexes.get(className);
+    const offset = canonical === undefined ? firstNodeByClass.get(className) :
+      firstNodeByClass.get(snapshot.nodeClassNames[canonical]);
+    if (offset !== undefined) snapshot.nodes[offset + 1] += cost;
+  }
+  return snapshot;
 }
 
 export function serialize(value, options = undefined) {
@@ -114,6 +205,7 @@ export function generateHeapSnapshotForDebugging(filename = undefined) {
 }
 
 export function estimateShallowMemoryUsageOf(value) {
+  trackEstimatedValue(value);
   return shallowSize(value);
 }
 
@@ -190,6 +282,13 @@ export function noFTL(fn = undefined) {
 }
 
 export function noInline(fn = undefined) {
+  if (typeof fn === "function") {
+    const name = typeof fn.displayName === "string" && fn.displayName ? fn.displayName : fn.name;
+    if (name) {
+      const registry = globalThis[stackFunctionRegistrySymbol] ??= new Map();
+      registry.set(name, typeof WeakRef === "function" ? new WeakRef(fn) : fn);
+    }
+  }
   return fn;
 }
 
