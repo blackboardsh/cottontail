@@ -525,9 +525,7 @@ pub fn generateCodeForFileInChunkJS(
                 }
 
                 if (inner_stmts.len > 0) {
-                    // See the comment in needsWrapperRef for why the symbol
-                    // is sometimes not generated.
-                    bun.assert(!ast.wrapper_ref.isEmpty()); // js_parser's needsWrapperRef thought wrapper was not needed
+                    bun.assert(!ast.wrapper_ref.isEmpty());
 
                     // "__esm(() => { ... })"
                     var esm_args = bun.handleOom(temp_allocator.alloc(Expr, 1));

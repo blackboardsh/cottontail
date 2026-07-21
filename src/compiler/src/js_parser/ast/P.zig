@@ -6650,9 +6650,10 @@ pub fn NewParser_(
                     break :brk p.hmr_api_ref;
                 }
 
-                // When code splitting is enabled, always create wrapper_ref to match esbuild behavior.
-                // Otherwise, use needsWrapperRef() to optimize away unnecessary wrappers.
-                if (p.options.bundle and (p.options.code_splitting or p.needsWrapperRef(parts.items))) {
+                // Linking can turn otherwise movable declarations into an ESM
+                // initializer after parsing. Keep the wrapper symbol for every
+                // bundled module so that later hoisting can always emit it.
+                if (p.options.bundle) {
                     break :brk p.newSymbol(
                         .other,
                         std.fmt.allocPrint(
@@ -6721,53 +6722,6 @@ pub fn NewParser_(
                 .parts = bun.BabyList(js_ast.Part).moveFromList(parts),
                 .import_records = ImportRecord.List.moveFromList(&p.import_records),
             };
-        }
-
-        /// The bundler will generate wrappers to contain top-level side effects using
-        /// the '__esm' helper. Example:
-        ///
-        ///     var init_foo = __esm(() => {
-        ///         someExport = Math.random();
-        ///     });
-        ///
-        /// This wrapper can be removed if all of the constructs get moved
-        /// outside of the file. Due to paralleization, we can't retroactively
-        /// delete the `init_foo` symbol, but instead it must be known far in
-        /// advance if the symbol is needed or not.
-        ///
-        /// The logic in this function must be in sync with the hoisting
-        /// logic in `LinkerContext.generateCodeForFileInChunkJS`
-        fn needsWrapperRef(p: *const P, parts: []const js_ast.Part) bool {
-            bun.assert(p.options.bundle);
-            for (parts) |part| {
-                for (part.stmts) |stmt| {
-                    switch (stmt.data) {
-                        .s_function => {},
-                        .s_class => |class| if (!class.class.canBeMoved()) return true,
-                        .s_local => |local| {
-                            if (local.was_commonjs_export or p.commonjs_named_exports.count() == 0) {
-                                for (local.decls.slice()) |decl| {
-                                    if (decl.value) |value|
-                                        if (value.data != .e_missing and !value.canBeMoved())
-                                            return true;
-                                }
-                                continue;
-                            }
-                            return true;
-                        },
-                        .s_export_default => |ed| {
-                            if (!ed.canBeMoved())
-                                return true;
-                        },
-                        .s_export_equals => |e| {
-                            if (!e.value.canBeMoved())
-                                return true;
-                        },
-                        else => return true,
-                    }
-                }
-            }
-            return false;
         }
 
         pub fn init(

@@ -5632,9 +5632,9 @@ fn scanDynamicImports(
             const assumes_json5 = isJson5Specifier(prefix);
             const assumes_toml = isTomlSpecifier(prefix);
             const target_path = try resolveDynamicImportTarget(ctx, resolution_dir, prefix);
-            const prefix_loader = if (!has_attributes and !has_query) inferredLoaderForTarget(prefix) else null;
+            const prefix_loader = if (!has_attributes and !has_query) inferredLoaderForImportSpecifier(prefix) else null;
             const inferred_loader = if (!has_attributes and !has_query)
-                inferredLoaderForTarget(target_path orelse prefix)
+                if (target_path) |path| inferredLoaderForTarget(path) else inferredLoaderForImportSpecifier(prefix)
             else
                 null;
             const needs_compat_resolution = target_path != null and prefix_loader != null and
@@ -5762,7 +5762,7 @@ fn scanDynamicImports(
                 has_custom_signal = true;
                 needs_generated_loader = true;
             } else if (comma == null) {
-                if (inferredLoaderForTarget(prefix)) |loader| {
+                if (inferredLoaderForImportSpecifier(prefix)) |loader| {
                     options = try loaderOptionsLiteral(ctx, loader);
                     has_custom_signal = true;
                     needs_generated_loader = true;
@@ -5917,6 +5917,24 @@ fn inferredLoaderForTarget(path: []const u8) ?[]const u8 {
         return null;
     }
     return "file";
+}
+
+fn inferredLoaderForImportSpecifier(specifier: []const u8) ?[]const u8 {
+    const loader = inferredLoaderForTarget(specifier) orelse return null;
+    if (!std.mem.eql(u8, loader, "file")) return loader;
+
+    const bare = pathWithoutQueryOrFragment(specifier);
+    if (std.fs.path.isAbsolute(bare) or
+        std.mem.startsWith(u8, bare, "./") or
+        std.mem.startsWith(u8, bare, "../") or
+        compiler.resolver.FileURL.isFileURL(bare))
+    {
+        return loader;
+    }
+
+    // A dot in a package subpath is not necessarily a file extension. For
+    // example, React exports `react-dom/server.browser` as JavaScript.
+    return null;
 }
 
 fn appendDynamicFactorySourceLiteral(

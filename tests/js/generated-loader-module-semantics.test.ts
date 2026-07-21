@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -47,6 +47,27 @@ test("async module self-imports observe the compiler's live namespace", () => {
   expect(child.stderr.toString()).toBe("");
 });
 
+test("a dynamically imported module can statically import its awaiting parent", () => {
+  const entry = join(root, "dynamic-back-edge-entry.js");
+  const dependency = join(root, "dynamic-back-edge-dependency.js");
+  writeFileSync(entry, [
+    'export function parentValue() { return "back-edge-ok"; }',
+    'const namespace = await import("./dynamic-back-edge-dependency.js");',
+    "console.log(namespace.value);",
+    "",
+  ].join("\n"));
+  writeFileSync(dependency, [
+    'import { parentValue } from "./dynamic-back-edge-entry.js";',
+    "export const value = parentValue();",
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("back-edge-ok\n");
+  expect(child.stderr.toString()).toBe("");
+});
+
 test("self-import and self-require share Bun's virtual ESM marker", () => {
   const entry = join(root, "esm-marker-self-import.js");
   writeFileSync(entry, [
@@ -91,4 +112,26 @@ test("static-import diagnostics preserve embedded NUL bytes", () => {
   const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
   expect(child.exitCode).not.toBe(0);
   expect(child.stderr.toString()).toContain(specifier);
+});
+
+test("package subpaths ending in condition names remain JavaScript modules", () => {
+  const packageRoot = join(root, "node_modules", "condition-package");
+  const entry = join(root, "condition-package-entry.js");
+  mkdirSync(packageRoot, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+    name: "condition-package",
+    exports: { "./server.browser": "./server.browser.js" },
+  }));
+  writeFileSync(join(packageRoot, "server.browser.js"), "exports.render = () => 'browser-module';\n");
+  writeFileSync(entry, [
+    'import { render } from "condition-package/server.browser";',
+    'if (render() !== "browser-module") throw new Error("package subpath was loaded as an asset");',
+    'console.log("browser-module");',
+    "",
+  ].join("\n"));
+
+  const child = Bun.spawnSync({ cmd: [process.execPath, entry] });
+  expect(child.exitCode).toBe(0);
+  expect(child.stdout.toString()).toBe("browser-module\n");
+  expect(child.stderr.toString()).toBe("");
 });
