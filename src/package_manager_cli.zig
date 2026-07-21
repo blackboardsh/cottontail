@@ -28,6 +28,7 @@ const manifest_accept = "application/vnd.npm.install-v1+json; q=1.0, application
 const default_registry = "https://registry.npmjs.org/";
 const max_manifest_bytes = 64 * 1024 * 1024;
 const max_tarball_bytes = 512 * 1024 * 1024;
+const security_resolution_output_env = "COTTONTAIL_PM_SECURITY_RESOLUTION_OUTPUT";
 const all_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies", "peerDependencies" };
 const mutable_dependency_sections = [_][]const u8{ "dependencies", "devDependencies", "optionalDependencies" };
 const runtime_dependency_sections = [_][]const u8{ "dependencies", "optionalDependencies" };
@@ -62,6 +63,7 @@ const DependencySection = enum {
 const Options = struct {
     command: Command,
     positionals: []const []const u8,
+    original_args: []const [:0]const u8 = &.{},
     cwd: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
     filters: []const []const u8 = &.{},
@@ -359,6 +361,20 @@ fn commandFromString(command: []const u8) ?Command {
     return null;
 }
 
+fn commandUsesSecurityScanner(command: Command) bool {
+    return switch (command) {
+        .install, .add, .remove, .update, .link => true,
+        else => false,
+    };
+}
+
+fn packageManagerChildExitCode(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| @intCast(@min(code, 255)),
+        else => 1,
+    };
+}
+
 pub fn run(
     init: std.process.Init,
     args: []const [:0]const u8,
@@ -392,6 +408,21 @@ pub fn run(
     if (options.cwd) |cwd| {
         std.process.setCurrentPath(init.io, cwd) catch |err| {
             try stderr.print("error: unable to use --cwd '{s}': {s}\n", .{ cwd, @errorName(err) });
+            try stderr.flush();
+            return 1;
+        };
+    }
+
+    if (options.command == .pm and
+        options.positionals.len > 0 and
+        std.mem.eql(u8, options.positionals[0], "scan"))
+    {
+        var manager = Manager.init(init, options, stdout, stderr);
+        defer manager.deinit();
+        return manager.executeSecurityScan() catch |err| {
+            if (err != error.PackageManagerErrorReported) {
+                try stderr.print("error: {s}\n", .{@errorName(err)});
+            }
             try stderr.flush();
             return 1;
         };
@@ -439,6 +470,7 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
     var options = Options{
         .command = commandFromString(args[1]) orelse return error.UnknownPackageManagerCommand,
         .positionals = &.{},
+        .original_args = args,
         .frozen_lockfile = std.mem.eql(u8, args[1], "ci"),
     };
     var positionals = std.array_list.Managed([]const u8).init(allocator);
@@ -1221,6 +1253,133 @@ fn normalizeRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]const 
     return std.fmt.allocPrint(allocator, "{s}/", .{url});
 }
 
+const SecurityPackage = struct {
+    name: []const u8,
+    version: []const u8,
+    requestedRange: []const u8,
+    tarball: []const u8,
+};
+
+const SecurityPackagePath = struct {
+    name: []const u8,
+    path: []const u8,
+};
+
+fn securityDependencyRequest(root: ?*const Value, name: []const u8) ?[]const u8 {
+    const package_json = root orelse return null;
+    if (package_json.* != .object) return null;
+    for (all_dependency_sections) |section_name| {
+        const section = package_json.object.get(section_name) orelse continue;
+        if (section != .object) continue;
+        const requested = section.object.get(name) orelse continue;
+        if (requested == .string) return requested.string;
+    }
+    return null;
+}
+
+const security_scanner_bridge =
+    \\import { isAbsolute, resolve } from "node:path";
+    \\import { pathToFileURL } from "node:url";
+    \\
+    \\const specifier = process.env.COTTONTAIL_PM_SECURITY_SCANNER;
+    \\const root = process.env.COTTONTAIL_PM_SECURITY_ROOT;
+    \\const payloadPath = process.env.COTTONTAIL_PM_SECURITY_PAYLOAD;
+    \\const mode = process.env.COTTONTAIL_PM_SECURITY_MODE ?? "install";
+    \\if (!specifier || !root || !payloadPath) {
+    \\  console.error("error: incomplete security scanner invocation");
+    \\  process.exit(1);
+    \\}
+    \\
+    \\let resolved;
+    \\if (isAbsolute(specifier) || specifier.startsWith("./") || specifier.startsWith("../")) {
+    \\  resolved = resolve(root, specifier);
+    \\  if (!(await Bun.file(resolved).exists())) {
+    \\    console.error(`Security scanner '${specifier}' is configured in bunfig.toml but the file could not be found.`);
+    \\    console.error("  Please check that the file exists and the path is correct.");
+    \\    process.exit(1);
+    \\  }
+    \\  resolved = pathToFileURL(resolved).href;
+    \\} else {
+    \\  try {
+    \\    resolved = Bun.resolveSync(specifier, root);
+    \\  } catch {
+    \\    console.error(`Security scanner '${specifier}' is configured in bunfig.toml but the package could not be resolved.`);
+    \\    process.exit(1);
+    \\  }
+    \\}
+    \\
+    \\try {
+    \\  const imported = await import(resolved);
+    \\  const scanner = imported.scanner ?? imported.default?.scanner;
+    \\  if (!scanner || !("version" in scanner)) {
+    \\    throw new Error("Security scanner module must export a scanner with a version property");
+    \\  }
+    \\  if (scanner.version !== "1") throw new Error("Security scanner must be version 1");
+    \\  if (typeof scanner.scan !== "function") throw new Error("scanner.scan is not a function");
+    \\
+    \\  const payload = await Bun.file(payloadPath).json();
+    \\  const started = performance.now();
+    \\  const progress = setTimeout(() => {
+    \\    const elapsed = Math.max(1, Math.round(performance.now() - started));
+    \\    console.error(`[${specifier}] Scanning ${payload.packages.length} package${payload.packages.length === 1 ? "" : "s"} took ${elapsed}ms`);
+    \\  }, 1000);
+    \\  let advisories;
+    \\  try {
+    \\    advisories = await scanner.scan({ packages: payload.packages });
+    \\  } finally {
+    \\    clearTimeout(progress);
+    \\  }
+    \\  if (!Array.isArray(advisories)) throw new Error("Security scanner must return an array of advisories");
+    \\
+    \\  for (let index = 0; index < advisories.length; index++) {
+    \\    const advisory = advisories[index];
+    \\    if (advisory === null || typeof advisory !== "object" || Array.isArray(advisory)) {
+    \\      throw new Error(`Security advisory at index ${index} must be an object`);
+    \\    }
+    \\    if (!("package" in advisory)) throw new Error(`Security advisory at index ${index} missing required 'package' field`);
+    \\    if (typeof advisory.package !== "string") throw new Error(`Security advisory at index ${index} 'package' field must be a string`);
+    \\    if (advisory.package.length === 0) throw new Error(`Security advisory at index ${index} 'package' field cannot be empty`);
+    \\    if (advisory.description !== undefined && advisory.description !== null && typeof advisory.description !== "string") {
+    \\      throw new Error(`Security advisory at index ${index} 'description' field must be a string or null`);
+    \\    }
+    \\    if (advisory.url !== undefined && advisory.url !== null && typeof advisory.url !== "string") {
+    \\      throw new Error(`Security advisory at index ${index} 'url' field must be a string or null`);
+    \\    }
+    \\    if (!("level" in advisory)) throw new Error(`Security advisory at index ${index} missing required 'level' field`);
+    \\    if (typeof advisory.level !== "string") throw new Error(`Security advisory at index ${index} 'level' field must be a string`);
+    \\    if (advisory.level !== "fatal" && advisory.level !== "warn") {
+    \\      throw new Error(`Security advisory at index ${index} 'level' field must be 'fatal' or 'warn'`);
+    \\    }
+    \\  }
+    \\
+    \\  let fatal = 0;
+    \\  let warnings = 0;
+    \\  const packagePaths = new Map((payload.paths ?? []).map(entry => [entry.name, entry.path]));
+    \\  for (const advisory of advisories) {
+    \\    if (advisory.level === "fatal") fatal++;
+    \\    else warnings++;
+    \\    console.log(`${advisory.level === "fatal" ? "FATAL" : "WARNING"}: ${advisory.package}`);
+    \\    if (packagePaths.has(advisory.package)) console.log(`via ${packagePaths.get(advisory.package)}`);
+    \\    if (advisory.description) console.log(advisory.description);
+    \\    if (advisory.url) console.log(advisory.url);
+    \\  }
+    \\  if (advisories.length === 0) {
+    \\    if (mode === "scan") console.log("No advisories found");
+    \\    process.exit(0);
+    \\  }
+    \\  const details = [fatal ? `${fatal} fatal` : "", warnings ? `${warnings} warning${warnings === 1 ? "" : "s"}` : ""].filter(Boolean).join(", ");
+    \\  console.log(`${advisories.length} advisor${advisories.length === 1 ? "y" : "ies"} (${details})`);
+    \\  if (mode !== "scan") {
+    \\    if (fatal > 0) console.log("Installation aborted due to fatal security advisories");
+    \\    else console.log("Security warnings found. Cannot prompt for confirmation (no TTY).\nInstallation cancelled.");
+    \\  }
+    \\  process.exit(1);
+    \\} catch (error) {
+    \\  console.error(`Security scanner failed: ${error?.message ?? error}`);
+    \\  process.exit(1);
+    \\}
+;
+
 const Manager = struct {
     init_data: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1282,6 +1441,7 @@ const Manager = struct {
     peer_conflict_warnings: std.StringHashMap(void),
     lock_graph: ?Lockfile.Graph = null,
     manifest_policy: ?Manifest.Policy = null,
+    security_scanner: ?[]const u8 = null,
     script_queue: Scripts.Queue,
 
     fn init(
@@ -1352,6 +1512,14 @@ const Manager = struct {
     }
 
     fn execute(manager: *Manager) !u8 {
+        const security_resolution_output = manager.init_data.environ_map.get(security_resolution_output_env);
+        if (security_resolution_output != null) {
+            manager.options.dry_run = true;
+            manager.options.no_save = true;
+            manager.options.silent = true;
+            manager.options.no_summary = true;
+            manager.options.ignore_scripts = true;
+        }
         // Bun treats `install <package>` as `add <package>` before it
         // initializes the package manager.
         if (manager.options.command == .install and manager.options.positionals.len > 0) {
@@ -1441,6 +1609,12 @@ const Manager = struct {
         }
         try manager.validateLockfileWorkspaces();
         try manager.configureInstallFilters(&root);
+        if (security_resolution_output == null and
+            manager.security_scanner != null and
+            commandUsesSecurityScanner(manager.options.command))
+        {
+            try manager.runSecurityScannerPreflight(&root);
+        }
         if (manager.options.command == .patch) return manager.preparePatchCommand();
         if (manager.options.command == .patch_commit) {
             return manager.commitPatchCommand(&root, package_json_path, had_trailing_newline);
@@ -1508,6 +1682,11 @@ const Manager = struct {
             .unlink => unreachable,
             .patch, .patch_commit => unreachable,
             .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
+        }
+
+        if (security_resolution_output) |output_path| {
+            try manager.writeSecurityResolution(output_path, null);
+            return 0;
         }
 
         try manager.reconcileIsolatedPeerGraph();
@@ -1614,6 +1793,290 @@ const Manager = struct {
         try manager.stdout.flush();
         try manager.stderr.flush();
         return 0;
+    }
+
+    fn executeSecurityScan(manager: *Manager) !u8 {
+        manager.invocation_dir = try absolutePath(manager.init_data.io, manager.allocator, ".");
+        const project = try findInstallProject(manager.init_data.io, manager.allocator, manager.invocation_dir);
+        manager.root_dir = project.root_dir;
+        manager.invocation_package_dir = project.package_dir;
+
+        const package_json_path = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "package.json" });
+        const package_source = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            package_json_path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                try manager.stderr.writeAll("error: No package.json was found\n");
+                return error.PackageManagerErrorReported;
+            },
+            else => return err,
+        };
+        var root = try std.json.parseFromSliceLeaky(Value, manager.allocator, package_source, .{});
+        if (root != .object) return error.InvalidPackageJSON;
+        manager.root_package_json = &root;
+        manager.manifest_policy = try Manifest.Policy.init(manager.allocator, &root);
+
+        if (!std.mem.eql(u8, manager.invocation_dir, manager.root_dir)) {
+            try std.process.setCurrentPath(manager.init_data.io, manager.root_dir);
+        }
+        try manager.loadConfiguration();
+        if (manager.security_scanner == null) {
+            try manager.stderr.writeAll("error: no security scanner configured\n");
+            return error.PackageManagerErrorReported;
+        }
+
+        try manager.loadLockfile(&root);
+        if (manager.lock_graph == null) {
+            try manager.stderr.writeAll("error: Lockfile not found. Run 'bun install' first.\n");
+            return error.PackageManagerErrorReported;
+        }
+
+        const payload_path = try manager.securityTempFile("json");
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
+        try manager.writeSecurityResolution(payload_path, &root);
+        try manager.runSecurityScannerPayload(payload_path, "scan");
+        return 0;
+    }
+
+    fn securityTempFile(manager: *Manager, suffix: []const u8) ![]const u8 {
+        const environment = manager.init_data.environ_map;
+        const temp_dir = environment.get("BUN_TMPDIR") orelse
+            environment.get("TMPDIR") orelse
+            environment.get("TEMP") orelse
+            environment.get("TMP") orelse
+            if (builtin.os.tag == .windows) "." else "/tmp";
+        const nonce: u128 = @bitCast(manager.started_ns);
+        return std.fmt.allocPrint(
+            manager.allocator,
+            "{s}/cottontail-security-{x}-{x}.{s}",
+            .{ temp_dir, nonce, std.hash.Wyhash.hash(0, manager.root_dir), suffix },
+        );
+    }
+
+    fn writeSecurityResolution(
+        manager: *Manager,
+        output_path: []const u8,
+        root_override: ?*const Value,
+    ) !void {
+        const selected_root: ?*const Value = if (root_override) |root| root else manager.root_package_json;
+        var packages = std.array_list.Managed(SecurityPackage).init(manager.allocator);
+        var seen = std.StringHashMap(void).init(manager.allocator);
+        defer seen.deinit();
+
+        for (manager.records.items) |record| {
+            if (record.kind != .npm or
+                record.name.len == 0 or
+                record.version.len == 0 or
+                record.tarball.len == 0) continue;
+            const requested_range = securityDependencyRequest(selected_root, record.alias) orelse
+                if (record.resolution.len > 0) record.resolution else record.version;
+            const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}\x00{s}", .{
+                record.name,
+                record.version,
+                record.tarball,
+            });
+            if (seen.contains(key)) continue;
+            try seen.put(key, {});
+            try packages.append(.{
+                .name = record.name,
+                .version = record.version,
+                .requestedRange = requested_range,
+                .tarball = record.tarball,
+            });
+        }
+
+        if (packages.items.len == 0) {
+            if (manager.lock_graph) |*graph| {
+                var locked = graph.packages.iterator();
+                while (locked.next()) |entry| {
+                    const package = entry.value_ptr;
+                    if (package.kind != .npm or
+                        package.name.len == 0 or
+                        package.version.len == 0 or
+                        package.source.len == 0) continue;
+                    try packages.append(.{
+                        .name = package.name,
+                        .version = package.version,
+                        .requestedRange = graph.rootDependencySpec(package.name) orelse package.version,
+                        .tarball = package.source,
+                    });
+                }
+            }
+        }
+
+        if (packages.items.len == 0) {
+            if (selected_root) |root| {
+                for (all_dependency_sections) |section_name| {
+                    var section = root.object.get(section_name) orelse continue;
+                    if (section != .object) continue;
+                    var dependencies = section.object.iterator();
+                    while (dependencies.next()) |entry| {
+                        const alias = entry.key_ptr.*;
+                        const requested = entry.value_ptr.*;
+                        if (requested != .string) continue;
+                        const locked = if (manager.lock_graph) |*graph| graph.get(alias) else null;
+                        var installed: ?Value = null;
+                        if (locked == null or locked.?.version.len == 0) {
+                            const package_json_path = try std.fs.path.join(manager.allocator, &.{
+                                manager.root_dir,
+                                "node_modules",
+                                alias,
+                                "package.json",
+                            });
+                            const source = std.Io.Dir.cwd().readFileAlloc(
+                                manager.init_data.io,
+                                package_json_path,
+                                manager.allocator,
+                                .limited(16 * 1024 * 1024),
+                            ) catch null;
+                            if (source) |bytes| {
+                                installed = std.json.parseFromSliceLeaky(Value, manager.allocator, bytes, .{}) catch null;
+                            }
+                        }
+                        const installed_name = if (installed) |*value| jsonString(value, "name") else null;
+                        const installed_version = if (installed) |*value| jsonString(value, "version") else null;
+                        const name = if (locked) |package|
+                            if (package.name.len > 0) package.name else installed_name orelse alias
+                        else
+                            installed_name orelse alias;
+                        const package_version = if (locked) |package|
+                            if (package.version.len > 0) package.version else installed_version orelse requested.string
+                        else
+                            installed_version orelse requested.string;
+                        const locked_tarball = if (locked) |package|
+                            if (package.source.len > 0) package.source else null
+                        else
+                            null;
+                        const tarball = locked_tarball orelse try std.fmt.allocPrint(
+                            manager.allocator,
+                            "{s}{s}/-/{s}-{s}.tgz",
+                            .{ manager.registry, name, std.fs.path.basename(name), package_version },
+                        );
+                        if (package_version.len == 0 or tarball.len == 0) continue;
+                        try packages.append(.{
+                            .name = name,
+                            .version = package_version,
+                            .requestedRange = requested.string,
+                            .tarball = tarball,
+                        });
+                    }
+                }
+            }
+        }
+
+        var package_paths = std.array_list.Managed(SecurityPackagePath).init(manager.allocator);
+        if (selected_root) |root| {
+            const root_name = jsonString(root, "name") orelse "root";
+            for (packages.items) |package| {
+                if (securityDependencyRequest(root, package.name) == null) continue;
+                try package_paths.append(.{
+                    .name = package.name,
+                    .path = try std.fmt.allocPrint(
+                        manager.allocator,
+                        "{s} \u{203a} {s}",
+                        .{ root_name, package.name },
+                    ),
+                });
+            }
+        }
+        const payload = .{ .packages = packages.items, .paths = package_paths.items };
+        const json = try std.json.Stringify.valueAlloc(manager.allocator, payload, .{});
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = output_path, .data = json });
+    }
+
+    fn runSecurityScannerPreflight(manager: *Manager, root: *const Value) !void {
+        const payload_path = try manager.securityTempFile("json");
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, payload_path) catch {};
+
+        var resolver_environment = try manager.init_data.environ_map.clone(manager.allocator);
+        defer resolver_environment.deinit();
+        try resolver_environment.put(security_resolution_output_env, payload_path);
+
+        const original_args = manager.options.original_args;
+        const resolver_args = try manager.allocator.alloc([]const u8, original_args.len + 3);
+        for (original_args, 0..) |arg, index| resolver_args[index] = arg;
+        resolver_args[original_args.len] = "--dry-run";
+        resolver_args[original_args.len + 1] = "--silent";
+        resolver_args[original_args.len + 2] = "--no-summary";
+
+        var resolver = try std.process.spawn(manager.init_data.io, .{
+            .argv = resolver_args,
+            .cwd = .{ .path = manager.invocation_dir },
+            .environ_map = &resolver_environment,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .inherit,
+            .create_no_window = true,
+        });
+        defer resolver.kill(manager.init_data.io);
+        const resolver_result = try resolver.wait(manager.init_data.io);
+        if (packageManagerChildExitCode(resolver_result) != 0) return error.PackageManagerErrorReported;
+
+        const resolved_payload = try std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            payload_path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        const parsed_payload = std.json.parseFromSliceLeaky(
+            Value,
+            manager.allocator,
+            resolved_payload,
+            .{},
+        ) catch return error.InvalidSecurityScannerPayload;
+        const resolved_packages = if (parsed_payload == .object)
+            parsed_payload.object.get("packages")
+        else
+            null;
+        if (resolved_packages == null or
+            resolved_packages.? != .array or
+            resolved_packages.?.array.items.len == 0)
+        {
+            try manager.writeSecurityResolution(payload_path, root);
+        }
+
+        try manager.runSecurityScannerPayload(payload_path, "install");
+    }
+
+    fn runSecurityScannerPayload(manager: *Manager, payload_path: []const u8, mode: []const u8) !void {
+        const scanner = manager.security_scanner orelse return;
+        const bridge_path = try manager.securityTempFile("mjs");
+        defer std.Io.Dir.cwd().deleteFile(manager.init_data.io, bridge_path) catch {};
+        try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{
+            .sub_path = bridge_path,
+            .data = security_scanner_bridge,
+        });
+        const executable = try std.process.executablePathAlloc(manager.init_data.io, manager.allocator);
+        var scanner_environment = try manager.init_data.environ_map.clone(manager.allocator);
+        defer scanner_environment.deinit();
+        try scanner_environment.put("COTTONTAIL_PM_SECURITY_SCANNER", scanner);
+        try scanner_environment.put("COTTONTAIL_PM_SECURITY_ROOT", manager.root_dir);
+        try scanner_environment.put("COTTONTAIL_PM_SECURITY_PAYLOAD", payload_path);
+        try scanner_environment.put("COTTONTAIL_PM_SECURITY_MODE", mode);
+
+        var scanner_process = try std.process.spawn(manager.init_data.io, .{
+            .argv = &.{ executable, bridge_path },
+            .cwd = .{ .path = manager.root_dir },
+            .environ_map = &scanner_environment,
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .create_no_window = true,
+        });
+        defer scanner_process.kill(manager.init_data.io);
+        const scanner_result = try scanner_process.wait(manager.init_data.io);
+        const scanner_exit_code = packageManagerChildExitCode(scanner_result);
+        if (scanner_exit_code == 0) return;
+        if (scanner_exit_code != 1) {
+            try manager.stderr.print(
+                "Security scanner exited with code {d} without sending data\n",
+                .{scanner_exit_code},
+            );
+        }
+        return error.PackageManagerErrorReported;
     }
 
     fn globalLinkPackageSpecs(manager: *Manager) ![]const []const u8 {
@@ -2364,6 +2827,13 @@ const Manager = struct {
                 }
                 if (cache.get("dir")) |directory| {
                     if (directory.asString(manager.allocator)) |value| manager.cache_directory = value;
+                }
+            }
+        }
+        if (install.get("security")) |security| {
+            if (security.get("scanner")) |scanner| {
+                if (scanner.asString(manager.allocator)) |value| {
+                    if (value.len > 0) manager.security_scanner = value;
                 }
             }
         }
@@ -3336,6 +3806,7 @@ const Manager = struct {
                 .version = resolved.version,
                 .tarball = resolved.tarball,
                 .integrity = resolved.integrity orelse "",
+                .resolution = registry_spec,
                 .metadata = resolved.metadata,
                 .peer_hash = peer_context.hash,
                 .install_dir = destination,
@@ -3386,6 +3857,7 @@ const Manager = struct {
             .version = resolved.version,
             .tarball = resolved.tarball,
             .integrity = resolved.integrity orelse "",
+            .resolution = registry_spec,
             .metadata = resolved.metadata,
             .peer_hash = peer_context.hash,
             .install_dir = destination,
@@ -8432,6 +8904,20 @@ test "package specs preserve scoped names and ranges" {
     const alias = splitPackageSpec("bap@npm:baz@0.0.5");
     try std.testing.expectEqualStrings("bap", alias.name.?);
     try std.testing.expectEqualStrings("npm:baz@0.0.5", alias.spec);
+}
+
+test "security scanner package metadata uses declared ranges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var root = try std.json.parseFromSliceLeaky(
+        Value,
+        arena.allocator(),
+        "{\"dependencies\":{\"bar\":\"^0.0.2\"},\"devDependencies\":{\"tool\":\"latest\"}}",
+        .{},
+    );
+    try std.testing.expectEqualStrings("^0.0.2", securityDependencyRequest(&root, "bar").?);
+    try std.testing.expectEqualStrings("latest", securityDependencyRequest(&root, "tool").?);
+    try std.testing.expect(securityDependencyRequest(&root, "missing") == null);
 }
 
 test "file URL paths follow Bun folder resolution" {
