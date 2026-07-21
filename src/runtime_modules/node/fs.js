@@ -563,25 +563,32 @@ const uvDirentTypeToMode = [
 ];
 
 export class Dirent {
-  constructor(name, typeOrStats = 0, path = undefined) {
+  #mode;
+
+  constructor(name, typeOrStats, path) {
     this.name = name;
-    this.parentPath = path;
     this.path = path;
-    if (typeof typeOrStats === "object" && typeOrStats !== null) {
-      this._mode = Number(typeOrStats.mode) || 0;
-    } else {
-      this._mode = uvDirentTypeToMode[Number(typeOrStats)] ?? 0;
-    }
+    this.parentPath = path;
+    this.#mode = typeOrStats instanceof Dirent
+      ? typeOrStats.#mode
+      : typeof typeOrStats === "object" && typeOrStats !== null
+        ? Number(typeOrStats.mode) || 0
+      : uvDirentTypeToMode[Number(typeOrStats)] ?? 0;
   }
 
-  isDirectory() { return modeMatches(this._mode, constants.S_IFDIR ?? 0o040000); }
-  isFile() { return modeMatches(this._mode, constants.S_IFREG ?? 0o100000); }
-  isBlockDevice() { return modeMatches(this._mode, constants.S_IFBLK ?? 0o060000); }
-  isCharacterDevice() { return modeMatches(this._mode, constants.S_IFCHR ?? 0o020000); }
-  isSymbolicLink() { return modeMatches(this._mode, constants.S_IFLNK ?? 0o120000); }
-  isFIFO() { return modeMatches(this._mode, constants.S_IFIFO ?? 0o010000); }
-  isSocket() { return modeMatches(this._mode, constants.S_IFSOCK ?? 0o140000); }
+  isDirectory() { return modeMatches(this.#mode, constants.S_IFDIR ?? 0o040000); }
+  isFile() { return modeMatches(this.#mode, constants.S_IFREG ?? 0o100000); }
+  isBlockDevice() { return modeMatches(this.#mode, constants.S_IFBLK ?? 0o060000); }
+  isCharacterDevice() { return modeMatches(this.#mode, constants.S_IFCHR ?? 0o020000); }
+  isSymbolicLink() { return modeMatches(this.#mode, constants.S_IFLNK ?? 0o120000); }
+  isFIFO() { return modeMatches(this.#mode, constants.S_IFIFO ?? 0o010000); }
+  isSocket() { return modeMatches(this.#mode, constants.S_IFSOCK ?? 0o140000); }
 }
+
+Object.defineProperty(Dirent.prototype, Symbol.toStringTag, {
+  value: "Dirent",
+  configurable: true,
+});
 
 function makeDirClosedError() {
   const error = new Error("Directory handle was closed");
@@ -1115,29 +1122,30 @@ export function readdirSync(path, options = undefined) {
       throw makeFsError(error, directory, "scandir");
     }
 
-    const entries = sourceEntries.map((entry) => {
-      const relativeName = relativePrefix ? join(relativePrefix, entry.name) : entry.name;
-      const encodedName = encoding === "buffer" ? bufferFrom(encoder.encode(relativeName)) : relativeName;
-      return {
-        entry,
-        value: withFileTypes
-          ? new Dirent(
-            encoding === "buffer" ? bufferFrom(encoder.encode(entry.name)) : entry.name,
-            entry,
-            directory,
-          )
-          : encodedName,
-      };
-    });
-
-    for (const item of entries) out.push(item.value);
-    if (!recursive) return;
-    for (const item of entries) {
-      const dirent = withFileTypes ? item.value : new Dirent(item.entry.name, item.entry, directory);
-      if (dirent.isDirectory()) {
-        const nextRelative = relativePrefix ? join(relativePrefix, item.entry.name) : item.entry.name;
-        visit(join(directory, item.entry.name), nextRelative);
+    const directories = recursive ? [] : null;
+    for (const entry of sourceEntries) {
+      if (withFileTypes) {
+        const mode = Number(entry.mode) || 0;
+        const dirent = new Dirent(
+          encoding === "buffer" ? bufferFrom(encoder.encode(entry.name)) : entry.name,
+          entry,
+          directory,
+        );
+        out.push(dirent);
+        if (recursive && modeMatches(mode, constants.S_IFDIR ?? 0o040000)) directories.push(entry.name);
+      } else {
+        const relativeName = relativePrefix ? join(relativePrefix, entry.name) : entry.name;
+        const encodedName = encoding === "buffer" ? bufferFrom(encoder.encode(relativeName)) : relativeName;
+        out.push(encodedName);
+        if (recursive && modeMatches(Number(entry.mode) || 0, constants.S_IFDIR ?? 0o040000)) {
+          directories.push(entry.name);
+        }
       }
+    }
+
+    for (const name of directories ?? []) {
+      const nextRelative = relativePrefix ? join(relativePrefix, name) : name;
+      visit(join(directory, name), nextRelative);
     }
   };
 

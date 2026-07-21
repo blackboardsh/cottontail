@@ -16182,6 +16182,32 @@ static JSValueRef ct_stat_sync(JSContextRef ctx, JSObjectRef function, JSObjectR
     return result;
 }
 
+static mode_t ct_mode_from_dirent_type(const struct dirent *entry) {
+#if defined(DT_REG) && defined(S_IFREG)
+    if (entry->d_type == DT_REG) return S_IFREG;
+#endif
+#if defined(DT_DIR) && defined(S_IFDIR)
+    if (entry->d_type == DT_DIR) return S_IFDIR;
+#endif
+#if defined(DT_LNK) && defined(S_IFLNK)
+    if (entry->d_type == DT_LNK) return S_IFLNK;
+#endif
+#if defined(DT_FIFO) && defined(S_IFIFO)
+    if (entry->d_type == DT_FIFO) return S_IFIFO;
+#endif
+#if defined(DT_SOCK) && defined(S_IFSOCK)
+    if (entry->d_type == DT_SOCK) return S_IFSOCK;
+#endif
+#if defined(DT_CHR) && defined(S_IFCHR)
+    if (entry->d_type == DT_CHR) return S_IFCHR;
+#endif
+#if defined(DT_BLK) && defined(S_IFBLK)
+    if (entry->d_type == DT_BLK) return S_IFBLK;
+#endif
+    (void)entry;
+    return 0;
+}
+
 static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -16202,19 +16228,27 @@ static JSValueRef ct_read_dir_sync(JSContextRef ctx, JSObjectRef function, JSObj
         struct dirent *entry = readdir(dir);
         if (entry == NULL) break;
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        size_t full_len = strlen(path) + strlen(entry->d_name) + 2;
-        char *full = (char *)malloc(full_len);
-        if (full == NULL) continue;
-        snprintf(full, full_len, "%s/%s", path, entry->d_name);
-        struct stat stat_value;
-        if (lstat(full, &stat_value) != 0) {
+        mode_t mode = ct_mode_from_dirent_type(entry);
+        double ino = 0;
+#if !defined(_WIN32)
+        ino = (double)entry->d_ino;
+#endif
+        if (mode == 0) {
+            size_t full_len = strlen(path) + strlen(entry->d_name) + 2;
+            char *full = (char *)malloc(full_len);
+            if (full == NULL) continue;
+            snprintf(full, full_len, "%s/%s", path, entry->d_name);
+            struct stat stat_value;
+            int status = lstat(full, &stat_value);
             free(full);
-            continue;
+            if (status != 0) continue;
+            mode = stat_value.st_mode;
+            ino = (double)stat_value.st_ino;
         }
-        free(full);
         JSObjectRef item = ct_make_object(ctx);
         ct_set_property(ctx, item, "name", ct_make_string(ctx, entry->d_name), exception);
-        ct_define_stat_fields(ctx, item, &stat_value, exception);
+        ct_set_property(ctx, item, "mode", JSValueMakeNumber(ctx, (double)mode), exception);
+        ct_set_property(ctx, item, "ino", JSValueMakeNumber(ctx, ino), exception);
         JSObjectSetPropertyAtIndex(ctx, result, index++, item, exception);
     }
     closedir(dir);

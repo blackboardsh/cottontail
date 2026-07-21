@@ -2251,6 +2251,7 @@ fn fullRuntimeGlobal(name: []const u8) bool {
         "it",
         "navigator",
         "performance",
+        "require",
         "reportError",
         "structuredClone",
         "test",

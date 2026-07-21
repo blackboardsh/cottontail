@@ -10,6 +10,7 @@ import {
   cpSync,
   createReadStream,
   createWriteStream,
+  Dirent,
   fchmodSync,
   fchownSync,
   fdatasyncSync,
@@ -521,15 +522,21 @@ export function readFile(path, options = undefined) {
 const pendingRecursiveReaddir = new Map();
 
 function cloneReaddirResult(result) {
-  return result.map((value) => {
-    if (value && typeof value === "object" && "_mode" in value && typeof value.isDirectory === "function") {
-      const clone = Object.assign(Object.create(Object.getPrototypeOf(value)), value);
-      if (ArrayBuffer.isView(clone.name)) clone.name = globalThis.Buffer?.from(clone.name) ?? clone.name.slice();
-      return clone;
+  const cloned = new Array(result.length);
+  for (let index = 0; index < result.length; index += 1) {
+    const value = result[index];
+    if (value instanceof Dirent) {
+      const name = ArrayBuffer.isView(value.name)
+        ? globalThis.Buffer?.from(value.name) ?? value.name.slice()
+        : value.name;
+      cloned[index] = new Dirent(name, value, value.parentPath);
+    } else if (ArrayBuffer.isView(value)) {
+      cloned[index] = globalThis.Buffer?.from(value) ?? value.slice();
+    } else {
+      cloned[index] = value;
     }
-    if (ArrayBuffer.isView(value)) return globalThis.Buffer?.from(value) ?? value.slice();
-    return value;
-  });
+  }
+  return cloned;
 }
 
 export function readdir(path, options = undefined) {

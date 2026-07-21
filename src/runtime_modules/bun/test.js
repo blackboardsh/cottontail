@@ -640,10 +640,36 @@ function finishExpectedPair(state, result) {
   return result;
 }
 
+function matchesEnumerableProperties(actual, expected, state, strict) {
+  if (strict && calculatedClassName(actual) !== calculatedClassName(expected)) return false;
+  const actualKeys = enumerableOwnKeys(actual);
+  const expectedKeys = enumerableOwnKeys(expected);
+  if (strict && actualKeys.length !== expectedKeys.length) return false;
+  const keys = Array.from(new Set([...actualKeys, ...expectedKeys]));
+  return matchEverySequential(keys, (key) => {
+    const leftHas = Object.hasOwn(actual, key);
+    const rightHas = Object.hasOwn(expected, key);
+    const left = leftHas ? actual[key] : missingArrayValue;
+    const right = rightHas ? expected[key] : missingArrayValue;
+    if (!strict && (left === missingArrayValue || right === missingArrayValue) &&
+        (left === missingArrayValue || left === undefined) &&
+        (right === missingArrayValue || right === undefined)) {
+      return true;
+    }
+    if (!leftHas || !rightHas) return false;
+    return matchesExpected(left, right, state, strict);
+  });
+}
+
 function matchesExpectedObject(actual, expected, state, strict) {
   if (isBlobLike(actual) || isBlobLike(expected)) {
     return isBlobLike(actual) && isBlobLike(expected) &&
       actual.size === expected.size && actual.type === expected.type;
+  }
+
+  if (objectPrototypeToString.call(actual) === "[object Dirent]" &&
+      objectPrototypeToString.call(expected) === "[object Dirent]") {
+    return matchesEnumerableProperties(actual, expected, state, strict);
   }
 
   const actualView = ArrayBuffer.isView(actual);
@@ -759,24 +785,7 @@ function matchesExpectedObject(actual, expected, state, strict) {
     });
   }
 
-  if (strict && calculatedClassName(actual) !== calculatedClassName(expected)) return false;
-  const actualKeys = enumerableOwnKeys(actual);
-  const expectedKeys = enumerableOwnKeys(expected);
-  if (strict && actualKeys.length !== expectedKeys.length) return false;
-  const keys = Array.from(new Set([...actualKeys, ...expectedKeys]));
-  return matchEverySequential(keys, (key) => {
-    const leftHas = Object.hasOwn(actual, key);
-    const rightHas = Object.hasOwn(expected, key);
-    const left = leftHas ? actual[key] : missingArrayValue;
-    const right = rightHas ? expected[key] : missingArrayValue;
-    if (!strict && (left === missingArrayValue || right === missingArrayValue) &&
-        (left === missingArrayValue || left === undefined) &&
-        (right === missingArrayValue || right === undefined)) {
-      return true;
-    }
-    if (!leftHas || !rightHas) return false;
-    return matchesExpected(left, right, state, strict);
-  });
+  return matchesEnumerableProperties(actual, expected, state, strict);
 }
 
 function matchesExpected(actual, expected, state = undefined, strict = false) {
