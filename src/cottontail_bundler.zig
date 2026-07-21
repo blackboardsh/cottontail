@@ -2210,3 +2210,49 @@ test "bundle graph retains split chunks and their source maps" {
     const transferred_source_map = entry.takeSourceMapContents() orelse return error.MissingSourceMap;
     defer c_allocator.free(transferred_source_map);
 }
+
+test "bundling a strict ESM dependency does not require an empty wrapper" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "entry.js",
+        .data =
+        \\import strictFunction from "./strict.js";
+        \\console.log(strictFunction());
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "strict.js",
+        .data =
+        \\'use strict';
+        \\export default function strictFunction() {
+        \\  return 42;
+        \\}
+        ,
+    });
+
+    const relative_root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(relative_root);
+    const absolute_root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
+    defer allocator.free(absolute_root);
+    const entry_path = try std.fs.path.join(allocator, &.{ absolute_root, "entry.js" });
+    defer allocator.free(entry_path);
+
+    var error_message: ?[*:0]u8 = null;
+    defer if (error_message) |message| ct_bundle_string_free(message);
+    const output = bundleEntryPointWithOptions(
+        entry_path,
+        absolute_root,
+        .{ .output_format = .cjs },
+        &error_message,
+    ) catch |err| {
+        if (error_message) |message| std.debug.print("bundle failed: {s}\n", .{std.mem.span(message)});
+        return err;
+    };
+    defer c_allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "function strictFunction") != null);
+}

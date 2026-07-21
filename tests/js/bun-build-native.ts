@@ -67,4 +67,24 @@ assert(keepNamesResult.success, "Bun.build should accept a single string conditi
 const keepNamesSource = await keepNamesResult.outputs[0].text();
 assert(keepNamesSource.includes('"LongFunctionName"'), "minify.keepNames should preserve the original function name");
 
+const nullCommonJSResult = await Bun.build({
+  entrypoints: ["virtual-null-entry.js"],
+  files: {
+    "virtual-null-entry.js": `
+      import value from "./null-export.cjs";
+      if (value !== null) throw new Error("CommonJS null export was not preserved");
+    `,
+    "null-export.cjs": "module.exports = null;",
+  },
+  target: "bun",
+  format: "cjs",
+});
+
+assert(nullCommonJSResult.success, "Bun.build should bundle a CommonJS module that exports null");
+const nullCommonJSSource = await nullCommonJSResult.outputs[0].text();
+const nullCommonJSFactory = (0, eval)(nullCommonJSSource);
+assert(typeof nullCommonJSFactory === "function", "CommonJS build output should evaluate to a module factory");
+const nullCommonJSModule = { exports: {} };
+nullCommonJSFactory(nullCommonJSModule.exports, () => {}, nullCommonJSModule, "virtual-null-entry.js", import.meta.dir);
+
 console.log("bun build native passed");
