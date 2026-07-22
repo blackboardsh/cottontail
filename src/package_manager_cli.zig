@@ -325,6 +325,10 @@ fn packageManagerFetchErrorName(err: anyerror) []const u8 {
         // boundary. Bun exposes this untrusted-registry condition with its
         // certificate-specific error code.
         error.TlsCertificateNotVerified, error.TlsInitializationFailed => "DEPTH_ZERO_SELF_SIGNED_CERT",
+        // COTTONTAIL-COMPAT: Zig reports a peer closing an HTTP connection
+        // before a response as HttpConnectionClosing. Bun exposes the same
+        // transport failure as ConnectionClosed.
+        error.HttpConnectionClosing, error.ConnectionResetByPeer, error.EndOfStream => "ConnectionClosed",
         else => @errorName(err),
     };
 }
@@ -4558,7 +4562,14 @@ const Manager = struct {
                 },
                 else => continue,
             }
-            if (configured.url.len == 0) continue;
+            // COTTONTAIL-COMPAT: Bun lets a scoped registry configure
+            // credentials without repeating the default registry URL.
+            if (configured.url.len == 0) {
+                configured.url = if (default_registry_config) |default_config|
+                    default_config.url
+                else
+                    default_registry;
+            }
             try manager.registry_scopes.put(try manager.allocator.dupe(u8, name), .{
                 .url = try normalizeRegistryUrl(manager.allocator, configured.url),
                 .source_url = configured.url,
@@ -6513,6 +6524,15 @@ const Manager = struct {
         return !std.mem.eql(u8, initial, resolved_version);
     }
 
+    fn rootLockResolutionIsCurrent(manager: *Manager, alias: []const u8) bool {
+        if (manager.changed) return false;
+        const graph = if (manager.lock_graph) |*value| value else return false;
+        if (graph.provenance != .bun_text) return false;
+        const locked_spec = graph.rootDependencySpec(alias) orelse return false;
+        const declared_spec = manager.rootDependencySpec(alias) orelse return false;
+        return std.mem.eql(u8, locked_spec, declared_spec);
+    }
+
     fn installDependency(
         manager: *Manager,
         alias: []const u8,
@@ -6606,6 +6626,11 @@ const Manager = struct {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
             } else if (manager.options.frozen_lockfile) {
                 return error.FrozenLockfilePackageMissing;
+            } else if (manager.lock_graph != null and
+                manager.options.production and direct and !optional and !peer)
+            {
+                try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{alias});
+                return error.PackageManagerErrorReported;
             }
         }
 
@@ -7008,6 +7033,14 @@ const Manager = struct {
         spec: []const u8,
         parent_dir: []const u8,
     ) !bool {
+        // COTTONTAIL-COMPAT: Keep an unchanged root lock mapping authoritative,
+        // including deliberately edited npm-to-Git resolutions.
+        if (std.mem.eql(u8, parent_dir, manager.root_dir) and
+            manager.rootLockResolutionIsCurrent(alias))
+        {
+            return true;
+        }
+
         const workspace_dependency = manager.isWorkspaceDependency(alias, spec);
         if (workspace_dependency and package.kind != .workspace) return false;
         switch (package.kind) {
@@ -9539,6 +9572,7 @@ const Manager = struct {
                 max_manifest_bytes,
                 configured_registry.authorization,
                 fetch_log_level,
+                name,
             );
             const parsed = (try manager.parseRegistryManifest(bytes)) orelse return error.InvalidRegistryManifest;
             if (cache_path) |path| {
@@ -9951,7 +9985,7 @@ const Manager = struct {
         limit: usize,
         authorization: ?[]const u8,
     ) ![]const u8 {
-        return manager.fetchBytesWithAuthorizationLogLevel(url, manifest, limit, authorization, .err);
+        return manager.fetchBytesWithAuthorizationLogLevel(url, manifest, limit, authorization, .err, null);
     }
 
     fn fetchBytesWithAuthorizationLogLevel(
@@ -9961,6 +9995,7 @@ const Manager = struct {
         limit: usize,
         authorization: ?[]const u8,
         log_level: FetchLogLevel,
+        manifest_name: ?[]const u8,
     ) ![]const u8 {
         var headers_buffer: [3]std.http.Header = undefined;
         var header_count: usize = 0;
@@ -9986,7 +10021,15 @@ const Manager = struct {
                 .extra_headers = headers,
             }) catch |err| {
                 if (attempt == manager.max_retry_count) {
-                    try manager.stderr.print("{s}: GET {s} - {s}\n", .{ log_level.label(), url, packageManagerFetchErrorName(err) });
+                    if (manifest_name) |name| {
+                        try manager.stderr.print("{s}: {s} downloading package manifest {s}\n", .{
+                            log_level.label(),
+                            packageManagerFetchErrorName(err),
+                            name,
+                        });
+                    } else {
+                        try manager.stderr.print("{s}: GET {s} - {s}\n", .{ log_level.label(), url, packageManagerFetchErrorName(err) });
+                    }
                     return error.PackageManagerErrorReported;
                 }
                 continue;
@@ -10075,6 +10118,7 @@ const Manager = struct {
             max_tarball_bytes,
             package.authorization,
             log_level,
+            null,
         );
         if (manager.options.verify_integrity) try verifyIntegrity(archive, package.integrity);
         if (cache_path) |path| {
@@ -10774,6 +10818,17 @@ const Manager = struct {
 
             const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
             if (manager.lock_graph) |*graph| {
+                if (manager.rootLockResolutionIsCurrent(alias)) {
+                    if (graph.get(alias)) |package| {
+                        if (package.kind == .npm) {
+                            try manager.root_versions.put(
+                                try manager.allocator.dupe(u8, alias),
+                                try manager.allocator.dupe(u8, package.version),
+                            );
+                        }
+                    }
+                    continue;
+                }
                 if (graph.get(alias)) |package| {
                     if (package.kind == .npm and std.mem.eql(u8, package.name, registry_name) and
                         semverSatisfies(manager.allocator, registry_spec, package.version))
