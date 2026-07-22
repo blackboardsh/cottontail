@@ -7464,7 +7464,22 @@ const Manager = struct {
             return manager.linkPeerDependencies(metadata, package_dir, peer_parent_dir);
         }
         const package_json = metadata orelse return;
-        try manager.installDependencyObject(@constCast(package_json), "peerDependencies", dependency_parent_dir, false, false);
+        if (package_json.* != .object) return;
+        const peers = package_json.object.get("peerDependencies") orelse return;
+        if (peers != .object) return;
+        const aliases = try manager.allocator.dupe([]const u8, peers.object.keys());
+        std.mem.sort([]const u8, aliases, {}, lessString);
+        for (aliases) |alias| {
+            const range_value = peers.object.get(alias) orelse continue;
+            if (range_value != .string or
+                peerDependencyIsOptional(package_json, alias) or
+                packageHasRuntimeDependency(package_json, alias)) continue;
+            if (try manager.findPeerProvider(alias, range_value.string, peer_parent_dir)) |provider| {
+                try manager.maybeWarnPeerConflict(range_value.string, provider);
+                continue;
+            }
+            _ = try manager.installDependency(alias, range_value.string, dependency_parent_dir, false, false);
+        }
     }
 
     fn reconcileIsolatedPeerGraph(manager: *Manager) !void {
