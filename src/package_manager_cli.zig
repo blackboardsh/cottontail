@@ -285,6 +285,7 @@ const RegistryArchive = struct {
 
 const RegistryConfig = struct {
     url: []const u8,
+    source_url: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
 };
 
@@ -1857,6 +1858,78 @@ fn normalizeRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]const 
     return std.fmt.allocPrint(allocator, "{s}/", .{without_trailing_slashes});
 }
 
+const RegistryJoinError = error{
+    InvalidRegistryURL,
+    UnsupportedRegistryScheme,
+};
+
+fn registryURLContainsForbiddenWhitespace(url: []const u8) bool {
+    for (url) |byte| {
+        if (byte <= ' ' or byte == 0x7f) return true;
+    }
+    return false;
+}
+
+fn validateRegistryPort(port: []const u8) RegistryJoinError!void {
+    if (port.len == 0) return;
+    for (port) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidRegistryURL;
+    const number = std.fmt.parseInt(u32, port, 10) catch return error.InvalidRegistryURL;
+    if (number > std.math.maxInt(u16)) return error.InvalidRegistryURL;
+}
+
+fn validateRegistryURLForJoin(source_url: []const u8) RegistryJoinError!void {
+    if (source_url.len == 0 or registryURLContainsForbiddenWhitespace(source_url)) {
+        return error.InvalidRegistryURL;
+    }
+
+    const scheme_end = std.mem.indexOfScalar(u8, source_url, ':') orelse
+        return error.InvalidRegistryURL;
+    const scheme = source_url[0..scheme_end];
+    const is_http = std.ascii.eqlIgnoreCase(scheme, "http");
+    const is_https = std.ascii.eqlIgnoreCase(scheme, "https");
+    if (!is_http and !is_https) {
+        // WHATWG joining rejects opaque bases such as `c:a`, while `c:/`
+        // joins and is then rejected by Bun's HTTP(S)-only registry check.
+        if (scheme_end + 1 < source_url.len and source_url[scheme_end + 1] == '/') {
+            return error.UnsupportedRegistryScheme;
+        }
+        return error.InvalidRegistryURL;
+    }
+
+    const suffix = source_url[scheme_end + 1 ..];
+    if (!std.mem.startsWith(u8, suffix, "//")) return;
+    const authority_start = scheme_end + 3;
+    const authority_end = std.mem.indexOfAnyPos(u8, source_url, authority_start, "/?#") orelse source_url.len;
+    const authority = source_url[authority_start..authority_end];
+    if (authority.len == 0) return;
+
+    const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+    const host_and_port = authority[host_start..];
+    if (host_and_port.len == 0) return error.InvalidRegistryURL;
+    if (host_and_port[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host_and_port, ']') orelse return error.InvalidRegistryURL;
+        const literal = host_and_port[1..close];
+        if (literal.len == 0 or std.mem.indexOfScalar(u8, literal, ':') == null) return error.InvalidRegistryURL;
+        if (close + 1 < host_and_port.len) {
+            if (host_and_port[close + 1] != ':') return error.InvalidRegistryURL;
+            try validateRegistryPort(host_and_port[close + 2 ..]);
+        }
+        return;
+    }
+    if (std.mem.lastIndexOfScalar(u8, host_and_port, ':')) |colon| {
+        try validateRegistryPort(host_and_port[colon + 1 ..]);
+    }
+}
+
+fn joinRegistryPackageURL(
+    allocator: std.mem.Allocator,
+    registry: RegistryConfig,
+    encoded_name: []const u8,
+) (RegistryJoinError || std.mem.Allocator.Error)![]const u8 {
+    try validateRegistryURLForJoin(registry.source_url orelse registry.url);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ registry.url, encoded_name });
+}
+
 fn resolveRegistryTarballURL(
     allocator: std.mem.Allocator,
     registry_url: []const u8,
@@ -1998,6 +2071,7 @@ const Manager = struct {
     invocation_dir: []const u8 = "",
     invocation_package_dir: []const u8 = "",
     registry: []const u8 = default_registry,
+    registry_source: []const u8 = default_registry,
     registry_authorization: ?[]const u8 = null,
     registry_scopes: std.StringHashMap(RegistryConfig),
     cache_directory: ?[]const u8 = null,
@@ -2242,6 +2316,7 @@ const Manager = struct {
         }
 
         try manager.discoverWorkspaces(&root);
+        try manager.discoverExplicitWorkspaceDependencies(&root, manager.root_dir);
         var duplicate_warning_workspaces = manager.workspaces.iterator();
         while (duplicate_warning_workspaces.next()) |entry| {
             try manager.warnDuplicateDependencies(entry.value_ptr.package_json);
@@ -3656,7 +3731,7 @@ const Manager = struct {
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            manager.workspaces.count() == 0 and
+            manager.lock_graph == null and
                 (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
@@ -3910,7 +3985,8 @@ const Manager = struct {
         manager.linker_configured = configured_linker != null;
         manager.node_linker = configured_linker orelse try manager.inferUnconfiguredLinker();
 
-        manager.registry = try normalizeRegistryUrl(manager.allocator, registry orelse default_registry);
+        manager.registry_source = try manager.allocator.dupe(u8, registry orelse default_registry);
+        manager.registry = try normalizeRegistryUrl(manager.allocator, manager.registry_source);
     }
 
     fn loadGlobalBunfigInstallConfiguration(
@@ -3989,7 +4065,8 @@ const Manager = struct {
             }
             if (configured.url.len > 0) {
                 default_registry_config = .{
-                    .url = try normalizeRegistryUrl(manager.allocator, configured.url),
+                    .url = configured.url,
+                    .source_url = configured.url,
                     .authorization = try manager.authorizationForRegistry(configured),
                 };
             }
@@ -4085,6 +4162,7 @@ const Manager = struct {
             if (configured.url.len == 0) continue;
             try manager.registry_scopes.put(try manager.allocator.dupe(u8, name), .{
                 .url = try normalizeRegistryUrl(manager.allocator, configured.url),
+                .source_url = configured.url,
                 .authorization = try manager.authorizationForRegistry(configured),
             });
         }
@@ -4151,6 +4229,7 @@ const Manager = struct {
                 const url = try normalizeRegistryUrl(manager.allocator, configured.url);
                 try manager.registry_scopes.put(try manager.allocator.dupe(u8, scope), .{
                     .url = url,
+                    .source_url = configured.url,
                     .authorization = try manager.authorizationForRegistry(configured),
                 });
             }
@@ -5701,6 +5780,9 @@ const Manager = struct {
                 if (manager.options.frozen_lockfile) return error.FrozenLockfileChanged;
             } else if (manager.options.frozen_lockfile) {
                 return error.FrozenLockfilePackageMissing;
+            } else if (manager.lock_graph != null and manager.options.production and direct and !optional) {
+                try manager.stderr.print("error: Failed to resolve root prod dependency '{s}'\n", .{alias});
+                return error.PackageManagerErrorReported;
             }
         }
 
@@ -5839,6 +5921,22 @@ const Manager = struct {
         }
 
         const resolved = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| {
+            if (err == error.InvalidRegistryURL or err == error.UnsupportedRegistryScheme) {
+                const configured = manager.registryConfigForPackage(registry_name);
+                const source_url = configured.source_url orelse configured.url;
+                if (err == error.InvalidRegistryURL) {
+                    try manager.stderr.print(
+                        "{s}: Failed to join registry \"{s}\" and package \"{s}\" URLs\n",
+                        .{ if (optional) "warn" else "error", source_url, registry_name },
+                    );
+                } else {
+                    try manager.stderr.print(
+                        "{s}: Registry URL must be http:// or https://\nReceived: \"{s}\"\n",
+                        .{ if (optional) "warn" else "error", source_url },
+                    );
+                }
+                return error.PackageManagerErrorReported;
+            }
             if (err == error.TooRecentVersion or err == error.AllVersionsTooRecent) {
                 const minimum_age_seconds = (manager.options.minimum_release_age_ms orelse 0) / std.time.ms_per_s;
                 try manager.stderr.print(
@@ -5862,6 +5960,10 @@ const Manager = struct {
                     "error: No version matching \"{s}\" found for specifier \"{s}\"{s}\n",
                     .{ registry_spec, registry_name, if (package_exists) " (but package exists)" else "" },
                 );
+                return error.PackageManagerErrorReported;
+            }
+            if (!optional and (err == error.RegistryManifestRequestFailed or err == error.PackageManagerErrorReported)) {
+                try manager.stderr.print("error: {s}@{s} failed to resolve\n", .{ alias, registry_spec });
                 return error.PackageManagerErrorReported;
             }
             return err;
@@ -6167,6 +6269,16 @@ const Manager = struct {
                         try manager.installedPackageMatches(selection.destination, package.name, package.version) and
                         try manager.packagePatchStateMatches(selection.destination, patch_paths);
                     if (!installed) {
+                        if (package.source.len > 0 and
+                            !std.mem.startsWith(u8, package.source, "https://") and
+                            !std.mem.startsWith(u8, package.source, "http://"))
+                        {
+                            try manager.stderr.print(
+                                "error: Expected tarball URL to start with https:// or http://, got \"{s}\" while fetching package \"{s}\"\n",
+                                .{ package.source, package.name },
+                            );
+                            return error.PackageManagerErrorReported;
+                        }
                         const registry = manager.registryConfigForPackage(package.name);
                         const tarball_url = if (package.source.len > 0)
                             try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
@@ -6227,12 +6339,16 @@ const Manager = struct {
             .workspace => {
                 if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
                 const workspace = manager.workspaces.get(package.name) orelse manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
+                const workspace_was_linked = pathsEquivalent(
+                    manager.init_data.io,
+                    manager.allocator,
+                    selection.destination,
+                    workspace.path,
+                ) catch false;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
-                    if (manager.node_linker == .isolated)
-                        try manager.linkRelativeDirectory(selection.destination, workspace.path, true)
-                    else
-                        try manager.linkDirectoryAt(selection.destination, workspace.path);
+                    try manager.linkRelativeDirectory(selection.destination, workspace.path, true);
                 }
+                try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
                 try manager.addRecord(.{
                     .key = record_key,
                     .alias = alias,
@@ -8451,7 +8567,11 @@ const Manager = struct {
                 if (manager.registry_scopes.get(name[1..slash])) |configured| return configured;
             }
         }
-        return .{ .url = manager.registry, .authorization = manager.registry_authorization };
+        return .{
+            .url = manager.registry,
+            .source_url = manager.registry_source,
+            .authorization = manager.registry_authorization,
+        };
     }
 
     fn resolveRegistryPackage(manager: *Manager, name: []const u8, spec: []const u8) !RegistryPackage {
@@ -8478,7 +8598,7 @@ const Manager = struct {
                     }
                 }
             }
-            const manifest_url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name });
+            const manifest_url = try joinRegistryPackageURL(manager.allocator, configured_registry, encoded_name);
             const bytes = try manager.fetchBytesWithAuthorization(manifest_url, true, max_manifest_bytes, configured_registry.authorization);
             const parsed = (try manager.parseRegistryManifest(bytes)) orelse return error.InvalidRegistryManifest;
             if (cache_path) |path| {
@@ -8777,7 +8897,7 @@ const Manager = struct {
                 .io = manager.init_data.io,
                 .environment = manager.init_data.environ_map,
                 .name = name,
-                .url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name }),
+                .url = try joinRegistryPackageURL(manager.allocator, configured_registry, encoded_name),
                 .authorization = configured_registry.authorization,
                 .cache_path = cache_path,
                 .accept = manager.registryManifestAccept(),
@@ -9354,6 +9474,42 @@ const Manager = struct {
         }
     }
 
+    fn discoverExplicitWorkspaceDependencies(
+        manager: *Manager,
+        package_json: *const Value,
+        parent_dir: []const u8,
+    ) !void {
+        var visited = std.StringHashMap(void).init(manager.allocator);
+        defer visited.deinit();
+        return manager.discoverExplicitWorkspaceDependenciesInner(package_json, parent_dir, &visited);
+    }
+
+    fn discoverExplicitWorkspaceDependenciesInner(
+        manager: *Manager,
+        package_json: *const Value,
+        parent_dir: []const u8,
+        visited: *std.StringHashMap(void),
+    ) !void {
+        const visit = try visited.getOrPut(parent_dir);
+        if (visit.found_existing) return;
+        if (package_json.* != .object) return;
+        for (all_dependency_sections) |section_name| {
+            const section = package_json.object.get(section_name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec_value| {
+                if (spec_value != .string) continue;
+                const request = Workspaces.parseRequest(alias, spec_value.string);
+                const path = request.path orelse continue;
+                const target_path = try absolutePathFrom(manager.allocator, parent_dir, path);
+                const workspace = if (manager.workspaceForPath(target_path)) |entry|
+                    entry.*
+                else
+                    (try manager.discoverExplicitWorkspacePath(target_path)) orelse continue;
+                try manager.discoverExplicitWorkspaceDependenciesInner(workspace.package_json, workspace.path, visited);
+            }
+        }
+    }
+
     fn workspaceForPath(manager: *Manager, path: []const u8) ?*Workspace {
         var iterator = manager.workspaces.iterator();
         while (iterator.next()) |entry| {
@@ -9362,6 +9518,33 @@ const Manager = struct {
             }
         }
         return null;
+    }
+
+    fn discoverExplicitWorkspacePath(manager: *Manager, path: []const u8) !?Workspace {
+        const package_json_path = try std.fs.path.join(manager.allocator, &.{ path, "package.json" });
+        const source = std.Io.Dir.cwd().readFileAlloc(
+            manager.init_data.io,
+            package_json_path,
+            manager.allocator,
+            .limited(64 * 1024 * 1024),
+        ) catch return null;
+        const package_json = try manager.allocator.create(Value);
+        package_json.* = PackageJSON.parsePackageJSON(manager.allocator, package_json_path, source) catch return null;
+        if (package_json.* != .object) return null;
+        const name = jsonString(package_json, "name") orelse return null;
+        if (name.len == 0) return null;
+        const version_value = package_json.object.get("version");
+        const has_version = version_value != null and version_value.? == .string;
+        const workspace: Workspace = .{
+            .name = name,
+            .path = path,
+            .relative_path = try manager.relativeLockPath(path),
+            .version = if (has_version) version_value.?.string else "0.0.0",
+            .has_version = has_version,
+            .package_json = package_json,
+        };
+        try manager.workspaces.put(name, workspace);
+        return workspace;
     }
 
     fn pathIsWorkspace(manager: *Manager, path: []const u8) bool {
@@ -9395,9 +9578,11 @@ const Manager = struct {
         const workspace = if (request.path) |path| path_workspace: {
             const target_path = try absolutePathFrom(manager.allocator, parent_dir, path);
             if (manager.workspaceForPath(target_path)) |entry| break :path_workspace entry.*;
+            if (try manager.discoverExplicitWorkspacePath(target_path)) |entry| break :path_workspace entry;
             if (!std.mem.eql(u8, parent_dir, manager.root_dir)) {
                 const root_target_path = try absolutePathFrom(manager.allocator, manager.root_dir, path);
                 if (manager.workspaceForPath(root_target_path)) |entry| break :path_workspace entry.*;
+                if (try manager.discoverExplicitWorkspacePath(root_target_path)) |entry| break :path_workspace entry;
             }
             break :path_workspace null;
         } else manager.workspaces.get(if (request.explicit) request.target_name else registry_name);
@@ -9446,10 +9631,7 @@ const Manager = struct {
             try manager.chooseDestination(alias, workspace.version, parent_dir, direct);
         const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
         if (!manager.options.lockfile_only) {
-            if (manager.node_linker == .isolated)
-                try manager.linkRelativeDirectory(destination, workspace.path, true)
-            else
-                try manager.linkDirectoryAt(destination, workspace.path);
+            try manager.linkRelativeDirectory(destination, workspace.path, true);
         }
         try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
         try manager.addRecord(.{
@@ -9545,7 +9727,7 @@ const Manager = struct {
             if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
                 const destination = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
                 const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
-                if (!manager.options.lockfile_only) try manager.linkDirectoryAt(destination, workspace.path);
+                if (!manager.options.lockfile_only) try manager.linkRelativeDirectory(destination, workspace.path, true);
                 try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
                 if (!manager.options.lockfile_only) try manager.linkBins(workspace.name, destination, workspace.package_json, true, manager.root_dir);
                 try manager.addRecord(.{

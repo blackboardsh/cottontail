@@ -125,7 +125,11 @@ fn selectUnfiltered(
 
     const effective_spec = if (spec.len == 0) "*" else spec;
     if (distTagVersion(manifest, "latest")) |latest| {
-        if (std.mem.eql(u8, effective_spec, "*") or semverSatisfies(allocator, effective_spec, latest)) {
+        // COTTONTAIL-COMPAT: Registry dist-tags are advisory. Bun ignores a
+        // tag whose target is absent from the manifest's versions object.
+        if (versions.get(latest) != null and
+            (std.mem.eql(u8, effective_spec, "*") or semverSatisfies(allocator, effective_spec, latest)))
+        {
             return latest;
         }
     }
