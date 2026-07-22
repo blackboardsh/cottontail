@@ -602,7 +602,7 @@ async function buildInternalBakeEntry(entryPath, outdir, buildConfig) {
     sourcemap: "external",
     define: developmentBuildDefines(buildConfig, "client"),
     env: buildConfig.env,
-    conditions: developmentBuildConditions(buildConfig),
+    conditions: developmentBuildConditions(buildConfig, ["browser"]),
     jsx: { ...(buildConfig.jsx ?? {}), development: true },
     throw: false,
   });
@@ -641,6 +641,13 @@ function rewriteBakeClientBuiltins(source) {
   return source
     .replaceAll('"bake/client"', '"bun:bake/client"')
     .replaceAll("'bake/client'", "'bun:bake/client'");
+}
+
+function rewriteBakeModuleIds(source, replacements) {
+  for (const [from, to] of replacements) {
+    source = source.replaceAll(JSON.stringify(from), JSON.stringify(to));
+  }
+  return source;
 }
 
 function bakeModuleDefinitionSource(value, onFunction = null, outputOffset = 0) {
@@ -917,7 +924,13 @@ function createHtmlDispatcher(config, development) {
         sourcemap: development ? "external" : "none",
         define: development ? developmentBuildDefines(buildConfig, "client") : buildConfig.define,
         env: buildConfig.env,
-        conditions: development ? developmentBuildConditions(buildConfig) : buildConfig.conditions,
+        conditions: development
+          ? developmentBuildConditions(buildConfig, ["browser"])
+          : [...new Set([
+              ...(Array.isArray(buildConfig.conditions) ? buildConfig.conditions : []),
+              "browser",
+              "production",
+            ])],
         jsx: development ? { ...(buildConfig.jsx ?? {}), development: true } : buildConfig.jsx,
         metafile: true,
         throw: false,
@@ -1504,7 +1517,7 @@ function rewriteHmrDependencies(modules, replacements) {
       }
       next[0] = encoded;
     }
-    rewritten[id] = next;
+    rewritten[replacements.get(id) ?? id] = next;
   }
   return rewritten;
 }
@@ -1786,7 +1799,7 @@ function createFrameworkDispatcher(config) {
       sourcemap: development ? "external" : "none",
       reactFastRefresh: development && reactFastRefresh,
       serverComponents: false,
-      conditions: developmentBuildConditions(clientOptions),
+      conditions: developmentBuildConditions(clientOptions, ["browser"]),
       define: developmentBuildDefines(clientOptions, "client"),
       jsx: { ...(clientOptions.jsx ?? {}), development: true },
       external: [...new Set([...(clientOptions.external ?? []), "bun:bake/client"])],
@@ -1808,7 +1821,13 @@ function createFrameworkDispatcher(config) {
       generatedSource,
       projectRoot,
     );
-    const originalSource = rewriteBakeClientBuiltins(generatedSource);
+    const boundaryIdReplacements = new Map(boundaries
+      .filter(boundary => boundary.__pluginModuleId && boundary.__pluginModuleId !== boundary.id)
+      .map(boundary => [boundary.__pluginModuleId, boundary.id]));
+    const originalSource = rewriteBakeModuleIds(
+      rewriteBakeClientBuiltins(generatedSource),
+      boundaryIdReplacements,
+    );
     const clientModules = development ? bakeRegistryModules(originalSource) : null;
     const url = bakeRouteClientUrl(record.id, record.generation);
     let servedSource = originalSource;
@@ -1967,6 +1986,9 @@ function createFrameworkDispatcher(config) {
         const replacements = new Map([
           ["bake/server", "bun:bake/server"],
           ...(ssr?.rootReplacements ?? []),
+          ...graph.boundaries
+            .filter(boundary => boundary.__pluginModuleId && boundary.__pluginModuleId !== boundary.id)
+            .map(boundary => [boundary.__pluginModuleId, boundary.id]),
         ]);
         const serverModules = rewriteHmrDependencies(parsed.modules, replacements);
         const allModules = { ...serverModules, ...(ssr?.modules ?? {}) };
@@ -2510,7 +2532,6 @@ function installDevelopmentSocket(config, bakeRuntime) {
             if (session.timer !== null) clearTimeout(session.timer);
             session.timer = null;
             session.phase = "building";
-            explicitWatchers = Math.max(0, explicitWatchers - 1);
             try {
               const update = await runUpdate(session.changedPaths);
               automaticSnapshot = projectSnapshot(projectRoot);
@@ -2519,6 +2540,7 @@ function installDevelopmentSocket(config, bakeRuntime) {
               console.error(error);
               sendWatchEvent(socket, 3);
             } finally {
+              explicitWatchers = Math.max(0, explicitWatchers - 1);
               session.phase = "idle";
             }
           }

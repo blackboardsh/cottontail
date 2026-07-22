@@ -3075,14 +3075,91 @@ async function buildWithPlugins(options, plugins) {
     return `${aliases[matched]}${specifier.slice(matched.length)}`;
   };
 
+  const buildResolveConditions = new Set([
+    "import",
+    "default",
+    ...(Array.isArray(options?.conditions) ? options.conditions : []),
+    options?.target === "browser" ? "browser" : "node",
+  ]);
+  const conditionalPackageCache = new Map();
+
+  const selectConditionalPackageTarget = (target, wildcard = "") => {
+    if (typeof target === "string") return target.replaceAll("*", wildcard);
+    if (Array.isArray(target)) {
+      for (const item of target) {
+        const selected = selectConditionalPackageTarget(item, wildcard);
+        if (selected !== null) return selected;
+      }
+      return null;
+    }
+    if (target === null || typeof target !== "object") return null;
+    for (const [condition, value] of Object.entries(target)) {
+      if (condition !== "default" && !buildResolveConditions.has(condition)) continue;
+      const selected = selectConditionalPackageTarget(value, wildcard);
+      if (selected !== null) return selected;
+    }
+    return null;
+  };
+
+  const conditionalPackageResolution = (specifier, fallback) => {
+    const cacheKey = `${specifier}\0${fallback}`;
+    if (conditionalPackageCache.has(cacheKey)) return conditionalPackageCache.get(cacheKey);
+
+    const parts = specifier.split("/");
+    const packageName = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+    const subpathParts = specifier.startsWith("@") ? parts.slice(2) : parts.slice(1);
+    const subpath = subpathParts.length === 0 ? "." : `./${subpathParts.join("/")}`;
+    let directory = pathDirname(fallback);
+    let resolved = fallback;
+    while (true) {
+      const packageJsonPath = pathJoin(directory, "package.json");
+      try {
+        const packageJson = JSON.parse(String(cottontail.readFile(packageJsonPath)));
+        if (packageJson.name === packageName && packageJson.exports !== undefined) {
+          const exportsField = packageJson.exports;
+          let target = exportsField;
+          if (exportsField !== null && typeof exportsField === "object" && !Array.isArray(exportsField) &&
+              Object.keys(exportsField).some(key => key.startsWith("."))) {
+            target = exportsField[subpath];
+            if (target === undefined) {
+              const patterns = Object.keys(exportsField)
+                .filter(key => key.includes("*"))
+                .sort((left, right) => right.length - left.length);
+              for (const pattern of patterns) {
+                const [prefix, suffix] = pattern.split("*");
+                if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) continue;
+                target = selectConditionalPackageTarget(
+                  exportsField[pattern],
+                  subpath.slice(prefix.length, subpath.length - suffix.length),
+                );
+                break;
+              }
+            }
+          }
+          const selected = typeof target === "string" ? target : selectConditionalPackageTarget(target);
+          if (typeof selected === "string" && selected.startsWith("./")) {
+            resolved = nodePathResolve(directory, selected);
+          }
+          break;
+        }
+      } catch {}
+      const parent = pathDirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    conditionalPackageCache.set(cacheKey, resolved);
+    return resolved;
+  };
+
   const defaultResolveImport = (specifier, importerRecord) => {
     specifier = applyBuildAlias(specifier);
     if (!specifier.startsWith("./") && !specifier.startsWith("../") && !specifier.startsWith("/")) {
       try {
-        const resolved = resolveSync(specifier, importerRecord.path);
+        let resolved = resolveSync(specifier, importerRecord.path);
         if (resolved.startsWith("node:") || resolved.startsWith("bun:") || nodeIsBuiltin(resolved)) {
           return { external: true };
         }
+        resolved = conditionalPackageResolution(specifier, resolved);
         return { path: resolved, namespace: "file" };
       } catch {
         return null;
@@ -3323,6 +3400,35 @@ async function buildWithPlugins(options, plugins) {
     return pathJoin(shadowRoot, name);
   };
 
+  async function discoverModuleEdges(record) {
+    const loader = record.loader;
+    if (loader !== "js" && loader !== "jsx" && loader !== "ts" && loader !== "tsx" && loader !== "html" && loader !== "css") {
+      return [];
+    }
+    record.contents = ctBuildContentsText(record.contents);
+    const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
+      const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
+      let target;
+      try {
+        target = await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
+          ?? defaultResolveImport(specifier, record);
+      } catch (error) {
+        errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
+        pluginResolveFailures.push({ importer: record.path, specifier });
+        return null;
+      }
+      if (!target || target.external) return null;
+      if (target.error) {
+        // The lightweight graph scan can see import-looking text in comments
+        // and template literals. Leave unresolved text untouched so the
+        // native parser decides whether it is an actual dependency.
+        return null;
+      }
+      return { specifier, target: await addModule(target) };
+    }));
+    return edges.filter(Boolean);
+  }
+
   const addModule = async (resolved, entryName = undefined) => {
     const key = `${resolved.namespace}\0${resolved.path}`;
     if (moduleRecords.has(key)) return moduleRecords.get(key);
@@ -3359,31 +3465,7 @@ async function buildWithPlugins(options, plugins) {
       record.pluginLoadFailed = true;
       return record;
     }
-    if (loader === "js" || loader === "jsx" || loader === "ts" || loader === "tsx" || loader === "html" || loader === "css") {
-      record.contents = ctBuildContentsText(record.contents);
-      const edges = await Promise.all(scanBundleImportsForLoader(record.contents, loader).map(async ({ specifier, kind }) => {
-        const resolveDir = record.namespace === "file" ? pathDirname(record.path) : cottontail.cwd();
-        let target;
-        try {
-          target = await resolveWithPlugins(specifier, record.path, record.namespace, resolveDir, kind)
-            ?? defaultResolveImport(specifier, record);
-        } catch (error) {
-          errors.push(ctPluginBuildMessage(error, record.path, record.namespace));
-          pluginResolveFailures.push({ importer: record.path, specifier });
-          return null;
-        }
-        if (!target || target.external) return null;
-        if (target.error) {
-          // The lightweight graph scan can see import-looking text in comments
-          // and template literals. Leave unresolved text untouched so the
-          // native parser decides whether it is an actual dependency.
-          return null;
-        }
-        const child = await addModule(target);
-        return { specifier, target: child };
-      }));
-      record.edges.push(...edges.filter(Boolean));
-    }
+    record.edges.push(...await discoverModuleEdges(record));
     return record;
   };
 
@@ -3445,7 +3527,7 @@ async function buildWithPlugins(options, plugins) {
           throw new TypeError("Bake's plugin graph replacement must be a string or Uint8Array");
         }
         record.contents = contents;
-        record.edges = [];
+        record.edges = await discoverModuleEdges(record);
       }
     }
   }

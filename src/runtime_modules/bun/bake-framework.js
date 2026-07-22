@@ -408,6 +408,76 @@ export function clientReferenceProxySource(boundary, serverComponents) {
   return `${lines.join("\n")}\n`;
 }
 
+function sourceWithoutUseClientDirective(source) {
+  let offset = source.startsWith("#!")
+    ? (source.indexOf("\n") < 0 ? source.length : source.indexOf("\n") + 1)
+    : 0;
+  while (true) {
+    offset = skipSpaceAndComments(source, offset);
+    const directive = readDirective(source, offset);
+    if (directive === null) return source;
+    if (directive.value === "use client") {
+      return `${source.slice(0, offset)}${source.slice(offset, directive.end).replace(/[^\r\n]/g, " ")}${source.slice(directive.end)}`;
+    }
+    offset = directive.end;
+  }
+}
+
+// COTTONTAIL-COMPAT: Bun's parser wraps real exports when the server and SSR graphs are shared.
+function sharedGraphClientReferenceSource(boundary, serverComponents) {
+  const runtime = serverComponents.serverRuntimeImportSource;
+  const register = serverComponents.serverRegisterClientReferenceExport ?? "registerClientReference";
+  const bindings = new Map();
+  let source = sourceWithoutUseClientDirective(boundary.source);
+
+  source = source.replace(
+    /^(\s*)export\s+default\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)/gm,
+    (statement, indent, local) => {
+      bindings.set("default", local);
+      return statement.replace(`${indent}export default `, indent);
+    },
+  );
+  source = source.replace(
+    /^(\s*)export\s+default\s+([A-Za-z_$][\w$]*)\s*;[ \t]*$/gm,
+    (_statement, indent, local) => {
+      bindings.set("default", local);
+      return indent;
+    },
+  );
+  source = source.replace(
+    /^(\s*)export\s+(async\s+)?(function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/gm,
+    (statement, indent, _async, _kind, local) => {
+      bindings.set(local, local);
+      return statement.replace(`${indent}export `, indent);
+    },
+  );
+  source = source.replace(/^(\s*)export\s*\{([\s\S]*?)\}\s*;[ \t]*$/gm, (statement, indent, list) => {
+    const entries = list.split(",").map(item => item.trim()).filter(Boolean);
+    const parsed = entries.map(item => /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(item));
+    if (parsed.some(entry => entry === null)) return statement;
+    for (const entry of parsed) bindings.set(entry[2] ?? entry[1], entry[1]);
+    return indent;
+  });
+
+  const missing = boundary.exports.filter(name => !bindings.has(name));
+  if (missing.length > 0) {
+    throw new TypeError(`Unsupported client boundary export shape for ${boundary.id}: ${missing.join(", ")}`);
+  }
+
+  const lines = [
+    `import { ${register} as __ctRegisterClientReference } from ${JSON.stringify(runtime)};`,
+    source,
+  ];
+  boundary.exports.forEach((name, index) => {
+    const wrapped = `__ctClientReference${index}`;
+    lines.push(
+      `const ${wrapped} = __ctRegisterClientReference(${bindings.get(name)}, ${JSON.stringify(boundary.id)}, ${JSON.stringify(name)});`,
+      name === "default" ? `export default ${wrapped};` : `export { ${wrapped} as ${name} };`,
+    );
+  });
+  return `${lines.join("\n")}\n`;
+}
+
 export function pluginClientBoundaryReplacements({
   projectRoot,
   modules,
@@ -423,9 +493,9 @@ export function pluginClientBoundaryReplacements({
 
     const namespace = String(module.namespace || "file");
     const modulePath = String(module.path);
-    const id = String(module.id || (namespace === "file"
+    const id = namespace === "file"
       ? moduleIdForPath(projectRoot, path.normalize(modulePath))
-      : `${namespace}:${modulePath}`));
+      : String(module.id || `${namespace}:${modulePath}`);
     const hash = BigInt.asUintN(64, globalThis.Bun.hash(`${namespace}\0${modulePath}`)).toString(16);
     const scan = transpilerForLoader(module.loader).scan(source);
     const boundary = {
@@ -433,6 +503,7 @@ export function pluginClientBoundaryReplacements({
       id,
       exports: [...new Set(scan.exports ?? [])],
       source,
+      __pluginModuleId: String(module.id || id),
       __pluginTarget: { path: modulePath, namespace },
     };
     const existingIndex = boundaryIndexes.get(id);
@@ -442,7 +513,12 @@ export function pluginClientBoundaryReplacements({
     } else {
       boundaries[existingIndex] = boundary;
     }
-    replacements.set(module.key, clientReferenceProxySource(boundary, serverComponents));
+    replacements.set(
+      module.key,
+      serverComponents.separateSSRGraph === false
+        ? sharedGraphClientReferenceSource(boundary, serverComponents)
+        : clientReferenceProxySource(boundary, serverComponents),
+    );
   }
   boundaries.sort((left, right) => left.id.localeCompare(right.id));
   return replacements;

@@ -274,6 +274,11 @@ async function writeClientGraph(context, route) {
     entrypoints,
     target: "browser",
     format: "esm",
+    conditions: [...new Set([
+      ...(Array.isArray(clientOptions.conditions) ? clientOptions.conditions : []),
+      "browser",
+      "production",
+    ])],
     splitting: true,
     naming: {
       entry: "_bun/[name]-[hash].[ext]",
