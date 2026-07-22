@@ -39,6 +39,7 @@ export const resolveNs = dnsPromises.resolveNs;
 export const resolvePtr = dnsPromises.resolvePtr;
 export const resolveSoa = dnsPromises.resolveSoa;
 export const resolveSrv = dnsPromises.resolveSrv;
+export const resolveTlsa = dnsPromises.resolveTlsa;
 export const resolveTxt = dnsPromises.resolveTxt;
 export const reverse = dnsPromises.reverse;
 export const setDefaultResultOrder = dnsPromises.setDefaultResultOrder;

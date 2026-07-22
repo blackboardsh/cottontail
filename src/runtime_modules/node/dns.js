@@ -37,7 +37,7 @@ export const ADDRGETNETWORKPARAMS = "EADDRGETNETWORKPARAMS";
 export const CANCELLED = "ECANCELLED";
 
 const SUPPORTED_RRTYPES = new Set([
-  "A", "AAAA", "ANY", "CAA", "CNAME", "MX", "NAPTR", "NS", "PTR", "SOA", "SRV", "TXT",
+  "A", "AAAA", "ANY", "CAA", "CNAME", "MX", "NAPTR", "NS", "PTR", "SOA", "SRV", "TLSA", "TXT",
 ]);
 
 let servers = [];
@@ -1072,6 +1072,7 @@ export function resolve(hostname, rrtype = "A", callback = undefined) {
   if (type === "NS") return resolveNs(hostname, callback);
   if (type === "SOA") return resolveSoa(hostname, callback);
   if (type === "SRV") return resolveSrv(hostname, callback);
+  if (type === "TLSA") return resolveTlsa(hostname, callback);
   if (type === "TXT") return resolveTxt(hostname, callback);
   throw invalidRrtypeError(type);
 }
@@ -1111,6 +1112,12 @@ export function resolveSoa(hostname, callback) {
 export function resolveSrv(hostname, callback) {
   validateResolveHostname(hostname, "resolveSrv");
   return resolveRecordsWithState(hostname, "SRV", "querySrv", callback, undefined);
+}
+
+export function resolveTlsa(hostname, callback) {
+  validateCallback(callback);
+  validateResolveHostname(hostname, "resolveTlsa", false, true);
+  return resolveRecordsWithState(hostname, "TLSA", "queryTlsa", callback, undefined);
 }
 
 export function resolveTxt(hostname, callback) {
@@ -1165,6 +1172,13 @@ function normalizeResolverOptions(options = undefined) {
     !Number.isInteger(normalized.timeout) || normalized.timeout < -1 || normalized.timeout >= 2 ** 31
   )) {
     const error = new RangeError(`The value of "timeout" is out of range. Received ${normalized.timeout}`);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  if (normalized.tries !== undefined && (
+    !Number.isInteger(normalized.tries) || normalized.tries < 1 || normalized.tries >= 2 ** 31
+  )) {
+    const error = new RangeError(`The value of "tries" is out of range. Received ${normalized.tries}`);
     error.code = "ERR_OUT_OF_RANGE";
     throw error;
   }
@@ -1244,6 +1258,7 @@ export class Resolver {
     if (type === "NS") return this.resolveNs(hostname, callback);
     if (type === "SOA") return this.resolveSoa(hostname, callback);
     if (type === "SRV") return this.resolveSrv(hostname, callback);
+    if (type === "TLSA") return this.resolveTlsa(hostname, callback);
     if (type === "TXT") return this.resolveTxt(hostname, callback);
     throw invalidRrtypeError(type);
   }
@@ -1272,6 +1287,7 @@ export class Resolver {
   resolvePtr(hostname, callback) { validateResolveHostname(hostname, "resolvePtr"); return resolvePtrWithState(hostname, callback, this); }
   resolveSoa(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveSoa", true, true); return resolveRecordsWithState(hostname, "SOA", "querySoa", callback, this, true); }
   resolveSrv(hostname, callback) { validateResolveHostname(hostname, "resolveSrv"); return resolveRecordsWithState(hostname, "SRV", "querySrv", callback, this); }
+  resolveTlsa(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveTlsa", false, true); return resolveRecordsWithState(hostname, "TLSA", "queryTlsa", callback, this); }
   resolveTxt(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveTxt", false, true); return resolveRecordsWithState(hostname, "TXT", "queryTxt", callback, this); }
   reverse(ip, callback) {
     if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip);
@@ -1308,6 +1324,7 @@ export class PromisesResolver {
     if (type === "NS") return this.resolveNs(hostname);
     if (type === "SOA") return this.resolveSoa(hostname);
     if (type === "SRV") return this.resolveSrv(hostname);
+    if (type === "TLSA") return this.resolveTlsa(hostname);
     if (type === "TXT") return this.resolveTxt(hostname);
     throw invalidRrtypeError(type);
   }
@@ -1322,6 +1339,7 @@ export class PromisesResolver {
   resolvePtr(hostname) { validateResolveHostname(hostname, "resolvePtr", false, true); return promiseFromCallback(Resolver.prototype.resolvePtr.bind(this), hostname); }
   resolveSoa(hostname) { validateResolveHostname(hostname, "resolveSoa", true, true); return promiseFromCallback(Resolver.prototype.resolveSoa.bind(this), hostname); }
   resolveSrv(hostname) { validateResolveHostname(hostname, "resolveSrv", false, true); return promiseFromCallback(Resolver.prototype.resolveSrv.bind(this), hostname); }
+  resolveTlsa(hostname) { validateResolveHostname(hostname, "resolveTlsa", false, true); return promiseFromCallback(Resolver.prototype.resolveTlsa.bind(this), hostname); }
   resolveTxt(hostname) { validateResolveHostname(hostname, "resolveTxt", false, true); return promiseFromCallback(Resolver.prototype.resolveTxt.bind(this), hostname); }
   reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(Resolver.prototype.reverse.bind(this), ip); }
 }
@@ -1385,6 +1403,7 @@ export const promises = {
   resolvePtr(hostname) { validateResolveHostname(hostname, "resolvePtr", false, true); return promiseFromCallback(resolvePtr, hostname); },
   resolveSoa(hostname) { validateResolveHostname(hostname, "resolveSoa", true, true); return promiseFromCallback(resolveSoa, hostname); },
   resolveSrv(hostname) { validateResolveHostname(hostname, "resolveSrv", false, true); return promiseFromCallback(resolveSrv, hostname); },
+  resolveTlsa(hostname) { validateResolveHostname(hostname, "resolveTlsa", false, true); return promiseFromCallback(resolveTlsa, hostname); },
   resolveTxt(hostname) { validateResolveHostname(hostname, "resolveTxt", false, true); return promiseFromCallback(resolveTxt, hostname); },
   reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(reverse, ip); },
   setDefaultResultOrder,
@@ -1407,6 +1426,7 @@ resolveNs[kCustomPromisify] = promises.resolveNs;
 resolvePtr[kCustomPromisify] = promises.resolvePtr;
 resolveSoa[kCustomPromisify] = promises.resolveSoa;
 resolveSrv[kCustomPromisify] = promises.resolveSrv;
+resolveTlsa[kCustomPromisify] = promises.resolveTlsa;
 resolveTxt[kCustomPromisify] = promises.resolveTxt;
 reverse[kCustomPromisify] = promises.reverse;
 
@@ -1456,6 +1476,7 @@ export default {
   resolvePtr,
   resolveSoa,
   resolveSrv,
+  resolveTlsa,
   resolveTxt,
   reverse,
   setDefaultResultOrder,
