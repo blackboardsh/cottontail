@@ -41,7 +41,7 @@ compat/upstream/bun/*/packages/bun-types/*
 !compat/upstream/bun/*/packages/bun-types/package.json
 compat/upstream/**/Heap.*.heapsnapshot
 compat/upstream/**/Heap-*.heapsnapshot
-compat/upstream/**/.cottontail-compat-*
+.cottontail-compat-*
 compat/upstream/**/.cottontail-compile-cache/
 compat/upstream/**/fstest*/
 compat/upstream/**/.verdaccio-db.json
