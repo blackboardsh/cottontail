@@ -2474,7 +2474,7 @@ const Manager = struct {
         }
 
         try manager.validateCatalogReferences(&root);
-        try manager.captureInitialRootVersions(&root);
+        try manager.captureInitialDirectVersions(command_package_json, manager.invocation_package_dir);
         try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
         if (manager.options.command == .install and manager.security_scanner == null) {
@@ -6827,16 +6827,10 @@ const Manager = struct {
             .workspace => {
                 if (protocol_patch_paths.len > 0) return error.UnsupportedPatchResolution;
                 const workspace = manager.workspaces.get(package.name) orelse manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
-                const workspace_was_linked = pathsEquivalent(
-                    manager.init_data.io,
-                    manager.allocator,
-                    selection.destination,
-                    workspace.path,
-                ) catch false;
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     try manager.linkRelativeDirectory(selection.destination, workspace.path, true);
                 }
-                try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
+                try manager.countWorkspaceInstall(workspace);
                 try manager.addRecord(.{
                     .key = record_key,
                     .alias = alias,
@@ -10196,11 +10190,10 @@ const Manager = struct {
             try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
         else
             try manager.chooseDestination(alias, workspace.version, parent_dir, direct);
-        const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
         if (!manager.options.lockfile_only) {
             try manager.linkRelativeDirectory(destination, workspace.path, true);
         }
-        try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
+        try manager.countWorkspaceInstall(workspace);
         try manager.addRecord(.{
             .key = if (manager.node_linker == .isolated)
                 try manager.dependencyLockKey(parent_dir, alias)
@@ -10269,20 +10262,31 @@ const Manager = struct {
         }
     }
 
-    fn captureInitialRootVersions(manager: *Manager, root: *const Value) !void {
-        if (root.* != .object or manager.options.lockfile_only or manager.options.dry_run) return;
+    fn captureInitialDirectVersions(
+        manager: *Manager,
+        package_json: *const Value,
+        parent_dir: []const u8,
+    ) !void {
+        if (package_json.* != .object or manager.options.lockfile_only or manager.options.dry_run) return;
         for (all_dependency_sections) |section_name| {
-            const section = root.object.get(section_name) orelse continue;
+            const section = package_json.object.get(section_name) orelse continue;
             if (section != .object) continue;
             for (section.object.keys()) |alias| {
                 if (manager.initial_root_versions.contains(alias)) continue;
-                const destination = try packageDestination(manager.allocator, manager.root_dir, alias);
-                const package_json = manager.readInstalledPackageJSON(destination) catch continue;
-                const installed_version = jsonString(package_json, "version") orelse continue;
-                try manager.initial_root_versions.put(
-                    try manager.allocator.dupe(u8, alias),
-                    try manager.allocator.dupe(u8, installed_version),
-                );
+                var base = parent_dir;
+                while (true) {
+                    const destination = try packageDestination(manager.allocator, base, alias);
+                    if (manager.readInstalledPackageJSON(destination) catch null) |installed_package_json| {
+                        const installed_version = jsonString(installed_package_json, "version") orelse break;
+                        try manager.initial_root_versions.put(
+                            try manager.allocator.dupe(u8, alias),
+                            try manager.allocator.dupe(u8, installed_version),
+                        );
+                        break;
+                    }
+                    if (std.mem.eql(u8, base, manager.root_dir)) break;
+                    base = parentPackageBase(manager.root_dir, base) orelse break;
+                }
             }
         }
     }
@@ -10359,8 +10363,10 @@ const Manager = struct {
         if (!entry.found_existing) manager.installed_count += 1;
     }
 
-    fn countWorkspaceInstall(manager: *Manager, workspace: Workspace, newly_linked: bool) !void {
-        if (!newly_linked or manager.options.lockfile_only or manager.options.dry_run) return;
+    fn countWorkspaceInstall(manager: *Manager, workspace: Workspace) !void {
+        if (manager.options.lockfile_only or manager.options.dry_run) return;
+        // COTTONTAIL-COMPAT: Bun counts each selected workspace as an install
+        // on every materialization pass, even when its link already exists.
         const entry = try manager.installed_workspaces.getOrPut(workspace.name);
         if (!entry.found_existing) manager.installed_count += 1;
     }
@@ -10383,9 +10389,8 @@ const Manager = struct {
             _ = try manager.peerContextForPackage(workspace.package_json, workspace.path, true);
             if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
                 const destination = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
-                const workspace_was_linked = pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false;
                 if (!manager.options.lockfile_only) try manager.linkRelativeDirectory(destination, workspace.path, true);
-                try manager.countWorkspaceInstall(workspace, !workspace_was_linked);
+                try manager.countWorkspaceInstall(workspace);
                 if (!manager.options.lockfile_only) try manager.linkBins(workspace.name, destination, workspace.package_json, true, manager.root_dir);
                 try manager.addRecord(.{
                     .key = try manager.lockKeyForDestination(destination),
