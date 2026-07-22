@@ -4881,6 +4881,7 @@ fn bundleScriptNative(
             ctx,
             tmp_dir,
             script_abs,
+            script_abs,
             false,
             preload_imports,
             is_test_cli_execution,
