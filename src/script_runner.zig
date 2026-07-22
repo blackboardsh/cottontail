@@ -4487,6 +4487,11 @@ const RuntimeBootstrapMode = enum {
     process,
 };
 
+const ReloadRuntimeBootstrapAnalysis = struct {
+    mode: RuntimeBootstrapMode = .minimal,
+    needs_runtime_module_sources: bool = false,
+};
+
 fn entrypointRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
     if (!try entrypointImportsOnlyRuntimeAliases(ctx, path)) return .full;
     return sourceRuntimeBootstrapMode(ctx, path);
@@ -4589,45 +4594,59 @@ fn reloadRuntimeBootstrapModeVisit(
     ctx: *const Context,
     path: []const u8,
     visited: *std.StringHashMapUnmanaged(void),
-) !RuntimeBootstrapMode {
+) !ReloadRuntimeBootstrapAnalysis {
     const canonical = resolvePathForCwd(ctx.io, ctx.allocator, path) catch path;
-    if (visited.contains(canonical)) return .minimal;
+    if (visited.contains(canonical)) return .{};
     try visited.put(ctx.allocator, canonical, {});
 
-    var mode = try sourceRuntimeBootstrapMode(ctx, canonical);
-    if (mode == .full) return .full;
-    const loader = transpilerLoaderForPath(canonical) orelse return .full;
+    var analysis: ReloadRuntimeBootstrapAnalysis = .{
+        .mode = try sourceRuntimeBootstrapMode(ctx, canonical),
+    };
+    if (analysis.mode == .full) return .{ .mode = .full, .needs_runtime_module_sources = true };
+    const loader = transpilerLoaderForPath(canonical) orelse
+        return .{ .mode = .full, .needs_runtime_module_sources = true };
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
         canonical,
         ctx.allocator,
         .limited(4 * 1024 * 1024),
-    ) catch return .full;
-    const imports_json = native_transpiler.scanImportsJson(source, loader) catch return .full;
+    ) catch return .{ .mode = .full, .needs_runtime_module_sources = true };
+    const imports_json = native_transpiler.scanImportsJson(source, loader) catch
+        return .{ .mode = .full, .needs_runtime_module_sources = true };
     defer std.heap.c_allocator.free(imports_json);
     const ScannedImport = struct {
         path: []const u8,
         kind: []const u8,
     };
-    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch return .full;
+    const parsed = std.json.parseFromSlice([]const ScannedImport, ctx.allocator, imports_json, .{}) catch
+        return .{ .mode = .full, .needs_runtime_module_sources = true };
     defer parsed.deinit();
 
     for (parsed.value) |item| {
-        if (!std.mem.eql(u8, item.kind, "import-statement") or item.path.len == 0) return .full;
-        if (isMinimalRuntimeAliasSpecifier(item.path)) continue;
-        const resolved = try resolveReloadRuntimeImport(ctx, canonical, item.path) orelse return .full;
+        if (!std.mem.eql(u8, item.kind, "import-statement") or item.path.len == 0) {
+            return .{ .mode = .full, .needs_runtime_module_sources = true };
+        }
+        if (isMinimalRuntimeAliasSpecifier(item.path)) {
+            analysis.needs_runtime_module_sources = true;
+            continue;
+        }
+        const resolved = try resolveReloadRuntimeImport(ctx, canonical, item.path) orelse
+            return .{ .mode = .full, .needs_runtime_module_sources = true };
         switch (resolved) {
             .asset => {},
             .script => |dependency| {
-                mode = mergeRuntimeBootstrapMode(mode, try reloadRuntimeBootstrapModeVisit(ctx, dependency, visited));
-                if (mode == .full) return .full;
+                const dependency_analysis = try reloadRuntimeBootstrapModeVisit(ctx, dependency, visited);
+                analysis.mode = mergeRuntimeBootstrapMode(analysis.mode, dependency_analysis.mode);
+                analysis.needs_runtime_module_sources = analysis.needs_runtime_module_sources or
+                    dependency_analysis.needs_runtime_module_sources;
+                if (analysis.mode == .full) return analysis;
             },
         }
     }
-    return mode;
+    return analysis;
 }
 
-fn reloadRuntimeBootstrapMode(ctx: *const Context, path: []const u8) !RuntimeBootstrapMode {
+fn reloadRuntimeBootstrapAnalysis(ctx: *const Context, path: []const u8) !ReloadRuntimeBootstrapAnalysis {
     var visited: std.StringHashMapUnmanaged(void) = .empty;
     return reloadRuntimeBootstrapModeVisit(ctx, path, &visited);
 }
@@ -4868,16 +4887,18 @@ fn bundleScriptNative(
         try shouldBundleCommonJsEntrypoint(ctx, script_entry_abs);
     const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_entry_abs);
+    var reload_needs_runtime_module_sources = true;
     const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_module_entrypoint and
         !runtime_cache_common_js_entrypoint and
         !standalone_compile and
         build_options == null and
         !requires_full_runtime_preloads and
         !is_wasm_entrypoint)
-        if (reload_dependencies_out != null)
-            try reloadRuntimeBootstrapMode(ctx, script_entry_abs)
-        else
-            try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
+        if (reload_dependencies_out != null) mode: {
+            const analysis = try reloadRuntimeBootstrapAnalysis(ctx, script_entry_abs);
+            reload_needs_runtime_module_sources = analysis.needs_runtime_module_sources;
+            break :mode analysis.mode;
+        } else try entrypointRuntimeBootstrapMode(ctx, script_entry_abs)
     else
         .full;
     const use_selective_runtime = runtime_bootstrap_mode != .full;
@@ -4999,7 +5020,14 @@ fn bundleScriptNative(
     options.node_path = ctx.environ_map.get("NODE_PATH");
     options.features = features.items;
     options.tsconfig_override = tsconfig_override;
-    options.include_runtime_modules = true;
+    options.include_runtime_modules = !reuse_minimal_reload_runtime or reload_needs_runtime_module_sources;
+    if (!options.include_runtime_modules) {
+        // The first hot generation already installed the minimal runtime.
+        // Preserve runtime bundle transforms while avoiding a fresh virtual
+        // file map when this generation's graph has no runtime alias imports.
+        options.keep_names = true;
+        options.env_behavior = .load_all_without_inlining;
+    }
     options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
     options.rewrite_jest_for_tests = is_test_cli_execution;
