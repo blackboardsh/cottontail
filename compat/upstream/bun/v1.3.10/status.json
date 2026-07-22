@@ -4958,8 +4958,8 @@
       "reason": "Passes on the native-bundler pipeline after stabilization (11 bun:test cases, 0 assertions)."
     },
     "test/regression/issue/24364.test.ts": {
-      "status": "expected-failure",
-      "reason": "The copied template installs unpinned current TypeScript, whose TS5102 removal of baseUrl now fails this case under both Bun 1.3.10 and Cottontail."
+      "status": "enabled",
+      "reason": "The template test pins Bun 1.3.10-era TypeScript and plugin dependencies, then passes both installation and tsc --noEmit under Cottontail (1 case, 4 assertions)."
     },
     "test/regression/issue/24388.test.ts": {
       "status": "enabled",
