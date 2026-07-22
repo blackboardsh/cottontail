@@ -3563,6 +3563,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (28 bun:test cases, 0 assertions)."
     },
+    "test/js/third_party/grpc-js/test-resolver.test.ts": {
+      "status": "expected-failure",
+      "reason": "19/20 active copied resolver cases pass, including localhost, IPv4/IPv6 literals, UDS targets, dotted and hyphenated public names, gRPC interop hosts, and failed-resolution throttling. The sole failure is example.com, which this environment also returns as ENOTFOUND under Node 24.11.1 and Bun 1.3.10."
+    },
     "test/js/third_party/grpc-js/test-server-credentials.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (11 bun:test cases, 0 assertions)."
