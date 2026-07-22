@@ -50,6 +50,7 @@ const transferredPortPeers = new Map();
 const transferredPortRoutes = new Map();
 const transferredPortTargets = new Map();
 const receivedMessagePorts = new Map();
+const referencedMessagePorts = new Set();
 const sharedEnvironmentGroups = new Map();
 const portMessageEnvelopeKey = "__cottontailWorkerThreadsPortMessage";
 const workerControlEnvelopeKey = "__cottontailWorkerThreadsControl";
@@ -63,6 +64,13 @@ let sharedEnvironmentProxyInstalled = false;
 let applyingSharedEnvironmentUpdate = false;
 const inheritedUncaughtExceptionListeners = new Set(globalThis.process?.listeners?.("uncaughtException") ?? []);
 let workerUserCaptureCallbackInstalled = false;
+const workerRuntimeCacheId = String(globalThis.__cottontailWorkerRuntimeCacheId ??
+  `${globalThis.process?.pid ?? 0}-${Date.now()}-${Math.floor(Math.random() * 1000000)}`);
+Object.defineProperty(globalThis, "__cottontailWorkerRuntimeCacheId", {
+  configurable: true,
+  value: workerRuntimeCacheId,
+  writable: true,
+});
 
 export const SHARE_ENV = Symbol.for("nodejs.worker_threads.SHARE_ENV");
 export const isMainThread = !cottontail.isWorker?.();
@@ -229,6 +237,7 @@ function encodeClone(value, state = { ids: new WeakMap(), nextId: 1 }) {
     }
     value._transferred = true;
     value._closed = true;
+    value._syncRefHandle();
     queueMicrotask(() => value.emit("close"));
     return { t: "MessagePort", id, portId: value._id, sourceThreadId: threadId, remoteEndpointThreadId };
   }
@@ -850,6 +859,7 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
   const nonce = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
   const wrapperPath = `${dir}/worker-thread-${nonce}.mjs`;
   const source = [
+    `globalThis.__cottontailWorkerRuntimeCacheId = ${JSON.stringify(workerRuntimeCacheId)};`,
     `globalThis.__cottontailWorkerBootstrap = ${JSON.stringify(bootstrap)};`,
     `if (globalThis.process) {`,
     `  globalThis.process.argv = ${JSON.stringify(argv)};`,
@@ -1429,26 +1439,24 @@ export class Worker extends EventEmitter {
   ref() {
     if (!this._running) {
       this._refed = false;
-      return this;
+      return;
     }
     this._worker.ref?.();
     this._refed = typeof cottontail.workerSetRef === "function"
       ? Boolean(cottontail.workerSetRef(this._nativeThreadId, true))
       : true;
-    return this;
   }
 
   unref() {
     if (!this._running) {
       this._refed = false;
-      return this;
+      return;
     }
     this._worker.unref?.();
     if (typeof cottontail.workerSetRef === "function") {
       cottontail.workerSetRef(this._nativeThreadId, false);
     }
     this._refed = false;
-    return this;
   }
 
   hasRef() {
@@ -1509,7 +1517,7 @@ export class MessagePort extends EventEmitter {
     this._transferred = false;
     this._onmessage = null;
     this._onmessageerror = null;
-    this._ref = true;
+    this._ref = false;
     this._dispatchScheduled = false;
     this._eventTargetListeners = new Map();
   }
@@ -1521,6 +1529,7 @@ export class MessagePort extends EventEmitter {
   set onmessage(handler) {
     this._onmessage = typeof handler === "function" ? handler : null;
     if (this._onmessage) this.start();
+    this._syncRefFromMessageListeners();
   }
 
   get onmessageerror() {
@@ -1584,6 +1593,7 @@ export class MessagePort extends EventEmitter {
     if (this._closed) return;
     this._closed = true;
     receivedMessagePorts.delete(this._id);
+    this._syncRefHandle();
     queueMicrotask(() => {
       const event = { type: "close", target: this, currentTarget: this };
       this._dispatchEventTarget("close", event);
@@ -1593,21 +1603,40 @@ export class MessagePort extends EventEmitter {
 
   ref() {
     this._ref = true;
-    return this;
+    this._syncRefHandle();
   }
 
   unref() {
     this._ref = false;
-    return this;
+    this._syncRefHandle();
   }
 
   hasRef() {
     return this._ref;
   }
 
+  _syncRefHandle() {
+    if (!this._closed && this._ref) referencedMessagePorts.add(this);
+    else referencedMessagePorts.delete(this);
+  }
+
+  _hasMessageListeners() {
+    return this.listenerCount("message") > 0 || typeof this._onmessage === "function" ||
+      Boolean(this._eventTargetListeners.get("message")?.size);
+  }
+
+  _syncRefFromMessageListeners() {
+    this._ref = this._hasMessageListeners();
+    this._syncRefHandle();
+  }
+
   addListener(name, handler) {
     super.addListener(name, handler);
-    if (String(name) === "message") this.start();
+    if (String(name) === "message") {
+      this.start();
+      this._ref = true;
+      this._syncRefHandle();
+    }
     return this;
   }
 
@@ -1617,7 +1646,28 @@ export class MessagePort extends EventEmitter {
 
   prependListener(name, handler) {
     super.prependListener(name, handler);
-    if (String(name) === "message") this.start();
+    if (String(name) === "message") {
+      this.start();
+      this._ref = true;
+      this._syncRefHandle();
+    }
+    return this;
+  }
+
+  removeListener(name, handler) {
+    super.removeListener(name, handler);
+    if (String(name) === "message") this._syncRefFromMessageListeners();
+    return this;
+  }
+
+  off(name, handler) {
+    return this.removeListener(name, handler);
+  }
+
+  removeAllListeners(name = undefined) {
+    if (arguments.length === 0) super.removeAllListeners();
+    else super.removeAllListeners(name);
+    if (arguments.length === 0 || String(name) === "message") this._syncRefFromMessageListeners();
     return this;
   }
 
@@ -1628,7 +1678,11 @@ export class MessagePort extends EventEmitter {
     if (byType.has(handler)) return;
     byType.set(handler, { handler, once: options?.once === true });
     this._eventTargetListeners.set(key, byType);
-    if (key === "message") this.start();
+    if (key === "message") {
+      this.start();
+      this._ref = true;
+      this._syncRefHandle();
+    }
   }
 
   removeEventListener(name, handler) {
@@ -1637,6 +1691,7 @@ export class MessagePort extends EventEmitter {
     if (!byType?.has(handler)) return;
     byType.delete(handler);
     if (byType.size === 0) this._eventTargetListeners.delete(key);
+    if (key === "message") this._syncRefFromMessageListeners();
   }
 
   _dispatchEventTarget(name, event) {
@@ -1684,6 +1739,10 @@ export class MessagePort extends EventEmitter {
       this._dispatchEventTarget("message", event);
       this.emit("message", value);
     }
+  }
+
+  _keepsEventLoopAlive() {
+    return !this._closed && this._ref;
   }
 }
 
@@ -2175,7 +2234,6 @@ function workerErrorPayload(value) {
 export const parentPort = isMainThread ? null : new class ParentPort extends MessagePort {
   constructor() {
     super(createMessagePortToken);
-    this._refed = true;
     const transportListener = (event) => {
       let message;
       const context = {};
@@ -2253,27 +2311,23 @@ export const parentPort = isMainThread ? null : new class ParentPort extends Mes
     this._closeLocal();
     this.removeAllListeners();
   }
-
-  ref() {
-    this._refed = true;
-    return this;
-  }
-
-  unref() {
-    this._refed = false;
-    return this;
-  }
-
-  hasRef() {
-    return this._refed;
-  }
-
-  _keepsEventLoopAlive() {
-    return !this._closed && this._refed &&
-      (this.listenerCount("message") > 0 || typeof this.onmessage === "function" ||
-       Boolean(this._eventTargetListeners.get("message")?.size));
-  }
 }();
+
+function hasReferencedMessagingHandles() {
+  if (referencedMessagePorts.size > 0) return true;
+  for (const channels of broadcastChannels.values()) {
+    for (const channel of channels) {
+      if (!channel._closed && channel._refed) return true;
+    }
+  }
+  return false;
+}
+
+if (isMainThread) {
+  const previousWebHasActiveHandles = globalThis.__cottontailWebHasActiveHandles;
+  globalThis.__cottontailWebHasActiveHandles = () =>
+    Boolean(previousWebHasActiveHandles?.() || hasReferencedMessagingHandles());
+}
 
 if (!isMainThread) {
   globalThis.__cottontailNormalizeWorkerEvalError = normalizeWorkerEvalError;
@@ -2286,16 +2340,7 @@ if (!isMainThread) {
     if (parentPort?._keepsEventLoopAlive()) return true;
     if (threadMessageRequests.size > 0) return true;
     if (localLockRequests.size > 0 || localLockQueries.size > 0) return true;
-    for (const channels of broadcastChannels.values()) {
-      for (const channel of channels) {
-        if (!channel._closed && channel._refed) return true;
-      }
-    }
-    for (const port of receivedMessagePorts.values()) {
-      if (!port._closed && port._ref &&
-          (port.listenerCount("message") > 0 || typeof port.onmessage === "function")) return true;
-    }
-    return false;
+    return hasReferencedMessagingHandles();
   };
   globalThis.__cottontailWebHasActiveHandles = () => {
     if (hasWorkerVisibleHandles()) {

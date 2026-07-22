@@ -2329,8 +2329,8 @@ function nextRunLoopDelay(now = timerNow()) {
 g.__cottontailHasActiveHandles = () => {
   if (cottontail.isWorker?.()) {
     if (hasWorkerMessageListener()) return true;
-    if (g.__cottontailWebHasActiveHandles?.()) return true;
   }
+  if (g.__cottontailWebHasActiveHandles?.()) return true;
   for (const worker of workerInstances.values()) {
     if (worker.hasRef()) return true;
   }
@@ -2428,6 +2428,9 @@ function rewriteWorkerNamedImports(spec) {
 
 const workerBundleCache = new Map();
 const workerRuntimePreludeCache = new Map();
+const workerRuntimePreludeCacheMarker = "\n//# cottontail-worker-runtime-cache";
+const workerRuntimePreludeDiskPaths = new Set();
+let workerRuntimePreludeCleanupInstalled = false;
 const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 const workerThreadName = Symbol.for("cottontail.worker.thread-name");
@@ -2437,6 +2440,65 @@ const workerNativeOptions = Symbol.for("cottontail.worker.native-options");
 function workerTempDir() {
   const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
   return configured ? `${configured}/workers` : `${cottontail.cwd()}/.cottontail-tmp`;
+}
+
+function workerRuntimePreludeDiskPath(tempDir, cwd) {
+  const cacheId = String(g.__cottontailWorkerRuntimeCacheId ?? "")
+    .replace(/[^A-Za-z0-9_.-]/g, "_")
+    .slice(0, 128);
+  if (!cacheId) return null;
+  let cwdHash = 2166136261;
+  for (let index = 0; index < cwd.length; index += 1) {
+    cwdHash = Math.imul(cwdHash ^ cwd.charCodeAt(index), 16777619) >>> 0;
+  }
+  return `${tempDir}/bun-worker-runtime-cache-${cacheId}-${cwdHash.toString(16)}.js`;
+}
+
+function trackWorkerRuntimePreludeDiskPath(path) {
+  if (path === null || cottontail.isWorker?.()) return;
+  workerRuntimePreludeDiskPaths.add(path);
+  if (workerRuntimePreludeCleanupInstalled) return;
+  workerRuntimePreludeCleanupInstalled = true;
+  processObject.once?.("exit", () => {
+    for (const cachedPath of workerRuntimePreludeDiskPaths) {
+      try { cottontail.unlinkSync?.(cachedPath); } catch {}
+    }
+    workerRuntimePreludeDiskPaths.clear();
+  });
+}
+
+function loadWorkerRuntimePrelude(tempDir, cwd, runtimeEntry, nonce) {
+  let runtimePrelude = workerRuntimePreludeCache.get(cwd);
+  if (runtimePrelude !== undefined) return runtimePrelude;
+
+  const diskPath = workerRuntimePreludeDiskPath(tempDir, cwd);
+  trackWorkerRuntimePreludeDiskPath(diskPath);
+  if (diskPath !== null) {
+    try {
+      const cached = String(cottontail.readFile(diskPath));
+      if (cached.endsWith(workerRuntimePreludeCacheMarker)) runtimePrelude = cached;
+    } catch {}
+  }
+
+  if (runtimePrelude === undefined) {
+    const preludeEntry = `${tempDir}/bun-worker-runtime-${nonce}.mjs`;
+    cottontail.writeFile(preludeEntry, `import ${JSON.stringify(runtimeEntry)};`);
+    try {
+      runtimePrelude = cottontail.bundleNative(preludeEntry, cottontail.cwd(), JSON.stringify({
+        format: "esm",
+        target: "bun",
+        includeRuntimeModules: true,
+        inlineImportMetaProperties: true,
+      }));
+    } finally {
+      try { cottontail.unlinkSync?.(preludeEntry); } catch {}
+    }
+    runtimePrelude += workerRuntimePreludeCacheMarker;
+    if (diskPath !== null) cottontail.writeFile(diskPath, runtimePrelude);
+  }
+
+  workerRuntimePreludeCache.set(cwd, runtimePrelude);
+  return runtimePrelude;
 }
 
 function canUseBareWorkerScript(target, options, hasWorkerOptions) {
@@ -2487,18 +2549,7 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const slashTarget = String(target).replace(/\\/g, "/");
   const runtimeEntry = `${slashCwd}/.cottontail-embedded-runtime/bun/index.js`;
   if (options?.[preparedWorkerScript] === true) {
-    let runtimePrelude = workerRuntimePreludeCache.get(slashCwd);
-    if (runtimePrelude === undefined) {
-      const preludeEntry = `${tempDir}/bun-worker-runtime-${nonce}.mjs`;
-      cottontail.writeFile(preludeEntry, `import ${JSON.stringify(runtimeEntry)};`);
-      runtimePrelude = cottontail.bundleNative(preludeEntry, cottontail.cwd(), JSON.stringify({
-        format: "esm",
-        target: "bun",
-        includeRuntimeModules: true,
-        inlineImportMetaProperties: true,
-      }));
-      workerRuntimePreludeCache.set(slashCwd, runtimePrelude);
-    }
+    const runtimePrelude = loadWorkerRuntimePrelude(tempDir, slashCwd, runtimeEntry, nonce);
     const source = cottontail.readFile(target);
     cottontail.writeFile(bundledPath, `${runtimePrelude}\n${source}\n//# sourceURL=${slashTarget}`);
     return bundledPath;
@@ -2637,13 +2688,20 @@ g.Worker ??= class Worker {
   _startWorker(scriptPath, options) {
     if (this._terminated) return;
     this.scriptPath = prepareWorkerScriptPath(scriptPath, options);
-    this.handle = cottontail.spawnWorker(
-      this.scriptPath,
-      options?.[workerEvalSource],
-      options?.[workerThreadName],
-      options?.[workerStackSize],
-      options?.[workerNativeOptions],
-    );
+    const disposePreparedScript = options?.[preparedWorkerScript] === true;
+    try {
+      this.handle = cottontail.spawnWorker(
+        this.scriptPath,
+        options?.[workerEvalSource],
+        options?.[workerThreadName],
+        options?.[workerStackSize],
+        options?.[workerNativeOptions],
+      );
+    } finally {
+      if (disposePreparedScript) {
+        try { cottontail.unlinkSync?.(this.scriptPath); } catch {}
+      }
+    }
     this.id = this.handle.id;
     this.threadId = this.id;
     if (typeof cottontail.workerHasRef === "function") {

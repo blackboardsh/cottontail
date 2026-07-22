@@ -87,6 +87,7 @@ test("worker options expose argv, execArgv, name, resource limits, and stdio", a
       stderr: true,
     },
   );
+  expect(worker.resourceLimits).toEqual({ stackSizeMb: 2 });
   const exit = once(worker, "exit");
   const stdoutText = streamText(worker.stdout);
   const stderrText = streamText(worker.stderr);
@@ -101,6 +102,7 @@ test("worker options expose argv, execArgv, name, resource limits, and stdio", a
   expect(metadata.resourceLimits).toEqual({ stackSizeMb: 2 });
   expect(stdout).toBe("stdin-ok");
   expect(stderr).toBe("stderr-ok");
+  expect(worker.resourceLimits).toEqual({});
 });
 
 test("Worker rejects invalid option containers", () => {

@@ -62,13 +62,13 @@ test("moving a MessagePort into a shared-realm vm context keeps it functional", 
 test("Worker ref state follows native startup and exit lifecycle", async () => {
   const worker = new Worker(`setTimeout(() => {}, 80);`, { eval: true });
   expect(worker.hasRef()).toBe(true);
-  expect(worker.unref()).toBe(worker);
+  expect(worker.unref()).toBeUndefined();
   expect(worker.hasRef()).toBe(false);
-  expect(worker.ref()).toBe(worker);
+  expect(worker.ref()).toBeUndefined();
   expect(worker.hasRef()).toBe(true);
   await once(worker, "exit");
   expect(worker.hasRef()).toBe(false);
-  expect(worker.ref()).toBe(worker);
+  expect(worker.ref()).toBeUndefined();
   expect(worker.hasRef()).toBe(false);
 });
 

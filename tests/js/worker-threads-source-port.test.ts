@@ -212,6 +212,65 @@ test("MessageEvent.ports preserves transferred-port identity and transfer valida
   expect((await reply)[0]).toBe("transferred-reply");
 });
 
+test("MessagePort ref state follows message listeners and explicit ownership", () => {
+  const { port1, port2 } = new MessageChannel();
+  const emitterListener = () => {};
+  const eventTargetListener = () => {};
+
+  expect(port1.hasRef()).toBe(false);
+  expect(port1.ref()).toBeUndefined();
+  expect(port1.hasRef()).toBe(true);
+  expect(port1.unref()).toBeUndefined();
+  expect(port1.hasRef()).toBe(false);
+
+  port1.on("message", emitterListener);
+  expect(port1.hasRef()).toBe(true);
+  port1.off("message", emitterListener);
+  expect(port1.hasRef()).toBe(false);
+
+  port1.onmessage = emitterListener;
+  expect(port1.hasRef()).toBe(true);
+  port1.onmessage = null;
+  expect(port1.hasRef()).toBe(false);
+
+  port1.addEventListener("message", eventTargetListener);
+  expect(port1.hasRef()).toBe(true);
+  port1.removeEventListener("message", eventTargetListener);
+  expect(port1.hasRef()).toBe(false);
+
+  port1.close();
+  port2.close();
+});
+
+test("parentPort starts unreferenced and tracks worker message listeners", async () => {
+  const worker = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     const initial = parentPort.hasRef();
+     const handler = value => {
+       const during = parentPort.hasRef();
+       parentPort.off("message", handler);
+       parentPort.postMessage({ type: "result", initial, during, after: parentPort.hasRef(), value });
+     };
+     parentPort.on("message", handler);
+     parentPort.postMessage({ type: "ready", afterAdd: parentPort.hasRef() });`,
+    { eval: true },
+  );
+  const ready = await messageFrom(worker);
+  expect(ready).toEqual({ type: "ready", afterAdd: true });
+
+  const result = messageFrom(worker);
+  const exit = once(worker, "exit");
+  worker.postMessage("worker-message");
+  expect(await result).toEqual({
+    type: "result",
+    initial: false,
+    during: true,
+    after: false,
+    value: "worker-message",
+  });
+  expect((await exit)[0]).toBe(0);
+});
+
 test("BroadcastChannel has Node emitter and Web EventTarget delivery in one isolate", async () => {
   const name = `source-port-broadcast-${Date.now()}`;
   const first = new BroadcastChannel(name);
@@ -391,8 +450,8 @@ test("terminate settles once and clears exited worker metadata", async () => {
   expect(worker.threadId).toBe(-1);
   expect(worker.threadName).toBeNull();
   expect(worker.resourceLimits).toEqual({});
-  expect(worker.ref()).toBe(worker);
-  expect(worker.unref()).toBe(worker);
+  expect(worker.ref()).toBeUndefined();
+  expect(worker.unref()).toBeUndefined();
 });
 
 test("process.exit clears worker handles and propagates the requested code", async () => {
