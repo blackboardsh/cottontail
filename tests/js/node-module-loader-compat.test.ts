@@ -41,6 +41,13 @@ test("require uses an ESM module.exports export as its direct result", () => {
   expect(require(namespace).value).toBe(42);
 });
 
+test("require detects transpiled ESM exports after preceding statements", () => {
+  const target = join(root, "single-line-export.mjs");
+  writeFileSync(target, "const config = { output: 'server' }; export { config as default };\n");
+
+  expect(require(target).default).toEqual({ output: "server" });
+});
+
 test("synchronous ESM entries preserve package-relative import referrers", () => {
   const { createRequire } = require("node:module");
   const packageDir = join(root, "node_modules", "loader-referrer-package");

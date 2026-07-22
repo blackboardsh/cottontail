@@ -2099,7 +2099,7 @@ function refreshModuleRequire(module) {
 // it is the only module-specific construct in a .js file.
 // Files reaching the CommonJS executor with ESM syntax must be transformed
 // first: `import x from "y"` inside new Function() is a parse error.
-const esmSyntaxPattern = /(?:\bimport\s*\.\s*meta\b|^[ \t]*(?:import\s+(?:[\w$*{]|["'])|export\s+(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*)))/m;
+const esmSyntaxPattern = /(?:\bimport\b\s*(?:\.\s*meta\b|[\w$*{]|["'])|\bexport\b\s*(?:default\b|const\b|let\b|var\b|function\b|class\b|async\b|\{|\*))/m;
 
 function codePositionMask(source) {
   const text = String(source);
@@ -2264,7 +2264,7 @@ function hasEsmSyntax(source) {
   const matcher = new RegExp(esmSyntaxPattern.source, "gm");
   let match;
   while ((match = matcher.exec(text)) != null) {
-    if (mask[match.index] === 1) return true;
+    if (mask[match.index] === 1 && text[match.index - 1] !== ".") return true;
   }
   return false;
 }
