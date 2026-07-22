@@ -526,6 +526,8 @@ function limitedCallSites(stack, fallbackSourceURL = undefined, configuredLimit 
   return Number.isFinite(limit) && limit >= 0 ? sites.slice(0, Math.floor(limit)) : sites;
 }
 
+const bunAccessedErrorStacks = new WeakSet();
+
 if (typeof nativeCaptureStackTrace === "function" && !Error.captureStackTrace.__cottontailStructuredCallSites) {
   const captureStackTrace = function(target, constructorOpt = undefined) {
     const prepare = Error.prepareStackTrace;
@@ -624,6 +626,7 @@ function installNodeStyleErrorConstructor(name) {
         configurable: true,
         enumerable: false,
         get() {
+          bunAccessedErrorStacks.add(error);
           if (!computed) {
             computed = true;
             applyMappedPosition();
@@ -9307,6 +9310,169 @@ See https://bun.com/docs/api/http for more information.`;
 }
 
 const serveHtmlStateSymbol = Symbol("cottontail.serveHtmlState");
+const serveInspectorOriginalRoutesSymbol = Symbol("cottontail.serveInspectorOriginalRoutes");
+const serveInspectorDevServerSymbol = Symbol("cottontail.serveInspectorDevServer");
+const serveInspectorRuntimeSymbol = Symbol.for("cottontail.serveInspectorRuntime");
+const serveInspectorRuntime = globalThis[serveInspectorRuntimeSymbol] ?? {
+  nextServerId: 1,
+  nextConnectionId: 0,
+  pendingReloads: [],
+};
+if (globalThis[serveInspectorRuntimeSymbol] == null) {
+  Object.defineProperty(globalThis, serveInspectorRuntimeSymbol, {
+    value: serveInspectorRuntime,
+    configurable: true,
+  });
+}
+
+function inspectorEmit(method, params) {
+  try {
+    return cottontail.inspectorEvent?.(method, JSON.stringify(params)) === true;
+  } catch {
+    return false;
+  }
+}
+
+function inspectorSetModuleGraph(state) {
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const argv = Array.from(globalThis.process?.argv ?? [], String);
+  const main = nodePathResolve(argv[1] ?? globalThis.__filename ?? "");
+  const esm = ["bun:main", main, ...state.sources];
+  const seen = new Set();
+  const graph = {
+    esm: esm.filter(value => value && !seen.has(value) && seen.add(value)),
+    cjs: [],
+    cwd,
+    main,
+    argv,
+  };
+  try { cottontail.inspectorSetModuleGraph?.(JSON.stringify(graph)); } catch {}
+}
+
+function inspectorRouteList(options) {
+  const routes = options[serveInspectorOriginalRoutesSymbol] ?? options.routes;
+  const api = [];
+  const html = [];
+  for (const [routePath, route] of Object.entries(routes ?? {})) {
+    if (isHtmlAssetRoute(route) || isHtmlSourceRoute(route) || isHtmlManifestRoute(route)) {
+      const source = isHtmlSourceRoute(route) || isHtmlManifestRoute(route) ? route.index : route;
+      html.push({
+        path: routePath,
+        type: "html",
+        scriptLine: -1,
+        filePath: nodePathResolve(String(source)),
+      });
+    } else {
+      api.push({ path: routePath, type: "api", scriptLine: -1 });
+    }
+  }
+  return [...api, ...html].map((route, routeId) => ({ routeId, ...route }));
+}
+
+function finalizeServeInspector(server, options, reloadState = null) {
+  const htmlState = options[serveHtmlStateSymbol];
+  const inspectorState = {
+    id: reloadState?.serverId ?? serveInspectorRuntime.nextServerId++,
+    hotReloadId: reloadState?.hotReloadId ?? 0,
+    suppressClose: false,
+    closed: false,
+    server,
+    sources: [...(htmlState?.sources ?? [])],
+  };
+  if (htmlState) htmlState.inspectorState = inspectorState;
+  const devState = options[serveInspectorDevServerSymbol];
+  if (devState) {
+    devState.inspectorState = inspectorState;
+    devState.server = server;
+  }
+
+  if (!reloadState) {
+    inspectorEmit("HTTPServer.listen", {
+      serverId: inspectorState.id,
+      url: String(server.url),
+      startTime: Date.now(),
+    });
+  }
+  inspectorEmit("HTTPServer.serverRoutesUpdated", {
+    serverId: inspectorState.id,
+    hotReloadId: inspectorState.hotReloadId,
+    routes: inspectorRouteList(options),
+  });
+  inspectorSetModuleGraph(inspectorState);
+
+  const originalStop = server.stop;
+  server.stop = function inspectorServerStop(force = false) {
+    if (!inspectorState.suppressClose && !inspectorState.closed) {
+      inspectorState.closed = true;
+      inspectorEmit("HTTPServer.close", { serverId: inspectorState.id, timestamp: Date.now() });
+    }
+    return Reflect.apply(originalStop, this, [force]);
+  };
+
+  globalThis.__cottontailHotReloadHooks?.add?.(() => {
+    inspectorState.suppressClose = true;
+    serveInspectorRuntime.pendingReloads.push({
+      serverId: inspectorState.id,
+      hotReloadId: inspectorState.hotReloadId + 1,
+      port: server.port,
+    });
+  });
+  return server;
+}
+
+function installInspectorDevServer(options) {
+  const htmlState = options[serveHtmlStateSymbol];
+  if (!serveIsDevelopment(options) || htmlState?.sources?.size === 0 || options.websocket != null) return options;
+  const htmlRoutes = Object.entries(options.routes ?? {})
+    .filter(([, route]) => isHtmlAssetRoute(route) || isHtmlSourceRoute(route) || isHtmlManifestRoute(route))
+    .map(([routePath]) => routePath);
+  const state = { server: null, inspectorState: null, htmlRoutes };
+  const hmrRoute = (request, server) => {
+    server.upgrade(request, { data: { inspectorHmr: true } });
+  };
+  const websocket = {
+    open(socket) {
+      const connectionId = serveInspectorRuntime.nextConnectionId++;
+      socket.data.connectionId = connectionId;
+      inspectorEmit("BunFrontendDevServer.clientConnected", {
+        serverId: state.inspectorState?.id ?? 0,
+        connectionId,
+      });
+    },
+    message(socket, rawMessage) {
+      const message = typeof rawMessage === "string" ? rawMessage : new TextDecoder().decode(rawMessage);
+      const connectionId = Number(socket.data?.connectionId ?? -1);
+      if (message.startsWith("n")) {
+        const destination = message.slice(1) || "/";
+        inspectorEmit("BunFrontendDevServer.clientNavigated", {
+          serverId: state.inspectorState?.id ?? 0,
+          connectionId,
+          url: new URL(destination, String(state.server.url)).href,
+          routeBundleId: Math.max(0, state.htmlRoutes.indexOf(destination)),
+        });
+      } else if (message.startsWith("l") && message.length >= 2) {
+        inspectorEmit("BunFrontendDevServer.consoleLog", {
+          serverId: state.inspectorState?.id ?? 0,
+          kind: message.charCodeAt(1),
+          message: message.slice(2),
+        });
+      }
+    },
+    close(socket) {
+      inspectorEmit("BunFrontendDevServer.clientDisconnected", {
+        serverId: state.inspectorState?.id ?? 0,
+        connectionId: Number(socket.data?.connectionId ?? -1),
+      });
+    },
+  };
+  return {
+    ...options,
+    [serveInspectorOriginalRoutesSymbol]: options.routes,
+    [serveInspectorDevServerSymbol]: state,
+    routes: { ...(options.routes ?? {}), "/_bun/hmr": hmrRoute },
+    websocket,
+  };
+}
 
 function isHtmlManifestRoute(value) {
   return value != null && typeof value === "object" &&
@@ -9457,9 +9623,61 @@ function generatedArtifactRoute(path) {
   return `/${relative.replace(/^\/+/, "")}`;
 }
 
+function serializeServeBuildErrors(owner, root, logs) {
+  const bytes = [];
+  const encoder = new TextEncoder();
+  const u8 = value => bytes.push(Number(value) & 0xff);
+  const u32 = value => {
+    const number = Number(value) >>> 0;
+    bytes.push(number & 0xff, (number >>> 8) & 0xff, (number >>> 16) & 0xff, (number >>> 24) & 0xff);
+  };
+  const string32 = value => {
+    const encoded = encoder.encode(String(value ?? ""));
+    u32(encoded.byteLength);
+    bytes.push(...encoded);
+  };
+  const location = position => {
+    if (!position || Number(position.line) <= 0) {
+      u32(0);
+      return;
+    }
+    u32(position.line);
+    u32(position.column);
+    u32(position.length ?? 0);
+    string32(position.lineText ?? "");
+  };
+  const level = value => ({ error: 0, warning: 1, warn: 1, note: 2, debug: 3, verbose: 4 })[value] ?? 0;
+  const normalizedLogs = Array.from(logs ?? []);
+  const sourcePath = normalizedLogs.find(log => log?.position?.file)?.position?.file ?? "";
+  const relativeSource = sourcePath ? nodePathRelative(root, String(sourcePath)).replace(/\\/g, "/") : "";
+  u32(owner);
+  string32(relativeSource);
+  u32(normalizedLogs.length);
+  for (const log of normalizedLogs) {
+    u8(level(log?.level));
+    string32(log?.message ?? String(log));
+    location(log?.position);
+    const notes = Array.isArray(log?.notes) ? log.notes : [];
+    u32(notes.length);
+    for (const note of notes) {
+      string32(note?.message ?? String(note));
+      location(note?.position);
+    }
+  }
+  return globalThis.Buffer.from(new Uint8Array(bytes)).toString("base64");
+}
+
 async function buildServeHtmlBatch(state, options, batch) {
   const development = serveIsDevelopment(options);
   const root = commonHtmlBuildRoot(batch);
+  const inspectorState = state.inspectorState;
+  const startedAt = globalThis.performance?.now?.() ?? Date.now();
+  if (inspectorState) {
+    inspectorEmit("BunFrontendDevServer.bundleStart", {
+      serverId: inspectorState.id,
+      triggerFiles: batch,
+    });
+  }
   const config = await serveHtmlBuildConfig(state);
   const buildOptions = {
     entrypoints: batch,
@@ -9474,11 +9692,32 @@ async function buildServeHtmlBatch(state, options, batch) {
       "process.env.NODE_ENV": JSON.stringify(development ? "development" : "production"),
     },
     jsx: { development },
+    throw: false,
     ...(config.env != null ? { env: config.env } : {}),
     ...(config.plugins.length > 0 ? { plugins: config.plugins } : {}),
   };
-  const result = await build(buildOptions);
-  if (!result.success) throw new AggregateError(result.logs ?? [], "Bundle failed");
+  let result;
+  try {
+    result = await build(buildOptions);
+  } catch (error) {
+    const logs = error instanceof AggregateError ? error.errors : [error];
+    if (inspectorState) {
+      inspectorEmit("BunFrontendDevServer.bundleFailed", {
+        serverId: inspectorState.id,
+        buildErrorsPayloadBase64: serializeServeBuildErrors(inspectorState.id, root, logs),
+      });
+    }
+    throw error;
+  }
+  if (!result.success) {
+    if (inspectorState) {
+      inspectorEmit("BunFrontendDevServer.bundleFailed", {
+        serverId: inspectorState.id,
+        buildErrorsPayloadBase64: serializeServeBuildErrors(inspectorState.id, root, result.logs),
+      });
+    }
+    throw new AggregateError(result.logs ?? [], "Bundle failed");
+  }
 
   const htmlOutputs = [];
   const outputDescriptors = [];
@@ -9538,15 +9777,29 @@ async function buildServeHtmlBatch(state, options, batch) {
     state.htmlBySource.set(source, descriptor);
     state.builtSources.add(source);
   }
+  if (inspectorState) {
+    inspectorEmit("BunFrontendDevServer.bundleComplete", {
+      serverId: inspectorState.id,
+      durationMs: (globalThis.performance?.now?.() ?? Date.now()) - startedAt,
+    });
+  }
 }
 
 function ensureServeHtmlSource(state, options, source) {
   const absoluteSource = nodePathResolve(source);
   state.sources.add(absoluteSource);
   const ready = state.htmlBySource.get(absoluteSource);
-  if (ready) return Promise.resolve(ready);
+  const development = serveIsDevelopment(options);
+  if (ready && !development) return Promise.resolve(ready);
   if (!state.buildPromise) {
-    const batch = [...state.sources].filter(path => !state.builtSources.has(path));
+    if (development) {
+      state.assets.clear();
+      state.htmlBySource.clear();
+      state.builtSources.clear();
+    }
+    const batch = development
+      ? [...state.sources]
+      : [...state.sources].filter(path => !state.builtSources.has(path));
     state.buildPromise = buildServeHtmlBatch(state, options, batch).finally(() => {
       state.buildPromise = null;
     });
@@ -10552,7 +10805,7 @@ function installBunTlsServerEvent(serverId, callback) {
 }
 
 function serveNodeBacked(options, context) {
-  const { hostname, unixPath, tlsConfigs } = context;
+  const { hostname, unixPath, tlsConfigs, inspectorReload } = context;
   const isUnix = unixPath.length > 0;
   const useTls = tlsConfigs != null;
   const protocol = useTls ? "https:" : "http:";
@@ -11047,12 +11300,16 @@ function serveNodeBacked(options, context) {
   };
   lifecycle.configure(stopNodeTransport, () => stopNodeTransport(true));
 
-  return server;
+  return finalizeServeInspector(server, activeOptions, inspectorReload);
 }
 
 export function serve(options) {
   if (options === undefined || options === null || typeof options !== "object") {
     throw new TypeError("Bun.serve expects an object");
+  }
+  const inspectorReload = serveInspectorRuntime.pendingReloads.shift() ?? null;
+  if (inspectorReload?.port != null && Number(options.port ?? 0) === 0) {
+    options = { ...options, port: inspectorReload.port };
   }
   const wrappedWebSocket = options.websocket && typeof options.websocket === "object"
     ? { ...options.websocket }
@@ -11077,6 +11334,7 @@ export function serve(options) {
     throw new TypeError(bunServeNeedsHandlerMessage());
   }
   options[serveHtmlStateSymbol] = createServeHtmlState(options);
+  options = installInspectorDevServer(options);
 
   const unixPath = normalizeServeUnixPath(options.unix);
   const suppliedHostname = options.hostname === null || options.hostname === undefined
@@ -11095,7 +11353,7 @@ export function serve(options) {
   const tlsConfigs = validateServeTls(options.tls);
   const configuredMaxRequestBodySize = Number(options.maxRequestBodySize ?? 128 * 1024 * 1024);
   if (websocketHandlers != null || tlsConfigs != null || hostname.includes(":")) {
-    return serveNodeBacked(options, { hostname, unixPath, tlsConfigs });
+    return serveNodeBacked(options, { hostname, unixPath, tlsConfigs, inspectorReload });
   }
 
   let native;
@@ -11475,7 +11733,7 @@ export function serve(options) {
 
   interval = setInterval(pump, 1);
   pump();
-  return server;
+  return finalizeServeInspector(server, activeOptions, inspectorReload);
 }
 
 function tarString(bytes, offset, length) {
@@ -12440,6 +12698,7 @@ function bunInspectBuildMessageDiagnostic(error) {
 }
 
 function bunInspectErrorDiagnostic(error, ctx = undefined) {
+  const stackWasAccessed = bunAccessedErrorStacks.has(error);
   let stack;
   try { stack = error instanceof Error ? error.stack : null; } catch { return null; }
   if (typeof stack !== "string") return null;
@@ -12526,7 +12785,25 @@ function bunInspectErrorDiagnostic(error, ctx = undefined) {
     : Math.max(0, Number(frame[3]) - 1);
   const caret = " ".repeat(String(target + 1).length + 3 + diagnosticColumn) + "^";
   const label = constructorName === "Error" ? "error" : constructorName;
-  return `${excerpt}\n${caret}\n${label}: ${message}\n      at <anonymous> (${sourcePath}:${target + 1}:${diagnosticColumn + 1})\n`;
+  const sourceFrames = stack.split("\n")
+    .filter(line => /^\s*at\s+/.test(line) && line.includes(sourcePath))
+    .filter(line => !line.includes("IGNORE_ME_AFTER_THIS_LINE"))
+    .map(line => {
+      let frame = line.trimStart();
+      frame = frame.replace(/^at ([A-Za-z_$][\w$]*?)(\d+) \(/, (match, name) =>
+        sourceLines.some(sourceLine => new RegExp(`\\bfunction\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\(`).test(sourceLine))
+          ? `at ${name} (`
+          : match);
+      if (frame.startsWith("at unknown (")) {
+        frame = stackWasAccessed
+          ? `at ${frame.slice("at unknown (".length, -1)}`
+          : `at <anonymous> (${frame.slice("at unknown (".length)}`;
+      }
+      return `      ${frame}`;
+    })
+    .join("\n");
+  const frames = sourceFrames || `      at <anonymous> (${sourcePath}:${target + 1}:${diagnosticColumn + 1})`;
+  return `${excerpt}\n${caret}\n${label}: ${message}\n${frames}\n`;
 }
 
 function bunInspectEvent(value, objectTag, ctx, indent, seen, depth) {

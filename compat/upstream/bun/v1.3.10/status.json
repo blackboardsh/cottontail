@@ -254,6 +254,19 @@
       "reason": "Requires Bun's WebKit inspector protocol server, which Cottontail does not expose yet."
     },
     {
+      "pattern": "^test/cli/inspect/inspect\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied inspector CLI and protocol coverage passes all 29 cases and 73 assertions across TCP, Unix, IPv4, IPv6, inspect-wait, inspect-brk, WebSocket, node:inspector, lifecycle, and error-stack behavior.",
+      "timeoutMs": 120000
+    },
+    {
+      "pattern": "^test/cli/inspect/BunFrontendDevServer\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied frontend dev-server inspector coverage passes all 5 active cases, 36 assertions, and 2 snapshots; 2 upstream cases remain authored as todos.",
+      "args": ["--timeout=20000"],
+      "timeoutMs": 120000
+    },
+    {
       "pattern": "^test/regression/issue/(?:10380/spy-matchers-diff|14709|16474|19661|20100|20546|23183|24234|24399|25231|25750|25794|27117)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."

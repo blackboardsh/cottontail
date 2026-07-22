@@ -101,6 +101,8 @@ extern char *ct_jsc_inspector_copy_url(CtJscInspector *inspector);
 extern bool ct_jsc_inspector_has_server(CtJscInspector *inspector);
 extern bool ct_jsc_inspector_keeps_event_loop_alive(CtJscInspector *inspector);
 extern int ct_jsc_inspector_wait_for_connection(CtJscInspector *inspector);
+extern int ct_jsc_inspector_emit(CtJscInspector *inspector, const char *method, const char *params_json);
+extern int ct_jsc_inspector_set_module_graph(CtJscInspector *inspector, const char *graph_json);
 extern uint64_t ct_jsc_inspector_connect_local(CtJscInspector *inspector);
 extern int ct_jsc_inspector_send_local(CtJscInspector *inspector, uint64_t id, const char *message);
 extern char **ct_jsc_inspector_take_local_messages(CtJscInspector *inspector, uint64_t id, size_t *count_out);
@@ -24431,6 +24433,38 @@ static JSValueRef ct_inspector_wait_host(JSContextRef ctx, JSObjectRef function,
         ct_throw_message(ctx, exception, "Inspector is not active");
     }
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_inspector_event_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || runtime->inspector == NULL || argc < 2) return JSValueMakeBoolean(ctx, false);
+    char *method = ct_value_to_string_copy(ctx, argv[0]);
+    char *params_json = ct_value_to_string_copy(ctx, argv[1]);
+    if (method == NULL || params_json == NULL) {
+        free(method);
+        free(params_json);
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_jsc_inspector_emit(runtime->inspector, method, params_json);
+    free(method);
+    free(params_json);
+    return JSValueMakeBoolean(ctx, status == 0);
+}
+
+static JSValueRef ct_inspector_set_module_graph_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    if (runtime == NULL || runtime->inspector == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+    char *graph_json = ct_value_to_string_copy(ctx, argv[0]);
+    if (graph_json == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    int status = ct_jsc_inspector_set_module_graph(runtime->inspector, graph_json);
+    free(graph_json);
+    return JSValueMakeBoolean(ctx, status == 0);
 }
 
 static bool ct_inspector_session_id(JSContextRef ctx, JSValueRef value, uint64_t *id_out, JSValueRef *exception) {

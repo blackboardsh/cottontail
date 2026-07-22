@@ -12,6 +12,7 @@
 #include <bit>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -344,6 +345,82 @@ static std::string_view trimASCII(std::string_view input)
     return input;
 }
 
+static std::string jsStringToUTF8(JSStringRef value)
+{
+    if (!value)
+        return {};
+    const size_t capacity = JSStringGetMaximumUTF8CStringSize(value);
+    std::vector<char> buffer(capacity);
+    if (!capacity)
+        return {};
+    const size_t written = JSStringGetUTF8CString(value, buffer.data(), capacity);
+    return written ? std::string(buffer.data(), written - 1) : std::string {};
+}
+
+enum class CustomInspectorDomain : uint8_t {
+    None,
+    HTTPServer,
+    BunFrontendDevServer,
+    LifecycleReporter,
+    TestReporter,
+};
+
+static CustomInspectorDomain customDomainForMethod(std::string_view method)
+{
+    if (method.starts_with("HTTPServer."))
+        return CustomInspectorDomain::HTTPServer;
+    if (method.starts_with("BunFrontendDevServer."))
+        return CustomInspectorDomain::BunFrontendDevServer;
+    if (method.starts_with("LifecycleReporter."))
+        return CustomInspectorDomain::LifecycleReporter;
+    if (method.starts_with("TestReporter."))
+        return CustomInspectorDomain::TestReporter;
+    return CustomInspectorDomain::None;
+}
+
+struct InspectorCommand {
+    uint64_t id { 0 };
+    std::string method;
+};
+
+static bool parseInspectorCommand(JSContextRef context, const std::string& message, InspectorCommand& command)
+{
+    JSStringRef json = JSStringCreateWithUTF8CString(message.c_str());
+    if (!json)
+        return false;
+    JSValueRef value = JSValueMakeFromJSONString(context, json);
+    JSStringRelease(json);
+    if (!value || !JSValueIsObject(context, value))
+        return false;
+
+    JSValueRef exception = nullptr;
+    JSObjectRef object = JSValueToObject(context, value, &exception);
+    if (!object || exception)
+        return false;
+
+    JSStringRef methodName = JSStringCreateWithUTF8CString("method");
+    JSValueRef methodValue = JSObjectGetProperty(context, object, methodName, &exception);
+    JSStringRelease(methodName);
+    if (exception || !methodValue || !JSValueIsString(context, methodValue))
+        return false;
+    JSStringRef method = JSValueToStringCopy(context, methodValue, &exception);
+    if (exception || !method)
+        return false;
+    command.method = jsStringToUTF8(method);
+    JSStringRelease(method);
+
+    JSStringRef idName = JSStringCreateWithUTF8CString("id");
+    JSValueRef idValue = JSObjectGetProperty(context, object, idName, &exception);
+    JSStringRelease(idName);
+    if (exception || !idValue || !JSValueIsNumber(context, idValue))
+        return false;
+    const double id = JSValueToNumber(context, idValue, &exception);
+    if (exception || !std::isfinite(id) || id < 1 || id > 9007199254740991.0 || std::floor(id) != id)
+        return false;
+    command.id = static_cast<uint64_t>(id);
+    return !command.method.empty();
+}
+
 class MessageSink {
 public:
     virtual ~MessageSink() = default;
@@ -423,16 +500,45 @@ public:
 
     uint64_t id() const { return m_id; }
     bool isRemoteDebugger() const { return m_sink->isRemoteDebugger(); }
+    void send(std::string message) { m_sink->send(std::move(message)); }
+
+    bool customDomainEnabled(CustomInspectorDomain domain) const
+    {
+        switch (domain) {
+        case CustomInspectorDomain::HTTPServer: return m_httpServerEnabled;
+        case CustomInspectorDomain::BunFrontendDevServer: return m_bunFrontendDevServerEnabled;
+        case CustomInspectorDomain::LifecycleReporter: return m_lifecycleReporterEnabled;
+        case CustomInspectorDomain::TestReporter: return m_testReporterEnabled;
+        case CustomInspectorDomain::None: return false;
+        }
+        return false;
+    }
+
+    void setCustomDomainEnabled(CustomInspectorDomain domain, bool enabled)
+    {
+        switch (domain) {
+        case CustomInspectorDomain::HTTPServer: m_httpServerEnabled = enabled; break;
+        case CustomInspectorDomain::BunFrontendDevServer: m_bunFrontendDevServerEnabled = enabled; break;
+        case CustomInspectorDomain::LifecycleReporter: m_lifecycleReporterEnabled = enabled; break;
+        case CustomInspectorDomain::TestReporter: m_testReporterEnabled = enabled; break;
+        case CustomInspectorDomain::None: break;
+        }
+    }
 
 private:
     uint64_t m_id;
     std::shared_ptr<MessageSink> m_sink;
+    bool m_httpServerEnabled { false };
+    bool m_bunFrontendDevServerEnabled { false };
+    bool m_lifecycleReporterEnabled { false };
+    bool m_testReporterEnabled { false };
 };
 
 enum class InspectorEventType {
     Open,
     Message,
     Close,
+    Notification,
 };
 
 struct InspectorEvent {
@@ -440,6 +546,8 @@ struct InspectorEvent {
     uint64_t id;
     std::shared_ptr<MessageSink> sink;
     std::string message;
+    CustomInspectorDomain domain { CustomInspectorDomain::None };
+    bool replayable { false };
 };
 
 struct CtJscInspector {
@@ -466,6 +574,9 @@ struct CtJscInspector {
     std::shared_ptr<InspectorServer> server;
     std::shared_ptr<FramedInspectorClient> framedClient;
     std::string serverUrl;
+    std::mutex moduleGraphMutex;
+    std::string moduleGraph { R"({"esm":[],"cjs":[],"cwd":"","main":"","argv":[]})" };
+    std::vector<std::string> testReporterFoundEvents;
     bool pauseOnStart { false };
     bool pauseConsumed { false };
 
@@ -492,6 +603,7 @@ struct CtJscInspector {
 
     void enqueue(InspectorEvent&& event);
     void processEvents();
+    bool dispatchCustomCommand(InspectorFrontend&, const std::string&);
     void destroyController();
     bool hasTransport() const { return server || framedClient; }
     void retain() { referenceCount.fetch_add(1, std::memory_order_relaxed); }
@@ -518,6 +630,55 @@ void CtJscInspector::enqueue(InspectorEvent&& event)
             return;
     }
     ct_jsc_run_loop_dispatch(runLoop, processInspectorEvents, this);
+}
+
+bool CtJscInspector::dispatchCustomCommand(InspectorFrontend& frontend, const std::string& message)
+{
+    InspectorCommand command;
+    if (!parseInspectorCommand(context, message, command))
+        return false;
+    const CustomInspectorDomain domain = customDomainForMethod(command.method);
+    if (domain == CustomInspectorDomain::None)
+        return false;
+
+    const size_t separator = command.method.find('.');
+    const std::string_view action = separator == std::string::npos
+        ? std::string_view {}
+        : std::string_view(command.method).substr(separator + 1);
+    std::string result = "{}";
+    bool knownCommand = true;
+
+    if (action == "enable") {
+        const bool wasEnabled = frontend.customDomainEnabled(domain);
+        frontend.setCustomDomainEnabled(domain, true);
+        frontend.send("{\"id\":" + std::to_string(command.id) + ",\"result\":{}}");
+        if (domain == CustomInspectorDomain::TestReporter && !wasEnabled) {
+            for (const auto& foundEvent : testReporterFoundEvents)
+                frontend.send(foundEvent);
+        }
+        return true;
+    }
+    if (action == "disable") {
+        frontend.setCustomDomainEnabled(domain, false);
+    } else if (domain == CustomInspectorDomain::HTTPServer
+        && (action == "startListening" || action == "stopListening"
+            || action == "getRequestBody" || action == "getResponseBody")) {
+    } else if (domain == CustomInspectorDomain::LifecycleReporter
+        && (action == "preventExit" || action == "stopPreventingExit")) {
+    } else if (domain == CustomInspectorDomain::LifecycleReporter && action == "getModuleGraph") {
+        std::lock_guard lock(moduleGraphMutex);
+        result = moduleGraph;
+    } else {
+        knownCommand = false;
+    }
+
+    if (knownCommand) {
+        frontend.send("{\"id\":" + std::to_string(command.id) + ",\"result\":" + result + "}");
+    } else {
+        frontend.send("{\"id\":" + std::to_string(command.id)
+            + ",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}");
+    }
+    return true;
 }
 
 void CtJscInspector::processEvents()
@@ -561,11 +722,14 @@ void CtJscInspector::processEvents()
             }
             case InspectorEventType::Message:
                 if (controller && frontends.contains(event.id)) {
-                    JSStringRef messageRef = JSStringCreateWithUTF8CString(event.message.c_str());
-                    if (messageRef) {
-                        auto message = const_cast<OpaqueJSString*>(messageRef)->string();
-                        JSStringRelease(messageRef);
-                        controller->dispatchMessageFromFrontend(message);
+                    auto& frontend = *frontends.at(event.id);
+                    if (!dispatchCustomCommand(frontend, event.message)) {
+                        JSStringRef messageRef = JSStringCreateWithUTF8CString(event.message.c_str());
+                        if (messageRef) {
+                            auto message = const_cast<OpaqueJSString*>(messageRef)->string();
+                            JSStringRelease(messageRef);
+                            controller->dispatchMessageFromFrontend(message);
+                        }
                     }
                 }
                 break;
@@ -581,6 +745,14 @@ void CtJscInspector::processEvents()
                     remoteConnectionCount.fetch_sub(1, std::memory_order_release);
                 break;
             }
+            case InspectorEventType::Notification:
+                if (event.replayable)
+                    testReporterFoundEvents.push_back(event.message);
+                for (auto& entry : frontends) {
+                    if (entry.second->customDomainEnabled(event.domain))
+                        entry.second->send(event.message);
+                }
+                break;
             }
         }
     }
@@ -1966,6 +2138,32 @@ extern "C" int ct_jsc_inspector_notify_unix(const char* unixPath)
     if (!unixPath || !unixPath[0])
         return -1;
     return sendInspectorNotification(nullptr, 0, unixPath);
+}
+
+extern "C" int ct_jsc_inspector_emit(CtJscInspector* inspector, const char* method, const char* paramsJson)
+{
+    if (!inspector || inspector->closing.load(std::memory_order_acquire) || !method || !paramsJson)
+        return -1;
+    const CustomInspectorDomain domain = customDomainForMethod(method);
+    if (domain == CustomInspectorDomain::None || !utf8IsValid(method) || !utf8IsValid(paramsJson))
+        return -1;
+    std::string message = "{\"method\":\"";
+    message += jsonEscape(method);
+    message += "\",\"params\":";
+    message += paramsJson;
+    message += '}';
+    const bool replayable = std::strcmp(method, "TestReporter.found") == 0;
+    inspector->enqueue({ InspectorEventType::Notification, 0, nullptr, std::move(message), domain, replayable });
+    return 0;
+}
+
+extern "C" int ct_jsc_inspector_set_module_graph(CtJscInspector* inspector, const char* graphJson)
+{
+    if (!inspector || inspector->closing.load(std::memory_order_acquire) || !graphJson || !utf8IsValid(graphJson))
+        return -1;
+    std::lock_guard lock(inspector->moduleGraphMutex);
+    inspector->moduleGraph = graphJson;
+    return 0;
 }
 
 extern "C" CtJscInspector* ct_jsc_inspector_create(JSGlobalContextRef context, char** errorOut)

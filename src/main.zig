@@ -369,6 +369,40 @@ fn testFlagTakesValue(arg: []const u8) bool {
     return false;
 }
 
+fn isInspectorRuntimeFlag(arg: []const u8) bool {
+    const inspector_flags = [_][]const u8{
+        "--inspect",
+        "--inspect-wait",
+        "--inspect-brk",
+    };
+    for (inspector_flags) |flag| {
+        if (std.mem.eql(u8, arg, flag) or
+            (arg.len > flag.len and arg[flag.len] == '=' and std.mem.startsWith(u8, arg, flag)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn testInspectorExecArgs(
+    allocator: std.mem.Allocator,
+    args: []const [:0]const u8,
+) ![]const [:0]const u8 {
+    var count: usize = 0;
+    for (args[2..]) |arg| {
+        if (isInspectorRuntimeFlag(arg)) count += 1;
+    }
+    const result = try allocator.alloc([:0]const u8, count);
+    var output_index: usize = 0;
+    for (args[2..]) |arg| {
+        if (!isInspectorRuntimeFlag(arg)) continue;
+        result[output_index] = arg;
+        output_index += 1;
+    }
+    return result;
+}
+
 fn testFlagSpan(args: []const [:0]const u8, index: usize) usize {
     const arg = args[index];
     if (!testFlagTakesValue(arg) or index + 1 >= args.len) return 1;
@@ -2599,19 +2633,20 @@ fn parseInvocation(io: std.Io, allocator: std.mem.Allocator, args: []const [:0]c
     }
 
     if (std.mem.eql(u8, args[1], "test")) {
+        const inspector_exec_args = try testInspectorExecArgs(allocator, args);
         if (testEntrypointIndex(args)) |entrypoint_index| {
             return .{
                 .mode = .script,
                 .payload = try resolveTestEntrypoint(io, allocator, args[entrypoint_index]),
                 .args = try testScriptArgs(allocator, args, entrypoint_index),
-                .exec_args = exec_args_storage[0..0],
+                .exec_args = inspector_exec_args,
             };
         }
         return .{
             .mode = .script,
             .payload = try defaultTestEntrypoint(io, allocator),
             .args = args[2..],
-            .exec_args = exec_args_storage[0..0],
+            .exec_args = inspector_exec_args,
         };
     }
 
@@ -3195,6 +3230,20 @@ test "runtime flags can precede the test command" {
     try std.testing.expectEqualStrings("--conditions", normalized[3]);
     try std.testing.expectEqualStrings("shell", normalized[4]);
     try std.testing.expectEqualStrings("suite.test.ts", normalized[5]);
+}
+
+test "test execution preserves inspector runtime flags" {
+    const args = [_][:0]const u8{
+        "cottontail",
+        "test",
+        ".cottontail-tmp/test-aggregate-abcd/entry.mjs",
+        "--inspect-wait=unix:/tmp/inspector.sock",
+        "--timeout=1000",
+    };
+    const inspector_args = try testInspectorExecArgs(std.testing.allocator, &args);
+    defer std.testing.allocator.free(inspector_args);
+    try std.testing.expectEqual(@as(usize, 1), inspector_args.len);
+    try std.testing.expectEqualStrings("--inspect-wait=unix:/tmp/inspector.sock", inspector_args[0]);
 }
 
 test "runtime user agent consumes its value" {

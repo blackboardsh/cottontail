@@ -2154,7 +2154,11 @@ class Expectation {
       // blocking wait here prevents fd events from completing network bodies.
       if (promise instanceof Promise) {
         result.catch(() => {});
-        const state = nativePromiseState(result);
+        let state = nativePromiseState(result);
+        if (state?.status === 0 && typeof globalThis.cottontail?.waitForPromise === "function") {
+          globalThis.cottontail.waitForPromise(result);
+          state = nativePromiseState(result);
+        }
         if (state?.status === 2) {
           throw state.value;
         }
@@ -3529,17 +3533,38 @@ function verifyAssertionState() {
   }
 }
 
-function wrapTestCallback(callback) {
+function inspectorTestEvent(method, params) {
+  try {
+    return globalThis.cottontail?.inspectorEvent?.(method, JSON.stringify(params)) === true;
+  } catch {
+    return false;
+  }
+}
+
+function wrapTestCallback(callback, inspectorId = 0) {
   const wrapped = wrapDoneCallback(callback);
   if (typeof wrapped !== "function") return wrapped;
   return async () => {
+    const startedAt = globalThis.performance?.now?.() ?? Date.now();
+    if (inspectorId > 0) inspectorTestEvent("TestReporter.start", { id: inspectorId });
     resetAssertionState();
+    let status = "pass";
     try {
       await wrapped();
       verifyAssertionState();
+    } catch (error) {
+      status = error?.code === "ERR_TEST_FAILURE" && error?.failureType === "testTimeoutFailure" ? "timeout" : "fail";
+      throw error;
     } finally {
       globalThis.__cottontailRecordTestAssertionCount?.(currentAssertionState().count);
       resetAssertionState();
+      if (inspectorId > 0) {
+        inspectorTestEvent("TestReporter.end", {
+          id: inspectorId,
+          status,
+          elapsed: (globalThis.performance?.now?.() ?? Date.now()) - startedAt,
+        });
+      }
     }
   };
 }
@@ -3633,6 +3658,19 @@ const bunRootSuite = {
   totalTestCount: 0,
   orderScope: createBunTestOrderScope(),
 };
+let nextInspectorTestId = 1;
+
+function reportInspectorTestFound(id, name, type, parent, line) {
+  const params = {
+    id,
+    url: normalizeInlineSnapshotPath(globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? ""),
+    line,
+    name,
+    type,
+  };
+  if (parent?.inspectorId > 0) params.parentId = parent.inspectorId;
+  inspectorTestEvent("TestReporter.found", params);
+}
 // Grouped runs share one JS realm, so use unnamed suites to retain Bun's
 // per-file lifecycle boundaries without changing visible test names.
 const bunFileSuites = new Map();
@@ -3742,6 +3780,8 @@ function makeBunTestFunction(base) {
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
     );
     if (options.todo && typeof parsed.callback !== "function") registrationLine = Math.max(0, registrationLine - 1);
+    const inspectorId = nextInspectorTestId++;
+    reportInspectorTestFound(inspectorId, name, "test", registrationSuite, registrationLine);
     noteBunTestSelection(name, registrationSuite);
     return enqueueBunTestEntry(registrationSuite.orderScope, () => base(
       name,
@@ -3751,7 +3791,7 @@ function makeBunTestFunction(base) {
         __bunTest: true,
         __bunUsesDoneCallback: typeof parsed.callback === "function" && parsed.callback.length > 0,
       }),
-      wrapTestCallback(parsed.callback),
+      wrapTestCallback(parsed.callback, inspectorId),
     ));
   };
   return createBunScopeFunction({
@@ -3785,9 +3825,12 @@ function makeBunDescribe(base) {
     const registrationLine = captureTestRegistrationLine(
       globalThis.__cottontailRegisteringTestFile ?? globalThis.__filename ?? "",
     );
+    const inspectorId = nextInspectorTestId++;
+    reportInspectorTestFound(inspectorId, name, "describe", registrationSuite, registrationLine);
     const suite = {
       name,
       parent: registrationSuite,
+      inspectorId,
       matchingTestCount: 0,
       totalTestCount: 0,
       orderScope: createBunTestOrderScope(registrationSuite.orderScope),

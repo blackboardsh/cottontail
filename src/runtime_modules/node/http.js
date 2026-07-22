@@ -4073,27 +4073,28 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
     const explicitPort = parsed.port ?? String(parsed.href).match(/^wss?:\/\/[^/:]+:(\d+)/)?.[1];
     const port = Number(explicitPort || (secure ? 443 : 80));
     const host = parsed.hostname || "localhost";
+    const connectHost = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 
     const customKey = this._customHeader("sec-websocket-key");
     this._key = customKey != null && WEBSOCKET_KEY_PATTERN.test(customKey)
       ? customKey
       : randomBytes(16).toString("base64");
 
-    this._target = { parsed, secure, host, port, explicitPort };
+    this._target = { parsed, secure, host, connectHost, port, explicitPort };
 
     const tlsOptions = this._tlsOptions ?? {};
-    const proxy = this._proxy != null && !websocketNoProxyMatches(host, port) ? this._proxy : null;
+    const proxy = this._proxy != null && !websocketNoProxyMatches(connectHost, port) ? this._proxy : null;
 
     if (!proxy) {
       let socket;
       try {
         socket = secure
           ? tlsConnect({
-              host,
+              host: connectHost,
               port,
-              ...websocketTlsSecurityOptions(host, tlsOptions),
+              ...websocketTlsSecurityOptions(connectHost, tlsOptions),
             })
-          : netConnect(port, host);
+          : netConnect(port, connectHost);
       } catch (error) {
         queueMicrotask(() => this._fail(error));
         return;
