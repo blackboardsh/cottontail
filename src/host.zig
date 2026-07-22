@@ -371,6 +371,7 @@ pub export fn ct_package_manager_parse_lockfile(
     };
     defer allocator.free(binary_path);
 
+    var loaded_from_text = false;
     const binary = std.Io.Dir.cwd().readFileAlloc(
         getIo(),
         binary_path,
@@ -396,6 +397,7 @@ pub export fn ct_package_manager_parse_lockfile(
             return null;
         };
         defer allocator.free(text_lockfile);
+        loaded_from_text = true;
         break :binary PackageManagerBunLockfile.textToBinaryAtRoot(
             allocator,
             text_lockfile,
@@ -424,6 +426,7 @@ pub export fn ct_package_manager_parse_lockfile(
         },
     }
     defer lockfile.deinit();
+    if (loaded_from_text) lockfile.meta_hash = std.mem.zeroes(@TypeOf(lockfile.meta_hash));
 
     const json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(lockfile, .{
         .whitespace = .indent_2,

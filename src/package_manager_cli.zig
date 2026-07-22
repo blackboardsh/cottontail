@@ -6611,6 +6611,10 @@ const Manager = struct {
             protocol_patch_paths = protocol.patch_paths;
             break :blk protocol.base_spec;
         } else effective_spec;
+        if (!std.mem.startsWith(u8, resolution_spec, "workspace:")) {
+            const registry_spec = parseNpmAlias(alias, resolution_spec)[1];
+            if (isRegistryDistTag(registry_spec)) workspace_package = false;
+        }
 
         const explicit_global_link = manager.options.command == .link and direct;
         // COTTONTAIL-COMPAT: scanner preflight has already resolved selected
@@ -6792,7 +6796,8 @@ const Manager = struct {
         const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
         const selected_registry_spec = (try manager.selectedUpdateVersion(parent_dir, alias)) orelse if (!direct)
             if (manager.root_versions.get(alias)) |root_version|
-                if (semverSatisfies(manager.allocator, registry_spec, root_version)) root_version else registry_spec
+                if (!manager.rootVersionReservedForWorkspace(alias) and
+                    semverSatisfies(manager.allocator, registry_spec, root_version)) root_version else registry_spec
             else
                 registry_spec
         else
@@ -6858,7 +6863,7 @@ const Manager = struct {
             }
             if (err == error.NoMatchingVersion and
                 manager.link_workspace_packages and
-                Semver.Version.isTaggedVersionOnly(registry_spec) and
+                isRegistryDistTag(registry_spec) and
                 manager.workspaces.get(registry_name) != null)
             {
                 const fallback_spec = try std.fmt.allocPrint(manager.allocator, "workspace:{s}@{s}", .{ registry_name, registry_spec });
@@ -7287,10 +7292,10 @@ const Manager = struct {
                     }
                 }
                 const workspace = manager.workspaces.get(package.name) orelse manager.workspaces.get(alias) orelse return error.WorkspaceNotFound;
+                try manager.countWorkspaceInstall(workspace, selection.destination);
                 if (!manager.options.lockfile_only and !manager.options.dry_run) {
                     try manager.linkRelativeDirectory(selection.destination, workspace.path, true);
                 }
-                try manager.countWorkspaceInstall(workspace);
                 try manager.addRecord(.{
                     .key = record_key,
                     .alias = alias,
@@ -9365,7 +9370,7 @@ const Manager = struct {
         // Dist-tags are manifest pointers, not semver ranges. An already
         // installed version cannot satisfy one without resolving the current
         // manifest first.
-        const tagged_version = Semver.Version.isTaggedVersionOnly(registry_spec);
+        const tagged_version = isRegistryDistTag(registry_spec);
         if (tagged_version and !(manager.node_linker == .isolated and manager.isSecurityResolution())) return null;
         if (manager.node_linker == .isolated) {
             for (manager.records.items) |record| {
@@ -10777,7 +10782,7 @@ const Manager = struct {
                 if (!version_matches and
                     trimmed.len > 0 and
                     !semverRangeIsWildcard(manager.allocator, trimmed) and
-                    !Semver.Version.isTaggedVersionOnly(trimmed))
+                    !isRegistryDistTag(trimmed))
                 {
                     try manager.stderr.print(
                         "error: No matching version for workspace dependency \"{s}\". Version: \"{s}\"\n",
@@ -10806,10 +10811,10 @@ const Manager = struct {
             try std.fs.path.join(manager.allocator, &.{ try manager.isolatedConsumerModules(parent_dir), alias })
         else
             try manager.chooseDestination(alias, workspace.version, parent_dir, direct);
+        try manager.countWorkspaceInstall(workspace, destination);
         if (!manager.options.lockfile_only) {
             try manager.linkRelativeDirectory(destination, workspace.path, true);
         }
-        try manager.countWorkspaceInstall(workspace);
         try manager.addRecord(.{
             .key = if (manager.node_linker == .isolated)
                 try manager.dependencyLockKey(parent_dir, alias)
@@ -10852,7 +10857,7 @@ const Manager = struct {
 
     fn workspaceMatchesRange(manager: *Manager, workspace: Workspace, range: []const u8) bool {
         if (std.mem.trim(u8, range, " \t\r\n").len == 0) return false;
-        if (Semver.Version.isTaggedVersionOnly(range)) return false;
+        if (isRegistryDistTag(range)) return false;
         const parsed_version = Semver.Version.parseUTF8(workspace.version);
         if (workspace.has_version and parsed_version.valid) {
             return semverSatisfies(manager.allocator, range, workspace.version);
@@ -10863,6 +10868,13 @@ const Manager = struct {
     fn workspaceShouldLinkAtRoot(manager: *Manager, workspace: Workspace) bool {
         const root_spec = manager.rootDependencySpec(workspace.name) orelse return true;
         return manager.isWorkspaceDependency(workspace.name, root_spec);
+    }
+
+    fn rootVersionReservedForWorkspace(manager: *Manager, alias: []const u8) bool {
+        const workspace = manager.workspaces.get(alias) orelse return false;
+        if (!manager.workspaceShouldLinkAtRoot(workspace)) return false;
+        const root_version = manager.root_versions.get(alias) orelse return false;
+        return std.mem.eql(u8, root_version, workspace.version);
     }
 
     fn reserveWorkspaceRootVersions(manager: *Manager) !void {
@@ -10893,7 +10905,7 @@ const Manager = struct {
                 while (true) {
                     const destination = try packageDestination(manager.allocator, base, alias);
                     if (manager.readInstalledPackageJSON(destination) catch null) |installed_package_json| {
-                        const installed_version = jsonString(installed_package_json, "version") orelse break;
+                        const installed_version = jsonString(installed_package_json, "version") orelse "0.0.0";
                         try manager.initial_root_versions.put(
                             try manager.allocator.dupe(u8, alias),
                             try manager.allocator.dupe(u8, installed_version),
@@ -10990,13 +11002,20 @@ const Manager = struct {
         if (!entry.found_existing) manager.installed_count += 1;
     }
 
-    fn countWorkspaceInstall(manager: *Manager, workspace: Workspace) !void {
+    fn countWorkspaceInstall(manager: *Manager, workspace: Workspace, destination: []const u8) !void {
         if (manager.options.lockfile_only or manager.options.dry_run or manager.options.command == .update) return;
-        // COTTONTAIL-COMPAT: Bun's hoisted installer counts each selected
-        // workspace on every materialization pass, even when its link exists.
-        // Its isolated installer reports workspace entries as checked instead.
         const entry = try manager.installed_workspaces.getOrPut(workspace.name);
-        if (!entry.found_existing and manager.node_linker == .hoisted) manager.installed_count += 1;
+        const manifest_changed = manager.options.command == .install and if (manager.lock_graph) |*graph|
+            !graph.workspaceMatchesPackageJSON(workspace.relative_path, workspace.package_json)
+        else
+            false;
+        if (!entry.found_existing and
+            manager.node_linker == .hoisted and
+            (manifest_changed or
+                !(pathsEquivalent(manager.init_data.io, manager.allocator, destination, workspace.path) catch false)))
+        {
+            manager.installed_count += 1;
+        }
     }
 
     fn checkedInstallCount(manager: *const Manager) usize {
@@ -11030,8 +11049,8 @@ const Manager = struct {
             _ = try manager.peerContextForPackage(workspace.package_json, workspace.path, true);
             if (manager.node_linker == .hoisted and manager.workspaceShouldLinkAtRoot(workspace)) {
                 const destination = try packageDestination(manager.allocator, manager.root_dir, workspace.name);
+                try manager.countWorkspaceInstall(workspace, destination);
                 if (!manager.options.lockfile_only) try manager.linkRelativeDirectory(destination, workspace.path, true);
-                try manager.countWorkspaceInstall(workspace);
                 if (!manager.options.lockfile_only) try manager.linkBins(workspace.name, destination, workspace.package_json, true, manager.root_dir);
                 try manager.addRecord(.{
                     .key = try manager.lockKeyForDestination(destination),
@@ -11935,6 +11954,13 @@ fn isRegistryUpdateSpecifier(spec: []const u8) bool {
     return !isLocalSpec(trimmed) and !isGitSpec(trimmed) and !isTarballSpec(trimmed) and !hasUnknownURLScheme(trimmed);
 }
 
+fn isRegistryDistTag(spec: []const u8) bool {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    return trimmed.len == 0 or
+        std.mem.eql(u8, trimmed, "latest") or
+        Semver.Version.isTaggedVersionOnly(trimmed);
+}
+
 fn shouldUpdateRegistrySpec(
     original_spec: []const u8,
     requested: bool,
@@ -11948,7 +11974,7 @@ fn shouldUpdateRegistrySpec(
     if (std.mem.startsWith(u8, original_spec, "catalog:")) return true;
     const parsed_alias = parseNpmAlias("", original_spec);
     const range = parsed_alias[1];
-    return requested or latest or !Semver.Version.isTaggedVersionOnly(range);
+    return requested or latest or !isRegistryDistTag(range);
 }
 
 fn npmAliasPrefix(spec: []const u8) ?[]const u8 {

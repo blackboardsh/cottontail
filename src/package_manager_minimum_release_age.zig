@@ -124,17 +124,67 @@ fn selectUnfiltered(
     if (distTagVersion(manifest, spec)) |version| return version;
 
     const effective_spec = if (spec.len == 0) "*" else spec;
-    if (distTagVersion(manifest, "latest")) |latest| {
-        // COTTONTAIL-COMPAT: Registry dist-tags are advisory. Bun ignores a
-        // tag whose target is absent from the manifest's versions object.
-        if (versions.get(latest) != null and
-            (std.mem.eql(u8, effective_spec, "*") or semverSatisfies(allocator, effective_spec, latest)))
-        {
-            return latest;
+    if (Semver.Version.isTaggedVersionOnly(effective_spec)) return error.NoMatchingVersion;
+
+    var releases = std.array_list.Managed(Candidate).init(allocator);
+    defer releases.deinit();
+    var prereleases = std.array_list.Managed(Candidate).init(allocator);
+    defer prereleases.deinit();
+    try collectCandidates(versions, &releases, &prereleases);
+
+    const sliced = Semver.SlicedString.init(effective_spec, effective_spec);
+    var query = Semver.Query.parse(allocator, effective_spec, sliced) catch return error.NoMatchingVersion;
+    defer query.deinit();
+
+    // Keep this selection order aligned with Bun's PackageManifest.findBestVersion.
+    // In particular, wildcard ranges containing prerelease/build syntax normalize
+    // to a regular wildcard for registry selection.
+    const left = query.head.head.range.left;
+    const normalized_wildcard = query.head.next == null and
+        query.head.head.next == null and
+        query.head.head.range.right.op == .unset and
+        left.op == .gte and
+        left.version.isZero();
+    if (normalized_wildcard) {
+        if (distTagVersion(manifest, "latest")) |latest_name| {
+            if (findCandidate(releases.items, latest_name) orelse findCandidate(prereleases.items, latest_name)) |latest| {
+                return latest.name;
+            }
+        }
+        if (releases.items.len > 0) return releases.items[0].name;
+        if (prereleases.items.len > 0) return prereleases.items[0].name;
+        return error.NoMatchingVersion;
+    }
+    if (left.op == .eql) {
+        const exact = findParsedCandidate(releases.items, left.version, effective_spec) orelse
+            findParsedCandidate(prereleases.items, left.version, effective_spec) orelse
+            return error.NoMatchingVersion;
+        return exact.name;
+    }
+
+    if (distTagVersion(manifest, "latest")) |latest_name| {
+        // Registry dist-tags are advisory. Bun ignores a tag whose target is
+        // absent from the manifest's versions object.
+        if (findCandidate(releases.items, latest_name) orelse findCandidate(prereleases.items, latest_name)) |latest| {
+            if (query.satisfies(latest.version, effective_spec, latest.name)) {
+                if (query.flags.isSet(Semver.Query.Group.Flags.pre)) {
+                    if (left.version.order(latest.version, effective_spec, latest.name) == .eq) return latest.name;
+                } else {
+                    return latest.name;
+                }
+            }
         }
     }
-    if (Semver.Version.isTaggedVersionOnly(effective_spec)) return error.NoMatchingVersion;
-    return bestMatchingVersion(allocator, versions, effective_spec) orelse error.NoMatchingVersion;
+
+    for (releases.items) |candidate| {
+        if (query.satisfies(candidate.version, effective_spec, candidate.name)) return candidate.name;
+    }
+    if (query.flags.isSet(Semver.Query.Group.Flags.pre)) {
+        for (prereleases.items) |candidate| {
+            if (query.satisfies(candidate.version, effective_spec, candidate.name)) return candidate.name;
+        }
+    }
+    return error.NoMatchingVersion;
 }
 
 fn selectDistTag(
@@ -307,36 +357,6 @@ fn publishTimestamp(manifest: *const Value, version_name: []const u8) f64 {
     return if (std.math.isFinite(timestamp)) timestamp else 0;
 }
 
-fn semverSatisfies(allocator: std.mem.Allocator, range: []const u8, version_value: []const u8) bool {
-    if (std.mem.eql(u8, range, "") or std.mem.eql(u8, range, "*") or std.mem.eql(u8, range, "latest")) return true;
-    const parsed_version = Semver.Version.parseUTF8(version_value);
-    if (!parsed_version.valid) return false;
-    const sliced = Semver.SlicedString.init(range, range);
-    var query = Semver.Query.parse(allocator, range, sliced) catch return false;
-    defer query.deinit();
-    return query.satisfies(parsed_version.version.min(), range, version_value);
-}
-
-fn bestMatchingVersion(
-    allocator: std.mem.Allocator,
-    versions: *const std.json.ObjectMap,
-    range: []const u8,
-) ?[]const u8 {
-    var best: ?[]const u8 = null;
-    var best_parsed: ?Semver.Version = null;
-    for (versions.keys()) |version_value| {
-        if (!semverSatisfies(allocator, range, version_value)) continue;
-        const parsed = Semver.Version.parseUTF8(version_value);
-        if (!parsed.valid) continue;
-        const concrete = parsed.version.min();
-        if (best_parsed == null or concrete.order(best_parsed.?, version_value, best.?) == .gt) {
-            best = version_value;
-            best_parsed = concrete;
-        }
-    }
-    return best;
-}
-
 test "minimum release age uses Bun stability window" {
     const source =
         \\{
@@ -364,6 +384,30 @@ test "minimum release age uses Bun stability window" {
     );
     try std.testing.expectEqualStrings("1.0.0", result.version);
     try std.testing.expectEqualStrings("1.0.3", result.newest_filtered.?);
+}
+
+test "unfiltered registry selection follows Bun wildcard normalization" {
+    const source =
+        \\{
+        \\  "dist-tags": { "latest": "2.0.0" },
+        \\  "versions": { "1.0.0": {}, "2.0.0": {} }
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(Value, std.testing.allocator, source, .{});
+    defer parsed.deinit();
+
+    for ([_][]const u8{ "*-pre+build", "*+build" }) |spec| {
+        const result = try selectVersion(
+            std.testing.allocator,
+            &parsed.value,
+            "example",
+            spec,
+            null,
+            &.{},
+            0,
+        );
+        try std.testing.expectEqualStrings("2.0.0", result.version);
+    }
 }
 
 test "minimum release age rejects a recent exact version" {
