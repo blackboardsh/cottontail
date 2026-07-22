@@ -4582,13 +4582,20 @@ fn bundleScriptNative(
     errdefer std.Io.Dir.cwd().deleteTree(ctx.io, tmp_dir) catch {};
 
     const script_abs = try resolvePathForCwd(ctx.io, ctx.allocator, script_path);
+    // Package bins are short-lived and often live under unique temp roots.
+    // Reuse the runtime artifact and let its module loader evaluate the entry.
+    const runtime_package_bin_entrypoint = build_options == null and
+        graph_out == null and
+        !standalone_compile and
+        reload_dependencies_out == null and
+        std.mem.eql(u8, ctx.environ_map.get("COTTONTAIL_PACKAGE_BIN_RUNTIME") orelse "", "1");
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const is_test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
 
     const is_wasm_entrypoint = std.mem.eql(u8, std.fs.path.extension(script_abs), ".wasm");
-    const script_entry_abs = if (is_wasm_entrypoint)
+    const script_entry_abs = if (is_wasm_entrypoint or runtime_package_bin_entrypoint)
         script_abs
     else
         try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir, standalone_compile);
@@ -4626,17 +4633,20 @@ fn bundleScriptNative(
         test_preload_imports.len > 0 or
         startup_options.requiresFullRuntime();
     const runtime_transpiler_cache_enabled = cli_run_execution.runtimeTranspilerCacheEnabled(ctx.environ_map);
-    const runtime_cache_common_js_entrypoint = if (runtime_transpiler_cache_enabled and !is_wasm_entrypoint)
+    const runtime_cache_common_js_entrypoint = if (!runtime_package_bin_entrypoint and
+        runtime_transpiler_cache_enabled and
+        !is_wasm_entrypoint)
         try runtimeCacheCanUseCommonJsLoader(ctx, script_abs)
     else
         false;
-    const detected_common_js_entrypoint = if (is_wasm_entrypoint)
+    const detected_common_js_entrypoint = if (is_wasm_entrypoint or runtime_package_bin_entrypoint)
         false
     else
         try shouldBundleCommonJsEntrypoint(ctx, script_abs);
     const is_common_js_entrypoint = detected_common_js_entrypoint or runtime_cache_common_js_entrypoint;
     if (is_common_js_entrypoint) try validateCommonJsTestSyntax(ctx, script_abs);
-    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_cache_common_js_entrypoint and
+    const runtime_bootstrap_mode: RuntimeBootstrapMode = if (!runtime_package_bin_entrypoint and
+        !runtime_cache_common_js_entrypoint and
         reload_dependencies_out == null and
         !standalone_compile and
         build_options == null and
@@ -4669,22 +4679,38 @@ fn bundleScriptNative(
     // transitive dependencies are embedded in the generated bundle.
     const bundle_common_js_entrypoint = is_common_js_entrypoint and
         (has_custom_conditions or build_options != null or use_selective_runtime or reload_dependencies_out != null);
-    const use_esm_bundle_cache = !is_wasm_entrypoint and
+    const use_package_bin_launcher_cache = runtime_package_bin_entrypoint and plain_launcher_cacheable;
+    const use_esm_bundle_cache = !runtime_package_bin_entrypoint and
+        !is_wasm_entrypoint and
         !is_common_js_entrypoint and
         plain_launcher_cacheable;
-    const use_common_js_launcher_cache = is_common_js_entrypoint and
+    const use_common_js_launcher_cache = !runtime_package_bin_entrypoint and
+        is_common_js_entrypoint and
         !bundle_common_js_entrypoint and
         plain_launcher_cacheable;
     const use_common_js_bundle_cache = is_common_js_entrypoint and
         bundle_common_js_entrypoint and
         plain_launcher_cacheable;
     const use_common_js_cache = use_common_js_launcher_cache or use_common_js_bundle_cache;
-    const runtime_virtual_root = if (use_common_js_launcher_cache)
+    const runtime_virtual_root = if (use_common_js_launcher_cache or use_package_bin_launcher_cache)
         reusable_runtime_bundle_root
     else
         ctx.project_root;
     const wrapped_entry = if (is_wasm_entrypoint)
         try writeWasiEntryWrapper(ctx, tmp_dir, script_abs)
+    else if (runtime_package_bin_entrypoint)
+        try writeCommonJsEntryWrapper(
+            ctx,
+            tmp_dir,
+            script_abs,
+            false,
+            preload_imports,
+            is_test_cli_execution,
+            use_package_bin_launcher_cache,
+            runtime_virtual_root,
+            runtime_bootstrap_mode,
+            true,
+        )
     else if (is_common_js_entrypoint)
         try writeCommonJsEntryWrapper(
             ctx,
@@ -4696,6 +4722,7 @@ fn bundleScriptNative(
             use_common_js_cache,
             runtime_virtual_root,
             runtime_bootstrap_mode,
+            false,
         )
     else
         try writeCottontailEntryWrapper(
@@ -4768,7 +4795,9 @@ fn bundleScriptNative(
     options.define_keys = runtime_define_keys.items;
     options.define_values = runtime_define_values.items;
 
-    const launcher_cache_name: ?[]const u8 = if (use_common_js_launcher_cache)
+    const launcher_cache_name: ?[]const u8 = if (use_package_bin_launcher_cache)
+        "package-bin-runtime"
+    else if (use_common_js_launcher_cache)
         "commonjs-runtime"
     else if (use_common_js_bundle_cache)
         try std.fmt.allocPrint(ctx.allocator, "commonjs-entry-{x}", .{std.hash.Wyhash.hash(0, script_abs)})
@@ -4784,7 +4813,7 @@ fn bundleScriptNative(
             ctx,
             wrapped_entry,
             name,
-            use_common_js_cache,
+            use_common_js_cache or use_package_bin_launcher_cache,
             if (use_common_js_bundle_cache or use_esm_bundle_cache) script_entry_abs else null,
         )
     else
@@ -8857,6 +8886,7 @@ fn writeCommonJsEntryWrapper(
     stable_source_map_path: bool,
     runtime_virtual_root: []const u8,
     bootstrap_mode: RuntimeBootstrapMode,
+    runtime_package_bin_entrypoint: bool,
 ) ![]const u8 {
     if (bootstrap_mode != .full) return writeMinimalRuntimeEntryWrapper(
         ctx,
@@ -9096,7 +9126,13 @@ fn writeCommonJsEntryWrapper(
         "globalThis.__cottontailBunTestHeaderPrinted = true;"
     else
         "";
-    const main_action = if (bundle_entry)
+    const main_action = if (runtime_package_bin_entrypoint)
+        \\const __ctEntryPath = globalThis.process?.argv?.[1];
+        \\if (!__ctEntryPath) throw new Error("Missing package bin entrypoint");
+        \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.(__ctEntryPath, __ctEntryPath);
+        \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
+        \\else await globalThis.__cottontailImportModule(__ctEntryPath, __ctEntryPath, undefined, true);
+    else if (bundle_entry)
         try std.fmt.allocPrint(ctx.allocator,
             \\const __ctPluginEntry = await globalThis.__cottontailResolvePluginEntrypoint?.({s}, {s});
             \\if (__ctPluginEntry?.matched) await __ctPluginEntry.value;
