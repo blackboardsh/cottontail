@@ -786,8 +786,8 @@
       "reason": "Copied upstream file passes directly under Cottontail (42 bun:test cases, 48 assertions)."
     },
     "test/bundler/bundler_compile.test.ts": {
-      "status": "expected-failure",
-      "reason": "49 of 51 generated standalone compile cases pass in exact isolation; the two source-map diagnostic cases remain expected-failure.",
+      "status": "enabled",
+      "reason": "All 51 generated standalone compile cases and the copied file-level tests pass under Cottontail.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true,
       "enabledBundlerTests": {
@@ -839,6 +839,8 @@
         "compile/sqlite-file": "A SQLite import attribute opens the embedded database from standalone bytes.",
         "compile/ImportMetaMain": "Standalone entrypoint inlining makes import.meta.main and require.main comparisons observable as true.",
         "compile/Utf8": "Standalone compilation preserves UTF-8 source and output.",
+        "compile/SourceMap": "Standalone external source maps report Bun-compatible source code frames after original files are removed.",
+        "compile/SourceMapBigFile": "Large standalone bundles preserve Bun-compatible source code frames through external source maps.",
         "compile/BunBeBunEnvVar": "Standalone execution keeps the runtime Bun version independent of the BUN_BE_BUN environment variable."
       },
       "env": {
