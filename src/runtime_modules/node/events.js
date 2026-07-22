@@ -10,11 +10,23 @@ export const usingDomains = false;
 
 const kCapture = Symbol("kCapture");
 const kFirstEventParam = Symbol.for("nodejs.kFirstEventParam");
+const kResistStopPropagation = Symbol.for("nodejs.internal.event_target.kResistStopPropagation");
 
 function checkListener(listener) {
   if (typeof listener !== "function") {
     const error = new TypeError(
       `The "listener" argument must be of type function. Received ${listener === null ? "null" : typeof listener}`,
+    );
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+}
+
+function checkAbortSignal(signal) {
+  if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
+    const received = signal === null ? "null" : signal === undefined ? "undefined" : typeof signal;
+    const error = new TypeError(
+      `The "signal" argument must be an instance of AbortSignal. Received ${received}`,
     );
     error.code = "ERR_INVALID_ARG_TYPE";
     throw error;
@@ -461,14 +473,17 @@ export function getMaxListeners(emitterOrTarget) {
 }
 
 export function addAbortListener(signal, listener) {
-  if (signal?.aborted) {
-    queueMicrotask(listener);
+  checkAbortSignal(signal);
+  checkListener(listener);
+  if (signal.aborted) {
+    const schedule = globalThis.process?.nextTick ?? queueMicrotask;
+    schedule(listener);
     return { [Symbol.dispose]() {} };
   }
-  signal?.addEventListener?.("abort", listener, { once: true });
+  signal.addEventListener("abort", listener, { once: true, [kResistStopPropagation]: true });
   return {
     [Symbol.dispose]() {
-      signal?.removeEventListener?.("abort", listener);
+      signal.removeEventListener("abort", listener);
     },
   };
 }
