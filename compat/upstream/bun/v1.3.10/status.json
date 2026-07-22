@@ -220,6 +220,13 @@
       "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
     },
     {
+      "pattern": "^test/regression/issue/(?:27428|3613)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Exact copied regressions pass with deterministic HTTP parser shutdown, async-context-safe responses, and ws handleProtocols selection and fallback behavior (4 cases).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 45000
+    },
+    {
       "pattern": "^test/regression/issue/24385\\.test\\.ts$",
       "status": "enabled",
       "reason": "All 14 copied Redis and Valkey environment URL variants load and duplicate the lazy client without protocol errors (42 assertions); stock-JSC subprocess startup requires a larger file budget.",
