@@ -10818,7 +10818,7 @@ function requestFromNodeIncoming(message, protocol, fallbackHost, tunnelRequest 
     }
   }
   const host = message.headers?.host ?? fallbackHost;
-  const controller = new AbortController();
+  const controller = new CottontailAbortController();
   const init = {
     method: message.method,
     headers,

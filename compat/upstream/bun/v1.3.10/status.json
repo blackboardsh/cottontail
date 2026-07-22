@@ -300,6 +300,19 @@
       "timeoutMs": 60000
     },
     {
+      "pattern": "^test/cli/inspect/HTTPServerAgent\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied HTTPServer inspector case passes initial and hot-reloaded route reporting, stable server identity, and close lifecycle coverage (1 case, 5 assertions, 3 snapshots).",
+      "args": ["--timeout=30000"],
+      "env": {
+        "COTTONTAIL_TMP_DIR": "/tmp",
+        "TMPDIR": "/tmp",
+        "TMP": "/tmp",
+        "TEMP": "/tmp"
+      },
+      "timeoutMs": 60000
+    },
+    {
       "pattern": "^test/regression/issue/(?:10380/spy-matchers-diff|14709|16474|19661|20100|20546|23183|24234|24399|25231|25750|25794|27117)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
