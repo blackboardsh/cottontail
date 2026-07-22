@@ -63,6 +63,13 @@
       "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
     },
     {
+      "pattern": "^test/cli/run/run-eval\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All 29 copied eval and print cases pass across argument placement, TypeScript and JSX transforms, top-level await, source URLs, inspect formatting, and syntax failures (58 assertions).",
+      "args": ["--timeout=50000"],
+      "timeoutMs": 600000
+    },
+    {
       "pattern": "^test/cli/update_interactive_formatting\\.test\\.ts$",
       "status": "enabled",
       "reason": "All 31 copied interactive update cases pass across selection and navigation, dry-run and cancellation, recursive and filtered workspaces, catalog layouts, semver prefix preservation, package installation, and lockfile persistence (163 assertions).",
