@@ -1,7 +1,17 @@
 import { file, Glob } from "bun";
 import { readdirSync } from "fs";
 import path from "path";
-import "../../scripts/glob-sources.mjs";
+
+const cottontailRoot =
+  process.env.COTTONTAIL_UPSTREAM_RUNTIME === "bun"
+    ? path.resolve(import.meta.dir, "../../../../../..")
+    : undefined;
+
+if (cottontailRoot) {
+  process.chdir(cottontailRoot);
+} else {
+  await import("../../scripts/glob-sources.mjs");
+}
 
 // prettier-ignore
 const words: Record<string, { reason: string; regex?: boolean }> = {
@@ -58,11 +68,16 @@ const words: Record<string, { reason: string; regex?: boolean }> = {
 };
 const words_keys = [...Object.keys(words)];
 
-const limits = await Bun.file(import.meta.dir + "/ban-limits.json").json();
+const limitsPath = path.join(
+  import.meta.dir,
+  cottontailRoot ? "ban-limits.cottontail.json" : "ban-limits.json",
+);
+const limits = await Bun.file(limitsPath).json();
 
-const sources: Array<{ output: string; paths: string[]; excludes?: string[] }> = await file(
-  path.join("cmake", "Sources.json"),
-).json();
+const sources: Array<{ output: string; paths: string[]; excludes?: string[] }> = cottontailRoot
+  ? [{ output: "ZigSources.txt", paths: ["src/**/*.zig"] }]
+  : await file(path.join("cmake", "Sources.json")).json();
+const bunSourceDir = cottontailRoot ? path.join("src", "compiler", "src") : "src";
 
 let counts: Record<string, [number, string][]> = {};
 
@@ -74,9 +89,9 @@ for (const source of sources) {
 
     for await (const source of glob.scan()) {
       if (!source.endsWith(".zig")) continue;
-      if (source.startsWith("src" + path.sep + "deps")) continue;
-      if (source.startsWith("src" + path.sep + "codegen")) continue;
-      if (source.startsWith("src" + path.sep + "unicode" + path.sep + "uucode")) continue;
+      if (source.startsWith(bunSourceDir + path.sep + "deps")) continue;
+      if (source.startsWith(bunSourceDir + path.sep + "codegen")) continue;
+      if (source.startsWith(bunSourceDir + path.sep + "unicode" + path.sep + "uucode")) continue;
       const content = await file(source).text();
       for (const word of words_keys) {
         let regex = words[word].regex ? new RegExp(word, "gm") : undefined;
@@ -99,7 +114,10 @@ for (const source of sources) {
   }
 }
 
-if (typeof describe === "undefined") {
+if (
+  typeof describe === "undefined" ||
+  (cottontailRoot !== undefined && process.env.COTTONTAIL_UPDATE_BAN_LIMITS === "1")
+) {
   const newLimits = {};
   for (const word of Object.keys(words).sort()) {
     const count = counts[word] ?? [];
@@ -119,7 +137,7 @@ if (typeof describe === "undefined") {
     }
     newLimits[word] = newLimit;
   }
-  await Bun.write(import.meta.dir + "/ban-limits.json", JSON.stringify(newLimits, null, 2));
+  await Bun.write(limitsPath, JSON.stringify(newLimits, null, 2));
   process.exit(0);
 }
 
@@ -146,7 +164,9 @@ describe("banned words", () => {
 });
 
 describe("required words", () => {
-  const expectDir = "src/bun.js/test/expect";
+  const expectDir = cottontailRoot
+    ? path.join(bunSourceDir, "test_runner", "expect")
+    : "src/bun.js/test/expect";
   const files = readdirSync(expectDir);
   for (const file of files) {
     if (!file.endsWith(".zig") || file.startsWith(".") || file === "toHaveReturnedTimes.zig") continue;

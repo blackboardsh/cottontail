@@ -15862,7 +15862,13 @@ function walkFiles(root, options = {}, prefix = "", seen = new Set()) {
     const absolute = pathJoin(root, entry.name);
     const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
     let stat = entry;
-    if (entry.isSymbolicLink === true && options.followSymlinks) {
+    const entryMode = Number(entry.mode) || 0;
+    const isSymbolicLink =
+      entry.isSymbolicLink === true ||
+      entry.kind === "symlink" ||
+      entry.type === "symlink" ||
+      (entryMode & 0o170000) === 0o120000;
+    if (isSymbolicLink && options.followSymlinks) {
       try {
         stat = cottontail.statSync(absolute, true);
         if (!stat) throw new Error(`Broken symbolic link: ${absolute}`);
@@ -15871,7 +15877,12 @@ function walkFiles(root, options = {}, prefix = "", seen = new Set()) {
         stat = entry;
       }
     }
-    const isDirectory = stat.kind === "directory" || stat.type === "directory" || stat.isDirectory === true;
+    const statMode = Number(stat.mode) || 0;
+    const isDirectory =
+      stat.kind === "directory" ||
+      stat.type === "directory" ||
+      stat.isDirectory === true ||
+      (statMode & 0o170000) === 0o040000;
     if (isDirectory) {
       if (options.onlyFiles === false) entries.push({ absolute, relative, isDirectory: true });
       const key = stat.dev != null && stat.ino != null ? `${stat.dev}:${stat.ino}` : absolute;

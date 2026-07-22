@@ -558,6 +558,14 @@
       "status": "enabled",
       "reason": "URLSearchParams parsing, mutation, sorting, and encoding pass the Deno-derived corpus."
     },
+    "test/internal/ban-words.test.ts": {
+      "status": "enabled",
+      "reason": "The repository-policy corpus scans all Cottontail Zig sources against exact banned-word limits and validates every active expect matcher counter (119 cases)."
+    },
+    "test/internal/bindgen.test.ts": {
+      "status": "enabled",
+      "reason": "The copied bindgen conversion, wrapping, defaults, range, and overflow coverage passes unchanged (3 cases, 39 assertions)."
+    },
     "test/internal/fifo.test.ts": {
       "status": "enabled",
       "reason": "The copied FIFO ordering, growth, wraparound, and stress corpus passes under Cottontail."
