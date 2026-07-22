@@ -69,6 +69,12 @@
       "timeoutMs": 30000
     },
     {
+      "pattern": "^test/cli/update_interactive_install\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Both copied interactive update installation cases pass, updating package.json and the installed node_modules package for compatible and latest-version selections (14 assertions).",
+      "timeoutMs": 30000
+    },
+    {
       "pattern": "^test/cli/run/sql-preconnect\\.test\\.ts$",
       "status": "enabled",
       "reason": "The copied SQL preconnect fixture passes both local-loopback cases: startup connects when DATABASE_URL and --sql-preconnect are present and does not connect without the flag (4 assertions).",
