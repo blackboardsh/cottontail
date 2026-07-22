@@ -57,6 +57,8 @@ test.skipIf(isWindows)(
     console.log("RSS delta", ((after - before) | 0) / 1024 / 1024);
     console.log("RSS total", (after / 1024 / 1024) | 0, "MB");
     const absoluteLimit = 250 * 1024 * 1024;
+    // COTTONTAIL-COMPAT: Stock JSC starts above Bun's absolute RSS ceiling,
+    // so retain Bun's ratio check and enforce a strict baseline growth cap.
     if (process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1" && before >= absoluteLimit) {
       const growthLimit = 192 * 1024 * 1024;
       expect(after).toBeLessThan(before + growthLimit);

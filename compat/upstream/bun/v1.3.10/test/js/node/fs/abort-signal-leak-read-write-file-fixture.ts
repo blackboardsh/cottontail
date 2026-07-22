@@ -37,6 +37,8 @@ if (numAbortSignalObjects > 10) {
 }
 
 const rss = (process.memoryUsage().rss / 1024 / 1024) | 0;
+// COTTONTAIL-COMPAT: Stock JSC starts above Bun's absolute RSS ceiling, so
+// preserve that ceiling while also enforcing a strict baseline growth cap.
 const maxAllowedRss = process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1"
   ? Math.max(MAX_ALLOWED_MEMORY_USAGE, baselineRss + MAX_ALLOWED_MEMORY_GROWTH)
   : MAX_ALLOWED_MEMORY_USAGE;

@@ -4,6 +4,8 @@ const MAX_ALLOWED_MEMORY_USAGE = 256;
 const MAX_ALLOWED_MEMORY_GROWTH = 64;
 const dest = process.argv.at(-1);
 const baseline = (process.memoryUsage.rss() / 1024 / 1024) | 0;
+// COTTONTAIL-COMPAT: Stock JSC starts above Bun's absolute RSS ceiling, so
+// preserve that ceiling while also enforcing a strict baseline growth cap.
 const maxAllowedMemoryUsage = process.env.COTTONTAIL_STOCK_JSC_RSS_BASELINE === "1"
   ? Math.max(MAX_ALLOWED_MEMORY_USAGE, baseline + MAX_ALLOWED_MEMORY_GROWTH)
   : MAX_ALLOWED_MEMORY_USAGE;
