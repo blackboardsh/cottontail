@@ -3126,9 +3126,8 @@ export class ClientRequest extends OutgoingMessage {
         responseMessage.destroy?.(failure);
       }
       socket.destroy?.();
-      // Once headers have produced an IncomingMessage, Node assigns transport
-      // truncation to that response stream. The ClientRequest only closes;
-      // emitting the same failure there creates a second, ownerless error.
+      // COTTONTAIL-COMPAT: Once headers produce an IncomingMessage, Node assigns
+      // transport truncation to that response stream. ClientRequest only closes.
       if (!this._responseEmitted) this.emit("error", failure);
       this._emitClose();
     };
