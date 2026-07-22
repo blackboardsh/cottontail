@@ -9500,6 +9500,7 @@ See https://bun.com/docs/api/http for more information.`;
 }
 
 const serveHtmlStateSymbol = Symbol("cottontail.serveHtmlState");
+const prepareServeHtmlSymbol = Symbol.for("cottontail.prepareHtmlServe");
 const serveInspectorOriginalRoutesSymbol = Symbol("cottontail.serveInspectorOriginalRoutes");
 const serveInspectorDevServerSymbol = Symbol("cottontail.serveInspectorDevServer");
 const serveInspectorRuntimeSymbol = Symbol.for("cottontail.serveInspectorRuntime");
@@ -9757,6 +9758,7 @@ function createServeHtmlState(options) {
     builtSources: new Set(),
     buildPromise: null,
     configPromise: null,
+    preparedBuildReady: false,
   };
   registerServeHtmlOptions(state, options);
   return state;
@@ -9779,30 +9781,40 @@ function commonHtmlBuildRoot(paths) {
   return root;
 }
 
+async function loadServeHtmlStaticConfig() {
+  const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
+  const bunfigPath = nodePathResolve(cwd, "bunfig.toml");
+  let staticConfig = {};
+  try {
+    staticConfig = parseTOML(cottontail.readFile(bunfigPath))?.serve?.static ?? {};
+  } catch {}
+  const pluginSpecifiers = [];
+  for (const pluginPath of Array.isArray(staticConfig.plugins) ? staticConfig.plugins : []) {
+    const resolvedPath = await resolve(String(pluginPath), pathDirname(bunfigPath));
+    pluginSpecifiers.push(nodePathToFileURL(resolvedPath).href);
+  }
+  return { env: staticConfig.env, pluginSpecifiers };
+}
+
+function normalizeServeHtmlPlugin(namespace) {
+  let plugin = namespace;
+  while (plugin != null && typeof plugin === "object" && typeof plugin.setup !== "function" &&
+    plugin.default != null && plugin.default !== plugin) {
+    plugin = plugin.default;
+  }
+  return plugin;
+}
+
 async function serveHtmlBuildConfig(state) {
   if (state.configPromise) return state.configPromise;
   state.configPromise = (async () => {
-    const cwd = globalThis.process?.cwd?.() ?? cottontail.cwd();
-    const bunfigPath = nodePathResolve(cwd, "bunfig.toml");
-    let staticConfig = {};
-    try {
-      staticConfig = parseTOML(cottontail.readFile(bunfigPath))?.serve?.static ?? {};
-    } catch {}
+    const staticConfig = await loadServeHtmlStaticConfig();
     const plugins = [];
-    for (const pluginPath of Array.isArray(staticConfig.plugins) ? staticConfig.plugins : []) {
-      const resolvedPath = await resolve(String(pluginPath), pathDirname(bunfigPath));
-      const namespace = await import(nodePathToFileURL(resolvedPath).href);
-      let plugin = namespace;
-      while (plugin != null && typeof plugin === "object" && typeof plugin.setup !== "function" &&
-        plugin.default != null && plugin.default !== plugin) {
-        plugin = plugin.default;
-      }
+    for (const specifier of staticConfig.pluginSpecifiers) {
+      const plugin = normalizeServeHtmlPlugin(await import(specifier));
       if (plugin != null) plugins.push(plugin);
     }
-    return {
-      env: staticConfig.env,
-      plugins,
-    };
+    return { env: staticConfig.env, plugins };
   })();
   return state.configPromise;
 }
@@ -9981,7 +9993,10 @@ function ensureServeHtmlSource(state, options, source) {
   state.sources.add(absoluteSource);
   const ready = state.htmlBySource.get(absoluteSource);
   const development = serveIsDevelopment(options);
-  if (ready && !development) return Promise.resolve(ready);
+  if (ready && (!development || state.preparedBuildReady)) {
+    state.preparedBuildReady = false;
+    return Promise.resolve(ready);
+  }
   if (!state.buildPromise) {
     if (development) {
       state.assets.clear();
@@ -10001,6 +10016,31 @@ function ensureServeHtmlSource(state, options, source) {
     return ensureServeHtmlSource(state, options, absoluteSource);
   });
 }
+
+async function prepareServeHtml(options, config) {
+  if (options == null || typeof options !== "object") return;
+  const state = options[serveHtmlStateSymbol] ?? createServeHtmlState(options);
+  options[serveHtmlStateSymbol] = state;
+  state.configPromise = Promise.resolve(config);
+  const batch = [...state.sources];
+  if (batch.length === 0 || state.buildPromise) return state.buildPromise;
+  state.buildPromise = buildServeHtmlBatch(state, options, batch);
+  try {
+    await state.buildPromise;
+    state.preparedBuildReady = true;
+  } finally {
+    state.buildPromise = null;
+  }
+}
+
+Object.defineProperty(globalThis, prepareServeHtmlSymbol, {
+  value: {
+    loadConfig: loadServeHtmlStaticConfig,
+    normalizePlugin: normalizeServeHtmlPlugin,
+    build: prepareServeHtml,
+  },
+  configurable: true,
+});
 
 function responseForServeHtmlDescriptor(descriptor) {
   const body = descriptor.body ?? descriptor.artifact ?? file(descriptor.path);
@@ -11061,10 +11101,32 @@ function serveNodeBacked(options, context) {
     nodeServer = new nodeHttp.Server();
     nodeServer.on("error", () => {});
     const listenHost = hostname === "localhost" ? "127.0.0.1" : hostname;
+    const preboundKey = Symbol.for("cottontail.preboundHttpServer");
+    const prebound = globalThis[preboundKey];
+    const requestedPort = defaultServePort(options);
+    const preboundFd = Number(prebound?.fd);
+    const canAdoptPrebound =
+      Number.isInteger(preboundFd) &&
+      preboundFd >= 0 &&
+      !isUnix &&
+      listenHost === "127.0.0.1" &&
+      Number(prebound.requestedPort) === requestedPort;
     try {
-      nodeServer.listen(isUnix
-        ? { path: unixPath }
-        : { host: listenHost, port: defaultServePort(options), family: listenHost.includes(":") ? 6 : 4 });
+      if (canAdoptPrebound) {
+        nodeServer.listen({ fd: preboundFd });
+        delete globalThis[preboundKey];
+      } else {
+        if (Number.isInteger(preboundFd) && preboundFd >= 0) {
+          try { cottontail.closeFd(preboundFd); } catch {}
+        }
+        if (prebound?.native != null) {
+          try { cottontail.httpServerStop(prebound.native.id, true); } catch {}
+        }
+        if (prebound != null) delete globalThis[preboundKey];
+        nodeServer.listen(isUnix
+          ? { path: unixPath }
+          : { host: listenHost, port: requestedPort, family: listenHost.includes(":") ? 6 : 4 });
+      }
     } catch (rawError) {
       if (rawError instanceof Error) throw rawError;
       const reason = String(rawError);
@@ -11078,7 +11140,6 @@ function serveNodeBacked(options, context) {
       throw error;
     }
     if (!nodeServer._native?.listening) {
-      const requestedPort = defaultServePort(options);
       const error = new Error(
         isUnix
           ? `Failed to listen on unix socket ${unixPath}`
@@ -11524,7 +11585,7 @@ export function serve(options) {
   if (typeof options.fetch !== "function" && !hasRoutes && !hasStaticRoutes) {
     throw new TypeError(bunServeNeedsHandlerMessage());
   }
-  options[serveHtmlStateSymbol] = createServeHtmlState(options);
+  options[serveHtmlStateSymbol] ??= createServeHtmlState(options);
   options = installInspectorDevServer(options);
 
   const unixPath = normalizeServeUnixPath(options.unix);
@@ -11561,10 +11622,14 @@ export function serve(options) {
       native = prebound.native;
       delete globalThis[preboundKey];
     } else {
+      const preboundFd = Number(prebound?.fd);
+      if (Number.isInteger(preboundFd) && preboundFd >= 0) {
+        try { cottontail.closeFd(preboundFd); } catch {}
+      }
       if (prebound?.native != null) {
         try { cottontail.httpServerStop(prebound.native.id, true); } catch {}
-        delete globalThis[preboundKey];
       }
+      if (prebound != null) delete globalThis[preboundKey];
       native = cottontail.httpServerStart(
         hostname,
         requestedPort,

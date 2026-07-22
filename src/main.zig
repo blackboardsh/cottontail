@@ -756,7 +756,7 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
         \\const now = globalThis.performance?.now?.bind(globalThis.performance) ?? Date.now;
         \\const startedAt = now();
         \\const development = process.env.NODE_ENV !== "production";
-        \\const server = Bun.serve({
+        \\const serveOptions = {
         \\  development,
         \\  port:
     );
@@ -780,7 +780,18 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     }
     try source.appendSlice(allocator,
         \\  },
-        \\});
+        \\};
+        \\const prepareHtmlServe = globalThis[Symbol.for("cottontail.prepareHtmlServe")];
+        \\if (prepareHtmlServe) {
+        \\  const config = await prepareHtmlServe.loadConfig();
+        \\  config.plugins = [];
+        \\  for (const specifier of config.pluginSpecifiers) {
+        \\    const plugin = prepareHtmlServe.normalizePlugin(await import(specifier));
+        \\    if (plugin != null) config.plugins.push(plugin);
+        \\  }
+        \\  await prepareHtmlServe.build(serveOptions, config);
+        \\}
+        \\const server = Bun.serve(serveOptions);
         \\const elapsed = (now() - startedAt).toFixed(2);
         \\console.log(`Bun v${Bun.version}${development ? " dev server" : ""} ready in ${elapsed} ms`);
         \\console.log(`url: ${server.url}`);
@@ -789,7 +800,7 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     const source_z = try allocator.dupeZ(u8, source.items);
     const early_source = try std.fmt.allocPrintSentinel(
         allocator,
-        "globalThis[Symbol.for(\"cottontail.preboundHttpServer\")]={{requestedPort:{s},native:cottontail.httpServerStart(\"localhost\",{s},undefined,134217728)}};",
+        "globalThis[Symbol.for(\"cottontail.preboundHttpServer\")]={{requestedPort:{s},fd:cottontail.tcpServerListen({s},\"127.0.0.1\",4).fd}};",
         .{ port, port },
         0,
     );
