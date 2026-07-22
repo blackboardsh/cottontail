@@ -671,12 +671,13 @@ pub const Parser = struct {
                 const count = @as(usize, @intFromBool(uses_dirname)) + @as(usize, @intFromBool(uses_filename));
                 var declared_symbols = DeclaredSymbol.List.initCapacity(p.allocator, count) catch unreachable;
                 var decls = p.allocator.alloc(G.Decl, count) catch unreachable;
+                const import_meta_path = p.pathForImportMeta();
                 if (uses_dirname) {
                     decls[0] = .{
                         .binding = p.b(B.Identifier{ .ref = p.dirname_ref }, logger.Loc.Empty),
                         .value = p.newExpr(
                             E.String{
-                                .data = p.source.path.name.dir,
+                                .data = import_meta_path.name.dir,
                             },
                             logger.Loc.Empty,
                         ),
@@ -688,7 +689,7 @@ pub const Parser = struct {
                         .binding = p.b(B.Identifier{ .ref = p.filename_ref }, logger.Loc.Empty),
                         .value = p.newExpr(
                             E.String{
-                                .data = p.source.path.text,
+                                .data = import_meta_path.text,
                             },
                             logger.Loc.Empty,
                         ),
@@ -1177,18 +1178,22 @@ pub const Parser = struct {
             const count = @as(usize, @intFromBool(uses_dirname)) + @as(usize, @intFromBool(uses_filename));
             var declared_symbols = DeclaredSymbol.List.initCapacity(p.allocator, count) catch unreachable;
             var decls = p.allocator.alloc(G.Decl, count) catch unreachable;
+            const original_import_meta_path = if (p.hasOriginalPathMarker()) p.pathForImportMeta() else null;
             if (uses_dirname) {
                 // var __dirname = import.meta
                 decls[0] = .{
                     .binding = p.b(B.Identifier{ .ref = p.dirname_ref }, logger.Loc.Empty),
-                    .value = p.newExpr(
-                        E.Dot{
-                            .name = "dir",
-                            .name_loc = logger.Loc.Empty,
-                            .target = p.newExpr(E.ImportMeta{}, logger.Loc.Empty),
-                        },
-                        logger.Loc.Empty,
-                    ),
+                    .value = if (original_import_meta_path) |path|
+                        p.newExpr(E.String.init(path.name.dir), logger.Loc.Empty)
+                    else
+                        p.newExpr(
+                            E.Dot{
+                                .name = "dir",
+                                .name_loc = logger.Loc.Empty,
+                                .target = p.newExpr(E.ImportMeta{}, logger.Loc.Empty),
+                            },
+                            logger.Loc.Empty,
+                        ),
                 };
                 declared_symbols.appendAssumeCapacity(.{ .ref = p.dirname_ref, .is_top_level = true });
             }
@@ -1196,14 +1201,17 @@ pub const Parser = struct {
                 // var __filename = import.meta.path
                 decls[@as(usize, @intFromBool(uses_dirname))] = .{
                     .binding = p.b(B.Identifier{ .ref = p.filename_ref }, logger.Loc.Empty),
-                    .value = p.newExpr(
-                        E.Dot{
-                            .name = "path",
-                            .name_loc = logger.Loc.Empty,
-                            .target = p.newExpr(E.ImportMeta{}, logger.Loc.Empty),
-                        },
-                        logger.Loc.Empty,
-                    ),
+                    .value = if (original_import_meta_path) |path|
+                        p.newExpr(E.String.init(path.text), logger.Loc.Empty)
+                    else
+                        p.newExpr(
+                            E.Dot{
+                                .name = "path",
+                                .name_loc = logger.Loc.Empty,
+                                .target = p.newExpr(E.ImportMeta{}, logger.Loc.Empty),
+                            },
+                            logger.Loc.Empty,
+                        ),
                 };
                 declared_symbols.appendAssumeCapacity(.{ .ref = p.filename_ref, .is_top_level = true });
             }
