@@ -3131,6 +3131,10 @@
       "status": "enabled",
       "reason": "Passes on the vendored Node util/readline/vm/process stack (1 bun:test cases, 0 assertions)."
     },
+    "test/js/node/util/node-inspect-tests/parallel/util-inspect.test.js": {
+      "status": "enabled",
+      "reason": "The copied Node inspect aggregate passes all five registered cases, including cross-context objects and stack-overflow handling."
+    },
     "test/js/node/util/parse_args/default-args.test.mjs": {
       "status": "enabled",
       "reason": "Implicit and explicit run modes preserve runtime flags in process.execArgv while exposing only script arguments to util.parseArgs (8 bun:test cases, 40 assertions)."
@@ -4335,6 +4339,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 6 assertions)."
     },
+    "test/regression/issue/23022-stack-trace-iterator.test.ts": {
+      "status": "enabled",
+      "reason": "Bun.inspect handles stack frames without parenthesized function locations (1 case, 1 assertion)."
+    },
     "test/regression/issue/23133.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 4 assertions)."
@@ -4647,6 +4655,10 @@
     "test/regression/issue/circular-error-stack.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (3 bun:test cases, 12 assertions)."
+    },
+    "test/regression/issue/circular-error-stack-edge-cases.test.ts": {
+      "status": "enabled",
+      "reason": "Error inspection safely handles throwing stack/name/message getters and circular stack values (3 cases, 6 assertions)."
     },
     "test/regression/issue/comma-operator-this-binding.test.ts": {
       "status": "enabled",
