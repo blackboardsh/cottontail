@@ -775,7 +775,6 @@ pub fn bundleEntryPointGraphWithOptions(
     transform_options.drop = options.drop;
     transform_options.feature_flags = options.features;
     transform_options.disable_hmr = true;
-    transform_options.main_fields = &.{ "main", "module" };
     if (options.jsx_factory != null or
         options.jsx_fragment != null or
         options.jsx_runtime != null or
@@ -2002,7 +2001,6 @@ pub fn buildEntryPointsJson(
         };
     }
     transform_options.disable_hmr = true;
-    transform_options.main_fields = &.{ "main", "module" };
     if (options.jsx_factory != null or
         options.jsx_fragment != null or
         options.jsx_runtime != null or

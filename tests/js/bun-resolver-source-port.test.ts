@@ -88,6 +88,19 @@ writeFileSync(join(mixedExports, "package.json"), JSON.stringify({
 }));
 write(join(mixedExports, "index.cjs"), "module.exports = { value: 'mixed' };\n");
 
+const extensionlessModule = join(root, "node_modules", "extensionless-module-field");
+mkdirSync(extensionlessModule, { recursive: true });
+writeFileSync(join(extensionlessModule, "package.json"), JSON.stringify({
+  name: "extensionless-module-field",
+  main: "./lib/umd/main.js",
+  module: "./lib/esm/main.js",
+}));
+write(join(extensionlessModule, "lib", "umd", "main.js"), "module.exports = { format: () => 'umd-fallback' };\n");
+write(join(extensionlessModule, "lib", "esm", "main.js"), 'export { format } from "./impl/format";\n');
+write(join(extensionlessModule, "lib", "esm", "impl", "format.js"), "export const format = () => 'extensionless-esm';\n");
+const extensionlessEntry = join(root, "extensionless-entry.js");
+write(extensionlessEntry, 'import { format } from "extensionless-module-field"; console.log(format());\n');
+
 const mainEntry = join(root, "module-main", "entry.cjs");
 write(join(root, "module-main", "child.cjs"), [
   "module.exports = {",
@@ -165,6 +178,20 @@ test("condition maps distinguish import and require while preserving custom cond
   } finally {
     process.execArgv.splice(process.execArgv.lastIndexOf("--conditions=cottontail_source_port"), 1);
   }
+});
+
+test("bundler follows module fields and extensionless relative ESM imports", async () => {
+  const result = await Bun.build({
+    entrypoints: [extensionlessEntry],
+    format: "esm",
+    target: "bun",
+  });
+
+  expect(result.success).toBe(true);
+  expect(result.outputs).toHaveLength(1);
+  const source = await result.outputs[0].text();
+  expect(source).toContain("extensionless-esm");
+  expect(source).not.toContain("umd-fallback");
 });
 
 test("file URL require and resolution decode paths", () => {
