@@ -357,11 +357,14 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
   }
   let entries;
   const includeExpectedFailures = options.includeExpectedFailures || options.onlyStatus === 'expected-failure';
+  const hasEnabledBundlerCases = (entry) =>
+    entry.splitBundlerTests === true && Object.keys(entry.enabledBundlerTests ?? {}).length > 0;
   if (status.defaultStatus === 'enabled' || patternEntries(status).length > 0) {
     entries = discoverRunnableFiles(snapshotRoot, runtime)
       .map((path) => statusEntryForPath(status, path, status.defaultStatus === 'enabled' ? 'enabled' : 'not-enabled'))
       .filter((entry) =>
         entry.status === 'enabled' ||
+        hasEnabledBundlerCases(entry) ||
         (includeExpectedFailures && entry.status === 'expected-failure') ||
         (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
       );
@@ -370,11 +373,17 @@ function selectedTests(status, options, snapshotRoot, runtime = 'node') {
       .map(([path, entry]) => ({ path, ...entry }))
       .filter((entry) =>
         entry.status === 'enabled' ||
+        hasEnabledBundlerCases(entry) ||
         (includeExpectedFailures && entry.status === 'expected-failure') ||
         (options.onlyStatus === 'not-enabled' && entry.status === 'not-enabled')
       );
   }
-  if (options.onlyStatus) entries = entries.filter((entry) => entry.status === options.onlyStatus);
+  if (options.onlyStatus) {
+    entries = entries.filter((entry) =>
+      entry.status === options.onlyStatus ||
+      (options.onlyStatus === 'enabled' && hasEnabledBundlerCases(entry))
+    );
+  }
   if (options.match) entries = entries.filter((entry) => options.match.test(entry.path));
   return entries;
 }
@@ -453,7 +462,12 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
     const ids = discoverBundlerTestIds(entry, snapshotRoot, target)
       .filter(id => !options.caseMatch || options.caseMatch.test(id));
     for (const id of ids) {
+      const enabledReason = entry.enabledBundlerTests?.[id];
       const expectedFailureReason = entry.expectedFailureBundlerTests?.[id];
+      if (entry.status === 'expected-failure' && entry.enabledBundlerTests != null) {
+        if (options.onlyStatus === 'expected-failure' && enabledReason) continue;
+        if (!options.includeExpectedFailures && options.onlyStatus !== 'expected-failure' && !enabledReason) continue;
+      }
       expanded.push({
         ...entry,
         variant: id,
@@ -461,7 +475,10 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
           ...(entry.args ?? []),
           `--test-name-pattern=(?:^| > )${escapeRegExp(id)}$`,
         ],
-        ...(expectedFailureReason ? {
+        ...(enabledReason ? {
+          status: 'enabled',
+          reason: String(enabledReason),
+        } : expectedFailureReason ? {
           status: 'expected-failure',
           reason: String(expectedFailureReason),
         } : {}),
@@ -474,11 +491,19 @@ function expandBunEntries(entries, snapshotRoot, target, options) {
     }
     const directId = '$file';
     if (entry.includeBundlerFileTests === true && (!options.caseMatch || options.caseMatch.test(directId))) {
+      const enabledReason = entry.enabledBundlerTests?.[directId];
       const expectedFailureReason = entry.expectedFailureBundlerTests?.[directId];
+      if (entry.status === 'expected-failure' && entry.enabledBundlerTests != null) {
+        if (options.onlyStatus === 'expected-failure' && enabledReason) continue;
+        if (!options.includeExpectedFailures && options.onlyStatus !== 'expected-failure' && !enabledReason) continue;
+      }
       expanded.push({
         ...entry,
         variant: directId,
-        ...(expectedFailureReason ? {
+        ...(enabledReason ? {
+          status: 'enabled',
+          reason: String(enabledReason),
+        } : expectedFailureReason ? {
           status: 'expected-failure',
           reason: String(expectedFailureReason),
         } : {}),

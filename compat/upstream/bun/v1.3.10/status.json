@@ -706,6 +706,19 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (42 bun:test cases, 48 assertions)."
     },
+    "test/bundler/bundler_compile.test.ts": {
+      "status": "expected-failure",
+      "reason": "The remaining standalone compile matrix is not promoted by this checkpoint; exact passing generated cases are enabled below.",
+      "splitBundlerTests": true,
+      "includeBundlerFileTests": true,
+      "enabledBundlerTests": {
+        "compile/pathToFileURLWorks": "Standalone import.meta path and URL identity matches Bun's virtual executable entry (1 case, 1 assertion)."
+      },
+      "env": {
+        "COTTONTAIL_TEST_TIMEOUT_SCALE": "6"
+      },
+      "timeoutMs": 180000
+    },
     "test/bundler/cli.test.ts": {
       "status": "enabled",
       "reason": "All 10 active build CLI cases pass with 32 assertions across warnings, UTF-8 input and paths, nested standalone outfiles, tsconfig overrides, source maps, and exact build summaries; two Windows-only cases remain platform-skipped.",
