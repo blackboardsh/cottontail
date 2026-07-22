@@ -711,6 +711,22 @@ function createHtmlDispatcher(config, development) {
     return { body: sourceText, sourceText, hmrEntries, buildError: false, errors: [] };
   }
 
+  async function internalHtmlFailureLogs(sourceText, htmlPath, outdir, buildConfig) {
+    const logs = [];
+    for (const { entryPath } of localHtmlModuleScripts(sourceText, htmlPath)) {
+      try {
+        await buildInternalBakeEntry(entryPath, outdir, buildConfig);
+      } catch (error) {
+        if (error instanceof AggregateError) logs.push(...error.errors);
+      }
+    }
+    // COTTONTAIL-COMPAT: Bun's native HTML DevServer builds browser scripts as
+    // an internal Bake graph, so diagnostics use Bake-specific ranges/messages.
+    // Replay the structured module-script entries in that format instead of
+    // rewriting generic Bun.build diagnostic strings or source positions.
+    return logs;
+  }
+
   async function buildHtml(htmlPath) {
     let pending = bundles.get(htmlPath);
     if (pending) return pending;
@@ -739,7 +755,10 @@ function createHtmlDispatcher(config, development) {
             const deferred = await buildDeferredHtmlHmr(sourceText, htmlPath, outdir, buildConfig);
             if (deferred !== null) return deferred;
           }
-          const errors = bakeBuildErrors(result.logs ?? [], htmlPath);
+          const internalLogs = buildConfig.hmr === false
+            ? []
+            : await internalHtmlFailureLogs(sourceText, htmlPath, outdir, buildConfig);
+          const errors = bakeBuildErrors(internalLogs.length > 0 ? internalLogs : result.logs ?? [], htmlPath);
           return {
             body: bakeBuildErrorPage(errors),
             sourceText,
@@ -2023,18 +2042,23 @@ function installDevelopmentSocket(config, bakeRuntime) {
   const queuedChangedPaths = new Set();
 
   function broadcastUpdate(update) {
-    if (!update.hardReload && update.packets.length === 0) return;
+    if (!update.hardReload && update.packets.length === 0) return false;
+    let sent = false;
     for (const browserSocket of browserSockets) {
       const browserSession = watchSessions.get(browserSocket);
       if (!update.hardReload && update.packets.length > 0 && browserSession?.kind === "hmr-browser") {
         for (const packet of update.packets) browserSocket.sendBinary(packet);
+        sent = true;
       } else if (browserSession?.kind === "hmr-browser") {
         // A second version frame tells Bun's full HMR client to reload.
         browserSocket.sendBinary(new TextEncoder().encode(`V${bakeClientVersion()}`));
+        sent = true;
       } else {
         browserSocket.sendBinary(new Uint8Array(["u".charCodeAt(0)]));
+        sent = true;
       }
     }
+    return sent;
   }
 
   async function runUpdate(changedPaths = []) {
@@ -2045,14 +2069,15 @@ function installDevelopmentSocket(config, bakeRuntime) {
     }
     updatePromise = (async () => {
       let update;
+      let hadSentHmrEvent = false;
       do {
         updateQueued = false;
         const currentChangedPaths = [...queuedChangedPaths];
         queuedChangedPaths.clear();
         update = await bakeRuntime?.update?.(currentChangedPaths) ?? { hardReload: true, packets: [] };
-        broadcastUpdate(update);
+        hadSentHmrEvent = broadcastUpdate(update) || hadSentHmrEvent;
       } while (updateQueued);
-      return update;
+      return { ...update, hadSentHmrEvent };
     })();
     try {
       return await updatePromise;
@@ -2170,9 +2195,9 @@ function installDevelopmentSocket(config, bakeRuntime) {
             session.phase = "building";
             explicitWatchers = Math.max(0, explicitWatchers - 1);
             try {
-              await runUpdate(session.changedPaths);
+              const update = await runUpdate(session.changedPaths);
               automaticSnapshot = projectSnapshot(projectRoot);
-              sendWatchEvent(socket, browserSockets.size > 0 ? 4 : 3);
+              sendWatchEvent(socket, update.hadSentHmrEvent ? 4 : 3);
             } catch (error) {
               console.error(error);
               sendWatchEvent(socket, 3);

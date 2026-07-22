@@ -683,6 +683,10 @@
       "status": "enabled",
       "reason": "Bake development and production compilation pass all 12 copied cases with 27 assertions."
     },
+    "test/bake/dev/bundle.test.ts": {
+      "status": "enabled",
+      "reason": "Bake bundle graph recovery, HTML diagnostics, client-side import validation, and loader behavior pass all 16 copied cases with 39 assertions."
+    },
     "test/bake/dev/html.test.ts": {
       "status": "enabled",
       "reason": "Bake HTML development routing, script/style injection, and response behavior pass all 7 copied cases with 26 assertions."
