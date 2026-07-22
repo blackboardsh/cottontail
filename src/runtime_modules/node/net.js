@@ -55,6 +55,13 @@ function makeNodeError(ErrorType, message, code, details = undefined) {
   const error = new ErrorType(message);
   error.code = code;
   if (details) Object.assign(error, details);
+  Object.defineProperty(error, "toString", {
+    configurable: true,
+    writable: true,
+    value() {
+      return `${this.name} [${this.code}]: ${this.message}`;
+    },
+  });
   return error;
 }
 
@@ -140,6 +147,26 @@ function installFdWatchDispatcher() {
     });
   }
   return listeners;
+}
+
+function pendingConnectIdForAcceptedSocket(socket) {
+  const localPort = Number(socket?.localPort);
+  const localAddress = socket?.localAddress;
+  if (!Number.isInteger(localPort) || typeof localAddress !== "string") return null;
+
+  for (const listener of globalThis.__cottontailTcpConnectListeners?.values?.() ?? []) {
+    const target = listener?.__cottontailConnectTarget;
+    if (Number(target?.port) !== localPort || typeof target?.address !== "string") continue;
+    if (target.address === localAddress) return target.id;
+
+    const targetFamily = isIP(target.address);
+    const localFamily = isIP(localAddress);
+    if (targetFamily === 0 || localFamily === 0) continue;
+    const targetRecord = addressRecord(target.address, `ipv${targetFamily}`, "address", false);
+    const localRecord = addressRecord(localAddress, `ipv${localFamily}`, "address", false);
+    if (targetRecord != null && localRecord != null && compareAddressRecords(targetRecord, localRecord) === 0) return target.id;
+  }
+  return null;
 }
 
 function startAcceptWatch(target, fd, referenced, onReadable, onError = (error) => target.emit("error", error)) {
@@ -248,12 +275,19 @@ function connectionException(rawError, options, host, port) {
     else if (/network.*unreachable|ENETUNREACH/i.test(text)) code = "ENETUNREACH";
     else if (/reset|ECONNRESET/i.test(text)) code = "ECONNRESET";
   }
+  if (typeof code === "string" && code.startsWith("ERR_")) return original;
+  if (original.syscall === "getaddrinfo") {
+    if (original.code == null && code != null) original.code = code;
+    if (original.errno == null && code != null) original.errno = code;
+    if (original.hostname == null) original.hostname = host;
+    return original;
+  }
   if (code === "ENOTFOUND") {
     const error = new Error(`getaddrinfo ENOTFOUND ${host}`);
     error.code = "ENOTFOUND";
-    error.errno = -3008;
+    error.errno = original.errno ?? -3008;
     error.syscall = "getaddrinfo";
-    error.hostname = host;
+    error.hostname = original.hostname ?? host;
     return error;
   }
   if (code == null) {
@@ -271,6 +305,20 @@ function connectionException(rawError, options, host, port) {
     error.address = host;
     error.port = port;
   }
+  return error;
+}
+
+function errnoException(errno, syscall) {
+  const normalized = Number(errno);
+  let code;
+  try {
+    code = process.binding?.("uv")?.errname?.(normalized);
+  } catch {}
+  code ??= `Unknown system error ${normalized}`;
+  const error = new Error(`${syscall} ${code}`);
+  error.errno = normalized;
+  error.code = code;
+  error.syscall = syscall;
   return error;
 }
 
@@ -355,9 +403,11 @@ class SocketImpl extends Duplex {
       ? options.onread
       : null;
     this._abortSignal = null;
+    this._abortListener = null;
     this._abortReason = undefined;
     this._connectAttemptIds = new Set();
     this._connectAttemptTimers = new Set();
+    this._connectFailureTimer = null;
     this._connectGeneration = 0;
     this._host = undefined;
     this._port = undefined;
@@ -502,7 +552,8 @@ class SocketImpl extends Duplex {
         this._timeoutTimer = null;
         if (!this.destroyed && Number(this._timeoutValue) > 0) this.emit("timeout");
       }, timeout);
-      if (!this._refed) this._timeoutTimer.unref?.();
+      // Node and Bun do not let an inactivity timeout keep the event loop alive.
+      this._timeoutTimer.unref?.();
     }
     return this;
   }
@@ -880,6 +931,7 @@ class SocketImpl extends Duplex {
     this._connectGeneration += 1;
     for (const timer of this._connectAttemptTimers) clearTimeout(timer);
     this._connectAttemptTimers.clear();
+    this._connectFailureTimer = null;
     const listeners = globalThis.__cottontailTcpConnectListeners;
     for (const id of this._connectAttemptIds) {
       listeners?.delete?.(id);
@@ -931,7 +983,11 @@ class SocketImpl extends Duplex {
   _setupAbortSignal(signal) {
     if (signal == null || typeof signal !== "object" || this._abortSignal === signal) return;
     if (typeof signal.addEventListener !== "function") return;
+    if (this._abortSignal != null && this._abortListener != null) {
+      try { this._abortSignal.removeEventListener("abort", this._abortListener); } catch {}
+    }
     this._abortSignal = signal;
+    this._abortListener = null;
     const abortReason = () => signal.reason !== undefined ? signal.reason : (() => {
       const err = new Error("The operation was aborted");
       err.name = "AbortError";
@@ -957,14 +1013,35 @@ class SocketImpl extends Duplex {
       return;
     }
     const onAbort = () => abort();
+    this._abortListener = onAbort;
     signal.addEventListener("abort", onAbort, { once: true });
     this.once("close", () => {
+      if (this._abortSignal !== signal) return;
       try {
         signal.removeEventListener("abort", onAbort);
       } catch {
         // ignore
       }
+      this._abortListener = null;
     });
+  }
+
+  _scheduleConnectFailure(error, options = {}) {
+    if (this.destroyed || !this.connecting || this._connectFailureTimer != null) return;
+    const signalPending = this._abortSignal != null && !this._abortSignal.aborted;
+    const delay = signalPending
+      ? Math.max(10, Number(options.autoSelectFamilyAttemptTimeout ?? defaultAutoSelectFamilyAttemptTimeout))
+      : 10;
+    const timer = setTimeout(() => {
+      this._connectAttemptTimers.delete(timer);
+      if (this._connectFailureTimer === timer) this._connectFailureTimer = null;
+      if (this.destroyed || !this.connecting || this._abortReason !== undefined) return;
+      this.connecting = false;
+      this.destroy(error);
+    }, delay);
+    this._connectFailureTimer = timer;
+    this._connectAttemptTimers.add(timer);
+    if (!this._refed) timer.unref?.();
   }
 
   _resolveConnectAddresses(host, options, callback) {
@@ -985,41 +1062,62 @@ class SocketImpl extends Duplex {
       return;
     }
     const all = autoSelectFamily && family === 0;
+    const invalidIpAddress = (value) => makeNodeError(TypeError, `Invalid IP address: ${String(value)}`, "ERR_INVALID_IP_ADDRESS");
+    const invalidAddressFamily = (value) => makeNodeError(
+      TypeError,
+      `Invalid address family: ${String(value)} ${host}:${String(options.port ?? 0)}`,
+      "ERR_INVALID_ADDRESS_FAMILY",
+      { host, port: Number(options.port ?? 0) },
+    );
     const done = (error, result, resultFamily = undefined) => {
       if (error) {
         this.emit("lookup", error, undefined, undefined, host);
         callback(error);
         return;
       }
-      let records;
-      if (all) {
-        records = Array.isArray(result) ? result : [];
-      } else if (result && typeof result === "object" && !ArrayBuffer.isView(result)) {
-        records = Array.isArray(result) ? result : [result];
-      } else {
-        records = [{ address: result, family: resultFamily }];
-      }
-      try {
-        records = records.map((record) => ({
-          address: String(record?.address ?? record ?? ""),
-          family: normalizeSocketFamily(record?.family ?? resultFamily ?? family),
-        }));
-      } catch (lookupError) {
-        callback(lookupError);
+      if (!all) {
+        this.emit("lookup", null, result, resultFamily, host);
+        if (typeof result !== "string" || isIP(result) === 0) {
+          callback(invalidIpAddress(result));
+          return;
+        }
+        if (resultFamily !== 4 && resultFamily !== 6) {
+          callback(invalidAddressFamily(resultFamily));
+          return;
+        }
+        const actualFamily = isIP(result);
+        if (family && actualFamily !== family) {
+          callback(invalidIpAddress(result));
+          return;
+        }
+        callback(null, [{ address: result, family: actualFamily }]);
         return;
       }
+
+      const records = Array.isArray(result) ? result : [];
       const valid = [];
+      let firstError = records.length === 0 ? invalidIpAddress(undefined) : null;
       for (const record of records) {
-        const actualFamily = isIP(record.address);
-        this.emit("lookup", null, record.address || undefined, record.family || actualFamily || undefined, host);
-        if (!actualFamily || (record.family && record.family !== actualFamily)) continue;
+        const address = record?.address;
+        const recordFamily = record?.family;
+        this.emit("lookup", null, address, recordFamily, host);
+        if (typeof address !== "string" || isIP(address) === 0) {
+          firstError ??= invalidIpAddress(address);
+          continue;
+        }
+        if (recordFamily !== 4 && recordFamily !== 6) {
+          firstError ??= invalidAddressFamily(recordFamily);
+          continue;
+        }
+        const actualFamily = isIP(address);
+        if (recordFamily !== actualFamily) continue;
         if (family && actualFamily !== family) continue;
-        if (!valid.some((candidate) => candidate.address === record.address && candidate.family === actualFamily)) {
-          valid.push({ address: record.address, family: actualFamily });
+        if (!valid.some((candidate) => candidate.address === address && candidate.family === actualFamily)) {
+          valid.push({ address, family: actualFamily });
         }
       }
       if (valid.length === 0) {
-        callback(makeNodeError(TypeError, `Invalid IP address: ${String(records[0]?.address ?? result)}`, "ERR_INVALID_IP_ADDRESS"));
+        callback(firstError ?? invalidIpAddress(records[0]?.address));
         return;
       }
       if (all && valid.length > 1) {
@@ -1037,10 +1135,6 @@ class SocketImpl extends Duplex {
     };
 
     if (options.lookup != null) {
-      if (typeof options.lookup !== "function") {
-        callback(invalidArgType("options.lookup", "of type function", options.lookup));
-        return;
-      }
       try {
         options.lookup(host, { family, hints: Number(options.hints) || 0, all }, done);
       } catch (error) {
@@ -1049,15 +1143,40 @@ class SocketImpl extends Duplex {
       return;
     }
 
-    try {
-      if (typeof cottontail.dnsLookup !== "function") throw new Error("native DNS lookup is unavailable");
-      const records = Array.from(cottontail.dnsLookup(host, family) ?? []);
-      done(null, all ? records : records[0]);
-    } catch (rawError) {
-      const error = rawError instanceof Error ? rawError : new Error(String(rawError));
-      if (error.code == null) error.code = "ENOTFOUND";
-      done(error);
+    const onNativeRecords = (records) => {
+      const normalized = Array.from(records ?? []);
+      if (all) done(null, normalized);
+      else done(null, normalized[0]?.address, normalized[0]?.family);
+    };
+    if (typeof cottontail.dnsLookupAsync === "function") {
+      try {
+        cottontail.dnsLookupAsync(host, family, Number(options.hints) || 0, (code, records) => {
+          if (code != null) {
+            const error = new Error(`getaddrinfo ${String(code)} ${host}`);
+            error.code = String(code);
+            error.errno = code === "ENOTFOUND" ? -3008 : code;
+            error.syscall = "getaddrinfo";
+            error.hostname = host;
+            done(error);
+            return;
+          }
+          onNativeRecords(records);
+        });
+      } catch (rawError) {
+        queueMicrotask(() => done(rawError instanceof Error ? rawError : new Error(String(rawError))));
+      }
+      return;
     }
+    queueMicrotask(() => {
+      try {
+        if (typeof cottontail.dnsLookup !== "function") throw new Error("native DNS lookup is unavailable");
+        onNativeRecords(cottontail.dnsLookup(host, family));
+      } catch (rawError) {
+        const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+        if (error.code == null) error.code = "ENOTFOUND";
+        done(error);
+      }
+    });
   }
 
   _attemptConnectAddresses(options, host, port, addresses) {
@@ -1073,14 +1192,14 @@ class SocketImpl extends Duplex {
 
     const fail = () => {
       if (this.destroyed || !this.connecting || generation !== this._connectGeneration) return;
-      this.connecting = false;
+      let error;
       if (errors.length > 1) {
-        const error = new AggregateError(errors, "All connection attempts failed");
+        error = new AggregateError(errors, "All connection attempts failed");
         error.code = errors[0]?.code;
-        this.destroy(error);
       } else {
-        this.destroy(errors[0] ?? connectionException(new Error("Failed to connect"), options, host, port));
+        error = errors[0] ?? connectionException(new Error("Failed to connect"), options, host, port);
       }
+      this._scheduleConnectFailure(error, options);
     };
 
     const startNext = () => {
@@ -1145,7 +1264,7 @@ class SocketImpl extends Duplex {
           timeoutTimer = null;
         }
       };
-      listeners.set(attemptId, _wrapAsyncCallback((event) => {
+      const connectListener = _wrapAsyncCallback((event) => {
         if (event?.type !== "connect") return;
         clearAttempt();
         let result;
@@ -1170,7 +1289,9 @@ class SocketImpl extends Duplex {
         errors.push(error);
         this.emit("connectionAttemptFailed", address, port, family, error);
         startNext();
-      }));
+      });
+      connectListener.__cottontailConnectTarget = { id: attemptId, address, port };
+      listeners.set(attemptId, connectListener);
 
       if (index < addresses.length) {
         timeoutTimer = setTimeout(() => {
@@ -1205,6 +1326,11 @@ class SocketImpl extends Duplex {
       throw makeNodeError(TypeError, `Invalid IP address: ${String(options.localAddress)}`, "ERR_INVALID_IP_ADDRESS");
     }
     if (options.localPort != null) validatePort(options.localPort, "options.localPort");
+    if (options.family != null) normalizeSocketFamily(options.family);
+    if (options.lookup != null && typeof options.lookup !== "function") {
+      throw invalidArgType("options.lookup", "of type function", options.lookup);
+    }
+    if (options.signal !== undefined) validateAbortSignal(options.signal);
     if (options.autoSelectFamily != null && typeof options.autoSelectFamily !== "boolean") {
       throw invalidArgType("options.autoSelectFamily", "of type boolean", options.autoSelectFamily);
     }
@@ -1239,16 +1365,7 @@ class SocketImpl extends Duplex {
     this._port = port;
     const failConnect = (rawError) => {
       const error = connectionException(rawError, options, host, port);
-      const timer = setTimeout(() => {
-        this._connectAttemptTimers.delete(timer);
-        if (this.destroyed || !this.connecting || this._abortReason !== undefined) return;
-        this.connecting = false;
-        this.destroy(error);
-      // A synchronous resolver failure still has to leave user code a turn to
-      // unref the pending socket before the error becomes runnable.
-      }, 10);
-      this._connectAttemptTimers.add(timer);
-      if (!this._refed) timer.unref?.();
+      this._scheduleConnectFailure(error, options);
     };
     const attachConnected = (result) => {
       queueMicrotask(() => {
@@ -1478,7 +1595,8 @@ class SocketImpl extends Duplex {
     return this;
   }
   setTimeout(timeout, callback) {
-    if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout < 0) throw outOfRange("msecs", "a non-negative finite number", timeout);
+    if (typeof timeout !== "number") throw invalidArgType("msecs", "of type number", timeout);
+    if (!Number.isFinite(timeout) || timeout < 0) throw outOfRange("msecs", "a non-negative finite number", timeout);
     if (callback !== undefined && typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
     this._timeoutValue = Math.trunc(timeout);
     this.timeout = this._timeoutValue;
@@ -1539,7 +1657,6 @@ class SocketImpl extends Duplex {
   }
   ref() {
     this._refed = true;
-    this._timeoutTimer?.ref?.();
     this._writeRetryTimer?.ref?.();
     this._destroyCloseTimer?.ref?.();
     for (const timer of this._connectAttemptTimers) timer.ref?.();
@@ -1622,6 +1739,10 @@ class ServerImpl extends EventEmitter {
     this._acceptTimer = null;
     this._acceptWatchId = 0;
     this._unregisterAcceptWatch = null;
+    this._acceptDispatchTimer = null;
+    this._pendingAcceptEvents = [];
+    this.__handleWrap = null;
+    this.__handleOverride = undefined;
     this._activeSockets = new Set();
     this._unref = false;
     this._usingWorkers = false;
@@ -1641,6 +1762,27 @@ class ServerImpl extends EventEmitter {
     if (typeof connectionListener === "function") this.on("connection", connectionListener);
   }
 
+  get _handle() {
+    if (this.__handleOverride !== undefined) return this.__handleOverride;
+    if (!this.listening || this._fd == null) return null;
+    if (this.__handleWrap == null) {
+      const owner = this;
+      this.__handleWrap = {
+        get fd() { return owner._fd ?? -1; },
+        getsockname(out = {}) { return owner._getsockname(out); },
+        close(callback) { owner.close(callback); },
+        ref() { owner.ref(); },
+        unref() { owner.unref(); },
+        hasRef() { return !owner._unref; },
+      };
+    }
+    return this.__handleWrap;
+  }
+
+  set _handle(value) {
+    this.__handleOverride = value;
+  }
+
   _setConnectionCount(value) {
     this[kConnectionCount] = Math.max(0, Number(value) || 0);
     if (typeof this._connections === "number") this._connections = this[kConnectionCount];
@@ -1656,13 +1798,50 @@ class ServerImpl extends EventEmitter {
   }
 
   _emitCloseIfDrained() {
-    if (!this._closePending || this._fd != null || this[kConnectionCount] > 0 || this._closeEmitted) return;
+    if (
+      !this._closePending ||
+      this._fd != null ||
+      this[kConnectionCount] > 0 ||
+      this._pendingAcceptEvents.length > 0 ||
+      this._acceptDispatchTimer != null ||
+      this._closeEmitted
+    ) return;
     this._closeEmitted = true;
     queueMicrotask(() => this.emit("close"));
   }
 
   _createAcceptedSocket(_accepted, options) {
     return new Socket(options);
+  }
+
+  _queueAcceptEvent(type, value, connectAttemptId = null) {
+    this._pendingAcceptEvents.push({ type, value, connectAttemptId });
+    if (this._acceptDispatchTimer != null) return;
+    this._scheduleAcceptDispatch();
+  }
+
+  _scheduleAcceptDispatch(waitForConnect = false) {
+    const dispatch = () => {
+      this._acceptDispatchTimer = null;
+      const connectListeners = globalThis.__cottontailTcpConnectListeners;
+      if (this._pendingAcceptEvents.some(event => event.connectAttemptId != null && connectListeners?.has?.(event.connectAttemptId))) {
+        this._scheduleAcceptDispatch(true);
+        return;
+      }
+      const events = this._pendingAcceptEvents.splice(0);
+      for (const event of events) {
+        if (event.type === "drop") {
+          this.emit("drop", event.value);
+          continue;
+        }
+        const socket = event.value;
+        this.emit("connection", socket);
+        if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
+      }
+      this._emitCloseIfDrained();
+    };
+    this._acceptDispatchTimer = waitForConnect ? setTimeout(dispatch, 1) : setImmediate(dispatch);
+    if (this._unref) this._acceptDispatchTimer.unref?.();
   }
 
   listen(...args) {
@@ -1707,6 +1886,8 @@ class ServerImpl extends EventEmitter {
     if (callback !== undefined) this.once("listening", callback);
     this._closePending = false;
     this._closeEmitted = false;
+    this.__handleWrap = null;
+    this.__handleOverride = undefined;
     this._options = { ...this._options, ...options };
     try {
       let result;
@@ -1806,14 +1987,16 @@ class ServerImpl extends EventEmitter {
       if (blocked || overLimit) {
         try { cottontail.closeFd?.(accepted.fd); } catch {}
         const familyName = (value, address) => String(value ?? (String(address ?? "").includes(":") ? "IPv6" : "IPv4")).replace(/^ipv/i, "IPv");
-        this.emit("drop", {
+        const data = {
           localAddress: accepted.local?.address ?? this._address?.address,
           localPort: accepted.local?.port ?? this._address?.port,
           localFamily: familyName(accepted.local?.family, accepted.local?.address ?? this._address?.address),
           remoteAddress: accepted.remote?.address,
           remotePort: accepted.remote?.port,
           remoteFamily: familyName(accepted.remote?.family, accepted.remote?.address),
-        });
+        };
+        if (this._pendingAcceptEvents.length > 0) this._queueAcceptEvent("drop", data);
+        else this.emit("drop", data);
         continue;
       }
       const socketOptions = {
@@ -1846,8 +2029,21 @@ class ServerImpl extends EventEmitter {
         this._activeSockets.delete(socket);
         this._decrementConnections();
       });
-      this.emit("connection", socket);
-      if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
+      // libuv can report listener readability before the matching local client
+      // connect completion. Deliver plain accepted sockets in the next check
+      // phase, preserving Node/Bun's client-connect-before-server-connection order.
+      if (socket.encrypted) {
+        this.emit("connection", socket);
+        if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
+      } else {
+        const connectAttemptId = pendingConnectIdForAcceptedSocket(socket);
+        if (connectAttemptId != null || this._pendingAcceptEvents.length > 0) {
+          this._queueAcceptEvent("connection", socket, connectAttemptId);
+        } else {
+          this.emit("connection", socket);
+          if (!this.pauseOnConnect && !socket.isPaused()) socket.resume();
+        }
+      }
     }
   }
 
@@ -1872,6 +2068,8 @@ class ServerImpl extends EventEmitter {
     this._ownsPipePath = false;
     this.listening = false;
     this._address = null;
+    this.__handleWrap = null;
+    this.__handleOverride = undefined;
     this._emitCloseIfDrained();
     return this;
   }
@@ -1883,13 +2081,28 @@ class ServerImpl extends EventEmitter {
   address() {
     if (!this.listening || this._fd == null) return null;
     if (this._isPipe) return this._address;
-    if (!this._address) return null;
-    const address = this._address.address ?? "0.0.0.0";
-    const rawFamily = this._address.family;
+    const out = {};
+    const result = this._handle?.getsockname?.(out);
+    if (result) throw errnoException(result, "address");
+    const address = out.address ?? "0.0.0.0";
+    const rawFamily = out.family;
     const family = rawFamily != null
       ? String(rawFamily).replace(/^ipv/i, "IPv")
       : (String(address).includes(":") ? "IPv6" : "IPv4");
-    return { address, family, port: Number(this._address.port ?? 0) };
+    return { address, family, port: Number(out.port ?? 0) };
+  }
+
+  _getsockname(out = {}) {
+    if (!this.listening || this._fd == null) return -9;
+    let address = this._address;
+    if (address == null) {
+      try { address = cottontail.tcpSocketAddress?.(this._fd, false) ?? null; } catch { return -9; }
+    }
+    if (address == null) return -9;
+    out.address = address.address ?? "0.0.0.0";
+    out.family = String(address.family ?? (String(out.address).includes(":") ? "IPv6" : "IPv4")).replace(/^ipv/i, "IPv");
+    out.port = Number(address.port ?? 0);
+    return 0;
   }
   getConnections(callback) {
     if (callback !== undefined && typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
@@ -1899,12 +2112,14 @@ class ServerImpl extends EventEmitter {
   ref() {
     this._unref = false;
     this._acceptTimer?.ref?.();
+    this._acceptDispatchTimer?.ref?.();
     if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, true);
     return this;
   }
   unref() {
     this._unref = true;
     this._acceptTimer?.unref?.();
+    this._acceptDispatchTimer?.unref?.();
     if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, false);
     return this;
   }
