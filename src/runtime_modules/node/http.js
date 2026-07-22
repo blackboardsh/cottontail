@@ -3936,15 +3936,24 @@ function websocketTlsServername(hostname) {
   return isIP(address) ? undefined : value;
 }
 
+function websocketTlsSecurityOptions(hostname, options = {}) {
+  const tls = {
+    servername: options.serverName ?? options.servername ?? websocketTlsServername(hostname),
+    rejectUnauthorized: options.rejectUnauthorized !== false,
+  };
+  for (const name of ["ca", "cert", "key", "passphrase"]) {
+    if (options[name] !== undefined) tls[name] = options[name];
+  }
+  return tls;
+}
+
 // Wraps an established byte stream (e.g. an HTTP CONNECT tunnel) in a TLS
 // client session using the shared memory-BIO Duplex transport.
 function websocketTlsOverStream(stream, options, callback, onError) {
   try {
     const tlsSocket = tlsConnect({
       socket: stream,
-      servername: options.servername,
-      rejectUnauthorized: options.rejectUnauthorized,
-      ca: options.ca,
+      ...options,
     });
     callback(tlsSocket);
   } catch (error) {
@@ -4078,9 +4087,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
           ? tlsConnect({
               host,
               port,
-              servername: websocketTlsServername(host),
-              rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
-              ca: tlsOptions.ca,
+              ...websocketTlsSecurityOptions(host, tlsOptions),
             })
           : netConnect(port, host);
       } catch (error) {
@@ -4125,9 +4132,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
         ? tlsConnect({
             host: proxyHost,
             port: proxyPort,
-            servername: websocketTlsServername(proxyHost),
-            rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
-            ca: tlsOptions.ca,
+            ...websocketTlsSecurityOptions(proxyHost, tlsOptions),
           })
         : netConnect(proxyPort, proxyHost);
     } catch (error) {
@@ -4166,11 +4171,7 @@ export const WebSocket = globalThis.WebSocket ?? class WebSocket extends EventEm
       // wss:// target: negotiate TLS inside the tunnel.
       websocketTlsOverStream(
         socket,
-        {
-          servername: websocketTlsServername(host),
-          rejectUnauthorized: tlsOptions.rejectUnauthorized !== false,
-          ca: tlsOptions.ca,
-        },
+        websocketTlsSecurityOptions(host, tlsOptions),
         (tlsSocket) => {
           this._socket = tlsSocket;
           tlsSocket.on("secureConnect", () => this._startHandshake(tlsSocket));

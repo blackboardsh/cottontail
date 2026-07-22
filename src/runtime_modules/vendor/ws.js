@@ -123,6 +123,20 @@ function replacePropertyListener(target, name, listener, wrap) {
   target.on(name, wrapped);
 }
 
+function eventTargetMessageData(data, isBinary) {
+  if (isBinary || typeof data === "string") return data;
+  return bytesFromData(data).toString("utf8");
+}
+
+function createEvent(type, target, properties = undefined) {
+  return Object.assign({ type, target, currentTarget: target }, properties);
+}
+
+function callEventListener(listener, target, event) {
+  if (typeof listener === "function") listener.call(target, event);
+  else listener.handleEvent.call(listener, event);
+}
+
 class WebSocket extends EventEmitter {
   static [Symbol.toStringTag] = "WebSocket";
   static CONNECTING = CONNECTING;
@@ -247,7 +261,10 @@ class WebSocket extends EventEmitter {
     ws.binaryType = this._binaryType === "arraybuffer" ? "arraybuffer" : "nodebuffer";
     ws.addEventListener("open", () => this.emit("open"));
     ws.addEventListener("close", (event) => this.emit("close", event.code, event.reason, event.wasClean));
-    ws.addEventListener("error", (event) => this.emit("error", event?.error ?? event));
+    ws.addEventListener("error", (event) => {
+      const error = event?.error ?? event;
+      if (this.listenerCount("error") > 0) this.emit("error", error);
+    });
     ws.addEventListener("message", (event) => {
       const isBinary = typeof event.data !== "string";
       let data = event.data;
@@ -285,6 +302,7 @@ class WebSocket extends EventEmitter {
     } else if (typeof mask === "function") {
       callback = mask;
     }
+    if (typeof data === "number") data = String(data);
     try {
       this._ws.ping(data);
       if (typeof callback === "function") callback();
@@ -301,6 +319,7 @@ class WebSocket extends EventEmitter {
     } else if (typeof mask === "function") {
       callback = mask;
     }
+    if (typeof data === "number") data = String(data);
     try {
       this._ws.pong(data);
       if (typeof callback === "function") callback();
@@ -343,17 +362,35 @@ class WebSocket extends EventEmitter {
   }
 
   addEventListener(type, listener, options = undefined) {
-    if (typeof listener !== "function") return;
+    type = String(type);
+    if (typeof listener !== "function" && typeof listener?.handleEvent !== "function") return;
     let listeners = this._eventListeners.get(type);
     if (!listeners) this._eventListeners.set(type, listeners = new Map());
     if (listeners.has(listener)) return;
+    const once = options === true || options?.once === true;
+    const invoke = (event) => {
+      if (once) listeners.delete(listener);
+      callEventListener(listener, this, event);
+    };
     let wrapped;
-    if (type === "message") wrapped = (data) => listener({ type, target: this, data });
-    else if (type === "close") wrapped = (code, reason, wasClean) => listener({ type, target: this, code, reason, wasClean });
-    else if (type === "ping" || type === "pong") wrapped = (data) => listener({ type, target: this, data });
-    else wrapped = (event) => listener(event?.type ? event : { type, target: this });
+    if (type === "message") {
+      wrapped = (data, isBinary) => invoke(createEvent(type, this, {
+        data: eventTargetMessageData(data, isBinary),
+      }));
+    } else if (type === "close") {
+      wrapped = (code, reason, wasClean) => invoke(createEvent(type, this, { code, reason, wasClean }));
+    } else if (type === "error") {
+      wrapped = (error) => invoke(createEvent(type, this, {
+        error,
+        message: String(error?.message ?? error ?? ""),
+      }));
+    } else if (type === "ping" || type === "pong") {
+      wrapped = (data) => invoke(createEvent(type, this, { data }));
+    } else {
+      wrapped = () => invoke(createEvent(type, this));
+    }
     listeners.set(listener, wrapped);
-    if (options === true || options?.once) this.once(type, wrapped);
+    if (once) this.once(type, wrapped);
     else this.on(type, wrapped);
   }
 
@@ -368,24 +405,35 @@ class WebSocket extends EventEmitter {
   get onopen() { return this._onopen ?? null; }
   set onopen(value) {
     this._onopen = typeof value === "function" ? value : null;
-    replacePropertyListener(this, "open", this._onopen, (listener) => () => listener({ type: "open", target: this }));
+    replacePropertyListener(this, "open", this._onopen, (listener) => () => {
+      listener.call(this, createEvent("open", this));
+    });
   }
   get onerror() { return this._onerror ?? null; }
   set onerror(value) {
     this._onerror = typeof value === "function" ? value : null;
-    replacePropertyListener(this, "error", this._onerror, (listener) => (error) => listener({ type: "error", target: this, error }));
+    replacePropertyListener(this, "error", this._onerror, (listener) => (error) => {
+      listener.call(this, createEvent("error", this, {
+        error,
+        message: String(error?.message ?? error ?? ""),
+      }));
+    });
   }
   get onclose() { return this._onclose ?? null; }
   set onclose(value) {
     this._onclose = typeof value === "function" ? value : null;
     replacePropertyListener(this, "close", this._onclose, (listener) => (code, reason, wasClean) => {
-      listener({ type: "close", target: this, code, reason, wasClean });
+      listener.call(this, createEvent("close", this, { code, reason, wasClean }));
     });
   }
   get onmessage() { return this._onmessage ?? null; }
   set onmessage(value) {
     this._onmessage = typeof value === "function" ? value : null;
-    replacePropertyListener(this, "message", this._onmessage, (listener) => (data) => listener({ data, target: this, type: "message" }));
+    replacePropertyListener(this, "message", this._onmessage, (listener) => (data, isBinary) => {
+      listener.call(this, createEvent("message", this, {
+        data: eventTargetMessageData(data, isBinary),
+      }));
+    });
   }
 }
 

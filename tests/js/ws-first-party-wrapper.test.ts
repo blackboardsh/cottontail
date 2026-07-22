@@ -53,3 +53,57 @@ test("ws forwards client options through its finishRequest facade", async () => 
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("ws EventTarget listeners receive browser-shaped text and close events", async () => {
+  const server = new WebSocketServer({ port: 0 });
+  await once(server, "listening");
+  server.once("connection", (socket) => socket.send("hello", { binary: false }));
+
+  const address = server.address();
+  if (address == null || typeof address === "string") throw new Error("expected an IP listener");
+  const client = new WebSocket(`http://127.0.0.1:${address.port}/events`);
+
+  try {
+    expect(client.url.startsWith("ws://")).toBe(true);
+    const message = await new Promise<MessageEvent>((resolve) => {
+      client.addEventListener("message", {
+        handleEvent(event) {
+          resolve(event);
+        },
+      }, { once: true });
+    });
+    expect(message.data).toBe("hello");
+    expect(message.target).toBe(client);
+    expect(message.currentTarget).toBe(client);
+
+    const close = new Promise<CloseEvent>((resolve) => client.addEventListener("close", resolve, { once: true }));
+    client.close(1000, "done");
+    const event = await close;
+    expect(event.code).toBe(1000);
+    expect(event.reason).toBe("done");
+    expect(event.wasClean).toBe(true);
+  } finally {
+    client.terminate();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("ws emits connection errors before abnormal close", async () => {
+  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await once(server, "listening");
+  const address = server.address();
+  if (address == null || typeof address === "string") throw new Error("expected an IP listener");
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/closed`);
+  const events: string[] = [];
+  client.on("error", () => events.push("error"));
+  await new Promise<void>((resolve) => client.on("close", (code, reason, wasClean) => {
+    events.push("close");
+    expect(code).toBe(1006);
+    expect(reason).toBe("");
+    expect(wasClean).toBe(false);
+    resolve();
+  }));
+  expect(events).toEqual(["error", "close"]);
+});
