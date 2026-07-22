@@ -46,7 +46,7 @@ test("FrameworkRouter matches static, parameter, and optional catch-all routes",
     expect(optionalMatch?.route.page).toBe(path.join(root, "docs", "[[...slug]].tsx"));
 
     const catchAllMatch = router.match("/docs/guides/runtime");
-    expect(catchAllMatch?.params).toEqual({ slug: "runtime" });
+    expect(catchAllMatch?.params).toEqual({ slug: ["guides", "runtime"] });
     expect(catchAllMatch?.route.page).toBe(path.join(root, "docs", "[[...slug]].tsx"));
     expect(router.match("/node_modules/ignored/page")).toBeNull();
   } finally {
