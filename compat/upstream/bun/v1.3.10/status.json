@@ -764,7 +764,7 @@
     },
     "test/bundler/bundler_compile.test.ts": {
       "status": "expected-failure",
-      "reason": "39 of 51 generated standalone compile cases pass in exact isolation; the remaining cases stay expected-failure for their specific compiler or runtime gaps.",
+      "reason": "40 of 51 generated standalone compile cases pass in exact isolation; the remaining cases stay expected-failure for their specific compiler or runtime gaps.",
       "splitBundlerTests": true,
       "includeBundlerFileTests": true,
       "enabledBundlerTests": {
@@ -793,6 +793,7 @@
         "compile/ReactSSR+cjs+minify": "Minified CJS React SSR standalone output executes.",
         "compile/ReactSSR+esm": "ESM React SSR standalone output executes.",
         "compile/ReactSSR+esm+minify": "Minified ESM React SSR standalone output executes.",
+        "compile/DynamicRequire": "Runtime dynamic requires resolve external packages from the standalone working directory.",
         "compile/DynamicImport": "Runtime dynamic imports resolve external packages from the standalone working directory.",
         "compile/NoAutoInstall": "Standalone execution reports a missing package without auto-installing it.",
         "compile/CanRequireLocalPackages": "Standalone execution can require a local package from the runtime environment.",

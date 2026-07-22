@@ -961,6 +961,14 @@ function normalizeStandaloneFilePath(path) {
   return `${prefix}${parts.join("/")}` || (rooted ? prefix : ".");
 }
 
+function isStandaloneVirtualPath(path) {
+  const normalized = normalizeStandaloneFilePath(path);
+  return normalized === "/$bunfs/root" ||
+    normalized.startsWith("/$bunfs/root/") ||
+    normalized === "B:/~BUN/root" ||
+    normalized.startsWith("B:/~BUN/root/");
+}
+
 function standaloneFileEntry(path) {
   const files = globalThis.__cottontailStandaloneFiles;
   if (files == null) return { found: false, value: undefined };
@@ -1956,9 +1964,12 @@ function resolveRequestCore(request, basePath, kind = "require", packageImportSe
   const tsMapped = resolveTsconfigPathsMapping(text, startDir);
   if (tsMapped) return withSpecifierSuffix(tsMapped, suffix);
 
-  const root = packageRootFor(text, startDir);
+  let root = packageRootFor(text, startDir);
+  const runtimeStartDir = isStandaloneVirtualPath(startDir) ? cottontail.cwd() : null;
+  if (!root && runtimeStartDir != null) root = packageRootFor(text, runtimeStartDir);
   if (!root) {
-    const directFile = bareModuleFileFor(text, startDir);
+    const directFile = bareModuleFileFor(text, startDir) ??
+      (runtimeStartDir == null ? null : bareModuleFileFor(text, runtimeStartDir));
     if (directFile) return withSpecifierSuffix(directFile, suffix);
     throw packageNotFoundError(originalText, basePath, kind === "import");
   }
