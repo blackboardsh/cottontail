@@ -1692,6 +1692,16 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 2 assertions)."
     },
+    "test/integration/next-pages/test/dev-server.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Next pages development-server fixture starts, serves, and shuts down under Cottontail (1 bun:test case, 5 assertions).",
+      "timeoutMs": 180000
+    },
+    "test/integration/next-pages/test/dev-server-ssr-100.test.ts": {
+      "status": "enabled",
+      "reason": "The unchanged Next pages SSR fixture completes all 100 requests and lifecycle checks under Cottontail (1 bun:test case, 204 assertions).",
+      "timeoutMs": 300000
+    },
     "test/integration/sass/sass.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
