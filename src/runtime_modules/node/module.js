@@ -3096,7 +3096,7 @@ function staticImportCall(specifier, asyncStaticImports, attributeKeyword, attri
 
 // Single line (no trailing newline) so prepending it does not shift line
 // numbers of the transformed module source.
-const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
+const staticImportHelperSource = `const __ctStaticImport = (spec) => { const value = require(spec); if (value && (typeof value === "object" || typeof value === "function") && value[Symbol.toStringTag] === "Module") return value; const ns = { default: value }; if (value && (typeof value === "object" || typeof value === "function")) { for (const key of Object.keys(value)) { if (key !== "default") ns[key] = value[key]; } if (value.__esModule && Object.hasOwn(value, "default")) ns.default = value.default; } return ns; }; const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options); `;
 const asyncStaticImportHelperSource = `const __ctDynamicImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true); const __ctStaticImport = async (spec, options) => globalThis.__cottontailImportModule(String(spec), (typeof __ctImportMeta === "object" && __ctImportMeta && __ctImportMeta.path) || undefined, options, true, __ctModuleAncestors); `;
 const esmExportDeclarationTrivia = String.raw`((?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\r\n]*(?:\r?\n|$))*)`;
 
@@ -3104,8 +3104,13 @@ function esmExportDeclarationPattern(declaration) {
   return new RegExp(String.raw`\bexport\b${esmExportDeclarationTrivia}${declaration}`, "g");
 }
 
+function liveExportStatement(exported, expression) {
+  return `Object.defineProperty(${ESM_EXPORTS_BINDING}, ${JSON.stringify(exported)}, ` +
+    `{ configurable: true, enumerable: true, get: () => ${expression} });`;
+}
+
 function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) {
-  const exportAssignments = [];
+  const liveExportDeclarations = [];
   // Import declarations are hoisted to the top of the transformed output
   // (matching ESM semantics, where imports are initialized before any module
   // code runs, even when the import statement appears at the bottom).
@@ -3179,24 +3184,30 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     /\bexport\s*\{([^}]*)\}\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
     (_all, names, spec, attributeKeyword, attributes) => {
       const statements = [];
+      const namespace = `__cottontailReExportNamespace${importNamespaceIndex++}`;
+      statements.push(`{ const ${namespace} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`);
       for (const part of String(names).split(",")) {
         const trimmed = part.trim();
         if (!trimmed) continue;
         const pieces = trimmed.split(/\s+as\s+/);
         const local = pieces[0].trim();
         const exported = (pieces[1] ?? pieces[0]).trim();
-        statements.push(`${ESM_EXPORTS_BINDING}.${exported} = (${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}).${local};`);
+        statements.push(liveExportStatement(exported, `${namespace}[${JSON.stringify(local)}]`));
       }
+      statements.push("}");
       return statements.join(" ");
     },
   );
   output = replaceCodePattern(output,
     /\bexport\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, name, spec, attributeKeyword, attributes) => `${ESM_EXPORTS_BINDING}.${name} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)};`,
+    (_all, name, spec, attributeKeyword, attributes) => {
+      const namespace = `__cottontailReExportNamespace${importNamespaceIndex++}`;
+      return `{ const ${namespace} = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; ${liveExportStatement(name, namespace)} }`;
+    },
   );
   output = replaceCodePattern(output,
     /\bexport\s*\*\s*from\s*(['"][^'"]+['"])(?:\s+(with|assert)\s*(\{[^}]*\}))?\s*;?/g,
-    (_all, spec, attributeKeyword, attributes) => `{ const __ctNs = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") ${ESM_EXPORTS_BINDING}[__ctKey] = __ctNs[__ctKey]; } }`,
+    (_all, spec, attributeKeyword, attributes) => `{ const __ctNs = ${staticImportCall(spec, asyncStaticImports, attributeKeyword, attributes)}; for (const __ctKey of Object.keys(__ctNs)) { if (__ctKey !== "default") Object.defineProperty(${ESM_EXPORTS_BINDING}, __ctKey, { configurable: true, enumerable: true, get: () => __ctNs[__ctKey] }); } }`,
   );
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`default\b`), (_all, trivia) => {
     return `${trivia}${ESM_EXPORTS_BINDING}.default =`;
@@ -3205,31 +3216,31 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
     for (const part of codeOnlyText(bindings).split(",")) {
       const name = part.trim().replace(/^\.\.\./, "").split(/\s*:\s*|\s*=\s*/, 2).at(-1)?.trim();
       if (/^[A-Za-z_$][\w$]*$/.test(name ?? "")) {
-        exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+        liveExportDeclarations.push(liveExportStatement(name, name));
       }
     }
     return `${trivia}${kind} {${bindings}} =`;
   });
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(const|let|var)\s+([A-Za-z_$][\w$]*)\s*=`), (_all, trivia, kind, name) => {
-    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+    liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}${kind} ${name} =`;
   });
   // Declarations without initializer (e.g. the `export var ns;` emitted for
   // TypeScript namespaces by the type stripper).
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`(let|var)\s+([A-Za-z_$][\w$]*)\s*;`), (_all, trivia, kind, name) => {
-    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+    liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}${kind} ${name};`;
   });
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`async\s+function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
-    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+    liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}async function ${star}${name}(`;
   });
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`function\s*(\*?)\s*([A-Za-z_$][\w$]*)\s*\(`), (_all, trivia, star, name) => {
-    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+    liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}function ${star}${name}(`;
   });
   output = replaceCodePattern(output, esmExportDeclarationPattern(String.raw`class\s+([A-Za-z_$][\w$]*)\s*`), (_all, trivia, name) => {
-    exportAssignments.push(`${ESM_EXPORTS_BINDING}.${name} = ${name};`);
+    liveExportDeclarations.push(liveExportStatement(name, name));
     return `${trivia}class ${name} `;
   });
   output = replaceCodePattern(output, /\bexport\s*\{([^}]*)\}\s*;?/g, (_all, names) => {
@@ -3241,20 +3252,21 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
       const exported = (pieces[1] ?? pieces[0]).trim();
       if (exported === '"module.exports"' || exported === "'module.exports'") {
         if (/^[A-Za-z_$][\w$]*$/.test(local)) {
-          exportAssignments.push(`${ESM_EXPORTS_BINDING}["module.exports"] = ${local};`);
+          liveExportDeclarations.push(liveExportStatement("module.exports", local));
         }
         continue;
       }
       if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(exported)) {
-        exportAssignments.push(`${ESM_EXPORTS_BINDING}.${exported} = ${local};`);
+        liveExportDeclarations.push(liveExportStatement(exported, local));
       }
     }
     return "";
   });
   const helperSource = asyncStaticImports ? asyncStaticImportHelperSource : staticImportHelperSource;
+  const exportDeclarations = liveExportDeclarations.join(" ");
   const bindingEntries = Object.entries(importedBindings);
   if (bindingEntries.length === 0) {
-    return `${helperSource}${importDeclarations.join(" ")}${output}\n${exportAssignments.join("\n")}`;
+    return `${helperSource}${importDeclarations.join(" ")}${exportDeclarations}${output}`;
   }
   const bindingScope = "__cottontailImportedBindings";
   const bindingDeclarations = bindingEntries.map(([local, expression]) =>
@@ -3268,7 +3280,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // where ordinary ESM bindings do.
   return `${helperSource}const ${bindingScope} = Object.create(null);` +
     `${importDeclarations.join(" ")}${bindingDeclarations.join(" ")}` +
-    `with (${bindingScope}) { ${output}\n${exportAssignments.join("\n")} }`;
+    `with (${bindingScope}) { ${exportDeclarations}${output} }`;
 }
 
 const dynamicErrorSourceSymbol = Symbol.for("cottontail.dynamicErrorSource");
