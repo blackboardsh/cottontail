@@ -30,6 +30,7 @@ const bunSnapshotSourceNames = new Set([
   'LICENSE.md',
   'manifest.json',
   'package.json',
+  'packages',
   'src',
   'status.json',
   'test',

@@ -2706,6 +2706,7 @@ function ctValidatePluginConstraints(constraints) {
 function ctPluginInvalidArgument(message) {
   const error = new TypeError(message);
   error.code = "ERR_INVALID_ARG_TYPE";
+  error.name = "TypeError [ERR_INVALID_ARG_TYPE]";
   return error;
 }
 

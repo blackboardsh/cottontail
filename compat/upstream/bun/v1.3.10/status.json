@@ -510,6 +510,11 @@
       "reason": "Bun.build and bun build metafile JSON/markdown generation, output path, splitting, imports, exports, CSS, and dependency analysis coverage passes under Cottontail.",
       "timeoutMs": 120000
     },
+    "test/bundler/native-plugin.test.ts": {
+      "status": "enabled",
+      "reason": "Native onBeforeParse plugins pass Node-API addon validation, source fetching and freeing, external pointers, concurrent files, logging, version diagnostics, crash attribution, callback short-circuiting, and all copied loader cases (18 cases, 35 assertions).",
+      "timeoutMs": 120000
+    },
     "test/bundler/resolver/cache-node-compat.test.ts": {
       "status": "enabled",
       "reason": "Node-compatible resolution path caching, module-content eviction, failed-load rollback, and file/directory replacement behavior pass under Cottontail."
@@ -1694,8 +1699,10 @@
       "reason": "Node-compatible histogram validation, statistics, BigInt accessors, percentiles, overflow accounting, merging, reset, delta timing, JSON, and inspection pass upstream coverage."
     },
     "test/js/bun/plugin/plugins.test.ts": {
-      "status": "expected-failure",
-      "reason": "Requires Bun's plugin runtime plus upstream Svelte/virtual-module fixtures not available in Cottontail's copied snapshot yet."
+      "status": "enabled",
+      "reason": "Runtime plugins pass exact Svelte, virtual module, async loader, object export, override, validation, rejection, HTTP, recursion, and CommonJS/ESM interop coverage (30 cases, 49 assertions).",
+      "args": ["--timeout", "120000"],
+      "timeoutMs": 300000
     },
     "test/js/bun/repl/repl.test.ts": {
       "status": "enabled",

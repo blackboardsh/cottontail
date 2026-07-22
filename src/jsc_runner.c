@@ -17020,6 +17020,7 @@ static JSObjectRef ct_rusage_object(JSContextRef ctx, const struct rusage *usage
 
 static volatile sig_atomic_t ct_crash_handler_active = 0;
 static volatile sig_atomic_t ct_crash_reporting_suppressed = 0;
+static const char *volatile ct_active_native_plugin_name = NULL;
 
 #if !defined(_WIN32)
 static void ct_crash_write_all(const char *bytes, size_t length) {
@@ -17058,6 +17059,16 @@ static void ct_crash_signal_handler(int signal_number, siginfo_t *info, void *co
         ct_crash_write_all("cottontail: fatal runtime signal ", sizeof("cottontail: fatal runtime signal ") - 1);
         ct_crash_write_all(signal_name, signal_name_length);
         ct_crash_write_all("\nversion: " COTTONTAIL_VERSION "\nplatform: " CT_PLATFORM_STRING " " CT_ARCH_STRING "\n", sizeof("\nversion: " COTTONTAIL_VERSION "\nplatform: " CT_PLATFORM_STRING " " CT_ARCH_STRING "\n") - 1);
+        const char *plugin_name = ct_active_native_plugin_name;
+        if (plugin_name != NULL) {
+            size_t plugin_name_length = 0;
+            while (plugin_name_length < 1024 && plugin_name[plugin_name_length] != '\0') {
+                plugin_name_length += 1;
+            }
+            ct_crash_write_all("\x1b[31m\x1b[2m\"", sizeof("\x1b[31m\x1b[2m\"") - 1);
+            ct_crash_write_all(plugin_name, plugin_name_length);
+            ct_crash_write_all("\"\x1b[0m\n", sizeof("\"\x1b[0m\n") - 1);
+        }
     }
 
     struct sigaction action;
@@ -19649,6 +19660,10 @@ static JSValueRef ct_native_bundler_plugin_run(
         free(symbol);
         return ct_native_plugin_validation_result(ctx, "missing-symbol", NULL, exception);
     }
+    const char **plugin_name_symbol = (const char **)ct_napi_get_addon_symbol(
+        runtime->napi_env,
+        argv[0],
+        "BUN_PLUGIN_NAME");
 
     void *external = NULL;
     if (!JSValueIsUndefined(ctx, argv[2]) && !JSValueIsNull(ctx, argv[2]) &&
@@ -19710,7 +19725,10 @@ static JSValueRef ct_native_bundler_plugin_run(
         .log = ct_native_plugin_log,
     };
 
+    const char *previous_plugin_name = ct_active_native_plugin_name;
+    ct_active_native_plugin_name = plugin_name_symbol != NULL ? *plugin_name_symbol : NULL;
     callback(&arguments, &native_result);
+    ct_active_native_plugin_name = previous_plugin_name;
 
     JSObjectRef result = ct_make_object(ctx);
     const char *status = invocation.out_of_memory ? "out-of-memory" : "ok";

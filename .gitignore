@@ -27,6 +27,11 @@ compat/upstream/bun/*/*
 !compat/upstream/bun/*/src/
 !compat/upstream/bun/*/status.json
 !compat/upstream/bun/*/test/
+!compat/upstream/bun/*/packages/
+compat/upstream/bun/*/packages/*
+!compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/
+compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/*
+!compat/upstream/bun/*/packages/bun-native-bundler-plugin-api/bundler_plugin.h
 compat/upstream/**/Heap.*.heapsnapshot
 compat/upstream/**/Heap-*.heapsnapshot
 compat/upstream/**/.cottontail-compat-*
