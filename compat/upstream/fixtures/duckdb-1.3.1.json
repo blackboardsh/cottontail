@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "package": "duckdb",
+  "version": "1.3.1",
+  "nodeAbi": "137",
+  "host": "https://npm.duckdb.org/duckdb",
+  "modulePath": "lib/binding/duckdb.node",
+  "archiveEntry": "binding/duckdb.node",
+  "artifacts": {
+    "darwin-arm64": {
+      "archive": "duckdb-v1.3.1-node-v137-darwin-arm64.tar.gz",
+      "sha256": "ea8ea73a472bcd7ce5845042d6a53719b6e5cb7338aff649c445bc3d8344e233",
+      "moduleSha256": "eb806fdbc1e980cf4acd5912784f9a68f0881ef90956ce2ce4ca5894c33c3370"
+    },
+    "darwin-x64": {
+      "archive": "duckdb-v1.3.1-node-v137-darwin-x64.tar.gz",
+      "sha256": "2fb0aa8a4d699180e19d5a58c666edbba2c3575043fbca84ea9310649879e059",
+      "moduleSha256": "16d3ed21f8690bcdd354ae5b01909be0d0937419cdb75c73b36a9d178d1cb742"
+    },
+    "linux-arm64": {
+      "archive": "duckdb-v1.3.1-node-v137-linux-arm64.tar.gz",
+      "sha256": "89c34255ee51f93ed7868eeb716ca1804e6c051ff11b4b382d58326285ea6392",
+      "moduleSha256": "20731f6f3e9d203e6321b36c9f6951adb24024827d73d8e09c01bbd0c953df83"
+    },
+    "linux-x64": {
+      "archive": "duckdb-v1.3.1-node-v137-linux-x64.tar.gz",
+      "sha256": "212083fa0de660f3d24545bf5016a46c85432a195b7a6f2bee1690ebdce61042",
+      "moduleSha256": "83db65a2f08dada4bb4775d7d76a64345104316de354bec801c2f19553309944"
+    },
+    "win32-x64": {
+      "archive": "duckdb-v1.3.1-node-v137-win32-x64.tar.gz",
+      "sha256": "3f3909948863f72a120bc16684e0731b2fa8bcaeb26e10c00542db62b3e05d94",
+      "moduleSha256": "50340c0ef5aa98743f2440cb0171da38d1305bf38bff12a42aee6d0e463c6585"
+    }
+  }
+}

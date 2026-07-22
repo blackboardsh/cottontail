@@ -3120,6 +3120,39 @@ extern "C" CtNapiEnv* ct_napi_env_create(
     return env;
 }
 
+static void drain_finalizer_queues(NapiEnv* env)
+{
+    for (;;) {
+        std::deque<NapiPostedFinalizer> basic;
+        std::deque<NapiPostedFinalizer> posted;
+        {
+            std::lock_guard lock(env->async_mutex);
+            basic.swap(env->basic_finalizers);
+            posted.swap(env->posted_finalizers);
+        }
+        if (basic.empty() && posted.empty())
+            break;
+        for (const auto& finalizer : basic) {
+            BasicFinalizerScope finalizer_scope(env, true);
+            if (finalizer.callback)
+                finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
+        }
+        for (const auto& finalizer : posted) {
+            BasicFinalizerScope finalizer_scope(env, false, finalizer.is_finalizer);
+            if (finalizer.callback)
+                finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
+        }
+    }
+}
+
+static uint32_t finalizer_retain_count(const NapiFinalizerData* finalizer)
+{
+    auto* reference = finalizer ? finalizer->wrap_ref : nullptr;
+    if (!reference || reference->deleted || reference->invalidated)
+        return 0;
+    return reference->count;
+}
+
 static void destroy_single_env(NapiEnv* env)
 {
     ActiveEnvScope active_scope(env);
@@ -3184,13 +3217,28 @@ static void destroy_single_env(NapiEnv* env)
         std::fflush(nullptr);
     }
 
-    auto finalizers = env->finalizers;
-    for (auto* finalizer : finalizers) {
+    // ObjectWrap instances can retain one another through their wrap refs.
+    // Run an unretained child's destructor before the parent it will unref.
+    while (!env->finalizers.empty()) {
+        NapiFinalizerData* finalizer = nullptr;
+        uint32_t lowest_retain_count = std::numeric_limits<uint32_t>::max();
+        for (auto* candidate : env->finalizers) {
+            const uint32_t retain_count = finalizer_retain_count(candidate);
+            if (!finalizer || retain_count < lowest_retain_count) {
+                finalizer = candidate;
+                lowest_retain_count = retain_count;
+            }
+            if (retain_count == 0)
+                break;
+        }
+        if (!finalizer)
+            break;
+        env->finalizers.erase(finalizer);
         invalidate_wrap_reference(finalizer);
         run_finalizer(finalizer);
         finalizer->env = nullptr;
+        drain_finalizer_queues(env);
     }
-    env->finalizers.clear();
 
     std::vector<NapiBufferFinalizer*> buffer_finalizers;
     {
@@ -3209,27 +3257,7 @@ static void destroy_single_env(NapiEnv* env)
         finalizer->env = nullptr;
     }
 
-    for (;;) {
-        std::deque<NapiPostedFinalizer> basic;
-        std::deque<NapiPostedFinalizer> posted;
-        {
-            std::lock_guard lock(env->async_mutex);
-            basic.swap(env->basic_finalizers);
-            posted.swap(env->posted_finalizers);
-        }
-        if (basic.empty() && posted.empty())
-            break;
-        for (const auto& finalizer : basic) {
-            BasicFinalizerScope finalizer_scope(env, true);
-            if (finalizer.callback)
-                finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
-        }
-        for (const auto& finalizer : posted) {
-            BasicFinalizerScope finalizer_scope(env, false, finalizer.is_finalizer);
-            if (finalizer.callback)
-                finalizer.callback(reinterpret_cast<napi_env>(env), finalizer.data, finalizer.hint);
-        }
-    }
+    drain_finalizer_queues(env);
 
     auto references = env->references;
     for (auto* reference : references) {

@@ -23,6 +23,7 @@ const directTestTimeoutMs = Number(process.env.COTTONTAIL_UPSTREAM_TEST_TIMEOUT_
 const directTestMaxBuffer = Number(process.env.COTTONTAIL_UPSTREAM_TEST_MAX_BUFFER ?? 64 * 1024 * 1024);
 const defaultBunJobs = Math.max(1, Math.min(4, os.availableParallelism?.() ?? os.cpus().length));
 const bundlerTestDiscoveryPrefix = 'COTTONTAIL_BUNDLER_TEST_ID:';
+const duckDBUpstreamTest = 'test/js/third_party/duckdb/duckdb-basic-usage.test.ts';
 const activeChildren = new Set();
 const snapshotArtifactRoots = new Map();
 const readOnlySnapshotRoots = new Set();
@@ -407,6 +408,18 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     COTTONTAIL_REPO_ROOT: rootDir,
     ...(overrides ?? {}),
   };
+}
+
+function prepareBunTestDependencies(entries, snapshotRoot) {
+  if (!entries.some((entry) => entry.path === duckDBUpstreamTest)) return;
+  const setupScript = join(rootDir, 'scripts', 'setup-upstream-duckdb.js');
+  const result = spawnSync(process.execPath, [setupScript, '--snapshot', snapshotRoot], {
+    cwd: rootDir,
+    env: process.env,
+    stdio: 'inherit',
+  });
+  if (result.error) fail(`Failed to prepare the DuckDB upstream fixture: ${result.error.message}`);
+  if (result.status !== 0) fail(`DuckDB upstream fixture setup exited ${result.status ?? 1}.`);
 }
 
 function entryLabel(entry) {
@@ -880,6 +893,7 @@ for (const name of runtimeTargets(runtime, targets)) {
   }
 
   const entries = selectedTests(status, options, snapshotRoot, name).slice(0, options.maxTests);
+  if (name === 'bun') prepareBunTestDependencies(entries, snapshotRoot);
   const results = name === 'node'
     ? runNode(name, target, status, entries, snapshotRoot, options)
     : await runBunEntries(name, target, entries, options);
