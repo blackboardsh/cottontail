@@ -4,6 +4,8 @@ import { Buffer } from "./buffer.js";
 import { createSocket } from "./dgram.js";
 
 const nativeDnsLookup = cottontail.dnsLookup;
+const nativeDnsLookupAsync = cottontail.dnsLookupAsync;
+const nativeDnsLookupServiceAsync = cottontail.dnsLookupServiceAsync;
 
 export const ADDRCONFIG = 1024;
 export const V4MAPPED = 2048;
@@ -35,24 +37,42 @@ export const ADDRGETNETWORKPARAMS = "EADDRGETNETWORKPARAMS";
 export const CANCELLED = "ECANCELLED";
 
 const SUPPORTED_RRTYPES = new Set([
-  "A", "AAAA", "ANY", "CAA", "CNAME", "MX", "NAPTR", "NS", "PTR", "SOA", "SRV", "TLSA", "TXT",
+  "A", "AAAA", "ANY", "CAA", "CNAME", "MX", "NAPTR", "NS", "PTR", "SOA", "SRV", "TXT",
 ]);
 
-let defaultResultOrder = "verbatim";
 let servers = [];
 let serversConfigured = false;
 let cachedSystemServers = null;
 
+function defaultResultOrder() {
+  if (defaultResultOrder.value === undefined) {
+    let configured = "verbatim";
+    for (const argument of globalThis.process?.execArgv ?? []) {
+      if (argument.startsWith("--dns-result-order=")) configured = argument.slice("--dns-result-order=".length);
+    }
+    defaultResultOrder.value = configured === "ipv4first" || configured === "ipv6first" ? configured : "verbatim";
+  }
+  return defaultResultOrder.value;
+}
+
 function systemServers() {
   if (cachedSystemServers != null) return cachedSystemServers;
   const found = [];
+  try {
+    for (const server of cottontail.dnsGetSystemServers?.() ?? []) {
+      const value = String(server);
+      if (isIP(value) !== 0 && !found.includes(value)) found.push(value);
+    }
+  } catch {}
   try {
     const content = String(readFileSync("/etc/resolv.conf", "utf8"));
     for (const line of content.split(/\r?\n/)) {
       const trimmed = line.trim();
       if (trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
       const parts = trimmed.split(/\s+/);
-      if (parts.length >= 2 && parts[0] === "nameserver") found.push(parts[1]);
+      if (parts.length >= 2 && parts[0] === "nameserver" && isIP(parts[1]) !== 0 && !found.includes(parts[1])) {
+        found.push(parts[1]);
+      }
     }
   } catch {}
   cachedSystemServers = found;
@@ -77,8 +97,15 @@ function makeDnsError(error, syscall, hostname = undefined, code = NOTFOUND) {
   const effectiveCode = typeof error?.code === "string" ? error.code : code;
   const host = hostname == null ? undefined : String(hostname);
   const out = new Error(host == null ? `${syscall} ${effectiveCode}` : `${syscall} ${effectiveCode} ${host}`);
+  out.name = "DNSException";
   out.code = effectiveCode;
-  out.errno = effectiveCode;
+  out.errno = {
+    ENODATA: 1, EFORMERR: 2, ESERVFAIL: 3, ENOTFOUND: 4, ENOTIMP: 5, EREFUSED: 6,
+    EBADQUERY: 7, EBADNAME: 8, EBADFAMILY: 9, EBADRESP: 10, ECONNREFUSED: 11,
+    ETIMEOUT: 12, EOF: 13, EFILE: 14, ENOMEM: 15, EDESTRUCTION: 16, EBADSTR: 17,
+    EBADFLAGS: 18, ENONAME: 19, EBADHINTS: 20, ENOTINITIALIZED: 21,
+    ELOADIPHLPAPI: 22, EADDRGETNETWORKPARAMS: 23, ECANCELLED: 24,
+  }[effectiveCode] ?? effectiveCode;
   out.syscall = syscall;
   if (host != null) out.hostname = host;
   return out;
@@ -127,13 +154,26 @@ function validateLookupHostname(hostname) {
   }
 }
 
-function validateResolveHostname(hostname) {
-  if (typeof hostname !== "string") throw invalidArgType("name", "of type string", hostname);
+function validateResolveHostname(hostname, method = "resolve", allowEmpty = false, nativeTypeError = false) {
+  const property = method === "resolve" ? "name" : "hostname";
+  if (typeof hostname !== "string") {
+    if (!nativeTypeError) throw invalidArgType("hostname", "of type string", hostname);
+    const error = new TypeError(`Expected ${property} to be a string for '${method}'.`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (!allowEmpty && hostname.length === 0) {
+    const error = new TypeError(`Expected ${property} to be a non-empty string for '${method}'.`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
 }
 
 function normalizeRrtype(rrtype) {
   if (typeof rrtype !== "string") throw invalidArgType("rrtype", "of type string", rrtype);
-  const type = rrtype.toUpperCase();
+  if (rrtype.length === 0) return "A";
+  const uppercase = rrtype.toUpperCase();
+  const type = rrtype === uppercase || rrtype === rrtype.toLowerCase() ? uppercase : rrtype;
   if (!SUPPORTED_RRTYPES.has(type)) throw invalidRrtypeError(type);
   return type;
 }
@@ -144,26 +184,16 @@ function invalidServerError(server) {
   return error;
 }
 
-function validatePort(port, server) {
-  if (port == null) return;
-  if (!/^\d+$/.test(String(port)) || Number(port) < 0 || Number(port) > 65535) {
-    throw invalidServerError(server);
-  }
-}
-
-function normalizeServer(server) {
-  const text = String(server);
+function normalizeServer(server, index = 0) {
+  if (typeof server !== "string") throw invalidArgType(`servers[${index}]`, "of type string", server);
+  const text = server;
   let host = text;
   let port = undefined;
   if (text.startsWith("[")) {
     const end = text.indexOf("]");
     if (end < 0) throw invalidServerError(server);
     host = text.slice(1, end);
-    const rest = text.slice(end + 1);
-    if (rest) {
-      if (!rest.startsWith(":")) throw invalidServerError(server);
-      port = rest.slice(1);
-    }
+    port = /:(\d+)$/.exec(text)?.[1];
   } else {
     const firstColon = text.indexOf(":");
     const lastColon = text.lastIndexOf(":");
@@ -174,15 +204,16 @@ function normalizeServer(server) {
   }
   const family = isIP(host);
   if (family === 0) throw invalidServerError(server);
-  validatePort(port, server);
-  if (port == null || Number(port) === 53) return host;
-  return family === 6 ? `[${host}]:${Number(port)}` : `${host}:${Number(port)}`;
+  if (port != null && !/^\d+$/.test(port)) throw invalidServerError(server);
+  const portNumber = port == null ? 53 : (Number(port) & 0xffff) || 53;
+  if (portNumber === 53) return host;
+  return family === 6 ? `[${host}]:${portNumber}` : `${host}:${portNumber}`;
 }
 
 function normalizeServers(nextServers) {
   if (!Array.isArray(nextServers)) throw invalidArgType("servers", "an instance of Array", nextServers);
   // Array#map skips holes and observes a getter that shortens the source array.
-  return nextServers.map(normalizeServer).filter(() => true);
+  return nextServers.map((server, index) => normalizeServer(server, index)).filter(() => true);
 }
 
 function callbackifyDns(work, callback) {
@@ -207,7 +238,7 @@ function normalizeLookupOptions(options = {}) {
       error.code = "ERR_INVALID_ARG_VALUE";
       throw error;
     }
-    return { family: options, all: false, order: defaultResultOrder };
+    return { family: options, all: false, hints: 0, order: defaultResultOrder() };
   }
   if (typeof options !== "object") {
     const error = new TypeError(`The "options" argument must be of type object or integer. Received type ${typeof options}`);
@@ -231,24 +262,30 @@ function normalizeLookupOptions(options = {}) {
     error.code = "ERR_INVALID_ARG_VALUE";
     throw error;
   }
+  if (options.verbatim !== undefined && typeof options.verbatim !== "boolean") {
+    throw invalidArgType("options.verbatim", "of type boolean", options.verbatim);
+  }
   let order = options.order;
   if (order == null) {
-    order = options.verbatim == null ? defaultResultOrder : options.verbatim ? "verbatim" : "ipv4first";
+    order = options.verbatim == null ? defaultResultOrder() : options.verbatim ? "verbatim" : "ipv4first";
   }
   if (order !== "verbatim" && order !== "ipv4first" && order !== "ipv6first") {
     const error = new TypeError(`The property 'options.order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received ${JSON.stringify(order)}`);
     error.code = "ERR_INVALID_ARG_VALUE";
     throw error;
   }
+  if (options.all !== undefined && typeof options.all !== "boolean") {
+    throw invalidArgType("options.all", "of type boolean", options.all);
+  }
   return {
     family,
-    all: Boolean(options.all),
+    all: options.all === true,
     hints,
     order,
   };
 }
 
-function orderedRecords(records, order = defaultResultOrder) {
+function orderedRecords(records, order = defaultResultOrder()) {
   const list = [...records];
   if (order === "ipv4first") list.sort((left, right) => left.family === right.family ? 0 : left.family === 4 ? -1 : 1);
   else if (order === "ipv6first") list.sort((left, right) => left.family === right.family ? 0 : left.family === 6 ? -1 : 1);
@@ -269,7 +306,7 @@ function resolverNativeOptions(resolverState = undefined) {
 function configuredQueryServers(resolverState = undefined) {
   if (resolverState === null) return [];
   if (resolverState == null) return serversConfigured ? [...servers] : [];
-  return resolverState._serversExplicit === true ? [...resolverState._servers] : [];
+  return [...resolverState._servers];
 }
 
 function parseServerAddress(server) {
@@ -564,6 +601,7 @@ function queryDnsServer(server, hostname, type, syscall, timeout, resolverState 
       ? resolverState?._localAddress6 ?? "::"
       : resolverState?._localAddress4 ?? "0.0.0.0";
     socket.bind(0, localAddress, () => {
+      if (settled) return;
       socket.send(query.packet, target.port, target.address, (error) => {
         if (error) finish(makeDnsError(error, syscall, hostname, SERVFAIL));
       });
@@ -591,29 +629,63 @@ async function queryConfiguredDns(hostname, type, syscall, resolverState) {
 
 function callbackifyDnsAsync(work, callback) {
   validateCallback(callback);
-  queueMicrotask(() => {
-    Promise.resolve().then(work).then(
-      (values) => callback(null, ...values),
-      (error) => callback(error),
-    );
-  });
+  let pending;
+  try {
+    pending = work();
+  } catch (error) {
+    queueMicrotask(() => callback(error));
+    return;
+  }
+  Promise.resolve(pending).then(
+    (values) => callback(null, ...values),
+    (error) => callback(error),
+  );
 }
 
-function lookupRecords(hostname, family = 0, order = defaultResultOrder, resolverState = null) {
+function normalizeLookupRecords(records, hostname, family, order) {
+  const normalized = Array.from(records ?? [])
+    .map((record) => ({ address: String(record.address), family: Number(record.family) }))
+    .filter((record) => (record.family === 4 || record.family === 6) && record.address)
+    .filter((record) => family !== 4 && family !== 6 || record.family === family);
+  if (normalized.length === 0) throw makeDnsError("no DNS records found", "getaddrinfo", hostname);
+  return orderedRecords(normalized, order);
+}
+
+function lookupRecords(hostname, family = 0, order = defaultResultOrder(), resolverState = null) {
   if (hostname == null || String(hostname) === "") return [{ address: null, family: 4 }];
   if (typeof nativeDnsLookup !== "function") throw makeDnsError("native DNS lookup is unavailable", "getaddrinfo", hostname);
   try {
     const nativeOptions = resolverNativeOptions(resolverState);
-    const records = Array.from((nativeOptions == null
+    const records = nativeOptions == null
       ? nativeDnsLookup(String(hostname), Number(family) || 0)
-      : nativeDnsLookup(String(hostname), Number(family) || 0, nativeOptions)) ?? [])
-      .map((record) => ({ address: String(record.address), family: Number(record.family) }))
-      .filter((record) => (record.family === 4 || record.family === 6) && record.address);
-    if (records.length === 0) throw makeDnsError("no DNS records found", "getaddrinfo", hostname);
-    return orderedRecords(records, order);
+      : nativeDnsLookup(String(hostname), Number(family) || 0, nativeOptions);
+    return normalizeLookupRecords(records, hostname, family, order);
   } catch (error) {
     throw makeDnsError(error, "getaddrinfo", hostname);
   }
+}
+
+function lookupRecordsAsync(hostname, family = 0, order = defaultResultOrder(), hints = 0) {
+  if (typeof nativeDnsLookupAsync !== "function") {
+    return Promise.resolve().then(() => lookupRecords(hostname, family, order, null));
+  }
+  return new Promise((resolvePromise, reject) => {
+    try {
+      nativeDnsLookupAsync(String(hostname), Number(family) || 0, Number(hints) || 0, (code, records, message) => {
+        if (code != null) {
+          reject(makeDnsError({ code, message }, "getaddrinfo", hostname, code));
+          return;
+        }
+        try {
+          resolvePromise(normalizeLookupRecords(records, hostname, family, order));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    } catch (error) {
+      reject(makeDnsError(error, "getaddrinfo", hostname));
+    }
+  });
 }
 
 const DNS_CACHE_MAX_ENTRIES = 256;
@@ -657,7 +729,7 @@ function resolveForNetwork(hostname, port = 0, preload = false) {
   const entry = { createdAt: now, port: Number(port) || 0, records: null, error: null };
   dnsCacheState.entries.set(host, entry);
   try {
-    entry.records = lookupRecords(host, 0, defaultResultOrder, null);
+    entry.records = lookupRecords(host, 0, defaultResultOrder(), null);
     return entry.records.map((record) => ({ ...record }));
   } catch (error) {
     entry.error = error;
@@ -680,6 +752,25 @@ function lookupServiceRecord(address, port, resolverState = null) {
   } catch (error) {
     throw makeDnsError(error, "getnameinfo", address);
   }
+}
+
+function lookupServiceRecordAsync(address, port) {
+  if (typeof nativeDnsLookupServiceAsync !== "function") {
+    return Promise.resolve().then(() => lookupServiceRecord(address, port));
+  }
+  return new Promise((resolvePromise, reject) => {
+    try {
+      nativeDnsLookupServiceAsync(String(address), Number(port), (code, record, message) => {
+        if (code != null) {
+          reject(makeDnsError({ code, message }, "getnameinfo", address, code));
+          return;
+        }
+        resolvePromise({ hostname: String(record.hostname), service: String(record.service) });
+      });
+    } catch (error) {
+      reject(makeDnsError(error, "getnameinfo", address));
+    }
+  });
 }
 
 function resolveAddressRecords(hostname, family, options = undefined, resolverState = undefined) {
@@ -794,18 +885,26 @@ function lookupWithNormalizedOptions(hostname, normalized, callback) {
   validateCallback(callback);
   if (!hostname) {
     // Deprecated behavior (DEP0118): falsy hostname resolves to null address.
-    queueMicrotask(() => {
-      if (normalized.all) callback(null, []);
-      else callback(null, null, normalized.family === 6 ? 6 : 4);
+    if (normalized.all) callback(null, []);
+    else callback(null, null, 4);
+    return;
+  }
+  const literalFamily = isIP(hostname);
+  if (literalFamily !== 0) {
+    const record = { address: hostname, family: literalFamily };
+    process.nextTick(() => {
+      if (normalized.all) callback(null, [record]);
+      else callback(null, record.address, record.family);
     });
     return;
   }
-  callbackifyDns(() => {
-    const records = lookupRecords(hostname, normalized.family, normalized.order, null);
-    if (normalized.all) return [records];
-    const first = records[0];
-    return [first.address, first.family];
-  }, callback);
+  lookupRecordsAsync(hostname, normalized.family, normalized.order, normalized.hints).then(
+    (records) => {
+      if (normalized.all) callback(null, records);
+      else callback(null, records[0].address, records[0].family);
+    },
+    (error) => callback(error, undefined, undefined),
+  );
 }
 
 export function lookup(hostname, options = undefined, callback = undefined) {
@@ -818,7 +917,7 @@ export function lookup(hostname, options = undefined, callback = undefined) {
   return lookupWithNormalizedOptions(hostname, normalized, callback);
 }
 
-export function prefetch(hostname, port = 443) {
+function prefetch(hostname, port = 443) {
   if (arguments.length === 0) {
     const error = new TypeError("Not enough arguments to 'prefetch'. Expected 1, got 0.");
     error.code = "ERR_MISSING_ARGS";
@@ -851,7 +950,7 @@ export function prefetch(hostname, port = 443) {
   } catch {}
 }
 
-export function getCacheStats() {
+function getCacheStats() {
   return {
     cacheHitsCompleted: dnsCacheState.cacheHitsCompleted,
     cacheHitsInflight: dnsCacheState.cacheHitsInflight,
@@ -861,6 +960,9 @@ export function getCacheStats() {
     totalCount: dnsCacheState.totalCount,
   };
 }
+
+dnsCacheState.prefetch = prefetch;
+dnsCacheState.getCacheStats = getCacheStats;
 
 function validateLookupServiceArgs(address, port) {
   if (typeof address !== "string" || address.length === 0) {
@@ -873,27 +975,34 @@ function validateLookupServiceArgs(address, port) {
     error.code = "ERR_INVALID_ARG_VALUE";
     throw error;
   }
-  const portNumber = typeof port === "string" && /^\d+$/.test(port) ? Number(port) : port;
-  if (typeof portNumber !== "number" || !Number.isInteger(portNumber) || portNumber < 0 || portNumber > 65535) {
-    const received = typeof port === "string" ? `type string ('${port}')` : String(port);
-    const error = new RangeError(`Port should be >= 0 and < 65536. Received ${received}.`);
+  if (typeof port !== "number" || Number.isNaN(port)) {
+    const error = new RangeError("Invalid port number");
     error.code = "ERR_SOCKET_BAD_PORT";
     throw error;
   }
+  const portNumber = Math.trunc(port);
+  if (!Number.isFinite(port) || portNumber < 0 || portNumber > 65535) {
+    const displayed = port === Infinity ? 9223372036854775807 : port === -Infinity ? -9223372036854775808 : portNumber;
+    const error = new RangeError(`Port number out of range: ${displayed}`);
+    error.code = "ERR_SOCKET_BAD_PORT";
+    throw error;
+  }
+  return portNumber;
 }
 
 function lookupServiceWithValidatedArgs(address, port, callback) {
   validateCallback(callback);
-  callbackifyDns(() => {
-    const record = lookupServiceRecord(address, port);
-    return [record.hostname, record.service];
-  }, callback);
+  lookupServiceRecordAsync(address, port).then(
+    (record) => callback(null, record.hostname, record.service),
+    (error) => callback(error),
+  );
 }
 
 export function lookupService(address, port, callback) {
   if (arguments.length < 3) throw missingArgs(["address", "port", "callback"]);
-  validateLookupServiceArgs(address, port);
-  return lookupServiceWithValidatedArgs(address, port, callback);
+  validateCallback(callback);
+  const normalizedPort = validateLookupServiceArgs(address, port);
+  return lookupServiceWithValidatedArgs(address, normalizedPort, callback);
 }
 
 export function resolve4(hostname, options = undefined, callback = undefined) {
@@ -901,7 +1010,7 @@ export function resolve4(hostname, options = undefined, callback = undefined) {
     callback = options;
     options = undefined;
   }
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolve");
   callbackifyDnsAsync(async () => [await resolveAddressRecordsAsync(hostname, 4, options, undefined)], callback);
 }
 
@@ -910,7 +1019,7 @@ export function resolve6(hostname, options = undefined, callback = undefined) {
     callback = options;
     options = undefined;
   }
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolve");
   callbackifyDnsAsync(async () => [await resolveAddressRecordsAsync(hostname, 6, options, undefined)], callback);
 }
 
@@ -919,7 +1028,7 @@ function resolveAnyWithState(hostname, callback, resolverState = undefined) {
 }
 
 export function resolveAny(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveAny");
   return resolveAnyWithState(hostname, callback, undefined);
 }
 
@@ -936,7 +1045,7 @@ function resolvePtrWithState(hostname, callback, resolverState = undefined) {
 }
 
 export function resolvePtr(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolvePtr");
   return resolvePtrWithState(hostname, callback, undefined);
 }
 
@@ -946,12 +1055,12 @@ export function reverse(ip, callback) {
 }
 
 export function resolve(hostname, rrtype = "A", callback = undefined) {
-  validateResolveHostname(hostname);
   if (typeof rrtype === "function") {
     callback = rrtype;
     rrtype = "A";
   }
   const type = normalizeRrtype(rrtype);
+  validateResolveHostname(hostname, "resolve");
   if (type === "A") return resolve4(hostname, callback);
   if (type === "AAAA") return resolve6(hostname, callback);
   if (type === "ANY") return resolveAny(hostname, callback);
@@ -963,53 +1072,50 @@ export function resolve(hostname, rrtype = "A", callback = undefined) {
   if (type === "NS") return resolveNs(hostname, callback);
   if (type === "SOA") return resolveSoa(hostname, callback);
   if (type === "SRV") return resolveSrv(hostname, callback);
-  if (type === "TLSA") return resolveTlsa(hostname, callback);
   if (type === "TXT") return resolveTxt(hostname, callback);
   throw invalidRrtypeError(type);
 }
 
 export function resolveCaa(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateCallback(callback);
+  validateResolveHostname(hostname, "resolveCaa", false, true);
   return resolveRecordsWithState(hostname, "CAA", "queryCaa", callback, undefined);
 }
 
 export function resolveCname(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveCname");
   return resolveRecordsWithState(hostname, "CNAME", "queryCname", callback, undefined);
 }
 
 export function resolveMx(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveMx");
   return resolveRecordsWithState(hostname, "MX", "queryMx", callback, undefined);
 }
 
 export function resolveNaptr(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveNaptr");
   return resolveRecordsWithState(hostname, "NAPTR", "queryNaptr", callback, undefined);
 }
 
 export function resolveNs(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveNs", true);
   return resolveRecordsWithState(hostname, "NS", "queryNs", callback, undefined);
 }
 
 export function resolveSoa(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateCallback(callback);
+  validateResolveHostname(hostname, "resolveSoa", true, true);
   return resolveRecordsWithState(hostname, "SOA", "querySoa", callback, undefined, true);
 }
 
 export function resolveSrv(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateResolveHostname(hostname, "resolveSrv");
   return resolveRecordsWithState(hostname, "SRV", "querySrv", callback, undefined);
 }
 
-export function resolveTlsa(hostname, callback) {
-  validateResolveHostname(hostname);
-  return resolveRecordsWithState(hostname, "TLSA", "queryTlsa", callback, undefined);
-}
-
 export function resolveTxt(hostname, callback) {
-  validateResolveHostname(hostname);
+  validateCallback(callback);
+  validateResolveHostname(hostname, "resolveTxt", false, true);
   return resolveRecordsWithState(hostname, "TXT", "queryTxt", callback, undefined);
 }
 
@@ -1018,11 +1124,12 @@ export function getDefaultResultOrder() {
 }
 
 export function setDefaultResultOrder(order) {
-  const value = String(order);
-  if (value !== "verbatim" && value !== "ipv4first" && value !== "ipv6first") {
-    throw new TypeError("order must be verbatim, ipv4first, or ipv6first");
+  if (order !== "verbatim" && order !== "ipv4first" && order !== "ipv6first") {
+    const error = new TypeError(`The argument 'order' is invalid. Received ${order === undefined ? "undefined" : order === null ? "null" : typeof order === "string" ? `'${order}'` : String(order)}`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
   }
-  defaultResultOrder = value;
+  defaultResultOrder.value = order;
 }
 
 export function getServers() {
@@ -1043,11 +1150,14 @@ function promiseFromCallback(fn, ...args) {
   });
 }
 
-function normalizeResolverOptions(options = {}) {
-  if (options == null || typeof options !== "object") throw invalidArgType("options", "of type object", options);
+function normalizeResolverOptions(options = undefined) {
+  if (options === undefined) return {};
+  if (options === null || (typeof options !== "object" && typeof options !== "function")) {
+    throw new TypeError(`${String(options)} is not an Object.`);
+  }
   const normalized = {};
-  for (const name of ["timeout", "tries", "maxTimeout"]) {
-    if (options[name] === undefined) continue;
+  for (const name of ["timeout", "tries"]) {
+    if (!(name in options)) continue;
     if (typeof options[name] !== "number") throw invalidArgType(name, "of type number", options[name]);
     normalized[name] = options[name];
   }
@@ -1055,18 +1165,6 @@ function normalizeResolverOptions(options = {}) {
     !Number.isInteger(normalized.timeout) || normalized.timeout < -1 || normalized.timeout >= 2 ** 31
   )) {
     const error = new RangeError(`The value of "timeout" is out of range. Received ${normalized.timeout}`);
-    error.code = "ERR_OUT_OF_RANGE";
-    throw error;
-  }
-  if (normalized.maxTimeout !== undefined && (
-    !Number.isInteger(normalized.maxTimeout) || normalized.maxTimeout < -1 || normalized.maxTimeout >= 2 ** 31
-  )) {
-    const error = new RangeError(`The value of "maxTimeout" is out of range. Received ${normalized.maxTimeout}`);
-    error.code = "ERR_OUT_OF_RANGE";
-    throw error;
-  }
-  if (normalized.tries !== undefined && (!Number.isInteger(normalized.tries) || normalized.tries < 1 || normalized.tries >= 2 ** 31)) {
-    const error = new RangeError(`The value of "tries" is out of range. Received ${normalized.tries}`);
     error.code = "ERR_OUT_OF_RANGE";
     throw error;
   }
@@ -1078,14 +1176,14 @@ function cancelResolverQueries(resolver) {
 }
 
 function invalidLocalAddress(address) {
-  const error = new Error(`Invalid IP address: ${address}`);
-  error.code = "ERR_INVALID_ARG_VALUE";
+  const error = new TypeError(`Invalid IP address: "${address}"`);
+  error.code = "ERR_INVALID_IP_ADDRESS";
   return error;
 }
 
 function setResolverLocalAddress(resolver, first, second = undefined) {
-  if (typeof first !== "string") throw invalidArgType("ipv4", "of type string", first);
-  if (second !== undefined && typeof second !== "string") throw invalidArgType("ipv6", "of type string", second);
+  if (typeof first !== "string") throw invalidArgType("undefined", "of type string", first);
+  if (second !== undefined && typeof second !== "string") throw invalidArgType("undefined", "of type string", second);
   const firstFamily = isIP(first);
   if (firstFamily === 0) throw invalidLocalAddress(first);
   if (second === undefined) {
@@ -1093,19 +1191,32 @@ function setResolverLocalAddress(resolver, first, second = undefined) {
     else resolver._localAddress6 = first;
     return;
   }
-  if (firstFamily !== 4 || isIP(second) !== 6) throw invalidLocalAddress(`${first}, ${second}`);
-  resolver._localAddress4 = first;
-  resolver._localAddress6 = second;
+  const secondFamily = isIP(second);
+  if (secondFamily === 0) throw invalidLocalAddress(second);
+  if (firstFamily === secondFamily) {
+    const error = new TypeError(`Cannot specify two IPv${firstFamily} addresses.`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  resolver._localAddress4 = firstFamily === 4 ? first : second;
+  resolver._localAddress6 = firstFamily === 6 ? first : second;
+}
+
+function setResolverServers(resolver, nextServers) {
+  if (resolver._pendingQueries.size > 0) {
+    const error = new Error("Failed to set servers: there are pending queries");
+    error.code = "ERR_DNS_SET_SERVERS_FAILED";
+    throw error;
+  }
+  resolver._servers = normalizeServers(nextServers);
 }
 
 export class Resolver {
-  constructor(options = {}) {
+  constructor(options = undefined) {
     options = normalizeResolverOptions(options);
     this._servers = effectiveServers();
-    this._serversExplicit = false;
     this.timeout = options?.timeout;
     this.tries = options?.tries;
-    this.maxTimeout = options?.maxTimeout;
     this._pendingQueries = new Set();
     this._localAddress4 = undefined;
     this._localAddress6 = undefined;
@@ -1113,15 +1224,15 @@ export class Resolver {
 
   cancel() { cancelResolverQueries(this); }
   getServers() { return [...this._servers]; }
-  setServers(nextServers) { this._servers = normalizeServers(nextServers); this._serversExplicit = true; }
+  setServers(nextServers) { setResolverServers(this, nextServers); }
   setLocalAddress(first, second = undefined) { setResolverLocalAddress(this, first, second); }
   resolve(hostname, rrtype = "A", callback = undefined) {
-    validateResolveHostname(hostname);
     if (typeof rrtype === "function") {
       callback = rrtype;
       rrtype = "A";
     }
     const type = normalizeRrtype(rrtype);
+    validateResolveHostname(hostname, "resolve");
     if (type === "A") return this.resolve4(hostname, callback);
     if (type === "AAAA") return this.resolve6(hostname, callback);
     if (type === "ANY") return this.resolveAny(hostname, callback);
@@ -1133,7 +1244,6 @@ export class Resolver {
     if (type === "NS") return this.resolveNs(hostname, callback);
     if (type === "SOA") return this.resolveSoa(hostname, callback);
     if (type === "SRV") return this.resolveSrv(hostname, callback);
-    if (type === "TLSA") return this.resolveTlsa(hostname, callback);
     if (type === "TXT") return this.resolveTxt(hostname, callback);
     throw invalidRrtypeError(type);
   }
@@ -1142,7 +1252,7 @@ export class Resolver {
       callback = options;
       options = undefined;
     }
-    validateResolveHostname(hostname);
+    validateResolveHostname(hostname, "resolve");
     callbackifyDnsAsync(async () => [await resolveAddressRecordsAsync(hostname, 4, options, this)], callback);
   }
   resolve6(hostname, options = undefined, callback = undefined) {
@@ -1150,20 +1260,19 @@ export class Resolver {
       callback = options;
       options = undefined;
     }
-    validateResolveHostname(hostname);
+    validateResolveHostname(hostname, "resolve");
     callbackifyDnsAsync(async () => [await resolveAddressRecordsAsync(hostname, 6, options, this)], callback);
   }
-  resolveAny(hostname, callback) { validateResolveHostname(hostname); return resolveAnyWithState(hostname, callback, this); }
-  resolveCaa(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "CAA", "queryCaa", callback, this); }
-  resolveCname(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "CNAME", "queryCname", callback, this); }
-  resolveMx(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "MX", "queryMx", callback, this); }
-  resolveNaptr(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "NAPTR", "queryNaptr", callback, this); }
-  resolveNs(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "NS", "queryNs", callback, this); }
-  resolvePtr(hostname, callback) { validateResolveHostname(hostname); return resolvePtrWithState(hostname, callback, this); }
-  resolveSoa(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "SOA", "querySoa", callback, this, true); }
-  resolveSrv(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "SRV", "querySrv", callback, this); }
-  resolveTlsa(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "TLSA", "queryTlsa", callback, this); }
-  resolveTxt(hostname, callback) { validateResolveHostname(hostname); return resolveRecordsWithState(hostname, "TXT", "queryTxt", callback, this); }
+  resolveAny(hostname, callback) { validateResolveHostname(hostname, "resolveAny"); return resolveAnyWithState(hostname, callback, this); }
+  resolveCaa(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveCaa", false, true); return resolveRecordsWithState(hostname, "CAA", "queryCaa", callback, this); }
+  resolveCname(hostname, callback) { validateResolveHostname(hostname, "resolveCname"); return resolveRecordsWithState(hostname, "CNAME", "queryCname", callback, this); }
+  resolveMx(hostname, callback) { validateResolveHostname(hostname, "resolveMx"); return resolveRecordsWithState(hostname, "MX", "queryMx", callback, this); }
+  resolveNaptr(hostname, callback) { validateResolveHostname(hostname, "resolveNaptr"); return resolveRecordsWithState(hostname, "NAPTR", "queryNaptr", callback, this); }
+  resolveNs(hostname, callback) { validateResolveHostname(hostname, "resolveNs", true); return resolveRecordsWithState(hostname, "NS", "queryNs", callback, this); }
+  resolvePtr(hostname, callback) { validateResolveHostname(hostname, "resolvePtr"); return resolvePtrWithState(hostname, callback, this); }
+  resolveSoa(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveSoa", true, true); return resolveRecordsWithState(hostname, "SOA", "querySoa", callback, this, true); }
+  resolveSrv(hostname, callback) { validateResolveHostname(hostname, "resolveSrv"); return resolveRecordsWithState(hostname, "SRV", "querySrv", callback, this); }
+  resolveTxt(hostname, callback) { validateCallback(callback); validateResolveHostname(hostname, "resolveTxt", false, true); return resolveRecordsWithState(hostname, "TXT", "queryTxt", callback, this); }
   reverse(ip, callback) {
     if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip);
     return reverseWithState(ip, callback, this);
@@ -1171,13 +1280,11 @@ export class Resolver {
 }
 
 export class PromisesResolver {
-  constructor(options = {}) {
+  constructor(options = undefined) {
     options = normalizeResolverOptions(options);
     this._servers = effectiveServers();
-    this._serversExplicit = false;
     this.timeout = options?.timeout;
     this.tries = options?.tries;
-    this.maxTimeout = options?.maxTimeout;
     this._pendingQueries = new Set();
     this._localAddress4 = undefined;
     this._localAddress6 = undefined;
@@ -1185,29 +1292,42 @@ export class PromisesResolver {
 
   cancel() { cancelResolverQueries(this); }
   getServers() { return [...this._servers]; }
-  setServers(nextServers) { this._servers = normalizeServers(nextServers); this._serversExplicit = true; }
+  setServers(nextServers) { setResolverServers(this, nextServers); }
   setLocalAddress(first, second = undefined) { setResolverLocalAddress(this, first, second); }
-  resolve(hostname, rrtype = "A") { validateResolveHostname(hostname); normalizeRrtype(rrtype); return promiseFromCallback(Resolver.prototype.resolve.bind(this), hostname, rrtype); }
-  resolve4(hostname, options = undefined) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolve4.bind(this), hostname, options); }
-  resolve6(hostname, options = undefined) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolve6.bind(this), hostname, options); }
-  resolveAny(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveAny.bind(this), hostname); }
-  resolveCaa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveCaa.bind(this), hostname); }
-  resolveCname(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveCname.bind(this), hostname); }
-  resolveMx(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveMx.bind(this), hostname); }
-  resolveNaptr(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveNaptr.bind(this), hostname); }
-  resolveNs(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveNs.bind(this), hostname); }
-  resolvePtr(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolvePtr.bind(this), hostname); }
-  resolveSoa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveSoa.bind(this), hostname); }
-  resolveSrv(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveSrv.bind(this), hostname); }
-  resolveTlsa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveTlsa.bind(this), hostname); }
-  resolveTxt(hostname) { validateResolveHostname(hostname); return promiseFromCallback(Resolver.prototype.resolveTxt.bind(this), hostname); }
+  resolve(hostname, rrtype = "A") {
+    validateResolveHostname(hostname, "resolve", false, true);
+    const type = normalizeRrtype(rrtype);
+    if (type === "A") return this.resolve4(hostname);
+    if (type === "AAAA") return this.resolve6(hostname);
+    if (type === "ANY") return this.resolveAny(hostname);
+    if (type === "PTR") return this.resolvePtr(hostname);
+    if (type === "CAA") return this.resolveCaa(hostname);
+    if (type === "CNAME") return this.resolveCname(hostname);
+    if (type === "MX") return this.resolveMx(hostname);
+    if (type === "NAPTR") return this.resolveNaptr(hostname);
+    if (type === "NS") return this.resolveNs(hostname);
+    if (type === "SOA") return this.resolveSoa(hostname);
+    if (type === "SRV") return this.resolveSrv(hostname);
+    if (type === "TXT") return this.resolveTxt(hostname);
+    throw invalidRrtypeError(type);
+  }
+  resolve4(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(Resolver.prototype.resolve4.bind(this), hostname, options); }
+  resolve6(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(Resolver.prototype.resolve6.bind(this), hostname, options); }
+  resolveAny(hostname) { validateResolveHostname(hostname, "resolveAny", false, true); return promiseFromCallback(Resolver.prototype.resolveAny.bind(this), hostname); }
+  resolveCaa(hostname) { validateResolveHostname(hostname, "resolveCaa", false, true); return promiseFromCallback(Resolver.prototype.resolveCaa.bind(this), hostname); }
+  resolveCname(hostname) { validateResolveHostname(hostname, "resolveCname", false, true); return promiseFromCallback(Resolver.prototype.resolveCname.bind(this), hostname); }
+  resolveMx(hostname) { validateResolveHostname(hostname, "resolveMx", false, true); return promiseFromCallback(Resolver.prototype.resolveMx.bind(this), hostname); }
+  resolveNaptr(hostname) { validateResolveHostname(hostname, "resolveNaptr", false, true); return promiseFromCallback(Resolver.prototype.resolveNaptr.bind(this), hostname); }
+  resolveNs(hostname) { validateResolveHostname(hostname, "resolveNs", true, true); return promiseFromCallback(Resolver.prototype.resolveNs.bind(this), hostname); }
+  resolvePtr(hostname) { validateResolveHostname(hostname, "resolvePtr", false, true); return promiseFromCallback(Resolver.prototype.resolvePtr.bind(this), hostname); }
+  resolveSoa(hostname) { validateResolveHostname(hostname, "resolveSoa", true, true); return promiseFromCallback(Resolver.prototype.resolveSoa.bind(this), hostname); }
+  resolveSrv(hostname) { validateResolveHostname(hostname, "resolveSrv", false, true); return promiseFromCallback(Resolver.prototype.resolveSrv.bind(this), hostname); }
+  resolveTxt(hostname) { validateResolveHostname(hostname, "resolveTxt", false, true); return promiseFromCallback(Resolver.prototype.resolveTxt.bind(this), hostname); }
   reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(Resolver.prototype.reverse.bind(this), ip); }
 }
 
 export const promises = {
-  ADDRCONFIG,
   ADDRGETNETWORKPARAMS,
-  ALL,
   BADFAMILY,
   BADFLAGS,
   BADHINTS,
@@ -1231,11 +1351,7 @@ export const promises = {
   REFUSED,
   SERVFAIL,
   TIMEOUT,
-  V4MAPPED,
   Resolver: PromisesResolver,
-  getCacheStats,
-  getDefaultResultOrder,
-  getServers,
   lookup(hostname, options = undefined) {
     validateLookupHostname(hostname);
     const normalized = normalizeLookupOptions(options);
@@ -1248,31 +1364,29 @@ export const promises = {
     });
   },
   lookupService(address, port) {
-    if (arguments.length < 2) throw missingArgs(["address", "port"]);
-    validateLookupServiceArgs(address, port);
+    if (arguments.length !== 2) throw missingArgs(["address", "port"]);
+    const normalizedPort = validateLookupServiceArgs(address, port);
     return new Promise((resolvePromise, reject) => {
-      lookupServiceWithValidatedArgs(address, port, (error, hostname, service) => {
+      lookupServiceWithValidatedArgs(address, normalizedPort, (error, hostname, service) => {
         if (error) reject(error);
         else resolvePromise({ hostname, service });
       });
     });
   },
-  resolve(hostname, rrtype = "A") { validateResolveHostname(hostname); normalizeRrtype(rrtype); return promiseFromCallback(resolve, hostname, rrtype); },
-  resolve4(hostname, options = undefined) { validateResolveHostname(hostname); return promiseFromCallback(resolve4, hostname, options); },
-  resolve6(hostname, options = undefined) { validateResolveHostname(hostname); return promiseFromCallback(resolve6, hostname, options); },
-  resolveAny(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveAny, hostname); },
-  resolveCaa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveCaa, hostname); },
-  resolveCname(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveCname, hostname); },
-  resolveMx(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveMx, hostname); },
-  resolveNaptr(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveNaptr, hostname); },
-  resolveNs(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveNs, hostname); },
-  resolvePtr(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolvePtr, hostname); },
-  resolveSoa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveSoa, hostname); },
-  resolveSrv(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveSrv, hostname); },
-  resolveTlsa(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveTlsa, hostname); },
-  resolveTxt(hostname) { validateResolveHostname(hostname); return promiseFromCallback(resolveTxt, hostname); },
+  resolve(hostname, rrtype = "A") { validateResolveHostname(hostname, "resolve"); normalizeRrtype(rrtype); return promiseFromCallback(resolve, hostname, rrtype); },
+  resolve4(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(resolve4, hostname, options); },
+  resolve6(hostname, options = undefined) { validateResolveHostname(hostname, "resolve", false, true); return promiseFromCallback(resolve6, hostname, options); },
+  resolveAny(hostname) { validateResolveHostname(hostname, "resolveAny", false, true); return promiseFromCallback(resolveAny, hostname); },
+  resolveCaa(hostname) { validateResolveHostname(hostname, "resolveCaa", false, true); return promiseFromCallback(resolveCaa, hostname); },
+  resolveCname(hostname) { validateResolveHostname(hostname, "resolveCname", false, true); return promiseFromCallback(resolveCname, hostname); },
+  resolveMx(hostname) { validateResolveHostname(hostname, "resolveMx", false, true); return promiseFromCallback(resolveMx, hostname); },
+  resolveNaptr(hostname) { validateResolveHostname(hostname, "resolveNaptr", false, true); return promiseFromCallback(resolveNaptr, hostname); },
+  resolveNs(hostname) { validateResolveHostname(hostname, "resolveNs", true, true); return promiseFromCallback(resolveNs, hostname); },
+  resolvePtr(hostname) { validateResolveHostname(hostname, "resolvePtr", false, true); return promiseFromCallback(resolvePtr, hostname); },
+  resolveSoa(hostname) { validateResolveHostname(hostname, "resolveSoa", true, true); return promiseFromCallback(resolveSoa, hostname); },
+  resolveSrv(hostname) { validateResolveHostname(hostname, "resolveSrv", false, true); return promiseFromCallback(resolveSrv, hostname); },
+  resolveTxt(hostname) { validateResolveHostname(hostname, "resolveTxt", false, true); return promiseFromCallback(resolveTxt, hostname); },
   reverse(ip) { if (typeof ip !== "string") throw invalidArgType("ip", "of type string", ip); return promiseFromCallback(reverse, ip); },
-  prefetch,
   setDefaultResultOrder,
   setServers,
 };
@@ -1293,7 +1407,6 @@ resolveNs[kCustomPromisify] = promises.resolveNs;
 resolvePtr[kCustomPromisify] = promises.resolvePtr;
 resolveSoa[kCustomPromisify] = promises.resolveSoa;
 resolveSrv[kCustomPromisify] = promises.resolveSrv;
-resolveTlsa[kCustomPromisify] = promises.resolveTlsa;
 resolveTxt[kCustomPromisify] = promises.resolveTxt;
 reverse[kCustomPromisify] = promises.reverse;
 
@@ -1326,13 +1439,11 @@ export default {
   SERVFAIL,
   TIMEOUT,
   V4MAPPED,
-  getCacheStats,
   getDefaultResultOrder,
   getServers,
   lookup,
   lookupService,
   promises,
-  prefetch,
   resolve,
   resolve4,
   resolve6,
@@ -1345,7 +1456,6 @@ export default {
   resolvePtr,
   resolveSoa,
   resolveSrv,
-  resolveTlsa,
   resolveTxt,
   reverse,
   setDefaultResultOrder,

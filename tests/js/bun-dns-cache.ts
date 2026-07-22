@@ -158,11 +158,13 @@ function dnsResponse(query: Buffer, answers: Buffer[], responseCode = 0) {
 const dnsServer = createSocket("udp4");
 dnsServer.on("message", (query, remote) => {
   const type = query.readUInt16BE(dnsQuestionEnd(query) - 4);
+  const questionName = dnsQuestionName(query);
+  if (questionName === "cancel.fixture.test") return;
   let answer;
   if (type === 1) answer = dnsAnswer(type, Buffer.from([192, 0, 2, 10]));
   else if (type === 12) answer = dnsAnswer(type, encodeDnsName("ptr.fixture.test"));
   else if (type === 16) answer = dnsAnswer(type, Buffer.concat([Buffer.from([7]), Buffer.from("fixture")]));
-  const missing = dnsQuestionName(query) === "missing.fixture.test";
+  const missing = questionName === "missing.fixture.test";
   dnsServer.send(dnsResponse(query, missing || answer == null ? [] : [answer], missing ? 3 : 0), remote.port, remote.address);
 });
 await new Promise<void>((resolve, reject) => {
@@ -185,6 +187,50 @@ try {
   const dnsPort = dnsServer.address().port;
   strictEqual(bunDns.setServers([[4, "127.0.0.1", dnsPort]]), undefined);
   deepStrictEqual(bunDns.getServers(), [`127.0.0.1:${dnsPort}`]);
+
+  let lookupReturned = false;
+  await new Promise<void>((resolve, reject) => {
+    dns.lookup("localhost", (error, address) => {
+      try {
+        strictEqual(lookupReturned, true, "native dns.lookup completion should be asynchronous");
+        if (error) throw error;
+        ok(typeof address === "string" && address.length > 0);
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+    lookupReturned = true;
+  });
+
+  const resultOrder = dns.getDefaultResultOrder();
+  strictEqual(typeof resultOrder, "function", "Bun 1.3.10 exposes its lazy result-order getter");
+  const originalResultOrder = resultOrder();
+  dns.setDefaultResultOrder("ipv4first");
+  strictEqual(resultOrder(), "ipv4first");
+  throws(() => dns.setDefaultResultOrder(4 as never), { code: "ERR_INVALID_ARG_VALUE" });
+  dns.setDefaultResultOrder(originalResultOrder);
+
+  const fractionalService = await dns.promises.lookupService("127.0.0.1", 80.9);
+  strictEqual(fractionalService.service, "http", "lookupService should truncate numeric ports");
+  throws(() => dns.lookupService("127.0.0.1", "80" as never, () => {}), { code: "ERR_SOCKET_BAD_PORT" });
+
+  const resolver = new dns.promises.Resolver({ timeout: 1_000, tries: 1.5 });
+  resolver.setServers([`127.0.0.1:${dnsPort}`]);
+  resolver.setLocalAddress("::1", "127.0.0.1");
+  const cancelled = resolver.resolve4("cancel.fixture.test");
+  throws(() => resolver.setServers(["127.0.0.1"]), { code: "ERR_DNS_SET_SERVERS_FAILED" });
+  resolver.cancel();
+  await cancelled.then(
+    () => { throw new Error("cancelled DNS query should reject"); },
+    (error) => {
+      strictEqual(error.name, "DNSException");
+      strictEqual(error.code, "ECANCELLED");
+      strictEqual(error.errno, 24);
+      strictEqual(error.syscall, "queryA");
+      strictEqual(error.hostname, "cancel.fixture.test");
+    },
+  );
 
   const addressPromise = bunDns.resolve("fixture.test", "A");
   ok(addressPromise instanceof Promise, "Bun.dns.resolve should return a promise");

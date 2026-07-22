@@ -1,3 +1,7 @@
 CT_NATIVE_BINDING("dnsLookup", ct_dns_lookup)
+CT_NATIVE_BINDING("dnsLookupAsync", ct_dns_lookup_async)
 CT_NATIVE_BINDING("dnsLookupService", ct_dns_lookup_service)
+CT_NATIVE_BINDING("dnsLookupServiceAsync", ct_dns_lookup_service_async)
 CT_NATIVE_BINDING("dnsResolveRecords", ct_dns_resolve_records)
+CT_NATIVE_BINDING("dnsCancel", ct_dns_cancel)
+CT_NATIVE_BINDING("dnsGetSystemServers", ct_dns_get_system_servers)

@@ -1361,6 +1361,27 @@ typedef struct CtTcpConnect {
 } CtTcpConnect;
 
 typedef enum {
+    CT_DNS_REQUEST_LOOKUP,
+    CT_DNS_REQUEST_LOOKUP_SERVICE,
+} CtDnsRequestKind;
+
+typedef struct CtDnsRequest {
+    uint32_t id;
+    CtDnsRequestKind kind;
+    CtJscRuntime *runtime;
+    JSContextRef context;
+    JSObjectRef callback;
+    bool suppress_callback;
+    char *hostname;
+    struct sockaddr_storage address;
+    union {
+        uv_getaddrinfo_t lookup;
+        uv_getnameinfo_t lookup_service;
+    } request;
+    struct CtDnsRequest *next;
+} CtDnsRequest;
+
+typedef enum {
     CT_PROCESS_STDIO_PIPE,
     CT_PROCESS_STDIO_INHERIT,
     CT_PROCESS_STDIO_IGNORE,
@@ -1712,6 +1733,8 @@ struct CtJscRuntime {
     uint32_t next_process_id;
     uint32_t next_worker_id;
     uint32_t next_fd_watch_id;
+    uint32_t next_dns_request_id;
+    CtDnsRequest *dns_requests;
     CtTimer **timer_heap;
     size_t timer_heap_len;
     size_t timer_heap_cap;
@@ -9199,6 +9222,228 @@ static JSValueRef ct_hostname(JSContextRef ctx, JSObjectRef function, JSObjectRe
     return ct_make_string(ctx, buffer);
 }
 
+static JSObjectRef ct_dns_addrinfo_to_js(JSContextRef ctx, struct addrinfo *results, JSValueRef *exception) {
+    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
+    if (array == NULL || (exception != NULL && *exception != NULL)) return array;
+
+    unsigned index = 0;
+    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
+        if (entry->ai_family != AF_INET && entry->ai_family != AF_INET6) continue;
+        char address[NI_MAXHOST];
+        int name_status = getnameinfo(
+            entry->ai_addr,
+            (socklen_t)entry->ai_addrlen,
+            address,
+            sizeof(address),
+            NULL,
+            0,
+            NI_NUMERICHOST
+        );
+        if (name_status != 0) continue;
+
+        JSObjectRef item = ct_make_object(ctx);
+        ct_set_property(ctx, item, "address", ct_make_string(ctx, address), exception);
+        ct_set_property(ctx, item, "family", JSValueMakeNumber(ctx, entry->ai_family == AF_INET6 ? 6 : 4), exception);
+        JSObjectSetPropertyAtIndex(ctx, array, index++, item, exception);
+        if (exception != NULL && *exception != NULL) return array;
+    }
+    return array;
+}
+
+static const char *ct_dns_uv_error_code(int status) {
+    if (status == UV_ECANCELED || status == UV_EAI_CANCELED) return "ECANCELLED";
+    if (status == UV_EAI_NONAME) return "ENOTFOUND";
+    if (status == UV_EAI_NODATA) return "ENODATA";
+    if (status == UV_EAI_AGAIN) return "EAI_AGAIN";
+    if (status == UV_EAI_BADFLAGS) return "EAI_BADFLAGS";
+    if (status == UV_EAI_BADHINTS) return "EAI_BADHINTS";
+    if (status == UV_EAI_FAMILY || status == UV_EAI_ADDRFAMILY) return "EAI_FAMILY";
+    if (status == UV_EAI_MEMORY || status == UV_ENOMEM) return "ENOMEM";
+    if (status == UV_EAI_SERVICE) return "EAI_SERVICE";
+    if (status == UV_EAI_SOCKTYPE) return "EAI_SOCKTYPE";
+    if (status == UV_EAI_FAIL) return "ESERVFAIL";
+    return "ENOTFOUND";
+}
+
+static void ct_dns_request_remove(CtDnsRequest *request) {
+    CtDnsRequest **cursor = &request->runtime->dns_requests;
+    while (*cursor != NULL && *cursor != request) cursor = &(*cursor)->next;
+    if (*cursor == request) *cursor = request->next;
+}
+
+static void ct_dns_request_free(CtDnsRequest *request) {
+    if (request->context != NULL && request->callback != NULL) {
+        JSValueUnprotect(request->context, request->callback);
+    }
+    free(request->hostname);
+    free(request);
+}
+
+static void ct_dns_request_callback(
+    CtDnsRequest *request,
+    const char *code,
+    JSValueRef result,
+    const char *message
+) {
+    if (request->suppress_callback) return;
+
+    JSContextRef ctx = request->context;
+    JSValueRef args[3] = {
+        code != NULL ? ct_make_string(ctx, code) : JSValueMakeNull(ctx),
+        result != NULL ? result : JSValueMakeUndefined(ctx),
+        message != NULL ? ct_make_string(ctx, message) : JSValueMakeUndefined(ctx),
+    };
+    JSValueRef callback_exception = NULL;
+    JSObjectCallAsFunction(ctx, request->callback, NULL, 3, args, &callback_exception);
+    if (callback_exception != NULL) {
+        JSValueRef handler_exception = NULL;
+        (void)ct_handle_uncaught_exception(request->runtime, callback_exception, &handler_exception);
+    }
+}
+
+static void ct_dns_lookup_after(uv_getaddrinfo_t *uv_request, int status, struct addrinfo *results) {
+    CtDnsRequest *request = (CtDnsRequest *)uv_request->data;
+    ct_dns_request_remove(request);
+
+    if (request->suppress_callback) {
+        if (results != NULL) uv_freeaddrinfo(results);
+        ct_dns_request_free(request);
+        return;
+    }
+
+    JSValueRef exception = NULL;
+    JSValueRef result = JSValueMakeUndefined(request->context);
+    const char *code = NULL;
+    const char *message = NULL;
+    if (status == 0) {
+        result = ct_dns_addrinfo_to_js(request->context, results, &exception);
+        if (exception != NULL) {
+            code = "ENOMEM";
+            message = "Failed to create DNS lookup result";
+        }
+    } else {
+        code = ct_dns_uv_error_code(status);
+        message = uv_strerror(status);
+    }
+    if (results != NULL) uv_freeaddrinfo(results);
+
+    ct_dns_request_callback(request, code, result, message);
+    ct_dns_request_free(request);
+}
+
+static void ct_dns_lookup_service_after(uv_getnameinfo_t *uv_request, int status, const char *hostname, const char *service) {
+    CtDnsRequest *request = (CtDnsRequest *)uv_request->data;
+    ct_dns_request_remove(request);
+
+    if (request->suppress_callback) {
+        ct_dns_request_free(request);
+        return;
+    }
+
+    JSValueRef exception = NULL;
+    JSValueRef result = JSValueMakeUndefined(request->context);
+    const char *code = NULL;
+    const char *message = NULL;
+    if (status == 0) {
+        JSObjectRef record = ct_make_object(request->context);
+        ct_set_property(request->context, record, "hostname", ct_make_string(request->context, hostname), &exception);
+        ct_set_property(request->context, record, "service", ct_make_string(request->context, service), &exception);
+        result = record;
+        if (exception != NULL) {
+            code = "ENOMEM";
+            message = "Failed to create DNS service result";
+        }
+    } else {
+        code = ct_dns_uv_error_code(status);
+        message = uv_strerror(status);
+    }
+
+    ct_dns_request_callback(request, code, result, message);
+    ct_dns_request_free(request);
+}
+
+static uint32_t ct_dns_next_request_id(CtJscRuntime *runtime) {
+    runtime->next_dns_request_id += 1;
+    if (runtime->next_dns_request_id == 0) runtime->next_dns_request_id = 1;
+    return runtime->next_dns_request_id;
+}
+
+static int ct_dns_sockaddr(const char *address, int port, struct sockaddr_storage *storage, socklen_t *storage_len) {
+    memset(storage, 0, sizeof(*storage));
+    struct sockaddr_in *addr4 = (struct sockaddr_in *)storage;
+    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)storage;
+    if (inet_pton(AF_INET, address, &addr4->sin_addr) == 1) {
+        addr4->sin_family = AF_INET;
+        addr4->sin_port = htons((uint16_t)port);
+        *storage_len = sizeof(struct sockaddr_in);
+        return 0;
+    }
+    if (inet_pton(AF_INET6, address, &addr6->sin6_addr) == 1) {
+        addr6->sin6_family = AF_INET6;
+        addr6->sin6_port = htons((uint16_t)port);
+        *storage_len = sizeof(struct sockaddr_in6);
+        return 0;
+    }
+    return -1;
+}
+
+static JSValueRef ct_dns_lookup_async(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    if (runtime == NULL || argc < 4 || !JSValueIsObject(ctx, argv[3]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[3])) {
+        ct_throw_message(ctx, exception, "dnsLookupAsync(hostname, family, flags, callback) requires a callback");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtDnsRequest *request = (CtDnsRequest *)calloc(1, sizeof(*request));
+    if (request == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    request->hostname = ct_value_to_string_copy(ctx, argv[0]);
+    if (request->hostname == NULL) {
+        free(request);
+        ct_throw_message(ctx, exception, "Failed to read hostname");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int family = (int)ct_value_to_number(ctx, argv[1]);
+    int flags = (int)ct_value_to_number(ctx, argv[2]);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = flags;
+    if (family == 4) hints.ai_family = AF_INET;
+    else if (family == 6) hints.ai_family = AF_INET6;
+    else hints.ai_family = AF_UNSPEC;
+
+    request->id = ct_dns_next_request_id(runtime);
+    request->kind = CT_DNS_REQUEST_LOOKUP;
+    request->runtime = runtime;
+    request->context = ctx;
+    request->callback = (JSObjectRef)argv[3];
+    request->request.lookup.data = request;
+    JSValueProtect(ctx, request->callback);
+
+    int status = uv_getaddrinfo(
+        &runtime->uv_loop,
+        &request->request.lookup,
+        ct_dns_lookup_after,
+        request->hostname,
+        NULL,
+        &hints
+    );
+    if (status != 0) {
+        ct_dns_request_free(request);
+        ct_throw_message(ctx, exception, uv_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    request->next = runtime->dns_requests;
+    runtime->dns_requests = request;
+    return JSValueMakeNumber(ctx, request->id);
+}
+
 static JSValueRef ct_dns_lookup(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
     (void)function;
     (void)thisObject;
@@ -9229,18 +9474,7 @@ static JSValueRef ct_dns_lookup(JSContextRef ctx, JSObjectRef function, JSObject
         return JSValueMakeUndefined(ctx);
     }
 
-    JSObjectRef array = ct_make_array(ctx, 0, NULL, exception);
-    unsigned index = 0;
-    for (struct addrinfo *entry = results; entry != NULL; entry = entry->ai_next) {
-        if (entry->ai_family != AF_INET && entry->ai_family != AF_INET6) continue;
-        char address[NI_MAXHOST];
-        int name_status = getnameinfo(entry->ai_addr, (socklen_t)entry->ai_addrlen, address, sizeof(address), NULL, 0, NI_NUMERICHOST);
-        if (name_status != 0) continue;
-        JSObjectRef item = ct_make_object(ctx);
-        ct_set_property(ctx, item, "address", ct_make_string(ctx, address), exception);
-        ct_set_property(ctx, item, "family", JSValueMakeNumber(ctx, entry->ai_family == AF_INET6 ? 6 : 4), exception);
-        JSObjectSetPropertyAtIndex(ctx, array, index++, item, exception);
-    }
+    JSObjectRef array = ct_dns_addrinfo_to_js(ctx, results, exception);
     freeaddrinfo(results);
     return array;
 }
@@ -9261,19 +9495,8 @@ static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, 
     }
 
     struct sockaddr_storage storage;
-    memset(&storage, 0, sizeof(storage));
     socklen_t storage_len = 0;
-    struct sockaddr_in *addr4 = (struct sockaddr_in *)&storage;
-    struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&storage;
-    if (inet_pton(AF_INET, address, &addr4->sin_addr) == 1) {
-        addr4->sin_family = AF_INET;
-        addr4->sin_port = htons((uint16_t)port);
-        storage_len = sizeof(struct sockaddr_in);
-    } else if (inet_pton(AF_INET6, address, &addr6->sin6_addr) == 1) {
-        addr6->sin6_family = AF_INET6;
-        addr6->sin6_port = htons((uint16_t)port);
-        storage_len = sizeof(struct sockaddr_in6);
-    } else {
+    if (ct_dns_sockaddr(address, port, &storage, &storage_len) != 0) {
         free(address);
         ct_throw_message(ctx, exception, "lookupService requires an IPv4 or IPv6 address");
         return JSValueMakeUndefined(ctx);
@@ -9291,6 +9514,148 @@ static JSValueRef ct_dns_lookup_service(JSContextRef ctx, JSObjectRef function, 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "hostname", ct_make_string(ctx, hostname), exception);
     ct_set_property(ctx, result, "service", ct_make_string(ctx, service), exception);
+    return result;
+}
+
+static JSValueRef ct_dns_lookup_service_async(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    if (runtime == NULL || argc < 3 || !JSValueIsObject(ctx, argv[2]) || !JSObjectIsFunction(ctx, (JSObjectRef)argv[2])) {
+        ct_throw_message(ctx, exception, "dnsLookupServiceAsync(address, port, callback) requires a callback");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtDnsRequest *request = (CtDnsRequest *)calloc(1, sizeof(*request));
+    if (request == NULL) {
+        ct_throw_message(ctx, exception, "Out of memory");
+        return JSValueMakeUndefined(ctx);
+    }
+    request->hostname = ct_value_to_string_copy(ctx, argv[0]);
+    if (request->hostname == NULL) {
+        free(request);
+        ct_throw_message(ctx, exception, "Failed to read address");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    int port = (int)ct_value_to_number(ctx, argv[1]);
+    socklen_t storage_len = 0;
+    if (ct_dns_sockaddr(request->hostname, port, &request->address, &storage_len) != 0) {
+        ct_dns_request_free(request);
+        ct_throw_message(ctx, exception, "lookupService requires an IPv4 or IPv6 address");
+        return JSValueMakeUndefined(ctx);
+    }
+    (void)storage_len;
+
+    request->id = ct_dns_next_request_id(runtime);
+    request->kind = CT_DNS_REQUEST_LOOKUP_SERVICE;
+    request->runtime = runtime;
+    request->context = ctx;
+    request->callback = (JSObjectRef)argv[2];
+    request->request.lookup_service.data = request;
+    JSValueProtect(ctx, request->callback);
+
+    int status = uv_getnameinfo(
+        &runtime->uv_loop,
+        &request->request.lookup_service,
+        ct_dns_lookup_service_after,
+        (const struct sockaddr *)&request->address,
+        0
+    );
+    if (status != 0) {
+        ct_dns_request_free(request);
+        ct_throw_message(ctx, exception, uv_strerror(status));
+        return JSValueMakeUndefined(ctx);
+    }
+
+    request->next = runtime->dns_requests;
+    runtime->dns_requests = request;
+    return JSValueMakeNumber(ctx, request->id);
+}
+
+static JSValueRef ct_dns_cancel(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    (void)thisObject;
+    (void)exception;
+    if (runtime == NULL || argc < 1) return JSValueMakeBoolean(ctx, false);
+
+    double id_number = ct_value_to_number(ctx, argv[0]);
+    if (!isfinite(id_number) || id_number <= 0 || id_number > UINT32_MAX || trunc(id_number) != id_number) {
+        return JSValueMakeBoolean(ctx, false);
+    }
+    uint32_t id = (uint32_t)id_number;
+    for (CtDnsRequest *request = runtime->dns_requests; request != NULL; request = request->next) {
+        if (request->id != id) continue;
+        request->suppress_callback = true;
+        uv_req_t *uv_request = request->kind == CT_DNS_REQUEST_LOOKUP
+            ? (uv_req_t *)&request->request.lookup
+            : (uv_req_t *)&request->request.lookup_service;
+        (void)uv_cancel(uv_request);
+        return JSValueMakeBoolean(ctx, true);
+    }
+    return JSValueMakeBoolean(ctx, false);
+}
+
+static void ct_dns_requests_cancel_runtime(CtJscRuntime *runtime) {
+    for (CtDnsRequest *request = runtime->dns_requests; request != NULL; request = request->next) {
+        request->suppress_callback = true;
+        uv_req_t *uv_request = request->kind == CT_DNS_REQUEST_LOOKUP
+            ? (uv_req_t *)&request->request.lookup
+            : (uv_req_t *)&request->request.lookup_service;
+        (void)uv_cancel(uv_request);
+    }
+}
+
+static JSValueRef ct_dns_get_system_servers(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    JSObjectRef result = ct_make_array(ctx, 0, NULL, exception);
+#if defined(_WIN32)
+    ULONG size = 16 * 1024;
+    IP_ADAPTER_ADDRESSES *adapters = NULL;
+    ULONG status = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 3 && status == ERROR_BUFFER_OVERFLOW; attempt += 1) {
+        free(adapters);
+        adapters = (IP_ADAPTER_ADDRESSES *)malloc(size);
+        if (adapters == NULL) {
+            ct_throw_message(ctx, exception, "Out of memory");
+            return result;
+        }
+        status = GetAdaptersAddresses(
+            AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME,
+            NULL,
+            adapters,
+            &size
+        );
+    }
+    if (status != NO_ERROR) {
+        free(adapters);
+        return result;
+    }
+
+    unsigned index = 0;
+    for (IP_ADAPTER_ADDRESSES *adapter = adapters; adapter != NULL; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        for (IP_ADAPTER_DNS_SERVER_ADDRESS *server = adapter->FirstDnsServerAddress; server != NULL; server = server->Next) {
+            if (server->Address.lpSockaddr == NULL) continue;
+            char address[NI_MAXHOST];
+            int name_status = getnameinfo(
+                server->Address.lpSockaddr,
+                (socklen_t)server->Address.iSockaddrLength,
+                address,
+                sizeof(address),
+                NULL,
+                0,
+                NI_NUMERICHOST
+            );
+            if (name_status != 0 || strcmp(address, "0.0.0.0") == 0 || strcmp(address, "::") == 0) continue;
+            JSObjectSetPropertyAtIndex(ctx, result, index++, ct_make_string(ctx, address), exception);
+        }
+    }
+    free(adapters);
+#endif
     return result;
 }
 
@@ -25521,6 +25886,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
             ct_napi_env_destroy(runtime->napi_env);
             runtime->napi_env = NULL;
         }
+        ct_dns_requests_cancel_runtime(runtime);
         ct_runtime_uv_shutdown(runtime);
         ct_timer_destroy_all(runtime);
         ct_brotli_encoder_destroy_all(runtime);

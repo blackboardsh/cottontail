@@ -1,8 +1,6 @@
 import { promises as dnsPromises } from "../dns.js";
 
-export const ADDRCONFIG = dnsPromises.ADDRCONFIG;
 export const ADDRGETNETWORKPARAMS = dnsPromises.ADDRGETNETWORKPARAMS;
-export const ALL = dnsPromises.ALL;
 export const BADFAMILY = dnsPromises.BADFAMILY;
 export const BADFLAGS = dnsPromises.BADFLAGS;
 export const BADHINTS = dnsPromises.BADHINTS;
@@ -27,9 +25,6 @@ export const REFUSED = dnsPromises.REFUSED;
 export const Resolver = dnsPromises.Resolver;
 export const SERVFAIL = dnsPromises.SERVFAIL;
 export const TIMEOUT = dnsPromises.TIMEOUT;
-export const V4MAPPED = dnsPromises.V4MAPPED;
-export const getDefaultResultOrder = dnsPromises.getDefaultResultOrder;
-export const getServers = dnsPromises.getServers;
 export const lookup = dnsPromises.lookup;
 export const lookupService = dnsPromises.lookupService;
 export const resolve = dnsPromises.resolve;
@@ -44,7 +39,6 @@ export const resolveNs = dnsPromises.resolveNs;
 export const resolvePtr = dnsPromises.resolvePtr;
 export const resolveSoa = dnsPromises.resolveSoa;
 export const resolveSrv = dnsPromises.resolveSrv;
-export const resolveTlsa = dnsPromises.resolveTlsa;
 export const resolveTxt = dnsPromises.resolveTxt;
 export const reverse = dnsPromises.reverse;
 export const setDefaultResultOrder = dnsPromises.setDefaultResultOrder;

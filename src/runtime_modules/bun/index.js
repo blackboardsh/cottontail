@@ -14237,30 +14237,56 @@ function bunDnsFamily(family) {
 }
 
 function bunDnsLookupOptions(options) {
+  const defaultBackend = process.platform === "darwin" || process.platform === "win32" ? "system" : "c-ares";
   const optionType = typeof options;
   if (optionType === "string" || optionType === "symbol" || optionType === "bigint") {
     throw new Error("Invalid options passed to lookup(): InvalidOptions");
   }
   if (options == null || (optionType !== "object" && optionType !== "function")) {
-    return { family: 0, all: true };
+    return {
+      family: 0,
+      all: true,
+      hints: 0,
+      backend: defaultBackend,
+      socketType: "stream",
+      protocol: "unspecified",
+    };
   }
 
   let backend = options.backend;
-  if (backend === "cares") backend = "c-ares";
-  if (backend == null || backend === "") backend = undefined;
-  if (backend !== undefined && backend !== "system" && backend !== "libc" && backend !== "c-ares" && backend !== "getaddrinfo") {
+  if (backend === "cares" || backend === "c_ares" || backend === "async") backend = "c-ares";
+  if (backend === "getaddrinfo") backend = "libc";
+  if (backend == null || backend === "") backend = defaultBackend;
+  if (backend !== "system" && backend !== "libc" && backend !== "c-ares") {
     throw new Error("Invalid options passed to lookup(): InvalidBackend");
   }
 
   let socketType = options.socketType;
-  if (socketType == null || socketType === "" || socketType === 0 || (typeof socketType === "number" && Number.isNaN(socketType))) {
-    socketType = undefined;
+  if (socketType == null) {
+    socketType = "stream";
+  } else if (socketType === "" || socketType === 0 || (typeof socketType === "number" && Number.isNaN(socketType))) {
+    socketType = "unspecified";
   } else if (socketType === 1) {
-    socketType = "udp";
+    socketType = "stream";
   } else if (socketType === 2) {
-    socketType = "tcp";
-  } else if (socketType !== "udp" && socketType !== "tcp") {
+    socketType = "dgram";
+  } else if (socketType === "tcp") {
+    socketType = "stream";
+  } else if (socketType === "udp") {
+    socketType = "dgram";
+  } else if (socketType !== "stream" && socketType !== "dgram") {
     throw new Error("Invalid options passed to lookup(): InvalidSocketType");
+  }
+
+  let protocol = options.protocol;
+  if (protocol == null || protocol === "" || protocol === 0 || (typeof protocol === "number" && Number.isNaN(protocol))) {
+    protocol = "unspecified";
+  } else if (protocol === 6) {
+    protocol = "tcp";
+  } else if (protocol === 17) {
+    protocol = "udp";
+  } else if (protocol !== "tcp" && protocol !== "udp") {
+    throw new Error("Invalid options passed to lookup(): InvalidProtocol");
   }
 
   let flags = options.flags;
@@ -14273,7 +14299,7 @@ function bunDnsLookupOptions(options) {
   }
 
   let port = options.port;
-  if (port != null) {
+  if (port != null && port !== "") {
     if (typeof port !== "number" || Number.isNaN(port)) {
       const error = new RangeError("Invalid port number");
       error.code = "ERR_SOCKET_BAD_PORT";
@@ -14295,6 +14321,7 @@ function bunDnsLookupOptions(options) {
     hints: flags,
     backend,
     socketType,
+    protocol,
     port,
   };
 }
@@ -14394,9 +14421,26 @@ function bunDnsLookup(hostname, options = {}) {
     throw error;
   }
   const lookupOptions = bunDnsLookupOptions(options);
+  if ((lookupOptions.socketType === "stream" && lookupOptions.protocol === "udp") ||
+      (lookupOptions.socketType === "dgram" && lookupOptions.protocol === "tcp")) {
+    return bunDnsPromise(Promise.reject(Object.assign(new Error("getaddrinfo ENOTFOUND"), {
+      code: "ENOTFOUND",
+      syscall: "getaddrinfo",
+    })), hostname);
+  }
+
+  let lookupHostname = hostname;
+  if (lookupOptions.backend === "c-ares") {
+    if (hostname.endsWith(".localhost")) {
+      lookupHostname = "localhost";
+      lookupOptions.backend = "system";
+    } else if (hostname === "localhost" || hostname.endsWith(".local") || nodeNet.isIPv6(hostname)) {
+      lookupOptions.backend = "system";
+    }
+  }
   const promise = lookupOptions.backend === "c-ares"
-    ? bunDnsCaresLookup(hostname, lookupOptions)
-    : bunDnsSystemLookup(hostname, lookupOptions);
+    ? bunDnsCaresLookup(lookupHostname, lookupOptions)
+    : bunDnsSystemLookup(lookupHostname, lookupOptions);
   return bunDnsPromise(promise, hostname);
 }
 
@@ -14493,11 +14537,12 @@ function bunDnsSetServers(nextServers) {
 }
 
 const bunDnsResolverHookKey = Symbol.for("cottontail.runtime.bun-dns-resolver-hook");
+const bunDnsCacheState = globalThis[Symbol.for("cottontail.runtime.dns-cache")];
 
 function installBunDnsResolverCache() {
   if (globalThis[bunDnsResolverHookKey] != null || typeof cottontail.dnsLookup !== "function") return;
 
-  const cacheState = globalThis[Symbol.for("cottontail.runtime.dns-cache")];
+  const cacheState = bunDnsCacheState;
   if (typeof cacheState?.resolveForNetwork !== "function") return;
 
   const state = {
@@ -14542,8 +14587,8 @@ export const dns = {
   setServers: bunDnsSetServers,
   reverse: bunDnsReverse,
   lookupService: bunDnsLookupService,
-  prefetch: nodeDns.prefetch,
-  getCacheStats: nodeDns.getCacheStats,
+  prefetch: bunDnsCacheState.prefetch,
+  getCacheStats: bunDnsCacheState.getCacheStats,
   ADDRCONFIG: nodeDns.ADDRCONFIG,
   ALL: nodeDns.ALL,
   V4MAPPED: nodeDns.V4MAPPED,
