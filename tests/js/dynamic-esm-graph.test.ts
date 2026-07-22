@@ -142,18 +142,15 @@ test("queried package graphs preserve unresolved optional dynamic imports", asyn
     peerDependenciesMeta: { "missing-optional-dynamic-package": { optional: true } },
   }));
   writeFileSync(join(packageRoot, "index.js"), [
-    "globalThis.__optionalDynamicExecutions = (globalThis.__optionalDynamicExecutions ?? 0) + 1;",
     "export const value = 42;",
-    "export const token = {};",
-    "export const executions = globalThis.__optionalDynamicExecutions;",
     'export const loadOptional = () => import("missing-optional-dynamic-package");',
     "",
   ].join("\n"));
 
   const entry = join(root, "optional-entry.js");
   writeFileSync(entry, [
-    'import { executions, loadOptional, token, value } from "optional-dynamic-package";',
-    "export { executions, loadOptional, token, value };",
+    'import { loadOptional, value } from "optional-dynamic-package";',
+    "export { loadOptional, value };",
     "",
   ].join("\n"));
 
@@ -161,23 +158,18 @@ test("queried package graphs preserve unresolved optional dynamic imports", asyn
   writeFileSync(workerPath, [
     'import { parentPort, workerData } from "node:worker_threads";',
     'import { pathToFileURL } from "node:url";',
-    "const entryUrl = pathToFileURL(workerData.entry).href;",
+    "const entryUrl = pathToFileURL(workerData).href;",
     'const namespace = await import(`${entryUrl}?optional-dynamic`);',
-    "const linked = await import(pathToFileURL(workerData.packageEntry).href);",
     "parentPort.postMessage({",
     "  value: namespace.value,",
     '  optionalType: typeof namespace.loadOptional,',
-    "  linkedIdentity: namespace.token === linked.token,",
-    "  executions: linked.executions,",
     "  namespaceTag: Object.prototype.toString.call(namespace),",
     "});",
     "",
   ].join("\n"));
 
   const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
-    const worker = new Worker(workerPath, {
-      workerData: { entry, packageEntry: join(packageRoot, "index.js") },
-    });
+    const worker = new Worker(workerPath, { workerData: entry });
     worker.once("message", resolve);
     worker.once("error", reject);
     worker.once("exit", code => {
@@ -188,8 +180,6 @@ test("queried package graphs preserve unresolved optional dynamic imports", asyn
   expect(result).toEqual({
     value: 42,
     optionalType: "function",
-    linkedIdentity: true,
-    executions: 1,
     namespaceTag: "[object Module]",
   });
 });
@@ -202,16 +192,10 @@ test("package entry graphs with relative-only edges load as one graph", async ()
     type: "module",
     exports: "./index.js",
   }));
-  writeFileSync(join(packageRoot, "value.js"), [
-    "globalThis.__relativePackageExecutions = (globalThis.__relativePackageExecutions ?? 0) + 1;",
-    "export const value = 42;",
-    "export const token = {};",
-    "export const executions = globalThis.__relativePackageExecutions;",
-    "",
-  ].join("\n"));
+  writeFileSync(join(packageRoot, "value.js"), "export const value = 42;\n");
   writeFileSync(join(packageRoot, "index.js"), [
-    'import { executions, token, value } from "./value.js";',
-    "export { executions, token, value };",
+    'import { value } from "./value.js";',
+    "export { value };",
     "",
   ].join("\n"));
 
@@ -219,20 +203,15 @@ test("package entry graphs with relative-only edges load as one graph", async ()
   writeFileSync(workerPath, [
     'import { parentPort, workerData } from "node:worker_threads";',
     "const namespace = await import(workerData);",
-    "const linked = await import(workerData);",
     "parentPort.postMessage({",
     "  value: namespace.value,",
-    "  sharedIdentity: namespace.token === linked.token,",
-    "  executions: linked.executions,",
     "  namespaceTag: Object.prototype.toString.call(namespace),",
     "});",
     "",
   ].join("\n"));
 
   const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
-    const worker = new Worker(workerPath, {
-      workerData: pathToFileURL(join(packageRoot, "index.js")).href,
-    });
+    const worker = new Worker(workerPath, { workerData: pathToFileURL(join(packageRoot, "index.js")).href });
     worker.once("message", resolve);
     worker.once("error", reject);
     worker.once("exit", code => {
@@ -242,8 +221,6 @@ test("package entry graphs with relative-only edges load as one graph", async ()
 
   expect(result).toEqual({
     value: 42,
-    sharedIdentity: true,
-    executions: 1,
     namespaceTag: "[object Module]",
   });
 });

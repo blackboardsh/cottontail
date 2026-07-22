@@ -227,7 +227,6 @@ export const builtinModules = [
 const commonJsCache = new Map();
 const commonJsWrapperFactoryCache = new Map();
 const bundledAsyncEsmGraphCache = new Map();
-const dynamicEsmNamespaceCache = new Map();
 const builtinModuleMap = new Map();
 const builtinNamespaceEntries = new Set();
 let modulePathCache = Object.create(null);
@@ -262,7 +261,6 @@ hotReloadHooks.add(() => {
   commonJsCache.clear();
   commonJsWrapperFactoryCache.clear();
   bundledAsyncEsmGraphCache.clear();
-  dynamicEsmNamespaceCache.clear();
   builtinModuleMap.clear();
   builtinNamespaceEntries.clear();
   for (const key of Object.keys(modulePathCache)) delete modulePathCache[key];
@@ -2581,11 +2579,6 @@ function runtimeEsmGraphPathKey(filename) {
   return String(absolute).replace(/\\/g, "/");
 }
 
-function runtimeEsmModuleIdentityKey(resolved) {
-  const { bare, suffix } = splitSpecifierSuffix(String(resolved));
-  return `${runtimeEsmGraphPathKey(bare)}${suffix}`;
-}
-
 function runtimeEsmSourceFingerprint(source) {
   const text = String(source);
   let hash = 2166136261;
@@ -2629,7 +2622,7 @@ function runtimeEsmRootBarePackageEdges(entryPath, entrySource) {
   }
 }
 
-function runtimeEsmIsExternalPackagePath(entryPath) {
+function runtimeEsmIsPackageModule(entryPath) {
   const path = splitSpecifierSuffix(String(entryPath)).bare.replace(/\\/g, "/");
   return path.includes("/node_modules/");
 }
@@ -2638,6 +2631,10 @@ function runtimeEsmMissingOptionalPeers(entryPath, packageEdges) {
   const roots = [];
   const entry = splitSpecifierSuffix(String(entryPath)).bare;
   const startDir = dirname(entry);
+  if (runtimeEsmIsPackageModule(entry)) {
+    const scope = nearestPackageScope(entry);
+    if (scope?.dir) roots.push(scope.dir);
+  }
   for (const request of packageEdges) {
     const root = packageRootFor(request, startDir);
     if (root) roots.push(root);
@@ -2719,10 +2716,8 @@ function unresolvedRuntimeEsmDynamicImport(error) {
 
 function runtimeAsyncEsmGraph(entryPath, entrySource) {
   const packageEdges = runtimeEsmRootBarePackageEdges(entryPath, entrySource);
-  // Package modules keep their own loader identity. Linking them into another
-  // runtime graph makes a later path import compile the same package twice.
   if (typeof cottontail.bundleNative !== "function" ||
-      packageEdges.length === 0 || runtimeEsmIsExternalPackagePath(entryPath)) {
+      (packageEdges.length === 0 && !runtimeEsmIsPackageModule(entryPath))) {
     return null;
   }
   const sourceFingerprint = runtimeEsmSourceFingerprint(entrySource);
@@ -2740,7 +2735,7 @@ function runtimeAsyncEsmGraph(entryPath, entrySource) {
         JSON.stringify({
           format: "esm",
           target: "bun",
-          packages: "external",
+          packages: "bundle",
           external,
           inlineImportMetaProperties: true,
         }),
@@ -3420,7 +3415,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
   return record.promise;
 }
 
-function executeDynamicImportSourceUncached(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
+function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
   let sourceText = String(source ?? "").replace(/^#!/, "//");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
@@ -3509,33 +3504,6 @@ function executeDynamicImportSourceUncached(resolved, source, format, forceAsync
   } catch (error) {
     if (!isAsyncModuleRequireError(error)) throw error;
     return executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, originalSource);
-  }
-  return namespace;
-}
-
-function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
-  const { bare: resolvedPath } = splitSpecifierSuffix(resolved);
-  const effectiveFormat = format ?? formatForHookSource(resolvedPath, String(source ?? ""));
-  if (effectiveFormat !== "module" || !isAbsolute(resolvedPath)) {
-    return executeDynamicImportSourceUncached(resolved, source, format, forceAsync, asyncAncestors);
-  }
-
-  const identityKey = runtimeEsmModuleIdentityKey(resolved);
-  if (dynamicEsmNamespaceCache.has(identityKey)) return dynamicEsmNamespaceCache.get(identityKey);
-  let namespace;
-  try {
-    namespace = executeDynamicImportSourceUncached(resolved, source, format, forceAsync, asyncAncestors);
-  } catch (error) {
-    dynamicEsmNamespaceCache.delete(identityKey);
-    throw error;
-  }
-  dynamicEsmNamespaceCache.set(identityKey, namespace);
-  if (isPromiseLike(namespace)) {
-    Promise.resolve(namespace).catch(() => {
-      if (dynamicEsmNamespaceCache.get(identityKey) === namespace) {
-        dynamicEsmNamespaceCache.delete(identityKey);
-      }
-    });
   }
   return namespace;
 }
