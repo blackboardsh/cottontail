@@ -547,24 +547,36 @@ describe.concurrent("socket", () => {
   });
 
   it("should not call drain before handshake", async () => {
-    const { promise, resolve, reject } = Promise.withResolvers();
-    using socket = await Bun.connect({
-      hostname: "www.example.com",
-      tls: true,
-      port: 443,
+    const listener = Bun.listen({
+      hostname: "localhost",
+      port: 0,
+      tls,
       socket: {
-        drain() {
-          if (!socket.authorized) {
-            reject(new Error("Socket not authorized"));
-          }
-        },
-        handshake() {
-          resolve();
-        },
+        data() {},
       },
     });
-    await promise;
-    expect(socket.authorized).toBe(true);
+    const { promise, resolve, reject } = Promise.withResolvers();
+    try {
+      using socket = await Bun.connect({
+        hostname: listener.hostname,
+        tls,
+        port: listener.port,
+        socket: {
+          drain() {
+            if (!socket.authorized) {
+              reject(new Error("Socket not authorized"));
+            }
+          },
+          handshake() {
+            resolve();
+          },
+        },
+      });
+      await promise;
+      expect(socket.authorized).toBe(true);
+    } finally {
+      listener.stop(true);
+    }
   });
   it("upgradeTLS handles errors", async () => {
     using server = Bun.serve({

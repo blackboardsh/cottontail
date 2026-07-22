@@ -1681,8 +1681,8 @@
       "reason": "Bun-compatible module namespace prototype isolation and synthetic __esModule assignment coverage passes under Cottontail."
     },
     "test/js/bun/net/socket.test.ts": {
-      "status": "expected-failure",
-      "reason": "25 of 26 active cases pass, covering fd adoption, connection lifecycle, 1 GB transfer, native drain readiness, callback errors, and TLS upgrades (1,348 assertions). The sole residual case connects to www.example.com:443, which this environment rejects under both Cottontail and Bun 1.3.10; scaled in-file and outer budgets let the strict xfail reach that actual network failure instead of the stock-JSC startup watchdog.",
+      "status": "enabled",
+      "reason": "All 26 active cases pass, covering fd adoption, connection lifecycle, 1 GB transfer, native drain readiness, callback errors, TLS upgrades, and deterministic local TLS handshake ordering (1,349 assertions).",
       "serial": true,
       "env": {
         "COTTONTAIL_TEST_TIMEOUT_SCALE": "5"
