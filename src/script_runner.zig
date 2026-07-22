@@ -1467,8 +1467,22 @@ fn runHtmlDevServerOnThread(server_run: *HtmlDevServerRun) !u8 {
     const executable_source = (try rewriteLegacyHtmlClosingComments(ctx.allocator, server_run.source)) orelse server_run.source;
     if (!validateEvalSyntax(&ctx, executable_source)) return 1;
 
+    const module_input = hasModuleInputType(server_run.exec_args) or sourceLooksEsm(executable_source);
+    const eval_entry = try writeEvalEntrypoint(
+        &ctx,
+        ctx.project_root,
+        executable_source,
+        false,
+        module_input,
+        "[eval]",
+        true,
+        .omit_entrypoint,
+    );
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, eval_entry.entry_path) catch {};
+    defer if (eval_entry.source_path) |path| std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
+
     const process_args = try ctx.allocator.alloc([:0]const u8, server_run.script_args.len + 1);
-    process_args[0] = try ctx.allocator.dupeZ(u8, "[eval]");
+    process_args[0] = try ctx.allocator.dupeZ(u8, eval_entry.entry_path);
     for (server_run.script_args, 0..) |arg, index| process_args[index + 1] = arg;
     if (!applyRuntimeEnvFlags(init.io, ctx.allocator, server_run.exec_args)) return 1;
     const inspector = inspectorLaunchFromArgs(&ctx, server_run.exec_args) catch |err| {
@@ -1495,7 +1509,33 @@ fn runHtmlDevServerOnThread(server_run: *HtmlDevServerRun) !u8 {
     if (!configureRuntimeInspector(&execution, &js_runtime)) return 1;
 
     try js_runtime.evalImmediate(server_run.early_source, "cottontail:html-server-prebind");
-    return js_runtime.runSource(executable_source, process_args[0]);
+
+    var runnable = try bundleScriptNative(
+        &ctx,
+        eval_entry.entry_path,
+        server_run.exec_args,
+        server_run.script_args,
+        ctx.project_root,
+        null,
+        null,
+        false,
+        null,
+    );
+    defer runnable.deinit(&ctx);
+    canonicalizeEvalSourceMap(&ctx, runnable.path, eval_entry.source_path orelse eval_entry.entry_path) catch |err| switch (err) {
+        error.EvalSourceMissingFromSourceMap => {},
+        else => return err,
+    };
+
+    const source_map_path = try std.mem.concat(ctx.allocator, u8, &.{ runnable.path, ".map" });
+    if (std.Io.Dir.cwd().access(ctx.io, source_map_path, .{})) {
+        try js_runtime.setExternalSourceMap(source_map_path, runnable.path);
+    } else |_| {}
+    if (runnableDirectoryForCleanup(&ctx, runnable.path)) |directory| {
+        try js_runtime.setExitCleanupPath(try ctx.allocator.dupeZ(u8, directory));
+    }
+
+    return js_runtime.runFile(try ctx.allocator.dupeZ(u8, runnable.path));
 }
 
 fn validateEvalSyntax(ctx: *const Context, source: []const u8) bool {
