@@ -173,6 +173,13 @@ const UpdateResult = struct {
     resolved_version: []const u8,
     saved_spec: []const u8,
     previous_version: ?[]const u8,
+    direct_bins: []const []const u8 = &.{},
+};
+
+const UpdateReport = struct {
+    alias: []const u8,
+    result: UpdateResult,
+    request_index: usize,
 };
 
 const InteractiveUpdatePackage = struct {
@@ -2163,6 +2170,7 @@ const Manager = struct {
     installed_registry_packages: std.StringHashMap(void),
     linked_bins: std.StringHashMap(void),
     refreshed_update_manifests: std.StringHashMap(void),
+    update_selections: std.StringHashMap([]const u8),
     direct_bins: std.array_list.Managed([]const u8),
     explicit_adds: std.StringHashMap(void),
     trusted_additions: std.StringHashMap(void),
@@ -2181,6 +2189,7 @@ const Manager = struct {
     link_workspace_packages: bool = true,
     started_ns: i128,
     installed_count: usize = 0,
+    reported_update_installed_count: ?usize = null,
     removed_count: usize = 0,
     network_task_count: usize = 0,
     changed: bool = false,
@@ -2239,6 +2248,7 @@ const Manager = struct {
             .installed_registry_packages = std.StringHashMap(void).init(allocator),
             .linked_bins = std.StringHashMap(void).init(allocator),
             .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
+            .update_selections = std.StringHashMap([]const u8).init(allocator),
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
             .explicit_adds = std.StringHashMap(void).init(allocator),
@@ -2271,6 +2281,7 @@ const Manager = struct {
         manager.registry_scopes.deinit();
         manager.initial_root_versions.deinit();
         manager.refreshed_update_manifests.deinit();
+        manager.update_selections.deinit();
         manager.linked_bins.deinit();
         manager.installed_registry_packages.deinit();
         manager.registry_archives.deinit();
@@ -2621,7 +2632,11 @@ const Manager = struct {
                 manager.options.positionals.len
             else
                 manager.installed_count;
-            const reported_installed_count = physical_installed_count -| manager.duplicateDirectInstallCount();
+            const command_installed_count = if (manager.options.command == .update)
+                manager.reported_update_installed_count orelse physical_installed_count
+            else
+                physical_installed_count;
+            const reported_installed_count = command_installed_count -| manager.duplicateDirectInstallCount();
             if (manager.options.command == .install and manager.options.dry_run) {
                 try manager.stdout.print("[{d:.2}ms] done\n", .{elapsed_ms});
             } else if (manager.options.command == .remove) {
@@ -5912,11 +5927,19 @@ const Manager = struct {
             try manager.installRoot(manager.root_package_json.?, true);
             return;
         }
+        if (manager.node_linker == .hoisted and !std.mem.eql(u8, parent_dir, manager.root_dir)) {
+            // Keep existing root selections reserved while resolving an update
+            // from a workspace so an explicit version is placed below it.
+            try manager.reserveDirectRootVersions(manager.root_package_json.?);
+        }
         const requests = try manager.parseUpdateRequests();
+        const installed_count_before_update = manager.installed_count;
         var handled = std.StringHashMap(void).init(manager.allocator);
         defer handled.deinit();
         var update_output: std.Io.Writer.Allocating = .init(manager.allocator);
         var reinstalled_output: std.Io.Writer.Allocating = .init(manager.allocator);
+        var requested_reports = std.array_list.Managed(UpdateReport).init(manager.allocator);
+        defer requested_reports.deinit();
 
         for (update_dependency_sections) |dependency_section| {
             const section_value = package_json.object.getPtr(dependency_section.name) orelse continue;
@@ -5925,7 +5948,8 @@ const Manager = struct {
             std.mem.sort([]const u8, aliases, {}, lessString);
             for (aliases) |name| {
                 const spec_value = section_value.object.getPtr(name) orelse continue;
-                const request = findUpdateRequest(requests, name);
+                const request_index = findUpdateRequestIndex(requests, name);
+                const request = if (request_index) |index| &requests[index] else null;
                 if (requests.len > 0 and request == null) continue;
                 if (spec_value.* != .string) {
                     if (request != null) try handled.put(name, {});
@@ -5975,16 +5999,22 @@ const Manager = struct {
                 const was_reinstalled = manager.installed_count > previous_installed_count and
                     result.previous_version != null and
                     std.mem.eql(u8, result.previous_version.?, result.resolved_version);
-                if (request == null and was_reinstalled) {
+                if (request_index) |index| {
+                    try requested_reports.append(.{
+                        .alias = name,
+                        .result = result,
+                        .request_index = index,
+                    });
+                } else if (was_reinstalled) {
                     try reinstalled_output.writer.print("+ {s}@{s}\n", .{ name, result.resolved_version });
                 } else {
-                    try manager.appendUpdateOutput(&update_output.writer, name, result, request != null);
+                    try manager.appendUpdateOutput(&update_output.writer, name, result, false);
                 }
             }
         }
 
         if (requests.len > 0) {
-            for (requests) |*request| {
+            for (requests, 0..) |*request, request_index| {
                 if (request.alias) |alias| {
                     if (handled.contains(alias)) continue;
                 }
@@ -6019,12 +6049,34 @@ const Manager = struct {
                 );
                 manager.update_package_json_changed = true;
                 manager.changed = true;
-                try manager.appendUpdateOutput(&update_output.writer, result.alias, result, true);
+                try requested_reports.append(.{
+                    .alias = result.alias,
+                    .result = result,
+                    .request_index = request_index,
+                });
                 try handled.put(result.alias, {});
+            }
+
+            std.mem.sort(UpdateReport, requested_reports.items, {}, struct {
+                fn lessThan(_: void, left: UpdateReport, right: UpdateReport) bool {
+                    return left.request_index < right.request_index;
+                }
+            }.lessThan);
+            for (requested_reports.items) |report| {
+                try manager.appendUpdateOutput(&update_output.writer, report.alias, report.result, true);
             }
         }
 
+        const directly_installed_count = manager.installed_count -| installed_count_before_update;
         try manager.installRoot(manager.root_package_json.?, true);
+        if (requests.len > 0) {
+            // Bun reports successful selections from the invoked workspace. The
+            // root graph reconciliation that follows must not inflate this count.
+            manager.reported_update_installed_count = if (directly_installed_count > 0)
+                @max(directly_installed_count, requests.len)
+            else
+                0;
+        }
         if (!manager.options.silent) {
             try manager.stdout.writeAll(update_output.written());
             if (update_output.written().len > 0 and reinstalled_output.written().len > 0) {
@@ -6094,6 +6146,7 @@ const Manager = struct {
             defer manager.refresh_direct_registry = previous_refresh;
             break :blk try manager.installDependency(alias, resolution_spec, parent_dir, true, optional, false);
         };
+        try manager.rememberUpdateSelection(parent_dir, alias, resolved_version);
         return .{
             .alias = alias,
             .resolved_version = resolved_version,
@@ -6107,6 +6160,7 @@ const Manager = struct {
                 manager.options.exact,
             ),
             .previous_version = previous_version,
+            .direct_bins = try manager.collectUpdateBins(alias, resolved_version),
         };
     }
 
@@ -6152,12 +6206,14 @@ const Manager = struct {
             return error.InvalidPackageName;
         }
         manager.changed = true;
+        try manager.rememberUpdateSelection(parent_dir, alias.?, resolved_version);
 
         return .{
             .alias = alias.?,
             .resolved_version = resolved_version,
             .saved_spec = saved_spec,
             .previous_version = previous_version,
+            .direct_bins = try manager.collectUpdateBins(alias.?, resolved_version),
         };
     }
 
@@ -6172,6 +6228,26 @@ const Manager = struct {
         return manager.initial_root_versions.get(alias);
     }
 
+    fn rememberUpdateSelection(
+        manager: *Manager,
+        parent_dir: []const u8,
+        alias: []const u8,
+        resolved_version: []const u8,
+    ) !void {
+        const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}", .{ parent_dir, alias });
+        try manager.update_selections.put(key, try manager.allocator.dupe(u8, resolved_version));
+    }
+
+    fn selectedUpdateVersion(
+        manager: *Manager,
+        parent_dir: []const u8,
+        alias: []const u8,
+    ) !?[]const u8 {
+        if (manager.options.command != .update) return null;
+        const key = try std.fmt.allocPrint(manager.allocator, "{s}\x00{s}", .{ parent_dir, alias });
+        return manager.update_selections.get(key);
+    }
+
     fn appendUpdateOutput(
         manager: *Manager,
         writer: *std.Io.Writer,
@@ -6181,11 +6257,11 @@ const Manager = struct {
     ) !void {
         if (manager.options.silent or manager.options.no_summary) return;
         if (requested) {
-            if (manager.direct_bins.items.len == 0) {
+            if (result.direct_bins.len == 0) {
                 try writer.print("installed {s}@{s}\n", .{ alias, result.resolved_version });
             } else {
                 try writer.print("installed {s}@{s} with binaries:\n", .{ alias, result.resolved_version });
-                for (manager.direct_bins.items) |bin_name| try writer.print(" - {s}\n", .{bin_name});
+                for (result.direct_bins) |bin_name| try writer.print(" - {s}\n", .{bin_name});
             }
             return;
         }
@@ -6200,6 +6276,40 @@ const Manager = struct {
         } else {
             try writer.print("+ {s}@{s}\n", .{ alias, result.resolved_version });
         }
+    }
+
+    fn collectUpdateBins(
+        manager: *Manager,
+        alias: []const u8,
+        resolved_version: []const u8,
+    ) ![]const []const u8 {
+        var bins = std.array_list.Managed([]const u8).init(manager.allocator);
+
+        var record_index = manager.records.items.len;
+        while (record_index > 0) {
+            record_index -= 1;
+            const record = manager.records.items[record_index];
+            if (!std.mem.eql(u8, record.alias, alias) or
+                !std.mem.eql(u8, record.version, resolved_version)) continue;
+            const metadata = record.metadata orelse continue;
+            if (metadata.* != .object) break;
+            const bin = metadata.object.get("bin") orelse break;
+            switch (bin) {
+                .string => try bins.append(normalizedBinName(alias)),
+                .object => {
+                    for (bin.object.keys()) |name| {
+                        try bins.append(normalizedBinObjectName(name));
+                    }
+                },
+                else => {},
+            }
+            break;
+        }
+
+        if (bins.items.len == 0) {
+            try bins.appendSlice(manager.direct_bins.items);
+        }
+        return bins.toOwnedSlice();
     }
 
     fn installDependencyObject(
@@ -6587,7 +6697,7 @@ const Manager = struct {
         }
 
         const registry_name, const registry_spec = parseNpmAlias(alias, resolution_spec);
-        const selected_registry_spec = if (!direct)
+        const selected_registry_spec = (try manager.selectedUpdateVersion(parent_dir, alias)) orelse if (!direct)
             if (manager.root_versions.get(alias)) |root_version|
                 if (semverSatisfies(manager.allocator, registry_spec, root_version)) root_version else registry_spec
             else
@@ -7139,6 +7249,15 @@ const Manager = struct {
                 return local.version;
             },
             .local_tarball, .remote_tarball => {
+                if (package.kind == .remote_tarball and
+                    manager.node_linker == .hoisted and
+                    !manager.options.lockfile_only and
+                    !manager.options.dry_run and
+                    manager.init_data.environ_map.get("BUN_INSTALL_CACHE_DIR") == null)
+                {
+                    const project_cache = try std.fs.path.join(manager.allocator, &.{ manager.root_dir, "node_modules", ".cache" });
+                    try std.Io.Dir.cwd().createDirPath(manager.init_data.io, project_cache);
+                }
                 const archive = if (package.kind == .remote_tarball)
                     try manager.fetchBytes(package.source, false, max_tarball_bytes)
                 else blk: {
@@ -11500,10 +11619,10 @@ fn packageSpecHasExplicitSpecifier(input: []const u8) bool {
     return if (std.mem.indexOfScalar(u8, input, '@')) |at| at > 0 else false;
 }
 
-fn findUpdateRequest(requests: []const UpdateRequest, alias: []const u8) ?*const UpdateRequest {
-    for (requests) |*request| {
+fn findUpdateRequestIndex(requests: []const UpdateRequest, alias: []const u8) ?usize {
+    for (requests, 0..) |request, index| {
         const request_alias = request.alias orelse continue;
-        if (std.mem.eql(u8, request_alias, alias)) return request;
+        if (std.mem.eql(u8, request_alias, alias)) return index;
     }
     return null;
 }
