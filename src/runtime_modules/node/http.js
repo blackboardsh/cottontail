@@ -1458,6 +1458,7 @@ export function validateHeaderValue(name, value) {
 
 export class IncomingMessage extends Readable {
   constructor(init = {}) {
+    init ??= {};
     if (init && typeof init.on === "function" && init.headers === undefined && init.deferBody === undefined) {
       init = { socket: init, deferBody: true };
     }
@@ -3812,14 +3813,24 @@ export function createServer(options = {}, requestListener = undefined) {
   return new Server(options, requestListener);
 }
 
-export function request(input, options = undefined, callback = undefined) {
+function requestImpl(input, options = undefined, callback = undefined) {
   return new ClientRequest(input, options, callback, "http:");
 }
 
-export function get(input, options = undefined, callback = undefined) {
-  const req = request(input, options, callback);
+function getImpl(input, options = undefined, callback = undefined) {
+  const req = requestImpl(input, options, callback);
   req.end();
   return req;
+}
+
+// Transpiled ESM dependencies commonly patch the mutable default export. Keep
+// named calls connected to that object so CJS-facing interceptors stay visible.
+export function request(...args) {
+  return httpDefault.request(...args);
+}
+
+export function get(...args) {
+  return httpDefault.get(...args);
 }
 
 export function setMaxIdleHTTPParsers(value) {
@@ -4617,9 +4628,9 @@ const httpDefault = {
   WebSocket,
   _connectionListener,
   createServer,
-  get,
+  get: getImpl,
   globalAgent,
-  request,
+  request: requestImpl,
   setMaxIdleHTTPParsers,
   validateHeaderName,
   validateHeaderValue,

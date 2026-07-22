@@ -1026,11 +1026,8 @@ class Zstd extends Zlib {}
 function makeCallableZlibConstructor(name, Parent, mode) {
   const Constructor = {
     [name]: function(options = {}) {
-      const instance = Reflect.construct(Parent, [mode, options], new.target ?? Constructor);
-      if (new.target || this == null || this === globalThis) return instance;
-      Object.defineProperties(this, Object.getOwnPropertyDescriptors(instance));
-      this._handle._stream = this;
-      return this;
+      if (!new.target) return new Constructor(options);
+      return Reflect.construct(Parent, [mode, options], new.target);
     },
   }[name];
   Object.setPrototypeOf(Constructor, Parent);

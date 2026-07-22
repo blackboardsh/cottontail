@@ -842,6 +842,10 @@ export function readSync(fd, buffer, offset = 0, length = undefined, position = 
 export function writeSync(fd, data, offset = undefined, length = undefined, position = null) {
   fd = validateFd(fd);
   if (typeof data === "string") {
+    if (typeof offset === "string") {
+      length = offset;
+      offset = null;
+    }
     const encoding = normalizeEncoding(typeof length === "string" ? length : "utf8", "utf8");
     position = validatePosition(offset ?? null);
     const bytes = bytesFromData(data, encoding);
@@ -2102,6 +2106,10 @@ export function write(fd, data, offset = undefined, length = undefined, position
   if (typeof callback !== "function") throw makeInvalidCallbackError("callback", callback);
   validateFd(fd);
   if (typeof data === "string") {
+    if (typeof offset === "string") {
+      length = offset;
+      offset = null;
+    }
     validatePosition(offset ?? null);
     normalizeEncoding(typeof length === "string" ? length : "utf8", "utf8");
   } else {

@@ -178,17 +178,17 @@ export function createServer(options = {}, requestListener = undefined) {
   return new Server(options, requestListener);
 }
 
-export function request(input, options = undefined, callback = undefined) {
+function requestImpl(input, options = undefined, callback = undefined) {
   return new ClientRequest(input, options, callback);
 }
 
-export function get(input, options = undefined, callback = undefined) {
-  const req = request(input, options, callback);
+function getImpl(input, options = undefined, callback = undefined) {
+  const req = requestImpl(input, options, callback);
   req.end();
   return req;
 }
 
-export default {
+const httpsDefault = {
   Agent,
   ClientRequest,
   IncomingMessage,
@@ -197,7 +197,17 @@ export default {
   Server,
   ServerResponse,
   createServer,
-  get,
+  get: getImpl,
   globalAgent,
-  request,
+  request: requestImpl,
 };
+
+export function request(...args) {
+  return httpsDefault.request(...args);
+}
+
+export function get(...args) {
+  return httpsDefault.get(...args);
+}
+
+export default httpsDefault;
