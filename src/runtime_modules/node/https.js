@@ -29,7 +29,8 @@ export class Agent extends HttpAgent {
     for (const key of [
       "ca", "cert", "clientCertEngine", "ciphers", "key", "pfx", "rejectUnauthorized",
       "servername", "minVersion", "maxVersion", "secureProtocol", "crl", "honorCipherOrder",
-      "ecdhCurve", "dhparam", "secureOptions", "sessionIdContext",
+      "ecdhCurve", "dhparam", "secureOptions", "sessionIdContext", "sigalgs",
+      "privateKeyIdentifier", "privateKeyEngine",
     ]) {
       const value = options[key] ?? this.options[key];
       if (value !== undefined) name += `:${key}=${tlsCacheKey(value)}`;
@@ -50,7 +51,7 @@ export class Agent extends HttpAgent {
       }
       this._sessionCache.list.push(key);
     }
-    this._sessionCache.map[key] = session;
+    this._sessionCache.map[key] = Buffer.from(session);
   }
 
   _evictSession(key) {
@@ -74,9 +75,7 @@ export class Agent extends HttpAgent {
       servername,
       port: Number(merged.port ?? 443),
     }, callback);
-    socket.once?.("secureConnect", () => {
-      try { this._cacheSession(name, socket.getSession?.()); } catch {}
-    });
+    socket.on?.("session", (session) => this._cacheSession(name, session));
     socket.once?.("error", () => this._evictSession(name));
     return socket;
   }

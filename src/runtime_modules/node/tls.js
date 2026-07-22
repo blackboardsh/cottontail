@@ -1,6 +1,6 @@
 import { Buffer } from "./buffer.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
-import { X509Certificate, createHash, createDecipheriv } from "./crypto.js";
+import { X509Certificate, createHash, createDecipheriv, randomBytes } from "./crypto.js";
 import { connect as netConnect, isIP, Server as NetServer, Socket, SocketAddress } from "./net.js";
 
 export const CLIENT_RENEG_LIMIT = 3;
@@ -362,6 +362,45 @@ function bufferFromNativeBytes(bytes) {
   return undefined;
 }
 
+function validateSessionTimeout(value, name = "options.sessionTimeout") {
+  if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+  if (!Number.isInteger(value) || value < 0 || value > 2 ** 31 - 1) {
+    throw outOfRange(name, `>= 0 && <= ${2 ** 31 - 1}`, value);
+  }
+  return value;
+}
+
+function validateTicketKeys(value, name = "ticketKeys") {
+  if (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) {
+    throw invalidArgType(name, "an instance of Buffer, TypedArray, DataView, or ArrayBuffer", value);
+  }
+  const keys = Buffer.from(bytesFrom(value));
+  if (keys.byteLength !== 48) {
+    const message = name === "options.ticketKeys"
+      ? `The property '${name}' must be exactly 48 bytes. Received ${keys.byteLength}`
+      : "Session ticket keys must be a 48-byte buffer";
+    const error = new TypeError(message);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  return keys;
+}
+
+function validateSessionIdContext(value, name = "options.sessionIdContext") {
+  if (typeof value !== "string") throw invalidArgType(name, "of type string", value);
+  const context = Buffer.from(value);
+  if (context.byteLength > 32) throw invalidArgValue(name, value, "must not exceed 32 bytes");
+  return value;
+}
+
+let defaultServerSessionIdContext;
+function serverSessionIdContext() {
+  if (defaultServerSessionIdContext == null) {
+    defaultServerSessionIdContext = createHash("sha1").update(process.argv.join(" ")).digest("hex").slice(0, 32);
+  }
+  return defaultServerSessionIdContext;
+}
+
 function legacyCertificateFromBytes(bytes) {
   const raw = bufferFromNativeBytes(bytes);
   if (raw == null || raw.byteLength === 0) return {};
@@ -571,8 +610,27 @@ class SecureContextImpl {
       if (options[versionName] != null && typeof options[versionName] !== "string") throw invalidArgType(`options.${versionName}`, "of type string", options[versionName]);
     }
     validateCiphers(options.ciphers);
-    tlsProtocolOptions(options);
-    this.context = { ...options };
+    const context = { ...options };
+    if (options.ticketKeys != null) context.ticketKeys = validateTicketKeys(options.ticketKeys, "options.ticketKeys");
+    if (options.sessionTimeout != null) context.sessionTimeout = validateSessionTimeout(options.sessionTimeout);
+    if (options.sessionIdContext != null) context.sessionIdContext = validateSessionIdContext(options.sessionIdContext);
+    const protocols = tlsProtocolOptions(context);
+    const credentials = tlsCredentialOptions(context);
+    try {
+      cottontail.tlsValidateSecureContext?.(
+        credentials.cert,
+        credentials.key,
+        credentials.passphrase,
+        credentials.ca,
+        context.ciphers,
+        protocols.minVersion,
+        protocols.maxVersion,
+        protocols.secureOptions,
+      );
+    } catch (error) {
+      throw normalizeTlsError(error, "Failed to initialize TLS context");
+    }
+    this.context = context;
     this.servername = options.servername;
   }
 }
@@ -624,6 +682,11 @@ export class TLSSocket extends Socket {
     if (options.secureContext != null && !(options.secureContext instanceof SecureContext)) {
       throw invalidArgType("options.secureContext", "an instance of SecureContext", options.secureContext);
     }
+    if (options.SNICallback != null && typeof options.SNICallback !== "function") throw invalidArgType("options.SNICallback", "of type function", options.SNICallback);
+    if (options.ALPNCallback != null && typeof options.ALPNCallback !== "function") throw invalidArgType("options.ALPNCallback", "of type function", options.ALPNCallback);
+    if (options.ALPNCallback != null && options.ALPNProtocols != null) {
+      throw tlsError("ALPNCallback and ALPNProtocols are mutually exclusive", "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS");
+    }
     this.encrypted = true;
     this.authorized = false;
     this.authorizationError = null;
@@ -632,6 +695,15 @@ export class TLSSocket extends Socket {
     this._parent = socket;
     this._secureContext = options?.secureContext ?? createSecureContext(options ?? {});
     this.ALPNProtocols = prepareALPNProtocols(options.ALPNProtocols);
+    this._SNICallback = options.SNICallback;
+    this._ALPNCallback = options.ALPNCallback;
+    this._clientHelloHandling = false;
+    this._clientHelloError = null;
+    this._ticketKeys = options.ticketKeys == null ? undefined : validateTicketKeys(options.ticketKeys, "options.ticketKeys");
+    this._sessionTimeout = options.sessionTimeout == null ? undefined : validateSessionTimeout(options.sessionTimeout);
+    this._sessionIdContext = options.sessionIdContext == null
+      ? undefined
+      : Buffer.from(validateSessionIdContext(options.sessionIdContext));
     this.ciphers = options.ciphers;
     this._tlsId = null;
     this._tlsInfo = null;
@@ -656,14 +728,14 @@ export class TLSSocket extends Socket {
     this._tlsWriteBlocked = false;
     this._tlsShutdownSent = false;
     this._renegotiationDisabled = false;
+    this.isServer = options?.isServer === true;
     this._rejectUnauthorized = options?.rejectUnauthorized == null ? rejectUnauthorizedDefault : options.rejectUnauthorized !== false;
-    this._requestCert = options?.requestCert !== false;
+    this._requestCert = this.isServer ? options?.requestCert === true : options?.requestCert !== false;
     this._requestOCSP = options?.requestOCSP === true;
     this._ocspResponseEmitted = false;
     this._checkServerIdentity = options?.checkServerIdentity ?? checkServerIdentity;
     this._identityHostname = options?.identityHostname;
     this._skipServerIdentity = options?.skipServerIdentity === true;
-    this.isServer = options?.isServer === true;
     const handshakeTimeout = options.handshakeTimeout ?? (this.isServer ? 120000 : 10000);
     if (typeof handshakeTimeout !== "number" || !Number.isFinite(handshakeTimeout) || handshakeTimeout < 0) {
       throw outOfRange("options.handshakeTimeout", "a non-negative finite number", handshakeTimeout);
@@ -689,6 +761,7 @@ export class TLSSocket extends Socket {
     this.readable = true;
     this.writable = !this._ending;
     cottontail.tlsConnectionSetRef?.(this._tlsId, this._refed);
+    if (this._renegotiationDisabled) cottontail.tlsConnectionDisableRenegotiation?.(this._tlsId);
     this._setAddressInfo(native.local, native.remote);
     if (this._maxSendFragment != null) {
       try { cottontail.tlsConnectionSetMaxSendFragment?.(this._tlsId, this._maxSendFragment); } catch {}
@@ -711,6 +784,7 @@ export class TLSSocket extends Socket {
     this.destroyed = false;
     this.readable = true;
     this.writable = !this._ending;
+    if (this._renegotiationDisabled) cottontail.tlsConnectionDisableRenegotiation?.(this._tlsId);
     const onData = (chunk) => {
       if (this.destroyed || this._tlsId == null) return;
       try {
@@ -785,9 +859,39 @@ export class TLSSocket extends Socket {
     return writable;
   }
 
+  _emitPendingSessions() {
+    if (this._tlsId == null || typeof cottontail.tlsConnectionTakeSession !== "function") return;
+    for (;;) {
+      const session = bufferFromNativeBytes(cottontail.tlsConnectionTakeSession(this._tlsId));
+      if (session == null || session.byteLength === 0) return;
+      this._session = session;
+      this.emit("session", session);
+    }
+  }
+
+  _handleRenegotiationSecure() {
+    const info = cottontail.tlsConnectionInfo?.(this._tlsId) ?? this._tlsInfo ?? {};
+    this._tlsInfo = info;
+    const authorizationError = info.verifyErrorCode
+      ? tlsError(info.verifyErrorMessage || info.verifyErrorCode, info.verifyErrorCode)
+      : null;
+    this.authorized = authorizationError == null;
+    this.authorizationError = authorizationError == null
+      ? null
+      : authorizationError.code || authorizationError.message;
+    if (authorizationError && this._rejectUnauthorized) {
+      this.destroy(authorizationError);
+      return;
+    }
+    this.alpnProtocol = info.alpnProtocol || false;
+    this.emit("secure", this);
+  }
+
   _drainMemoryPlaintext() {
     if (this._tlsId == null || this._memoryTransport == null || this.connecting) return;
     const result = cottontail.tlsConnectionReadMemory(this._tlsId);
+    if (result?.secure) this._handleRenegotiationSecure();
+    if (this.destroyed) return;
     const chunk = bufferFromNativeBytes(result?.data);
     if (chunk != null && chunk.byteLength > 0) {
       this.bytesRead += chunk.byteLength;
@@ -795,10 +899,15 @@ export class TLSSocket extends Socket {
       this._refreshTimeout?.();
     }
     if (result?.error) {
-      const error = tlsError(String(result.error), result.code);
+      const message = String(result.error);
+      const code = result.code ?? (/no renegotiation|renegotiation.*disabled/i.test(message)
+        ? "ERR_TLS_RENEGOTIATION_DISABLED"
+        : undefined);
+      const error = tlsError(message, code);
       this.destroy(error);
       return;
     }
+    this._emitPendingSessions();
     if (result?.ended) this._endMemoryTransport(true);
   }
 
@@ -894,17 +1003,124 @@ export class TLSSocket extends Socket {
     });
   }
 
+  _addServerContext(servername, secureContext) {
+    const contextOptions = secureContext.context ?? {};
+    const credentials = tlsCredentialOptions(contextOptions);
+    const protocols = tlsProtocolOptions(contextOptions);
+    const sessionIdContext = contextOptions.sessionIdContext == null
+      ? this._sessionIdContext
+      : Buffer.from(contextOptions.sessionIdContext);
+    cottontail.tlsConnectionAddServerContext(
+      this._tlsId,
+      servername,
+      credentials.cert,
+      credentials.key,
+      credentials.ca,
+      credentials.passphrase,
+      contextOptions.requestCert == null ? this._requestCert : Boolean(contextOptions.requestCert),
+      contextOptions.rejectUnauthorized == null ? this._rejectUnauthorized : contextOptions.rejectUnauthorized !== false,
+      contextOptions.ciphers ?? this.ciphers,
+      protocols.minVersion,
+      protocols.maxVersion,
+      protocols.secureOptions,
+      contextOptions.ticketKeys ?? this._ticketKeys,
+      contextOptions.sessionTimeout ?? this._sessionTimeout,
+      sessionIdContext,
+    );
+  }
+
+  _rejectClientHello(error, alert = 80) {
+    this._clientHelloError = normalizeTlsError(error, "TLS ClientHello callback failed");
+    try {
+      cottontail.tlsConnectionResolveClientHello(this._tlsId, undefined, true, alert);
+    } catch (resolveError) {
+      this._clientHelloError = normalizeTlsError(resolveError);
+    }
+    this._clientHelloHandling = false;
+  }
+
+  _handleClientHello(hello) {
+    if (this._clientHelloHandling || this._tlsId == null) return;
+    this._clientHelloHandling = true;
+    const servername = typeof hello?.servername === "string" ? hello.servername : undefined;
+    const protocols = Array.isArray(hello?.protocols) ? hello.protocols.map(String) : [];
+    this.servername = servername ?? this.servername;
+
+    let selectedProtocol;
+    if (typeof this._ALPNCallback === "function" && protocols.length > 0) {
+      try {
+        selectedProtocol = this._ALPNCallback({ servername, protocols: [...protocols] });
+      } catch (error) {
+        this._rejectClientHello(error);
+        return;
+      }
+      if (typeof selectedProtocol !== "string" || !protocols.includes(selectedProtocol)) {
+        this._rejectClientHello(
+          tlsError(
+            `ALPN callback selected a protocol that was not offered: ${String(selectedProtocol)}`,
+            "ERR_TLS_ALPN_CALLBACK_INVALID_RESULT",
+          ),
+          120,
+        );
+        return;
+      }
+    }
+
+    let callbackCalled = false;
+    const finish = (error, secureContext) => {
+      if (callbackCalled || !this._clientHelloHandling || this._tlsId == null) return;
+      callbackCalled = true;
+      if (error) {
+        this._rejectClientHello(error);
+        return;
+      }
+      try {
+        if (secureContext != null) {
+          if (!(secureContext instanceof SecureContext)) {
+            throw tlsError("Invalid SNI context", "ERR_TLS_INVALID_CONTEXT");
+          }
+          if (servername != null) this._addServerContext(servername, secureContext);
+        }
+        const selected = selectedProtocol == null ? undefined : Buffer.from(selectedProtocol);
+        cottontail.tlsConnectionResolveClientHello(this._tlsId, selected, false, 0);
+        this._clientHelloHandling = false;
+      } catch (contextError) {
+        this._rejectClientHello(contextError);
+      }
+    };
+
+    if (servername != null && typeof this._SNICallback === "function") {
+      try {
+        this._SNICallback(servername, finish);
+      } catch (error) {
+        finish(error);
+      }
+      return;
+    }
+    finish(null, null);
+  }
+
   _continueTlsHandshake(connectedEvent) {
     const startedAt = Date.now();
     const step = () => {
       this._tlsHandshakeTimer = null;
       if (this.destroyed || this._tlsId == null) return;
       try {
+        if (this._clientHelloHandling) {
+          if (this._handshakeTimeout > 0 && Date.now() - startedAt >= this._handshakeTimeout) {
+            throw tlsError("TLS handshake timed out", "ETIMEDOUT");
+          }
+          this._tlsHandshakeTimer = setTimeout(step, 1);
+          if (!this._refed) this._tlsHandshakeTimer.unref?.();
+          return;
+        }
         if (cottontail.tlsClientHandshake(this._tlsId) === true) {
           this._tlsInfo = cottontail.tlsConnectionInfo?.(this._tlsId) ?? this._tlsInfo;
           this._finishTlsConnect(connectedEvent);
           return;
         }
+        const hello = cottontail.tlsConnectionClientHello?.(this._tlsId);
+        if (hello != null) this._handleClientHello(hello);
         if (this._handshakeTimeout > 0 && Date.now() - startedAt >= this._handshakeTimeout) {
           const error = new Error("TLS handshake timed out");
           error.code = "ETIMEDOUT";
@@ -913,7 +1129,8 @@ export class TLSSocket extends Socket {
         this._tlsHandshakeTimer = setTimeout(step, 1);
         if (!this._refed) this._tlsHandshakeTimer.unref?.();
       } catch (error) {
-        error = normalizeTlsError(error);
+        error = this._clientHelloError ?? normalizeTlsError(error);
+        this._clientHelloError = null;
         if (this.isServer && error.code === "UNABLE_TO_GET_ISSUER_CERT_LOCALLY" && this._secureContext?.context?.ca != null) {
           error.code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
           error.message = "unable to verify the first certificate";
@@ -952,6 +1169,18 @@ export class TLSSocket extends Socket {
         }
         return;
       }
+      if (event.type === "session") {
+        const session = bufferFromNativeBytes(event.data);
+        if (session != null && session.byteLength > 0) {
+          this._session = session;
+          this.emit("session", session);
+        }
+        return;
+      }
+      if (event.type === "secure") {
+        this._handleRenegotiationSecure();
+        return;
+      }
       if (event.type === "end") {
         if (this._tlsReadEndTimer != null) return;
         const tlsId = this._tlsId;
@@ -976,6 +1205,8 @@ export class TLSSocket extends Socket {
       if (event.type === "error") {
         const error = new Error(event.message || "TLS read failed");
         if (event.code != null) error.code = String(event.code);
+        else if (/renegotiation attack/i.test(error.message)) error.code = "ERR_TLS_SESSION_ATTACK";
+        else if (/no renegotiation|renegotiation.*disabled/i.test(error.message)) error.code = "ERR_TLS_RENEGOTIATION_DISABLED";
         else if (/connection reset/i.test(error.message)) error.code = "ECONNRESET";
         else if (/broken pipe/i.test(error.message)) error.code = "EPIPE";
         if (event.errno != null) error.errno = Number(event.errno);
@@ -1251,7 +1482,7 @@ export class TLSSocket extends Socket {
     return bufferFromNativeBytes(this._currentTlsInfo()?.ocspResponse);
   }
   getSession() {
-    return bufferFromNativeBytes(this._currentTlsInfo()?.session) ?? this._session;
+    return this._session ?? bufferFromNativeBytes(this._currentTlsInfo()?.session);
   }
   getTLSTicket() {
     return bufferFromNativeBytes(this._currentTlsInfo()?.tlsTicket);
@@ -1315,6 +1546,7 @@ export class TLSSocket extends Socket {
   }
   disableRenegotiation() {
     this._renegotiationDisabled = true;
+    if (this._tlsId != null) cottontail.tlsConnectionDisableRenegotiation?.(this._tlsId);
     return undefined;
   }
   enableTrace() {
@@ -1330,9 +1562,44 @@ export class TLSSocket extends Socket {
       if (typeof callback === "function") queueMicrotask(() => callback(error));
       return false;
     }
-    const error = tlsError("TLS renegotiation is not supported by this transport", "ERR_TLS_RENEGOTIATION_UNSUPPORTED");
-    if (typeof callback === "function") queueMicrotask(() => callback(error));
-    return false;
+    if (this._tlsId == null || typeof cottontail.tlsConnectionRenegotiate !== "function") {
+      const error = tlsError("TLS renegotiation is not supported by this transport", "ERR_TLS_RENEGOTIATION_UNSUPPORTED");
+      if (typeof callback === "function") queueMicrotask(() => callback(error));
+      return false;
+    }
+    const requestCert = options.requestCert === undefined ? this._requestCert : Boolean(options.requestCert);
+    const rejectUnauthorized = options.rejectUnauthorized === undefined
+      ? this._rejectUnauthorized
+      : Boolean(options.rejectUnauthorized);
+    let onSecure;
+    let onError;
+    const cleanup = () => {
+      if (onSecure) this.removeListener("secure", onSecure);
+      if (onError) this.removeListener("error", onError);
+    };
+    if (typeof callback === "function") {
+      onSecure = () => {
+        cleanup();
+        callback(null);
+      };
+      onError = (error) => {
+        cleanup();
+        callback(normalizeTlsError(error));
+      };
+      this.once("secure", onSecure);
+      this.once("error", onError);
+    }
+    try {
+      cottontail.tlsConnectionRenegotiate(this._tlsId, requestCert, rejectUnauthorized);
+      if (this._memoryTransport != null) this._flushMemoryCiphertext();
+      this._requestCert = requestCert;
+      this._rejectUnauthorized = rejectUnauthorized;
+      return true;
+    } catch (error) {
+      cleanup();
+      if (typeof callback === "function") queueMicrotask(() => callback(normalizeTlsError(error)));
+      return false;
+    }
   }
 }
 
@@ -1348,6 +1615,17 @@ class ServerImpl extends NetServer {
       throw outOfRange("options.handshakeTimeout", "a non-negative finite number", options.handshakeTimeout);
     }
     if (options.SNICallback != null && typeof options.SNICallback !== "function") throw invalidArgType("options.SNICallback", "of type function", options.SNICallback);
+    if (options.ALPNCallback != null && typeof options.ALPNCallback !== "function") throw invalidArgType("options.ALPNCallback", "of type function", options.ALPNCallback);
+    if (options.ALPNCallback != null && options.ALPNProtocols != null) {
+      throw tlsError("ALPNCallback and ALPNProtocols are mutually exclusive", "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS");
+    }
+    const ticketKeys = options.ticketKeys == null
+      ? Buffer.from(randomBytes(48))
+      : validateTicketKeys(options.ticketKeys, "options.ticketKeys");
+    const sessionTimeout = options.sessionTimeout == null ? 300 : validateSessionTimeout(options.sessionTimeout);
+    const sessionIdContext = options.sessionIdContext == null
+      ? serverSessionIdContext()
+      : validateSessionIdContext(options.sessionIdContext);
     super(options);
     this._tlsOptions = {};
     this._tlsContexts = new Map();
@@ -1357,6 +1635,9 @@ class ServerImpl extends NetServer {
     this._secureContext = null;
     this._requestCert = false;
     this._rejectUnauthorized = rejectUnauthorizedDefault;
+    this._ticketKeys = ticketKeys;
+    this._sessionTimeout = sessionTimeout;
+    this._sessionIdContext = Buffer.from(sessionIdContext);
     this.setSecureContext(options);
     if (typeof secureConnectionListener === "function") this.on("secureConnection", secureConnectionListener);
   }
@@ -1364,17 +1645,34 @@ class ServerImpl extends NetServer {
   setSecureContext(options = {}) {
     const secureContext = options instanceof SecureContext ? options : createSecureContext(options);
     const context = secureContext.context ?? {};
+    const merged = { ...this._tlsOptions, ...context };
+    if (merged.ALPNCallback != null && merged.ALPNProtocols != null) {
+      throw tlsError("ALPNCallback and ALPNProtocols are mutually exclusive", "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS");
+    }
+    if (context.ticketKeys != null) this._ticketKeys = validateTicketKeys(context.ticketKeys, "options.ticketKeys");
+    if (context.sessionTimeout != null) this._sessionTimeout = validateSessionTimeout(context.sessionTimeout);
+    if (context.sessionIdContext != null) {
+      this._sessionIdContext = Buffer.from(validateSessionIdContext(context.sessionIdContext));
+    }
     this._secureContext = secureContext;
-    this._tlsOptions = { ...this._tlsOptions, ...context, secureContext };
+    this._tlsOptions = {
+      ...merged,
+      secureContext,
+      ticketKeys: Buffer.from(this._ticketKeys),
+      sessionTimeout: this._sessionTimeout,
+      sessionIdContext: this._sessionIdContext.toString(),
+    };
     this.key = context.key;
     this.cert = context.cert;
     this.ca = context.ca;
     this.passphrase = context.passphrase;
     this.secureOptions = context.secureOptions ?? 0;
     this.servername = context.servername;
-    this.ALPNProtocols = context.ALPNProtocols;
-    this._requestCert = Boolean(context.requestCert);
-    this._rejectUnauthorized = context.rejectUnauthorized == null ? rejectUnauthorizedDefault : context.rejectUnauthorized !== false;
+    this.ALPNProtocols = merged.ALPNProtocols;
+    this.ALPNCallback = merged.ALPNCallback;
+    this.SNICallback = merged.SNICallback;
+    this._requestCert = Boolean(merged.requestCert);
+    this._rejectUnauthorized = merged.rejectUnauthorized == null ? rejectUnauthorizedDefault : merged.rejectUnauthorized !== false;
     return this;
   }
 
@@ -1522,11 +1820,17 @@ class ServerImpl extends NetServer {
 
 
   getTicketKeys() {
-    throw new Error("TLS ticket key access is not available");
+    return Buffer.from(this._ticketKeys);
   }
 
-  setTicketKeys() {
-    throw new Error("TLS ticket key access is not available");
+  setTicketKeys(keys) {
+    this._ticketKeys = validateTicketKeys(keys);
+    this._tlsOptions.ticketKeys = Buffer.from(this._ticketKeys);
+    for (const socket of this._activeSockets) {
+      socket._ticketKeys = Buffer.from(this._ticketKeys);
+      if (socket._tlsId != null) cottontail.tlsConnectionSetTicketKeys?.(socket._tlsId, this._ticketKeys);
+    }
+    return undefined;
   }
 }
 
@@ -1738,7 +2042,7 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
   const alpnProtocols = prepareALPNProtocols(options.ALPNProtocols);
   const protocolOptions = tlsProtocolOptions(options);
   const contexts = [];
-  if (options.contexts) {
+  if (options.contexts && typeof options.SNICallback !== "function") {
     for (const [hostname, secureContext] of options.contexts) {
       const contextOptions = secureContext instanceof SecureContext ? secureContext.context : secureContext;
       contexts.push({
@@ -1765,6 +2069,13 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
     protocolOptions.minVersion,
     protocolOptions.maxVersion,
     protocolOptions.secureOptions,
+    typeof options.SNICallback === "function" || typeof options.ALPNCallback === "function",
+    typeof options.ALPNCallback === "function",
+    options.ticketKeys,
+    options.sessionTimeout,
+    socket._sessionIdContext,
+    CLIENT_RENEG_LIMIT,
+    CLIENT_RENEG_WINDOW,
   );
   try {
     if (typeof cottontail.tlsConnectionAddServerContext === "function") {
@@ -1776,12 +2087,17 @@ export function _upgradeServerSocket(parentSocket, options = {}) {
           context.credentials.key,
           context.credentials.ca,
           context.credentials.passphrase,
-          Boolean(options.requestCert),
-          rejectUnauthorized,
+          context.options?.requestCert == null ? Boolean(options.requestCert) : Boolean(context.options.requestCert),
+          context.options?.rejectUnauthorized == null ? rejectUnauthorized : context.options.rejectUnauthorized !== false,
           context.options?.ciphers ?? options.ciphers,
           context.protocols.minVersion,
           context.protocols.maxVersion,
           context.protocols.secureOptions,
+          context.options?.ticketKeys ?? options.ticketKeys,
+          context.options?.sessionTimeout ?? options.sessionTimeout,
+          context.options?.sessionIdContext == null
+            ? socket._sessionIdContext
+            : Buffer.from(context.options.sessionIdContext),
         );
       }
     }
@@ -1959,8 +2275,8 @@ export function getCiphers() {
   return [...defaultCipherNames];
 }
 
-// COTTONTAIL-COMPAT: Dynamic asynchronous SNICallback/OCSP callbacks, renegotiation, trace output,
-// and server-wide ticket-key/session-cache management require a persistent native server context.
+// COTTONTAIL-COMPAT: OpenSSL trace output, OCSP stapling callbacks, and custom
+// server-side newSession/resumeSession stores are not exposed by the stock-JSC host boundary yet.
 
 const tlsDefault = {
   CLIENT_RENEG_LIMIT,
