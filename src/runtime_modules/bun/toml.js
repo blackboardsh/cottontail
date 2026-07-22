@@ -49,6 +49,45 @@ function findEquals(line) {
   return -1;
 }
 
+function logicalStatements(input) {
+  const statements = [];
+  let statement = "";
+  let square = 0;
+  let curly = 0;
+
+  for (const rawLine of input.split(/\r?\n/)) {
+    const line = stripComment(rawLine);
+    if (!statement && !line.trim()) continue;
+
+    statement += statement ? `\n${line}` : line;
+
+    let quote = "";
+    let escaped = false;
+    for (const char of line) {
+      if (quote) {
+        if (quote === "\"" && escaped) escaped = false;
+        else if (quote === "\"" && char === "\\") escaped = true;
+        else if (char === quote) quote = "";
+        continue;
+      }
+      if (char === "\"" || char === "'") quote = char;
+      else if (char === "[") square += 1;
+      else if (char === "]") square -= 1;
+      else if (char === "{") curly += 1;
+      else if (char === "}") curly -= 1;
+    }
+
+    if (square === 0 && curly === 0) {
+      const trimmed = statement.trim();
+      if (trimmed) statements.push(trimmed);
+      statement = "";
+    }
+  }
+
+  if (statement.trim()) statements.push(statement.trim());
+  return statements;
+}
+
 class TOMLValueParser {
   constructor(source, depth = 0) {
     this.source = String(source);
@@ -258,9 +297,7 @@ function createArrayTable(root, parts) {
 export function parse(input) {
   const root = {};
   let current = root;
-  for (const rawLine of textInput(input).split(/\r?\n/)) {
-    const line = stripComment(rawLine).trim();
-    if (!line) continue;
+  for (const line of logicalStatements(textInput(input))) {
     if (line.startsWith("[[") && line.endsWith("]]")) {
       current = createArrayTable(root, parseKeyPath(line.slice(2, -2).trim()));
       continue;
