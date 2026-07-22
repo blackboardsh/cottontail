@@ -2596,128 +2596,32 @@ function runtimeEsmGraphLoader(filename) {
   return "js";
 }
 
-function runtimeEsmRootBarePackageEdges(entryPath, entrySource) {
-  if (typeof cottontail.transpilerScanImports !== "function") return [];
+function runtimeEsmRootHasBarePackageEdges(entryPath, entrySource) {
+  if (typeof cottontail.transpilerScanImports !== "function") return false;
   try {
     const imports = JSON.parse(cottontail.transpilerScanImports(
       String(entrySource),
       "{}",
       runtimeEsmGraphLoader(entryPath),
     ));
-    if (!Array.isArray(imports)) return [];
-    return imports.flatMap(item => {
-      if (item?.kind !== "import-statement" && item?.kind !== "require-call") return [];
+    return Array.isArray(imports) && imports.some(item => {
+      if (item?.kind !== "import-statement" && item?.kind !== "require-call") return false;
       const specifier = String(item?.path ?? "");
       return specifier.length > 0 &&
         !specifier.startsWith(".") &&
         !specifier.startsWith("/") &&
         !specifier.startsWith("file:") &&
         !isBuiltin(specifier) &&
-        !hasRuntimePackageReplacement(specifier)
-        ? [specifier]
-        : [];
+        !hasRuntimePackageReplacement(specifier);
     });
   } catch {
-    return [];
-  }
-}
-
-function runtimeEsmIsPackageModule(entryPath) {
-  const path = splitSpecifierSuffix(String(entryPath)).bare.replace(/\\/g, "/");
-  return path.includes("/node_modules/");
-}
-
-function runtimeEsmMissingOptionalPeers(entryPath, packageEdges) {
-  const roots = [];
-  const entry = splitSpecifierSuffix(String(entryPath)).bare;
-  const startDir = dirname(entry);
-  if (runtimeEsmIsPackageModule(entry)) {
-    const scope = nearestPackageScope(entry);
-    if (scope?.dir) roots.push(scope.dir);
-  }
-  for (const request of packageEdges) {
-    const root = packageRootFor(request, startDir);
-    if (root) roots.push(root);
-  }
-
-  const seen = new Set();
-  const missing = new Set();
-  while (roots.length > 0 && seen.size < 1024) {
-    const root = roots.pop();
-    const key = runtimeEsmGraphPathKey(root);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const manifest = readPackageJson(join(root, "package.json"));
-    if (!manifest) continue;
-
-    const peers = manifest.peerDependencies;
-    const peerMetadata = manifest.peerDependenciesMeta;
-    if (peers && typeof peers === "object" && peerMetadata && typeof peerMetadata === "object") {
-      for (const name of Object.keys(peers)) {
-        if (peerMetadata[name]?.optional === true && !packageRootFor(name, root)) missing.add(name);
-      }
-    }
-
-    const dependencyGroups = [manifest.dependencies, manifest.optionalDependencies, manifest.peerDependencies];
-    for (const dependencies of dependencyGroups) {
-      if (!dependencies || typeof dependencies !== "object") continue;
-      for (const name of Object.keys(dependencies)) {
-        const dependencyRoot = packageRootFor(name, root);
-        if (dependencyRoot) roots.push(dependencyRoot);
-      }
-    }
-  }
-  return [...missing];
-}
-
-function unresolvedRuntimeEsmDynamicImport(error) {
-  if (typeof cottontail.transpilerScanImports !== "function") return null;
-  const message = String(error?.message ?? error);
-  const unresolved = message.match(/Could not resolve:\s*(["'])(.*?)\1/);
-  if (!unresolved) return null;
-  const specifier = unresolved[2];
-  if (!specifier || specifier.startsWith(".") || specifier.startsWith("/") ||
-      specifier.startsWith("file:") || isBuiltin(specifier) || hasRuntimePackageReplacement(specifier)) {
-    return null;
-  }
-
-  let importer = null;
-  for (const line of message.split("\n")) {
-    let location = line.trim();
-    if (!location.startsWith("at ")) continue;
-    location = location.slice(3);
-    const openingParen = location.lastIndexOf("(");
-    if (openingParen !== -1 && location.endsWith(")")) {
-      location = location.slice(openingParen + 1, -1);
-    }
-    const match = location.match(/^(.*):(\d+):(\d+)$/);
-    if (!match) continue;
-    importer = match[1];
-    break;
-  }
-  if (!importer) return null;
-  if (importer.startsWith("file:")) {
-    try { importer = fileURLToPath(importer); } catch { return null; }
-  }
-
-  try {
-    const imports = JSON.parse(cottontail.transpilerScanImports(
-      readModuleFile(importer),
-      "{}",
-      runtimeEsmGraphLoader(importer),
-    ));
-    return Array.isArray(imports) && imports.some(item =>
-      item?.kind === "dynamic-import" && String(item?.path ?? "") === specifier
-    ) ? specifier : null;
-  } catch {
-    return null;
+    return false;
   }
 }
 
 function runtimeAsyncEsmGraph(entryPath, entrySource) {
-  const packageEdges = runtimeEsmRootBarePackageEdges(entryPath, entrySource);
   if (typeof cottontail.bundleNative !== "function" ||
-      (packageEdges.length === 0 && !runtimeEsmIsPackageModule(entryPath))) {
+      !runtimeEsmRootHasBarePackageEdges(entryPath, entrySource)) {
     return null;
   }
   const sourceFingerprint = runtimeEsmSourceFingerprint(entrySource);
@@ -2725,29 +2629,20 @@ function runtimeAsyncEsmGraph(entryPath, entrySource) {
   const memoryCached = bundledAsyncEsmGraphCache.get(cacheKey);
   if (memoryCached !== undefined) return memoryCached;
 
-  const external = ["*.node", ...runtimeEsmMissingOptionalPeers(entryPath, packageEdges)];
-  let bundled = null;
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    try {
-      bundled = String(cottontail.bundleNative(
-        splitSpecifierSuffix(String(entryPath)).bare,
-        dirname(entryPath),
-        JSON.stringify({
-          format: "esm",
-          target: "bun",
-          packages: "bundle",
-          external,
-          inlineImportMetaProperties: true,
-        }),
-      ));
-      break;
-    } catch (error) {
-      const optionalImport = unresolvedRuntimeEsmDynamicImport(error);
-      if (!optionalImport || external.includes(optionalImport)) break;
-      external.push(optionalImport);
-    }
-  }
-  if (bundled === null) {
+  let bundled;
+  try {
+    bundled = String(cottontail.bundleNative(
+      splitSpecifierSuffix(String(entryPath)).bare,
+      dirname(entryPath),
+      JSON.stringify({
+        format: "esm",
+        target: "bun",
+        packages: "bundle",
+        external: ["*.node"],
+        inlineImportMetaProperties: true,
+      }),
+    ));
+  } catch {
     bundledAsyncEsmGraphCache.set(cacheKey, null);
     return null;
   }
@@ -3417,7 +3312,7 @@ function executeAsyncDynamicImportSource(resolved, resolvedPath, suffix, origina
 
 function executeDynamicImportSource(resolved, source, format, forceAsync = false, asyncAncestors = undefined) {
   const { bare: resolvedPath, suffix } = splitSpecifierSuffix(resolved);
-  let sourceText = String(source ?? "").replace(/^#!/, "//");
+  const sourceText = String(source ?? "").replace(/^#!/, "//");
   const effectiveFormat = format ?? formatForHookSource(resolvedPath, sourceText);
   if (effectiveFormat === "builtin") {
     return namespaceFromBuiltin(resolvedPath, loadBuiltinOrReplacement(resolvedPath));
@@ -3444,13 +3339,13 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       moduleHooks.length === 0 &&
       runtimePluginOnResolve.length === 0 &&
       runtimePluginOnLoad.length === 0) {
-    const linkedGraph = runtimeAsyncEsmGraph(resolvedPath, sourceText);
-    if (linkedGraph !== null) {
+    const asyncGraph = runtimeAsyncEsmGraph(resolvedPath, sourceText);
+    if (asyncGraph !== null) {
       return executeAsyncDynamicImportSource(
         resolved,
         resolvedPath,
         suffix,
-        linkedGraph.source,
+        asyncGraph.source,
         asyncAncestors,
       );
     }
@@ -3677,11 +3572,10 @@ globalThis.__cottontailImportModule = (
 
 function executeQueriedModule(module, filename, suffix) {
   const originalSource = readModuleFile(filename).replace(/^#![^\n]*(\n|$)/, "");
-  const bundledGraph = runtimeAsyncEsmGraph(filename, originalSource);
-  if (bundledGraph?.async === true || (!bundledGraph && sourceRequiresAsyncModuleExecution(filename, originalSource))) {
+  if (sourceRequiresAsyncModuleExecution(filename, originalSource)) {
     throw new TypeError(`require() async module "${filename}" is unsupported. use "await import()" instead.`);
   }
-  const source = bundledGraph?.source ?? transpileExtensionSource(
+  const source = transpileExtensionSource(
     filename,
     runtimeEsmGraphLoader(filename),
     true,
