@@ -62,7 +62,6 @@ beforeAll(async () => {
 
       cd ${BASE_FIXTURE_DIR}
       bun add bun-types@${BUN_TYPES_TARBALL_NAME}
-      rm ${BUN_TYPES_TARBALL_NAME}
     `.quiet();
 
     const atTypesBunDir = join(BASE_FIXTURE_DIR, "node_modules", "@types", "bun");
