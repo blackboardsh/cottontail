@@ -593,6 +593,45 @@ export function parseV8Date(input, NativeDate = globalThis.Date, dateIntrinsics 
 
 const installedDates = new WeakSet();
 
+function installISO8601LocaleDateCompatibility(NativeDate) {
+  const prototype = NativeDate.prototype;
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, "toLocaleDateString");
+  const nativeToLocaleDateString = descriptor?.value;
+  if (typeof nativeToLocaleDateString !== "function") return;
+
+  const probe = Reflect.construct(NativeDate, [Date.UTC(1583, 0, 1)]);
+  const isoResult = Reflect.apply(nativeToLocaleDateString, probe, [
+    "en-US",
+    { timeZone: "UTC", calendar: "iso8601" },
+  ]);
+  const gregoryResult = Reflect.apply(nativeToLocaleDateString, probe, [
+    "en-US",
+    { timeZone: "UTC", calendar: "gregory" },
+  ]);
+  if (isoResult === gregoryResult) return;
+
+  function toLocaleDateString(locales, options) {
+    if (options !== null && (typeof options === "object" || typeof options === "function") &&
+        options.calendar === "iso8601") {
+      const compatibleOptions = Object.create(options);
+      Object.defineProperty(compatibleOptions, "calendar", {
+        configurable: true,
+        enumerable: true,
+        value: "gregory",
+        writable: true,
+      });
+      return Reflect.apply(nativeToLocaleDateString, this, [locales, compatibleOptions]);
+    }
+    return Reflect.apply(nativeToLocaleDateString, this, arguments);
+  }
+
+  Object.defineProperty(toLocaleDateString, "name", { value: "toLocaleDateString" });
+  Object.defineProperty(prototype, "toLocaleDateString", {
+    ...descriptor,
+    value: toLocaleDateString,
+  });
+}
+
 export function installV8DateParser() {
   const NativeDate = globalThis.Date;
   if (typeof NativeDate !== "function" || installedDates.has(NativeDate)) return NativeDate;
@@ -641,6 +680,7 @@ export function installV8DateParser() {
     ...constructorDescriptor,
     value: CompatibleDate,
   });
+  installISO8601LocaleDateCompatibility(NativeDate);
   globalThis.Date = CompatibleDate;
   return CompatibleDate;
 }

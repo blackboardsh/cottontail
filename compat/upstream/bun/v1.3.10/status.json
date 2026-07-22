@@ -3156,8 +3156,8 @@
       "reason": "Passes on the vendored Node util/readline/vm/process stack (192 bun:test cases, 288 assertions)."
     },
     "test/js/node/v8/v8-date-parser.test.js": {
-      "status": "expected-failure",
-      "reason": "Four of five copied cases pass (6226 assertions total); the remaining pre-Gregorian ISO-8601 locale-format expectation also fails under stock Bun 1.3.10 and Node on this macOS system-ICU host (both return 1582-01-01 instead of 1/1/1582), so it is retained as an explicit platform xfail rather than patched into divergent runtime behavior."
+      "status": "enabled",
+      "reason": "V8-compatible legacy and ISO date parsing plus deterministic ISO-8601 locale-date formatting pass all five copied cases with 6227 assertions on stock JSC."
     },
     "test/js/node/vm/happy-dom-vm-16277.test.ts": {
       "status": "enabled",
