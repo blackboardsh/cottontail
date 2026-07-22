@@ -214,6 +214,9 @@ export function estimateShallowMemoryUsageOf(value) {
 }
 
 export function describe(value) {
+  if (typeof value === "number" && typeof cottontail.jscDescribeNumber === "function") {
+    return cottontail.jscDescribeNumber(value);
+  }
   if (typeof value === "string" && typeof cottontail.jscStringIs8Bit === "function") {
     const is8Bit = cottontail.jscStringIs8Bit(value);
     return `String,8Bit:(${is8Bit ? 1 : 0}),length:(${value.length}): ${value}`;

@@ -24639,6 +24639,26 @@ static JSValueRef ct_jsc_cached_data_version_tag_host(JSContextRef ctx, JSObject
     return JSValueMakeNumber(ctx, (double)ct_jsc_cached_data_version_tag());
 }
 
+static JSValueRef ct_jsc_describe_number_host(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1 || !JSValueIsNumber(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+
+    const uint64_t encoded = (uint64_t)(uintptr_t)argv[0];
+    const uint64_t int32_tag = UINT64_C(0xfffe000000000000);
+    char description[128];
+    if ((encoded & int32_tag) == int32_tag) {
+        snprintf(description, sizeof(description), "Int32: %d", (int32_t)encoded);
+    } else {
+        const uint64_t bits = encoded - (UINT64_C(1) << 49);
+        double number;
+        memcpy(&number, &bits, sizeof(number));
+        snprintf(description, sizeof(description), "Double: %llu, %f", (unsigned long long)bits, number);
+    }
+    return ct_make_string(ctx, description);
+}
+
 static JSValueRef ct_jsc_heap_snapshot_host_impl(JSContextRef ctx, JSValueRef *exception, bool gc_debugging) {
     char *snapshot = ct_jsc_heap_snapshot(ctx, gc_debugging ? 1 : 0);
     if (snapshot == NULL) {

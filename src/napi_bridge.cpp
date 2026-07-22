@@ -39,6 +39,7 @@ extern "C" JSStringRef ct_jsc_string_create_external_utf16(
     void*);
 extern "C" void* ct_jsc_microtask_delay_begin(JSContextGroupRef);
 extern "C" void ct_jsc_microtask_delay_end(void*);
+extern "C" bool ct_jsc_string_is_8_bit(JSStringRef);
 
 // COTTONTAIL-COMPAT: A native weak handle can clear during the current job;
 // JavaScript WeakRef intentionally keeps its target alive until the job ends.
@@ -1046,8 +1047,18 @@ static JSStringRef make_utf8_string(const char* bytes, size_t length)
 {
     if (!bytes)
         return nullptr;
-    if (length == NAPI_AUTO_LENGTH)
+    if (length == NAPI_AUTO_LENGTH) {
         length = std::strlen(bytes);
+        bool is_ascii = true;
+        for (size_t index = 0; index < length; ++index) {
+            if (static_cast<unsigned char>(bytes[index]) > 0x7f) {
+                is_ascii = false;
+                break;
+            }
+        }
+        if (is_ascii)
+            return JSStringCreateWithUTF8CString(bytes);
+    }
 
     std::vector<JSChar> characters;
     characters.reserve(length);
@@ -2495,8 +2506,18 @@ int v8::String::WriteUtf8(v8::Isolate*, char* buffer, int signed_length, int* nc
             JSStringRelease(string);
         return 0;
     }
-    const JSChar* characters = JSStringGetCharactersPtr(string);
     const size_t string_length = JSStringGetLength(string);
+    if (signed_length < 0 && ct_jsc_string_is_8_bit(string)) {
+        const size_t capacity = JSStringGetMaximumUTF8CStringSize(string);
+        const size_t written = JSStringGetUTF8CString(string, buffer, capacity);
+        if (nchars)
+            *nchars = static_cast<int>(std::min(string_length, static_cast<size_t>(std::numeric_limits<int>::max())));
+        JSStringRelease(string);
+        return written > static_cast<size_t>(std::numeric_limits<int>::max())
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(written);
+    }
+    const JSChar* characters = JSStringGetCharactersPtr(string);
     const size_t capacity = signed_length < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(signed_length);
     size_t read = 0;
     size_t written = 0;
@@ -2896,7 +2917,7 @@ void v8::Function::SetName(v8::Local<v8::String> name)
     if (!env || !function || !name_value)
         return;
     JSValueRef exception = nullptr;
-    set_property(env, function, "name", name_value, kJSPropertyAttributeDontEnum, &exception);
+    define_data_property(env, function, "name", name_value, false, false, true, &exception);
     if (exception)
         caught(env, exception);
 }
@@ -3502,6 +3523,17 @@ static void* find_addon_symbol(void* handle, const char* symbol)
     return status == 0 ? pointer : nullptr;
 }
 
+static std::string addon_no_entrypoint_message(const char* path)
+{
+    std::string module_name = path ? path : "unknown";
+    const size_t separator = module_name.find_last_of("/\\");
+    if (separator != std::string::npos)
+        module_name.erase(0, separator + 1);
+    if (module_name.ends_with(".node"))
+        module_name.resize(module_name.size() - 5);
+    return std::string("The module '") + module_name + "' has no declared entry point.";
+}
+
 extern "C" JSValueRef ct_napi_load_addon(
     CtNapiEnv* opaque_env,
     const char* path,
@@ -3556,7 +3588,7 @@ extern "C" JSValueRef ct_napi_load_addon(
     }
 
     if (registered_during_load && registration_session.invalid) {
-        *exception = make_loader_error(env, "Module has no declared entry point.");
+        *exception = make_loader_error(env, addon_no_entrypoint_message(path));
         destroy_single_env(env);
         return nullptr;
     }
@@ -3634,7 +3666,7 @@ extern "C" JSValueRef ct_napi_load_addon(
                 return nullptr;
             }
             if (registration_session.invalid) {
-                *exception = make_loader_error(module_env, "Module has no declared entry point.");
+                *exception = make_loader_error(module_env, addon_no_entrypoint_message(path));
                 return nullptr;
             }
         }

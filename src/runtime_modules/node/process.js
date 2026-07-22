@@ -1882,6 +1882,7 @@ const configVariables = Object.freeze({
   clang: Number(processObject.config?.variables?.clang ?? 1),
   host_arch: processObject.arch,
   target_arch: processObject.arch,
+  enable_lto: false,
   node_target_type: "executable",
   node_use_openssl: true,
   node_shared_zlib: false,
