@@ -503,6 +503,49 @@ fn wildcardPathMatch(pattern: []const u8, path: []const u8) bool {
     return pattern_index == pattern.len;
 }
 
+fn appendRecursiveHtmlEntrypointPattern(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    requested: []const u8,
+    matches: *std.ArrayList([:0]const u8),
+) !bool {
+    const globstar_index = std.mem.indexOf(u8, requested, "**") orelse return false;
+    const directory_prefix = std.mem.trimRight(u8, requested[0..globstar_index], "/\\");
+    const directory_path = if (directory_prefix.len == 0) "." else directory_prefix;
+    const remaining_pattern = std.mem.trimLeft(u8, requested[globstar_index + 2 ..], "/\\");
+
+    var directory = if (std.fs.path.isAbsolute(directory_path))
+        std.Io.Dir.openDirAbsolute(init.io, directory_path, .{ .iterate = true }) catch return true
+    else
+        std.Io.Dir.cwd().openDir(init.io, directory_path, .{ .iterate = true }) catch return true;
+    defer directory.close(init.io);
+
+    var walker = try directory.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(init.io)) |entry| {
+        if (entry.kind == .directory) {
+            if ((entry.basename.len > 0 and entry.basename[0] == '.') or
+                std.mem.eql(u8, entry.basename, "node_modules"))
+            {
+                walker.leave(init.io);
+            }
+            continue;
+        }
+        if (entry.kind != .file or !isHtmlEntrypoint(entry.basename)) continue;
+        const pattern_matches = wildcardPathMatch(remaining_pattern, entry.path) or
+            (std.mem.indexOfAny(u8, remaining_pattern, "/\\") == null and
+                wildcardPathMatch(remaining_pattern, entry.basename));
+        if (!pattern_matches) continue;
+
+        const path = if (std.mem.eql(u8, directory_path, "."))
+            try allocator.dupe(u8, entry.path)
+        else
+            try std.fs.path.join(allocator, &.{ directory_path, entry.path });
+        try matches.append(allocator, try allocator.dupeZ(u8, path));
+    }
+    return true;
+}
+
 fn appendHtmlEntrypointPattern(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -516,6 +559,17 @@ fn appendHtmlEntrypointPattern(
         return;
     }
 
+    var matches: std.ArrayList([:0]const u8) = .empty;
+    if (try appendRecursiveHtmlEntrypointPattern(init, allocator, requested, &matches)) {
+        std.mem.sort([:0]const u8, matches.items, {}, struct {
+            fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.lessThan);
+        try entries.appendSlice(allocator, matches.items);
+        return;
+    }
+
     const directory_path = std.fs.path.dirname(requested) orelse ".";
     const name_pattern = std.fs.path.basename(requested);
     var directory = if (std.fs.path.isAbsolute(directory_path))
@@ -524,7 +578,6 @@ fn appendHtmlEntrypointPattern(
         std.Io.Dir.cwd().openDir(init.io, directory_path, .{ .iterate = true }) catch return;
     defer directory.close(init.io);
     var iterator = directory.iterate();
-    var matches: std.ArrayList([:0]const u8) = .empty;
     while (try iterator.next(init.io)) |entry| {
         if (entry.kind != .file or !wildcardPathMatch(name_pattern, entry.name) or !isHtmlEntrypoint(entry.name)) continue;
         const path = if (std.mem.eql(u8, directory_path, "."))
@@ -556,6 +609,9 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     if (entries.items.len == 0) return null;
 
     var port: []const u8 = "3000";
+    if (init.environ_map.get("BUN_PORT")) |value| {
+        if (std.fmt.parseUnsigned(u16, value, 10)) |_| port = value else |_| {}
+    }
     var index: usize = 0;
     while (index < invocation.args.len) : (index += 1) {
         const arg = invocation.args[index];
@@ -571,8 +627,10 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
 
     var source: std.ArrayList(u8) = .empty;
     try source.appendSlice(allocator,
+        \\const startedAt = performance.now();
+        \\const development = process.env.NODE_ENV !== "production";
         \\const server = Bun.serve({
-        \\  development: process.env.NODE_ENV !== "production",
+        \\  development,
         \\  port:
     );
     try source.appendSlice(allocator, port);
@@ -596,7 +654,9 @@ fn runHtmlEntrypoints(init: std.process.Init, invocation: CliInvocation) !?u8 {
     try source.appendSlice(allocator,
         \\  },
         \\});
-        \\console.log(`Started development server: ${server.url}`);
+        \\const elapsed = (performance.now() - startedAt).toFixed(2);
+        \\console.log(`Bun v${Bun.version}${development ? " dev server" : ""} ready in ${elapsed} ms`);
+        \\console.log(`url: ${server.url}`);
         \\
     );
     const source_z = try allocator.dupeZ(u8, source.items);

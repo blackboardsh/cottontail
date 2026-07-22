@@ -2,7 +2,6 @@
   "compilerOptions": {
     "jsx": "react-jsx",
     "allowJs": true,
-    "types": ["bun", "react"],
 
     // Bundler mode
     "moduleResolution": "bundler",
@@ -11,6 +10,7 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
 
+    "baseUrl": ".",
     "paths": {
       "@/*": ["./*"]
     }

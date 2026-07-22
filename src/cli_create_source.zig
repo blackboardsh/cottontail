@@ -179,7 +179,7 @@ fn run(
     var analysis = try analyze(init, entry_absolute, stderr);
 
     const component_export = analysis.component_export orelse {
-        try stderr.print("error: No component export found in {s}\n", .{entry_argument});
+        try stderr.print("error: No component export found in \"{s}\"\n", .{entry_argument});
         try stderr.writeAll(
             "Please add an export to your file. For example:\n\n" ++
                 "   export default function MyApp() {\n" ++
@@ -190,23 +190,32 @@ fn run(
         return .{ .exit_code = 1 };
     };
 
-    const template: TemplateKind = if (analysis.shadcn_components.items.len > 0)
+    const has_tailwind_dependency = containsDependency(analysis.dependencies.items, "tailwindcss") or
+        containsDependency(analysis.dependencies.items, "bun-plugin-tailwind");
+    const inject_tailwind = !has_tailwind_dependency and analysis.uses_tailwind;
+    if (inject_tailwind) {
+        try appendUnique(allocator, &analysis.dependencies, "tailwindcss");
+        try appendUnique(allocator, &analysis.dependencies, "bun-plugin-tailwind");
+    }
+
+    const inject_shadcn = analysis.shadcn_components.items.len > 0;
+    if (inject_shadcn) try addShadcnDependencies(allocator, &analysis.dependencies);
+
+    try forceReact19Dependencies(allocator, &analysis.dependencies);
+
+    const template: TemplateKind = if (inject_shadcn)
         .react_shadcn
-    else if (analysis.uses_tailwind or
-        containsDependency(analysis.dependencies.items, "tailwindcss") or
-        containsDependency(analysis.dependencies.items, "bun-plugin-tailwind"))
+    else if (has_tailwind_dependency or inject_tailwind)
         .react_tailwind
     else
         .react;
-
-    try addTemplateDependencies(allocator, &analysis, template);
 
     const relative_entry = try relativeModulePath(allocator, cwd, entry_absolute);
     const extension = std.fs.path.extension(relative_entry);
     const relative_name = relative_entry[0 .. relative_entry.len - extension.len];
     const basename = std.fs.path.basename(relative_name);
 
-    try generateFiles(init, template, basename, relative_name, component_export, stdout);
+    const generated_files = try generateFiles(init, template, basename, relative_name, component_export, stdout);
     if (analysis.dependencies.items.len > 0) {
         const install_code = try installDependencies(
             init,
@@ -230,7 +239,7 @@ fn run(
         if (shadcn_code != 0) return .{ .exit_code = shadcn_code };
     }
 
-    try printConfigured(stdout, template);
+    if (generated_files) try printConfigured(stdout, template);
     try stdout.flush();
     try stderr.flush();
 
@@ -266,7 +275,14 @@ fn analyze(init: std.process.Init, entry_absolute: []const u8, stderr: *std.Io.W
             return error.CreateErrorReported;
         };
 
-        if (hasTailwindClasses(contents)) result.uses_tailwind = true;
+        if (loader == .html) {
+            if (hasTailwindClassesInHtml(contents)) result.uses_tailwind = true;
+            continue;
+        }
+        if (!loader.isJavaScriptLike()) continue;
+
+        const scans_react_features = loader == .jsx or loader == .tsx;
+        if (scans_react_features and hasTailwindClasses(contents)) result.uses_tailwind = true;
 
         const parser_allocator = compiler.default_allocator;
         var log = compiler.logger.Log.init(parser_allocator);
@@ -308,7 +324,7 @@ fn analyze(init: std.process.Init, entry_absolute: []const u8, stderr: *std.Io.W
             if (record.flags.is_internal or record.flags.is_unused) continue;
             const specifier = stripImportSuffix(record.path.text);
             if (specifier.len == 0) continue;
-            if (std.mem.startsWith(u8, specifier, "@/components/ui/")) {
+            if (scans_react_features and std.mem.startsWith(u8, specifier, "@/components/ui/")) {
                 const component = specifier["@/components/ui/".len..];
                 if (component.len > 0) try appendUnique(allocator, &result.shadcn_components, component);
                 continue;
@@ -328,8 +344,7 @@ fn analyze(init: std.process.Init, entry_absolute: []const u8, stderr: *std.Io.W
 }
 
 fn loaderForPath(path: []const u8) ?compiler.options.Loader {
-    const loader = compiler.options.defaultLoaders.get(std.fs.path.extension(path)) orelse return null;
-    return if (loader.isJavaScriptLike()) loader else null;
+    return compiler.options.defaultLoaders.get(std.fs.path.extension(path));
 }
 
 fn stripImportSuffix(specifier: []const u8) []const u8 {
@@ -359,7 +374,7 @@ fn resolveLocalImport(
         try std.fs.path.resolve(allocator, &.{ std.fs.path.dirname(importer) orelse ".", specifier });
 
     if (fileExists(io, base)) return base;
-    const extensions = [_][]const u8{ ".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs" };
+    const extensions = [_][]const u8{ ".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs", ".html", ".css" };
     if (std.fs.path.extension(base).len == 0) {
         for (extensions) |extension| {
             const candidate = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, extension });
@@ -436,6 +451,36 @@ fn hasTailwindClasses(source: []const u8) bool {
     return false;
 }
 
+fn hasTailwindClassesInHtml(source: []const u8) bool {
+    const patterns = [_][]const u8{
+        "bg-",      "text-",  "p-",     "m-",     "flex",   "grid", "border",
+        "rounded",  "shadow", "hover:", "focus:", "dark:",  "sm:",  "md:",
+        "lg:",      "xl:",    "w-",     "h-",     "space-", "gap-", "items-",
+        "justify-", "font-",
+    };
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, source, cursor, "class")) |index| {
+        cursor = index + "class".len;
+        if (index > 0 and (std.ascii.isAlphanumeric(source[index - 1]) or source[index - 1] == '-' or source[index - 1] == '_')) continue;
+
+        while (cursor < source.len and std.ascii.isWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor >= source.len or source[cursor] != '=') continue;
+        cursor += 1;
+        while (cursor < source.len and std.ascii.isWhitespace(source[cursor])) : (cursor += 1) {}
+        if (cursor >= source.len or (source[cursor] != '\'' and source[cursor] != '"')) continue;
+
+        const quote = source[cursor];
+        cursor += 1;
+        const end = std.mem.indexOfScalarPos(u8, source, cursor, quote) orelse return false;
+        const class_name = source[cursor..end];
+        for (patterns) |pattern| {
+            if (std.mem.indexOf(u8, class_name, pattern) != null) return true;
+        }
+        cursor = end + 1;
+    }
+    return false;
+}
+
 fn chooseComponentExport(
     allocator: Allocator,
     exports: []const []const u8,
@@ -447,30 +492,57 @@ fn chooseComponentExport(
 
     const extension = std.fs.path.extension(filename_with_extension);
     const filename = filename_with_extension[0 .. filename_with_extension.len - extension.len];
-    for (exports) |name| if (std.mem.eql(u8, name, filename)) return try allocator.dupe(u8, name);
+    if (filename.len == 0) return null;
 
-    const pascal = try pascalCaseIdentifier(allocator, filename);
-    for (exports) |name| if (std.mem.eql(u8, name, pascal)) return try allocator.dupe(u8, name);
+    if (std.ascii.isUpper(filename[0]) and compiler.js_lexer.isIdentifier(filename)) {
+        for (exports) |name| if (std.mem.eql(u8, name, filename)) return try allocator.dupe(u8, name);
+    }
+
+    if (std.ascii.isLower(filename[0])) {
+        const candidate = try allocator.dupe(u8, filename);
+        candidate[0] = std.ascii.toUpper(candidate[0]);
+        if (compiler.js_lexer.isIdentifier(candidate)) {
+            for (exports) |name| if (std.mem.eql(u8, name, candidate)) return try allocator.dupe(u8, name);
+        }
+
+        var input_index: usize = 0;
+        var output_index: usize = 0;
+        var capitalize_next = false;
+        while (input_index < candidate.len) : (input_index += 1) {
+            const byte = candidate[input_index];
+            if (byte == ' ' or byte == '-' or byte == '_' or
+                (output_index == 0 and !compiler.js_lexer.isIdentifierStart(byte)))
+            {
+                capitalize_next = true;
+                continue;
+            }
+            candidate[output_index] = if ((output_index == 0 or capitalize_next) and std.ascii.isLower(byte))
+                std.ascii.toUpper(byte)
+            else
+                byte;
+            output_index += 1;
+            capitalize_next = false;
+        }
+        for (exports) |name| {
+            if (std.mem.eql(u8, name, candidate[0..output_index])) return try allocator.dupe(u8, name);
+        }
+
+        if (output_index > 1) {
+            for (candidate[1..output_index]) |*byte| byte.* = std.ascii.toLower(byte.*);
+        }
+        for (exports) |name| {
+            if (std.mem.eql(u8, name, candidate[0..output_index])) return try allocator.dupe(u8, name);
+        }
+    }
+
+    const valid_identifier = try compiler.MutableString.ensureValidIdentifier(filename, allocator);
+    for (exports) |name| {
+        if (std.mem.eql(u8, name, valid_identifier)) return try allocator.dupe(u8, name);
+    }
     for (exports) |name| {
         if (name.len > 0 and std.ascii.isUpper(name[0])) return try allocator.dupe(u8, name);
     }
     return try allocator.dupe(u8, exports[0]);
-}
-
-fn pascalCaseIdentifier(allocator: Allocator, input: []const u8) ![]const u8 {
-    const output = try allocator.alloc(u8, input.len);
-    var output_index: usize = 0;
-    var capitalize = true;
-    for (input) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '$') {
-            capitalize = true;
-            continue;
-        }
-        output[output_index] = if (capitalize) std.ascii.toUpper(byte) else byte;
-        output_index += 1;
-        capitalize = false;
-    }
-    return output[0..output_index];
 }
 
 fn appendUnique(allocator: Allocator, list: *std.ArrayList([]const u8), value: []const u8) !void {
@@ -483,25 +555,30 @@ fn containsDependency(dependencies: []const []const u8, dependency: []const u8) 
     return false;
 }
 
-fn addTemplateDependencies(allocator: Allocator, analysis: *Analysis, template: TemplateKind) !void {
-    switch (template) {
-        .react => {},
-        .react_tailwind => {
-            try appendUnique(allocator, &analysis.dependencies, "tailwindcss");
-            try appendUnique(allocator, &analysis.dependencies, "bun-plugin-tailwind");
-        },
-        .react_shadcn => {
-            try appendUnique(allocator, &analysis.dependencies, "tailwindcss");
-            try appendUnique(allocator, &analysis.dependencies, "bun-plugin-tailwind");
-            try appendUnique(allocator, &analysis.dependencies, "tailwindcss-animate");
-            try appendUnique(allocator, &analysis.dependencies, "class-variance-authority");
-            try appendUnique(allocator, &analysis.dependencies, "clsx");
-            try appendUnique(allocator, &analysis.dependencies, "tailwind-merge");
-            try appendUnique(allocator, &analysis.dependencies, "lucide-react");
-        },
+fn addShadcnDependencies(allocator: Allocator, dependencies: *std.ArrayList([]const u8)) !void {
+    try appendUnique(allocator, dependencies, "tailwindcss-animate");
+    try appendUnique(allocator, dependencies, "class-variance-authority");
+    try appendUnique(allocator, dependencies, "clsx");
+    try appendUnique(allocator, dependencies, "tailwind-merge");
+    try appendUnique(allocator, dependencies, "lucide-react");
+}
+
+fn forceReact19Dependencies(allocator: Allocator, dependencies: *std.ArrayList([]const u8)) !void {
+    removeDependency(dependencies, "react");
+    removeDependency(dependencies, "react-dom");
+    try appendUnique(allocator, dependencies, "react-dom@19");
+    try appendUnique(allocator, dependencies, "react@19");
+}
+
+fn removeDependency(dependencies: *std.ArrayList([]const u8), dependency: []const u8) void {
+    var index: usize = 0;
+    while (index < dependencies.items.len) {
+        if (std.mem.eql(u8, dependencies.items[index], dependency)) {
+            _ = dependencies.orderedRemove(index);
+        } else {
+            index += 1;
+        }
     }
-    try appendUnique(allocator, &analysis.dependencies, "react-dom@19");
-    try appendUnique(allocator, &analysis.dependencies, "react@19");
 }
 
 fn relativeModulePath(allocator: Allocator, cwd: []const u8, absolute: []const u8) ![]const u8 {
@@ -546,26 +623,37 @@ fn generateFiles(
     relative_name: []const u8,
     component_export: []const u8,
     stdout: *std.Io.Writer,
-) !void {
+) !bool {
     const allocator = init.arena.allocator();
     const files = templateFiles(template);
     var paths = try allocator.alloc([]const u8, files.len);
+    var created = try allocator.alloc(bool, files.len);
+    @memset(created, false);
     var max_path_len: usize = 0;
     for (files, 0..) |file, index| {
         paths[index] = try renderTemplate(allocator, file.path, basename, relative_name, component_export);
-        max_path_len = @max(max_path_len, paths[index].len);
     }
 
-    for (files, paths) |file, path| {
+    for (files, paths, 0..) |file, path, index| {
         if (!file.overwrite and fileExists(init.io, path)) continue;
         const contents = try renderTemplate(allocator, file.contents, basename, relative_name, component_export);
         if (try writeChangedFile(init, path, contents)) {
+            created[index] = true;
+            max_path_len = @max(max_path_len, path.len);
+        }
+    }
+
+    var generated = false;
+    for (files, paths, created) |file, path, was_created| {
+        if (was_created) {
+            generated = true;
             try stdout.print(" create  {s}", .{path});
             var padding = max_path_len - path.len;
             while (padding > 0) : (padding -= 1) try stdout.writeByte(' ');
             try stdout.print("   {s}\n", .{@tagName(file.reason)});
         }
     }
+    return generated;
 }
 
 fn writeChangedFile(init: std.process.Init, path: []const u8, contents: []const u8) !bool {
