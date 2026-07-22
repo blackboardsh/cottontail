@@ -399,6 +399,11 @@
       "reason": "Focused batch validation confirms package-manager, CLI diagnostics, completion, package-script ancestry, test alias, socket lifecycle, and HTTP/2 frame-size regressions."
     },
     {
+      "pattern": "^test/regression/issue/17766\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied Unicode property escape and Acorn parser regression passes both deterministic cases with its inline snapshot."
+    },
+    {
       "pattern": "^test/js/third_party/grpc-js/test-(?:channelz|global-subchannel-pool|idle-timer|local-subchannel-pool|outlier-detection|pick-first|retry|server-errors|server-interceptors)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Focused batch validation confirms deterministic gRPC channel, resolver-pool, retry, server, interceptor, and HTTP/2 stream lifecycle behavior."
