@@ -47,6 +47,7 @@ const Command = enum {
     add,
     remove,
     update,
+    outdated,
     link,
     unlink,
     patch,
@@ -136,6 +137,8 @@ const Options = struct {
     invalid_os: ?[]const u8 = null,
     minimum_release_age_ms: ?f64 = null,
     minimum_release_age_cli: bool = false,
+    concurrent_scripts: ?usize = null,
+    concurrent_scripts_cli: bool = false,
     pack_destination: ?[]const u8 = null,
     pack_filename: ?[]const u8 = null,
     pack_gzip_level: ?[]const u8 = null,
@@ -174,6 +177,16 @@ const InteractiveUpdatePackage = struct {
     dependency_type: []const u8,
     selected: bool = false,
     use_latest: bool = false,
+};
+
+const OutdatedPackage = struct {
+    alias: []const u8,
+    current_version: []const u8,
+    update_version: []const u8,
+    latest_version: []const u8,
+    dependency_type: []const u8,
+    update_filtered: bool,
+    latest_filtered: bool,
 };
 
 const InteractiveTerminalMode = if (builtin.os.tag == .windows) struct {
@@ -235,6 +248,7 @@ const RegistryPackage = struct {
     integrity: ?[]const u8,
     metadata: *const Value,
     authorization: ?[]const u8 = null,
+    age_filtered: bool = false,
 
     fn archive(package: RegistryPackage) RegistryArchive {
         return .{
@@ -451,6 +465,7 @@ fn commandFromString(command: []const u8) ?Command {
     if (std.mem.eql(u8, command, "add") or std.mem.eql(u8, command, "a")) return .add;
     if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm") or std.mem.eql(u8, command, "uninstall")) return .remove;
     if (std.mem.eql(u8, command, "update") or std.mem.eql(u8, command, "up")) return .update;
+    if (std.mem.eql(u8, command, "outdated")) return .outdated;
     if (std.mem.eql(u8, command, "link")) return .link;
     if (std.mem.eql(u8, command, "unlink")) return .unlink;
     if (std.mem.eql(u8, command, "patch")) return .patch;
@@ -467,7 +482,7 @@ fn commandFromString(command: []const u8) ?Command {
 fn commandUsesSecurityScanner(command: Command) bool {
     return switch (command) {
         .install, .add, .remove, .update, .link => true,
-        else => false,
+        .audit, .outdated, .unlink, .patch, .patch_commit, .publish, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => false,
     };
 }
 
@@ -668,6 +683,16 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.production = true;
         } else if (std.mem.eql(u8, arg, "--ignore-scripts")) {
             options.ignore_scripts = true;
+        } else if (std.mem.eql(u8, arg, "--concurrent-scripts")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOptionValue;
+            options.concurrent_scripts = try parseConcurrentScripts(args[index]);
+            options.concurrent_scripts_cli = true;
+        } else if (std.mem.startsWith(u8, arg, "--concurrent-scripts=")) {
+            const value = arg["--concurrent-scripts=".len..];
+            if (value.len == 0) return error.MissingOptionValue;
+            options.concurrent_scripts = try parseConcurrentScripts(value);
+            options.concurrent_scripts_cli = true;
         } else if (std.mem.eql(u8, arg, "--trust")) {
             options.trust = true;
         } else if (std.mem.eql(u8, arg, "--lockfile-only")) {
@@ -788,7 +813,7 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             if (options.command != .update) return error.InvalidPackageManagerOption;
             options.interactive = true;
         } else if (std.mem.eql(u8, arg, "--recursive") or std.mem.eql(u8, arg, "-r")) {
-            if (options.command != .update) return error.InvalidPackageManagerOption;
+            if (options.command != .update and options.command != .outdated) return error.InvalidPackageManagerOption;
             options.recursive = true;
         } else if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "-A")) {
             options.all = true;
@@ -919,6 +944,11 @@ fn parseMinimumReleaseAge(value: []const u8) !f64 {
     return milliseconds;
 }
 
+fn parseConcurrentScripts(value: []const u8) !?usize {
+    const concurrency = std.fmt.parseInt(usize, value, 10) catch return error.InvalidConcurrentScripts;
+    return if (concurrency == 0) null else concurrency;
+}
+
 fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
     try writer.print(
         \\Usage: cottontail {s} [packages...] [flags]
@@ -930,6 +960,7 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  -p, --production         Omit devDependencies
         \\  --omit <kind>            Omit dev, optional, or peer dependencies
         \\  --ignore-scripts         Skip project lifecycle scripts
+        \\  --concurrent-scripts N  Maximum concurrent lifecycle scripts
         \\  --trust                  Trust added packages and run lifecycle scripts
         \\  --lockfile-only          Resolve without writing node_modules
         \\  --linker <strategy>      Use the isolated or hoisted install layout
@@ -940,13 +971,18 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --patches-dir <path>     Set the generated patch directory
         \\
     , .{@tagName(command)});
-    if (command == .update) {
+    if (command == .update or command == .outdated) {
         try writer.writeAll(
-            \\  -r, --recursive          Update packages in all workspaces
-            \\  -i, --interactive        Select outdated packages to update
-            \\  --latest                 Update to the latest version
+            \\  -r, --recursive          Include packages in all workspaces
             \\
         );
+        if (command == .update) {
+            try writer.writeAll(
+                \\  -i, --interactive        Select outdated packages to update
+                \\  --latest                 Update to the latest version
+                \\
+            );
+        }
     }
     if (command == .publish) {
         try writer.writeAll(
@@ -2199,6 +2235,10 @@ const Manager = struct {
             command_package_json_had_trailing_newline = command_source.len > 0 and command_source[command_source.len - 1] == '\n';
         }
 
+        if (manager.options.command == .outdated) {
+            return manager.printOutdated(command_package_json, manager.invocation_package_dir);
+        }
+
         if (manager.options.command == .add and manager.options.analyze) {
             manager.options.positionals = try Analyzer.scan(
                 manager.allocator,
@@ -2231,7 +2271,7 @@ const Manager = struct {
             .link => try manager.addPackages(command_package_json, manager.invocation_package_dir),
             .unlink => unreachable,
             .patch, .patch_commit, .publish => unreachable,
-            .audit, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
+            .audit, .outdated, .pm, .pm_list, .pm_info, .pm_whoami, .pm_why => unreachable,
         }
 
         if (manager.trusted_additions.count() > 0 and !manager.options.no_save) {
@@ -2287,9 +2327,9 @@ const Manager = struct {
         }
 
         if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
-            try manager.script_queue.run(manager.init_data, manager.root_dir, manager.stderr);
+            try manager.script_queue.run(manager.init_data, manager.root_dir, manager.options.concurrent_scripts, manager.stderr);
             if (manager.options.command == .install and manager.root_selected) {
-                try Scripts.runRoot(manager.init_data, manager.root_dir, &root, manager.stderr);
+                try Scripts.runRoot(manager.init_data, manager.root_dir, &root, manager.options.silent, manager.stderr);
             }
         }
 
@@ -3225,7 +3265,7 @@ const Manager = struct {
         try manager.finalizeIsolatedNodeModules();
         try manager.writeTextLockfile(root, true);
         if (!manager.options.ignore_scripts and !manager.options.dry_run and !manager.options.lockfile_only) {
-            try manager.script_queue.run(manager.init_data, manager.root_dir, manager.stderr);
+            try manager.script_queue.run(manager.init_data, manager.root_dir, manager.options.concurrent_scripts, manager.stderr);
         }
         try manager.stdout.flush();
         try manager.stderr.flush();
@@ -3852,6 +3892,14 @@ const Manager = struct {
                 },
             }
         }
+        if (install.get("concurrentScripts")) |configured_concurrency| {
+            if (configured_concurrency.data == .e_number and !manager.options.concurrent_scripts_cli) {
+                const jobs = configured_concurrency.data.e_number.value;
+                if (std.math.isFinite(jobs) and jobs > 0 and jobs <= @as(f64, @floatFromInt(std.math.maxInt(usize)))) {
+                    manager.options.concurrent_scripts = @intFromFloat(jobs);
+                }
+            }
+        }
         if (install.get("minimumReleaseAgeExcludes")) |exclusions| {
             switch (exclusions.data) {
                 .e_array => |array| {
@@ -3974,6 +4022,9 @@ const Manager = struct {
         if (install.link_workspace_packages) |value| manager.link_workspace_packages = value;
         if (install.exact) |value| manager.options.exact = value;
         if (install.ignore_scripts) |value| manager.options.ignore_scripts = value;
+        if (install.concurrent_scripts) |value| {
+            if (!manager.options.concurrent_scripts_cli and value > 0) manager.options.concurrent_scripts = @intCast(value);
+        }
 
         if (install.scoped) |scoped| {
             for (scoped.scopes.keys(), scoped.scopes.values()) |scope, configured| {
@@ -4506,6 +4557,129 @@ const Manager = struct {
         }
         manager.removed_count += removed;
         try manager.installRoot(manager.root_package_json.?, true);
+    }
+
+    fn printOutdated(manager: *Manager, package_json: *Value, parent_dir: []const u8) !u8 {
+        if (manager.lock_graph == null) {
+            try manager.stderr.writeAll("error: missing lockfile, nothing outdated\n");
+            try manager.stderr.flush();
+            return 1;
+        }
+
+        var packages = std.array_list.Managed(OutdatedPackage).init(manager.allocator);
+        defer packages.deinit();
+
+        const previous_refresh = manager.refresh_direct_registry;
+        manager.refresh_direct_registry = true;
+        defer manager.refresh_direct_registry = previous_refresh;
+
+        try manager.collectOutdatedPackages(package_json, parent_dir, &packages);
+        if (manager.options.recursive) {
+            var workspaces = manager.workspaces.iterator();
+            while (workspaces.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.path, parent_dir)) continue;
+                try manager.collectOutdatedPackages(entry.value_ptr.package_json, entry.value_ptr.path, &packages);
+            }
+        }
+
+        std.sort.pdq(OutdatedPackage, packages.items, {}, struct {
+            fn lessThan(_: void, left: OutdatedPackage, right: OutdatedPackage) bool {
+                const alias_order = std.mem.order(u8, left.alias, right.alias);
+                if (alias_order != .eq) return alias_order == .lt;
+                return interactiveDependencyPriority(left.dependency_type) < interactiveDependencyPriority(right.dependency_type);
+            }
+        }.lessThan);
+
+        if (packages.items.len == 0) {
+            try manager.stdout.flush();
+            return 0;
+        }
+
+        try manager.stdout.writeAll("Package\tCurrent\tUpdate\tLatest\n");
+        var has_filtered_versions = false;
+        for (packages.items) |package| {
+            const dependency_suffix = if (std.mem.eql(u8, package.dependency_type, "devDependencies"))
+                " (dev)"
+            else if (std.mem.eql(u8, package.dependency_type, "peerDependencies"))
+                " (peer)"
+            else if (std.mem.eql(u8, package.dependency_type, "optionalDependencies"))
+                " (optional)"
+            else
+                "";
+            const update_suffix = if (package.update_filtered) " *" else "";
+            const latest_suffix = if (package.latest_filtered) " *" else "";
+            has_filtered_versions = has_filtered_versions or package.update_filtered or package.latest_filtered;
+            try manager.stdout.print("{s}{s}\t{s}\t{s}{s}\t{s}{s}\n", .{
+                package.alias,
+                dependency_suffix,
+                package.current_version,
+                package.update_version,
+                update_suffix,
+                package.latest_version,
+                latest_suffix,
+            });
+        }
+        if (has_filtered_versions) {
+            try manager.stdout.writeAll("\n* Versions excluded by the configured minimum release age are filtered.\n");
+        }
+        try manager.stdout.flush();
+        return 0;
+    }
+
+    fn collectOutdatedPackages(
+        manager: *Manager,
+        package_json: *Value,
+        parent_dir: []const u8,
+        packages: *std.array_list.Managed(OutdatedPackage),
+    ) !void {
+        var seen = std.StringHashMap(void).init(manager.allocator);
+        defer seen.deinit();
+
+        for (update_dependency_sections) |dependency_section| {
+            if (std.mem.eql(u8, dependency_section.name, "devDependencies") and
+                (manager.options.production or manager.options.omit_dev)) continue;
+            if (std.mem.eql(u8, dependency_section.name, "optionalDependencies") and manager.options.omit_optional) continue;
+            if (std.mem.eql(u8, dependency_section.name, "peerDependencies") and manager.options.omit_peer) continue;
+
+            const section = package_json.object.get(dependency_section.name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec_value| {
+                if (seen.contains(alias) or spec_value != .string) continue;
+                try seen.put(alias, {});
+                if (manager.options.positionals.len > 0 and !interactiveRequestContains(manager.options.positionals, alias)) continue;
+
+                const original_spec = spec_value.string;
+                if (manager.isWorkspaceDependency(alias, original_spec)) continue;
+                const effective_spec = manager.manifest_policy.?.resolveDependency(alias, original_spec, false) catch |err| switch (err) {
+                    error.CatalogDependencyNotFound, error.InvalidCatalogDependency => continue,
+                };
+                if (!isRegistryUpdateSpecifier(effective_spec)) continue;
+
+                const selection = try manager.findLockedSelection(alias, parent_dir) orelse continue;
+                if (selection.package.kind != .npm) continue;
+                const registry_name, const registry_spec = parseNpmAlias(alias, effective_spec);
+                const latest = manager.resolveRegistryPackage(registry_name, "latest") catch |err| switch (err) {
+                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => continue,
+                    else => return err,
+                };
+                const actual_latest = latest.latest_version orelse latest.version;
+                if (!semverVersionLessThan(selection.package.version, actual_latest)) continue;
+
+                const target = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| switch (err) {
+                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => null,
+                    else => return err,
+                };
+                try packages.append(.{
+                    .alias = alias,
+                    .current_version = selection.package.version,
+                    .update_version = if (target) |resolved| resolved.version else selection.package.version,
+                    .latest_version = latest.version,
+                    .dependency_type = dependency_section.name,
+                    .update_filtered = if (target) |resolved| resolved.age_filtered else false,
+                    .latest_filtered = latest.age_filtered,
+                });
+            }
+        }
     }
 
     fn prepareInteractiveUpdate(manager: *Manager, package_json: *Value, parent_dir: []const u8) !bool {
@@ -7748,6 +7922,7 @@ const Manager = struct {
             .integrity = integrity,
             .metadata = metadata,
             .authorization = manager.authorizationForPackageURL(name, tarball_url),
+            .age_filtered = selection.newest_filtered != null,
         };
     }
 
@@ -8827,6 +9002,20 @@ const Manager = struct {
                     manifest,
                     kind,
                 ) catch return;
+                if (direct and kind == .local and scripts.total == 1 and
+                    scripts.commands[1] != null and
+                    std.mem.eql(u8, scripts.commands[1].?, "node-gyp rebuild"))
+                {
+                    try manager.script_queue.add(.{
+                        .name = package_name,
+                        .version = version_value,
+                        .cwd = package_dir,
+                        .kind = kind,
+                        .optional = optional,
+                        .auto_node_gyp_only = true,
+                    });
+                    return;
+                }
                 manager.blocked_scripts += scripts.total;
             }
             return;
@@ -9957,6 +10146,13 @@ fn semverRangeIsWildcard(allocator: std.mem.Allocator, range: []const u8) bool {
     var query = Semver.Query.parse(allocator, range, sliced) catch return false;
     defer query.deinit();
     return query.@"is *"();
+}
+
+fn semverVersionLessThan(current: []const u8, latest: []const u8) bool {
+    const current_parsed = Semver.Version.parseUTF8(current);
+    const latest_parsed = Semver.Version.parseUTF8(latest);
+    if (!current_parsed.valid or !latest_parsed.valid) return !std.mem.eql(u8, current, latest);
+    return current_parsed.version.min().order(latest_parsed.version.min(), current, latest) == .lt;
 }
 
 fn bestMatchingVersion(

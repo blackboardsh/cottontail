@@ -65,6 +65,8 @@ pub const Task = struct {
     cwd: []const u8,
     kind: PackageKind,
     optional: bool,
+    auto_node_gyp_only: bool = false,
+    print_commands: bool = false,
 };
 
 pub const Queue = struct {
@@ -92,14 +94,22 @@ pub const Queue = struct {
             .cwd = try queue.allocator.dupe(u8, task.cwd),
             .kind = task.kind,
             .optional = task.optional,
+            .auto_node_gyp_only = task.auto_node_gyp_only,
+            .print_commands = task.print_commands,
         });
     }
 
-    pub fn run(queue: *Queue, process_init: std.process.Init, root_dir: []const u8, stderr: *std.Io.Writer) !void {
+    pub fn run(
+        queue: *Queue,
+        process_init: std.process.Init,
+        root_dir: []const u8,
+        max_concurrent_scripts: ?usize,
+        stderr: *std.Io.Writer,
+    ) !void {
         if (queue.tasks.items.len == 0) return;
         const node_gyp = try NodeGypWrapper.create(process_init);
         defer node_gyp.deinit(process_init.io);
-        const concurrency = @max(1, (std.Thread.getCpuCount() catch 2) * 2);
+        const concurrency = max_concurrent_scripts orelse @max(1, (std.Thread.getCpuCount() catch 2) * 2);
         var offset: usize = 0;
         while (offset < queue.tasks.items.len) {
             const end = @min(offset + concurrency, queue.tasks.items.len);
@@ -161,17 +171,20 @@ pub fn runRoot(
     init: std.process.Init,
     root_dir: []const u8,
     root: *const Value,
+    quiet: bool,
     stderr: *std.Io.Writer,
 ) !void {
     if (!rootHasLifecycleScripts(init.io, root_dir, root)) return;
     const node_gyp = try NodeGypWrapper.create(init);
     defer node_gyp.deinit(init.io);
+    if (!quiet) try stderr.writeByte('\n');
     try runManifestScripts(init, root_dir, .{
         .name = jsonString(root, "name") orelse "root",
         .version = jsonString(root, "version") orelse "0.0.0",
         .cwd = root_dir,
         .kind = .git,
         .optional = false,
+        .print_commands = !quiet,
     }, root, node_gyp.directory, stderr);
 }
 
@@ -315,6 +328,11 @@ fn runManifestScripts(
     stderr: *std.Io.Writer,
 ) !void {
     const scripts = try inspectLifecycleScripts(init.io, init.arena.allocator(), task.cwd, manifest, task.kind);
+    if (task.auto_node_gyp_only) {
+        const command = scripts.commands[1] orelse return;
+        if (!std.mem.eql(u8, command, "node-gyp rebuild")) return;
+        return runCommandStage(init, root_dir, task, "install", command, node_gyp_dir, stderr, .install);
+    }
     for (lifecycle_stage_names, scripts.commands) |stage, maybe_command| {
         const command = maybe_command orelse continue;
         try runCommandStage(init, root_dir, task, stage, command, node_gyp_dir, stderr, .install);
@@ -348,6 +366,10 @@ fn runCommandStage(
     stderr: *std.Io.Writer,
     diagnostic: StageDiagnostic,
 ) !void {
+    if (task.print_commands) {
+        try stderr.print("$ {s}\n", .{script});
+        try stderr.flush();
+    }
     const allocator = init.arena.allocator();
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
