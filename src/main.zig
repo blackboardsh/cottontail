@@ -85,6 +85,44 @@ fn printHelp(writer: anytype) !void {
     try writer.print(help_text_template, .{version});
 }
 
+const test_help_text =
+    \\Usage: bun test [flags] [<patterns>]
+    \\  Run all matching test files and print the results to stdout
+    \\
+    \\Flags:
+    \\  -t, --test-name-pattern <pattern>  Run tests with matching names
+    \\      --timeout <ms>                 Set the per-test timeout
+    \\      --max-concurrency <count>      Set the maximum parallel tests
+    \\      --rerun-each <count>           Run each test file repeatedly
+    \\      --retry <count>                Retry failed tests
+    \\      --bail[=<count>]               Stop after failures
+    \\      --only                         Run tests marked with test.only
+    \\      --todo                         Include tests marked as todo
+    \\      --concurrent                   Run tests concurrently
+    \\      --randomize                    Randomize test order
+    \\      --seed <value>                 Set the randomization seed
+    \\      --coverage                     Generate a coverage report
+    \\      --preload <module>             Load a module before tests
+    \\  -u, --update-snapshots             Update snapshots
+    \\  -h, --help                         Print this help
+    \\
+    \\Full documentation is available at https://bun.com/docs/cli/test
+    \\
+;
+
+fn commandHasHelpFlag(args: []const [:0]const u8, start: usize) bool {
+    if (start >= args.len) return false;
+    for (args[start..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) return false;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
+}
+
+fn printTestHelp(writer: anytype) !void {
+    try writer.writeAll(test_help_text);
+}
+
 const CliMode = enum { script, eval, print, stdin };
 
 const RunShell = enum { bun, system };
@@ -3490,6 +3528,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, arg, "test") and commandHasHelpFlag(args, 2)) {
+        try printTestHelp(stdout);
+        try stdout.flush();
+        return;
+    }
+
     if (missingProfilerOptionValue(args)) |flag| {
         try printHelp(stdout);
         try stdout.flush();
@@ -3873,6 +3917,15 @@ test "test flags can precede the entrypoint" {
 
     const config_args = [_][:0]const u8{ "cottontail", "test", "--config", "coverage.toml", "suite.test.ts" };
     try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&config_args));
+}
+
+test "test help flags are handled before discovery" {
+    const long = [_][:0]const u8{ "cottontail", "test", "--help" };
+    const short = [_][:0]const u8{ "cottontail", "test", "-h" };
+    const script_arg = [_][:0]const u8{ "cottontail", "test", "suite.test.ts", "--", "--help" };
+    try std.testing.expect(commandHasHelpFlag(&long, 2));
+    try std.testing.expect(commandHasHelpFlag(&short, 2));
+    try std.testing.expect(!commandHasHelpFlag(&script_arg, 2));
 }
 
 test "test flag values are not treated as additional entrypoints" {
