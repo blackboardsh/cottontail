@@ -6933,6 +6933,7 @@ export class Request {
     const inputResponse = input instanceof Response ? input : null;
     const inputObject = isObjectLike(input) ? input : null;
     let urlText = inputIsUrl ? bunString(input) : undefined;
+    let urlOverlayText;
 
     let bodySet = false;
     let rawBody = null;
@@ -6958,11 +6959,15 @@ export class Request {
           bodyFromInit = candidate === initObject;
         }
       }
-      if (urlText === undefined) {
+      const acceptsURLOverlay = candidate === initObject && !inputIsUrl && urlFactory === null;
+      if (urlText === undefined || acceptsURLOverlay) {
         const value = candidate.url;
         if (value !== undefined) {
           const candidateUrl = bunString(value);
-          if (candidateUrl !== "") urlText = candidateUrl;
+          if (candidateUrl !== "") {
+            urlText = candidateUrl;
+            if (acceptsURLOverlay) urlOverlayText = candidateUrl;
+          }
         } else if (inputFallback && requestInputImplementsToString(candidate)) {
           const candidateUrl = bunString(candidate);
           if (candidateUrl !== "") urlText = candidateUrl;
@@ -7042,6 +7047,8 @@ export class Request {
     } else if (inputObject && typeof input !== "string" && !(input instanceof URL)) {
       readCandidate(inputObject, false, true);
     }
+
+    if (urlOverlayText !== undefined) urlText = urlOverlayText;
 
     let url = "";
     if (urlFactory === null) {

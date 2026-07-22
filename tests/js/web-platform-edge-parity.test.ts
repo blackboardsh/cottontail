@@ -71,6 +71,12 @@ test("RequestInit overlays use Bun coercion and inheritance", async () => {
 
   expect(new Request(source, { url: "https://example.com/override" } as any).url)
     .toBe("https://example.com/override");
+  expect(new Request({ url: "https://example.com/object" } as any, {
+    url: "https://example.com/object-override",
+  } as any).url).toBe("https://example.com/object-override");
+  expect(new Request("https://example.com/string", {
+    url: "https://example.com/string-override",
+  } as any).url).toBe("https://example.com/string");
 
   let headersReads = 0;
   let methodReads = 0;
