@@ -52,10 +52,100 @@ test("HTTP named calls observe interceptors installed on default exports", () =>
   }
 });
 
-test("IncomingMessage accepts a missing socket", () => {
+test("IncomingMessage accepts a missing socket without ending the response", async () => {
   const message = new http.IncomingMessage(null as any);
   expect(message).toBeInstanceOf(http.IncomingMessage);
   expect(message.connection).toBe(message.socket);
+  expect(message.complete).toBe(false);
+
+  await Promise.resolve();
+  expect(message.readableEnded).toBe(false);
+
+  const body = new Promise<string>((resolve, reject) => {
+    const chunks: Uint8Array[] = [];
+    message.on("data", chunk => chunks.push(chunk));
+    message.once("end", () => resolve(Buffer.concat(chunks).toString()));
+    message.once("error", reject);
+  });
+  message.push(Buffer.from("intercepted"));
+  message.push(null);
+  message.complete = true;
+
+  expect(await body).toBe("intercepted");
+});
+
+test("ClientRequest subclasses can synthesize an intercepted response", async () => {
+  class InterceptedClientRequest extends http.ClientRequest {
+    response: http.IncomingMessage;
+
+    constructor(callback: (response: http.IncomingMessage) => void) {
+      super({
+        protocol: "http:",
+        hostname: "interception.invalid",
+        method: "GET",
+        path: "/resource",
+      }, callback);
+      this.response = new http.IncomingMessage(this.socket as any);
+    }
+
+    end(...args: any[]) {
+      const callback = args.find(value => typeof value === "function");
+      Object.defineProperties(this, {
+        writableFinished: { value: true },
+        writableEnded: { value: true },
+      });
+      this.emit("finish");
+
+      this.response.statusCode = 200;
+      this.response.statusMessage = "OK";
+      this.response.headers = { "content-type": "application/json" };
+      this.response.rawHeaders = ["content-type", "application/json"];
+      this.res = this.response;
+
+      queueMicrotask(() => {
+        this.emit("response", this.response);
+        this.response.push(Buffer.from('{"source":"interceptor"}'));
+        this.response.push(null);
+        this.response.complete = true;
+        callback?.();
+      });
+      return this;
+    }
+  }
+
+  const body = await new Promise<string>((resolve, reject) => {
+    const request = new InterceptedClientRequest(response => {
+      const chunks: Uint8Array[] = [];
+      response.on("data", chunk => chunks.push(chunk));
+      response.once("end", () => resolve(Buffer.concat(chunks).toString()));
+      response.once("error", reject);
+    });
+    request.once("error", reject);
+    request.end();
+  });
+
+  expect(body).toBe('{"source":"interceptor"}');
+});
+
+test("global fetch can be intercepted and restored", async () => {
+  const nativeFetch = globalThis.fetch;
+  const requests: string[] = [];
+  const interceptedFetch: typeof fetch = async input => {
+    const request = new Request(input);
+    requests.push(request.url);
+    return Response.json({ intercepted: true });
+  };
+
+  globalThis.fetch = interceptedFetch;
+  try {
+    expect(globalThis.fetch).toBe(interceptedFetch);
+    expect(await fetch("http://localhost/intercepted").then(response => response.json())).toEqual({ intercepted: true });
+    expect(requests).toEqual(["http://localhost/intercepted"]);
+  } finally {
+    globalThis.fetch = nativeFetch;
+  }
+
+  expect(globalThis.fetch).toBe(nativeFetch);
 });
 
 test("zlib constructors called as methods return stream instances", async () => {

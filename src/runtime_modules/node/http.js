@@ -7,6 +7,7 @@ import { createHash, randomBytes } from "./crypto.js";
 import { deflateRawSync, inflateRawSync, constants as zlibConstants } from "./zlib.js";
 import { AsyncResource } from "./async_hooks.js";
 import { HTTPParser as BindingHTTPParser, allMethods as bindingHTTPMethods } from "../internal/node-http-parser.js";
+import { normalizeIncomingMessageArgument } from "./http-interception.js";
 
 const asyncIdSymbol = Symbol.for("nodejs.async_id_symbol");
 const captureRejectionSymbol = Symbol.for("nodejs.rejection");
@@ -1457,11 +1458,8 @@ export function validateHeaderValue(name, value) {
 }
 
 export class IncomingMessage extends Readable {
-  constructor(init = {}) {
-    init ??= {};
-    if (init && typeof init.on === "function" && init.headers === undefined && init.deferBody === undefined) {
-      init = { socket: init, deferBody: true };
-    }
+  constructor(init = undefined) {
+    init = normalizeIncomingMessageArgument(init);
     super({ captureRejections: true, highWaterMark: init.highWaterMark });
     this.aborted = false;
     this.complete = init.deferBody !== true;
