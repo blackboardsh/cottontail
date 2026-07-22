@@ -30468,52 +30468,155 @@ static const char *ct_js_block_comment_end(const char *start, const char *end) {
     return NULL;
 }
 
-// Tracks whether a scan position is inside a string/template literal. The
-// source is processed line by line, but template literals span lines, so the
-// state must be carried across line boundaries (otherwise `import.meta.*`
-// inside a multi-line template gets falsely rewritten).
+// Source rewriting is line-oriented, but templates and block comments span
+// lines. Each template stack entry alternates between raw text and a `${...}`
+// expression; nested templates therefore retain the same lexical boundaries
+// as JavaScript instead of exposing source-looking text to the rewriter.
+#define CT_JS_TEMPLATE_STACK_MAX 64
 typedef struct {
     char quote;
     bool escaped;
+    bool in_block_comment;
+    unsigned char template_depth;
+    bool template_in_expression[CT_JS_TEMPLATE_STACK_MAX];
+    unsigned int template_brace_depth[CT_JS_TEMPLATE_STACK_MAX];
 } CtJsScanState;
 
-static void ct_js_scan_advance_line(CtJsScanState *state, const char *bytes, size_t len) {
-    for (size_t i = 0; i < len; i += 1) {
-        char ch = bytes[i];
+static bool ct_js_scan_in_template_raw(const CtJsScanState *state) {
+    return state->template_depth > 0 &&
+        !state->template_in_expression[state->template_depth - 1];
+}
+
+// Advances over one lexical unit and reports whether its first byte is
+// executable JavaScript. Strings, template raw text, comments, and regular
+// expression literals are skipped as a unit.
+static size_t ct_js_scan_step(
+    CtJsScanState *state,
+    const char *bytes,
+    size_t len,
+    size_t index,
+    bool *is_code
+) {
+    *is_code = false;
+    if (index >= len) return len;
+
+    const char *end = bytes + len;
+    char ch = bytes[index];
+    if (state->in_block_comment) {
+        const char *after_comment = ct_js_block_comment_end(bytes + index, end);
+        if (after_comment == NULL) return len;
+        state->in_block_comment = false;
+        return (size_t)(after_comment - bytes);
+    }
+
+    if (state->quote != 0) {
         if (state->escaped) {
             state->escaped = false;
-            continue;
+        } else if (ch == '\\') {
+            state->escaped = true;
+        } else if (ch == state->quote) {
+            state->quote = 0;
         }
-        if (state->quote != 0) {
-            if (ch == '\\') state->escaped = true;
-            else if (ch == state->quote) state->quote = 0;
-            continue;
+        return index + 1;
+    }
+
+    if (ct_js_scan_in_template_raw(state)) {
+        if (state->escaped) {
+            state->escaped = false;
+        } else if (ch == '\\') {
+            state->escaped = true;
+        } else if (ch == '`') {
+            state->template_depth -= 1;
+        } else if (ch == '$' && index + 1 < len && bytes[index + 1] == '{') {
+            const unsigned int top = state->template_depth - 1;
+            state->template_in_expression[top] = true;
+            state->template_brace_depth[top] = 1;
+            return index + 2;
         }
-        if (ch == '"' || ch == '\'' || ch == '`') {
-            state->quote = ch;
-            continue;
+        return index + 1;
+    }
+
+    if (ch == '/' && index + 1 < len && bytes[index + 1] == '/') return len;
+    if (ch == '/' && index + 1 < len && bytes[index + 1] == '*') {
+        const char *after_comment = ct_js_block_comment_end(bytes + index + 2, end);
+        if (after_comment == NULL) {
+            state->in_block_comment = true;
+            return len;
         }
-        if (ch == '/' && i + 1 < len && bytes[i + 1] == '/') break;
-        if (ch == '/' && i + 1 < len && bytes[i + 1] == '*') {
-            const char *after_comment = ct_js_block_comment_end(bytes + i + 2, bytes + len);
-            if (after_comment == NULL) break;
-            i = (size_t)(after_comment - bytes - 1);
-            continue;
+        return (size_t)(after_comment - bytes);
+    }
+    if (ch == '/') {
+        const char *after_regex = ct_js_regex_literal_end(bytes, bytes + index, end);
+        if (after_regex != bytes + index) return (size_t)(after_regex - bytes);
+    }
+    if (ch == '"' || ch == '\'') {
+        state->quote = ch;
+        return index + 1;
+    }
+    if (ch == '`') {
+        if (state->template_depth < CT_JS_TEMPLATE_STACK_MAX) {
+            const unsigned int top = state->template_depth;
+            state->template_in_expression[top] = false;
+            state->template_brace_depth[top] = 0;
+            state->template_depth += 1;
+        } else {
+            // Stay conservative at pathological nesting depths: suppress
+            // rewrites until the matching backtick rather than touching raw
+            // template contents.
+            state->quote = '`';
         }
-        if (ch == '/') {
-            const char *after_regex = ct_js_regex_literal_end(bytes, bytes + i, bytes + len);
-            if (after_regex != bytes + i) {
-                i = (size_t)(after_regex - bytes - 1);
+        return index + 1;
+    }
+
+    if (state->template_depth > 0) {
+        const unsigned int top = state->template_depth - 1;
+        if (ch == '{') {
+            state->template_brace_depth[top] += 1;
+        } else if (ch == '}') {
+            if (state->template_brace_depth[top] > 0) {
+                state->template_brace_depth[top] -= 1;
+            }
+            if (state->template_brace_depth[top] == 0) {
+                state->template_in_expression[top] = false;
+                return index + 1;
             }
         }
     }
-    // Line boundary: an escape at end of line consumes the newline (string
-    // continues); otherwise only template literals stay open across lines.
+
+    *is_code = true;
+    return index + 1;
+}
+
+static void ct_js_scan_advance_line(CtJsScanState *state, const char *bytes, size_t len) {
+    size_t index = 0;
+    while (index < len) {
+        bool is_code = false;
+        index = ct_js_scan_step(state, bytes, len, index, &is_code);
+    }
+    // An escaped newline continues quoted strings and template raw text. An
+    // unescaped newline terminates ordinary quotes, including invalid source
+    // that JSC will subsequently diagnose.
     if (state->escaped) {
         state->escaped = false;
     } else if (state->quote == '"' || state->quote == '\'') {
         state->quote = 0;
     }
+}
+
+static size_t ct_js_scan_advance_to(
+    CtJsScanState *state,
+    const char *bytes,
+    size_t len,
+    size_t index,
+    size_t target
+) {
+    while (index < target && index < len) {
+        bool is_code = false;
+        size_t next = ct_js_scan_step(state, bytes, len, index, &is_code);
+        if (next <= index) return target;
+        index = next;
+    }
+    return index;
 }
 
 static bool ct_append_rewritten_dynamic_imports(
@@ -30525,41 +30628,19 @@ static bool ct_append_rewritten_dynamic_imports(
 ) {
     const char *cursor = line;
     const char *end = line + line_len;
-    char scan_quote = line_state.quote;
-    bool scan_escaped = line_state.escaped;
+    CtJsScanState scan_state = line_state;
+    size_t scan_index = 0;
 
     while (cursor < end) {
         const char *import_start = NULL;
         const char *open_paren = NULL;
-        for (const char *scan = cursor; scan + 6 <= end; scan += 1) {
-            char ch = *scan;
-            if (scan_escaped) {
-                scan_escaped = false;
-                continue;
-            }
-            if (scan_quote != 0) {
-                if (ch == '\\') scan_escaped = true;
-                else if (ch == scan_quote) scan_quote = 0;
-                continue;
-            }
-            if (ch == '"' || ch == '\'' || ch == '`') {
-                scan_quote = ch;
-                continue;
-            }
-            if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
-            if (ch == '/' && scan + 1 < end && scan[1] == '*') {
-                const char *after_comment = ct_js_block_comment_end(scan + 2, end);
-                if (after_comment == NULL) break;
-                scan = after_comment - 1;
-                continue;
-            }
-            if (ch == '/') {
-                const char *after_regex = ct_js_regex_literal_end(line, scan, end);
-                if (after_regex != scan) {
-                    scan = after_regex - 1;
-                    continue;
-                }
-            }
+        if (scan_index < (size_t)(cursor - line)) scan_index = (size_t)(cursor - line);
+        while (scan_index + 6 <= line_len) {
+            const char *scan = line + scan_index;
+            bool is_code = false;
+            size_t next_index = ct_js_scan_step(&scan_state, line, line_len, scan_index, &is_code);
+            scan_index = next_index;
+            if (!is_code) continue;
             if (strncmp(scan, "import", 6) != 0) continue;
             if (scan > line && (ct_is_js_identifier_char(scan[-1]) || scan[-1] == '#' || scan[-1] == '.')) continue;
             if (scan + 6 < end && ct_is_js_identifier_char(scan[6])) continue;
@@ -30581,39 +30662,35 @@ static bool ct_append_rewritten_dynamic_imports(
         const char *argument_start = open_paren + 1;
         const char *argument_end = argument_start;
         int depth = 1;
-        char quote = 0;
-        bool escaped = false;
-        while (argument_end < end) {
+        CtJsScanState argument_state = { 0 };
+        size_t argument_index = (size_t)(argument_start - line);
+        while (argument_index < line_len) {
+            argument_end = line + argument_index;
             char ch = *argument_end;
-            if (escaped) {
-                escaped = false;
-                argument_end += 1;
-                continue;
-            }
-            if (quote != 0) {
-                if (ch == '\\') {
-                    escaped = true;
-                } else if (ch == quote) {
-                    quote = 0;
-                }
-                argument_end += 1;
-                continue;
-            }
-            if (ch == '"' || ch == '\'' || ch == '`') {
-                quote = ch;
-            } else if (ch == '(') {
+            bool is_code = false;
+            size_t next_index = ct_js_scan_step(
+                &argument_state,
+                line,
+                line_len,
+                argument_index,
+                &is_code
+            );
+            if (is_code && ch == '(') {
                 depth += 1;
-            } else if (ch == ')') {
+            } else if (is_code && ch == ')') {
                 depth -= 1;
                 if (depth == 0) break;
-            } else if (ch == '\\') {
-                escaped = true;
             }
-            argument_end += 1;
+            argument_index = next_index;
         }
         if (argument_end >= end || *argument_end != ')') {
-            if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
-            cursor = open_paren + 1;
+            scan_index = ct_js_scan_advance_to(
+                &scan_state,
+                line,
+                line_len,
+                scan_index,
+                (size_t)(open_paren + 1 - line)
+            );
             continue;
         }
 
@@ -30626,8 +30703,13 @@ static bool ct_append_rewritten_dynamic_imports(
         const char *after_close = argument_end + 1;
         while (after_close < end && (*after_close == ' ' || *after_close == '\t')) after_close += 1;
         if (trimmed_argument == argument_end || (after_close < end && *after_close == '{')) {
-            if (!ct_sb_append_bytes(builder, import_start, (size_t)(argument_end + 1 - import_start))) return false;
-            cursor = argument_end + 1;
+            scan_index = ct_js_scan_advance_to(
+                &scan_state,
+                line,
+                line_len,
+                scan_index,
+                (size_t)(argument_end + 1 - line)
+            );
             continue;
         }
 
@@ -30638,6 +30720,13 @@ static bool ct_append_rewritten_dynamic_imports(
         if (!ct_sb_append_js_string_literal(builder, filename != NULL ? filename : "<script>")) return false;
         if (!ct_sb_append_cstr(builder, ")")) return false;
         cursor = argument_end + 1;
+        scan_index = ct_js_scan_advance_to(
+            &scan_state,
+            line,
+            line_len,
+            scan_index,
+            (size_t)(cursor - line)
+        );
     }
 
     return true;
@@ -30705,39 +30794,17 @@ static bool ct_append_rewritten_import_meta(
         return false;
     }
 
-    char scan_quote = line_state.quote;
-    bool scan_escaped = line_state.escaped;
+    CtJsScanState scan_state = line_state;
+    size_t scan_index = 0;
     while (cursor < end) {
         const char *found = NULL;
-        for (const char *scan = cursor; scan + meta_token_len <= end; scan += 1) {
-            char ch = *scan;
-            if (scan_escaped) {
-                scan_escaped = false;
-                continue;
-            }
-            if (scan_quote != 0) {
-                if (ch == '\\') scan_escaped = true;
-                else if (ch == scan_quote) scan_quote = 0;
-                continue;
-            }
-            if (ch == '"' || ch == '\'' || ch == '`') {
-                scan_quote = ch;
-                continue;
-            }
-            if (ch == '/' && scan + 1 < end && scan[1] == '/') break;
-            if (ch == '/' && scan + 1 < end && scan[1] == '*') {
-                const char *after_comment = ct_js_block_comment_end(scan + 2, end);
-                if (after_comment == NULL) break;
-                scan = after_comment - 1;
-                continue;
-            }
-            if (ch == '/') {
-                const char *after_regex = ct_js_regex_literal_end(line, scan, end);
-                if (after_regex != scan) {
-                    scan = after_regex - 1;
-                    continue;
-                }
-            }
+        if (scan_index < (size_t)(cursor - line)) scan_index = (size_t)(cursor - line);
+        while (scan_index + meta_token_len <= line_len) {
+            const char *scan = line + scan_index;
+            bool is_code = false;
+            size_t next_index = ct_js_scan_step(&scan_state, line, line_len, scan_index, &is_code);
+            scan_index = next_index;
+            if (!is_code) continue;
             if (strncmp(scan, meta_token, meta_token_len) == 0 &&
                 (scan == line || !ct_is_js_identifier_char(scan[-1])) &&
                 (scan + meta_token_len == end || !ct_is_js_identifier_char(scan[meta_token_len]))) {
@@ -30769,6 +30836,13 @@ static bool ct_append_rewritten_import_meta(
                 return false;
             }
             cursor = after_meta;
+            scan_index = ct_js_scan_advance_to(
+                &scan_state,
+                line,
+                line_len,
+                scan_index,
+                (size_t)(cursor - line)
+            );
             continue;
         }
 
@@ -30849,6 +30923,13 @@ static bool ct_append_rewritten_import_meta(
             }
             cursor = property_start;
         }
+        scan_index = ct_js_scan_advance_to(
+            &scan_state,
+            line,
+            line_len,
+            scan_index,
+            (size_t)(cursor - line)
+        );
     }
 
     free(dirname);
@@ -30921,7 +31002,7 @@ static char *ct_prepare_source_with_wrappers(
     const char *lowered_marker = "/* cottontail:module-syntax-lowered */";
     bool module_syntax_lowered = source_len >= strlen(lowered_marker) &&
         memcmp(source, lowered_marker, strlen(lowered_marker)) == 0;
-    CtJsScanState scan_state = { 0, false };
+    CtJsScanState scan_state = { 0 };
     // Reused across lines: allocating a fresh builder per line costs two
     // heap operations per source line (ruinous under libgmalloc, which some
     // upstream tests inject into spawned cottontail processes).
@@ -30939,7 +31020,8 @@ static char *ct_prepare_source_with_wrappers(
         const char *trim = start;
         while (trim < line_end && (*trim == ' ' || *trim == '\t')) trim += 1;
         bool skip = false;
-        if (line_state.quote == 0 &&
+        if (line_state.quote == 0 && !line_state.in_block_comment &&
+            !ct_js_scan_in_template_raw(&line_state) &&
             (size_t)(line_end - trim) >= 9 && strncmp(trim, "export {", 8) == 0) {
             skip = true;
         }
