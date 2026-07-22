@@ -1,5 +1,7 @@
 import "../internal/v8-date-parser.js";
 import * as FFI from "./ffi.js";
+import { plugin } from "./plugin.js";
+export { plugin };
 import { dns } from "./dns.js";
 export { dns };
 import * as nodeHttp from "../node/http.js";
@@ -16,8 +18,6 @@ import * as zlib from "../node/zlib.js";
 import { createUndiciModule } from "../node/undici.js";
 import { CryptoKey, SubtleCrypto as NodeSubtleCrypto, createHash, createHmac, randomBytes, randomUUID, webcrypto as nodeWebcrypto } from "../node/crypto.js";
 import {
-  _clearBunPlugins as nodeClearBunPlugins,
-  _registerBunPlugin as nodeRegisterBunPlugin,
   _resolveForImport as nodeResolveForImport,
   __setBuiltinModules as nodeSetBuiltinModules,
   createRequire as nodeCreateRequire,
@@ -2847,23 +2847,23 @@ async function buildWithPlugins(options, plugins) {
     onResolve(constraints, callback) {
       if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
       onResolveRules.push({ ...ctValidatePluginConstraints(constraints), callback });
-      return builder;
+      return this;
     },
     onLoad(constraints, callback) {
       if (!callback || typeof callback !== "function") throw new TypeError("lmao callback must be a function");
       onLoadRules.push({ ...ctValidatePluginConstraints(constraints), callback });
-      return builder;
+      return this;
     },
     onStart(callback) {
       if (typeof callback !== "function") throw new TypeError("callback must be a function");
-      const result = callback();
-      if (result && typeof result.then === "function") onStartPromises.push(result);
-      return builder;
+      const result = Reflect.apply(callback, undefined, []);
+      if (cottontail.promiseStatus?.(result) >= 0) onStartPromises.push(result);
+      return this;
     },
     onEnd(callback) {
       if (typeof callback !== "function") throw new TypeError("onEnd() expects a callback function");
       onEndCallbacks.push(callback);
-      return builder;
+      return this;
     },
     onBeforeParse(constraints, { napiModule, external, symbol }) {
       if (!constraints || typeof constraints !== "object") {
@@ -2896,7 +2896,7 @@ async function buildWithPlugins(options, plugins) {
         symbol,
         name: validation?.name ?? "<unknown>",
       });
-      return builder;
+      return this;
     },
   };
   for (const plugin of plugins) {
@@ -2906,7 +2906,10 @@ async function buildWithPlugins(options, plugins) {
       throw error;
     }
   }
-  for (const plugin of plugins) await plugin.setup(builder);
+  for (const plugin of plugins) {
+    const setupResult = Reflect.apply(plugin.setup, undefined, [builder]);
+    if (cottontail.promiseStatus?.(setupResult) >= 0) await setupResult;
+  }
   if (onStartPromises.length > 0) await Promise.all(onStartPromises);
 
   if (onResolveRules.length === 0 && onLoadRules.length === 0 && onBeforeParseRules.length === 0) {
@@ -2980,7 +2983,7 @@ async function buildWithPlugins(options, plugins) {
     };
 
     try {
-      return await callback({ ...arguments_, defer });
+      return await Reflect.apply(callback, undefined, [{ ...arguments_, defer }]);
     } finally {
       state.completed = true;
       if (!state.called || state.resumed) activeOnLoadCallbacks--;
@@ -2992,14 +2995,13 @@ async function buildWithPlugins(options, plugins) {
     for (const rule of onResolveRules) {
       if (rule.namespace !== importerNamespace) continue;
       if (!rule.filter.test(specifier)) continue;
-      const result = await rule.callback({
+      const result = await Reflect.apply(rule.callback, undefined, [{
         path: specifier,
         importer,
         namespace: importerNamespace,
         resolveDir: importerNamespace === "file" ? resolveDir : undefined,
         kind,
-        pluginData: undefined,
-      });
+      }]);
       if (result == null || typeof result !== "object") continue;
       let { path, namespace: userNamespace = importerNamespace, external } = result;
       if (path !== undefined && typeof path !== "string") {
@@ -3066,7 +3068,6 @@ async function buildWithPlugins(options, plugins) {
         path: record.path,
         namespace: record.namespace,
         loader: defaultLoader,
-        pluginData: undefined,
         side: options?.target === "browser" ? "client" : "server",
       });
       if (result == null || typeof result !== "object") continue;
@@ -3338,7 +3339,7 @@ async function buildWithPlugins(options, plugins) {
   for (const entry of (options?.entrypoints ?? []).map(String)) {
     let resolved;
     try {
-      resolved = await resolveWithPlugins(entry, "", "file", cottontail.cwd(), "entry-point-build");
+      resolved = await resolveWithPlugins(entry, "", "file", ".", "entry-point-build");
     } catch (error) {
       errors.push(ctPluginBuildMessage(error, entry.startsWith("/") ? entry : nodePathResolve(entry), "file"));
       continue;
@@ -3626,37 +3627,20 @@ function ctMaterializeBuildResult(raw) {
   return result;
 }
 
-// onEnd semantics (matches real bun): every callback is invoked in
-// registration order even after one throws; returned promises are awaited
-// sequentially, stopping at the first rejection; only the first error is
-// recorded and it flips success to false.
+// Every callback starts in registration order. Bun turns synchronous throws
+// into rejected promises, then waits for all asynchronous callbacks together.
 async function ctRunOnEnd(state, result) {
   if (state.onEnd.length === 0) return;
-  let failure = null;
   const promises = [];
   for (const callback of state.onEnd) {
     try {
-      const returned = callback(result);
-      if (returned && typeof returned.then === "function") promises.push(returned);
+      const returned = Reflect.apply(callback, undefined, [result]);
+      if (cottontail.promiseStatus?.(returned) >= 0) promises.push(returned);
     } catch (error) {
-      if (!failure) failure = { error };
+      promises.push(Promise.reject(error));
     }
   }
-  if (!failure) {
-    for (const promise of promises) {
-      try {
-        await promise;
-      } catch (error) {
-        failure = { error };
-        break;
-      }
-    }
-  }
-  for (const promise of promises) Promise.resolve(promise).catch(() => {});
-  if (failure) {
-    result.success = false;
-    result.logs.push(new CTBuildMessage({ message: ctErrorMessage(failure.error) }));
-  }
+  if (promises.length > 0) await Promise.all(promises);
 }
 
 async function ctRunBuild(options, state) {
@@ -16222,17 +16206,6 @@ async function createUdpSocket(options) {
   if (typeof options.socket?.error === "function") socket.on("error", (error) => options.socket.error(result, error));
   return result;
 }
-
-export function plugin(pluginOptions) {
-  return nodeRegisterBunPlugin(...arguments);
-}
-Object.defineProperty(plugin, "clearAll", {
-  value: function clearAll(_unused) {
-    return nodeClearBunPlugins(_unused);
-  },
-  configurable: false,
-  writable: true,
-});
 
 export function registerMacro(_name, _macro = undefined) {
   return undefined;

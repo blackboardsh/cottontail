@@ -231,6 +231,9 @@ const runtimePluginOnLoad = [];
 const runtimePluginVirtualModules = new Map();
 const runtimePluginResolvedModules = new Map();
 const runtimePluginPendingLoads = new Map();
+const runtimePluginInvalidatableKeys = new Set();
+const runtimePluginRevisions = new Map();
+let runtimePluginGeneration = 0;
 const runtimePluginNamespacePattern = /^[/@A-Za-z0-9_-]+$/;
 
 const hotReloadHooks = globalThis.__cottontailHotReloadHooks ?? new Set();
@@ -245,11 +248,7 @@ hotReloadHooks.add(() => {
   moduleHooks.length = 0;
   hookResolvedFormats.clear();
   sourceMapCache.clear();
-  runtimePluginOnResolve.length = 0;
-  runtimePluginOnLoad.length = 0;
-  runtimePluginVirtualModules.clear();
-  runtimePluginResolvedModules.clear();
-  runtimePluginPendingLoads.clear();
+  clearRuntimePlugins();
   mainModule = null;
 });
 
@@ -263,12 +262,21 @@ function runtimePluginFilterMatches(filter, path) {
   }
 }
 
-function runtimePluginNamespace(value) {
-  const namespace = value == null || value === "" ? "file" : String(value);
+function runtimePluginRegistrationNamespace(value) {
+  if (typeof value !== "string") return "";
+  const namespace = value;
   if (!runtimePluginNamespacePattern.test(namespace)) {
     throw new Error("namespace can only contain letters, numbers, dashes, or underscores");
   }
-  return namespace;
+  return namespace === "file" ? "" : namespace;
+}
+
+function runtimePluginResultNamespace(value) {
+  if (value == null || value === "") return "file";
+  if (!runtimePluginNamespacePattern.test(value)) {
+    throw new Error("namespace can only contain letters, numbers, dashes, or underscores");
+  }
+  return value;
 }
 
 function runtimePluginRegistration(kind, constraints, callback) {
@@ -280,7 +288,7 @@ function runtimePluginRegistration(kind, constraints, callback) {
   }
   return {
     filter: new RegExp(constraints.filter.source, constraints.filter.flags),
-    namespace: runtimePluginNamespace(constraints.namespace),
+    namespace: runtimePluginRegistrationNamespace(constraints.namespace),
     callback,
   };
 }
@@ -289,11 +297,19 @@ function splitRuntimePluginSpecifier(specifier) {
   const text = String(specifier);
   const colon = text.indexOf(":");
   if (colon < 0 || (colon === 1 && /^[A-Za-z]:[\\/]/.test(text))) {
-    return { namespace: "file", path: text };
+    return { namespace: "", path: text };
   }
   const namespace = text.slice(0, colon);
-  if (!runtimePluginNamespacePattern.test(namespace)) return { namespace: "file", path: text };
-  return { namespace, path: text.slice(colon + 1) };
+  return { namespace: namespace === "file" ? "" : namespace, path: text.slice(colon + 1) };
+}
+
+function runtimePluginCouldResolve(specifier) {
+  const lastDot = specifier.lastIndexOf(".");
+  if (lastDot >= 0 && lastDot + 1 < specifier.length) {
+    const first = specifier.charCodeAt(lastDot + 1);
+    if ((first >= 65 && first <= 90) || (first >= 97 && first <= 122) || first > 127) return true;
+  }
+  return !isAbsolute(specifier) && specifier.includes(":");
 }
 
 function runtimePluginKey(namespace, path) {
@@ -301,11 +317,63 @@ function runtimePluginKey(namespace, path) {
 }
 
 function runtimePluginRuleFor(rules, namespace, path) {
+  const group = namespace === "file" ? "" : namespace;
   for (const rule of rules) {
-    if (rule.namespace !== namespace) continue;
+    if (rule.namespace !== group) continue;
     if (runtimePluginFilterMatches(rule.filter, path)) return rule;
   }
   return null;
+}
+
+function runtimePluginRevision(key) {
+  return runtimePluginRevisions.get(key) ?? 0;
+}
+
+function invalidateRuntimePluginKey(key) {
+  commonJsCache.delete(key);
+  globalThis.Loader?.registry?.delete?.(key);
+}
+
+function trackRuntimePluginDescriptor(descriptor, requestKey, invalidatable) {
+  descriptor.requestKey = String(requestKey ?? descriptor.key);
+  descriptor.invalidatable = invalidatable;
+  if (invalidatable) {
+    runtimePluginInvalidatableKeys.add(descriptor.key);
+    runtimePluginInvalidatableKeys.add(descriptor.requestKey);
+  }
+  return descriptor;
+}
+
+function runtimePluginLoadToken(descriptor) {
+  return {
+    generation: runtimePluginGeneration,
+    revision: runtimePluginRevision(descriptor.key),
+  };
+}
+
+function runtimePluginLoadIsCurrent(descriptor, token) {
+  return (!descriptor.invalidatable || token.generation === runtimePluginGeneration) &&
+    token.revision === runtimePluginRevision(descriptor.key);
+}
+
+function discardStaleRuntimePluginRegistryEntry(descriptor, token) {
+  queueMicrotask(() => {
+    if (runtimePluginLoadIsCurrent(descriptor, token)) return;
+    if (runtimePluginRevision(descriptor.key) !== token.revision && commonJsCache.has(descriptor.key)) return;
+    globalThis.Loader?.registry?.delete?.(descriptor.key);
+    if (descriptor.requestKey !== descriptor.key) globalThis.Loader?.registry?.delete?.(descriptor.requestKey);
+  });
+}
+
+function clearRuntimePlugins() {
+  runtimePluginGeneration++;
+  for (const key of runtimePluginInvalidatableKeys) invalidateRuntimePluginKey(key);
+  runtimePluginInvalidatableKeys.clear();
+  runtimePluginOnResolve.length = 0;
+  runtimePluginOnLoad.length = 0;
+  runtimePluginVirtualModules.clear();
+  runtimePluginResolvedModules.clear();
+  runtimePluginPendingLoads.clear();
 }
 
 function normalizeRuntimePluginThrownError(error) {
@@ -317,7 +385,25 @@ function normalizeRuntimePluginThrownError(error) {
   return error;
 }
 
-function normalizeRuntimePluginResolution(result, importer) {
+function runtimePluginPromiseStatus(value) {
+  return typeof cottontail.promiseStatus === "function"
+    ? cottontail.promiseStatus(value)
+    : -1;
+}
+
+function unwrapRuntimePluginResolveResult(result) {
+  const status = runtimePluginPromiseStatus(result);
+  if (status < 0) return result;
+  if (status === 0) throw new TypeError("onResolve() doesn't support pending promises yet");
+  const settled = cottontail.promiseResult(result);
+  if (status === 2) {
+    Promise.resolve(result).catch(() => {});
+    throw settled;
+  }
+  return settled;
+}
+
+function normalizeRuntimePluginResolution(result, importer, requestKey, inputNamespace) {
   if (result == null) return null;
   if (typeof result !== "object") throw new TypeError("onResolve() expects an object returned");
   if (result.path == null) return null;
@@ -333,45 +419,55 @@ function normalizeRuntimePluginResolution(result, importer) {
   if (result.namespace != null && typeof result.namespace !== "string") {
     throw new TypeError('Expected "namespace" to be a string');
   }
-  const namespace = runtimePluginNamespace(result.namespace);
+  const namespace = runtimePluginResultNamespace(result.namespace);
   let path = result.path;
   if (namespace === "file" && !isAbsolute(path) && !path.startsWith("file:")) {
     const base = importer && isAbsolute(importer) ? dirname(importer) : cottontail.cwd();
     path = resolve(base, path);
   }
-  const descriptor = { namespace, path, key: runtimePluginKey(namespace, path) };
+  const descriptor = trackRuntimePluginDescriptor(
+    { namespace, path, key: runtimePluginKey(namespace, path) },
+    requestKey,
+    inputNamespace !== "" || namespace !== "file",
+  );
   runtimePluginResolvedModules.set(descriptor.key, descriptor);
   return descriptor;
 }
 
 function resolveWithRuntimePlugins(specifier, importer = "", kind = "import") {
+  void kind;
   const text = String(specifier);
   if (runtimePluginVirtualModules.has(text)) {
-    return { namespace: "virtual", path: text, key: text, virtual: true };
+    return trackRuntimePluginDescriptor(
+      { namespace: "virtual", path: text, key: text, virtual: true },
+      text,
+      true,
+    );
   }
+  if (!runtimePluginCouldResolve(text)) return null;
   const initial = splitRuntimePluginSpecifier(text);
   for (const rule of runtimePluginOnResolve) {
     if (rule.namespace !== initial.namespace) continue;
     if (!runtimePluginFilterMatches(rule.filter, initial.path)) continue;
     let result;
     try {
-      result = rule.callback({
+      result = Reflect.apply(rule.callback, undefined, [{
         path: initial.path,
         importer: String(importer ?? ""),
-        namespace: initial.namespace,
-        kind,
-      });
+      }]);
     } catch (error) {
       throw normalizeRuntimePluginThrownError(error);
     }
-    if (result && typeof result.then === "function") {
-      throw new TypeError("onResolve() doesn't support pending promises yet");
-    }
-    const descriptor = normalizeRuntimePluginResolution(result, importer);
+    result = unwrapRuntimePluginResolveResult(result);
+    const descriptor = normalizeRuntimePluginResolution(result, importer, text, initial.namespace);
     if (descriptor) return descriptor;
   }
-  if (initial.namespace !== "file" && runtimePluginRuleFor(runtimePluginOnLoad, initial.namespace, initial.path)) {
-    const descriptor = { ...initial, key: runtimePluginKey(initial.namespace, initial.path) };
+  if (initial.namespace !== "" && runtimePluginRuleFor(runtimePluginOnLoad, initial.namespace, initial.path)) {
+    const descriptor = trackRuntimePluginDescriptor(
+      { ...initial, key: runtimePluginKey(initial.namespace, initial.path) },
+      text,
+      true,
+    );
     runtimePluginResolvedModules.set(descriptor.key, descriptor);
     return descriptor;
   }
@@ -400,7 +496,9 @@ function runtimePluginContents(value) {
 
 function normalizeRuntimePluginLoadResult(result, descriptor) {
   if (result == null || typeof result !== "object") {
-    throw new TypeError("onLoad() expects an object returned");
+    throw new TypeError(descriptor.virtual
+      ? "virtual module expects an object returned"
+      : "onLoad() expects an object returned");
   }
   const loader = result.loader == null ? runtimePluginDefaultLoader(descriptor.path) : String(result.loader);
   if (!new Set(["js", "jsx", "object", "ts", "tsx", "toml", "yaml", "json", "md"]).has(loader)) {
@@ -530,13 +628,26 @@ function runtimePluginCallback(descriptor) {
   return runtimePluginRuleFor(runtimePluginOnLoad, descriptor.namespace, descriptor.path)?.callback ?? null;
 }
 
+function callRuntimePluginLoadCallback(callback, descriptor) {
+  const args = descriptor.virtual ? [] : [{ path: descriptor.path }];
+  return Reflect.apply(callback, undefined, args);
+}
+
 function loadRuntimePluginSync(descriptor) {
   const cached = commonJsCache.get(descriptor.key);
   if (cached) return cached.exports;
   const callback = runtimePluginCallback(descriptor);
   if (!callback) return undefined;
-  const rawResult = callback({ path: descriptor.path, namespace: descriptor.namespace });
-  if (rawResult && typeof rawResult.then === "function") {
+  const token = runtimePluginLoadToken(descriptor);
+  let rawResult = callRuntimePluginLoadCallback(callback, descriptor);
+  const status = runtimePluginPromiseStatus(rawResult);
+  if (status === 1) {
+    rawResult = cottontail.promiseResult(rawResult);
+  } else if (status === 2) {
+    const reason = cottontail.promiseResult(rawResult);
+    Promise.resolve(rawResult).catch(() => {});
+    throw reason;
+  } else if (status === 0) {
     Promise.resolve(rawResult).catch(() => {});
     throw new TypeError(`require() async module "${descriptor.key}" is unsupported. use "await import()" instead.`);
   }
@@ -545,7 +656,11 @@ function loadRuntimePluginSync(descriptor) {
     evaluated.promise.catch(() => {});
     throw new TypeError(`require() async module "${descriptor.key}" is unsupported. use "await import()" instead.`);
   }
-  return cacheRuntimePluginModule(descriptor, evaluated.requireValue, evaluated.namespace).exports;
+  if (runtimePluginLoadIsCurrent(descriptor, token)) {
+    return cacheRuntimePluginModule(descriptor, evaluated.requireValue, evaluated.namespace).exports;
+  }
+  discardStaleRuntimePluginRegistryEntry(descriptor, token);
+  return evaluated.requireValue;
 }
 
 function importRuntimePlugin(descriptor) {
@@ -554,29 +669,47 @@ function importRuntimePlugin(descriptor) {
   if (runtimePluginPendingLoads.has(descriptor.key)) return runtimePluginPendingLoads.get(descriptor.key);
   const callback = runtimePluginCallback(descriptor);
   if (!callback) return undefined;
+  const token = runtimePluginLoadToken(descriptor);
   let rawResult;
   try {
-    rawResult = callback({ path: descriptor.path, namespace: descriptor.namespace });
+    rawResult = callRuntimePluginLoadCallback(callback, descriptor);
   } catch (error) {
     throw error;
   }
+  const cacheResolved = (requireValue, namespace) => {
+    if (runtimePluginLoadIsCurrent(descriptor, token)) {
+      cacheRuntimePluginModule(descriptor, requireValue, namespace);
+    } else {
+      discardStaleRuntimePluginRegistryEntry(descriptor, token);
+    }
+    return namespace;
+  };
   const finish = (value) => {
     const evaluated = evaluateRuntimePluginResult(descriptor, value);
     if (evaluated.async) {
-      return evaluated.promise.then((resolved) => {
-        cacheRuntimePluginModule(descriptor, resolved.requireValue, resolved.namespace);
-        return resolved.namespace;
-      });
+      return evaluated.promise.then(resolved => cacheResolved(resolved.requireValue, resolved.namespace));
     }
-    cacheRuntimePluginModule(descriptor, evaluated.requireValue, evaluated.namespace);
-    return evaluated.namespace;
+    return cacheResolved(evaluated.requireValue, evaluated.namespace);
   };
-  if (!rawResult || typeof rawResult.then !== "function") return finish(rawResult);
-  const pending = Promise.resolve(rawResult).then(finish);
+  const status = runtimePluginPromiseStatus(rawResult);
+  if (status === 1) {
+    rawResult = cottontail.promiseResult(rawResult);
+  } else if (status === 2) {
+    const reason = cottontail.promiseResult(rawResult);
+    Promise.resolve(rawResult).catch(() => {});
+    throw reason;
+  }
+  const output = status === 0 ? Promise.resolve(rawResult).then(finish) : finish(rawResult);
+  if (runtimePluginPromiseStatus(output) < 0) return output;
+  const pending = Promise.resolve(output);
   runtimePluginPendingLoads.set(descriptor.key, pending);
   pending.then(
-    () => runtimePluginPendingLoads.delete(descriptor.key),
-    () => runtimePluginPendingLoads.delete(descriptor.key),
+    () => {
+      if (runtimePluginPendingLoads.get(descriptor.key) === pending) runtimePluginPendingLoads.delete(descriptor.key);
+    },
+    () => {
+      if (runtimePluginPendingLoads.get(descriptor.key) === pending) runtimePluginPendingLoads.delete(descriptor.key);
+    },
   );
   return pending;
 }
@@ -607,6 +740,8 @@ function tryImportRuntimePlugin(specifier, referrer, options = undefined, resolv
     namespace: "file",
     path: String(resolved),
     key: String(resolved),
+    requestKey: text,
+    invalidatable: false,
   };
   if (!runtimePluginCallback(fileDescriptor)) return null;
   return { matched: true, value: importRuntimePlugin(fileDescriptor) };
@@ -618,18 +753,23 @@ export function _registerBunPlugin(pluginOptions) {
     throw new TypeError("plugin needs an object as first argument");
   }
   if (typeof pluginOptions.setup !== "function") throw new TypeError("plugin needs a setup() function");
-  if (pluginOptions.target != null && !["node", "bun", "browser"].includes(String(pluginOptions.target))) {
-    throw new TypeError("plugin target must be one of 'node', 'bun' or 'browser'");
+  if ("target" in pluginOptions) {
+    const target = String(pluginOptions.target);
+    if (!["node", "bun", "browser"].includes(target)) {
+      throw new TypeError("plugin target must be one of 'node', 'bun' or 'browser'");
+    }
   }
   const builder = {
     target: "bun",
     onResolve(constraints, callback) {
+      if (arguments.length < 2) throw new Error("onResolve() requires at least 2 arguments");
       runtimePluginOnResolve.push(runtimePluginRegistration("onResolve", constraints, callback));
-      return builder;
+      return this;
     },
     onLoad(constraints, callback) {
+      if (arguments.length < 2) throw new Error("onLoad() requires at least 2 arguments");
       runtimePluginOnLoad.push(runtimePluginRegistration("onLoad", constraints, callback));
-      return builder;
+      return this;
     },
     module(id, callback) {
       if (arguments.length < 2) throw new Error("module() needs 2 arguments: a module ID and a function to call");
@@ -638,23 +778,22 @@ export function _registerBunPlugin(pluginOptions) {
       if (id.length === 0) throw new Error("virtual module cannot be blank");
       if (isBuiltin(id)) throw new Error(`module() cannot be used to override builtin module "${id}"`);
       if (id.startsWith(".")) throw new Error('virtual module cannot start with "."');
+      runtimePluginRevisions.set(id, runtimePluginRevision(id) + 1);
       runtimePluginVirtualModules.set(id, callback);
+      runtimePluginInvalidatableKeys.add(id);
       runtimePluginPendingLoads.delete(id);
-      commonJsCache.delete(id);
-      globalThis.Loader?.registry?.delete?.(id);
-      return builder;
+      runtimePluginResolvedModules.delete(id);
+      invalidateRuntimePluginKey(id);
+      return this;
     },
   };
-  return pluginOptions.setup(builder);
+  const result = Reflect.apply(pluginOptions.setup, undefined, [builder]);
+  return runtimePluginPromiseStatus(result) >= 0 ? result : undefined;
 }
 
 export function _clearBunPlugins(_unused) {
   void _unused;
-  runtimePluginOnResolve.length = 0;
-  runtimePluginOnLoad.length = 0;
-  runtimePluginVirtualModules.clear();
-  runtimePluginResolvedModules.clear();
-  runtimePluginPendingLoads.clear();
+  clearRuntimePlugins();
 }
 
 globalThis.__cottontailImportPluginModule = (specifier, referrer, options, resolvedPath) => {
@@ -2772,6 +2911,10 @@ export function __importModule(specifier, referrer = undefined, options = undefi
     throw dynamicResolveMessage(`Cannot find module '${specifierText}' from '${parent}'`);
   }
   const resolved = pluginAttempt?.resolved ?? resolveRequest(String(specifier), parent, true, "import");
+  const cachedPluginModule = commonJsCache.get(resolved);
+  if (cachedPluginModule && Object.hasOwn(cachedPluginModule, "__cottontailPluginNamespace")) {
+    return cachedPluginModule.__cottontailPluginNamespace;
+  }
   const loader = options?.with?.type ?? options?.assert?.type ?? options?.type;
   if (loader === "text") {
     return { default: readModuleFile(splitSpecifierSuffix(resolved).bare) };
@@ -2883,7 +3026,11 @@ function loadCommonJsModule(resolved, parent = null, isMain = false) {
   }
   const pluginDescriptor = runtimePluginResolvedModules.get(resolved)
     ?? (runtimePluginVirtualModules.has(resolved)
-      ? { namespace: "virtual", path: resolved, key: resolved, virtual: true }
+      ? trackRuntimePluginDescriptor(
+          { namespace: "virtual", path: resolved, key: resolved, virtual: true },
+          resolved,
+          true,
+        )
       : { namespace: "file", path: resolvedPath, key: resolved });
   if (runtimePluginCallback(pluginDescriptor)) {
     return loadRuntimePluginSync(pluginDescriptor);
