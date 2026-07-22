@@ -47,7 +47,7 @@ function artifactNames(directory = cacheDirectory) {
   return readdirSync(directory).filter(name => name.endsWith(".mjs")).sort();
 }
 
-test("embedded runtime bundle artifacts are reused and content-invalidated", async () => {
+test("runtime module launcher is reused while entry sources stay live", async () => {
   const dependency = join(project, "dependency.mjs");
   const entry = join(project, "entry.mjs");
   writeFileSync(dependency, [
@@ -70,9 +70,8 @@ test("embedded runtime bundle artifacts are reused and content-invalidated", asy
   expect(first.stdout.toString()).toBe("one-tla\n");
   expect(first.stderr.toString()).toBe("");
 
-  const manifest = readdirSync(cacheDirectory).find(name => name.startsWith("esm-entry-") && name.endsWith(".manifest"));
-  expect(manifest).toBeTruthy();
-  const manifestPath = join(cacheDirectory, manifest!);
+  const manifestPath = join(cacheDirectory, "module-runtime.manifest");
+  expect(existsSync(manifestPath)).toBe(true);
   expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
   const firstManifestMtime = statSync(manifestPath).mtimeMs;
   const firstArtifacts = artifactNames();
@@ -111,6 +110,7 @@ test("embedded runtime bundle artifacts are reused and content-invalidated", asy
   expect(readFileSync(manifestPath).subarray(0, 8).toString()).toBe("CTLCACH3");
   const recoveredArtifacts = artifactNames();
   expect(recoveredArtifacts.length).toBe(1);
+  const recoveredManifestMtime = statSync(manifestPath).mtimeMs;
 
   await Bun.sleep(25);
   writeFileSync(dependency, [
@@ -123,12 +123,11 @@ test("embedded runtime bundle artifacts are reused and content-invalidated", asy
   expect(invalidated.exitCode).toBe(0);
   expect(invalidated.stdout.toString()).toBe("two-tla\n");
   expect(invalidated.stderr.toString()).toBe("");
-  expect(artifactNames().length).toBe(recoveredArtifacts.length);
-  expect(artifactNames()).not.toEqual(recoveredArtifacts);
-  expect(statSync(manifestPath).mtimeMs).toBeGreaterThan(repairedManifestMtime);
+  expect(artifactNames()).toEqual(recoveredArtifacts);
+  expect(statSync(manifestPath).mtimeMs).toBe(recoveredManifestMtime);
 }, 60_000);
 
-test("stale generations remain leased until their process exits", async () => {
+test("shared runtime launcher stays reusable while an entry is running", async () => {
   const dependency = join(project, "leased-dependency.mjs");
   const entry = join(project, "leased-entry.mjs");
   const ready = join(project, "leased-entry.ready");
@@ -154,14 +153,14 @@ test("stale generations remain leased until their process exits", async () => {
     const deadline = Date.now() + 5_000;
     while (!existsSync(ready) && Date.now() < deadline) await Bun.sleep(10);
     expect(existsSync(ready)).toBe(true);
-    expect(artifactNames().length).toBe(baselineArtifacts + 1);
+    expect(artifactNames().length).toBe(baselineArtifacts);
 
     writeFileSync(dependency, 'export const value = "leased-two";\n');
     const replacement = run(entry);
     expect(replacement.exitCode).toBe(0);
     expect(replacement.stdout.toString()).toBe("leased-two\n");
     expect(replacement.stderr.toString()).toBe("");
-    expect(artifactNames().length).toBe(baselineArtifacts + 2);
+    expect(artifactNames().length).toBe(baselineArtifacts);
 
     child.kill();
     await child.exited;
@@ -172,7 +171,7 @@ test("stale generations remain leased until their process exits", async () => {
     expect(cleaned.exitCode).toBe(0);
     expect(cleaned.stdout.toString()).toBe("leased-two\n");
     expect(cleaned.stderr.toString()).toBe("");
-    expect(artifactNames().length).toBe(baselineArtifacts + 1);
+    expect(artifactNames().length).toBe(baselineArtifacts);
   } finally {
     child.kill();
   }

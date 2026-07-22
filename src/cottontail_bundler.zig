@@ -105,10 +105,10 @@ pub const BundleOptions = struct {
     entry_naming: []const u8 = "[dir]/[name].[ext]",
     chunk_naming: []const u8 = "./chunk-[hash].[ext]",
     asset_naming: []const u8 = "./[name]-[hash].[ext]",
-    /// One-shot startup bundles (`cottontail run`) skip the bundle teardown:
-    /// the process immediately evaluates the result and user-visible startup
-    /// latency matters more than reclaiming a single bundle's memory.
-    /// Repeated in-process bundles (Bun.build) always tear down.
+    /// Bundle-backed one-shot startup artifacts may skip teardown when the
+    /// process immediately evaluates their user graph. Runtime-only launchers
+    /// must leave this false so compiler state is gone before on-demand module
+    /// evaluation begins. Repeated in-process bundles always tear down.
     skip_teardown: bool = false,
 };
 
