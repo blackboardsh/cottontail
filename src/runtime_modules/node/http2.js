@@ -3097,6 +3097,9 @@ export function connect(authority, options = undefined, listener = undefined) {
       rejectUnauthorized: options.rejectUnauthorized,
       ca: options.ca ?? contextOptions.ca,
       ALPNProtocols: options.ALPNProtocols ?? ["h2"],
+      // COTTONTAIL-COMPAT: Bun 1.3.10's native HTTP/2 client verifies the
+      // certificate chain without routing hostname checks through node:tls.
+      skipServerIdentity: true,
     });
   } else {
     socket = netConnect({ ...options, host, port });

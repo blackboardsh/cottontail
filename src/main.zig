@@ -436,7 +436,7 @@ fn cliPathExists(io: std.Io, path: []const u8) bool {
 }
 
 fn cliBunEntrypointExists(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !bool {
-    if (cliPathExists(io, path)) return true;
+    if (pathIsFile(io, path)) return true;
     const extension = std.fs.path.extension(path);
     const replacements = script_runner.bunEntrypointFallbackExtensions(path);
     if (replacements.len == 0) return false;
@@ -444,7 +444,7 @@ fn cliBunEntrypointExists(io: std.Io, allocator: std.mem.Allocator, path: []cons
     const stem = path[0 .. path.len - extension.len];
     for (replacements) |replacement| {
         const candidate = try std.mem.concat(allocator, u8, &.{ stem, replacement });
-        if (cliPathExists(io, candidate)) return true;
+        if (pathIsFile(io, candidate)) return true;
     }
     return false;
 }
@@ -859,7 +859,7 @@ const fake_node_extensions = [_][]const u8{ ".tsx", ".jsx", ".mts", ".ts", ".cts
 
 fn pathIsFile(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    return stat.kind == .file;
+    return stat.kind == .file or stat.kind == .sym_link;
 }
 
 fn resolveFakeNodeEntry(io: std.Io, allocator: std.mem.Allocator, entry: []const u8) !?[:0]const u8 {

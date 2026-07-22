@@ -1933,7 +1933,7 @@ export function connect(...args) {
   socket.servername = options.servername || undefined;
   socket._host = String(host);
   socket._identityHostname = options.servername;
-  socket._skipServerIdentity = options.servername == null;
+  socket._skipServerIdentity = options.skipServerIdentity === true || options.servername == null;
   if (options.timeout != null) socket.setTimeout(options.timeout);
   socket[bunTlsConnectOptions] = {
     serverName: options.servername ?? String(host),
@@ -2069,7 +2069,7 @@ export function _connectMemoryTransport(parentSocket, options = {}) {
   socket.servername = options.servername || undefined;
   socket._host = String(host);
   socket._identityHostname = options.servername;
-  socket._skipServerIdentity = options.servername == null;
+  socket._skipServerIdentity = options.skipServerIdentity === true || options.servername == null;
   if (options.timeout != null) socket.setTimeout(options.timeout);
   socket[bunTlsConnectOptions] = {
     serverName: options.servername ?? String(host),
