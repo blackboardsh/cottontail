@@ -219,6 +219,14 @@ async function writePublicArtifact(outputRoot, artifact) {
   return `/${relative.split(path.sep).join("/")}`;
 }
 
+function throwBuildFailure(result, message) {
+  const logs = result.logs ?? [];
+  const details = logs
+    .map(log => typeof log?.message === "string" ? log.message : String(log))
+    .filter(Boolean);
+  throw new AggregateError(logs, details.length === 0 ? message : `${message}\n${details.join("\n")}`);
+}
+
 function isJavaScriptArtifact(artifact) {
   return ["js", "jsx", "ts", "tsx"].includes(artifact.loader) || /\.[cm]?js$/i.test(String(artifact.path));
 }
@@ -246,10 +254,10 @@ function entrySourceForArtifact(result, artifact, projectRoot) {
 
 async function writeClientGraph(context, route) {
   const { clientOptions, clientPlugins, builtIns, outputRoot, projectRoot, serverComponents } = context;
-  const needsRuntime = serverComponents === null || route.boundaries.length > 0;
+  const attachRuntime = serverComponents === null || route.boundaries.length > 0;
   const entrypoints = [];
   let wrapperPath = null;
-  if (needsRuntime && route.clientEntryPoint !== null) {
+  if (route.clientEntryPoint !== null) {
     wrapperPath = path.join(projectRoot, `.cottontail-bake-prod-client-${route.index}.js`);
     entrypoints.push(wrapperPath);
   }
@@ -301,7 +309,7 @@ async function writeClientGraph(context, route) {
     throw: false,
     plugins: clientPlugins,
   }, clientBuiltIns, files));
-  if (!result.success) throw new AggregateError(result.logs ?? [], `Failed to bundle client graph for ${route.page}`);
+  if (!result.success) throwBuildFailure(result, `Failed to bundle client graph for ${route.page}`);
 
   const boundaryByPath = new Map(route.boundaries.map(boundary => [path.normalize(boundary.path), boundary]));
   const boundaryUrls = new Map();
@@ -321,7 +329,7 @@ async function writeClientGraph(context, route) {
     if (!isJavaScriptArtifact(artifact)) continue;
     const source = entrySourceForArtifact(result, artifact, projectRoot);
     if (source !== null && wrapperPath !== null && path.normalize(source) === path.normalize(wrapperPath)) {
-      modules.push(url);
+      if (attachRuntime) modules.push(url);
     } else if (source !== null && boundaryByPath.has(path.normalize(source))) {
       boundaryUrls.set(boundaryByPath.get(path.normalize(source)).id, url);
     } else if (artifact.kind === "chunk") {
@@ -479,7 +487,7 @@ async function buildSsrFrameworkAliases(context) {
       throw: false,
       plugins: serverPlugins,
     }, builtIns, { [wrapperPath]: `export * from ${JSON.stringify(specifier)};` }));
-    if (!result.success) throw new AggregateError(result.logs ?? [], `Failed to bundle SSR framework module ${specifier}`);
+    if (!result.success) throwBuildFailure(result, `Failed to bundle SSR framework module ${specifier}`);
     const filename = path.join(tempRoot, `framework-${index}.mjs`);
     aliases[specifier] = await writeStandardESM(result, filename);
   }
@@ -507,7 +515,7 @@ async function buildSsrComponents(context, route) {
       throw: false,
       plugins: context.serverPlugins,
     }, context.builtIns));
-    if (!build.success) throw new AggregateError(build.logs ?? [], `Failed to bundle SSR component ${boundary.path}`);
+    if (!build.success) throwBuildFailure(build, `Failed to bundle SSR component ${boundary.path}`);
     const hash = BigInt.asUintN(64, globalThis.Bun.hash(`${route.index}:${boundary.id}`)).toString(16);
     const filename = path.join(context.tempRoot, `component-${hash}.mjs`);
     result.set(boundary.id, await writeStandardESM(build, filename));
@@ -563,7 +571,7 @@ async function loadServerRoute(context, route) {
     ...proxyFiles,
     [wrapperPath]: routeWrapperSource(route.serverEntryPoint, route.page, route.layouts),
   }));
-  if (!result.success) throw new AggregateError(result.logs ?? [], `Failed to bundle server route ${route.page}`);
+  if (!result.success) throwBuildFailure(result, `Failed to bundle server route ${route.page}`);
   const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
   if (!artifact) throw new Error(`Bake's server build did not emit ${route.page}`);
 
