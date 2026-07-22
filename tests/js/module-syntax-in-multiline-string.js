@@ -25,4 +25,16 @@ if (importedFromInterpolation !== "42") {
   throw new Error(`dynamic import inside a template interpolation was not rewritten`);
 }
 
+const objectWithImportMethod = { import(value) { return value; } };
+if (objectWithImportMethod.import("object") !== "object") {
+  throw new Error("object method named import was rewritten");
+}
+
+class ClassWithImportMethod {
+  import() { return "class"; }
+}
+if (new ClassWithImportMethod().import() !== "class") {
+  throw new Error("class method named import was rewritten");
+}
+
 console.log('module syntax string passed');

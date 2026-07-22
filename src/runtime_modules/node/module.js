@@ -2262,6 +2262,49 @@ function replaceCodePattern(source, pattern, replacer) {
   });
 }
 
+function replaceDynamicImportExpressions(source) {
+  const text = String(source);
+  const mask = codePositionMask(text);
+  return text.replace(/\bimport\s*\(/g, (match, offset) => {
+    const previous = text[offset - 1];
+    if (mask[offset] !== 1 || (previous && /[\w$#.]/.test(previous))) return match;
+
+    const open = offset + match.lastIndexOf("(");
+    let depth = 1;
+    let close = open + 1;
+    while (close < text.length && depth > 0) {
+      if (mask[close] === 1) {
+        if (text[close] === "(") depth += 1;
+        else if (text[close] === ")") depth -= 1;
+      }
+      close += 1;
+    }
+    if (depth !== 0) return match;
+    close -= 1;
+
+    let after = close + 1;
+    while (after < text.length) {
+      if (/\s/.test(text[after])) {
+        after += 1;
+        continue;
+      }
+      if (text.startsWith("//", after)) {
+        const newline = text.indexOf("\n", after + 2);
+        after = newline < 0 ? text.length : newline + 1;
+        continue;
+      }
+      if (text.startsWith("/*", after)) {
+        const commentEnd = text.indexOf("*/", after + 2);
+        after = commentEnd < 0 ? text.length : commentEnd + 2;
+        continue;
+      }
+      break;
+    }
+    if (text[after] === "{") return match;
+    return "__ctDynamicImport(";
+  });
+}
+
 function codeOnlyText(source) {
   const text = String(source);
   const mask = codePositionMask(text);
@@ -3129,7 +3172,7 @@ function transformEsmSourceForDynamicImport(source, asyncStaticImports = false) 
   // Dynamic import() cannot execute inside new Function()-compiled code for
   // formats JSC's own loader cannot parse (e.g. TypeScript); route it through
   // the runtime module loader, which also consults the CommonJS cache.
-  output = replaceCodePattern(output, /\bimport\s*\(/g, "__ctDynamicImport(");
+  output = replaceDynamicImportExpressions(output);
   // Re-exports must be rewritten before the plain `export { ... }` handler
   // below, which would otherwise leave a dangling `from "..."` clause behind.
   output = replaceCodePattern(output,
