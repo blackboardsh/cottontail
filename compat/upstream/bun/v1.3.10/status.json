@@ -2901,6 +2901,10 @@
       "status": "enabled",
       "reason": "Copied upstream process argument file passes directly under Cottontail (1 bun:test case, 50 assertions)."
     },
+    "test/js/node/process/process.test.js": {
+      "status": "enabled",
+      "reason": "Node process metadata, environment, lifecycle, signals, resource usage, exit handling, stdio accessors, dlopen, and uncaught-exception behavior pass the copied upstream file (101 cases, 282 assertions; 3 upstream TODOs)."
+    },
     "test/js/node/process/process-on.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream process event file passes directly under Cottontail (3 bun:test cases, 5 assertions)."
