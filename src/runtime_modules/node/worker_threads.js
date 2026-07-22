@@ -607,6 +607,28 @@ function normalizeWorkerOptions(options) {
   return options;
 }
 
+function workerHeapLimitBytes(limits) {
+  const oldGeneration = typeof limits?.maxOldGenerationSizeMb === "number"
+    ? limits.maxOldGenerationSizeMb
+    : 0;
+  const youngGeneration = typeof limits?.maxYoungGenerationSizeMb === "number"
+    ? limits.maxYoungGenerationSizeMb
+    : 0;
+  const oldSize = Number.isFinite(oldGeneration) && oldGeneration > 0 ? oldGeneration : 0;
+  const youngSize = Number.isFinite(youngGeneration) && youngGeneration > 0 ? youngGeneration : 0;
+  const megabytes = oldSize > 0 && youngSize > 0 ? oldSize + youngSize : oldSize || youngSize;
+  if (megabytes === 0) return undefined;
+  const bytes = megabytes * 1024 * 1024;
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
+}
+
+function workerStackSizeBytes(limits) {
+  const megabytes = typeof limits?.stackSizeMb === "number" ? limits.stackSizeMb : 0;
+  if (!Number.isFinite(megabytes) || megabytes <= 0) return undefined;
+  const bytes = megabytes * 1024 * 1024;
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
+}
+
 function stringEnvironment(source) {
   const result = {};
   for (const key of Object.keys(source ?? {})) {
@@ -853,35 +875,204 @@ function makeWorkerWrapper(input, options = {}, sharedEnvironmentGroupId = null)
   return wrapperPath;
 }
 
-function bytesForStdio(chunk, encoding = undefined) {
-  if (chunk instanceof ArrayBuffer) return Array.from(new Uint8Array(chunk));
-  if (ArrayBuffer.isView(chunk)) return Array.from(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-  void encoding;
-  return Array.from(new TextEncoder().encode(String(chunk)));
+function bytesViewForStdio(chunk, encoding = undefined) {
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (globalThis.Buffer?.from) return globalThis.Buffer.from(String(chunk), encoding ?? "utf8");
+  return new TextEncoder().encode(String(chunk));
 }
 
-class WorkerStdin extends Writable {
-  constructor(worker) {
-    super();
-    this._worker = worker;
+function installWorkerStdioFdDispatcher() {
+  const listeners = globalThis.__cottontailFdWatchListeners ??= new Map();
+  if (!globalThis.__cottontailFdWatchHandlerInstalled && typeof cottontail.fdSetEventHandler === "function") {
+    globalThis.__cottontailFdWatchHandlerInstalled = true;
+    cottontail.fdSetEventHandler((event) => {
+      const connectListener = globalThis.__cottontailTcpConnectListeners?.get?.(Number(event?.id));
+      if (typeof connectListener === "function") {
+        connectListener(event);
+        return;
+      }
+      const listener = listeners.get(Number(event?.id));
+      if (typeof listener === "function") {
+        listener(event);
+        return;
+      }
+      const tlsListener = globalThis.__cottontailTlsListeners?.get?.(Number(event?.id));
+      if (typeof tlsListener === "function") tlsListener(event);
+    });
+  }
+  return listeners;
+}
+
+function workerStdioError(errno, operation = "write") {
+  const normalized = Math.abs(Number(errno) || 5);
+  const code = normalized === 32 ? "EPIPE"
+    : normalized === 9 ? "EBADF"
+      : normalized === 22 ? "EINVAL"
+        : normalized === 3 ? "ESRCH"
+          : "EIO";
+  const error = new Error(`${code}: ${operation}`);
+  error.errno = -normalized;
+  error.code = code;
+  error.syscall = operation;
+  return error;
+}
+
+class ReadableWorkerStdio extends Readable {
+  constructor(workerThreadId, streamName, fd, referenced = true) {
+    super({ highWaterMark: 64 * 1024 });
+    this._workerThreadId = workerThreadId;
+    this._streamName = streamName;
+    this._nativeFd = fd;
+    this._watchId = 0;
+    this._watchListener = null;
+    this._referenced = referenced;
+    this._nativeClosed = false;
+  }
+
+  _read() {
+    if (this.destroyed || this._nativeClosed) return;
+    if (this._watchId) {
+      cottontail.fdWatchSetPaused?.(this._watchId, false);
+      return;
+    }
+    const listeners = installWorkerStdioFdDispatcher();
+    const watch = cottontail.fdWatchStart?.(
+      this._nativeFd,
+      Math.max(1, Math.min(this.readableHighWaterMark, 1024 * 1024)),
+      this._referenced,
+      false,
+    );
+    this._watchId = Number(watch?.id ?? 0);
+    if (!this._watchId) {
+      this.destroy(new Error("failed to start worker stdio reader"));
+      return;
+    }
+    const watchId = this._watchId;
+    this._watchListener = (event) => {
+      if (this.destroyed) return;
+      if (event.type === "data") {
+        const bytes = new Uint8Array(event.data ?? new ArrayBuffer(0));
+        if (bytes.byteLength === 0) return;
+        const chunk = globalThis.Buffer?.from ? globalThis.Buffer.from(bytes) : bytes;
+        if (!this.push(chunk)) cottontail.fdWatchSetPaused?.(watchId, true);
+        return;
+      }
+      if (event.type === "end") {
+        this._stopWatcher();
+        this._closeNative();
+        this.push(null);
+        return;
+      }
+      if (event.type === "error") {
+        const error = new Error(String(event.message ?? "worker stdio read failed"));
+        if (event.code != null) error.code = String(event.code);
+        if (event.errno != null) error.errno = Number(event.errno);
+        this.destroy(error);
+      }
+    };
+    listeners.set(watchId, this._watchListener);
+  }
+
+  _stopWatcher() {
+    const watchId = this._watchId;
+    this._watchId = 0;
+    this._watchListener = null;
+    if (!watchId) return;
+    globalThis.__cottontailFdWatchListeners?.delete?.(watchId);
+    cottontail.fdWatchStop?.(watchId);
+  }
+
+  _closeNative() {
+    if (this._nativeClosed) return;
+    this._nativeClosed = true;
+    cottontail.workerStdioClose?.(this._workerThreadId, this._streamName, "read");
+  }
+
+  _destroy(error, callback) {
+    this._stopWatcher();
+    this._closeNative();
+    callback(error);
+  }
+}
+
+class WritableWorkerStdio extends Writable {
+  constructor(workerThreadId, streamName) {
+    super({ highWaterMark: 64 * 1024 });
+    this._workerThreadId = workerThreadId;
+    this._streamName = streamName;
+    this._pendingNativeWrite = null;
+    this._writeRetryTimer = null;
+    this._nativeClosed = false;
   }
 
   _write(chunk, encoding, callback) {
-    try {
-      this._worker._postControl({ type: "stdin", data: bytesForStdio(chunk, encoding) });
-      callback?.();
-    } catch (error) {
-      callback?.(error);
+    this._pendingNativeWrite = {
+      bytes: bytesViewForStdio(chunk, encoding),
+      offset: 0,
+      callback,
+    };
+    this._flushNativeWrite();
+  }
+
+  _flushNativeWrite() {
+    const pending = this._pendingNativeWrite;
+    if (!pending || this.destroyed) return;
+    while (pending.offset < pending.bytes.byteLength) {
+      let written;
+      try {
+        written = Number(cottontail.workerStdioWrite(
+          this._workerThreadId,
+          this._streamName,
+          pending.bytes.subarray(pending.offset),
+        ));
+      } catch (error) {
+        this._completeNativeWrite(error);
+        return;
+      }
+      if (written < 0) {
+        this._completeNativeWrite(workerStdioError(-written));
+        return;
+      }
+      if (written === 0) {
+        this._writeRetryTimer = setTimeout(() => {
+          this._writeRetryTimer = null;
+          this._flushNativeWrite();
+        }, 1);
+        return;
+      }
+      pending.offset += written;
     }
+    this._completeNativeWrite();
+  }
+
+  _completeNativeWrite(error = undefined) {
+    const pending = this._pendingNativeWrite;
+    this._pendingNativeWrite = null;
+    if (this._writeRetryTimer != null) clearTimeout(this._writeRetryTimer);
+    this._writeRetryTimer = null;
+    pending?.callback(error);
+  }
+
+  _closeNative() {
+    if (this._nativeClosed) return;
+    this._nativeClosed = true;
+    cottontail.workerStdioClose?.(this._workerThreadId, this._streamName, "write");
   }
 
   _final(callback) {
-    try {
-      this._worker._postControl({ type: "stdin", end: true });
-      callback?.();
-    } catch (error) {
-      callback?.(error);
-    }
+    this._closeNative();
+    callback();
+  }
+
+  _destroy(error, callback) {
+    if (this._writeRetryTimer != null) clearTimeout(this._writeRetryTimer);
+    this._writeRetryTimer = null;
+    const pending = this._pendingNativeWrite;
+    this._pendingNativeWrite = null;
+    this._closeNative();
+    if (pending) queueMicrotask(() => pending.callback(error ?? workerStdioError(32)));
+    callback(error);
   }
 }
 
@@ -991,14 +1182,10 @@ export class Worker extends EventEmitter {
 
     this.threadId = 0;
     this.threadName = String(options.name ?? "");
-    // COTTONTAIL-COMPAT: resourceLimits are observable configuration here; JSC
-    // heap and native thread-stack enforcement require worker host hooks.
     this.resourceLimits = { ...(options.resourceLimits ?? {}) };
     this.stdin = null;
-    this.stdout = options.stdout === true ? new Readable() : null;
-    this.stderr = options.stderr === true ? new Readable() : null;
-    if (this.stdout) this.stdout._read = () => {};
-    if (this.stderr) this.stderr._read = () => {};
+    this.stdout = null;
+    this.stderr = null;
     this._running = true;
     this._input = input;
     this._emptyEvalSource = emptyEvalSource;
@@ -1016,17 +1203,34 @@ export class Worker extends EventEmitter {
       [Symbol.for("cottontail.worker.prepared-script")]: true,
       [Symbol.for("cottontail.worker.eval-source")]: input.kind === "eval" ? input.source : undefined,
       [Symbol.for("cottontail.worker.thread-name")]: this.threadName,
-      [Symbol.for("cottontail.worker.stack-size")]: Number(options.resourceLimits?.stackSizeMb) > 0
-        ? Number(options.resourceLimits.stackSizeMb) * 1024 * 1024
-        : undefined,
+      [Symbol.for("cottontail.worker.stack-size")]: workerStackSizeBytes(options.resourceLimits),
+      [Symbol.for("cottontail.worker.native-options")]: {
+        heapLimit: workerHeapLimitBytes(options.resourceLimits),
+        stdin: options.stdin === true,
+        stdout: options.stdout === true,
+        stderr: options.stderr === true,
+      },
     });
     this.threadId = Number(this._worker.id ?? this._worker.handle?.id ?? 0);
     this._nativeThreadId = this.threadId;
+    const nativeHandle = this._worker.handle ?? {};
+    if (options.stdin === true) {
+      this.stdin = new WritableWorkerStdio(this._nativeThreadId, "stdin");
+    }
+    if (options.stdout === true) {
+      const fd = Number(nativeHandle.stdoutFd);
+      if (!Number.isInteger(fd) || fd < 0) throw nativeBoundaryError("Worker stdout");
+      this.stdout = new ReadableWorkerStdio(this._nativeThreadId, "stdout", fd, false);
+    }
+    if (options.stderr === true) {
+      const fd = Number(nativeHandle.stderrFd);
+      if (!Number.isInteger(fd) || fd < 0) throw nativeBoundaryError("Worker stderr");
+      this.stderr = new ReadableWorkerStdio(this._nativeThreadId, "stderr", fd, false);
+    }
     if (typeof cottontail.workerHasRef === "function") {
       this._refed = Boolean(cottontail.workerHasRef(this._nativeThreadId));
     }
     this.performance = new WorkerPerformance(this);
-    this.stdin = options.stdin === true ? new WorkerStdin(this) : null;
 
     for (const item of options.transferList ?? []) {
       if (item instanceof MessagePort) {
@@ -1153,8 +1357,6 @@ export class Worker extends EventEmitter {
     this.resourceLimits = {};
     for (const request of this._controlRequests.values()) request.reject(workerNotRunningError());
     this._controlRequests.clear();
-    this.stdout?.push(null);
-    this.stderr?.push(null);
     this._terminationResolve?.(this._exitCode);
     this._terminationResolve = null;
     this.emit("exit", this._exitCode);
@@ -2153,51 +2355,33 @@ if (!isMainThread) {
   };
   globalThis.__cottontailConfigureWorkerStdio = () => {
     const bootstrap = globalThis.__cottontailWorkerBootstrap ?? {};
+    const nativeStdio = cottontail.workerStdioInfo?.() ?? {};
     if (bootstrap.stdin === true) {
-      const stdin = new Readable();
-      stdin._read = () => {};
-      globalThis.process.stdin = stdin;
+      const fd = Number(nativeStdio.stdinFd);
+      if (!Number.isInteger(fd) || fd < 0) throw nativeBoundaryError("Worker stdin");
+      globalThis.process.stdin = new ReadableWorkerStdio(threadId, "stdin", fd, true);
     }
 
     const installOutput = (streamName) => {
-      const stream = globalThis.process?.[streamName] ?? {};
-      stream.write = (chunk, encoding = undefined, callback = undefined) => {
-        if (typeof encoding === "function") {
-          callback = encoding;
-          encoding = undefined;
-        }
-        sendParentControl({
-          type: "stdio",
-          stream: streamName,
-          data: bytesForStdio(chunk, encoding),
-        });
-        callback?.();
-        return true;
-      };
+      if (nativeStdio[streamName] !== true) throw nativeBoundaryError(`Worker ${streamName}`);
+      const stream = new WritableWorkerStdio(threadId, streamName);
       globalThis.process[streamName] = stream;
+      return stream;
     };
 
     if (bootstrap.stdout === true) {
-      installOutput("stdout");
+      const stdout = installOutput("stdout");
       for (const name of ["log", "info", "debug"]) {
         globalThis.console[name] = (...args) => {
-          sendParentControl({
-            type: "stdio",
-            stream: "stdout",
-            data: bytesForStdio(`${formatValue(...args)}\n`),
-          });
+          stdout.write(`${formatValue(...args)}\n`);
         };
       }
     }
     if (bootstrap.stderr === true) {
-      installOutput("stderr");
+      const stderr = installOutput("stderr");
       for (const name of ["error", "warn"]) {
         globalThis.console[name] = (...args) => {
-          sendParentControl({
-            type: "stdio",
-            stream: "stderr",
-            data: bytesForStdio(`${formatValue(...args)}\n`),
-          });
+          stderr.write(`${formatValue(...args)}\n`);
         };
       }
     }
@@ -2643,11 +2827,9 @@ try {
   });
 } catch {}
 
-// COTTONTAIL-COMPAT: node:worker_threads native boundaries - resource-limit
-// enforcement, per-thread CPU/profilers, and native stdio backpressure need
-// additional host support. The JavaScript implementation does
-// not synthesize those measurements or claim enforcement; focused boundary tests
-// encode each remaining contract.
+// COTTONTAIL-COMPAT: Per-thread CPU/profilers still need additional stock-JSC
+// host support. The JavaScript implementation does not synthesize those
+// measurements or claim support for them.
 
 export default {
   BroadcastChannel,

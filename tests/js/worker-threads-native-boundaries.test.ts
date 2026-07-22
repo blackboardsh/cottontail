@@ -12,6 +12,27 @@ function once(target: any, event: string) {
   return new Promise<any[]>(resolve => target.once(event, (...args: any[]) => resolve(args)));
 }
 
+function matchingMessage(target: Worker, predicate: (value: any) => boolean) {
+  return new Promise<any>((resolve, reject) => {
+    const onMessage = (value: any) => {
+      if (!predicate(value)) return;
+      target.off("message", onMessage);
+      resolve(value);
+    };
+    target.on("message", onMessage);
+    target.once("error", reject);
+  });
+}
+
+function streamBuffer(stream: any) {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on("data", (chunk: any) => chunks.push(Buffer.from(chunk)));
+    stream.once("error", reject);
+    stream.once("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 test("per-worker CPU and profiler APIs expose the native boundary instead of fake data", async () => {
   const worker = new Worker(`setInterval(() => {}, 1000);`, { eval: true });
   await once(worker, "online");
@@ -51,12 +72,18 @@ test("Worker ref state follows native startup and exit lifecycle", async () => {
   expect(worker.hasRef()).toBe(false);
 });
 
-test.todo("COTTONTAIL-COMPAT: resourceLimits still needs native JSC heap enforcement", async () => {
-  const worker = new Worker(`for (;;) new ArrayBuffer(1024 * 1024);`, {
+test("resourceLimits terminates a worker that exceeds its stock-JSC heap ceiling", async () => {
+  const worker = new Worker(`const retained = []; for (;;) retained.push(new ArrayBuffer(1024 * 1024));`, {
     eval: true,
-    resourceLimits: { maxOldGenerationSizeMb: 8, stackSizeMb: 1 },
+    resourceLimits: { maxOldGenerationSizeMb: 24, stackSizeMb: 2 },
   });
-  expect(await once(worker, "error")).toBeDefined();
+  const error = once(worker, "error");
+  const exit = once(worker, "exit");
+  expect((await error)[0]).toMatchObject({
+    code: "ERR_WORKER_OUT_OF_MEMORY",
+    message: "Worker terminated due to reaching memory limit: JS heap out of memory",
+  });
+  expect((await exit)[0]).toBe(1);
 });
 
 test("BroadcastChannel delivers across worker isolates", async () => {
@@ -231,4 +258,48 @@ test("worker_threads.locks supports shared queues, pending abort, and steal", as
   releaseStolenHolder!();
 });
 
-test.todo("COTTONTAIL-COMPAT: exact worker stdio backpressure and fd writes need native worker pipe hooks", () => {});
+test("worker stdio uses native pipes with descriptor isolation and backpressure", async () => {
+  const byteLength = 512 * 1024;
+  const worker = new Worker(
+    `const { parentPort } = require("node:worker_threads");
+     const chunk = Buffer.alloc(${byteLength}, 120);
+     const returned = process.stdout.write(chunk, () => parentPort.postMessage({ type: "callback" }));
+     parentPort.postMessage({
+       type: "write",
+       returned,
+       writableLength: process.stdout.writableLength,
+       highWaterMark: process.stdout.writableHighWaterMark,
+       stdinFd: process.stdin.fd,
+       stdoutFd: process.stdout.fd,
+       stderrFd: process.stderr.fd,
+       stdinConstructor: process.stdin.constructor.name,
+       stdoutConstructor: process.stdout.constructor.name,
+       stderrConstructor: process.stderr.constructor.name,
+     });
+     process.stdout.once("drain", () => parentPort.postMessage({ type: "drain" }));`,
+    { eval: true, stdin: true, stdout: true, stderr: true },
+  );
+
+  const [write] = await once(worker, "message");
+  expect(write).toMatchObject({
+    type: "write",
+    returned: false,
+    writableLength: byteLength,
+    highWaterMark: 64 * 1024,
+    stdinConstructor: "ReadableWorkerStdio",
+    stdoutConstructor: "WritableWorkerStdio",
+    stderrConstructor: "WritableWorkerStdio",
+  });
+  expect([write.stdinFd, write.stdoutFd, write.stderrFd]).toEqual([undefined, undefined, undefined]);
+  expect(worker.stdin?.constructor.name).toBe("WritableWorkerStdio");
+  expect(worker.stdout?.constructor.name).toBe("ReadableWorkerStdio");
+
+  const drain = matchingMessage(worker, value => value?.type === "drain");
+  const callback = matchingMessage(worker, value => value?.type === "callback");
+  const output = streamBuffer(worker.stdout);
+  const exit = once(worker, "exit");
+  expect(await drain).toEqual({ type: "drain" });
+  expect(await callback).toEqual({ type: "callback" });
+  expect((await output).equals(Buffer.alloc(byteLength, 120))).toBe(true);
+  expect((await exit)[0]).toBe(0);
+});

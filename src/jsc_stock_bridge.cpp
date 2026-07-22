@@ -44,7 +44,9 @@ public:
 
 class Heap final {
 public:
+    std::size_t extraMemorySize();
     std::size_t protectedObjectCount();
+    std::size_t size();
 };
 
 }
@@ -138,6 +140,26 @@ extern "C" bool ct_jsc_set_time_zone(JSContextRef context, const char* time_zone
         const_cast<std::uint8_t*>(vm + vm_date_cache_offset));
     date_cache->resetIfNecessarySlow();
     return true;
+}
+
+extern "C" std::size_t ct_jsc_heap_footprint(JSContextRef context)
+{
+    if (context == nullptr)
+        return invalid_count;
+
+    // Stock JSC does not expose a per-VM heap limit in its public C API. The
+    // pinned Heap ABI does expose the two counters used by
+    // JSGetMemoryUsageStatistics: GC heap cells and externally-owned backing
+    // stores such as ArrayBuffer memory.
+    const auto* vm = reinterpret_cast<const std::uint8_t*>(JSContextGetGroup(context));
+    if (vm == nullptr)
+        return invalid_count;
+    auto* heap = reinterpret_cast<JSC::Heap*>(const_cast<std::uint8_t*>(vm + vm_heap_offset));
+    const std::size_t heap_size = heap->size();
+    const std::size_t extra_size = heap->extraMemorySize();
+    if (heap_size > invalid_count - extra_size)
+        return invalid_count;
+    return heap_size + extra_size;
 }
 
 extern "C" std::size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef* values, std::size_t capacity)

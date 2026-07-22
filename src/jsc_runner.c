@@ -28,6 +28,7 @@ extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
+extern size_t ct_jsc_heap_footprint(JSContextRef context);
 extern bool ct_jsc_value_is_rope(JSContextRef context, JSValueRef value);
 extern bool ct_jsc_set_time_zone(JSContextRef context, const char *time_zone);
 extern size_t ct_jsc_copy_protected_objects(JSContextRef context, JSValueRef *values, size_t capacity);
@@ -964,7 +965,8 @@ extern void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx);
 
 #define CT_FFI_MAX_ARGS 64
 #define CT_WORKER_STACK_SIZE (32u * 1024u * 1024u)
-#define CT_WORKER_TERMINATION_POLL_SECONDS 0.05
+#define CT_WORKER_TERMINATION_POLL_SECONDS 0.01
+#define CT_WORKER_RESOURCE_LIMIT_MESSAGE "Worker terminated due to reaching memory limit: JS heap out of memory"
 #define CT_TLS_CONNECTION_EVENT_ID_BASE 0x20000000u
 #define CT_TLS_SERVER_EVENT_ID_BASE 0x80000000u
 
@@ -1294,7 +1296,16 @@ struct CtWorker {
     bool finished;
     bool referenced;
     bool exit_event_sent;
+    bool resource_limit_exceeded;
+    bool resource_limit_event_sent;
     int exit_code;
+    size_t heap_limit;
+    int parent_stdin_fd;
+    int parent_stdout_fd;
+    int parent_stderr_fd;
+    int worker_stdin_fd;
+    int worker_stdout_fd;
+    int worker_stderr_fd;
     uint64_t performance_started_ns;
     uint64_t performance_active_ns;
     uint64_t performance_last_ns;
@@ -1452,6 +1463,7 @@ static pthread_mutex_t ct_async_processes_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtAsyncProcess *ct_async_processes = NULL;
 static pthread_mutex_t ct_fd_watchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtFdWatcher *ct_fd_watchers = NULL;
+static uint32_t ct_next_fd_watch_id = 1;
 static pthread_mutex_t ct_tcp_connects_mutex = PTHREAD_MUTEX_INITIALIZER;
 static CtTcpConnect *ct_tcp_connects = NULL;
 static uint32_t ct_next_tcp_connect_id = 0x40000000u;
@@ -22976,6 +22988,53 @@ static JSValueRef ct_import_module(JSContextRef ctx, JSObjectRef function, JSObj
     return ct_make_object(ctx);
 }
 
+static void ct_worker_initialize_stdio(CtWorker *worker) {
+    worker->parent_stdin_fd = -1;
+    worker->parent_stdout_fd = -1;
+    worker->parent_stderr_fd = -1;
+    worker->worker_stdin_fd = -1;
+    worker->worker_stdout_fd = -1;
+    worker->worker_stderr_fd = -1;
+}
+
+static void ct_worker_close_parent_stdio_locked(CtWorker *worker) {
+    ct_process_close_fd(&worker->parent_stdin_fd);
+    ct_process_close_fd(&worker->parent_stdout_fd);
+    ct_process_close_fd(&worker->parent_stderr_fd);
+}
+
+static void ct_worker_close_runtime_stdio_locked(CtWorker *worker) {
+    ct_process_close_fd(&worker->worker_stdin_fd);
+    ct_process_close_fd(&worker->worker_stdout_fd);
+    ct_process_close_fd(&worker->worker_stderr_fd);
+}
+
+static int ct_worker_create_pipe(int pipe_fds[2]) {
+#if defined(_WIN32)
+    return _pipe(pipe_fds, 64 * 1024, _O_BINARY | _O_NOINHERIT);
+#else
+    if (pipe(pipe_fds) != 0) return -1;
+    if (ct_process_relocate_fds(pipe_fds, STDERR_FILENO + 1) != 0) {
+        ct_process_close_fd(&pipe_fds[0]);
+        ct_process_close_fd(&pipe_fds[1]);
+        return -1;
+    }
+    ct_process_set_close_on_exec(pipe_fds[0]);
+    ct_process_set_close_on_exec(pipe_fds[1]);
+    return 0;
+#endif
+}
+
+static void ct_worker_set_nonblocking(int fd) {
+#if !defined(_WIN32)
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#else
+    (void)fd;
+#endif
+}
+
 static CtWorker *ct_worker_find_locked(uint32_t id) {
     for (CtWorker *worker = ct_workers; worker != NULL; worker = worker->next) {
         if (worker->id == id) return worker;
@@ -23012,6 +23071,7 @@ static void ct_workers_detach_runtime(CtJscRuntime *runtime) {
             worker->parent_runtime = NULL;
             worker->referenced = false;
             worker->terminate_requested = true;
+            ct_worker_close_parent_stdio_locked(worker);
             ct_runtime_wake(worker->runtime);
         }
         pthread_mutex_unlock(&worker->mutex);
@@ -23193,6 +23253,117 @@ static JSValueRef ct_worker_poll_messages(JSContextRef ctx, JSObjectRef function
     return ct_worker_drain_queue(ctx, worker, false, exception);
 }
 
+static int *ct_worker_stdio_slot(CtWorker *worker, const char *stream, bool write_side) {
+    if (strcmp(stream, "stdin") == 0) {
+        return write_side ? &worker->parent_stdin_fd : &worker->worker_stdin_fd;
+    }
+    if (strcmp(stream, "stdout") == 0) {
+        return write_side ? &worker->worker_stdout_fd : &worker->parent_stdout_fd;
+    }
+    if (strcmp(stream, "stderr") == 0) {
+        return write_side ? &worker->worker_stderr_fd : &worker->parent_stderr_fd;
+    }
+    return NULL;
+}
+
+static JSValueRef ct_worker_stdio_info(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)thisObject;
+    (void)argc;
+    (void)argv;
+    CtJscRuntime *runtime = ct_callback_runtime(function);
+    JSObjectRef result = ct_make_object(ctx);
+    if (runtime == NULL || runtime->worker == NULL) return result;
+
+    pthread_mutex_lock(&runtime->worker->mutex);
+    int stdin_fd = runtime->worker->worker_stdin_fd;
+    bool has_stdout = runtime->worker->worker_stdout_fd >= 0;
+    bool has_stderr = runtime->worker->worker_stderr_fd >= 0;
+    pthread_mutex_unlock(&runtime->worker->mutex);
+    if (stdin_fd >= 0) ct_set_property(ctx, result, "stdinFd", JSValueMakeNumber(ctx, stdin_fd), exception);
+    ct_set_property(ctx, result, "stdout", JSValueMakeBoolean(ctx, has_stdout), exception);
+    ct_set_property(ctx, result, "stderr", JSValueMakeBoolean(ctx, has_stderr), exception);
+    return result;
+}
+
+static JSValueRef ct_worker_stdio_write(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) {
+        ct_throw_message(ctx, exception, "workerStdioWrite(id, stream, data) requires a worker id, stream, and data");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    char *stream = ct_value_to_string_copy(ctx, argv[1]);
+    uint8_t *bytes = NULL;
+    size_t len = 0;
+    if (stream == NULL || ct_get_bytes(ctx, argv[2], &bytes, &len) != 0) {
+        free(stream);
+        ct_throw_message(ctx, exception, "worker stdio data must be an ArrayBuffer or typed array");
+        return JSValueMakeUndefined(ctx);
+    }
+
+    CtWorker *worker = ct_worker_find(id);
+    if (worker == NULL) {
+        free(stream);
+        return JSValueMakeNumber(ctx, -(double)ESRCH);
+    }
+
+    ssize_t written = -1;
+    int write_error = 0;
+    pthread_mutex_lock(&worker->mutex);
+    int *slot = ct_worker_stdio_slot(worker, stream, true);
+    int fd = slot != NULL ? *slot : -1;
+    if (fd < 0) {
+        write_error = EBADF;
+    } else if (len == 0) {
+        written = 0;
+    } else {
+#if !defined(_WIN32)
+        (void)signal(SIGPIPE, SIG_IGN);
+#endif
+        do {
+            written = write(fd, bytes, len);
+        } while (written < 0 && errno == EINTR);
+        if (written < 0) write_error = errno;
+    }
+    pthread_mutex_unlock(&worker->mutex);
+    free(stream);
+
+    if (write_error == EAGAIN || write_error == EWOULDBLOCK) return JSValueMakeNumber(ctx, 0);
+    if (write_error != 0) return JSValueMakeNumber(ctx, -(double)write_error);
+    return JSValueMakeNumber(ctx, (double)written);
+}
+
+static JSValueRef ct_worker_stdio_close(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 3) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    char *stream = ct_value_to_string_copy(ctx, argv[1]);
+    char *side = ct_value_to_string_copy(ctx, argv[2]);
+    if (stream == NULL || side == NULL) {
+        free(stream);
+        free(side);
+        return JSValueMakeBoolean(ctx, false);
+    }
+
+    CtWorker *worker = ct_worker_find(id);
+    bool closed = false;
+    if (worker != NULL) {
+        pthread_mutex_lock(&worker->mutex);
+        int *slot = ct_worker_stdio_slot(worker, stream, strcmp(side, "write") == 0);
+        if (slot != NULL && *slot >= 0) {
+            ct_process_close_fd(slot);
+            closed = true;
+        }
+        pthread_mutex_unlock(&worker->mutex);
+    }
+    free(stream);
+    free(side);
+    return JSValueMakeBoolean(ctx, closed);
+}
+
 static void ct_worker_set_current_thread_name(const char *name) {
     if (name == NULL || name[0] == '\0') return;
 #if defined(_WIN32)
@@ -23319,15 +23490,35 @@ static JSValueRef ct_worker_set_event_handler(JSContextRef ctx, JSObjectRef func
     return JSValueMakeUndefined(ctx);
 }
 
+static bool ct_worker_check_heap_limit(JSContextRef context, CtWorker *worker) {
+    size_t heap_limit = 0;
+    pthread_mutex_lock(&worker->mutex);
+    if (!worker->terminate_requested && worker->termination_watchdog_armed) heap_limit = worker->heap_limit;
+    pthread_mutex_unlock(&worker->mutex);
+    if (heap_limit == 0) return false;
+
+    size_t footprint = ct_jsc_heap_footprint(context);
+    if (footprint == SIZE_MAX || footprint <= heap_limit) return false;
+
+    pthread_mutex_lock(&worker->mutex);
+    bool exceeded = !worker->terminate_requested && worker->termination_watchdog_armed;
+    if (exceeded) {
+        worker->resource_limit_exceeded = true;
+        worker->terminate_requested = true;
+        worker->exit_code = 1;
+    }
+    pthread_mutex_unlock(&worker->mutex);
+    return exceeded;
+}
+
 static bool ct_worker_should_terminate(JSContextRef context, void *opaque) {
-    (void)context;
     CtWorker *worker = (CtWorker *)opaque;
     if (worker == NULL) return true;
 
     pthread_mutex_lock(&worker->mutex);
     bool should_terminate = worker->terminate_requested && worker->termination_watchdog_armed;
     pthread_mutex_unlock(&worker->mutex);
-    return should_terminate;
+    return should_terminate || ct_worker_check_heap_limit(context, worker);
 }
 
 static void ct_worker_finish(CtWorkerStart *start, CtJscRuntime *runtime, const char *error_message) {
@@ -23336,12 +23527,19 @@ static void ct_worker_finish(CtWorkerStart *start, CtJscRuntime *runtime, const 
     start->worker->finishing = true;
     start->worker->termination_watchdog_armed = false;
     if (start->worker->runtime == runtime) start->worker->runtime = NULL;
+    if (start->worker->resource_limit_exceeded && !start->worker->resource_limit_event_sent) {
+        start->worker->resource_limit_event_sent = true;
+        start->worker->exit_code = 1;
+        ct_worker_queue_parent_event_locked(start->worker, "resourceLimit", CT_WORKER_RESOURCE_LIMIT_MESSAGE);
+    }
     if (error_message != NULL) {
         ct_worker_queue_parent_event_locked(start->worker, "error", error_message);
     }
     pthread_mutex_unlock(&start->worker->mutex);
     if (runtime != NULL) ct_jsc_runtime_destroy(runtime);
     pthread_mutex_lock(&start->worker->mutex);
+    ct_worker_close_runtime_stdio_locked(start->worker);
+    ct_process_close_fd(&start->worker->parent_stdin_fd);
     start->worker->performance_last_ns = ct_timer_now_ns();
     start->worker->finishing = false;
     start->worker->finished = true;
@@ -23518,6 +23716,11 @@ static void *ct_worker_entry(void *opaque) {
     }
     free(source);
 
+    if (ct_worker_check_heap_limit(runtime->context, start->worker)) {
+        ct_worker_finish(start, runtime, NULL);
+        return NULL;
+    }
+
     uint64_t initial_active_finished_ns = ct_timer_now_ns();
     pthread_mutex_lock(&start->worker->mutex);
     if (initial_active_finished_ns > initial_active_started_ns) {
@@ -23549,6 +23752,7 @@ static void *ct_worker_entry(void *opaque) {
             error = NULL;
             break;
         }
+        if (ct_worker_check_heap_limit(runtime->context, start->worker)) break;
         bool has_active_handles = false;
         if (ct_jsc_runtime_has_active_handles(runtime, &has_active_handles, &error) != 0) {
             fprintf(stderr, "%s\n", error != NULL ? error : "cottontail: worker active-handle check failed");
@@ -23616,6 +23820,33 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
             stack_size = (size_t)requested_stack_size;
         }
     }
+    size_t heap_limit = 0;
+    bool stdin_pipe_requested = false;
+    bool stdout_pipe_requested = false;
+    bool stderr_pipe_requested = false;
+    if (argc >= 5 && JSValueIsObject(ctx, argv[4])) {
+        JSObjectRef native_options = (JSObjectRef)argv[4];
+        JSValueRef heap_limit_value = ct_get_property(ctx, native_options, "heapLimit", exception);
+        JSValueRef stdin_value = ct_get_property(ctx, native_options, "stdin", exception);
+        JSValueRef stdout_value = ct_get_property(ctx, native_options, "stdout", exception);
+        JSValueRef stderr_value = ct_get_property(ctx, native_options, "stderr", exception);
+        if (exception != NULL && *exception != NULL) {
+            free(script_path);
+            free(script_source);
+            free(eval_source);
+            free(thread_name);
+            return JSValueMakeUndefined(ctx);
+        }
+        if (JSValueIsNumber(ctx, heap_limit_value)) {
+            double requested_heap_limit = ct_value_to_number(ctx, heap_limit_value);
+            if (isfinite(requested_heap_limit) && requested_heap_limit > 0 && requested_heap_limit <= (double)SIZE_MAX) {
+                heap_limit = (size_t)requested_heap_limit;
+            }
+        }
+        stdin_pipe_requested = ct_value_to_bool(ctx, stdin_value);
+        stdout_pipe_requested = ct_value_to_bool(ctx, stdout_value);
+        stderr_pipe_requested = ct_value_to_bool(ctx, stderr_value);
+    }
 
     CtWorker *worker = (CtWorker *)calloc(1, sizeof(CtWorker));
     CtWorkerStart *start = (CtWorkerStart *)calloc(1, sizeof(CtWorkerStart));
@@ -23628,6 +23859,32 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         free(thread_name);
         ct_throw_message(ctx, exception, "Out of memory");
         return JSValueMakeUndefined(ctx);
+    }
+
+    ct_worker_initialize_stdio(worker);
+    worker->heap_limit = heap_limit;
+    int pipe_fds[2] = { -1, -1 };
+    if (stdin_pipe_requested) {
+        if (ct_worker_create_pipe(pipe_fds) != 0) goto stdio_fail;
+        worker->worker_stdin_fd = pipe_fds[0];
+        worker->parent_stdin_fd = pipe_fds[1];
+        ct_worker_set_nonblocking(worker->parent_stdin_fd);
+    }
+    if (stdout_pipe_requested) {
+        pipe_fds[0] = -1;
+        pipe_fds[1] = -1;
+        if (ct_worker_create_pipe(pipe_fds) != 0) goto stdio_fail;
+        worker->parent_stdout_fd = pipe_fds[0];
+        worker->worker_stdout_fd = pipe_fds[1];
+        ct_worker_set_nonblocking(worker->worker_stdout_fd);
+    }
+    if (stderr_pipe_requested) {
+        pipe_fds[0] = -1;
+        pipe_fds[1] = -1;
+        if (ct_worker_create_pipe(pipe_fds) != 0) goto stdio_fail;
+        worker->parent_stderr_fd = pipe_fds[0];
+        worker->worker_stderr_fd = pipe_fds[1];
+        ct_worker_set_nonblocking(worker->worker_stderr_fd);
     }
 
     pthread_mutex_init(&worker->mutex, NULL);
@@ -23658,6 +23915,8 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     if (attr_status != 0) {
         pthread_mutex_lock(&worker->mutex);
         worker->finished = true;
+        ct_worker_close_parent_stdio_locked(worker);
+        ct_worker_close_runtime_stdio_locked(worker);
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -23680,6 +23939,8 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
         pthread_attr_destroy(&attr);
         pthread_mutex_lock(&worker->mutex);
         worker->finished = true;
+        ct_worker_close_parent_stdio_locked(worker);
+        ct_worker_close_runtime_stdio_locked(worker);
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -23696,6 +23957,8 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
     if (create_status != 0) {
         pthread_mutex_lock(&worker->mutex);
         worker->finished = true;
+        ct_worker_close_parent_stdio_locked(worker);
+        ct_worker_close_runtime_stdio_locked(worker);
         pthread_mutex_unlock(&worker->mutex);
         free(start->script_path);
         free(start->script_source);
@@ -23711,7 +23974,28 @@ static JSValueRef ct_worker_spawn(JSContextRef ctx, JSObjectRef function, JSObje
 
     JSObjectRef result = ct_make_object(ctx);
     ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, worker->id), exception);
+    if (worker->parent_stdin_fd >= 0) {
+        ct_set_property(ctx, result, "stdinFd", JSValueMakeNumber(ctx, worker->parent_stdin_fd), exception);
+    }
+    if (worker->parent_stdout_fd >= 0) {
+        ct_set_property(ctx, result, "stdoutFd", JSValueMakeNumber(ctx, worker->parent_stdout_fd), exception);
+    }
+    if (worker->parent_stderr_fd >= 0) {
+        ct_set_property(ctx, result, "stderrFd", JSValueMakeNumber(ctx, worker->parent_stderr_fd), exception);
+    }
     return result;
+
+stdio_fail:
+    ct_worker_close_parent_stdio_locked(worker);
+    ct_worker_close_runtime_stdio_locked(worker);
+    free(worker);
+    free(start);
+    free(script_path);
+    free(script_source);
+    free(eval_source);
+    free(thread_name);
+    ct_throw_message(ctx, exception, "failed to create worker stdio pipe");
+    return JSValueMakeUndefined(ctx);
 }
 
 static JSValueRef ct_open_fd(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
@@ -24917,8 +25201,10 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
         return JSValueMakeUndefined(ctx);
     }
 
-    watcher->id = ++runtime->next_fd_watch_id;
-    if (watcher->id == 0) watcher->id = ++runtime->next_fd_watch_id;
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    watcher->id = ct_next_fd_watch_id++;
+    if (watcher->id == 0) watcher->id = ct_next_fd_watch_id++;
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
     watcher->fd = fd;
     watcher->max_bytes = max_bytes;
     watcher->runtime = runtime;

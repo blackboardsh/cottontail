@@ -2257,6 +2257,19 @@ function installWorkerNativeEventHandler() {
       });
       return;
     }
+    if (event?.type === "resourceLimit") {
+      const message = String(event?.message ?? "Worker terminated due to reaching memory limit");
+      const error = new Error(message);
+      error.code = "ERR_WORKER_OUT_OF_MEMORY";
+      worker._emit("error", {
+        type: "error",
+        message,
+        error,
+        code: error.code,
+        target: worker,
+      });
+      return;
+    }
     if (event?.type === "open") {
       worker._emit("open", { type: "open", target: worker });
       return;
@@ -2382,6 +2395,7 @@ const preparedWorkerScript = Symbol.for("cottontail.worker.prepared-script");
 const workerEvalSource = Symbol.for("cottontail.worker.eval-source");
 const workerThreadName = Symbol.for("cottontail.worker.thread-name");
 const workerStackSize = Symbol.for("cottontail.worker.stack-size");
+const workerNativeOptions = Symbol.for("cottontail.worker.native-options");
 
 function workerTempDir() {
   const configured = cottontail.env?.()?.COTTONTAIL_TMP_DIR;
@@ -2591,6 +2605,7 @@ g.Worker ??= class Worker {
       options?.[workerEvalSource],
       options?.[workerThreadName],
       options?.[workerStackSize],
+      options?.[workerNativeOptions],
     );
     this.id = this.handle.id;
     this.threadId = this.id;
