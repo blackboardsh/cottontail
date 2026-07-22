@@ -4163,6 +4163,10 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 0 assertions)."
     },
+    "test/regression/issue/14945-lifecycle-script-crash.test.ts": {
+      "status": "enabled",
+      "reason": "Package lifecycle scripts that remove or replace their working tree complete without crashing across both copied regression cases."
+    },
     "test/regression/issue/14976/14976.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (7 bun:test cases, 180 assertions)."
@@ -4170,6 +4174,10 @@
     "test/regression/issue/14982/14982.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 2 assertions)."
+    },
+    "test/regression/issue/15276.test.ts": {
+      "status": "enabled",
+      "reason": "npm alias dependency installation and lockfile behavior pass the copied upstream regression."
     },
     "test/regression/issue/15314.test.ts": {
       "status": "enabled",
@@ -4395,6 +4403,10 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (2 bun:test cases, 6 assertions)."
     },
+    "test/regression/issue/24314.test.ts": {
+      "status": "enabled",
+      "reason": "bun pm pack observes package.json mutations made by prepack and prepare lifecycle scripts across both copied cases (10 assertions)."
+    },
     "test/regression/issue/24329.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 10 assertions)."
@@ -4418,6 +4430,10 @@
     "test/regression/issue/24709.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (1 bun:test cases, 6 assertions)."
+    },
+    "test/regression/issue/24806.test.ts": {
+      "status": "enabled",
+      "reason": "bun publish help and dry-run command behavior pass the copied upstream regression."
     },
     "test/regression/issue/24817.test.ts": {
       "status": "enabled",
@@ -4507,6 +4523,10 @@
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 15 assertions)."
     },
+    "test/regression/issue/26337.test.ts": {
+      "status": "enabled",
+      "reason": "Stale file-dependency diagnostics pass the copied upstream package-manager regression."
+    },
     "test/regression/issue/26358.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (4 bun:test cases, 10 assertions)."
@@ -4578,6 +4598,10 @@
     "test/regression/issue/3179.test.ts": {
       "status": "enabled",
       "reason": "Passes on the native-bundler pipeline after stabilization (3 bun:test cases, 9 assertions)."
+    },
+    "test/regression/issue/3192.test.ts": {
+      "status": "enabled",
+      "reason": "Yarn lockfile quote parsing and migration pass the copied upstream regression."
     },
     "test/regression/issue/3657.test.ts": {
       "status": "enabled",
@@ -4671,6 +4695,10 @@
     "test/regression/issue/pe-codesigning-integrity.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (4 bun:test cases, 0 assertions)."
+    },
+    "test/regression/issue/patch-bounds-check.test.ts": {
+      "status": "enabled",
+      "reason": "Malformed and truncated package patches fail safely across all three copied bounds-check cases."
     },
     "test/regression/issue/require-extensions-override.test.ts": {
       "status": "enabled",
