@@ -9,6 +9,9 @@ const bunSleepSetTimeout = globalThis.setTimeout.bind(globalThis);
 globalThis.__cottontailRemapStackString ??= remapStackString;
 globalThis.__cottontailSourceContextForLocation ??= sourceContextForLocation;
 globalThis.__cottontailFormatUncaughtException ??= (error) => {
+  if (error?.__cottontailFormattedStack === true && typeof error.stack === "string") {
+    return error.stack;
+  }
   let referenceErrorHeaders;
   if (error?.name === "ReferenceError" && typeof error.message === "string" && error.message.startsWith("Can't find variable: ")) {
     const normalizedMessage = `${error.message.slice("Can't find variable: ".length)} is not defined`;

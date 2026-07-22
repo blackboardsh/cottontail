@@ -63,6 +63,9 @@ function uncaughtRuntimeTrailer() {
 
 globalThis.__cottontailFormatUncaughtException ??= (value) => {
   if (!value || typeof value !== "object") return null;
+  if (value.__cottontailFormattedStack === true && typeof value.stack === "string") {
+    return value.stack;
+  }
   const code = safeUncaughtDescriptorValue(value, "code");
   const syscall = safeUncaughtDescriptorValue(value, "syscall");
   const errno = safeUncaughtDescriptorValue(value, "errno");

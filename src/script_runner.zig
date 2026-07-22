@@ -4796,7 +4796,8 @@ fn bundleScriptNative(
     const script_dir = std.fs.path.dirname(script_abs) orelse ctx.project_root;
     const is_test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null;
     const is_test_runtime_execution = is_test_cli_execution or
-        ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null;
+        ctx.environ_map.get("COTTONTAIL_TEST_FILE_COUNT") != null or
+        isTestEntrypointPath(script_abs);
     var package_json_patch = try maybePatchEmptyPackageJsonForBundle(ctx, script_dir);
     defer restoreEmptyMetadataPatch(ctx, &package_json_patch);
 
@@ -6491,10 +6492,17 @@ fn writeEvalEntrypoint(
 
 fn isTestEntrypointPath(path: []const u8) bool {
     const name = std.fs.path.basename(path);
-    if (std.mem.indexOf(u8, name, ".test.") == null) return false;
     const extensions = [_][]const u8{ ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts" };
-    for (extensions) |extension| {
-        if (std.mem.endsWith(u8, name, extension)) return true;
+    const extension = std.fs.path.extension(name);
+    if (extension.len == 0) return false;
+    const stem = name[0 .. name.len - extension.len];
+    const has_test_suffix = std.mem.endsWith(u8, stem, ".test") or
+        std.mem.endsWith(u8, stem, "_test") or
+        std.mem.endsWith(u8, stem, ".spec") or
+        std.mem.endsWith(u8, stem, "_spec");
+    if (!has_test_suffix) return false;
+    for (extensions) |candidate| {
+        if (std.mem.eql(u8, extension, candidate)) return true;
     }
     return false;
 }
@@ -9774,6 +9782,9 @@ test "parseBunfigTestPreloads ignores test subsections and missing preload" {
 test "isTestEntrypointPath matches bun test naming" {
     try std.testing.expect(isTestEntrypointPath("/a/b/example.test.ts"));
     try std.testing.expect(isTestEntrypointPath("/a/b/example.test.cjs"));
+    try std.testing.expect(isTestEntrypointPath("/a/b/example_test.ts"));
+    try std.testing.expect(isTestEntrypointPath("/a/b/example.spec.mts"));
+    try std.testing.expect(isTestEntrypointPath("/a/b/example_spec.cts"));
     try std.testing.expect(!isTestEntrypointPath("/a/b.test.d/example.ts"));
     try std.testing.expect(!isTestEntrypointPath("/a/b/example.test.txt"));
     try std.testing.expect(!isTestEntrypointPath("/a/b/example.ts"));
