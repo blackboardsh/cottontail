@@ -19,9 +19,62 @@ const createFromNodeStreamOptions: Manifest = {
   moduleLoading: { prefix: "/" },
 };
 
-// COTTONTAIL-COMPAT: Stock-JSC direct streams ignore a rejected pull after close; error explicitly.
-function errorDirectStream(controller: ReadableStreamDirectController, error: any) {
+const fallbackTextEncoder = new TextEncoder();
+
+function fallbackErrorHtml(error: any) {
+  const bytes: number[] = [];
+  const writeByte = (value: number) => bytes.push(value & 0xff);
+  const writeUint16 = (value: number) => {
+    writeByte(value);
+    writeByte(value >>> 8);
+  };
+  const writeUint32 = (value: number) => {
+    writeByte(value);
+    writeByte(value >>> 8);
+    writeByte(value >>> 16);
+    writeByte(value >>> 24);
+  };
+  const writeString = (value: string) => {
+    const encoded = fallbackTextEncoder.encode(value);
+    writeUint32(encoded.byteLength);
+    for (const byte of encoded) writeByte(byte);
+  };
+
+  const name = error instanceof Error ? error.name : "Error";
+  const message = error instanceof Error ? error.message : String(error);
+
+  // FallbackMessageContainer.problems
+  writeByte(4);
+  writeUint16(500);
+  writeString("RuntimeError");
+  writeUint32(1);
+  writeByte(1);
+  writeString(name || "Error");
+  writeByte(2);
+  writeString(message);
+  writeByte(0);
+  writeUint32(0);
+  writeUint32(0);
+  writeUint32(0);
+  writeByte(0);
+
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.slice(index, index + 0x8000));
+  }
+  return `<h1>Runtime Error</h1><script id="__bunfallback" type="binary/peechy">${btoa(binary)}</script>`;
+}
+
+// Bun's development server converts a failed streaming render into its
+// fallback document. Stock JSC needs that recovery in the stream itself.
+function finishDirectStreamError(controller: ReadableStreamDirectController, error: any) {
+  if (import.meta.env.DEV) {
+    controller.write(fallbackErrorHtml(error));
+    controller.close();
+    return true;
+  }
   controller.error(error);
+  return false;
 }
 
 // The `renderToHtml` function not only implements converting the RSC payload
@@ -41,6 +94,7 @@ export function renderToHtml(
   rscPayload: Readable,
   bootstrapModules: readonly string[],
   signal: MiniAbortSignal,
+  recoverStreamingErrors = false,
 ): ReadableStream {
   // Bun supports a special type of readable stream type called "direct",
   // which provides a raw handle to the controller. We can bypass all of
@@ -63,8 +117,9 @@ export function renderToHtml(
 
       // If the signal is already aborted, we should not proceed
       if (signal.aborted) {
-        errorDirectStream(controller, signal.aborted);
-        return Promise.reject(signal.aborted);
+        return recoverStreamingErrors && finishDirectStreamError(controller, signal.aborted)
+          ? Promise.resolve()
+          : Promise.reject(signal.aborted);
       }
 
       // `renderToPipeableStream` is what actually generates HTML.
@@ -79,14 +134,13 @@ export function renderToHtml(
             abort();
             if (signal.abort) signal.abort();
             if (stream) {
-              errorDirectStream(stream.controller, error);
-              stream.reject(error);
+              stream.finishError(error, recoverStreamingErrors);
             }
           }
         },
       }));
 
-      stream = new RscInjectionStream(rscPayload, controller);
+      stream = new RscInjectionStream(rscPayload, controller, recoverStreamingErrors);
       pipe(stream);
 
       return stream.finished;
@@ -153,14 +207,22 @@ class RscInjectionStream extends EventEmitter {
   finished: Promise<void>;
   finalize: () => void;
   reject: (err: any) => void;
+  resolve: () => void;
+  settled = false;
 
-  constructor(rscPayload: Readable, controller: ReadableStreamDirectController) {
+  constructor(rscPayload: Readable, controller: ReadableStreamDirectController, recoverStreamingErrors: boolean) {
     super();
     this.controller = controller;
 
     const { resolve, promise, reject } = Promise.withResolvers<void>();
     this.finished = promise;
-    this.finalize = x => (controller.close(), resolve(x));
+    this.resolve = resolve;
+    this.finalize = x => {
+      if (this.settled) return;
+      this.settled = true;
+      controller.close();
+      resolve(x);
+    };
     this.reject = reject;
 
     rscPayload.on("data", this.writeRscData.bind(this));
@@ -168,14 +230,24 @@ class RscInjectionStream extends EventEmitter {
       this.rscHasEnded = true;
     });
     rscPayload.on("error", err => {
-      this.rscHasEnded = true;
-      errorDirectStream(controller, err);
-      // Reject the promise instead of resolving it
-      this.reject(err);
+      this.finishError(err, recoverStreamingErrors);
     });
   }
 
+  finishError(error: any, recoverStreamingErrors: boolean) {
+    if (this.settled) return;
+    this.settled = true;
+    this.rscHasEnded = true;
+    if (recoverStreamingErrors && finishDirectStreamError(this.controller, error)) {
+      this.resolve();
+    } else {
+      this.controller.error(error);
+      this.reject(error);
+    }
+  }
+
   write(data: Uint8Array) {
+    if (this.settled) return;
     if (import.meta.env.DEV && process.env.VERBOSE_SSR)
       console.write(
         "write" +
@@ -229,6 +301,7 @@ class RscInjectionStream extends EventEmitter {
   }
 
   writeRscData(chunk: Uint8Array) {
+    if (this.settled) return;
     if (import.meta.env.DEV && process.env.VERBOSE_SSR)
       console.write(
         "writeRscData " +

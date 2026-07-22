@@ -66,6 +66,10 @@ export async function render(
   meta: Bake.RouteMetadata,
   als?: AsyncLocalStorage<RequestContext>,
 ): Promise<Response> {
+  // Stock JSC can resume stream callbacks under another concurrent request's
+  // async context. Capture this request's store before starting either graph.
+  const requestContext = als?.getStore();
+
   // The framework generally has two rendering modes.
   // - Standard browser navigation
   // - Client-side navigation
@@ -113,7 +117,7 @@ export async function render(
   pipe(rscPayload);
 
   if (skipSSR) {
-    const responseOptions = als?.getStore()?.responseOptions || {};
+    const responseOptions = requestContext?.responseOptions || {};
     return new Response(rscPayload as any, {
       status: 200,
       headers: { "Content-Type": "text/x-component" },
@@ -123,13 +127,10 @@ export async function render(
 
   // The RSC payload is rendered into HTML
   if (streaming) {
-    const responseOptions = als?.getStore()?.responseOptions || {};
-    if (als) {
-      const state = als.getStore();
-      if (state) state.streamingStarted = true;
-    }
+    const responseOptions = requestContext?.responseOptions || {};
+    if (requestContext) requestContext.streamingStarted = true;
     // Stream the response as before
-    return new Response(renderToHtml(rscPayload, meta.modules, signal), {
+    return new Response(renderToHtml(rscPayload, meta.modules, signal, true), {
       headers: {
         "Content-Type": "text/html; charset=utf8",
       },
@@ -140,7 +141,7 @@ export async function render(
     const htmlStream = renderToHtml(rscPayload, meta.modules, signal);
     const result = await htmlStream.bytes();
 
-    const opts = als?.getStore()?.responseOptions ?? { headers: {} };
+    const opts = requestContext?.responseOptions ?? { headers: {} };
     const { headers, ...response_options } = opts;
 
     const cookies = meta.pageModule.mode === "ssr" ? { "Set-Cookie": request.cookies.toSetCookieHeaders() } : {};
