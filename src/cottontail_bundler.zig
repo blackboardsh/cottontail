@@ -22,6 +22,9 @@ pub const BundleOptions = struct {
     features: []const []const u8 = &.{},
     public_path: []const u8 = "",
     transform_only: bool = false,
+    /// Standalone executable graph. This enables compiler-specific path and
+    /// HTML manifest handling without entering Bun's JSC bytecode pipeline.
+    compile: bool = false,
     /// Bun.build({ compile: true, target: "browser" }) with HTML entries
     /// emits one self-contained HTML artifact instead of an executable.
     compile_to_standalone_html: bool = false,
@@ -834,6 +837,7 @@ pub fn bundleEntryPointGraphWithOptions(
     transpiler.options.footer = options.footer;
     transpiler.options.public_path = options.public_path;
     transpiler.options.transform_only = options.transform_only;
+    transpiler.options.compile = options.compile;
     transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
@@ -2009,6 +2013,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.footer = options.footer;
     transpiler.options.public_path = options.public_path;
     transpiler.options.transform_only = options.transform_only;
+    transpiler.options.compile = options.compile;
     transpiler.options.compile_to_standalone_html = options.compile_to_standalone_html;
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;

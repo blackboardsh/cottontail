@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compiler = @import("cottontail_compiler");
+const signal_forwarding = @import("signal_forwarding.zig");
 const c = if (builtin.os.tag == .windows) @cImport({
     @cInclude("stdlib.h");
 }) else @cImport({
@@ -1265,6 +1266,8 @@ pub export fn ct_host_spawn_sync(
         .request_resource_usage_statistics = true,
         .create_no_window = shouldCreateNoWindow(options.stdin_mode, options.stdout_mode, options.stderr_mode),
     };
+    var signal_scope = signal_forwarding.Scope.begin();
+    defer signal_scope.deinit();
     const child_result = if (comptime builtin.os.tag != .windows)
         if (options.argv0 != null or options.stdin_fd >= 0 or options.stdout_fd >= 0 or options.stderr_fd >= 0)
             spawnPosixWithArgv0(
@@ -1285,6 +1288,7 @@ pub export fn ct_host_spawn_sync(
         return -1;
     };
     defer child.kill(io);
+    if (child.id) |id| signal_scope.setChild(id);
 
     result_out.memfd_count = @intFromBool(stdin_memfd != null) +
         @intFromBool(stdout_memfd != null) +

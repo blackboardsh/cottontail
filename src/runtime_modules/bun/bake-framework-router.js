@@ -343,6 +343,25 @@ function effectiveRouteKey(parts) {
   return key || "/";
 }
 
+function partsForNode(node) {
+  const parts = [];
+  while (node && node.parent !== null) {
+    parts.push(node.part);
+    node = node.parent;
+  }
+  return parts.reverse();
+}
+
+function productionPattern(parts) {
+  let pattern = "";
+  for (const part of parts) {
+    if (part.type === "group") continue;
+    if (part.type === "text") pattern += `/${part.value}`;
+    else pattern += `/:${part.value}`;
+  }
+  return pattern || "/";
+}
+
 export class FrameworkRouter {
   constructor(options) {
     if (options === null || typeof options !== "object") {
@@ -476,6 +495,23 @@ export class FrameworkRouter {
 
   toJSON() {
     return routeToJSON(this.tree);
+  }
+
+  routes() {
+    const nodes = new Set([...this.staticRoutes.values(), ...this.dynamicRoutes.map(route => route.node)]);
+    return [...nodes].map(node => {
+      const parts = partsForNode(node);
+      return {
+        dynamic: parts.some(part => part.type === "param" || part.type.startsWith("catch_all")),
+        page: node.page,
+        params: parts
+          .filter(part => part.type === "param" || part.type.startsWith("catch_all"))
+          .map(part => part.value),
+        parts: parts.map(part => ({ ...part })),
+        pattern: productionPattern(parts),
+        route: routeToInverseJSON(node),
+      };
+    });
   }
 }
 

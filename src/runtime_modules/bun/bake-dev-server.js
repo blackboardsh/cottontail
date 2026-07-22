@@ -1,9 +1,23 @@
 import path from "../node/path.js";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "../node/fs.js";
 import { pathToFileURL } from "../node/url.js";
 import { __setBuiltinModules } from "../node/module.js";
 import { Bun, serve } from "./index.js";
+import {
+  bakeGraphAttributeFiles,
+  contentTypeForStaticFile,
+  discoverClientBoundaries,
+  frameworkBuildOptions,
+  moduleIdForPath,
+  normalizeBakeFramework,
+  normalizeBuiltInModules,
+  normalizeStaticRouters,
+  resolveBakeImport,
+  serverBoundaryFiles,
+  staticRouterFile,
+} from "./bake-framework.js";
 import { FrameworkRouter } from "./bake-framework-router.js";
+import { buildBakeProduction } from "./bake-production.js";
 
 let responseOptionsAsyncLocalStorage = null;
 let BakeResponse = null;
@@ -433,6 +447,12 @@ function bakeRegistryModules(source) {
   return (0, eval)(`({${bakeRegistrySource(source)}\n})`);
 }
 
+function rewriteBakeClientBuiltins(source) {
+  return source
+    .replaceAll('"bake/client"', '"bun:bake/client"')
+    .replaceAll("'bake/client'", "'bun:bake/client'");
+}
+
 function bakeModuleDefinitionSource(value) {
   if (typeof value === "function") return value.toString();
   if (Array.isArray(value)) return `[${value.map(bakeModuleDefinitionSource).join(",")}]`;
@@ -784,6 +804,21 @@ function clientBuildOptions(framework, app) {
   return options;
 }
 
+function ssrBuildOptions(framework, app) {
+  const frameworkOptions = framework.bundlerOptions ?? {};
+  const appOptions = app.bundlerOptions ?? {};
+  const options = {
+    ...frameworkOptions,
+    ...(frameworkOptions.ssr ?? {}),
+    ...appOptions,
+    ...(appOptions.ssr ?? {}),
+  };
+  delete options.client;
+  delete options.server;
+  delete options.ssr;
+  return options;
+}
+
 function loaderForPath(value) {
   const match = /\.([a-zA-Z0-9]+)(?:[?#].*)?$/.exec(String(value));
   switch ((match?.[1] ?? "").toLowerCase()) {
@@ -976,18 +1011,73 @@ function moduleDependencyIds(definition) {
   return ids;
 }
 
+function hmrImportWrapperSource(imports) {
+  return imports.map((specifier, index) => `import * as __ctGraph${index} from ${JSON.stringify(specifier)};`).join("\n") ||
+    "export {};";
+}
+
+function prefixHmrGraph(parsed, prefix) {
+  const sourceIds = new Set(Object.keys(parsed.modules));
+  const modules = {};
+  for (const [id, definition] of Object.entries(parsed.modules)) {
+    const next = [...definition];
+    const encoded = Array.isArray(definition?.[0]) ? [...definition[0]] : null;
+    if (encoded !== null) {
+      for (let index = 0; index < encoded.length;) {
+        if (sourceIds.has(encoded[index])) encoded[index] = `${prefix}${encoded[index]}`;
+        index += 2 + encoded[index + 1];
+      }
+      next[0] = encoded;
+    }
+    modules[`${prefix}${id}`] = next;
+  }
+  return { modules };
+}
+
+function rewriteHmrDependencies(modules, replacements) {
+  if (replacements.size === 0) return modules;
+  const rewritten = {};
+  for (const [id, definition] of Object.entries(modules)) {
+    const next = [...definition];
+    const encoded = Array.isArray(definition?.[0]) ? [...definition[0]] : null;
+    if (encoded !== null) {
+      for (let index = 0; index < encoded.length;) {
+        encoded[index] = replacements.get(encoded[index]) ?? encoded[index];
+        index += 2 + encoded[index + 1];
+      }
+      next[0] = encoded;
+    }
+    rewritten[id] = next;
+  }
+  return rewritten;
+}
+
 function createFrameworkDispatcher(config) {
   const app = config.app;
-  const framework = app?.framework;
-  if (!app || !framework || typeof framework !== "object") return null;
+  if (!app || app.framework == null) return null;
+  const framework = normalizeBakeFramework(app.framework);
   ensureBakeResponseInstalled();
 
   const projectRoot = globalThis.process?.cwd?.() ?? ".";
+  const builtIns = normalizeBuiltInModules(framework, projectRoot);
+  const staticRouters = normalizeStaticRouters(framework, projectRoot);
+  const componentServerManifest = Object.create(null);
+  const componentSsrManifest = Object.create(null);
+  const componentManifestModule = Object.freeze({
+    actionManifest: undefined,
+    serverManifest: componentServerManifest,
+    ssrManifest: componentSsrManifest,
+  });
+  __setBuiltinModules({
+    "bake/server": componentManifestModule,
+    "bun:bake/server": componentManifestModule,
+  });
   const configuredPlugins = [...(framework.plugins ?? []), ...(app.plugins ?? [])];
   const serverPlugins = adaptFrameworkPlugins(configuredPlugins, "server");
   const clientPlugins = adaptFrameworkPlugins(configuredPlugins, "client");
   const serverOptions = serverBuildOptions(framework, app);
   const clientOptions = clientBuildOptions(framework, app);
+  const ssrOptions = ssrBuildOptions(framework, app);
   const serverComponents = framework.serverComponents && typeof framework.serverComponents === "object"
     ? framework.serverComponents
     : null;
@@ -997,6 +1087,7 @@ function createFrameworkDispatcher(config) {
   const bundles = new Map();
   const wrapperPaths = new Map();
   const clientWrapperPaths = new Map();
+  const ssrWrapperPaths = new Map();
   const hmrDefinitions = new Map();
   const routeRecords = [];
   const routeRecordByPage = new Map();
@@ -1007,6 +1098,8 @@ function createFrameworkDispatcher(config) {
   let hotUpdateId = 0;
   let hadBuildErrors = false;
   const routerTypes = framework.fileSystemRouterTypes ?? [];
+  const graphAlias = { ...(serverOptions.alias ?? {}), ...builtIns.alias };
+  const graphFiles = { ...(serverOptions.files ?? {}), ...builtIns.files };
   const createRouters = () => routerTypes.map(type => {
     const root = path.resolve(projectRoot, String(type.root));
     return {
@@ -1074,22 +1167,95 @@ function createFrameworkDispatcher(config) {
     return css;
   }
 
-  async function buildClientRoute(record, router) {
+  function addComponentManifests(boundaries) {
+    for (const boundary of boundaries) {
+      const ssr = componentSsrManifest[boundary.id] ??= Object.create(null);
+      for (const exportName of boundary.exports) {
+        componentServerManifest[`${boundary.id}#${exportName}`] = {
+          id: boundary.id,
+          name: exportName,
+          chunks: [],
+        };
+        ssr[exportName] = {
+          specifier: `ssr:${boundary.id}`,
+          name: exportName,
+        };
+      }
+    }
+  }
+
+  function deleteComponentManifests(ids) {
+    for (const id of ids) {
+      const ssr = componentSsrManifest[id];
+      for (const exportName of Object.keys(ssr ?? {})) {
+        delete componentServerManifest[`${id}#${exportName}`];
+      }
+      delete componentSsrManifest[id];
+    }
+  }
+
+  async function buildSsrRoute(record, boundaries) {
+    if (serverComponents === null) return null;
+    const configuredRoots = framework.__cottontailSsrEntryPoints ?? [];
+    const roots = configuredRoots.map(source => resolveImportSource(projectRoot, source));
+    const imports = [...roots, ...boundaries.map(boundary => boundary.path)];
+    if (imports.length === 0) return null;
+
+    let wrapperPath = ssrWrapperPaths.get(record.page);
+    if (!wrapperPath) {
+      wrapperPath = path.join(projectRoot, `.cottontail-bake-ssr-${record.id}.js`);
+      ssrWrapperPaths.set(record.page, wrapperPath);
+    }
+    const configuredConditions = Array.isArray(ssrOptions.conditions) ? ssrOptions.conditions : [];
+    const result = await Bun.build(frameworkBuildOptions({
+      ...ssrOptions,
+      entrypoints: [wrapperPath],
+      format: "internal_bake_dev",
+      minify: false,
+      target: "bun",
+      sourcemap: "external",
+      serverComponents: false,
+      conditions: [...new Set([...configuredConditions, "node"])],
+      external: [...new Set([...(ssrOptions.external ?? []), "bun:bake/server"])],
+      metafile: true,
+      write: false,
+      throw: false,
+      plugins: serverPlugins,
+    }, builtIns, { [wrapperPath]: hmrImportWrapperSource(imports) }));
+    if (!result.success || result.outputs.length === 0) {
+      throw new AggregateError(result.logs ?? [], `Failed to bundle Bake SSR graph for ${record.page}`);
+    }
+    const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
+    const parsed = parseHmrArtifact(await artifact.text());
+    const prefixed = prefixHmrGraph(parsed, "ssr:");
+    const rootIds = roots.map(source => {
+      const resolved = resolveBakeImport(wrapperPath, source, {
+        alias: { ...(ssrOptions.alias ?? {}), ...builtIns.alias },
+        files: { ...(ssrOptions.files ?? {}), ...builtIns.files },
+      });
+      return resolved === null ? null : moduleIdForPath(projectRoot, resolved);
+    }).filter(id => id !== null && Object.prototype.hasOwnProperty.call(parsed.modules, id));
+    return {
+      modules: rewriteHmrDependencies(prefixed.modules, new Map([["bake/server", "bun:bake/server"]])),
+      roots: rootIds,
+      styles: await collectBuildAssets(result),
+    };
+  }
+
+  async function buildClientRoute(record, router, boundaries) {
     let wrapperPath = clientWrapperPaths.get(record.page);
     if (!wrapperPath) {
       wrapperPath = path.join(projectRoot, `.cottontail-bake-client-${record.id}.js`);
       clientWrapperPaths.set(record.page, wrapperPath);
     }
-    const source = router.clientEntryPoint === null
-      ? "export {};"
-      : `import ${JSON.stringify(router.clientEntryPoint)};`;
-    const result = await Bun.build({
+    const imports = [
+      ...(router.clientEntryPoint === null ? [] : [router.clientEntryPoint]),
+      ...boundaries.map(boundary => boundary.path),
+    ];
+    const source = hmrImportWrapperSource(imports);
+    const result = await Bun.build(frameworkBuildOptions({
       ...clientOptions,
       entrypoints: [wrapperPath],
-      files: {
-        ...(clientOptions.files ?? {}),
-        [wrapperPath]: source,
-      },
       format: development ? "internal_bake_dev" : "esm",
       minify: development ? false : clientOptions.minify,
       target: "browser",
@@ -1102,14 +1268,14 @@ function createFrameworkDispatcher(config) {
       write: false,
       throw: false,
       plugins: clientPlugins,
-    });
+    }, builtIns, { [wrapperPath]: source }));
     if (!result.success || result.outputs.length === 0) {
       throw new AggregateError(result.logs ?? [], `Failed to bundle Bake client entry ${router.clientEntryPoint ?? wrapperPath}`);
     }
     const artifact = result.outputs.find(isJavaScriptEntry);
     if (!artifact) throw new Error(`Bake's client build did not emit ${router.clientEntryPoint ?? wrapperPath}`);
 
-    const originalSource = await artifact.text();
+    const originalSource = rewriteBakeClientBuiltins(await artifact.text());
     const url = bakeRouteClientUrl(record.id, record.generation);
     let servedSource = originalSource;
     const sourceMap = artifact.sourcemap ?? result.outputs.find(output => output.kind === "sourcemap");
@@ -1149,15 +1315,28 @@ function createFrameworkDispatcher(config) {
       const conditions = serverComponents === null
         ? configuredConditions
         : [...new Set([...configuredConditions, "react-server"])];
-      const result = await Bun.build({
+      const graph = serverComponents === null
+        ? { boundaries: [] }
+        : discoverClientBoundaries({
+            projectRoot,
+            roots: [page, ...layouts],
+            alias: graphAlias,
+            files: graphFiles,
+            builtInSources: builtIns.sources,
+          });
+      const boundaryFiles = serverComponents === null
+        ? {}
+        : serverBoundaryFiles(graph.boundaries, serverComponents);
+      const serverEntryFile = resolveBakeImport(wrapperPath, router.serverEntryPoint, {
+        alias: graphAlias,
+        files: graphFiles,
+      });
+      const graphAttributeFiles = serverComponents === null
+        ? {}
+        : bakeGraphAttributeFiles([serverEntryFile, ...graph.visited], graphFiles);
+      const result = await Bun.build(frameworkBuildOptions({
         ...serverOptions,
         entrypoints: [wrapperPath],
-        files: {
-          ...(serverOptions.files ?? {}),
-          [wrapperPath]: development
-            ? hmrRouteWrapperSource(router.serverEntryPoint, page, layouts)
-            : commonJSRouteWrapperSource(router.serverEntryPoint, page, layouts),
-        },
         format: development ? "internal_bake_dev" : "cjs",
         minify: development ? false : serverOptions.minify,
         target: "bun",
@@ -1165,18 +1344,26 @@ function createFrameworkDispatcher(config) {
         sourcemap: development ? "external" : serverOptions.sourcemap,
         serverComponents: serverComponents !== null,
         conditions,
+        external: [...new Set([...(serverOptions.external ?? []), "bun:bake/server"])],
         metafile: true,
         write: false,
         throw: false,
         plugins: serverPlugins,
-      });
+      }, builtIns, {
+        ...graphAttributeFiles,
+        ...boundaryFiles,
+        [wrapperPath]: development
+          ? hmrRouteWrapperSource(router.serverEntryPoint, page, layouts)
+          : commonJSRouteWrapperSource(router.serverEntryPoint, page, layouts),
+      }));
       if (!result.success || result.outputs.length === 0) {
         throw new AggregateError(result.logs ?? [], `Failed to bundle Bake route ${page}`);
       }
       const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
       const serverStyles = await collectBuildAssets(result);
-      const client = await buildClientRoute(record, router);
-      const styles = new Map([...serverStyles, ...client.styles]);
+      const client = await buildClientRoute(record, router, graph.boundaries);
+      const ssr = development ? await buildSsrRoute(record, graph.boundaries) : null;
+      const styles = new Map([...serverStyles, ...(ssr?.styles ?? []), ...client.styles]);
       if (development) {
         const parsed = parseHmrArtifact(await artifact.text());
         if (hmrRuntime === null) {
@@ -1191,24 +1378,47 @@ function createFrameworkDispatcher(config) {
           }
         }
 
+        const replacements = new Map([
+          ["bake/server", "bun:bake/server"],
+          ...(ssr?.roots ?? []).map(id => [id, `ssr:${id}`]),
+        ]);
+        const serverModules = rewriteHmrDependencies(parsed.modules, replacements);
+        const allModules = { ...serverModules, ...(ssr?.modules ?? {}) };
         const changedModules = {};
-        for (const [id, definition] of Object.entries(parsed.modules)) {
+        for (const [id, definition] of Object.entries(allModules)) {
           const signature = moduleDefinitionSignature(definition);
           if (hmrDefinitions.get(id) === signature) continue;
           hmrDefinitions.set(id, signature);
           changedModules[id] = definition;
         }
-        await hmrRuntime.registerUpdate(changedModules, null, null);
 
-        const entryDefinition = parsed.modules[parsed.bundleConfig.main];
+        const previousBoundaries = new Map((record.route?.boundaries ?? []).map(item => [item.id, item]));
+        const nextBoundaries = new Map(graph.boundaries.map(item => [item.id, item]));
+        const changedBoundaryIds = graph.boundaries
+          .filter(item => JSON.stringify(previousBoundaries.get(item.id)?.exports) !== JSON.stringify(item.exports))
+          .map(item => item.id);
+        const removedBoundaryIds = [...previousBoundaries.keys()].filter(id => {
+          if (nextBoundaries.has(id)) return false;
+          return !routeRecords.some(other => other !== record && other.route?.boundaries?.some(item => item.id === id));
+        });
+        const manifestDeletes = [...new Set([...changedBoundaryIds.filter(id => previousBoundaries.has(id)), ...removedBoundaryIds])];
+        if (manifestDeletes.length > 0) {
+          deleteComponentManifests(manifestDeletes);
+          await hmrRuntime.registerUpdate({}, null, manifestDeletes);
+        }
+        addComponentManifests(graph.boundaries);
+        await hmrRuntime.registerUpdate(changedModules, changedBoundaryIds, null);
+
+        const entryDefinition = serverModules[parsed.bundleConfig.main];
         const [serverId, pageId, ...layoutIds] = moduleDependencyIds(entryDefinition);
         if (!serverId || !pageId) throw new TypeError("Bake's HMR route bundle is missing framework modules");
         const route = {
           clientModules: client.modules,
+          boundaries: graph.boundaries,
           css: styles,
           matched,
           router,
-          serverModules: parsed.modules,
+          serverModules: allModules,
           hmrArgs: {
             routerTypeMain: serverId,
             routeModules: [pageId, ...layoutIds],
@@ -1238,6 +1448,7 @@ function createFrameworkDispatcher(config) {
       }
       return {
         clientModules: null,
+        boundaries: graph.boundaries,
         css: styles,
         matched,
         router,
@@ -1326,6 +1537,15 @@ function createFrameworkDispatcher(config) {
         { headers: { "content-type": "text/javascript; charset=utf-8" } },
       );
     }
+    const staticFile = staticRouterFile(staticRouters, pathname);
+    if (staticFile !== null) {
+      return new Response(readFileSync(staticFile), {
+        headers: {
+          "cache-control": "no-cache",
+          "content-type": contentTypeForStaticFile(staticFile),
+        },
+      });
+    }
     const found = matchFrameworkRoute(request.url, request.url);
     if (found === null) return new Response("Not Found", { status: 404 });
     const { page } = routeFiles(found.matched.route);
@@ -1365,6 +1585,7 @@ function createFrameworkDispatcher(config) {
     routeRecordByPage.clear();
     wrapperPaths.clear();
     clientWrapperPaths.clear();
+    ssrWrapperPaths.clear();
     routers = createRouters();
   };
   dispatchFrameworkRequest.update = async (changedPaths = []) => {
@@ -1733,161 +1954,16 @@ function trackLifecycle(server) {
   return server;
 }
 
-function productionPageFiles(root) {
-  const files = [];
-  const visit = directory => {
-    let entries;
-    try {
-      entries = readdirSync(directory, { withFileTypes: true });
-    } catch (error) {
-      if (error?.code === "ENOENT") return;
-      throw error;
-    }
-    for (const entry of entries) {
-      const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        visit(absolute);
-      } else if (entry.isFile() && /\.(?:[cm]?[jt]sx?)$/i.test(entry.name)) {
-        files.push(absolute);
-      }
-    }
-  };
-  visit(root);
-  return files.sort();
-}
-
-function resolveProductionImport(importer, specifier) {
-  if (!specifier.startsWith(".") && !specifier.startsWith("/")) return null;
-  const base = specifier.startsWith("/") ? specifier : path.resolve(path.dirname(importer), specifier);
-  const candidates = [
-    base,
-    ...[".tsx", ".ts", ".jsx", ".js", ".mts", ".mjs", ".cts", ".cjs"].map(extension => base + extension),
-    ...[".tsx", ".ts", ".jsx", ".js"].map(extension => path.join(base, `index${extension}`)),
-  ];
-  for (const candidate of candidates) {
-    try {
-      if (statSync(candidate).isFile()) return candidate;
-    } catch {}
-  }
-  return null;
-}
-
-function productionClientEntries(page) {
-  const clients = new Set();
-  const visited = new Set();
-  const visit = filename => {
-    filename = path.resolve(filename);
-    if (visited.has(filename)) return;
-    visited.add(filename);
-    let source;
-    try {
-      source = readFileSync(filename, "utf8");
-    } catch {
-      return;
-    }
-    if (/^\s*["']use client["'];?/m.test(source)) clients.add(filename);
-    const pattern = /(?:import|export)\s+(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g;
-    for (const match of source.matchAll(pattern)) {
-      const resolved = resolveProductionImport(filename, match[1]);
-      if (resolved) visit(resolved);
-    }
-  };
-  visit(page);
-  return [...clients];
-}
-
-function productionRouteInfo(pagesRoot, page) {
-  const relative = path.relative(pagesRoot, page).replaceAll(path.sep, "/").replace(/\.[^.]+$/, "");
-  const segments = relative.split("/");
-  if (segments.at(-1) === "index") segments.pop();
-  const catchAll = segments.findIndex(segment => /^\[\.\.\.[^\]]+\]$/.test(segment));
-  return {
-    segments,
-    catchAll,
-    parameter: catchAll >= 0 ? segments[catchAll].slice(4, -1) : null,
-  };
-}
-
-async function loadProductionPage(page) {
-  const result = await Bun.build({
-    entrypoints: [page],
-    target: "bun",
-    format: "cjs",
-    packages: "external",
-    sourcemap: "inline",
-    inlineImportMetaProperties: true,
-    minify: false,
+export async function buildProductionApp(options = {}) {
+  ensureBakeResponseInstalled();
+  const { AsyncLocalStorage } = globalThis.require("node:async_hooks");
+  const storage = new AsyncLocalStorage();
+  setBakeResponseAsyncLocalStorage(storage);
+  return buildBakeProduction(options, {
+    runWithResponseContext(streaming, callback) {
+      return storage.run({ responseOptions: {}, streaming: Boolean(streaming) }, callback);
+    },
   });
-  const artifact = result.outputs.find(output => output.kind === "entry-point") ?? result.outputs[0];
-  if (!artifact) throw new Error(`Bake production build did not emit ${page}`);
-  return executeCommonJSArtifact(await artifact.text(), page);
-}
-
-async function productionClientScripts(entries, outdir) {
-  if (entries.length === 0) return [];
-  const result = await Bun.build({
-    entrypoints: entries,
-    target: "browser",
-    format: "esm",
-    outdir,
-    minify: false,
-    naming: { entry: "[hash].[ext]" },
-  });
-  return result.outputs
-    .filter(output => output.kind === "entry-point" && ["js", "jsx", "ts", "tsx"].includes(output.loader))
-    .map(output => `/_bun/${path.basename(output.path)}`);
-}
-
-function productionDocument(markup, scripts) {
-  const tags = scripts.map(source => `<script type="module" src="${source}"></script>`).join("");
-  return `<!DOCTYPE html>${markup}${tags}`;
-}
-
-export async function buildProductionApp({ outdir = "dist" } = {}) {
-  const projectRoot = globalThis.process?.cwd?.() ?? ".";
-  const pagesRoot = path.join(projectRoot, "pages");
-  const outputRoot = path.resolve(projectRoot, outdir);
-  const clientRoot = path.join(outputRoot, "_bun");
-  mkdirSync(clientRoot, { recursive: true });
-
-  const reactModule = globalThis.require("react");
-  const React = reactModule.default ?? reactModule;
-  const { renderToStaticMarkup } = globalThis.require("react-dom/server");
-  for (const page of productionPageFiles(pagesRoot)) {
-    const source = readFileSync(page, "utf8");
-    if (!/^\s*["']use client["'];?/m.test(source) &&
-        /\bimport\s*\{[^}]*\buseState\b[^}]*\}\s*from\s*["']react["']/.test(source)) {
-      throw new Error(
-        '"useState" is not available in a server component. If you need interactivity, consider converting part of this to a Client Component (by adding `"use client";` to the top of the file).',
-      );
-    }
-
-    const pageModule = await loadProductionPage(page);
-    const Page = pageModule.default ?? pageModule;
-    if (typeof Page !== "function") continue;
-    const route = productionRouteInfo(pagesRoot, page);
-    let variants = [{ params: {} }];
-    if (route.catchAll >= 0 && typeof pageModule.getStaticPaths === "function") {
-      const paths = await pageModule.getStaticPaths();
-      variants = Array.isArray(paths?.paths) ? paths.paths : [];
-    }
-
-    const clients = productionClientEntries(page);
-    const scripts = await productionClientScripts(clients, clientRoot);
-    for (const variant of variants) {
-      const params = variant?.params ?? {};
-      const segments = [...route.segments];
-      if (route.catchAll >= 0) {
-        const value = params[route.parameter];
-        const replacement = Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)];
-        segments.splice(route.catchAll, 1, ...replacement);
-      }
-      const destination = path.join(outputRoot, ...segments, "index.html");
-      mkdirSync(path.dirname(destination), { recursive: true });
-      const markup = renderToStaticMarkup(React.createElement(Page, { params }));
-      writeFileSync(destination, productionDocument(markup, scripts));
-    }
-  }
 }
 
 Object.defineProperty(globalThis, Symbol.for("cottontail.internal.buildBakeProduction"), {

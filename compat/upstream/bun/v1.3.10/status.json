@@ -63,6 +63,13 @@
       "reason": "Serially confirmed after unclassified discovery: Unicode script names and arguments pass both copied upstream cases with two assertions."
     },
     {
+      "pattern": "^test/cli/run/sql-preconnect\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied SQL preconnect fixture passes both local-loopback cases: startup connects when DATABASE_URL and --sql-preconnect are present and does not connect without the flag (4 assertions).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 30000
+    },
+    {
       "pattern": "^test/cli/bunfig-test-options\\.test\\.ts$",
       "status": "enabled",
       "reason": "Bunfig test randomization, seeded ordering, invalid seed combinations, rerunEach, and combined test options pass all five copied cases; subprocess-heavy stock-JSC startup requires a larger per-case budget.",
@@ -102,6 +109,11 @@
       "reason": "The copied PGlite fixture loads through the integrated PostgreSQL/Node compatibility runtime and completes a real embedded SQL query (one case, 16 assertions); initialization requires a larger stock-JSC budget.",
       "args": ["--timeout=30000"],
       "timeoutMs": 60000
+    },
+    {
+      "pattern": "^test/js/third_party/(?:grpc-js/test-(?:channel-credentials|server)|pnpm/pnpm)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "The copied gRPC credentials/server and pnpm fixtures pass with HTTP/2 TLS controls, package binary resolution, symlinked .bin entries, and native process behavior (60 cases)."
     },
     {
       "pattern": "^test/js/bun/.*\\.test\\.(?:js|mjs|cjs|ts|tsx|mts|cts)$",
@@ -218,6 +230,13 @@
       "pattern": "^test/regression/issue/(?:24593|26125|26225|5344)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Exact copied regressions pass under the integrated runtime: compressed WebSocket publish, mTLS client-certificate switching, node-fetch form-data streams, and split re-export linking (11 cases, 52 assertions)."
+    },
+    {
+      "pattern": "^test/regression/issue/(?:27428|3613)\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Exact copied regressions pass with deterministic HTTP parser shutdown, async-context-safe responses, and ws handleProtocols selection and fallback behavior (4 cases).",
+      "args": ["--timeout=10000"],
+      "timeoutMs": 45000
     },
     {
       "pattern": "^test/regression/issue/24385\\.test\\.ts$",

@@ -366,6 +366,7 @@ fn configureJsc(step: *std.Build.Step.Compile, b: *std.Build) void {
     step.root_module.addCSourceFiles(.{
         .root = b.path("."),
         .files = &.{
+            "src/signal_forwarding.c",
             "src/jsc_runner.c",
             "src/native_bindings/registry.c",
             "src/native_bindings/runtime.c",

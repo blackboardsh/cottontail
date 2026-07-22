@@ -1625,7 +1625,8 @@ fn compileStandaloneSourceWithContext(
 ) !StandaloneSource {
     const empty_args: [0][:0]const u8 = .{};
     var standalone_options = build_options;
-    standalone_options.public_path = "";
+    standalone_options.compile = true;
+    standalone_options.public_path = standaloneVirtualRoot();
     standalone_options.entry_naming = "index.js";
     if (standalone_options.source_map != .none) standalone_options.source_map = .linked;
     var graph: native_bundler.BundleGraphOutput = undefined;
@@ -1983,8 +1984,11 @@ fn standaloneVirtualPath(
 ) ![]const u8 {
     const trimmed = try standaloneGraphOutputPath(ctx, output_path);
 
-    const root = if (builtin.os.tag == .windows) "B:/~BUN/root/" else "/$bunfs/root/";
-    return try std.mem.concat(ctx.allocator, u8, &.{ root, trimmed });
+    return try std.mem.concat(ctx.allocator, u8, &.{ standaloneVirtualRoot(), trimmed });
+}
+
+fn standaloneVirtualRoot() []const u8 {
+    return if (builtin.os.tag == .windows) "B:/~BUN/root/" else "/$bunfs/root/";
 }
 
 fn serializeStandaloneGraph(
@@ -3911,7 +3915,7 @@ fn bundleScriptNative(
     const script_entry_abs = if (is_wasm_entrypoint)
         script_abs
     else
-        try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir);
+        try writeBunCompatTransformedSource(ctx, script_abs, source_base_dir, standalone_compile);
     defer cleanupGeneratedSource(ctx, script_entry_abs, script_abs);
     const script_identity_abs = if (is_wasm_entrypoint)
         script_abs
@@ -6252,6 +6256,7 @@ fn writeBunCompatTransformedSource(
     ctx: *const Context,
     script_abs: []const u8,
     source_base_dir: ?[]const u8,
+    preserve_static_html_imports: bool,
 ) anyerror![]const u8 {
     const source = std.Io.Dir.cwd().readFileAlloc(
         ctx.io,
@@ -6271,7 +6276,7 @@ fn writeBunCompatTransformedSource(
         changed = true;
     }
     if (isTestAggregateEntrypointPath(script_abs)) {
-        if (try rewriteTestAggregateImports(ctx, transformed_source)) |transformed| {
+        if (try rewriteTestAggregateImports(ctx, transformed_source, preserve_static_html_imports)) |transformed| {
             transformed_source = transformed;
             changed = true;
         }
@@ -6324,7 +6329,13 @@ fn writeBunCompatTransformedSource(
         transformed_source = transformed;
         changed = true;
     }
-    if (try rewriteQueryImports(ctx, transformed_source, resolution_dir, transpilerLoaderForPath(script_abs))) |transformed| {
+    if (try rewriteQueryImports(
+        ctx,
+        transformed_source,
+        resolution_dir,
+        transpilerLoaderForPath(script_abs),
+        preserve_static_html_imports,
+    )) |transformed| {
         transformed_source = transformed;
         changed = true;
     }
@@ -6374,7 +6385,11 @@ fn writeBunCompatTransformedSource(
     return generated_path;
 }
 
-fn rewriteTestAggregateImports(ctx: *const Context, source: []const u8) anyerror!?[]u8 {
+fn rewriteTestAggregateImports(
+    ctx: *const Context,
+    source: []const u8,
+    preserve_static_html_imports: bool,
+) anyerror!?[]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(ctx.allocator);
     var generated_paths: std.ArrayList([]const u8) = .empty;
@@ -6406,7 +6421,12 @@ fn rewriteTestAggregateImports(ctx: *const Context, source: []const u8) anyerror
             continue;
         }
 
-        const transformed_path = try writeBunCompatTransformedSource(ctx, specifier, null);
+        const transformed_path = try writeBunCompatTransformedSource(
+            ctx,
+            specifier,
+            null,
+            preserve_static_html_imports,
+        );
         if (std.mem.eql(u8, transformed_path, specifier)) {
             cursor = quote_end;
             continue;
@@ -6852,6 +6872,7 @@ fn scanDynamicImports(
     targets: *std.ArrayList(DynamicImportTarget),
     rewrite_standard_imports: bool,
     source_loader: ?[]const u8,
+    preserve_static_html_imports: bool,
 ) !bool {
     var has_custom_signal = false;
     const uses_module_mock = std.mem.indexOf(u8, source, "mock.module(") != null or
@@ -7070,6 +7091,13 @@ fn scanDynamicImports(
                 if (target_path) |path| inferredLoaderForTarget(path) else inferredLoaderForImportSpecifier(prefix)
             else
                 null;
+            if (preserve_static_html_imports and
+                inferred_loader != null and
+                std.mem.eql(u8, inferred_loader.?, "html"))
+            {
+                cursor = semicolon + 1;
+                continue;
+            }
             const needs_compat_resolution = target_path != null and prefix_loader != null and
                 std.mem.eql(u8, prefix_loader.?, "file") and inferred_loader == null;
             const import_clause = source[cursor + "import".len .. specifier_start];
@@ -7258,7 +7286,7 @@ fn rewriteTranspiledDynamicImports(
     defer occurrences.deinit(ctx.allocator);
     var targets: std.ArrayList(DynamicImportTarget) = .empty;
     defer targets.deinit(ctx.allocator);
-    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets, true, null);
+    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets, true, null, false);
 
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(ctx.allocator);
@@ -7750,10 +7778,20 @@ fn rewriteQueryImports(
     source: []const u8,
     resolution_dir: []const u8,
     source_loader: ?[]const u8,
+    preserve_static_html_imports: bool,
 ) !?[]u8 {
     var occurrences: std.ArrayList(DynamicImportOccurrence) = .empty;
     var targets: std.ArrayList(DynamicImportTarget) = .empty;
-    _ = try scanDynamicImports(ctx, source, resolution_dir, &occurrences, &targets, false, source_loader);
+    _ = try scanDynamicImports(
+        ctx,
+        source,
+        resolution_dir,
+        &occurrences,
+        &targets,
+        false,
+        source_loader,
+        preserve_static_html_imports,
+    );
     if (occurrences.items.len == 0) return null;
 
     var output: std.ArrayList(u8) = .empty;

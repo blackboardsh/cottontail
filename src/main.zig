@@ -13,6 +13,7 @@ const package_manager_cli = @import("package_manager_cli.zig");
 const package_manager_create = @import("package_manager_create.zig");
 const cli_script_command = @import("cli_script_command.zig");
 const repl = @import("repl.zig");
+const signal_forwarding = @import("signal_forwarding.zig");
 const cottontail_transpiler = @import("cottontail_transpiler.zig");
 const completions = @import("completions.zig");
 const native_bindings = @import("native_bindings.zig");
@@ -733,6 +734,8 @@ fn runAncestorBin(
     const argv = try allocator.alloc([]const u8, args.len + 1);
     argv[0] = executable;
     for (args, 0..) |arg, index| argv[index + 1] = arg;
+    var signal_scope = signal_forwarding.Scope.begin();
+    defer signal_scope.deinit();
     var child = try std.process.spawn(init.io, .{
         .argv = argv,
         .environ_map = &env,
@@ -742,7 +745,7 @@ fn runAncestorBin(
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    return childExitCode(try child.wait(init.io));
+    return signal_scope.waitAndPropagate(init.io, &child);
 }
 
 fn shellEscapeArg(allocator: std.mem.Allocator, arg: []const u8) ![]const u8 {
@@ -793,6 +796,8 @@ fn runOnePackageScript(
         &.{ "cmd.exe", "/d", "/s", "/c", rewritten_command }
     else
         &.{ "/bin/sh", "-c", rewritten_command };
+    var signal_scope = signal_forwarding.Scope.begin();
+    defer signal_scope.deinit();
     var child = try std.process.spawn(init.io, .{
         .argv = shell_args,
         .cwd = .{ .path = dir },
@@ -803,7 +808,7 @@ fn runOnePackageScript(
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    return childExitCode(try child.wait(init.io));
+    return signal_scope.waitAndPropagate(init.io, &child);
 }
 
 fn runPackageScripts(
@@ -1712,6 +1717,8 @@ fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_a
     for (script_args, 0..) |arg, index| {
         argv[index + 2] = arg;
     }
+    var signal_scope = signal_forwarding.Scope.begin();
+    defer signal_scope.deinit();
     var child = try std.process.spawn(init.io, .{
         .argv = argv,
         .stdin = .inherit,
@@ -1720,7 +1727,7 @@ fn runBunShellScript(init: std.process.Init, script_path: [:0]const u8, script_a
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    return childExitCode(try child.wait(init.io));
+    return signal_scope.waitAndPropagate(init.io, &child);
 }
 
 fn appendJavaScriptStringLiteral(
@@ -1859,6 +1866,8 @@ fn runMultipleTestFilesWithBail(
             child_args[child_index] = arg;
             child_index += 1;
         }
+        var signal_scope = signal_forwarding.Scope.begin();
+        defer signal_scope.deinit();
         var child = try std.process.spawn(init.io, .{
             .argv = child_args,
             .environ_map = init.environ_map,
@@ -1868,7 +1877,7 @@ fn runMultipleTestFilesWithBail(
             .create_no_window = true,
         });
         defer child.kill(init.io);
-        const code = childExitCode(try child.wait(init.io));
+        const code = try signal_scope.waitAndPropagate(init.io, &child);
         executed_files += 1;
         if (code != 0) {
             exit_code = code;
@@ -2140,6 +2149,8 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         child_args[child_index] = arg;
         child_index += 1;
     }
+    var signal_scope = signal_forwarding.Scope.begin();
+    defer signal_scope.deinit();
     var child = try std.process.spawn(init.io, .{
         .argv = child_args,
         .environ_map = init.environ_map,
@@ -2149,7 +2160,7 @@ fn runMultipleTestFiles(init: std.process.Init, args: []const [:0]const u8) !?u8
         .create_no_window = true,
     });
     defer child.kill(init.io);
-    return childExitCode(try child.wait(init.io));
+    return try signal_scope.waitAndPropagate(init.io, &child);
 }
 
 fn testBailLimit(args: []const [:0]const u8) ?usize {
