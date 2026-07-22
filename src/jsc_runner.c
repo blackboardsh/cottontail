@@ -1403,7 +1403,10 @@ typedef struct CtHttpServer {
     uint16_t port;
     char *hostname;
     char *unix_path;
+    bool stopping;
     bool stopped;
+    bool listen_fd_closed;
+    bool thread_joined;
     pthread_t thread;
     pthread_mutex_t mutex;
     pthread_cond_t clients_cond;
@@ -2022,6 +2025,22 @@ static bool ct_http_server_is_stopped(CtHttpServer *server) {
     stopped = server->stopped;
     pthread_mutex_unlock(&server->mutex);
     return stopped;
+}
+
+static bool ct_http_server_is_accepting(CtHttpServer *server) {
+    bool accepting = false;
+    pthread_mutex_lock(&server->mutex);
+    accepting = !server->stopping && !server->stopped;
+    pthread_mutex_unlock(&server->mutex);
+    return accepting;
+}
+
+static bool ct_http_server_is_stopping(CtHttpServer *server) {
+    bool stopping = false;
+    pthread_mutex_lock(&server->mutex);
+    stopping = server->stopping;
+    pthread_mutex_unlock(&server->mutex);
+    return stopping;
 }
 
 static const char *ct_http_reason_phrase(int status) {
@@ -2659,7 +2678,7 @@ static ssize_t ct_http_send_chunk(CtHttpRequest *request, const uint8_t *data, s
 
 static bool ct_http_server_track_request(CtHttpServer *server, CtHttpRequest *request) {
     pthread_mutex_lock(&server->mutex);
-    if (server->stopped) {
+    if (server->stopping || server->stopped) {
         pthread_mutex_unlock(&server->mutex);
         return false;
     }
@@ -2712,7 +2731,7 @@ static void *ct_http_client_thread(void *opaque) {
 
         if (ct_http_server_is_stopped(server)) break;
         if (!request->response_streaming) ct_http_send_response(request);
-        if (!request->keep_alive) break;
+        if (!request->keep_alive || ct_http_server_is_stopping(server)) break;
 
         pthread_mutex_lock(&ct_http_servers_mutex);
         uint32_t next_request_id = ct_next_http_request_id++;
@@ -2733,11 +2752,11 @@ static void *ct_http_client_thread(void *opaque) {
 
 static void *ct_http_server_thread(void *opaque) {
     CtHttpServer *server = (CtHttpServer *)opaque;
-    while (!ct_http_server_is_stopped(server)) {
+    while (ct_http_server_is_accepting(server)) {
         int client_fd = accept(server->listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            if (ct_http_server_is_stopped(server)) break;
+            if (!ct_http_server_is_accepting(server)) break;
             continue;
         }
         int no_delay = 1;
@@ -22076,28 +22095,57 @@ static JSValueRef ct_http_server_response_abort(JSContextRef ctx, JSObjectRef fu
     return JSValueMakeUndefined(ctx);
 }
 
-static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_list) {
+static void ct_http_server_stop_accepting(CtHttpServer *server) {
     if (server == NULL) return;
+
+    bool should_join = false;
     pthread_mutex_lock(&server->mutex);
-    if (!server->stopped) {
-        server->stopped = true;
+    if (!server->stopping) {
+        server->stopping = true;
+    }
+    if (!server->listen_fd_closed) {
+        server->listen_fd_closed = true;
         shutdown(server->listen_fd, SHUT_RDWR);
         close(server->listen_fd);
         CtHttpRequest *request = server->requests;
         while (request != NULL) {
-            shutdown(request->client_fd, SHUT_RDWR);
-            pthread_mutex_lock(&request->mutex);
-            request->completed = true;
-            pthread_cond_signal(&request->cond);
-            pthread_mutex_unlock(&request->mutex);
+            request->keep_alive = false;
+            if (!request->ready) shutdown(request->client_fd, SHUT_RDWR);
             request = request->next;
         }
     }
+    if (!server->thread_joined) {
+        server->thread_joined = true;
+        should_join = true;
+    }
     pthread_mutex_unlock(&server->mutex);
-    pthread_join(server->thread, NULL);
+    if (should_join) pthread_join(server->thread, NULL);
+}
+
+static void ct_http_stop_server(CtHttpServer *server, bool remove_from_global_list, bool abrupt) {
+    if (server == NULL) return;
+    ct_http_server_stop_accepting(server);
+
+    if (abrupt) {
+        pthread_mutex_lock(&server->mutex);
+        if (!server->stopped) {
+            server->stopped = true;
+            CtHttpRequest *request = server->requests;
+            while (request != NULL) {
+                shutdown(request->client_fd, SHUT_RDWR);
+                pthread_mutex_lock(&request->mutex);
+                request->completed = true;
+                pthread_cond_signal(&request->cond);
+                pthread_mutex_unlock(&request->mutex);
+                request = request->next;
+            }
+        }
+        pthread_mutex_unlock(&server->mutex);
+    }
 
     pthread_mutex_lock(&server->mutex);
     while (server->active_clients > 0) pthread_cond_wait(&server->clients_cond, &server->mutex);
+    server->stopped = true;
     pthread_mutex_unlock(&server->mutex);
 
     if (remove_from_global_list) {
@@ -22132,10 +22180,70 @@ static JSValueRef ct_http_server_stop(JSContextRef ctx, JSObjectRef function, JS
     (void)exception;
     if (argc < 1) return JSValueMakeUndefined(ctx);
     uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool abrupt = argc < 2 || JSValueToBoolean(ctx, argv[1]);
     pthread_mutex_lock(&ct_http_servers_mutex);
     CtHttpServer *server = ct_http_find_server(server_id);
     pthread_mutex_unlock(&ct_http_servers_mutex);
-    if (server != NULL) ct_http_stop_server(server, true);
+    if (server != NULL) ct_http_stop_server(server, true, abrupt);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_http_server_stop_listening(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server != NULL) ct_http_server_stop_accepting(server);
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef ct_http_server_status(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    if (argc < 1) return JSValueMakeNull(ctx);
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) pthread_mutex_lock(&server->mutex);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) return JSValueMakeNull(ctx);
+
+    size_t ready_requests = 0;
+    CtHttpRequest *request = server->requests;
+    while (request != NULL) {
+        if (request->ready) ready_requests += 1;
+        request = request->next;
+    }
+    JSObjectRef result = ct_make_object(ctx);
+    ct_set_property(ctx, result, "activeClients", JSValueMakeNumber(ctx, (double)server->active_clients), exception);
+    ct_set_property(ctx, result, "readyRequests", JSValueMakeNumber(ctx, (double)ready_requests), exception);
+    ct_set_property(ctx, result, "stopping", JSValueMakeBoolean(ctx, server->stopping), exception);
+    pthread_mutex_unlock(&server->mutex);
+    return result;
+}
+
+static JSValueRef ct_http_server_close_idle(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+    uint32_t server_id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    pthread_mutex_lock(&ct_http_servers_mutex);
+    CtHttpServer *server = ct_http_find_server(server_id);
+    if (server != NULL) pthread_mutex_lock(&server->mutex);
+    pthread_mutex_unlock(&ct_http_servers_mutex);
+    if (server == NULL) return JSValueMakeUndefined(ctx);
+
+    CtHttpRequest *request = server->requests;
+    while (request != NULL) {
+        if (!request->ready) shutdown(request->client_fd, SHUT_RDWR);
+        request = request->next;
+    }
+    pthread_mutex_unlock(&server->mutex);
     return JSValueMakeUndefined(ctx);
 }
 
@@ -23459,7 +23567,7 @@ void ct_jsc_runtime_destroy(CtJscRuntime *runtime) {
     pthread_mutex_unlock(&ct_http_servers_mutex);
     while (servers != NULL) {
         CtHttpServer *next = servers->next;
-        ct_http_stop_server(servers, false);
+        ct_http_stop_server(servers, false, true);
         servers = next;
     }
 

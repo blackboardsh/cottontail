@@ -120,6 +120,180 @@ test("force-stopping an in-process server rejects the active fetch", async () =>
       error = caught;
     }
     expect(error?.code).toBe("ECONNRESET");
+    expect(server.pendingRequests).toBe(0);
+  }
+});
+
+test("graceful stop tracks an in-process fetch as pending", async () => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch() {
+      started.resolve();
+      await release.promise;
+      return new Response("complete");
+    },
+  });
+
+  try {
+    const response = fetch(server.url);
+    await started.promise;
+    expect(server.pendingRequests).toBe(1);
+
+    let stopResolved = false;
+    const stopped = server.stop();
+    stopped.then(() => { stopResolved = true; });
+    await Bun.sleep(10);
+    expect(stopResolved).toBe(false);
+
+    release.resolve();
+    expect(await response.then(result => result.text())).toBe("complete");
+    await stopped;
+    expect(server.pendingRequests).toBe(0);
+  } finally {
+    release.resolve();
+    await server.stop(true);
+  }
+});
+
+test("Bun.serve graceful stop waits for in-flight native and Node-backed requests", async () => {
+  for (const nodeBacked of [false, true]) {
+    const started = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      ...(nodeBacked ? { websocket: { message() {} } } : {}),
+      async fetch() {
+        started.resolve();
+        await release.promise;
+        return new Response(nodeBacked ? "node-backed" : "native", {
+          headers: { connection: "close" },
+        });
+      },
+    });
+
+    try {
+      expect(server.protocol).toBe("http");
+      expect(server.address).toEqual({
+        address: "127.0.0.1",
+        family: "IPv4",
+        port: server.port,
+      });
+
+      const response = getNativeHttpText(server.url);
+      await started.promise;
+      expect(server.pendingRequests).toBe(1);
+
+      let stopResolved = false;
+      const stopped = server.stop();
+      expect(server.stop()).toBe(stopped);
+      stopped.then(() => { stopResolved = true; });
+      await Bun.sleep(10);
+      expect(stopResolved).toBe(false);
+
+      release.resolve();
+      expect(await response).toBe(nodeBacked ? "node-backed" : "native");
+      await stopped;
+      expect(server.pendingRequests).toBe(0);
+    } finally {
+      release.resolve();
+      await server.stop(true);
+    }
+  }
+});
+
+test("Bun.serve force stop aborts native and Node-backed requests", async () => {
+  for (const nodeBacked of [false, true]) {
+    const started = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      ...(nodeBacked ? { websocket: { message() {} } } : {}),
+      async fetch() {
+        started.resolve();
+        await release.promise;
+        return new Response("too late");
+      },
+    });
+
+    const requestError = getNativeHttpText(server.url).then(
+      () => null,
+      error => error,
+    );
+    try {
+      await started.promise;
+      expect(server.pendingRequests).toBe(1);
+      await server.stop(true);
+      expect(server.pendingRequests).toBe(0);
+      expect(await requestError).toBeInstanceOf(Error);
+    } finally {
+      release.resolve();
+      await server.stop(true);
+    }
+  }
+});
+
+test("Bun.serve closeIdleConnections retires idle native and Node-backed sockets", async () => {
+  for (const nodeBacked of [false, true]) {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      ...(nodeBacked ? { websocket: { message() {} } } : {}),
+      fetch: () => new Response("ok"),
+    });
+    const socket = net.connect(server.port, server.hostname);
+    socket.on("error", () => {});
+    try {
+      await once(socket, "connect");
+      await Bun.sleep(10);
+      const closed = once(socket, "close");
+      server.closeIdleConnections();
+      await closed;
+    } finally {
+      socket.destroy();
+      await server.stop(true);
+    }
+  }
+});
+
+test("Bun.serve graceful stop waits for upgraded WebSockets", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, activeServer) {
+      if (activeServer.upgrade(request)) return;
+      return new Response("upgrade required", { status: 426 });
+    },
+    websocket: {
+      message() {},
+    },
+  });
+  const client = new WebSocket(server.url.href.replace(/^http/, "ws"));
+  try {
+    await new Promise((resolve, reject) => {
+      client.addEventListener("open", resolve, { once: true });
+      client.addEventListener("error", reject, { once: true });
+    });
+    expect(server.pendingWebSockets).toBe(1);
+
+    let stopResolved = false;
+    const stopped = server.stop();
+    stopped.then(() => { stopResolved = true; });
+    await Bun.sleep(10);
+    expect(stopResolved).toBe(false);
+
+    const closed = new Promise(resolve => client.addEventListener("close", resolve, { once: true }));
+    client.close();
+    await closed;
+    await stopped;
+    expect(server.pendingWebSockets).toBe(0);
+  } finally {
+    client.close();
+    await server.stop(true);
   }
 });
 

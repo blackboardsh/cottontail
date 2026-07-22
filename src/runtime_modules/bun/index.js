@@ -6691,7 +6691,91 @@ function formatInspectBodyByteSize(size, emptyAsKilobytes) {
 const activeServeOrigins = globalThis.__cottontailActiveServeOrigins ??= new Map();
 const activeServeDispatches = globalThis.__cottontailActiveServeDispatches ??= new WeakMap();
 const activeServeAbortControllers = globalThis.__cottontailActiveServeAbortControllers ??= new WeakMap();
+const activeServeLifecycles = globalThis.__cottontailActiveServeLifecycles ??= new WeakMap();
 const activeServeRequestBodyStateSymbol = Symbol("cottontail.activeServeRequestBodyState");
+
+function createServeLifecycle(getPendingWebSockets) {
+  const requests = new Set();
+  let pendingRequests = 0;
+  let stopRequested = false;
+  let forceRequested = false;
+  let transportDrained = false;
+  let stopPromise = null;
+  let resolveStop = null;
+  let stopTransport = null;
+  let forceTransport = null;
+
+  const maybeResolveStop = () => {
+    if (!stopRequested || !transportDrained || pendingRequests !== 0 || getPendingWebSockets() !== 0) return;
+    resolveStop?.();
+    resolveStop = null;
+  };
+
+  const finishRequest = (request) => {
+    if (request == null || request.finished) return;
+    request.finished = true;
+    requests.delete(request);
+    if (pendingRequests > 0) pendingRequests -= 1;
+    maybeResolveStop();
+  };
+
+  const finishForcedRequests = () => {
+    for (const request of Array.from(requests)) {
+      try { request.onForce?.(); } catch {}
+      finishRequest(request);
+    }
+  };
+
+  return {
+    get pendingRequests() {
+      return pendingRequests;
+    },
+    get stopRequested() {
+      return stopRequested;
+    },
+    get forceRequested() {
+      return forceRequested;
+    },
+    configure(stop, force) {
+      stopTransport = stop;
+      forceTransport = force;
+    },
+    beginRequest(onForce = undefined) {
+      const request = { finished: false, onForce };
+      requests.add(request);
+      pendingRequests += 1;
+      return request;
+    },
+    finishRequest,
+    stop(force = false) {
+      const abrupt = force === true;
+      if (stopPromise == null) {
+        stopPromise = new Promise((resolve) => {
+          resolveStop = resolve;
+        });
+      }
+      if (!stopRequested) {
+        stopRequested = true;
+        forceRequested = abrupt;
+        stopTransport?.(abrupt);
+        if (abrupt) finishForcedRequests();
+      } else if (abrupt && !forceRequested) {
+        forceRequested = true;
+        forceTransport?.();
+        finishForcedRequests();
+      }
+      maybeResolveStop();
+      return stopPromise;
+    },
+    markTransportDrained() {
+      transportDrained = true;
+      maybeResolveStop();
+    },
+    notifyWebSocketsChanged() {
+      maybeResolveStop();
+    },
+  };
+}
 
 function abortActiveServeRequests(server) {
   const controllers = activeServeAbortControllers.get(server);
@@ -8621,6 +8705,8 @@ async function fetchFromActiveServer(
   // retain the stable loopback peer identity that its keepalive connection represents.
   serveRequestPeers.set(dispatchRequest, peer);
   const dispatch = activeServeDispatches.get(activeServer);
+  const lifecycle = activeServeLifecycles.get(activeServer);
+  const lifecycleRequest = lifecycle?.beginRequest(() => forceStopController.abort());
   let controllers = activeServeAbortControllers.get(activeServer);
   if (controllers == null) activeServeAbortControllers.set(activeServer, controllers = new Set());
   controllers.add(forceStopController);
@@ -8633,6 +8719,7 @@ async function fetchFromActiveServer(
     await armActiveFetchResponseAbort(response, dispatchSignal);
   } finally {
     controllers.delete(forceStopController);
+    lifecycle?.finishRequest(lifecycleRequest);
   }
   throwIfAborted(request.signal);
   response.url = request.url;
@@ -9939,6 +10026,7 @@ function finalizeServerWebSocket(state, code, reason) {
   unsubscribeServerWebSocketAll(state);
   const server = state.serverState.server;
   if (server && server.pendingWebSockets > 0) server.pendingWebSockets -= 1;
+  state.serverState.lifecycle?.notifyWebSocketsChanged();
   invokeWebSocketHandler(state, "close", state.ws, code, reason);
 }
 
@@ -10148,6 +10236,7 @@ function attachServerWebSocket(serverState, socket, head, data, deflate = null) 
   state.ws = ws;
   serverState.websockets.add(state);
   serverState.server.pendingWebSockets += 1;
+  serverState.lifecycle?.notifyWebSocketsChanged();
 
   const invokeOpen = () => {
     if (state.opened || state.finalized) return;
@@ -10576,7 +10665,6 @@ function serveNodeBacked(options, context) {
   const useTls = tlsConfigs != null;
   const protocol = useTls ? "https:" : "http:";
   let activeOptions = options;
-  let stopped = false;
   let publicUrl = null;
 
   let nodeServer;
@@ -10688,42 +10776,32 @@ function serveNodeBacked(options, context) {
     topics: new Map(),
     websockets: new Set(),
     getWebSocketOptions: () => (activeOptions.websocket && typeof activeOptions.websocket === "object" ? activeOptions.websocket : null),
+    lifecycle: null,
     server: null,
   };
 
-  const server = {
+  let server;
+  const lifecycle = createServeLifecycle(() => Number(server?.pendingWebSockets ?? 0));
+  server = {
     id: options.id ?? `bun-serve-${boundPort || unixPath}`,
     hostname: isUnix ? undefined : boundHostname,
     port: isUnix ? undefined : boundPort,
     address: listenerAddress,
     development: options.development ?? false,
-    pendingRequests: 0,
+    get pendingRequests() {
+      return lifecycle.pendingRequests;
+    },
     pendingWebSockets: 0,
+    protocol: useTls ? "https" : "http",
     get url() {
       publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
       return publicUrl;
     },
     stop(force = false) {
-      if (stopped) return Promise.resolve();
-      stopped = true;
-      for (const origin of originKeys) activeServeOrigins.delete(origin);
-      if (force) {
-        abortActiveServeRequests(server);
-        for (const state of Array.from(serverState.websockets)) {
-          terminateServerWebSocket(state);
-          serverState.websockets.delete(state);
-        }
-      }
-      if (tlsAcceptEventId !== 0) {
-        globalThis.__cottontailFdWatchListeners?.delete?.(tlsAcceptEventId);
-        tlsAcceptEventId = 0;
-      }
-      nodeServer.close();
-      if (force) nodeServer.closeAllConnections?.();
-      return Promise.resolve();
+      return lifecycle.stop(force);
     },
     [Symbol.dispose]() {
-      return server.stop(true);
+      server.stop(true);
     },
     [Symbol.asyncDispose]() {
       return server.stop(true);
@@ -10760,6 +10838,13 @@ function serveNodeBacked(options, context) {
         port: Number(socket.remotePort ?? 0),
         family: String(address).includes(":") ? "IPv6" : "IPv4",
       };
+    },
+    closeIdleConnections() {
+      for (const socket of Array.from(nodeServer._connections ?? [])) {
+        if (socket._httpMessage == null && socket._cottontailBunServeUpgradeActive !== true) {
+          socket.destroy?.();
+        }
+      }
     },
     timeout() {},
     upgrade(request, upgradeOptions = {}) {
@@ -10855,7 +10940,9 @@ function serveNodeBacked(options, context) {
     },
   };
   serverState.server = server;
+  serverState.lifecycle = lifecycle;
   activeServeDispatches.set(server, (input, init) => dispatchServeFetch(activeOptions, server, input, init));
+  activeServeLifecycles.set(server, lifecycle);
 
   for (const origin of originKeys) activeServeOrigins.set(origin, server);
 
@@ -10915,8 +11002,14 @@ function serveNodeBacked(options, context) {
   };
 
   nodeServer.on("request", (message, nodeResponse) => {
-    server.pendingRequests += 1;
     const { request, controller } = requestFromNodeIncoming(message, protocol, fallbackHost);
+    const lifecycleRequest = lifecycle.beginRequest(() => {
+      try { controller.abort(); } catch {}
+      try { message.socket?.destroy?.(); } catch {}
+    });
+    const finalize = () => {
+      lifecycle.finishRequest(lifecycleRequest);
+    };
     const prepareResponse = (response) => {
       const requestBody = request._body;
       // COTTONTAIL-COMPAT: Bun.serve drains an unread upload after the handler
@@ -10951,13 +11044,11 @@ function serveNodeBacked(options, context) {
         if (!nodeResponse.writableEnded) {
           try { controller.abort(); } catch {}
         }
+        finalize();
       };
       socket.once("close", onSocketClose);
       nodeResponse.once("finish", () => socket.off?.("close", onSocketClose));
     }
-    const finalize = () => {
-      server.pendingRequests -= 1;
-    };
     let handled;
     try {
       handled = runServeHandler(activeOptions, request, server);
@@ -10983,15 +11074,21 @@ function serveNodeBacked(options, context) {
     // whose fetch handler still needs to write its response.
     socket._cottontailBunServeUpgradeActive = true;
     const { request } = requestFromNodeIncoming(message, protocol, fallbackHost, true);
+    const lifecycleRequest = lifecycle.beginRequest(() => {
+      try { socket.destroy?.(); } catch {}
+    });
+    const finalize = () => lifecycle.finishRequest(lifecycleRequest);
     serveUpgradeContexts.set(request, { socket, head, used: false });
     serveRequestSockets.set(request, socket);
     socket.on("error", () => {});
+    socket.once("close", finalize);
     let result;
     try {
       result = runServeHandler(activeOptions, request, server);
     } catch (error) {
       reportServeHandlerError(error);
       socket.destroy?.();
+      finalize();
       return;
     }
     Promise.resolve(result).then(
@@ -11022,8 +11119,38 @@ function serveNodeBacked(options, context) {
         reportServeHandlerError(error);
         socket.destroy?.();
       },
-    );
+    ).then(finalize, finalize);
   });
+
+  let nodeTransportClosing = false;
+  const stopNodeTransport = (force) => {
+    for (const origin of originKeys) activeServeOrigins.delete(origin);
+    if (force) {
+      abortActiveServeRequests(server);
+      for (const state of Array.from(serverState.websockets)) {
+        terminateServerWebSocket(state);
+        serverState.websockets.delete(state);
+      }
+    }
+    if (tlsAcceptEventId !== 0) {
+      globalThis.__cottontailFdWatchListeners?.delete?.(tlsAcceptEventId);
+      tlsAcceptEventId = 0;
+    }
+    if (!nodeTransportClosing) {
+      nodeTransportClosing = true;
+      // https.Server.close() only recognizes an HTTP message as active. Keep
+      // upgraded Bun sockets out of its idle-connection sweep while stopping.
+      for (const socket of Array.from(nodeServer._connections ?? [])) {
+        if (socket._cottontailBunServeUpgradeActive === true && socket._httpMessage == null) {
+          socket._httpMessage = serverState;
+        }
+      }
+      nodeServer.once("close", () => lifecycle.markTransportDrained());
+      nodeServer.close();
+    }
+    if (force) nodeServer.closeAllConnections?.();
+  };
+  lifecycle.configure(stopNodeTransport, () => stopNodeTransport(true));
 
   return server;
 }
@@ -11098,7 +11225,7 @@ export function serve(options) {
     : native.hostname;
   const requestOrigin = isUnix ? "http://localhost" : `http://${nativeDisplayHostname}:${native.port}`;
   let activeOptions = options;
-  let stopped = false;
+  let nativeClosed = false;
   let pumping = false;
   let interval = null;
   let publicUrl = null;
@@ -11108,32 +11235,36 @@ export function serve(options) {
     ...(native.hostname === "0.0.0.0" ? [`http://127.0.0.1:${native.port}`, `http://localhost:${native.port}`] : []),
   ];
 
-  const server = {
+  const nativeRequests = new Map();
+  let server;
+  const lifecycle = createServeLifecycle(() => 0);
+  server = {
     id: options.id ?? native.id,
     hostname: isUnix ? undefined : native.hostname,
     port: isUnix ? undefined : native.port,
-    address: isUnix ? native.address : undefined,
+    address: isUnix ? native.address : {
+      address: native.hostname,
+      family: "IPv4",
+      port: native.port,
+    },
     development: activeOptions.development ?? false,
-    pendingRequests: 0,
+    get pendingRequests() {
+      return lifecycle.pendingRequests;
+    },
     pendingWebSockets: 0,
+    protocol: "http",
     get url() {
       publicUrl ??= new globalThis.URL(isUnix ? serveUnixUrlText(unixPath) : `${requestOrigin}/`);
       return publicUrl;
     },
     stop(force = false) {
-      if (stopped) return;
-      stopped = true;
-      if (force) abortActiveServeRequests(server);
-      if (interval != null) clearInterval(interval);
-      for (const origin of originKeys) activeServeOrigins.delete(origin);
-      cottontail.httpServerStop(native.id);
-      return Promise.resolve();
+      return lifecycle.stop(force);
     },
     [Symbol.dispose]() {
-      server.stop();
+      server.stop(true);
     },
     [Symbol.asyncDispose]() {
-      return server.stop();
+      return server.stop(true);
     },
     reload(nextOptions = {}) {
       registerServeHtmlOptions(activeOptions[serveHtmlStateSymbol], nextOptions);
@@ -11159,6 +11290,9 @@ export function serve(options) {
       const peer = serveRequestPeers.get(request);
       return peer ? { ...peer } : null;
     },
+    closeIdleConnections() {
+      if (!nativeClosed) cottontail.httpServerCloseIdle(native.id);
+    },
     timeout() {},
     upgrade() {
       return false;
@@ -11172,14 +11306,15 @@ export function serve(options) {
   };
 
   activeServeDispatches.set(server, (input, init) => dispatchServeFetch(activeOptions, server, input, init));
+  activeServeLifecycles.set(server, lifecycle);
   for (const origin of originKeys) activeServeOrigins.set(origin, server);
 
   const respond = (item, status, headersText, body) => {
-    if (stopped) return;
+    if (nativeClosed) return;
     try {
       cottontail.httpServerRespond(native.id, item.id, status, headersText, body);
     } catch (error) {
-      if (stopped && String(error).includes("HTTP server not found")) return;
+      if (nativeClosed && String(error).includes("HTTP server not found")) return;
       throw error;
     }
   };
@@ -11196,6 +11331,7 @@ export function serve(options) {
   };
 
   const sendStreamingResponse = async (item, response, status, headers) => {
+    if (nativeClosed) return;
     response._bodyUsed = true;
     cottontail.httpServerResponseStart(native.id, item.id, status, headers);
     try {
@@ -11206,7 +11342,7 @@ export function serve(options) {
       cottontail.httpServerResponseEnd(native.id, item.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!stopped) console.error(`error: ${message}`);
+      if (!nativeClosed) console.error(`error: ${message}`);
       try {
         cottontail.httpServerResponseEnd(native.id, item.id);
       } catch {
@@ -11294,37 +11430,77 @@ export function serve(options) {
     }
   };
 
+  const finishNativeRequest = (item, lifecycleRequest) => {
+    nativeRequests.delete(item.id);
+    lifecycle.finishRequest(lifecycleRequest);
+  };
+
+  const maybeFinishNativeStop = () => {
+    if (!lifecycle.stopRequested || lifecycle.forceRequested || nativeClosed || nativeRequests.size !== 0) return;
+    const status = cottontail.httpServerStatus(native.id);
+    if (status == null || Number(status.activeClients) !== 0) return;
+    nativeClosed = true;
+    if (interval != null) {
+      clearInterval(interval);
+      interval = null;
+    }
+    cottontail.httpServerStop(native.id, false);
+    lifecycle.markTransportDrained();
+  };
+
+  const stopNativeTransport = (force) => {
+    for (const origin of originKeys) activeServeOrigins.delete(origin);
+    if (force) {
+      abortActiveServeRequests(server);
+      nativeClosed = true;
+      if (interval != null) {
+        clearInterval(interval);
+        interval = null;
+      }
+      nativeRequests.clear();
+      cottontail.httpServerStop(native.id, true);
+      lifecycle.markTransportDrained();
+      return;
+    }
+    cottontail.httpServerStopListening(native.id);
+    maybeFinishNativeStop();
+  };
+  lifecycle.configure(stopNativeTransport, () => stopNativeTransport(true));
+
   const pump = () => {
-    if (stopped || pumping) return;
+    if (nativeClosed || pumping) return;
     if (globalThis.__cottontailProcessIpcPending === true) return;
     pumping = true;
     if ((globalThis.__cottontailPollProcessIpc?.() ?? 0) > 0) {
       cottontail.drainJobs?.();
       pumping = false;
+      maybeFinishNativeStop();
       return;
     }
-    while (!stopped && server.pendingRequests < maxConcurrentNativeRequests) {
+    while (!nativeClosed && server.pendingRequests < maxConcurrentNativeRequests) {
       const item = cottontail.httpServerPoll(native.id);
       if (!item) break;
-      server.pendingRequests += 1;
+      const lifecycleRequest = lifecycle.beginRequest();
+      nativeRequests.set(item.id, lifecycleRequest);
       const handled = handle(item);
       if (isPromiseLike(handled)) {
         Promise.resolve(handled).then(
           () => {
-            server.pendingRequests -= 1;
+            finishNativeRequest(item, lifecycleRequest);
             pump();
           },
           (error) => {
             console.error(error instanceof Error ? error.stack || error.message : error);
-            server.pendingRequests -= 1;
+            finishNativeRequest(item, lifecycleRequest);
             pump();
           },
         );
       } else {
-        server.pendingRequests -= 1;
+        finishNativeRequest(item, lifecycleRequest);
       }
     }
     pumping = false;
+    maybeFinishNativeStop();
   };
 
   interval = setInterval(pump, 1);
