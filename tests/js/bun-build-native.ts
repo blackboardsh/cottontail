@@ -131,6 +131,19 @@ assert(keepNamesResult.success, "Bun.build should accept a single string conditi
 const keepNamesSource = await keepNamesResult.outputs[0].text();
 assert(keepNamesSource.includes('"LongFunctionName"'), "minify.keepNames should preserve the original function name");
 
+const inlineImportMetaResult = await Bun.build({
+  entrypoints: ["virtual-inline-import-meta.js"],
+  files: {
+    "virtual-inline-import-meta.js": "export default import.meta.dir;",
+  },
+  target: "bun",
+  inlineImportMetaProperties: true,
+});
+
+assert(inlineImportMetaResult.success, "Bun.build should inline import.meta properties when requested");
+const inlineImportMetaSource = await inlineImportMetaResult.outputs[0].text();
+assert(!inlineImportMetaSource.includes("import.meta.dir"), "inlineImportMetaProperties should replace import.meta.dir");
+
 const nullCommonJSResult = await Bun.build({
   entrypoints: ["virtual-null-entry.js"],
   files: {

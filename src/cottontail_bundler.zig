@@ -2229,6 +2229,7 @@ pub fn buildEntryPointsJson(
     transpiler.options.env.behavior = options.env_behavior;
     transpiler.options.env.prefix = options.env_prefix;
     transpiler.options.bytecode = options.bytecode;
+    transpiler.options.inline_import_meta_properties = options.inline_import_meta_properties;
     transpiler.options.minify_whitespace = options.minify_whitespace;
     transpiler.options.minify_identifiers = options.minify_identifiers;
     transpiler.options.minify_syntax = options.minify_syntax;
