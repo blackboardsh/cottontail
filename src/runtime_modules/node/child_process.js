@@ -1,6 +1,6 @@
 import { EventEmitter } from "./events.js";
 import { Buffer } from "./buffer.js";
-import { deserialize, serialize } from "./v8.js";
+import { deserializeJscValue, serializeJscValue } from "../internal/jsc-value-serialization.js";
 import { Server as NetServer, Socket as NetSocket } from "./net.js";
 import { Readable as ReadableStreamClass, Writable as WritableStreamClass } from "./stream.js";
 import { accessSync, statSync, writeSync, constants as fsConstants } from "./fs.js";
@@ -1133,13 +1133,13 @@ const ipcEnvelopeKey = "__cottontailIpcEnvelope";
 const inheritedNodeIpcSymbol = Symbol.for("cottontail.inheritedNodeIpc");
 
 function encodeIpcMessage(message, mode = "json") {
-  if (mode === "advanced") return `A:${serialize(message).toString("base64")}`;
+  if (mode === "advanced") return `A:${Buffer.from(serializeJscValue(message)).toString("base64")}`;
   return `J:${JSON.stringify(message)}`;
 }
 
 function decodeIpcMessage(payload) {
   const text = String(payload);
-  if (text.startsWith("A:")) return deserialize(Buffer.from(text.slice(2), "base64"));
+  if (text.startsWith("A:")) return deserializeJscValue(Buffer.from(text.slice(2), "base64"));
   if (text.startsWith("J:")) return JSON.parse(text.slice(2));
   return JSON.parse(text);
 }

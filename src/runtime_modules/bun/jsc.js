@@ -154,7 +154,10 @@ export function serialize(value, options = undefined) {
 }
 
 export function deserialize(value) {
-  return v8Deserialize(value);
+  // bun:jsc returns its storage payload in a SharedArrayBuffer. node:v8 keeps
+  // Node's stricter TypedArray/DataView input contract, so use the internal
+  // ArrayBuffer path only for this Bun-facing API.
+  return v8Deserialize(value, { allowArrayBuffer: true });
 }
 
 export function memoryUsage() {
