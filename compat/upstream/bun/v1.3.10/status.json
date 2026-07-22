@@ -243,6 +243,13 @@
       "reason": "Copied upstream regressions pass directly under Cottontail and were independently confirmed at the normal test timeout."
     },
     {
+      "pattern": "^test/regression/issue/26298\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "All three copied standalone bytecode regressions pass with stock JSC, including multi-module execution and the real verbose disk-cache hit diagnostic (15 assertions).",
+      "args": ["--timeout=30000"],
+      "timeoutMs": 120000
+    },
+    {
       "pattern": "^test/regression/issue/(?:04298/04298|09041|14624)\\.test\\.ts$",
       "status": "enabled",
       "reason": "Copied runtime regressions pass directly under Cottontail in the grouped unclassified discovery run."

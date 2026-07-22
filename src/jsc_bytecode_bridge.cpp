@@ -4,6 +4,16 @@
  * archive. They adapt stock JSC APIs; no Bun-patched JSC symbols are used.
  */
 
+// The vendored JSC archive uses WTF's release layouts. They change return ABIs
+// and container field offsets, so this translation unit must match them even
+// when the surrounding Cottontail build is unoptimized.
+#ifndef NDEBUG
+#define NDEBUG 1
+#ifndef RELEASE_WITHOUT_OPTIMIZATIONS
+#define RELEASE_WITHOUT_OPTIMIZATIONS 1
+#endif
+#endif
+
 #include <JavaScriptCore/JSContextRef.h>
 #include <JavaScriptCore/JSStringRef.h>
 #include <JavaScriptCore/JSValueRef.h>
@@ -17,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <type_traits>
 #include <utility>
 
 #include <wtf/FastMalloc.h>
@@ -70,11 +81,6 @@ struct OpaqueJSString {
 
 namespace JSC {
 
-class CacheUpdate {
-    // Vector has no inline capacity here. Its element shape is irrelevant for
-    // the empty update vector created by this adapter.
-    uint8_t m_unused;
-};
 class CodeBlockHash;
 class Identifier;
 class ScriptFetcher;
@@ -206,36 +212,69 @@ private:
     DataType m_data;
 };
 
+using CodeFeatures = uint16_t;
+using LexicallyScopedFeatures = uint8_t;
+
+struct CachedFunctionExecutableMetadata {
+    CodeFeatures m_features;
+    LexicallyScopedFeatures m_lexicallyScopedFeatures;
+    bool m_hasCapturedVariables;
+};
+
+class CacheUpdate {
+public:
+    struct GlobalUpdate {
+        CachePayload m_payload;
+    };
+
+    struct FunctionUpdate {
+        ptrdiff_t m_base;
+        CodeSpecializationKind m_kind;
+        CachedFunctionExecutableMetadata m_metadata;
+        CachePayload m_payload;
+    };
+
+    CacheUpdate(GlobalUpdate&&);
+    CacheUpdate(FunctionUpdate&&);
+    CacheUpdate(CacheUpdate&&);
+    CacheUpdate& operator=(CacheUpdate&&);
+
+    bool isGlobal() const;
+    const GlobalUpdate& asGlobal() const;
+    const FunctionUpdate& asFunction() const;
+
+private:
+    WTF::Variant<GlobalUpdate, FunctionUpdate> m_update;
+};
+
 class LeafExecutable {
 public:
     LeafExecutable() = default;
 
 private:
-    ptrdiff_t m_base { 0 };
+    ptrdiff_t m_base;
 };
 
 using LeafExecutableMap = WTF::UncheckedKeyHashMap<const UnlinkedFunctionExecutable*, LeafExecutable>;
 
 class CachedBytecode : public WTF::RefCounted<CachedBytecode> {
 public:
-    static CachedBytecode* createCopy(std::span<const uint8_t> bytes)
+    static WTF::Ref<CachedBytecode> create(
+        WTF::MallocSpan<uint8_t, VMMalloc>&& data,
+        LeafExecutableMap&& leaf_executables)
     {
-        // Own the payload so executable trailer offsets and lifetimes never become
-        // part of the cache ABI. FastMalloc is the canonical JSC cache allocator.
-        auto allocation = WTF::MallocSpan<uint8_t, VMMalloc>::tryMalloc(bytes.size());
-        if (!allocation)
-            return nullptr;
-        if (!bytes.empty())
-            std::memcpy(allocation.mutableSpan().data(), bytes.data(), bytes.size());
-        return new CachedBytecode(CachePayload::makeMallocPayload(WTF::move(allocation)));
+        return WTF::adoptRef(*new CachedBytecode(
+            CachePayload::makeMallocPayload(WTF::move(data)),
+            WTF::move(leaf_executables)));
     }
 
     std::span<const uint8_t> span() const { return m_payload.span(); }
 
 private:
-    explicit CachedBytecode(CachePayload&& payload)
+    CachedBytecode(CachePayload&& payload, LeafExecutableMap&& leaf_executables)
         : m_size(payload.size())
         , m_payload(WTF::move(payload))
+        , m_leafExecutables(WTF::move(leaf_executables))
     {
     }
 
@@ -244,6 +283,22 @@ private:
     LeafExecutableMap m_leafExecutables;
     WTF::Vector<CacheUpdate> m_updates;
 };
+
+static_assert(sizeof(CachePayload) == 0x20,
+    "pinned CachePayload layout changed; update the stock-JSC bytecode bridge");
+static_assert(sizeof(CachedFunctionExecutableMetadata) == 0x4,
+    "pinned function metadata layout changed; update the stock-JSC bytecode bridge");
+static_assert(sizeof(CacheUpdate::GlobalUpdate) == 0x20,
+    "pinned global cache update layout changed; update the stock-JSC bytecode bridge");
+static_assert(offsetof(CacheUpdate::FunctionUpdate, m_payload) == 0x10
+        && sizeof(CacheUpdate::FunctionUpdate) == 0x30,
+    "pinned function cache update layout changed; update the stock-JSC bytecode bridge");
+static_assert(sizeof(CacheUpdate) == 0x38,
+    "pinned CacheUpdate layout changed; update the stock-JSC bytecode bridge");
+static_assert(sizeof(LeafExecutableMap) == 0x8,
+    "pinned LeafExecutableMap layout changed; update the stock-JSC bytecode bridge");
+static_assert(sizeof(CachedBytecode) == 0x48,
+    "pinned CachedBytecode layout changed; update the stock-JSC bytecode bridge");
 
 } // namespace JSC
 
@@ -333,6 +388,11 @@ protected:
 };
 
 static_assert(sizeof(void*) == 8, "cached-bytecode bridge supports Cottontail's 64-bit targets");
+static_assert(sizeof(WTF::StringView) == 16,
+    "pinned release JSC StringView layout changed; update the stock-JSC bytecode bridge");
+static_assert(std::is_trivially_copy_constructible_v<WTF::StringView>
+        && std::is_trivially_destructible_v<WTF::StringView>,
+    "pinned release JSC StringView return ABI changed; update the stock-JSC bytecode bridge");
 static_assert(sizeof(SourceProvider) == 0x80,
     "pinned SourceProvider layout changed; update the stock-JSC bytecode bridge");
 
@@ -638,9 +698,11 @@ extern "C" int ct_jsc_bytecode_evaluate(
     if (!unpack_cache(source, source_url, bytes, length, payload))
         return 1;
 
-    JSC::CachedBytecode* cached = JSC::CachedBytecode::createCopy(payload);
-    if (!cached)
+    auto allocation = WTF::MallocSpan<uint8_t, JSC::VMMalloc>::tryMalloc(payload.size());
+    if (!allocation)
         return 1;
+    std::memcpy(allocation.mutableSpan().data(), payload.data(), payload.size());
+    auto cached = JSC::CachedBytecode::create(WTF::move(allocation), { });
 
     JSContextGroupRef group = JSContextGetGroup(context);
     WTF::String source_string = const_cast<OpaqueJSString*>(source)->string();
@@ -648,7 +710,7 @@ extern "C" int ct_jsc_bytecode_evaluate(
     WTF::URL parsed_source_url { WTF::URL(), source_url_string };
     JSC::SourceOrigin source_origin(parsed_source_url);
     auto provider = JSC::BytecodeSourceProvider::create(
-        *to_vm(group), source_origin, parsed_source_url.string(), source_string, cached);
+        *to_vm(group), source_origin, parsed_source_url.string(), source_string, cached.ptr());
 
     JSValueRef result = JSScriptEvaluate(
         context,
@@ -656,6 +718,5 @@ extern "C" int ct_jsc_bytecode_evaluate(
         nullptr,
         exception);
 
-    cached->deref();
     return result || (exception && *exception) ? 0 : 1;
 }
