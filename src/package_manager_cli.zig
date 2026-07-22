@@ -2657,6 +2657,7 @@ const Manager = struct {
                 });
             } else if (manager.options.command == .install and
                 reported_installed_count == 0 and
+                manager.records.items.len == 0 and
                 !hasAnyDependencies(&root))
             {
                 try manager.stdout.print("{s}[{d:.2}ms] done\n", .{
@@ -2664,7 +2665,7 @@ const Manager = struct {
                     elapsed_ms,
                 });
             } else if (manager.options.command == .install and reported_installed_count == 0) {
-                const checked_installs = manager.records.items.len;
+                const checked_installs = manager.checkedInstallCount();
                 if (checked_installs == 0) {
                     try manager.stdout.print("Done! Checked {d} packages (no changes) [{d:.2}ms]\n", .{ manager.lockfilePackageCount(), elapsed_ms });
                 } else {
@@ -3872,10 +3873,12 @@ const Manager = struct {
         } else {
             try std.Io.Dir.cwd().createDirPath(manager.init_data.io, node_modules);
         }
+        const install_reuses_lockfile = manager.options.command == .install and manager.lock_graph != null;
         const create_project_cache = if (manager.node_linker == .isolated)
             manager.options.command == .add
         else
-            (manager.lock_graph == null or !node_modules_existed) and
+            !install_reuses_lockfile and
+                (manager.lock_graph == null or !node_modules_existed) and
                 (manager.options.command == .add or manager.options.command == .install or manager.options.command == .update or
                     manager.options.cpu_overridden or manager.options.os_overridden);
         if (!uses_explicit_install_cache and create_project_cache) {
@@ -10598,10 +10601,20 @@ const Manager = struct {
 
     fn countWorkspaceInstall(manager: *Manager, workspace: Workspace) !void {
         if (manager.options.lockfile_only or manager.options.dry_run) return;
-        // COTTONTAIL-COMPAT: Bun counts each selected workspace as an install
-        // on every materialization pass, even when its link already exists.
+        // COTTONTAIL-COMPAT: Bun's hoisted installer counts each selected
+        // workspace on every materialization pass, even when its link exists.
+        // Its isolated installer reports workspace entries as checked instead.
         const entry = try manager.installed_workspaces.getOrPut(workspace.name);
-        if (!entry.found_existing) manager.installed_count += 1;
+        if (!entry.found_existing and manager.node_linker == .hoisted) manager.installed_count += 1;
+    }
+
+    fn checkedInstallCount(manager: *const Manager) usize {
+        if (manager.node_linker == .isolated) {
+            // Bun's isolated installer checks one store entry for the root and
+            // each package, plus one entry per distinct explicit workspace target.
+            return manager.lockfilePackageCount() + manager.installed_workspaces.count();
+        }
+        return manager.records.items.len;
     }
 
     fn installWorkspaceDependencies(manager: *Manager) !void {
