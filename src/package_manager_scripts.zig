@@ -583,7 +583,14 @@ test "lifecycle inspection applies Bun's binding.gyp fallback" {
     const scripts = try inspectLifecycleScripts(io, allocator, package_dir, &manifest, .npm);
 
     try std.testing.expectEqual(@as(usize, 2), scripts.total);
+    try std.testing.expect(scripts.automatic_node_gyp);
     try std.testing.expectEqualStrings("node-gyp rebuild", scripts.commands[1].?);
     try std.testing.expectEqualStrings("node post.js", scripts.commands[2].?);
     try std.testing.expect(scripts.commands[4] == null);
+
+    const explicit_manifest = try std.json.parseFromSliceLeaky(Value, allocator,
+        \\{"scripts":{"install":"node-gyp rebuild"}}
+    , .{});
+    const explicit_scripts = try inspectLifecycleScripts(io, allocator, package_dir, &explicit_manifest, .npm);
+    try std.testing.expect(!explicit_scripts.automatic_node_gyp);
 }
