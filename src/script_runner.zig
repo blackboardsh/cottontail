@@ -4914,8 +4914,6 @@ fn bundleScriptNative(
     // transitive dependencies are embedded in the generated bundle.
     const bundle_common_js_entrypoint = is_common_js_entrypoint and
         (has_custom_conditions or build_options != null or use_selective_runtime or reload_dependencies_out != null);
-    const runtime_only_launcher = runtime_module_entrypoint or
-        (is_common_js_entrypoint and !bundle_common_js_entrypoint);
     const use_runtime_module_launcher_cache = runtime_module_entrypoint and plain_launcher_cacheable;
     const use_esm_bundle_cache = !runtime_module_entrypoint and
         !is_wasm_entrypoint and
@@ -4989,9 +4987,6 @@ fn bundleScriptNative(
     var options = build_options orelse native_bundler.BundleOptions{};
     options.ignore_dce_annotations = options.ignore_dce_annotations or ignore_dce_annotations;
     if (build_options == null) {
-        // The runtime-only artifact has no user graph to retain. Release the
-        // compiler arena before on-demand modules start accumulating in JSC.
-        options.skip_teardown = !runtime_only_launcher;
         options.externalize_runtime_require_resolve = true;
         // COTTONTAIL-COMPAT: Runtime HTML imports are lazy HTMLBundle values.
         // Bake owns the browser graph build so client errors remain recoverable.

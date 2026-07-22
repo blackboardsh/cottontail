@@ -105,11 +105,6 @@ pub const BundleOptions = struct {
     entry_naming: []const u8 = "[dir]/[name].[ext]",
     chunk_naming: []const u8 = "./chunk-[hash].[ext]",
     asset_naming: []const u8 = "./[name]-[hash].[ext]",
-    /// Bundle-backed one-shot startup artifacts may skip teardown when the
-    /// process immediately evaluates their user graph. Runtime-only launchers
-    /// must leave this false so compiler state is gone before on-demand module
-    /// evaluation begins. Repeated in-process bundles always tear down.
-    skip_teardown: bool = false,
 };
 
 /// Process-wide worker pool shared by every bundle. Passing an external pool
@@ -1031,9 +1026,7 @@ pub fn bundleEntryPointGraphWithOptions(
     }
     var bundle: ?*compiler.bundle_v2.BundleV2 = null;
     defer if (bundle) |value| {
-        if (options.skip_teardown) {
-            // One-shot startup bundle: leave everything for process exit.
-        } else if (worker_pool != null) {
+        if (worker_pool != null) {
             value.deinitFromCLI(allocator);
         } else {
             value.deinitWithoutFreeingArena();
