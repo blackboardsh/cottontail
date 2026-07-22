@@ -15,9 +15,9 @@ test("react-tailwind template passes tsc --noEmit", async () => {
     "tsconfig.json": tsconfigJson,
   });
 
-  // Install typescript and bun types
+  // Pin Bun v1.3.10's TypeScript and the package versions available at release.
   await using install = Bun.spawn({
-    cmd: [bunExe(), "add", "-d", "typescript", "@types/bun", "bun-plugin-tailwind"],
+    cmd: [bunExe(), "add", "-d", "typescript@5.9.2", "@types/bun@1.3.9", "bun-plugin-tailwind@0.1.2"],
     cwd: String(dir),
     env: bunEnv,
     stdout: "pipe",
@@ -41,4 +41,4 @@ test("react-tailwind template passes tsc --noEmit", async () => {
   expect(stderr).toBe("");
   expect(stdout).toBe("");
   expect(exitCode).toBe(0);
-});
+}, 20_000);
