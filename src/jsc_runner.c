@@ -2662,7 +2662,7 @@ static bool ct_http_header_value_has_token(const char *value, const char *value_
 }
 
 #define CT_HTTP_MAX_HEADER_SIZE (2u * 1024u * 1024u)
-#define CT_HTTP_BODY_CHUNK_SIZE (16u * 1024u)
+#define CT_HTTP_BODY_CHUNK_SIZE (256u * 1024u)
 #define CT_HTTP_DEFAULT_MAX_BODY_SIZE (128u * 1024u * 1024u)
 
 static int ct_http_parse_head(
@@ -2792,6 +2792,16 @@ static int ct_http_read_buffer_grow(CtHttpReadBuffer *input, size_t max_capacity
     if (next == NULL) return -1;
     input->data = next;
     input->capacity = next_capacity;
+    return 0;
+}
+
+static int ct_http_read_buffer_reserve(CtHttpReadBuffer *input, size_t capacity, size_t max_capacity) {
+    if (input->capacity >= capacity) return 0;
+    if (capacity > max_capacity) return -1;
+    char *next = (char *)realloc(input->data, capacity + 1);
+    if (next == NULL) return -1;
+    input->data = next;
+    input->capacity = capacity;
     return 0;
 }
 
@@ -3002,7 +3012,7 @@ static int ct_http_socket_read_ready(int fd, int timeout_ms) {
 
 /* Returns 1 after reading, 0 on timeout, and -1 on disconnect/error. */
 static int ct_http_read_more(int fd, CtHttpReadBuffer *input, int timeout_ms) {
-    if (ct_http_read_buffer_grow(input, CT_HTTP_MAX_HEADER_SIZE) != 0) return -1;
+    if (ct_http_read_buffer_reserve(input, CT_HTTP_BODY_CHUNK_SIZE, CT_HTTP_MAX_HEADER_SIZE) != 0) return -1;
     int ready = ct_http_socket_read_ready(fd, timeout_ms);
     if (ready == 0) return 0;
     if (ready < 0) return errno == EINTR ? 0 : -1;
@@ -27951,7 +27961,18 @@ static JSValueRef ct_http_server_poll(JSContextRef ctx, JSObjectRef function, JS
         result = ct_make_object(ctx);
         ct_set_property(ctx, result, "id", JSValueMakeNumber(ctx, request->id), exception);
         ct_set_property(ctx, result, "method", ct_make_string(ctx, request->method != NULL ? request->method : "GET"), exception);
-        ct_set_property(ctx, result, "url", ct_make_string(ctx, request->url != NULL ? request->url : "/"), exception);
+        if (request->url != NULL) {
+            size_t url_len = strlen(request->url);
+            ct_set_property(
+                ctx,
+                result,
+                "url",
+                ct_array_buffer_take_owned_bytes(ctx, &request->url, url_len, exception),
+                exception
+            );
+        } else {
+            ct_set_property(ctx, result, "url", ct_make_string(ctx, "/"), exception);
+        }
         ct_set_property(ctx, result, "headersText", ct_make_string(ctx, request->headers_text != NULL ? request->headers_text : ""), exception);
         ct_set_property(
             ctx,
@@ -28029,7 +28050,7 @@ static JSValueRef ct_http_server_request_event_poll(JSContextRef ctx, JSObjectRe
             ctx,
             result,
             "data",
-            ct_array_buffer_from_copy(ctx, body_chunk != NULL ? body_chunk : "", body_chunk_len, exception),
+            ct_array_buffer_take_owned_bytes(ctx, &body_chunk, body_chunk_len, exception),
             exception
         );
         free(body_chunk);

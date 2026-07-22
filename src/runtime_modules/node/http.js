@@ -365,7 +365,10 @@ if (typeof cottontail === "object" && cottontail != null &&
       for (;;) {
         const item = nativePoll(serverId);
         if (item == null) return item;
-        const requestLineLength = String(item.method ?? "GET").length + String(item.url ?? "/").length + 12;
+        const requestTargetLength = item.url instanceof ArrayBuffer || ArrayBuffer.isView(item.url)
+          ? item.url.byteLength
+          : String(item.url ?? "/").length;
+        const requestLineLength = String(item.method ?? "GET").length + requestTargetLength + 12;
         const headerLength = Buffer.byteLength(String(item.headersText ?? ""), "latin1") + requestLineLength;
         if (headerLength <= getCurrentMaxHeaderSize()) return item;
         try {

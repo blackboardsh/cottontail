@@ -1500,8 +1500,8 @@
       "reason": "Bun.serve request and response header propagation coverage passes under Cottontail."
     },
     "test/js/bun/http/bun-serve-html-entry.test.ts": {
-      "status": "expected-failure",
-      "reason": "Three of six HTML entrypoint cases pass; the direct, multiple, and glob server-start cases exceed their copied 5-second deadlines in integrated validation."
+      "status": "enabled",
+      "reason": "All six HTML entrypoint cases pass for direct, multiple, glob, SVG/content-type, and bun:main preload serving (91 assertions)."
     },
     "test/js/bun/http/bun-serve-html-manifest.test.ts": {
       "status": "enabled",
@@ -1532,8 +1532,11 @@
       "reason": "Bun.serve static routes, reload, GET/HEAD, redirects, large responses, and stress coverage passes under Cottontail."
     },
     "test/js/bun/http/bun-server.test.ts": {
-      "status": "expected-failure",
-      "reason": "42 active cases pass and one upstream case is skipped; the remaining Nitro/source-map fixture hangs when its server performs a streaming self-fetch through the serial native request pump."
+      "status": "enabled",
+      "reason": "All 43 active Bun server cases pass and one upstream huge-stream case remains skipped. Child fixtures receive a 15-second case budget because parsing Cottontail's embedded runtime alone can exceed Bun's copied 5-second default on loaded builders.",
+      "serial": true,
+      "args": ["--max-concurrency=1", "--timeout=15000"],
+      "timeoutMs": 120000
     },
     "test/js/bun/http/decodeURIComponentSIMD.test.ts": {
       "status": "enabled",
@@ -1560,12 +1563,15 @@
       "reason": "Bun fetch proxy authentication, concurrent failures, environment normalization, and host-plus-port NO_PROXY behavior pass upstream coverage."
     },
     "test/js/bun/http/proxy.test.ts": {
-      "status": "expected-failure",
-      "reason": "Dependencies are present, but bundling aborts in generateCodeForFileInChunkJS because the generated chunk is missing wrapper_ref; no proxy assertions run."
+      "status": "enabled",
+      "reason": "All 34 proxy cases pass across HTTP/TLS targets and proxies, redirects, large bodies, close-delimited responses, custom headers, axios agents, and explicit NO_PROXY matching (112 assertions). Subprocess cases receive a 15-second budget because Cottontail runtime startup can exceed their copied 5-second default on loaded builders.",
+      "serial": true,
+      "args": ["--max-concurrency=1", "--timeout=15000"],
+      "timeoutMs": 120000
     },
     "test/js/bun/http/req-url-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "The 10-second request URL stress case times out and the child reaches roughly 884 MB RSS versus the upstream 150 MB ceiling."
+      "reason": "Request targets are now transferred into a lazy GC-owned buffer and sampled child RSS stays flat, but the exact workload still exceeds its copied 10-second deadline and Cottontail's roughly 970 MB debug-runtime baseline already exceeds Bun's absolute 150 MB ceiling."
     },
     "test/js/bun/http/request-smuggling.test.ts": {
       "status": "enabled",
@@ -1573,7 +1579,7 @@
     },
     "test/js/bun/http/serve-body-leak.test.ts": {
       "status": "expected-failure",
-      "reason": "The representative ignored-body case grows roughly 230 MB over 10,000 requests versus the upstream 64 MB allowance; native request bodies are still copied into JSC ArrayBuffers."
+      "reason": "Native body chunks now transfer into JSC without a second copy and the exact ignored-body case completes warmup plus 9,600 of 10,000 measured requests, but it still exceeds the copied 40-second deadline before producing the final memory assertions."
     },
     "test/js/bun/http/serve-direct-readable-stream.test.ts": {
       "status": "enabled",
@@ -1589,7 +1595,7 @@
     },
     "test/js/bun/http/serve.test.ts": {
       "status": "expected-failure",
-      "reason": "175 cases pass and one is skipped; remaining independent failures cover ReadableStream retention, React server-module interop, concurrent idle timeouts, and native streaming response flush behavior."
+      "reason": "The prior request lifecycle, React server-module, idle-timeout, and streaming-flush failures now pass. The exact file remains quarantined because its 15,000-request big-file cancellation case retains multi-gigabyte child processes and does not complete under focused validation."
     },
     "test/js/bun/http/tls-keepalive.test.ts": {
       "status": "enabled",

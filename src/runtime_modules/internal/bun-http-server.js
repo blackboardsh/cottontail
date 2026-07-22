@@ -1,8 +1,21 @@
+const incomingRequestTargetDecoder = new TextDecoder();
+
+function incomingRequestTargetText(target) {
+  if (target instanceof ArrayBuffer) return incomingRequestTargetDecoder.decode(target);
+  if (ArrayBuffer.isView(target)) {
+    return incomingRequestTargetDecoder.decode(
+      new Uint8Array(target.buffer, target.byteOffset, target.byteLength),
+    );
+  }
+  return String(target ?? "/");
+}
+
 export function incomingRequestURLFactory(protocol, host, target, fallbackOrigin, normalizeURL) {
-  const rawTarget = String(target ?? "/");
   const requestBase = host ? `${protocol}//${host}` : String(fallbackOrigin);
-  const isAbsolute = /^https?:\/\//i.test(rawTarget);
-  return () => normalizeURL(isAbsolute ? rawTarget : `${requestBase}${rawTarget}`);
+  return () => {
+    const rawTarget = incomingRequestTargetText(target);
+    return normalizeURL(/^https?:\/\//i.test(rawTarget) ? rawTarget : `${requestBase}${rawTarget}`);
+  };
 }
 
 export function createServeLifecycle(getPendingWebSockets) {
