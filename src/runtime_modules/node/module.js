@@ -2637,7 +2637,7 @@ function runtimeAsyncEsmGraph(entryPath, entrySource) {
       JSON.stringify({
         format: "esm",
         target: "bun",
-        packages: "bundle",
+        packages: "external",
         external: ["*.node"],
         inlineImportMetaProperties: true,
       }),
@@ -3341,7 +3341,7 @@ function executeDynamicImportSource(resolved, source, format, forceAsync = false
       runtimePluginOnResolve.length === 0 &&
       runtimePluginOnLoad.length === 0) {
     const asyncGraph = runtimeAsyncEsmGraph(resolvedPath, sourceText);
-    if (asyncGraph?.async === true) {
+    if (asyncGraph !== null) {
       return executeAsyncDynamicImportSource(
         resolved,
         resolvedPath,
