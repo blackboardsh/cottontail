@@ -4229,6 +4229,15 @@ const Manager = struct {
             }
             if (parseTomlBool(source, "exact")) |value| manager.options.exact = value;
             if (parseTomlBool(source, "frozenLockfile")) |value| manager.options.frozen_lockfile = value;
+            if (parseTomlBool(source, "dev")) |value| {
+                if (!value) manager.options.omit_dev = true;
+            }
+            if (parseTomlBool(source, "optional")) |value| {
+                if (!value) manager.options.omit_optional = true;
+            }
+            if (parseTomlBool(source, "peer")) |value| {
+                if (!value) manager.options.omit_peer = true;
+            }
             if (parseTomlBool(source, "linkWorkspacePackages")) |value| manager.link_workspace_packages = value;
             const public_patterns = parseTomlStringList(manager.allocator, source, "publicHoistPattern") catch |err| {
                 try manager.reportPatternConfigurationError(err);
