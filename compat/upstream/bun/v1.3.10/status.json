@@ -103,6 +103,11 @@
       "reason": "Bun utility API conformance needs a dedicated implementation pass; individual smoke tests are re-enabled explicitly."
     },
     {
+      "pattern": "^test/js/bun/util/fuzzy-wuzzy\\.test\\.ts$",
+      "status": "enabled",
+      "reason": "Bun's copied fuzzy-wuzzy utility corpus passes with finite cached test/describe modifier graphs, conditional modifiers, conflict validation, prototypes, and .each behavior (153 cases, 330 assertions)."
+    },
+    {
       "pattern": "^test/js/third_party/jsonwebtoken/.*\\.test\\.js$",
       "status": "enabled",
       "reason": "The copied jsonwebtoken corpus passes with Node-compatible HMAC, RSA, RSA-PSS, ECDSA, PEM/DER key import, claims, validation, and asynchronous behavior."
