@@ -988,7 +988,7 @@ pub const LinkerContext = struct {
                     }
 
                     // Require of a top-level await chain is forbidden
-                    if (record.kind == .require) {
+                    if (record.kind == .require and c.options.output_format != .internal_bake_dev) {
                         var notes = std.array_list.Managed(Logger.Data).init(c.allocator());
 
                         var tla_pretty_path: string = "";
@@ -2010,6 +2010,11 @@ pub const LinkerContext = struct {
                     }
                 },
                 .no_match => {
+                    // Bake modules read imports from runtime namespace objects. Keep
+                    // missing bindings deferred so an earlier runtime failure, such
+                    // as requiring a TLA module, retains the correct error semantics.
+                    if (c.options.output_format == .internal_bake_dev) break :loop;
+
                     // Report mismatched imports and exports
                     const symbol = c.graph.symbols.get(tracker.import_ref).?;
                     const named_import: js_ast.NamedImport = named_imports[prev_source_index].get(tracker.import_ref).?;

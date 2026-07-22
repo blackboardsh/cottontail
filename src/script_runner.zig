@@ -6378,11 +6378,12 @@ fn buildBunfigPreloadImports(
     const preloads = try parseBunfigTestPreloads(ctx.allocator, contents, include_test_section);
     var imports: std.ArrayList(u8) = .empty;
     for (preloads) |preload| {
-        const preload_abs = if (std.fs.path.isAbsolute(preload))
+        const is_path = std.fs.path.isAbsolute(preload) or std.mem.startsWith(u8, preload, ".");
+        const preload_specifier = if (std.fs.path.isAbsolute(preload) or !is_path)
             preload
         else
             try std.fs.path.join(ctx.allocator, &.{ config_dir, preload });
-        if (!pathExists(ctx.io, preload_abs)) {
+        if (is_path and !preloadPathExists(ctx, preload_specifier)) {
             try imports.appendSlice(ctx.allocator, "console.error('error: preload not found ' + ");
             try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload));
             try imports.appendSlice(ctx.allocator, "); globalThis.process?.exit?.(1);\n");
@@ -6390,7 +6391,7 @@ fn buildBunfigPreloadImports(
         }
         try imports.appendSlice(ctx.allocator, "globalThis.__cottontailTestRegistrationLayer = (globalThis.__cottontailTestRegistrationLayer ?? 0) + 1;\n");
         try imports.appendSlice(ctx.allocator, "await import(");
-        try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload_abs));
+        try imports.appendSlice(ctx.allocator, try jsonStringLiteral(ctx, preload_specifier));
         try imports.appendSlice(ctx.allocator, ");\n");
     }
     return try imports.toOwnedSlice(ctx.allocator);
