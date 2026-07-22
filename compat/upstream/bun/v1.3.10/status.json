@@ -1128,6 +1128,10 @@
       "status": "enabled",
       "reason": "BUN_OPTIONS parsing, precedence, quoting, bare profiler flags, and compiled standalone execution pass upstream coverage (7 bun:test cases, 16 assertions)."
     },
+    "test/cli/hot/watch.test.ts": {
+      "status": "enabled",
+      "reason": "Bun build --watch rebuild and recovery behavior passes the full copied file twice: 2 tests and 12 assertions per run."
+    },
     "test/cli/install/bad-workspace.test.ts": {
       "status": "enabled",
       "reason": "Invalid workspace globs, ./ paths, and Windows-style .\\ paths fail cleanly without crashing across all three copied cases (8 assertions)."
