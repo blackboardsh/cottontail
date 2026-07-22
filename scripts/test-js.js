@@ -347,6 +347,12 @@ try {
       stdoutIncludes: ['bun build native passed'],
     },
     {
+      name: 'bun-typescript-compiler-parity',
+      argv: ['test', join(rootDir, 'tests', 'js', 'bun-typescript-compiler-parity.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['8 pass', '0 fail'],
+    },
+    {
       name: 'native-build-cli',
       argv: [
         'build',

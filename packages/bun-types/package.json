@@ -1,0 +1,38 @@
+{
+  "name": "bun-types",
+  "license": "MIT",
+  "types": "./index.d.ts",
+  "description": "Type definitions for the Bun-compatible APIs exposed by Cottontail",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blackboardsh/cottontail",
+    "directory": "packages/bun-types"
+  },
+  "files": [
+    "./*.d.ts",
+    "./CLAUDE.md",
+    "./docs/*.md",
+    "./docs/*.mdx",
+    "./docs/**/*.md",
+    "./docs/**/*.mdx",
+    "./README.md",
+    "./vendor/**/*.d.ts"
+  ],
+  "homepage": "https://github.com/blackboardsh/cottontail",
+  "dependencies": {
+    "@types/node": "*"
+  },
+  "scripts": {
+    "prebuild": "echo $(pwd)",
+    "build": "bun scripts/build.ts",
+    "test": "tsc",
+    "fmt": "echo $(which biome) && biome format --write ."
+  },
+  "keywords": [
+    "bun",
+    "bun.js",
+    "cottontail",
+    "types"
+  ],
+  "version": "1.3.10"
+}

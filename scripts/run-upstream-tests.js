@@ -394,6 +394,7 @@ function makeEnv(runtime, target, runTemp = tempRoot, overrides = undefined) {
     TEMP: runTemp,
     COTTONTAIL_UPSTREAM_RUNTIME: runtime,
     COTTONTAIL_UPSTREAM_VERSION: target.version,
+    COTTONTAIL_REPO_ROOT: rootDir,
     ...(overrides ?? {}),
   };
 }

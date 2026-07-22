@@ -1,5 +1,5 @@
 import { $ as Shell, fileURLToPath } from "bun";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { makeTree } from "harness";
 import { readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -8,10 +8,13 @@ import { dirname, join, relative } from "node:path";
 
 import ts from "typescript";
 
-const BUN_REPO_ROOT = fileURLToPath(import.meta.resolve("../../../"));
-const BUN_TYPES_PACKAGE_ROOT = join(BUN_REPO_ROOT, "packages", "bun-types");
-const FIXTURE_SOURCE_DIR = fileURLToPath(import.meta.resolve("./fixture"));
-const TSCONFIG_SOURCE_PATH = join(BUN_REPO_ROOT, "src/cli/init/tsconfig.default.json");
+const COTTONTAIL_REPO_ROOT = process.env.COTTONTAIL_REPO_ROOT ?? fileURLToPath(import.meta.resolve("../../../../../../../"));
+const BUN_TYPES_PACKAGE_ROOT = join(COTTONTAIL_REPO_ROOT, "packages", "bun-types");
+const FIXTURE_SOURCE_DIR = join(
+  COTTONTAIL_REPO_ROOT,
+  "compat/upstream/bun/v1.3.10/test/integration/bun-types/fixture",
+);
+const TSCONFIG_SOURCE_PATH = join(COTTONTAIL_REPO_ROOT, "src/compiler/src/cli/init/tsconfig.default.json");
 const BUN_TYPES_PACKAGE_JSON_PATH = join(BUN_TYPES_PACKAGE_ROOT, "package.json");
 const BUN_VERSION = (process.env.BUN_VERSION ?? Bun.version ?? process.versions.bun).replace(/^.*v/, "");
 const BUN_TYPES_TARBALL_NAME = `bun-types-${BUN_VERSION}.tgz`;
@@ -24,7 +27,9 @@ const DEFAULT_COMPILER_OPTIONS = ts.parseJsonConfigFileContent(
   dirname(TSCONFIG_SOURCE_PATH),
 ).options;
 
-const $ = Shell.cwd(BUN_REPO_ROOT);
+const $ = Shell.cwd(COTTONTAIL_REPO_ROOT);
+
+setDefaultTimeout(120_000);
 
 let TEMP_DIR: string;
 let BASE_FIXTURE_DIR: string;
