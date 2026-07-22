@@ -1277,6 +1277,11 @@
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 2 assertions)."
     },
+    "test/integration/bun-types/bun-types.test.ts": {
+      "status": "enabled",
+      "reason": "The vendored Bun 1.3.10 declarations pass the copied package, compiler-option, global, and fixture conformance corpus (11 cases, 22 assertions).",
+      "timeoutMs": 600000
+    },
     "test/integration/bun-types/fixture/23347.test.ts": {
       "status": "enabled",
       "reason": "Copied upstream file passes directly under Cottontail (6 bun:test cases, 12 assertions)."
