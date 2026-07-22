@@ -5921,7 +5921,10 @@ const Manager = struct {
         for (update_dependency_sections) |dependency_section| {
             const section_value = package_json.object.getPtr(dependency_section.name) orelse continue;
             if (section_value.* != .object) continue;
-            for (section_value.object.keys(), section_value.object.values()) |name, *spec_value| {
+            const aliases = try manager.allocator.dupe([]const u8, section_value.object.keys());
+            std.mem.sort([]const u8, aliases, {}, lessString);
+            for (aliases) |name| {
+                const spec_value = section_value.object.getPtr(name) orelse continue;
                 const request = findUpdateRequest(requests, name);
                 if (requests.len > 0 and request == null) continue;
                 if (spec_value.* != .string) {
@@ -6077,10 +6080,7 @@ const Manager = struct {
         parent_dir: []const u8,
         optional: bool,
     ) !UpdateResult {
-        const previous_version = if (try manager.findLockedSelection(alias, parent_dir)) |selection|
-            selection.package.version
-        else
-            null;
+        const previous_version = try manager.previousUpdateVersion(alias, parent_dir);
         const resolution_spec = try updateResolutionSpec(
             manager.allocator,
             original_spec,
@@ -6129,7 +6129,7 @@ const Manager = struct {
         }
 
         const previous_version = if (alias) |name|
-            if (try manager.findLockedSelection(name, parent_dir)) |selection| selection.package.version else null
+            try manager.previousUpdateVersion(name, parent_dir)
         else
             null;
         manager.direct_bins.clearRetainingCapacity();
@@ -6161,6 +6161,17 @@ const Manager = struct {
         };
     }
 
+    fn previousUpdateVersion(
+        manager: *Manager,
+        alias: []const u8,
+        parent_dir: []const u8,
+    ) !?[]const u8 {
+        if (try manager.findLockedSelection(alias, parent_dir)) |selection| {
+            return selection.package.version;
+        }
+        return manager.initial_root_versions.get(alias);
+    }
+
     fn appendUpdateOutput(
         manager: *Manager,
         writer: *std.Io.Writer,
@@ -6180,7 +6191,11 @@ const Manager = struct {
         }
         if (result.previous_version) |previous| {
             if (!std.mem.eql(u8, previous, result.resolved_version)) {
-                try writer.print("^ {s} {s} -> {s}\n", .{ alias, previous, result.resolved_version });
+                if (manager.options.no_save) {
+                    try writer.print("+ {s}@{s}\n", .{ alias, result.resolved_version });
+                } else {
+                    try writer.print("^ {s} {s} -> {s}\n", .{ alias, previous, result.resolved_version });
+                }
             }
         } else {
             try writer.print("+ {s}@{s}\n", .{ alias, result.resolved_version });
@@ -6678,12 +6693,26 @@ const Manager = struct {
             direct,
             peer_context,
         );
-        const package_metadata: *const Value = resolved.metadata;
-        const platform_matches = packageSupportsPlatform(
-            resolved.metadata,
+        var package_metadata: *const Value = resolved.metadata;
+        var prefetched_archive: ?[]const u8 = null;
+        var platform_matches = packageSupportsPlatform(
+            package_metadata,
             manager.options.cpu,
             manager.options.os,
         );
+        if (platform_matches and
+            (optional or manager.options.cpu_overridden or manager.options.os_overridden) and
+            !manager.options.lockfile_only and !manager.options.dry_run)
+        {
+            const archive = try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
+            prefetched_archive = archive;
+            package_metadata = try manager.readTarballPackageJSON(archive);
+            platform_matches = packageSupportsPlatform(
+                package_metadata,
+                manager.options.cpu,
+                manager.options.os,
+            );
+        }
         if (!platform_matches and (optional or manager.options.cpu_overridden or manager.options.os_overridden)) {
             const previous_resolution_only = manager.setResolutionOnly(true);
             defer manager.restoreResolutionOnly(previous_resolution_only);
@@ -6701,20 +6730,20 @@ const Manager = struct {
                 .tarball = resolved.tarball,
                 .integrity = resolved.integrity orelse "",
                 .resolution = registry_spec,
-                .metadata = resolved.metadata,
+                .metadata = package_metadata,
                 .peer_hash = peer_context.hash,
                 .install_dir = destination,
             });
-            try manager.rememberPackageMetadata(destination, resolved.metadata);
+            try manager.rememberPackageMetadata(destination, package_metadata);
             manager.changed = true;
 
             // Keep the lockfile graph cross-platform even though this optional
             // package is not materialized on the current host. Its required
             // dependencies must still be resolvable when the same lockfile is
             // consumed on a matching platform.
-            try manager.installDependencyObject(@constCast(resolved.metadata), "dependencies", destination, false, false);
-            try manager.installOptionalDependencies(@constCast(resolved.metadata), destination, false);
-            try manager.installOrLinkPeerDependencies(resolved.metadata, destination, destination, parent_dir);
+            try manager.installDependencyObject(@constCast(package_metadata), "dependencies", destination, false, false);
+            try manager.installOptionalDependencies(@constCast(package_metadata), destination, false);
+            try manager.installOrLinkPeerDependencies(package_metadata, destination, destination, parent_dir);
             return resolved.version;
         }
         var installed = false;
@@ -6723,7 +6752,8 @@ const Manager = struct {
                 try manager.installedPackageMatches(destination, resolved.name, resolved.version) and
                 try manager.packagePatchStateMatches(destination, protocol_patch_paths);
             if (!installed) {
-                const archive = try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
+                const archive = prefetched_archive orelse
+                    try manager.fetchRegistryArchive(resolved.archive(), fetch_log_level);
                 deletePath(manager.init_data.io, destination);
                 try std.Io.Dir.cwd().createDirPath(manager.init_data.io, destination);
                 var destination_dir = try std.Io.Dir.cwd().openDir(manager.init_data.io, destination, .{});
@@ -6750,7 +6780,7 @@ const Manager = struct {
             .tarball = resolved.tarball,
             .integrity = resolved.integrity orelse "",
             .resolution = registry_spec,
-            .metadata = resolved.metadata,
+            .metadata = package_metadata,
             .peer_hash = peer_context.hash,
             .install_dir = destination,
         });
@@ -10617,7 +10647,7 @@ const Manager = struct {
     }
 
     fn countWorkspaceInstall(manager: *Manager, workspace: Workspace) !void {
-        if (manager.options.lockfile_only or manager.options.dry_run) return;
+        if (manager.options.lockfile_only or manager.options.dry_run or manager.options.command == .update) return;
         // COTTONTAIL-COMPAT: Bun's hoisted installer counts each selected
         // workspace on every materialization pass, even when its link exists.
         // Its isolated installer reports workspace entries as checked instead.
@@ -11956,7 +11986,16 @@ fn packageSupportsPlatform(
     if (metadata.object.get("cpu")) |cpu| {
         if (!platformSetFromJson(Npm.Architecture, cpu).isMatch(cpu_target)) return false;
     }
+    if (metadata.object.get("libc")) |libc| {
+        const target = currentLibcName() orelse return false;
+        if (!platformFieldMatches(libc, target)) return false;
+    }
     return true;
+}
+
+fn currentLibcName() ?[]const u8 {
+    if (builtin.os.tag != .linux) return null;
+    return if (std.mem.indexOf(u8, @tagName(builtin.abi), "musl") != null) "musl" else "glibc";
 }
 
 fn platformSetFromJson(comptime T: type, value: Value) T {
