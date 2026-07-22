@@ -78,3 +78,9 @@ test("SocketAddress accessors stay read-only in callback code", () => {
   }).toThrow(TypeError);
   expect(address.address).toBe("127.0.0.1");
 });
+
+test("SocketAddress rejects invalid family values consistently", () => {
+  for (const family of [Symbol.for("ipv4"), function ipv4() {}, { family: "ipv4" }]) {
+    expect(() => new net.SocketAddress({ family } as any)).toThrowWithCode(Error, "ERR_INVALID_ARG_VALUE");
+  }
+});

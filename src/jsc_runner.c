@@ -1326,6 +1326,8 @@ typedef struct CtFdWatcher {
     bool active;
     bool referenced;
     bool paused;
+    bool readiness_only;
+    bool watch_writable;
     struct CtFdWatcher *next;
 } CtFdWatcher;
 
@@ -17113,20 +17115,47 @@ static bool ct_fd_watcher_is_active(CtFdWatcher *watcher) {
     return active;
 }
 
-static bool ct_fd_watcher_is_paused(CtFdWatcher *watcher) {
-    bool paused = false;
-    pthread_mutex_lock(&watcher->mutex);
-    paused = watcher->paused;
-    pthread_mutex_unlock(&watcher->mutex);
-    return paused;
-}
-
 static bool ct_fd_watcher_is_referenced(CtFdWatcher *watcher) {
     bool referenced = false;
     pthread_mutex_lock(&watcher->mutex);
     referenced = watcher->referenced;
     pthread_mutex_unlock(&watcher->mutex);
     return referenced;
+}
+
+static void ct_fd_watcher_get_interest(
+    CtFdWatcher *watcher,
+    bool *readable,
+    bool *writable,
+    bool *readiness_only
+) {
+    pthread_mutex_lock(&watcher->mutex);
+    *readable = watcher->active && !watcher->paused;
+    *writable = watcher->active && watcher->watch_writable;
+    *readiness_only = watcher->readiness_only;
+    pthread_mutex_unlock(&watcher->mutex);
+}
+
+static bool ct_fd_watcher_take_writable(CtFdWatcher *watcher) {
+    bool writable = false;
+    pthread_mutex_lock(&watcher->mutex);
+    if (watcher->active && watcher->watch_writable) {
+        watcher->watch_writable = false;
+        writable = true;
+    }
+    pthread_mutex_unlock(&watcher->mutex);
+    return writable;
+}
+
+static bool ct_fd_watcher_take_readable_notification(CtFdWatcher *watcher) {
+    bool readable = false;
+    pthread_mutex_lock(&watcher->mutex);
+    if (watcher->active && watcher->readiness_only && !watcher->paused) {
+        watcher->paused = true;
+        readable = true;
+    }
+    pthread_mutex_unlock(&watcher->mutex);
+    return readable;
 }
 
 static void ct_fd_watcher_set_active(CtFdWatcher *watcher, bool active) {
@@ -17155,6 +17184,26 @@ static void ct_fd_watchers_remove(CtFdWatcher *watcher) {
 
 #if !defined(_WIN32)
 static void ct_fd_watcher_uv_poll(uv_poll_t *handle, int status, int events);
+
+static int ct_fd_watcher_update_uv(CtFdWatcher *watcher) {
+    bool readable = false;
+    bool writable = false;
+    bool active = false;
+    bool closing = false;
+    pthread_mutex_lock(&watcher->mutex);
+    active = watcher->active;
+    closing = watcher->closing;
+    readable = active && !watcher->paused;
+    writable = active && watcher->watch_writable;
+    pthread_mutex_unlock(&watcher->mutex);
+
+    if (!active || closing) return 0;
+    int poll_events = 0;
+    if (readable) poll_events |= UV_READABLE | UV_DISCONNECT;
+    if (writable) poll_events |= UV_WRITABLE;
+    if (poll_events == 0) return uv_poll_stop(&watcher->poll);
+    return uv_poll_start(&watcher->poll, poll_events, ct_fd_watcher_uv_poll);
+}
 
 static void ct_fd_watcher_uv_closed(uv_handle_t *handle) {
     CtFdWatcher *watcher = (CtFdWatcher *)handle->data;
@@ -17338,12 +17387,16 @@ static void *ct_fd_watcher_thread(void *opaque) {
 #endif
 
     while (ct_fd_watcher_is_active(watcher)) {
-        if (ct_fd_watcher_is_paused(watcher)) {
+        bool readable = false;
+        bool writable = false;
+        bool readiness_only = false;
+        ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
+        if (!readable && !writable) {
             usleep(1000);
             continue;
         }
 #if defined(_WIN32)
-        if (is_crt_pipe) {
+        if (readable && !readiness_only && is_crt_pipe) {
             DWORD available = 0;
             if (!PeekNamedPipe((HANDLE)os_handle, NULL, 0, NULL, &available, NULL)) {
                 DWORD error = GetLastError();
@@ -17362,20 +17415,23 @@ static void *ct_fd_watcher_thread(void *opaque) {
 #endif
         struct pollfd poll_fd;
         poll_fd.fd = watcher->fd;
-        poll_fd.events = POLLIN | POLLHUP | POLLERR;
+        poll_fd.events = 0;
+        if (readable) poll_fd.events |= POLLIN | POLLHUP | POLLERR;
+        if (writable) poll_fd.events |= POLLOUT | POLLHUP | POLLERR;
         poll_fd.revents = 0;
 #if defined(_WIN32)
-        if (is_crt_handle) poll_fd.revents = POLLIN;
+        if (is_crt_handle) {
+            if (readable) poll_fd.revents |= POLLIN;
+            if (writable) poll_fd.revents |= POLLOUT;
+        }
 #endif
 
 #if defined(_WIN32)
         int ready;
         if (is_crt_handle) {
-            poll_fd.revents = POLLIN;
             ready = 1;
         } else {
-            ready = ct_windows_descriptor_read_ready(watcher->fd);
-            if (ready > 0) poll_fd.revents = POLLIN;
+            ready = poll(&poll_fd, 1, 50);
         }
 #else
         int ready = poll(&poll_fd, 1, 50);
@@ -17391,7 +17447,16 @@ static void *ct_fd_watcher_thread(void *opaque) {
             ct_queue_fd_error(watcher->runtime, watcher->id, EBADF, "invalid file descriptor");
             break;
         }
-        if ((poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+
+        if (writable && (poll_fd.revents & (POLLOUT | POLLHUP | POLLERR)) != 0 &&
+            ct_fd_watcher_take_writable(watcher)) {
+            ct_queue_fd_simple(watcher->runtime, watcher->id, "writable", NULL);
+        }
+
+        ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
+        if (!readable || (poll_fd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+        if (readiness_only && ct_fd_watcher_take_readable_notification(watcher)) {
+            ct_queue_fd_simple(watcher->runtime, watcher->id, "readable", NULL);
             continue;
         }
 
@@ -17451,14 +17516,37 @@ static void *ct_fd_watcher_thread(void *opaque) {
 #else
 static void ct_fd_watcher_uv_poll(uv_poll_t *handle, int status, int events) {
     CtFdWatcher *watcher = (CtFdWatcher *)handle->data;
-    if (watcher == NULL || !ct_fd_watcher_is_active(watcher) || ct_fd_watcher_is_paused(watcher)) return;
+    if (watcher == NULL || !ct_fd_watcher_is_active(watcher)) return;
 
     if (status < 0) {
         ct_queue_fd_error(watcher->runtime, watcher->id, -status, uv_strerror(status));
         ct_fd_watcher_close_uv(watcher);
         return;
     }
-    if ((events & (UV_READABLE | UV_DISCONNECT)) == 0) return;
+
+    bool readable = false;
+    bool writable = false;
+    bool readiness_only = false;
+    ct_fd_watcher_get_interest(watcher, &readable, &writable, &readiness_only);
+    bool writable_ready = writable && (events & (UV_WRITABLE | UV_DISCONNECT)) != 0 &&
+        ct_fd_watcher_take_writable(watcher);
+    bool readable_ready = readable && readiness_only && (events & (UV_READABLE | UV_DISCONNECT)) != 0 &&
+        ct_fd_watcher_take_readable_notification(watcher);
+
+    if (writable_ready || readable_ready) {
+        int poll_status = ct_fd_watcher_update_uv(watcher);
+        if (poll_status != 0) {
+            ct_queue_fd_error(watcher->runtime, watcher->id, -poll_status, uv_strerror(poll_status));
+            ct_fd_watcher_close_uv(watcher);
+            return;
+        }
+    }
+    if (writable_ready) ct_queue_fd_simple(watcher->runtime, watcher->id, "writable", NULL);
+    if (readable_ready) {
+        ct_queue_fd_simple(watcher->runtime, watcher->id, "readable", NULL);
+        return;
+    }
+    if (!readable || (events & (UV_READABLE | UV_DISCONNECT)) == 0) return;
 
     bool terminal = false;
     char buffer[64 * 1024];
@@ -21346,7 +21434,7 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
     (void)thisObject;
     CtJscRuntime *runtime = ct_callback_runtime(function);
     if (runtime == NULL || argc < 1) {
-        ct_throw_message(ctx, exception, "cottontail.fdWatchStart(fd[, maxBytes]) requires a file descriptor");
+        ct_throw_message(ctx, exception, "cottontail.fdWatchStart(fd[, maxBytes[, referenced[, paused[, readinessOnly]]]]) requires a file descriptor");
         return JSValueMakeUndefined(ctx);
     }
 
@@ -21372,9 +21460,18 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
     watcher->active = true;
     watcher->referenced = argc < 3 || ct_value_to_bool(ctx, argv[2]);
     watcher->paused = argc >= 4 && ct_value_to_bool(ctx, argv[3]);
+    watcher->readiness_only = argc >= 5 && ct_value_to_bool(ctx, argv[4]);
+    watcher->watch_writable = false;
     pthread_mutex_init(&watcher->mutex, NULL);
     if (ct_debug_flag("COTTONTAIL_FD_DEBUG")) {
-        fprintf(stderr, "[cottontail:fd] start id=%u fd=%d max=%zu\n", watcher->id, watcher->fd, watcher->max_bytes);
+        fprintf(
+            stderr,
+            "[cottontail:fd] start id=%u fd=%d max=%zu mode=%s\n",
+            watcher->id,
+            watcher->fd,
+            watcher->max_bytes,
+            watcher->readiness_only ? "readiness" : "read"
+        );
         fflush(stderr);
     }
 
@@ -21404,15 +21501,13 @@ static JSValueRef ct_fd_watch_start(JSContextRef ctx, JSObjectRef function, JSOb
     watcher->poll_initialized = true;
     watcher->poll.data = watcher;
     if (!watcher->referenced) uv_unref((uv_handle_t *)&watcher->poll);
-    if (!watcher->paused) {
-        poll_status = uv_poll_start(&watcher->poll, UV_READABLE | UV_DISCONNECT, ct_fd_watcher_uv_poll);
-        if (poll_status != 0) {
-            watcher->closing = true;
-            watcher->active = false;
-            uv_close((uv_handle_t *)&watcher->poll, ct_fd_watcher_uv_closed);
-            ct_throw_message(ctx, exception, uv_strerror(poll_status));
-            return JSValueMakeUndefined(ctx);
-        }
+    poll_status = ct_fd_watcher_update_uv(watcher);
+    if (poll_status != 0) {
+        watcher->closing = true;
+        watcher->active = false;
+        uv_close((uv_handle_t *)&watcher->poll, ct_fd_watcher_uv_closed);
+        ct_throw_message(ctx, exception, uv_strerror(poll_status));
+        return JSValueMakeUndefined(ctx);
     }
 
     pthread_mutex_lock(&ct_fd_watchers_mutex);
@@ -21479,19 +21574,17 @@ static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function,
     (void)exception;
     if (argc < 2) return JSValueMakeBoolean(ctx, false);
     uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool paused = ct_value_to_bool(ctx, argv[1]);
     bool found = false;
 #if !defined(_WIN32)
     CtFdWatcher *target = NULL;
-    bool paused = ct_value_to_bool(ctx, argv[1]);
 #endif
     pthread_mutex_lock(&ct_fd_watchers_mutex);
     for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
         if (watcher->id != id) continue;
         pthread_mutex_lock(&watcher->mutex);
-#if defined(_WIN32)
-        watcher->paused = ct_value_to_bool(ctx, argv[1]);
-#else
         watcher->paused = paused;
+#if !defined(_WIN32)
         target = watcher;
 #endif
         pthread_mutex_unlock(&watcher->mutex);
@@ -21501,9 +21594,43 @@ static JSValueRef ct_fd_watch_set_paused(JSContextRef ctx, JSObjectRef function,
     pthread_mutex_unlock(&ct_fd_watchers_mutex);
 #if !defined(_WIN32)
     if (target != NULL) {
-        int poll_status = paused
-            ? uv_poll_stop(&target->poll)
-            : uv_poll_start(&target->poll, UV_READABLE | UV_DISCONNECT, ct_fd_watcher_uv_poll);
+        int poll_status = ct_fd_watcher_update_uv(target);
+        if (poll_status != 0) {
+            ct_queue_fd_error(target->runtime, target->id, -poll_status, uv_strerror(poll_status));
+            ct_fd_watcher_close_uv(target);
+        }
+    }
+#endif
+    return JSValueMakeBoolean(ctx, found);
+}
+
+static JSValueRef ct_fd_watch_set_writable(JSContextRef ctx, JSObjectRef function, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef *exception) {
+    (void)function;
+    (void)thisObject;
+    (void)exception;
+    if (argc < 2) return JSValueMakeBoolean(ctx, false);
+    uint32_t id = (uint32_t)ct_value_to_number(ctx, argv[0]);
+    bool writable = ct_value_to_bool(ctx, argv[1]);
+    bool found = false;
+#if !defined(_WIN32)
+    CtFdWatcher *target = NULL;
+#endif
+    pthread_mutex_lock(&ct_fd_watchers_mutex);
+    for (CtFdWatcher *watcher = ct_fd_watchers; watcher != NULL; watcher = watcher->next) {
+        if (watcher->id != id) continue;
+        pthread_mutex_lock(&watcher->mutex);
+        watcher->watch_writable = writable;
+#if !defined(_WIN32)
+        target = watcher;
+#endif
+        pthread_mutex_unlock(&watcher->mutex);
+        found = true;
+        break;
+    }
+    pthread_mutex_unlock(&ct_fd_watchers_mutex);
+#if !defined(_WIN32)
+    if (target != NULL) {
+        int poll_status = ct_fd_watcher_update_uv(target);
         if (poll_status != 0) {
             ct_queue_fd_error(target->runtime, target->id, -poll_status, uv_strerror(poll_status));
             ct_fd_watcher_close_uv(target);

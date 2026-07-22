@@ -547,6 +547,18 @@ try {
       stdoutIncludes: ['node net passed'],
     },
     {
+      name: 'node-net-native-readiness',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-net-native-readiness.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['2 pass', '0 fail'],
+    },
+    {
+      name: 'node-net-lifecycle-regressions',
+      argv: ['test', join(rootDir, 'tests', 'js', 'node-net-lifecycle-regressions.test.ts')],
+      expectExitCode: 0,
+      stdoutIncludes: ['6 pass', '0 fail'],
+    },
+    {
       name: 'node-readline',
       scriptPath: join(rootDir, 'tests', 'js', 'node-readline.ts'),
       expectExitCode: 0,

@@ -2,6 +2,9 @@ import { EventEmitter } from "./events.js";
 import { _wrapAsyncCallback } from "./async_hooks.js";
 
 const kConnectionCount = Symbol("connectionCount");
+// Allow a stock-JSC host-loop turn for bytes racing a graceful destroy to
+// be consumed before close(2), which otherwise converts the FIN into a reset.
+const gracefulDestroyDrainMilliseconds = 16;
 const kSocketAddressState = new WeakMap();
 const kSocketAddressReadonlyProperties = new Set(["address", "port", "family", "flowlabel"]);
 const kBlockListState = new WeakMap();
@@ -134,6 +137,58 @@ function installFdWatchDispatcher() {
     });
   }
   return listeners;
+}
+
+function startAcceptWatch(target, fd, referenced, onReadable, onError = (error) => target.emit("error", error)) {
+  if (typeof cottontail.fdWatchStart !== "function" || typeof cottontail.fdWatchSetPaused !== "function") {
+    return false;
+  }
+
+  const listeners = installFdWatchDispatcher();
+  let watch;
+  try {
+    watch = cottontail.fdWatchStart(fd, 1, referenced, false, true);
+  } catch {
+    return false;
+  }
+  const watchId = Number(watch?.id || 0);
+  if (!watchId) return false;
+
+  target._acceptWatchId = watchId;
+  listeners.set(watchId, _wrapAsyncCallback((event) => {
+    if (target._acceptWatchId !== watchId) return;
+    if (event.type === "readable") {
+      try {
+        onReadable();
+      } finally {
+        if (target._acceptWatchId === watchId) cottontail.fdWatchSetPaused(watchId, false);
+      }
+      return;
+    }
+    if (event.type === "error") {
+      target._acceptWatchId = 0;
+      target._unregisterAcceptWatch?.();
+      target._unregisterAcceptWatch = null;
+      const error = new Error(event.message || "socket listener failed");
+      if (event.code != null) error.code = String(event.code);
+      if (event.errno != null) error.errno = Number(event.errno);
+      onError(error);
+    }
+  }));
+  target._unregisterAcceptWatch = () => listeners.delete(watchId);
+  return true;
+}
+
+function stopAcceptWatch(target) {
+  const watchId = target._acceptWatchId;
+  target._acceptWatchId = 0;
+  target._unregisterAcceptWatch?.();
+  target._unregisterAcceptWatch = null;
+  if (watchId) cottontail.fdWatchStop?.(watchId);
+  if (target._acceptTimer != null) {
+    clearInterval(target._acceptTimer);
+    target._acceptTimer = null;
+  }
 }
 
 function bytesFrom(chunk, encoding = undefined) {
@@ -269,7 +324,7 @@ class SocketImpl extends EventEmitter {
     this._pendingWrites = [];
     this._outboundWrites = [];
     this._writeRetryTimer = null;
-    this._destroyCloseImmediate = null;
+    this._destroyCloseTimer = null;
     this._destroyFinalize = null;
     this._drainQueued = false;
     this._ending = false;
@@ -399,8 +454,8 @@ class SocketImpl extends EventEmitter {
     if (emitConnect) {
       this.connecting = false;
       if (this.destroyed) return this;
-      this._flushPendingWrites();
       this._startRead();
+      this._flushPendingWrites();
       this.emit("connect");
       this._readyEmitted = true;
       this.emit("ready");
@@ -425,7 +480,17 @@ class SocketImpl extends EventEmitter {
   }
 
   _scheduleOutboundFlush() {
-    if (this._writeRetryTimer != null || this.destroyed) return;
+    if (this.destroyed) return;
+    if (this._watchId && typeof cottontail.fdWatchSetWritable === "function") {
+      if (cottontail.fdWatchSetWritable(this._watchId, true) === true) {
+        if (this._writeRetryTimer != null) {
+          clearTimeout(this._writeRetryTimer);
+          this._writeRetryTimer = null;
+        }
+        return;
+      }
+    }
+    if (this._writeRetryTimer != null) return;
     this._writeRetryTimer = globalThis.setTimeout(() => {
       this._writeRetryTimer = null;
       this._flushOutboundWrites();
@@ -468,6 +533,8 @@ class SocketImpl extends EventEmitter {
       return;
     }
 
+    if (this._watchId) cottontail.fdWatchSetWritable?.(this._watchId, false);
+
     if (this.writableNeedDrain && this.writableLength === 0 && !this._drainQueued) {
       this._drainQueued = true;
       queueMicrotask(() => {
@@ -495,9 +562,9 @@ class SocketImpl extends EventEmitter {
     const finalize = this._destroyFinalize;
     if (finalize == null) return;
     this._destroyFinalize = null;
-    if (this._destroyCloseImmediate != null) {
-      clearImmediate(this._destroyCloseImmediate);
-      this._destroyCloseImmediate = null;
+    if (this._destroyCloseTimer != null) {
+      clearTimeout(this._destroyCloseTimer);
+      this._destroyCloseTimer = null;
     }
     finalize();
   }
@@ -708,7 +775,13 @@ class SocketImpl extends EventEmitter {
     const watchId = this._watchId;
     fdWatchListeners.set(watchId, _wrapAsyncCallback((event) => {
       if (this.destroyed) {
-        if (this._destroyFinalize != null) this._finishDeferredDestroy();
+        if (this._destroyFinalize != null && event.type !== "data" && event.type !== "writable") {
+          this._finishDeferredDestroy();
+        }
+        return;
+      }
+      if (event.type === "writable") {
+        this._flushOutboundWrites();
         return;
       }
       if (event.type === "data") {
@@ -743,6 +816,7 @@ class SocketImpl extends EventEmitter {
     this._unregisterWatch = () => {
       fdWatchListeners.delete(watchId);
     };
+    if (this._outboundWrites.length > 0) this._scheduleOutboundFlush();
     return this;
   }
 
@@ -1294,18 +1368,18 @@ class SocketImpl extends EventEmitter {
         this._closeEmitted = true;
         this.emit("close", true);
       }
-    } else if (!immediate && fd != null && this._watchId) {
+    } else if (!immediate && fd != null && this._watchId && !this._endEmitted) {
       // Match Bun's deferred handle close: let one poll turn drain bytes that
       // raced with destroy(), then close even if the peer stays open.
       try { cottontail.tcpSocketShutdown?.(fd); } catch {}
       this._destroyFinalize = emitClose;
-      this._destroyCloseImmediate = setImmediate(() => {
-        this._destroyCloseImmediate = null;
+      this._destroyCloseTimer = setTimeout(() => {
+        this._destroyCloseTimer = null;
         const finalize = this._destroyFinalize;
         this._destroyFinalize = null;
         finalize?.();
-      });
-      if (!this._refed) this._destroyCloseImmediate.unref?.();
+      }, gracefulDestroyDrainMilliseconds);
+      if (!this._refed) this._destroyCloseTimer.unref?.();
     } else {
       emitClose();
     }
@@ -1398,7 +1472,7 @@ class SocketImpl extends EventEmitter {
     this._refed = true;
     this._timeoutTimer?.ref?.();
     this._writeRetryTimer?.ref?.();
-    this._destroyCloseImmediate?.ref?.();
+    this._destroyCloseTimer?.ref?.();
     for (const timer of this._connectAttemptTimers) timer.ref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, true);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, true);
@@ -1408,7 +1482,7 @@ class SocketImpl extends EventEmitter {
     this._refed = false;
     this._timeoutTimer?.unref?.();
     this._writeRetryTimer?.unref?.();
-    this._destroyCloseImmediate?.unref?.();
+    this._destroyCloseTimer?.unref?.();
     for (const timer of this._connectAttemptTimers) timer.unref?.();
     if (this._watchId) cottontail.fdWatchSetRef?.(this._watchId, false);
     for (const id of this._connectAttemptIds) cottontail.tcpSocketConnectSetRef?.(id, false);
@@ -1498,6 +1572,8 @@ class ServerImpl extends EventEmitter {
     this._isPipe = false;
     this._ownsPipePath = false;
     this._acceptTimer = null;
+    this._acceptWatchId = 0;
+    this._unregisterAcceptWatch = null;
     this._activeSockets = new Set();
     this._unref = false;
     this._usingWorkers = false;
@@ -1618,8 +1694,10 @@ class ServerImpl extends EventEmitter {
         this._address = this._isPipe ? this._path : result.address ?? null;
       }
       this.listening = true;
-      this._acceptTimer = setInterval(() => this._acceptPending(), 1);
-      if (this._unref) this._acceptTimer?.unref?.();
+      if (!startAcceptWatch(this, this._fd, !this._unref, () => this._acceptPending())) {
+        this._acceptTimer = setInterval(() => this._acceptPending(), 1);
+        if (this._unref) this._acceptTimer?.unref?.();
+      }
       queueMicrotask(() => {
         if (this.listening) this.emit("listening");
       });
@@ -1653,7 +1731,9 @@ class ServerImpl extends EventEmitter {
       server._address = server._isPipe ? server._path : null;
     }
     server.listening = true;
-    server._acceptTimer = setInterval(() => server._acceptPending(), 1);
+    if (!startAcceptWatch(server, server._fd, true, () => server._acceptPending())) {
+      server._acceptTimer = setInterval(() => server._acceptPending(), 1);
+    }
     queueMicrotask(() => server.emit("listening"));
     return server;
   }
@@ -1732,10 +1812,7 @@ class ServerImpl extends EventEmitter {
       else this.once("close", () => callback(makeNodeError(Error, "Server is not running.", "ERR_SERVER_NOT_RUNNING")));
     }
     this._closePending = true;
-    if (this._acceptTimer) {
-      clearInterval(this._acceptTimer);
-      this._acceptTimer = null;
-    }
+    stopAcceptWatch(this);
     if (this._fd != null) {
       try { cottontail.closeFd?.(this._fd); } catch {}
       this._fd = null;
@@ -1773,11 +1850,13 @@ class ServerImpl extends EventEmitter {
   ref() {
     this._unref = false;
     this._acceptTimer?.ref?.();
+    if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, true);
     return this;
   }
   unref() {
     this._unref = true;
     this._acceptTimer?.unref?.();
+    if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, false);
     return this;
   }
 
@@ -1803,6 +1882,9 @@ export class TCP {
     this._address = native.address ?? native.local ?? null;
     this._remote = native.remote ?? null;
     this._acceptTimer = null;
+    this._acceptWatchId = 0;
+    this._unregisterAcceptWatch = null;
+    this._refed = true;
   }
 
   bind(address = "0.0.0.0", port = 0) {
@@ -1822,9 +1904,20 @@ export class TCP {
   }
 
   listen() {
-    if (this.fd == null || this._acceptTimer != null) return 0;
+    if (this.fd == null || this._acceptTimer != null || this._acceptWatchId) return 0;
     this.reading = true;
-    this._acceptTimer = setInterval(() => this._acceptPending(), 1);
+    if (!startAcceptWatch(
+      this,
+      this.fd,
+      this._refed,
+      () => this._acceptPending(),
+      (error) => {
+        if (typeof this.onconnection === "function") this.onconnection(error);
+      },
+    )) {
+      this._acceptTimer = setInterval(() => this._acceptPending(), 1);
+      if (!this._refed) this._acceptTimer.unref?.();
+    }
     return 0;
   }
 
@@ -1851,10 +1944,7 @@ export class TCP {
   }
 
   close(callback = undefined) {
-    if (this._acceptTimer != null) {
-      clearInterval(this._acceptTimer);
-      this._acceptTimer = null;
-    }
+    stopAcceptWatch(this);
     this.reading = false;
     if (this.fd != null) {
       try { cottontail.closeFd?.(this.fd); } catch {}
@@ -1864,15 +1954,19 @@ export class TCP {
   }
 
   ref() {
+    this._refed = true;
     this._acceptTimer?.ref?.();
+    if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, true);
     return this;
   }
   unref() {
+    this._refed = false;
     this._acceptTimer?.unref?.();
+    if (this._acceptWatchId) cottontail.fdWatchSetRef?.(this._acceptWatchId, false);
     return this;
   }
   hasRef() {
-    return this._acceptTimer?.hasRef?.() ?? true;
+    return this._refed;
   }
 
   getsockname(out = {}) {
@@ -1927,8 +2021,11 @@ export class TCP {
 
 export const Stream = Socket;
 
-function strictAddressFamily(value, name = "family") {
-  if (typeof value !== "string") throw invalidArgType(name, "of type string", value);
+function strictAddressFamily(value, name = "family", invalidTypeIsValue = false) {
+  if (typeof value !== "string") {
+    if (invalidTypeIsValue) throw invalidArgValue(name, value);
+    throw invalidArgType(name, "of type string", value);
+  }
   const family = value.toLowerCase();
   if (family !== "ipv4" && family !== "ipv6") throw invalidArgValue(name, value);
   return family;
@@ -2085,7 +2182,7 @@ export class SocketAddress {
   constructor(options = undefined) {
     if (options === undefined) options = {};
     if (options === null || typeof options !== "object") throw invalidArgType("options", "of type object", options);
-    const family = options.family === undefined ? "ipv4" : strictAddressFamily(options.family, "options.family");
+    const family = options.family === undefined ? "ipv4" : strictAddressFamily(options.family, "options.family", true);
     const address = options.address === undefined ? (family === "ipv6" ? "::" : "127.0.0.1") : options.address;
     if (typeof address !== "string") throw invalidArgType("options.address", "of type string", address);
     const record = addressRecord(address, family, "address");
