@@ -349,6 +349,12 @@ function pickConstants(predicate) {
 
 const errnoConstants = pickConstants((name, value) => /^E[A-Z0-9]+$/.test(name) && Number.isInteger(value));
 const signalConstants = pickConstants((name, value) => /^SIG[A-Z0-9]+$/.test(name) && Number.isInteger(value));
+const signalNamesByNumber = new Map();
+for (const signals of [signalConstants, fallbackSignalNumbers]) {
+  for (const [name, value] of Object.entries(signals)) {
+    if (!signalNamesByNumber.has(value)) signalNamesByNumber.set(value, name);
+  }
+}
 const priorityConstants = pickConstants((name) => name.startsWith("PRIORITY_"));
 const dlopenConstants = pickConstants((name) => name.startsWith("RTLD_"));
 const fsConstants = pickConstants((name) =>
@@ -2085,6 +2091,19 @@ export const kill = processObject.kill = (targetPid, signal = "SIGTERM") => {
     error.errno = -(errnoConstants.EINVAL ?? 22);
     error.syscall = "kill";
     throw error;
+  }
+  const signalName = signalValue === 0
+    ? undefined
+    : typeof signal === "string"
+      ? String(signal).toUpperCase()
+      : signalNamesByNumber.get(signalValue);
+  if (pidNumber === processObject.pid && signalName && processObject.listenerCount(signalName) > 0) {
+    _enqueueNextTick(() => {
+      if (!processObject.emit(signalName, signalName, signalValue)) {
+        processObject._kill(pidNumber, signalValue);
+      }
+    });
+    return true;
   }
   let result;
   try {
