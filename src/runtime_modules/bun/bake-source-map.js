@@ -79,6 +79,70 @@ function positionAt(source, offset) {
   return { line, column: offset - lineStart };
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function declarationLocation(source, name) {
+  if (!/^[$A-Z_a-z][$\w]*$/.test(name)) return null;
+  const pattern = new RegExp(`(?:^|\\n)[^\\n]*?\\bfunction\\s+${escapeRegExp(name)}\\s*(\\()`, "g");
+  const match = pattern.exec(source);
+  if (!match) return null;
+  const parenthesis = match.index + match[0].lastIndexOf("(");
+  const lineStart = source.lastIndexOf("\n", parenthesis - 1);
+  return {
+    column: parenthesis - lineStart,
+    line: source.slice(0, parenthesis).split("\n").length,
+  };
+}
+
+function serverFrameAliases(modules, record) {
+  const importedNames = new Set();
+  const factorySources = [];
+  for (const definition of Object.values(modules)) {
+    if (!Array.isArray(definition)) continue;
+    factorySources.push(typeof definition[3] === "function" ? String(definition[3]) : "");
+    const dependencies = definition[0];
+    if (!Array.isArray(dependencies)) continue;
+    for (let index = 0; index < dependencies.length;) {
+      index += 1;
+      const count = Number(dependencies[index++]);
+      if (!Number.isInteger(count) || count < 0 || index + count > dependencies.length) break;
+      for (let imported = 0; imported < count; imported += 1) {
+        importedNames.add(String(dependencies[index++]));
+      }
+    }
+  }
+
+  const allFactories = factorySources.join("\n");
+  const aliases = [];
+  for (const [moduleId, definition] of Object.entries(modules)) {
+    if (!Array.isArray(definition) || !Array.isArray(definition[1])) continue;
+    const modulePath = nativePath(path.resolve(record.projectRoot, moduleId));
+    const source = record.sources.find(candidate => nativePath(candidate.path) === modulePath);
+    if (!source) continue;
+    const factorySource = typeof definition[3] === "function" ? String(definition[3]) : "";
+    for (const exported of definition[1]) {
+      const name = String(exported);
+      if (!importedNames.has(name)) continue;
+      const escaped = escapeRegExp(name);
+      if (!new RegExp(`\\bfunction\\s+${escaped}\\s*\\(`).test(factorySource)) continue;
+      const location = declarationLocation(source.content, name);
+      if (!location) continue;
+      let suffix = 2;
+      while (new RegExp(`\\b${escaped}${suffix}\\b`).test(allFactories)) suffix += 1;
+      aliases.push({
+        column: location.column,
+        displayName: `${name}${suffix}`,
+        line: location.line,
+        name,
+        source: source.path,
+      });
+    }
+  }
+  return aliases;
+}
+
 function relocate(inputs, addRuntimeMapping) {
   const binding = globalThis.cottontail?.bakeSourceMapRelocate;
   if (typeof binding !== "function") {
@@ -236,7 +300,10 @@ export function registerBakeServerPatch(source, record, patchId) {
       inputStartColumn: inputStart.column,
       inputEndLine: inputEnd.line,
       inputEndColumn: inputEnd.column,
-      outputStartLine: outputStart.line,
+      // SourceMapStore joins every HMR chunk after the one-line client HMR
+      // invocation prefix, including server patches whose executable source
+      // starts directly with the module registry.
+      outputStartLine: outputStart.line + 1,
       outputStartColumn: outputStart.column,
     }],
   }], "server");
@@ -248,5 +315,29 @@ export function registerBakeServerPatch(source, record, patchId) {
   if (!Array.isArray(value) || value.length < 2) {
     throw new TypeError("Bake's registered server patch did not export its module registry");
   }
-  return { bundleConfig: value[1], filename, modules: value[0], sourceMap };
+  return {
+    bundleConfig: value[1],
+    filename,
+    frameAliases: serverFrameAliases(value[0], record),
+    modules: value[0],
+    sourceMap,
+  };
+}
+
+export function normalizeBakeServerStack(stack, registrations) {
+  let output = String(stack ?? "");
+  for (const registration of registrations ?? []) {
+    for (const alias of registration?.frameAliases ?? []) {
+      const name = escapeRegExp(alias.name);
+      const source = escapeRegExp(alias.source);
+      const location = `${alias.source}:${alias.line}:${alias.column}`;
+      output = output
+        .replace(new RegExp(`${name}@${source}:\\d+:\\d+`, "g"), `${alias.displayName}@${location}`)
+        .replace(
+          new RegExp(`(\\bat\\s+)${name}(\\s+\\()${source}:\\d+:\\d+(\\))`, "g"),
+          `$1${alias.displayName}$2${location}$3`,
+        );
+    }
+  }
+  return output;
 }

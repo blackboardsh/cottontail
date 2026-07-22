@@ -27,6 +27,7 @@ import { buildBakeProduction } from "./bake-production.js";
 import {
   composeBakeClientHotUpdateSourceMap,
   createBakeSourceMapRecord,
+  normalizeBakeServerStack,
   normalizeBakeClientSourceMap,
   registerBakeServerPatch,
 } from "./bake-source-map.js";
@@ -2105,7 +2106,10 @@ function createFrameworkDispatcher(config) {
         target: "bun",
         publicPath: "/_bun/asset",
         sourcemap: development ? "external" : serverOptions.sourcemap,
-        serverComponents: serverComponents !== null,
+        // The JS Bake graph has already materialized client boundaries. The
+        // generic build bridge otherwise enables BuildCommand's production
+        // syntax minification, unlike Bake's development transpiler.
+        serverComponents: development ? false : serverComponents !== null,
         conditions,
         define: developmentBuildDefines(serverOptions, "server"),
         jsx: { ...(serverOptions.jsx ?? {}), development: true },
@@ -2340,13 +2344,23 @@ function createFrameworkDispatcher(config) {
     record.pathname = pathname;
     const route = await bundleRoute(found.router, found.matched);
     if (route === null) return new Response("Not Found", { status: 404 });
-    const response = await route.render(request, {
-      params: found.matched.params,
-      modules: [route.hmrArgs?.clientEntryUrl ?? ""],
-      modulepreload: [],
-      styles: route.hmrArgs?.styles ?? [],
-    });
-    return development ? withBakeFrameworkHmrBootstrap(response) : response;
+    try {
+      const response = await route.render(request, {
+        params: found.matched.params,
+        modules: [route.hmrArgs?.clientEntryUrl ?? ""],
+        modulepreload: [],
+        styles: route.hmrArgs?.styles ?? [],
+      });
+      return development ? withBakeFrameworkHmrBootstrap(response) : response;
+    } catch (error) {
+      if (error && typeof error.stack === "string") {
+        const remap = globalThis.__cottontailRemapModuleStackString;
+        if (typeof remap === "function") error.stack = remap(error.stack);
+        error.stack = normalizeBakeServerStack(error.stack, serverSourceMapRegistrations.values());
+      }
+      console.error(error);
+      throw error;
+    }
   };
   dispatchFrameworkRequest.projectRoot = projectRoot;
   dispatchFrameworkRequest.sourceMapForPath = pathname => sourceMaps.get(pathname) ?? null;

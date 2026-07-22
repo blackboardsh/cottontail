@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import {
   composeBakeClientHotUpdateSourceMap,
   createBakeSourceMapRecord,
+  normalizeBakeServerStack,
   normalizeBakeClientSourceMap,
   registerBakeServerPatch,
 } from "../../src/runtime_modules/bun/bake-source-map.js";
@@ -99,7 +100,8 @@ test("Bake server patches register their map before module factories execute", (
     sources: ["app.ts"],
     sourcesContent: ["\n\n\n\n\nthrow new Error(\"mapped\");\n"],
     names: [],
-    mappings: ";;;;MAKe",
+    // SourceMapStore places this chunk after the one-line HMR invocation.
+    mappings: ";;;MAKe",
   }, { mapPath: join(root, "entry.js.map"), projectRoot: root });
   const registration = registerBakeServerPatch(generatedSource, record, "focused-test");
   const patchSource = readFileSync(registration.filename, "utf8");
@@ -120,4 +122,39 @@ test("Bake server patches register their map before module factories execute", (
     const stack = globalThis.__cottontailRemapModuleStackString(String(error.stack));
     expect(stack).toContain(`${join(root, "app.ts")}:6:16`);
   }
+});
+
+test("Bake server stacks preserve DevServer renamer frames for imported exports", () => {
+  const root = temporaryRoot("bake-server-renamer");
+  const generatedSource = `(() => {})
+  // lib/utils.ts
+  "lib/utils.ts": [[],["doSomething"],[],(hmr) => {
+    function doSomething() {}
+    hmr.exports = { doSomething };
+  },false],
+
+  // pages/nested.tsx
+  "pages/nested.tsx": [["lib/utils.ts",1,"doSomething"],["default"],[],(hmr) => {
+    const [utils] = hmr.imports;
+    hmr.exports = { default() { return utils.doSomething(); } };
+  },false]
+}, {
+  main: "pages/nested.tsx"
+});`;
+  const record = createBakeSourceMapRecord(generatedSource, {
+    version: 3,
+    sources: ["lib/utils.ts", "pages/nested.tsx"],
+    sourcesContent: [
+      "export function doSomething() {\n  return helperFunction();\n}\n",
+      "import { doSomething } from '../lib/utils';\n",
+    ],
+    names: [],
+    mappings: "AAAA",
+  }, { mapPath: join(root, "entry.js.map"), projectRoot: root });
+  const registration = registerBakeServerPatch(generatedSource, record, "renamer-test");
+  const stack = `Error: nested\n    doSomething@${join(root, "lib/utils.ts")}:1:31`;
+
+  expect(normalizeBakeServerStack(stack, [registration])).toContain(
+    `doSomething2@${join(root, "lib/utils.ts")}:1:28`,
+  );
 });
