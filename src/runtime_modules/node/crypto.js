@@ -5098,8 +5098,32 @@ for (const method of Object.keys(subtleCrypto)) {
   });
 }
 Object.setPrototypeOf(subtleCrypto, SubtleCrypto.prototype);
-export const webcrypto = globalThis.crypto ?? { getRandomValues, randomUUID };
-if (webcrypto.subtle == null) webcrypto.subtle = subtleCrypto;
+
+class Crypto {
+  constructor() {
+    throw nodeCryptoError(TypeError, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+  }
+
+  get subtle() {
+    return subtleCrypto;
+  }
+
+  getRandomValues(view) {
+    return getRandomValues(view);
+  }
+
+  randomUUID() {
+    return randomUUID();
+  }
+
+  get [Symbol.toStringTag]() {
+    return "Crypto";
+  }
+}
+Object.defineProperty(Crypto, "name", { value: "Crypto", configurable: true });
+
+export const webcrypto = globalThis.crypto ?? Object.create(Crypto.prototype);
+if (!(webcrypto instanceof Crypto)) Object.setPrototypeOf(webcrypto, Crypto.prototype);
 export const subtle = webcrypto.subtle;
 export let fips = 0;
 

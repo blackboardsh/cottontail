@@ -175,6 +175,27 @@ test("HTTP response parsing preserves an empty wire status message", async () =>
   }
 });
 
+test("HTTP server responses replace an empty status message with the standard reason phrase", async () => {
+  const server = http.createServer((_request, response) => {
+    response.statusMessage = "";
+    response.end();
+  });
+  const port = await listen(server);
+  try {
+    const socket = net.connect(port, "127.0.0.1");
+    await once(socket, "connect");
+    socket.setEncoding("utf8");
+    let wire = "";
+    socket.on("data", (chunk) => { wire += chunk; });
+    const ended = once(socket, "end");
+    socket.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    await ended;
+    expect(wire.split("\r\n", 1)[0]).toBe("HTTP/1.1 200 OK");
+  } finally {
+    await close(server);
+  }
+});
+
 test("live request and response parsers preserve duplicate header semantics", async () => {
   let resolveRequestHeaders!: (value: {
     cookie: string;

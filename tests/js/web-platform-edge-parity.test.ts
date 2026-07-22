@@ -3,10 +3,21 @@ import {
   ReadableStream,
   ReadableStreamBYOBRequest,
 } from "node:stream/web";
+import { webcrypto } from "node:crypto";
 
 function expectCode(callback: () => unknown, code: string) {
   expect(callback).toThrow(expect.objectContaining({ code }));
 }
+
+test("Web Crypto exposes a coherent global constructor", () => {
+  expect(typeof globalThis.Crypto).toBe("function");
+  expect(globalThis.crypto).toBe(webcrypto);
+  expect(globalThis.crypto).toBeInstanceOf(globalThis.Crypto);
+  expect(globalThis.crypto.constructor).toBe(globalThis.Crypto);
+  expect(globalThis.crypto.subtle).toBeInstanceOf(globalThis.SubtleCrypto);
+  expect(Object.prototype.toString.call(globalThis.crypto)).toBe("[object Crypto]");
+  expect(() => new globalThis.Crypto()).toThrow(expect.objectContaining({ code: "ERR_ILLEGAL_CONSTRUCTOR" }));
+});
 
 test("ResponseInit uses Bun status coercion and field order", () => {
   expect(new Response(null, { status: 101 }).status).toBe(101);

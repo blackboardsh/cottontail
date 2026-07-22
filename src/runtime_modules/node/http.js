@@ -2013,7 +2013,7 @@ export class ServerResponse extends OutgoingMessage {
     if (!Number.isInteger(status) || status < 100 || status > 999) {
       throw nodeError(RangeError, "ERR_HTTP_INVALID_STATUS_CODE", `Invalid status code: ${originalStatus}`);
     }
-    const statusText = this.statusMessage != null ? String(this.statusMessage) : (STATUS_CODES[status] ?? "unknown");
+    const statusText = this.statusMessage ? String(this.statusMessage) : (STATUS_CODES[status] ?? "unknown");
     if (/[\r\n]/.test(statusText)) {
       const error = new Error("Invalid character in statusMessage.");
       error.code = "ERR_INVALID_CHAR";

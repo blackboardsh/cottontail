@@ -18639,7 +18639,7 @@ if (globalThis.navigator == null) {
     hardwareConcurrency: Number(cottontail.cpuCount?.() ?? 1) || 1,
   };
 }
-const CryptoObject = globalThis.crypto ?? {};
+const CryptoObject = globalThis.crypto ?? nodeWebcrypto;
 CryptoObject.randomUUID ??= randomUUID;
 // Bun's crypto.getRandomValues also accepts ArrayBuffer/SharedArrayBuffer and
 // has no 65536-byte quota; wrap the base implementation accordingly.
@@ -18673,6 +18673,7 @@ CryptoObject.getRandomValues = function getRandomValuesCompat(view) {
   });
 }
 globalThis.crypto = CryptoObject;
+globalThis.Crypto ??= nodeWebcrypto.constructor;
 globalThis.CryptoKey ??= CryptoKey;
 globalThis.SubtleCrypto ??= NodeSubtleCrypto;
 // URLPattern (WHATWG URL Pattern spec) via the vendored urlpattern-polyfill.
