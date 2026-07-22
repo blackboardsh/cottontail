@@ -13,7 +13,12 @@ import {
   githubErrorAnnotation,
   githubTimeoutAnnotation,
 } from "../internal/bun-test-github.js";
-import { bunTestRuntimeOptions } from "../internal/bun-test-config.js";
+import { bunTestConfig, bunTestRuntimeOptions } from "../internal/bun-test-config.js";
+import {
+  coverageOptions as configuredCoverageOptions,
+  reportTestCoverage,
+} from "../internal/bun-test-coverage.js";
+import { finalizeTestReporters } from "../internal/bun-test-reporters.js";
 
 const tests = [];
 const events = [];
@@ -82,6 +87,21 @@ const dotsMode = testRuntimeOptions.reporters.dots;
 const globalOnlyMode = testRuntimeOptions.only;
 const passWithNoTests = testRuntimeOptions.passWithNoTests;
 const junitOptions = junitReporterOptions(testRuntimeOptions);
+const testCoverageOptions = configuredCoverageOptions(testCliArgs, bunTestConfig());
+const testReporterFinalizers = [
+  {
+    name: "snapshot writer",
+    finalize: async () => { await globalThis.__cottontailFlushSnapshots?.(); },
+  },
+  {
+    name: "coverage reporter",
+    finalize: () => reportTestCoverage(testCoverageOptions),
+  },
+  {
+    name: "JUnit reporter",
+    finalize: () => writeJunitReport(tests, rootSuite, junitOptions),
+  },
+];
 const testFileCount = Math.max(1, Number(globalThis.process?.env?.COTTONTAIL_TEST_FILE_COUNT ?? 1) || 1);
 const configuredTimeoutScale = Number(globalThis.process?.env?.COTTONTAIL_TEST_TIMEOUT_SCALE ?? 1);
 const timeoutScale = Number.isFinite(configuredTimeoutScale) && configuredTimeoutScale >= 1
@@ -1638,15 +1658,8 @@ async function finalizeRun(exitOnFailure = true) {
       const error = await runHookList(rootSuite.afterHooks, new TestContext({ name: rootSuite.name }), true);
       if (error) recordHookFailure(rootSuite.name, error);
     }
-    try {
-      await globalThis.__cottontailFlushSnapshots?.();
-    } catch (error) {
-      recordHookFailure("snapshot writer", error);
-    }
-    try {
-      writeJunitReport(tests, rootSuite, junitOptions);
-    } catch (error) {
-      recordHookFailure("JUnit reporter", error);
+    if (await finalizeTestReporters(testReporterFinalizers, recordHookFailure)) {
+      globalThis.process.exitCode = 1;
     }
     reportResults();
     const labelFilterMatchedNoTests = Boolean(testNamePattern) &&
@@ -1707,6 +1720,8 @@ function scheduleRun() {
     !hasPendingSuiteDefinitions() && !globalThis.__cottontailHasPendingSnapshots?.();
   if (noRegisteredWork) {
     if (reportEmptyGithubFile && globalThis.__cottontailTestEntrypointLoaded) reportResults();
+    if (testCoverageOptions.enabled && testCliModeEnabled() &&
+        globalThis.__cottontailLoadingTestModules !== true) scheduleAfterHooks();
     return;
   }
   installUncaughtCapture();

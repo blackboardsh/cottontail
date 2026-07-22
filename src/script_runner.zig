@@ -92,6 +92,7 @@ const ScriptExecution = struct {
     embedded_bytecode: ?[]const u8 = null,
     standalone_flags: ?standalone_executable.Flags = null,
     exit_cleanup_path: ?[:0]const u8 = null,
+    test_cli_execution: bool = false,
     reload: ?ReloadExecution = null,
     exit_code: u8 = 1,
 };
@@ -2535,6 +2536,7 @@ fn runPrepared(
         .embedded_source_map = embedded_source_map,
         .embedded_files = embedded_files,
         .embedded_bytecode = embedded_bytecode,
+        .test_cli_execution = ctx.environ_map.get("COTTONTAIL_TEST_CLI_HEADER_PRINTED") != null,
         .standalone_flags = standalone_flags,
         .exit_cleanup_path = if (runnableDirectoryForCleanup(ctx, runnable_path_z)) |path|
             try allocator.dupeZ(u8, path)
@@ -2760,6 +2762,60 @@ fn runElectrobunMainThread(ctx: *const Context) !u8 {
     }
 
     return 0;
+}
+
+fn bunfigTestCoverageEnabled(contents: []const u8) bool {
+    var in_test_section = false;
+    var enabled = false;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const comment = std.mem.indexOfScalar(u8, raw_line, '#') orelse raw_line.len;
+        const line = std.mem.trim(u8, raw_line[0..comment], " \t\r");
+        if (line.len == 0) continue;
+        if (line[0] == '[') {
+            in_test_section = std.mem.eql(u8, line, "[test]");
+            continue;
+        }
+        if (!in_test_section) continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..equals], " \t");
+        if (!std.mem.eql(u8, key, "coverage")) continue;
+        const value = std.mem.trim(u8, line[equals + 1 ..], " \t");
+        if (std.mem.eql(u8, value, "true")) enabled = true;
+        if (std.mem.eql(u8, value, "false")) enabled = false;
+    }
+    return enabled;
+}
+
+fn testCoverageRequestedFromArgs(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    test_cli_execution: bool,
+    args: []const [:0]const u8,
+) bool {
+    if (!test_cli_execution) return false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--coverage")) return true;
+    }
+
+    const configured = configPathFromArgs(args) orelse "bunfig.toml";
+    const contents = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        configured,
+        allocator,
+        .limited(1024 * 1024),
+    ) catch return false;
+    return bunfigTestCoverageEnabled(contents);
+}
+
+fn testCoverageRequested(execution: *const ScriptExecution) bool {
+    if (execution.process_args.len == 0) return false;
+    return testCoverageRequestedFromArgs(
+        execution.io,
+        execution.allocator,
+        execution.test_cli_execution,
+        execution.process_args[1..],
+    );
 }
 
 const ReloadDependencies = struct {
@@ -3091,6 +3147,12 @@ fn runScriptExecution(execution: *ScriptExecution) void {
     const cpu_profiler_started = profiler_options.enabled() and js_runtime.enableSamplingProfiler();
     if (profiler_options.enabled() and !cpu_profiler_started) {
         writeStderr(execution.io, "cottontail: failed to enable the JSC sampling profiler\n", .{});
+    }
+
+    if (testCoverageRequested(execution) and !js_runtime.enableControlFlowProfiler()) {
+        writeStderr(execution.io, "cottontail: failed to enable JavaScriptCore coverage profiling\n", .{});
+        execution.exit_code = 1;
+        return;
     }
 
     if (execution.exit_cleanup_path) |path| {
@@ -4319,6 +4381,14 @@ fn bundleScriptNative(
     options.runtime_virtual_root = runtime_virtual_root;
     options.preserve_external_require_name = true;
     options.rewrite_jest_for_tests = is_test_cli_execution;
+    if (build_options == null) {
+        options.code_coverage = testCoverageRequestedFromArgs(
+            ctx.io,
+            ctx.allocator,
+            is_test_cli_execution,
+            script_args,
+        );
+    }
     options.inline_import_meta_properties = true;
     if (build_options == null and graph_out == null) {
         // Runtime execution can load the original addon directly. A fixed

@@ -30,6 +30,8 @@ extern uint32_t ct_jsc_weak_collection_size(JSValueRef value);
 extern bool ct_jsc_array_buffer_view_has_buffer(JSValueRef value);
 extern JSObjectRef ct_jsc_create_buffer_is_ascii(JSContextRef context);
 extern JSObjectRef ct_jsc_create_buffer_transcode(JSContextRef context);
+extern JSObjectRef ct_jsc_create_test_coverage_collector(JSContextRef context);
+extern bool ct_jsc_enable_control_flow_profiler(JSContextRef context);
 extern uint32_t ct_jsc_cached_data_version_tag(void);
 extern char *ct_jsc_heap_snapshot(JSContextRef context, int gc_debugging);
 extern size_t ct_jsc_query_objects_count(JSContextRef context, JSObjectRef prototype);
@@ -1965,6 +1967,7 @@ struct CtJscRuntime {
     uint64_t uv_poll_count;
     bool next_tick_pending;
     bool next_tick_priority_armed;
+    bool control_flow_profiler_enabled;
     bool fatal_exception_routed;
     bool reload_requested;
     CtReloadWatcher *reload_watchers;
@@ -28700,6 +28703,10 @@ static int ct_install_host_api(CtJscRuntime *runtime) {
     JSValueProtect(ctx, host);
 
     ct_register_host_native_bindings(ctx, host, runtime);
+    JSObjectRef coverage_collector = ct_jsc_create_test_coverage_collector(ctx);
+    if (coverage_collector != NULL) {
+        ct_set_property(ctx, host, "collectTestCoverage", coverage_collector, &exception);
+    }
     JSObjectRef args = ct_make_array(ctx, 0, NULL, &exception);
     ct_set_property(ctx, host, "args", args, &exception);
 #if defined(COTTONTAIL_VENDORED_JSC)
@@ -29854,7 +29861,9 @@ static char *ct_prepare_source_with_wrappers(
     size_t source_len,
     const char *filename,
     const char *prefix,
-    const char *suffix
+    const char *suffix,
+    size_t *source_offset_out,
+    size_t *source_length_out
 ) {
     size_t prefix_len = strlen(prefix);
     size_t suffix_len = strlen(suffix);
@@ -29868,6 +29877,7 @@ static char *ct_prepare_source_with_wrappers(
         free(builder.data);
         return NULL;
     }
+    if (source_offset_out != NULL) *source_offset_out = builder.len;
 
     const char *start = (const char *)source;
     const char *end = start + source_len;
@@ -29932,6 +29942,11 @@ static char *ct_prepare_source_with_wrappers(
     }
     free(meta_builder.data);
 
+    if (source_length_out != NULL) {
+        const size_t source_offset = source_offset_out != NULL ? *source_offset_out : 0;
+        *source_length_out = builder.len - source_offset;
+    }
+
     if (!ct_sb_append_bytes(&builder, suffix, suffix_len)) {
         free(builder.data);
         return NULL;
@@ -29939,7 +29954,13 @@ static char *ct_prepare_source_with_wrappers(
     return builder.data;
 }
 
-static char *ct_prepare_wrapped_source(const uint8_t *source, size_t source_len, const char *filename) {
+static char *ct_prepare_wrapped_source(
+    const uint8_t *source,
+    size_t source_len,
+    const char *filename,
+    size_t *source_offset_out,
+    size_t *source_length_out
+) {
     return ct_prepare_source_with_wrappers(
         source,
         source_len,
@@ -29949,7 +29970,9 @@ static char *ct_prepare_wrapped_source(const uint8_t *source, size_t source_len,
         "\n})();try{globalThis.__cottontailSuppressAsyncHookPromise=true;"
         "__ctTopLevelPromise.then(()=>{globalThis.__ctDone=true;},"
         "e=>{globalThis.__ctError=e;globalThis.__ctErrorSet=true;globalThis.__ctDone=true;});}"
-        "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();"
+        "finally{globalThis.__cottontailSuppressAsyncHookPromise=false;}})();",
+        source_offset_out,
+        source_length_out
     );
 }
 
@@ -29959,7 +29982,9 @@ static char *ct_prepare_sync_source(const uint8_t *source, size_t source_len, co
         source_len,
         filename,
         "(()=>{\n",
-        "\n})();"
+        "\n})();",
+        NULL,
+        NULL
     );
 }
 
@@ -30095,7 +30120,14 @@ static int ct_jsc_runtime_eval_internal(
     if (error_out != NULL) *error_out = NULL;
     if (runtime->reload_requested) return CT_JSC_EVAL_RELOAD;
     JSContextRef ctx = runtime->context;
-    char *wrapped = ct_prepare_wrapped_source(source, source_len, filename);
+    size_t coverage_source_offset = 0;
+    size_t coverage_source_length = 0;
+    char *wrapped = ct_prepare_wrapped_source(
+        source,
+        source_len,
+        filename,
+        &coverage_source_offset,
+        &coverage_source_length);
     if (wrapped == NULL) {
         ct_set_error_out(error_out, ct_duplicate_bytes("Out of memory", 13));
         return -1;
@@ -30104,8 +30136,24 @@ static int ct_jsc_runtime_eval_internal(
     JSStringRef script = ct_js_string(wrapped);
     JSStringRef source_url = ct_js_string(filename != NULL ? filename : "<script>");
     JSValueRef exception = NULL;
+    if (runtime->host_object != NULL && runtime->control_flow_profiler_enabled) {
+        ct_set_property(
+            ctx,
+            runtime->host_object,
+            "coverageSourceOffset",
+            JSValueMakeNumber(ctx, (double)coverage_source_offset),
+            &exception);
+        if (exception == NULL) {
+            ct_set_property(
+                ctx,
+                runtime->host_object,
+                "coverageSource",
+                ct_make_string_len(ctx, wrapped + coverage_source_offset, coverage_source_length),
+                &exception);
+        }
+    }
     int bytecode_status = 1;
-    if (bytecode != NULL && bytecode_len > 0) {
+    if (exception == NULL && bytecode != NULL && bytecode_len > 0) {
         bytecode_status = ct_jsc_bytecode_evaluate(
             ctx,
             script,
@@ -30124,7 +30172,7 @@ static int ct_jsc_runtime_eval_internal(
             fflush(stderr);
         }
     }
-    if (bytecode_status != 0) {
+    if (exception == NULL && bytecode_status != 0) {
         exception = NULL;
         JSEvaluateScript(ctx, script, NULL, source_url, 1, &exception);
     }
@@ -30558,6 +30606,12 @@ static int ct_jsc_runtime_tick_with_delay(CtJscRuntime *runtime, int *delay_ms_o
 
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out) {
     return ct_jsc_runtime_tick_with_delay(runtime, NULL, error_out);
+}
+
+bool ct_jsc_runtime_enable_control_flow_profiler(CtJscRuntime *runtime) {
+    if (runtime == NULL || runtime->context == NULL) return false;
+    runtime->control_flow_profiler_enabled = ct_jsc_enable_control_flow_profiler(runtime->context);
+    return runtime->control_flow_profiler_enabled;
 }
 
 bool ct_jsc_runtime_enable_sampling_profiler(CtJscRuntime *runtime) {

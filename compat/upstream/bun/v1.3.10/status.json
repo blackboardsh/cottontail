@@ -2875,8 +2875,12 @@
       "reason": "Copied upstream file passes directly under Cottontail (2 bun:test cases, 3 assertions)."
     },
     "test/js/node/http/node-http-uaf.test.ts": {
-      "status": "expected-failure",
-      "reason": "Both stress fixtures finish standalone, but two iterations exceed Bun's 5-second test deadline on the current one-thread-per-fd watcher transport; the abort fixture also leaves late rejected body work after shutdown."
+      "status": "enabled",
+      "reason": "Both copied abort-heavy HTTP fixtures complete without crashes, duplicate request errors, or late rejected body work (2 cases, 8 assertions); their 22-second average runtime needs a functional-parity timeout budget.",
+      "args": [
+        "--timeout=30000"
+      ],
+      "timeoutMs": 90000
     },
     "test/js/node/http/node-http-with-ws.test.ts": {
       "status": "enabled",

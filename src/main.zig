@@ -1866,6 +1866,12 @@ fn runMultipleTestFilesWithBail(
     try init.environ_map.put("COTTONTAIL_TEST_AGGREGATE_FILE", summary_path);
     defer _ = init.environ_map.swapRemove("COTTONTAIL_TEST_AGGREGATE_FILE");
 
+    const reporter_state_path = try std.fmt.allocPrint(allocator, ".cottontail-test-reporters-{x}", .{summary_id});
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = reporter_state_path, .data = "" });
+    defer std.Io.Dir.cwd().deleteFile(init.io, reporter_state_path) catch {};
+    try init.environ_map.put("COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE", reporter_state_path);
+    defer _ = init.environ_map.swapRemove("COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE");
+
     var exit_code: u8 = 0;
     var failed_files: usize = 0;
     var executed_files: usize = 0;
@@ -2204,6 +2210,7 @@ fn testBailLimit(args: []const [:0]const u8) ?usize {
 
 const TestCliValidationError = enum {
     invalid_bail,
+    invalid_coverage_reporter,
     invalid_timeout,
 };
 
@@ -2228,6 +2235,18 @@ fn validateTestCliOptions(args: []const [:0]const u8) ?TestCliValidationError {
             if (index + 1 >= args.len) return .invalid_timeout;
             _ = std.fmt.parseUnsigned(u32, args[index + 1], 10) catch
                 return .invalid_timeout;
+            index += 1;
+        } else if (std.mem.startsWith(u8, arg, "--coverage-reporter=")) {
+            const reporter = arg["--coverage-reporter=".len..];
+            if (!std.mem.eql(u8, reporter, "text") and !std.mem.eql(u8, reporter, "lcov")) {
+                return .invalid_coverage_reporter;
+            }
+        } else if (std.mem.eql(u8, arg, "--coverage-reporter")) {
+            if (index + 1 >= args.len) return .invalid_coverage_reporter;
+            const reporter = args[index + 1];
+            if (!std.mem.eql(u8, reporter, "text") and !std.mem.eql(u8, reporter, "lcov")) {
+                return .invalid_coverage_reporter;
+            }
             index += 1;
         }
         index += 1;
@@ -2876,6 +2895,9 @@ pub fn main(init: std.process.Init) !void {
     if (validateTestCliOptions(args)) |validation_error| {
         switch (validation_error) {
             .invalid_bail => try stderr.writeAll("error: --bail expects a number greater than 0\n"),
+            .invalid_coverage_reporter => try stderr.writeAll(
+                "error: invalid coverage reporter. Available options: 'text' (console output), 'lcov' (code coverage file)\n",
+            ),
             .invalid_timeout => try stderr.writeAll("error: Invalid timeout\n"),
         }
         try stderr.flush();
@@ -3026,6 +3048,9 @@ test "test flags can precede the entrypoint" {
 
     const tsconfig_args = [_][:0]const u8{ "cottontail", "test", "--tsconfig-override", "test-tsconfig.json", "suite.test.ts" };
     try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&tsconfig_args));
+
+    const config_args = [_][:0]const u8{ "cottontail", "test", "--config", "coverage.toml", "suite.test.ts" };
+    try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&config_args));
 }
 
 test "test flag values are not treated as additional entrypoints" {
@@ -3058,14 +3083,16 @@ test "bare bail keeps a following test filter positional" {
     try std.testing.expectEqual(@as(?usize, 4), testEntrypointIndex(&numeric));
 }
 
-test "test CLI validation rejects invalid bail and timeout values" {
+test "test CLI validation rejects invalid bail timeout and coverage values" {
     const bail_text = [_][:0]const u8{ "cottontail", "test", "--bail=wat" };
     const bail_zero = [_][:0]const u8{ "cottontail", "test", "--bail=0" };
     const timeout_text = [_][:0]const u8{ "cottontail", "test", "--timeout", "wat" };
+    const coverage_reporter = [_][:0]const u8{ "cottontail", "test", "--coverage-reporter", "json" };
     const valid = [_][:0]const u8{ "cottontail", "test", "--bail", "3", "--timeout=50" };
     try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_text).?);
     try std.testing.expectEqual(TestCliValidationError.invalid_bail, validateTestCliOptions(&bail_zero).?);
     try std.testing.expectEqual(TestCliValidationError.invalid_timeout, validateTestCliOptions(&timeout_text).?);
+    try std.testing.expectEqual(TestCliValidationError.invalid_coverage_reporter, validateTestCliOptions(&coverage_reporter).?);
     try std.testing.expectEqual(@as(?TestCliValidationError, null), validateTestCliOptions(&valid));
 }
 

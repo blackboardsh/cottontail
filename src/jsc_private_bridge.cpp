@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <wtf/Function.h>
@@ -29,6 +30,7 @@
 #include <wtf/MainThread.h>
 #endif
 #include <wtf/PtrTag.h>
+#include <wtf/Vector.h>
 #include <wtf/text/ASCIILiteral.h>
 #include <wtf/text/ExternalStringImpl.h>
 #include <wtf/text/StringImpl.h>
@@ -255,11 +257,39 @@ namespace JSC {
 using EncodedJSValue = int64_t;
 
 class CallFrame;
+class ControlFlowProfiler;
 class Exception;
+class FunctionHasExecutedCache;
 class JSCell;
 class JSGlobalObject;
 class JSObject;
 class VM;
+
+using SourceID = unsigned;
+
+struct BasicBlockRange {
+    int start_offset;
+    int end_offset;
+    bool has_executed;
+    size_t execution_count;
+};
+
+class ControlFlowProfiler {
+public:
+    WTF::Vector<BasicBlockRange> getBasicBlocksForSourceID(SourceID, VM&) const;
+};
+
+using FunctionRange = std::tuple<bool, unsigned, unsigned>;
+
+class FunctionHasExecutedCache {
+public:
+    WTF::Vector<FunctionRange> getFunctionRanges(SourceID);
+};
+
+class DebuggerCallFrame {
+public:
+    static SourceID sourceIDForCallFrame(CallFrame*);
+};
 
 enum class RootMarkReason : uint8_t;
 
@@ -332,6 +362,7 @@ public:
     };
 
     void drainMicrotasks();
+    bool enableControlFlowProfiler();
     Exception* cottontailThrowException(JSGlobalObject* global_object, JSObject* exception)
     {
         return throwException(global_object, exception);
@@ -429,6 +460,87 @@ static JSC::VM* ct_jsc_vm(JSContextRef context)
 {
     return reinterpret_cast<JSC::VM*>(
         const_cast<OpaqueJSContextGroup*>(JSContextGetGroup(context)));
+}
+
+static std::atomic<ptrdiff_t> ct_jsc_control_flow_profiler_offset { -1 };
+
+static JSC::ControlFlowProfiler* ct_jsc_control_flow_profiler(JSC::VM* vm)
+{
+    const ptrdiff_t offset = ct_jsc_control_flow_profiler_offset.load(std::memory_order_acquire);
+    if (offset < 0)
+        return nullptr;
+    auto* field = reinterpret_cast<JSC::ControlFlowProfiler**>(
+        reinterpret_cast<unsigned char*>(vm) + offset);
+    const unsigned enabled_count = *reinterpret_cast<unsigned*>(
+        reinterpret_cast<unsigned char*>(field) + sizeof(void*));
+    return enabled_count == 0 ? nullptr : *field;
+}
+
+static JSC::FunctionHasExecutedCache* ct_jsc_function_has_executed_cache(JSC::VM* vm)
+{
+    const ptrdiff_t offset = ct_jsc_control_flow_profiler_offset.load(std::memory_order_acquire);
+    if (offset < static_cast<ptrdiff_t>(sizeof(void*)))
+        return nullptr;
+
+    // FunctionHasExecutedCache is immediately before m_controlFlowProfiler in
+    // the pinned VM. Its sole member is an UncheckedKeyHashMap, whose release
+    // layout is one table pointer on every supported JSC target.
+    return reinterpret_cast<JSC::FunctionHasExecutedCache*>(
+        reinterpret_cast<unsigned char*>(vm) + offset - sizeof(void*));
+}
+
+extern "C" bool ct_jsc_enable_control_flow_profiler(JSContextRef context)
+{
+    if (context == nullptr)
+        return false;
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+
+    ptrdiff_t known_offset = ct_jsc_control_flow_profiler_offset.load(std::memory_order_acquire);
+    if (known_offset >= 0) {
+        vm->enableControlFlowProfiler();
+        return ct_jsc_control_flow_profiler(vm) != nullptr;
+    }
+
+    // VM's private headers are not installed by JSCOnly. Discover the two
+    // adjacent fields by their documented transition from {null, 0} to
+    // {profiler, 1}. This is the same pinned, fail-closed strategy used by the
+    // heap profiler bridge below, without fixing an OS-specific byte offset.
+    constexpr size_t vm_scan_size = 128 * 1024;
+    constexpr size_t word_count = vm_scan_size / sizeof(uintptr_t);
+    std::vector<uintptr_t> before(word_count);
+    auto* words = reinterpret_cast<uintptr_t*>(vm);
+    for (size_t index = 0; index < word_count; ++index)
+        before[index] = words[index];
+
+    vm->enableControlFlowProfiler();
+
+    ptrdiff_t discovered_offset = -1;
+    for (size_t index = 1; index + 1 < word_count; ++index) {
+        const size_t byte_offset = index * sizeof(uintptr_t);
+        const unsigned before_count = static_cast<unsigned>(before[index + 1]);
+        const unsigned after_count = *reinterpret_cast<unsigned*>(
+            reinterpret_cast<unsigned char*>(vm) + byte_offset + sizeof(void*));
+        const uintptr_t profiler = words[index];
+        if (before[index] != 0 || before_count != 0 || profiler == 0 ||
+            (profiler % alignof(void*)) != 0 || after_count != 1)
+            continue;
+        if (discovered_offset >= 0)
+            return false;
+        discovered_offset = static_cast<ptrdiff_t>(byte_offset);
+    }
+    if (discovered_offset < 0)
+        return false;
+
+    ct_jsc_control_flow_profiler_offset.store(discovered_offset, std::memory_order_release);
+    if (std::getenv("COTTONTAIL_JSC_DEBUG") != nullptr) {
+        std::fprintf(
+            stderr,
+            "cottontail: JSC control-flow profiler offset=%td profiler=%p\n",
+            discovered_offset,
+            static_cast<void*>(ct_jsc_control_flow_profiler(vm)));
+    }
+    return ct_jsc_control_flow_profiler(vm) != nullptr;
 }
 
 extern "C" void ct_jsc_drain_microtasks(JSContextRef context)
@@ -708,6 +820,93 @@ static JSC::EncodedJSValue ct_jsc_throw(
         : JSC::createError(global_object, text);
     ct_jsc_vm(context)->cottontailThrowException(global_object, error);
     return 0;
+}
+
+static JSC::EncodedJSValue ct_jsc_collect_test_coverage(
+    JSC::JSGlobalObject* global_object,
+    JSC::CallFrame* call_frame)
+{
+    auto context = reinterpret_cast<JSContextRef>(global_object);
+    auto* vm = ct_jsc_vm(context);
+    auto* profiler = ct_jsc_control_flow_profiler(vm);
+    auto* function_cache = ct_jsc_function_has_executed_cache(vm);
+    if (profiler == nullptr || function_cache == nullptr)
+        return ct_jsc_throw(global_object, "Control-flow coverage profiler is not enabled");
+
+    // Slot zero is callerFrame in the pinned 64-bit CallFrame layout. The
+    // native collector itself has no source provider, so coverage belongs to
+    // its JavaScript caller in the generated test bundle.
+    const auto* slots = reinterpret_cast<const uint64_t*>(call_frame);
+    auto* caller_frame = reinterpret_cast<JSC::CallFrame*>(slots[0]);
+    if (caller_frame == nullptr)
+        return ct_jsc_throw(global_object, "Unable to identify the coverage source provider");
+    const JSC::SourceID source_id = JSC::DebuggerCallFrame::sourceIDForCallFrame(caller_frame);
+
+    auto basic_blocks = profiler->getBasicBlocksForSourceID(source_id, *vm);
+    auto function_ranges = function_cache->getFunctionRanges(source_id);
+
+    // Stock JSC appends FunctionHasExecutedCache ranges to this vector. Bun's
+    // patched JSC has a second API that omits them; separate the stock result
+    // here so Cottontail does not require that patch.
+    if (basic_blocks.size() < function_ranges.size())
+        return ct_jsc_throw(global_object, "JSC coverage range ABI mismatch");
+    const size_t block_count = basic_blocks.size() - function_ranges.size();
+    for (size_t index = 0; index < function_ranges.size(); ++index) {
+        const auto& block = basic_blocks[block_count + index];
+        const auto& function = function_ranges[index];
+        if (block.start_offset != static_cast<int>(std::get<1>(function)) ||
+            block.end_offset != static_cast<int>(std::get<2>(function)) ||
+            block.has_executed != std::get<0>(function))
+            return ct_jsc_throw(global_object, "JSC coverage range ordering mismatch");
+    }
+
+    std::vector<JSValueRef> values;
+    values.reserve(3 + block_count * 4 + function_ranges.size() * 3);
+    values.push_back(JSValueMakeNumber(context, source_id));
+    values.push_back(JSValueMakeNumber(context, block_count));
+    values.push_back(JSValueMakeNumber(context, function_ranges.size()));
+    for (size_t index = 0; index < block_count; ++index) {
+        const auto& block = basic_blocks[index];
+        values.push_back(JSValueMakeNumber(context, block.start_offset));
+        values.push_back(JSValueMakeNumber(context, block.end_offset));
+        values.push_back(JSValueMakeBoolean(context, block.has_executed));
+        values.push_back(JSValueMakeNumber(context, static_cast<double>(block.execution_count)));
+    }
+    for (const auto& function : function_ranges) {
+        values.push_back(JSValueMakeBoolean(context, std::get<0>(function)));
+        values.push_back(JSValueMakeNumber(context, std::get<1>(function)));
+        values.push_back(JSValueMakeNumber(context, std::get<2>(function)));
+    }
+
+    JSValueRef exception = nullptr;
+    auto array = JSObjectMakeArray(context, values.size(), values.data(), &exception);
+    if (exception != nullptr) {
+        auto* error = reinterpret_cast<JSC::JSObject*>(const_cast<OpaqueJSValue*>(exception));
+        vm->cottontailThrowException(global_object, error);
+        return 0;
+    }
+    return ct_jsc_encode(array);
+}
+
+extern "C" JSObjectRef ct_jsc_create_test_coverage_collector(JSContextRef context)
+{
+    auto* vm = ct_jsc_vm(context);
+    JSC::JSLockHolder lock(*vm);
+    auto* global_object = ct_jsc_global_object(context);
+    auto name_ref = JSStringCreateWithUTF8CString("collectTestCoverage");
+    auto name = const_cast<OpaqueJSString*>(name_ref)->string();
+    JSStringRelease(name_ref);
+    auto callback = JSC::NativeFunction(ct_jsc_collect_test_coverage);
+    return reinterpret_cast<JSObjectRef>(JSC::JSFunction::create(
+        *vm,
+        global_object,
+        0,
+        name,
+        callback,
+        JSC::ImplementationVisibility::Private,
+        JSC::NoIntrinsic,
+        callback,
+        nullptr));
 }
 
 static JSC::EncodedJSValue ct_jsc_buffer_is_ascii(

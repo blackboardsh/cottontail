@@ -962,10 +962,11 @@ pub const BundleV2 = struct {
         this.transpiler.log.msgs.allocator = this.graph.heap.allocator();
         this.transpiler.log.clone_line_text = true;
 
-        // We don't expose an option to disable this. Bake forbids tree-shaking
-        // since every export must is always exist in case a future module
-        // starts depending on it.
-        if (this.transpiler.options.output_format == .internal_bake_dev) {
+        // Bake keeps every export available for future module dependencies.
+        // Coverage likewise needs unused source to reach JSC's profiler.
+        if (this.transpiler.options.output_format == .internal_bake_dev or
+            this.transpiler.options.code_coverage)
+        {
             this.transpiler.options.tree_shaking = false;
             this.transpiler.resolver.opts.tree_shaking = false;
         } else {

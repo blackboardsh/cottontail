@@ -524,6 +524,10 @@ pub const Runtime = struct {
         }
     }
 
+    pub fn enableControlFlowProfiler(self: *Runtime) bool {
+        return c.ct_jsc_runtime_enable_control_flow_profiler(self.handle);
+    }
+
     pub fn enableSamplingProfiler(self: *Runtime) bool {
         return c.ct_jsc_runtime_enable_sampling_profiler(self.handle);
     }

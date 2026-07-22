@@ -1,4 +1,4 @@
-import { writeFileSync } from "../node/fs.js";
+import { appendFileSync, readFileSync, writeFileSync } from "../node/fs.js";
 
 export function junitReporterOptions(testOptions) {
   if (!testOptions.reporters.junit) return null;
@@ -246,16 +246,56 @@ function renderSuite(node, depth, fileName, lines) {
   lines.push(`${indent}</testsuite>`);
 }
 
-export function writeJunitReport(records, rootSuite, options) {
-  if (!options) return;
+function createJunitDocument(records, rootSuite) {
   const files = buildReportTree(records, rootSuite);
   const total = emptyMetrics();
   for (const file of files) addMetrics(total, metricsForNode(file));
+  const lines = [];
+  for (const file of files) renderSuite(file, 1, file.value, lines);
+  return { metrics: total, lines };
+}
+
+function renderJunitDocuments(documents) {
+  const total = emptyMetrics();
+  for (const document of documents) addMetrics(total, document.metrics);
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<testsuites name="bun test" ${metricsAttributes(total, false)}>`,
   ];
-  for (const file of files) renderSuite(file, 1, file.value, lines);
+  for (const document of documents) lines.push(...document.lines);
   lines.push("</testsuites>", "");
-  writeFileSync(options.outfile, lines.join("\n"));
+  return lines.join("\n");
+}
+
+function isJunitDocument(value) {
+  const metrics = value?.metrics;
+  return Array.isArray(value?.lines) && value.lines.every((line) => typeof line === "string") &&
+    metrics != null && ["tests", "assertions", "failures", "skipped", "durationMs"]
+      .every((name) => Number.isFinite(metrics[name]));
+}
+
+function aggregateJunitDocuments(statePath, outfile, document) {
+  const record = { version: 1, reporter: "junit", outfile: String(outfile), document };
+  appendFileSync(statePath, `${JSON.stringify(record)}\n`);
+
+  const documents = [];
+  for (const line of String(readFileSync(statePath, "utf8")).split("\n")) {
+    if (!line) continue;
+    const entry = JSON.parse(line);
+    if (entry?.version === 1 && entry.reporter === "junit" &&
+      entry.outfile === record.outfile && isJunitDocument(entry.document)) {
+      documents.push(entry.document);
+    }
+  }
+  return documents;
+}
+
+export function writeJunitReport(records, rootSuite, options) {
+  if (!options) return;
+  const document = createJunitDocument(records, rootSuite);
+  const statePath = globalThis.process?.env?.COTTONTAIL_TEST_REPORTER_AGGREGATE_FILE;
+  const documents = statePath
+    ? aggregateJunitDocuments(statePath, options.outfile, document)
+    : [document];
+  writeFileSync(options.outfile, renderJunitDocuments(documents));
 }

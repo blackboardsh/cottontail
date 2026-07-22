@@ -73,6 +73,7 @@ int ct_jsc_runtime_wait_for_reload(CtJscRuntime *runtime, char **error_out);
 int ct_jsc_runtime_prepare_hot_reload(CtJscRuntime *runtime, char **error_out);
 int ct_jsc_runtime_exit_code(CtJscRuntime *runtime);
 int ct_jsc_runtime_tick(CtJscRuntime *runtime, char **error_out);
+bool ct_jsc_runtime_enable_control_flow_profiler(CtJscRuntime *runtime);
 int ct_jsc_runtime_start_inspector(
     CtJscRuntime *runtime,
     const char *host,

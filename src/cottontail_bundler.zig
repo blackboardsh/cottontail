@@ -59,6 +59,8 @@ pub const BundleOptions = struct {
     no_macros: bool = false,
     ignore_dce_annotations: bool = false,
     emit_dce_annotations: ?bool = null,
+    /// Test coverage must retain otherwise-unused source so JSC can profile it.
+    code_coverage: bool = false,
     production: bool = false,
     /// Compile-time defines (parallel key/value arrays), e.g. mapping
     /// `import.meta.url` to a runtime identifier for dynamic-import target
@@ -856,6 +858,8 @@ pub fn bundleEntryPointGraphWithOptions(
         .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
+    transpiler.options.code_coverage = options.code_coverage;
+    if (options.code_coverage) transpiler.options.dead_code_elimination = false;
     // Runtime execution bundles modules into one linker scope. Preserve each
     // module's observable function/class names when the linker renames a
     // colliding binding, matching direct ESM/CJS evaluation semantics.
@@ -2033,6 +2037,8 @@ pub fn buildEntryPointsJson(
         .all;
     transpiler.options.ignore_dce_annotations = options.ignore_dce_annotations;
     transpiler.options.emit_dce_annotations = options.emit_dce_annotations orelse !options.minify_whitespace;
+    transpiler.options.code_coverage = options.code_coverage;
+    if (options.code_coverage) transpiler.options.dead_code_elimination = false;
     transpiler.options.setProduction(options.production);
     if (options.production) try transpiler.env.map.put("NODE_ENV", "production");
     // The filesystem root must be selected before resolving inputs because it
