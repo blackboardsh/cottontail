@@ -156,6 +156,7 @@ pub fn run(
 
     const invocation_dir = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
     const request = try makeRequest(allocator, invocation_dir, options);
+    const ignored_path = init.environ_map.get("BUN_WHICH_IGNORE_CWD");
     const local_bin_dirs = try collectLocalBinDirs(init, allocator, invocation_dir);
     const temp_dir = platformTempDir(init.environ_map);
     const uid = userUniqueId(init.environ_map);
@@ -167,7 +168,8 @@ pub fn run(
 
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
-    try configureEnvironment(init, allocator, &environment, cache_bin_dir, local_bin_dirs, options.package_spec);
+    if (ignored_path != null) _ = environment.swapRemove("BUN_WHICH_IGNORE_CWD");
+    try configureEnvironment(init, allocator, &environment, cache_bin_dir, local_bin_dirs, options.package_spec, ignored_path);
 
     const can_use_unversioned_path = !request.explicit_version;
     if (can_use_unversioned_path) {
@@ -181,6 +183,7 @@ pub fn run(
                 allocator,
                 init.environ_map.get("PATH") orelse "",
                 request.initial_bin_name,
+                ignored_path,
             )) |path| {
                 return runBinary(init, allocator, &environment, invocation_dir, path, options.passthrough, options.force_runtime);
             }
@@ -537,8 +540,10 @@ fn collectLocalBinDirs(
 }
 
 fn pathsLexicallyEqual(left: []const u8, right: []const u8) bool {
-    if (builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(left, right);
-    return std.mem.eql(u8, left, right);
+    const normalized_left = std.mem.trimEnd(u8, left, "/\\");
+    const normalized_right = std.mem.trimEnd(u8, right, "/\\");
+    if (builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(normalized_left, normalized_right);
+    return std.mem.eql(u8, normalized_left, normalized_right);
 }
 
 fn platformTempDir(environment: *const std.process.Environ.Map) []const u8 {
@@ -567,6 +572,7 @@ fn configureEnvironment(
     cache_bin_dir: []const u8,
     local_bin_dirs: []const []const u8,
     lifecycle_script: []const u8,
+    ignored_path: ?[]const u8,
 ) !void {
     try environment.put("npm_command", "exec");
     try environment.put("npm_lifecycle_event", "bunx");
@@ -585,7 +591,14 @@ fn configureEnvironment(
         try path.writer.writeAll(bin_dir);
     }
     if (environment.get("PATH")) |original| {
-        if (original.len > 0) {
+        if (ignored_path) |ignored| {
+            var segments = std.mem.tokenizeScalar(u8, original, std.fs.path.delimiter);
+            while (segments.next()) |segment| {
+                if (pathsLexicallyEqual(segment, ignored)) continue;
+                try path.writer.writeByte(std.fs.path.delimiter);
+                try path.writer.writeAll(segment);
+            }
+        } else if (original.len > 0) {
             try path.writer.writeByte(std.fs.path.delimiter);
             try path.writer.writeAll(original);
         }
@@ -610,9 +623,13 @@ fn findExecutableInPath(
     allocator: std.mem.Allocator,
     path_value: []const u8,
     name: []const u8,
+    ignored_path: ?[]const u8,
 ) !?[]const u8 {
     var iterator = std.mem.tokenizeScalar(u8, path_value, std.fs.path.delimiter);
     while (iterator.next()) |directory| {
+        if (ignored_path) |ignored| {
+            if (pathsLexicallyEqual(directory, ignored)) continue;
+        }
         if (try executableInDirectory(io, allocator, directory, name)) |path| return path;
     }
     return null;
@@ -812,7 +829,7 @@ fn runBinary(
     const executable_kind = classifyExecutable(init.io, resolved);
     const is_script = executable_kind != .native;
     const node_executable = if (is_script and !force_runtime and executable_kind != .bun_script)
-        try findExecutableInPath(init.io, allocator, environment.get("PATH") orelse "", "node")
+        try findExecutableInPath(init.io, allocator, environment.get("PATH") orelse "", "node", null)
     else
         null;
     const use_runtime = is_script and (force_runtime or executable_kind == .bun_script or node_executable == null);

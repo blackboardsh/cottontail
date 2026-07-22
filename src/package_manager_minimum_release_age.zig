@@ -30,7 +30,7 @@ pub fn selectVersion(
     if (versions_value != .object) return error.InvalidRegistryManifest;
 
     const age_gate = if (minimum_release_age_ms) |minimum_age|
-        if (minimum_age > 0 and !isExcluded(package_name, exclusions)) minimum_age else null
+        if (!isExcluded(package_name, exclusions)) minimum_age else null
     else
         null;
     if (age_gate == null) {

@@ -96,6 +96,9 @@ pub const Queue = struct {
     }
 
     pub fn run(queue: *Queue, process_init: std.process.Init, root_dir: []const u8, stderr: *std.Io.Writer) !void {
+        if (queue.tasks.items.len == 0) return;
+        const node_gyp = try NodeGypWrapper.create(process_init);
+        defer node_gyp.deinit(process_init.io);
         const concurrency = @max(1, (std.Thread.getCpuCount() catch 2) * 2);
         var offset: usize = 0;
         while (offset < queue.tasks.items.len) {
@@ -109,6 +112,7 @@ pub const Queue = struct {
                     .process_init = process_init,
                     .root_dir = root_dir,
                     .task = task,
+                    .node_gyp_dir = node_gyp.directory,
                     .diagnostics = .init(process_init.gpa),
                 };
             }
@@ -136,6 +140,7 @@ const RunState = struct {
     process_init: std.process.Init,
     root_dir: []const u8,
     task: Task,
+    node_gyp_dir: []const u8,
     diagnostics: std.Io.Writer.Allocating,
     failure: ?anyerror = null,
 
@@ -144,6 +149,7 @@ const RunState = struct {
             state.process_init,
             state.root_dir,
             state.task,
+            state.node_gyp_dir,
             &state.diagnostics.writer,
         ) catch |err| {
             state.failure = err;
@@ -157,23 +163,26 @@ pub fn runRoot(
     root: *const Value,
     stderr: *std.Io.Writer,
 ) !void {
+    if (!rootHasLifecycleScripts(init.io, root_dir, root)) return;
+    const node_gyp = try NodeGypWrapper.create(init);
+    defer node_gyp.deinit(init.io);
     try runManifestScripts(init, root_dir, .{
         .name = jsonString(root, "name") orelse "root",
         .version = jsonString(root, "version") orelse "0.0.0",
         .cwd = root_dir,
         .kind = .git,
         .optional = false,
-    }, root, stderr);
+    }, root, node_gyp.directory, stderr);
 }
 
-pub fn rootHasLifecycleScripts(root: *const Value) bool {
-    const scripts = if (root.* == .object) root.object.get("scripts") orelse return false else return false;
-    if (scripts != .object) return false;
-    for ([_][]const u8{ "preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare" }) |stage| {
-        const command = scripts.object.get(stage) orelse continue;
-        if (command == .string and command.string.len > 0) return true;
+pub fn rootHasLifecycleScripts(io: std.Io, root_dir: []const u8, root: *const Value) bool {
+    const scripts = manifestScripts(root);
+    if (scripts) |value| {
+        for ([_][]const u8{ "preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare" }) |stage| {
+            if (hasScript(value, stage)) return true;
+        }
     }
-    return false;
+    return shouldAutoRebuild(io, root_dir, scripts);
 }
 
 pub fn runNamedStage(
@@ -185,6 +194,8 @@ pub fn runNamedStage(
 ) !void {
     const scripts = if (manifest.* == .object) manifest.object.get("scripts") orelse return else return;
     if (scripts != .object) return;
+    const node_gyp = try NodeGypWrapper.create(init);
+    defer node_gyp.deinit(init.io);
     const task: Task = .{
         .name = jsonString(manifest, "name") orelse "root",
         .version = jsonString(manifest, "version") orelse "0.0.0",
@@ -192,7 +203,7 @@ pub fn runNamedStage(
         .kind = .git,
         .optional = false,
     };
-    try runStage(init, root_dir, task, &scripts, stage, stderr, .version);
+    try runStage(init, root_dir, task, &scripts, stage, node_gyp.directory, stderr, .version);
 }
 
 pub fn runPackStage(
@@ -238,10 +249,12 @@ fn runLifecycleStage(
         .kind = .git,
         .optional = false,
     };
+    const node_gyp = try NodeGypWrapper.create(init);
+    defer node_gyp.deinit(init.io);
     const allocator = init.arena.allocator();
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
-    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, value.string);
+    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, value.string, node_gyp.directory);
     try environment.put("npm_command", npm_command);
 
     const command = try replaceBunCommand(allocator, init.io, value.string);
@@ -274,7 +287,13 @@ fn runLifecycleStage(
     return error.LifecycleScriptFailed;
 }
 
-fn runPackage(init: std.process.Init, root_dir: []const u8, task: Task, stderr: *std.Io.Writer) !void {
+fn runPackage(
+    init: std.process.Init,
+    root_dir: []const u8,
+    task: Task,
+    node_gyp_dir: []const u8,
+    stderr: *std.Io.Writer,
+) !void {
     const package_json_path = try std.fs.path.join(init.arena.allocator(), &.{ task.cwd, "package.json" });
     const source = std.Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -284,7 +303,7 @@ fn runPackage(init: std.process.Init, root_dir: []const u8, task: Task, stderr: 
     ) catch return;
     const manifest = std.json.parseFromSliceLeaky(Value, init.arena.allocator(), source, .{}) catch return;
     if (manifest != .object) return;
-    try runManifestScripts(init, root_dir, task, &manifest, stderr);
+    try runManifestScripts(init, root_dir, task, &manifest, node_gyp_dir, stderr);
 }
 
 fn runManifestScripts(
@@ -292,12 +311,13 @@ fn runManifestScripts(
     root_dir: []const u8,
     task: Task,
     manifest: *const Value,
+    node_gyp_dir: []const u8,
     stderr: *std.Io.Writer,
 ) !void {
     const scripts = try inspectLifecycleScripts(init.io, init.arena.allocator(), task.cwd, manifest, task.kind);
     for (lifecycle_stage_names, scripts.commands) |stage, maybe_command| {
         const command = maybe_command orelse continue;
-        try runStageCommand(init, root_dir, task, stage, command, stderr, .install);
+        try runCommandStage(init, root_dir, task, stage, command, node_gyp_dir, stderr, .install);
     }
 }
 
@@ -309,28 +329,29 @@ fn runStage(
     task: Task,
     scripts: *const Value,
     stage: []const u8,
+    node_gyp_dir: []const u8,
     stderr: *std.Io.Writer,
     diagnostic: StageDiagnostic,
 ) !void {
     const value = scripts.object.get(stage) orelse return;
     if (value != .string or value.string.len == 0) return;
-
-    try runStageCommand(init, root_dir, task, stage, value.string, stderr, diagnostic);
+    return runCommandStage(init, root_dir, task, stage, value.string, node_gyp_dir, stderr, diagnostic);
 }
 
-fn runStageCommand(
+fn runCommandStage(
     init: std.process.Init,
     root_dir: []const u8,
     task: Task,
     stage: []const u8,
     script: []const u8,
+    node_gyp_dir: []const u8,
     stderr: *std.Io.Writer,
     diagnostic: StageDiagnostic,
 ) !void {
     const allocator = init.arena.allocator();
     var environment = try init.environ_map.clone(allocator);
     defer environment.deinit();
-    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, script);
+    try configureEnvironment(&environment, allocator, init.io, root_dir, task, stage, script, node_gyp_dir);
 
     const command = try replaceBunCommand(allocator, init.io, script);
     const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
@@ -370,6 +391,7 @@ fn configureEnvironment(
     task: Task,
     stage: []const u8,
     script: []const u8,
+    node_gyp_dir: []const u8,
 ) !void {
     try environment.put("INIT_CWD", root_dir);
     try environment.put("npm_lifecycle_event", stage);
@@ -402,7 +424,92 @@ fn configureEnvironment(
             try path.writer.writeAll(original);
         }
     }
+    if (node_gyp_dir.len > 0) {
+        if (path.written().len > 0) try path.writer.writeByte(pathDelimiter());
+        try path.writer.writeAll(node_gyp_dir);
+        try environment.put("BUN_WHICH_IGNORE_CWD", node_gyp_dir);
+    }
     try environment.put("PATH", path.written());
+}
+
+const NodeGypWrapper = struct {
+    directory: []const u8,
+
+    fn create(init: std.process.Init) !NodeGypWrapper {
+        const allocator = init.arena.allocator();
+        const base = temporaryDirectory(init.environ_map);
+        try std.Io.Dir.cwd().createDirPath(init.io, base);
+
+        var directory: []const u8 = undefined;
+        for (0..8) |_| {
+            var random: [8]u8 = undefined;
+            init.io.random(&random);
+            const suffix = std.fmt.bytesToHex(random, .lower);
+            const name = try std.fmt.allocPrint(allocator, "cottontail-node-gyp-{s}", .{&suffix});
+            directory = try std.fs.path.join(allocator, &.{ base, name });
+            std.Io.Dir.cwd().createDir(init.io, directory, .default_dir) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            break;
+        } else return error.TempDirCollision;
+        errdefer std.Io.Dir.cwd().deleteTree(init.io, directory) catch {};
+
+        const filename = if (builtin.os.tag == .windows) "node-gyp.cmd" else "node-gyp";
+        const wrapper_path = try std.fs.path.join(allocator, &.{ directory, filename });
+        const permissions: std.Io.File.Permissions = if (builtin.os.tag == .windows) .default_file else .executable_file;
+        var file = try std.Io.Dir.cwd().createFile(init.io, wrapper_path, .{ .truncate = true, .permissions = permissions });
+        defer file.close(init.io);
+        const contents = if (builtin.os.tag == .windows)
+            "@if not defined npm_config_node_gyp (\r\n" ++
+                "  @\"%BUN%\" x --silent node-gyp %*\r\n" ++
+                ") else (\r\n" ++
+                "  @\"%BUN%\" \"%npm_config_node_gyp%\" %*\r\n" ++
+                ")\r\n"
+        else
+            "#!/bin/sh\n" ++
+                "if [ \"x$npm_config_node_gyp\" = \"x\" ]; then\n" ++
+                "  exec \"$BUN\" x --silent node-gyp \"$@\"\n" ++
+                "else\n" ++
+                "  exec \"$npm_config_node_gyp\" \"$@\"\n" ++
+                "fi\n";
+        try file.writeStreamingAll(init.io, contents);
+        return .{ .directory = directory };
+    }
+
+    fn deinit(wrapper: NodeGypWrapper, io: std.Io) void {
+        std.Io.Dir.cwd().deleteTree(io, wrapper.directory) catch {};
+    }
+};
+
+fn temporaryDirectory(environment: *const std.process.Environ.Map) []const u8 {
+    for ([_][]const u8{ "BUN_TMPDIR", "TMPDIR", "TEMP", "TMP" }) |name| {
+        if (environment.get(name)) |value| {
+            if (value.len > 0) return value;
+        }
+    }
+    return if (builtin.os.tag == .windows) "." else "/tmp";
+}
+
+fn manifestScripts(manifest: *const Value) ?*const Value {
+    if (manifest.* != .object) return null;
+    const scripts = manifest.object.getPtr("scripts") orelse return null;
+    return if (scripts.* == .object) scripts else null;
+}
+
+fn hasScript(scripts: *const Value, stage: []const u8) bool {
+    const value = scripts.object.get(stage) orelse return false;
+    return value == .string and value.string.len > 0;
+}
+
+fn shouldAutoRebuild(io: std.Io, cwd: []const u8, scripts: ?*const Value) bool {
+    if (scripts) |value| {
+        if (hasScript(value, "preinstall") or hasScript(value, "install")) return false;
+    }
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const binding_gyp = std.fmt.bufPrint(&path_buffer, "{s}{c}binding.gyp", .{ cwd, std.fs.path.sep }) catch return false;
+    std.Io.Dir.cwd().access(io, binding_gyp, .{}) catch return false;
+    return true;
 }
 
 fn replaceBunCommand(allocator: std.mem.Allocator, io: std.Io, script: []const u8) ![]const u8 {

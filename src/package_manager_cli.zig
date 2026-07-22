@@ -70,6 +70,20 @@ const DependencySection = enum {
     }
 };
 
+const UpdateDependencySection = struct {
+    name: []const u8,
+    optional: bool = false,
+};
+
+// This is Bun's install/update precedence. When a dependency is declared in
+// more than one group, only the first declaration is updated.
+const update_dependency_sections = [_]UpdateDependencySection{
+    .{ .name = "optionalDependencies", .optional = true },
+    .{ .name = "devDependencies" },
+    .{ .name = "dependencies" },
+    .{ .name = "peerDependencies" },
+};
+
 const Options = struct {
     command: Command,
     positionals: []const []const u8,
@@ -95,6 +109,8 @@ const Options = struct {
     verbose: bool = false,
     verify_integrity: bool = true,
     latest: bool = false,
+    interactive: bool = false,
+    recursive: bool = false,
     save_text_lockfile: bool = false,
     save_yarn_lockfile: bool = false,
     omit_dev: bool = false,
@@ -136,6 +152,58 @@ const Options = struct {
 const PackageSpec = struct {
     name: ?[]const u8,
     spec: []const u8,
+};
+
+const UpdateRequest = struct {
+    alias: ?[]const u8,
+    spec: ?[]const u8,
+};
+
+const UpdateResult = struct {
+    alias: []const u8,
+    resolved_version: []const u8,
+    saved_spec: []const u8,
+    previous_version: ?[]const u8,
+};
+
+const InteractiveUpdatePackage = struct {
+    alias: []const u8,
+    current_version: []const u8,
+    target_version: []const u8,
+    latest_version: []const u8,
+    dependency_type: []const u8,
+    selected: bool = false,
+    use_latest: bool = false,
+};
+
+const InteractiveTerminalMode = if (builtin.os.tag == .windows) struct {
+    is_tty: bool = false,
+
+    fn enter() @This() {
+        return .{};
+    }
+
+    fn restore(_: @This()) void {}
+} else struct {
+    saved: ?std.posix.termios = null,
+    is_tty: bool = false,
+
+    fn enter() @This() {
+        const saved = std.posix.tcgetattr(0) catch return .{};
+        var raw = saved;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        std.posix.tcsetattr(0, .NOW, raw) catch return .{};
+        return .{ .saved = saved, .is_tty = true };
+    }
+
+    fn restore(mode: @This()) void {
+        if (mode.saved) |saved| std.posix.tcsetattr(0, .NOW, saved) catch {};
+    }
 };
 
 const TarballPackage = struct {
@@ -194,6 +262,7 @@ const RegistryConfig = struct {
 
 const RegistryManifestFetch = struct {
     io: std.Io,
+    environment: *const std.process.Environ.Map,
     name: []const u8,
     url: []const u8,
     authorization: ?[]const u8,
@@ -212,13 +281,16 @@ const RegistryManifestFetch = struct {
     fn fetch(fetch_state: *RegistryManifestFetch) !void {
         var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
         defer client.deinit();
+        client.initDefaultProxies(std.heap.smp_allocator, fetch_state.environment) catch {};
 
-        var headers: [2]std.http.Header = undefined;
+        var headers: [3]std.http.Header = undefined;
         var header_count: usize = 0;
         headers[header_count] = .{ .name = "accept", .value = fetch_state.accept };
         header_count += 1;
         if (fetch_state.authorization) |authorization| {
             headers[header_count] = .{ .name = "authorization", .value = authorization };
+            header_count += 1;
+            headers[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
             header_count += 1;
         }
 
@@ -238,6 +310,7 @@ const RegistryManifestFetch = struct {
 
 const RegistryArchiveFetch = struct {
     io: std.Io,
+    environment: *const std.process.Environ.Map,
     url: []const u8,
     authorization: ?[]const u8,
     integrity: ?[]const u8,
@@ -270,6 +343,7 @@ const RegistryArchiveFetch = struct {
 
         var client: std.http.Client = .{ .allocator = std.heap.smp_allocator, .io = fetch_state.io };
         defer client.deinit();
+        client.initDefaultProxies(std.heap.smp_allocator, fetch_state.environment) catch {};
 
         var headers: [1]std.http.Header = undefined;
         const header_count: usize = if (fetch_state.authorization) |authorization| blk: {
@@ -710,6 +784,12 @@ fn parseOptions(allocator: std.mem.Allocator, args: []const [:0]const u8) !Optio
             options.verify_integrity = false;
         } else if (std.mem.eql(u8, arg, "--latest")) {
             options.latest = true;
+        } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "-i")) {
+            if (options.command != .update) return error.InvalidPackageManagerOption;
+            options.interactive = true;
+        } else if (std.mem.eql(u8, arg, "--recursive") or std.mem.eql(u8, arg, "-r")) {
+            if (options.command != .update) return error.InvalidPackageManagerOption;
+            options.recursive = true;
         } else if (std.mem.eql(u8, arg, "--all") or std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "-A")) {
             options.all = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -860,6 +940,14 @@ fn printPackageManagerHelp(command: Command, writer: *std.Io.Writer) !void {
         \\  --patches-dir <path>     Set the generated patch directory
         \\
     , .{@tagName(command)});
+    if (command == .update) {
+        try writer.writeAll(
+            \\  -r, --recursive          Update packages in all workspaces
+            \\  -i, --interactive        Select outdated packages to update
+            \\  --latest                 Update to the latest version
+            \\
+        );
+    }
     if (command == .publish) {
         try writer.writeAll(
             \\Publish options:
@@ -1680,8 +1768,31 @@ fn decodeConfigText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
 }
 
 fn normalizeRegistryUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
-    if (std.mem.endsWith(u8, url, "/")) return allocator.dupe(u8, url);
-    return std.fmt.allocPrint(allocator, "{s}/", .{url});
+    const without_trailing_slashes = std.mem.trimEnd(u8, url, "/");
+    if (without_trailing_slashes.len == 0) return allocator.dupe(u8, "/");
+    return std.fmt.allocPrint(allocator, "{s}/", .{without_trailing_slashes});
+}
+
+fn resolveRegistryTarballURL(
+    allocator: std.mem.Allocator,
+    registry_url: []const u8,
+    tarball_url: []const u8,
+) ![]const u8 {
+    if (std.mem.startsWith(u8, tarball_url, "http://") or
+        std.mem.startsWith(u8, tarball_url, "https://")) return allocator.dupe(u8, tarball_url);
+
+    const relative_tarball = if (std.mem.startsWith(u8, tarball_url, "./")) tarball_url[2..] else tarball_url;
+    const scheme_end = std.mem.indexOf(u8, registry_url, "://") orelse
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ registry_url, relative_tarball });
+    if (std.mem.startsWith(u8, tarball_url, "//")) {
+        return std.fmt.allocPrint(allocator, "{s}:{s}", .{ registry_url[0..scheme_end], tarball_url });
+    }
+    if (std.mem.startsWith(u8, tarball_url, "/")) {
+        const authority_start = scheme_end + "://".len;
+        const authority_end = std.mem.indexOfScalarPos(u8, registry_url, authority_start, '/') orelse registry_url.len;
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ registry_url[0..authority_end], tarball_url });
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ registry_url, relative_tarball });
 }
 
 const SecurityPackage = struct {
@@ -1820,6 +1931,7 @@ const Manager = struct {
     root_versions: std.StringHashMap([]const u8),
     resolving: std.StringHashMap(void),
     registry_manifests: std.StringHashMap(*Value),
+    refreshed_update_manifests: std.StringHashMap(void),
     direct_bins: std.array_list.Managed([]const u8),
     explicit_adds: std.StringHashMap(void),
     trusted_additions: std.StringHashMap(void),
@@ -1833,6 +1945,8 @@ const Manager = struct {
     root_selected: bool = true,
     filter_resolution_only: bool = false,
     report_direct_installs: bool = false,
+    refresh_direct_registry: bool = false,
+    refresh_direct_source: bool = false,
     link_workspace_packages: bool = true,
     started_ns: i128,
     installed_count: usize = 0,
@@ -1881,6 +1995,7 @@ const Manager = struct {
             .root_versions = std.StringHashMap([]const u8).init(allocator),
             .resolving = std.StringHashMap(void).init(allocator),
             .registry_manifests = std.StringHashMap(*Value).init(allocator),
+            .refreshed_update_manifests = std.StringHashMap(void).init(allocator),
             .registry_scopes = std.StringHashMap(RegistryConfig).init(allocator),
             .direct_bins = std.array_list.Managed([]const u8).init(allocator),
             .explicit_adds = std.StringHashMap(void).init(allocator),
@@ -1911,6 +2026,7 @@ const Manager = struct {
 
     fn deinit(manager: *Manager) void {
         manager.registry_scopes.deinit();
+        manager.refreshed_update_manifests.deinit();
         manager.registry_manifests.deinit();
         manager.resolution_only_records.deinit();
         manager.filtered_workspaces.deinit();
@@ -2094,6 +2210,10 @@ const Manager = struct {
             manager.options.only_missing = true;
         }
 
+        if (manager.options.command == .update and manager.options.interactive) {
+            if (!try manager.prepareInteractiveUpdate(command_package_json, manager.invocation_package_dir)) return 0;
+        }
+
         try manager.validateCatalogReferences(&root);
         try manager.prepareNodeModules();
         try manager.reserveWorkspaceRootVersions();
@@ -2226,7 +2346,17 @@ const Manager = struct {
             } else if (manager.options.command == .add and reported_installed_count == 0) {
                 try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
             } else if (manager.options.command == .update and reported_installed_count == 0) {
-                try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
+                if (manager.options.positionals.len == 0) {
+                    const checked_installs = manager.records.items.len;
+                    try manager.stdout.print("Checked {d} install{s} across {d} packages (no changes) [{d:.2}ms]\n", .{
+                        checked_installs,
+                        if (checked_installs == 1) "" else "s",
+                        manager.lockfilePackageCount(),
+                        elapsed_ms,
+                    });
+                } else {
+                    try manager.stdout.print("\n[{d:.2}ms] done\n", .{elapsed_ms});
+                }
             } else if (reported_installed_count == 1) {
                 try manager.stdout.print("{s}1 package installed [{d:.2}ms]\n", .{
                     manager.installSummarySeparator(),
@@ -3620,11 +3750,7 @@ const Manager = struct {
         manager.linker_configured = configured_linker != null;
         manager.node_linker = configured_linker orelse try manager.inferUnconfiguredLinker();
 
-        const selected = registry orelse default_registry;
-        manager.registry = if (std.mem.endsWith(u8, selected, "/"))
-            try manager.allocator.dupe(u8, selected)
-        else
-            try std.fmt.allocPrint(manager.allocator, "{s}/", .{selected});
+        manager.registry = try normalizeRegistryUrl(manager.allocator, registry orelse default_registry);
     }
 
     fn loadGlobalBunfigInstallConfiguration(
@@ -4382,149 +4508,470 @@ const Manager = struct {
         try manager.installRoot(manager.root_package_json.?, true);
     }
 
-    fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
-        const UpdateRequest = struct {
-            name: []const u8,
-            spec: ?[]const u8,
-        };
-        var requests = std.array_list.Managed(UpdateRequest).init(manager.allocator);
-        defer requests.deinit();
-        for (manager.options.positionals) |raw_spec| {
-            if (hasUnknownURLScheme(raw_spec)) {
-                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
-                return error.PackageManagerErrorReported;
-            }
-            const parsed = splitPackageSpec(raw_spec);
-            const name = parsed.name orelse {
-                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
-                return error.PackageManagerErrorReported;
-            };
-            if (!compiler.strings.isNPMPackageName(name)) {
-                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_spec});
-                return error.PackageManagerErrorReported;
-            }
-            try requests.append(.{
-                .name = name,
-                .spec = if (hasExplicitRange(raw_spec)) parsed.spec else null,
-            });
+    fn prepareInteractiveUpdate(manager: *Manager, package_json: *Value, parent_dir: []const u8) !bool {
+        if (manager.lock_graph == null) {
+            try manager.stderr.writeAll("error: missing lockfile, nothing outdated\n");
+            return error.PackageManagerErrorReported;
         }
 
-        var handled = std.StringHashMap(void).init(manager.allocator);
-        defer handled.deinit();
-        var changed_output: std.Io.Writer.Allocating = .init(manager.allocator);
-        var installed_output: std.Io.Writer.Allocating = .init(manager.allocator);
+        var packages = std.array_list.Managed(InteractiveUpdatePackage).init(manager.allocator);
+        defer packages.deinit();
+        var seen = std.StringHashMap(void).init(manager.allocator);
+        defer seen.deinit();
 
-        for (mutable_dependency_sections) |section_name| {
-            const section_value = package_json.object.getPtr(section_name) orelse continue;
-            if (section_value.* != .object) continue;
-            for (section_value.object.keys(), section_value.object.values()) |name, *spec_value| {
-                var request: ?UpdateRequest = null;
-                for (requests.items) |candidate| {
-                    if (std.mem.eql(u8, candidate.name, name)) {
-                        request = candidate;
-                        break;
-                    }
-                }
-                if (requests.items.len > 0 and request == null) continue;
-                if (handled.contains(name)) continue;
-                try handled.put(try manager.allocator.dupe(u8, name), {});
-                if (spec_value.* != .string or !isUpdatableRegistrySpec(spec_value.string)) continue;
+        const previous_refresh = manager.refresh_direct_registry;
+        manager.refresh_direct_registry = true;
+        defer manager.refresh_direct_registry = previous_refresh;
+
+        for (update_dependency_sections) |dependency_section| {
+            if (std.mem.eql(u8, dependency_section.name, "devDependencies") and
+                (manager.options.production or manager.options.omit_dev)) continue;
+            if (std.mem.eql(u8, dependency_section.name, "optionalDependencies") and manager.options.omit_optional) continue;
+            if (std.mem.eql(u8, dependency_section.name, "peerDependencies") and manager.options.omit_peer) continue;
+
+            const section = package_json.object.get(dependency_section.name) orelse continue;
+            if (section != .object) continue;
+            for (section.object.keys(), section.object.values()) |alias, spec_value| {
+                if (seen.contains(alias) or spec_value != .string) continue;
+                try seen.put(try manager.allocator.dupe(u8, alias), {});
+                if (manager.options.positionals.len > 0 and !interactiveRequestContains(manager.options.positionals, alias)) continue;
 
                 const original_spec = spec_value.string;
-                const resolution_spec = try updateResolutionSpec(
-                    manager.allocator,
-                    original_spec,
-                    if (request) |selected| selected.spec else null,
-                    manager.options.latest,
-                );
+                if (std.mem.startsWith(u8, original_spec, "catalog:") or
+                    manager.isWorkspaceDependency(alias, original_spec)) continue;
+                const effective_spec = manager.manifest_policy.?.resolveDependency(alias, original_spec, false) catch |err| switch (err) {
+                    error.CatalogDependencyNotFound, error.InvalidCatalogDependency => continue,
+                };
+                if (!isRegistryUpdateSpecifier(effective_spec)) continue;
+
+                const selection = try manager.findLockedSelection(alias, parent_dir) orelse continue;
+                if (selection.package.kind != .npm) continue;
+                const registry_name, const registry_spec = parseNpmAlias(alias, effective_spec);
+                const target = manager.resolveRegistryPackage(registry_name, registry_spec) catch |err| switch (err) {
+                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => continue,
+                    else => return err,
+                };
+                const latest = manager.resolveRegistryPackage(registry_name, "latest") catch |err| switch (err) {
+                    error.NoMatchingVersion, error.PackageNotFound, error.TooRecentVersion, error.AllVersionsTooRecent => continue,
+                    else => return err,
+                };
+                const current_version = selection.package.version;
+                if (std.mem.eql(u8, current_version, target.version) and
+                    std.mem.eql(u8, current_version, latest.version)) continue;
+
+                try packages.append(.{
+                    .alias = try manager.allocator.dupe(u8, alias),
+                    .current_version = try manager.allocator.dupe(u8, current_version),
+                    .target_version = try manager.allocator.dupe(u8, target.version),
+                    .latest_version = try manager.allocator.dupe(u8, latest.version),
+                    .dependency_type = dependency_section.name,
+                    .use_latest = manager.options.latest,
+                });
+            }
+        }
+
+        std.sort.pdq(InteractiveUpdatePackage, packages.items, {}, struct {
+            fn lessThan(_: void, left: InteractiveUpdatePackage, right: InteractiveUpdatePackage) bool {
+                const left_priority = interactiveDependencyPriority(left.dependency_type);
+                const right_priority = interactiveDependencyPriority(right.dependency_type);
+                if (left_priority != right_priority) return left_priority < right_priority;
+                return std.mem.order(u8, left.alias, right.alias) == .lt;
+            }
+        }.lessThan);
+
+        if (packages.items.len == 0) {
+            try manager.stdout.writeAll("All packages are up to date!\n");
+            try manager.stdout.flush();
+            return false;
+        }
+        if (!try manager.promptInteractiveUpdates(packages.items)) {
+            try manager.stdout.writeAll("No packages selected for update\n");
+            try manager.stdout.flush();
+            return false;
+        }
+
+        var requests = std.array_list.Managed([]const u8).init(manager.allocator);
+        for (packages.items) |package| {
+            if (!package.selected) continue;
+            const request = if (package.use_latest)
+                try std.fmt.allocPrint(manager.allocator, "{s}@latest", .{package.alias})
+            else
+                try manager.allocator.dupe(u8, package.alias);
+            try requests.append(request);
+        }
+        manager.options.positionals = try requests.toOwnedSlice();
+        manager.options.latest = false;
+        return manager.options.positionals.len > 0;
+    }
+
+    fn promptInteractiveUpdates(manager: *Manager, packages: []InteractiveUpdatePackage) !bool {
+        var cursor: usize = 0;
+        var toggle_all = false;
+        const terminal_mode = InteractiveTerminalMode.enter();
+        defer terminal_mode.restore();
+
+        var reader_buffer: [1]u8 = undefined;
+        var reader_file = std.Io.File.stdin().readerStreaming(manager.init_data.io, &reader_buffer);
+        const reader = &reader_file.interface;
+        while (true) {
+            try manager.renderInteractiveUpdates(packages, cursor, terminal_mode.is_tty);
+            const byte = reader.takeByte() catch return false;
+            switch (byte) {
+                '\n', '\r', 'y', 'Y' => {
+                    for (packages) |package| if (package.selected) return true;
+                    return false;
+                },
+                3, 4, 'q', 'Q' => return false,
+                ' ' => {
+                    packages[cursor].selected = !packages[cursor].selected;
+                    if (std.mem.eql(u8, packages[cursor].current_version, packages[cursor].target_version)) {
+                        packages[cursor].use_latest = true;
+                    }
+                    toggle_all = false;
+                },
+                'a', 'A' => {
+                    for (packages) |*package| {
+                        package.selected = true;
+                        if (std.mem.eql(u8, package.current_version, package.target_version)) package.use_latest = true;
+                    }
+                    toggle_all = true;
+                },
+                'n', 'N' => {
+                    for (packages) |*package| package.selected = false;
+                    toggle_all = false;
+                },
+                'i', 'I' => {
+                    for (packages) |*package| package.selected = !package.selected;
+                    toggle_all = false;
+                },
+                'l', 'L' => {
+                    if (toggle_all) {
+                        const use_latest = !packages[cursor].use_latest;
+                        for (packages) |*package| {
+                            if (package.selected) package.use_latest = use_latest;
+                        }
+                    } else {
+                        packages[cursor].use_latest = !packages[cursor].use_latest;
+                        packages[cursor].selected = true;
+                    }
+                },
+                'j' => {
+                    cursor = if (cursor + 1 < packages.len) cursor + 1 else 0;
+                    toggle_all = false;
+                },
+                'k' => {
+                    cursor = if (cursor > 0) cursor - 1 else packages.len - 1;
+                    toggle_all = false;
+                },
+                27 => {
+                    const bracket = reader.takeByte() catch return false;
+                    if (bracket != '[') continue;
+                    const arrow = reader.takeByte() catch return false;
+                    switch (arrow) {
+                        'A' => cursor = if (cursor > 0) cursor - 1 else packages.len - 1,
+                        'B' => cursor = if (cursor + 1 < packages.len) cursor + 1 else 0,
+                        'C' => {
+                            packages[cursor].use_latest = true;
+                            packages[cursor].selected = true;
+                        },
+                        'D' => {
+                            packages[cursor].use_latest = false;
+                            packages[cursor].selected = true;
+                        },
+                        else => {},
+                    }
+                    toggle_all = false;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn renderInteractiveUpdates(
+        manager: *Manager,
+        packages: []const InteractiveUpdatePackage,
+        cursor: usize,
+        clear_terminal: bool,
+    ) !void {
+        if (clear_terminal) try manager.stdout.writeAll("\x1b[2J\x1b[H");
+        try manager.stdout.writeAll("Select packages to update (space: select, l: latest, enter: confirm)\n\n");
+        var current_section: ?[]const u8 = null;
+        for (packages, 0..) |package, index| {
+            if (current_section == null or !std.mem.eql(u8, current_section.?, package.dependency_type)) {
+                current_section = package.dependency_type;
+                try manager.stdout.print("{s}\n", .{package.dependency_type});
+            }
+            try manager.stdout.print("{s} [{c}] {s}: {s} -> {s} (latest {s})\n", .{
+                if (index == cursor) ">" else " ",
+                if (package.selected) @as(u8, 'x') else @as(u8, ' '),
+                package.alias,
+                package.current_version,
+                if (package.use_latest) package.latest_version else package.target_version,
+                package.latest_version,
+            });
+        }
+        try manager.stdout.flush();
+    }
+
+    fn updatePackages(manager: *Manager, package_json: *Value, parent_dir: []const u8) !void {
+        const requests = try manager.parseUpdateRequests();
+        var handled = std.StringHashMap(void).init(manager.allocator);
+        defer handled.deinit();
+        var update_output: std.Io.Writer.Allocating = .init(manager.allocator);
+
+        for (update_dependency_sections) |dependency_section| {
+            const section_value = package_json.object.getPtr(dependency_section.name) orelse continue;
+            if (section_value.* != .object) continue;
+            for (section_value.object.keys(), section_value.object.values()) |name, *spec_value| {
+                const request = findUpdateRequest(requests, name);
+                if (requests.len > 0 and request == null) continue;
+                if (spec_value.* != .string) {
+                    if (request != null) try handled.put(name, {});
+                    continue;
+                }
+
+                const original_spec = spec_value.string;
+                const source_update = request != null and blk: {
+                    if (request.?.spec) |requested_spec| break :blk isNativeSourceSpecifier(requested_spec);
+                    break :blk isNativeSourceSpecifier(original_spec);
+                };
+                if (!source_update and !shouldUpdateRegistrySpec(original_spec, request != null, manager.options.latest, request)) {
+                    if (request != null) try handled.put(name, {});
+                    continue;
+                }
+                const handled_entry = try handled.getOrPut(name);
+                if (handled_entry.found_existing) continue;
                 const previous_changed = manager.changed;
                 const previous_installed_count = manager.installed_count;
-                const previous_locked_version = if (try manager.findLockedSelection(name, parent_dir)) |selection|
-                    selection.package.version
+                const result = if (source_update)
+                    try manager.resolveUpdatedSourceDependency(
+                        name,
+                        if (request.?.spec) |requested_spec| requested_spec else original_spec,
+                        parent_dir,
+                        dependency_section.optional,
+                    )
                 else
-                    null;
-                manager.direct_bins.clearRetainingCapacity();
-                const resolved = try manager.installDependency(
-                    name,
-                    resolution_spec,
-                    parent_dir,
-                    true,
-                    false,
-                );
-                const rewrite_dist_tag = requests.items.len > 0 or manager.options.latest;
-                const saved_spec = try updatedDependencySpec(
-                    manager.allocator,
-                    original_spec,
-                    resolved,
-                    manager.options.exact,
-                    rewrite_dist_tag,
-                );
-                const manifest_changed = !std.mem.eql(u8, original_spec, saved_spec);
+                    try manager.resolveUpdatedDependency(
+                        name,
+                        if (isRegistryUpdateSpecifier(original_spec)) original_spec else null,
+                        request,
+                        parent_dir,
+                        dependency_section.optional,
+                    );
+                const manifest_changed = !std.mem.eql(u8, original_spec, result.saved_spec);
                 if (manifest_changed) {
-                    spec_value.* = .{ .string = saved_spec };
+                    spec_value.* = .{ .string = try manager.allocator.dupe(u8, result.saved_spec) };
                     manager.update_package_json_changed = true;
                     manager.changed = true;
-                } else if (previous_locked_version) |locked| {
-                    if (std.mem.eql(u8, locked, resolved) and manager.installed_count == previous_installed_count) {
+                } else if (result.previous_version) |previous_version| {
+                    if (std.mem.eql(u8, previous_version, result.resolved_version) and
+                        manager.installed_count == previous_installed_count)
+                    {
                         manager.changed = previous_changed;
                     }
                 }
-
-                if (!manager.options.silent) {
-                    if (requests.items.len > 0) {
-                        try printNamedUpdate(&installed_output.writer, name, resolved, manager.direct_bins.items);
-                    } else if (dependencyBaselineVersion(original_spec)) |previous| {
-                        if (!std.mem.eql(u8, previous, resolved)) {
-                            try changed_output.writer.print("^ {s} {s} -> {s}\n", .{ name, previous, resolved });
-                        } else {
-                            try installed_output.writer.print("+ {s}@{s}\n", .{ name, resolved });
-                        }
-                    } else {
-                        try installed_output.writer.print("+ {s}@{s}\n", .{ name, resolved });
-                    }
-                }
+                try manager.appendUpdateOutput(&update_output.writer, name, result, request != null);
             }
         }
 
-        if (requests.items.len > 0) {
-            var dependencies: ?*std.json.ObjectMap = null;
-            for (requests.items) |request| {
-                if (handled.contains(request.name)) continue;
-                if (dependencies == null) {
-                    dependencies = try ensureObjectProperty(manager.allocator, &package_json.object, "dependencies");
+        if (requests.len > 0) {
+            for (requests) |*request| {
+                if (request.alias) |alias| {
+                    if (handled.contains(alias)) continue;
                 }
-                manager.direct_bins.clearRetainingCapacity();
-                const resolved = try manager.installDependency(
-                    request.name,
-                    request.spec orelse "latest",
-                    parent_dir,
-                    true,
-                    false,
-                );
-                const saved_spec = try newUpdateDependencySpec(
+                const requested_spec = request.spec orelse "latest";
+                const result = if (isNativeSourceSpecifier(requested_spec))
+                    try manager.resolveUpdatedSourceDependency(
+                        request.alias,
+                        requested_spec,
+                        parent_dir,
+                        manager.options.section == .optionalDependencies,
+                    )
+                else if (request.alias) |alias|
+                    try manager.resolveUpdatedDependency(
+                        alias,
+                        null,
+                        request,
+                        parent_dir,
+                        manager.options.section == .optionalDependencies,
+                    )
+                else {
+                    try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{requested_spec});
+                    return error.PackageManagerErrorReported;
+                };
+                if (handled.contains(result.alias)) continue;
+                const target_section = manager.sectionForAdd(package_json, result.alias);
+                const section = try ensureObjectProperty(manager.allocator, &package_json.object, target_section.key());
+                manager.removeDependencyFromOtherSections(package_json, result.alias, target_section);
+                try section.put(
                     manager.allocator,
-                    request.spec,
-                    resolved,
-                    manager.options.exact,
+                    try manager.allocator.dupe(u8, result.alias),
+                    .{ .string = try manager.allocator.dupe(u8, result.saved_spec) },
                 );
-                try dependencies.?.put(
-                    manager.allocator,
-                    try manager.allocator.dupe(u8, request.name),
-                    .{ .string = saved_spec },
-                );
-                try handled.put(try manager.allocator.dupe(u8, request.name), {});
                 manager.update_package_json_changed = true;
                 manager.changed = true;
-                if (!manager.options.silent) {
-                    try printNamedUpdate(&installed_output.writer, request.name, resolved, manager.direct_bins.items);
-                }
+                try manager.appendUpdateOutput(&update_output.writer, result.alias, result, true);
+                try handled.put(result.alias, {});
             }
         }
 
-        if (!manager.options.silent) {
-            if (changed_output.written().len > 0) try manager.stdout.writeAll(changed_output.written());
-            if (changed_output.written().len > 0 and installed_output.written().len > 0) try manager.stdout.writeByte('\n');
-            if (installed_output.written().len > 0) try manager.stdout.writeAll(installed_output.written());
+        try manager.installRoot(manager.root_package_json.?, true);
+        if (!manager.options.silent) try manager.stdout.writeAll(update_output.written());
+    }
+
+    fn parseUpdateRequests(manager: *Manager) ![]const UpdateRequest {
+        var requests = std.array_list.Managed(UpdateRequest).init(manager.allocator);
+        var seen = std.StringHashMap(void).init(manager.allocator);
+        defer seen.deinit();
+
+        for (manager.options.positionals) |raw_positional| {
+            const positional = std.mem.trim(u8, raw_positional, " \t\r\n");
+            if (positional.len == 0 or hasUnknownURLScheme(positional)) {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_positional});
+                return error.PackageManagerErrorReported;
+            }
+            const parsed = splitPackageSpec(positional);
+            const alias = parsed.name;
+            const explicit_spec = alias == null or packageSpecHasExplicitSpecifier(positional);
+            if (alias) |name| {
+                if (!compiler.strings.isNPMPackageName(name)) {
+                    try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_positional});
+                    return error.PackageManagerErrorReported;
+                }
+            }
+            if (alias == null and !isNativeSourceSpecifier(parsed.spec)) {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_positional});
+                return error.PackageManagerErrorReported;
+            }
+            if (explicit_spec and !isNativeSourceSpecifier(parsed.spec) and !isRegistryUpdateSpecifier(parsed.spec)) {
+                try manager.stderr.print("error: unrecognised dependency format: {s}\n", .{raw_positional});
+                return error.PackageManagerErrorReported;
+            }
+            const entry = try seen.getOrPut(alias orelse positional);
+            if (entry.found_existing) continue;
+            try requests.append(.{
+                .alias = alias,
+                .spec = if (explicit_spec) parsed.spec else null,
+            });
+        }
+        return requests.toOwnedSlice();
+    }
+
+    fn resolveUpdatedDependency(
+        manager: *Manager,
+        alias: []const u8,
+        original_spec: ?[]const u8,
+        request: ?*const UpdateRequest,
+        parent_dir: []const u8,
+        optional: bool,
+    ) !UpdateResult {
+        const previous_version = if (try manager.findLockedSelection(alias, parent_dir)) |selection|
+            selection.package.version
+        else
+            null;
+        const resolution_spec = try updateResolutionSpec(
+            manager.allocator,
+            original_spec,
+            request,
+            manager.options.latest,
+        );
+        manager.direct_bins.clearRetainingCapacity();
+        const resolved_version = blk: {
+            const previous_refresh = manager.refresh_direct_registry;
+            manager.refresh_direct_registry = true;
+            defer manager.refresh_direct_registry = previous_refresh;
+            break :blk try manager.installDependency(alias, resolution_spec, parent_dir, true, optional);
+        };
+        return .{
+            .alias = alias,
+            .resolved_version = resolved_version,
+            .saved_spec = try formatUpdatedRegistrySpec(
+                manager.allocator,
+                alias,
+                original_spec,
+                resolution_spec,
+                resolved_version,
+                if (request) |value| value.spec != null else false,
+                manager.options.exact,
+            ),
+            .previous_version = previous_version,
+        };
+    }
+
+    fn resolveUpdatedSourceDependency(
+        manager: *Manager,
+        alias_hint: ?[]const u8,
+        requested_spec: []const u8,
+        parent_dir: []const u8,
+        optional: bool,
+    ) !UpdateResult {
+        var alias = alias_hint;
+        var saved_spec = requested_spec;
+        if (isLocalSpec(requested_spec) and !isTarballSpec(requested_spec)) {
+            const local = manager.resolveLocalPackage(requested_spec, parent_dir) catch |err| {
+                try manager.stderr.print("note: error occurred while resolving {s}\n", .{requested_spec});
+                return err;
+            };
+            alias = alias orelse local.name;
+            saved_spec = try manager.normalizeLocalSpecFrom(requested_spec, local.path, parent_dir);
+        }
+
+        const previous_version = if (alias) |name|
+            if (try manager.findLockedSelection(name, parent_dir)) |selection| selection.package.version else null
+        else
+            null;
+        manager.direct_bins.clearRetainingCapacity();
+
+        var resolved_version: []const u8 = undefined;
+        if (alias) |name| {
+            const previous_refresh = manager.refresh_direct_source;
+            manager.refresh_direct_source = true;
+            defer manager.refresh_direct_source = previous_refresh;
+            resolved_version = try manager.installDependency(name, saved_spec, parent_dir, true, optional);
+        } else if (isGitSpec(requested_spec)) {
+            const git = try manager.installGit(null, requested_spec, parent_dir, true, optional, null, &.{});
+            alias = git.alias;
+            resolved_version = git.version;
+        } else if (isTarballSpec(requested_spec)) {
+            const tarball = try manager.installTarball(null, requested_spec, parent_dir, true, optional, &.{});
+            alias = tarball.alias;
+            resolved_version = tarball.version;
+        } else {
+            return error.InvalidPackageName;
+        }
+        manager.changed = true;
+
+        return .{
+            .alias = alias.?,
+            .resolved_version = resolved_version,
+            .saved_spec = saved_spec,
+            .previous_version = previous_version,
+        };
+    }
+
+    fn appendUpdateOutput(
+        manager: *Manager,
+        writer: *std.Io.Writer,
+        alias: []const u8,
+        result: UpdateResult,
+        requested: bool,
+    ) !void {
+        if (manager.options.silent) return;
+        if (requested) {
+            if (manager.direct_bins.items.len == 0) {
+                try writer.print("installed {s}@{s}\n", .{ alias, result.resolved_version });
+            } else {
+                try writer.print("installed {s}@{s} with binaries:\n", .{ alias, result.resolved_version });
+                for (manager.direct_bins.items) |bin_name| try writer.print(" - {s}\n", .{bin_name});
+            }
+            return;
+        }
+        if (result.previous_version) |previous| {
+            if (!std.mem.eql(u8, previous, result.resolved_version)) {
+                try writer.print("^ {s} {s} -> {s}\n", .{ alias, previous, result.resolved_version });
+            }
+        } else {
+            try writer.print("+ {s}@{s}\n", .{ alias, result.resolved_version });
         }
     }
 
@@ -4618,7 +5065,7 @@ const Manager = struct {
             !manager.options.ignore_scripts and
             !manager.options.lockfile_only and
             !manager.options.dry_run and
-            Scripts.rootHasLifecycleScripts(manager.root_package_json.?);
+            Scripts.rootHasLifecycleScripts(manager.init_data.io, manager.root_dir, manager.root_package_json.?);
     }
 
     fn installSummarySeparator(manager: *const Manager) []const u8 {
@@ -4652,16 +5099,19 @@ const Manager = struct {
         } else effective_spec;
 
         const explicit_global_link = manager.options.command == .link and direct;
-        const refresh_direct_registry = (manager.options.command == .add or manager.options.command == .update) and
-            direct and
-            (manager.options.command == .update or !manager.report_direct_installs) and
+        const refresh_direct_registry = direct and
             !workspace_package and
             !isGitSpec(resolution_spec) and
             !isTarballSpec(resolution_spec) and
-            !isLocalSpec(resolution_spec);
+            !isLocalSpec(resolution_spec) and
+            (manager.refresh_direct_registry or
+                (manager.options.command == .add and !manager.report_direct_installs));
+        const refresh_direct_source = direct and manager.refresh_direct_source and
+            (workspace_package or isGitSpec(resolution_spec) or isTarballSpec(resolution_spec) or
+                isLocalSpec(resolution_spec) or std.mem.startsWith(u8, effective_spec, "patch:"));
 
         const inspect_direct_trust = manager.options.trust and manager.options.command == .add and direct;
-        if (direct and !refresh_direct_registry and !inspect_direct_trust) {
+        if (direct and !refresh_direct_registry and !refresh_direct_source and !inspect_direct_trust) {
             const direct_key = if (explicit_global_link and !std.mem.eql(u8, parent_dir, manager.root_dir)) blk: {
                 const destination = try packageDestination(manager.allocator, parent_dir, alias);
                 break :blk try manager.lockKeyForDestination(destination);
@@ -4677,7 +5127,7 @@ const Manager = struct {
             }
         }
 
-        if (!refresh_direct_registry) {
+        if (!refresh_direct_registry and !refresh_direct_source) {
             if (try manager.findLockedSelection(alias, parent_dir)) |selection| {
                 if (try manager.lockedPackageMatches(selection.package, alias, resolution_spec, parent_dir)) {
                     const cycle_key = try std.fmt.allocPrint(manager.allocator, "lock:{s}", .{selection.package.key});
@@ -5130,8 +5580,9 @@ const Manager = struct {
                         try manager.installedPackageMatches(selection.destination, package.name, package.version) and
                         try manager.packagePatchStateMatches(selection.destination, patch_paths);
                     if (!installed) {
+                        const registry = manager.registryConfigForPackage(package.name);
                         const tarball_url = if (package.source.len > 0)
-                            package.source
+                            try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
                         else
                             try manager.defaultTarballURL(package.name, package.version);
                         const archive = try manager.fetchRegistryArchive(.{
@@ -5139,7 +5590,7 @@ const Manager = struct {
                             .version = package.version,
                             .tarball = tarball_url,
                             .integrity = if (package.integrity.len > 0) package.integrity else null,
-                            .authorization = manager.authorizationForURL(tarball_url),
+                            .authorization = manager.authorizationForPackageURL(package.name, tarball_url),
                         });
                         deletePath(manager.init_data.io, selection.destination);
                         try std.Io.Dir.cwd().createDirPath(manager.init_data.io, selection.destination);
@@ -7192,7 +7643,7 @@ const Manager = struct {
     }
 
     fn needsExtendedRegistryManifest(manager: *const Manager) bool {
-        return if (manager.options.minimum_release_age_ms) |minimum_age| minimum_age > 0 else false;
+        return manager.options.minimum_release_age_ms != null;
     }
 
     fn registryManifestAccept(manager: *const Manager) []const u8 {
@@ -7216,19 +7667,24 @@ const Manager = struct {
     }
 
     fn resolveRegistryPackage(manager: *Manager, name: []const u8, spec: []const u8) !RegistryPackage {
-        const manifest = manager.registry_manifests.get(name) orelse blk: {
+        const refresh_manifest = manager.refresh_direct_registry and
+            !manager.refreshed_update_manifests.contains(name);
+        const cached_manifest: ?*Value = if (refresh_manifest) null else manager.registry_manifests.get(name);
+        const manifest = cached_manifest orelse blk: {
             const encoded_name = try encodePackageName(manager.allocator, name);
             const configured_registry = manager.registryConfigForPackage(name);
             const cache_path = try manager.registryManifestCachePath(configured_registry.url, encoded_name);
-            if (cache_path) |path| {
-                if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
-                    if (try manager.parseRegistryManifest(cached)) |parsed| {
-                        if (manager.cachedRegistryManifestIsUsable(parsed)) {
-                            try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
-                            break :blk parsed;
+            if (!refresh_manifest) {
+                if (cache_path) |path| {
+                    if (try readOptionalFile(manager.init_data.io, manager.allocator, path, max_manifest_bytes)) |cached| {
+                        if (try manager.parseRegistryManifest(cached)) |parsed| {
+                            if (manager.cachedRegistryManifestIsUsable(parsed)) {
+                                try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+                                break :blk parsed;
+                            }
                         }
+                        std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
                     }
-                    std.Io.Dir.cwd().deleteFile(manager.init_data.io, path) catch {};
                 }
             }
             const manifest_url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name });
@@ -7238,6 +7694,7 @@ const Manager = struct {
                 try std.Io.Dir.cwd().writeFile(manager.init_data.io, .{ .sub_path = path, .data = bytes });
             }
             try manager.registry_manifests.put(try manager.allocator.dupe(u8, name), parsed);
+            if (refresh_manifest) try manager.refreshed_update_manifests.put(try manager.allocator.dupe(u8, name), {});
             break :blk parsed;
         };
         if (manifest.* != .object) return error.InvalidRegistryManifest;
@@ -7282,14 +7739,15 @@ const Manager = struct {
         else
             null;
         const configured_registry = manager.registryConfigForPackage(name);
+        const tarball_url = try resolveRegistryTarballURL(manager.allocator, configured_registry.url, tarball_value.string);
         return .{
             .name = if (metadata.object.get("name")) |value| if (value == .string) value.string else name else name,
             .version = version_value,
             .latest_version = latest_version,
-            .tarball = tarball_value.string,
+            .tarball = tarball_url,
             .integrity = integrity,
             .metadata = metadata,
-            .authorization = configured_registry.authorization,
+            .authorization = manager.authorizationForPackageURL(name, tarball_url),
         };
     }
 
@@ -7310,8 +7768,9 @@ const Manager = struct {
         while (packages.next()) |entry| {
             const package = entry.value_ptr;
             if (package.kind != .npm or package.name.len == 0 or package.version.len == 0) continue;
+            const registry = manager.registryConfigForPackage(package.name);
             const tarball = if (package.source.len > 0)
-                package.source
+                try resolveRegistryTarballURL(manager.allocator, registry.url, package.source)
             else
                 try manager.defaultTarballURL(package.name, package.version);
             try archives.append(.{
@@ -7319,7 +7778,7 @@ const Manager = struct {
                 .version = package.version,
                 .tarball = tarball,
                 .integrity = if (package.integrity.len > 0) package.integrity else null,
-                .authorization = manager.authorizationForURL(tarball),
+                .authorization = manager.authorizationForPackageURL(package.name, tarball),
             });
         }
         try manager.prefetchRegistryArchives(archives.items);
@@ -7522,6 +7981,7 @@ const Manager = struct {
             }
             try fetches.append(.{
                 .io = manager.init_data.io,
+                .environment = manager.init_data.environ_map,
                 .name = name,
                 .url = try std.fmt.allocPrint(manager.allocator, "{s}{s}", .{ configured_registry.url, encoded_name }),
                 .authorization = configured_registry.authorization,
@@ -7566,6 +8026,7 @@ const Manager = struct {
             try queued.put(cache_path, {});
             try fetches.append(.{
                 .io = manager.init_data.io,
+                .environment = manager.init_data.environ_map,
                 .url = archive.tarball,
                 .authorization = archive.authorization,
                 .integrity = archive.integrity,
@@ -7606,6 +8067,12 @@ const Manager = struct {
         return authorization;
     }
 
+    fn authorizationForPackageURL(manager: *Manager, package_name: []const u8, url: []const u8) ?[]const u8 {
+        const configured = manager.registryConfigForPackage(package_name);
+        if (std.mem.startsWith(u8, url, configured.url)) return configured.authorization;
+        return manager.authorizationForURL(url);
+    }
+
     fn fetchBytesWithAuthorization(
         manager: *Manager,
         url: []const u8,
@@ -7613,7 +8080,7 @@ const Manager = struct {
         limit: usize,
         authorization: ?[]const u8,
     ) ![]const u8 {
-        var headers_buffer: [2]std.http.Header = undefined;
+        var headers_buffer: [3]std.http.Header = undefined;
         var header_count: usize = 0;
         if (manifest) {
             headers_buffer[header_count] = .{ .name = "accept", .value = manager.registryManifestAccept() };
@@ -7622,6 +8089,10 @@ const Manager = struct {
         if (authorization) |value| {
             headers_buffer[header_count] = .{ .name = "authorization", .value = value };
             header_count += 1;
+            if (manifest) {
+                headers_buffer[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
+                header_count += 1;
+            }
         }
         const headers = headers_buffer[0..header_count];
         var attempt: usize = 0;
@@ -7644,7 +8115,8 @@ const Manager = struct {
                 return try output.toOwnedSlice();
             }
             output.deinit();
-            if (status < 500 or attempt == manager.max_retry_count) {
+            const retryable = status >= 500 or status == 429;
+            if (!retryable or attempt == manager.max_retry_count) {
                 try manager.stderr.print("error: GET {s} - {d}\n", .{ url, status });
                 return error.PackageManagerErrorReported;
             }
@@ -7653,15 +8125,15 @@ const Manager = struct {
     }
 
     fn fetchInfoManifest(manager: *Manager, url: []const u8) !?[]const u8 {
-        var headers_buffer: [2]std.http.Header = undefined;
+        var headers_buffer: [3]std.http.Header = undefined;
         var header_count: usize = 0;
         headers_buffer[header_count] = .{ .name = "accept", .value = "application/json" };
         header_count += 1;
-        if (manager.registry_authorization) |authorization| {
-            if (std.mem.startsWith(u8, url, manager.registry)) {
-                headers_buffer[header_count] = .{ .name = "authorization", .value = authorization };
-                header_count += 1;
-            }
+        if (manager.authorizationForURL(url)) |authorization| {
+            headers_buffer[header_count] = .{ .name = "authorization", .value = authorization };
+            header_count += 1;
+            headers_buffer[header_count] = .{ .name = "npm-auth-type", .value = "legacy" };
+            header_count += 1;
         }
 
         var attempt: usize = 0;
@@ -7685,7 +8157,7 @@ const Manager = struct {
                 return try output.toOwnedSlice();
             }
             output.deinit();
-            if (status >= 500 and attempt < manager.max_retry_count) continue;
+            if ((status >= 500 or status == 429) and attempt < manager.max_retry_count) continue;
             try manager.stderr.print("error: {s}\n", .{result.status.phrase() orelse @tagName(result.status)});
             try manager.stderr.flush();
             return null;
@@ -8865,9 +9337,6 @@ const Manager = struct {
 };
 
 fn splitPackageSpec(input: []const u8) PackageSpec {
-    if (isGitSpec(input) or isTarballSpec(input) or isLocalSpec(input) or std.mem.startsWith(u8, input, "http://") or std.mem.startsWith(u8, input, "https://")) {
-        return .{ .name = null, .spec = input };
-    }
     if (std.mem.startsWith(u8, input, "@")) {
         const slash = std.mem.indexOfScalar(u8, input, '/') orelse return .{ .name = input, .spec = "latest" };
         if (std.mem.indexOfScalarPos(u8, input, slash + 1, '@')) |at| {
@@ -8876,9 +9345,171 @@ fn splitPackageSpec(input: []const u8) PackageSpec {
         return .{ .name = input, .spec = "latest" };
     }
     if (std.mem.indexOfScalar(u8, input, '@')) |at| {
+        if (at > 0 and at + 1 < input.len and isExplicitNamedSourceSpecifier(input[at + 1 ..])) {
+            return .{ .name = input[0..at], .spec = input[at + 1 ..] };
+        }
+    }
+    if (isGitSpec(input) or isTarballSpec(input) or isLocalSpec(input) or std.mem.startsWith(u8, input, "http://") or std.mem.startsWith(u8, input, "https://")) {
+        return .{ .name = null, .spec = input };
+    }
+    if (std.mem.indexOfScalar(u8, input, '@')) |at| {
         if (at > 0) return .{ .name = input[0..at], .spec = if (at + 1 < input.len) input[at + 1 ..] else "latest" };
     }
     return .{ .name = input, .spec = "latest" };
+}
+
+fn isExplicitNamedSourceSpecifier(spec: []const u8) bool {
+    return isTarballSpec(spec) or isLocalSpec(spec) or
+        std.mem.startsWith(u8, spec, "github:") or
+        std.mem.startsWith(u8, spec, "bitbucket:") or
+        std.mem.startsWith(u8, spec, "gitlab:") or
+        std.mem.startsWith(u8, spec, "gist:") or
+        std.mem.startsWith(u8, spec, "sourcehut:") or
+        std.mem.startsWith(u8, spec, "git+") or
+        std.mem.startsWith(u8, spec, "git://") or
+        std.mem.startsWith(u8, spec, "ssh://") or
+        std.mem.startsWith(u8, spec, "git@") or
+        std.mem.startsWith(u8, spec, "workspace:") or
+        std.mem.startsWith(u8, spec, "patch:");
+}
+
+fn packageSpecHasExplicitSpecifier(input: []const u8) bool {
+    if (std.mem.startsWith(u8, input, "@")) {
+        const slash = std.mem.indexOfScalar(u8, input, '/') orelse return false;
+        return std.mem.indexOfScalarPos(u8, input, slash + 1, '@') != null;
+    }
+    return if (std.mem.indexOfScalar(u8, input, '@')) |at| at > 0 else false;
+}
+
+fn findUpdateRequest(requests: []const UpdateRequest, alias: []const u8) ?*const UpdateRequest {
+    for (requests) |*request| {
+        const request_alias = request.alias orelse continue;
+        if (std.mem.eql(u8, request_alias, alias)) return request;
+    }
+    return null;
+}
+
+fn interactiveRequestContains(requests: []const []const u8, alias: []const u8) bool {
+    for (requests) |request| {
+        const parsed = splitPackageSpec(request);
+        if (parsed.name) |name| {
+            if (std.mem.eql(u8, name, alias)) return true;
+        }
+    }
+    return false;
+}
+
+fn interactiveDependencyPriority(dependency_type: []const u8) u8 {
+    if (std.mem.eql(u8, dependency_type, "dependencies")) return 0;
+    if (std.mem.eql(u8, dependency_type, "devDependencies")) return 1;
+    if (std.mem.eql(u8, dependency_type, "peerDependencies")) return 2;
+    if (std.mem.eql(u8, dependency_type, "optionalDependencies")) return 3;
+    return 4;
+}
+
+fn isNativeSourceSpecifier(spec: []const u8) bool {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    return isGitSpec(trimmed) or isTarballSpec(trimmed) or isLocalSpec(trimmed) or
+        std.mem.startsWith(u8, trimmed, "workspace:") or
+        std.mem.startsWith(u8, trimmed, "patch:");
+}
+
+fn isRegistryUpdateSpecifier(spec: []const u8) bool {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "npm:") or std.mem.startsWith(u8, trimmed, "catalog:")) return true;
+    if (std.mem.startsWith(u8, trimmed, "workspace:") or
+        std.mem.startsWith(u8, trimmed, "patch:") or
+        std.mem.startsWith(u8, trimmed, "http://") or
+        std.mem.startsWith(u8, trimmed, "https://")) return false;
+    return !isLocalSpec(trimmed) and !isGitSpec(trimmed) and !isTarballSpec(trimmed) and !hasUnknownURLScheme(trimmed);
+}
+
+fn shouldUpdateRegistrySpec(
+    original_spec: []const u8,
+    requested: bool,
+    latest: bool,
+    request: ?*const UpdateRequest,
+) bool {
+    if (request) |value| {
+        if (value.spec) |requested_spec| return isRegistryUpdateSpecifier(requested_spec);
+    }
+    if (!isRegistryUpdateSpecifier(original_spec)) return false;
+    if (std.mem.startsWith(u8, original_spec, "catalog:")) return true;
+    const parsed_alias = parseNpmAlias("", original_spec);
+    const range = parsed_alias[1];
+    return requested or latest or !Semver.Version.isTaggedVersionOnly(range);
+}
+
+fn npmAliasPrefix(spec: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, spec, "npm:")) return null;
+    const parsed = splitPackageSpec(spec["npm:".len..]);
+    const name = parsed.name orelse return null;
+    return spec[0 .. "npm:".len + name.len];
+}
+
+fn updateResolutionSpec(
+    allocator: std.mem.Allocator,
+    original_spec: ?[]const u8,
+    request: ?*const UpdateRequest,
+    latest: bool,
+) ![]const u8 {
+    if (latest) {
+        var alias_source = original_spec;
+        if (request) |value| {
+            if (value.spec) |requested_spec| {
+                if (npmAliasPrefix(requested_spec) != null) alias_source = requested_spec;
+            }
+        }
+        if (alias_source) |source| {
+            if (npmAliasPrefix(source)) |prefix| return std.fmt.allocPrint(allocator, "{s}@latest", .{prefix});
+        }
+        return "latest";
+    }
+    if (request) |value| {
+        if (value.spec) |requested_spec| {
+            if (npmAliasPrefix(requested_spec) != null) return requested_spec;
+            if (original_spec) |original| {
+                if (npmAliasPrefix(original)) |prefix| {
+                    return std.fmt.allocPrint(allocator, "{s}@{s}", .{ prefix, requested_spec });
+                }
+            }
+            return requested_spec;
+        }
+    }
+    return original_spec orelse "latest";
+}
+
+fn formatUpdatedRegistrySpec(
+    allocator: std.mem.Allocator,
+    alias: []const u8,
+    original_spec: ?[]const u8,
+    resolution_spec: []const u8,
+    resolved_version: []const u8,
+    request_had_explicit_spec: bool,
+    exact: bool,
+) ![]const u8 {
+    if (original_spec) |original| {
+        if (std.mem.startsWith(u8, original, "catalog:") and !request_had_explicit_spec) return original;
+    }
+
+    const pin_source = if (original_spec) |original|
+        parseNpmAlias(alias, original)[1]
+    else
+        parseNpmAlias(alias, resolution_spec)[1];
+    const version_spec = if (exact)
+        resolved_version
+    else switch (Semver.Version.whichVersionIsPinned(pin_source)) {
+        .patch => resolved_version,
+        .minor => try std.fmt.allocPrint(allocator, "~{s}", .{resolved_version}),
+        .major => try std.fmt.allocPrint(allocator, "^{s}", .{resolved_version}),
+    };
+
+    var alias_prefix = npmAliasPrefix(resolution_spec);
+    if (alias_prefix == null) {
+        if (original_spec) |original| alias_prefix = npmAliasPrefix(original);
+    }
+    if (alias_prefix) |prefix| return std.fmt.allocPrint(allocator, "{s}@{s}", .{ prefix, version_spec });
+    return version_spec;
 }
 
 fn parseNpmAlias(alias: []const u8, spec: []const u8) struct { []const u8, []const u8 } {
@@ -8890,122 +9521,6 @@ fn parseNpmAlias(alias: []const u8, spec: []const u8) struct { []const u8, []con
 fn hasExplicitRange(input: []const u8) bool {
     const parsed = splitPackageSpec(input);
     return parsed.name != null and !std.mem.eql(u8, parsed.spec, "latest");
-}
-
-fn isUpdatableRegistrySpec(spec: []const u8) bool {
-    return !isLocalSpec(spec) and
-        !isGitSpec(spec) and
-        !isTarballSpec(spec) and
-        !std.mem.startsWith(u8, spec, "http://") and
-        !std.mem.startsWith(u8, spec, "https://") and
-        !std.mem.startsWith(u8, spec, "workspace:") and
-        !std.mem.startsWith(u8, spec, "catalog:") and
-        !std.mem.startsWith(u8, spec, "patch:");
-}
-
-const NpmAliasLiteral = struct {
-    prefix: []const u8,
-    version: []const u8,
-};
-
-fn npmAliasLiteral(spec: []const u8) ?NpmAliasLiteral {
-    if (!std.mem.startsWith(u8, spec, "npm:")) return null;
-    const at = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return null;
-    if (at < "npm:".len or at + 1 >= spec.len) return null;
-    return .{ .prefix = spec[0 .. at + 1], .version = spec[at + 1 ..] };
-}
-
-fn updateResolutionSpec(
-    allocator: std.mem.Allocator,
-    original_spec: []const u8,
-    requested_spec: ?[]const u8,
-    latest: bool,
-) ![]const u8 {
-    const target = requested_spec orelse if (latest) "latest" else return original_spec;
-    if (npmAliasLiteral(original_spec)) |alias| {
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ alias.prefix, target });
-    }
-    return target;
-}
-
-fn updatedDependencySpec(
-    allocator: std.mem.Allocator,
-    original_spec: []const u8,
-    resolved: []const u8,
-    exact: bool,
-    rewrite_dist_tag: bool,
-) ![]const u8 {
-    const alias = npmAliasLiteral(original_spec);
-    const original_version = if (alias) |value| value.version else original_spec;
-    if (Semver.Version.isTaggedVersionOnly(original_version) and !rewrite_dist_tag) return original_spec;
-
-    const pinned: Semver.Version.PinnedVersion = if (exact)
-        .patch
-    else if (Semver.Version.isTaggedVersionOnly(original_version))
-        .major
-    else
-        Semver.Version.whichVersionIsPinned(original_version);
-    const saved_version = switch (pinned) {
-        .patch => try allocator.dupe(u8, resolved),
-        .minor => try std.fmt.allocPrint(allocator, "~{s}", .{resolved}),
-        .major => try std.fmt.allocPrint(allocator, "^{s}", .{resolved}),
-    };
-    if (alias) |value| return std.fmt.allocPrint(allocator, "{s}{s}", .{ value.prefix, saved_version });
-    return saved_version;
-}
-
-fn newUpdateDependencySpec(
-    allocator: std.mem.Allocator,
-    requested_spec: ?[]const u8,
-    resolved: []const u8,
-    exact: bool,
-) ![]const u8 {
-    if (requested_spec) |requested| {
-        if (npmAliasLiteral(requested)) |alias| {
-            if (isExactVersionLiteral(alias.version)) return allocator.dupe(u8, requested);
-            const saved_version = if (exact)
-                try allocator.dupe(u8, resolved)
-            else
-                try std.fmt.allocPrint(allocator, "^{s}", .{resolved});
-            return std.fmt.allocPrint(allocator, "{s}{s}", .{ alias.prefix, saved_version });
-        }
-        if (isExactVersionLiteral(requested)) return allocator.dupe(u8, requested);
-    }
-    if (exact) return allocator.dupe(u8, resolved);
-    return std.fmt.allocPrint(allocator, "^{s}", .{resolved});
-}
-
-fn isExactVersionLiteral(input: []const u8) bool {
-    var value = std.mem.trim(u8, input, " \t\r\n");
-    if (value.len > 0 and value[0] == '=') value = std.mem.trimStart(u8, value[1..], " \t\r\n");
-    if (value.len > 1 and value[0] == 'v') value = value[1..];
-    if (std.SemanticVersion.parse(value)) |_| return true else |_| return false;
-}
-
-fn dependencyBaselineVersion(spec: []const u8) ?[]const u8 {
-    var value = if (npmAliasLiteral(spec)) |alias| alias.version else spec;
-    value = std.mem.trim(u8, value, " \t\r\n");
-    while (value.len > 0 and switch (value[0]) {
-        '^', '~', '=', '<', '>', 'v' => true,
-        else => false,
-    }) value = std.mem.trimStart(u8, value[1..], " \t\r\n");
-    const parsed = Semver.Version.parseUTF8(value);
-    if (!parsed.valid or parsed.len == 0 or parsed.len > value.len) return null;
-    return value[0..parsed.len];
-}
-
-fn printNamedUpdate(
-    writer: *std.Io.Writer,
-    name: []const u8,
-    resolved: []const u8,
-    bins: []const []const u8,
-) !void {
-    if (bins.len == 0) {
-        try writer.print("installed {s}@{s}\n", .{ name, resolved });
-        return;
-    }
-    try writer.print("installed {s}@{s} with binaries:\n", .{ name, resolved });
-    for (bins) |bin| try writer.print(" - {s}\n", .{bin});
 }
 
 fn isLocalSpec(spec: []const u8) bool {
@@ -10194,6 +10709,15 @@ test "package specs preserve scoped names and ranges" {
     const alias = splitPackageSpec("bap@npm:baz@0.0.5");
     try std.testing.expectEqualStrings("bap", alias.name.?);
     try std.testing.expectEqualStrings("npm:baz@0.0.5", alias.spec);
+    const tarball_alias = splitPackageSpec("fixture@https://registry.example/fixture.tgz");
+    try std.testing.expectEqualStrings("fixture", tarball_alias.name.?);
+    try std.testing.expectEqualStrings("https://registry.example/fixture.tgz", tarball_alias.spec);
+    const git_alias = splitPackageSpec("fixture@github:owner/repository");
+    try std.testing.expectEqualStrings("fixture", git_alias.name.?);
+    try std.testing.expectEqualStrings("github:owner/repository", git_alias.spec);
+    const raw_git = splitPackageSpec("git@github.com:owner/repository.git");
+    try std.testing.expect(raw_git.name == null);
+    try std.testing.expectEqualStrings("git@github.com:owner/repository.git", raw_git.spec);
 }
 
 test "security scanner package metadata uses declared ranges" {
