@@ -1825,7 +1825,7 @@
     },
     "test/js/bun/http/serve.test.ts": {
       "status": "expected-failure",
-      "reason": "The prior request lifecycle, React server-module, idle-timeout, and streaming-flush failures now pass. The exact file remains quarantined because its 15,000-request big-file cancellation case retains multi-gigabyte child processes and does not complete under focused validation."
+      "reason": "Focused big-file cancellation (1 test, 3 assertions) and immediate streaming-pull error handling (2 tests, 12 assertions) pass after bounded fetch connection reuse and stream finalization fixes. The exact file remains quarantined for its remaining functional and heap-count failures."
     },
     "test/js/bun/http/tls-keepalive.test.ts": {
       "status": "enabled",

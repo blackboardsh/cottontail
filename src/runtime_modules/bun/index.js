@@ -7365,6 +7365,13 @@ const reusableFetchHttpsAgents = new Map();
 const reusableCustomFetchHttpsAgents = new Map();
 const MAX_REUSABLE_CUSTOM_FETCH_HTTPS_AGENTS = 64;
 const proxyTunnelAgentSymbol = Symbol("cottontail.fetchProxyTunnelAgent");
+const reusableFetchHttpAgent = new nodeHttp.Agent({
+  keepAlive: true,
+  scheduling: "lifo",
+  timeout: 5000,
+  maxSockets: 16,
+  maxTotalSockets: 256,
+});
 
 function defaultFetchHttpsAgent(tlsOptions, keepalive) {
   if (!keepalive) return new nodeHttps.Agent({ ...tlsOptions, keepAlive: false });
@@ -7503,7 +7510,7 @@ function dispatchNodeFetchRequest(request, redirected, transport, onResponse, ur
   let port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
   let path = `${url.pathname || "/"}${url.search || ""}`;
   const tlsOptions = fetchTlsOptions(url, transport.tlsConfig);
-  let agent = keepalive ? undefined : false;
+  let agent = keepalive ? reusableFetchHttpAgent : false;
   const proxyValue = transport.proxy?.explicit ?? transport.proxy?.environment;
   if (proxyValue) {
     const proxy = normalizedProxyUrl(proxyValue);
@@ -11591,17 +11598,57 @@ export function serve(options) {
   const sendStreamingResponse = async (item, response, status, headers) => {
     if (nativeClosed) return;
     const body = response._takeBody();
-    cottontail.httpServerResponseStart(native.id, item.id, status, headers);
+    let responseStarted = false;
+    const startResponse = () => {
+      if (responseStarted) return;
+      cottontail.httpServerResponseStart(native.id, item.id, status, headers);
+      responseStarted = true;
+    };
+    const writeChunk = (chunk) => {
+      const bytes = bytesFromData(chunk);
+      if (bytes.byteLength > 0) cottontail.httpServerResponseWrite(native.id, item.id, bytes);
+    };
     try {
-      await consumeStreamingBody(body, (chunk) => {
-        const bytes = bytesFromData(chunk);
-        if (bytes.byteLength > 0) cottontail.httpServerResponseWrite(native.id, item.id, bytes);
-      });
+      if (body && typeof body.getReader === "function") {
+        const reader = body.getReader();
+        const read = () => reader.read().then(
+          (readResult) => ({ readResult, error: null }),
+          (error) => ({ readResult: null, error }),
+        );
+        const pendingRead = read();
+        const checkpoint = {};
+        let checkpointTimer;
+        let settled = await Promise.race([
+          pendingRead,
+          new Promise((resolve) => {
+            checkpointTimer = setTimeout(() => resolve(checkpoint), 0);
+          }),
+        ]);
+        if (settled === checkpoint) {
+          startResponse();
+          settled = await pendingRead;
+        } else {
+          clearTimeout(checkpointTimer);
+        }
+
+        for (;;) {
+          if (settled.error != null) throw settled.error;
+          if (settled.readResult.done) break;
+          startResponse();
+          writeChunk(settled.readResult.value);
+          settled = await read();
+        }
+        startResponse();
+      } else {
+        startResponse();
+        await consumeStreamingBody(body, writeChunk);
+      }
       cottontail.httpServerResponseEnd(native.id, item.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!nativeClosed) console.error(`error: ${message}`);
       try {
+        startResponse();
         cottontail.httpServerResponseEnd(native.id, item.id);
       } catch {
         try {
