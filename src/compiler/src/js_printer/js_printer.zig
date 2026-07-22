@@ -1689,6 +1689,20 @@ fn NewPrinter(
             }
 
             if (record.source_index.isValid()) {
+                if (record.kind == .dynamic and module_type == .internal_bake_dev) {
+                    p.printSpaceBeforeIdentifier();
+                    p.printSymbol(p.options.hmr_ref);
+                    p.print(".dynamicImport(");
+                    const path = p.options.input_files_for_dev_server.?[record.source_index.get()].path;
+                    p.printStringLiteralUTF8(path.pretty, false);
+                    if (!import_options.isMissing()) {
+                        p.printWhitespacer(ws(", "));
+                        p.printExpr(import_options, .comma, .{});
+                    }
+                    p.print(")");
+                    return;
+                }
+
                 var meta = p.options.requireOrImportMetaForSource(record.source_index.get(), was_unwrapped_require);
 
                 // Don't need the namespace object if the result is unused anyway
