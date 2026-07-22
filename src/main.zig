@@ -1534,11 +1534,6 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
         try stderr.flush();
         return 1;
     }
-    if (compile and entries.items.len != 1) {
-        try stderr.writeAll("error: --compile requires exactly one entrypoint\n");
-        try stderr.flush();
-        return 1;
-    }
     if (options.server_components and options.target == .browser) {
         try stderr.writeAll("error: Cannot use client-side --target=browser with --server-components\n");
         try stderr.flush();
@@ -1585,13 +1580,18 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
     if (compile) {
         options.target = .bun;
         options.output_format = .esm;
+        const default_basename = std.fs.path.stem(entries.items[0]);
+        const default_name = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}.exe", .{default_basename})
+        else
+            default_basename;
+        const destination = outfile orelse default_name;
         const requested_source_map = options.source_map;
         // The standalone payload always embeds a normal external map. Inline
         // mode keeps it inside the executable; external/linked modes also
         // materialize the same compiler output next to the binary.
         if (requested_source_map != .none) options.source_map = .external;
-        const entry_z = try allocator.dupeZ(u8, entries.items[0]);
-        var payload = script_runner.compileStandaloneSource(init, entry_z, options) catch |err| {
+        var payload = script_runner.compileStandaloneSource(init, entries.items, destination, options) catch |err| {
             try stderr.print("error: standalone build failed: {s}\n", .{@errorName(err)});
             try stderr.flush();
             return 1;
@@ -1603,12 +1603,6 @@ fn nativeBuild(init: std.process.Init, args: []const [:0]const u8) !u8 {
             .disable_autoload_tsconfig = !(compile_autoload_tsconfig orelse false),
             .disable_autoload_package_json = !(compile_autoload_package_json orelse false),
         };
-        const default_basename = std.fs.path.stem(entries.items[0]);
-        const default_name = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(allocator, "{s}.exe", .{default_basename})
-        else
-            default_basename;
-        const destination = outfile orelse default_name;
         try standalone_executable.write(
             init,
             destination,

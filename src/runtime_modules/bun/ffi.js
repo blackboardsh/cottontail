@@ -2514,6 +2514,62 @@ function canUseBareWorkerScript(target, options, hasWorkerOptions) {
   return !/(?:^|\n)\s*(?:import|export)\b|import\.meta|\b(?:Bun|process|Buffer|require|fetch|setTimeout|setInterval|clearTimeout|clearInterval|queueMicrotask|structuredClone|MessageChannel|MessagePort|BroadcastChannel|Worker|URL|Blob|File|crypto|performance)\b/.test(source);
 }
 
+function standaloneWorkerEntry(scriptPath) {
+  const files = g.__cottontailStandaloneFiles;
+  if (files == null) return null;
+
+  let relative = String(scriptPath).replace(/\\/g, "/");
+  const roots = ["/$bunfs/root/", "B:/~BUN/root/"];
+  const virtualRoot = roots.find(root => relative.startsWith(root));
+  if (virtualRoot) {
+    relative = relative.slice(virtualRoot.length);
+  } else {
+    if (relative.startsWith("/") || /^[A-Za-z]:\//.test(relative)) return null;
+    relative = relative.replace(/^\.\//, "");
+  }
+
+  const parts = [];
+  for (const part of relative.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else {
+      parts.push(part);
+    }
+  }
+  relative = parts.join("/");
+  if (!relative) return null;
+
+  const outputNames = [relative];
+  if (/\.[cm]?[jt]sx?$/i.test(relative)) {
+    const jsName = relative.replace(/\.[cm]?[jt]sx?$/i, ".js");
+    if (jsName !== relative) outputNames.push(jsName);
+  } else if (!/\.[^/]+$/.test(relative)) {
+    outputNames.push(`${relative}.js`);
+  }
+
+  for (const root of roots) {
+    for (const outputName of outputNames) {
+      const path = `${root}${outputName}`;
+      const found = typeof files.has === "function" && typeof files.get === "function"
+        ? files.has(path)
+        : Object.prototype.hasOwnProperty.call(files, path);
+      if (!found) continue;
+      const value = typeof files.get === "function" ? files.get(path) : files[path];
+      const source = typeof value === "string"
+        ? value
+        : value instanceof ArrayBuffer
+          ? stringFromBytes(new Uint8Array(value))
+          : ArrayBuffer.isView(value)
+            ? stringFromBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
+            : String(value);
+      return { path, source };
+    }
+  }
+  return null;
+}
+
 function prepareWorkerScriptPath(scriptPath, options = undefined) {
   const cacheKey = normalizeWorkerScriptPath(scriptPath);
   const preloads = normalizeWorkerPreloads(options);
@@ -2538,6 +2594,12 @@ function prepareWorkerScriptPath(scriptPath, options = undefined) {
     const dataPath = `${tempDir}/bun-worker-data-${nonce}.js`;
     cottontail.writeFile(dataPath, source);
     target = dataPath;
+  }
+  const standalone = standaloneWorkerEntry(target);
+  if (standalone) {
+    const standalonePath = `${tempDir}/bun-worker-standalone-${nonce}.js`;
+    cottontail.writeFile(standalonePath, `${standalone.source}\n//# sourceURL=${standalone.path}`);
+    target = standalonePath;
   }
   if (canUseBareWorkerScript(target, options, hasWorkerOptions)) {
     workerBundleCache.set(cacheKey, target);

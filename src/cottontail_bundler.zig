@@ -25,6 +25,9 @@ pub const BundleOptions = struct {
     /// Standalone executable graph. This enables compiler-specific path and
     /// HTML manifest handling without entering Bun's JSC bytecode pipeline.
     compile: bool = false,
+    /// Additional standalone entry points are emitted into the executable's
+    /// module graph while the first entry remains the process entry point.
+    additional_entry_points: []const []const u8 = &.{},
     /// Bun.build({ compile: true, target: "browser" }) with HTML entries
     /// emits one self-contained HTML artifact instead of an executable.
     compile_to_standalone_html: bool = false,
@@ -747,9 +750,17 @@ pub fn bundleEntryPointGraphWithOptions(
     const working_dir_z = try allocator.dupeZ(u8, working_dir);
     defer allocator.free(working_dir_z);
 
+    const entry_points: []const []const u8 = if (options.additional_entry_points.len > 0) entries: {
+        const combined = try allocator.alloc([]const u8, options.additional_entry_points.len + 1);
+        combined[0] = entry_path;
+        @memcpy(combined[1..], options.additional_entry_points);
+        break :entries combined;
+    } else &.{entry_path};
+    defer if (options.additional_entry_points.len > 0) allocator.free(entry_points);
+
     var transform_options = std.mem.zeroes(compiler.schema.api.TransformOptions);
     transform_options.absolute_working_dir = working_dir_z;
-    transform_options.entry_points = &.{entry_path};
+    transform_options.entry_points = entry_points;
     transform_options.target = options.target;
     transform_options.write = false;
     transform_options.output_dir = "";

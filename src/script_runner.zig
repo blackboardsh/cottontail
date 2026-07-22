@@ -1758,19 +1758,22 @@ pub fn runEmbedded(
 
 pub fn compileStandaloneSource(
     init: std.process.Init,
-    script_path: [:0]const u8,
+    entry_paths: []const []const u8,
+    output_path: []const u8,
     build_options: native_bundler.BundleOptions,
 ) !StandaloneSource {
     const ctx = try makeContext(init);
-    return compileStandaloneSourceWithContext(init, &ctx, script_path, build_options);
+    return compileStandaloneSourceWithContext(init, &ctx, entry_paths, output_path, build_options);
 }
 
 fn compileStandaloneSourceWithContext(
     init: std.process.Init,
     ctx: *const Context,
-    script_path: [:0]const u8,
+    entry_paths: []const []const u8,
+    output_path: []const u8,
     build_options: native_bundler.BundleOptions,
 ) !StandaloneSource {
+    if (entry_paths.len == 0) return error.MissingStandaloneEntryPoint;
     if (build_options.bytecode) try icu_bootstrap.ensure(init);
     const empty_args: [0][:0]const u8 = .{};
     var standalone_options = build_options;
@@ -1780,12 +1783,14 @@ fn compileStandaloneSourceWithContext(
     standalone_options.bytecode = false;
     standalone_options.compile = true;
     standalone_options.public_path = standaloneVirtualRoot();
-    standalone_options.entry_naming = "index.js";
+    standalone_options.additional_entry_points = entry_paths[1..];
+    standalone_options.entry_naming = if (entry_paths.len == 1) "index.js" else "[dir]/[name].[ext]";
     if (standalone_options.source_map != .none) standalone_options.source_map = .linked;
+    try applyStandaloneCompileDefines(ctx, output_path, &standalone_options);
     var graph: native_bundler.BundleGraphOutput = undefined;
     var runnable = try bundleScriptNative(
         ctx,
-        script_path,
+        entry_paths[0],
         empty_args[0..],
         empty_args[0..],
         null,
@@ -1827,6 +1832,75 @@ fn compileStandaloneSourceWithContext(
         .files = files,
         .bytecode = bytecode,
     };
+}
+
+fn applyStandaloneCompileDefines(
+    ctx: *const Context,
+    output_path: []const u8,
+    options: *native_bundler.BundleOptions,
+) !void {
+    const platform = switch (builtin.os.tag) {
+        .macos => "\"darwin\"",
+        .linux => "\"linux\"",
+        .windows => "\"win32\"",
+        else => @compileError("unsupported standalone platform"),
+    };
+    const architecture = switch (builtin.cpu.arch) {
+        .aarch64 => "\"arm64\"",
+        .x86_64 => "\"x64\"",
+        else => @compileError("unsupported standalone architecture"),
+    };
+    const output_name = std.fs.path.basename(output_path);
+    if (output_name.len == 0) return error.InvalidStandaloneOutputPath;
+    const virtual_dir = if (builtin.os.tag == .windows) "B:\\~BUN\\root" else "/$bunfs/root";
+    const virtual_path = try std.fmt.allocPrint(
+        ctx.allocator,
+        if (builtin.os.tag == .windows) "{s}\\{s}" else "{s}/{s}",
+        .{ virtual_dir, output_name },
+    );
+    const url_path = try std.fmt.allocPrint(
+        ctx.allocator,
+        if (builtin.os.tag == .windows) "/B:/~BUN/root/{s}" else "/$bunfs/root/{s}",
+        .{output_name},
+    );
+    const uri: std.Uri = .{
+        .scheme = "file",
+        .host = .{ .raw = "" },
+        .path = .{ .raw = url_path },
+    };
+    const virtual_url = try std.fmt.allocPrint(ctx.allocator, "{f}", .{&uri});
+
+    const compile_keys = [_][]const u8{
+        "process.platform",
+        "process.arch",
+        "process.versions.bun",
+        "import.meta.path",
+        "import.meta.filename",
+        "import.meta.dir",
+        "import.meta.dirname",
+        "import.meta.url",
+    };
+    const compile_values = [_][]const u8{
+        platform,
+        architecture,
+        "\"1.3.10\"",
+        try jsonStringLiteral(ctx, virtual_path),
+        try jsonStringLiteral(ctx, virtual_path),
+        try jsonStringLiteral(ctx, virtual_dir),
+        try jsonStringLiteral(ctx, virtual_dir),
+        try jsonStringLiteral(ctx, virtual_url),
+    };
+
+    var keys: std.ArrayList([]const u8) = .empty;
+    var values: std.ArrayList([]const u8) = .empty;
+    try keys.appendSlice(ctx.allocator, &compile_keys);
+    try values.appendSlice(ctx.allocator, &compile_values);
+    // Bun installs target defaults before user defines so explicit --define
+    // values retain precedence.
+    try keys.appendSlice(ctx.allocator, options.define_keys);
+    try values.appendSlice(ctx.allocator, options.define_values);
+    options.define_keys = keys.items;
+    options.define_values = values.items;
 }
 
 const CompileBuildOutputJson = struct {
@@ -1944,7 +2018,7 @@ fn compileBuild(
         try std.fs.path.resolve(allocator, &.{working_dir});
     ctx.stderr_capture = &diagnostics;
 
-    var payload = compileStandaloneSourceWithContext(init, &ctx, entry_z, build_options) catch |err| {
+    var payload = compileStandaloneSourceWithContext(init, &ctx, &.{entry_z}, output_path, build_options) catch |err| {
         const message = std.mem.trim(u8, diagnostics.items, " \t\r\n");
         if (message.len > 0) {
             diagnostic_out.* = try std.heap.c_allocator.dupe(u8, message);
