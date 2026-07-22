@@ -2300,7 +2300,7 @@ function replaceDynamicImportExpressions(source) {
       }
       break;
     }
-    if (text[after] === "{") return match;
+    if (text[after] === "{") return '["import"](';
     return "__ctDynamicImport(";
   });
 }

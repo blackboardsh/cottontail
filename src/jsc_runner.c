@@ -30684,6 +30684,8 @@ static bool ct_append_rewritten_dynamic_imports(
             argument_index = next_index;
         }
         if (argument_end >= end || *argument_end != ')') {
+            if (!ct_sb_append_bytes(builder, import_start, (size_t)(open_paren + 1 - import_start))) return false;
+            cursor = open_paren + 1;
             scan_index = ct_js_scan_advance_to(
                 &scan_state,
                 line,
@@ -30702,7 +30704,23 @@ static bool ct_append_rewritten_dynamic_imports(
         }
         const char *after_close = argument_end + 1;
         while (after_close < end && (*after_close == ' ' || *after_close == '\t')) after_close += 1;
-        if (trimmed_argument == argument_end || (after_close < end && *after_close == '{')) {
+        const bool is_method = after_close < end && *after_close == '{';
+        if (is_method) {
+            if (!ct_sb_append_cstr(builder, "[\"import\"]")) return false;
+            if (!ct_sb_append_bytes(builder, open_paren, (size_t)(argument_end + 1 - open_paren))) return false;
+            cursor = argument_end + 1;
+            scan_index = ct_js_scan_advance_to(
+                &scan_state,
+                line,
+                line_len,
+                scan_index,
+                (size_t)(cursor - line)
+            );
+            continue;
+        }
+        if (trimmed_argument == argument_end) {
+            if (!ct_sb_append_bytes(builder, import_start, (size_t)(argument_end + 1 - import_start))) return false;
+            cursor = argument_end + 1;
             scan_index = ct_js_scan_advance_to(
                 &scan_state,
                 line,

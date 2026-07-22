@@ -8,6 +8,12 @@ class ClassMethod {
   }
 }
 
+class AsyncClassMethod {
+  async import(value: string) {
+    return value;
+  }
+}
+
 const objectMethod = {
   import(value: string) {
     return value;
@@ -15,6 +21,7 @@ const objectMethod = {
 };
 
 assert(new ClassMethod()["import"]() === "class", "class method named import was rewritten");
+assert(await new AsyncClassMethod()["import"]("async") === "async", "async class method named import was rewritten");
 assert(objectMethod.import("object") === "object", "object method named import was rewritten");
 
 const queried = await import("./modules/dep.js?method-regression");
